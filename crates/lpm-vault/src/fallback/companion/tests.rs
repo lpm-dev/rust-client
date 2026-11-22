@@ -1013,6 +1013,120 @@ fn an_override_change_interrupted_at_any_step_is_finished_by_the_next_operation(
 }
 
 #[test]
+fn the_last_removal_needs_no_other_projects_records_in_the_file_store() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        change_overrides(&[set_override("API_URL", "mine")]).expect("set");
+        // A sibling the service count can't read: a file where a folder goes.
+        std::fs::write(vaults_path(home).join("broken.companion"), b"").expect("seed");
+
+        change_overrides(&[crate::companion::overrides::change::Edit::ClearAll])
+            .expect("the last removal reads only this project's records");
+        assert!(read_overrides().expect("read").is_empty());
+    });
+}
+
+#[test]
+fn a_record_that_fails_to_decrypt_is_damage_with_the_way_to_repair_it() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        change_overrides(&[set_override("API_URL", "fixture-mine")]).expect("set");
+        let entry = vaults_path(home)
+            .join(companion_folder_name(VAULT))
+            .join(entry_name(&record("overrides", None)));
+        let mut sealed = std::fs::read(&entry).expect("the sealed record");
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0xff;
+        std::fs::write(&entry, sealed).expect("corrupt it");
+        crate::companion::forget(VAULT);
+
+        for error in [
+            read_overrides().expect_err("damage refuses a read"),
+            change_overrides(&[set_override("B", "2")]).expect_err("damage refuses a change"),
+        ] {
+            assert!(
+                error.starts_with("This env project's newer data is damaged"),
+                "{error}"
+            );
+        }
+    });
+}
+
+#[test]
+fn an_override_change_loads_the_data_key_once() {
+    with_temp_vault_home(|_| {
+        force_file_vault();
+        seed_values();
+        change_overrides(&[set_override("API_URL", "mine")]).expect("set");
+        crate::companion::forget(VAULT);
+        crate::fallback::DATA_KEY_LOADS.with(|loads| loads.set(0));
+
+        change_overrides(&[set_override("API_URL", "yours")]).expect("replace");
+
+        assert_eq!(
+            crate::fallback::DATA_KEY_LOADS.with(std::cell::Cell::get),
+            1
+        );
+    });
+}
+
+#[test]
+fn removing_overrides_without_values_in_the_file_store_changes_nothing_and_says_so() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        let plan = change_overrides(&[crate::companion::overrides::change::Edit::Remove {
+            environment: "default".to_owned(),
+            key: "API_URL".to_owned(),
+        }])
+        .expect("nothing to remove");
+        assert!(plan.mutations.is_empty());
+        assert!(matches!(
+            plan.effects[..],
+            [crate::companion::overrides::change::Effect::Key { changed: false, .. }]
+        ));
+        assert!(
+            !vaults_path(home)
+                .join(companion_folder_name(VAULT))
+                .exists()
+        );
+    });
+}
+
+#[test]
+fn the_last_removal_interrupted_at_any_step_is_finished_by_the_next_operation() {
+    // Deleting the record and the marker: a crash can come once the journal
+    // is committed, before either, between them or after both.
+    for applied in 0..=2 {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            seed_values();
+            change_overrides(&[set_override("API_URL", "mine")]).expect("set");
+            CRASH_AFTER_CHANGES.with(|crash| crash.set(Some(applied)));
+
+            change_overrides(&[crate::companion::overrides::change::Edit::ClearAll])
+                .expect_err("the simulated crash");
+
+            assert!(journal_path(home, VAULT).exists(), "{applied}");
+            assert!(
+                read_overrides()
+                    .expect("the next operation recovers")
+                    .is_empty(),
+                "{applied}"
+            );
+            assert!(!journal_path(home, VAULT).exists(), "{applied}");
+            assert!(
+                !vaults_path(home)
+                    .join(companion_folder_name(VAULT))
+                    .exists(),
+                "{applied}"
+            );
+        });
+    }
+}
+
+#[test]
 fn a_damaged_record_refuses_override_changes_in_the_file_store() {
     with_temp_vault_home(|_| {
         force_file_vault();

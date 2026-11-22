@@ -207,6 +207,9 @@ fn fixture_edit(edit: &serde_json::Value) -> crate::overrides::change::Edit {
             from: text("from"),
             to: text("to"),
         },
+        "environmentCreated" => Edit::EnvironmentCreated {
+            environment: text("environment"),
+        },
         other => panic!("unknown action {other}"),
     }
 }
@@ -244,7 +247,7 @@ fn every_override_change_fixture_plans_the_transaction_it_records() {
         );
         let expect = &case.expect;
         match (expect.result.as_str(), planned) {
-            ("needsNames", Err(PlanError::NeedsInventory)) => {}
+            ("needsNames", Err(PlanError::NeedsInventory { .. })) => {}
             ("refused", Err(error)) => assert_eq!(
                 Some(format!("overrides.{}", error.code())),
                 expect.code,

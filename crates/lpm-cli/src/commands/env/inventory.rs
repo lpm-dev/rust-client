@@ -414,7 +414,11 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
             .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?,
         None => (HashMap::new(), HashMap::new()),
     };
-    let all_envs = lpm_env::resolver::list_all(env_map, environments, &vault_envs);
+    let all_envs = lpm_env::resolver::list_all_from_vault_names(
+        env_map,
+        environments,
+        lpm_vault::run_environment_names(&vault_envs, &overrides_by_env),
+    );
 
     if all_envs.is_empty() {
         if json_output {

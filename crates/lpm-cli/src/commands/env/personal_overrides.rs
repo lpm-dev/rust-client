@@ -46,15 +46,12 @@ pub(super) fn run(
             project_dir,
             json_output,
         ),
-        OverrideAction::List {
-            environment,
-            reveal,
-        } => list(environment.env.as_deref(), reveal, project_dir, json_output),
-        OverrideAction::Clear {
-            environment,
-            all: _,
-            yes,
-        } => clear(environment.env.as_deref(), yes, project_dir, json_output),
+        OverrideAction::List { env, reveal } => {
+            list(env.as_deref(), reveal, project_dir, json_output)
+        }
+        OverrideAction::Clear { env, all: _, yes } => {
+            clear(env.as_deref(), yes, project_dir, json_output)
+        }
     }
 }
 
@@ -76,16 +73,22 @@ fn set(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let environment = environment(env_input, project_dir)?;
-    let assignments = super::value_input::collect(
-        &super::value_input::Request {
-            entries: &values.entries,
-            stdin: values.stdin,
-            from_files: &values.from_files,
-            json_output,
-            command: "lpm env override set",
+    let request = super::value_input::Request {
+        entries: &values.entries,
+        stdin: values.stdin,
+        from_files: &values.from_files,
+        json_output,
+        command: "lpm env override set",
+        asking: super::value_input::Asking {
+            what: "Override",
+            environment: &environment,
         },
-        &mut super::value_input::ProcessSources,
-    )?;
+    };
+    let keys = super::value_input::named_keys(&request)?;
+    lpm_vault::overrides::check_before_values(project_dir, &environment, &keys)
+        .map_err(vault_error)?;
+    let assignments =
+        super::value_input::collect(&request, &mut super::value_input::ProcessSources)?;
     // A key given twice as KEY=VALUE keeps its last value, as `env set` does.
     let mut seen = std::collections::HashSet::with_capacity(assignments.len());
     let mut edits: Vec<Edit> = assignments
@@ -177,8 +180,18 @@ fn change_keys(
         ));
     }
     let environment = environment(env_input, project_dir)?;
+    // A key named twice is one change; where names differ only in case are
+    // one variable, so are they.
+    let mut named = std::collections::HashSet::with_capacity(keys.len());
     let edits: Vec<Edit> = keys
         .iter()
+        .filter(|key| {
+            named.insert(if cfg!(windows) {
+                key.to_ascii_uppercase()
+            } else {
+                (*key).clone()
+            })
+        })
         .map(|key| match kind {
             KeyChange::Unset => Edit::Unset {
                 environment: environment.clone(),
@@ -259,6 +272,7 @@ fn key_changes_json(environment: &str, change: &lpm_vault::overrides::Change) ->
         "env": environment,
         "changes": changes,
         "activated": change.activated,
+        "over_admission_target": change.over_admission_target,
     })
 }
 
@@ -382,12 +396,18 @@ fn list(
             println!("{line}");
         }
         for key in unset {
+            let never_passed = if lpm_env::is_denied_env_var(key) {
+                "  (LPM never passes it to processes)"
+            } else {
+                ""
+            };
             println!(
                 "{}",
                 install_ui::terminal_line!(
-                    "  {} {}",
+                    "  {} {}{}",
                     install_ui::bold(key),
                     install_ui::dim("(no value from the project)"),
+                    install_ui::dim(never_passed),
                 )
             );
         }
@@ -411,23 +431,49 @@ fn clear(
     let selected = env_input
         .map(|_| environment(env_input, project_dir))
         .transpose()?;
-    let all = lpm_vault::overrides::read_all(project_dir).map_err(vault_error)?;
-    let count: usize = match &selected {
-        Some(environment) => all
-            .get(environment)
-            .map_or(0, lpm_vault::PersonalOverrides::len),
-        None => all.values().map(lpm_vault::PersonalOverrides::len).sum(),
-    };
     let scope = match &selected {
         Some(environment) => environment.clone(),
         None => "every environment".to_owned(),
     };
-    if count > 0 {
+    let edits = if yes {
+        vec![match &selected {
+            Some(environment) => Edit::ClearEnvironment {
+                environment: environment.clone(),
+            },
+            None => Edit::ClearAll,
+        }]
+    } else {
+        // The question counts exactly what's removed: an override another
+        // command adds while it waits stays.
+        let reviewed: Vec<Edit> = lpm_vault::overrides::read_all(project_dir)
+            .map_err(vault_error)?
+            .into_iter()
+            .filter(|(environment, _)| {
+                selected
+                    .as_ref()
+                    .is_none_or(|selected| selected == environment)
+            })
+            .flat_map(|(environment, overrides)| {
+                overrides
+                    .set
+                    .into_keys()
+                    .chain(overrides.unset)
+                    .map(move |key| Edit::Remove {
+                        environment: environment.clone(),
+                        key,
+                    })
+            })
+            .collect();
+        if reviewed.is_empty() {
+            report_cleared(&selected, &scope, 0, json_output);
+            return Ok(());
+        }
+        let count = reviewed.len();
         let question = format!(
             "Remove {count} personal override{} on {THIS_MACHINE} ({scope})?",
             if count == 1 { "" } else { "s" }
         );
-        match confirm(&question, yes, json_output)? {
+        match confirm(&question, false, json_output)? {
             Some(true) => {}
             Some(false) => {
                 output::info("nothing was changed");
@@ -441,22 +487,23 @@ fn clear(
                 });
             }
         }
-    }
-    let edit = match &selected {
-        Some(environment) => Edit::ClearEnvironment {
-            environment: environment.clone(),
-        },
-        None => Edit::ClearAll,
+        reviewed
     };
-    let change = lpm_vault::overrides::change(project_dir, &[edit]).map_err(vault_error)?;
+    let change = lpm_vault::overrides::change(project_dir, &edits).map_err(vault_error)?;
     let removed = change
         .effects
         .iter()
         .map(|effect| match effect {
             Effect::Cleared { removed, .. } => *removed,
+            Effect::Key { changed: true, .. } => 1,
             _ => 0,
         })
         .sum::<usize>();
+    report_cleared(&selected, &scope, removed, json_output);
+    Ok(())
+}
+
+fn report_cleared(selected: &Option<String>, scope: &str, removed: usize, json_output: bool) {
     if json_output {
         println!(
             "{}",
@@ -470,10 +517,9 @@ fn clear(
             install_ui::bold(&removed.to_string()),
             if removed == 1 { "" } else { "s" },
             THIS_MACHINE,
-            &scope,
+            scope,
         ));
     }
-    Ok(())
 }
 
 /// Ask a yes-or-no question that defaults to No, or skip it with `yes`.

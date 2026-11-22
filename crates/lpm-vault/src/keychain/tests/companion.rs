@@ -15,7 +15,7 @@ fn run_overrides(storage: &mut MemoryProjectStorage) -> Result<crate::PersonalOv
         &read.gate,
         VAULT,
         "default",
-        read.overrides_record.as_deref(),
+        read.overrides_record.as_ref().map(|bytes| bytes.as_slice()),
     )
     .map_err(crate::companion::damaged)
 }

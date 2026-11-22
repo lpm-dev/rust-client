@@ -73,7 +73,7 @@ pub(super) fn authorize(
 pub(super) struct RunRead {
     pub(super) values: Option<Vec<u8>>,
     pub(super) gate: ProjectGate,
-    pub(super) overrides_record: Option<Vec<u8>>,
+    pub(super) overrides_record: Option<zeroize::Zeroizing<Vec<u8>>>,
 }
 
 /// Why the values item damages a project's access, when its approval
@@ -129,30 +129,38 @@ pub(super) fn read_for_run(
 
 /// The personal overrides record with its approval checked against the
 /// values item's claim `values_access`: contradictory attributes damage the
-/// project's access, and a record weaker than its values is strengthened
-/// before its bytes are used.
+/// project's access, and a record that claims less approval than its values
+/// is strengthened before its bytes are read, so they're never read without
+/// the approval the values need. Bytes read from a record that claims less
+/// all the same, as another process could leave it in between, are refused.
 pub(super) fn read_overrides_record(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
     values_access: Option<ClaimedAccess>,
-) -> Result<Option<Vec<u8>>, String> {
+) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, String> {
     let overrides_account = record_account(OVERRIDES_KIND, vault_id, None);
-    Ok(match storage.read_with_access(&overrides_account)? {
-        Some((_, ClaimedAccess::Contradictory)) => {
-            return Err(damaged(Damage::Access(
-                "the personal overrides' approval attributes contradict each other".to_owned(),
-            )));
-        }
+    let protected_values = values_access == Some(ClaimedAccess::RequireApproval);
+    if protected_values
+        && storage.claimed_access(&overrides_account)? == Some(ClaimedAccess::Automatic)
+    {
+        match_values_approval(storage, vault_id, &overrides_account)?;
+    }
+    match storage.read_with_access(&overrides_account)? {
+        None => Ok(None),
         Some((bytes, access)) => {
-            if values_access == Some(ClaimedAccess::RequireApproval)
-                && access == ClaimedAccess::Automatic
-            {
-                match_values_approval(storage, vault_id, &overrides_account)?;
+            let bytes = zeroize::Zeroizing::new(bytes);
+            match access {
+                ClaimedAccess::Contradictory => Err(damaged(Damage::Access(
+                    "the personal overrides' approval attributes contradict each other".to_owned(),
+                ))),
+                ClaimedAccess::Automatic if protected_values => Err(
+                    "the personal overrides' approval changed while they were read; try again"
+                        .to_owned(),
+                ),
+                _ => Ok(Some(bytes)),
             }
-            Some(bytes)
         }
-        None => None,
-    })
+    }
 }
 
 /// A record that follows values but claims no approval while the values item

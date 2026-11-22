@@ -37,6 +37,7 @@ use crate::companion::lifecycle::{
     Mutation, Plan,
 };
 use crate::companion::marker::MAX_RECORD_BYTES;
+use crate::companion::overrides::change::InventoryNeed;
 use crate::companion::overrides::{OVERRIDES_KIND, PersonalOverrides};
 use crate::companion::repair::{CompanionRepair, CompanionReview};
 use crate::companion::{Checked, CompanionBackend, damaged};
@@ -576,7 +577,6 @@ impl<'directory> FileCompanion<'directory> {
         for (index, operation) in journal.operations.iter().enumerate() {
             #[cfg(test)]
             if replay == Replay::Commit
-                && index > 0
                 && CRASH_AFTER_CHANGES.with(|crash| crash.get()) == Some(index)
             {
                 CRASH_AFTER_CHANGES.with(|crash| crash.set(None));
@@ -959,13 +959,44 @@ pub(crate) fn authorize_unlocked(
     vault_id: &str,
     operation: Operation,
 ) -> Result<ProjectGate, String> {
-    let mut companion = FileCompanion::open(directory)?;
+    authorize_with(&mut FileCompanion::open(directory)?, vault_id, operation)
+}
+
+fn authorize_with(
+    companion: &mut FileCompanion<'_>,
+    vault_id: &str,
+    operation: Operation,
+) -> Result<ProjectGate, String> {
     if !crate::companion::is_open(vault_id) {
         companion
             .recover(vault_id)
             .map_err(RecoveryError::into_message)?;
     }
-    crate::companion::authorize(&mut companion, vault_id, operation)
+    crate::companion::authorize(companion, vault_id, operation)
+}
+
+/// A record's bytes, wiped when dropped; `None` when it's absent.
+pub(crate) type RecordBytes = Option<zeroize::Zeroizing<Vec<u8>>>;
+
+/// The personal overrides record. One that fails to decrypt is damage,
+/// which says how to repair it.
+fn read_overrides_record(
+    companion: &mut FileCompanion<'_>,
+    vault_id: &str,
+) -> Result<RecordBytes, String> {
+    let account = CompanionAccount::Record {
+        kind: OVERRIDES_KIND.to_owned(),
+        vault_id: vault_id.to_owned(),
+        part: None,
+    };
+    match companion.read_checked(&account)? {
+        Checked::Present(bytes) => Ok(Some(bytes)),
+        Checked::Absent => Ok(None),
+        Checked::Unreadable(reason) => Err(damaged(Damage::InvalidRecord {
+            kind: OVERRIDES_KIND.to_owned(),
+            reason,
+        })),
+    }
 }
 
 /// The personal overrides record, read in the caller's lock after the Apply
@@ -973,14 +1004,10 @@ pub(crate) fn authorize_unlocked(
 pub(crate) fn read_overrides_record_unlocked(
     directory: &VaultStorageDirectory,
     vault_id: &str,
-) -> Result<(ProjectGate, Option<Vec<u8>>), String> {
-    let gate = authorize_unlocked(directory, vault_id, Operation::ReadApplyingOverrides)?;
+) -> Result<(ProjectGate, RecordBytes), String> {
     let mut companion = FileCompanion::open(directory)?;
-    let record = companion.read(&CompanionAccount::Record {
-        kind: OVERRIDES_KIND.to_owned(),
-        vault_id: vault_id.to_owned(),
-        part: None,
-    })?;
+    let gate = authorize_with(&mut companion, vault_id, Operation::ReadApplyingOverrides)?;
+    let record = read_overrides_record(&mut companion, vault_id)?;
     Ok((gate, record))
 }
 
@@ -991,8 +1018,13 @@ pub(crate) fn read_overrides_unlocked(
     environment: &str,
 ) -> Result<PersonalOverrides, String> {
     let (gate, record) = read_overrides_record_unlocked(directory, vault_id)?;
-    crate::companion::overrides::evaluate(&gate, vault_id, environment, record.as_deref())
-        .map_err(damaged)
+    crate::companion::overrides::evaluate(
+        &gate,
+        vault_id,
+        environment,
+        record.as_ref().map(|bytes| bytes.as_slice()),
+    )
+    .map_err(damaged)
 }
 
 /// Every environment's personal overrides, read in the caller's lock after
@@ -1002,7 +1034,12 @@ pub(crate) fn read_all_overrides_unlocked(
     vault_id: &str,
 ) -> Result<std::collections::BTreeMap<String, PersonalOverrides>, String> {
     let (gate, record) = read_overrides_record_unlocked(directory, vault_id)?;
-    crate::companion::overrides::evaluate_all(&gate, vault_id, record.as_deref()).map_err(damaged)
+    crate::companion::overrides::evaluate_all(
+        &gate,
+        vault_id,
+        record.as_ref().map(|bytes| bytes.as_slice()),
+    )
+    .map_err(damaged)
 }
 
 /// Plan `edits` against `vault_id`'s overrides and commit them in one
@@ -1012,26 +1049,33 @@ pub(crate) fn change_overrides_unlocked(
     vault_id: &str,
     edits: &[crate::companion::overrides::change::Edit],
 ) -> Result<crate::companion::overrides::change::ChangePlan, String> {
-    let gate = authorize_unlocked(directory, vault_id, Operation::Write)?;
     let mut companion = FileCompanion::open(directory)?;
+    let gate = authorize_with(&mut companion, vault_id, Operation::Write)?;
     let has_values = companion
         .vaults
         .entry_exists(&ValuesFile::Digest.name(vault_id))?
         || super::existing_legacy_vault_file_name(&companion.vaults, vault_id)?.is_some();
     if !has_values {
-        return Err(crate::overrides::no_values(vault_id));
+        return crate::overrides::plan_without_values(vault_id, &gate, edits);
     }
-    let record = companion.read(&CompanionAccount::Record {
-        kind: OVERRIDES_KIND.to_owned(),
-        vault_id: vault_id.to_owned(),
-        part: None,
-    })?;
-    let mut plan = crate::overrides::plan(vault_id, &gate, record.as_deref(), edits, || {
-        Ok(crate::companion::overrides::change::Inventory {
-            project: companion.inventory_of(vault_id)?,
-            service_records: companion.record_count()?,
-        })
-    })?;
+    let record = read_overrides_record(&mut companion, vault_id)?;
+    let mut plan = crate::overrides::plan(
+        vault_id,
+        &gate,
+        record.as_ref().map(|bytes| bytes.as_slice()),
+        edits,
+        |need| {
+            // Only creating the record counts every project's records.
+            Ok(crate::companion::overrides::change::Inventory {
+                project: companion.inventory_of(vault_id)?,
+                service_records: match need {
+                    InventoryNeed::Project => None,
+                    InventoryNeed::ProjectAndService => Some(companion.record_count()?),
+                },
+            })
+        },
+    )?;
+    drop(record);
     let mutations = std::mem::take(&mut plan.mutations);
     if !mutations.is_empty() {
         companion.commit(mutations)?;

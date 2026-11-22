@@ -292,6 +292,21 @@ pub(super) fn collect(
     Ok(assignments)
 }
 
+/// The keys `request` names, in order, once every argument is valid, for a
+/// check made before any value is read or asked for.
+pub(super) fn named_keys<'a>(request: &Request<'a>) -> Result<Vec<&'a str>, LpmError> {
+    let mut keys = Vec::with_capacity(request.entries.len() + request.from_files.len());
+    for entry in request.entries {
+        keys.push(match parse_entry(entry)? {
+            Entry::Given(key, _) | Entry::Bare(key) => key,
+        });
+    }
+    for file in request.from_files {
+        keys.push(parse_from_file(file)?.0);
+    }
+    Ok(keys)
+}
+
 fn parse_entry(entry: &str) -> Result<Entry<'_>, LpmError> {
     match entry.split_once('=') {
         Some((key, value)) if lpm_env::is_valid_env_var_name(key) => Ok(Entry::Given(key, value)),

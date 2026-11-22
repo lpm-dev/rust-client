@@ -614,6 +614,19 @@ pub(super) fn roll_back(
         Ok(writes) => writes,
         Err(error) => return Ok(Err(error)),
     };
+    let followed: Vec<crate::overrides::Edit> = writes
+        .iter()
+        .filter_map(|write| match (&write.renamed_from, &write.values) {
+            (Some(from), _) => Some(crate::overrides::Edit::EnvironmentRenamed {
+                from: from.clone(),
+                to: write.name.clone(),
+            }),
+            (None, None) => Some(crate::overrides::Edit::EnvironmentRemoved {
+                environment: write.name.clone(),
+            }),
+            (None, Some(_)) => None,
+        })
+        .collect();
     let written = apply_writes(&mut values, writes, recording);
     crate::write_all_environments_unlocked(
         directory,
@@ -623,6 +636,12 @@ pub(super) fn roll_back(
         &values,
         recording,
     )?;
+    crate::overrides::follow_environment_changes_unlocked(directory, vault_id, &followed)
+        .map_err(|error| {
+            format!(
+                "the rollback was applied, but this computer's personal overrides didn't follow the environments it renamed or removed: {error}"
+            )
+        })?;
     Ok(Ok(written))
 }
 

@@ -250,13 +250,24 @@ fn print_applies_overrides_but_ci_emission_excludes_them() {
         stderr(&printed)
     );
 
-    let ci = lpm(&project)
-        .args(["env", "print", "--ci"])
-        .output()
-        .unwrap();
-    assert!(ci.status.success(), "{}", stderr(&ci));
-    assert!(stdout(&ci).contains("team"), "{}", stdout(&ci));
-    assert!(!stdout(&ci).contains("mine"), "{}", stdout(&ci));
+    for ci_args in [
+        &["env", "print", "--ci"][..],
+        &["env", "print", "--format=github-actions"],
+    ] {
+        let ci = lpm(&project).args(ci_args).output().unwrap();
+        assert!(ci.status.success(), "{ci_args:?}: {}", stderr(&ci));
+        assert!(stdout(&ci).contains("team"), "{ci_args:?}: {}", stdout(&ci));
+        assert!(
+            !stdout(&ci).contains("mine"),
+            "{ci_args:?}: {}",
+            stdout(&ci)
+        );
+        assert!(
+            !stderr(&ci).contains(&personal_overrides_here(1)),
+            "{ci_args:?}: {}",
+            stderr(&ci)
+        );
+    }
 }
 
 #[test]
@@ -693,7 +704,8 @@ fn override_commands_change_what_a_run_gets_and_never_the_team_value() {
           "changed": true
         }
       ],
-      "activated": false
+      "activated": false,
+      "over_admission_target": false
     }
     "#);
     assert!(shown(&project, "show").contains("API_URL=team"));
@@ -739,6 +751,7 @@ fn override_set_reports_each_key_and_its_hidden_characters_as_json() {
         }
       ],
       "activated": true,
+      "over_admission_target": false,
       "value_warnings": [
         {
           "key": "API_URL",
@@ -1112,4 +1125,227 @@ fn export_and_copy_take_team_values_only() {
     let environments = listed(&project, &[])["environments"].clone();
     assert_eq!(environments.as_array().unwrap().len(), 1, "{environments}");
     assert_eq!(environments[0]["env"], "default");
+}
+
+#[test]
+fn removing_or_clearing_without_overrides_or_values_removes_nothing_and_says_so() {
+    let project = TempProject::empty(r#"{"name":"no-env-project","version":"1.0.0"}"#);
+    let removed = lpm(&project)
+        .args(["env", "override", "remove", "API_URL"])
+        .output()
+        .unwrap();
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    assert!(
+        stderr(&removed).contains("had no override (default); nothing to remove"),
+        "{}",
+        stderr(&removed)
+    );
+    let cleared = lpm(&project)
+        .args(["--json", "env", "override", "clear", "--all", "--yes"])
+        .output()
+        .unwrap();
+    assert!(cleared.status.success(), "{}", stderr(&cleared));
+    let envelope: serde_json::Value = serde_json::from_slice(&cleared.stdout).unwrap();
+    assert_eq!(envelope["removed"], 0);
+    let asked = lpm(&project)
+        .args(["env", "override", "clear", "--env", "default"])
+        .output()
+        .unwrap();
+    assert!(
+        asked.status.success(),
+        "nothing to ask about: {}",
+        stderr(&asked)
+    );
+    assert!(!project.path().join("lpm.json").exists());
+}
+
+#[test]
+fn a_key_named_twice_in_unset_or_remove_is_one_change() {
+    let (project, _) = project_with_team_value("{}");
+    lpm(&project)
+        .args(["env", "override", "set", "API_URL=mine"])
+        .assert()
+        .success();
+    let removed = lpm(&project)
+        .args(["env", "override", "remove", "API_URL", "API_URL"])
+        .output()
+        .unwrap();
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    let text = stdout(&removed) + &stderr(&removed);
+    assert_eq!(text.matches("API_URL").count(), 1, "{text}");
+    assert!(!text.contains("nothing to remove"), "{text}");
+
+    let unset = lpm(&project)
+        .args([
+            "--json",
+            "env",
+            "override",
+            "unset",
+            "SENTRY_DSN",
+            "SENTRY_DSN",
+        ])
+        .output()
+        .unwrap();
+    assert!(unset.status.success(), "{}", stderr(&unset));
+    let envelope: serde_json::Value = serde_json::from_slice(&unset.stdout).unwrap();
+    assert_eq!(envelope["changes"].as_array().map(Vec::len), Some(1));
+}
+
+#[test]
+fn the_human_list_says_when_lpm_never_passes_an_unset_name_too() {
+    let (project, vault_id) = project_with_team_value("{}");
+    seed(
+        &project,
+        &vault_id,
+        Some(OVERRIDES_MARKER),
+        Some(&overrides_record(
+            &vault_id,
+            "default",
+            "",
+            r#""CLASSPATH""#,
+        )),
+    );
+    let listed = lpm(&project)
+        .args(["env", "override", "list"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    let text = stdout(&listed);
+    let line = text
+        .lines()
+        .find(|line| line.contains("CLASSPATH"))
+        .expect("the unset name is listed");
+    assert!(line.contains("LPM never passes it to processes"), "{text}");
+}
+
+#[test]
+fn the_override_commands_say_what_env_means_for_each() {
+    for (command, said) in [
+        ("list", "every environment when left out"),
+        ("clear", "The environment whose overrides to remove"),
+        ("set", "default when left out"),
+    ] {
+        let project = TempProject::empty(r#"{"name":"help","version":"1.0.0"}"#);
+        let help = lpm(&project)
+            .args(["env", "override", command, "--help"])
+            .output()
+            .unwrap();
+        assert!(help.status.success(), "{}", stderr(&help));
+        assert!(stdout(&help).contains(said), "{command}: {}", stdout(&help));
+    }
+}
+
+#[test]
+fn an_environment_with_overrides_and_no_values_is_checked_and_listed() {
+    let (project, _) = project_with_team_value("{}");
+    extend_lpm_json(
+        &project,
+        serde_json::json!({"envSchema":{"vars":{"API_URL":{"format":"url"}}}}),
+    );
+    lpm(&project)
+        .args(["env", "set", "API_URL=https://team.example"])
+        .assert()
+        .success();
+    lpm(&project)
+        .args([
+            "env",
+            "override",
+            "set",
+            "--env",
+            "staging",
+            "API_URL=not-a-url",
+        ])
+        .assert()
+        .success();
+
+    let checked = lpm(&project)
+        .args(["--json", "env", "check"])
+        .output()
+        .unwrap();
+    assert!(!checked.status.success(), "staging fails with its override");
+    let checked: serde_json::Value = serde_json::from_slice(&checked.stdout).unwrap();
+    let staging = checked["environments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|environment| environment["environment"] == "staging")
+        .unwrap_or_else(|| panic!("staging is checked: {checked}"));
+    assert_eq!(staging["errors"][0]["key"], "API_URL");
+    assert_eq!(staging["errors"][0]["personalOverride"], true);
+
+    let listed = lpm(&project)
+        .args(["env", "ls", "--json"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let staging = listed["environments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|environment| environment["environment"] == "staging")
+        .unwrap_or_else(|| panic!("staging is listed: {listed}"));
+    assert_eq!(staging["personalOverrides"], 1);
+}
+
+#[test]
+fn override_writes_from_several_commands_at_once_all_land() {
+    let (project, _) = project_with_team_value("{}");
+    std::thread::scope(|scope| {
+        let runs: Vec<_> = (0..6)
+            .map(|index| {
+                let project = &project;
+                scope.spawn(move || {
+                    lpm(project)
+                        .args([
+                            "env",
+                            "override",
+                            "set",
+                            &format!("KEY_{index}=fixture-{index}"),
+                        ])
+                        .output()
+                        .unwrap()
+                })
+            })
+            .collect();
+        for run in runs {
+            let output = run.join().expect("the command ran");
+            assert!(output.status.success(), "{}", stderr(&output));
+        }
+    });
+    let set = listed(&project, &[])["environments"][0]["set"].clone();
+    let keys: Vec<&str> = set
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, ["KEY_0", "KEY_1", "KEY_2", "KEY_3", "KEY_4", "KEY_5"]);
+}
+
+#[test]
+fn a_warning_after_a_run_with_overrides_still_shows() {
+    let (project, _) = project_with_team_value(r#"{"build":"node build.cjs"}"#);
+    lpm(&project)
+        .args(["env", "override", "set", "API_URL=mine"])
+        .assert()
+        .success();
+    extend_lpm_json(
+        &project,
+        serde_json::json!({"tasks":{"build":{"cache":true,"outputs":["src/generated/**"]}}}),
+    );
+    project.write_file("src/index.ts", "export const value = 1;\n");
+    project.write_file(
+        "build.cjs",
+        "const fs = require('fs');\nfs.mkdirSync('src/generated', {recursive: true});\nfs.writeFileSync('src/generated/value.js', String(Date.now()));",
+    );
+
+    let run = lpm(&project).args(["run", "build"]).output().unwrap();
+    assert!(run.status.success(), "{}", stderr(&run));
+    let text = stdout(&run) + &stderr(&run);
+    assert!(text.contains(&personal_overrides_here(1)), "{text}");
+    assert!(
+        text.contains("writes src/generated/value.js, which its cache inputs also match"),
+        "{text}"
+    );
 }

@@ -7,16 +7,19 @@
 use std::collections::BTreeMap;
 
 use lpm_common::stored_env::is_safe_vault_id;
+use lpm_env_companion::budgets::ADMISSION_CAP;
 use lpm_env_companion::gate::{GateError, Operation, ProjectGate};
 use lpm_env_companion::lifecycle::{Mutation, needs_resume};
-use lpm_env_companion::marker::Marker;
-use lpm_env_companion::overrides::change::{Edit, Effect, Inventory, PlanError, plan_change};
+use lpm_env_companion::marker::{MAX_RECORD_BYTES, Marker};
+use lpm_env_companion::overrides::change::{
+    Edit, EditError, Effect, Inventory, InventoryNeed, PlanError, plan_change,
+};
 use lpm_env_companion::overrides::evaluate_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
-use crate::frame::{self, Domain, Output, blob, refused};
+use crate::frame::{self, Domain, Output, blob, refused, refused_with};
 use crate::{LPMEnvResult, failure};
 
 /// A record and a marker of 100 KiB each, the values a batch sets, and the
@@ -28,6 +31,7 @@ const DOMAIN: Domain = Domain {
     serialization: "overrides.serialization",
     panic: "overrides.panic",
     input_limit: OVERRIDES_INPUT_LIMIT,
+    input_blobs: MAX_EDITS + 2,
 };
 
 /// The gate the marker read in the caller's lock gives.
@@ -86,7 +90,10 @@ pub unsafe extern "C" fn lpm_env_overrides_read(input: *const u8, length: usize)
             };
             let gate = gate_of(vault_id, marker);
             if gate.marker().is_some_and(needs_resume) {
-                return refused("overrides.needs_resume", None);
+                return refused(
+                    "overrides.needs_resume",
+                    Some(PlanError::NeedsResume.to_string()),
+                );
             }
             if let Err(error) = gate.authorize(Operation::ReadApplyingOverrides) {
                 return refused(gate_code(&error), Some(error.to_string()));
@@ -161,6 +168,9 @@ enum EditRequest {
         from: String,
         to: String,
     },
+    EnvironmentCreated {
+        environment: String,
+    },
 }
 
 #[derive(Deserialize)]
@@ -181,25 +191,88 @@ struct PlanRequest {
 /// The most edits one batch makes.
 const MAX_EDITS: usize = 1024;
 
-fn edit(request: EditRequest, blobs: &[&[u8]]) -> Option<Edit> {
-    Some(match request {
-        EditRequest::Set {
-            environment,
-            key,
-            value,
-        } => Edit::Set {
-            environment,
-            key,
-            value: Zeroizing::new(std::str::from_utf8(blob(blobs, value)?).ok()?.to_owned()),
-        },
-        EditRequest::Unset { environment, key } => Edit::Unset { environment, key },
-        EditRequest::Remove { environment, key } => Edit::Remove { environment, key },
-        EditRequest::ClearEnvironment { environment } => Edit::ClearEnvironment { environment },
-        EditRequest::ClearAll => Edit::ClearAll,
-        EditRequest::EnvironmentRenamed { from, to } => Edit::EnvironmentRenamed { from, to },
-        EditRequest::EnvironmentRemoved { environment } => Edit::EnvironmentRemoved { environment },
-        EditRequest::EnvironmentDuplicated { from, to } => Edit::EnvironmentDuplicated { from, to },
-    })
+/// Why the edits of a request can't be read.
+enum EditsFailure {
+    InvalidInput,
+    /// A value larger than one record holds, or the values set so far past
+    /// what one input carries: refused before more is copied.
+    TooLarge {
+        index: usize,
+        key: String,
+    },
+}
+
+/// The edits a request names, each value copied once out of its blob.
+fn edits(requests: Vec<EditRequest>, blobs: &[&[u8]]) -> Result<Vec<Edit>, EditsFailure> {
+    let mut copied = 0_usize;
+    let mut edits = Vec::with_capacity(requests.len());
+    for (index, request) in requests.into_iter().enumerate() {
+        edits.push(match request {
+            EditRequest::Set {
+                environment,
+                key,
+                value,
+            } => {
+                let bytes = blob(blobs, value).ok_or(EditsFailure::InvalidInput)?;
+                copied = copied.saturating_add(bytes.len());
+                if bytes.len() > MAX_RECORD_BYTES || copied > OVERRIDES_INPUT_LIMIT {
+                    return Err(EditsFailure::TooLarge { index, key });
+                }
+                let text = std::str::from_utf8(bytes).map_err(|_| EditsFailure::InvalidInput)?;
+                Edit::Set {
+                    environment,
+                    key,
+                    value: Zeroizing::new(text.to_owned()),
+                }
+            }
+            EditRequest::Unset { environment, key } => Edit::Unset { environment, key },
+            EditRequest::Remove { environment, key } => Edit::Remove { environment, key },
+            EditRequest::ClearEnvironment { environment } => Edit::ClearEnvironment { environment },
+            EditRequest::ClearAll => Edit::ClearAll,
+            EditRequest::EnvironmentRenamed { from, to } => Edit::EnvironmentRenamed { from, to },
+            EditRequest::EnvironmentRemoved { environment } => {
+                Edit::EnvironmentRemoved { environment }
+            }
+            EditRequest::EnvironmentDuplicated { from, to } => {
+                Edit::EnvironmentDuplicated { from, to }
+            }
+            EditRequest::EnvironmentCreated { environment } => {
+                Edit::EnvironmentCreated { environment }
+            }
+        });
+    }
+    Ok(edits)
+}
+
+/// What a refusal names besides its code: the edit and the name it's
+/// about, or the sizes, never a value or an invalid key.
+fn refusal_details(error: &PlanError) -> serde_json::Map<String, Value> {
+    let mut details = serde_json::Map::new();
+    match error {
+        PlanError::Edit { index, reason } => {
+            details.insert("edit".to_owned(), json!(index));
+            match reason {
+                EditError::InvalidEnvironment(environment)
+                | EditError::SameEnvironment { environment, .. } => {
+                    details.insert("environment".to_owned(), json!(environment));
+                }
+                EditError::DeniedName(key) | EditError::NulValue(key) => {
+                    details.insert("key".to_owned(), json!(key));
+                }
+                EditError::InvalidKey => {}
+            }
+        }
+        PlanError::TooLarge(bytes) => {
+            details.insert("bytes".to_owned(), json!(bytes));
+            details.insert("limit".to_owned(), json!(MAX_RECORD_BYTES));
+        }
+        PlanError::AdmissionRefused(records) => {
+            details.insert("records".to_owned(), json!(records));
+            details.insert("limit".to_owned(), json!(ADMISSION_CAP));
+        }
+        _ => {}
+    }
+    details
 }
 
 #[derive(Serialize)]
@@ -228,13 +301,17 @@ enum EffectOutput<'a> {
         to: &'a str,
         moved: usize,
         replaced: usize,
+        kept: usize,
     },
     #[serde(rename_all = "camelCase")]
     NotCopied {
         from: &'a str,
         to: &'a str,
         count: usize,
+        existing: usize,
     },
+    #[serde(rename_all = "camelCase")]
+    Existing { environment: &'a str, count: usize },
 }
 
 impl<'a> From<&'a Effect> for EffectOutput<'a> {
@@ -270,15 +347,27 @@ impl<'a> From<&'a Effect> for EffectOutput<'a> {
                 to,
                 moved,
                 replaced,
+                kept,
             } => Self::Moved {
                 from,
                 to,
                 moved: *moved,
                 replaced: *replaced,
+                kept: *kept,
             },
-            Effect::NotCopied { from, to, count } => Self::NotCopied {
+            Effect::NotCopied {
                 from,
                 to,
+                count,
+                existing,
+            } => Self::NotCopied {
+                from,
+                to,
+                count: *count,
+                existing: *existing,
+            },
+            Effect::Existing { environment, count } => Self::Existing {
+                environment,
                 count: *count,
             },
         }
@@ -305,13 +394,23 @@ pub unsafe extern "C" fn lpm_env_overrides_plan(input: *const u8, length: usize)
             ) else {
                 return failure(2, DOMAIN.invalid_input);
             };
-            let Some(edits) = request
-                .edits
-                .into_iter()
-                .map(|request| edit(request, blobs))
-                .collect::<Option<Vec<Edit>>>()
-            else {
-                return failure(2, DOMAIN.invalid_input);
+            let edits = match edits(request.edits, blobs) {
+                Ok(edits) => edits,
+                Err(EditsFailure::InvalidInput) => return failure(2, DOMAIN.invalid_input),
+                Err(EditsFailure::TooLarge { index, key }) => {
+                    let mut details = serde_json::Map::new();
+                    details.insert("edit".to_owned(), json!(index));
+                    details.insert("key".to_owned(), json!(key));
+                    details.insert("limit".to_owned(), json!(MAX_RECORD_BYTES));
+                    return refused_with(
+                        "overrides.too_large",
+                        Some(format!(
+                            "the personal override of {key} would be larger than the {} KiB one record may hold",
+                            MAX_RECORD_BYTES / 1024
+                        )),
+                        details,
+                    );
+                }
             };
             let inventory = request
                 .names
@@ -320,14 +419,22 @@ pub unsafe extern "C" fn lpm_env_overrides_plan(input: *const u8, length: usize)
             let gate = gate_of(vault_id, marker);
             let plan = match plan_change(vault_id, &gate, record, &edits, inventory.as_ref()) {
                 Ok(plan) => plan,
-                Err(PlanError::NeedsInventory) => {
-                    return Output::new(DOMAIN.serialization)
-                        .finish(&json!({ "result": "needsNames" }));
+                Err(PlanError::NeedsInventory { need, effects }) => {
+                    let effects: Vec<EffectOutput<'_>> =
+                        effects.iter().map(EffectOutput::from).collect();
+                    let needs = match need {
+                        InventoryNeed::Project => "project",
+                        InventoryNeed::ProjectAndService => "projectAndService",
+                    };
+                    return Output::new(DOMAIN.serialization).finish(
+                        &json!({ "result": "needsNames", "needs": needs, "effects": effects }),
+                    );
                 }
                 Err(error) => {
-                    return refused(
+                    return refused_with(
                         &format!("overrides.{}", error.code()),
                         Some(error.to_string()),
+                        refusal_details(&error),
                     );
                 }
             };
@@ -366,22 +473,25 @@ pub unsafe extern "C" fn lpm_env_overrides_plan(input: *const u8, length: usize)
     }
 }
 
-/// Every environment's overrides, for `lpm_env_check`'s effective mode.
+/// Every environment's overrides, for `lpm_env_check`'s effective mode, or
+/// the status and code it fails with: 2 for invalid input, 1 for overrides
+/// it can't apply.
 pub(crate) fn for_check(
     vault_id: &str,
     marker: Option<&[u8]>,
     record: Option<&[u8]>,
-) -> Result<BTreeMap<String, lpm_env_companion::overrides::PersonalOverrides>, &'static str> {
+) -> Result<BTreeMap<String, lpm_env_companion::overrides::PersonalOverrides>, (u32, &'static str)>
+{
     if !is_safe_vault_id(vault_id) {
-        return Err("env.invalid_input");
+        return Err((2, "env.invalid_input"));
     }
     let gate = gate_of(vault_id, marker);
     if gate.marker().is_some_and(needs_resume) {
-        return Err("overrides.needs_resume");
+        return Err((1, "overrides.needs_resume"));
     }
     gate.authorize(Operation::ReadApplyingOverrides)
-        .map_err(|error| gate_code(&error))?;
-    evaluate_all(&gate, vault_id, record).map_err(|_| "overrides.damaged")
+        .map_err(|error| (1, gate_code(&error)))?;
+    evaluate_all(&gate, vault_id, record).map_err(|_| (1, "overrides.damaged"))
 }
 
 #[cfg(test)]

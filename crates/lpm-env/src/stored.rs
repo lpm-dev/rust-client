@@ -212,11 +212,12 @@ pub struct StoredValuesCheck {
     pub errors: Vec<ValidationError>,
     /// Declared keys without a usable stored value that a schema default fills.
     pub defaults: BTreeMap<String, String>,
-    /// Stored keys the runner never passes to a process, ordered by key.
+    /// Keys the runner never passes to a process, stored or given by a
+    /// personal override, ordered by key.
     pub ignored: Vec<String>,
-    /// The keys of the errors a personal override caused, ordered: it gave
-    /// the value the schema judged, or its unset left the value missing.
-    pub from_overrides: Vec<String>,
+    /// For each of `errors`, in order, whether a personal override caused
+    /// it: see [`PersonalOverrideOrigins::attribute`].
+    pub from_overrides: Vec<bool>,
     /// The personal overrides that change the environment, ordered: what a
     /// run's notice counts.
     pub applied_overrides: Vec<String>,
@@ -344,16 +345,7 @@ fn check_stored_values_with_case_policy(
             (!was_empty || !value.is_empty()).then(|| (key.clone(), value.clone()))
         })
         .collect();
-    let mut from_overrides: Vec<String> = if origins.is_empty() {
-        Vec::new()
-    } else {
-        errors
-            .iter()
-            .filter(|error| origins.caused(error, &values))
-            .map(|error| error.key.clone())
-            .collect()
-    };
-    from_overrides.dedup();
+    let from_overrides = origins.attribute(&errors, &values);
     let applied_overrides = origins.names().into_iter().map(str::to_owned).collect();
     Ok(StoredValuesCheck {
         reads_default_environment: reads_default,
@@ -766,6 +758,31 @@ mod tests {
         .expect("no casing conflict")
     }
 
+    /// The keys of the errors a personal override caused.
+    fn blamed(check: &StoredValuesCheck) -> Vec<&str> {
+        assert_eq!(check.from_overrides.len(), check.errors.len());
+        check
+            .errors
+            .iter()
+            .zip(&check.from_overrides)
+            .filter(|(_, caused)| **caused)
+            .map(|(error, _)| error.key.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_group_an_override_broke_blames_it_for_each_member() {
+        let stored = environments(&[("default", &[("PRIMARY", "team")])]);
+        let check = effective(
+            r#"{"vars":{"PRIMARY":{},"FALLBACK":{}},"groups":{"database":{"mode":"exactlyOne","vars":["PRIMARY","FALLBACK"]}}}"#,
+            "default",
+            &stored,
+            &personal(&[], &["PRIMARY"]),
+            false,
+        );
+        assert_eq!(blamed(&check), ["FALLBACK", "PRIMARY"]);
+    }
+
     #[test]
     fn the_effective_check_judges_what_the_overrides_give_and_names_them() {
         let schema = r#"{"vars":{"API_URL":{"format":"url"},"TOKEN":{"required":true},"PORT":{"format":"port"}}}"#;
@@ -792,7 +809,7 @@ mod tests {
                 ("TOKEN", "missing"),
             ]
         );
-        assert_eq!(check.from_overrides, ["API_URL", "TOKEN"]);
+        assert_eq!(blamed(&check), ["API_URL", "TOKEN"]);
         assert_eq!(check.applied_overrides, ["API_URL", "TOKEN"]);
         let team_only = check_stored_values(
             &EnvValidator::new(&serde_json::from_str(schema).unwrap()),
@@ -801,7 +818,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(codes(&team_only), [("PORT", "format")]);
-        assert!(team_only.from_overrides.is_empty());
+        assert!(blamed(&team_only).is_empty());
     }
 
     #[test]
@@ -815,7 +832,7 @@ mod tests {
             false,
         );
         assert_eq!(codes(&check), [("PORT", "format")]);
-        assert!(check.from_overrides.is_empty());
+        assert!(blamed(&check).is_empty());
         assert!(
             check.applied_overrides.is_empty(),
             "an override of the same value changes nothing"
@@ -833,7 +850,7 @@ mod tests {
             false,
         );
         assert!(check.reads_default_environment);
-        assert_eq!(check.from_overrides, ["API_URL"]);
+        assert_eq!(blamed(&check), ["API_URL"]);
     }
 
     #[test]
@@ -861,6 +878,6 @@ mod tests {
             true,
         );
         assert_eq!(codes(&check), [("API_URL", "format")]);
-        assert_eq!(check.from_overrides, ["API_URL"]);
+        assert_eq!(blamed(&check), ["API_URL"]);
     }
 }

@@ -58,6 +58,8 @@ const DOMAIN: Domain = Domain {
     serialization: "history.serialization",
     panic: "history.panic",
     input_limit: HISTORY_INPUT_LIMIT,
+    // The head, the key, the values and at most 16 parts, with room to spare.
+    input_blobs: 64,
 };
 
 impl Output {

@@ -115,10 +115,11 @@ pub(super) enum OverrideAction {
         keys: Vec<String>,
     },
     /// List this computer's overrides: names only, values with --reveal.
-    /// Every environment's, unless --env picks one.
     List {
-        #[command(flatten)]
-        environment: Environment,
+        /// Only this environment, by name or by an alias lpm.json gives it;
+        /// every environment when left out.
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        env: Option<String>,
         /// Show values.
         #[arg(long)]
         reveal: bool,
@@ -126,8 +127,10 @@ pub(super) enum OverrideAction {
     /// Remove every override of one environment, or of all of them.
     #[command(group(clap::ArgGroup::new("scope").required(true).args(["env", "all"])))]
     Clear {
-        #[command(flatten)]
-        environment: Environment,
+        /// The environment whose overrides to remove, by name or by an alias
+        /// lpm.json gives it.
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        env: Option<String>,
         /// Every environment's overrides.
         #[arg(long, conflicts_with = "env")]
         all: bool,

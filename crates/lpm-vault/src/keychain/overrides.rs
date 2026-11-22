@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use crate::PersonalOverrides;
 use crate::companion::gate::Operation;
 use crate::companion::lifecycle::LifecycleStore as _;
-use crate::companion::overrides::change::{ChangePlan, Edit, Inventory};
+use crate::companion::overrides::change::{ChangePlan, Edit, Inventory, InventoryNeed};
 use crate::companion::{damaged, overrides};
 use crate::macos_keychain::ClaimedAccess;
 
@@ -34,22 +34,34 @@ pub(super) fn read_all_with_storage(
         )));
     }
     let record = read_overrides_record(storage, vault_id, values_access)?;
-    overrides::evaluate_all(&gate, vault_id, record.as_deref()).map_err(damaged)
+    overrides::evaluate_all(
+        &gate,
+        vault_id,
+        record.as_ref().map(|bytes| bytes.as_slice()),
+    )
+    .map_err(damaged)
 }
 
 pub(crate) fn change_unlocked(vault_id: &str, edits: &[Edit]) -> Result<ChangePlan, String> {
     change_with_storage(&mut super::KeychainProjectStorage, vault_id, edits)
 }
 
+/// Plan and commit `edits` through one listing of the service: the gate,
+/// the inventory a plan asks for and the commit's own check all read it.
 pub(super) fn change_with_storage(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
     edits: &[Edit],
 ) -> Result<ChangePlan, String> {
     super::validate_vault_id(vault_id)?;
-    let gate = authorize(storage, vault_id, Operation::Write)?;
-    let values_access = match storage.claimed_access(vault_id)? {
-        None => return Err(crate::overrides::no_values(vault_id)),
+    let mut listed = super::ListedStorage::new(storage);
+    let gate = crate::companion::authorize(
+        &mut KeychainCompanion(&mut listed),
+        vault_id,
+        Operation::Write,
+    )?;
+    let values_access = match listed.claimed_access(vault_id)? {
+        None => return crate::overrides::plan_without_values(vault_id, &gate, edits),
         Some(ClaimedAccess::Contradictory) => {
             return Err(damaged(crate::companion::gate::Damage::Access(
                 super::companion_gate::CONTRADICTORY_VALUES.to_owned(),
@@ -57,17 +69,25 @@ pub(super) fn change_with_storage(
         }
         access => access,
     };
-    let record = read_overrides_record(storage, vault_id, values_access)?;
-    let mut plan = crate::overrides::plan(vault_id, &gate, record.as_deref(), edits, || {
-        let names = storage.account_names()?;
-        Ok(Inventory::from_names(
-            vault_id,
-            names.iter().map(String::as_str),
-        ))
-    })?;
+    let record = read_overrides_record(&mut listed, vault_id, values_access)?;
+    let mut plan = crate::overrides::plan(
+        vault_id,
+        &gate,
+        record.as_ref().map(|bytes| bytes.as_slice()),
+        edits,
+        |need| {
+            let names = listed.account_names()?;
+            let names = names.iter().map(String::as_str);
+            Ok(match need {
+                InventoryNeed::Project => Inventory::project_from_names(vault_id, names),
+                InventoryNeed::ProjectAndService => Inventory::from_names(vault_id, names),
+            })
+        },
+    )?;
+    drop(record);
     let mutations = std::mem::take(&mut plan.mutations);
     if !mutations.is_empty() {
-        if let Err(error) = KeychainCompanion(storage).commit(mutations) {
+        if let Err(error) = KeychainCompanion(&mut listed).commit(mutations) {
             crate::companion::forget(vault_id);
             return Err(error);
         }

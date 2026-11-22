@@ -208,9 +208,10 @@ pub struct ChildEnv {
     vars: HashMap<String, String>,
     overrides: PersonalOverrides,
     origins: OverrideOrigins,
-    /// The names of the overrides that changed the environment at layer 4,
-    /// in order.
-    applied: Vec<String>,
+    /// How many overrides changed the environment at layer 4.
+    applied: usize,
+    /// Their names, in order, kept only while a debug log can show them.
+    applied_names: Vec<String>,
     /// The names the last [`validate`](Self::validate) inserted, `PATH`
     /// and the trusted values: lpm's own, which validating again replaces
     /// rather than ignoring as a project's.
@@ -236,12 +237,13 @@ impl ChildEnv {
 
     /// How many personal overrides changed this environment.
     pub fn override_count(&self) -> usize {
-        self.applied.len()
+        self.applied
     }
 
-    /// The names of the personal overrides that changed this environment.
+    /// The names of the personal overrides that changed this environment,
+    /// kept only while debug logging is on, the one place they're shown.
     pub fn override_names(&self) -> &[String] {
-        &self.applied
+        &self.applied_names
     }
 
     pub fn overrides(&self) -> &PersonalOverrides {
@@ -290,9 +292,10 @@ impl ChildEnv {
         evaluate_project_env(&mut self.vars, validator, context)
     }
 
-    /// Whether a personal override caused `error`.
-    pub fn caused_by_override(&self, error: &lpm_env::ValidationError) -> bool {
-        self.origins.caused(error, &self.vars)
+    /// For each of `errors`, in order, whether a personal override caused
+    /// it.
+    pub fn override_attribution(&self, errors: &[lpm_env::ValidationError]) -> Vec<bool> {
+        self.origins.attribute(errors, &self.vars)
     }
 
     /// Steps 6–8 for a child: remove dangerous names from layers 1–5, insert
@@ -365,7 +368,7 @@ impl ProjectEnvLayers {
     /// of a name it has. Names LPM never passes to a process count for neither.
     pub fn override_count(&self) -> usize {
         match &self.composed {
-            Some(child) => child.applied.len(),
+            Some(child) => child.applied,
             None => {
                 OverrideOrigins::changing(&self.vars, self.overrides.layer(), cfg!(windows)).len()
             }
@@ -375,7 +378,7 @@ impl ProjectEnvLayers {
     /// The names [`override_count`](Self::override_count) counts, in order.
     pub fn override_names(&self) -> Vec<String> {
         match &self.composed {
-            Some(child) => child.applied.clone(),
+            Some(child) => child.applied_names.clone(),
             None => OverrideOrigins::changing(&self.vars, self.overrides.layer(), cfg!(windows))
                 .names()
                 .into_iter()
@@ -465,13 +468,18 @@ pub fn compose_with_overrides(
 
 fn apply_layer_four(mut vars: HashMap<String, String>, overrides: &PersonalOverrides) -> ChildEnv {
     let origins = OverrideOrigins::changing(&vars, overrides.layer(), cfg!(windows));
-    let applied = origins.names().into_iter().map(str::to_owned).collect();
+    let applied_names = if !origins.is_empty() && debug_logging() {
+        origins.names().into_iter().map(str::to_owned).collect()
+    } else {
+        Vec::new()
+    };
     apply_personal_overrides(&mut vars, overrides);
     ChildEnv {
         vars,
         overrides: overrides.clone(),
+        applied: origins.len(),
         origins,
-        applied,
+        applied_names,
         validated: Vec::new(),
     }
 }
@@ -526,7 +534,7 @@ pub fn announce_personal_overrides(child: &ChildEnv, environment: &str) {
         .insert(notice.clone());
     if first {
         eprintln!("lpm: {notice}");
-        log_personal_override_names(child.override_names());
+        log_personal_override_names(|| child.override_names().to_vec());
     }
 }
 
@@ -541,11 +549,21 @@ pub(crate) fn personal_overrides_shown(count: usize, environment: &str) {
     }
 }
 
+/// Whether anything may log at debug level. `tracing::enabled!` can't say:
+/// under the CLI's per-layer filters, an answer of no leaves filter state
+/// behind that drops the thread's next event, such as a warning.
+fn debug_logging() -> bool {
+    tracing::level_filters::LevelFilter::current() >= tracing::level_filters::LevelFilter::DEBUG
+}
+
 /// Log the names of the overrides a notice counted at debug level, which
 /// `--verbose` shows.
-pub fn log_personal_override_names(names: &[String]) {
-    if !names.is_empty() {
-        tracing::debug!("personal overrides apply to: {}", names.join(", "));
+pub fn log_personal_override_names(names: impl FnOnce() -> Vec<String>) {
+    if debug_logging() {
+        let names = names();
+        if !names.is_empty() {
+            tracing::debug!("personal overrides apply to: {}", names.join(", "));
+        }
     }
 }
 
@@ -804,7 +822,7 @@ pub fn load_project_env_layers_for_resolved(
 pub fn read_vault_environments_for_run(
     project_dir: &Path,
     policy: OverridePolicy,
-    environments: impl FnOnce(&lpm_vault::EnvironmentMap) -> Vec<lpm_env::ResolvedEnv>,
+    environments: impl FnOnce(&[&str]) -> Vec<lpm_env::ResolvedEnv>,
 ) -> Result<Option<Vec<lpm_env::ResolvedEnv>>, String> {
     crate::env_access::read_vaults(|| {
         let all = match policy {
@@ -814,7 +832,7 @@ pub fn read_vault_environments_for_run(
                 overrides: HashMap::new(),
             },
         };
-        let resolved = environments(&all.values);
+        let resolved = environments(&all.environment_names());
         let values = resolved
             .iter()
             .map(|environment| {
@@ -979,11 +997,13 @@ fn validation_result(
     if errors.is_empty() {
         return Ok(());
     }
+    let caused = child.override_attribution(&errors);
     Err(LpmError::EnvValidation(
         errors
             .iter()
-            .map(|error| {
-                if child.caused_by_override(error) {
+            .zip(caused)
+            .map(|(error, caused)| {
+                if caused {
                     format!("  {error} (from a personal override on {THIS_MACHINE})")
                 } else {
                     format!("  {error}")
@@ -1340,6 +1360,24 @@ fn merge_env_file(target: &mut HashMap<String, String>, path: &Path) -> Result<(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn layer_four_counts_the_overrides_and_names_them_only_for_a_debug_log() {
+        let overrides = PersonalOverrides {
+            set: HashMap::from([("API_URL".to_owned(), "mine".to_owned())]),
+            unset: vec!["TOKEN".to_owned()],
+        };
+        let vars = HashMap::from([
+            ("API_URL".to_owned(), "team".to_owned()),
+            ("TOKEN".to_owned(), "team".to_owned()),
+        ]);
+        let child = compose_with_overrides(vars, Some(&overrides), OverridePolicy::Apply);
+        assert_eq!(child.override_count(), 2);
+        assert!(
+            child.override_names().is_empty(),
+            "nothing logs at debug level here, so no names are kept"
+        );
+    }
 
     /// A pre-hook and its script, or a restarted service, validate one
     /// environment again: the `PATH` and trusted values lpm put there are

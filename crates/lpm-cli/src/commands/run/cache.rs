@@ -381,7 +381,10 @@ fn build_task_context(
         project_dir,
         &std::env::current_dir()?,
     );
-    let env_vars = lpm_runner::script::load_script_child_env_with_config(
+    let lpm_runner::script::ScriptChildEnv {
+        vars: env_vars,
+        personal_overrides,
+    } = lpm_runner::script::load_script_child_env_with_config(
         project_dir,
         script_name,
         env_mode,
@@ -505,7 +508,16 @@ fn build_task_context(
             .verify_dependencies()
             .map_err(|error| LpmError::EnvValidation(error.to_string()))?;
     }
+    // Outputs and logs built with this computer's personal overrides stay on
+    // it: they're never shared, and the team's never stand in for them.
     let remote_cache = match remote_cache {
+        RemoteCacheResolution::Resolve(_) if personal_overrides > 0 => {
+            tracing::debug!(
+                "task '{}' runs with personal overrides; not using the remote cache for it",
+                lpm_common::sanitize_terminal_inline(script_name)
+            );
+            None
+        }
         RemoteCacheResolution::Resolve(session) => {
             crate::commands::remote_cache::client_from_config(config_ref, session)
         }

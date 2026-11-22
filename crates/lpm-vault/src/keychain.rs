@@ -2020,7 +2020,7 @@ pub(crate) fn read_for_run_unlocked(
         &read.gate,
         vault_id,
         env,
-        read.overrides_record.as_deref(),
+        read.overrides_record.as_ref().map(|bytes| bytes.as_slice()),
     )
     .map_err(crate::companion::damaged)?;
     let Some(bytes) = read.values else {
@@ -2054,7 +2054,7 @@ pub(crate) fn read_all_for_run_unlocked(
     let overrides = crate::companion::overrides::evaluate_all(
         &read.gate,
         vault_id,
-        read.overrides_record.as_deref(),
+        read.overrides_record.as_ref().map(|bytes| bytes.as_slice()),
     )
     .map_err(crate::companion::damaged)?;
     let values = read
@@ -2915,6 +2915,12 @@ mod tests {
         claims: HashMap<String, ClaimedAccess>,
         /// Items that really demand user presence, whatever they claim.
         protected: HashSet<String>,
+        /// The person cancels every approval, so a protected item's data
+        /// can't be read.
+        approval_cancelled: bool,
+        /// Items another process makes automatic just before their next read
+        /// with access.
+        weakened_before_read: HashSet<String>,
         keychain_unavailable: bool,
         probes: Vec<String>,
         approvals_required: Vec<String>,
@@ -2981,6 +2987,9 @@ mod tests {
             *self.reads.entry(account.to_owned()).or_default() += 1;
             if self.failing_reads.contains(account) {
                 return Err("the macOS Keychain is locked".to_owned());
+            }
+            if self.approval_cancelled && self.protected.contains(account) {
+                return Err("env access approval was cancelled".to_owned());
             }
             if account == TRANSACTION_MARKER_ACCOUNT
                 && self.fail_committed_marker_verification_once
@@ -3078,6 +3087,10 @@ mod tests {
             &mut self,
             account: &str,
         ) -> Result<Option<(Vec<u8>, ClaimedAccess)>, String> {
+            if self.weakened_before_read.remove(account) {
+                self.claims.remove(account);
+                self.protected.remove(account);
+            }
             let claim = self
                 .claims
                 .get(account)

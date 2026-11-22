@@ -45,7 +45,7 @@ pub(super) fn print_env_context(loaded: &LoadedEnv) {
             override_count,
             loaded.env_name.as_deref().unwrap_or("default"),
         );
-        dotenv::log_personal_override_names(&loaded.layers.override_names());
+        dotenv::log_personal_override_names(|| loaded.layers.override_names());
     }
 
     // Build parts and join with " · "
@@ -245,6 +245,13 @@ pub fn load_script_env_with_config(
         .map(dotenv::ChildEnv::into_vars)
 }
 
+/// A script's validated final environment, and how many personal overrides
+/// changed it.
+pub struct ScriptChildEnv {
+    pub vars: HashMap<String, String>,
+    pub personal_overrides: usize,
+}
+
 /// Load the validated final script environment for task-cache fingerprinting.
 /// A change to the effective environment, personal overrides included under
 /// [`dotenv::OverridePolicy::Apply`], changes the result.
@@ -258,7 +265,7 @@ pub fn load_script_child_env_with_config(
     command: &str,
     context: &NpmScriptContext,
     policy: dotenv::OverridePolicy,
-) -> Result<HashMap<String, String>, LpmError> {
+) -> Result<ScriptChildEnv, LpmError> {
     let mut loaded = resolve_and_load_env_with_schema_validation(
         project_dir,
         script_name,
@@ -268,6 +275,7 @@ pub fn load_script_child_env_with_config(
         policy,
     )?;
     let mut vars = loaded.take_child_env()?;
+    let personal_overrides = vars.override_count();
     mark_script_child_env(&mut vars);
     vars.apply_npm_context(context, script_name, command);
     let validate_schema = !should_skip_env_validation();
@@ -286,7 +294,10 @@ pub fn load_script_child_env_with_config(
         path,
         validate_schema,
     )?;
-    Ok(vars.into_vars())
+    Ok(ScriptChildEnv {
+        vars: vars.into_vars(),
+        personal_overrides,
+    })
 }
 
 #[cfg(test)]

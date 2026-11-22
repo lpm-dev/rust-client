@@ -44,7 +44,7 @@ fn call(
             Vec::new(),
         );
     }
-    let decoded = decode_frame(&raw).expect("an output frame");
+    let decoded = decode_frame(&raw, usize::MAX).expect("an output frame");
     (
         status,
         serde_json::from_slice(decoded.request).expect("response json"),

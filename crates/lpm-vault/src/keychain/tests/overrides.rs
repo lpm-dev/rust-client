@@ -172,14 +172,14 @@ fn a_damaged_record_refuses_changes_and_writes_nothing() {
 }
 
 #[test]
-fn a_change_to_existing_overrides_lists_nothing_and_a_first_one_lists_once() {
+fn a_change_lists_the_service_at_most_once_and_a_replacement_never() {
     let mut storage = storage_with_values();
     let listings = storage.listings;
     change(&mut storage, &[set("API_URL", "mine")]).expect("set");
-    let first = storage.listings - listings;
-    assert!(
-        first >= 1,
-        "creating the record takes the names-only inventory"
+    assert_eq!(
+        storage.listings - listings,
+        1,
+        "creating the record and its marker takes one names-only listing"
     );
 
     let listings = storage.listings;
@@ -188,6 +188,79 @@ fn a_change_to_existing_overrides_lists_nothing_and_a_first_one_lists_once() {
         storage.listings, listings,
         "replacing the record needs neither an inventory nor an invariant listing"
     );
+
+    let listings = storage.listings;
+    change(&mut storage, &[remove("API_URL")]).expect("remove");
+    assert_eq!(
+        storage.listings - listings,
+        1,
+        "deleting the record and its marker takes one listing"
+    );
+}
+
+#[test]
+fn a_first_override_beside_a_marker_lists_the_service_once() {
+    let mut storage = storage_with_values();
+    storage.values.insert(
+        marker_account(VAULT),
+        r#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{"history-off":{"version":1,"ifUnsupported":"ignore","kinds":["history-off"],"state":"active"}}}"#.to_owned(),
+    );
+    let listings = storage.listings;
+    change(&mut storage, &[set("API_URL", "mine")]).expect("set");
+    assert_eq!(storage.listings - listings, 1);
+}
+
+#[test]
+fn a_weaker_record_under_approved_values_is_never_read_without_their_approval() {
+    let mut storage = storage_with_values();
+    change(&mut storage, &[set("API_URL", "fixture-mine")]).expect("set");
+    storage
+        .claims
+        .insert(VAULT.to_owned(), ClaimedAccess::RequireApproval);
+    storage.protected.insert(VAULT.to_owned());
+    storage.approval_cancelled = true;
+
+    let error = read_all(&mut storage).expect_err("the approval was cancelled");
+    assert!(error.contains("cancelled"), "{error}");
+    assert!(storage.protected.contains(&overrides_account()));
+}
+
+#[test]
+fn a_record_weakened_while_it_is_read_is_refused_rather_than_used() {
+    let mut storage = storage_with_values();
+    change(&mut storage, &[set("API_URL", "fixture-mine")]).expect("set");
+    for account in [VAULT.to_owned(), overrides_account()] {
+        storage
+            .claims
+            .insert(account.clone(), ClaimedAccess::RequireApproval);
+        storage.protected.insert(account);
+    }
+    storage.weakened_before_read.insert(overrides_account());
+
+    let error = read_all(&mut storage).expect_err("weakened during the read");
+    assert!(error.contains("approval"), "{error}");
+    assert!(!error.contains("fixture-mine"), "{error}");
+}
+
+#[test]
+fn removing_overrides_from_a_project_without_values_changes_nothing_and_says_so() {
+    let mut storage = MemoryProjectStorage::default();
+    let _scope = crate::companion::LockScope::enter();
+    let plan = crate::keychain::overrides::change_with_storage(
+        &mut storage,
+        VAULT,
+        &[remove("API_URL"), Edit::ClearAll],
+    )
+    .expect("nothing to remove");
+    assert!(plan.mutations.is_empty());
+    assert!(matches!(
+        plan.effects[..],
+        [
+            crate::companion::overrides::change::Effect::Key { changed: false, .. },
+            crate::companion::overrides::change::Effect::Cleared { removed: 0, .. }
+        ]
+    ));
+    assert_eq!(storage.values.keys().count(), 0);
 }
 
 #[test]

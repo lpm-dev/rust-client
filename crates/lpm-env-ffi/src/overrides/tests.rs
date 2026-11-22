@@ -46,7 +46,7 @@ fn call(
             Vec::new(),
         );
     }
-    let decoded = decode_frame(&raw).expect("an output frame");
+    let decoded = decode_frame(&raw, usize::MAX).expect("an output frame");
     (
         status,
         serde_json::from_slice(decoded.request).expect("response json"),
@@ -436,4 +436,143 @@ fn the_check_refuses_overrides_it_cant_apply() {
     );
     assert_eq!(status, 1, "{refused}");
     assert_eq!(refused["code"], "overrides.damaged");
+}
+
+#[test]
+fn a_batch_sets_as_many_values_as_it_has_edits_and_a_read_returns_them_all() {
+    let mut store = Store::default();
+    let values: Vec<Vec<u8>> = (0..200)
+        .map(|index| format!("fixture-{index}").into_bytes())
+        .collect();
+    let edits: Vec<Value> = (0..200)
+        .map(|index| json!({"action": "set", "environment": "development", "key": format!("KEY_{index:03}"), "value": index + 1}))
+        .collect();
+    let blobs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+    let (status, planned) = store.change(json!(edits), &blobs);
+    assert_eq!(status, 0, "{planned}");
+    assert_eq!(planned["result"], "planned");
+    let (status, read, returned) = store.read(true);
+    assert_eq!(status, 0, "{read}");
+    assert_eq!(returned.len(), 200);
+    assert_eq!(returned[0], b"fixture-0");
+}
+
+#[test]
+fn a_value_larger_than_a_record_or_values_past_the_input_bound_are_refused_before_copying() {
+    let mut store = Store::default();
+    let large = vec![b'x'; 100 * 1024 + 1];
+    let (status, refused) = store.change(
+        json!([
+            {"action": "set", "environment": "development", "key": "SMALL", "value": 1},
+            {"action": "set", "environment": "development", "key": "LARGE", "value": 2},
+        ]),
+        &[b"fixture", &large],
+    );
+    assert_eq!(status, 5, "{refused}");
+    assert_eq!(refused["code"], "overrides.too_large");
+    assert_eq!(refused["edit"], 1);
+    assert_eq!(refused["key"], "LARGE");
+
+    let shared = vec![b'x'; 64 * 1024];
+    let edits: Vec<Value> = (0..MAX_EDITS)
+        .map(|index| json!({"action": "set", "environment": "development", "key": format!("K{index}"), "value": 1}))
+        .collect();
+    let (status, refused) = store.change(json!(edits), &[&shared]);
+    assert_eq!(status, 5, "{refused}");
+    assert_eq!(refused["code"], "overrides.too_large");
+    assert_eq!(
+        refused["edit"], 64,
+        "the first edit past the input bound, before any more is copied"
+    );
+}
+
+#[test]
+fn a_refusal_names_the_edit_and_what_it_was_about_never_a_value() {
+    let mut store = Store::default();
+    let (status, refused) = store.change(
+        json!([
+            {"action": "set", "environment": "development", "key": "A", "value": 1},
+            {"action": "remove", "environment": "development", "key": "B"},
+            {"action": "set", "environment": "development", "key": "NODE_OPTIONS", "value": 1},
+        ]),
+        &[b"fixture-secret"],
+    );
+    assert_eq!(status, 5, "{refused}");
+    assert_eq!(refused["code"], "overrides.denied_name");
+    assert_eq!(refused["edit"], 2);
+    assert_eq!(refused["key"], "NODE_OPTIONS");
+    assert!(!refused.to_string().contains("fixture-secret"));
+
+    let (status, refused) = store.change(
+        json!([{"action": "environmentDuplicated", "from": "dev", "to": "dev"}]),
+        &[],
+    );
+    assert_eq!(status, 5, "{refused}");
+    assert_eq!(refused["code"], "overrides.same_environment");
+    assert_eq!(refused["environment"], "dev");
+    assert_eq!(
+        refused["message"],
+        "environment \"dev\" can't be copied to itself"
+    );
+}
+
+#[test]
+fn needs_names_says_what_to_list_and_brings_the_effects_for_a_confirmation() {
+    let mut store = Store::default();
+    let (status, _) = store.change(
+        json!([{"action": "set", "environment": "development", "key": "A", "value": 1}]),
+        &[b"fixture"],
+    );
+    assert_eq!(status, 0);
+    let mut request =
+        json!({"vaultId": VAULT, "marker": 1, "record": 2, "edits": [{"action": "clearAll"}]});
+    let marker = store.get(MARKER_ACCOUNT).unwrap().to_vec();
+    let record = store.get(RECORD_ACCOUNT).unwrap().to_vec();
+    let (status, response, _) = call(lpm_env_overrides_plan, &request, &[&marker, &record]);
+    assert_eq!(status, 0, "{response}");
+    assert_eq!(response["result"], "needsNames");
+    assert_eq!(response["needs"], "project");
+    assert_eq!(
+        response["effects"],
+        json!([{"kind": "cleared", "environment": null, "removed": 1}])
+    );
+    request["edits"] =
+        json!([{"action": "set", "environment": "development", "key": "A", "value": 3}]);
+    let (_, created, _) = call(
+        lpm_env_overrides_plan,
+        &json!({"vaultId": VAULT, "edits": [{"action": "set", "environment": "development", "key": "A", "value": 1}]}),
+        &[b"fixture"],
+    );
+    assert_eq!(created["needs"], "projectAndService");
+}
+
+#[test]
+fn an_unfinished_project_is_refused_with_what_to_do() {
+    let mut store = Store::default();
+    store.0.insert(
+        MARKER_ACCOUNT.to_owned(),
+        OVERRIDES_MARKER
+            .replace(r#""state":"active"}}"#, r#""state":"removing"}}"#)
+            .into_bytes(),
+    );
+    let (status, refused, _) = store.read(false);
+    assert_eq!(status, 5, "{refused}");
+    assert_eq!(refused["code"], "overrides.needs_resume");
+    assert_eq!(
+        refused["message"],
+        "finish the env project's interrupted change first"
+    );
+}
+
+#[test]
+fn the_check_says_an_invalid_vault_id_is_invalid_input() {
+    let (status, refused) = check(
+        r#"{"vars":{"A":{}}}"#,
+        &json!({
+            "environments": {"default": {"A": "1"}},
+            "overrides": {"vaultId": "../proj"},
+        }),
+    );
+    assert_eq!(status, 2, "{refused}");
+    assert_eq!(refused["code"], "env.invalid_input");
 }

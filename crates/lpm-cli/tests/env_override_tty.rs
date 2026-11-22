@@ -11,7 +11,7 @@ mod common;
 #[cfg(unix)]
 mod tty {
     use crate::common;
-    use crate::common::pty::run_in_pty;
+    use crate::common::pty::{PtyOptions, run_in_pty, run_in_pty_answering};
 
     use tempfile::TempDir;
 
@@ -53,7 +53,10 @@ mod tty {
             project.path(),
             lpm_home.path(),
             &["env", "override", "set", "API_URL"],
-            &[(b"Value for API_URL (hidden): ", b"fixture-mine\r")],
+            &[(
+                b"Override for API_URL (default, hidden): ",
+                b"fixture-mine\r",
+            )],
         );
         assert!(session.status.success(), "{}", session.transcript);
         assert!(
@@ -113,6 +116,88 @@ mod tty {
         assert_eq!(
             overrides(project.path(), lpm_home.path()),
             serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn override_clear_removes_only_the_overrides_it_asked_about() {
+        let (project, lpm_home) = project();
+        let (status, _, stderr) = common::run_lpm(
+            project.path(),
+            lpm_home.path(),
+            None,
+            &["env", "override", "set", "API_URL=mine"],
+        );
+        assert!(status.success(), "{stderr}");
+
+        let accepted = run_in_pty_answering(
+            project.path(),
+            lpm_home.path(),
+            &["env", "override", "clear", "--env", "default"],
+            &[(b"Remove 1 personal override", b"y\r")],
+            &PtyOptions::default(),
+            &mut |_, _| {
+                // Another command adds an override while the question waits.
+                let (status, _, stderr) = common::run_lpm(
+                    project.path(),
+                    lpm_home.path(),
+                    None,
+                    &["env", "override", "set", "LATER=added"],
+                );
+                assert!(status.success(), "{stderr}");
+            },
+        );
+        assert!(accepted.status.success(), "{}", accepted.transcript);
+        assert!(
+            accepted.transcript.contains("removed 1 personal override"),
+            "{}",
+            accepted.transcript
+        );
+        let left = overrides(project.path(), lpm_home.path());
+        assert_eq!(left[0]["set"][0]["key"], "LATER", "{left}");
+        assert_eq!(left[0]["set"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn override_set_refuses_what_it_can_before_asking_for_a_value() {
+        let (project, lpm_home) = project();
+        let denied = run_in_pty(
+            project.path(),
+            lpm_home.path(),
+            &["env", "override", "set", "NODE_OPTIONS"],
+            &[],
+        );
+        assert!(!denied.status.success(), "{}", denied.transcript);
+        assert!(
+            denied
+                .transcript
+                .contains("so it can't be a personal override"),
+            "{}",
+            denied.transcript
+        );
+        assert!(
+            !denied.transcript.contains("Override for"),
+            "{}",
+            denied.transcript
+        );
+
+        let elsewhere = TempDir::new().expect("create a directory without an env project");
+        let unlinked = run_in_pty(
+            elsewhere.path(),
+            lpm_home.path(),
+            &["env", "override", "set", "API_URL"],
+            &[],
+        );
+        assert!(!unlinked.status.success(), "{}", unlinked.transcript);
+        assert!(
+            unlinked.transcript.contains("store a value first"),
+            "{}",
+            unlinked.transcript
+        );
+        assert!(
+            !unlinked.transcript.contains("Override for"),
+            "{}",
+            unlinked.transcript
         );
     }
 }

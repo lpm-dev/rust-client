@@ -39,12 +39,19 @@ pub fn feature_entry() -> FeatureEntry {
 const _: () = assert!(crate::graph::OVERRIDES.supported_versions[0] == VERSION);
 
 /// The overrides of the selected environment.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct PersonalOverrides {
     /// Values that replace the project's, an empty string included.
     pub set: HashMap<String, String>,
     /// Names whose project value is removed.
     pub unset: Vec<String>,
+}
+
+/// Names only: an override's value is a secret.
+impl fmt::Debug for PersonalOverrides {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.layer().fmt(formatter)
+    }
 }
 
 impl PersonalOverrides {
@@ -422,5 +429,19 @@ mod tests {
     fn records_larger_than_the_record_limit_are_rejected_before_parsing() {
         let oversized = vec![b' '; MAX_RECORD_BYTES + 1];
         assert!(parse_selected(&oversized, "proj", 1, "default").is_err());
+    }
+
+    #[test]
+    fn debug_output_names_overrides_and_never_shows_their_values() {
+        let overrides = PersonalOverrides {
+            set: HashMap::from([("TOKEN".to_owned(), "fixture-secret".to_owned())]),
+            unset: vec!["SENTRY_DSN".to_owned()],
+        };
+        let printed = format!("{overrides:?}");
+        assert!(!printed.contains("fixture-secret"), "{printed}");
+        assert!(
+            printed.contains("TOKEN") && printed.contains("SENTRY_DSN"),
+            "{printed}"
+        );
     }
 }

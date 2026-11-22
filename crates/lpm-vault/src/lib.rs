@@ -682,6 +682,28 @@ impl AllRunEnvironments {
             overrides: self.overrides.get(name).cloned().unwrap_or_default(),
         }
     }
+
+    /// See [`run_environment_names`].
+    pub fn environment_names(&self) -> Vec<&str> {
+        run_environment_names(&self.values, &self.overrides)
+    }
+}
+
+/// The environments that have values or personal overrides, each once, in
+/// order: one with overrides and no values is still one a run on this
+/// computer uses, with `default`'s values.
+pub fn run_environment_names<'a>(
+    values: &'a EnvironmentMap,
+    overrides: &'a HashMap<String, PersonalOverrides>,
+) -> Vec<&'a str> {
+    let mut names: Vec<&str> = values
+        .keys()
+        .chain(overrides.keys())
+        .map(String::as_str)
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 /// [`AllRunEnvironments`] for the project's vault; empty when it has none.

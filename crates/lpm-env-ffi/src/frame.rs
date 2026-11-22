@@ -21,16 +21,15 @@ pub(crate) const FRAME_MAGIC: [u8; 4] = *b"LPMF";
 pub(crate) const FRAME_VERSION: u8 = 1;
 const REFUSED: u32 = 5;
 
-/// The most blobs a frame carries: every input names far fewer (a history
-/// reading names the head, the key, the values and at most 16 parts).
-const MAX_FRAME_BLOBS: usize = 64;
-
-/// The codes and input limit of one family of functions.
+/// The codes and input limits of one family of functions. An output frame
+/// carries as many blobs as it needs.
 pub(crate) struct Domain {
     pub(crate) invalid_input: &'static str,
     pub(crate) serialization: &'static str,
     pub(crate) panic: &'static str,
     pub(crate) input_limit: usize,
+    /// The most blobs an input frame carries.
+    pub(crate) input_blobs: usize,
 }
 
 /// A decoded input frame: the request and its blobs.
@@ -39,7 +38,8 @@ pub(crate) struct Frame<'a> {
     pub(crate) blobs: Vec<&'a [u8]>,
 }
 
-pub(crate) fn decode_frame(bytes: &[u8]) -> Option<Frame<'_>> {
+/// The frame `bytes` hold, with at most `max_blobs` blobs.
+pub(crate) fn decode_frame(bytes: &[u8], max_blobs: usize) -> Option<Frame<'_>> {
     let rest = bytes.strip_prefix(&FRAME_MAGIC)?;
     let (&version, rest) = rest.split_first()?;
     if version != FRAME_VERSION {
@@ -47,7 +47,7 @@ pub(crate) fn decode_frame(bytes: &[u8]) -> Option<Frame<'_>> {
     }
     let (count, mut rest) = rest.split_first_chunk::<4>()?;
     let count = u32::from_be_bytes(*count) as usize;
-    if count == 0 || count > MAX_FRAME_BLOBS + 1 || count > rest.len() / 4 + 1 {
+    if count == 0 || count - 1 > max_blobs || count > rest.len() / 4 + 1 {
         return None;
     }
     let mut fields = Vec::with_capacity(count);
@@ -152,9 +152,22 @@ impl Output {
 }
 
 pub(crate) fn refused(code: &str, message: Option<String>) -> LPMEnvResult {
+    refused_with(code, message, serde_json::Map::new())
+}
+
+/// A refusal that also names what it's about, such as an edit and its key,
+/// never a value.
+pub(crate) fn refused_with(
+    code: &str,
+    message: Option<String>,
+    details: serde_json::Map<String, serde_json::Value>,
+) -> LPMEnvResult {
     let mut output = json!({ "abiVersion": ABI_VERSION, "code": code });
     if let Some(message) = message {
         output["message"] = json!(message);
+    }
+    if let Some(fields) = output.as_object_mut() {
+        fields.extend(details);
     }
     result(
         REFUSED,
@@ -181,7 +194,7 @@ pub(crate) unsafe fn respond<R: for<'de> Deserialize<'de>>(
         return failure(2, domain.invalid_input);
     };
     catch_unwind(AssertUnwindSafe(|| {
-        let Some(frame) = decode_frame(raw) else {
+        let Some(frame) = decode_frame(raw, domain.input_blobs) else {
             return failure(2, domain.invalid_input);
         };
         let Ok(request) = serde_json::from_slice::<R>(frame.request) else {

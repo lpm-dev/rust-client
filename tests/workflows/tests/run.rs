@@ -3628,6 +3628,47 @@ fn run_workspace_no_cache_does_not_read_cache_contract_files() {
 }
 
 #[tokio::test]
+async fn a_task_run_with_personal_overrides_never_uses_the_remote_cache() {
+    let server = MockServer::start().await;
+    let state = RemoteCacheState::default();
+    mount_stateful_remote_cache(&server, state.clone()).await;
+    let project = remote_cache_project(&server, "");
+    lpm(&project)
+        .args(["env", "set", "API_URL=team"])
+        .assert()
+        .success();
+    lpm(&project)
+        .args(["env", "override", "set", "API_URL=mine"])
+        .assert()
+        .success();
+
+    let run = run_build_with_remote_token(&project);
+    assert!(
+        run.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    assert!(project.file_exists("executed-marker"));
+    assert!(
+        state
+            .artifact
+            .lock()
+            .expect("remote cache artifact mutex poisoned")
+            .is_none(),
+        "outputs built with this computer's overrides are never uploaded"
+    );
+    let asked = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.url.path().starts_with("/v8/artifacts"))
+        .count();
+    assert_eq!(asked, 0, "the remote cache isn't asked either");
+}
+
+#[tokio::test]
 async fn run_remote_cache_miss_uploads_and_later_restores_outputs() {
     let server = MockServer::start().await;
     let state = RemoteCacheState::default();

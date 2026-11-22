@@ -158,8 +158,9 @@ fn an_override_of_the_value_the_project_has_is_never_blamed() {
         "API_URL",
         lpm_env::ValidationErrorKind::ConstraintViolation { constraint: "url" },
     );
-    assert!(
-        !child.caused_by_override(&invalid),
+    assert_eq!(
+        child.override_attribution(&[invalid]),
+        [false],
         "removing the override wouldn't change the value"
     );
 }

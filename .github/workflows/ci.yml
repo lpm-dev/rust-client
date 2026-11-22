@@ -743,6 +743,11 @@ jobs:
       - name: Every history state and override change through the v0.84.0 engine
         run: bash scripts/ci/check-engine-compatibility.sh v0.84.0
 
+      # CLI 0.82.0, the first release that applies personal overrides, must
+      # accept every override change this release plans, and read them.
+      - name: Every history state and override change through the v0.82.0 engine
+        run: bash scripts/ci/check-engine-compatibility.sh v0.82.0
+
   windows-platform-backends:
     if: ${{ !github.event.pull_request.draft }}
     name: Windows platform backend runtime checks

@@ -479,7 +479,6 @@ impl Serialize for Checks<'_, '_> {
                 self.conflict.set(true);
                 return Err(S::Error::custom("ambiguous environment variable casing"));
             };
-            let from_overrides = &check.from_overrides;
             map.serialize_entry(
                 name,
                 &CheckedEnvironment {
@@ -487,12 +486,10 @@ impl Serialize for Checks<'_, '_> {
                     problems: check
                         .errors
                         .into_iter()
-                        .map(|error| {
-                            let caused = from_overrides.contains(&error.key);
-                            Problem {
-                                personal_override: caused,
-                                ..Problem::from(error)
-                            }
+                        .zip(check.from_overrides)
+                        .map(|(error, caused)| Problem {
+                            personal_override: caused,
+                            ..Problem::from(error)
                         })
                         .collect(),
                     defaults: check.defaults,
@@ -561,7 +558,7 @@ pub unsafe extern "C" fn lpm_env_check(
                 given.record.as_ref().map(|bytes| bytes.0.as_slice()),
             ) {
                 Ok(overrides) => overrides,
-                Err(code) => return failure(1, code),
+                Err((status, code)) => return failure(status, code),
             },
         };
         let rule_work = schema.vars.values().fold(schema.vars.len(), |work, rule| {

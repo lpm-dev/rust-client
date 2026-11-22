@@ -58,7 +58,22 @@ fn inventory(project: Vec<CompanionAccount>) -> Inventory {
     let service_records = project.len();
     Inventory {
         project,
-        service_records,
+        service_records: Some(service_records),
+    }
+}
+
+fn project_inventory(project: Vec<CompanionAccount>) -> Inventory {
+    Inventory {
+        project,
+        service_records: None,
+    }
+}
+
+/// What inventory a refusal asks for, if it asks for one.
+fn needed(result: Result<ChangePlan, PlanError>) -> Option<InventoryNeed> {
+    match result {
+        Err(PlanError::NeedsInventory { need, .. }) => Some(need),
+        _ => None,
     }
 }
 
@@ -142,8 +157,8 @@ const ONE_OVERRIDE: &str = r#"{"schemaVersion":1,"vaultId":"proj","environments"
 fn the_first_override_adds_the_feature_and_creates_the_marker_once_the_inventory_is_known() {
     let edits = || vec![set("development", "API_URL", "http://localhost:4000")];
     assert_eq!(
-        plan(&ProjectGate::Plain, None, edits(), None).unwrap_err(),
-        PlanError::NeedsInventory
+        needed(plan(&ProjectGate::Plain, None, edits(), None)),
+        Some(InventoryNeed::ProjectAndService)
     );
     let planned = plan(
         &ProjectGate::Plain,
@@ -324,8 +339,8 @@ fn removing_the_last_override_deletes_the_record_and_a_marker_left_with_nothing(
     let gate = ProjectGate::Marked(overrides_marker());
     let edits = || vec![remove("development", "API_URL")];
     assert_eq!(
-        plan(&gate, Some(ONE_OVERRIDE), edits(), None).unwrap_err(),
-        PlanError::NeedsInventory
+        needed(plan(&gate, Some(ONE_OVERRIDE), edits(), None)),
+        Some(InventoryNeed::Project)
     );
     let before = [overrides_account()];
     let planned = plan(
@@ -383,11 +398,12 @@ fn removing_the_last_override_keeps_the_marker_for_other_features() {
 const TWO_ENVIRONMENTS: &str = r#"{"schemaVersion":1,"vaultId":"proj","environments":{"stage":{"set":{"A":"1","B":"2"},"unset":["C"]},"staging":{"set":{"OLD":"x"},"unset":[]}}}"#;
 
 #[test]
-fn a_rename_moves_the_overrides_and_replaces_what_a_removed_environment_left() {
+fn a_rename_merges_into_what_the_new_name_has_the_moved_overrides_winning() {
     let gate = ProjectGate::Marked(overrides_marker());
+    let record = r#"{"schemaVersion":1,"vaultId":"proj","environments":{"stage":{"set":{"A":"1","B":"2"},"unset":["C"]},"staging":{"set":{"A":"old","OWN":"x"},"unset":[]}}}"#;
     let planned = plan(
         &gate,
-        Some(TWO_ENVIRONMENTS),
+        Some(record),
         vec![Edit::EnvironmentRenamed {
             from: "stage".to_owned(),
             to: "staging".to_owned(),
@@ -398,7 +414,7 @@ fn a_rename_moves_the_overrides_and_replaces_what_a_removed_environment_left() {
     assert_eq!(
         written_record(&planned).as_deref(),
         Some(
-            r#"{"schemaVersion":1,"vaultId":"proj","environments":{"staging":{"set":{"A":"1","B":"2"},"unset":["C"]}}}"#
+            r#"{"schemaVersion":1,"vaultId":"proj","environments":{"staging":{"set":{"A":"1","B":"2","OWN":"x"},"unset":["C"]}}}"#
         )
     );
     assert_eq!(
@@ -407,13 +423,14 @@ fn a_rename_moves_the_overrides_and_replaces_what_a_removed_environment_left() {
             from: "stage".to_owned(),
             to: "staging".to_owned(),
             moved: 3,
-            replaced: 1
+            replaced: 1,
+            kept: 1,
         }]
     );
 }
 
 #[test]
-fn renaming_an_environment_without_overrides_drops_what_was_left_under_the_new_name() {
+fn renaming_an_environment_without_overrides_keeps_what_the_new_name_has() {
     let gate = ProjectGate::Marked(overrides_marker());
     let planned = plan(
         &gate,
@@ -425,25 +442,21 @@ fn renaming_an_environment_without_overrides_drops_what_was_left_under_the_new_n
         None,
     )
     .unwrap();
-    assert_eq!(
-        written_record(&planned).as_deref(),
-        Some(
-            r#"{"schemaVersion":1,"vaultId":"proj","environments":{"stage":{"set":{"A":"1","B":"2"},"unset":["C"]}}}"#
-        )
-    );
+    assert!(planned.mutations.is_empty());
     assert_eq!(
         planned.effects,
         [Effect::Moved {
             from: "qa".to_owned(),
             to: "staging".to_owned(),
             moved: 0,
-            replaced: 1
+            replaced: 0,
+            kept: 1,
         }]
     );
 }
 
 #[test]
-fn a_removed_environment_loses_its_overrides_and_a_duplicate_copies_none() {
+fn only_removing_an_environment_removes_its_overrides() {
     let gate = ProjectGate::Marked(overrides_marker());
     let planned = plan(
         &gate,
@@ -451,7 +464,10 @@ fn a_removed_environment_loses_its_overrides_and_a_duplicate_copies_none() {
         vec![
             Edit::EnvironmentDuplicated {
                 from: "stage".to_owned(),
-                to: "stage-copy".to_owned(),
+                to: "staging".to_owned(),
+            },
+            Edit::EnvironmentCreated {
+                environment: "qa".to_owned(),
             },
             Edit::EnvironmentRemoved {
                 environment: "staging".to_owned(),
@@ -465,8 +481,13 @@ fn a_removed_environment_loses_its_overrides_and_a_duplicate_copies_none() {
         [
             Effect::NotCopied {
                 from: "stage".to_owned(),
-                to: "stage-copy".to_owned(),
-                count: 3
+                to: "staging".to_owned(),
+                count: 3,
+                existing: 1,
+            },
+            Effect::Existing {
+                environment: "qa".to_owned(),
+                count: 0,
             },
             Effect::EnvironmentRemoved {
                 environment: "staging".to_owned(),
@@ -480,17 +501,63 @@ fn a_removed_environment_loses_its_overrides_and_a_duplicate_copies_none() {
             r#"{"schemaVersion":1,"vaultId":"proj","environments":{"stage":{"set":{"A":"1","B":"2"},"unset":["C"]}}}"#
         )
     );
-    let only_duplicate = plan(
-        &gate,
-        Some(TWO_ENVIRONMENTS),
-        vec![Edit::EnvironmentDuplicated {
+}
+
+#[test]
+fn creating_or_duplicating_onto_a_name_with_overrides_keeps_them_and_says_how_many() {
+    let gate = ProjectGate::Marked(overrides_marker());
+    for edit in [
+        Edit::EnvironmentDuplicated {
             from: "stage".to_owned(),
-            to: "qa".to_owned(),
+            to: "staging".to_owned(),
+        },
+        Edit::EnvironmentCreated {
+            environment: "staging".to_owned(),
+        },
+    ] {
+        let planned = plan(&gate, Some(TWO_ENVIRONMENTS), vec![edit], None).unwrap();
+        assert!(planned.mutations.is_empty());
+        let existing = match &planned.effects[..] {
+            [Effect::NotCopied { existing, .. }] => *existing,
+            [Effect::Existing { count, .. }] => *count,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(existing, 1);
+    }
+}
+
+#[test]
+fn renaming_or_copying_an_environment_to_itself_says_which() {
+    let gate = ProjectGate::Marked(overrides_marker());
+    let renamed = plan(
+        &gate,
+        Some(ONE_OVERRIDE),
+        vec![Edit::EnvironmentRenamed {
+            from: "dev".to_owned(),
+            to: "dev".to_owned(),
         }],
         None,
     )
-    .unwrap();
-    assert!(only_duplicate.mutations.is_empty());
+    .unwrap_err();
+    assert_eq!(
+        renamed.to_string(),
+        "environment \"dev\" can't be renamed to itself"
+    );
+    let copied = plan(
+        &gate,
+        Some(ONE_OVERRIDE),
+        vec![Edit::EnvironmentDuplicated {
+            from: "dev".to_owned(),
+            to: "dev".to_owned(),
+        }],
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(
+        copied.to_string(),
+        "environment \"dev\" can't be copied to itself"
+    );
+    assert_eq!(copied.code(), "same_environment");
 }
 
 #[test]
@@ -504,7 +571,13 @@ fn names_lpm_never_passes_are_refused_when_written_but_can_be_removed() {
     ] {
         let error = plan(&gate, Some(ONE_OVERRIDE), vec![edit.clone()], None).unwrap_err();
         assert!(
-            matches!(error, PlanError::DeniedName(_)),
+            matches!(
+                error,
+                PlanError::Edit {
+                    index: 0,
+                    reason: EditError::DeniedName(_)
+                }
+            ),
             "{edit:?}: {error:?}"
         );
         assert_eq!(error.code(), "denied_name");
@@ -531,20 +604,41 @@ fn invalid_names_values_and_sizes_are_refused_without_showing_values() {
     let refused = |edit: Edit| plan(&gate, Some(ONE_OVERRIDE), vec![edit], None).unwrap_err();
     assert_eq!(
         refused(set("bad name", "A", "1")),
-        PlanError::InvalidEnvironment("bad name".to_owned())
+        PlanError::Edit {
+            index: 0,
+            reason: EditError::InvalidEnvironment("bad name".to_owned())
+        }
     );
     let invalid_key = refused(set("development", "sk-live-0123", "1"));
-    assert_eq!(invalid_key, PlanError::InvalidKey);
+    assert_eq!(
+        invalid_key,
+        PlanError::Edit {
+            index: 0,
+            reason: EditError::InvalidKey
+        }
+    );
     assert!(!invalid_key.to_string().contains("sk-live"));
     let nul = refused(set("development", "A", "fixture\0secret"));
-    assert_eq!(nul, PlanError::NulValue("A".to_owned()));
+    assert_eq!(
+        nul,
+        PlanError::Edit {
+            index: 0,
+            reason: EditError::NulValue("A".to_owned())
+        }
+    );
     assert!(!nul.to_string().contains("fixture"));
     assert_eq!(
         refused(Edit::EnvironmentRenamed {
             from: "dev".to_owned(),
             to: "dev".to_owned()
         }),
-        PlanError::SameEnvironment("dev".to_owned())
+        PlanError::Edit {
+            index: 0,
+            reason: EditError::SameEnvironment {
+                environment: "dev".to_owned(),
+                copy: false
+            }
+        }
     );
     let too_large = refused(set("development", "BIG", &"x".repeat(MAX_RECORD_BYTES)));
     assert!(matches!(too_large, PlanError::TooLarge(bytes) if bytes > MAX_RECORD_BYTES));
@@ -596,7 +690,10 @@ fn a_later_invalid_edit_refuses_the_whole_batch() {
             ],
             None,
         ),
-        Err(PlanError::DeniedName(_))
+        Err(PlanError::Edit {
+            index: 1,
+            reason: EditError::DeniedName(_)
+        })
     ));
 }
 
@@ -718,7 +815,7 @@ fn creating_the_record_keeps_the_project_and_service_budgets() {
 
     let at_cap = Inventory {
         project: Vec::new(),
-        service_records: budgets::ADMISSION_CAP,
+        service_records: Some(budgets::ADMISSION_CAP),
     };
     assert_eq!(
         plan(&ProjectGate::Plain, None, edits(), Some(&at_cap)).unwrap_err(),
@@ -726,13 +823,13 @@ fn creating_the_record_keeps_the_project_and_service_budgets() {
     );
     let past_target = Inventory {
         project: Vec::new(),
-        service_records: budgets::ADMISSION_TARGET,
+        service_records: Some(budgets::ADMISSION_TARGET),
     };
     let planned = plan(&ProjectGate::Plain, None, edits(), Some(&past_target)).unwrap();
     assert!(planned.over_admission_target);
     let below_target = Inventory {
         project: Vec::new(),
-        service_records: budgets::ADMISSION_TARGET - 1,
+        service_records: Some(budgets::ADMISSION_TARGET - 1),
     };
     assert!(
         !plan(&ProjectGate::Plain, None, edits(), Some(&below_target))
@@ -752,7 +849,7 @@ fn the_inventory_comes_from_names_of_every_project_in_the_service() {
     ];
     let inventory = Inventory::from_names(VAULT, names.iter().map(String::as_str));
     assert_eq!(inventory.project, [overrides_account()]);
-    assert_eq!(inventory.service_records, 3);
+    assert_eq!(inventory.service_records, Some(3));
 }
 
 #[test]
@@ -782,4 +879,209 @@ fn a_planned_edit_never_prints_its_value() {
     let printed = format!("{:?}", set("development", "TOKEN", "fixture-secret"));
     assert!(!printed.contains("fixture-secret"), "{printed}");
     assert!(printed.contains("TOKEN"), "{printed}");
+}
+
+#[test]
+fn removing_the_last_override_deletes_the_record_even_when_the_inventory_missed_it() {
+    let gate = ProjectGate::Marked(overrides_marker());
+    for listed in [Vec::new(), vec![overrides_account(), overrides_account()]] {
+        let planned = plan(
+            &gate,
+            Some(ONE_OVERRIDE),
+            vec![remove("development", "API_URL")],
+            Some(&project_inventory(listed)),
+        )
+        .unwrap();
+        assert_eq!(
+            deleted(&planned),
+            [
+                record_account(OVERRIDES_KIND, VAULT, None),
+                marker_account(VAULT)
+            ]
+        );
+        passes_the_commit_check(&planned, Some(&overrides_marker()), &[overrides_account()]);
+    }
+}
+
+#[test]
+fn deleting_the_record_needs_only_the_projects_own_inventory() {
+    let gate = ProjectGate::Marked(overrides_marker());
+    let planned = plan(
+        &gate,
+        Some(ONE_OVERRIDE),
+        vec![Edit::ClearAll],
+        Some(&project_inventory(vec![overrides_account()])),
+    )
+    .unwrap();
+    assert_eq!(planned.gate, ProjectGate::Plain);
+    assert_eq!(
+        needed(plan(
+            &ProjectGate::Plain,
+            None,
+            vec![set("development", "A", "1")],
+            Some(&project_inventory(Vec::new())),
+        )),
+        Some(InventoryNeed::ProjectAndService),
+        "creating the record counts the service too"
+    );
+}
+
+#[test]
+fn removing_the_last_override_beside_staged_records_is_one_transaction_that_keeps_their_marker() {
+    let gate = ProjectGate::Marked(overrides_marker());
+    let mut listed = vec![overrides_account()];
+    listed.extend((0..64).map(|index| {
+        CompanionAccount::parse(&crate::account::staged_account(
+            OVERRIDES_KIND,
+            VAULT,
+            Some(index),
+        ))
+        .expect("valid")
+    }));
+    let planned = plan(
+        &gate,
+        Some(ONE_OVERRIDE),
+        vec![Edit::ClearAll],
+        Some(&project_inventory(listed.clone())),
+    )
+    .unwrap();
+    assert_eq!(
+        deleted(&planned),
+        [record_account(OVERRIDES_KIND, VAULT, None)]
+    );
+    assert_eq!(
+        written_marker(&planned),
+        Some(Marker::empty(VAULT, ProjectState::Active))
+    );
+    passes_the_commit_check(&planned, Some(&overrides_marker()), &listed);
+}
+
+#[test]
+fn a_record_with_no_overrides_left_is_deleted_by_the_next_change() {
+    let gate = ProjectGate::Marked(overrides_marker());
+    let empty = r#"{"schemaVersion":1,"vaultId":"proj","environments":{}}"#;
+    let edits = || vec![remove("development", "NOTHING")];
+    assert_eq!(
+        needed(plan(&gate, Some(empty), edits(), None)),
+        Some(InventoryNeed::Project)
+    );
+    let planned = plan(
+        &gate,
+        Some(empty),
+        edits(),
+        Some(&project_inventory(vec![overrides_account()])),
+    )
+    .unwrap();
+    assert_eq!(
+        deleted(&planned),
+        [
+            record_account(OVERRIDES_KIND, VAULT, None),
+            marker_account(VAULT)
+        ]
+    );
+    assert!(matches!(
+        planned.effects[..],
+        [Effect::Key { changed: false, .. }]
+    ));
+}
+
+#[test]
+fn a_record_too_large_says_its_size_in_kib() {
+    assert_eq!(
+        PlanError::TooLarge(MAX_RECORD_BYTES + 1).to_string(),
+        "the personal overrides would take 100.1 KiB, more than the 100 KiB one record may hold"
+    );
+}
+
+#[test]
+fn a_refused_edit_says_which_one_it_was_and_a_needed_inventory_brings_the_effects() {
+    let gate = ProjectGate::Marked(overrides_marker());
+    let refused = plan(
+        &gate,
+        Some(ONE_OVERRIDE),
+        vec![
+            set("development", "A", "1"),
+            remove("development", "B"),
+            set("development", "NODE_OPTIONS", "x"),
+        ],
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(refused, PlanError::Edit { index: 2, .. }),
+        "{refused:?}"
+    );
+    match plan(&gate, Some(ONE_OVERRIDE), vec![Edit::ClearAll], None) {
+        Err(PlanError::NeedsInventory { need, effects }) => {
+            assert_eq!(need, InventoryNeed::Project);
+            assert_eq!(
+                effects,
+                [Effect::Cleared {
+                    environment: None,
+                    removed: 1
+                }]
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn edits_that_give_no_key_an_override_have_effects_without_any_overrides() {
+    assert_eq!(
+        effects_without_overrides(&[remove("development", "A"), Edit::ClearAll]).unwrap(),
+        Some(vec![
+            Effect::Key {
+                environment: "development".to_owned(),
+                key: "A".to_owned(),
+                previous: Previous::None,
+                changed: false,
+            },
+            Effect::Cleared {
+                environment: None,
+                removed: 0
+            },
+        ])
+    );
+    assert_eq!(
+        effects_without_overrides(&[set("development", "A", "1")]).unwrap(),
+        None
+    );
+    assert_eq!(
+        effects_without_overrides(&[remove("development", "sk-live")])
+            .unwrap_err()
+            .code(),
+        "invalid_key"
+    );
+}
+
+#[test]
+fn removing_the_environment_that_held_the_last_overrides_deletes_the_record_and_marker() {
+    let gate = ProjectGate::Marked(overrides_marker());
+    let edits = || {
+        vec![Edit::EnvironmentRemoved {
+            environment: "development".to_owned(),
+        }]
+    };
+    assert_eq!(
+        needed(plan(&gate, Some(ONE_OVERRIDE), edits(), None)),
+        Some(InventoryNeed::Project)
+    );
+    let before = [overrides_account()];
+    let planned = plan(
+        &gate,
+        Some(ONE_OVERRIDE),
+        edits(),
+        Some(&project_inventory(before.to_vec())),
+    )
+    .unwrap();
+    assert_eq!(
+        deleted(&planned),
+        [
+            record_account(OVERRIDES_KIND, VAULT, None),
+            marker_account(VAULT)
+        ]
+    );
+    assert_eq!(planned.gate, ProjectGate::Plain);
+    passes_the_commit_check(&planned, Some(&overrides_marker()), &before);
 }

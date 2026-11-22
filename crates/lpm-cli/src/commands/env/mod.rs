@@ -381,6 +381,7 @@ mod tests {
         include_str!("local.rs"),
         include_str!("oidc.rs"),
         include_str!("pairing.rs"),
+        include_str!("personal_overrides.rs"),
         include_str!("platform/mod.rs"),
         include_str!("platform/coolify.rs"),
         include_str!("platform/fly.rs"),
