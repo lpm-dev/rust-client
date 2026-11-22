@@ -123,7 +123,7 @@ pub(super) const CONTRADICTORY_VALUES: &str =
 /// Why an approval couldn't be verified while the Keychain is locked.
 pub(super) const APPROVAL_UNCONFIRMED: &str = "the macOS Keychain is unavailable, so env approval couldn't be confirmed; retry once the Mac is unlocked";
 
-fn contradictory_record() -> String {
+pub(super) fn contradictory_record() -> String {
     damaged(Damage::Access(
         "the personal overrides' approval attributes contradict each other".to_owned(),
     ))

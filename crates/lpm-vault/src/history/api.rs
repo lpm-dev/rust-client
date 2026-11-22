@@ -615,8 +615,6 @@ pub(super) fn roll_back(
         Err(error) => return Ok(Err(error)),
     };
     let (renamed, removed) = environment_changes(&writes);
-    let following =
-        crate::overrides::plan_following_unlocked(directory, vault_id, renamed, removed)?;
     let written = apply_writes(&mut values, writes, recording);
     crate::write_all_environments_following_unlocked(
         directory,
@@ -625,7 +623,8 @@ pub(super) fn roll_back(
         project.path,
         &values,
         recording,
-        following,
+        renamed,
+        removed,
     )?;
     Ok(Ok(written))
 }

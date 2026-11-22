@@ -6,13 +6,16 @@
 use std::collections::BTreeMap;
 
 use crate::PersonalOverrides;
+use crate::companion::account::record_account;
 use crate::companion::gate::{Operation, ProjectGate};
 use crate::companion::lifecycle::LifecycleStore as _;
-use crate::companion::overrides;
 use crate::companion::overrides::change::{ChangePlan, Edit, Inventory, InventoryNeed};
+use crate::companion::overrides::{self, OVERRIDES_KIND};
+use crate::macos_keychain::ClaimedAccess;
 
 use super::companion_gate::{
-    KeychainCompanion, authorize, read_overrides_record, values_demand_approval,
+    KeychainCompanion, authorize, contradictory_record, read_overrides_record,
+    values_demand_approval,
 };
 use super::{ListedStorage, ProjectStorage};
 
@@ -43,9 +46,9 @@ pub(super) fn read_all_with_storage(
 
 /// Refuse what `edits` to `vault_id`'s overrides are refused for whatever
 /// their values: an interrupted step that can't be finished, a gate that
-/// refuses writes, or no values, which overrides need. It reads the marker
-/// and attributes, and probes without showing anything; only finishing an
-/// interrupted step first can ask for approval.
+/// refuses writes, no values, which overrides need, or a record whose
+/// approval attributes contradict each other. It reads only the marker and
+/// attributes; only finishing an interrupted step first can ask for approval.
 pub(crate) fn check_unlocked(vault_id: &str, edits: &[Edit]) -> Result<(), String> {
     check_with_storage(&mut super::KeychainProjectStorage, vault_id, edits)
 }
@@ -57,31 +60,29 @@ pub(super) fn check_with_storage(
 ) -> Result<(), String> {
     super::validate_vault_id(vault_id)?;
     let mut listed = ListedStorage::new(storage);
-    match writable(&mut listed, vault_id)? {
-        Writable::WithoutValues(gate) => {
-            crate::overrides::plan_without_values(&gate, edits).map(drop)
-        }
-        Writable::WithValues { .. } => Ok(()),
+    let gate = crate::companion::authorize(
+        &mut KeychainCompanion(&mut listed),
+        vault_id,
+        Operation::Write,
+    )?;
+    // Whether values exist is all it needs, which their attributes say;
+    // the change verifies their approval when it reads.
+    match listed.claimed_access(vault_id)? {
+        None => crate::overrides::plan_without_values(&gate, edits).map(drop),
+        Some(ClaimedAccess::Contradictory) => Err(crate::companion::damaged(
+            crate::companion::gate::Damage::Access(
+                super::companion_gate::CONTRADICTORY_VALUES.to_owned(),
+            ),
+        )),
+        Some(_) => match listed.claimed_access(&record_account(OVERRIDES_KIND, vault_id, None))? {
+            Some(ClaimedAccess::Contradictory) => Err(contradictory_record()),
+            _ => Ok(()),
+        },
     }
 }
 
 pub(crate) fn change_unlocked(vault_id: &str, edits: &[Edit]) -> Result<ChangePlan, String> {
     change_with_storage(&mut super::KeychainProjectStorage, vault_id, edits)
-}
-
-/// Plan `edits` without committing them, for a values write that commits
-/// them in its own transaction.
-pub(crate) fn plan_unlocked(vault_id: &str, edits: &[Edit]) -> Result<ChangePlan, String> {
-    plan_with_storage(&mut super::KeychainProjectStorage, vault_id, edits)
-}
-
-pub(super) fn plan_with_storage(
-    storage: &mut impl ProjectStorage,
-    vault_id: &str,
-    edits: &[Edit],
-) -> Result<ChangePlan, String> {
-    super::validate_vault_id(vault_id)?;
-    plan_listed(&mut ListedStorage::new(storage), vault_id, edits)
 }
 
 /// Plan and commit `edits` through one listing of the service: the gate,
@@ -132,7 +133,9 @@ fn writable<S: ProjectStorage>(
     })
 }
 
-fn plan_listed<S: ProjectStorage>(
+/// Plan `edits` without committing them, through `listed`, which a values
+/// write that commits them in its own transaction goes on to use.
+pub(super) fn plan_listed<S: ProjectStorage>(
     listed: &mut ListedStorage<'_, S>,
     vault_id: &str,
     edits: &[Edit],

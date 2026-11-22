@@ -1701,11 +1701,15 @@ fn write_all_environments_unlocked(
     }
 }
 
-/// Write `environments` with `following`, the personal overrides change
-/// planned for this write in the caller's lock before it
-/// (`overrides::plan_following_unlocked`): in the Keychain, in the values
-/// write's own journal transaction; in the file store, right after the
-/// values, every refusal already found by the plan.
+/// Write `environments`, carrying the environments the write renames,
+/// `(from, to)`, and removes, all at once as it makes them, over to the
+/// project's personal overrides: planned before anything is written, so a
+/// refusal leaves both as they were, and committed in the values write's own
+/// journal transaction in either store.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a values write's arguments and the environment changes it carries"
+)]
 fn write_all_environments_following_unlocked(
     directory: &storage_transaction::VaultStorageDirectory,
     vault_id: &str,
@@ -1713,9 +1717,10 @@ fn write_all_environments_following_unlocked(
     project_path: &str,
     environments: &EnvironmentMap,
     recording: &history::scope::Recording,
-    following: Option<companion::overrides::change::ChangePlan>,
+    renamed: Vec<(String, String)>,
+    removed: Vec<String>,
 ) -> Result<(), String> {
-    let Some(following) = following else {
+    if renamed.is_empty() && removed.is_empty() {
         return write_all_environments_unlocked(
             directory,
             vault_id,
@@ -1724,42 +1729,38 @@ fn write_all_environments_following_unlocked(
             environments,
             recording,
         );
-    };
-    let in_files = |following| {
-        fallback::write_all_environments_then_unlocked(
+    }
+    let edits = [companion::overrides::change::Edit::EnvironmentsChanged { renamed, removed }];
+    if force_file_vault_backend() {
+        return fallback::companion::write_values_following_unlocked(
             directory,
             vault_id,
             environments,
             recording,
-            || {
-                fallback::companion::commit_planned_overrides_unlocked(directory, vault_id, following)
-                    .map_err(|error| {
-                        format!(
-                            "the values were written, but this computer's personal overrides didn't follow the environments they renamed or removed: {error}"
-                        )
-                    })
-            },
-        )
-    };
-    if force_file_vault_backend() {
-        return in_files(following);
+            &edits,
+        );
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = in_files;
         keychain::write_all_environments_following_unlocked(
             vault_id,
             project_name,
             project_path,
             environments,
             recording,
-            following,
+            &edits,
         )
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (project_name, project_path);
-        in_files(following)
+        fallback::companion::write_values_following_unlocked(
+            directory,
+            vault_id,
+            environments,
+            recording,
+            &edits,
+        )
     }
 }
 

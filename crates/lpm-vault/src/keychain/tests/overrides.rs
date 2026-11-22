@@ -349,6 +349,51 @@ fn a_change_probes_the_values_once_for_its_read_and_its_journal() {
     );
 }
 
+/// A rollback's write that renames `default` to `prod`, its overrides
+/// following.
+fn rename_default_to_prod(storage: &mut MemoryProjectStorage) -> Result<(), String> {
+    let _scope = crate::companion::LockScope::enter();
+    recover_project_transaction(storage)?;
+    let renamed = HashMap::from([(
+        "prod".to_owned(),
+        HashMap::from([("TOKEN".to_owned(), "team".to_owned())]),
+    )]);
+    write_all_environments_following_with_storage(
+        storage,
+        VAULT,
+        "Project",
+        "/project",
+        &renamed,
+        &crate::history::scope::begin(
+            VAULT,
+            &crate::history::Source::new(crate::history::Action::Rollback),
+        ),
+        &[Edit::EnvironmentsChanged {
+            renamed: vec![("default".to_owned(), "prod".to_owned())],
+            removed: Vec::new(),
+        }],
+    )
+}
+
+#[test]
+fn a_write_its_overrides_follow_probes_the_values_once_for_its_plan_and_its_journal() {
+    let mut storage = storage_with_values();
+    change(&mut storage, &[set("TOKEN", "mine")]).expect("set");
+    storage.probes.clear();
+
+    rename_default_to_prod(&mut storage).expect("renamed");
+
+    assert_eq!(
+        storage
+            .probes
+            .iter()
+            .filter(|account| *account == VAULT)
+            .count(),
+        1
+    );
+    assert!(read_all(&mut storage).expect("read").contains_key("prod"));
+}
+
 #[test]
 fn values_and_the_overrides_that_follow_them_land_together_or_not_at_all() {
     let storage = || {
@@ -357,34 +402,7 @@ fn values_and_the_overrides_that_follow_them_land_together_or_not_at_all() {
         storage.mutation_attempts = 0;
         storage
     };
-    let rename = |storage: &mut MemoryProjectStorage| {
-        let _scope = crate::companion::LockScope::enter();
-        recover_project_transaction(storage)?;
-        let following = crate::keychain::overrides::plan_with_storage(
-            storage,
-            VAULT,
-            &[Edit::EnvironmentsChanged {
-                renamed: vec![("default".to_owned(), "prod".to_owned())],
-                removed: Vec::new(),
-            }],
-        )?;
-        let renamed = HashMap::from([(
-            "prod".to_owned(),
-            HashMap::from([("TOKEN".to_owned(), "team".to_owned())]),
-        )]);
-        write_all_environments_following_with_storage(
-            storage,
-            VAULT,
-            "Project",
-            "/project",
-            &renamed,
-            &crate::history::scope::begin(
-                VAULT,
-                &crate::history::Source::new(crate::history::Action::Rollback),
-            ),
-            following,
-        )
-    };
+    let rename = rename_default_to_prod;
     let mut uninterrupted = storage();
     rename(&mut uninterrupted).expect("renamed");
     assert!(
@@ -417,6 +435,43 @@ fn values_and_the_overrides_that_follow_them_land_together_or_not_at_all() {
         );
         assert_eq!(overrides.len(), 1, "{failure_point}");
     }
+}
+
+#[test]
+fn the_check_before_values_neither_probes_nor_reads_the_values() {
+    let mut storage = storage_with_values();
+    storage.reads.clear();
+    storage.probes.clear();
+    {
+        let _scope = crate::companion::LockScope::enter();
+        crate::keychain::overrides::check_with_storage(&mut storage, VAULT, &[remove("API_URL")])
+            .expect("a project that can have overrides");
+    }
+    assert!(storage.probes.is_empty(), "{:?}", storage.probes);
+    assert_eq!(storage.reads.get(VAULT).copied(), None);
+}
+
+#[test]
+fn the_check_before_values_refuses_a_record_whose_approval_attributes_contradict() {
+    let mut storage = storage_with_values();
+    change(&mut storage, &[set("API_URL", "fixture-mine")]).expect("set");
+    storage
+        .claims
+        .insert(overrides_account(), ClaimedAccess::Contradictory);
+    storage.reads.clear();
+
+    let refused = {
+        let _scope = crate::companion::LockScope::enter();
+        crate::keychain::overrides::check_with_storage(
+            &mut storage,
+            VAULT,
+            &[set("API_URL", "fixture-yours")],
+        )
+        .expect_err("damaged")
+    };
+
+    assert!(refused.contains("contradict"), "{refused}");
+    assert_eq!(storage.reads.get(&overrides_account()).copied(), None);
 }
 
 #[test]

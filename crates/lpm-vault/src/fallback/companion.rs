@@ -379,6 +379,9 @@ enum FileChange {
     /// Delete one of the project's values files, as a deletion's first
     /// transaction does with the shared key and the single records.
     DeleteValues(ValuesFile),
+    /// Replace the project's values file with these encrypted bytes, with
+    /// the records that follow a values write.
+    ReplaceValues(zeroize::Zeroizing<Vec<u8>>),
 }
 
 /// Why recovery couldn't finish a project's journal.
@@ -700,6 +703,7 @@ impl<'directory> FileCompanion<'directory> {
             .map(|change| match change {
                 FileChange::Companion(mutation) => mutation.payload_bytes(),
                 FileChange::DeleteValues(_) => 0,
+                FileChange::ReplaceValues(bytes) => bytes.len(),
             })
             .sum();
         if payload > MAX_TRANSACTION_PAYLOAD_BYTES {
@@ -720,7 +724,7 @@ impl<'directory> FileCompanion<'directory> {
                     FileChange::Companion(Mutation::Delete { account }) => {
                         Some((account.name(), None))
                     }
-                    FileChange::DeleteValues(_) => None,
+                    FileChange::DeleteValues(_) | FileChange::ReplaceValues(_) => None,
                 })
                 .collect();
             self.check_changes(&companion, &key)
@@ -731,8 +735,38 @@ impl<'directory> FileCompanion<'directory> {
         let folder = self.folder(vault_id)?;
         let mut stage = None;
         let mut operations = Vec::with_capacity(changes.len());
+        let mut staged = |index: usize, bytes: &[u8]| -> Result<String, String> {
+            if stage.is_none() {
+                stage = Some(
+                    self.vaults
+                        .open_or_create_directory(&stage_folder_name(vault_id))?,
+                );
+            }
+            let Some(stage) = stage.as_ref() else {
+                unreachable!("the stage folder was just opened");
+            };
+            stage.write_owner_only_file_unsynced(
+                &stage_name(&transaction_id, index),
+                bytes,
+                "env file journal stage",
+            )?;
+            Ok(sha256_hex(bytes))
+        };
         for (index, change) in changes.iter().enumerate() {
             let operation = match change {
+                FileChange::ReplaceValues(bytes) => FileOperation {
+                    action: FileAction::Replace,
+                    target: vault_id.to_owned(),
+                    values_file: Some(ValuesFile::Digest),
+                    before: self
+                        .vaults
+                        .sha256_owner_only_file(
+                            &ValuesFile::Digest.name(vault_id),
+                            "encrypted vault",
+                        )?
+                        .map(hex::encode),
+                    after: Some(staged(index, bytes)?),
+                },
                 FileChange::DeleteValues(file) => FileOperation {
                     action: FileAction::Delete,
                     target: vault_id.to_owned(),
@@ -765,24 +799,7 @@ impl<'directory> FileCompanion<'directory> {
                         .flatten()
                         .map(hex::encode);
                     let after = match value {
-                        Some(value) => {
-                            let sealed = seal(&key, account, value)?;
-                            if stage.is_none() {
-                                stage = Some(
-                                    self.vaults
-                                        .open_or_create_directory(&stage_folder_name(vault_id))?,
-                                );
-                            }
-                            let Some(stage) = stage.as_ref() else {
-                                unreachable!("the stage folder was just opened");
-                            };
-                            stage.write_owner_only_file_unsynced(
-                                &stage_name(&transaction_id, index),
-                                &sealed,
-                                "env file journal stage",
-                            )?;
-                            Some(sha256_hex(&sealed))
-                        }
+                        Some(value) => Some(staged(index, &seal(&key, account, value)?)?),
                         None => None,
                     };
                     FileOperation {
@@ -1070,7 +1087,7 @@ pub(crate) fn read_all_overrides_unlocked(
 /// Refuse what `edits` to `vault_id`'s overrides are refused for whatever
 /// their values, in the caller's lock: an interrupted step that can't be
 /// finished, a gate that refuses writes, or no values, which overrides need.
-/// Nothing is decrypted.
+/// No value or record is decrypted.
 pub(crate) fn check_overrides_unlocked(
     directory: &VaultStorageDirectory,
     vault_id: &str,
@@ -1097,23 +1114,79 @@ pub(crate) fn change_overrides_unlocked(
     Ok(plan)
 }
 
-/// Plan `edits` without committing them, for a values write that commits
-/// them right after its own (see [`commit_planned_overrides_unlocked`]).
-pub(crate) fn plan_overrides_unlocked(
+/// Write `environments` and carry `edits`, the environments the write
+/// renames and removes, over to `vault_id`'s personal overrides, in the
+/// caller's lock. The plan comes first, so a refusal leaves both as they
+/// were; then one journal transaction replaces the values file, removes a
+/// legacy one, and changes the records, as the journals of LPM CLI 0.82 and
+/// later replay. Only a transaction past a journal's payload writes the
+/// values first and the overrides right after.
+pub(crate) fn write_values_following_unlocked(
     directory: &VaultStorageDirectory,
     vault_id: &str,
+    environments: &crate::EnvironmentMap,
+    recording: &crate::history::scope::Recording,
     edits: &[crate::companion::overrides::change::Edit],
-) -> Result<crate::companion::overrides::change::ChangePlan, String> {
-    plan_with(&mut FileCompanion::open(directory)?, vault_id, edits)
-}
-
-/// Commit a plan from [`plan_overrides_unlocked`], in the lock it was made in.
-pub(crate) fn commit_planned_overrides_unlocked(
-    directory: &VaultStorageDirectory,
-    vault_id: &str,
-    mut plan: crate::companion::overrides::change::ChangePlan,
 ) -> Result<(), String> {
-    commit_plan(&mut FileCompanion::open(directory)?, vault_id, &mut plan)
+    let mut companion = FileCompanion::open(directory)?;
+    let mut plan = plan_with(&mut companion, vault_id, edits)?;
+    if plan.mutations.is_empty() {
+        drop(companion);
+        return super::write_all_environments_unlocked(
+            directory,
+            vault_id,
+            environments,
+            recording,
+        );
+    }
+    let json = crate::selected_environment::serialize(environments)?;
+    let encrypted = zeroize::Zeroizing::new(
+        super::encrypt_with_store_unlocked(
+            directory,
+            vault_id,
+            &json,
+            &super::KeyringNativeDataKeyStore,
+        )?
+        .into_bytes(),
+    );
+    let payload = plan
+        .mutations
+        .iter()
+        .map(Mutation::payload_bytes)
+        .sum::<usize>()
+        .saturating_add(encrypted.len());
+    if payload > MAX_TRANSACTION_PAYLOAD_BYTES {
+        drop(companion);
+        return super::write_all_environments_then_unlocked(
+            directory,
+            vault_id,
+            environments,
+            recording,
+            || {
+                commit_plan(&mut FileCompanion::open(directory)?, vault_id, &mut plan).map_err(
+                    |error| {
+                        format!(
+                            "the values were written, but this computer's personal overrides didn't follow the environments they renamed or removed: {error}"
+                        )
+                    },
+                )
+            },
+        );
+    }
+    crate::history::scope::observe_before(recording, || {
+        super::read_environments_with_digest(directory, vault_id).map(|(before, _)| before)
+    });
+    let mutations = std::mem::take(&mut plan.mutations);
+    let mut changes = Vec::with_capacity(mutations.len() + 2);
+    changes.push(FileChange::ReplaceValues(encrypted));
+    if super::existing_legacy_vault_file_name(&companion.vaults, vault_id)?.is_some() {
+        changes.push(FileChange::DeleteValues(ValuesFile::Legacy));
+    }
+    changes.extend(mutations.into_iter().map(FileChange::Companion));
+    companion.commit_changes(vault_id, changes, true)?;
+    crate::history::scope::committed(recording, std::borrow::Cow::Borrowed(environments));
+    crate::companion::remember(vault_id, &plan.gate);
+    Ok(())
 }
 
 fn plan_with(

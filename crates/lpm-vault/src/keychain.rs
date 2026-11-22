@@ -1655,17 +1655,19 @@ pub(crate) fn write_all_environments_unlocked(
     )
 }
 
-/// [`write_all_environments_unlocked`] with `following`, the personal
-/// overrides change planned for it in this lock before the write
-/// (`overrides::plan_following_unlocked`), committed in the values write's
-/// own journal transaction, so neither lands without the other.
+/// [`write_all_environments_unlocked`], carrying `edits`, the environments
+/// the write renames and removes, over to the project's personal overrides:
+/// planned before anything is written, so a refusal leaves both as they
+/// were, and committed in the values write's own journal transaction, so
+/// neither lands without the other. The plan and the write share one
+/// listing and one probe of the values.
 pub(crate) fn write_all_environments_following_unlocked(
     vault_id: &str,
     project_name: &str,
     project_path: &str,
     environments: &EnvironmentMap,
     recording: &crate::history::scope::Recording,
-    following: crate::companion::overrides::change::ChangePlan,
+    edits: &[crate::companion::overrides::change::Edit],
 ) -> Result<(), String> {
     write_all_environments_following_with_storage(
         &mut KeychainProjectStorage,
@@ -1674,7 +1676,7 @@ pub(crate) fn write_all_environments_following_unlocked(
         project_path,
         environments,
         recording,
-        following,
+        edits,
     )
 }
 
@@ -1685,24 +1687,30 @@ fn write_all_environments_following_with_storage(
     project_path: &str,
     environments: &EnvironmentMap,
     recording: &crate::history::scope::Recording,
-    following: crate::companion::overrides::change::ChangePlan,
+    edits: &[crate::companion::overrides::change::Edit],
 ) -> Result<(), String> {
+    validate_vault_id(vault_id)?;
+    let mut listed = ListedStorage::new(storage);
+    let mut following = overrides::plan_listed(&mut listed, vault_id, edits)?;
+    let mutations: Vec<ProjectStorageMutation> = std::mem::take(&mut following.mutations)
+        .into_iter()
+        .map(companion_gate::storage_mutation)
+        .collect();
+    let changes_overrides = !mutations.is_empty();
     let written = write_all_environments_with_storage_after_recovery(
-        storage,
+        &mut listed,
         vault_id,
         project_name,
         project_path,
         std::borrow::Cow::Borrowed(environments),
         recording,
-        following
-            .mutations
-            .into_iter()
-            .map(companion_gate::storage_mutation)
-            .collect(),
+        mutations,
     );
-    match &written {
-        Ok(()) => crate::companion::remember(vault_id, &following.gate),
-        Err(_) => crate::companion::forget(vault_id),
+    if changes_overrides {
+        match &written {
+            Ok(()) => crate::companion::remember(vault_id, &following.gate),
+            Err(_) => crate::companion::forget(vault_id),
+        }
     }
     written
 }

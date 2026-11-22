@@ -84,8 +84,8 @@ pub fn review_all(project_dir: &Path) -> Result<Option<Reviewed>, String> {
 
 /// Remove the overrides `removals` name, as [`change`] would, refused when
 /// `project_dir` names another project than the one `reviewed` read, or when
-/// an override it would remove changed since: one set to another value, set
-/// where it was unset, or the reverse. An override another command added
+/// an override it would remove changed since: set to another value, set where
+/// it was unset or the reverse, or removed. An override another command added
 /// meanwhile stays.
 pub fn remove_reviewed(
     project_dir: &Path,
@@ -180,10 +180,10 @@ pub fn change(project_dir: &Path, edits: &[Edit]) -> Result<Change, String> {
 /// whatever their values, before any value is read or asked for: an invalid
 /// environment or name, a name LPM never passes to a process, no env project
 /// here or no values for it on this computer, an interrupted step that can't
-/// be finished, or newer data that refuses the change. It reads the marker
-/// and attributes, and probes without showing anything; only finishing an
-/// interrupted step can ask for approval. The project it checked is the one
-/// [`change_checked`] commits to.
+/// be finished, or newer data that refuses the change. It reads only the
+/// marker and attributes; only finishing an interrupted step can ask for
+/// approval. The project it checked is the one [`change_checked`] commits
+/// to.
 pub fn check_before_values(
     project_dir: &Path,
     environment: &str,
@@ -241,36 +241,6 @@ pub(crate) fn plan_without_values(
             error => error.to_string(),
         }
     })
-}
-
-/// Plan carrying the environments a values write renames and removes, all
-/// at once as it makes them, over to the project's personal overrides, in
-/// the caller's lock before the values are written, so a refusal leaves
-/// both as they were. Commit it with
-/// [`write_all_environments_following_unlocked`](crate::write_all_environments_following_unlocked).
-pub(crate) fn plan_following_unlocked(
-    directory: &VaultStorageDirectory,
-    vault_id: &str,
-    renamed: Vec<(String, String)>,
-    removed: Vec<String>,
-) -> Result<Option<ChangePlan>, String> {
-    if renamed.is_empty() && removed.is_empty() {
-        return Ok(None);
-    }
-    let edits = [Edit::EnvironmentsChanged { renamed, removed }];
-    let plan = if crate::force_file_vault_backend() {
-        crate::fallback::companion::plan_overrides_unlocked(directory, vault_id, &edits)
-    } else {
-        #[cfg(target_os = "macos")]
-        {
-            crate::keychain::overrides::plan_unlocked(vault_id, &edits)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            crate::fallback::companion::plan_overrides_unlocked(directory, vault_id, &edits)
-        }
-    }?;
-    Ok((!plan.mutations.is_empty()).then_some(plan))
 }
 
 /// Run `operation` inside the values lock as an overrides command: on
@@ -374,7 +344,9 @@ mod tests {
             store_value_and_override(&dir);
             let reviewed = review_all(&dir).expect("review").expect("a project");
             assert!(reviewed.overrides.contains_key("default"));
-            std::fs::write(dir.join("lpm.json"), r#"{"vault":"another-project"}"#)
+            let manifest = dir.join("lpm.json");
+            let reviewed_manifest = std::fs::read(&manifest).expect("the reviewed project");
+            std::fs::write(&manifest, r#"{"vault":"another-project"}"#)
                 .expect("another project takes the folder");
             store_value_and_override(&dir);
 
@@ -384,6 +356,12 @@ mod tests {
 
             assert!(refused.contains("nothing was changed"), "{refused}");
             assert_eq!(read_all(&dir).expect("read")["default"].set["A"], "mine");
+            std::fs::write(&manifest, reviewed_manifest).expect("the reviewed project returns");
+            assert_eq!(
+                read_all(&dir).expect("read")["default"].set["A"],
+                "mine",
+                "the reviewed project keeps its override too"
+            );
         });
     }
 }
