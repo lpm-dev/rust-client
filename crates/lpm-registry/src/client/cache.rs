@@ -251,16 +251,21 @@ impl OpenedMetadataCacheEntry {
         mut self,
         path: &std::path::Path,
     ) -> Option<CachedResolution<T, P>> {
+        let source = ProjectionSource {
+            entry: path.to_path_buf(),
+            content_id: self.header.content_id,
+        };
         if let Some((value, facts)) = read_projection::<P>(path, self.header.content_id) {
-            return Some(CachedResolution::Projected { value, facts });
+            return Some(CachedResolution::Projected {
+                value,
+                facts,
+                source,
+            });
         }
         let value = decode_metadata_cache_payload(&mut self.reader)?;
         Some(CachedResolution::Document {
             value,
-            source: Some(ProjectionSource {
-                entry: path.to_path_buf(),
-                content_id: self.header.content_id,
-            }),
+            source: Some(source),
         })
     }
 }
@@ -275,6 +280,7 @@ pub(super) enum CachedResolution<T, P> {
     Projected {
         value: P,
         facts: ProjectionFacts,
+        source: ProjectionSource,
     },
 }
 
@@ -587,7 +593,10 @@ impl RegistryClient {
         }
     }
 
-    pub(super) fn read_release_time_memory_cache(&self, key: &str) -> Option<ReleaseTimeMetadata> {
+    pub(super) fn read_release_time_memory_cache(
+        &self,
+        key: &str,
+    ) -> Option<Arc<ReleaseTimeMetadata>> {
         let mut cache = self
             .release_time_memory_cache
             .as_ref()?
@@ -600,13 +609,13 @@ impl RegistryClient {
             cache.remove(key);
             return None;
         }
-        cache.get(key).map(|entry| entry.value.as_ref().clone())
+        cache.get(key).map(|entry| Arc::clone(&entry.value))
     }
 
     pub(super) fn remember_release_times_for_command(
         &self,
         key: &str,
-        metadata: &ReleaseTimeMetadata,
+        metadata: Arc<ReleaseTimeMetadata>,
         fresh_for: std::time::Duration,
     ) {
         if fresh_for.is_zero() {
@@ -621,7 +630,6 @@ impl RegistryClient {
         let Some(cache) = &self.release_time_memory_cache else {
             return;
         };
-        let metadata = Arc::new(metadata.clone());
         cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -636,6 +644,12 @@ impl RegistryClient {
 
     fn invalidate_metadata_memory_cache(&self, key: &str) {
         if let Some(cache) = &self.metadata_memory_cache {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(key);
+        }
+        if let Some(cache) = &self.release_time_memory_cache {
             cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -736,6 +750,8 @@ impl RegistryClient {
             self.npm_direct_metadata_cache_key(package_name, access),
             self.npm_preferred_metadata_cache_key(package_name, access),
             self.npm_latest_metadata_cache_key(package_name, access),
+            self.npm_direct_release_times_cache_key(package_name),
+            self.npm_direct_full_metadata_cache_key(package_name),
         ] {
             self.invalidate_metadata_cache_key(&key);
         }
@@ -958,6 +974,26 @@ impl RegistryClient {
             etag: entry.header.etag,
             remaining_freshness,
         })
+    }
+
+    pub(super) async fn read_stale_metadata_cache_entry_as_async<
+        T: serde::de::DeserializeOwned + Send + 'static,
+    >(
+        &self,
+        key: &str,
+    ) -> Option<MetadataCacheEntry<T>> {
+        let path = self.cache_path(key)?;
+        tokio::task::spawn_blocking(move || {
+            let (value, etag, fresh_for) = Self::read_stale_metadata_cache_path_as::<T>(&path)?;
+            Some(MetadataCacheEntry {
+                value,
+                etag,
+                remaining_freshness: fresh_for,
+            })
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     pub(super) fn read_stale_metadata_cache_path_as<T: serde::de::DeserializeOwned>(

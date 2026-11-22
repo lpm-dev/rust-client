@@ -3076,16 +3076,35 @@ impl RegistryClient {
         name: &str,
         route: crate::UpstreamRoute,
     ) -> Result<ReleaseTimeMetadata, LpmError> {
+        self.get_npm_release_times_routed_full_for_modified(name, route, None)
+            .await
+            .map(Arc::unwrap_or_clone)
+    }
+
+    pub async fn get_npm_release_times_routed_full_for_modified(
+        &self,
+        name: &str,
+        route: crate::UpstreamRoute,
+        expected_modified: Option<&str>,
+    ) -> Result<Arc<ReleaseTimeMetadata>, LpmError> {
         match route {
-            crate::UpstreamRoute::LpmWorker => self.get_npm_package_release_times_full(name).await,
+            crate::UpstreamRoute::LpmWorker => self
+                .get_npm_package_release_times_full(name)
+                .await
+                .map(Arc::new),
             crate::UpstreamRoute::NpmDirect => {
-                self.get_npm_release_times_direct_full_inner(name, true)
-                    .await
+                self.get_npm_release_times_direct_full_inner_with_timings(
+                    name,
+                    true,
+                    expected_modified,
+                )
+                .await
+                .map(|timed| timed.metadata)
             }
-            crate::UpstreamRoute::Custom { target, auth } => {
-                self.get_npm_release_times_from_full(&target.base_url, name, auth.as_deref())
-                    .await
-            }
+            crate::UpstreamRoute::Custom { target, auth } => self
+                .get_npm_release_times_from_full(&target.base_url, name, auth.as_deref())
+                .await
+                .map(Arc::new),
         }
     }
 
@@ -3103,13 +3122,29 @@ impl RegistryClient {
         name: &str,
         route: crate::UpstreamRoute,
     ) -> Result<TimedReleaseTimeMetadata, LpmError> {
+        self.get_npm_release_times_routed_full_with_timings_for_modified(name, route, None)
+            .await
+    }
+
+    pub async fn get_npm_release_times_routed_full_with_timings_for_modified(
+        &self,
+        name: &str,
+        route: crate::UpstreamRoute,
+        expected_modified: Option<&str>,
+    ) -> Result<TimedReleaseTimeMetadata, LpmError> {
         match route {
             crate::UpstreamRoute::NpmDirect => {
-                self.get_npm_release_times_direct_full_inner_with_timings(name, true)
-                    .await
+                self.get_npm_release_times_direct_full_inner_with_timings(
+                    name,
+                    true,
+                    expected_modified,
+                )
+                .await
             }
             route => {
-                let metadata = self.get_npm_release_times_routed_full(name, route).await?;
+                let metadata = self
+                    .get_npm_release_times_routed_full_for_modified(name, route, expected_modified)
+                    .await?;
                 Ok(TimedReleaseTimeMetadata {
                     metadata,
                     timings: PackageMetadataFetchTimings::default(),
@@ -3124,10 +3159,11 @@ impl RegistryClient {
         route: crate::UpstreamRoute,
     ) -> Result<ReleaseTimeMetadata, LpmError> {
         match route {
-            crate::UpstreamRoute::NpmDirect => Ok(self
-                .get_npm_platform_metadata_direct_full_with_timings(name)
-                .await?
-                .metadata),
+            crate::UpstreamRoute::NpmDirect => Ok(Arc::unwrap_or_clone(
+                self.get_npm_platform_metadata_direct_full_with_timings(name)
+                    .await?
+                    .metadata,
+            )),
             crate::UpstreamRoute::LpmWorker => self.get_npm_package_release_times_full(name).await,
             crate::UpstreamRoute::Custom { target, auth } => {
                 let compact = self
@@ -3158,7 +3194,7 @@ impl RegistryClient {
                     .get_npm_platform_metadata_routed_full(name, route)
                     .await?;
                 Ok(TimedReleaseTimeMetadata {
-                    metadata,
+                    metadata: Arc::new(metadata),
                     timings: PackageMetadataFetchTimings::default(),
                 })
             }
@@ -3170,13 +3206,13 @@ impl RegistryClient {
         name: &str,
     ) -> Result<TimedReleaseTimeMetadata, LpmError> {
         let cached = self
-            .get_npm_release_times_direct_full_inner_with_timings(name, true)
+            .get_npm_release_times_direct_full_inner_with_timings(name, true, None)
             .await?;
         if cached.metadata.versions.is_some() {
             return Ok(cached);
         }
         let mut fetched = self
-            .get_npm_release_times_direct_full_inner_with_timings(name, false)
+            .get_npm_release_times_direct_full_inner_with_timings(name, false, None)
             .await?;
         fetched.timings.cache_read_ms = fetched
             .timings
@@ -3310,7 +3346,7 @@ impl RegistryClient {
         }
 
         crate::timing::record_rpc(rpc_start.elapsed());
-        self.get_npm_release_times_direct_full_inner(name, false)
+        self.get_npm_release_times_direct_full_inner(name, true)
             .await
     }
 
@@ -3319,16 +3355,18 @@ impl RegistryClient {
         name: &str,
         use_cache: bool,
     ) -> Result<ReleaseTimeMetadata, LpmError> {
-        Ok(self
-            .get_npm_release_times_direct_full_inner_with_timings(name, use_cache)
-            .await?
-            .metadata)
+        Ok(Arc::unwrap_or_clone(
+            self.get_npm_release_times_direct_full_inner_with_timings(name, use_cache, None)
+                .await?
+                .metadata,
+        ))
     }
 
     async fn get_npm_release_times_direct_full_inner_with_timings(
         &self,
         name: &str,
         use_cache: bool,
+        expected_modified: Option<&str>,
     ) -> Result<TimedReleaseTimeMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
         let cache_key = self.npm_direct_release_times_cache_key(name);
@@ -3354,15 +3392,13 @@ impl RegistryClient {
                 timings.cache_read_ms = cache_read_start.elapsed().as_millis();
                 timings.cache_hit = true;
                 crate::timing::record_metadata_cache_hit();
+                let metadata = Arc::new(cached.value);
                 self.remember_release_times_for_command(
                     &memory_cache_key,
-                    &cached.value,
+                    Arc::clone(&metadata),
                     cached.remaining_freshness,
                 );
-                return Ok(TimedReleaseTimeMetadata {
-                    metadata: cached.value,
-                    timings,
-                });
+                return Ok(TimedReleaseTimeMetadata { metadata, timings });
             }
             let full_cache_key = self.npm_direct_full_metadata_cache_key(name);
             if let Some(cached) = self
@@ -3374,34 +3410,42 @@ impl RegistryClient {
                 timings.cache_read_ms = cache_read_start.elapsed().as_millis();
                 timings.cache_hit = true;
                 crate::timing::record_metadata_cache_hit();
+                let metadata = Arc::new(cached.value);
                 self.remember_release_times_for_command(
                     &memory_cache_key,
-                    &cached.value,
+                    Arc::clone(&metadata),
                     cached.remaining_freshness,
                 );
-                return Ok(TimedReleaseTimeMetadata {
-                    metadata: cached.value,
-                    timings,
-                });
+                return Ok(TimedReleaseTimeMetadata { metadata, timings });
             }
-            let abbreviated_cache_key =
-                self.npm_direct_metadata_cache_key(name, PublicNpmAccess::ANONYMOUS);
-            if let Some(cached) = self
-                .cached_release_times_from_metadata_cache(name, &abbreviated_cache_key)
-                .await
+            // Past publish timestamps are immutable: when the freshly validated
+            // abbreviated packument reports the exact same `modified` timestamp
+            // as an expired release-time cache entry, no new versions were
+            // published and we can skip re-fetching the multi-MB full packument.
+            if let Some(expected_mod) = expected_modified
+                && let Some(stale) = self
+                    .read_stale_metadata_cache_entry_as_async::<ReleaseTimeMetadata>(&cache_key)
+                    .await
+                && stale.value.matches_package(name)
+                && !stale.value.time.is_empty()
+                && stale.value.time.get("modified").map(String::as_str) == Some(expected_mod)
             {
                 timings.cache_read_ms = cache_read_start.elapsed().as_millis();
                 timings.cache_hit = true;
                 crate::timing::record_metadata_cache_hit();
+                let fresh_for = self
+                    .refresh_metadata_cache_freshness(
+                        &cache_key,
+                        super::cache::METADATA_CACHE_TTL,
+                    )
+                    .unwrap_or(super::cache::METADATA_CACHE_TTL);
+                let metadata = Arc::new(stale.value);
                 self.remember_release_times_for_command(
                     &memory_cache_key,
-                    &cached.value,
-                    cached.remaining_freshness,
+                    Arc::clone(&metadata),
+                    fresh_for,
                 );
-                return Ok(TimedReleaseTimeMetadata {
-                    metadata: cached.value,
-                    timings,
-                });
+                return Ok(TimedReleaseTimeMetadata { metadata, timings });
             }
             timings.cache_read_ms = cache_read_start.elapsed().as_millis();
         }
@@ -3426,15 +3470,13 @@ impl RegistryClient {
                     .cache_read_ms
                     .saturating_add(coalesced_read_start.elapsed().as_millis());
                 timings.cache_hit = true;
+                let metadata = Arc::new(cached.value);
                 self.remember_release_times_for_command(
                     &memory_cache_key,
-                    &cached.value,
+                    Arc::clone(&metadata),
                     cached.remaining_freshness,
                 );
-                return Ok(TimedReleaseTimeMetadata {
-                    metadata: cached.value,
-                    timings,
-                });
+                return Ok(TimedReleaseTimeMetadata { metadata, timings });
             }
             timings.cache_read_ms = timings
                 .cache_read_ms
@@ -3486,15 +3528,13 @@ impl RegistryClient {
                 .await
             {
                 timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
+                let metadata = Arc::new(cached.value);
                 self.remember_release_times_for_command(
                     &memory_cache_key,
-                    &cached.value,
+                    Arc::clone(&metadata),
                     cached.remaining_freshness,
                 );
-                return finish!(Ok(TimedReleaseTimeMetadata {
-                    metadata: cached.value,
-                    timings,
-                }));
+                return finish!(Ok(TimedReleaseTimeMetadata { metadata, timings }));
             }
             timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
             let retry_http_start = std::time::Instant::now();
@@ -3520,8 +3560,9 @@ impl RegistryClient {
         let etag = Self::response_etag(&response);
         let cache_directive = Self::metadata_cache_directive(response.headers());
         let (metadata, body_timings) =
-            match parse_capped_metadata_with_timing::<ReleaseTimeMetadata>(
+            match super::release_time_stream::parse_streaming_release_time_metadata_with_timing(
                 response,
+                MAX_METADATA_BYTES,
                 &format!("get_npm_release_times_direct_full {name}"),
             )
             .await
@@ -3544,9 +3585,10 @@ impl RegistryClient {
             cache_directive,
         );
         timings.cache_write_dispatch_ms = cache_write_start.elapsed().as_millis();
+        let metadata = Arc::new(metadata);
         self.remember_release_times_for_command(
             &memory_cache_key,
-            &metadata,
+            Arc::clone(&metadata),
             cache_directive.local_freshness().unwrap_or_default(),
         );
         finish!(Ok(TimedReleaseTimeMetadata { metadata, timings }))
@@ -3568,7 +3610,7 @@ impl RegistryClient {
 
         if let Some(cached) = self.read_release_time_memory_cache(&memory_cache_key) {
             crate::timing::record_metadata_cache_hit();
-            return Ok(cached);
+            return Ok(Arc::unwrap_or_clone(cached));
         }
 
         if let Some(cached) = self
@@ -3577,12 +3619,13 @@ impl RegistryClient {
             && cached.value.matches_package(name)
         {
             crate::timing::record_metadata_cache_hit();
+            let metadata = Arc::new(cached.value);
             self.remember_release_times_for_command(
                 &memory_cache_key,
-                &cached.value,
+                Arc::clone(&metadata),
                 cached.remaining_freshness,
             );
-            return Ok(cached.value);
+            return Ok(Arc::unwrap_or_clone(metadata));
         }
         let full_cache_key = format!("npm-full:{principal}:{url}");
         if let Some(cached) = self
@@ -3592,30 +3635,32 @@ impl RegistryClient {
             && !cached.value.time.is_empty()
         {
             crate::timing::record_metadata_cache_hit();
+            let metadata = Arc::new(cached.value);
             self.remember_release_times_for_command(
                 &memory_cache_key,
-                &cached.value,
+                Arc::clone(&metadata),
                 cached.remaining_freshness,
             );
-            return Ok(cached.value);
+            return Ok(Arc::unwrap_or_clone(metadata));
         }
         crate::timing::record_metadata_cache_miss();
 
         let _flight = metadata_fetch_flight_guard(&memory_cache_key).await;
         if let Some(cached) = self.read_release_time_memory_cache(&memory_cache_key) {
-            return Ok(cached);
+            return Ok(Arc::unwrap_or_clone(cached));
         }
         if let Some(cached) = self
             .read_metadata_cache_entry_as_async::<ReleaseTimeMetadata>(&cache_key)
             .await
             && cached.value.matches_package(name)
         {
+            let metadata = Arc::new(cached.value);
             self.remember_release_times_for_command(
                 &memory_cache_key,
-                &cached.value,
+                Arc::clone(&metadata),
                 cached.remaining_freshness,
             );
-            return Ok(cached.value);
+            return Ok(Arc::unwrap_or_clone(metadata));
         }
 
         let cache_validator = self.read_cache_validator(&cache_key);
@@ -3653,12 +3698,13 @@ impl RegistryClient {
                 )
                 .await
             {
+                let metadata = Arc::new(cached.value);
                 self.remember_release_times_for_command(
                     &memory_cache_key,
-                    &cached.value,
+                    Arc::clone(&metadata),
                     cached.remaining_freshness,
                 );
-                return finish!(Ok(cached.value));
+                return finish!(Ok(Arc::unwrap_or_clone(metadata)));
             }
             let req = self
                 .http
@@ -3677,15 +3723,17 @@ impl RegistryClient {
         }
         let etag = Self::response_etag(&response);
         let cache_directive = Self::metadata_cache_directive(response.headers());
-        let metadata = match parse_capped_metadata::<ReleaseTimeMetadata>(
-            response,
-            &format!("get_npm_release_times_from_full {name} @ {base_url}"),
-        )
-        .await
-        {
-            Ok(metadata) => metadata,
-            Err(err) => return finish!(Err(err)),
-        };
+        let (metadata, _) =
+            match super::release_time_stream::parse_streaming_release_time_metadata_with_timing(
+                response,
+                MAX_METADATA_BYTES,
+                &format!("get_npm_release_times_from_full {name} @ {base_url}"),
+            )
+            .await
+            {
+                Ok(parsed) => parsed,
+                Err(err) => return finish!(Err(err)),
+            };
         let metadata = match Self::validate_release_time_metadata(name, metadata) {
             Ok(metadata) => metadata,
             Err(err) => return finish!(Err(err)),
@@ -3696,12 +3744,13 @@ impl RegistryClient {
             etag.as_deref(),
             cache_directive,
         );
+        let metadata = Arc::new(metadata);
         self.remember_release_times_for_command(
             &memory_cache_key,
-            &metadata,
+            Arc::clone(&metadata),
             cache_directive.local_freshness().unwrap_or_default(),
         );
-        finish!(Ok(metadata))
+        finish!(Ok(Arc::unwrap_or_clone(metadata)))
     }
 
     /// Reuse validated exact-version history for blocked-script enrichment,

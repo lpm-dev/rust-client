@@ -383,7 +383,7 @@ async fn manual_redirect_dispatch_reselects_the_client_for_each_origin() {
             .expect("manual redirect client");
         CachedClient {
             client: reqwest::Client::new(),
-            policy_metadata_client: reqwest::Client::new(),
+            policy_metadata_lanes: std::sync::Arc::from([reqwest::Client::new()]),
             request_lanes: std::sync::Arc::from([manual_redirect_client.clone()]),
             transfer_client: manual_redirect_client,
             identity_fp: None,
@@ -464,7 +464,7 @@ async fn retry_transport_reselects_origin_specific_clients_across_redirects() {
             .expect("manual client");
         CachedClient {
             client: automatic.clone(),
-            policy_metadata_client: automatic,
+            policy_metadata_lanes: std::sync::Arc::from([automatic]),
             request_lanes: std::sync::Arc::from([manual.clone()]),
             transfer_client: manual,
             identity_fp: None,

@@ -1529,6 +1529,211 @@ async fn direct_npm_release_times_etag_304_revalidation_refreshes_cache() {
 }
 
 #[tokio::test]
+async fn stale_release_time_cache_reused_without_http_when_expected_modified_matches() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+
+    let npm_name = "immutable-history";
+    let modified = "2026-11-20T00:00:00.000Z";
+    Mock::given(method("GET"))
+        .and(path("/immutable-history"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": npm_name,
+            "time": {
+                "modified": modified,
+                "1.0.0": "2025-01-01T00:00:00.000Z"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client
+        .get_npm_release_times_routed_full_for_modified(
+            npm_name,
+            crate::UpstreamRoute::NpmDirect,
+            Some(modified),
+        )
+        .await
+        .unwrap();
+
+    // Clear in-memory cache and expire disk TTL so a normal fetch would hit HTTP.
+    let cache_key = client.npm_direct_release_times_cache_key(npm_name);
+    expire_cache_entry(&client, &cache_key);
+    if let Some(mem) = &client.release_time_memory_cache {
+        mem.lock().unwrap().clear();
+    }
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/immutable-history"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let reused = client
+        .get_npm_release_times_routed_full_with_timings_for_modified(
+            npm_name,
+            crate::UpstreamRoute::NpmDirect,
+            Some(modified),
+        )
+        .await
+        .expect("matching modified timestamp should reuse stale release-time cache without HTTP");
+    assert!(reused.timings.cache_hit);
+    assert_eq!(
+        reused.metadata.time.get("1.0.0").map(String::as_str),
+        Some("2025-01-01T00:00:00.000Z")
+    );
+
+    // When modified advances, stale cache must NOT be reused.
+    expire_cache_entry(&client, &cache_key);
+    if let Some(mem) = &client.release_time_memory_cache {
+        mem.lock().unwrap().clear();
+    }
+    server.reset().await;
+    let newer_modified = "2026-11-22T00:00:00.000Z";
+    Mock::given(method("GET"))
+        .and(path("/immutable-history"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": npm_name,
+            "time": {
+                "modified": newer_modified,
+                "1.0.0": "2025-01-01T00:00:00.000Z",
+                "1.1.0": newer_modified
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let refreshed = client
+        .get_npm_release_times_routed_full_for_modified(
+            npm_name,
+            crate::UpstreamRoute::NpmDirect,
+            Some(newer_modified),
+        )
+        .await
+        .expect("changed modified timestamp must refetch release times");
+    assert_eq!(
+        refreshed.time.get("1.1.0").map(String::as_str),
+        Some(newer_modified)
+    );
+}
+
+#[tokio::test]
+async fn invalidate_metadata_cache_clears_direct_release_times_disk_and_memory() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+
+    let npm_name = "invalidate-rt";
+    Mock::given(method("GET"))
+        .and(path("/invalidate-rt"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": npm_name,
+            "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client
+        .get_npm_release_times_routed_full(npm_name, crate::UpstreamRoute::NpmDirect)
+        .await
+        .unwrap();
+
+    client.invalidate_metadata_cache(npm_name);
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/invalidate-rt"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": npm_name,
+            "time": {
+                "1.0.0": "2025-01-01T00:00:00.000Z",
+                "1.0.1": "2026-11-22T00:00:00.000Z"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fetched = client
+        .get_npm_release_times_routed_full(npm_name, crate::UpstreamRoute::NpmDirect)
+        .await
+        .unwrap();
+    assert!(fetched.time.contains_key("1.0.1"));
+}
+
+#[tokio::test]
+async fn worker_release_time_fallback_reuses_direct_cache() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let worker = MockServer::start().await;
+    let npm = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new()
+        .with_base_url(worker.uri())
+        .with_npm_registry_url(npm.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+
+    let npm_name = "fallback-rt";
+    Mock::given(method("GET"))
+        .and(path("/fallback-rt"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": npm_name,
+            "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+        })))
+        .expect(1)
+        .mount(&npm)
+        .await;
+
+    client
+        .get_npm_release_times_routed_full(npm_name, crate::UpstreamRoute::NpmDirect)
+        .await
+        .unwrap();
+
+    npm.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/fallback-rt"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&npm)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/fallback-rt"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&worker)
+        .await;
+
+    let fetched = client
+        .get_npm_release_times_routed_full(npm_name, crate::UpstreamRoute::LpmWorker)
+        .await
+        .expect("worker fallback should reuse warm direct release-time cache");
+    assert_eq!(
+        fetched.time.get("1.0.0").map(String::as_str),
+        Some("2025-01-01T00:00:00.000Z")
+    );
+}
+
+#[tokio::test]
 async fn direct_npm_full_refetch_ignores_fresh_cache_and_overwrites_it() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

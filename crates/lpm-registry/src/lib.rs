@@ -20,9 +20,9 @@ pub use client::{
     ManagedInstallNode, ManagedInstallRoot, MetadataProjection, NoProjection,
     PackageMetadataFetchTimings, ProjectionSlot, PublicNpmAccess, RegistryClient,
     ResolutionMetadata, SecondFactorProof, TARBALL_BODY_ATTEMPTS, TarballBodyError,
-    TarballBodyRetry, TimedPackageMetadata, TimedPreferredMetadata, TimedPreferredResolution,
-    TimedReleaseTimeMetadata, evaluate_cached_url, is_https_url, is_localhost_url,
-    parse_capped_api_json, reserve_compressed_tarball_spool,
+    TarballBodyRetry, TimedDirectResolution, TimedPackageMetadata, TimedPreferredMetadata,
+    TimedPreferredResolution, TimedReleaseTimeMetadata, evaluate_cached_url, is_https_url,
+    is_localhost_url, parse_capped_api_json, reserve_compressed_tarball_spool,
 };
 pub use npmrc::{
     NpmrcConfig, OriginKey, OriginTlsOverrides, RegistryAuth, RegistryKind, RegistryTarget,
