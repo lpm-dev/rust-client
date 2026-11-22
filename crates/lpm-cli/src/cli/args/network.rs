@@ -3,7 +3,7 @@ use clap::Args;
 
 #[derive(Args)]
 pub(crate) struct EnvArgs {
-    /// Subcommand and its arguments (e.g., `set KEY=VALUE`,
+    /// Subcommand and its arguments (e.g., `set API_KEY`,
     /// `pull --org acme`, `oidc allow --provider=github …`).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub(crate) extra: Vec<String>,

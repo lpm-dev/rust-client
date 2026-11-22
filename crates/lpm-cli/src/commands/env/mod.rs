@@ -23,6 +23,7 @@ mod response;
 mod rotation;
 mod schema;
 mod sync_payload;
+mod value_input;
 
 mod prelude {
     pub(super) use crate::{install_ui, output};
@@ -124,10 +125,10 @@ fn run_local_sync_action(
     let result = match action {
         LocalAction::Set {
             environment,
-            assignments,
+            values,
         } => local::env_set(
             environment.env.as_deref(),
-            &assignments,
+            &values,
             project_dir,
             json_output,
         ),

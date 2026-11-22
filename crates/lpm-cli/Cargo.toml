@@ -106,6 +106,7 @@ crypto_box = { workspace = true }
 hex = { workspace = true }
 subtle = { workspace = true }
 secrecy = { workspace = true }
+zeroize = "1"
 
 # Config
 toml = { workspace = true }

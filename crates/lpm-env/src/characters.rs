@@ -250,6 +250,22 @@ pub fn trim_ends(value: &str) -> &str {
     &value[edges.leading..end]
 }
 
+/// `input` without the one line break, `\n` or `\r\n`, that ends it when
+/// nothing before it breaks a line: the end `echo`, a heredoc or an editor
+/// adds to a one-line value, and the one [`check_value_characters`] flags as
+/// trailing whitespace. Input that spans lines keeps its final line break,
+/// which a PEM file needs and [`check_value_characters`] accepts, and any
+/// other whitespace stays for that check to report.
+pub fn strip_single_line_end(input: &str) -> &str {
+    let content = input
+        .strip_suffix("\r\n")
+        .or_else(|| input.strip_suffix('\n'));
+    match content {
+        Some(content) if !content.contains('\n') => content,
+        _ => input,
+    }
+}
+
 /// A value shown with each flagged character written as its escape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShownCharacters {
@@ -905,6 +921,42 @@ mod tests {
             )
         );
         assert_eq!(trim_ends("token\n"), "token");
+    }
+
+    #[test]
+    fn the_line_end_stripped_from_input_is_exactly_the_one_the_check_flags() {
+        for (input, stripped) in [
+            ("token\n", "token"),
+            ("token\r\n", "token"),
+            ("\n", ""),
+            ("token ", "token "),
+            ("token \n", "token "),
+            ("token", "token"),
+            ("", ""),
+            ("a\nb\n", "a\nb\n"),
+            ("a\r\nb\r\n", "a\r\nb\r\n"),
+            ("token\n\n", "token\n\n"),
+            ("token\r", "token\r"),
+        ] {
+            assert_eq!(strip_single_line_end(input), stripped, "{input:?}");
+        }
+        for one_line in ["token\n", "token\r\n"] {
+            let flagged = check_value_characters(one_line).expect("a stray line end");
+            assert!(
+                flagged
+                    .characters
+                    .iter()
+                    .all(|found| found.kind == CharacterKind::TrailingWhitespace),
+                "{one_line:?}"
+            );
+            assert_eq!(
+                check_value_characters(strip_single_line_end(one_line)),
+                None
+            );
+        }
+        let pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQ\n-----END PRIVATE KEY-----\n";
+        assert_eq!(check_value_characters(pem), None);
+        assert_eq!(strip_single_line_end(pem), pem);
     }
 
     #[test]

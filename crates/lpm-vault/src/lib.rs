@@ -1680,33 +1680,8 @@ pub fn import_env_file(
     overwrite: bool,
     source: &history::Source,
 ) -> Result<EnvFileImport, String> {
-    let content =
-        lpm_common::read_text_file_capped(env_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-            .map_err(|e| format!("failed to read {}: {e}", env_path.display()))?;
-
-    let parsed = parse_env_content(&content);
-    if parsed.is_empty() {
-        return Ok(EnvFileImport::default());
-    }
-
-    let vault_id = linked_vault_id_for_write(project_dir)?;
-    let project_name = vault_id::read_project_name(project_dir);
-    let project_path = project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.to_path_buf())
-        .display()
-        .to_string();
-
-    let imported = mutate_secrets_env(
-        &vault_id,
-        &project_name,
-        &project_path,
-        "default",
-        move |secrets| merge_imported_secrets(secrets, parsed, overwrite),
-        source,
-    )?;
-
-    Ok(imported)
+    let content = read_env_file_to_import(env_path)?;
+    import_env_content(project_dir, None, &content, overwrite, source)
 }
 
 /// Import secrets from a .env file into a specific environment, as they're
@@ -1718,11 +1693,26 @@ pub fn import_env_file_to_env(
     overwrite: bool,
     source: &history::Source,
 ) -> Result<EnvFileImport, String> {
-    let content =
-        lpm_common::read_text_file_capped(env_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-            .map_err(|e| format!("failed to read {}: {e}", env_path.display()))?;
+    let content = read_env_file_to_import(env_path)?;
+    import_env_content(project_dir, Some(env), &content, overwrite, source)
+}
 
-    let parsed = parse_env_content(&content);
+fn read_env_file_to_import(env_path: &Path) -> Result<String, String> {
+    lpm_common::read_text_file_capped(env_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+        .map_err(|e| format!("failed to read {}: {e}", env_path.display()))
+}
+
+/// Import secrets from .env `content` read elsewhere, such as from standard
+/// input, into `env`, or `default` when it's `None`, parsed exactly as a .env
+/// file is.
+pub fn import_env_content(
+    project_dir: &Path,
+    env: Option<&str>,
+    content: &str,
+    overwrite: bool,
+    source: &history::Source,
+) -> Result<EnvFileImport, String> {
+    let parsed = parse_env_content(content);
     if parsed.is_empty() {
         return Ok(EnvFileImport::default());
     }
@@ -1735,16 +1725,14 @@ pub fn import_env_file_to_env(
         .display()
         .to_string();
 
-    let imported = mutate_secrets_env(
+    mutate_secrets_env(
         &vault_id,
         &project_name,
         &project_path,
-        env,
+        env.unwrap_or(lpm_env::DEFAULT_ENVIRONMENT),
         move |secrets| merge_imported_secrets(secrets, parsed, overwrite),
         source,
-    )?;
-
-    Ok(imported)
+    )
 }
 
 /// Serialize a secret map into sorted dotenv lines, applying the

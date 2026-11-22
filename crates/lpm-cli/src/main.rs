@@ -25,6 +25,7 @@ pub mod engine_strict_config;
 mod firewall_bypass;
 mod global_blocked_set;
 mod graph_render;
+mod hidden_prompt;
 mod import_rewriter;
 mod install_recovery;
 pub mod install_state;
