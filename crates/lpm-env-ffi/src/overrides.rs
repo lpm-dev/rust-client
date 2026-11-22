@@ -9,14 +9,14 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
 
-use lpm_common::stored_env::{is_safe_vault_id, is_valid_variable_name};
+use lpm_common::stored_env::is_safe_vault_id;
 use lpm_env_companion::budgets::ADMISSION_CAP;
 use lpm_env_companion::gate::{GateError, Operation, ProjectGate};
 use lpm_env_companion::lifecycle::{Mutation, needs_resume};
 use lpm_env_companion::marker::{MAX_RECORD_BYTES, Marker};
 use lpm_env_companion::overrides::change::{
     ChangePlan, Edit, EditError, Effect, EnvironmentMove, Inventory, InventoryNeed, PlanError,
-    plan_change, plan_without_values,
+    check_edit, check_writable, plan_change, plan_without_values,
 };
 use lpm_env_companion::overrides::evaluate_all;
 use serde::{Deserialize, Serialize};
@@ -73,6 +73,7 @@ struct ReadRequest {
     marker: Option<usize>,
     #[serde(default)]
     record: Option<usize>,
+    has_values: bool,
     #[serde(default)]
     values: bool,
 }
@@ -106,6 +107,9 @@ pub unsafe extern "C" fn lpm_env_overrides_read(input: *const u8, length: usize)
             }
             if let Err(error) = gate.authorize(Operation::ReadApplyingOverrides) {
                 return refused(gate_code(&error), Some(error.to_string()));
+            }
+            if !request.has_values {
+                return Output::new(DOMAIN.serialization).finish(&json!({ "environments": [] }));
             }
             let environments = match evaluate_all(&gate, vault_id, record) {
                 Ok(environments) => environments,
@@ -193,10 +197,6 @@ struct RenameRequest {
     to: String,
 }
 
-fn present() -> bool {
-    true
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PlanRequest {
@@ -209,8 +209,8 @@ struct PlanRequest {
     /// once a plan asked for them.
     #[serde(default)]
     names: Option<Bounded<String, MAX_NAMES, false>>,
-    /// Whether the project's values item exists, which overrides need.
-    #[serde(default = "present")]
+    /// Whether the project's values item exists, which overrides need. A
+    /// client says so every time, so it never leaves it out by mistake.
     has_values: bool,
     edits: Vec<EditRequest>,
 }
@@ -298,11 +298,9 @@ where
 /// Why the edits of a request can't be read.
 enum EditsFailure {
     InvalidInput,
-    /// A set's name that isn't a valid variable name, refused before its
-    /// value's size so a refusal never names it.
-    InvalidKey {
-        index: usize,
-    },
+    /// An edit the engine refuses whatever the overrides: checked before its
+    /// value is copied, so a refusal never names a value or an invalid key.
+    Refused(PlanError),
     /// A value larger than one record holds, refused before it's copied.
     ValueTooLarge {
         index: usize,
@@ -315,21 +313,69 @@ enum EditsFailure {
     },
 }
 
-/// The edits a request names, each value copied once out of its blob.
-fn edits(requests: Vec<EditRequest>, blobs: &[&[u8]]) -> Result<Vec<Edit>, EditsFailure> {
+/// The edits a request names, in order, each checked before its value is
+/// copied once out of its blob. A project without values takes no value at
+/// all: any set is refused, whatever it holds.
+fn edits(
+    requests: Vec<EditRequest>,
+    blobs: &[&[u8]],
+    has_values: bool,
+) -> Result<Vec<Edit>, EditsFailure> {
     let mut copied = 0_usize;
     let mut edits = Vec::with_capacity(requests.len());
     for (index, request) in requests.into_iter().enumerate() {
-        edits.push(match request {
+        let (edit, value) = match request {
             EditRequest::Set {
                 environment,
                 key,
                 value,
-            } => {
-                let bytes = blob(blobs, value).ok_or(EditsFailure::InvalidInput)?;
-                if !is_valid_variable_name(&key) {
-                    return Err(EditsFailure::InvalidKey { index });
-                }
+            } => (
+                Edit::Set {
+                    environment,
+                    key,
+                    value: Zeroizing::new(String::new()),
+                },
+                Some(blob(blobs, value).ok_or(EditsFailure::InvalidInput)?),
+            ),
+            EditRequest::Unset { environment, key } => (Edit::Unset { environment, key }, None),
+            EditRequest::Remove { environment, key } => (Edit::Remove { environment, key }, None),
+            EditRequest::ClearEnvironment { environment } => {
+                (Edit::ClearEnvironment { environment }, None)
+            }
+            EditRequest::ClearAll => (Edit::ClearAll, None),
+            EditRequest::EnvironmentRenamed { from, to } => {
+                (Edit::EnvironmentRenamed { from, to }, None)
+            }
+            EditRequest::EnvironmentRemoved { environment } => {
+                (Edit::EnvironmentRemoved { environment }, None)
+            }
+            EditRequest::EnvironmentDuplicated { from, to } => {
+                (Edit::EnvironmentDuplicated { from, to }, None)
+            }
+            EditRequest::EnvironmentCreated { environment } => {
+                (Edit::EnvironmentCreated { environment }, None)
+            }
+            EditRequest::EnvironmentsChanged { renamed, removed } => (
+                Edit::EnvironmentsChanged {
+                    renamed: renamed
+                        .0
+                        .into_iter()
+                        .map(|rename| (rename.from, rename.to))
+                        .collect(),
+                    removed: removed.0,
+                },
+                None,
+            ),
+        };
+        check_edit(&edit)
+            .map_err(|reason| EditsFailure::Refused(PlanError::Edit { index, reason }))?;
+        let edit = match (edit, value) {
+            (
+                Edit::Set {
+                    environment, key, ..
+                },
+                Some(bytes),
+            ) if has_values => {
                 if bytes.len() > MAX_RECORD_BYTES {
                     return Err(EditsFailure::ValueTooLarge { index, key });
                 }
@@ -344,29 +390,9 @@ fn edits(requests: Vec<EditRequest>, blobs: &[&[u8]]) -> Result<Vec<Edit>, Edits
                     value: Zeroizing::new(text.to_owned()),
                 }
             }
-            EditRequest::Unset { environment, key } => Edit::Unset { environment, key },
-            EditRequest::Remove { environment, key } => Edit::Remove { environment, key },
-            EditRequest::ClearEnvironment { environment } => Edit::ClearEnvironment { environment },
-            EditRequest::ClearAll => Edit::ClearAll,
-            EditRequest::EnvironmentRenamed { from, to } => Edit::EnvironmentRenamed { from, to },
-            EditRequest::EnvironmentRemoved { environment } => {
-                Edit::EnvironmentRemoved { environment }
-            }
-            EditRequest::EnvironmentDuplicated { from, to } => {
-                Edit::EnvironmentDuplicated { from, to }
-            }
-            EditRequest::EnvironmentCreated { environment } => {
-                Edit::EnvironmentCreated { environment }
-            }
-            EditRequest::EnvironmentsChanged { renamed, removed } => Edit::EnvironmentsChanged {
-                renamed: renamed
-                    .0
-                    .into_iter()
-                    .map(|rename| (rename.from, rename.to))
-                    .collect(),
-                removed: removed.0,
-            },
-        });
+            (edit, _) => edit,
+        };
+        edits.push(edit);
     }
     Ok(edits)
 }
@@ -567,15 +593,14 @@ pub unsafe extern "C" fn lpm_env_overrides_plan(input: *const u8, length: usize)
             ) else {
                 return failure(2, DOMAIN.invalid_input);
             };
-            let edits = match edits(request.edits, blobs) {
+            let gate = gate_of(vault_id, marker);
+            if let Err(error) = check_writable(&gate) {
+                return refusal(&error);
+            }
+            let edits = match edits(request.edits, blobs, request.has_values) {
                 Ok(edits) => edits,
                 Err(EditsFailure::InvalidInput) => return failure(2, DOMAIN.invalid_input),
-                Err(EditsFailure::InvalidKey { index }) => {
-                    return refusal(&PlanError::Edit {
-                        index,
-                        reason: EditError::InvalidKey,
-                    });
-                }
+                Err(EditsFailure::Refused(error)) => return refusal(&error),
                 Err(EditsFailure::ValueTooLarge { index, key }) => {
                     let mut details = serde_json::Map::new();
                     details.insert("edit".to_owned(), json!(index));
@@ -584,7 +609,7 @@ pub unsafe extern "C" fn lpm_env_overrides_plan(input: *const u8, length: usize)
                     return refused_with(
                         "overrides.too_large",
                         Some(format!(
-                            "the personal override of {key} would be larger than the {} KiB one record may hold",
+                            "the personal override of {key} would be larger than the {} KiB a project's overrides can use",
                             MAX_RECORD_BYTES / 1024
                         )),
                         details,
@@ -604,7 +629,6 @@ pub unsafe extern "C" fn lpm_env_overrides_plan(input: *const u8, length: usize)
                     );
                 }
             };
-            let gate = gate_of(vault_id, marker);
             if !request.has_values {
                 return match plan_without_values(&gate, &edits) {
                     Ok(plan) => unchanged(&plan),

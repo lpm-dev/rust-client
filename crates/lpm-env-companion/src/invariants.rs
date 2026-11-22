@@ -15,18 +15,12 @@ use crate::account::{CompanionAccount, is_in_companion_namespace};
 use crate::marker::{Marker, ProjectState};
 
 /// Whether `account` may exist next to `marker`: the marker itself always,
-/// a record whose kind a feature or the restore in progress lists, a staged
-/// record whose kind the restore lists, and under a `deleting` or
-/// `discarding` marker every record, since none is read for its content
-/// again. Without a marker no record may exist. `history-off` never has
-/// records, so one of its kind is never listed.
-/// Whether a record of `kind` may be one of several parts: one of a kind
-/// this engine knows as a single record may not, and a kind it doesn't know,
-/// a newer client's, keeps any.
-fn parts_allowed(kind: &str) -> bool {
-    crate::budgets::max_parts(kind).is_some() || !crate::graph::is_known_kind(kind)
-}
-
+/// a record whose kind a feature or the restore in progress lists, unless
+/// it's a numbered part of a kind that is one record, a staged record whose
+/// kind the restore lists, and under a `deleting` or `discarding` marker
+/// every record, since none is read for its content again. Without a marker
+/// no record may exist. `history-off` never has records, so one of its kind
+/// is never listed.
 pub fn is_listed(marker: Option<&Marker>, account: &CompanionAccount) -> bool {
     let recordless = matches!(account.kind(), Some(kind) if kind == crate::graph::HISTORY_OFF.name);
     match (account, marker) {
@@ -47,6 +41,13 @@ pub fn is_listed(marker: Option<&Marker>, account: &CompanionAccount) -> bool {
         (CompanionAccount::Staged { kind, .. }, Some(marker)) => marker.restore_lists_kind(kind),
         (_, None) => false,
     }
+}
+
+/// Whether a record of `kind` may be one of several parts: one of a kind
+/// this engine knows as a single record may not, and a kind it doesn't know,
+/// a newer client's, keeps any.
+fn parts_allowed(kind: &str) -> bool {
+    crate::budgets::max_parts(kind).is_some() || !crate::graph::is_known_kind(kind)
 }
 
 /// A record a transaction writes without a feature that lists it.

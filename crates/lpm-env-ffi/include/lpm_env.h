@@ -46,8 +46,9 @@ uint32_t lpm_env_verify(const LPMEnvSnapshot *snapshot);
  * once per call), each environment
  * given is checked as a run on this computer gets it: its own overrides applied
  * over the values it selects, even when it reads "default"'s. A problem an
- * override caused has personalOverride: true, and appliedOverrides lists the
- * overrides that change the environment, the ones a run's notice counts. An
+ * override caused has personalOverride: true (the key is left out otherwise),
+ * and appliedOverrides lists the overrides that change the environment, the ones
+ * a run's notice counts; it's left out when none do. Neither shows a value. An
  * environment that has overrides but no values must be given, empty, to be
  * checked.
  * At most 256 environments and 262144 work units are checked. Each environment
@@ -431,17 +432,20 @@ LPMEnvResult lpm_env_history_ring(const uint8_t *input, size_t input_length);
  * refusal {code: "overrides.<reason>", message, ...details}: details name what
  * it's about, never a value. Every output is wiped when released.
  *
- * Every environment's overrides. Input {vaultId, marker?, record?, values?:
- * bool}. Output {environments: [{environment, set: [{key, passed, value?:
- * blob}], unset: [{key, passed}]}]}, environments and keys in order. value is
- * given only with values: true. passed is false for a name LPM never passes to
- * a process, which only a record written before LPM denied it can hold.
+ * Every environment's overrides. Input {vaultId, marker?, record?, hasValues:
+ * bool, values?: bool}. Output {environments: [{environment, set: [{key,
+ * passed, value?: blob}], unset: [{key, passed}]}]}, environments and keys in
+ * order. hasValues, which every read states, is false when the project's
+ * values item is absent: overrides live beside values, so after the marker's
+ * refusals there are none to list. value is given only with values: true.
+ * passed is false for a name LPM never passes to a process, which only a
+ * record written before LPM denied it can hold.
  * Refusals: overrides.damaged, overrides.unsupported, overrides.needs_resume
  * (finish the interrupted step first, as lpm_env_companion_plan's resume does;
  * its message says so). */
 LPMEnvResult lpm_env_overrides_read(const uint8_t *input, size_t input_length);
 /* Plan one batch of edits, all or none. Input {vaultId, marker?, record?,
- * hasValues?: bool, names?: [every account name in the service, from one
+ * hasValues: bool, names?: [every account name in the service, from one
  * names-only listing], edits: [{action: "set", environment, key, value: blob} |
  * {action: "unset", environment, key} | {action: "remove", environment, key} |
  * {action: "clearEnvironment", environment} | {action: "clearAll"} | {action:
@@ -450,10 +454,11 @@ LPMEnvResult lpm_env_overrides_read(const uint8_t *input, size_t input_length);
  * environment} | {action: "environmentsChanged", renamed: [{from, to}],
  * removed: [environment]}]}, at most 1024 edits, with at most 1024 renames and
  * removals of environments changed together across them, and at most 131072
- * names; past any of them is invalid input. hasValues is false when the
- * project's values item is absent: overrides live beside values, so after the
- * marker's refusals a batch that gives no key an override removes nothing and
- * is unchanged, and any other is refused with overrides.no_values. set gives
+ * names; past any of them is invalid input. hasValues, which every plan
+ * states, is false when the project's values item is absent: overrides live
+ * beside values, so after the marker's refusals a batch that gives no key an
+ * override removes nothing and is unchanged, and any other is refused with
+ * overrides.no_values. set gives
  * the key this Mac's own value (an empty value is a value, at most 100 KiB; the
  * values one batch sets total at most 4 MiB); unset removes the project's
  * value; remove drops the key's override. Report every rename, removal,
@@ -466,9 +471,10 @@ LPMEnvResult lpm_env_overrides_read(const uint8_t *input, size_t input_length);
  * every renamed and removed environment's overrides are taken out first, then
  * each renamed one's merge into its new name, so names that swap or chain keep
  * their own; a name is the source of one rename or removal at most, and the
- * target of one rename at most. Plan an edit that follows a values change
- * before writing the values, so a refusal leaves both as they were, and commit
- * its writes and deletes in the values write's own journal transaction. Output
+ * target of one rename at most, and a removed name is no rename's target. Plan
+ * an edit that follows a values change before writing the values, so a refusal
+ * leaves both as they were, and commit its writes and deletes in the values
+ * write's own journal transaction. Output
  * {result: "needsNames", needs: "project" | "projectAndService", effects} when
  * the batch deletes the record (needs: "project", for the project's records)
  * or creates it (needs: "projectAndService", for the service's count as well):

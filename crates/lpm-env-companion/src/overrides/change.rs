@@ -391,7 +391,7 @@ impl fmt::Display for PlanError {
                 let tenths = bytes.saturating_mul(10).div_ceil(1024);
                 write!(
                     formatter,
-                    "the personal overrides would take {}.{} KiB, more than the {} KiB one record may hold",
+                    "the personal overrides would take {}.{} KiB, more than the {} KiB a project's overrides can use",
                     tenths / 10,
                     tenths % 10,
                     MAX_RECORD_BYTES / 1024
@@ -440,11 +440,7 @@ pub(super) fn plan_change_with_case_policy(
     inventory: Option<&Inventory>,
     case_insensitive: bool,
 ) -> Result<ChangePlan, PlanError> {
-    if gate.marker().is_some_and(needs_resume) {
-        return Err(PlanError::NeedsResume);
-    }
-    gate.authorize(Operation::Write)
-        .map_err(PlanError::Refused)?;
+    check_writable(gate)?;
     let mut next = Overrides::stored(gate, vault_id, record, case_insensitive)?;
     let mut effects = Vec::with_capacity(edits.len());
     let mut changed = false;
@@ -601,6 +597,27 @@ fn plan_record_removal(
     ))
 }
 
+/// Refuse what a change to the overrides of a project with `gate` is
+/// refused for before any edit: an interrupted step it must finish first, or
+/// a marker that refuses writes.
+pub fn check_writable(gate: &ProjectGate) -> Result<(), PlanError> {
+    if gate.marker().is_some_and(needs_resume) {
+        return Err(PlanError::NeedsResume);
+    }
+    gate.authorize(Operation::Write).map_err(PlanError::Refused)
+}
+
+/// Refuse what `edit` is refused for whatever overrides a project has: an
+/// invalid environment or name, a name LPM never passes to a process, a NUL
+/// in a value, or environments changed together that name one twice.
+pub fn check_edit(edit: &Edit) -> Result<(), EditError> {
+    let mut none = Overrides {
+        case_insensitive: cfg!(windows),
+        ..Overrides::default()
+    };
+    none.apply(edit).map(drop)
+}
+
 /// What `edits` do to a project that has no overrides, such as one without
 /// values beside which none can live: their effects when none of them gives
 /// a key an override, so a removal of nothing succeeds and says so; `None`
@@ -625,11 +642,7 @@ pub fn effects_without_overrides(edits: &[Edit]) -> Result<Option<Vec<Effect>>, 
 /// gives a key an override, and [`PlanError::NoValues`] when one does, since
 /// a project needs values on this computer to have overrides.
 pub fn plan_without_values(gate: &ProjectGate, edits: &[Edit]) -> Result<ChangePlan, PlanError> {
-    if gate.marker().is_some_and(needs_resume) {
-        return Err(PlanError::NeedsResume);
-    }
-    gate.authorize(Operation::Write)
-        .map_err(PlanError::Refused)?;
+    check_writable(gate)?;
     let effects = effects_without_overrides(edits)?.ok_or(PlanError::NoValues)?;
     Ok(ChangePlan {
         mutations: Vec::new(),

@@ -989,7 +989,7 @@ fn a_record_with_no_overrides_left_is_deleted_by_the_next_change() {
 fn a_record_too_large_says_its_size_in_kib() {
     assert_eq!(
         PlanError::TooLarge(MAX_RECORD_BYTES + 1).to_string(),
-        "the personal overrides would take 100.1 KiB, more than the 100 KiB one record may hold"
+        "the personal overrides would take 100.1 KiB, more than the 100 KiB a project's overrides can use"
     );
 }
 
@@ -1114,7 +1114,7 @@ fn environments_renamed_together_keep_their_own_overrides_when_names_swap_or_cha
             r#"{"schemaVersion":1,"vaultId":"proj","environments":{"a":{"set":{"K":"from-b","Y":"2"},"unset":[]},"b":{"set":{"K":"from-a","X":"1"},"unset":[]},"c":{"set":{"Z":"3"},"unset":[]}}}"#
         )
     );
-    let chained = plan(
+    let into_a_removed_name = plan(
         &gate,
         Some(SWAP_RECORD),
         vec![changed(&[("b", "c"), ("a", "b")], &["c"])],
@@ -1122,13 +1122,13 @@ fn environments_renamed_together_keep_their_own_overrides_when_names_swap_or_cha
     );
     assert!(
         matches!(
-            chained,
+            into_a_removed_name,
             Err(PlanError::Edit {
                 reason: EditError::EnvironmentNamedTwice(_),
                 ..
             })
         ),
-        "{chained:?}"
+        "a chain can't end in a name it removes: {into_a_removed_name:?}"
     );
     let chained = plan(
         &gate,

@@ -69,7 +69,7 @@ impl Store {
         let marker = self.get(MARKER_ACCOUNT).map(<[u8]>::to_vec);
         let record = self.get(RECORD_ACCOUNT).map(<[u8]>::to_vec);
         let mut blobs: Vec<&[u8]> = values.to_vec();
-        let mut request = json!({ "vaultId": VAULT, "edits": edits });
+        let mut request = json!({ "vaultId": VAULT, "hasValues": true, "edits": edits });
         if let Some(marker) = &marker {
             blobs.push(marker);
             request["marker"] = json!(blobs.len());
@@ -103,8 +103,13 @@ impl Store {
     }
 
     fn read(&self, values: bool) -> (u32, Value, Vec<Vec<u8>>) {
+        self.read_of(true, values)
+    }
+
+    /// Read as the app does, saying whether the project's values item exists.
+    fn read_of(&self, has_values: bool, values: bool) -> (u32, Value, Vec<Vec<u8>>) {
         let mut blobs: Vec<&[u8]> = Vec::new();
-        let mut request = json!({ "vaultId": VAULT, "values": values });
+        let mut request = json!({ "vaultId": VAULT, "hasValues": has_values, "values": values });
         if let Some(marker) = self.get(MARKER_ACCOUNT) {
             blobs.push(marker);
             request["marker"] = json!(blobs.len());
@@ -140,7 +145,7 @@ fn a_batch_at_every_limit_with_a_full_service_of_names_is_one_input() {
 
     let (status, response, _) = call(
         lpm_env_overrides_plan,
-        &json!({"vaultId": VAULT, "marker": 1, "record": 2, "names": names, "edits": edits}),
+        &json!({"vaultId": VAULT, "hasValues": true, "marker": 1, "record": 2, "names": names, "edits": edits}),
         &blobs,
     );
 
@@ -161,7 +166,7 @@ fn environments_changed_together_share_one_budget_across_the_batch() {
     let plan = |edits: Value| {
         call(
             lpm_env_overrides_plan,
-            &json!({"vaultId": VAULT, "edits": edits}),
+            &json!({"vaultId": VAULT, "hasValues": true, "edits": edits}),
             &[],
         )
     };
@@ -179,11 +184,101 @@ fn environments_changed_together_share_one_budget_across_the_batch() {
 }
 
 #[test]
+fn a_plan_refuses_for_the_marker_first_then_for_each_edit_in_order() {
+    let large = vec![b'x'; MAX_RECORD_BYTES + 1];
+    let damaged_marker: &[u8] = b"not a marker";
+    let (status, refused, _) = call(
+        lpm_env_overrides_plan,
+        &json!({"vaultId": VAULT, "hasValues": true, "marker": 2, "edits": [
+            {"action": "set", "environment": "dev", "key": "fixture-not-a-key", "value": 1},
+        ]}),
+        &[&large, damaged_marker],
+    );
+    assert_eq!(status, 5, "{refused}");
+    assert_eq!(
+        refused["code"], "overrides.damaged",
+        "the marker before the edit"
+    );
+
+    let (status, refused, _) = call(
+        lpm_env_overrides_plan,
+        &json!({"vaultId": VAULT, "hasValues": true, "edits": [
+            {"action": "unset", "environment": "not an environment", "key": "A"},
+            {"action": "set", "environment": "dev", "key": "B", "value": 1},
+        ]}),
+        &[&large],
+    );
+    assert_eq!(status, 5, "{refused}");
+    assert_eq!(refused["code"], "overrides.invalid_environment");
+    assert_eq!(
+        refused["edit"], 0,
+        "the first edit's refusal before the second's"
+    );
+
+    let (status, refused, _) = call(
+        lpm_env_overrides_plan,
+        &json!({"vaultId": VAULT, "hasValues": false, "edits": [
+            {"action": "set", "environment": "dev", "key": "B", "value": 1},
+        ]}),
+        &[&large],
+    );
+    assert_eq!(status, 5, "{refused}");
+    assert_eq!(
+        refused["code"], "overrides.no_values",
+        "no value is read without values"
+    );
+}
+
+#[test]
+fn a_plan_says_whether_the_project_has_values() {
+    let (status, response, _) = call(
+        lpm_env_overrides_plan,
+        &json!({"vaultId": VAULT, "edits": [{"action": "clearAll"}]}),
+        &[],
+    );
+    assert_eq!(status, 2, "{response}");
+}
+
+#[test]
+fn a_read_lists_no_overrides_beside_no_values_after_the_marker_s_refusals() {
+    let mut store = Store::default();
+    let (status, planned) = store.change(
+        json!([{"action": "set", "environment": "dev", "key": "A", "value": 1}]),
+        &[b"mine"],
+    );
+    assert_eq!(status, 0, "{planned}");
+
+    let (status, read, values) = store.read_of(false, true);
+    assert_eq!(status, 0, "{read}");
+    assert_eq!(
+        read["environments"],
+        json!([]),
+        "overrides live beside values, so a record left without them is never listed"
+    );
+    assert!(values.is_empty());
+
+    let damaged_marker: &[u8] = b"not a marker";
+    let (status, refused, _) = call(
+        lpm_env_overrides_read,
+        &json!({"vaultId": VAULT, "hasValues": false, "marker": 1}),
+        &[damaged_marker],
+    );
+    assert_eq!(status, 5, "{refused}");
+    assert_eq!(refused["code"], "overrides.damaged");
+
+    let (status, refused, _) = call(lpm_env_overrides_read, &json!({"vaultId": VAULT}), &[]);
+    assert_eq!(
+        status, 2,
+        "every read says whether there are values: {refused}"
+    );
+}
+
+#[test]
 fn a_listing_past_any_service_s_names_is_refused_before_it_is_kept() {
     let names = vec![""; MAX_NAMES + 1];
     let (status, response, _) = call(
         lpm_env_overrides_plan,
-        &json!({"vaultId": VAULT, "names": names, "edits": []}),
+        &json!({"vaultId": VAULT, "hasValues": true, "names": names, "edits": []}),
         &[],
     );
     assert_eq!(status, 2, "{response}");
@@ -322,15 +417,15 @@ fn malformed_requests_are_invalid_input() {
     for (request, blobs) in [
         (json!({"vaultId": "../proj", "edits": []}), Vec::new()),
         (
-            json!({"vaultId": VAULT, "edits": [{"action": "set", "environment": "dev", "key": "A", "value": 1}]}),
+            json!({"vaultId": VAULT, "hasValues": true, "edits": [{"action": "set", "environment": "dev", "key": "A", "value": 1}]}),
             vec![&[0xff_u8, 0xfe][..]],
         ),
         (
-            json!({"vaultId": VAULT, "edits": [{"action": "set", "environment": "dev", "key": "A", "value": 2}]}),
+            json!({"vaultId": VAULT, "hasValues": true, "edits": [{"action": "set", "environment": "dev", "key": "A", "value": 2}]}),
             vec![&b"x"[..]],
         ),
         (
-            json!({"vaultId": VAULT, "edits": [{"action": "rename"}]}),
+            json!({"vaultId": VAULT, "hasValues": true, "edits": [{"action": "rename"}]}),
             Vec::new(),
         ),
         (
@@ -338,7 +433,7 @@ fn malformed_requests_are_invalid_input() {
             Vec::new(),
         ),
         (
-            json!({"vaultId": VAULT, "edits": vec![json!({"action": "clearAll"}); MAX_EDITS + 1]}),
+            json!({"vaultId": VAULT, "hasValues": true, "edits": vec![json!({"action": "clearAll"}); MAX_EDITS + 1]}),
             Vec::new(),
         ),
     ] {
@@ -388,10 +483,11 @@ fn every_override_change_fixture_plans_through_the_engine_as_recorded() {
                 edit
             })
             .collect();
-        let mut request = json!({ "vaultId": case.vault_id, "edits": edits });
-        if let Some(values) = case.has_values {
-            request["hasValues"] = json!(values);
-        }
+        let mut request = json!({
+            "vaultId": case.vault_id,
+            "hasValues": case.has_values.unwrap_or(true),
+            "edits": edits,
+        });
         if let Some(marker) = &case.marker {
             blobs.push(marker.as_bytes().to_vec());
             request["marker"] = json!(blobs.len());
@@ -601,8 +697,7 @@ fn needs_names_says_what_to_list_and_brings_the_effects_for_a_confirmation() {
         &[b"fixture"],
     );
     assert_eq!(status, 0);
-    let mut request =
-        json!({"vaultId": VAULT, "marker": 1, "record": 2, "edits": [{"action": "clearAll"}]});
+    let mut request = json!({"vaultId": VAULT, "hasValues": true, "marker": 1, "record": 2, "edits": [{"action": "clearAll"}]});
     let marker = store.get(MARKER_ACCOUNT).unwrap().to_vec();
     let record = store.get(RECORD_ACCOUNT).unwrap().to_vec();
     let (status, response, _) = call(lpm_env_overrides_plan, &request, &[&marker, &record]);
@@ -617,7 +712,7 @@ fn needs_names_says_what_to_list_and_brings_the_effects_for_a_confirmation() {
         json!([{"action": "set", "environment": "development", "key": "A", "value": 3}]);
     let (_, created, _) = call(
         lpm_env_overrides_plan,
-        &json!({"vaultId": VAULT, "edits": [{"action": "set", "environment": "development", "key": "A", "value": 1}]}),
+        &json!({"vaultId": VAULT, "hasValues": true, "edits": [{"action": "set", "environment": "development", "key": "A", "value": 1}]}),
         &[b"fixture"],
     );
     assert_eq!(created["needs"], "projectAndService");
@@ -707,7 +802,7 @@ fn a_too_large_refusal_never_repeats_an_invalid_key_and_names_the_limit_it_met()
     let large = vec![b'x'; 100 * 1024 + 1];
     let (status, refused, _) = call(
         lpm_env_overrides_plan,
-        &json!({"vaultId": VAULT, "edits": [{"action": "set", "environment": "dev", "key": "fixture-secret-pasted", "value": 1}]}),
+        &json!({"vaultId": VAULT, "hasValues": true, "edits": [{"action": "set", "environment": "dev", "key": "fixture-secret-pasted", "value": 1}]}),
         &[&large],
     );
     assert_eq!(status, 5, "{refused}");
@@ -723,7 +818,7 @@ fn a_too_large_refusal_never_repeats_an_invalid_key_and_names_the_limit_it_met()
         .collect();
     let (status, refused, _) = call(
         lpm_env_overrides_plan,
-        &json!({"vaultId": VAULT, "edits": edits}),
+        &json!({"vaultId": VAULT, "hasValues": true, "edits": edits}),
         &[&shared],
     );
     assert_eq!(status, 5, "{refused}");
