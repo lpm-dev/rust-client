@@ -124,7 +124,7 @@ fn public_digest_routes_preserve_contents_with_supported_writer_activation() {
         return;
     }
 
-    for file_count in [100, 270] {
+    for file_count in [3, 100, 270] {
         let names: Vec<_> = (0..file_count)
             .map(|index| format!("file-{index}"))
             .collect();
@@ -164,8 +164,8 @@ fn public_digest_routes_preserve_contents_with_supported_writer_activation() {
             assert_eq!(
                 activations.load(Ordering::Relaxed),
                 usize::from(
-                    route != "streaming"
-                        && file_count > 256
+                    ((route == "pipelined-file" && file_count > 4)
+                        || (route != "streaming" && file_count > 256))
                         && std::env::var("LPM_INTERNAL_EXTRACT_WRITERS").as_deref() != Ok("0")
                         && crate::writers::writer_pool_capacity() > 0
                 ),

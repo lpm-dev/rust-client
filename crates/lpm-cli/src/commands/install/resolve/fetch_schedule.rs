@@ -43,7 +43,7 @@ fn streaming_candidate_order(a: &InstallPackage, b: &InstallPackage) -> std::cmp
         .then_with(|| a.source.cmp(&b.source))
 }
 
-fn is_streaming_candidate(package: &InstallPackage) -> bool {
+pub(in crate::commands::install) fn is_streaming_candidate(package: &InstallPackage) -> bool {
     package.unpacked_size.is_some()
         && package.integrity.is_some()
         && matches!(

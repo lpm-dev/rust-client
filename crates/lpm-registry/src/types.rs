@@ -426,10 +426,77 @@ fn deserialize_optional_nonzero_u64<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(value
-        .and_then(|value| value.as_u64())
-        .and_then(std::num::NonZeroU64::new))
+    struct OptionalNonZeroU64Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for OptionalNonZeroU64Visitor {
+        type Value = Option<std::num::NonZeroU64>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an optional positive integer or ignored JSON value")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(std::num::NonZeroU64::new(value))
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+            Ok(u64::try_from(value)
+                .ok()
+                .and_then(std::num::NonZeroU64::new))
+        }
+
+        fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_bytes<E>(self, _value: &[u8]) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            while map
+                .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                .is_some()
+            {}
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(OptionalNonZeroU64Visitor)
 }
 
 impl DistInfo {
@@ -2975,6 +3042,64 @@ mod tests {
     fn resolve_version_spec_dist_tag_latest() {
         let m = metadata_for_resolver_tests();
         assert_eq!(m.resolve_version_spec("latest").unwrap(), "1.2.3");
+    }
+
+    #[test]
+    fn dist_unpacked_size_deserializes_positive_integers_and_ignores_invalid_values() {
+        let cases = [
+            (r#"{"unpackedSize": 4096}"#, std::num::NonZeroU64::new(4096)),
+            (r#"{"unpackedSize": 0}"#, None),
+            (r#"{"unpackedSize": null}"#, None),
+            (r#"{"unpackedSize": -1}"#, None),
+            (r#"{"unpackedSize": 12.5}"#, None),
+            (r#"{"unpackedSize": "4096"}"#, None),
+            (r#"{"unpackedSize": true}"#, None),
+            (r#"{"unpackedSize": [1, 2]}"#, None),
+            (r#"{"unpackedSize": {"nested": 1}}"#, None),
+            (r#"{}"#, None),
+        ];
+        for (raw, expected) in cases {
+            let parsed: DistInfo = serde_json::from_str(raw).expect(raw);
+            assert_eq!(parsed.unpacked_size, expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn dist_unpacked_size_deserializes_from_messagepack_and_ignores_invalid_values() {
+        let populated = DistInfo {
+            tarball: Some("https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz".to_string()),
+            shasum: None,
+            integrity: Some("sha512-test".to_string()),
+            unpacked_size: std::num::NonZeroU64::new(4096),
+            signatures: None,
+            attestations: None,
+        };
+        let encoded = rmp_serde::to_vec_named(&populated).unwrap();
+        let decoded: DistInfo = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.unpacked_size, std::num::NonZeroU64::new(4096));
+
+        let empty = DistInfo {
+            unpacked_size: None,
+            ..populated
+        };
+        let encoded_empty = rmp_serde::to_vec_named(&empty).unwrap();
+        let decoded_empty: DistInfo = rmp_serde::from_slice(&encoded_empty).unwrap();
+        assert_eq!(decoded_empty.unpacked_size, None);
+
+        let invalid_cases = [
+            serde_json::json!({"unpackedSize": 0}),
+            serde_json::json!({"unpackedSize": -5}),
+            serde_json::json!({"unpackedSize": 12.5}),
+            serde_json::json!({"unpackedSize": "4096"}),
+            serde_json::json!({"unpackedSize": true}),
+            serde_json::json!({"unpackedSize": [1, 2]}),
+            serde_json::json!({"unpackedSize": {"nested": 1}}),
+        ];
+        for value in invalid_cases {
+            let bytes = rmp_serde::to_vec_named(&value).unwrap();
+            let parsed: DistInfo = rmp_serde::from_slice(&bytes).expect("messagepack decode");
+            assert_eq!(parsed.unpacked_size, None, "{value}");
+        }
     }
 
     #[test]

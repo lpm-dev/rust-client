@@ -3,7 +3,7 @@ use tracing::Instrument as _;
 
 const ENV_FETCH_OVERLAP: &str = "LPM_FETCH_OVERLAP";
 const ENV_FETCH_OVERLAP_MIN_SELECTED: &str = "LPM_FETCH_OVERLAP_MIN_SELECTED";
-const DEFAULT_FETCH_OVERLAP_MIN_SELECTED: usize = 64;
+const DEFAULT_FETCH_OVERLAP_MIN_SELECTED: usize = 16;
 const FETCH_OVERLAP_QUEUE_MULTIPLIER: usize = 4;
 
 fn fetch_overlap_queue_capacity(download_concurrency: usize) -> usize {
@@ -362,8 +362,10 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
     install_accounting: ManagedInstallAccounting,
     dependency_engine_policy: Arc<crate::engine_check::DependencyEnginePolicy>,
     streaming_fetch: bool,
+    streaming_lane: Option<Arc<super::fetch::V2StreamingLane>>,
     min_selected: usize,
 ) -> FetchOverlapJoin {
+    let mut streaming_lane = streaming_lane;
     let task = async move {
         let mut seen = HashSet::new();
         let mut buffered = Vec::new();
@@ -389,12 +391,29 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
                         stats.record_buffered_event();
                         if stats.selected_count as usize >= min_selected {
                             dispatching = true;
+                            if streaming_lane.is_some()
+                                && let Some((largest_idx, _)) = buffered
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(index, entry)| {
+                                        let size = entry.event.unpacked_size?.get();
+                                        (size >= super::fetch::LARGE_V2_STREAMING_OBJECT_BYTES
+                                            && entry.event.integrity.is_some()
+                                            && !entry.event.optional)
+                                            .then_some((index, size))
+                                    })
+                                    .max_by_key(|&(_, size)| size)
+                            {
+                                let largest = buffered.remove(largest_idx);
+                                buffered.insert(0, largest);
+                            }
                             for buffered_event in buffered.drain(..) {
                                 stats.record_buffered_dispatch(
                                     buffered_event.selected_at.elapsed().as_millis(),
                                 );
                                 dispatch_selected_event(
                                     buffered_event.event,
+                                    &mut streaming_lane,
                                     &route_table,
                                     &client,
                                     &store,
@@ -417,6 +436,7 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
                     }
                     dispatch_selected_event(
                         event,
+                        &mut streaming_lane,
                         &route_table,
                         &client,
                         &store,
@@ -716,6 +736,7 @@ pub(super) fn spawn_fetch_overlap_for_packages(
 #[allow(clippy::too_many_arguments)]
 fn dispatch_selected_event(
     event: lpm_resolver::SelectedPackageEvent,
+    streaming_lane: &mut Option<Arc<super::fetch::V2StreamingLane>>,
     route_table: &RouteTable,
     client: &Arc<RegistryClient>,
     store: &PackageStore,
@@ -743,9 +764,31 @@ fn dispatch_selected_event(
         stats.skipped_engine_count = stats.skipped_engine_count.saturating_add(1);
         return;
     }
+    if !package_platform_compatible(&package) {
+        stats.skipped_platform_count = stats.skipped_platform_count.saturating_add(1);
+        return;
+    }
+    if object_already_stored(&package, store_v2_handle.as_deref()) {
+        stats.cache_hit_count = stats.cache_hit_count.saturating_add(1);
+        return;
+    }
+    let qualifies_for_streaming = super::resolve::is_streaming_candidate(&package)
+        && package
+            .unpacked_size
+            .is_some_and(|size| size.get() >= super::fetch::LARGE_V2_STREAMING_OBJECT_BYTES)
+        && !seen.contains(&install_pkg_key(&package))
+        && !super::fetch::credentialed_private_registry(
+            &route_table.route_for_package(&package.name),
+            client,
+        );
+    let package_streaming_lane = if qualifies_for_streaming {
+        streaming_lane.take()
+    } else {
+        None
+    };
     dispatch_install_package(
         package,
-        None,
+        package_streaming_lane,
         route_table,
         client,
         store,
@@ -1340,7 +1383,7 @@ mod tests {
 
     #[test]
     fn fetch_overlap_min_selected_default_skips_tiny_graphs() {
-        assert_eq!(DEFAULT_FETCH_OVERLAP_MIN_SELECTED, 64);
+        assert_eq!(DEFAULT_FETCH_OVERLAP_MIN_SELECTED, 16);
     }
 
     #[test]
@@ -1406,5 +1449,99 @@ mod tests {
 
         assert!(owner_rx.try_recv().expect("owner completion").dispatched);
         assert!(!reuse_rx.try_recv().expect("reuse completion").dispatched);
+    }
+
+    #[tokio::test]
+    async fn selected_event_overlap_excludes_unverified_packages_from_streaming_lane() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        let build_tgz = |name: &str| {
+            let manifest = format!(r#"{{"name":"{name}","version":"1.0.0"}}"#);
+            let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut archive = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(manifest.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "package/package.json", manifest.as_bytes())
+                .unwrap();
+            let body = archive.into_inner().unwrap().finish().unwrap();
+            let integrity = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+            (body, integrity)
+        };
+
+        let (unverified_body, _) = build_tgz("huge-unverified");
+        Mock::given(method("GET"))
+            .and(path("/huge-unverified.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(unverified_body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let directory = tempfile::tempdir().unwrap();
+        let client = Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        );
+        let lane = Arc::new(super::super::fetch::V2StreamingLane::default());
+        let policy = Arc::new(
+            crate::engine_check::prepare_dependency_policy_reusing(
+                directory.path(),
+                true,
+                false,
+                crate::engine_check::NodeVersionReuse::default(),
+            )
+            .unwrap(),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let join = spawn_fetch_overlap_dispatcher(
+            rx,
+            client,
+            RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+            PackageStore::at(directory.path().join("store")),
+            Some(Arc::new(lpm_store::v2::Store::at(
+                directory.path().join("store-v2"),
+            ))),
+            Arc::new(Semaphore::new(4)),
+            Arc::new(FetchCoordinator::default()),
+            directory.path().to_path_buf(),
+            Arc::new(GateStats::default()),
+            None,
+            ManagedInstallAccounting,
+            policy,
+            true,
+            Some(Arc::clone(&lane)),
+            1,
+        );
+        tx.send(lpm_resolver::SelectedPackageEvent {
+            name: "huge-unverified".to_string(),
+            version: "1.0.0".to_string(),
+            tarball_url: Some(format!("{}/huge-unverified.tgz", server.uri())),
+            integrity: None,
+            is_lpm: false,
+            optional: false,
+            platform: None,
+            node_engine: None,
+            unpacked_size: std::num::NonZeroU64::new(
+                super::super::fetch::LARGE_V2_STREAMING_OBJECT_BYTES * 4,
+            ),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let result = join.drain().await.unwrap();
+        assert_eq!(result.stats.completed_count, 1);
+        assert!(
+            lane.try_claim(),
+            "packages without integrity metadata must not claim the streaming lane"
+        );
     }
 }

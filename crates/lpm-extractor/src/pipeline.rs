@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const BUFFER_SIZE: usize = 256 * 1024;
-const BUFFER_COUNT: usize = 3;
+const BUFFER_COUNT: usize = 4;
 
 #[cfg(test)]
 thread_local! {
@@ -158,11 +158,14 @@ pub(super) fn extract(
     cancel_input: impl FnOnce(),
 ) -> Result<Vec<ExtractedFileDigest>, LpmError> {
     with_decoder(reader, limits, cancel_input, |decoded| {
-        let writer_setup = decoded
-            .writer_failure_signal()
-            .map_or(crate::writers::WriterSetup::Disabled, |signal| {
-                crate::writers::WriterSetup::configured().with_failure_signal(signal)
-            });
+        let writer_setup = decoded.writer_failure_signal().map_or(
+            crate::writers::WriterSetup::Disabled,
+            |signal| {
+                crate::writers::WriterSetup::configured()
+                    .with_minimum_files(4)
+                    .with_failure_signal(signal)
+            },
+        );
         extract_tar_archive_with_writers(
             decoded,
             target_dir,
