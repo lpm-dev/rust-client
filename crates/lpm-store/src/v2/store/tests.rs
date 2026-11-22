@@ -1283,6 +1283,9 @@ fn populate_is_idempotent_and_touches_last_referenced_at() {
         .unwrap()
         .modified()
         .unwrap();
+    // Advance past the integer-second `first_sidecar.last_referenced_at` timestamp
+    // so `effective_last_referenced_at` strictly increases after `touch_on_disk`.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
 
     let second = populate_link_entry_source(&store, req()).unwrap();
     assert!(!second.freshly_populated);

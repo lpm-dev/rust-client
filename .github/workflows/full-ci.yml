@@ -11,7 +11,7 @@ name: Full CI
 # hand runs them on any branch.
 on:
   pull_request:
-    branches: [main, "codex/**"]
+    branches: [main, "codex/**", "perf/**"]
     types: [opened, synchronize, reopened, ready_for_review, labeled]
   workflow_dispatch:
 
