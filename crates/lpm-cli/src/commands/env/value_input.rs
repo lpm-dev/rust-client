@@ -38,6 +38,9 @@ pub(super) struct Request<'a> {
     pub command: &'static str,
     /// What the prompt asks for.
     pub asking: Asking<'a>,
+    /// The most the values may hold in all, the most the command stores at
+    /// once: reading stops once they pass it.
+    pub total_limit: usize,
 }
 
 /// What a prompt asks for, such as a value for `default`: `Value for
@@ -154,6 +157,34 @@ pub(super) fn check(request: &Request<'_>, sources: &impl Sources) -> Result<Che
     })
 }
 
+/// The bytes the values read so far hold, refused once they pass what the
+/// request's command stores at once.
+struct Total<'r, 'a> {
+    bytes: usize,
+    request: &'r Request<'a>,
+}
+
+impl Total<'_, '_> {
+    fn add(&mut self, bytes: usize) -> Result<(), LpmError> {
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.bytes <= self.request.total_limit {
+            return Ok(());
+        }
+        let limit = self.request.total_limit;
+        let size = match limit {
+            _ if limit >= 1024 * 1024 && limit.is_multiple_of(1024 * 1024) => {
+                format!("{} MiB", limit / (1024 * 1024))
+            }
+            _ if limit >= 1024 && limit.is_multiple_of(1024) => format!("{} KiB", limit / 1024),
+            _ => format!("{limit} bytes"),
+        };
+        Err(LpmError::Env(format!(
+            "the values given total more than {size}, the most `{}` stores at once; nothing was stored",
+            self.request.command
+        )))
+    }
+}
+
 /// Every key's value, in the order the arguments name them, then the
 /// `--from-file` keys. Nothing is read or asked until every argument is
 /// valid, and nothing is asked until every file and standard input are read.
@@ -181,11 +212,13 @@ pub(super) fn collect(
     refuse_repeated_keys(&entries, &files, cfg!(windows))?;
     check_how_bare_keys_get_values(request, &bare, sources)?;
 
+    let mut total = Total { bytes: 0, request };
     let mut from_files = Vec::with_capacity(files.len());
     for (key, path) in &files {
         let text = sources
             .read_file(path, MAX_VALUE_BYTES)
             .map_err(|error| file_error(path, &error))?;
+        total.add(text.len())?;
         from_files.push(Assignment {
             key: (*key).to_owned(),
             value: finish(key, text, Origin::File(path), request.command)?,
@@ -199,6 +232,7 @@ pub(super) fn collect(
         let text = sources
             .read_stdin(MAX_VALUE_BYTES)
             .map_err(|error| stdin_error(key, &error))?;
+        total.add(text.len())?;
         piped = Some(finish(key, text, Origin::Stdin, request.command)?);
     }
 
@@ -208,7 +242,11 @@ pub(super) fn collect(
             Entry::Given(key, value) => (key, Zeroizing::new(value.to_owned())),
             Entry::Bare(key) => match piped.take() {
                 Some(value) => (key, value),
-                None => (key, prompted(key, sources, request)?),
+                None => {
+                    let value = prompted(key, sources, request)?;
+                    total.add(value.len())?;
+                    (key, value)
+                }
             },
         };
         assignments.push(Assignment {
@@ -368,6 +406,9 @@ fn prompted(
             PromptError::IncompletePaste => LpmError::Env(format!(
                 "the paste of the value for {key} never ended, so nothing was stored. Paste it again, pipe it in with `{command} {key} --stdin`, or read it from a file with `{command} --from-file {key}=PATH`"
             )),
+            PromptError::TypedTextLost => LpmError::Env(format!(
+                "some of what was typed for {key} after the Escape or an Alt key may have been taken for the terminal's own reply, so nothing was stored. Type the value again, pipe it in with `{command} {key} --stdin`, or read it from a file with `{command} --from-file {key}=PATH`"
+            )),
             PromptError::NotText => LpmError::Env(format!(
                 "the value entered for {key} isn't UTF-8 text, so this terminal may use another encoding. Nothing was stored. Pipe it in with `{command} {key} --stdin`"
             )),
@@ -462,6 +503,7 @@ mod tests {
         cant_hide: bool,
         stdin: Option<Vec<u8>>,
         files: HashMap<String, Result<String, &'static str>>,
+        file_reads: usize,
         typed: VecDeque<Result<&'static str, PromptError>>,
         asked: Vec<String>,
         stdin_reads: usize,
@@ -496,6 +538,7 @@ mod tests {
             path: &str,
             limit: usize,
         ) -> Result<Zeroizing<String>, SecretReadError> {
+            self.file_reads += 1;
             match self.files.get(path) {
                 None => Err(SecretReadError::NotFound),
                 Some(Ok(text)) if text.len() > limit => Err(SecretReadError::TooLarge),
@@ -537,6 +580,7 @@ mod tests {
                     what: "Value",
                     environment: "default",
                 },
+                total_limit: usize::MAX,
             },
             fake,
         )
@@ -557,6 +601,37 @@ mod tests {
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn reading_stops_once_the_values_pass_what_the_command_stores_at_once() {
+        let mut fake = Fake {
+            files: HashMap::from([("big".to_owned(), Ok("x".repeat(60)))]),
+            ..Fake::default()
+        };
+        let from_files = strings(&["A=big", "B=big", "C=big"]);
+        let request = Request {
+            entries: &[],
+            stdin: false,
+            from_files: &from_files,
+            json_output: false,
+            command: "lpm env set",
+            asking: Asking {
+                what: "Value",
+                environment: "default",
+            },
+            total_limit: 100,
+        };
+
+        let Err(LpmError::Env(refused)) = collect(&request, &mut fake) else {
+            panic!("too much in all");
+        };
+
+        assert_eq!(
+            refused,
+            "the values given total more than 100 bytes, the most `lpm env set` stores at once; nothing was stored"
+        );
+        assert_eq!(fake.file_reads, 2, "the third file is never read");
     }
 
     #[test]
@@ -898,6 +973,7 @@ mod tests {
                     what: "Value",
                     environment: "default",
                 },
+                total_limit: usize::MAX,
             },
             &mut fake,
         );

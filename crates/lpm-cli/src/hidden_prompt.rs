@@ -53,6 +53,9 @@ pub(crate) enum PromptError {
     TooLarge,
     /// A paste began but never ended, so the value isn't whole.
     IncompletePaste,
+    /// Text typed after the Escape or an Alt key was read as a terminal's
+    /// string, so the value may have lost some of it.
+    TypedTextLost,
     /// What was typed isn't UTF-8, as a terminal set to another encoding
     /// sends.
     NotText,
@@ -153,6 +156,16 @@ enum Event {
         )
     )]
     PasteCut,
+    /// Text that may have been typed was read as a terminal's string, which
+    /// ended without its end.
+    #[cfg_attr(
+        all(not(unix), not(test)),
+        expect(
+            dead_code,
+            reason = "only a Unix terminal sends strings that can hold typing"
+        )
+    )]
+    Lost,
     Enter,
     Backspace,
     /// Ctrl+W: erase the word before the end.
@@ -182,6 +195,7 @@ impl fmt::Debug for Event {
             Self::Pasted(_) => "Pasted(..)",
             Self::PasteEnded => "PasteEnded",
             Self::PasteCut => "PasteCut",
+            Self::Lost => "Lost",
             Self::Enter => "Enter",
             Self::Backspace => "Backspace",
             Self::EraseWord => "EraseWord",
@@ -221,6 +235,7 @@ enum Ending {
     Cancel,
     TooLarge,
     IncompletePaste,
+    TypedTextLost,
 }
 
 /// The text typed or pasted so far. Its buffer holds the most a value may
@@ -233,6 +248,8 @@ struct HiddenLine {
     overflowed: bool,
     /// A paste was cut off, so submitting refuses the value.
     cut: bool,
+    /// Typed text may have been lost, so submitting refuses the value.
+    lost: bool,
 }
 
 impl HiddenLine {
@@ -242,6 +259,7 @@ impl HiddenLine {
             limit,
             overflowed: false,
             cut: false,
+            lost: false,
         }
     }
 
@@ -266,7 +284,9 @@ impl HiddenLine {
                 return Step::End(Ending::TooLarge);
             }
             Event::PasteCut => self.cut = true,
+            Event::Lost => self.lost = true,
             Event::Enter if self.cut => return Step::End(Ending::IncompletePaste),
+            Event::Enter if self.lost => return Step::End(Ending::TypedTextLost),
             Event::Enter => return Step::End(Ending::Submit),
             Event::Backspace => self.erase_character(),
             Event::EraseWord => self.erase_word(),
@@ -372,6 +392,7 @@ fn read_line(keyboard: &mut impl Keyboard, limit: usize) -> Result<Zeroizing<Str
         Ending::Cancel => Err(PromptError::Cancelled),
         Ending::TooLarge => Err(PromptError::TooLarge),
         Ending::IncompletePaste => Err(PromptError::IncompletePaste),
+        Ending::TypedTextLost => Err(PromptError::TypedTextLost),
     }
 }
 
@@ -450,6 +471,11 @@ mod tests {
             Step::End(Ending::Cancel)
         );
         assert_eq!(line([Event::EndOfFile], 100).0, Step::End(Ending::Cancel));
+        assert_eq!(
+            line([Event::Typed(b'a'), Event::Lost, Event::Enter], 100).0,
+            Step::End(Ending::TypedTextLost),
+            "text that may have been lost refuses the value"
+        );
         let (step, text) = line(typed("a").chain([Event::EndOfFile, Event::Enter]), 100);
         assert_eq!(step, Step::End(Ending::Submit));
         assert_eq!(text, "a");

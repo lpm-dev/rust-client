@@ -37,9 +37,15 @@ enum State {
         remaining: u8,
     },
     /// A string a terminal sends, such as an `ESC ]` reply, which ends with
-    /// BEL or `ESC \\`; `escape` once an `ESC` of that end was read.
+    /// BEL or `ESC \\`; `escape` once an `ESC` of that end was read. A
+    /// terminal sends a string with what it holds, so one that `held`
+    /// nothing when its read ended began with a key: `introducer` after the
+    /// Escape key, or with it as a Meta chord when `chord`.
     TerminalString {
         escape: bool,
+        held: bool,
+        introducer: u8,
+        chord: bool,
     },
     /// In a bracketed paste, with `matched` bytes of its end marker read.
     Paste {
@@ -67,7 +73,12 @@ impl Bytes {
                 }
                 b'O' => self.state = State::SingleShift,
                 b']' | b'P' | b'_' | b'^' | b'X' => {
-                    self.state = State::TerminalString { escape: false };
+                    self.state = State::TerminalString {
+                        escape: false,
+                        held: false,
+                        introducer: byte,
+                        chord: self.escape_in_read,
+                    };
                 }
                 // An escape that starts no sequence edits nothing, and what
                 // follows it is read on its own.
@@ -119,21 +130,31 @@ impl Bytes {
                     },
                 };
             }
-            State::TerminalString { escape } => {
-                self.state = match (escape, byte) {
-                    (_, 0x07) | (true, b'\\') => State::Ground,
-                    (_, 0x1b) => State::TerminalString { escape: true },
+            State::TerminalString {
+                escape,
+                held,
+                introducer,
+                chord,
+            } => {
+                let string = |escape, held| State::TerminalString {
+                    escape,
+                    held,
+                    introducer,
+                    chord,
+                };
+                match (escape, byte) {
+                    (_, 0x07) | (true, b'\\') => self.state = State::Ground,
+                    (_, 0x1b) => self.state = string(true, held),
                     // CAN and SUB cancel the string, as ECMA-48 has them.
-                    (_, 0x18 | 0x1a) => State::Ground,
+                    (_, 0x18 | 0x1a) => self.end_string(held, each),
                     // A string a terminal sends holds no other control, so
                     // one is a key that ends it: Enter or Ctrl+C after Alt+P.
                     (_, 0x00..=0x1f | 0x7f) => {
-                        self.state = State::Ground;
+                        self.end_string(held, each);
                         self.ground(byte, each);
-                        return;
                     }
-                    _ => State::TerminalString { escape: false },
-                };
+                    _ => self.state = string(false, true),
+                }
             }
             State::Paste { matched } => self.paste(byte, matched, each),
         }
@@ -162,8 +183,35 @@ impl Bytes {
                 self.after_carriage_return = false;
                 each(Event::PasteCut);
             }
-            State::TerminalString { .. } => self.state = State::Ground,
+            State::TerminalString { held, .. } => self.end_string(held, each),
             _ => {}
+        }
+    }
+
+    /// A terminal string ends without its end, which a terminal always
+    /// sends: what it `held` may have been typed, and is lost.
+    fn end_string(&mut self, held: bool, each: &mut dyn FnMut(Event)) {
+        self.state = State::Ground;
+        if held {
+            each(Event::Lost);
+        }
+    }
+
+    /// The read being fed ended. A terminal string that holds nothing yet
+    /// began with a key: Escape and the key in one read are a Meta chord,
+    /// which edits nothing, and a key typed after the Escape key is text.
+    pub(super) fn end_of_read(&mut self, each: &mut dyn FnMut(Event)) {
+        if let State::TerminalString {
+            escape: false,
+            held: false,
+            introducer,
+            chord,
+        } = self.state
+        {
+            self.state = State::Ground;
+            if !chord {
+                each(Event::Typed(introducer));
+            }
         }
     }
 
@@ -398,6 +446,7 @@ mod tests {
             for &byte in *chunk {
                 bytes.feed(byte, &mut |event| shown.take(event));
             }
+            bytes.end_of_read(&mut |event| shown.take(event));
         }
         shown.finish()
     }
@@ -436,8 +485,36 @@ mod tests {
             "<Interrupt>",
             "Alt+], then Ctrl+C"
         );
-        assert_eq!(decoded(&[b"\x1bPab\x18cd"]), "cd", "CAN cancels the string");
-        assert_eq!(decoded(&[b"\x1b_x\x1ayz"]), "yz", "SUB cancels the string");
+        assert_eq!(
+            decoded(&[b"\x1bPab\x18cd"]),
+            "<Lost>cd",
+            "CAN cancels the string, which may have held typed text"
+        );
+        assert_eq!(
+            decoded(&[b"\x1b_x\x1ayz"]),
+            "<Lost>yz",
+            "SUB cancels it too"
+        );
+        assert_eq!(
+            decoded(&[b"\x1bP1$r0m\x1b\\a"]),
+            "a",
+            "a string a terminal ends adds and loses nothing"
+        );
+    }
+
+    #[test]
+    fn a_string_introducer_that_ends_its_read_is_a_key() {
+        assert_eq!(decoded(&[b"a", b"\x1bP", b"b"]), "ab", "Alt+P adds nothing");
+        assert_eq!(
+            decoded(&[b"\x1b", b"P", b"b"]),
+            "Pb",
+            "P typed after the Escape key is text"
+        );
+        assert_eq!(
+            decoded(&[b"a", b"\x1bPb", b"\r"]),
+            "a<Lost><Enter>",
+            "text read with Alt+P can't be told from a terminal's string"
+        );
     }
 
     #[test]
@@ -599,7 +676,11 @@ mod tests {
             assert!(bytes.unfinished());
             bytes.end_unfinished(&mut |event| events.push(event));
             bytes.feed(0x03, &mut |event| events.push(event));
-            assert_eq!(events, [Event::Interrupt]);
+            assert_eq!(
+                events,
+                [Event::Lost, Event::Interrupt],
+                "what it held may have been typed, and Ctrl+C cancels again"
+            );
         }
     }
 

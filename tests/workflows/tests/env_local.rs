@@ -1318,6 +1318,64 @@ fn stdin_that_is_a_device_is_refused_rather_than_read() {
     assert_eq!(revealed(&project, "TOKEN"), None);
 }
 
+/// Wait for `child` to exit; one still waiting at the deadline, which only
+/// bounds a failure, is killed and fails the test.
+fn exit_of(mut child: std::process::Child, waiting_on: &str) -> std::process::Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while child.try_wait().expect("inspect lpm").is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("lpm waited on {waiting_on} instead of refusing first");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    child.wait_with_output().expect("lpm's output")
+}
+
+#[test]
+fn import_refuses_a_project_it_cant_change_before_it_reads_its_source() {
+    let project = TempProject::empty(r#"{"name":"import-read-only","version":"1.0.0"}"#);
+    for args in [
+        &["env", "set", "SEEDED=team"][..],
+        &["env", "debug-companion", "read-only"],
+    ] {
+        lpm(&project).args(args).assert().success();
+    }
+
+    let mut child = support::lpm_spawnable(&project)
+        .args(["env", "import", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run lpm");
+    let held_open = child.stdin.take();
+    let output = exit_of(child, "standard input");
+    drop(held_open);
+    assert!(!output.status.success());
+    assert_eq!(revealed(&project, "IMPORTED"), None);
+
+    #[cfg(unix)]
+    {
+        let fifo = project.path().join("never-written.env");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo");
+        assert!(status.success());
+        let child = support::lpm_spawnable(&project)
+            .args(["env", "import", "never-written.env"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to run lpm");
+        let output = exit_of(child, "a named pipe without a writer");
+        assert!(!output.status.success());
+    }
+}
+
 #[test]
 fn stdin_that_is_a_directory_is_refused_by_name() {
     let project = TempProject::empty(r#"{"name":"stdin-directory","version":"1.0.0"}"#);

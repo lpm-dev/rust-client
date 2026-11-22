@@ -14,8 +14,8 @@ mod common;
 mod tty {
     use crate::common;
     use crate::common::pty::{
-        PtyOptions, PtySession, run_in_pty, run_in_pty_chunked, run_in_pty_with,
-        run_in_pty_with_stdout_captured,
+        PtyOptions, PtySession, run_in_pty, run_in_pty_answering, run_in_pty_chunked,
+        run_in_pty_with, run_in_pty_with_stdout_captured,
     };
     use std::time::Duration;
 
@@ -556,6 +556,40 @@ mod tty {
     }
 
     #[test]
+    fn a_value_is_stored_nowhere_when_the_folder_names_another_project_by_the_answer() {
+        let (project, lpm_home) = project();
+        let run = |args: &[&str]| {
+            let (status, _, stderr) = common::run_lpm(project.path(), lpm_home.path(), None, args);
+            assert!(status.success(), "{args:?}: {stderr}");
+        };
+        run(&["env", "set", "SEEDED=team"]);
+        let lpm_json = project.path().join("lpm.json");
+        let checked_project = std::fs::read_to_string(&lpm_json).expect("lpm.json");
+        let another_project = r#"{"vault":"another-project"}"#;
+        std::fs::write(&lpm_json, another_project).expect("another project");
+        run(&["env", "set", "THEIRS=team"]);
+        std::fs::write(&lpm_json, &checked_project).expect("the checked project");
+
+        let answered = run_in_pty_answering(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(b"Value for TOKEN (default, hidden): ", b"fixture-mine\r")],
+            &mut |_| std::fs::write(&lpm_json, another_project).expect("switch projects"),
+        );
+
+        assert!(!answered.status.success(), "{}", answered.transcript);
+        assert!(
+            answered.transcript.contains("nothing was stored"),
+            "{}",
+            answered.transcript
+        );
+        assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
+        std::fs::write(&lpm_json, &checked_project).expect("the checked project");
+        assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
+    }
+
+    #[test]
     fn ctrl_c_a_moment_after_a_paste_that_never_ends_cancels() {
         let (project, lpm_home) = project();
         let session = run_in_pty_chunked(
@@ -664,6 +698,48 @@ mod tty {
             stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
             Some("fixture-key")
         );
+    }
+
+    #[test]
+    fn alt_p_between_typed_text_keeps_the_text_on_both_sides() {
+        let (project, lpm_home) = project();
+        let session = run_in_pty_chunked(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(
+                b"Value for TOKEN (default, hidden): ",
+                vec![b"fixture-", b"\x1bP", b"key\r"],
+            )],
+            Duration::from_millis(120),
+        );
+        assert!(session.status.success(), "{}", session.transcript);
+        assert_eq!(
+            stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
+            Some("fixture-key")
+        );
+    }
+
+    #[test]
+    fn text_read_with_alt_p_stores_nothing_rather_than_part_of_the_value() {
+        let (project, lpm_home) = project();
+        let session = run_in_pty_chunked(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(
+                b"Value for TOKEN (default, hidden): ",
+                vec![b"fixture-", b"\x1bPkey", b"\r"],
+            )],
+            Duration::from_millis(120),
+        );
+        assert!(!session.status.success(), "{}", session.transcript);
+        assert!(
+            session.transcript.contains("nothing was stored"),
+            "{}",
+            session.transcript
+        );
+        assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
     }
 
     #[test]

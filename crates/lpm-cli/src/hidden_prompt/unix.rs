@@ -2,7 +2,7 @@
 
 use std::io;
 use std::mem::MaybeUninit;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
@@ -17,10 +17,13 @@ const BRACKETED_PASTE_OFF: &[u8] = b"\x1b[?2004l";
 /// over a slow connection.
 const ESCAPE_KEY_WAIT: Duration = Duration::from_millis(500);
 
-/// How long a read waits for the rest of a sequence after its escape: never
-/// longer than the read itself may wait, so a bounded wait stays bounded.
-fn escape_key_wait(wait: Option<Duration>) -> Duration {
-    wait.map_or(ESCAPE_KEY_WAIT, |wait| wait.min(ESCAPE_KEY_WAIT))
+/// How long a read that may wait `wait` and has spent `elapsed` waits for
+/// the rest of a sequence after its escape: never past the read's own wait,
+/// so a bounded wait stays bounded.
+fn escape_budget(wait: Option<Duration>, elapsed: Duration) -> Duration {
+    wait.map_or(ESCAPE_KEY_WAIT, |wait| {
+        wait.saturating_sub(elapsed).min(ESCAPE_KEY_WAIT)
+    })
 }
 
 /// Whether the terminal can hide what's typed: a Unix terminal can, but
@@ -89,9 +92,9 @@ impl Terminal {
 
 impl Keyboard for Terminal {
     fn read(&mut self, wait: Option<Duration>, each: &mut dyn FnMut(Event)) -> io::Result<bool> {
-        if let Some(wait) = wait
-            && !input_within(Some(wait))?
-        {
+        let started = Instant::now();
+        let deadline = wait.map(|wait| started + wait);
+        if deadline.is_some() && !input_by(deadline)? {
             return Ok(false);
         }
         let mut buffer = Zeroizing::new([0_u8; 1024]);
@@ -107,7 +110,9 @@ impl Keyboard for Terminal {
                 io::ErrorKind::Interrupted => {}
                 // An earlier program can leave the terminal non-blocking.
                 io::ErrorKind::WouldBlock => {
-                    input_within(None)?;
+                    if !input_by(deadline)? {
+                        return Ok(false);
+                    }
                 }
                 _ => return Err(error),
             }
@@ -122,9 +127,14 @@ impl Keyboard for Terminal {
         for &byte in &buffer[..read] {
             self.bytes.feed(byte, each);
         }
+        self.bytes.end_of_read(each);
         // A terminal sends the rest of a sequence with the escape that
         // starts it; one nothing follows soon was the Escape key.
-        if self.bytes.after_escape() && !input_within(Some(escape_key_wait(wait)))? {
+        if self.bytes.after_escape()
+            && !input_by(Some(
+                Instant::now() + escape_budget(wait, started.elapsed()),
+            ))?
+        {
             self.bytes.escape_key();
         }
         Ok(true)
@@ -139,17 +149,16 @@ impl Keyboard for Terminal {
     }
 }
 
-/// Whether input arrives within `wait`, or at all when `None`.
-fn input_within(wait: Option<Duration>) -> io::Result<bool> {
-    let timeout = wait.map_or(-1, |wait| {
-        libc::c_int::try_from(wait.as_millis()).unwrap_or(libc::c_int::MAX)
-    });
+/// Whether input arrives by `deadline`, or at all when `None`.
+fn input_by(deadline: Option<Instant>) -> io::Result<bool> {
     let mut descriptor = libc::pollfd {
         fd: libc::STDIN_FILENO,
         events: libc::POLLIN,
         revents: 0,
     };
     loop {
+        // A poll a signal interrupts waits only for what's left.
+        let timeout = poll_timeout(deadline, Instant::now());
         // SAFETY: `descriptor` is one valid pollfd for the call's duration.
         let ready = unsafe { libc::poll(&mut descriptor, 1, timeout) };
         if ready >= 0 {
@@ -160,6 +169,14 @@ fn input_within(wait: Option<Duration>) -> io::Result<bool> {
             return Err(error);
         }
     }
+}
+
+/// The milliseconds `poll` waits at `now` for `deadline`; -1 for none.
+fn poll_timeout(deadline: Option<Instant>, now: Instant) -> libc::c_int {
+    deadline.map_or(-1, |deadline| {
+        let left = deadline.saturating_duration_since(now);
+        libc::c_int::try_from(left.as_millis()).unwrap_or(libc::c_int::MAX)
+    })
 }
 
 impl Drop for Terminal {
@@ -192,15 +209,38 @@ mod tests {
     }
 
     #[test]
-    fn the_wait_for_the_rest_of_a_sequence_stays_within_the_read_s_own() {
-        assert_eq!(escape_key_wait(None), ESCAPE_KEY_WAIT);
+    fn the_wait_for_the_rest_of_a_sequence_stays_within_what_the_read_has_left() {
+        let ms = Duration::from_millis;
+        assert_eq!(escape_budget(None, ms(900)), ESCAPE_KEY_WAIT);
+        assert_eq!(escape_budget(Some(ms(40)), Duration::ZERO), ms(40));
         assert_eq!(
-            escape_key_wait(Some(Duration::from_millis(40))),
-            Duration::from_millis(40)
-        );
-        assert_eq!(
-            escape_key_wait(Some(Duration::from_secs(2))),
+            escape_budget(Some(Duration::from_secs(2)), ms(10)),
             ESCAPE_KEY_WAIT
         );
+        assert_eq!(
+            escape_budget(Some(ms(100)), ms(80)),
+            ms(20),
+            "the poll before it already spent most of the read's wait"
+        );
+        assert_eq!(escape_budget(Some(ms(100)), ms(150)), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_poll_waits_only_for_what_its_deadline_leaves() {
+        let now = Instant::now();
+        assert_eq!(poll_timeout(None, now), -1);
+        assert_eq!(
+            poll_timeout(Some(now + Duration::from_millis(250)), now),
+            250
+        );
+        assert_eq!(
+            poll_timeout(
+                Some(now + Duration::from_millis(250)),
+                now + Duration::from_millis(200)
+            ),
+            50,
+            "after an interruption, only what's left"
+        );
+        assert_eq!(poll_timeout(Some(now), now + Duration::from_secs(1)), 0);
     }
 }

@@ -224,17 +224,42 @@ pub(crate) fn authorize_companion(
     }
 }
 
+/// The env project a values write was checked for: the one `project_dir`
+/// named, or none yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedValues {
+    vault_id: Option<String>,
+}
+
+impl CheckedValues {
+    /// The vault the values go to: the checked project's, refused when
+    /// `project_dir` names another project since, while `gathered`.
+    fn vault_id(&self, project_dir: &Path, gathered: &str) -> Result<String, String> {
+        if vault_id::read_vault_id(project_dir) != self.vault_id {
+            return Err(format!(
+                "this directory's env project changed while {gathered}; nothing was stored"
+            ));
+        }
+        match &self.vault_id {
+            Some(vault_id) => Ok(vault_id.clone()),
+            None => linked_vault_id_for_write(project_dir),
+        }
+    }
+}
+
 /// Refuse what a write of `project_dir`'s values is refused for, before
 /// they're read or asked for: newer data that refuses writes, or an
 /// interrupted step that can't be finished. Nothing for a folder without an
-/// env project yet, which the write creates.
-pub fn check_values_writable(project_dir: &Path) -> Result<(), String> {
-    let Some(vault_id) = linked_vault_id(project_dir)? else {
-        return Ok(());
-    };
-    with_project_vault_transaction(|directory| {
-        authorize_companion(directory, &vault_id, companion::gate::Operation::Write)
-    })
+/// env project yet, which the write creates. [`set_checked`] writes to the
+/// project it checked.
+pub fn check_values_writable(project_dir: &Path) -> Result<CheckedValues, String> {
+    let vault_id = linked_vault_id(project_dir)?;
+    if let Some(vault_id) = &vault_id {
+        with_project_vault_transaction(|directory| {
+            authorize_companion(directory, vault_id, companion::gate::Operation::Write)
+        })?;
+    }
+    Ok(CheckedValues { vault_id })
 }
 
 fn with_project_vault_transaction<T>(
@@ -768,28 +793,22 @@ pub fn set(
     pairs: &[(&str, &str)],
     source: &history::Source,
 ) -> Result<(), String> {
+    set_env(project_dir, "default", pairs, source)
+}
+
+/// [`set_env`] into the project `checked` was for, refused when
+/// `project_dir` names another one since, such as while its values were
+/// asked for.
+pub fn set_checked(
+    project_dir: &Path,
+    checked: &CheckedValues,
+    env: &str,
+    pairs: &[(&str, &str)],
+    source: &history::Source,
+) -> Result<(), String> {
     reject_invalid_keys(pairs.iter().map(|(k, _)| *k))?;
-
-    let vault_id = linked_vault_id_for_write(project_dir)?;
-    let project_name = vault_id::read_project_name(project_dir);
-    let project_path = project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.to_path_buf())
-        .display()
-        .to_string();
-
-    mutate_secrets_env(
-        &vault_id,
-        &project_name,
-        &project_path,
-        "default",
-        |secrets| {
-            for (key, value) in pairs {
-                secrets.insert((*key).to_owned(), (*value).to_owned());
-            }
-        },
-        source,
-    )
+    let vault_id = checked.vault_id(project_dir, "its values were asked for")?;
+    write_env(project_dir, &vault_id, env, pairs, source)
 }
 
 /// Set secrets for a specific environment.
@@ -800,8 +819,17 @@ pub fn set_env(
     source: &history::Source,
 ) -> Result<(), String> {
     reject_invalid_keys(pairs.iter().map(|(k, _)| *k))?;
-
     let vault_id = linked_vault_id_for_write(project_dir)?;
+    write_env(project_dir, &vault_id, env, pairs, source)
+}
+
+fn write_env(
+    project_dir: &Path,
+    vault_id: &str,
+    env: &str,
+    pairs: &[(&str, &str)],
+    source: &history::Source,
+) -> Result<(), String> {
     let project_name = vault_id::read_project_name(project_dir);
     let project_path = project_dir
         .canonicalize()
@@ -810,7 +838,7 @@ pub fn set_env(
         .to_string();
 
     mutate_secrets_env(
-        &vault_id,
+        vault_id,
         &project_name,
         &project_path,
         env,
@@ -1697,17 +1725,19 @@ pub fn import_env_file(
     import_env_content(project_dir, None, &content, overwrite, source)
 }
 
-/// Import secrets from a .env file into a specific environment, as they're
-/// written there.
-pub fn import_env_file_to_env(
+/// [`import_env_file`] into `env`, or `default` when it's `None`, of the
+/// project `checked` was for: refused when `project_dir` names another one
+/// once the file is read, which can wait on a pipe's writer.
+pub fn import_env_file_checked(
     project_dir: &Path,
-    env: &str,
+    checked: &CheckedValues,
+    env: Option<&str>,
     env_path: &Path,
     overwrite: bool,
     source: &history::Source,
 ) -> Result<EnvFileImport, String> {
     let content = read_env_file_to_import(env_path)?;
-    import_env_content(project_dir, Some(env), &content, overwrite, source)
+    import_env_content_checked(project_dir, checked, env, &content, overwrite, source)
 }
 
 /// The .env file or pipe at `env_path`; a device or a directory is refused.
@@ -1741,8 +1771,36 @@ pub fn import_env_content(
     if parsed.is_empty() {
         return Ok(EnvFileImport::default());
     }
-
     let vault_id = linked_vault_id_for_write(project_dir)?;
+    import_parsed(project_dir, &vault_id, env, parsed, overwrite, source)
+}
+
+/// [`import_env_content`] into the project `checked` was for, refused when
+/// `project_dir` names another one since.
+pub fn import_env_content_checked(
+    project_dir: &Path,
+    checked: &CheckedValues,
+    env: Option<&str>,
+    content: &str,
+    overwrite: bool,
+    source: &history::Source,
+) -> Result<EnvFileImport, String> {
+    let parsed = parse_env_content(content);
+    if parsed.is_empty() {
+        return Ok(EnvFileImport::default());
+    }
+    let vault_id = checked.vault_id(project_dir, "the values to import were read")?;
+    import_parsed(project_dir, &vault_id, env, parsed, overwrite, source)
+}
+
+fn import_parsed(
+    project_dir: &Path,
+    vault_id: &str,
+    env: Option<&str>,
+    parsed: HashMap<String, String>,
+    overwrite: bool,
+    source: &history::Source,
+) -> Result<EnvFileImport, String> {
     let project_name = vault_id::read_project_name(project_dir);
     let project_path = project_dir
         .canonicalize()
@@ -1751,7 +1809,7 @@ pub fn import_env_content(
         .to_string();
 
     mutate_secrets_env(
-        &vault_id,
+        vault_id,
         &project_name,
         &project_path,
         env.unwrap_or(lpm_env::DEFAULT_ENVIRONMENT),
