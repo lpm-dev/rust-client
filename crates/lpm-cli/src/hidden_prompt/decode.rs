@@ -122,21 +122,31 @@ impl Bytes {
         }
     }
 
-    /// Whether a paste has begun and not ended.
-    pub(super) fn pasting(&self) -> bool {
-        matches!(self.state, State::Paste { .. })
+    /// Whether a paste or a terminal string has begun and not ended, so
+    /// every byte that comes is read as part of it, Enter's and Ctrl+C's
+    /// included.
+    pub(super) fn unfinished(&self) -> bool {
+        matches!(
+            self.state,
+            State::Paste { .. } | State::TerminalString { .. }
+        )
     }
 
-    /// End a paste whose end marker never came: what began like the marker
-    /// was pasted text.
-    pub(super) fn end_paste(&mut self, each: &mut dyn FnMut(Event)) {
-        if let State::Paste { matched } = self.state {
-            for &held in &PASTE_END[..usize::from(matched)] {
-                self.pasted(held, each);
+    /// End a paste or a terminal string whose end never came. What began
+    /// like a paste's end marker was pasted text, and the paste is cut off;
+    /// a terminal string adds nothing.
+    pub(super) fn end_unfinished(&mut self, each: &mut dyn FnMut(Event)) {
+        match self.state {
+            State::Paste { matched } => {
+                for &held in &PASTE_END[..usize::from(matched)] {
+                    self.pasted(held, each);
+                }
+                self.state = State::Ground;
+                self.after_carriage_return = false;
+                each(Event::PasteCut);
             }
-            self.state = State::Ground;
-            self.after_carriage_return = false;
-            each(Event::PasteEnded);
+            State::TerminalString { .. } => self.state = State::Ground,
+            _ => {}
         }
     }
 
@@ -238,6 +248,19 @@ impl Utf16 {
 pub(super) fn typed_unit(key_down: bool, virtual_key: u16, unit: u16) -> Option<u16> {
     const VK_MENU: u16 = 0x12;
     (unit != 0 && (key_down || virtual_key == VK_MENU)).then_some(unit)
+}
+
+/// The clipboard's units a paste needs: its text up to the NUL that ends it,
+/// but never more than a value of `limit` bytes can come from. Every two
+/// units make at least one byte of UTF-8, as `\r\n` does, so a longer text
+/// is known to be too large from that bounded prefix, whatever the
+/// clipboard holds.
+#[cfg(any(windows, test))]
+pub(super) fn clipboard_units(held: &[u16], limit: usize) -> &[u16] {
+    let held = &held[..held.len().min(limit.saturating_mul(2).saturating_add(1))];
+    held.iter()
+        .position(|&unit| unit == 0)
+        .map_or(held, |end| &held[..end])
 }
 
 /// Text pasted from the clipboard, as UTF-16, the way a terminal's paste
@@ -470,11 +493,48 @@ mod tests {
     }
 
     #[test]
+    fn a_clipboard_paste_copies_no_more_than_decides_its_value() {
+        let limit = 8;
+        let padded: Vec<u16> = "fixture\0junk after the end".encode_utf16().collect();
+        assert_eq!(clipboard_units(&padded, limit), &padded[..7]);
+        let long = vec![u16::from(b'x'); 10_000];
+        assert_eq!(clipboard_units(&long, limit).len(), 2 * limit + 1);
+
+        let breaks: Vec<u16> = "\r\n".repeat(10_000).encode_utf16().collect();
+        let mut line = super::super::HiddenLine::new(limit);
+        let mut ended = None;
+        paste_units(clipboard_units(&breaks, limit), &mut |event| {
+            if let super::super::Step::End(ending) = line.apply(event) {
+                ended.get_or_insert(ending);
+            }
+        });
+        assert!(
+            matches!(ended, Some(super::super::Ending::TooLarge)),
+            "even line breaks that make one byte each overflow the value"
+        );
+    }
+
+    #[test]
     fn a_clipboard_paste_is_pasted_text_with_its_line_breaks_made_line_feeds() {
         let units: Vec<u16> = "one\r\ntwo\rthree\n🔑".encode_utf16().collect();
         let mut shown = Shown::default();
         paste_units(&units, &mut |event| shown.take(event));
         assert_eq!(shown.finish(), "<paste>one\ntwo\nthree\n🔑<PasteEnded>");
+    }
+
+    #[test]
+    fn a_terminal_string_that_never_ends_ends_once_quiet_so_ctrl_c_cancels_again() {
+        for unfinished in [&b"\x1b]0;fixture-title"[..], b"\x1bPfixture-device"] {
+            let mut bytes = Bytes::default();
+            let mut events = Vec::new();
+            for &byte in unfinished {
+                bytes.feed(byte, &mut |event| events.push(event));
+            }
+            assert!(bytes.unfinished());
+            bytes.end_unfinished(&mut |event| events.push(event));
+            bytes.feed(0x03, &mut |event| events.push(event));
+            assert_eq!(events, [Event::Interrupt]);
+        }
     }
 
     #[test]
@@ -500,12 +560,12 @@ mod tests {
         for &byte in b"\x1b[200~ab\x1b[20" {
             bytes.feed(byte, &mut |event| shown.take(event));
         }
-        assert!(bytes.pasting());
-        bytes.end_paste(&mut |event| shown.take(event));
-        assert!(!bytes.pasting());
+        assert!(bytes.unfinished());
+        bytes.end_unfinished(&mut |event| shown.take(event));
+        assert!(!bytes.unfinished());
         for &byte in b"c" {
             bytes.feed(byte, &mut |event| shown.take(event));
         }
-        assert_eq!(shown.finish(), "<paste>ab\x1b[20<PasteEnded>c");
+        assert_eq!(shown.finish(), "<paste>ab\x1b[20<PasteCut>c");
     }
 }

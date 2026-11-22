@@ -330,6 +330,9 @@ fn prompted(
                 "the value entered for {key} is larger than {} KiB, the most one value can hold. Nothing was stored",
                 MAX_VALUE_BYTES / 1024
             )),
+            PromptError::IncompletePaste => LpmError::Env(format!(
+                "the paste of the value for {key} never ended, so nothing was stored. Paste it again, pipe it in with `{command} {key} --stdin`, or read it from a file with `{command} --from-file {key}=PATH`"
+            )),
             PromptError::NotText => LpmError::Env(format!(
                 "the value entered for {key} isn't UTF-8 text, so this terminal may use another encoding. Nothing was stored. Pipe it in with `{command} {key} --stdin`"
             )),
@@ -842,6 +845,7 @@ mod tests {
                 Err(PromptError::SeveralLines),
                 Err(PromptError::TooLarge),
                 Err(PromptError::NotText),
+                Err(PromptError::IncompletePaste),
             ]),
             ..Fake::default()
         };
@@ -879,6 +883,8 @@ mod tests {
         let not_text = run(&["A"], false, &[], false, &mut fake).unwrap_err();
         assert!(not_text.contains("isn't UTF-8 text"), "{not_text}");
         assert!(not_text.contains("`lpm env set A --stdin`"), "{not_text}");
+        let cut = run(&["A"], false, &[], false, &mut fake).unwrap_err();
+        assert!(cut.contains("never ended, so nothing was stored"), "{cut}");
     }
 
     #[test]

@@ -506,6 +506,47 @@ mod tty {
     }
 
     #[test]
+    fn a_paste_that_never_ends_stores_nothing_when_enter_follows() {
+        let (project, lpm_home) = project();
+        let session = run_in_pty_chunked(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(
+                b"Value for TOKEN (default, hidden): ",
+                vec![b"\x1b[200~fixture-part", b"\r"],
+            )],
+            Duration::from_millis(2500),
+        );
+        assert!(!session.status.success(), "{}", session.transcript);
+        assert!(
+            session.transcript.contains("never ended"),
+            "{}",
+            session.transcript
+        );
+        assert!(session.echo_restored);
+        assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
+    }
+
+    #[test]
+    fn ctrl_c_cancels_once_a_terminal_string_that_never_ends_goes_quiet() {
+        let (project, lpm_home) = project();
+        let session = run_in_pty_chunked(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(
+                b"Value for TOKEN (default, hidden): ",
+                vec![b"\x1b]0;fixture-title", b"\x03"],
+            )],
+            Duration::from_millis(2500),
+        );
+        assert_eq!(session.status.code(), Some(130), "{}", session.transcript);
+        assert!(session.echo_restored);
+        assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
+    }
+
+    #[test]
     fn a_terminal_left_non_blocking_still_answers_the_prompt() {
         let (project, lpm_home) = project();
         let options = PtyOptions {

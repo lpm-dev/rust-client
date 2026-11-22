@@ -269,6 +269,53 @@ fn into_text(mut bytes: Zeroizing<Vec<u8>>) -> Result<Zeroizing<String>, SecretR
 mod tests {
     use super::*;
 
+    /// Reading standard input takes from its descriptor no more than one byte
+    /// past the limit: none of it passes through std's buffered stdin, whose
+    /// buffer is never wiped and would have taken the rest. The test runs
+    /// itself again as the reader, with a pipe for standard input.
+    #[cfg(unix)]
+    #[test]
+    fn standard_input_is_read_from_its_descriptor_and_no_further_than_needed() {
+        use std::io::{Read as _, Write as _};
+        use std::os::fd::FromRawFd as _;
+        const READER: &str = "LPM_SECRET_READ_STDIN_READER";
+        if std::env::var_os(READER).is_some() {
+            assert!(matches!(
+                read_secret_stdin(4),
+                Err(SecretReadError::TooLarge)
+            ));
+            // SAFETY: standard input stays open; ManuallyDrop never closes it.
+            let mut stdin = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(0) });
+            let mut rest = Vec::new();
+            stdin
+                .read_to_end(&mut rest)
+                .expect("the rest of standard input");
+            println!("left on the descriptor: {}", rest.len());
+            return;
+        }
+        let mut reader = std::process::Command::new(std::env::current_exe().expect("this test"))
+            .args([
+                "--exact",
+                "secret_read::tests::standard_input_is_read_from_its_descriptor_and_no_further_than_needed",
+                "--nocapture",
+            ])
+            .env(READER, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("run the reader");
+        reader
+            .stdin
+            .take()
+            .expect("its standard input")
+            .write_all(&[b'x'; 64])
+            .expect("fill the pipe");
+        let output = reader.wait_with_output().expect("the reader ends");
+        let shown = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{shown}");
+        assert!(shown.contains("left on the descriptor: 59"), "{shown}");
+    }
+
     /// A reader that hands out at most `step` bytes a call, as a pipe does.
     struct Trickle<'a> {
         bytes: &'a [u8],

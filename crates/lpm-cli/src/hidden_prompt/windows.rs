@@ -20,7 +20,7 @@ use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 use zeroize::Zeroizing;
 
-use super::decode::{Utf16, paste_units, typed_unit};
+use super::decode::{Utf16, clipboard_units, paste_units, typed_unit};
 
 /// The character Ctrl+V types.
 const CTRL_V: u16 = 0x16;
@@ -39,8 +39,9 @@ pub(super) fn can_hide_input() -> bool {
         && unsafe { GetConsoleMode(input, &mut mode) } != 0
 }
 
-/// The clipboard's text, or `None` when it holds none.
-fn clipboard_text() -> Option<Zeroizing<Vec<u16>>> {
+/// The clipboard's text as a paste of a value of at most `limit` bytes needs
+/// it (see [`clipboard_units`]), or `None` when it holds none.
+fn clipboard_text(limit: usize) -> Option<Zeroizing<Vec<u16>>> {
     // SAFETY: opening the clipboard for this thread, with no window.
     if unsafe { OpenClipboard(std::ptr::null_mut()) } == 0 {
         return None;
@@ -55,13 +56,11 @@ fn clipboard_text() -> Option<Zeroizing<Vec<u16>>> {
         if units.is_null() {
             None
         } else {
-            // SAFETY: the object holds `GlobalSize` bytes; its text ends at a
-            // NUL within them.
-            let available = unsafe { GlobalSize(data) } / 2;
-            let held = unsafe { std::slice::from_raw_parts(units, available) };
-            let length = held.iter().position(|&unit| unit == 0).unwrap_or(available);
-            let mut copied = Zeroizing::new(Vec::with_capacity(length));
-            copied.extend_from_slice(&held[..length]);
+            // SAFETY: the object holds `GlobalSize` bytes, read in place.
+            let held = unsafe { std::slice::from_raw_parts(units, GlobalSize(data) / 2) };
+            let text = clipboard_units(held, limit);
+            let mut copied = Zeroizing::new(Vec::with_capacity(text.len()));
+            copied.extend_from_slice(text);
             // SAFETY: unlocking what was locked above.
             unsafe { GlobalUnlock(data) };
             Some(copied)
@@ -78,10 +77,12 @@ pub(super) struct Terminal {
     input: HANDLE,
     original_mode: CONSOLE_MODE,
     utf16: Utf16,
+    /// The most bytes the value may hold, which bounds a clipboard paste.
+    limit: usize,
 }
 
 impl Terminal {
-    pub(super) fn enter(_output: Output) -> io::Result<Self> {
+    pub(super) fn enter(_output: Output, limit: usize) -> io::Result<Self> {
         // SAFETY: the call takes a constant and returns a handle the process
         // owns, or none.
         let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
@@ -109,6 +110,7 @@ impl Terminal {
             input,
             original_mode,
             utf16: Utf16::default(),
+            limit,
         })
     }
 
@@ -138,7 +140,7 @@ impl Terminal {
         }
         for &unit in &units[..read as usize] {
             if unit == CTRL_V {
-                if let Some(text) = clipboard_text() {
+                if let Some(text) = clipboard_text(self.limit) {
                     paste_units(&text, each);
                 }
             } else {

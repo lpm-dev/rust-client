@@ -46,6 +46,8 @@ pub(crate) enum PromptError {
     SeveralLines,
     /// More than the prompt's limit was typed or pasted.
     TooLarge,
+    /// A paste began but never ended, so the value isn't whole.
+    IncompletePaste,
     /// What was typed isn't UTF-8, as a terminal set to another encoding
     /// sends.
     NotText,
@@ -67,7 +69,8 @@ pub(crate) fn can_hide_input() -> bool {
 pub(crate) fn read_hidden(prompt: &str, limit: usize) -> Result<Zeroizing<String>, PromptError> {
     let output = Output::for_prompt();
     let result = {
-        let mut terminal = platform::Terminal::enter(output).map_err(PromptError::Terminal)?;
+        let mut terminal =
+            platform::Terminal::enter(output, limit).map_err(PromptError::Terminal)?;
         output
             .write(prompt.as_bytes())
             .map_err(PromptError::Terminal)?;
@@ -116,13 +119,15 @@ trait Keyboard {
     /// time.
     fn read(&mut self, wait: Option<Duration>, each: &mut dyn FnMut(Event)) -> io::Result<bool>;
 
-    /// Whether a paste the terminal marked has begun and not ended.
-    fn pasting(&self) -> bool {
+    /// Whether a paste the terminal marked, or a string it sent, has begun
+    /// and not ended.
+    fn unfinished(&self) -> bool {
         false
     }
 
-    /// End a paste whose end never came, passing its end to `each`.
-    fn end_paste(&mut self, _each: &mut dyn FnMut(Event)) {}
+    /// End a paste or a terminal string whose end never came, passing a cut
+    /// paste's end to `each`.
+    fn end_unfinished(&mut self, _each: &mut dyn FnMut(Event)) {}
 }
 
 /// One key, or one byte of text, read from the terminal.
@@ -134,6 +139,15 @@ enum Event {
     /// marked as pasted, or the Windows clipboard's.
     Pasted(u8),
     PasteEnded,
+    /// A paste whose end never came: what it holds isn't the whole value.
+    #[cfg_attr(
+        all(not(unix), not(test)),
+        expect(
+            dead_code,
+            reason = "only a Unix terminal marks a paste whose end can fail to come"
+        )
+    )]
+    PasteCut,
     Enter,
     Backspace,
     /// Ctrl+W: erase the word before the end.
@@ -162,6 +176,7 @@ impl fmt::Debug for Event {
             Self::Typed(_) => "Typed(..)",
             Self::Pasted(_) => "Pasted(..)",
             Self::PasteEnded => "PasteEnded",
+            Self::PasteCut => "PasteCut",
             Self::Enter => "Enter",
             Self::Backspace => "Backspace",
             Self::EraseWord => "EraseWord",
@@ -200,6 +215,7 @@ enum Ending {
     Submit,
     Cancel,
     TooLarge,
+    IncompletePaste,
 }
 
 /// The text typed or pasted so far. Its buffer holds the most a value may
@@ -210,6 +226,8 @@ struct HiddenLine {
     limit: usize,
     /// A paste went past the limit; the rest of it is read and dropped.
     overflowed: bool,
+    /// A paste was cut off, so submitting refuses the value.
+    cut: bool,
 }
 
 impl HiddenLine {
@@ -218,6 +236,7 @@ impl HiddenLine {
             bytes: Zeroizing::new(Vec::with_capacity(limit)),
             limit,
             overflowed: false,
+            cut: false,
         }
     }
 
@@ -238,7 +257,11 @@ impl HiddenLine {
                     self.bytes.push(byte);
                 }
             }
-            Event::PasteEnded if self.overflowed => return Step::End(Ending::TooLarge),
+            Event::PasteEnded | Event::PasteCut if self.overflowed => {
+                return Step::End(Ending::TooLarge);
+            }
+            Event::PasteCut => self.cut = true,
+            Event::Enter if self.cut => return Step::End(Ending::IncompletePaste),
             Event::Enter => return Step::End(Ending::Submit),
             Event::Backspace => self.erase_character(),
             Event::EraseWord => self.erase_word(),
@@ -308,14 +331,15 @@ fn read_line(keyboard: &mut impl Keyboard, limit: usize) -> Result<Zeroizing<Str
         if let Some(ending) = reading.ended {
             break ending;
         }
-        // Inside a paste every key is pasted text, Ctrl+C's included, so a
-        // paste whose end never comes ends once the terminal goes quiet.
-        if keyboard.pasting() {
+        // Inside a paste or a terminal string every key is part of it,
+        // Enter's and Ctrl+C's included, so one whose end never comes ends
+        // once the terminal goes quiet.
+        if keyboard.unfinished() {
             let arrived = keyboard
                 .read(Some(LEFTOVERS_LIMIT), &mut |event| reading.take(event))
                 .map_err(PromptError::Terminal)?;
             if !arrived {
-                keyboard.end_paste(&mut |event| reading.take(event));
+                keyboard.end_unfinished(&mut |event| reading.take(event));
             }
         } else {
             keyboard
@@ -326,17 +350,23 @@ fn read_line(keyboard: &mut impl Keyboard, limit: usize) -> Result<Zeroizing<Str
     // A failure ends the wait too: the line has ended, and a terminal that
     // can't be read passes nothing on either.
     let deadline = Instant::now() + LEFTOVERS_LIMIT;
-    while Instant::now() < deadline
-        && matches!(
-            keyboard.read(Some(QUIET), &mut |event| reading.take(event)),
-            Ok(true)
-        )
-    {}
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero()
+            || !matches!(
+                keyboard.read(Some(QUIET.min(left)), &mut |event| reading.take(event)),
+                Ok(true)
+            )
+        {
+            break;
+        }
+    }
     match ending {
         Ending::Submit if reading.text_left => Err(PromptError::SeveralLines),
         Ending::Submit => reading.line.into_text(),
         Ending::Cancel => Err(PromptError::Cancelled),
         Ending::TooLarge => Err(PromptError::TooLarge),
+        Ending::IncompletePaste => Err(PromptError::IncompletePaste),
     }
 }
 
@@ -500,13 +530,13 @@ mod tests {
             }
         }
 
-        fn pasting(&self) -> bool {
+        fn unfinished(&self) -> bool {
             self.pasting
         }
 
-        fn end_paste(&mut self, each: &mut dyn FnMut(Event)) {
+        fn end_unfinished(&mut self, each: &mut dyn FnMut(Event)) {
             self.pasting = false;
-            each(Event::PasteEnded);
+            each(Event::PasteCut);
         }
     }
 
@@ -523,6 +553,13 @@ mod tests {
             script.waits[..2],
             [Some(LEFTOVERS_LIMIT), Some(LEFTOVERS_LIMIT)]
         );
+    }
+
+    #[test]
+    fn a_paste_that_never_ends_is_refused_rather_than_stored_in_part() {
+        let mut script = Script::new([vec![Event::Pasted(b'x')], Vec::new(), vec![Event::Enter]]);
+        script.pasting = true;
+        assert_eq!(outcome(&mut script), Err("IncompletePaste".to_owned()));
     }
 
     #[test]

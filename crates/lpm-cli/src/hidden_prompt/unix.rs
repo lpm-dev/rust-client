@@ -17,6 +17,12 @@ const BRACKETED_PASTE_OFF: &[u8] = b"\x1b[?2004l";
 /// over a slow connection.
 const ESCAPE_KEY_WAIT: Duration = Duration::from_millis(500);
 
+/// How long a read waits for the rest of a sequence after its escape: never
+/// longer than the read itself may wait, so a bounded wait stays bounded.
+fn escape_key_wait(wait: Option<Duration>) -> Duration {
+    wait.map_or(ESCAPE_KEY_WAIT, |wait| wait.min(ESCAPE_KEY_WAIT))
+}
+
 /// Any Unix terminal can hide what's typed.
 pub(super) fn can_hide_input() -> bool {
     true
@@ -37,7 +43,7 @@ pub(super) struct Terminal {
 }
 
 impl Terminal {
-    pub(super) fn enter(output: Output) -> io::Result<Self> {
+    pub(super) fn enter(output: Output, _limit: usize) -> io::Result<Self> {
         let mut original = MaybeUninit::<libc::termios>::uninit();
         // SAFETY: standard input is open, and `tcgetattr` initializes
         // `original` when it returns zero.
@@ -103,18 +109,18 @@ impl Keyboard for Terminal {
         }
         // A terminal sends the rest of a sequence with the escape that
         // starts it; one nothing follows soon was the Escape key.
-        if self.bytes.after_escape() && !input_within(Some(ESCAPE_KEY_WAIT))? {
+        if self.bytes.after_escape() && !input_within(Some(escape_key_wait(wait)))? {
             self.bytes.escape_key();
         }
         Ok(true)
     }
 
-    fn pasting(&self) -> bool {
-        self.bytes.pasting()
+    fn unfinished(&self) -> bool {
+        self.bytes.unfinished()
     }
 
-    fn end_paste(&mut self, each: &mut dyn FnMut(Event)) {
-        self.bytes.end_paste(each);
+    fn end_unfinished(&mut self, each: &mut dyn FnMut(Event)) {
+        self.bytes.end_unfinished(each);
     }
 }
 
@@ -154,5 +160,23 @@ impl Drop for Terminal {
             libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_wait_for_the_rest_of_a_sequence_stays_within_the_read_s_own() {
+        assert_eq!(escape_key_wait(None), ESCAPE_KEY_WAIT);
+        assert_eq!(
+            escape_key_wait(Some(Duration::from_millis(40))),
+            Duration::from_millis(40)
+        );
+        assert_eq!(
+            escape_key_wait(Some(Duration::from_secs(2))),
+            ESCAPE_KEY_WAIT
+        );
     }
 }
