@@ -35,6 +35,12 @@ fn record_file_sync() {
 static FORCE_DIRECTORY_SYNC_FAILURE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(test)]
+thread_local! {
+    /// The label of the one directory sync this thread fails, once.
+    pub(crate) static FAIL_DIRECTORY_SYNC_OF: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
 pub(crate) struct VaultStorageDirectory {
     directory: Dir,
     display: PathBuf,
@@ -558,6 +564,25 @@ impl VaultStorageDirectory {
         }
     }
 
+    /// Whether the regular file `name` exists, found without opening it;
+    /// anything else there, such as a directory or a link, is refused, as a
+    /// read of it is.
+    pub(crate) fn regular_file_exists(&self, name: &str, label: &str) -> Result<bool, String> {
+        validate_name(OsStr::new(name))?;
+        match self.directory.symlink_metadata(name) {
+            Ok(metadata) if metadata.is_file() => Ok(true),
+            Ok(_) => Err(format!(
+                "{label} {} isn't a regular file",
+                self.display.join(name).display()
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!(
+                "failed to inspect {}: {error}",
+                self.display.join(name).display()
+            )),
+        }
+    }
+
     /// Every entry's name, which must be UTF-8.
     pub(crate) fn entry_names(&self) -> Result<Vec<String>, String> {
         #[cfg(test)]
@@ -639,6 +664,14 @@ impl VaultStorageDirectory {
     fn sync_directory(&self, label: &str) -> Result<(), String> {
         #[cfg(test)]
         DIRECTORY_SYNCS.with(|syncs| syncs.borrow_mut().push(self.display.clone()));
+        #[cfg(test)]
+        if FAIL_DIRECTORY_SYNC_OF
+            .with(|failing| failing.get() == Some(label) && failing.replace(None).is_some())
+        {
+            return Err(format!(
+                "failed to persist {label}: injected directory sync failure"
+            ));
+        }
         #[cfg(test)]
         if FORCE_DIRECTORY_SYNC_FAILURE.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(format!(

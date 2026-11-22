@@ -819,40 +819,11 @@ pub(crate) fn write_all_environments_unlocked(
     )
 }
 
-/// [`write_all_environments_unlocked`], running `then` once the values are
-/// durable and before the cleanup after them, so a cleanup that fails never
-/// keeps `then` from following the write.
-pub(crate) fn write_all_environments_then_unlocked(
-    directory: &crate::storage_transaction::VaultStorageDirectory,
-    vault_id: &str,
-    environments: &EnvironmentMap,
-    recording: &crate::history::scope::Recording,
-    then: impl FnOnce() -> Result<(), String>,
-) -> Result<(), String> {
-    commit_environments_then(
-        directory,
-        vault_id,
-        std::borrow::Cow::Borrowed(environments),
-        recording,
-        then,
-    )
-}
-
 fn commit_environments(
     directory: &crate::storage_transaction::VaultStorageDirectory,
     vault_id: &str,
     environments: std::borrow::Cow<'_, EnvironmentMap>,
     recording: &crate::history::scope::Recording,
-) -> Result<(), String> {
-    commit_environments_then(directory, vault_id, environments, recording, || Ok(()))
-}
-
-fn commit_environments_then(
-    directory: &crate::storage_transaction::VaultStorageDirectory,
-    vault_id: &str,
-    environments: std::borrow::Cow<'_, EnvironmentMap>,
-    recording: &crate::history::scope::Recording,
-    then: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     crate::authorize_companion(directory, vault_id, Operation::Write)?;
     crate::history::scope::observe_before(recording, || {
@@ -867,12 +838,10 @@ fn commit_environments_then(
         encrypted.as_bytes(),
         "encrypted vault",
     )?;
-    // The write is durable now, so history records it, and what follows it
-    // runs, even if the cleanup after it fails.
+    // The write is durable now, so history records it even if the cleanup
+    // after it fails.
     crate::history::scope::committed(recording, environments);
-    let followed = then();
-    let cleaned = remove_legacy_vault_file(&vaults, vault_id);
-    followed.and(cleaned)
+    remove_legacy_vault_file(&vaults, vault_id)
 }
 
 /// Removes the vault's legacy file, when an entry is named that exactly.

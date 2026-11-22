@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::*;
 use crate::fallback::tests::{force_file_vault, with_temp_vault_home};
@@ -1013,6 +1013,33 @@ fn an_override_change_interrupted_at_any_step_is_finished_by_the_next_operation(
 }
 
 #[test]
+fn a_journal_whose_folder_sync_failed_is_finished_before_the_next_read_in_the_same_lock() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        with_vault_transaction(|directory| {
+            assert!(read_all_overrides_unlocked(directory, VAULT)?.is_empty());
+            assert!(crate::companion::is_open(VAULT));
+            crate::storage_transaction::FAIL_DIRECTORY_SYNC_OF
+                .with(|failing| failing.set(Some("env file journal")));
+
+            change_overrides_unlocked(directory, VAULT, &[set_override("API_URL", "mine")])
+                .expect_err("the journal's folder didn't sync");
+
+            assert!(journal_path(home, VAULT).exists());
+            assert!(
+                !crate::companion::is_open(VAULT),
+                "a journal that may be in place leaves the project to open again"
+            );
+            let read = read_all_overrides_unlocked(directory, VAULT)?;
+            assert_eq!(read["default"].set["API_URL"], "mine");
+            Ok(())
+        })
+        .expect("in one lock");
+    });
+}
+
+#[test]
 fn the_last_removal_needs_no_other_projects_records_in_the_file_store() {
     with_temp_vault_home(|home| {
         force_file_vault();
@@ -1146,6 +1173,33 @@ fn a_marker_past_the_size_one_may_have_is_repaired_by_a_discard() {
 }
 
 #[test]
+fn an_ordinary_operation_reports_a_marker_past_its_size_as_damage() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        change_overrides(&[set_override("API_URL", "fixture-mine")]).expect("set");
+        let entry = vaults_path(home)
+            .join(companion_folder_name(VAULT))
+            .join(entry_name(&marker_account()));
+        std::fs::write(&entry, vec![0_u8; MAX_SEALED_ENTRY_BYTES as usize + 1])
+            .expect("grow it past the cap");
+        crate::companion::forget(VAULT);
+
+        for failed in [
+            read_overrides().map(drop),
+            change_overrides(&[set_override("API_URL", "fixture-yours")]).map(drop),
+            crate::try_get_run_environment_for_vault_id(VAULT, None).map(drop),
+        ] {
+            let error = failed.expect_err("damaged");
+            assert!(
+                crate::companion::gate::GateError::describes(&error),
+                "the gate's damage, which names the repair: {error}"
+            );
+        }
+    });
+}
+
+#[test]
 fn a_record_left_without_values_is_never_applied_or_listed() {
     with_temp_vault_home(|home| {
         force_file_vault();
@@ -1164,6 +1218,33 @@ fn a_record_left_without_values_is_never_applied_or_listed() {
         assert!(all.1.is_empty());
         assert!(read_overrides().expect("listed").is_empty());
     });
+}
+
+#[test]
+fn a_directory_or_link_where_the_values_go_never_counts_as_values() {
+    let replacements: &[fn(&std::path::Path)] = &[
+        |path| std::fs::create_dir(path).expect("a directory there"),
+        #[cfg(unix)]
+        |path| std::os::unix::fs::symlink("/dev/null", path).expect("a link there"),
+    ];
+    for replace in replacements {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            seed_values();
+            change_overrides(&[set_override("API_URL", "fixture-mine")]).expect("set");
+            let values = vaults_path(home).join(ValuesFile::Digest.name(VAULT));
+            std::fs::remove_file(&values).expect("the values go");
+            replace(&values);
+            crate::companion::forget(VAULT);
+
+            let listed = read_overrides();
+
+            assert!(
+                listed.as_ref().is_ok_and(BTreeMap::is_empty) || listed.is_err(),
+                "no values, no overrides: {listed:?}"
+            );
+        });
+    }
 }
 
 #[test]

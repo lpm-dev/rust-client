@@ -620,36 +620,38 @@ mod api {
 
     #[test]
     fn a_rollback_commits_its_values_and_overrides_in_one_file_journal() {
-        with_temp_vault_home(|home| {
-            let (dir, vault_id, plan) = renamed_with_an_override(home, false);
-            let values_file = home
-                .join(".lpm")
-                .join("vaults")
-                .join(crate::fallback::vault_file_name(&vault_id));
-            let before = std::fs::read(&values_file).expect("the values");
-            crate::fallback::companion::CRASH_AFTER_CHANGES.with(|crash| crash.set(Some(0)));
+        // Values past what a companion transaction may write travel in the
+        // journal too: their own cap bounds them, as it bounds every write.
+        for large in [false, true] {
+            with_temp_vault_home(|home| {
+                let (dir, vault_id, plan) = renamed_with_an_override(home, large);
+                let values_file = home
+                    .join(".lpm")
+                    .join("vaults")
+                    .join(crate::fallback::vault_file_name(&vault_id));
+                let before = std::fs::read(&values_file).expect("the values");
+                crate::fallback::companion::CRASH_AFTER_CHANGES.with(|crash| crash.set(Some(0)));
 
-            crate::history::commit_rollback(&dir, &plan, &Choices::default())
-                .expect_err("the simulated crash after the journal");
+                crate::history::commit_rollback(&dir, &plan, &Choices::default())
+                    .expect_err("the simulated crash after the journal");
 
-            assert_eq!(
-                std::fs::read(&values_file).expect("the values"),
-                before,
-                "nothing was changed before the journal's changes"
-            );
-            crate::companion::forget(&vault_id);
-            let overrides = crate::overrides::read_all(&dir).expect("the next operation recovers");
-            assert_eq!(overrides.keys().collect::<Vec<_>>(), ["default"]);
-            assert_eq!(stored(&dir, "A").as_deref(), Some("1"), "and finishes both");
-        });
+                assert!(
+                    std::fs::read(&values_file).expect("the values") == before,
+                    "nothing was changed before the journal's changes, large: {large}"
+                );
+                crate::companion::forget(&vault_id);
+                let overrides =
+                    crate::overrides::read_all(&dir).expect("the next operation recovers");
+                assert_eq!(overrides.keys().collect::<Vec<_>>(), ["default"], "{large}");
+                assert_eq!(stored(&dir, "A").as_deref(), Some("1"), "and finishes both");
+            });
+        }
     }
 
     #[test]
-    fn a_rollback_past_a_journal_s_payload_whose_cleanup_fails_still_takes_the_overrides_along() {
+    fn a_rollback_refused_by_what_lies_where_the_legacy_values_were_changes_nothing() {
         with_temp_vault_home(|home| {
-            let (dir, vault_id, plan) = renamed_with_an_override(home, true);
-            // A directory with the legacy file's name makes the cleanup
-            // after the values write fail.
+            let (dir, vault_id, plan) = renamed_with_an_override(home, false);
             std::fs::create_dir(
                 home.join(".lpm")
                     .join("vaults")
@@ -657,17 +659,13 @@ mod api {
             )
             .expect("a directory in the legacy file's place");
 
-            let failed = crate::history::commit_rollback(&dir, &plan, &Choices::default())
-                .expect_err("the cleanup failed");
+            crate::history::commit_rollback(&dir, &plan, &Choices::default())
+                .expect_err("the legacy file's place holds a directory");
 
-            assert_eq!(
-                stored(&dir, "A").as_deref(),
-                Some("1"),
-                "the values rolled back: {failed:?}"
-            );
+            assert_eq!(stored(&dir, "A"), None, "the values kept their environment");
             let overrides = crate::overrides::read_all(&dir).expect("overrides");
-            assert_eq!(overrides.keys().collect::<Vec<_>>(), ["default"]);
-            assert_eq!(overrides["default"].set["A"], "mine");
+            assert_eq!(overrides.keys().collect::<Vec<_>>(), ["prod"]);
+            assert_eq!(overrides["prod"].set["A"], "mine");
         });
     }
 

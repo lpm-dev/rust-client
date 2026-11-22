@@ -4,7 +4,7 @@
 //! transaction, after any interrupted step is finished. Overrides never
 //! leave this computer and are never recorded in local history.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 pub use lpm_env_companion::marker::MAX_RECORD_BYTES;
@@ -104,14 +104,17 @@ pub fn remove_reviewed(
         .collect();
     in_overrides_lock(|directory| {
         let current = read_all_unlocked(directory, vault_id)?;
-        if removals.iter().any(|(environment, key)| {
-            decision(&reviewed.overrides, environment, key) != decision(&current, environment, key)
-        }) {
+        let (before, now) = (Decisions::of(&reviewed.overrides), Decisions::of(&current));
+        if removals
+            .iter()
+            .any(|(environment, key)| before.get(environment, key) != now.get(environment, key))
+        {
             return Err(
                 "a personal override it asked about changed while it asked; nothing was changed"
                     .to_owned(),
             );
         }
+        drop((before, now));
         drop(current);
         change_unlocked(directory, vault_id, &edits)
     })
@@ -122,19 +125,32 @@ pub fn remove_reviewed(
     })
 }
 
-/// What `all` decides for `key` in `environment`: its value when set, and
-/// whether it's unset; `None` without overrides there.
-fn decision<'all>(
-    all: &'all BTreeMap<String, PersonalOverrides>,
-    environment: &str,
-    key: &str,
-) -> Option<(Option<&'all str>, bool)> {
-    all.get(environment).map(|overrides| {
-        (
-            overrides.set.get(key).map(String::as_str),
-            overrides.unset.iter().any(|unset| unset == key),
+/// What every environment's overrides decide, each environment's unset
+/// names indexed once, so each key is looked up in constant time.
+struct Decisions<'all>(HashMap<&'all str, (&'all PersonalOverrides, HashSet<&'all str>)>);
+
+impl<'all> Decisions<'all> {
+    fn of(all: &'all BTreeMap<String, PersonalOverrides>) -> Self {
+        Self(
+            all.iter()
+                .map(|(environment, overrides)| {
+                    let unset = overrides.unset.iter().map(String::as_str).collect();
+                    (environment.as_str(), (overrides, unset))
+                })
+                .collect(),
         )
-    })
+    }
+
+    /// What they decide for `key` in `environment`: its value when set, and
+    /// whether it's unset; `None` without overrides there.
+    fn get(&self, environment: &str, key: &str) -> Option<(Option<&'all str>, bool)> {
+        self.0.get(environment).map(|(overrides, unset)| {
+            (
+                overrides.set.get(key).map(String::as_str),
+                unset.contains(key),
+            )
+        })
+    }
 }
 
 /// [`change`] for edits to `project`, the one [`check_before_values`]

@@ -763,10 +763,12 @@ fn follows_values(account: &CompanionAccount) -> bool {
     }
 }
 
-/// Write `target`'s stage. A values stage copies the values item's claimed
-/// approval, as it always has. A companion record that follows values takes
-/// the values item's approval as a probe verifies it, so a weak item
-/// claiming approval can't pass a weaker one on.
+/// Write `target`'s stage. A companion record that follows values takes the
+/// values item's approval as a probe verifies it, so a weak item claiming
+/// approval can't pass a weaker one on, and so does the values stage of a
+/// transaction that also changes companion records, whose probe that
+/// verification shares. A values stage alone copies the values item's
+/// claimed approval, as it always has.
 fn stage_write(
     storage: &mut impl ProjectStorage,
     stage: &str,
@@ -776,8 +778,18 @@ fn stage_write(
     values_access: &mut HashMap<String, CliAccess>,
 ) -> Result<(), String> {
     let companion = CompanionAccount::parse(target);
-    if let Some(companion) = companion.as_ref().filter(|parsed| follows_values(parsed)) {
-        let vault_id = companion.vault_id().to_owned();
+    let verified_for = match companion.as_ref() {
+        Some(parsed) if follows_values(parsed) => Some(parsed.vault_id().to_owned()),
+        None if validate_vault_id(target).is_ok()
+            && mutations
+                .iter()
+                .any(|mutation| CompanionAccount::parse(mutation.account()).is_some()) =>
+        {
+            Some(target.to_owned())
+        }
+        _ => None,
+    };
+    if let Some(vault_id) = verified_for {
         let access = match values_access.get(&vault_id) {
             Some(access) => *access,
             None => {

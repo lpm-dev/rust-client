@@ -176,9 +176,12 @@ pub(crate) fn open_project_or_unfinished(
     let marker_account = CompanionAccount::Marker {
         vault_id: vault_id.to_owned(),
     };
-    let gate = match backend.read(&marker_account)? {
-        None => ProjectGate::Plain,
-        Some(bytes) => match Marker::parse(vault_id, &bytes) {
+    // A marker the store holds but can't read, such as one past its size or
+    // one that won't decrypt, damages the project, which a repair discards.
+    let gate = match backend.read_checked(&marker_account)? {
+        Checked::Absent => ProjectGate::Plain,
+        Checked::Unreadable(reason) => ProjectGate::Damaged(Damage::InvalidMarker(reason)),
+        Checked::Present(bytes) => match Marker::parse(vault_id, &bytes) {
             Err(error) => ProjectGate::Damaged(error.into()),
             Ok(marker) if lifecycle::needs_resume(&marker) => {
                 let notice = resume_notice(&marker);

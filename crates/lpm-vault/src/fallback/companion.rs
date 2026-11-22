@@ -698,12 +698,14 @@ impl<'directory> FileCompanion<'directory> {
                 .remove_file(&file.name(vault_id), "encrypted vault")?;
             return Ok(());
         }
+        // The budget is for the companion records a transaction writes;
+        // values a journal carries have their own cap, which every values
+        // write has and older recovery reads stages within.
         let payload: usize = changes
             .iter()
             .map(|change| match change {
                 FileChange::Companion(mutation) => mutation.payload_bytes(),
-                FileChange::DeleteValues(_) => 0,
-                FileChange::ReplaceValues(bytes) => bytes.len(),
+                FileChange::DeleteValues(_) | FileChange::ReplaceValues(_) => 0,
             })
             .sum();
         if payload > MAX_TRANSACTION_PAYLOAD_BYTES {
@@ -832,8 +834,15 @@ impl<'directory> FileCompanion<'directory> {
         if encoded.len() > MAX_FILE_JOURNAL_BYTES {
             return Err("the env file journal is too large".to_owned());
         }
-        self.vaults
-            .write_owner_only_file(&journal_name(vault_id), &encoded, "env file journal")?;
+        if let Err(error) =
+            self.vaults
+                .write_owner_only_file(&journal_name(vault_id), &encoded, "env file journal")
+        {
+            // The journal's rename can land before its folder's sync fails,
+            // so the next operation opens the project and finishes it.
+            crate::companion::forget(vault_id);
+            return Err(error);
+        }
         let applied = (|| {
             #[cfg(test)]
             if CRASH_AFTER_CHANGES.with(|crash| crash.get()) == Some(0) {
@@ -875,12 +884,19 @@ impl<'directory> FileCompanion<'directory> {
         Ok(())
     }
 
-    /// Whether `vault_id` has values, in either file name.
+    /// Whether `vault_id` has values, in either file name; anything but a
+    /// regular file there is refused, as the values' read refuses it.
     fn has_values(&self, vault_id: &str) -> Result<bool, String> {
-        Ok(self
+        if self
             .vaults
-            .entry_exists(&ValuesFile::Digest.name(vault_id))?
-            || super::existing_legacy_vault_file_name(&self.vaults, vault_id)?.is_some())
+            .regular_file_exists(&ValuesFile::Digest.name(vault_id), "encrypted vault")?
+        {
+            return Ok(true);
+        }
+        match super::existing_legacy_vault_file_name(&self.vaults, vault_id)? {
+            Some(legacy) => self.vaults.regular_file_exists(&legacy, "encrypted vault"),
+            None => Ok(false),
+        }
     }
 
     /// `vault_id`'s companion and staged records, failing on an entry whose
@@ -1119,8 +1135,7 @@ pub(crate) fn change_overrides_unlocked(
 /// caller's lock. The plan comes first, so a refusal leaves both as they
 /// were; then one journal transaction replaces the values file, removes a
 /// legacy one, and changes the records, as the journals of LPM CLI 0.82 and
-/// later replay. Only a transaction past a journal's payload writes the
-/// values first and the overrides right after.
+/// later replay.
 pub(crate) fn write_values_following_unlocked(
     directory: &VaultStorageDirectory,
     vault_id: &str,
@@ -1149,30 +1164,6 @@ pub(crate) fn write_values_following_unlocked(
         )?
         .into_bytes(),
     );
-    let payload = plan
-        .mutations
-        .iter()
-        .map(Mutation::payload_bytes)
-        .sum::<usize>()
-        .saturating_add(encrypted.len());
-    if payload > MAX_TRANSACTION_PAYLOAD_BYTES {
-        drop(companion);
-        return super::write_all_environments_then_unlocked(
-            directory,
-            vault_id,
-            environments,
-            recording,
-            || {
-                commit_plan(&mut FileCompanion::open(directory)?, vault_id, &mut plan).map_err(
-                    |error| {
-                        format!(
-                            "the values were written, but this computer's personal overrides didn't follow the environments they renamed or removed: {error}"
-                        )
-                    },
-                )
-            },
-        );
-    }
     crate::history::scope::observe_before(recording, || {
         super::read_environments_with_digest(directory, vault_id).map(|(before, _)| before)
     });

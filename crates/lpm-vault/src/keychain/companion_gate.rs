@@ -244,8 +244,14 @@ pub(super) fn read_overrides_record(
             None => return Ok(None),
             Some(ClaimedAccess::Contradictory) => return Err(contradictory_record()),
             Some(claim) => {
-                match_values_approval(storage, vault_id, &overrides_account)?;
-                claimed = Some(claim);
+                // A record just strengthened claims approval, so a read that
+                // finds it claiming none was weakened in between.
+                let strengthened = match_values_approval(storage, vault_id, &overrides_account)?;
+                claimed = Some(if strengthened {
+                    ClaimedAccess::RequireApproval
+                } else {
+                    claim
+                });
             }
         }
     }
@@ -267,17 +273,18 @@ pub(super) fn read_overrides_record(
 
 /// A record that follows values but claims no approval while the values item
 /// requires it, as a client that predates this check leaves it after turning
-/// approval on: strengthen it before its bytes are used.
+/// approval on: strengthen it before its bytes are used. True when it was
+/// strengthened, rather than protected already.
 pub(super) fn match_values_approval(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
     account: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let marker = marker_account(vault_id);
     let open = [PROJECT_INDEX_MARKER_ACCOUNT, marker.as_str()];
     match storage.probe(account, &open) {
-        ProbeOutcome::Protected => Ok(()),
-        ProbeOutcome::Automatic => storage.require_approval(account, &open),
+        ProbeOutcome::Protected => Ok(false),
+        ProbeOutcome::Automatic => storage.require_approval(account, &open).map(|()| true),
         ProbeOutcome::Absent => Err(format!("{account} disappeared while it was read")),
         ProbeOutcome::Inconclusive => Err(APPROVAL_UNCONFIRMED.to_owned()),
     }

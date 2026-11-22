@@ -243,6 +243,21 @@ fn a_record_weakened_while_it_is_read_is_refused_rather_than_used() {
 }
 
 #[test]
+fn a_record_weakened_again_after_it_was_strengthened_is_refused_rather_than_used() {
+    let mut storage = storage_with_values();
+    change(&mut storage, &[set("API_URL", "fixture-mine")]).expect("set");
+    storage
+        .claims
+        .insert(VAULT.to_owned(), ClaimedAccess::RequireApproval);
+    storage.protected.insert(VAULT.to_owned());
+    storage.weakened_before_read.insert(overrides_account());
+
+    let error = read_all(&mut storage).expect_err("weakened after the strengthening");
+    assert!(error.contains("approval"), "{error}");
+    assert!(!error.contains("fixture-mine"), "{error}");
+}
+
+#[test]
 fn values_that_demand_approval_they_dont_claim_keep_their_overrides_behind_it() {
     let mut storage = storage_with_values();
     change(&mut storage, &[set("API_URL", "fixture-mine")]).expect("set");
@@ -392,6 +407,27 @@ fn a_write_its_overrides_follow_probes_the_values_once_for_its_plan_and_its_jour
         1
     );
     assert!(read_all(&mut storage).expect("read").contains_key("prod"));
+}
+
+#[test]
+fn a_write_its_overrides_follow_stages_the_values_with_their_verified_approval() {
+    let mut storage = storage_with_values();
+    change(&mut storage, &[set("TOKEN", "mine")]).expect("set");
+    // The values demand approval their attributes don't claim, as a client
+    // that predates the check can leave them.
+    storage.protected.insert(VAULT.to_owned());
+    storage.access_sources.clear();
+
+    rename_default_to_prod(&mut storage).expect("renamed");
+
+    assert!(
+        storage
+            .access_sources
+            .iter()
+            .all(|(_, source)| source != VAULT),
+        "no stage copied the values' claim: {:?}",
+        storage.access_sources
+    );
 }
 
 #[test]
