@@ -391,6 +391,25 @@ mod tests {
         include_str!("value_input.rs"),
     ];
 
+    /// std's buffered stdin keeps what it read in a buffer it never wipes,
+    /// so secret input reads standard input from its descriptor
+    /// (`secret_read::read_secret_stdin`) and never through std's reader.
+    #[test]
+    fn secret_input_never_reads_through_std_s_buffered_stdin() {
+        for (name, source) in [
+            ("value_input.rs", include_str!("value_input.rs")),
+            ("local.rs", include_str!("local.rs")),
+        ] {
+            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+            for read in [".lock()", "read_line(", "read_to_string(", "read_to_end("] {
+                assert!(
+                    !production.contains(read),
+                    "{name} reads through std's buffered stdin: {read}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_script_error_from_a_shared_helper_is_reported_as_an_env_error() {
         use super::{LpmError, env_error};

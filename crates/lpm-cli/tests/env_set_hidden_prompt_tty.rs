@@ -529,6 +529,51 @@ mod tty {
     }
 
     #[test]
+    fn a_project_whose_newer_data_refuses_writes_is_refused_before_the_prompt() {
+        let (project, lpm_home) = project();
+        for args in [
+            &["env", "set", "SEEDED=team"][..],
+            &["env", "debug-companion", "read-only"],
+        ] {
+            let (status, _, stderr) = common::run_lpm(project.path(), lpm_home.path(), None, args);
+            assert!(status.success(), "{args:?}: {stderr}");
+        }
+
+        let session = run_in_pty(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[],
+        );
+
+        assert!(!session.status.success(), "{}", session.transcript);
+        assert!(
+            !session.transcript.contains("Value for"),
+            "{}",
+            session.transcript
+        );
+        assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
+    }
+
+    #[test]
+    fn ctrl_c_a_moment_after_a_paste_that_never_ends_cancels() {
+        let (project, lpm_home) = project();
+        let session = run_in_pty_chunked(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(
+                b"Value for TOKEN (default, hidden): ",
+                vec![b"\x1b[200~fixture-part", b"\x03"],
+            )],
+            Duration::from_millis(1500),
+        );
+        assert_eq!(session.status.code(), Some(130), "{}", session.transcript);
+        assert!(session.echo_restored);
+        assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
+    }
+
+    #[test]
     fn ctrl_c_cancels_once_a_terminal_string_that_never_ends_goes_quiet() {
         let (project, lpm_home) = project();
         let session = run_in_pty_chunked(

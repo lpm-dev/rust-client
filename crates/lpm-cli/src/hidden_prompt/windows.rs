@@ -21,6 +21,7 @@ use windows_sys::Win32::System::Threading::WaitForSingleObject;
 use zeroize::Zeroizing;
 
 use super::decode::{Utf16, clipboard_units, paste_units, typed_unit};
+use super::{Event, Keyboard, Output};
 
 /// The character Ctrl+V types.
 const CTRL_V: u16 = 0x16;
@@ -70,7 +71,6 @@ fn clipboard_text(limit: usize) -> Option<Zeroizing<Vec<u16>>> {
     unsafe { CloseClipboard() };
     text
 }
-use super::{Event, Keyboard, Output};
 
 /// The console's input mode for as long as it lives.
 pub(super) struct Terminal {
@@ -140,6 +140,7 @@ impl Terminal {
         }
         for &unit in &units[..read as usize] {
             if unit == CTRL_V {
+                self.utf16.end(each);
                 if let Some(text) = clipboard_text(self.limit) {
                     paste_units(&text, each);
                 }

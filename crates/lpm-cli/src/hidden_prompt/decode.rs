@@ -13,6 +13,8 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 pub(super) struct Bytes {
     state: State,
     after_carriage_return: bool,
+    /// The escape that began the current state came in the read being fed.
+    escape_in_read: bool,
 }
 
 #[cfg(any(unix, test))]
@@ -51,6 +53,12 @@ impl Bytes {
         match self.state {
             State::Ground => self.ground(byte, each),
             State::Escape => match byte {
+                // A key and its escape that come in one read are a Meta
+                // chord, such as Alt+B, which edits nothing, as an arrow
+                // doesn't.
+                0x20..=0x7e if self.escape_in_read && !b"[O]P_^X".contains(&byte) => {
+                    self.state = State::Ground;
+                }
                 b'[' => {
                     self.state = State::ControlSequence {
                         parameters: [0; 3],
@@ -115,6 +123,15 @@ impl Bytes {
                 self.state = match (escape, byte) {
                     (_, 0x07) | (true, b'\\') => State::Ground,
                     (_, 0x1b) => State::TerminalString { escape: true },
+                    // CAN and SUB cancel the string, as ECMA-48 has them.
+                    (_, 0x18 | 0x1a) => State::Ground,
+                    // A string a terminal sends holds no other control, so
+                    // one is a key that ends it: Enter or Ctrl+C after Alt+P.
+                    (_, 0x00..=0x1f | 0x7f) => {
+                        self.state = State::Ground;
+                        self.ground(byte, each);
+                        return;
+                    }
                     _ => State::TerminalString { escape: false },
                 };
             }
@@ -163,9 +180,17 @@ impl Bytes {
         }
     }
 
+    /// The next bytes fed come in a read of their own.
+    pub(super) fn next_read(&mut self) {
+        self.escape_in_read = false;
+    }
+
     fn ground(&mut self, byte: u8, each: &mut dyn FnMut(Event)) {
         match byte {
-            0x1b => self.state = State::Escape,
+            0x1b => {
+                self.state = State::Escape;
+                self.escape_in_read = true;
+            }
             0x00..=0x1f | 0x7f => each(control(byte)),
             _ => each(Event::Typed(byte)),
         }
@@ -237,6 +262,15 @@ impl Utf16 {
             char::from_u32(u32::from(unit)).unwrap_or(char::REPLACEMENT_CHARACTER),
             each,
         );
+    }
+
+    /// End what was typed before a paste: a high surrogate still waiting
+    /// for its pair types a replacement character there, as one any other
+    /// unit follows does, rather than after the pasted text.
+    pub(super) fn end(&mut self, each: &mut dyn FnMut(Event)) {
+        if self.high_surrogate.take().is_some() {
+            console_character(char::REPLACEMENT_CHARACTER, each);
+        }
     }
 }
 
@@ -355,10 +389,12 @@ mod tests {
         }
     }
 
+    /// What `chunks` show, each one read on its own.
     fn decoded(chunks: &[&[u8]]) -> String {
         let mut bytes = Bytes::default();
         let mut shown = Shown::default();
         for chunk in chunks {
+            bytes.next_read();
             for &byte in *chunk {
                 bytes.feed(byte, &mut |event| shown.take(event));
             }
@@ -381,9 +417,27 @@ mod tests {
     }
 
     #[test]
-    fn an_escape_that_starts_no_sequence_drops_only_itself() {
-        assert_eq!(decoded(&[b"\x1bx\x1b\x1b[Dy"]), "xy");
+    fn a_meta_chord_adds_nothing_and_an_escape_key_drops_only_itself() {
+        assert_eq!(decoded(&[b"\x1bx\x1b\x1b[Dy"]), "y", "Alt+X adds nothing");
+        assert_eq!(decoded(&[b"\x1b", b"x"]), "x", "Escape, then x typed later");
+        assert_eq!(
+            decoded(&[b"\x1b\r"]),
+            "<Enter>",
+            "a control after it is its key"
+        );
         assert_eq!(decoded(&[b"\x1b[1\x03"]), "<Interrupt>");
+    }
+
+    #[test]
+    fn a_control_key_ends_a_terminal_string_so_enter_and_ctrl_c_still_work() {
+        assert_eq!(decoded(&[b"\x1bP\r"]), "<Enter>", "Alt+P, then Enter");
+        assert_eq!(
+            decoded(&[b"\x1b]\x03"]),
+            "<Interrupt>",
+            "Alt+], then Ctrl+C"
+        );
+        assert_eq!(decoded(&[b"\x1bPab\x18cd"]), "cd", "CAN cancels the string");
+        assert_eq!(decoded(&[b"\x1b_x\x1ayz"]), "yz", "SUB cancels the string");
     }
 
     #[test]
@@ -520,6 +574,18 @@ mod tests {
         let mut shown = Shown::default();
         paste_units(&units, &mut |event| shown.take(event));
         assert_eq!(shown.finish(), "<paste>one\ntwo\nthree\n🔑<PasteEnded>");
+    }
+
+    #[test]
+    fn a_surrogate_typed_before_a_paste_is_replaced_before_the_pasted_text() {
+        let mut typed = Utf16::default();
+        let mut shown = Shown::default();
+        typed.feed(0xD83D, &mut |event| shown.take(event));
+        typed.end(&mut |event| shown.take(event));
+        let units: Vec<u16> = "ab".encode_utf16().collect();
+        paste_units(&units, &mut |event| shown.take(event));
+        typed.end(&mut |event| shown.take(event));
+        assert_eq!(shown.finish(), "\u{FFFD}<paste>ab<PasteEnded>");
     }
 
     #[test]

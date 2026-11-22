@@ -36,6 +36,11 @@ const QUIET: Duration = Duration::from_millis(100);
 /// the prompt open; whatever is still unread then is discarded.
 const LEFTOVERS_LIMIT: Duration = Duration::from_secs(2);
 
+/// How long a paste or a terminal string may go quiet before it's taken to
+/// have ended without its end: a terminal sends either in bursts, so a key
+/// pressed after this, Ctrl+C's included, is a key again.
+const UNFINISHED_QUIET: Duration = Duration::from_millis(500);
+
 /// Why a prompt returned no value.
 #[derive(Debug)]
 pub(crate) enum PromptError {
@@ -336,7 +341,7 @@ fn read_line(keyboard: &mut impl Keyboard, limit: usize) -> Result<Zeroizing<Str
         // once the terminal goes quiet.
         if keyboard.unfinished() {
             let arrived = keyboard
-                .read(Some(LEFTOVERS_LIMIT), &mut |event| reading.take(event))
+                .read(Some(UNFINISHED_QUIET), &mut |event| reading.take(event))
                 .map_err(PromptError::Terminal)?;
             if !arrived {
                 keyboard.end_unfinished(&mut |event| reading.take(event));
@@ -514,7 +519,7 @@ mod tests {
         ) -> io::Result<bool> {
             self.waits.push(wait);
             if self.pasting
-                && wait == Some(LEFTOVERS_LIMIT)
+                && wait == Some(UNFINISHED_QUIET)
                 && self.batches.front().is_none_or(Vec::is_empty)
             {
                 self.batches.pop_front();
@@ -551,7 +556,7 @@ mod tests {
         assert_eq!(outcome(&mut script), Err("Cancelled".to_owned()));
         assert_eq!(
             script.waits[..2],
-            [Some(LEFTOVERS_LIMIT), Some(LEFTOVERS_LIMIT)]
+            [Some(UNFINISHED_QUIET), Some(UNFINISHED_QUIET)]
         );
     }
 

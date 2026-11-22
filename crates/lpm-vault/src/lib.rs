@@ -224,6 +224,19 @@ pub(crate) fn authorize_companion(
     }
 }
 
+/// Refuse what a write of `project_dir`'s values is refused for, before
+/// they're read or asked for: newer data that refuses writes, or an
+/// interrupted step that can't be finished. Nothing for a folder without an
+/// env project yet, which the write creates.
+pub fn check_values_writable(project_dir: &Path) -> Result<(), String> {
+    let Some(vault_id) = linked_vault_id(project_dir)? else {
+        return Ok(());
+    };
+    with_project_vault_transaction(|directory| {
+        authorize_companion(directory, &vault_id, companion::gate::Operation::Write)
+    })
+}
+
 fn with_project_vault_transaction<T>(
     operation: impl FnOnce(&storage_transaction::VaultStorageDirectory) -> Result<T, String>,
 ) -> Result<T, String> {

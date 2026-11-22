@@ -147,6 +147,15 @@ enum WindowsKind {
     Other,
 }
 
+/// Whether a standard handle names something: a process started without
+/// standard input, as a GUI or a detached process can be, has a null one,
+/// and a failed lookup gives an invalid one, neither of which a `File` may
+/// hold.
+#[cfg(windows)]
+fn is_usable_handle(handle: std::os::windows::io::RawHandle) -> bool {
+    !handle.is_null() && handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
+}
+
 #[cfg(windows)]
 fn windows_kind(file: &File) -> WindowsKind {
     use std::os::windows::io::AsRawHandle as _;
@@ -174,12 +183,16 @@ pub fn read_secret_stdin(limit: usize) -> Result<Zeroizing<String>, SecretReadEr
         File::from_raw_fd(stdin.as_raw_fd())
     });
     #[cfg(windows)]
-    // SAFETY: standard input stays open for the process, and ManuallyDrop
-    // never closes it.
-    let file = std::mem::ManuallyDrop::new(unsafe {
+    let file = {
         use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
-        File::from_raw_handle(stdin.as_raw_handle())
-    });
+        let handle = stdin.as_raw_handle();
+        if !is_usable_handle(handle) {
+            return Err(SecretReadError::NotFileOrPipe);
+        }
+        // SAFETY: the handle is standard input's, neither null nor invalid,
+        // open for the process; ManuallyDrop never closes it.
+        std::mem::ManuallyDrop::new(unsafe { File::from_raw_handle(handle) })
+    };
     #[cfg(windows)]
     if matches!(windows_kind(&file), WindowsKind::Other) {
         return Err(SecretReadError::NotFileOrPipe);
@@ -190,6 +203,9 @@ pub fn read_secret_stdin(limit: usize) -> Result<Zeroizing<String>, SecretReadEr
         {
             use std::os::unix::fs::FileTypeExt as _;
             let kind = metadata.file_type();
+            if kind.is_dir() {
+                return Err(SecretReadError::Directory);
+            }
             if kind.is_char_device() || kind.is_block_device() {
                 return Err(SecretReadError::NotFileOrPipe);
             }
@@ -198,7 +214,43 @@ pub fn read_secret_stdin(limit: usize) -> Result<Zeroizing<String>, SecretReadEr
             size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
         }
     }
-    into_text(read_wiped(&*file, limit, size)?)
+    #[cfg(unix)]
+    let reader = WaitingForInput(&file);
+    #[cfg(windows)]
+    let reader = &*file;
+    into_text(read_wiped(reader, limit, size)?)
+}
+
+/// Reads of standard input that wait for input rather than fail with
+/// `WouldBlock`, for a descriptor an earlier program left non-blocking. Its
+/// flags belong to an open file that program shares, so they're left alone.
+#[cfg(unix)]
+struct WaitingForInput<'file>(&'file File);
+
+#[cfg(unix)]
+impl Read for WaitingForInput<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        use std::os::fd::AsRawFd as _;
+        loop {
+            match (&mut &*self.0).read(buffer) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let mut ready = libc::pollfd {
+                        fd: self.0.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // SAFETY: `ready` is one valid pollfd for the call.
+                    if unsafe { libc::poll(&mut ready, 1, -1) } < 0 {
+                        let error = io::Error::last_os_error();
+                        if error.kind() != io::ErrorKind::Interrupted {
+                            return Err(error);
+                        }
+                    }
+                }
+                read => return read,
+            }
+        }
+    }
 }
 
 /// Reads from the pipe wait for what its writer sends, until it closes,
@@ -268,6 +320,72 @@ fn into_text(mut bytes: Zeroizing<Vec<u8>>) -> Result<Zeroizing<String>, SecretR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_or_invalid_standard_handle_is_never_read() {
+        assert!(!is_usable_handle(std::ptr::null_mut()));
+        assert!(!is_usable_handle(
+            windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
+        ));
+    }
+
+    /// Standard input an earlier program left non-blocking is still read
+    /// whole: the read waits for what its writer sends. The test runs itself
+    /// again as the reader, with the non-blocking end of a pipe for its
+    /// standard input and a writer that sends a moment later.
+    #[cfg(unix)]
+    #[test]
+    fn standard_input_left_non_blocking_waits_for_its_writer() {
+        use std::io::Write as _;
+        use std::os::fd::FromRawFd as _;
+        const READER: &str = "LPM_SECRET_READ_NON_BLOCKING_READER";
+        if std::env::var_os(READER).is_some() {
+            match read_secret_stdin(64) {
+                Ok(text) => println!("read: {}", text.as_str()),
+                Err(error) => println!("failed: {error}"),
+            }
+            return;
+        }
+        let mut ends = [0; 2];
+        // SAFETY: `ends` has room for the two descriptors `pipe` makes.
+        assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+        // SAFETY: both descriptors were just made and are owned here.
+        let (read_end, mut write_end) =
+            unsafe { (File::from_raw_fd(ends[0]), File::from_raw_fd(ends[1])) };
+        // SAFETY: both ends are open; the calls read and set their flags.
+        // Neither end may stay open in the reader beyond its standard
+        // input, or a write end it held would keep its read from ending.
+        unsafe {
+            for end in ends {
+                assert_eq!(libc::fcntl(end, libc::F_SETFD, libc::FD_CLOEXEC), 0);
+            }
+            let flags = libc::fcntl(ends[0], libc::F_GETFL);
+            assert_eq!(
+                libc::fcntl(ends[0], libc::F_SETFL, flags | libc::O_NONBLOCK),
+                0
+            );
+        }
+        let reader = std::process::Command::new(std::env::current_exe().expect("this test"))
+            .args([
+                "--exact",
+                "secret_read::tests::standard_input_left_non_blocking_waits_for_its_writer",
+                "--nocapture",
+            ])
+            .env(READER, "1")
+            .stdin(read_end)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("run the reader");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // A reader that gave up already has closed its end.
+        let _ = write_end.write_all(b"fixture-late");
+        drop(write_end);
+        let output = reader.wait_with_output().expect("the reader ends");
+        let shown = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{shown}");
+        assert!(shown.contains("read: fixture-late"), "{shown}");
+    }
 
     /// Reading standard input takes from its descriptor no more than one byte
     /// past the limit: none of it passes through std's buffered stdin, whose

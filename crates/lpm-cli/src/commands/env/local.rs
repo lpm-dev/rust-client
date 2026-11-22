@@ -8,20 +8,25 @@ pub(super) fn env_set(
 ) -> Result<(), LpmError> {
     let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
     let env_label = resolved_env.as_deref().unwrap_or("default");
-    let assignments = super::value_input::collect(
-        &super::value_input::Request {
-            entries: &values.entries,
-            stdin: values.stdin,
-            from_files: &values.from_files,
-            json_output,
-            command: "lpm env set",
-            asking: super::value_input::Asking {
-                what: "Value",
-                environment: env_label,
-            },
+    let request = super::value_input::Request {
+        entries: &values.entries,
+        stdin: values.stdin,
+        from_files: &values.from_files,
+        json_output,
+        command: "lpm env set",
+        asking: super::value_input::Asking {
+            what: "Value",
+            environment: env_label,
         },
-        &mut super::value_input::ProcessSources,
-    )?;
+    };
+    // A value that's typed, piped or read waits on the person, so what
+    // refuses the write whatever it holds is found first.
+    if super::value_input::check(&request, &super::value_input::ProcessSources)?.reads_input {
+        lpm_vault::check_values_writable(project_dir)
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
+    }
+    let assignments =
+        super::value_input::collect(&request, &mut super::value_input::ProcessSources)?;
     let pairs: Vec<(&str, &str)> = assignments
         .iter()
         .map(|assignment| (assignment.key.as_str(), assignment.value.as_str()))
@@ -395,7 +400,10 @@ fn read_piped_env_file() -> Result<zeroize::Zeroizing<String>, LpmError> {
                 "the .env file piped to `lpm env import -` isn't UTF-8 text".into()
             }
             SecretReadError::NotFileOrPipe => {
-                "`lpm env import -` reads a .env file piped to lpm or redirected from a file, but standard input is a device".into()
+                "`lpm env import -` reads a .env file piped to lpm or redirected from a file, but standard input is a device, such as a terminal or /dev/null".into()
+            }
+            SecretReadError::Directory => {
+                "`lpm env import -` reads a .env file piped to lpm or redirected from a file, but standard input is a directory".into()
             }
             other => format!("failed to read standard input: {other}"),
         })

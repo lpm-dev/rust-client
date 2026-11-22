@@ -119,6 +119,41 @@ enum Entry<'a> {
     Bare(&'a str),
 }
 
+/// A request whose arguments were checked before any value is read.
+pub(super) struct Checked {
+    /// Some value comes from the prompt, standard input or a file, rather
+    /// than the arguments alone.
+    pub(super) reads_input: bool,
+}
+
+/// Refuse what `request`'s arguments are refused for, as [`collect`] would,
+/// before any value is read or asked for: a malformed key, a key named
+/// twice, or a value with nowhere to come from.
+pub(super) fn check(request: &Request<'_>, sources: &impl Sources) -> Result<Checked, LpmError> {
+    let entries = request
+        .entries
+        .iter()
+        .map(|entry| parse_entry(entry))
+        .collect::<Result<Vec<_>, _>>()?;
+    let files = request
+        .from_files
+        .iter()
+        .map(|file| parse_from_file(file))
+        .collect::<Result<Vec<_>, _>>()?;
+    let bare: Vec<&str> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::Bare(key) => Some(*key),
+            Entry::Given(..) => None,
+        })
+        .collect();
+    refuse_repeated_keys(&entries, &files, cfg!(windows))?;
+    check_how_bare_keys_get_values(request, &bare, sources)?;
+    Ok(Checked {
+        reads_input: !bare.is_empty() || !files.is_empty(),
+    })
+}
+
 /// Every key's value, in the order the arguments name them, then the
 /// `--from-file` keys. Nothing is read or asked until every argument is
 /// valid, and nothing is asked until every file and standard input are read.
@@ -301,7 +336,7 @@ fn check_how_bare_keys_get_values(
             } else if !sources.can_prompt() {
                 "LPM asks for a value, hidden, only in an interactive terminal"
             } else {
-                "This terminal can't hide what's typed, as Git Bash's mintty can't"
+                "This terminal can't hide what's typed, as Git Bash's mintty and Emacs's shell can't"
             };
             Err(LpmError::Env(format!(
                 "{key} has no value. {reason}. Pipe it in with `{command} {key} --stdin`, or read it from a file with `{command} --from-file {key}=PATH`"
@@ -392,7 +427,10 @@ fn stdin_error(key: &str, error: &SecretReadError) -> LpmError {
         ),
         SecretReadError::NotText => format!("the value piped in for {key} isn't UTF-8 text"),
         SecretReadError::NotFileOrPipe => format!(
-            "--stdin reads a value piped to lpm or redirected from a file, but standard input is a device; nothing was read for {key}"
+            "--stdin reads a value piped to lpm or redirected from a file, but standard input is a device, such as a terminal or /dev/null; nothing was read for {key}"
+        ),
+        SecretReadError::Directory => format!(
+            "--stdin reads a value piped to lpm or redirected from a file, but standard input is a directory; nothing was read for {key}"
         ),
         other => format!("failed to read the value for {key} from standard input: {other}"),
     })

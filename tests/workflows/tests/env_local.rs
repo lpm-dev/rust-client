@@ -1299,7 +1299,7 @@ fn stdin_that_is_a_device_is_refused_rather_than_read() {
     for (args, said) in [
         (
             &["env", "set", "TOKEN", "--stdin"][..],
-            "standard input is a device; nothing was read for TOKEN",
+            "standard input is a device, such as a terminal or /dev/null; nothing was read for TOKEN",
         ),
         (
             &["env", "import", "-"][..],
@@ -1309,6 +1309,31 @@ fn stdin_that_is_a_device_is_refused_rather_than_read() {
         let output = support::lpm_spawnable(&project)
             .args(args)
             .stdin(std::fs::File::open("/dev/zero").expect("open /dev/zero"))
+            .output()
+            .expect("failed to run lpm");
+        assert!(!output.status.success(), "{args:?}");
+        let text = failure_text(&output);
+        assert!(text.contains(said), "{args:?}: {text}");
+    }
+    assert_eq!(revealed(&project, "TOKEN"), None);
+}
+
+#[test]
+fn stdin_that_is_a_directory_is_refused_by_name() {
+    let project = TempProject::empty(r#"{"name":"stdin-directory","version":"1.0.0"}"#);
+    for (args, said) in [
+        (
+            &["env", "set", "TOKEN", "--stdin"][..],
+            "standard input is a directory; nothing was read for TOKEN",
+        ),
+        (
+            &["env", "import", "-"][..],
+            "but standard input is a directory",
+        ),
+    ] {
+        let output = support::lpm_spawnable(&project)
+            .args(args)
+            .stdin(std::fs::File::open(project.path()).expect("open the project folder"))
             .output()
             .expect("failed to run lpm");
         assert!(!output.status.success(), "{args:?}");
