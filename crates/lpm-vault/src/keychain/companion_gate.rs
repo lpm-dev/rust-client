@@ -86,7 +86,7 @@ pub(super) fn authorize(
 /// lock scope on one thread, so one approval covers both, with the gate that
 /// decides what the record means.
 pub(super) struct RunRead {
-    pub(super) values: Option<Vec<u8>>,
+    pub(super) values: Option<zeroize::Zeroizing<Vec<u8>>>,
     pub(super) gate: ProjectGate,
     pub(super) overrides_record: Option<zeroize::Zeroizing<Vec<u8>>>,
 }
@@ -110,6 +110,16 @@ impl RunRead {
             self.overrides_record.as_ref().map(|bytes| bytes.as_slice()),
         )
         .map_err(damaged)
+    }
+
+    /// The values item's payload as text, wiped when dropped.
+    pub(super) fn into_values_text(self) -> Result<Option<zeroize::Zeroizing<String>>, String> {
+        self.values
+            .map(|mut bytes| {
+                crate::zeroizing_text(std::mem::take(&mut *bytes))
+                    .map_err(|_| "vault keychain data is not valid UTF-8".to_owned())
+            })
+            .transpose()
     }
 
     /// Every environment's personal overrides for a run, as
@@ -147,18 +157,25 @@ pub(super) fn contradictory_record() -> String {
     damaged(Damage::Access(CONTRADICTORY_RECORD.to_owned()))
 }
 
+/// The values item's bytes, wiped when dropped, with the approval they claim.
+type ValuesRead = (zeroize::Zeroizing<Vec<u8>>, ClaimedAccess);
+
 /// The values item's bytes with the approval they claim, read in one call.
 /// Approval attributes that contradict each other damage the project's
 /// access, which refuses every read.
 fn read_values(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
-) -> Result<Option<(Vec<u8>, ClaimedAccess)>, String> {
+) -> Result<Option<ValuesRead>, String> {
     match storage.read_with_access(vault_id)? {
-        Some((_, ClaimedAccess::Contradictory)) => {
-            Err(damaged(Damage::Access(CONTRADICTORY_VALUES.to_owned())))
+        None => Ok(None),
+        Some((bytes, access)) => {
+            let bytes = zeroize::Zeroizing::new(bytes);
+            if access == ClaimedAccess::Contradictory {
+                return Err(damaged(Damage::Access(CONTRADICTORY_VALUES.to_owned())));
+            }
+            Ok(Some((bytes, access)))
         }
-        read => Ok(read),
     }
 }
 
@@ -170,8 +187,9 @@ pub(super) fn read_values_excluding_overrides(
 ) -> Result<Option<zeroize::Zeroizing<String>>, String> {
     authorize(storage, vault_id, Operation::ReadExcludingOverrides)?;
     read_values(storage, vault_id)?
-        .map(|(bytes, _)| {
-            crate::zeroizing_text(bytes).map_err(|_| "vault keychain data is not UTF-8".to_owned())
+        .map(|(mut bytes, _)| {
+            crate::zeroizing_text(std::mem::take(&mut *bytes))
+                .map_err(|_| "vault keychain data is not UTF-8".to_owned())
         })
         .transpose()
 }

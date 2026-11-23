@@ -2149,17 +2149,24 @@ pub(crate) fn read_for_run_unlocked(
     env: &str,
     default_fallback: bool,
 ) -> Result<crate::StoredRunEnvironment, String> {
-    let read = companion_gate::read_for_run(&mut KeychainProjectStorage, vault_id)?;
+    read_for_run_from(&mut KeychainProjectStorage, vault_id, env, default_fallback)
+}
+
+fn read_for_run_from(
+    storage: &mut impl ProjectStorage,
+    vault_id: &str,
+    env: &str,
+    default_fallback: bool,
+) -> Result<crate::StoredRunEnvironment, String> {
+    let read = companion_gate::read_for_run(storage, vault_id)?;
     let overrides = read.overrides(vault_id, env)?;
     let identity = read
         .overrides_record
         .as_deref()
         .map(|record| crate::OverridesIdentity::of(record));
-    let Some(bytes) = read.values else {
+    let Some(json) = read.into_values_text()? else {
         return Ok((None, overrides, identity));
     };
-    let json = String::from_utf8(bytes)
-        .map_err(|_| "vault keychain data is not valid UTF-8".to_owned())?;
     let parsed = if default_fallback {
         crate::selected_environment::parse_with_default_fallback(&json, env)
     } else {
@@ -2176,17 +2183,22 @@ pub(crate) fn read_for_run_unlocked(
 pub(crate) fn read_all_for_run_unlocked(
     vault_id: &str,
 ) -> Result<crate::StoredRunEnvironments, String> {
-    let read = companion_gate::read_for_run(&mut KeychainProjectStorage, vault_id)?;
+    read_all_for_run_from(&mut KeychainProjectStorage, vault_id)
+}
+
+fn read_all_for_run_from(
+    storage: &mut impl ProjectStorage,
+    vault_id: &str,
+) -> Result<crate::StoredRunEnvironments, String> {
+    let read = companion_gate::read_for_run(storage, vault_id)?;
     let overrides = read.all_overrides(vault_id)?;
     let identity = read
         .overrides_record
         .as_deref()
         .map(|record| crate::OverridesIdentity::of(record));
     let values = read
-        .values
-        .map(|bytes| {
-            let json = String::from_utf8(bytes)
-                .map_err(|_| "vault keychain data is not valid UTF-8".to_owned())?;
+        .into_values_text()?
+        .map(|json| {
             crate::selected_environment::parse_all(&json)
                 .map_err(|error| format!("vault keychain data is not valid JSON: {error}"))
         })
@@ -3010,6 +3022,41 @@ mod tests {
         });
         assert!(read);
         assert!(!found, "the payload read from the Keychain is wiped");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn reading_the_keychain_s_values_for_a_run_leaves_no_copy_of_the_payload() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        let mut storage = MemoryProjectStorage::default();
+        // Escaped, as in a PEM private key, in the environment the run
+        // reads and in one it doesn't.
+        storage.values.insert(
+            "proj",
+            format!(
+                r#"{{"environments":{{"default":{{"TOKEN":"{MARKER}\n-----END-----"}},"live":{{"OTHER":"{MARKER}\n"}}}}}}"#
+            ),
+        );
+        let (read, found) = watch(|| {
+            let (values, _, _) =
+                read_for_run_from(&mut storage, "proj", "default", false).expect("read");
+            let mut values = values.expect("stored values");
+            let read = values["TOKEN"].starts_with(MARKER);
+            crate::history::wipe_environment(&mut values);
+            read
+        });
+        assert!(read);
+        assert!(!found, "a run's read of one environment is wiped");
+
+        let (read, found) = watch(|| {
+            let (values, _, _) = read_all_for_run_from(&mut storage, "proj").expect("read");
+            let mut values = values.expect("stored values");
+            let read = values["live"]["OTHER"].starts_with(MARKER);
+            crate::history::wipe_values(&mut values);
+            read
+        });
+        assert!(read);
+        assert!(!found, "a run's read of every environment is wiped");
     }
 
     #[cfg(not(miri))]

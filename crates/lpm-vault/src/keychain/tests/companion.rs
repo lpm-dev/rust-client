@@ -473,7 +473,10 @@ fn applying_overrides_returns_the_selected_environment_with_the_values() {
     let values = run_read(&mut storage).expect("apply read").values;
     let overrides = run_overrides(&mut storage).expect("apply read");
 
-    assert_eq!(values.as_deref(), Some(VALUES.as_bytes()));
+    assert_eq!(
+        values.as_deref().map(Vec::as_slice),
+        Some(VALUES.as_bytes())
+    );
     assert_eq!(overrides.set["TOKEN"], "mine");
 }
 
