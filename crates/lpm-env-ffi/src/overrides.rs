@@ -118,10 +118,11 @@ pub unsafe extern "C" fn lpm_env_overrides_read(input: *const u8, length: usize)
                 };
                 let mut output = Output::new(DOMAIN.serialization);
                 let mut listed = Vec::with_capacity(environments.len());
-                for (environment, overrides) in environments {
-                    let mut set: Vec<(String, String)> = overrides.set.into_iter().collect();
+                for (environment, mut overrides) in environments {
+                    let mut set: Vec<(String, String)> =
+                        std::mem::take(&mut overrides.set).into_iter().collect();
                     set.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-                    let mut unset = overrides.unset;
+                    let mut unset = std::mem::take(&mut overrides.unset);
                     unset.sort_unstable();
                     let set: Vec<Value> = set
                         .into_iter()

@@ -338,10 +338,11 @@ fn list(
     }
     let listed: Vec<Listed> = all
         .into_iter()
-        .map(|(environment, overrides)| {
-            let mut set: Vec<(String, String)> = overrides.set.into_iter().collect();
+        .map(|(environment, mut overrides)| {
+            let mut set: Vec<(String, String)> =
+                std::mem::take(&mut overrides.set).into_iter().collect();
             set.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-            let mut unset = overrides.unset;
+            let mut unset = std::mem::take(&mut overrides.unset);
             unset.sort_unstable();
             Listed {
                 environment,

@@ -49,6 +49,16 @@ pub struct PersonalOverrides {
     pub unset: Vec<String>,
 }
 
+/// An override's value is a secret, so it's wiped with the overrides. A
+/// caller that keeps a value takes it out first.
+impl Drop for PersonalOverrides {
+    fn drop(&mut self) {
+        for value in self.set.values_mut() {
+            zeroize::Zeroize::zeroize(value);
+        }
+    }
+}
+
 /// Names only: an override's value is a secret.
 impl fmt::Debug for PersonalOverrides {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

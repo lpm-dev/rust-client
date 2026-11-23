@@ -3150,6 +3150,27 @@ KEY3=no-quotes"#;
 
     #[cfg(not(miri))]
     #[test]
+    fn personal_overrides_are_wiped_when_dropped() {
+        use crate::companion::overrides::evaluate;
+        use crate::freed_memory_probe::{MARKER, watch};
+        let marker = br#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{"overrides":{"version":1,"ifUnsupported":"refuse","kinds":["overrides"],"state":"active"}}}"#;
+        let gate = crate::companion::assessment::gate_of("proj", Some(marker));
+        let record = format!(
+            r#"{{"schemaVersion":1,"vaultId":"proj","environments":{{"default":{{"set":{{"TOKEN":"{MARKER}"}},"unset":[]}}}}}}"#
+        );
+
+        let (read, found) = watch(|| {
+            let overrides =
+                evaluate(&gate, "proj", "default", Some(record.as_bytes())).expect("valid");
+            overrides.set["TOKEN"] == MARKER
+        });
+
+        assert!(read);
+        assert!(!found, "a reader that never shows the value leaves no copy");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
     fn parsing_leaves_no_copy_of_a_value_a_later_line_replaces_or_a_quoted_value_outgrows() {
         use crate::freed_memory_probe::{MARKER, watch};
         let continued = "x".repeat(4096);
