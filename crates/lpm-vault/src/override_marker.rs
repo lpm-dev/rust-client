@@ -326,11 +326,13 @@ fn add_entry(marker: &Path, entry: &str) -> Result<(), String> {
         .open(marker.join(entry))
     {
         Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        // Windows says a path through a file isn't found, as it says of a
+        // marker that's gone, so only a marker with nothing at its path is.
         Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotFound
-            ) =>
+            if error.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(marker)
+                    .is_err_and(|missing| missing.kind() == std::io::ErrorKind::NotFound) =>
         {
             Ok(())
         }
