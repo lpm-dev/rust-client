@@ -7,7 +7,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use super::decode::Bytes;
 use super::{Event, Keyboard, Output};
@@ -117,6 +117,22 @@ impl Terminal {
     }
 }
 
+impl Terminal {
+    /// Starts the value over when the prompt did since this last looked,
+    /// which a read that waited in vain looks for too: a paste whose end is
+    /// awaited ends in the restart rather than as a cut paste. True when it
+    /// did.
+    fn take_restart(&mut self, each: &mut dyn FnMut(Event)) -> bool {
+        let restarts = RESTARTS.load(Ordering::SeqCst);
+        if restarts == self.restarts_seen {
+            return false;
+        }
+        self.restarts_seen = restarts;
+        start_over(&mut self.bytes, each);
+        true
+    }
+}
+
 impl Keyboard for Terminal {
     /// Raises `SIGTSTP`, whose handler gives the terminal back and stops the
     /// process where its default action would.
@@ -133,7 +149,7 @@ impl Keyboard for Terminal {
         let started = Instant::now();
         let deadline = wait.map(|wait| started + wait);
         if deadline.is_some() && !input_by(deadline)? {
-            return Ok(false);
+            return Ok(self.take_restart(each));
         }
         let mut buffer = Zeroizing::new([0_u8; 1024]);
         let read = loop {
@@ -149,7 +165,7 @@ impl Keyboard for Terminal {
                 // An earlier program can leave the terminal non-blocking.
                 io::ErrorKind::WouldBlock => {
                     if !input_by(deadline)? {
-                        return Ok(false);
+                        return Ok(self.take_restart(each));
                     }
                 }
                 _ => return Err(error),
@@ -163,11 +179,7 @@ impl Keyboard for Terminal {
         }
         // A stop gave the terminal back and showed the prompt again once it
         // continued, so what's read now begins a value of its own.
-        let restarts = RESTARTS.load(Ordering::SeqCst);
-        if restarts != self.restarts_seen {
-            self.restarts_seen = restarts;
-            start_over(&mut self.bytes, each);
-        }
+        self.take_restart(each);
         self.bytes.next_read();
         for &byte in &buffer[..read] {
             self.bytes.feed(byte, each);
@@ -285,9 +297,9 @@ fn put_back(original: &libc::termios, paste_output: libc::c_int) {
     turn_paste_off(paste_output);
 }
 
-/// How long the writes of one handler, or one put-back, may take in all:
-/// less than the [`PUT_BACK_STEPS`] a handler ending the process waits for
-/// one giving raw mode.
+/// How long the writes of one handler, or one put-back, may take in all, and
+/// a handler's drain: each less than the [`PUT_BACK_STEPS`] a handler ending
+/// the process waits for one giving raw mode.
 const WRITE_BUDGET_MS: i64 = 1000;
 
 /// Milliseconds on a clock that only goes forward. It makes only
@@ -363,13 +375,13 @@ fn nonblocking_twin(output: libc::c_int) -> Option<OwnedFd> {
 /// sending, as the prompt waits after its line.
 const DRAIN_QUIET_MS: i64 = 100;
 
-/// Reads what standard input holds, and drops it, until it's quiet for
-/// [`DRAIN_QUIET_MS`] or `deadline` comes, wiping what it read: the rest of
-/// a paste under way when a signal came, which would reach the shell once
-/// the terminal is back, and echo or run there. It makes only
-/// async-signal-safe calls.
+/// Discards what standard input holds until it's quiet for
+/// [`DRAIN_QUIET_MS`] or `deadline` comes: the rest of a paste under way when
+/// a signal came, which would reach the shell once the terminal is back, and
+/// echo or run there. It never reads, so a thread waiting in `read` that
+/// takes the input first can't leave it waiting, and what it drops never
+/// passes through memory. It makes only async-signal-safe calls.
 fn drain_input(deadline: i64) {
-    let mut buffer = [0_u8; 256];
     loop {
         let left = deadline - now_ms();
         if left <= 0 {
@@ -392,25 +404,18 @@ fn drain_input(deadline: i64) {
             }
             _ => {}
         }
-        // SAFETY: `buffer` is valid for writes of its whole length.
-        let read =
-            unsafe { libc::read(libc::STDIN_FILENO, buffer.as_mut_ptr().cast(), buffer.len()) };
-        if read == 0
-            || (read < 0
-                && !matches!(
-                    io::Error::last_os_error().kind(),
-                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                ))
-        {
+        // A terminal that hung up is readable for good.
+        if readable.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
             break;
         }
+        // SAFETY: standard input is open; this only discards its queue.
+        unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
     }
-    buffer.zeroize();
 }
 
 /// Gives standard input `original` back from a handler counted `own` times
-/// in [`RAW_MODE_WRITERS`]: the rest of a paste under way is read and
-/// dropped first, while nothing echoes; raw mode another thread was giving
+/// in [`RAW_MODE_WRITERS`]: the rest of a paste under way is discarded
+/// first, while nothing echoes; raw mode another thread was giving
 /// meanwhile is undone once it's given; then bracketed paste goes off. It
 /// makes only async-signal-safe calls.
 fn hand_terminal_back(original: &libc::termios, own: u32) {
@@ -543,9 +548,15 @@ static LINE_ENDED: AtomicBool = AtomicBool::new(false);
 /// write through, or -1 (see [`through_twin`]).
 static HANDLER_OUTPUT: AtomicI32 = AtomicI32::new(-1);
 
-/// How long a handler that finds another ending the process waits for it to
-/// give standard input back, in steps of [`PUT_BACK_STEP`].
+/// How long a handler waits for others giving standard input raw mode, in
+/// steps of [`PUT_BACK_STEP`].
 const PUT_BACK_STEPS: u32 = 2000;
+
+/// How long a handler that finds another ending the process waits for it to
+/// give the terminal back, in steps of [`PUT_BACK_STEP`]: longer than all
+/// that one may take, its drain, its wait for the others and its writes.
+const ENDING_WAIT_STEPS: u32 = PUT_BACK_STEPS + 2 * WRITE_BUDGET_STEPS + 500;
+const WRITE_BUDGET_STEPS: u32 = WRITE_BUDGET_MS as u32;
 const PUT_BACK_STEP: libc::timespec = libc::timespec {
     tv_sec: 0,
     tv_nsec: 1_000_000,
@@ -578,8 +589,7 @@ static PROMPT_OUTPUT: AtomicI32 = AtomicI32::new(-1);
 
 /// What a prompt that starts over says, on a line of its own, before it
 /// shows itself again.
-const STARTS_OVER: &[u8] =
-    b"\r\nWhat was typed before the stop is gone: enter the whole value again.\r\n";
+const STARTS_OVER: &[u8] = b"\r\nThe value starts over: enter all of it again.\r\n";
 
 /// The handler, read from one place so the address an installed action
 /// holds compares equal to it.
@@ -845,16 +855,25 @@ impl Drop for PromptSignals {
         }
         PROMPT_LENGTH.store(0, Ordering::SeqCst);
         RAW_GIVEN.store(false, Ordering::SeqCst);
-        let _ = HANDLER_STATE.compare_exchange(ARMED, IDLE, Ordering::SeqCst, Ordering::SeqCst);
+        let idle = HANDLER_STATE
+            .compare_exchange(ARMED, IDLE, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
         // A handler that found the state `ARMED` counted itself first, so
         // this waits for it before another prompt may save its state; one
         // that counts itself from now on finds it `IDLE`.
         while RAW_MODE_WRITERS.load(Ordering::SeqCst) > 0 {
             std::thread::sleep(Duration::from_millis(1));
         }
-        PASTE_OUTPUT.store(-1, Ordering::SeqCst);
-        PROMPT_OUTPUT.store(-1, Ordering::SeqCst);
-        HANDLER_OUTPUT.store(-1, Ordering::SeqCst);
+        if idle {
+            PASTE_OUTPUT.store(-1, Ordering::SeqCst);
+            PROMPT_OUTPUT.store(-1, Ordering::SeqCst);
+            HANDLER_OUTPUT.store(-1, Ordering::SeqCst);
+        } else {
+            // A handler is ending the process, uncounted, and may still
+            // write through the twin, which stays open until the process
+            // ends rather than close under it.
+            std::mem::forget(self.twin.take());
+        }
         for (replaced, signal) in self.replaced.iter().zip(ENDING_SIGNALS) {
             give_back(signal, replaced.as_ref(), HANDLER);
         }
@@ -928,7 +947,7 @@ extern "C" fn put_back_and_end(signal: libc::c_int) {
             TERMINAL_PUT_BACK.store(true, Ordering::SeqCst);
         }
         ENDING => {
-            wait_while(&TERMINAL_PUT_BACK, false);
+            wait_while(&TERMINAL_PUT_BACK, false, ENDING_WAIT_STEPS);
         }
         _ => TERMINAL_PUT_BACK.store(true, Ordering::SeqCst),
     }
@@ -1124,11 +1143,12 @@ fn wait_for_writers_beyond(own: u32) -> bool {
     was
 }
 
-/// Waits, at most [`PUT_BACK_STEPS`] steps, while `flag` is `value`; true
-/// when it was at first. It makes only async-signal-safe calls.
-fn wait_while(flag: &AtomicBool, value: bool) -> bool {
+/// Waits, at most `steps` steps of [`PUT_BACK_STEP`], while `flag` is
+/// `value`; true when it was at first. It makes only async-signal-safe
+/// calls.
+fn wait_while(flag: &AtomicBool, value: bool, steps: u32) -> bool {
     let was = flag.load(Ordering::SeqCst) == value;
-    for _ in 0..PUT_BACK_STEPS {
+    for _ in 0..steps {
         if flag.load(Ordering::SeqCst) != value {
             break;
         }
@@ -1323,6 +1343,10 @@ mod tests {
         /// group isn't orphaned: a stop stops it, and the session leader
         /// notes whether the terminal echoes then and continues it.
         Foreground,
+        /// A job of the session in the background, which the session leader,
+        /// once the job stops, brings to the foreground of a terminal in
+        /// cooked mode and continues, as `fg` does.
+        BackgroundThenForeground,
     }
 
     /// The PTY's other side, which foreground work in the session leader
@@ -1424,7 +1448,7 @@ mod tests {
             if libc::waitpid(job, &mut status, libc::WUNTRACED) != job {
                 return 42;
             }
-            if let Group::Foreground = group
+            if matches!(group, Group::Foreground | Group::BackgroundThenForeground)
                 && libc::WIFSTOPPED(status)
             {
                 let mut attributes = MaybeUninit::<libc::termios>::uninit();
@@ -1432,6 +1456,11 @@ mod tests {
                     return 49;
                 }
                 let echoing = attributes.assume_init().c_lflag & libc::ECHO != 0;
+                if let Group::BackgroundThenForeground = group
+                    && libc::tcsetpgrp(terminal, job) != 0
+                {
+                    return 38;
+                }
                 libc::kill(job, libc::SIGCONT);
                 if libc::waitpid(job, &mut status, libc::WUNTRACED) != job
                     || !libc::WIFEXITED(status)
@@ -1892,4 +1921,199 @@ mod tests {
             assert!(bytes.at_ground(), "{case}");
         }
     }
+
+    #[test]
+    fn a_prompt_stopped_in_the_background_takes_raw_mode_again_once_brought_to_the_foreground() {
+        let ended = in_a_session(Group::BackgroundThenForeground, || {
+            // In the background the terminal is the shell's, so the stop
+            // puts nothing back; `fg` gives it cooked mode.
+            let prompt = arm();
+            put_back_and_stop(libc::SIGTSTP);
+            let raw = !echoes();
+            std::mem::forget(prompt);
+            // SAFETY: exiting the child.
+            unsafe { libc::_exit(if raw { 0 } else { 1 }) }
+        });
+
+        assert_eq!(
+            ended,
+            Ended::StoppedThenExited {
+                echoing: true,
+                code: 0
+            },
+            "hidden again in the foreground"
+        );
+    }
+
+    #[test]
+    fn a_stop_and_its_continue_start_the_value_over_once() {
+        let ended = in_a_session(Group::Foreground, || {
+            let prompt = arm();
+            RAW_GIVEN.store(true, Ordering::SeqCst);
+            let before = RESTARTS.load(Ordering::SeqCst);
+            // As a signal on a process of one thread, the handler blocks
+            // SIGCONT, which then runs once the handler returns.
+            // SAFETY: raising a signal this process handles.
+            unsafe { libc::raise(libc::SIGTSTP) };
+            let once = RESTARTS.load(Ordering::SeqCst) == before + 1;
+            std::mem::forget(prompt);
+            // SAFETY: exiting the child.
+            unsafe { libc::_exit(if once { 0 } else { 1 }) }
+        });
+
+        assert_eq!(
+            ended,
+            Ended::StoppedThenExited {
+                echoing: true,
+                code: 0
+            }
+        );
+    }
+
+    #[test]
+    fn a_read_that_waits_in_vain_still_starts_the_value_over() {
+        let ended = in_a_session(Group::OrphanedForeground, || {
+            let master = TEST_MASTER.load(Ordering::SeqCst);
+            // SAFETY: standard input is this session's PTY, which these
+            // calls read and set; exiting the child.
+            unsafe {
+                let mut original = MaybeUninit::<libc::termios>::uninit();
+                if libc::tcgetattr(libc::STDIN_FILENO, original.as_mut_ptr()) != 0 {
+                    libc::_exit(44);
+                }
+                let original = original.assume_init();
+                let mut raw = original;
+                libc::cfmakeraw(&mut raw);
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw);
+                let mut terminal = Terminal {
+                    original,
+                    output: Output::Stderr,
+                    paste_marked: false,
+                    bytes: Bytes::default(),
+                    signals: PromptSignals {
+                        armed: false,
+                        replaced: [None; ENDING_SIGNALS.len()],
+                        continued: None,
+                        stopped: None,
+                        twin: None,
+                    },
+                    restarts_seen: RESTARTS.load(Ordering::SeqCst),
+                };
+                let paste = b"\x1b[200~fixture";
+                libc::write(master, paste.as_ptr().cast(), paste.len());
+                let pasting = matches!(
+                    terminal.read(Some(Duration::from_secs(5)), &mut |_| {}),
+                    Ok(true)
+                ) && terminal.unfinished();
+                // A stop's handler started the value over meanwhile.
+                RESTARTS.fetch_add(1, Ordering::SeqCst);
+                let (mut restarted, mut cut) = (0, 0);
+                let arrived =
+                    terminal.read(Some(Duration::from_millis(10)), &mut |event| match event {
+                        Event::Restart => restarted += 1,
+                        Event::PasteCut => cut += 1,
+                        _ => {}
+                    });
+                let started_over = matches!(arrived, Ok(true))
+                    && restarted == 1
+                    && cut == 1
+                    && !terminal.unfinished();
+                std::mem::forget(terminal);
+                libc::_exit(match (pasting, started_over) {
+                    (true, true) => 0,
+                    (false, _) => 2,
+                    (true, false) => 1,
+                })
+            }
+        });
+
+        assert_eq!(
+            ended,
+            Ended::Exited(0),
+            "the restart ends the paste rather than a cut paste ending the value"
+        );
+    }
+
+    #[test]
+    fn a_handler_s_drain_ends_by_its_deadline_whoever_else_reads_the_terminal() {
+        let ended = in_a_session(Group::OrphanedForeground, || {
+            let prompt = arm();
+            let master = TEST_MASTER.load(Ordering::SeqCst);
+            // SAFETY: async-signal-safe calls on this session's PTY, the
+            // saved state is written, and the children are this one's to end;
+            // exiting them and this child.
+            unsafe {
+                // Another reader of the terminal, as the prompt's thread is
+                // when a signal runs its handler on another.
+                let reader = libc::fork();
+                if reader == 0 {
+                    let mut byte = [0_u8; 1];
+                    loop {
+                        libc::read(libc::STDIN_FILENO, byte.as_mut_ptr().cast(), 1);
+                    }
+                }
+                let typist = libc::fork();
+                if typist == 0 {
+                    let pause = |milliseconds: libc::c_long| {
+                        let pause = libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: milliseconds * 1_000_000,
+                        };
+                        libc::nanosleep(&pause, std::ptr::null_mut());
+                    };
+                    pause(20);
+                    libc::write(master, b"x".as_ptr().cast(), 1);
+                    // Only a key long after the drain's deadline would free
+                    // a drain that waits in `read`.
+                    for _ in 0..5 {
+                        pause(900);
+                    }
+                    libc::write(master, b"y".as_ptr().cast(), 1);
+                    libc::_exit(0);
+                }
+                // A drain that waits for good ends the child rather than the
+                // test.
+                libc::signal(libc::SIGALRM, libc::SIG_DFL);
+                libc::alarm(10);
+                let started = now_ms();
+                hand_terminal_back((*SAVED_TERMIOS.0.get()).assume_init_ref(), 0);
+                let took = now_ms() - started;
+                libc::alarm(0);
+                libc::kill(reader, libc::SIGKILL);
+                libc::kill(typist, libc::SIGKILL);
+                libc::waitpid(reader, std::ptr::null_mut(), 0);
+                libc::waitpid(typist, std::ptr::null_mut(), 0);
+                std::mem::forget(prompt);
+                libc::_exit(if took < 2 * WRITE_BUDGET_MS { 0 } else { 1 });
+            }
+        });
+
+        assert_eq!(ended, Ended::Exited(0));
+    }
+
+    #[test]
+    fn the_twin_stays_open_while_a_handler_ends_the_process() {
+        let ended = in_a_session(Group::OrphanedForeground, || {
+            let mut prompt = arm();
+            prompt.write_through(libc::STDIN_FILENO);
+            let twin = HANDLER_OUTPUT.load(Ordering::SeqCst);
+            HANDLER_STATE.store(ENDING, Ordering::SeqCst);
+            drop(prompt);
+            // SAFETY: reading a descriptor's flags; exiting the child.
+            unsafe {
+                libc::_exit(match (twin >= 0, libc::fcntl(twin, libc::F_GETFD) >= 0) {
+                    (true, true) => 0,
+                    (false, _) => 2,
+                    (true, false) => 1,
+                })
+            }
+        });
+
+        assert_eq!(ended, Ended::Exited(0));
+    }
+
+    const _: () = assert!(
+        ENDING_WAIT_STEPS > PUT_BACK_STEPS + 2 * WRITE_BUDGET_STEPS,
+        "a second ending handler waits out all the first may take"
+    );
 }

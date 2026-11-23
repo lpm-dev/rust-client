@@ -22,8 +22,7 @@ mod tty {
     use tempfile::TempDir;
 
     /// What the prompt says when it starts the value over after a stop.
-    const STARTS_OVER: &str =
-        "What was typed before the stop is gone: enter the whole value again.";
+    const STARTS_OVER: &str = "The value starts over: enter all of it again.";
 
     const BRACKETED_PASTE_ON: &[u8] = b"\x1b[?2004h";
 
@@ -831,11 +830,12 @@ mod tty {
             &PtyOptions::default(),
             &mut |answering| {
                 answering.type_keys(b"fixture-");
-                // Time for lpm to read it, so a value that started over
-                // would lose it, and for the handler to run before the rest.
-                std::thread::sleep(Duration::from_millis(300));
+                // Read, so a value that started over would lose it.
+                answering.wait_until_read();
                 signal(answering.pid, libc::SIGCONT);
-                std::thread::sleep(Duration::from_millis(300));
+                // The handler turns bracketed paste on again before the
+                // rest is typed.
+                answering.wait_for_output(BRACKETED_PASTE_ON, 1);
             },
         );
 

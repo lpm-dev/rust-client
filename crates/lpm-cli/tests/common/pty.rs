@@ -151,6 +151,8 @@ pub struct Answering<'pty> {
     pub index: usize,
     pub pid: u32,
     master: &'pty File,
+    /// What lpm wrote that a wait here read, for the transcript.
+    read: std::cell::RefCell<Vec<u8>>,
 }
 
 impl Answering<'_> {
@@ -174,6 +176,80 @@ impl Answering<'_> {
         // valid termios.
         let set = unsafe { libc::tcsetattr(self.master.as_raw_fd(), libc::TCSANOW, &attributes) };
         assert_eq!(set, 0, "give the PTY cooked mode");
+    }
+
+    /// Wait, at most 30 seconds, until lpm has read everything typed.
+    pub fn wait_until_read(&self) {
+        let slave = self.open_slave(libc::O_RDONLY);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let mut waiting: libc::c_int = 0;
+            // SAFETY: `slave` is an open descriptor of the PTY, and FIONREAD
+            // writes how much its input holds into `waiting`.
+            let asked = unsafe { libc::ioctl(slave.as_raw_fd(), libc::FIONREAD, &mut waiting) };
+            assert_eq!(asked, 0, "ask how much the PTY's input holds");
+            if waiting == 0 {
+                return;
+            }
+            assert!(Instant::now() < deadline, "lpm never read what was typed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Wait, at most 30 seconds, until lpm writes `needle` `count` times from
+    /// when this step began, keeping what's read for the transcript.
+    pub fn wait_for_output(&self, needle: &[u8], count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut buffer = [0_u8; 4096];
+        loop {
+            if self
+                .read
+                .borrow()
+                .windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+                >= count
+            {
+                return;
+            }
+            let mut master = self.master;
+            match master.read(&mut buffer) {
+                Ok(read) => self.read.borrow_mut().extend_from_slice(&buffer[..read]),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == Some(libc::EIO) =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("read PTY output: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "lpm never wrote it: {}",
+                String::from_utf8_lossy(&self.read.borrow())
+            );
+        }
+    }
+
+    /// A new descriptor of the PTY's slave, opened with `access`, whose flags
+    /// lpm's don't share.
+    fn open_slave(&self, access: libc::c_int) -> File {
+        // SAFETY: `master` is a valid PTY master, whose slave `ptsname`
+        // names in a buffer the call returns.
+        let name = unsafe { libc::ptsname(self.master.as_raw_fd()) };
+        assert!(!name.is_null(), "name the PTY slave");
+        // SAFETY: `ptsname` returned a valid C string.
+        let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_owned();
+        // SAFETY: `name` is a valid C string.
+        let fd = unsafe {
+            libc::open(
+                name.as_ptr(),
+                access | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
+            )
+        };
+        assert!(fd >= 0, "open the PTY slave");
+        // SAFETY: `open` returned a descriptor owned here alone.
+        unsafe { File::from_raw_fd(fd) }
     }
 
     /// Type `keys` at the terminal, as the person would.
@@ -213,23 +289,7 @@ impl Answering<'_> {
     /// lpm's next write to the terminal waits. The run reads it all after
     /// the step.
     pub fn fill_output(&self) {
-        // SAFETY: `master` is a valid PTY master, whose slave `ptsname`
-        // names in a buffer the call returns.
-        let name = unsafe { libc::ptsname(self.master.as_raw_fd()) };
-        assert!(!name.is_null(), "name the PTY slave");
-        // SAFETY: `ptsname` returned a valid C string.
-        let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_owned();
-        // SAFETY: `name` is a valid C string, and the call opens a new
-        // descriptor of the slave, whose flags lpm's don't share.
-        let fd = unsafe {
-            libc::open(
-                name.as_ptr(),
-                libc::O_WRONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
-            )
-        };
-        assert!(fd >= 0, "open the PTY slave to fill its output");
-        // SAFETY: `open` returned a descriptor owned here alone.
-        let mut slave = unsafe { File::from_raw_fd(fd) };
+        let mut slave = self.open_slave(libc::O_WRONLY);
         let chunk = [b'.'; 1024];
         loop {
             match slave.write(&chunk) {
@@ -380,11 +440,14 @@ fn run(
                 .position(|window| window == *prompt)
             && terminal_echo_is_disabled(&master)
         {
-            before_answer(&Answering {
+            let answering = Answering {
                 index: answered,
                 pid: child.id(),
                 master: &master,
-            });
+                read: std::cell::RefCell::new(Vec::new()),
+            };
+            before_answer(&answering);
+            transcript.extend_from_slice(&answering.read.into_inner());
             for (index, chunk) in response.iter().enumerate() {
                 if index > 0 {
                     std::thread::sleep(options.pause);
