@@ -253,12 +253,11 @@ pub(crate) async fn hydrate_release_times_if_needed(
 
     let expected_modified = metadata.modified.as_deref();
     let known_versions: Vec<&str> = metadata.versions.keys().map(String::as_str).collect();
-    let suffix_hint = expected_modified.map(|expected_modified| {
-        lpm_registry::ReleaseTimeSuffixHint {
+    let suffix_hint =
+        expected_modified.map(|expected_modified| lpm_registry::ReleaseTimeSuffixHint {
             expected_modified,
             known_versions: &known_versions,
-        }
-    });
+        });
     let release_times = match source {
         ReleaseTimeMetadataSource::NpmDirect => {
             client
@@ -286,9 +285,12 @@ pub(crate) async fn hydrate_release_times_if_needed(
                 .await?,
         ),
     };
-    metadata
-        .time
-        .extend(release_times.time.iter().map(|(k, v)| (k.clone(), v.clone())));
+    metadata.time.extend(
+        release_times
+            .time
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone())),
+    );
 
     if let Some(version) = metadata
         .versions

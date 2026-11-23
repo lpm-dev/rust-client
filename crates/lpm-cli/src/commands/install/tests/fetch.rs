@@ -322,9 +322,8 @@ fn speculative_version_picker_skips_versions_blocked_by_min_release_age() {
         1_735_862_400,
     );
 
-    let picked = super::super::fetch::pick_speculative_version_with_policy(
-        "fixture", &slim, "*", &policy,
-    );
+    let picked =
+        super::super::fetch::pick_speculative_version_with_policy("fixture", &slim, "*", &policy);
     assert_eq!(
         picked,
         Some((
@@ -725,8 +724,7 @@ async fn speculation_refuses_version_without_trust_metadata_under_trust_policy()
             }
         }
     })));
-    let policy =
-        lpm_resolver::ResolverPolicy::new(0, lpm_resolver::TrustPolicyMode::NoDowngrade);
+    let policy = lpm_resolver::ResolverPolicy::new(0, lpm_resolver::TrustPolicyMode::NoDowngrade);
     assert!(
         pick_speculative_version_with_policy("trusted-pkg", &incomplete, "^1.0.0", &policy)
             .is_none()

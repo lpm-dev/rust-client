@@ -187,7 +187,8 @@ where
             let direct_limit = if policy.requires_trust_history() {
                 prefetch_canonicals.len()
             } else {
-                RELEASE_AGE_LOOKAHEAD_FETCH_LIMIT.saturating_sub(cache.release_age_lookahead_fetches)
+                RELEASE_AGE_LOOKAHEAD_FETCH_LIMIT
+                    .saturating_sub(cache.release_age_lookahead_fetches)
             };
             let prefetched_direct = provider
                 .prefetch_manifests(&prefetch_canonicals, direct_limit)

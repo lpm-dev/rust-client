@@ -1489,7 +1489,10 @@ mod tests {
         let skewed = lpm_registry::ReleaseTimeMetadata {
             name: Some("fixture".to_string()),
             time: HashMap::from([
-                ("modified".to_string(), "2026-11-20T00:00:00.000Z".to_string()),
+                (
+                    "modified".to_string(),
+                    "2026-11-20T00:00:00.000Z".to_string(),
+                ),
                 ("1.0.0".to_string(), "2025-01-01T00:00:00.000Z".to_string()),
             ]),
             versions: None,

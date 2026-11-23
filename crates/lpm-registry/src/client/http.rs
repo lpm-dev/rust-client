@@ -717,7 +717,8 @@ impl lpm_http::ReplayableHttpClientProvider for PolicyMetadataClientProvider<'_>
         &self,
         url: &reqwest::Url,
     ) -> impl std::future::Future<Output = Result<reqwest::Client, Self::Error>> + Send {
-        self.http.for_policy_metadata_url_lane(url.as_str(), self.lane)
+        self.http
+            .for_policy_metadata_url_lane(url.as_str(), self.lane)
     }
 }
 

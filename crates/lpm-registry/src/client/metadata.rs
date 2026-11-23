@@ -3139,16 +3139,15 @@ impl RegistryClient {
                 .get_npm_package_release_times_full(name)
                 .await
                 .map(Arc::new),
-            crate::UpstreamRoute::NpmDirect => {
-                self.get_npm_release_times_direct_full_inner_with_timings(
+            crate::UpstreamRoute::NpmDirect => self
+                .get_npm_release_times_direct_full_inner_with_timings(
                     name,
                     true,
                     expected_modified,
                     suffix_hint,
                 )
                 .await
-                .map(|timed| timed.metadata)
-            }
+                .map(|timed| timed.metadata),
             crate::UpstreamRoute::Custom { target, auth } => self
                 .get_npm_release_times_from_full_for_modified(
                     &target.base_url,
@@ -3521,7 +3520,8 @@ impl RegistryClient {
                 let allowed_ttl = stale
                     .remaining_freshness
                     .min(super::cache::METADATA_CACHE_TTL);
-                let fresh_for = self.refresh_metadata_cache_freshness_async(&cache_key, allowed_ttl);
+                let fresh_for =
+                    self.refresh_metadata_cache_freshness_async(&cache_key, allowed_ttl);
                 let metadata = Arc::new(stale.value);
                 self.remember_release_times_for_command(
                     &memory_cache_key,

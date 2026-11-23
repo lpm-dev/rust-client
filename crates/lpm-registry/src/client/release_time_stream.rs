@@ -107,7 +107,9 @@ pub(super) fn extract_verified_time_from_packument_suffix(
         return None;
     }
     let suffix = if starts_at_zero {
-        raw_suffix.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(raw_suffix)
+        raw_suffix
+            .strip_prefix(&[0xEF, 0xBB, 0xBF])
+            .unwrap_or(raw_suffix)
     } else {
         raw_suffix
     };
@@ -427,18 +429,14 @@ impl ReleaseTimeStreamParser {
         let len = bytes.len();
         while i < len {
             match self.state {
-                State::SkipString {
-                    mut in_escape,
-                    ret,
-                } => {
+                State::SkipString { mut in_escape, ret } => {
                     while i < len {
                         if in_escape {
                             in_escape = false;
                             i += 1;
                             continue;
                         }
-                        if let Some(rel) = Self::find_quote_or_backslash(&bytes[i..])
-                        {
+                        if let Some(rel) = Self::find_quote_or_backslash(&bytes[i..]) {
                             i += rel;
                             if bytes[i] == b'\\' {
                                 in_escape = true;
@@ -470,8 +468,7 @@ impl ReleaseTimeStreamParser {
                                 i += 1;
                                 continue;
                             }
-                            if let Some(rel) = Self::find_quote_or_backslash(&bytes[i..])
-                            {
+                            if let Some(rel) = Self::find_quote_or_backslash(&bytes[i..]) {
                                 i += rel;
                                 if bytes[i] == b'\\' {
                                     in_escape = true;
@@ -675,8 +672,7 @@ impl ReleaseTimeStreamParser {
                     let slice = &bytes[start..i];
                     match ctx {
                         KeyContext::Versions => {
-                            if self.version_key_buf.len() + slice.len() + 1
-                                > MAX_NAME_CAPTURE_BYTES
+                            if self.version_key_buf.len() + slice.len() + 1 > MAX_NAME_CAPTURE_BYTES
                             {
                                 return Err("version key exceeds length cap".to_string());
                             }
@@ -1197,25 +1193,22 @@ impl ReleaseTimeStreamParser {
                 self.time = parsed.unwrap_or_default();
             }
             CaptureTarget::VersionOs => {
-                self.cur_platform.os = serde_json::from_slice::<PlatformFieldValue>(
-                    &self.capture_buf,
-                )
-                .map_err(|e| format!("invalid 'os' field: {e}"))?
-                .0;
+                self.cur_platform.os =
+                    serde_json::from_slice::<PlatformFieldValue>(&self.capture_buf)
+                        .map_err(|e| format!("invalid 'os' field: {e}"))?
+                        .0;
             }
             CaptureTarget::VersionCpu => {
-                self.cur_platform.cpu = serde_json::from_slice::<PlatformFieldValue>(
-                    &self.capture_buf,
-                )
-                .map_err(|e| format!("invalid 'cpu' field: {e}"))?
-                .0;
+                self.cur_platform.cpu =
+                    serde_json::from_slice::<PlatformFieldValue>(&self.capture_buf)
+                        .map_err(|e| format!("invalid 'cpu' field: {e}"))?
+                        .0;
             }
             CaptureTarget::VersionLibc => {
-                self.cur_platform.libc = serde_json::from_slice::<PlatformFieldValue>(
-                    &self.capture_buf,
-                )
-                .map_err(|e| format!("invalid 'libc' field: {e}"))?
-                .0;
+                self.cur_platform.libc =
+                    serde_json::from_slice::<PlatformFieldValue>(&self.capture_buf)
+                        .map_err(|e| format!("invalid 'libc' field: {e}"))?
+                        .0;
             }
         }
         Ok(())
@@ -1273,9 +1266,9 @@ pub(super) async fn parse_streaming_release_time_metadata_with_timing(
             )));
         }
         let parse_start = std::time::Instant::now();
-        parser
-            .feed(&chunk)
-            .map_err(|error| LpmError::Registry(format!("{context}: failed to parse JSON: {error}")))?;
+        parser.feed(&chunk).map_err(|error| {
+            LpmError::Registry(format!("{context}: failed to parse JSON: {error}"))
+        })?;
         parse_ns = parse_ns.saturating_add(parse_start.elapsed().as_nanos());
     }
 
@@ -1395,7 +1388,9 @@ mod tests {
     #[test]
     fn streaming_parser_strips_utf8_bom_across_chunks_and_rejects_malformed() {
         let mut with_bom = vec![0xEF, 0xBB, 0xBF];
-        with_bom.extend_from_slice(br#"{"name":"bom-pkg","time":{"1.0.0":"2025-01-01T00:00:00.000Z"}}"#);
+        with_bom.extend_from_slice(
+            br#"{"name":"bom-pkg","time":{"1.0.0":"2025-01-01T00:00:00.000Z"}}"#,
+        );
         let parsed = parse_chunked(&with_bom, 1).unwrap();
         assert_eq!(parsed.name.as_deref(), Some("bom-pkg"));
         assert_eq!(
@@ -1431,9 +1426,13 @@ mod tests {
         // Suffix starting inside versions must extract the real top-level time map,
         // NOT the spoofed one inside readme.
         let tail = &full[full.len() - 512..];
-        let extracted =
-            extract_verified_time_from_packument_suffix(tail, false, modified, &["1.0.0", "5.4.21"])
-                .expect("real top-level time map should extract cleanly");
+        let extracted = extract_verified_time_from_packument_suffix(
+            tail,
+            false,
+            modified,
+            &["1.0.0", "5.4.21"],
+        )
+        .expect("real top-level time map should extract cleanly");
         assert_eq!(
             extracted.get("5.4.21").map(String::as_str),
             Some("2025-10-20T00:00:00.000Z")

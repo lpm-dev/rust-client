@@ -1475,7 +1475,8 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn source_dependency_resolution_hydrates_release_times_for_recently_modified_npm_pkg() {
+        async fn source_dependency_resolution_hydrates_release_times_for_recently_modified_npm_pkg()
+        {
             use wiremock::matchers::{header, method, path};
             use wiremock::{Mock, MockServer, ResponseTemplate};
 

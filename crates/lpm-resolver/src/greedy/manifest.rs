@@ -310,9 +310,11 @@ async fn fetch_metadata_for_resolver_inner(
         CanonicalKey::Npm { name } => Some((name.as_str(), route_table.route_for_package(name))),
         _ => None,
     };
-    let public_npm = npm_route
-        .as_ref()
-        .and_then(|(name, route)| client.public_npm_access(route).map(|access| (*name, access)));
+    let public_npm = npm_route.as_ref().and_then(|(name, route)| {
+        client
+            .public_npm_access(route)
+            .map(|access| (*name, access))
+    });
 
     let (mut info, dist_tags, latest_version, version_count, projection_hit, projection_slot) =
         if let Some((name, access)) = public_npm {
@@ -1202,12 +1204,16 @@ pub(super) async fn hydrate_cached_manifest_for_edge(
         let mut merged = (*info).clone();
         let supplemental_start = trace_metadata_fetches.then(Instant::now);
         let npm_route = match canonical {
-            CanonicalKey::Npm { name } => Some((name.as_str(), route_table.route_for_package(name))),
+            CanonicalKey::Npm { name } => {
+                Some((name.as_str(), route_table.route_for_package(name)))
+            }
             _ => None,
         };
-        let public_npm = npm_route
-            .as_ref()
-            .and_then(|(name, route)| client.public_npm_access(route).map(|access| (*name, access)));
+        let public_npm = npm_route.as_ref().and_then(|(name, route)| {
+            client
+                .public_npm_access(route)
+                .map(|access| (*name, access))
+        });
         let exact_platform_target = exact_version.and_then(|version| {
             if merged.needs_platform_metadata_for_version(version) {
                 public_npm.map(|(name, access)| (name, access, version))
@@ -1216,87 +1222,86 @@ pub(super) async fn hydrate_cached_manifest_for_edge(
             }
         });
         let needs_full_platform = needs_platform && exact_platform_target.is_none();
-        let (detail, policy_release_time_ms) = if needs_release_time
-            && let Some((name, access, version)) = exact_platform_target
-        {
-            let release_time_start = trace_metadata_fetches.then(Instant::now);
-            let (release_result, exact_platform) = tokio::join!(
-                fetch_release_times_raw_for_policy(
-                    client,
-                    route_table,
-                    canonical,
-                    &merged,
-                    true,
-                    trace_metadata_fetches,
-                ),
-                fetch_exact_version_platform_doc(client, name, version, access),
-            );
-            let (release_times, detail) = release_result?;
-            merge_release_times_into_cache_info(&mut merged, &release_times);
-            if let Some((os, cpu, libc)) = exact_platform {
-                merged.merge_exact_version_platform(version, &os, &cpu, &libc);
-            } else if merged.needs_platform_metadata_for_version(version) {
-                fetch_platform_metadata(
-                    client,
-                    route_table,
-                    canonical,
-                    &mut merged,
-                    trace_metadata_fetches,
-                )
-                .await?;
-            }
-            (
-                detail,
-                release_time_start.map_or(0, |start| start.elapsed().as_millis()),
-            )
-        } else {
-            let (detail, policy_release_time_ms) = if needs_release_time {
+        let (detail, policy_release_time_ms) =
+            if needs_release_time && let Some((name, access, version)) = exact_platform_target {
                 let release_time_start = trace_metadata_fetches.then(Instant::now);
-                let detail = fetch_release_times_for_policy(
-                    client,
-                    route_table,
-                    canonical,
-                    &mut merged,
-                    !needs_full_platform,
-                    trace_metadata_fetches,
-                )
-                .await?;
+                let (release_result, exact_platform) = tokio::join!(
+                    fetch_release_times_raw_for_policy(
+                        client,
+                        route_table,
+                        canonical,
+                        &merged,
+                        true,
+                        trace_metadata_fetches,
+                    ),
+                    fetch_exact_version_platform_doc(client, name, version, access),
+                );
+                let (release_times, detail) = release_result?;
+                merge_release_times_into_cache_info(&mut merged, &release_times);
+                if let Some((os, cpu, libc)) = exact_platform {
+                    merged.merge_exact_version_platform(version, &os, &cpu, &libc);
+                } else if merged.needs_platform_metadata_for_version(version) {
+                    fetch_platform_metadata(
+                        client,
+                        route_table,
+                        canonical,
+                        &mut merged,
+                        trace_metadata_fetches,
+                    )
+                    .await?;
+                }
                 (
                     detail,
                     release_time_start.map_or(0, |start| start.elapsed().as_millis()),
                 )
             } else {
-                (None, 0)
-            };
-            if let Some((name, access, version)) = exact_platform_target {
-                if merged.needs_platform_metadata_for_version(version) {
-                    if let Some((os, cpu, libc)) =
-                        fetch_exact_version_platform_doc(client, name, version, access).await
-                    {
-                        merged.merge_exact_version_platform(version, &os, &cpu, &libc);
-                    } else {
-                        fetch_platform_metadata(
-                            client,
-                            route_table,
-                            canonical,
-                            &mut merged,
-                            trace_metadata_fetches,
-                        )
-                        .await?;
+                let (detail, policy_release_time_ms) = if needs_release_time {
+                    let release_time_start = trace_metadata_fetches.then(Instant::now);
+                    let detail = fetch_release_times_for_policy(
+                        client,
+                        route_table,
+                        canonical,
+                        &mut merged,
+                        !needs_full_platform,
+                        trace_metadata_fetches,
+                    )
+                    .await?;
+                    (
+                        detail,
+                        release_time_start.map_or(0, |start| start.elapsed().as_millis()),
+                    )
+                } else {
+                    (None, 0)
+                };
+                if let Some((name, access, version)) = exact_platform_target {
+                    if merged.needs_platform_metadata_for_version(version) {
+                        if let Some((os, cpu, libc)) =
+                            fetch_exact_version_platform_doc(client, name, version, access).await
+                        {
+                            merged.merge_exact_version_platform(version, &os, &cpu, &libc);
+                        } else {
+                            fetch_platform_metadata(
+                                client,
+                                route_table,
+                                canonical,
+                                &mut merged,
+                                trace_metadata_fetches,
+                            )
+                            .await?;
+                        }
                     }
+                } else if needs_full_platform && merged.needs_platform_metadata() {
+                    fetch_platform_metadata(
+                        client,
+                        route_table,
+                        canonical,
+                        &mut merged,
+                        trace_metadata_fetches,
+                    )
+                    .await?;
                 }
-            } else if needs_full_platform && merged.needs_platform_metadata() {
-                fetch_platform_metadata(
-                    client,
-                    route_table,
-                    canonical,
-                    &mut merged,
-                    trace_metadata_fetches,
-                )
-                .await?;
-            }
-            (detail, policy_release_time_ms)
-        };
+                (detail, policy_release_time_ms)
+            };
         if let Some(start) = supplemental_start {
             let elapsed = start.elapsed().as_millis();
             lpm_registry::timing::record_metadata_fetch_detail(
@@ -1470,7 +1475,13 @@ async fn fetch_release_times_raw_for_policy(
     info: &CachedPackageInfo,
     allow_suffix_range: bool,
     capture_timings: bool,
-) -> Result<(Arc<lpm_registry::ReleaseTimeMetadata>, Option<ReleaseTimeFetchDetail>), ResolveError> {
+) -> Result<
+    (
+        Arc<lpm_registry::ReleaseTimeMetadata>,
+        Option<ReleaseTimeFetchDetail>,
+    ),
+    ResolveError,
+> {
     let CanonicalKey::Npm { name } = canonical else {
         return Ok((Arc::new(lpm_registry::ReleaseTimeMetadata::default()), None));
     };

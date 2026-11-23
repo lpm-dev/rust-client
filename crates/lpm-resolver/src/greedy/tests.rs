@@ -5103,7 +5103,11 @@ async fn fusion_prefetches_children_while_blocked_behind_slow_earlier_manifest()
         child_ms < 150,
         "c-child should be prefetched while b-fast is blocked behind 200ms a-slow (observed at {child_ms}ms)"
     );
-    let mut names: Vec<String> = result.packages.iter().map(|p| p.package.to_string()).collect();
+    let mut names: Vec<String> = result
+        .packages
+        .iter()
+        .map(|p| p.package.to_string())
+        .collect();
     names.sort();
     assert_eq!(names, vec!["a-slow", "b-fast", "c-child"]);
     server.verify().await;
@@ -5170,11 +5174,8 @@ async fn exact_version_linux_platform_hydration_uses_version_doc_under_release_a
             .with_npm_registry_url(server.uri())
             .with_cache_dir(None),
     );
-    let policy = ResolverPolicy::with_cutoff_unix(
-        7 * 86_400,
-        1_900_000_000,
-        crate::TrustPolicyMode::Off,
-    );
+    let policy =
+        ResolverPolicy::with_cutoff_unix(7 * 86_400, 1_900_000_000, crate::TrustPolicyMode::Off);
     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
     let result = resolve_greedy_fused_with_cache_options_policy_and_selected_events(
         client,
@@ -5292,11 +5293,8 @@ async fn fusion_hydrates_multiple_exact_platform_versions_concurrently() {
             .with_npm_registry_url(server.uri())
             .with_cache_dir(None),
     );
-    let policy = ResolverPolicy::with_cutoff_unix(
-        7 * 86_400,
-        1_900_000_000,
-        crate::TrustPolicyMode::Off,
-    );
+    let policy =
+        ResolverPolicy::with_cutoff_unix(7 * 86_400, 1_900_000_000, crate::TrustPolicyMode::Off);
     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
     let started = std::time::Instant::now();
     let result = resolve_greedy_fused_with_cache_options_policy_and_selected_events(
@@ -5327,9 +5325,18 @@ async fn fusion_hydrates_multiple_exact_platform_versions_concurrently() {
         .cache
         .get(&CanonicalKey::npm("linux-multi"))
         .expect("linux-multi cached");
-    assert_eq!(info.platform("1.0.0").unwrap().libc, vec!["glibc".to_string()]);
-    assert_eq!(info.platform("2.0.0").unwrap().libc, vec!["musl".to_string()]);
-    assert_eq!(info.platform("3.0.0").unwrap().libc, vec!["glibc".to_string()]);
+    assert_eq!(
+        info.platform("1.0.0").unwrap().libc,
+        vec!["glibc".to_string()]
+    );
+    assert_eq!(
+        info.platform("2.0.0").unwrap().libc,
+        vec!["musl".to_string()]
+    );
+    assert_eq!(
+        info.platform("3.0.0").unwrap().libc,
+        vec!["glibc".to_string()]
+    );
     server.verify().await;
 }
 

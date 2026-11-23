@@ -708,7 +708,10 @@ impl RegistryClient {
                         value,
                         facts,
                         source,
-                    } => (ResolutionMetadata::Projected(value), source.slot::<P>(facts)),
+                    } => (
+                        ResolutionMetadata::Projected(value),
+                        source.slot::<P>(facts),
+                    ),
                     CachedResolution::Document { value, source } => {
                         let facts = ProjectionFacts {
                             versions_complete: true,
@@ -813,7 +816,10 @@ impl RegistryClient {
                 value,
                 facts,
                 source,
-            } => Some((ResolutionMetadata::Projected(value), source.slot::<P>(facts))),
+            } => Some((
+                ResolutionMetadata::Projected(value),
+                source.slot::<P>(facts),
+            )),
             CachedResolution::Document { value, source } => {
                 batch_metadata_entry_matches_name(name, &value.0).then(|| {
                     let facts = ProjectionFacts {

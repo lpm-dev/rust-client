@@ -3715,7 +3715,8 @@ pub(super) fn pick_speculative_version_with_policy(
     if meta.info.needs_trust_metadata(policy) {
         return None;
     }
-    let check_release_age = !package_name.is_empty() && policy.release_age_applies_to_package(&canonical);
+    let check_release_age =
+        !package_name.is_empty() && policy.release_age_applies_to_package(&canonical);
     if check_release_age && meta.info.needs_release_time_metadata(&canonical, policy) {
         return None;
     }
@@ -3752,17 +3753,16 @@ pub(super) fn pick_speculative_version_with_policy(
     }
 
     let range = lpm_resolver::NpmRange::parse(range_str).ok()?;
-    let version = meta
-        .info
-        .latest_version
-        .as_ref()
-        .filter(|version| range.satisfies(version) && version_allowed(&version.to_string()))
-        .or_else(|| {
-            meta.info
-                .versions
-                .iter()
-                .find(|version| range.satisfies(version) && version_allowed(&version.to_string()))
-        })?;
+    let version =
+        meta.info
+            .latest_version
+            .as_ref()
+            .filter(|version| range.satisfies(version) && version_allowed(&version.to_string()))
+            .or_else(|| {
+                meta.info.versions.iter().find(|version| {
+                    range.satisfies(version) && version_allowed(&version.to_string())
+                })
+            })?;
     let v_str = version.to_string();
     let url = meta.info.tarball_url(&v_str)?.to_owned();
     let integrity = meta.info.integrity(&v_str).map(str::to_owned);
