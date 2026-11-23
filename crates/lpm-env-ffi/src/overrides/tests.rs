@@ -1030,3 +1030,42 @@ fn a_value_many_sets_name_is_read_once_for_its_text_and_once_for_what_it_holds()
         );
     }
 }
+
+#[test]
+fn requests_take_only_their_documented_objects_and_leave_out_what_is_absent() {
+    let clear = json!({"action": "clearAll"});
+    let plans = [
+        json!([VAULT, null, null, null, true, [clear]]),
+        json!({"vaultId": VAULT, "hasValues": true, "edits": [["clearAll"]]}),
+        json!({"vaultId": VAULT, "hasValues": true, "edits": [{"action": "clearAll", "environment": null}]}),
+        json!({"vaultId": VAULT, "hasValues": true, "edits": [{"action": "clearAll", "value": null}]}),
+        json!({"vaultId": VAULT, "hasValues": true, "marker": null, "edits": [clear]}),
+        json!({"vaultId": VAULT, "hasValues": true, "names": null, "edits": [clear]}),
+        json!({"vaultId": VAULT, "hasValues": true, "edits": [
+            {"action": "environmentsChanged", "renamed": [["dev", "prod"]], "removed": []},
+        ]}),
+    ];
+    for plan in plans {
+        let (status, refused, _) = call(lpm_env_overrides_plan, &plan, &[]);
+        assert_eq!(status, 2, "{plan}: {refused}");
+        assert_eq!(refused["code"], "overrides.invalid_input", "{plan}");
+    }
+    for read in [
+        json!([VAULT, null, null, true]),
+        json!({"vaultId": VAULT, "hasValues": true, "record": null}),
+    ] {
+        let (status, refused, _) = call(lpm_env_overrides_read, &read, &[]);
+        assert_eq!(status, 2, "{read}: {refused}");
+    }
+    let schema = r#"{"vars":{}}"#;
+    for overrides in [
+        json!([VAULT, null, null, true]),
+        json!({"vaultId": VAULT, "hasValues": true, "marker": null}),
+    ] {
+        let (status, refused) = check(
+            schema,
+            &json!({"environments": {"default": {}}, "overrides": overrides}),
+        );
+        assert_eq!(status, 2, "{overrides}: {refused}");
+    }
+}

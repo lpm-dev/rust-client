@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
-use crate::frame::{self, Domain, Output, blob, refused, refused_with};
+use crate::frame::{self, Domain, Object, Output, blob, present, refused, refused_with};
 use crate::{LPMEnvResult, failure};
 
 /// The most the values one batch sets may total.
@@ -69,9 +69,9 @@ fn optional_blob<'a>(blobs: &[&'a [u8]], index: Option<usize>) -> Result<Option<
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReadRequest {
     vault_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     marker: Option<usize>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     record: Option<usize>,
     has_values: bool,
     #[serde(default)]
@@ -87,66 +87,72 @@ struct ReadRequest {
 pub unsafe extern "C" fn lpm_env_overrides_read(input: *const u8, length: usize) -> LPMEnvResult {
     // SAFETY: Forwarded from this function's contract.
     unsafe {
-        frame::respond(&DOMAIN, input, length, |request: ReadRequest, blobs| {
-            let vault_id = request.vault_id.as_str();
-            if !is_safe_vault_id(vault_id) {
-                return failure(2, DOMAIN.invalid_input);
-            }
-            let (Ok(marker), Ok(record)) = (
-                optional_blob(blobs, request.marker),
-                optional_blob(blobs, request.record),
-            ) else {
-                return failure(2, DOMAIN.invalid_input);
-            };
-            let gate = gate_of(vault_id, marker);
-            if gate.marker().is_some_and(needs_resume) {
-                return refused(
-                    "overrides.needs_resume",
-                    Some(PlanError::NeedsResume.to_string()),
-                );
-            }
-            if let Err(error) = gate.authorize(Operation::ReadApplyingOverrides) {
-                return refused(gate_code(&error), Some(error.to_string()));
-            }
-            if !request.has_values {
-                return Output::new(DOMAIN.serialization).finish(&json!({ "environments": [] }));
-            }
-            let environments = match evaluate_all(&gate, vault_id, record) {
-                Ok(environments) => environments,
-                Err(damage) => {
+        frame::respond(
+            &DOMAIN,
+            input,
+            length,
+            |Object(request): Object<ReadRequest>, blobs| {
+                let vault_id = request.vault_id.as_str();
+                if !is_safe_vault_id(vault_id) {
+                    return failure(2, DOMAIN.invalid_input);
+                }
+                let (Ok(marker), Ok(record)) = (
+                    optional_blob(blobs, request.marker),
+                    optional_blob(blobs, request.record),
+                ) else {
+                    return failure(2, DOMAIN.invalid_input);
+                };
+                let gate = gate_of(vault_id, marker);
+                if gate.marker().is_some_and(needs_resume) {
                     return refused(
-                        "overrides.damaged",
-                        Some(GateError::Damaged(damage).to_string()),
+                        "overrides.needs_resume",
+                        Some(PlanError::NeedsResume.to_string()),
                     );
                 }
-            };
-            let mut output = Output::new(DOMAIN.serialization);
-            let mut listed = Vec::with_capacity(environments.len());
-            for (environment, overrides) in environments {
-                let mut set: Vec<(String, String)> = overrides.set.into_iter().collect();
-                set.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-                let mut unset = overrides.unset;
-                unset.sort_unstable();
-                let set: Vec<Value> = set
-                    .into_iter()
-                    .map(|(key, value)| {
-                        let passed = !lpm_env::is_denied_env_var(&key);
-                        let value = Zeroizing::new(value);
-                        let mut entry = json!({ "key": key, "passed": passed });
-                        if request.values {
-                            entry["value"] = json!(output.secret(value));
-                        }
-                        entry
-                    })
-                    .collect();
-                let unset: Vec<Value> = unset
+                if let Err(error) = gate.authorize(Operation::ReadApplyingOverrides) {
+                    return refused(gate_code(&error), Some(error.to_string()));
+                }
+                if !request.has_values {
+                    return Output::new(DOMAIN.serialization)
+                        .finish(&json!({ "environments": [] }));
+                }
+                let environments = match evaluate_all(&gate, vault_id, record) {
+                    Ok(environments) => environments,
+                    Err(damage) => {
+                        return refused(
+                            "overrides.damaged",
+                            Some(GateError::Damaged(damage).to_string()),
+                        );
+                    }
+                };
+                let mut output = Output::new(DOMAIN.serialization);
+                let mut listed = Vec::with_capacity(environments.len());
+                for (environment, overrides) in environments {
+                    let mut set: Vec<(String, String)> = overrides.set.into_iter().collect();
+                    set.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+                    let mut unset = overrides.unset;
+                    unset.sort_unstable();
+                    let set: Vec<Value> = set
+                        .into_iter()
+                        .map(|(key, value)| {
+                            let passed = !lpm_env::is_denied_env_var(&key);
+                            let value = Zeroizing::new(value);
+                            let mut entry = json!({ "key": key, "passed": passed });
+                            if request.values {
+                                entry["value"] = json!(output.secret(value));
+                            }
+                            entry
+                        })
+                        .collect();
+                    let unset: Vec<Value> = unset
                     .into_iter()
                     .map(|key| json!({ "passed": !lpm_env::is_denied_env_var(&key), "key": key }))
                     .collect();
-                listed.push(json!({ "environment": environment, "set": set, "unset": unset }));
-            }
-            output.finish(&json!({ "environments": listed }))
-        })
+                    listed.push(json!({ "environment": environment, "set": set, "unset": unset }));
+                }
+                output.finish(&json!({ "environments": listed }))
+            },
+        )
     }
 }
 
@@ -201,7 +207,7 @@ enum EditRequest<'b> {
         environment: String,
     },
     EnvironmentsChanged {
-        renamed: Bounded<RenameRequest, MAX_EDITS, true>,
+        renamed: Bounded<Object<RenameRequest>, MAX_EDITS, true>,
         removed: Bounded<String, MAX_EDITS, true>,
     },
 }
@@ -221,19 +227,19 @@ struct RenameRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DecodedEdit {
     action: Action,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     environment: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     key: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     value: Option<usize>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     from: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     to: Option<String>,
-    #[serde(default)]
-    renamed: Option<Bounded<RenameRequest, MAX_EDITS, true>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
+    renamed: Option<Bounded<Object<RenameRequest>, MAX_EDITS, true>>,
+    #[serde(default, deserialize_with = "present")]
     removed: Option<Bounded<String, MAX_EDITS, true>>,
 }
 
@@ -387,18 +393,18 @@ impl DecodedEdit {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PlanRequest {
     vault_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     marker: Option<usize>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     record: Option<usize>,
     /// Every account name in the service, from one names-only listing,
     /// once a plan asked for them.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     names: Option<Bounded<String, MAX_NAMES, false>>,
     /// Whether the project's values item exists, which overrides need. A
     /// client says so every time, so it never leaves it out by mistake.
     has_values: bool,
-    edits: Bounded<DecodedEdit, MAX_EDITS, false>,
+    edits: Bounded<Object<DecodedEdit>, MAX_EDITS, false>,
 }
 
 /// The most edits one batch makes.
@@ -563,7 +569,7 @@ fn edits(
                 renamed: renamed
                     .0
                     .into_iter()
-                    .map(|rename| (rename.from, rename.to))
+                    .map(|Object(rename)| (rename.from, rename.to))
                     .collect(),
                 removed: removed.0,
             },
@@ -761,118 +767,122 @@ pub unsafe extern "C" fn lpm_env_overrides_plan(input: *const u8, length: usize)
     let _budget = EnvironmentChangeBudget::start();
     // SAFETY: Forwarded from this function's contract.
     unsafe {
-        frame::respond(&DOMAIN, input, length, |request: PlanRequest, blobs| {
-            let vault_id = request.vault_id.as_str();
-            if !is_safe_vault_id(vault_id) {
-                return failure(2, DOMAIN.invalid_input);
-            }
-            let mut texts = BlobTexts::new(blobs);
-            let Some(requested) = request
-                .edits
-                .0
-                .into_iter()
-                .map(|edit| edit.edit(&mut texts))
-                .collect::<Option<Vec<_>>>()
-            else {
-                return failure(2, DOMAIN.invalid_input);
-            };
-            let (Ok(marker), Ok(record)) = (
-                optional_blob(blobs, request.marker),
-                optional_blob(blobs, request.record),
-            ) else {
-                return failure(2, DOMAIN.invalid_input);
-            };
-            let gate = gate_of(vault_id, marker);
-            if let Err(error) = check_writable(&gate) {
-                return refusal(&error);
-            }
-            let edits = match edits(requested, blobs.len(), request.has_values) {
-                Ok(edits) => edits,
-                Err(EditsFailure::Refused(error)) => return refusal(&error),
-                Err(EditsFailure::ValueTooLarge { index, key }) => {
-                    let mut details = serde_json::Map::new();
-                    details.insert("edit".to_owned(), json!(index));
-                    details.insert("key".to_owned(), json!(key));
-                    details.insert("limit".to_owned(), json!(MAX_RECORD_BYTES));
-                    return refused_with(
-                        "overrides.too_large",
-                        Some(format!(
-                            "the personal override of {key} would be larger than the {} KiB a project's overrides can use",
-                            MAX_RECORD_BYTES / 1024
-                        )),
-                        details,
-                    );
+        frame::respond(
+            &DOMAIN,
+            input,
+            length,
+            |Object(request): Object<PlanRequest>, blobs| {
+                let vault_id = request.vault_id.as_str();
+                if !is_safe_vault_id(vault_id) {
+                    return failure(2, DOMAIN.invalid_input);
                 }
-                Err(EditsFailure::ValuesTooLarge { index }) => {
-                    let mut details = serde_json::Map::new();
-                    details.insert("edit".to_owned(), json!(index));
-                    details.insert("limit".to_owned(), json!(MAX_BATCH_VALUE_BYTES));
-                    return refused_with(
-                        "overrides.too_large",
-                        Some(format!(
-                            "the values one batch sets total more than {} MiB",
-                            MAX_BATCH_VALUE_BYTES / (1024 * 1024)
-                        )),
-                        details,
-                    );
-                }
-            };
-            if !request.has_values {
-                return match plan_without_values(&gate, &edits) {
-                    Ok(plan) => unchanged(&plan),
-                    Err(error) => refusal(&error),
+                let mut texts = BlobTexts::new(blobs);
+                let Some(requested) = request
+                    .edits
+                    .0
+                    .into_iter()
+                    .map(|Object(edit)| edit.edit(&mut texts))
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return failure(2, DOMAIN.invalid_input);
                 };
-            }
-            let inventory = request
-                .names
-                .as_ref()
-                .map(|names| Inventory::from_names(vault_id, names.0.iter().map(String::as_str)));
-            let plan = match plan_change(vault_id, &gate, record, &edits, inventory.as_ref()) {
-                Ok(plan) => plan,
-                Err(PlanError::NeedsInventory { need, effects }) => {
-                    let effects: Vec<EffectOutput<'_>> =
-                        effects.iter().map(EffectOutput::from).collect();
-                    let needs = match need {
-                        InventoryNeed::Project => "project",
-                        InventoryNeed::ProjectAndService => "projectAndService",
-                    };
-                    return Output::new(DOMAIN.serialization).finish(
-                        &json!({ "result": "needsNames", "needs": needs, "effects": effects }),
-                    );
+                let (Ok(marker), Ok(record)) = (
+                    optional_blob(blobs, request.marker),
+                    optional_blob(blobs, request.record),
+                ) else {
+                    return failure(2, DOMAIN.invalid_input);
+                };
+                let gate = gate_of(vault_id, marker);
+                if let Err(error) = check_writable(&gate) {
+                    return refusal(&error);
                 }
-                Err(error) => return refusal(&error),
-            };
-            if plan.mutations.is_empty() {
-                return unchanged(&plan);
-            }
-            let effects: Vec<EffectOutput<'_>> =
-                plan.effects.iter().map(EffectOutput::from).collect();
-            let mut output = Output::new(DOMAIN.serialization);
-            let mut writes = Vec::with_capacity(plan.mutations.len());
-            let mut deletes = Vec::new();
-            for mutation in plan.mutations {
-                match mutation {
-                    Mutation::Write { account, mut value } => {
-                        let index = output.blob(std::mem::take(&mut *value));
-                        writes.push(json!({ "account": account.name(), "blob": index }));
+                let edits = match edits(requested, blobs.len(), request.has_values) {
+                    Ok(edits) => edits,
+                    Err(EditsFailure::Refused(error)) => return refusal(&error),
+                    Err(EditsFailure::ValueTooLarge { index, key }) => {
+                        let mut details = serde_json::Map::new();
+                        details.insert("edit".to_owned(), json!(index));
+                        details.insert("key".to_owned(), json!(key));
+                        details.insert("limit".to_owned(), json!(MAX_RECORD_BYTES));
+                        return refused_with(
+                            "overrides.too_large",
+                            Some(format!(
+                                "the personal override of {key} would be larger than the {} KiB a project's overrides can use",
+                                MAX_RECORD_BYTES / 1024
+                            )),
+                            details,
+                        );
                     }
-                    Mutation::Delete { account } => deletes.push(account.name()),
+                    Err(EditsFailure::ValuesTooLarge { index }) => {
+                        let mut details = serde_json::Map::new();
+                        details.insert("edit".to_owned(), json!(index));
+                        details.insert("limit".to_owned(), json!(MAX_BATCH_VALUE_BYTES));
+                        return refused_with(
+                            "overrides.too_large",
+                            Some(format!(
+                                "the values one batch sets total more than {} MiB",
+                                MAX_BATCH_VALUE_BYTES / (1024 * 1024)
+                            )),
+                            details,
+                        );
+                    }
+                };
+                if !request.has_values {
+                    return match plan_without_values(&gate, &edits) {
+                        Ok(plan) => unchanged(&plan),
+                        Err(error) => refusal(&error),
+                    };
                 }
-            }
-            output.finish(&json!({
-                "result": "planned",
-                "journal": true,
-                "writes": writes,
-                "deletes": deletes,
-                "markerAfter": match plan.gate {
-                    ProjectGate::Plain => "absent",
-                    _ => "present",
-                },
-                "activated": plan.activated,
-                "overAdmissionTarget": plan.over_admission_target,
-                "effects": effects,
-            }))
-        })
+                let inventory = request.names.as_ref().map(|names| {
+                    Inventory::from_names(vault_id, names.0.iter().map(String::as_str))
+                });
+                let plan = match plan_change(vault_id, &gate, record, &edits, inventory.as_ref()) {
+                    Ok(plan) => plan,
+                    Err(PlanError::NeedsInventory { need, effects }) => {
+                        let effects: Vec<EffectOutput<'_>> =
+                            effects.iter().map(EffectOutput::from).collect();
+                        let needs = match need {
+                            InventoryNeed::Project => "project",
+                            InventoryNeed::ProjectAndService => "projectAndService",
+                        };
+                        return Output::new(DOMAIN.serialization).finish(
+                            &json!({ "result": "needsNames", "needs": needs, "effects": effects }),
+                        );
+                    }
+                    Err(error) => return refusal(&error),
+                };
+                if plan.mutations.is_empty() {
+                    return unchanged(&plan);
+                }
+                let effects: Vec<EffectOutput<'_>> =
+                    plan.effects.iter().map(EffectOutput::from).collect();
+                let mut output = Output::new(DOMAIN.serialization);
+                let mut writes = Vec::with_capacity(plan.mutations.len());
+                let mut deletes = Vec::new();
+                for mutation in plan.mutations {
+                    match mutation {
+                        Mutation::Write { account, mut value } => {
+                            let index = output.blob(std::mem::take(&mut *value));
+                            writes.push(json!({ "account": account.name(), "blob": index }));
+                        }
+                        Mutation::Delete { account } => deletes.push(account.name()),
+                    }
+                }
+                output.finish(&json!({
+                    "result": "planned",
+                    "journal": true,
+                    "writes": writes,
+                    "deletes": deletes,
+                    "markerAfter": match plan.gate {
+                        ProjectGate::Plain => "absent",
+                        _ => "present",
+                    },
+                    "activated": plan.activated,
+                    "overAdmissionTarget": plan.over_admission_target,
+                    "effects": effects,
+                }))
+            },
+        )
     }
 }
 

@@ -360,17 +360,17 @@ struct CheckInput {
     /// The project's personal overrides record, with its marker, as read in
     /// the caller's lock: given, each environment is checked as a run on
     /// this computer gets it.
-    #[serde(default)]
-    overrides: Option<CheckOverrides>,
+    #[serde(default, deserialize_with = "frame::present")]
+    overrides: Option<frame::Object<CheckOverrides>>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CheckOverrides {
     vault_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "frame::present")]
     marker: Option<Base64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "frame::present")]
     record: Option<Base64>,
     /// Whether the project's values item exists, beside which overrides
     /// live. A client says so every time, so it never leaves it out by
@@ -556,7 +556,7 @@ pub unsafe extern "C" fn lpm_env_check(
         }
         let overrides = match &input.overrides {
             None => BTreeMap::new(),
-            Some(given) => match overrides::for_check(
+            Some(frame::Object(given)) => match overrides::for_check(
                 &given.vault_id,
                 given.marker.as_ref().map(|bytes| bytes.0.as_slice()),
                 given.record.as_ref().map(|bytes| bytes.0.as_slice()),

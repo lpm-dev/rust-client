@@ -317,6 +317,16 @@ fn a_filtered_print_counts_only_the_overrides_of_the_names_it_prints() {
         );
     }
 
+    let printed = lpm(&project)
+        .args(["env", "print", "--client-only"])
+        .output()
+        .unwrap();
+    assert!(
+        !stdout(&printed).contains("NEXT_PUBLIC_GONE"),
+        "the unset leaves the key out of what's printed: {}",
+        stdout(&printed)
+    );
+
     let log = notice(&["--verbose", "env", "print", "--client-only"]);
     let named = log
         .lines()

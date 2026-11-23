@@ -40,7 +40,8 @@ uint32_t lpm_env_verify(const LPMEnvSnapshot *snapshot);
  * "default"'s values were checked), problems [{key, code, format?, constraint?,
  * group?, mode?}], defaults {KEY: schema default that fills it}, and ignored keys the
  * runner never passes to a process. Output never contains stored values.
- * With overrides: {vaultId, marker?, record?, hasValues: bool} (the marker and
+ * With overrides: {vaultId, marker?, record?, hasValues: bool}, an object whose
+ * optional fields are left out, never null (the marker and
  * the personal overrides record as read in the same lock, standard base64: this
  * function takes stored values as JSON, as it takes environments, and decodes
  * the record once per call), each environment given is checked as a run on this
@@ -428,7 +429,9 @@ LPMEnvResult lpm_env_history_ring(const uint8_t *input, size_t input_length);
  * do; values only ever travel as blobs. marker and record name the blobs of the
  * project's feature marker and its overrides record
  * (__vault_companion_v1__:overrides:<b64url(vault id)>), read in the caller's
- * lock; leave each out when its account is absent. An input carries at most
+ * lock; leave each out when its account is absent. An optional field is left
+ * out, never null, and every shape is an object with named fields; any other
+ * input is invalid. An input carries at most
  * 1026 blobs, the marker, the record and one value per edit; an output as many
  * as it needs. Status 2 is {code: "overrides.invalid_input"}, 3 a panic, 5 a
  * refusal {code: "overrides.<reason>", message, ...details}: details name what

@@ -205,6 +205,42 @@ pub(crate) unsafe fn respond<R: for<'de> Deserialize<'de>>(
     .unwrap_or_else(|_| failure(3, domain.panic))
 }
 
+/// A JSON object decoded as `T`, refusing the array that serde's derived
+/// structs also take: an input's shapes are objects with named fields.
+pub(crate) struct Object<T>(pub(crate) T);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Object<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Fields<T>(std::marker::PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for Fields<T> {
+            type Value = T;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
+                T::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+            }
+        }
+
+        deserializer
+            .deserialize_map(Fields(std::marker::PhantomData))
+            .map(Self)
+    }
+}
+
+/// An optional field, which is left out when absent: given, it holds a
+/// value, never `null`.
+pub(crate) fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 /// The blob `index` names, counted from 1 as requests name them.
 pub(crate) fn blob<'a>(blobs: &[&'a [u8]], index: usize) -> Option<&'a [u8]> {
     index

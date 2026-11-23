@@ -228,6 +228,15 @@ pub fn change(project_dir: &Path, edits: &[Edit]) -> Result<Change, String> {
         })
 }
 
+/// Refuse what `edits` are refused for whatever project they change: an
+/// invalid environment or name, or a name LPM never passes to a process.
+/// Nothing is read.
+pub fn check_edits(edits: &[Edit]) -> Result<(), String> {
+    effects_without_overrides(edits)
+        .map(drop)
+        .map_err(|error| error.to_string())
+}
+
 /// Refuse what a set or unset of `keys` in `environment` is refused for
 /// whatever their values, before any value is read or asked for: an invalid
 /// environment or name, a name LPM never passes to a process, no env project
@@ -248,7 +257,7 @@ pub fn check_before_values(
             key: (*key).to_owned(),
         })
         .collect();
-    effects_without_overrides(&edits).map_err(|error| error.to_string())?;
+    check_edits(&edits)?;
     let Some(vault_id) = crate::linked_vault_id(project_dir)? else {
         return Err(NO_PROJECT.to_owned());
     };

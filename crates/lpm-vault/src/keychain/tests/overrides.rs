@@ -97,6 +97,34 @@ fn an_override_takes_the_values_verified_approval() {
 }
 
 #[test]
+fn a_first_override_whose_approval_is_cancelled_leaves_the_project_as_it_was() {
+    let mut storage = storage_with_values();
+    storage
+        .claims
+        .insert(VAULT.to_owned(), ClaimedAccess::RequireApproval);
+    storage.protected.insert(VAULT.to_owned());
+    storage.approval_cancelled = true;
+
+    let error = change(&mut storage, &[set("API_URL", "fixture-mine")])
+        .expect_err("verifying the protected stage asks for the approval");
+    assert!(error.contains("cancelled"), "{error}");
+
+    storage.approval_cancelled = false;
+    assert!(read_all(&mut storage).expect("read").is_empty());
+    for account in [
+        overrides_account(),
+        marker_account(VAULT),
+        TRANSACTION_MARKER_ACCOUNT.to_owned(),
+    ] {
+        assert!(
+            !storage.values.contains_key(&account),
+            "{account} is left after the cancelled write is finished"
+        );
+    }
+    assert_eq!(storage.values.get_bytes(VAULT), Some(VALUES.as_bytes()));
+}
+
+#[test]
 fn an_override_of_values_without_approval_stays_automatic() {
     let mut storage = storage_with_values();
     change(&mut storage, &[set("API_URL", "mine")]).expect("set");

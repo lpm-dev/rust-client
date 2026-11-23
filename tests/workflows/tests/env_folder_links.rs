@@ -93,15 +93,41 @@ fn invalid_value_arguments_are_refused_before_an_unlinked_folder_is_asked_about(
     let project = project_with_a_value();
     let other = copied_checkout(&project, "other-checkout");
 
-    for args in [
-        &["env", "set", "--from-file", "NOT-A-KEY=./value"][..],
-        &["env", "set", "--from-file", "A_SECRET"],
+    for (args, said) in [
+        (
+            &["env", "set", "--from-file", "NOT-A-KEY=./value"][..],
+            "--from-file",
+        ),
+        (&["env", "set", "--from-file", "A_SECRET"], "--from-file"),
+        (
+            &["env", "override", "set", "--from-file", "NOT-A-KEY=./value"],
+            "--from-file",
+        ),
+        (
+            &["env", "override", "unset", "NOT-A-KEY"],
+            "env keys must match",
+        ),
+        (
+            &["env", "override", "unset", "NODE_OPTIONS"],
+            "NODE_OPTIONS",
+        ),
+        (
+            &[
+                "env",
+                "override",
+                "remove",
+                "--env",
+                "not an environment",
+                "A",
+            ],
+            "environment",
+        ),
     ] {
         let output = lpm_in(&project, &other, args);
 
         let text = output_of(&output);
         assert!(!output.status.success(), "{args:?}: {text}");
-        assert!(text.contains("--from-file"), "{args:?}: {text}");
+        assert!(text.contains(said), "{args:?}: {text}");
         assert!(
             !text.contains("lpm env link"),
             "the arguments are wrong whichever folder runs them: {args:?}: {text}"

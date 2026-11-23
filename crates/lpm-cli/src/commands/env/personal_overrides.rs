@@ -47,9 +47,11 @@ pub(super) fn run(
             json_output,
         ),
         OverrideAction::List { env, reveal } => {
+            super::links::ensure_folder_linked(project_dir, json_output)?;
             list(env.as_deref(), reveal, project_dir, json_output)
         }
         OverrideAction::Clear { env, all: _, yes } => {
+            super::links::ensure_folder_linked(project_dir, json_output)?;
             clear(env.as_deref(), yes, project_dir, json_output)
         }
     }
@@ -87,6 +89,7 @@ fn set(
         total_limit: lpm_vault::overrides::MAX_RECORD_BYTES,
     };
     let checked = super::value_input::check(&request, &super::value_input::ProcessSources)?;
+    super::links::ensure_folder_linked(project_dir, json_output)?;
     // Only a value that's typed, piped or read waits on the person; one in
     // the arguments needs no check before it.
     let project = checked
@@ -216,6 +219,8 @@ fn change_keys(
             },
         })
         .collect();
+    lpm_vault::overrides::check_edits(&edits).map_err(vault_error)?;
+    super::links::ensure_folder_linked(project_dir, json_output)?;
     let change = lpm_vault::overrides::change(project_dir, &edits).map_err(vault_error)?;
     if json_output {
         println!("{}", key_changes_json(&environment, &change));
