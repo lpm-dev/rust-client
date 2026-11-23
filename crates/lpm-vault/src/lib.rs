@@ -967,7 +967,7 @@ struct PreparedEnvironmentFileInitialization<'a> {
     initialization: &'a EnvironmentFileInitialization,
     file_present: bool,
     file_variable_count: usize,
-    secrets: Option<SecretMap>,
+    secrets: Option<wiping::ParsedValues>,
 }
 
 /// Decode a vault once for inventory planning and later initialization.
@@ -1031,7 +1031,7 @@ fn prepare_environment_file_initializations<'a>(
                 "dotenv sources exceed the {source_budget_bytes}-byte aggregate limit"
             ));
         }
-        let secrets = parse_env_content(&content);
+        let secrets = wiping::ParsedValues::from(parse_env_content(&content));
         let file_variable_count = secrets.len();
         if initialization.import_if_present && !secrets.is_empty() {
             reject_invalid_keys(secrets.keys().map(String::as_str))?;
@@ -1815,7 +1815,7 @@ pub fn import_env_content(
     overwrite: bool,
     source: &history::Source,
 ) -> Result<EnvFileImport, String> {
-    let parsed = parse_env_content(content);
+    let parsed = wiping::ParsedValues::from(parse_env_content(content));
     if parsed.is_empty() {
         return Ok(EnvFileImport::default());
     }
@@ -1833,7 +1833,7 @@ pub fn import_env_content_checked(
     overwrite: bool,
     source: &history::Source,
 ) -> Result<EnvFileImport, String> {
-    let parsed = parse_env_content(content);
+    let parsed = wiping::ParsedValues::from(parse_env_content(content));
     if parsed.is_empty() {
         return Ok(EnvFileImport::default());
     }
@@ -1845,7 +1845,7 @@ fn import_parsed(
     project_dir: &Path,
     vault_id: &str,
     env: Option<&str>,
-    parsed: HashMap<String, String>,
+    parsed: wiping::ParsedValues,
     overwrite: bool,
     source: &history::Source,
 ) -> Result<EnvFileImport, String> {
@@ -2073,7 +2073,15 @@ fn write_all_environments(
 ///
 /// Public so callers like `vars init` can count variables before importing.
 pub fn parse_env_content(content: &str) -> HashMap<String, String> {
-    parse_env_entries(content).into_iter().collect()
+    use zeroize::Zeroize as _;
+    let entries = parse_env_entries(content);
+    let mut parsed = HashMap::with_capacity(entries.len());
+    for (key, value) in entries {
+        if let Some(mut replaced) = parsed.insert(key, value) {
+            replaced.zeroize();
+        }
+    }
+    parsed
 }
 
 /// The entries of a .env file in file order, a later one for the same key
@@ -2108,7 +2116,10 @@ pub fn parse_env_entries(content: &str) -> Vec<(String, String)> {
     entries
 }
 
-fn parse_env_value(value: &str, lines: &mut std::str::Lines<'_>) -> String {
+fn parse_env_value<'content>(
+    value: &'content str,
+    lines: &mut std::str::Lines<'content>,
+) -> String {
     if let Some(rest) = value.strip_prefix('"') {
         return parse_double_quoted_env_value(rest, lines);
     }
@@ -2142,19 +2153,21 @@ pub fn is_dotenv_blank_line(line: &str) -> bool {
 }
 
 /// Writes each parsed value unless its key is there and `overwrite` is off,
-/// noting what each written value holds that's hard to see.
+/// noting what each written value holds that's hard to see. A value it
+/// skips or replaces is wiped.
 fn merge_imported_secrets(
     secrets: &mut HashMap<String, String>,
-    parsed: HashMap<String, String>,
+    mut parsed: wiping::ParsedValues,
     overwrite: bool,
 ) -> EnvFileImport {
     use std::collections::hash_map::Entry;
+    use zeroize::Zeroize as _;
     let mut import = EnvFileImport::default();
-    for (key, value) in parsed {
+    for (key, mut value) in parsed.drain() {
         let key = match secrets.entry(key) {
             Entry::Occupied(mut entry) if overwrite => {
                 let found = lpm_env::check_value_characters(&value);
-                entry.insert(value);
+                entry.insert(value).zeroize();
                 found.map(|found| (entry.key().clone(), found))
             }
             Entry::Vacant(entry) => {
@@ -2163,7 +2176,10 @@ fn merge_imported_secrets(
                 entry.insert(value);
                 key
             }
-            Entry::Occupied(_) => continue,
+            Entry::Occupied(_) => {
+                value.zeroize();
+                continue;
+            }
         };
         import.count += 1;
         import.characters.extend(key);
@@ -2176,39 +2192,58 @@ fn merge_imported_secrets(
 
 /// Decode a dotenv value after its opening double quote, consuming continuation lines.
 /// Escaped quotes and backslashes remain part of the value; the first unescaped quote closes it.
-pub fn parse_double_quoted_env_value(value: &str, lines: &mut std::str::Lines<'_>) -> String {
-    let mut decoded = String::with_capacity(value.len());
-    let mut fragment = value;
-    let mut pending_escape = false;
-
-    loop {
-        if let Some(close_idx) = find_closing_quote(fragment, '"') {
-            append_unescaped_double_quoted(
-                &mut decoded,
-                &fragment[..close_idx],
-                &mut pending_escape,
-            );
-            if pending_escape {
-                decoded.push('\\');
-            }
-            return decoded;
+pub fn parse_double_quoted_env_value<'content>(
+    value: &'content str,
+    lines: &mut std::str::Lines<'content>,
+) -> String {
+    let fragments = quoted_fragments(value, lines, |fragment| find_closing_quote(fragment, '"'));
+    // Decoding never lengthens a line, so the value never outgrows its block.
+    let mut decoded = String::with_capacity(spanned_length(&fragments));
+    for (index, fragment) in fragments.iter().enumerate() {
+        if index > 0 {
+            decoded.push('\n');
         }
-
-        decoded.reserve(fragment.len().saturating_add(1));
+        let mut pending_escape = false;
         append_unescaped_double_quoted(&mut decoded, fragment, &mut pending_escape);
         if pending_escape {
             decoded.push('\\');
-            pending_escape = false;
-        }
-
-        match lines.next() {
-            Some(next_line) => {
-                decoded.push('\n');
-                fragment = next_line;
-            }
-            None => return decoded,
         }
     }
+    decoded
+}
+
+/// The lines a quoted value spans, from the text after its opening quote:
+/// each line `closes` finds no closing quote in, then the one it does, up to
+/// that quote, or every line left when none has one. `lines` moves past the
+/// lines the value takes. Finding them first lets the value be given its
+/// whole block at once, so no block it outgrows keeps a copy of it.
+fn quoted_fragments<'content>(
+    first: &'content str,
+    lines: &mut std::str::Lines<'content>,
+    closes: impl Fn(&str) -> Option<usize>,
+) -> smallvec::SmallVec<[&'content str; 1]> {
+    let mut fragments = smallvec::SmallVec::new();
+    let mut fragment = first;
+    loop {
+        if let Some(close) = closes(fragment) {
+            fragments.push(&fragment[..close]);
+            return fragments;
+        }
+        fragments.push(fragment);
+        match lines.next() {
+            Some(next) => fragment = next,
+            None => return fragments,
+        }
+    }
+}
+
+/// The length of `fragments` joined by line breaks.
+fn spanned_length(fragments: &[&str]) -> usize {
+    fragments
+        .iter()
+        .map(|fragment| fragment.len())
+        .sum::<usize>()
+        + fragments.len().saturating_sub(1)
 }
 
 fn append_unescaped_double_quoted(output: &mut String, value: &str, pending_escape: &mut bool) {
@@ -2242,7 +2277,10 @@ fn append_unescaped_double_quoted(output: &mut String, value: &str, pending_esca
 /// on the same line makes that quote part of the value, which then reads as
 /// written, without its outer quotes when it ends with one, as dotenv reads
 /// `'Tolga's App'`.
-fn parse_single_quoted_env_value(value: &str, lines: &mut std::str::Lines<'_>) -> String {
+fn parse_single_quoted_env_value<'content>(
+    value: &'content str,
+    lines: &mut std::str::Lines<'content>,
+) -> String {
     if let Some(close_idx) = value.find('\'') {
         let after = value[close_idx + 1..].trim_start_matches(is_dotenv_blank);
         if after.is_empty() || after.starts_with('#') {
@@ -2255,26 +2293,15 @@ fn parse_single_quoted_env_value(value: &str, lines: &mut std::str::Lines<'_>) -
         };
     }
 
-    let mut collected = String::with_capacity(value.len());
-    let mut fragment = value;
-
-    loop {
-        if let Some(close_idx) = fragment.find('\'') {
-            collected.push_str(&fragment[..close_idx]);
-            return collected;
+    let fragments = quoted_fragments(value, lines, |fragment| fragment.find('\''));
+    let mut collected = String::with_capacity(spanned_length(&fragments));
+    for (index, fragment) in fragments.iter().enumerate() {
+        if index > 0 {
+            collected.push('\n');
         }
-
-        collected.reserve(fragment.len().saturating_add(1));
         collected.push_str(fragment);
-
-        match lines.next() {
-            Some(next_line) => {
-                collected.push('\n');
-                fragment = next_line;
-            }
-            None => return collected,
-        }
     }
+    collected
 }
 
 fn find_closing_quote(value: &str, quote: char) -> Option<usize> {
@@ -2705,7 +2732,7 @@ KEY3=no-quotes"#;
         let value = "transferred-value".to_owned();
         let key_ptr = key.as_ptr();
         let value_ptr = value.as_ptr();
-        let parsed = HashMap::from([(key, value)]);
+        let parsed = HashMap::from([(key, value)]).into();
         let mut secrets = HashMap::new();
 
         assert_eq!(merge_imported_secrets(&mut secrets, parsed, false).count, 1);
@@ -2714,6 +2741,84 @@ KEY3=no-quotes"#;
             .expect("imported secret");
         assert_eq!(stored_key.as_ptr(), key_ptr);
         assert_eq!(stored_value.as_ptr(), value_ptr);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn parsing_leaves_no_copy_of_a_value_a_later_line_replaces_or_a_quoted_value_outgrows() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        let continued = "x".repeat(4096);
+        for (case, content) in [
+            ("a later line", format!("TOKEN={MARKER}\nTOKEN=later\n")),
+            (
+                "a double-quoted value",
+                format!("TOKEN=\"{MARKER}\n{continued}\n{continued}\"\n"),
+            ),
+            (
+                "a single-quoted value",
+                format!("TOKEN='{MARKER}\n{continued}\n{continued}'\n"),
+            ),
+            ("a quote inside a value", format!("TOKEN='{MARKER}'s app\n")),
+        ] {
+            let (mut parsed, found) = watch(|| parse_env_content(&content));
+
+            assert!(!found, "{case}: a freed block kept the value");
+            assert!(!parsed["TOKEN"].is_empty(), "{case}: the value was parsed");
+            history::wipe_environment(&mut parsed);
+        }
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn an_import_leaves_no_copy_of_a_value_it_skips_or_replaces() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        for (overwrite, stored, imported) in [(false, "stored", MARKER), (true, MARKER, "imported")]
+        {
+            let mut secrets = HashMap::from([("TOKEN".to_owned(), stored.to_owned())]);
+            let parsed = wiping::ParsedValues::from(HashMap::from([(
+                "TOKEN".to_owned(),
+                imported.to_owned(),
+            )]));
+
+            let (import, found) = watch(|| merge_imported_secrets(&mut secrets, parsed, overwrite));
+
+            assert!(
+                !found,
+                "overwrite {overwrite}: a dropped value wasn't wiped"
+            );
+            assert_eq!(import.count, usize::from(overwrite));
+            history::wipe_environment(&mut secrets);
+        }
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn a_refused_checked_import_leaves_no_copy_of_what_it_parsed() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        crate::fallback::tests::with_temp_vault_home(|_| {
+            crate::fallback::tests::force_file_vault();
+            let project = tempfile::tempdir().unwrap();
+            let manifest = project.path().join("lpm.json");
+            std::fs::write(&manifest, r#"{"vault":"checked-project"}"#).unwrap();
+            let checked = check_values_writable(project.path()).unwrap();
+            std::fs::write(&manifest, r#"{"vault":"named-meanwhile"}"#).unwrap();
+            let content = format!("TOKEN={MARKER}\n");
+
+            let (refused, found) = watch(|| {
+                import_env_content_checked(
+                    project.path(),
+                    &checked,
+                    None,
+                    &content,
+                    false,
+                    &history::Source::new(history::Action::Import),
+                )
+            });
+
+            let refused = refused.expect_err("another project");
+            assert!(!refused.contains(MARKER), "{refused}");
+            assert!(!found, "the parsed value wasn't wiped");
+        });
     }
 
     #[cfg(debug_assertions)]
@@ -4018,7 +4123,8 @@ KEY3=no-quotes"#;
                 let value = "x".repeat(48_000);
                 let parsed = (0..256)
                     .map(|index| (format!("KEY_{index}"), value.clone()))
-                    .collect();
+                    .collect::<HashMap<_, _>>()
+                    .into();
                 let mut secrets = HashMap::new();
                 let imported = merge_imported_secrets(&mut secrets, parsed, false).count;
                 imported + secrets.values().map(String::len).sum::<usize>()

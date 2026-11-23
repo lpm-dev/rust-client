@@ -310,9 +310,9 @@ const ENDING: u8 = 3;
 /// nothing leaves.
 static HANDLER_STATE: AtomicU8 = AtomicU8::new(IDLE);
 
-/// Set once the handler that is ending the process gave standard input its
-/// state back, or found none to give back.
-static INPUT_PUT_BACK: AtomicBool = AtomicBool::new(false);
+/// Set once the handler that is ending the process gave the terminal its
+/// state back, bracketed paste included, or found none to give back.
+static TERMINAL_PUT_BACK: AtomicBool = AtomicBool::new(false);
 
 /// How many are giving standard input raw mode right now: the prompt as it
 /// starts, and the handler of `SIGCONT`. The handler that is ending the
@@ -444,7 +444,12 @@ impl PromptSignals {
     fn leave(&self) {
         if self.armed {
             RAW_WANTED.store(false, Ordering::SeqCst);
-            wait_for_writers();
+            // However long a handler is held up, none may give raw mode back
+            // after the prompt gave the terminal its state back, and each
+            // write a handler makes waits a bounded time, so this ends.
+            while RAW_MODE_WRITERS.load(Ordering::SeqCst) > 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
     }
 
@@ -536,13 +541,13 @@ extern "C" fn put_back_and_end(signal: libc::c_int) {
             if wait_for_writers() {
                 put_back_input(original);
             }
-            INPUT_PUT_BACK.store(true, Ordering::SeqCst);
             turn_paste_off(PASTE_OUTPUT.load(Ordering::SeqCst));
+            TERMINAL_PUT_BACK.store(true, Ordering::SeqCst);
         }
         ENDING => {
-            wait_while(&INPUT_PUT_BACK, false);
+            wait_while(&TERMINAL_PUT_BACK, false);
         }
-        _ => INPUT_PUT_BACK.store(true, Ordering::SeqCst),
+        _ => TERMINAL_PUT_BACK.store(true, Ordering::SeqCst),
     }
     // SAFETY: an all-zero sigaction with SIG_DFL is the default action, and
     // these calls are async-signal-safe.
