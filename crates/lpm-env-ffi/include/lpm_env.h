@@ -240,7 +240,8 @@ LPMEnvResult lpm_env_companion_account_names(const uint8_t *input, size_t input_
  * overrides?: {bytes: bytes | null} when the overrides record was read, found or
  * not, accessDamage?: why access was found damaged, unfinished?: why a resume
  * found the interrupted step can never be finished, hasValues?: whether the
- * values item exists}. Output {marker: "absent" |
+ * values item exists, which a caller that doesn't read overrides may leave out,
+ * as unknown}. Output {marker: "absent" |
  * "invalid" | "valid", state, restorePhase, needsResume, level: "ignore" |
  * "readOnly" | "refuse" (null unless valid), unsupported: {feature, version,
  * level} | null, features: [{name, version, ifUnsupported, kinds, state,
@@ -253,8 +254,8 @@ LPMEnvResult lpm_env_companion_account_names(const uint8_t *input, size_t input_
  * the client reads the overrides record, with the values' approval, and
  * assesses again with it: only when the record's contents decide part of the
  * assessment, inventory shows the record, hasValues is true, and neither
- * accessDamage nor unfinished is given. A record given otherwise is never
- * judged by its contents.
+ * accessDamage nor unfinished is given. A record given otherwise is ignored,
+ * so its contents never count.
  * repairs lists what sets every damage right, each once in the order found: a
  * discardProject alone when any damage needs one, none for damaged access.
  * allows applies the operation matrix to the marker and to every damage listed,
