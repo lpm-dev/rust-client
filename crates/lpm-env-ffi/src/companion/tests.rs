@@ -220,6 +220,34 @@ fn every_marker_fixture_assesses_with_its_recorded_level() {
 }
 
 #[test]
+fn the_assessment_says_whether_the_overrides_record_s_contents_count() {
+    let newer = OVERRIDES_MARKER.replace(r#""version":1"#, r#""version":2"#);
+    let removing = OVERRIDES_MARKER.replace(r#""state":"active"}"#, r#""state":"removing"}"#);
+    for (case, marker, judged) in [
+        (
+            "an active overrides feature",
+            Some(OVERRIDES_MARKER.to_owned()),
+            true,
+        ),
+        ("no marker", None, false),
+        ("an invalid marker", Some("not a marker".to_owned()), false),
+        ("a newer overrides feature", Some(newer), false),
+        ("an overrides feature being removed", Some(removing), false),
+    ] {
+        let (status, output) = call(
+            lpm_env_companion_assess,
+            &json!({
+                "vaultId": "proj",
+                "marker": marker.map(|marker| base64(marker.as_bytes())),
+                "inventory": [record_name("overrides", None)],
+            }),
+        );
+        assert_eq!(status, 0, "{case}");
+        assert_eq!(output["judgesOverrides"], judged, "{case}");
+    }
+}
+
+#[test]
 fn an_unsupported_feature_names_itself_and_its_level() {
     let newer = OVERRIDES_MARKER.replace(r#""version":1"#, r#""version":2"#);
     let (_, output) = call(

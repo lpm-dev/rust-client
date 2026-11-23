@@ -159,6 +159,9 @@ pub fn repair_companion_data(
     let Some(vault_id) = linked_vault_id(project_dir)? else {
         return Err("this directory has no env project".to_owned());
     };
+    if vault_id != reviewed.vault_id() {
+        return Err(companion::repair::CHANGED_SINCE_REVIEW.to_owned());
+    }
     // A repair can remove the project's overrides.
     override_marker::report_access(override_marker::Access::Change {
         vault_id: &vault_id,
@@ -2562,6 +2565,33 @@ mod tests {
         )
     }
 
+    /// Values for `vault_id` beside an overrides record no marker lists,
+    /// damage whose description names no project.
+    fn plant_unlisted_overrides(project_dir: &Path, vault_id: &str) {
+        std::fs::write(
+            project_dir.join("lpm.json"),
+            format!(r#"{{"vault":"{vault_id}"}}"#),
+        )
+        .unwrap();
+        set(project_dir, &[("TOKEN", "value")]).unwrap();
+        storage_transaction::with_vault_transaction(|directory| {
+            fallback::companion::commit_unchecked(
+                directory,
+                vault_id,
+                vec![companion::lifecycle::Mutation::Write {
+                    account: companion::account::CompanionAccount::Record {
+                        kind: companion::overrides::OVERRIDES_KIND.to_owned(),
+                        vault_id: vault_id.to_owned(),
+                        part: None,
+                    },
+                    value: br#"{"schemaVersion":1}"#.to_vec().into(),
+                }],
+            )
+        })
+        .unwrap();
+        companion::forget(vault_id);
+    }
+
     #[test]
     fn a_values_identity_changes_with_any_name_or_value_and_never_with_their_order() {
         let of = |pairs: &[(&str, &str)]| {
@@ -2584,6 +2614,45 @@ mod tests {
             assert_ne!(first, other);
         }
         assert_eq!(format!("{first:?}"), "ValuesIdentity(..)");
+    }
+
+    #[test]
+    fn a_repair_never_runs_on_a_project_other_than_the_one_reviewed() {
+        crate::fallback::tests::with_temp_vault_home(|_| {
+            crate::fallback::tests::force_file_vault();
+            let reviewed_folder = tempfile::tempdir().unwrap();
+            let other_folder = tempfile::tempdir().unwrap();
+            plant_unlisted_overrides(reviewed_folder.path(), "reviewed-project");
+            plant_unlisted_overrides(other_folder.path(), "other-project");
+            let reviewed = review_companion_data(reviewed_folder.path())
+                .unwrap()
+                .expect("the folder has an env project");
+            let other = review_companion_data(other_folder.path())
+                .unwrap()
+                .expect("the folder has an env project");
+            assert_eq!(
+                (&other.problems, other.repairs()),
+                (&reviewed.problems, reviewed.repairs()),
+                "the same damage reads the same way for either project"
+            );
+            assert!(!reviewed.repairs().is_empty(), "{reviewed:?}");
+            std::fs::write(
+                reviewed_folder.path().join("lpm.json"),
+                r#"{"vault":"other-project"}"#,
+            )
+            .unwrap();
+            link_folder_to_vault_id(reviewed_folder.path(), "other-project").unwrap();
+
+            let refused = repair_companion_data(reviewed_folder.path(), &reviewed)
+                .expect_err("the review was of another project");
+
+            assert_eq!(refused, companion::repair::CHANGED_SINCE_REVIEW);
+            assert_eq!(
+                review_companion_data(other_folder.path()).unwrap(),
+                Some(other),
+                "the other project's damage is untouched"
+            );
+        });
     }
 
     #[test]

@@ -5,6 +5,7 @@
 use super::*;
 use crate::companion::account::{marker_account, record_account};
 use crate::companion::overrides::change::Edit;
+use crate::companion::repair::CompanionRepair;
 use zeroize::Zeroizing;
 
 const VAULT: &str = "proj";
@@ -278,6 +279,70 @@ fn a_repair_review_never_reads_a_weaker_record_without_the_values_approval() {
 
     assert!(error.contains("cancelled"), "{error}");
     assert!(!error.contains("malformed"), "{error}");
+}
+
+#[test]
+fn a_repair_review_never_reads_a_record_whose_contents_decide_nothing() {
+    const SUPPORTED: &str = r#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{"overrides":{"version":1,"ifUnsupported":"refuse","kinds":["overrides"],"state":"active"}}}"#;
+    const NEWER: &str = r#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{"overrides":{"version":9,"ifUnsupported":"refuse","kinds":["overrides"],"state":"active"}}}"#;
+    for (case, values, marker, repairs) in [
+        (
+            "an invalid marker",
+            true,
+            Some("not a marker"),
+            vec![CompanionRepair::DiscardProject],
+        ),
+        (
+            "a version this client doesn't support",
+            true,
+            Some(NEWER),
+            Vec::new(),
+        ),
+        (
+            "a record no marker lists",
+            true,
+            None,
+            vec![CompanionRepair::DiscardProject],
+        ),
+        (
+            "a project without values",
+            false,
+            Some(SUPPORTED),
+            Vec::new(),
+        ),
+    ] {
+        let mut storage = if values {
+            storage_with_values()
+        } else {
+            MemoryProjectStorage::default()
+        };
+        if let Some(marker) = marker {
+            storage.values.insert(marker_account(VAULT), marker);
+        }
+        storage
+            .values
+            .insert(overrides_account(), "fixture-damaged-record");
+        storage
+            .claims
+            .insert(overrides_account(), ClaimedAccess::RequireApproval);
+        storage.protected.insert(overrides_account());
+        storage.reads.clear();
+
+        let reviewed = review_companion_data_with_storage(&mut storage, VAULT)
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+
+        assert_eq!(reviewed.repairs(), repairs, "{case}: {reviewed:?}");
+        assert_eq!(
+            storage.reads.get(&overrides_account()),
+            None,
+            "{case}: the record's contents are never read"
+        );
+        assert!(
+            !storage.probes.contains(&overrides_account())
+                && !storage.approvals_required.contains(&overrides_account()),
+            "{case}: nor is its approval asked about or changed"
+        );
+    }
 }
 
 #[test]

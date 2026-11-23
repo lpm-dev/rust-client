@@ -56,6 +56,25 @@ pub enum Repair {
     RemoveUnlisted,
 }
 
+/// Whether [`assess`] judges the overrides record by what it holds, under
+/// the marker `marker`: only while that marker lets records be read and
+/// lists overrides, active, at a version this engine supports. Anywhere
+/// else, only whether the record is there counts, which a names-only
+/// listing tells, so a client doesn't read it.
+pub fn judges_overrides_content(vault_id: &str, marker: Option<&[u8]>) -> bool {
+    marker
+        .and_then(|bytes| Marker::parse(vault_id, bytes).ok())
+        .is_some_and(|marker| {
+            !needs_resume(&marker)
+                && marker
+                    .feature(overrides::OVERRIDES_KIND)
+                    .is_some_and(|entry| {
+                        entry.state == FeatureState::Active
+                            && OVERRIDES.supported_versions.contains(&entry.version)
+                    })
+        })
+}
+
 pub fn assess(vault_id: &str, observed: Observed<'_>) -> Assessment {
     let gate = match observed.marker {
         None => ProjectGate::Plain,
@@ -271,6 +290,80 @@ mod tests {
             kind: kind.to_owned(),
             vault_id: "proj".to_owned(),
             part,
+        }
+    }
+
+    #[test]
+    fn the_overrides_record_is_judged_by_its_contents_exactly_where_the_engine_says() {
+        let marker = |state: &str, feature: &str| {
+            format!(
+                r#"{{"schemaVersion":1,"vaultId":"proj","state":"{state}","features":{{{feature}}}}}"#
+            )
+            .into_bytes()
+        };
+        let overrides = |version: u16, state: &str| {
+            format!(
+                r#""overrides":{{"version":{version},"ifUnsupported":"refuse","kinds":["overrides"],"state":"{state}"}}"#
+            )
+        };
+        let judged = marker("active", &overrides(1, "active"));
+        let unjudged: [(&str, Option<Vec<u8>>); 6] = [
+            ("no marker", None),
+            ("an invalid marker", Some(b"not a marker".to_vec())),
+            ("a marker without overrides", Some(marker("active", ""))),
+            (
+                "a newer version",
+                Some(marker("active", &overrides(9, "active"))),
+            ),
+            (
+                "a feature being removed",
+                Some(marker("active", &overrides(1, "removing"))),
+            ),
+            (
+                "an interrupted deletion",
+                Some(marker("deleting", &overrides(1, "active"))),
+            ),
+        ];
+        let inventory = [record("overrides", None)];
+        let assessed = |marker: Option<&[u8]>, record: &[u8]| {
+            assess(
+                "proj",
+                Observed {
+                    marker,
+                    inventory: Some(&inventory),
+                    overrides: Some(Some(record)),
+                    ..Observed::default()
+                },
+            )
+        };
+
+        assert!(judges_overrides_content("proj", Some(&judged)));
+        assert_ne!(
+            assessed(Some(&judged), RECORD),
+            assessed(Some(&judged), b"not a record"),
+            "the contents decide the assessment"
+        );
+        for (case, marker) in unjudged {
+            let marker = marker.as_deref();
+            assert!(!judges_overrides_content("proj", marker), "{case}");
+            assert_eq!(
+                assessed(marker, RECORD),
+                assessed(marker, b"not a record"),
+                "{case}: the contents decide nothing"
+            );
+            let unread = assess(
+                "proj",
+                Observed {
+                    marker,
+                    inventory: Some(&inventory),
+                    ..Observed::default()
+                },
+            );
+            assert_eq!(
+                unread,
+                assessed(marker, RECORD),
+                "{case}: the listing alone tells as much"
+            );
         }
     }
 

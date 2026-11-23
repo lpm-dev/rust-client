@@ -11,7 +11,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use lpm_common::stored_env::is_safe_vault_id;
 use lpm_env_companion::account::CompanionAccount;
-use lpm_env_companion::assessment::{Assessment, Observed, Repair, assess};
+use lpm_env_companion::assessment::{
+    Assessment, Observed, Repair, assess, judges_overrides_content,
+};
 use lpm_env_companion::gate::{Damage, Operation, ProjectGate};
 use lpm_env_companion::graph::{AccessClass, record_access_class};
 use lpm_env_companion::invariants::{Refusal, check_transaction};
@@ -365,6 +367,7 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
         damage: Vec<DamageOutput<'assessment>>,
         repairs: Vec<RepairOutput>,
         allows: Allows,
+        judges_overrides: bool,
     }
     fn repair_output(repair: Repair) -> RepairOutput {
         match repair {
@@ -421,10 +424,11 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
                     reason: damage.reason.clone(),
                 })
                 .collect();
+            let marker_bytes = request.marker.as_ref().map(|bytes| bytes.0.as_slice());
             let assessment = assess(
                 &request.vault_id,
                 Observed {
-                    marker: request.marker.as_ref().map(|bytes| bytes.0.as_slice()),
+                    marker: marker_bytes,
                     inventory: inventory.as_deref(),
                     overrides: request
                         .overrides
@@ -474,6 +478,7 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
                     read_applying_overrides: allows(Operation::ReadApplyingOverrides),
                     write: allows(Operation::Write),
                 },
+                judges_overrides: judges_overrides_content(&request.vault_id, marker_bytes),
             })
         })
     }

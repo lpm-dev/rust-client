@@ -1229,6 +1229,30 @@ fn a_record_left_without_values_is_never_applied_or_listed() {
 }
 
 #[test]
+fn a_repair_review_never_reads_a_record_left_without_values() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        change_overrides(&[set_override("API_URL", "fixture-mine")]).expect("set");
+        let entry = vaults_path(home)
+            .join(companion_folder_name(VAULT))
+            .join(entry_name(&record("overrides", None)));
+        let mut sealed = std::fs::read(&entry).expect("the sealed record");
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0xff;
+        std::fs::write(&entry, sealed).expect("corrupt it");
+        std::fs::remove_file(vaults_path(home).join(ValuesFile::Digest.name(VAULT)))
+            .expect("the values go");
+        crate::companion::forget(VAULT);
+
+        let reviewed = review();
+
+        assert!(reviewed.problems.is_empty(), "{reviewed:?}");
+        assert!(reviewed.repairs().is_empty());
+    });
+}
+
+#[test]
 fn a_directory_or_link_where_the_values_go_never_counts_as_values() {
     let replacements: &[fn(&std::path::Path)] = &[
         |path| std::fs::create_dir(path).expect("a directory there"),

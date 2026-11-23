@@ -978,6 +978,18 @@ impl CompanionBackend for FileCompanion<'_> {
         self.inventory_of(vault_id)
     }
 
+    fn read_overrides_beside_values(&mut self, vault_id: &str) -> Result<Option<Checked>, String> {
+        if !self.has_values(vault_id)? {
+            return Ok(None);
+        }
+        self.read_checked(&CompanionAccount::Record {
+            kind: OVERRIDES_KIND.to_owned(),
+            vault_id: vault_id.to_owned(),
+            part: None,
+        })
+        .map(Some)
+    }
+
     fn read_checked(&mut self, account: &CompanionAccount) -> Result<Checked, String> {
         let Some(folder) = self.folder(account.vault_id())? else {
             return Ok(Checked::Absent);
@@ -1363,6 +1375,7 @@ pub(crate) fn review_companion_data_unlocked(
         Ok(()) => {}
         Err(RecoveryError::Stuck(reason)) => {
             return Ok(CompanionReview::discard(
+                vault_id,
                 Damage::Unfinished(reason).to_string(),
             ));
         }
@@ -1370,14 +1383,17 @@ pub(crate) fn review_companion_data_unlocked(
     }
     let strays = companion.stray_entries(vault_id)?;
     if !strays.is_empty() {
-        return Ok(CompanionReview::discard(format!(
-            "its folder holds files LPM doesn't write: {}",
-            strays
-                .iter()
-                .map(|name| format!("{name:?}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
+        return Ok(CompanionReview::discard(
+            vault_id,
+            format!(
+                "its folder holds files LPM doesn't write: {}",
+                strays
+                    .iter()
+                    .map(|name| format!("{name:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
     }
     // A marker that won't decrypt says nothing about what the project holds,
     // so only discarding everything repairs it. A record that won't decrypt
@@ -1397,7 +1413,7 @@ pub(crate) fn review_companion_data_unlocked(
             Some(Ok(sealed)) => open(&companion.data_key()?, &marker, sealed).err(),
         };
         if let Some(error) = unreadable {
-            return Ok(CompanionReview::discard(error));
+            return Ok(CompanionReview::discard(vault_id, error));
         }
     }
     crate::companion::authorize(&mut companion, vault_id, Operation::Maintenance)?;

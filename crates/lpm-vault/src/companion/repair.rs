@@ -4,16 +4,18 @@
 //! repair runs only against the state the person reviewed.
 
 use super::account::CompanionAccount;
-use super::assessment::{Observed, Repair, assess};
+use super::assessment::{Observed, Repair, assess, judges_overrides_content};
 use super::lifecycle::{FoundMarker, execute, plan_discard};
 use super::marker::Marker;
 use super::overrides::OVERRIDES_KIND;
 use super::{Checked, CompanionBackend};
 
-/// What's damaged in a project's newer data, and how each problem is
-/// repaired, in the order the engine found them.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// What's damaged in one project's newer data, and how each problem is
+/// repaired, in the order the engine found them. A repair runs it only on
+/// the project it reviewed.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompanionReview {
+    vault_id: String,
     pub problems: Vec<CompanionProblem>,
     /// The repairs that set every problem right, as the engine decides them.
     repairs: Vec<CompanionRepair>,
@@ -67,8 +69,9 @@ impl From<Repair> for CompanionRepair {
 impl CompanionReview {
     /// A review of one problem that only discarding the newer data repairs,
     /// such as an interrupted change that can't be finished.
-    pub(crate) fn discard(description: String) -> Self {
+    pub(crate) fn discard(vault_id: &str, description: String) -> Self {
         Self {
+            vault_id: vault_id.to_owned(),
             problems: vec![CompanionProblem {
                 description,
                 repair: Some(CompanionRepair::DiscardProject),
@@ -81,6 +84,11 @@ impl CompanionReview {
     /// is needed, since it removes everything the others would.
     pub fn repairs(&self) -> &[CompanionRepair] {
         &self.repairs
+    }
+
+    /// The project this reviewed.
+    pub(crate) fn vault_id(&self) -> &str {
+        &self.vault_id
     }
 }
 
@@ -98,7 +106,9 @@ fn marker_account(vault_id: &str) -> CompanionAccount {
 /// project's access damaged, if it did, and `unfinished` why its interrupted
 /// step can never be finished, if it can't; its records aren't read then,
 /// since the approval that protects them can't be told, or what they hold
-/// can't be trusted.
+/// can't be trusted. Otherwise the overrides record is read only where the
+/// listing shows it and the engine judges what it holds, and only beside
+/// values.
 pub(crate) fn review(
     backend: &mut impl CompanionBackend,
     vault_id: &str,
@@ -107,15 +117,20 @@ pub(crate) fn review(
 ) -> Result<CompanionReview, String> {
     let marker = backend.read(&marker_account(vault_id))?;
     let inventory = backend.inventory(vault_id)?;
+    let overrides_account = CompanionAccount::Record {
+        kind: OVERRIDES_KIND.to_owned(),
+        vault_id: vault_id.to_owned(),
+        part: None,
+    };
+    let contents_are_judged = unfinished.is_none()
+        && access.is_none()
+        && inventory.contains(&overrides_account)
+        && judges_overrides_content(vault_id, marker.as_deref());
     let mut unreadable_overrides = None;
-    let overrides = match (unfinished, access) {
-        (Some(_), _) | (_, Some(_)) => None,
-        (None, None) => Some(
-            match backend.read_checked(&CompanionAccount::Record {
-                kind: OVERRIDES_KIND.to_owned(),
-                vault_id: vault_id.to_owned(),
-                part: None,
-            })? {
+    let overrides = if contents_are_judged {
+        backend
+            .read_overrides_beside_values(vault_id)?
+            .map(|checked| match checked {
                 Checked::Present(bytes) => Some(bytes),
                 Checked::Absent => None,
                 // Content that won't decrypt won't open as a record either, so
@@ -124,8 +139,9 @@ pub(crate) fn review(
                     unreadable_overrides = Some(reason);
                     Some(zeroize::Zeroizing::new(Vec::new()))
                 }
-            },
-        ),
+            })
+    } else {
+        None
     };
     let history = match (unfinished, marker.as_deref()) {
         (None, Some(bytes)) => history_damage(backend, vault_id, bytes)?,
@@ -157,6 +173,7 @@ pub(crate) fn review(
         _ => damage.to_string(),
     };
     Ok(CompanionReview {
+        vault_id: vault_id.to_owned(),
         problems: assessment
             .every_damage()
             .map(|damage| CompanionProblem {

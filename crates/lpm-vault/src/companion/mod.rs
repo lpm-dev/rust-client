@@ -39,6 +39,11 @@ pub(crate) trait CompanionBackend: LifecycleStore {
             None => Checked::Absent,
         })
     }
+
+    /// `vault_id`'s personal overrides record, read as every reader of it
+    /// reads it, for a damage check; `None` when the project has no values:
+    /// a record left without them is one LPM Vault collects, never reads.
+    fn read_overrides_beside_values(&mut self, vault_id: &str) -> Result<Option<Checked>, String>;
 }
 
 /// A record as a damage check found it. A present record may be a key, so
