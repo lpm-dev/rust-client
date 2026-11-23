@@ -629,9 +629,6 @@ mod api {
         });
     }
 
-    /// A project whose `default` environment was renamed `prod` and given a
-    /// personal override, `large` enough to pass a file journal's payload
-    /// when asked, and the review of the rollback that renames it back.
     // Measured at about 5.3 times the values on the file store: the values
     // read, the target built from them, their JSON and ciphertext, and the
     // journal that carries it.
@@ -651,6 +648,9 @@ mod api {
         });
     }
 
+    /// A project whose `default` environment was renamed `prod` and given a
+    /// personal override, `large` enough to pass a file journal's payload
+    /// when asked, and the review of the rollback that renames it back.
     fn renamed_with_an_override(
         home: &std::path::Path,
         large: bool,
