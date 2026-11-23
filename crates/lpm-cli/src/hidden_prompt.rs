@@ -341,7 +341,8 @@ impl Reading {
                     self.ended = Some(ending);
                 }
             }
-            Some(_) => self.text_left |= event.is_text(),
+            // What a sequence may have taken from typing is more input too.
+            Some(_) => self.text_left |= event.is_text() || matches!(event, Event::Lost),
         }
     }
 }
@@ -591,6 +592,15 @@ mod tests {
         let mut script = Script::new([vec![Event::Pasted(b'x')], Vec::new(), vec![Event::Enter]]);
         script.pasting = true;
         assert_eq!(outcome(&mut script), Err("IncompletePaste".to_owned()));
+    }
+
+    #[test]
+    fn text_a_sequence_may_have_taken_after_enter_counts_as_more_input() {
+        let mut script = Script::new([
+            vec![Event::Typed(b'a'), Event::Enter],
+            vec![Event::Lost, Event::Ignored],
+        ]);
+        assert_eq!(outcome(&mut script), Err("SeveralLines".to_owned()));
     }
 
     #[test]

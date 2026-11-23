@@ -267,8 +267,9 @@ pub(super) fn env_import(
         (imported, Vec::new())
     } else {
         let path = invocation_relative(file)?;
-        let can_wait = std::fs::metadata(&path).map_or(true, |metadata| !metadata.is_file());
-        let checked = can_wait.then(checked_values).transpose()?;
+        let opened = lpm_vault::open_env_file_to_import(&path)
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
+        let checked = opened.can_wait().then(checked_values).transpose()?;
         let source = lpm_vault::history::Source::with_detail(
             lpm_vault::history::Action::Import,
             lpm_vault::history::SourceDetail {
@@ -285,14 +286,14 @@ pub(super) fn env_import(
                 project_dir,
                 checked,
                 resolved_env.as_deref(),
-                &path,
+                opened,
                 overwrite,
                 &source,
             ),
             None => lpm_vault::import_env_file(
                 project_dir,
                 resolved_env.as_deref(),
-                &path,
+                opened,
                 overwrite,
                 &source,
             ),

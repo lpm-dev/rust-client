@@ -189,15 +189,19 @@ impl Bytes {
                     introducer,
                     chord,
                 };
+                // An introducer that came after its escape's read may have
+                // been typed, as what the string held may have been, unless
+                // the string ends as only a terminal ends one.
+                let typed = held || !chord;
                 match (escape, byte) {
                     (_, 0x07) | (true, b'\\') => self.state = State::Ground,
                     (_, 0x1b) => self.state = string(true, held),
                     // CAN and SUB cancel the string, as ECMA-48 has them.
-                    (_, 0x18 | 0x1a) => self.end_string(held, each),
+                    (_, 0x18 | 0x1a) => self.end_string(typed, each),
                     // A string a terminal sends holds no other control, so
                     // one is a key that ends it: Enter or Ctrl+C after Alt+P.
                     (_, 0x00..=0x1f | 0x7f) => {
-                        self.end_string(held, each);
+                        self.end_string(typed, each);
                         self.ground(byte, each);
                     }
                     _ => self.state = string(false, true),
@@ -237,16 +241,16 @@ impl Bytes {
                 self.after_carriage_return = false;
                 each(Event::PasteCut);
             }
-            State::TerminalString { held, .. } => self.end_string(held, each),
+            State::TerminalString { held, chord, .. } => self.end_string(held || !chord, each),
             _ => {}
         }
     }
 
     /// A terminal string ends without its end, which a terminal always
-    /// sends: what it `held` may have been typed, and is lost.
-    fn end_string(&mut self, held: bool, each: &mut dyn FnMut(Event)) {
+    /// sends: what may have been `typed` is lost.
+    fn end_string(&mut self, typed: bool, each: &mut dyn FnMut(Event)) {
         self.state = State::Ground;
-        if held {
+        if typed {
             each(Event::Lost);
         }
     }
@@ -635,6 +639,16 @@ mod tests {
             decoded(&[b"ab", b"\x1b", b"]", b"11;x\x07", b"\r"]),
             "ab<Lost>11;x<Ignored><Enter>",
             "] after the Escape key, or a reply split twice"
+        );
+        assert_eq!(
+            decoded(&[b"ab", b"\x1b", b"]\r"]),
+            "ab<Lost><Enter>",
+            "] after the Escape key, then Enter in the same read"
+        );
+        assert_eq!(
+            decoded(&[b"ab", b"\x1b", b"P\x18"]),
+            "ab<Lost>",
+            "P after the Escape key, then CAN"
         );
         assert_eq!(
             decoded(&[b"a", b"\x1bPb", b"\r"]),

@@ -66,15 +66,72 @@ pub fn read_secret_text_file(
     path: &Path,
     limit: usize,
 ) -> Result<Zeroizing<String>, SecretReadError> {
-    let (file, size) = open_file_or_pipe(path, limit)?;
-    #[cfg(unix)]
-    let reader = WaitingForInput(&file);
-    #[cfg(not(unix))]
-    let reader = &file;
-    into_text(read_wiped(reader, limit, size)?)
+    open_secret_source(path, limit)?.read()
 }
 
-fn open_file_or_pipe(path: &Path, limit: usize) -> Result<(File, usize), SecretReadError> {
+/// A file or pipe to read secrets from, known by what was opened: what the
+/// path names can't change between telling whether reading can wait and the
+/// read.
+pub struct SecretSource {
+    opened: Option<(File, usize)>,
+    pipe: bool,
+    path: std::path::PathBuf,
+    limit: usize,
+}
+
+/// The file or pipe at `path`, ready for [`SecretSource::read`], without
+/// waiting for a pipe's writer. A directory or a device is refused.
+pub fn open_secret_source(path: &Path, limit: usize) -> Result<SecretSource, SecretReadError> {
+    let source = |opened, pipe| SecretSource {
+        opened,
+        pipe,
+        path: path.to_path_buf(),
+        limit,
+    };
+    // A named pipe is opened only to read it: opening one waits for its
+    // writer, which reading may do only once the caller says so.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        if std::fs::metadata(path).is_ok_and(|metadata| metadata.file_type().is_fifo()) {
+            return Ok(source(None, true));
+        }
+    }
+    let (file, size, pipe) = open_file_or_pipe(path, limit)?;
+    // One that became a named pipe once it was looked at was opened without
+    // waiting for a writer, so it reads nothing until opened again.
+    if pipe && cfg!(unix) {
+        return Ok(source(None, true));
+    }
+    Ok(source(Some((file, size)), pipe))
+}
+
+impl SecretSource {
+    /// Whether reading it can wait on whatever writes to it: a pipe.
+    pub fn can_wait(&self) -> bool {
+        self.pipe
+    }
+
+    /// Everything it holds, at most its limit, as UTF-8 text.
+    pub fn read(self) -> Result<Zeroizing<String>, SecretReadError> {
+        let (file, size) = match self.opened {
+            Some(opened) => opened,
+            None => {
+                let (file, size, _) = open_file_or_pipe(&self.path, self.limit)?;
+                (file, size)
+            }
+        };
+        #[cfg(unix)]
+        let reader = WaitingForInput(&file);
+        #[cfg(not(unix))]
+        let reader = &file;
+        into_text(read_wiped(reader, self.limit, size)?)
+    }
+}
+
+/// The file or pipe at `path`, its size when it's a file, and whether it's a
+/// pipe.
+fn open_file_or_pipe(path: &Path, limit: usize) -> Result<(File, usize, bool), SecretReadError> {
     // Windows opens no directory as a file, and says only that access is
     // denied.
     #[cfg(windows)]
@@ -110,7 +167,7 @@ fn open_file_or_pipe(path: &Path, limit: usize) -> Result<(File, usize), SecretR
     #[cfg(windows)]
     match windows_kind(&file) {
         WindowsKind::Disk => {}
-        WindowsKind::Pipe => return Ok((file, 0)),
+        WindowsKind::Pipe => return Ok((file, 0, true)),
         WindowsKind::Other => return Err(SecretReadError::NotFileOrPipe),
     }
     let metadata = file.metadata().map_err(SecretReadError::Io)?;
@@ -122,10 +179,10 @@ fn open_file_or_pipe(path: &Path, limit: usize) -> Result<(File, usize), SecretR
         if size > limit {
             return Err(SecretReadError::TooLarge);
         }
-        return Ok((file, size));
+        return Ok((file, size, false));
     }
     if is_pipe(&file, &metadata) {
-        return Ok((file, 0));
+        return Ok((file, 0, true));
     }
     Err(SecretReadError::NotFileOrPipe)
 }
@@ -522,6 +579,29 @@ mod tests {
             read_secret_text_file(&dir.path().join("missing"), 100),
             Err(SecretReadError::NotFound)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_source_is_read_as_what_was_opened_whatever_its_path_names_since() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("values.env");
+        std::fs::write(&path, "TOKEN=fixture\n").unwrap();
+        let source = open_secret_source(&path, 1024).unwrap();
+        assert!(!source.can_wait(), "a regular file never waits");
+
+        std::fs::remove_file(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is a valid C string naming a path no file is at.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+
+        assert_eq!(source.read().unwrap().as_str(), "TOKEN=fixture\n");
+        assert!(
+            open_secret_source(&path, 1024).unwrap().can_wait(),
+            "a named pipe is told apart without waiting for its writer"
+        );
     }
 
     #[cfg(unix)]
