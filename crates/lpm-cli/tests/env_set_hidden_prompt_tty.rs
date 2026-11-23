@@ -719,9 +719,10 @@ mod tty {
             project.path(),
             lpm_home.path(),
             &["env", "set", "TOKEN"],
-            &[(prompt.as_bytes(), b"fixture-typed\r")],
+            &[(prompt.as_bytes(), b"fixture-b\r")],
             &PtyOptions::default(),
             &mut |answering| {
+                answering.type_keys(b"fixture-a");
                 signal(answering.pid, libc::SIGTSTP);
                 answering.wait_until_stopped();
                 cooked_while_stopped = !answering.echo_is_disabled();
@@ -755,10 +756,11 @@ mod tty {
                 >= 2,
             "bracketed paste goes off for the stop, and again at the end"
         );
-        assert!(!session.transcript.contains("fixture-typed"));
+        assert!(!session.transcript.contains("fixture-"));
         assert_eq!(
             stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
-            Some("fixture-typed")
+            Some("fixture-b"),
+            "the prompt shown again starts the value over"
         );
     }
 
@@ -772,10 +774,10 @@ mod tty {
             project.path(),
             lpm_home.path(),
             &["env", "set", "TOKEN"],
-            &[(prompt.as_bytes(), b"ture\r")],
+            &[(prompt.as_bytes(), b"fixture-b\r")],
             &PtyOptions::default(),
             &mut |answering| {
-                answering.type_keys(b"fix\x1a");
+                answering.type_keys(b"fixture-a\x1a");
                 answering.wait_until_stopped();
                 cooked_while_stopped = !answering.echo_is_disabled();
                 signal(answering.pid, libc::SIGCONT);
@@ -796,8 +798,8 @@ mod tty {
         assert_eq!(session.transcript.matches(prompt).count(), 2);
         assert_eq!(
             stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
-            Some("fixture"),
-            "what was typed before the stop is kept"
+            Some("fixture-b"),
+            "the prompt shown again starts the value over"
         );
     }
 

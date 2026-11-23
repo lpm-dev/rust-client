@@ -2105,9 +2105,11 @@ pub fn parse_env_entries(content: &str) -> Vec<(String, String)> {
 
         if let Some((key, value)) = line.split_once('=') {
             let key = trim_dotenv_blanks(key).to_string();
-            let value = parse_env_value(value.trim_start_matches(is_dotenv_blank), &mut lines);
+            let mut value = parse_env_value(value.trim_start_matches(is_dotenv_blank), &mut lines);
 
-            if !key.is_empty() {
+            if key.is_empty() {
+                zeroize::Zeroize::zeroize(&mut value);
+            } else {
                 entries.push((key, value));
             }
         }
@@ -2759,6 +2761,11 @@ KEY3=no-quotes"#;
                 format!("TOKEN='{MARKER}\n{continued}\n{continued}'\n"),
             ),
             ("a quote inside a value", format!("TOKEN='{MARKER}'s app\n")),
+            (
+                "a quote inside a value that ends unquoted",
+                format!("TOKEN='{MARKER}'tail\n"),
+            ),
+            ("a line with no key", format!("={MARKER}\nTOKEN=kept\n")),
         ] {
             let (mut parsed, found) = watch(|| parse_env_content(&content));
 

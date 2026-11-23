@@ -182,6 +182,16 @@ enum Event {
     /// Ctrl+Z on a Unix terminal: stop the prompt, as a shell stops the job
     /// it runs.
     Suspend,
+    /// The prompt continued after a stop and showed itself again, so the
+    /// value starts over.
+    #[cfg_attr(
+        all(not(unix), not(test)),
+        expect(
+            dead_code,
+            reason = "a Windows console has no stop to start over after"
+        )
+    )]
+    Restart,
     /// A key that edits nothing, such as an arrow.
     Ignored,
 }
@@ -209,6 +219,7 @@ impl fmt::Debug for Event {
             Self::Interrupt => "Interrupt",
             Self::EndOfFile => "EndOfFile",
             Self::Suspend => "Suspend",
+            Self::Restart => "Restart",
             Self::Ignored => "Ignored",
         })
     }
@@ -299,6 +310,12 @@ impl HiddenLine {
             Event::Backspace => self.erase_character(),
             Event::EraseWord => self.erase_word(),
             Event::ClearLine => self.bytes.clear(),
+            Event::Restart => {
+                self.bytes.zeroize();
+                self.overflowed = false;
+                self.cut = false;
+                self.lost = false;
+            }
             Event::Interrupt => return Step::End(Ending::Cancel),
             Event::EndOfFile if self.bytes.is_empty() => return Step::End(Ending::Cancel),
             Event::PasteEnded | Event::EndOfFile | Event::Suspend | Event::Ignored => {}
@@ -609,6 +626,29 @@ mod tests {
 
         assert_eq!(outcome(&mut script).as_deref(), Ok("fixture"));
         assert_eq!(script.suspended_after, [5]);
+    }
+
+    #[test]
+    fn a_prompt_that_continued_after_a_stop_starts_the_value_over() {
+        let mut script = Script::new([
+            typed("fixture-a").collect(),
+            vec![Event::Restart],
+            typed("fixture-b").chain([Event::Enter]).collect(),
+        ]);
+
+        assert_eq!(outcome(&mut script).as_deref(), Ok("fixture-b"));
+    }
+
+    #[test]
+    fn a_restart_forgets_a_paste_cut_or_text_lost_before_it() {
+        let (step, text) = line(
+            [Event::PasteCut, Event::Lost, Event::Restart]
+                .into_iter()
+                .chain(typed("ok"))
+                .chain([Event::Enter]),
+            100,
+        );
+        assert_eq!((step, text.as_str()), (Step::End(Ending::Submit), "ok"));
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! paste.
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
@@ -269,34 +270,51 @@ impl ControlEvents {
         mode: CONSOLE_MODE,
         enter: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<Self> {
+        // The console holds its own lock while it calls the routine, which
+        // waits for `HELD_CONSOLE`, so the routine is added and removed only
+        // while `HELD_CONSOLE` isn't held.
+        let registered = REGISTERED
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+            // SAFETY: the handler is a valid routine for the process's
+            // lifetime.
+            && (unsafe { SetConsoleCtrlHandler(Some(put_back_console), TRUE) } != 0
+                || {
+                    REGISTERED.store(false, Ordering::SeqCst);
+                    false
+                });
         let mut held = HELD_CONSOLE.lock().unwrap_or_else(PoisonError::into_inner);
-        // SAFETY: the handler is a valid routine for the process's lifetime.
-        let registered =
-            held.is_none() && unsafe { SetConsoleCtrlHandler(Some(put_back_console), TRUE) } != 0;
-        if let Err(error) = enter() {
-            // A control event the console dispatches meanwhile waits for
-            // this lock while the console holds its own, which removing the
-            // routine waits for.
-            drop(held);
+        let entered = enter();
+        if entered.is_ok() && registered {
+            *held = Some(HeldConsole { input, mode });
+        }
+        drop(held);
+        if let Err(error) = entered {
             if registered {
-                // SAFETY: removing the routine added above.
-                unsafe { SetConsoleCtrlHandler(Some(put_back_console), FALSE) };
+                unregister();
             }
             return Err(error);
         }
-        if registered {
-            *held = Some(HeldConsole { input, mode });
-        }
         Ok(Self { held: registered })
     }
+}
+
+/// Whether [`put_back_console`] is the console's routine, added by the one
+/// prompt that holds it.
+static REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Removes [`put_back_console`], with `HELD_CONSOLE` released.
+fn unregister() {
+    // SAFETY: removing the routine a prompt added.
+    unsafe { SetConsoleCtrlHandler(Some(put_back_console), FALSE) };
+    REGISTERED.store(false, Ordering::SeqCst);
 }
 
 impl Drop for ControlEvents {
     fn drop(&mut self) {
         if self.held {
             *HELD_CONSOLE.lock().unwrap_or_else(PoisonError::into_inner) = None;
-            // SAFETY: removing the routine added above.
-            unsafe { SetConsoleCtrlHandler(Some(put_back_console), FALSE) };
+            unregister();
         }
     }
 }
