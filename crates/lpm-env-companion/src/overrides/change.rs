@@ -519,13 +519,6 @@ pub(super) fn plan_change_with_case_policy(
     };
     budgets::check_project(project.iter().chain(std::iter::once(&account)))
         .map_err(PlanError::OverBudget)?;
-    let over_admission_target = match budgets::admit(*service_records, 1) {
-        Admission::Admitted => false,
-        Admission::OverTarget => true,
-        Admission::Refused => {
-            return Err(PlanError::AdmissionRefused(*service_records));
-        }
-    };
     let mut marker = gate
         .marker()
         .cloned()
@@ -537,6 +530,13 @@ pub(super) fn plan_change_with_case_policy(
             marker.features.len() + 1,
         )));
     }
+    let over_admission_target = match budgets::admit(*service_records, 1) {
+        Admission::Admitted => false,
+        Admission::OverTarget => true,
+        Admission::Refused => {
+            return Err(PlanError::AdmissionRefused(*service_records));
+        }
+    };
     marker
         .features
         .insert(OVERRIDES_KIND.to_owned(), feature_entry());

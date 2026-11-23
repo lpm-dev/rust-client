@@ -1216,6 +1216,39 @@ fn the_first_override_beside_a_full_marker_is_over_budget_not_damage() {
 }
 
 #[test]
+fn a_full_marker_is_refused_before_a_service_at_its_admission_cap() {
+    let mut marker = Marker::empty(VAULT, ProjectState::Active);
+    for index in 0..crate::marker::MAX_FEATURES {
+        let kind = format!("future-{index}");
+        marker.features.insert(
+            kind.clone(),
+            FeatureEntry {
+                version: 1,
+                if_unsupported: Level::Ignore,
+                kinds: vec![kind],
+                state: FeatureState::Active,
+            },
+        );
+    }
+    let at_cap = Inventory {
+        project: Vec::new(),
+        service_records: Some(budgets::ADMISSION_CAP),
+    };
+
+    assert_eq!(
+        plan(
+            &ProjectGate::Marked(marker),
+            None,
+            vec![set("development", "A", "1")],
+            Some(&at_cap),
+        )
+        .unwrap_err(),
+        PlanError::OverBudget(OverBudget::Features(crate::marker::MAX_FEATURES + 1)),
+        "the budget before admission, as the FFI documents"
+    );
+}
+
+#[test]
 fn a_project_without_values_removes_nothing_and_refuses_the_rest() {
     let removed = plan_without_values(&ProjectGate::Plain, &[remove("development", "A")])
         .expect("a removal of nothing succeeds");
