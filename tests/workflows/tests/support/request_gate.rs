@@ -33,12 +33,14 @@ pub const QUIET_PERIOD: Duration = Duration::from_millis(250);
 /// timeout, which each byte starts again.
 const STALL_TRICKLE: Duration = Duration::from_secs(1);
 
-type Picks = dyn Fn(&Parts) -> bool + Send + Sync;
+/// What the gate does with a request: hold it, stall it, or, for `None`,
+/// pass it straight through.
+type Picks = dyn Fn(&Parts) -> Option<Picked> + Send + Sync;
 type Body = BoxBody<Bytes, Infallible>;
 
 /// What the gate does with a request its test picks.
 #[derive(Clone, Copy)]
-enum Picked {
+pub enum Picked {
     /// Hold it until the test lets it through.
     Hold,
     /// Answer it at once and never finish its body, a byte at a time so the
@@ -98,7 +100,6 @@ impl HeldRequest {
 struct Front {
     upstream: String,
     picks: Box<Picks>,
-    picked: Picked,
     events: mpsc::UnboundedSender<Event>,
     counts: Arc<Counts>,
     client: reqwest::Client,
@@ -150,7 +151,9 @@ impl RequestGate {
     /// Starts a front for the mock server at `upstream` that holds every
     /// request `holds` picks and passes the others straight through.
     pub fn start(upstream: &str, holds: impl Fn(&Parts) -> bool + Send + Sync + 'static) -> Self {
-        Self::launch(upstream, Box::new(holds), Picked::Hold)
+        Self::choosing(upstream, move |request| {
+            holds(request).then_some(Picked::Hold)
+        })
     }
 
     /// Starts a front for the mock server at `upstream` that stalls every
@@ -159,10 +162,18 @@ impl RequestGate {
         upstream: &str,
         stalls: impl Fn(&Parts) -> bool + Send + Sync + 'static,
     ) -> Self {
-        Self::launch(upstream, Box::new(stalls), Picked::Stall)
+        Self::choosing(upstream, move |request| {
+            stalls(request).then_some(Picked::Stall)
+        })
     }
 
-    fn launch(upstream: &str, picks: Box<Picks>, picked: Picked) -> Self {
+    /// Starts a front for the mock server at `upstream` that does with each
+    /// request what `picks` chooses, and passes the others straight through.
+    pub fn choosing(
+        upstream: &str,
+        picks: impl Fn(&Parts) -> Option<Picked> + Send + Sync + 'static,
+    ) -> Self {
+        let picks: Box<Picks> = Box::new(picks);
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind the request gate listener");
         listener
@@ -177,7 +188,6 @@ impl RequestGate {
         let front = Arc::new(Front {
             upstream: upstream.trim_end_matches('/').to_owned(),
             picks,
-            picked,
             events: events_sender,
             counts: Arc::clone(&counts),
             client: reqwest::Client::builder()
@@ -248,6 +258,22 @@ impl RequestGate {
     /// The most held requests that were in flight at once.
     pub fn peak(&self) -> usize {
         self.counts.peak.load(Ordering::SeqCst)
+    }
+
+    /// Wait until the gate has held or stalled `count` requests, at most
+    /// [`WAIT_LIMIT`].
+    pub async fn wait_until_held(&self, count: usize) {
+        let waited = tokio::time::timeout(WAIT_LIMIT, async {
+            while self.held() < count {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            waited.is_ok(),
+            "only {} of {count} requests were held or stalled within {WAIT_LIMIT:?}",
+            self.held()
+        );
     }
 
     /// The next request the gate holds, in the order they arrived.
@@ -343,10 +369,12 @@ impl Front {
         let Ok(body) = body.collect().await.map(|body| body.to_bytes()) else {
             return status_only(StatusCode::BAD_REQUEST);
         };
-        if self.counts.stopped_holding.load(Ordering::SeqCst) || !(self.picks)(&parts) {
+        let picked = (self.picks)(&parts);
+        let Some(picked) = picked.filter(|_| !self.counts.stopped_holding.load(Ordering::SeqCst))
+        else {
             return self.forward(&parts, body).await;
-        }
-        if let Picked::Stall = self.picked {
+        };
+        if let Picked::Stall = picked {
             self.counts.held.fetch_add(1, Ordering::SeqCst);
             return stalled();
         }
@@ -460,9 +488,13 @@ pub async fn run_while(command: std::process::Command, drive: impl Future<Output
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // A group of its own, so stopping it stops what it started too, which
+    // can hold its output open.
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child = command.spawn().expect("spawn lpm");
-    let stdout = read_to_end(child.stdout.take().expect("piped stdout"));
-    let stderr = read_to_end(child.stderr.take().expect("piped stderr"));
+    let stdout = Captured::read(child.stdout.take().expect("piped stdout"));
+    let stderr = Captured::read(child.stderr.take().expect("piped stderr"));
     let driven = std::panic::AssertUnwindSafe(drive).catch_unwind();
     tokio::pin!(driven);
     let early = tokio::select! {
@@ -484,37 +516,71 @@ pub async fn run_while(command: std::process::Command, drive: impl Future<Output
             .map(|status| status.expect("wait for lpm")),
     };
     if status.is_err() {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+        stop(&mut child).await;
     }
-    let output = Output {
-        status: match &status {
-            Ok(status) => *status,
-            Err(_) => child.wait().await.expect("wait for lpm"),
+    let (stdout, stderr) = (stdout.finish().await, stderr.finish().await);
+    match status {
+        Ok(status) => Output {
+            status,
+            stdout,
+            stderr,
         },
-        stdout: stdout.await.expect("read lpm's stdout"),
-        stderr: stderr.await.expect("read lpm's stderr"),
-    };
-    if let Err(reason) = status {
-        panic!(
+        Err(reason) => panic!(
             "{reason}\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr),
+        ),
     }
-    output
 }
 
-/// Everything `pipe` gives until it closes, read alongside the command.
-fn read_to_end(
-    mut pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
-) -> tokio::task::JoinHandle<Vec<u8>> {
-    tokio::spawn(async move {
-        use tokio::io::AsyncReadExt as _;
-        let mut bytes = Vec::new();
-        let _ = pipe.read_to_end(&mut bytes).await;
-        bytes
-    })
+/// Stop `child`, and on Unix everything in its group, then wait for it, at
+/// most [`WAIT_LIMIT`].
+async fn stop(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(group) = child.id().and_then(|id| libc::pid_t::try_from(id).ok()) {
+        // SAFETY: killpg takes a process group ID and a signal, and touches
+        // no memory of this process.
+        unsafe {
+            libc::killpg(group, libc::SIGKILL);
+        }
+    }
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(WAIT_LIMIT, child.wait()).await;
+}
+
+/// What a command writes to a pipe, read alongside it.
+struct Captured {
+    bytes: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    reading: tokio::task::JoinHandle<()>,
+}
+
+impl Captured {
+    fn read(mut pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static) -> Self {
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let read = std::sync::Arc::clone(&bytes);
+        let reading = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+            let mut chunk = [0_u8; 8192];
+            while let Ok(count @ 1..) = pipe.read(&mut chunk).await {
+                read.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(&chunk[..count]);
+            }
+        });
+        Self { bytes, reading }
+    }
+
+    /// Everything read once the pipe closes, or what was read by
+    /// [`WAIT_LIMIT`], as a process the command started can hold it open.
+    async fn finish(self) -> Vec<u8> {
+        let _ = tokio::time::timeout(WAIT_LIMIT, self.reading).await;
+        std::mem::take(
+            &mut self
+                .bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
 }
 
 fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {

@@ -5,7 +5,7 @@ use support::assertions::{assert_fault_injection_aborted, parse_json_output};
 use support::mock_registry::{
     MockRegistry, lpm_published_tarball, make_tarball, mount_tarball_uploads,
 };
-use support::request_gate::{HeldRequest, RequestGate, query_value, run_while};
+use support::request_gate::{HeldRequest, Picked, RequestGate, query_value, run_while};
 use support::{
     LOCK_CONTENTION_MARKER_ENV, TempProject, lpm, lpm_spawnable, lpm_spawnable_with_registry,
     lpm_with_registry, wait_for_lock_contention,
@@ -1143,52 +1143,40 @@ async fn release_publish_preflight_refills_slots_behind_a_slow_first_request() {
 
 #[tokio::test]
 async fn release_publish_preflight_stops_the_delayed_tail_after_the_first_error() {
-    let project = TempProject::empty(
-        r#"{"name":"root","private":true,"version":"0.0.0","workspaces":["packages/*"]}"#,
-    );
-    for index in 0..12 {
-        project.write_file(
-            &format!("packages/package-{index}/package.json"),
-            &format!(r#"{{"name":"@lpm.dev/acme.package-{index}","version":"1.0.0"}}"#),
-        );
-    }
+    let project = release_of_twelve();
     let server = MockServer::start().await;
-    let (answered, mut first_answered) = tokio::sync::mpsc::unbounded_channel();
     // The first package's preflight answers without saying whether the
     // version exists, which fails it.
     Mock::given(method("GET"))
         .and(path(PUBLISH_PREFLIGHT_PATH))
         .and(query_param("name", "@lpm.dev/acme.package-0"))
-        .respond_with(move |_: &Request| {
-            let _ = answered.send(());
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "success": true,
-                "name": "@lpm.dev/acme.package-0",
-                "version": "1.0.0"
-            }))
-        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "name": "@lpm.dev/acme.package-0",
+            "version": "1.0.0"
+        })))
         .expect(1)
         .mount(&server)
         .await;
-    let gate = RequestGate::stalling(&server.uri(), |request| {
-        request.uri.path() == PUBLISH_PREFLIGHT_PATH
-            && query_value(request, "name").as_deref() != Some("@lpm.dev/acme.package-0")
+    let mut gate = RequestGate::choosing(&server.uri(), |request| {
+        (request.uri.path() == PUBLISH_PREFLIGHT_PATH).then(|| {
+            if query_value(request, "name").as_deref() == Some("@lpm.dev/acme.package-0") {
+                Picked::Hold
+            } else {
+                Picked::Stall
+            }
+        })
     });
 
-    let mut command = lpm_spawnable_with_registry(&project, gate.url());
-    command.args([
-        "release",
-        "publish",
-        "--all",
-        "--lpm",
-        "--dry-run",
-        "--json",
-    ]);
-    let output = run_while(command, async {
-        tokio::time::timeout(support::request_gate::WAIT_LIMIT, first_answered.recv())
-            .await
-            .expect("the first package's preflight, which starts the first window, never started")
-            .expect("the mock answered");
+    let output = run_while(release_publish(&project, gate.url()), async {
+        let first = gate.next().await;
+        assert!(
+            first.target().contains("package-0"),
+            "the first package's preflight starts the first window: {}",
+            first.target()
+        );
+        gate.wait_until_held(4).await;
+        first.release();
     })
     .await;
 
@@ -1205,11 +1193,99 @@ async fn release_publish_preflight_stops_the_delayed_tail_after_the_first_error(
                 && error.contains("packageExists")),
         "the release failed for the first package's answer: {envelope:#}"
     );
-    assert!(
-        gate.held() <= 3,
-        "release preflight started {} requests beyond the first package's in its first window",
-        gate.held()
+    assert_eq!(
+        gate.held(),
+        4,
+        "the three stalled preflights of the first window were stopped, and none after them started"
     );
+}
+
+#[tokio::test]
+async fn release_publish_preflight_starts_none_after_a_failure_while_an_earlier_one_runs() {
+    let project = release_of_twelve();
+    let server = MockServer::start().await;
+    let (failed, mut failure_answered) = tokio::sync::mpsc::unbounded_channel();
+    Mock::given(method("GET"))
+        .and(path(PUBLISH_PREFLIGHT_PATH))
+        .and(query_param("name", "@lpm.dev/acme.package-1"))
+        .respond_with(move |_: &Request| {
+            let _ = failed.send(());
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "name": "@lpm.dev/acme.package-1",
+                "version": "1.0.0"
+            }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(PUBLISH_PREFLIGHT_PATH))
+        .respond_with(preflight_for_a_new_version)
+        .mount(&server)
+        .await;
+    let mut gate = RequestGate::start(&server.uri(), |request| {
+        request.uri.path() == PUBLISH_PREFLIGHT_PATH
+            && query_value(request, "name").as_deref() != Some("@lpm.dev/acme.package-1")
+    });
+
+    let output = run_while(release_publish(&project, gate.url()), async {
+        let held = [gate.next().await, gate.next().await, gate.next().await];
+        assert!(
+            held.iter()
+                .any(|request| request.target().contains("package-0")),
+            "the first package's preflight, before the failing one, still runs"
+        );
+        tokio::time::timeout(support::request_gate::WAIT_LIMIT, failure_answered.recv())
+            .await
+            .expect("the second package's preflight never started")
+            .expect("the mock answered");
+        gate.assert_quiet(
+            "a preflight started in the slot of one that failed, after an earlier one",
+        )
+        .await;
+        held.into_iter().for_each(HeldRequest::release);
+    })
+    .await;
+
+    assert!(!output.status.success());
+    let envelope = parse_json_output(&output.stdout);
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("packageExists")),
+        "the release failed for the second package's answer: {envelope:#}"
+    );
+    gate.assert_held(3);
+}
+
+/// A workspace of twelve packages to release.
+fn release_of_twelve() -> TempProject {
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"version":"0.0.0","workspaces":["packages/*"]}"#,
+    );
+    for index in 0..12 {
+        project.write_file(
+            &format!("packages/package-{index}/package.json"),
+            &format!(r#"{{"name":"@lpm.dev/acme.package-{index}","version":"1.0.0"}}"#),
+        );
+    }
+    project
+}
+
+/// `lpm release publish` of every package to lpm.dev, a dry run, through
+/// `registry`.
+fn release_publish(project: &TempProject, registry: &str) -> std::process::Command {
+    let mut command = lpm_spawnable_with_registry(project, registry);
+    command.args([
+        "release",
+        "publish",
+        "--all",
+        "--lpm",
+        "--dry-run",
+        "--json",
+    ]);
+    command
 }
 
 #[tokio::test]

@@ -150,14 +150,63 @@ async fn a_command_that_exits_while_its_requests_are_awaited_shows_its_output() 
     .await;
 }
 
+/// Run `command` with a step that fails once `ready` exists, and what
+/// `run_while` panicked with.
+#[cfg(unix)]
+async fn failing_step(command: std::process::Command, ready: Option<&std::path::Path>) -> String {
+    use futures_util::FutureExt as _;
+    let failed = std::panic::AssertUnwindSafe(support::request_gate::run_while(command, async {
+        if let Some(ready) = ready {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        panic!("the drive's own reason");
+    }))
+    .catch_unwind()
+    .await
+    .expect_err("the step failed");
+    failed.downcast_ref::<String>().cloned().expect("a message")
+}
+
 #[cfg(unix)]
 #[tokio::test]
-#[should_panic(expected = "the test failed: the drive's own reason")]
 async fn a_failed_step_says_why_and_stops_the_command() {
+    let folder = tempfile::tempdir().expect("folder");
+    let finished = folder.path().join("finished");
     let mut command = std::process::Command::new("sh");
-    command.args(["-c", "sleep 60"]);
-    support::request_gate::run_while(command, async {
-        panic!("the drive's own reason");
-    })
-    .await;
+    command
+        .args(["-c", "sleep 2 && touch \"$0\""])
+        .arg(&finished);
+    let started = std::time::Instant::now();
+
+    let message = failing_step(command, None).await;
+
+    assert!(
+        message.contains("the test failed: the drive's own reason"),
+        "{message}"
+    );
+    // Long enough for the command to have finished, had it not been stopped.
+    tokio::time::sleep(Duration::from_secs(3).saturating_sub(started.elapsed())).await;
+    assert!(!finished.exists(), "the command ran on");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_step_ends_though_something_the_command_started_holds_its_output() {
+    let folder = tempfile::tempdir().expect("folder");
+    let holding = folder.path().join("holding");
+    let mut command = std::process::Command::new("sh");
+    command
+        .args(["-c", "echo started; sleep 600 & touch \"$0\"; wait"])
+        .arg(&holding);
+
+    let message = tokio::time::timeout(
+        support::request_gate::WAIT_LIMIT / 2,
+        failing_step(command, Some(&holding)),
+    )
+    .await
+    .expect("the failure is said without waiting for the sleep");
+
+    assert!(message.contains("stdout: started"), "{message}");
 }
