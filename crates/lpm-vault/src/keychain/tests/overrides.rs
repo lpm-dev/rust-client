@@ -190,6 +190,38 @@ fn an_override_change_interrupted_after_its_journal_is_finished_by_the_next_oper
 }
 
 #[test]
+fn a_committed_override_change_is_replayed_only_by_an_lpm_that_can_report_it() {
+    let mut storage = storage_with_values();
+    change(&mut storage, &[set("FIRST", "1")]).expect("set");
+    let record = storage
+        .values
+        .get(&overrides_account())
+        .expect("the record")
+        .replace(r#""FIRST":"1""#, r#""FIRST":"1","INTERRUPTED":"2""#);
+    super::companion::committed_journal(
+        &mut storage,
+        &[(overrides_account().as_str(), Some(record.as_bytes()))],
+    );
+    let root = tempfile::tempdir().expect("temporary folder");
+    let not_a_marker = root.path().join("not-a-marker");
+    std::fs::write(&not_a_marker, "").expect("a file where a marker would be");
+
+    let refused =
+        crate::override_marker::reporting_to(vec![not_a_marker], || read_all(&mut storage))
+            .expect_err("the replay couldn't be reported");
+
+    assert!(crate::override_marker::describes(&refused), "{refused}");
+    assert!(
+        storage.values.contains_key(TRANSACTION_MARKER_ACCOUNT),
+        "the journal waits for an lpm that can report it"
+    );
+    assert_eq!(
+        read_all(&mut storage).expect("read")["default"].set["INTERRUPTED"],
+        "2"
+    );
+}
+
+#[test]
 fn a_damaged_record_refuses_changes_and_writes_nothing() {
     let mut storage = storage_with_values();
     change(&mut storage, &[set("API_URL", "mine")]).expect("set");

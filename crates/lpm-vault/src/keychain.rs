@@ -912,6 +912,21 @@ fn recover_project_transaction(
             Ok(TransactionRecovery::DiscardedPreparing)
         }
         TransactionState::Committed => {
+            let mut changed: Vec<String> = Vec::new();
+            for account in journal
+                .operations
+                .iter()
+                .filter_map(|operation| CompanionAccount::parse(&operation.target_account))
+                .filter(crate::companion::changes_overrides)
+            {
+                if !changed
+                    .iter()
+                    .any(|vault_id| vault_id == account.vault_id())
+                {
+                    crate::companion::report_replayed_change(account.vault_id())?;
+                    changed.push(account.vault_id().to_owned());
+                }
+            }
             roll_forward_persisted_project_transaction(storage, &journal)?;
             Ok(TransactionRecovery::RolledForwardCommitted)
         }

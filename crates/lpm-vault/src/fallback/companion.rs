@@ -470,6 +470,15 @@ impl<'directory> FileCompanion<'directory> {
             .vaults
             .open_existing_directory(&stage_folder_name(vault_id))?;
         self.check_journal_invariants(vault_id, &journal, stage.as_ref())?;
+        if journal.operations.iter().any(|operation| {
+            matches!(
+                operation.physical(vault_id),
+                Ok(PhysicalTarget::Companion { account, .. })
+                    if crate::companion::changes_overrides(&account)
+            )
+        }) {
+            crate::companion::report_replayed_change(vault_id).map_err(RecoveryError::Failed)?;
+        }
         self.replay(vault_id, &journal, stage.as_ref(), Replay::Recovery)?;
         drop(stage);
         Ok(self.finish(vault_id)?)

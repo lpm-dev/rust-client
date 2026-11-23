@@ -1016,6 +1016,31 @@ fn an_override_change_interrupted_at_any_step_is_finished_by_the_next_operation(
 }
 
 #[test]
+fn a_committed_override_change_is_replayed_only_by_an_lpm_that_can_report_it() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        CRASH_AFTER_CHANGES.with(|crash| crash.set(Some(1)));
+        change_overrides(&[set_override("API_URL", "mine")]).expect_err("the simulated crash");
+        let not_a_marker = home.join("not-a-marker");
+        std::fs::write(&not_a_marker, "").expect("a file where a marker would be");
+
+        let refused = crate::override_marker::reporting_to(vec![not_a_marker], read_overrides)
+            .expect_err("the replay couldn't be reported");
+
+        assert!(crate::override_marker::describes(&refused), "{refused}");
+        assert!(
+            journal_path(home, VAULT).exists(),
+            "the journal waits for an lpm that can report it"
+        );
+        assert_eq!(
+            read_overrides().expect("the next operation recovers")["default"].set["API_URL"],
+            "mine"
+        );
+    });
+}
+
+#[test]
 fn a_journal_whose_folder_sync_failed_is_finished_before_the_next_read_in_the_same_lock() {
     with_temp_vault_home(|home| {
         force_file_vault();

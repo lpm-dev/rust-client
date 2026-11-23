@@ -244,6 +244,24 @@ fn resume_notice(marker: &Marker) -> Option<String> {
     })
 }
 
+/// Whether a change to `account` can change what its project's personal
+/// overrides are: the overrides record, or the feature marker that says
+/// whether they apply.
+pub(crate) fn changes_overrides(account: &CompanionAccount) -> bool {
+    match account {
+        CompanionAccount::Marker { .. } => true,
+        CompanionAccount::Record { kind, .. } => kind == overrides::OVERRIDES_KIND,
+        _ => false,
+    }
+}
+
+/// Tell every `lpm` above this one that a journal an earlier run committed
+/// changes `vault_id`'s overrides, before it's replayed: one that can't be
+/// told leaves the journal for one that can.
+pub(crate) fn report_replayed_change(vault_id: &str) -> Result<(), String> {
+    crate::override_marker::report_access(crate::override_marker::Access::Change { vault_id })
+}
+
 /// [`open_project`], then the operation matrix.
 pub(crate) fn authorize(
     backend: &mut impl CompanionBackend,
