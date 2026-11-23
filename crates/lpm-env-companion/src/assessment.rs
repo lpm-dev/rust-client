@@ -89,6 +89,33 @@ pub fn judges_overrides_content(vault_id: &str, marker: Option<&[u8]>) -> bool {
     judges_overrides(&gate_of(vault_id, marker))
 }
 
+/// Whether a client reads `vault_id`'s overrides record for an assessment:
+/// only where [`judges_overrides`] holds under `gate`, the names-only
+/// listing `inventory` shows the record, and nothing makes what it holds, or
+/// the approval that protects it, untrustworthy: no `access` damage and no
+/// step that can't be finished (`unfinished`). A record left without values
+/// isn't read either, which the client tells itself.
+pub fn reads_overrides_record(
+    vault_id: &str,
+    gate: &ProjectGate,
+    inventory: Option<&[CompanionAccount]>,
+    access: Option<&str>,
+    unfinished: Option<&str>,
+) -> bool {
+    access.is_none()
+        && unfinished.is_none()
+        && inventory.is_some_and(|inventory| {
+            inventory.iter().any(|account| {
+                matches!(
+                    account,
+                    CompanionAccount::Record { kind, vault_id: owner, part: None }
+                        if kind == overrides::OVERRIDES_KIND && owner == vault_id
+                )
+            })
+        })
+        && judges_overrides(gate)
+}
+
 pub fn assess(vault_id: &str, observed: Observed<'_>) -> Assessment {
     assess_gate(vault_id, gate_of(vault_id, observed.marker), observed)
 }
@@ -167,7 +194,11 @@ pub fn assess_gate(vault_id: &str, gate: ProjectGate, observed: Observed<'_>) ->
             .marker()
             .and_then(|marker| marker.feature(overrides::OVERRIDES_KIND))
             .is_none_or(|entry| OVERRIDES.supported_versions.contains(&entry.version));
+        // A record read despite damaged access or a step that can't be
+        // finished says nothing that can be trusted.
         if overrides_are_supported
+            && observed.access.is_none()
+            && observed.unfinished.is_none()
             && let Some(record) = observed.overrides
             && let Err(damaged) = overrides::evaluate_all(&gate, vault_id, record)
         {
@@ -184,11 +215,6 @@ pub fn assess_gate(vault_id: &str, gate: ProjectGate, observed: Observed<'_>) ->
 }
 
 impl Assessment {
-    /// [`judges_overrides`] under this assessment's gate.
-    pub fn judges_overrides(&self) -> bool {
-        judges_overrides(&self.gate)
-    }
-
     /// Whether an interrupted lifecycle step must be finished before
     /// anything but maintenance runs.
     pub fn needs_resume(&self) -> bool {
@@ -381,6 +407,81 @@ mod tests {
                 unread,
                 assessed(marker, RECORD),
                 "{case}: the listing alone tells as much"
+            );
+        }
+    }
+
+    #[test]
+    fn the_overrides_record_is_read_only_where_the_listing_shows_it_and_nothing_makes_it_untrustworthy()
+     {
+        let judged = gate_of("proj", Some(OVERRIDES_MARKER));
+        let listed = [record("overrides", None)];
+        let other = [CompanionAccount::Record {
+            kind: "overrides".to_owned(),
+            vault_id: "other".to_owned(),
+            part: None,
+        }];
+
+        assert!(reads_overrides_record(
+            "proj",
+            &judged,
+            Some(&listed),
+            None,
+            None
+        ));
+        for (case, inventory, access, unfinished) in [
+            ("no listing", None, None, None),
+            ("not listed", Some(&[][..]), None, None),
+            ("another project's record", Some(&other[..]), None, None),
+            (
+                "damaged access",
+                Some(&listed[..]),
+                Some("contradictory"),
+                None,
+            ),
+            (
+                "a step that can't be finished",
+                Some(&listed[..]),
+                None,
+                Some("stuck"),
+            ),
+        ] {
+            assert!(
+                !reads_overrides_record("proj", &judged, inventory, access, unfinished),
+                "{case}"
+            );
+        }
+        assert!(!reads_overrides_record(
+            "proj",
+            &ProjectGate::Plain,
+            Some(&listed),
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn a_record_handed_over_with_damaged_access_or_an_unfinished_step_is_never_judged() {
+        let inventory = [record("overrides", None)];
+        for (access, unfinished) in [(Some("contradictory"), None), (None, Some("stuck"))] {
+            let assessment = assess(
+                "proj",
+                Observed {
+                    marker: Some(OVERRIDES_MARKER),
+                    inventory: Some(&inventory),
+                    overrides: Some(Some(b"not a record")),
+                    access,
+                    unfinished,
+                    history: &[],
+                },
+            );
+
+            assert!(
+                !assessment
+                    .every_damage()
+                    .any(|damage| matches!(damage, Damage::InvalidRecord { .. })),
+                "{:?}",
+                assessment.damage
             );
         }
     }

@@ -4,7 +4,7 @@
 //! repair runs only against the state the person reviewed.
 
 use super::account::CompanionAccount;
-use super::assessment::{Observed, Repair, assess_gate, gate_of, judges_overrides};
+use super::assessment::{Observed, Repair, assess_gate, gate_of, reads_overrides_record};
 use super::lifecycle::{FoundMarker, execute, plan_discard};
 use super::marker::Marker;
 use super::overrides::OVERRIDES_KIND;
@@ -117,16 +117,9 @@ pub(crate) fn review(
 ) -> Result<CompanionReview, String> {
     let marker = backend.read(&marker_account(vault_id))?;
     let inventory = backend.inventory(vault_id)?;
-    let overrides_account = CompanionAccount::Record {
-        kind: OVERRIDES_KIND.to_owned(),
-        vault_id: vault_id.to_owned(),
-        part: None,
-    };
     let gate = gate_of(vault_id, marker.as_deref());
-    let contents_are_judged = unfinished.is_none()
-        && access.is_none()
-        && inventory.contains(&overrides_account)
-        && judges_overrides(&gate);
+    let contents_are_judged =
+        reads_overrides_record(vault_id, &gate, Some(&inventory), access, unfinished);
     let mut unreadable_overrides = None;
     let overrides = if contents_are_judged {
         backend

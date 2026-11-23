@@ -220,30 +220,67 @@ fn every_marker_fixture_assesses_with_its_recorded_level() {
 }
 
 #[test]
-fn the_assessment_says_whether_the_overrides_record_s_contents_count() {
+fn the_assessment_says_when_to_read_the_overrides_record() {
     let newer = OVERRIDES_MARKER.replace(r#""version":1"#, r#""version":2"#);
     let removing = OVERRIDES_MARKER.replace(r#""state":"active"}"#, r#""state":"removing"}"#);
-    for (case, marker, judged) in [
+    let listed = json!([record_name("overrides", None)]);
+    let read = |marker: Option<&str>, extra: Value| {
+        let mut input = json!({
+            "vaultId": "proj",
+            "marker": marker.map(|marker| base64(marker.as_bytes())),
+            "inventory": listed,
+            "hasValues": true,
+        });
+        for (key, value) in extra.as_object().expect("an object") {
+            input[key] = value.clone();
+        }
+        let (status, output) = call(lpm_env_companion_assess, &input);
+        assert_eq!(status, 0);
+        output["readsOverrides"].clone()
+    };
+
+    assert_eq!(read(Some(OVERRIDES_MARKER), json!({})), true);
+    for (case, marker, extra) in [
+        ("no marker", None, json!({})),
+        ("an invalid marker", Some("not a marker"), json!({})),
+        ("a newer overrides feature", Some(newer.as_str()), json!({})),
         (
-            "an active overrides feature",
-            Some(OVERRIDES_MARKER.to_owned()),
-            true,
+            "a feature being removed",
+            Some(removing.as_str()),
+            json!({}),
         ),
-        ("no marker", None, false),
-        ("an invalid marker", Some("not a marker".to_owned()), false),
-        ("a newer overrides feature", Some(newer), false),
-        ("an overrides feature being removed", Some(removing), false),
+        (
+            "not listed",
+            Some(OVERRIDES_MARKER),
+            json!({"inventory": []}),
+        ),
+        (
+            "no listing",
+            Some(OVERRIDES_MARKER),
+            json!({"inventory": null}),
+        ),
+        (
+            "no values",
+            Some(OVERRIDES_MARKER),
+            json!({"hasValues": false}),
+        ),
+        (
+            "values not said",
+            Some(OVERRIDES_MARKER),
+            json!({"hasValues": null}),
+        ),
+        (
+            "damaged access",
+            Some(OVERRIDES_MARKER),
+            json!({"accessDamage": "contradictory"}),
+        ),
+        (
+            "a step that can't be finished",
+            Some(OVERRIDES_MARKER),
+            json!({"unfinished": "stuck"}),
+        ),
     ] {
-        let (status, output) = call(
-            lpm_env_companion_assess,
-            &json!({
-                "vaultId": "proj",
-                "marker": marker.map(|marker| base64(marker.as_bytes())),
-                "inventory": [record_name("overrides", None)],
-            }),
-        );
-        assert_eq!(status, 0, "{case}");
-        assert_eq!(output["judgesOverrides"], judged, "{case}");
+        assert_eq!(read(marker, extra), false, "{case}");
     }
 }
 

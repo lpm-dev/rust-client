@@ -11,7 +11,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use lpm_common::stored_env::is_safe_vault_id;
 use lpm_env_companion::account::CompanionAccount;
-use lpm_env_companion::assessment::{Assessment, Observed, Repair, assess};
+use lpm_env_companion::assessment::{Assessment, Observed, Repair, assess, reads_overrides_record};
 use lpm_env_companion::gate::{Damage, Operation, ProjectGate};
 use lpm_env_companion::graph::{AccessClass, record_access_class};
 use lpm_env_companion::invariants::{Refusal, check_transaction};
@@ -304,6 +304,10 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
         access_damage: Option<String>,
         #[serde(default)]
         unfinished: Option<String>,
+        /// Whether the project's values item exists, which only the caller
+        /// can tell; a record left without values is never read.
+        #[serde(default)]
+        has_values: Option<bool>,
         /// The damage `lpm_env_history_check` found in history's records,
         /// passed on unchanged.
         #[serde(default)]
@@ -365,7 +369,7 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
         damage: Vec<DamageOutput<'assessment>>,
         repairs: Vec<RepairOutput>,
         allows: Allows,
-        judges_overrides: bool,
+        reads_overrides: bool,
     }
     fn repair_output(repair: Repair) -> RepairOutput {
         match repair {
@@ -476,7 +480,14 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
                     read_applying_overrides: allows(Operation::ReadApplyingOverrides),
                     write: allows(Operation::Write),
                 },
-                judges_overrides: assessment.judges_overrides(),
+                reads_overrides: request.has_values == Some(true)
+                    && reads_overrides_record(
+                        &request.vault_id,
+                        &assessment.gate,
+                        inventory.as_deref(),
+                        request.access_damage.as_deref(),
+                        request.unfinished.as_deref(),
+                    ),
             })
         })
     }
