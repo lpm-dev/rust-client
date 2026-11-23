@@ -142,7 +142,12 @@ pub(super) fn run_tasks_sequential(
             let context = cache_context.as_ref().ok_or_else(|| {
                 LpmError::Task(format!("cache context missing for task '{script}'"))
             })?;
-            if let Some(identity) = complete_task_cache_identity(project_dir, script, context) {
+            if let Some(identity) = complete_task_cache_identity(
+                project_dir,
+                script,
+                context,
+                &hit.meta.folders_without_env_project,
+            ) {
                 cache_identities.insert(script.clone(), identity);
             }
             print_task_result(results.last().unwrap());

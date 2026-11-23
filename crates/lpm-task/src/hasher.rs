@@ -1557,6 +1557,11 @@ mod tests {
             key,
             "d3b2a1bcebe04b9fc98188966738004448d07cd1471580d4d485082fb64e8a45"
         );
+        // The key a build whose entries named no folder computed for it.
+        assert_ne!(
+            key,
+            "644dbb1b52adeaa6a6f22218b14ccbed4969320c94331be368d7cfaac9010183"
+        );
     }
 
     #[test]

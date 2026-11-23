@@ -491,21 +491,18 @@ fn link_for_write(project_dir: &Path, vault_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether `folder` certainly has no env project: it's a directory whose
-/// lpm.json is missing, or is a JSON object whose `vault` is missing or
-/// null. One that can't be read, isn't such an object, or names anything as
-/// its vault may have one, as some read there finds, so what a cached task
-/// built while an `lpm` it started found none there is reused only on this
-/// answer.
+/// Whether `folder` certainly has no env project: it has no lpm.json, as a
+/// folder that's gone has none, or its lpm.json is a JSON object whose
+/// `vault` is missing or null, read as a command that changes or lists what
+/// a project holds reads it. One that can't be read, or that such a command
+/// refuses or finds a vault in, may have one, so what a cached task built
+/// while an `lpm` it started found none there is reused only on this answer.
 pub fn has_no_env_project(folder: &Path) -> bool {
-    if !std::fs::metadata(folder).is_ok_and(|metadata| metadata.is_dir()) {
-        return false;
-    }
     match lpm_common::read_text_regular_file_capped_with_metadata(
         &folder.join("lpm.json"),
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     ) {
-        Ok((content, _)) => vault_id::names_no_vault(&content),
+        Ok((content, _)) => matches!(vault_id::checked_vault_id_in(&content), Ok(None)),
         Err(lpm_common::BoundedReadError::NotFound { .. }) => true,
         Err(_) => false,
     }
@@ -2587,7 +2584,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_folder_has_no_env_project_only_when_its_lpm_json_is_missing_or_names_no_vault() {
+    fn a_folder_has_no_env_project_only_when_its_lpm_json_is_missing_or_a_command_finds_no_vault_in_it()
+     {
         let root = tempfile::tempdir().expect("temporary folder");
         let folder = root.path().join("other");
         std::fs::create_dir(&folder).expect("folder");
@@ -2618,6 +2616,10 @@ mod tests {
             ("{bad", "JSON that doesn't parse"),
             (r#"["vault"]"#, "an array"),
             (r#"{} {}"#, "more than one value"),
+            (
+                r#"{"name":"\ud800","tasks":{}}"#,
+                "a lone surrogate in another member, which a command refuses",
+            ),
         ] {
             assert!(!with(content), "{what}");
         }
@@ -2628,8 +2630,8 @@ mod tests {
             "an lpm.json that isn't a file"
         );
         assert!(
-            !has_no_env_project(&root.path().join("gone")),
-            "a folder that's gone"
+            has_no_env_project(&root.path().join("gone")),
+            "a folder that's gone has no lpm.json"
         );
         std::fs::write(root.path().join("file"), "").expect("file");
         assert!(!has_no_env_project(&root.path().join("file")), "a file");
