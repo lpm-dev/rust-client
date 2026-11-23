@@ -2853,11 +2853,58 @@ fn a_projects_shell_hooks_never_reach_a_script_or_run_in_a_trace_but_the_shells_
     let output = run(&[
         ("PS4", "inherited+ "),
         ("PROMPT_COMMAND", "inherited-prompt"),
+        ("FPATH", "/inherited/functions"),
     ]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in ["PS4=inherited+ ", "PROMPT_COMMAND=inherited-prompt"] {
+    for line in [
+        "PS4=inherited+ ",
+        "PROMPT_COMMAND=inherited-prompt",
+        "FPATH=/inherited/functions",
+    ] {
         assert!(stdout.contains(line), "{line} in {stdout}");
     }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("inherited+ true"),
+        "the shell's own PS4 runs in the trace: {stderr}"
+    );
+}
+
+#[test]
+fn a_projects_comspec_never_reaches_a_script_but_the_inherited_one_does() {
+    let project = TempProject::empty(r#"{"scripts":{"show":"node show.cjs"}}"#);
+    project.write_file(
+        "show.cjs",
+        "console.log(`COMSPEC=${process.env.COMSPEC ?? process.env.ComSpec}`)",
+    );
+    lpm(&project)
+        .args(["env", "set", "COMSPEC=project-shell.exe"])
+        .assert()
+        .success();
+    let inherited = if cfg!(windows) {
+        std::env::var("ComSpec").expect("Windows names its command processor")
+    } else {
+        "inherited-shell".to_owned()
+    };
+
+    let output = lpm(&project)
+        .args(["run", "show"])
+        .env("COMSPEC", &inherited)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(&format!("COMSPEC={inherited}")), "{stdout}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("ignored COMSPEC from project env"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
