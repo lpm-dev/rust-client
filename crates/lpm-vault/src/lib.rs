@@ -490,6 +490,13 @@ fn link_for_write(project_dir: &Path, vault_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `folder`'s lpm.json names an env project, as a read there finds
+/// one. What a cached task built while an `lpm` it started found none there
+/// is reused only while there's still none.
+pub fn names_an_env_project(folder: &Path) -> bool {
+    vault_id::read_vault_id(folder).is_some()
+}
+
 /// Whether `project_dir` may use the vault its lpm.json names; `None` when
 /// it names none.
 pub fn folder_link(project_dir: &Path) -> Result<Option<FolderLink>, String> {
@@ -751,6 +758,7 @@ pub fn try_get_run_environment(
     env: Option<&str>,
 ) -> Result<RunEnvironment, String> {
     let Some(vault_id) = linked_vault_id(project_dir)? else {
+        override_marker::report_no_project(project_dir)?;
         return Ok(RunEnvironment::default());
     };
     try_get_run_environment_for_vault_id(&vault_id, env)
@@ -841,6 +849,7 @@ pub fn run_environment_names<'a>(
 /// [`AllRunEnvironments`] for the project's vault; empty when it has none.
 pub fn try_get_all_run_environments(project_dir: &Path) -> Result<AllRunEnvironments, String> {
     let Some(vault_id) = linked_vault_id(project_dir)? else {
+        override_marker::report_no_project(project_dir)?;
         return Ok(AllRunEnvironments::default());
     };
     try_get_all_run_environments_for_vault_id(&vault_id)

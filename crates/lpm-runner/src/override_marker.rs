@@ -75,16 +75,24 @@ impl TaskMarker {
         self.directory.as_ref().err().map(String::as_str)
     }
 
-    /// What keeps what the task built out of a cache whose key holds the
-    /// reads that `keyed` entries report (see
-    /// [`lpm_vault::override_marker::Access::keyed`]); `None`
-    /// when every `lpm` the task started, if any, made only such reads.
-    pub fn unkeyed(&self, keyed: &[String]) -> Option<Unkeyed> {
+    /// What every `lpm` the task started, if any, reported, when a cache
+    /// whose key holds the reads that `keyed` entries report (see
+    /// [`lpm_vault::override_marker::Access::keyed`]) may keep what the
+    /// task built; else what keeps it out.
+    pub fn judge(&self, keyed: &[String]) -> Result<Keyed, Unkeyed> {
         match &self.directory {
-            Ok(directory) => unkeyed(directory, keyed),
-            Err(_) => Some(Unkeyed::Unwatched),
+            Ok(directory) => judge(directory, keyed),
+            Err(_) => Err(Unkeyed::Unwatched),
         }
     }
+}
+
+/// What a task's `lpm` processes reported, all of which its key holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Keyed {
+    /// The canonical folders they found no env project for, sorted, each
+    /// once. What the task built is reused only while each still has none.
+    pub folders_without_env_project: Vec<PathBuf>,
 }
 
 /// Why what a task built can't be cached under its key, the most specific
@@ -109,16 +117,24 @@ pub enum Unkeyed {
     /// The marker holds a file no `lpm` adds, named here, as the file
     /// system gave it.
     Foreign(String),
+    /// An `lpm` the task started found no env project for this folder,
+    /// which no path from the task's own folder reaches, as one on another
+    /// drive, so a cache can't check it again.
+    Unreachable(PathBuf),
+    /// An `lpm` the task left running found no env project for another
+    /// folder once the cache had taken what the task built.
+    LateFolder,
     /// The task has no marker of its own (see [`TaskMarker::unwatched`]).
     Unwatched,
 }
 
-/// [`TaskMarker::unkeyed`] for the entries in `directory`.
-fn unkeyed(directory: &Path, keyed: &[String]) -> Option<Unkeyed> {
+/// [`TaskMarker::judge`] for the entries in `directory`.
+fn judge(directory: &Path, keyed: &[String]) -> Result<Keyed, Unkeyed> {
     let Ok(entries) = std::fs::read_dir(directory) else {
-        return Some(Unkeyed::Unlisted);
+        return Err(Unkeyed::Unlisted);
     };
     let mut found: Option<Unkeyed> = None;
+    let mut folders = Vec::new();
     for entry in entries {
         let reason = match entry {
             Err(_) => Unkeyed::Unlisted,
@@ -127,7 +143,19 @@ fn unkeyed(directory: &Path, keyed: &[String]) -> Option<Unkeyed> {
                 match name.to_str() {
                     Some(name) if keyed.iter().any(|keyed| keyed == name) => continue,
                     Some(name) => match Reported::of_entry(name) {
-                        Some(Reported::Change) => return Some(Unkeyed::Changed),
+                        Some(Reported::Change) => return Err(Unkeyed::Changed),
+                        Some(Reported::NoProject) => {
+                            let added = entry.file_type().is_ok_and(|kind| kind.is_file())
+                                && lpm_vault::override_marker::folder_without_env_project(
+                                    directory, name,
+                                )
+                                .map(|folder| folders.push(folder))
+                                .is_some();
+                            if added {
+                                continue;
+                            }
+                            Unkeyed::Foreign(name.to_owned())
+                        }
                         Some(Reported::Environment | Reported::Overrides) => Unkeyed::Used,
                         Some(Reported::Environments) => Unkeyed::EveryEnvironment,
                         Some(Reported::Uncertain) => Unkeyed::Untold,
@@ -142,7 +170,16 @@ fn unkeyed(directory: &Path, keyed: &[String]) -> Option<Unkeyed> {
             None => reason,
         });
     }
-    found
+    match found {
+        Some(unkeyed) => Err(unkeyed),
+        None => {
+            folders.sort_unstable();
+            folders.dedup();
+            Ok(Keyed {
+                folders_without_env_project: folders,
+            })
+        }
+    }
 }
 
 impl Drop for TaskMarker {
@@ -235,8 +272,8 @@ mod tests {
             }),
             "its own marker comes after the ones this process inherited"
         );
-        assert_eq!(task.unkeyed(&keyed()), None, "nothing read yet");
-        assert_eq!(task.unkeyed(&[]), None);
+        assert_eq!(task.judge(&keyed()).err(), None, "nothing read yet");
+        assert_eq!(task.judge(&[]).err(), None);
 
         report(&directory, read("vault-1", "default", false));
         report(
@@ -246,9 +283,9 @@ mod tests {
                 overrides: None,
             },
         );
-        assert_eq!(task.unkeyed(&keyed()), None, "reads the key holds");
+        assert_eq!(task.judge(&keyed()).err(), None, "reads the key holds");
         assert_eq!(
-            task.unkeyed(&[]),
+            task.judge(&[]).err(),
             Some(Unkeyed::Used),
             "a task of a project without one"
         );
@@ -303,15 +340,45 @@ mod tests {
         ] {
             let task = TaskMarker::watch().expect("watch");
             report(task.directory.as_deref().expect("marker"), access);
-            assert_eq!(task.unkeyed(&keyed()), Some(reason), "{access:?}");
+            assert_eq!(task.judge(&keyed()).err(), Some(reason), "{access:?}");
         }
+    }
+
+    #[test]
+    fn folders_an_lpm_found_no_env_project_for_go_with_the_task_but_a_planted_one_doesn_t() {
+        let folder = tempfile::tempdir().expect("folder");
+        let canonical = std::fs::canonicalize(folder.path()).expect("canonical");
+        let name = canonical.to_str().expect("UTF-8");
+        let task = TaskMarker::watch().expect("watch");
+        let directory = task.directory.clone().expect("a marker of its own");
+        for _ in 0..2 {
+            std::fs::write(
+                directory.join(Access::NoProject { folder: name }.entry()),
+                name,
+            )
+            .expect("report");
+        }
+        report(&directory, read("vault-1", "default", false));
+        assert_eq!(
+            task.judge(&keyed()),
+            Ok(Keyed {
+                folders_without_env_project: vec![canonical.clone()]
+            })
+        );
+
+        let elsewhere = Access::NoProject {
+            folder: "/elsewhere",
+        }
+        .entry();
+        std::fs::write(directory.join(&elsewhere), name).expect("plant");
+        assert_eq!(task.judge(&keyed()), Err(Unkeyed::Foreign(elsewhere)));
     }
 
     #[test]
     fn a_marker_that_can_t_be_listed_or_holds_an_unknown_entry_can_t_be_told() {
         let root = tempfile::tempdir().expect("temporary folder");
         assert_eq!(
-            unkeyed(&root.path().join("gone"), &keyed()),
+            judge(&root.path().join("gone"), &keyed()).err(),
             Some(Unkeyed::Unlisted)
         );
 
@@ -319,7 +386,7 @@ mod tests {
         std::fs::create_dir(&unknown).expect("marker");
         std::fs::write(unknown.join("read-vault-1"), "").expect("entry");
         assert_eq!(
-            unkeyed(&unknown, &keyed()),
+            judge(&unknown, &keyed()).err(),
             Some(Unkeyed::Foreign("read-vault-1".to_owned()))
         );
 
@@ -335,12 +402,12 @@ mod tests {
             },
         );
         assert_eq!(
-            unkeyed(&both, &keyed()),
+            judge(&both, &keyed()).err(),
             Some(Unkeyed::EveryEnvironment),
             "a use is named before what can't be told"
         );
         report(&both, read("vault-2", "default", false));
-        assert_eq!(unkeyed(&both, &keyed()), Some(Unkeyed::Used));
+        assert_eq!(judge(&both, &keyed()).err(), Some(Unkeyed::Used));
         report(
             &both,
             Access::Change {
@@ -348,7 +415,7 @@ mod tests {
             },
         );
         assert_eq!(
-            unkeyed(&both, &keyed()),
+            judge(&both, &keyed()).err(),
             Some(Unkeyed::Changed),
             "a change is named first"
         );
@@ -365,7 +432,7 @@ mod tests {
             if std::fs::write(not_utf8.join(std::ffi::OsStr::from_bytes(b"read-\xff")), "").is_ok()
             {
                 assert_eq!(
-                    unkeyed(&not_utf8, &keyed()),
+                    judge(&not_utf8, &keyed()).err(),
                     Some(Unkeyed::Foreign("read-\u{fffd}".to_owned()))
                 );
             }
@@ -375,7 +442,7 @@ mod tests {
             std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o300))
                 .expect("make it unreadable");
             let listed = std::fs::read_dir(&unreadable).is_ok();
-            assert!(listed || unkeyed(&unreadable, &keyed()) == Some(Unkeyed::Unlisted));
+            assert!(listed || judge(&unreadable, &keyed()).err() == Some(Unkeyed::Unlisted));
             std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o700))
                 .expect("make it readable again");
         }
@@ -395,8 +462,8 @@ mod tests {
             task.unwatched()
                 .is_some_and(|reason| reason.contains("a:b"))
         );
-        assert_eq!(task.unkeyed(&keyed()), Some(Unkeyed::Unwatched));
-        assert_eq!(task.unkeyed(&[]), Some(Unkeyed::Unwatched));
+        assert_eq!(task.judge(&keyed()).err(), Some(Unkeyed::Unwatched));
+        assert_eq!(task.judge(&[]).err(), Some(Unkeyed::Unwatched));
         assert_eq!(marker(), outer, "the task gets the inherited markers");
         assert_eq!(
             std::fs::read_dir(&separated).expect("folder").count(),
@@ -418,7 +485,7 @@ mod tests {
             "{:?}",
             task.unwatched()
         );
-        assert_eq!(task.unkeyed(&keyed()), Some(Unkeyed::Unwatched));
+        assert_eq!(task.judge(&keyed()).err(), Some(Unkeyed::Unwatched));
     }
 
     #[cfg(unix)]

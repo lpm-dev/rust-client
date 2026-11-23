@@ -8963,6 +8963,126 @@ fn a_task_whose_nested_lpm_checks_every_environment_says_so_and_one_that_checks_
 }
 
 #[test]
+fn a_task_cached_while_a_folder_its_lpm_ran_in_had_no_env_project_runs_again_once_it_has_one() {
+    let project = TempProject::empty(
+        r#"{"name":"folder-without-project","version":"1.0.0","scripts":{"gen":"node gen.js"}}"#,
+    );
+    project.write_file(
+        "other/package.json",
+        r#"{"name":"other","version":"1.0.0","scripts":{"show":"node -e \"console.log('API_URL=' + (process.env.API_URL || 'none'))\""}}"#,
+    );
+    project.write_file(
+        "gen.js",
+        &nested_lpm_script("gen", "other", &["run", "show"]),
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{"tasks":{"gen":{"cache":true,"inputs":["gen.js"],"outputs":["dist/gen.txt"]}}}"#,
+    );
+    let run = || {
+        let output = lpm(&project)
+            .env("LPM_TEST_BIN", support::lpm_binary())
+            .args(["run", "gen"])
+            .output()
+            .expect("run the task");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    run();
+    run();
+    assert_eq!(
+        runs(&project, "gen"),
+        1,
+        "cached while other has no env project"
+    );
+    assert!(project.read_file("dist/gen.txt").contains("API_URL=none"));
+
+    let other = project.path().join("other");
+    lpm(&project)
+        .current_dir(&other)
+        .args(["env", "set", "API_URL=team"])
+        .assert()
+        .success();
+    lpm(&project)
+        .current_dir(&other)
+        .args(["env", "override", "set", "API_URL=mine"])
+        .assert()
+        .success();
+    run();
+    assert_eq!(
+        runs(&project, "gen"),
+        2,
+        "the cached run never saw other's env project or its override"
+    );
+    assert!(
+        project.read_file("dist/gen.txt").contains("API_URL=mine"),
+        "{}",
+        project.read_file("dist/gen.txt")
+    );
+}
+
+#[tokio::test]
+async fn a_remote_entry_built_while_a_folder_had_no_env_project_is_reused_only_while_it_still_has_none()
+ {
+    let server = MockServer::start().await;
+    mount_stateful_remote_cache(&server, RemoteCacheState::default()).await;
+    let project = cached_gen_project(
+        &server,
+        &nested_lpm_script("gen", "other", &["run", "show"]),
+    );
+    project.write_file(
+        "other/package.json",
+        r#"{"name":"other","version":"1.0.0","scripts":{"show":"node -e \"console.log('API_URL=' + (process.env.API_URL || 'none'))\""}}"#,
+    );
+    let from_the_remote_cache_only = || {
+        remove_local_task_cache(&project);
+        remove_project_file(&project, "dist");
+        remove_project_file(&project, "runs.txt");
+        run_with_remote_cache(&project, &["run", "gen"]);
+        if project.file_exists("runs.txt") {
+            runs(&project, "gen")
+        } else {
+            0
+        }
+    };
+
+    run_with_remote_cache(&project, &["run", "gen"]);
+    assert_eq!(artifact_requests(&server, "PUT").await, 1);
+    assert_eq!(
+        from_the_remote_cache_only(),
+        0,
+        "a remote hit while other still has no env project"
+    );
+    assert!(project.read_file("dist/gen.txt").contains("API_URL=none"));
+
+    let other = project.path().join("other");
+    for args in [
+        &["env", "set", "API_URL=team"][..],
+        &["env", "override", "set", "API_URL=mine"],
+    ] {
+        lpm(&project)
+            .current_dir(&other)
+            .args(args)
+            .assert()
+            .success();
+    }
+    assert_eq!(
+        from_the_remote_cache_only(),
+        1,
+        "other has an env project now, which the remote entry was built without"
+    );
+    assert!(
+        project.read_file("dist/gen.txt").contains("API_URL=mine"),
+        "{}",
+        project.read_file("dist/gen.txt")
+    );
+}
+
+#[test]
 fn a_task_whose_nested_lpm_read_overrides_changed_and_put_back_while_it_ran_isn_t_cached() {
     let project = TempProject::empty(
         r#"{"name":"put-back","version":"1.0.0","scripts":{"gen":"node gen.js"}}"#,

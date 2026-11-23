@@ -27,6 +27,7 @@ fn remote_artifact(path: &Path, entries: &[(&str, bool)]) {
             .iter()
             .filter(|(name, directory)| !directory && name.starts_with("outputs/"))
             .count(),
+        folders_without_env_project: Vec::new(),
     };
     append_bytes(
         &mut archive,
@@ -171,6 +172,7 @@ fn local_restore_enforces_output_declarations_and_preserves_existing_files() {
         "",
         "",
         1,
+        &[],
         &|| true,
     )
     .unwrap();
@@ -205,6 +207,7 @@ fn local_output_can_be_a_regular_file_named_outputs() {
         "",
         "",
         1,
+        &[],
         &|| true,
     )
     .unwrap();
@@ -251,6 +254,7 @@ fn a_cache_entry_drops_access_its_directory_hands_down() {
         "PRIVATE_TOKEN=stdout-secret\n",
         "",
         1,
+        &[],
         &|| true,
     )
     .unwrap();
@@ -288,6 +292,7 @@ fn a_cache_entry_open_to_other_accounts_is_not_restored() {
         "",
         "",
         1,
+        &[],
         &|| true,
     )
     .unwrap();

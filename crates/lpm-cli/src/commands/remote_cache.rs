@@ -284,7 +284,7 @@ pub fn try_restore(
     key: &str,
     project_dir: &Path,
     output_globs: &[String],
-    validate: impl FnOnce() -> Result<bool, lpm_common::LpmError>,
+    validate: impl FnOnce(&lpm_task::cache::CacheMeta) -> Result<bool, lpm_common::LpmError>,
 ) -> Option<lpm_task::cache::CacheHit> {
     if client.limits.lookups_refused() {
         return None;
@@ -622,7 +622,7 @@ impl RemoteCacheClient {
         key: &str,
         project_dir: &Path,
         output_globs: &[String],
-        validate: impl FnOnce() -> Result<bool, lpm_common::LpmError>,
+        validate: impl FnOnce(&lpm_task::cache::CacheMeta) -> Result<bool, lpm_common::LpmError>,
     ) -> Result<Option<lpm_task::cache::CacheHit>, String> {
         let Some(artifact) = block_on_remote(self.clone().fetch_verified_artifact(key.to_owned()))?
         else {
@@ -2758,7 +2758,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
 
         for key in ["a", "b", "c"] {
-            let restored = client.restore(&key.repeat(64), project.path(), &[], || Ok(true));
+            let restored = client.restore(&key.repeat(64), project.path(), &[], |_| Ok(true));
             assert!(matches!(restored, Ok(None)), "lookup {key} was not a miss");
         }
 
@@ -2938,7 +2938,7 @@ mod tests {
         let client = client.clone();
         tokio::task::spawn_blocking(move || {
             let project = tempfile::tempdir().unwrap();
-            let restored = try_restore(&client, &"b".repeat(64), project.path(), &[], || Ok(true));
+            let restored = try_restore(&client, &"b".repeat(64), project.path(), &[], |_| Ok(true));
             assert!(restored.is_none());
         })
         .await
@@ -2984,7 +2984,7 @@ mod tests {
         let client = client.clone();
         tokio::task::spawn_blocking(move || {
             let project = tempfile::tempdir().unwrap();
-            let restored = try_restore(&client, &"b".repeat(64), project.path(), &[], || Ok(true));
+            let restored = try_restore(&client, &"b".repeat(64), project.path(), &[], |_| Ok(true));
             assert!(restored.is_none());
             store_with(&client);
         })
@@ -3071,7 +3071,7 @@ mod tests {
         tokio::task::spawn_blocking(move || {
             let project = tempfile::tempdir().unwrap();
             assert!(
-                try_restore(&client, &"b".repeat(64), project.path(), &[], || Ok(true)).is_none()
+                try_restore(&client, &"b".repeat(64), project.path(), &[], |_| Ok(true)).is_none()
             );
             store_with(&client);
         })
@@ -3451,7 +3451,7 @@ mod tests {
             .pause(LimitedRequest::Lookup, Duration::from_secs(3));
         let project = tempfile::tempdir().unwrap();
 
-        let hit = try_restore(&client, "abc123", project.path(), &[], || Ok(true));
+        let hit = try_restore(&client, "abc123", project.path(), &[], |_| Ok(true));
 
         assert!(hit.is_none());
         assert!(!client.limits.first_busy_notice(LimitedRequest::Lookup));

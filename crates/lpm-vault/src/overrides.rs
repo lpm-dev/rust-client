@@ -36,6 +36,7 @@ pub struct Change {
 /// `project_dir`, by environment; empty when it has none or no env project.
 pub fn read_all(project_dir: &Path) -> Result<BTreeMap<String, PersonalOverrides>, String> {
     let Some(vault_id) = crate::checked_linked_vault_id(project_dir)? else {
+        crate::override_marker::report_no_project(project_dir)?;
         return Ok(BTreeMap::new());
     };
     let (overrides, identity) =

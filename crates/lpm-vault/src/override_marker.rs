@@ -2,18 +2,22 @@
 //! projects it read with their personal overrides, or whose overrides it
 //! changed, which a task cache must know: a cached task's key holds one
 //! environment's values of its own project, and that project's overrides,
-//! but not what a nested `lpm` reads otherwise.
+//! but not what a nested `lpm` reads otherwise. It also tells them each
+//! folder it found no env project for, which a cache checks still has none
+//! before it uses what the task built.
 //!
 //! [`MARKER_ENV`] holds a `PATH`-style list of directories: an `lpm` that
 //! caches a task makes a directory for it, adds it to the list it inherited,
 //! and passes the list to the task. Before an `lpm` uses what it read, or
 //! changes overrides, it adds an entry to every directory in the list, so
 //! each `lpm` above it knows, whether or not those between them end well.
-//! An entry is an empty file, only ever created, never followed or written
-//! to. Its name is the kind of access and a digest of the store, project
-//! and environment it touched and whether the project had overrides, so
-//! names that differ only in case, as some file systems can't keep apart,
-//! never meet, and nothing of what was read is in it.
+//! An entry is only ever created, never followed or written to after. Its
+//! name is the kind of access and a digest of the store, project and
+//! environment it touched and whether the project had overrides, so names
+//! that differ only in case, as some file systems can't keep apart, never
+//! meet, and nothing of what was read is in it. It's empty, but for a folder
+//! without an env project: that entry holds the folder's path, whose digest
+//! its name is, written whole before it takes the name.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -104,6 +108,9 @@ pub enum Access<'a> {
     },
     /// It changed the project's overrides.
     Change { vault_id: &'a str },
+    /// It found no env project for `folder`, the canonical path of the
+    /// folder it ran for, so it read nothing there.
+    NoProject { folder: &'a str },
     /// What it used can't be told: it couldn't pass a marker to a task.
     Uncertain,
 }
@@ -112,9 +119,18 @@ pub enum Access<'a> {
 const UNCERTAIN: &str = "uncertain";
 
 /// The kinds of the entries that report an access that can be told.
-const KINDS: [&str; 4] = ["environment", "environments", "overrides", "change"];
+const KINDS: [&str; 5] = [
+    "environment",
+    "environments",
+    "overrides",
+    "change",
+    "absent",
+];
 
-impl Access<'_> {
+/// The most a folder's entry holds, past which it isn't one an `lpm` added.
+const MAX_FOLDER_BYTES: u64 = 64 * 1024;
+
+impl<'a> Access<'a> {
     /// The name of the entry that reports it. A read's names what it read
     /// by digest, so it's one a task's key holds only when the key holds
     /// exactly that, even after the project changed back by the task's end.
@@ -140,6 +156,16 @@ impl Access<'_> {
             Self::Environments { vault_id, .. } => (KINDS[1], vault_id, ""),
             Self::Overrides { vault_id, .. } => (KINDS[2], vault_id, ""),
             Self::Change { vault_id } => (KINDS[3], vault_id, ""),
+            // Whether a folder has an env project is its lpm.json's to say,
+            // whichever store an `lpm` reads.
+            Self::NoProject { folder } => {
+                let digest = sha2::Sha256::new()
+                    .chain_update(KINDS[4])
+                    .chain_update([0])
+                    .chain_update(folder)
+                    .finalize();
+                return format!("{}-{}", KINDS[4], hex::encode(digest));
+            }
             Self::Uncertain => return UNCERTAIN.to_owned(),
         };
         // No part holds a NUL: a path, a vault ID or an environment can't.
@@ -163,7 +189,7 @@ impl Access<'_> {
             Self::Overrides { overrides, .. } => {
                 identified(named, overrides.as_ref().map(|overrides| &overrides.0))
             }
-            Self::Change { .. } | Self::Uncertain => named,
+            Self::Change { .. } | Self::NoProject { .. } | Self::Uncertain => named,
         }
         .finalize();
         format!("{kind}-{}", hex::encode(digest))
@@ -195,6 +221,15 @@ impl Access<'_> {
             .entry(),
         ]
     }
+
+    /// What its entry holds: the folder of a [`Self::NoProject`], else
+    /// nothing.
+    fn content(self) -> &'a [u8] {
+        match self {
+            Self::NoProject { folder } => folder.as_bytes(),
+            _ => &[],
+        }
+    }
 }
 
 /// What the entry named `entry` says, when an `lpm` adds such an entry: the
@@ -205,6 +240,7 @@ pub enum Reported {
     Environments,
     Overrides,
     Change,
+    NoProject,
     Uncertain,
 }
 
@@ -228,6 +264,7 @@ impl Reported {
             Self::Environments,
             Self::Overrides,
             Self::Change,
+            Self::NoProject,
         ]
         .into_iter()
         .zip(KINDS)
@@ -254,23 +291,73 @@ pub fn report_uncertain() -> Result<(), String> {
     report(|| Access::Uncertain)
 }
 
+/// Tell every `lpm` above this one that `project_dir` has no env project, so
+/// this one reads nothing there, before it goes on without one. A folder
+/// whose canonical path can't be found or isn't UTF-8 can't be named in an
+/// entry, so it's a use no `lpm` can tell.
+pub fn report_no_project(project_dir: &Path) -> Result<(), String> {
+    if !reporting() {
+        return Ok(());
+    }
+    match std::fs::canonicalize(project_dir)
+        .ok()
+        .and_then(|folder| folder.into_os_string().into_string().ok())
+    {
+        Some(folder) => report(|| Access::NoProject { folder: &folder }),
+        None => report_uncertain(),
+    }
+}
+
+/// The folder the entry named `entry` in `marker` says has no env project,
+/// when it's one an `lpm` added: a canonical path whose digest its name is.
+pub fn folder_without_env_project(marker: &Path, entry: &str) -> Option<PathBuf> {
+    if Reported::of_entry(entry) != Some(Reported::NoProject) {
+        return None;
+    }
+    let folder = std::fs::File::open(marker.join(entry))
+        .ok()
+        .and_then(|file| {
+            use std::io::Read as _;
+            let mut folder = String::new();
+            file.take(MAX_FOLDER_BYTES + 1)
+                .read_to_string(&mut folder)
+                .ok()?;
+            Some(folder)
+        })?;
+    (folder.len() as u64 <= MAX_FOLDER_BYTES
+        && Path::new(&folder).is_absolute()
+        && Access::NoProject { folder: &folder }.entry() == entry)
+        .then(|| PathBuf::from(folder))
+}
+
+/// Whether an `lpm` above this one watches what this one uses.
+fn reporting() -> bool {
+    #[cfg(test)]
+    if REPORTING_TO.with_borrow(Option::is_some) {
+        return true;
+    }
+    !inherited().is_empty()
+}
+
 /// Add `access`'s entry to every inherited marker, once a process. One that
 /// can't be told would share what this one builds, so the access fails
 /// instead.
 fn report<'a>(access: impl FnOnce() -> Access<'a>) -> Result<(), String> {
     #[cfg(test)]
     if let Some(markers) = REPORTING_TO.with_borrow(Clone::clone) {
-        return report_to(&markers, &access().entry());
+        let access = access();
+        return report_to(&markers, &access.entry(), access.content());
     }
     if inherited().is_empty() {
         return Ok(());
     }
-    let entry = access().entry();
+    let access = access();
+    let entry = access.entry();
     let mut reported = REPORTED.lock().unwrap_or_else(PoisonError::into_inner);
     if reported.contains(&entry) {
         return Ok(());
     }
-    report_to(inherited(), &entry)?;
+    report_to(inherited(), &entry, access.content())?;
     reported.insert(entry);
     Ok(())
 }
@@ -299,10 +386,11 @@ const WITHOUT_MARKER: &str = if cfg!(windows) {
     "run it as `env -u LPM_PERSONAL_OVERRIDES_MARKER lpm ...`"
 };
 
-/// Create `entry` in each of `markers`, where an `lpm` above watches.
-fn report_to(markers: &[PathBuf], entry: &str) -> Result<(), String> {
+/// Create `entry`, holding `content`, in each of `markers`, where an `lpm`
+/// above watches.
+fn report_to(markers: &[PathBuf], entry: &str, content: &[u8]) -> Result<(), String> {
     for marker in markers {
-        add_entry(marker, entry).map_err(|reason| {
+        add_entry(marker, entry, content).map_err(|reason| {
             format!(
                 "{UNREPORTED}{}, {reason}, so the lpm that set it couldn't be told which env project this one uses, and this one used nothing. If no lpm above this one caches what it builds, {WITHOUT_MARKER}",
                 lpm_common::sanitize_terminal_inline(&marker.display().to_string())
@@ -316,16 +404,21 @@ fn report_to(markers: &[PathBuf], entry: &str) -> Result<(), String> {
 /// made it removes it only once it decided about its task, and one still
 /// watching treats a marker it can't list as a use it can't tell, so a
 /// process that outlives a task still runs.
-fn add_entry(marker: &Path, entry: &str) -> Result<(), String> {
+fn add_entry(marker: &Path, entry: &str, content: &[u8]) -> Result<(), String> {
     if !marker.is_absolute() {
         return Err("which isn't an absolute path".to_owned());
     }
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(marker.join(entry))
-    {
-        Ok(_) => Ok(()),
+    let added = if content.is_empty() {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(marker.join(entry))
+            .map(drop)
+    } else {
+        add_entry_holding(marker, entry, content)
+    };
+    match added {
+        Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         // Windows says a path through a file isn't found, as it says of a
         // marker that's gone, so only a marker with nothing at its path is.
@@ -340,9 +433,105 @@ fn add_entry(marker: &Path, entry: &str) -> Result<(), String> {
     }
 }
 
+/// Add `entry` holding `content`, written whole under a name of this
+/// process's own before it takes the entry's, so no `lpm` reads part of it.
+/// An entry already there holds the same, as its name is its digest.
+fn add_entry_holding(marker: &Path, entry: &str, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let path = marker.join(entry);
+    if std::fs::symlink_metadata(&path).is_ok() {
+        return Ok(());
+    }
+    let staging = marker.join(format!(".{entry}.{}", std::process::id()));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&staging)
+        .and_then(|mut file| file.write_all(content))
+        .and_then(|()| {
+            std::fs::rename(&staging, &path).or_else(|error| {
+                if std::fs::symlink_metadata(&path).is_ok() {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            })
+        });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+    written
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_folder_without_an_env_project_is_held_by_its_entry_whose_name_is_its_digest() {
+        let marker = tempfile::tempdir().expect("marker");
+        let folder = tempfile::tempdir().expect("folder");
+        let canonical = std::fs::canonicalize(folder.path())
+            .expect("canonical")
+            .into_os_string()
+            .into_string()
+            .expect("UTF-8");
+        let entry = Access::NoProject { folder: &canonical }.entry();
+        assert_eq!(Reported::of_entry(&entry), Some(Reported::NoProject));
+
+        for _ in 0..2 {
+            reporting_to(vec![marker.path().to_owned()], || {
+                report_no_project(folder.path())
+            })
+            .expect("report");
+        }
+        let names: Vec<String> = std::fs::read_dir(marker.path())
+            .expect("list")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .into_string()
+                    .expect("UTF-8")
+            })
+            .collect();
+        assert_eq!(names, [entry.clone()], "one entry, and nothing staged left");
+        assert_eq!(
+            folder_without_env_project(marker.path(), &entry),
+            Some(PathBuf::from(&canonical))
+        );
+
+        let elsewhere = Access::NoProject {
+            folder: "/elsewhere",
+        }
+        .entry();
+        std::fs::write(marker.path().join(&elsewhere), &canonical).expect("plant");
+        assert_eq!(
+            folder_without_env_project(marker.path(), &elsewhere),
+            None,
+            "a folder its name isn't the digest of"
+        );
+        std::fs::write(
+            marker.path().join(&entry),
+            &canonical[..canonical.len() - 1],
+        )
+        .expect("cut");
+        assert_eq!(
+            folder_without_env_project(marker.path(), &entry),
+            None,
+            "part of a folder"
+        );
+        let relative = Access::NoProject { folder: "relative" }.entry();
+        std::fs::write(marker.path().join(&relative), "relative").expect("plant");
+        assert_eq!(folder_without_env_project(marker.path(), &relative), None);
+        let change = Access::Change {
+            vault_id: "vault-1",
+        }
+        .entry();
+        std::fs::write(marker.path().join(&change), &canonical).expect("plant");
+        assert_eq!(folder_without_env_project(marker.path(), &change), None);
+    }
 
     #[test]
     fn an_entry_names_what_was_done_to_what_and_by_digest_what_was_read() {
@@ -388,6 +577,10 @@ mod tests {
             .entry(),
             Access::Change {
                 vault_id: "vault-1",
+            }
+            .entry(),
+            Access::NoProject {
+                folder: "/repo/vault-1",
             }
             .entry(),
         ];
@@ -480,7 +673,7 @@ mod tests {
                 overrides: Some(crate::OverridesIdentity::of(b"record")),
             }
             .entry();
-            report_to(std::slice::from_ref(&marker), &entry).expect("reported");
+            report_to(std::slice::from_ref(&marker), &entry, &[]).expect("reported");
         }
         assert_eq!(std::fs::read_dir(&marker).expect("entries").count(), 2);
     }
@@ -497,8 +690,8 @@ mod tests {
             vault_id: "vault-1",
         }
         .entry();
-        report_to(&markers, &entry).expect("reported");
-        report_to(&markers, &entry).expect("an entry that's there already");
+        report_to(&markers, &entry, &[]).expect("reported");
+        report_to(&markers, &entry, &[]).expect("an entry that's there already");
 
         for marker in &markers {
             let entries: Vec<_> = std::fs::read_dir(marker)
@@ -519,7 +712,7 @@ mod tests {
             (file, "where an entry can't be added"),
         ] {
             let error =
-                report_to(std::slice::from_ref(&marker), "read-vault-1").expect_err("refused");
+                report_to(std::slice::from_ref(&marker), "read-vault-1", &[]).expect_err("refused");
             assert!(describes(&error), "{error}");
             assert!(error.starts_with(MARKER_ENV), "{error}");
             assert!(error.contains(reason), "{}: {error}", marker.display());
@@ -539,7 +732,7 @@ mod tests {
         std::fs::create_dir(&watching).expect("marker");
         let markers = [root.path().join("ended"), watching.clone()];
 
-        report_to(&markers, "read-vault-1").expect("reported to the marker still there");
+        report_to(&markers, "read-vault-1", &[]).expect("reported to the marker still there");
 
         assert!(watching.join("read-vault-1").exists());
         assert!(!markers[0].exists());

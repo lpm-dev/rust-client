@@ -482,16 +482,18 @@ pub fn restore_cache(
     project_dir: &Path,
     output_globs: &[String],
 ) -> Result<CacheHit, LpmError> {
-    restore_cache_if(key, project_dir, output_globs, || Ok(true))?.ok_or_else(|| {
+    restore_cache_if(key, project_dir, output_globs, |_| Ok(true))?.ok_or_else(|| {
         LpmError::Task("unconditional task cache restore was unexpectedly rejected".into())
     })
 }
 
+/// Restore the entry under `key` if `validate`, given its metadata, still
+/// accepts it once the outputs are staged.
 pub fn restore_cache_if(
     key: &str,
     project_dir: &Path,
     output_globs: &[String],
-    validate: impl FnOnce() -> Result<bool, LpmError>,
+    validate: impl FnOnce(&CacheMeta) -> Result<bool, LpmError>,
 ) -> Result<Option<CacheHit>, LpmError> {
     let root = LpmRoot::from_env()
         .map_err(|error| LpmError::Task(format!("could not determine LPM home: {error}")))?;
@@ -505,7 +507,7 @@ fn restore_cache_with_root(
     project_dir: &Path,
     output_globs: &[String],
 ) -> Result<CacheHit, LpmError> {
-    restore_cache_with_root_if(root, key, project_dir, output_globs, || Ok(true))?.ok_or_else(
+    restore_cache_with_root_if(root, key, project_dir, output_globs, |_| Ok(true))?.ok_or_else(
         || LpmError::Task("unconditional task cache restore was unexpectedly rejected".into()),
     )
 }
@@ -515,7 +517,7 @@ fn restore_cache_with_root_if(
     key: &str,
     project_dir: &Path,
     output_globs: &[String],
-    validate: impl FnOnce() -> Result<bool, LpmError>,
+    validate: impl FnOnce(&CacheMeta) -> Result<bool, LpmError>,
 ) -> Result<Option<CacheHit>, LpmError> {
     validate_cache_key(key)?;
     let project = open_project(project_dir)?;
@@ -544,7 +546,7 @@ fn restore_cache_locked_if(
     key: &str,
     project: &OpenProject,
     output_globs: &[String],
-    validate: impl FnOnce() -> Result<bool, LpmError>,
+    validate: impl FnOnce(&CacheMeta) -> Result<bool, LpmError>,
 ) -> Result<Option<CacheHit>, LpmError> {
     let entry = open_cache_entry(cache, key)?;
     let meta = read_cache_meta(&entry, key)?;
@@ -569,10 +571,10 @@ fn restore_cache_locked_if(
             project,
             meta.output_file_count,
             output_globs,
-            validate,
+            || validate(&meta),
         )?
     } else {
-        validate()?
+        validate(&meta)?
     };
     if !accepted {
         return Ok(None);
@@ -638,12 +640,14 @@ pub fn store_cache(
         stdout,
         stderr,
         duration_ms,
+        &[],
         &|| true,
     )
 }
 
 /// [`store_cache`], publishing the result only if `publishable` still says
-/// so once its outputs were taken.
+/// so once its outputs were taken. The entry keeps
+/// `folders_without_env_project` (see [`CacheMeta`]).
 #[expect(
     clippy::too_many_arguments,
     reason = "cache publication needs the complete entry payload"
@@ -656,6 +660,7 @@ pub fn store_cache_checked(
     stdout: &str,
     stderr: &str,
     duration_ms: u64,
+    folders_without_env_project: &[String],
     publishable: &dyn Fn() -> bool,
 ) -> Result<StoredCacheEntry, LpmError> {
     let root = LpmRoot::from_env()
@@ -669,6 +674,7 @@ pub fn store_cache_checked(
         stdout,
         stderr,
         duration_ms,
+        folders_without_env_project,
         publishable,
     )
 }
@@ -686,6 +692,7 @@ fn store_cache_with_root(
     stdout: &str,
     stderr: &str,
     duration_ms: u64,
+    folders_without_env_project: &[String],
     publishable: &dyn Fn() -> bool,
 ) -> Result<StoredCacheEntry, LpmError> {
     validate_cache_key(key)?;
@@ -711,6 +718,7 @@ fn store_cache_with_root(
             stdout,
             stderr,
             duration_ms,
+            folders_without_env_project,
             publishable,
         )
         .map(|published| published.map_or(StoredCacheEntry::Withdrawn, StoredCacheEntry::Published))
@@ -730,6 +738,7 @@ fn store_cache_locked(
     stdout: &str,
     stderr: &str,
     duration_ms: u64,
+    folders_without_env_project: &[String],
     publishable: &dyn Fn() -> bool,
 ) -> Result<Option<PublishedCacheEntry>, LpmError> {
     publish_cache_entry(cache, key, publishable, |open| {
@@ -748,6 +757,7 @@ fn store_cache_locked(
                 cache_key: key.to_string(),
                 duration_ms,
                 output_file_count,
+                folders_without_env_project: folders_without_env_project.to_vec(),
             },
         )
     })
@@ -1216,6 +1226,7 @@ fn write_remote_artifact(
         cache_key: args.key.to_string(),
         duration_ms: args.duration_ms,
         output_file_count,
+        folders_without_env_project: Vec::new(),
     };
     let meta_json = serde_json::to_string_pretty(&meta)
         .map_err(|e| LpmError::Task(format!("failed to serialize remote cache meta: {e}")))?;
@@ -1274,7 +1285,7 @@ pub fn restore_remote_artifact_from_file(
     project_dir: &Path,
     output_globs: &[String],
 ) -> Result<CacheHit, LpmError> {
-    restore_remote_artifact_from_file_if(expected_key, artifact, project_dir, output_globs, || {
+    restore_remote_artifact_from_file_if(expected_key, artifact, project_dir, output_globs, |_| {
         Ok(true)
     })?
     .ok_or_else(|| {
@@ -1287,7 +1298,7 @@ pub fn restore_remote_artifact_from_file_if(
     artifact: std::fs::File,
     project_dir: &Path,
     output_globs: &[String],
-    validate: impl FnOnce() -> Result<bool, LpmError>,
+    validate: impl FnOnce(&CacheMeta) -> Result<bool, LpmError>,
 ) -> Result<Option<CacheHit>, LpmError> {
     let root = LpmRoot::from_env()
         .map_err(|error| LpmError::Task(format!("could not determine LPM home: {error}")))?;
@@ -1326,7 +1337,7 @@ fn restore_remote_artifact_file_with_root(
         artifact,
         project_dir,
         output_globs,
-        || Ok(true),
+        |_| Ok(true),
     )?
     .ok_or_else(|| {
         LpmError::Task("unconditional remote cache restore was unexpectedly rejected".into())
@@ -1339,7 +1350,7 @@ fn restore_remote_artifact_file_with_root_if(
     mut artifact: std::fs::File,
     project_dir: &Path,
     output_globs: &[String],
-    validate: impl FnOnce() -> Result<bool, LpmError>,
+    validate: impl FnOnce(&CacheMeta) -> Result<bool, LpmError>,
 ) -> Result<Option<CacheHit>, LpmError> {
     validate_cache_key(expected_key)?;
     artifact.rewind()?;
@@ -1366,7 +1377,7 @@ fn restore_remote_artifact_locked_if(
     file: std::fs::File,
     project: &OpenProject,
     output_globs: &[String],
-    validate: impl FnOnce() -> Result<bool, LpmError>,
+    validate: impl FnOnce(&CacheMeta) -> Result<bool, LpmError>,
 ) -> Result<Option<CacheHit>, LpmError> {
     let dec = flate2::read::GzDecoder::new(file);
     let mut total_bytes: u64 = 0;
@@ -1461,7 +1472,7 @@ fn restore_remote_artifact_locked_if(
         LpmError::Task("remote cache artifact is missing .lpm-cache/stderr.log".into())
     })?;
 
-    if !staged_outputs.apply_if(output_globs, validate)? {
+    if !staged_outputs.apply_if(output_globs, || validate(&meta))? {
         return Ok(None);
     }
 
@@ -1604,6 +1615,11 @@ pub struct CacheMeta {
     /// Number of output files archived (for integrity check on restore).
     #[serde(default)]
     pub output_file_count: usize,
+    /// The folders, from the task's own and written with `/`, that an `lpm`
+    /// the task started found no env project for. The entry is used only
+    /// while each still has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folders_without_env_project: Vec<String>,
 }
 
 /// Create a .tar.gz archive of files matching output globs.
@@ -2204,6 +2220,7 @@ mod tests {
                 stdout,
                 stderr,
                 duration_ms,
+                &[],
                 &|| true,
             )
         }
@@ -2576,6 +2593,7 @@ mod tests {
                     "",
                     "",
                     1,
+                    &[],
                     &|| true,
                 );
                 stored.send(()).unwrap();
@@ -2628,6 +2646,7 @@ mod tests {
                 "",
                 "",
                 1,
+                &[],
                 &|| true,
             )
         });
@@ -2752,6 +2771,75 @@ mod tests {
     }
 
     #[test]
+    fn an_entry_hands_its_folders_without_an_env_project_to_every_restore_that_checks_it() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        write_build_outputs(project.path());
+        let key = unique_key("folders-without-env-project");
+        let outputs = ["dist/**".to_string()];
+        let folders = ["../other".to_owned(), ".".to_owned()];
+        let StoredCacheEntry::Published(published) = store_cache_with_root(
+            &cache.root,
+            &key,
+            project.path(),
+            "build",
+            &outputs,
+            "",
+            "",
+            1,
+            &folders,
+            &|| true,
+        )
+        .unwrap() else {
+            panic!("the first store of a key publishes its entry");
+        };
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        let refused =
+            restore_cache_with_root_if(&cache.root, &key, project.path(), &outputs, |meta| {
+                seen.replace(meta.folders_without_env_project.clone());
+                Ok(false)
+            })
+            .unwrap();
+        assert!(refused.is_none(), "a refusing check is a miss");
+        assert_eq!(seen.take(), folders);
+        assert_build_outputs(project.path());
+
+        let artifact_path = project.path().join("artifact.tar.gz");
+        drop(
+            artifact::write_remote_artifact_from_local_entry_with_root(
+                &cache.root,
+                &published,
+                fs::File::create(&artifact_path).unwrap(),
+            )
+            .unwrap(),
+        );
+        let hit = restore_remote_artifact_file_with_root_if(
+            &cache.root,
+            &key,
+            fs::File::open(&artifact_path).unwrap(),
+            project.path(),
+            &outputs,
+            |meta| {
+                seen.replace(meta.folders_without_env_project.clone());
+                Ok(true)
+            },
+        )
+        .unwrap()
+        .expect("an accepted remote hit");
+        assert_eq!(seen.take(), folders, "the remote artifact carries them");
+        assert_eq!(hit.meta.folders_without_env_project, folders);
+    }
+
+    #[test]
+    fn metadata_without_folders_reads_and_writes_as_it_did() {
+        let older = r#"{"command":"build","cache_key":"k","duration_ms":1,"output_file_count":0}"#;
+        let meta: CacheMeta = serde_json::from_str(older).unwrap();
+        assert!(meta.folders_without_env_project.is_empty());
+        assert_eq!(serde_json::to_string(&meta).unwrap(), older);
+    }
+
+    #[test]
     fn a_remote_artifact_built_from_the_local_entry_restores_the_same_outputs() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
@@ -2839,6 +2927,7 @@ mod tests {
             "",
             "",
             1,
+            &[],
             &|| {
                 checked.set(staged_outputs());
                 false
@@ -3502,6 +3591,7 @@ mod tests {
                 cache_key: key.clone(),
                 duration_ms: 1,
                 output_file_count: 0,
+                folders_without_env_project: Vec::new(),
             };
             let meta_json = serde_json::to_string(&meta).unwrap();
             append_bytes(
@@ -3699,6 +3789,7 @@ mod tests {
                 cache_key: key.clone(),
                 duration_ms: 999,
                 output_file_count: 0,
+                folders_without_env_project: Vec::new(),
             })
             .unwrap(),
         )
@@ -3811,6 +3902,7 @@ mod tests {
                 "",
                 "",
                 1,
+                &[],
                 &|| true,
             )
         });
@@ -5384,6 +5476,7 @@ mod tests {
                 cache_key: key.clone(),
                 duration_ms: 1,
                 output_file_count: 1,
+                folders_without_env_project: Vec::new(),
             })
             .unwrap(),
         )
@@ -5419,6 +5512,7 @@ mod tests {
                 cache_key: key.clone(),
                 duration_ms: 1,
                 output_file_count: 1,
+                folders_without_env_project: Vec::new(),
             })
             .unwrap(),
         )
@@ -5463,6 +5557,7 @@ mod tests {
                 cache_key: "deadbeef".into(),
                 duration_ms: 1,
                 output_file_count: 0,
+                folders_without_env_project: Vec::new(),
             })
             .unwrap(),
         )
@@ -5495,6 +5590,7 @@ mod tests {
                 cache_key: key.clone(),
                 duration_ms: 1,
                 output_file_count: 0,
+                folders_without_env_project: Vec::new(),
             })
             .unwrap(),
         )
@@ -5615,6 +5711,7 @@ mod tests {
                 "",
                 "",
                 1,
+                &[],
                 &|| true,
             );
             completed_tx.send(()).unwrap();
