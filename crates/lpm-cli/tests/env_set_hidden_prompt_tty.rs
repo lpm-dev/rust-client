@@ -763,6 +763,45 @@ mod tty {
     }
 
     #[test]
+    fn ctrl_z_stops_the_prompt_with_the_terminal_given_back_and_it_goes_on_once_continued() {
+        let (project, lpm_home) = project();
+        let prompt = "Value for TOKEN (default, hidden): ";
+        let mut cooked_while_stopped = false;
+        let mut hidden_again = false;
+        let session = run_in_pty_controlled(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(prompt.as_bytes(), b"ture\r")],
+            &PtyOptions::default(),
+            &mut |answering| {
+                answering.type_keys(b"fix\x1a");
+                answering.wait_until_stopped();
+                cooked_while_stopped = !answering.echo_is_disabled();
+                signal(answering.pid, libc::SIGCONT);
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while !answering.echo_is_disabled() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                hidden_again = answering.echo_is_disabled();
+            },
+        );
+
+        assert!(
+            cooked_while_stopped,
+            "the shell gets its terminal as it left it"
+        );
+        assert!(hidden_again, "raw mode again once lpm continues");
+        assert!(session.status.success(), "{}", session.transcript);
+        assert_eq!(session.transcript.matches(prompt).count(), 2);
+        assert_eq!(
+            stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
+            Some("fixture"),
+            "what was typed before the stop is kept"
+        );
+    }
+
+    #[test]
     fn a_signal_lpm_was_started_ignoring_leaves_the_prompt_waiting() {
         let (project, lpm_home) = project();
         let options = PtyOptions {

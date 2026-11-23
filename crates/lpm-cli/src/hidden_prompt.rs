@@ -136,6 +136,9 @@ trait Keyboard {
     /// End a paste or a terminal string whose end never came, passing a cut
     /// paste's end to `each`.
     fn end_unfinished(&mut self, _each: &mut dyn FnMut(Event)) {}
+
+    /// Stop the prompt as Ctrl+Z asks, until it's continued.
+    fn suspend(&mut self) {}
 }
 
 /// One key, or one byte of text, read from the terminal.
@@ -176,6 +179,9 @@ enum Event {
     Interrupt,
     /// Ctrl+D, or Ctrl+Z on Windows.
     EndOfFile,
+    /// Ctrl+Z on a Unix terminal: stop the prompt, as a shell stops the job
+    /// it runs.
+    Suspend,
     /// A key that edits nothing, such as an arrow.
     Ignored,
 }
@@ -202,6 +208,7 @@ impl fmt::Debug for Event {
             Self::ClearLine => "ClearLine",
             Self::Interrupt => "Interrupt",
             Self::EndOfFile => "EndOfFile",
+            Self::Suspend => "Suspend",
             Self::Ignored => "Ignored",
         })
     }
@@ -219,6 +226,7 @@ fn control(byte: u8) -> Event {
         0x15 => Event::ClearLine,
         0x03 => Event::Interrupt,
         0x04 => Event::EndOfFile,
+        0x1a if cfg!(unix) => Event::Suspend,
         _ => Event::Ignored,
     }
 }
@@ -293,7 +301,7 @@ impl HiddenLine {
             Event::ClearLine => self.bytes.clear(),
             Event::Interrupt => return Step::End(Ending::Cancel),
             Event::EndOfFile if self.bytes.is_empty() => return Step::End(Ending::Cancel),
-            Event::PasteEnded | Event::EndOfFile | Event::Ignored => {}
+            Event::PasteEnded | Event::EndOfFile | Event::Suspend | Event::Ignored => {}
         }
         Step::Continue
     }
@@ -331,12 +339,16 @@ struct Reading {
     line: HiddenLine,
     ended: Option<Ending>,
     text_left: bool,
+    /// Ctrl+Z was pressed, so the prompt stops once the keys read with it
+    /// are taken.
+    suspend: bool,
 }
 
 impl Reading {
     fn take(&mut self, event: Event) {
         match self.ended {
             None => {
+                self.suspend |= event == Event::Suspend;
                 if let Step::End(ending) = self.line.apply(event) {
                     self.ended = Some(ending);
                 }
@@ -352,8 +364,12 @@ fn read_line(keyboard: &mut impl Keyboard, limit: usize) -> Result<Zeroizing<Str
         line: HiddenLine::new(limit),
         ended: None,
         text_left: false,
+        suspend: false,
     };
     let ending = loop {
+        if std::mem::take(&mut reading.suspend) && reading.ended.is_none() {
+            keyboard.suspend();
+        }
         if let Some(ending) = reading.ended {
             break ending;
         }
@@ -526,6 +542,9 @@ mod tests {
         batches: VecDeque<Vec<Event>>,
         waits: Vec<Option<Duration>>,
         pasting: bool,
+        /// How many keys were read when the prompt suspended, each time.
+        suspended_after: Vec<usize>,
+        read: usize,
     }
 
     impl Script {
@@ -534,6 +553,8 @@ mod tests {
                 batches: batches.into_iter().collect(),
                 waits: Vec::new(),
                 pasting: false,
+                suspended_after: Vec::new(),
+                read: 0,
             }
         }
     }
@@ -554,6 +575,7 @@ mod tests {
             }
             match self.batches.pop_front() {
                 Some(batch) => {
+                    self.read += batch.len();
                     batch.into_iter().for_each(each);
                     Ok(true)
                 }
@@ -570,6 +592,31 @@ mod tests {
             self.pasting = false;
             each(Event::PasteCut);
         }
+
+        fn suspend(&mut self) {
+            self.suspended_after.push(self.read);
+        }
+    }
+
+    #[test]
+    fn ctrl_z_stops_the_prompt_once_the_keys_read_with_it_are_taken_and_it_goes_on() {
+        let mut script = Script::new([
+            typed("fix")
+                .chain([Event::Suspend, Event::Typed(b't')])
+                .collect(),
+            typed("ure").chain([Event::Enter]).collect(),
+        ]);
+
+        assert_eq!(outcome(&mut script).as_deref(), Ok("fixture"));
+        assert_eq!(script.suspended_after, [5]);
+    }
+
+    #[test]
+    fn ctrl_z_after_the_line_ends_stops_nothing() {
+        let mut script = Script::new([vec![Event::Typed(b'a'), Event::Enter, Event::Suspend]]);
+
+        assert_eq!(outcome(&mut script).as_deref(), Ok("a"));
+        assert!(script.suspended_after.is_empty());
     }
 
     #[test]

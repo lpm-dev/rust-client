@@ -176,6 +176,21 @@ impl Answering<'_> {
         assert_eq!(set, 0, "give the PTY cooked mode");
     }
 
+    /// Type `keys` at the terminal, as the person would.
+    pub fn type_keys(&self, keys: &[u8]) {
+        let mut master = self.master;
+        let mut rest = keys;
+        while !rest.is_empty() {
+            match master.write(rest) {
+                Ok(written) => rest = &rest[written..],
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("type at the PTY: {error}"),
+            }
+        }
+    }
+
     /// Wait, at most 30 seconds, until lpm is stopped by a signal.
     pub fn wait_until_stopped(&self) {
         let pid = libc::pid_t::try_from(self.pid).expect("a process ID");

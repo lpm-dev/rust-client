@@ -587,7 +587,7 @@ mod tests {
     fn typed_text_and_control_keys() {
         assert_eq!(
             decoded(&[b"ab\tc\x7f\x08\x17\x15\x03\x04\x1a\r\n"]),
-            "ab\tc<Backspace><Backspace><EraseWord><ClearLine><Interrupt><EndOfFile><Ignored><Enter><Enter>"
+            "ab\tc<Backspace><Backspace><EraseWord><ClearLine><Interrupt><EndOfFile><Suspend><Enter><Enter>"
         );
         assert_eq!(decoded(&["é€".as_bytes()]), "é€");
     }
