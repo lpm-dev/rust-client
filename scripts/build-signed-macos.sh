@@ -124,24 +124,9 @@ fi
 cd "$REPO_ROOT"
 if [ "$VAULT_TESTS" = 1 ]; then
 	# Cargo renders its diagnostics on stderr and writes one JSON message a
-	# line here; plutil decodes the strings, which may hold any character.
+	# line here.
 	cargo "${BUILD_ARGS[@]}" >"$BUILD_LOG"
-	BINARY=""
-	field() { printf '%s' "$2" | plutil -extract "$1" raw -o - - 2>/dev/null || true; }
-	while IFS= read -r message; do
-		case "$message" in
-		*lpm_vault*) ;;
-		*) continue ;;
-		esac
-		if [ "$(field target.name "$message")" = "lpm_vault" ] &&
-			[ "$(field profile.test "$message")" = "true" ]; then
-			BINARY="$(field executable "$message")"
-		fi
-	done <"$BUILD_LOG"
-	if [ -z "$BINARY" ]; then
-		echo "error: cargo built no lpm-vault test executable" >&2
-		exit 1
-	fi
+	BINARY="$(python3 "$REPO_ROOT/scripts/test-executable.py" lpm_vault <"$BUILD_LOG")"
 	APP_BUNDLE="$TARGET_PROFILE_ROOT/LPM CLI Tests.app"
 else
 	cargo "${BUILD_ARGS[@]}"
