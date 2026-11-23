@@ -250,6 +250,8 @@ pub fn load_script_env_with_config(
 pub struct ScriptChildEnv {
     pub vars: HashMap<String, String>,
     pub personal_overrides: usize,
+    /// See [`lpm_vault::RunEnvironment::overrides_identity`].
+    pub project_overrides: Option<lpm_vault::OverridesIdentity>,
 }
 
 /// Load the validated final script environment for task-cache fingerprinting.
@@ -276,6 +278,7 @@ pub fn load_script_child_env_with_config(
     )?;
     let mut vars = loaded.take_child_env()?;
     let personal_overrides = vars.override_count();
+    let project_overrides = vars.overrides_identity();
     mark_script_child_env(&mut vars);
     vars.apply_npm_context(context, script_name, command);
     let validate_schema = !should_skip_env_validation();
@@ -297,6 +300,7 @@ pub fn load_script_child_env_with_config(
     Ok(ScriptChildEnv {
         vars: vars.into_vars(),
         personal_overrides,
+        project_overrides,
     })
 }
 

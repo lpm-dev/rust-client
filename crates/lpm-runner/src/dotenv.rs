@@ -181,6 +181,8 @@ pub fn load_project_env_for_resolved_with_config(
 pub struct ProjectEnvLayers {
     vars: HashMap<String, String>,
     overrides: Arc<PersonalOverrides>,
+    /// See [`lpm_vault::RunEnvironment::overrides_identity`].
+    overrides_identity: Option<lpm_vault::OverridesIdentity>,
     /// The child environment, once layer 4 was applied to the layers.
     composed: Option<ChildEnv>,
     vault_count: usize,
@@ -218,6 +220,8 @@ pub struct Verdict {
 pub struct ChildEnv {
     vars: HashMap<String, String>,
     overrides: Arc<PersonalOverrides>,
+    /// See [`lpm_vault::RunEnvironment::overrides_identity`].
+    overrides_identity: Option<lpm_vault::OverridesIdentity>,
     origins: OverrideOrigins,
     /// How many overrides changed the environment at layer 4.
     applied: usize,
@@ -280,6 +284,11 @@ impl ChildEnv {
     /// How many personal overrides changed this environment.
     pub fn override_count(&self) -> usize {
         self.applied
+    }
+
+    /// See [`lpm_vault::RunEnvironment::overrides_identity`].
+    pub fn overrides_identity(&self) -> Option<lpm_vault::OverridesIdentity> {
+        self.overrides_identity
     }
 
     /// The names of the personal overrides that changed this environment,
@@ -379,6 +388,7 @@ impl ProjectEnvLayers {
         Self {
             vars: HashMap::new(),
             overrides: Arc::clone(&child.overrides),
+            overrides_identity: child.overrides_identity,
             composed: Some(child),
             vault_count,
             vault_values: HashMap::new(),
@@ -474,7 +484,11 @@ impl ProjectEnvLayers {
         }
         let mut vars = self.vars;
         merge_configured_service_env(&mut vars, config, service)?;
-        Ok(apply_layer_four(vars, &self.overrides))
+        Ok(apply_layer_four(
+            vars,
+            &self.overrides,
+            self.overrides_identity,
+        ))
     }
 
     /// [`Self::compose`] for one of several children that share the layers,
@@ -491,7 +505,11 @@ impl ProjectEnvLayers {
         let mut vars = self.vars.clone();
         merge_project_env(&mut vars, service_env)?;
         remove_dangerous_env_vars(&mut vars, "service env");
-        Ok(apply_layer_four(vars, &self.overrides))
+        Ok(apply_layer_four(
+            vars,
+            &self.overrides,
+            self.overrides_identity,
+        ))
     }
 }
 
@@ -505,7 +523,7 @@ pub fn compose_with_overrides(
 ) -> ChildEnv {
     match (policy, overrides) {
         (OverridePolicy::Apply, Some(overrides)) => {
-            apply_layer_four(vars, &Arc::new(overrides.clone()))
+            apply_layer_four(vars, &Arc::new(overrides.clone()), None)
         }
         (OverridePolicy::Apply, None) | (OverridePolicy::Exclude, _) => ChildEnv::plain(vars),
     }
@@ -514,11 +532,9 @@ pub fn compose_with_overrides(
 fn apply_layer_four(
     mut vars: HashMap<String, String>,
     overrides: &Arc<PersonalOverrides>,
+    overrides_identity: Option<lpm_vault::OverridesIdentity>,
 ) -> ChildEnv {
     let origins = OverrideOrigins::changing(&vars, overrides.layer(), cfg!(windows));
-    if !origins.is_empty() {
-        crate::override_marker::record_personal_overrides_applied();
-    }
     let applied_names = if !origins.is_empty() && debug_logging() {
         origins.names().into_iter().map(str::to_owned).collect()
     } else {
@@ -528,6 +544,7 @@ fn apply_layer_four(
     ChildEnv {
         vars,
         overrides: Arc::clone(overrides),
+        overrides_identity,
         applied: origins.len(),
         origins,
         applied_names,
@@ -748,20 +765,26 @@ pub(crate) fn load_project_env_layers(
     };
     let read = crate::env_access::read_vault(read_key, || {
         match policy {
-            OverridePolicy::Apply => lpm_vault::try_get_run_environment(project_dir, env_name)
-                .map(|run| (run.values, run.overrides)),
+            OverridePolicy::Apply => lpm_vault::try_get_run_environment(project_dir, env_name),
             OverridePolicy::Exclude => match env_name {
                 Some(env_name) => {
                     lpm_vault::try_get_all_env_with_default_fallback(project_dir, env_name)
                 }
                 None => lpm_vault::try_get_all(project_dir),
             }
-            .map(|values| (values, PersonalOverrides::default())),
+            .map(|values| lpm_vault::RunEnvironment {
+                values,
+                ..lpm_vault::RunEnvironment::default()
+            }),
         }
         .map(Arc::new)
     })
     .map_err(vault_error(LpmError::EnvValidation))?;
-    let (vault_vars, overrides) = Arc::unwrap_or_clone(read);
+    let lpm_vault::RunEnvironment {
+        values: vault_vars,
+        overrides,
+        overrides_identity,
+    } = Arc::unwrap_or_clone(read);
 
     let vault_count = vault_vars.len();
     if vault_count > 0 {
@@ -774,6 +797,7 @@ pub(crate) fn load_project_env_layers(
     Ok(ProjectEnvLayers {
         vars: loaded,
         overrides: Arc::new(overrides),
+        overrides_identity,
         composed: None,
         vault_count,
         vault_values: vault_vars,
@@ -903,7 +927,7 @@ pub fn read_vault_environments_for_run(
             OverridePolicy::Apply => lpm_vault::try_get_all_run_environments(project_dir)?,
             OverridePolicy::Exclude => lpm_vault::AllRunEnvironments {
                 values: lpm_vault::try_get_all_environments(project_dir)?,
-                overrides: HashMap::new(),
+                ..lpm_vault::AllRunEnvironments::default()
             },
         };
         let resolved = environments(&all.environment_names());
@@ -918,7 +942,7 @@ pub fn read_vault_environments_for_run(
                         env_name: mode.map(ToOwned::to_owned),
                         with_overrides: matches!(policy, OverridePolicy::Apply),
                     },
-                    Arc::new((run.values, run.overrides)),
+                    Arc::new(run),
                 )
             })
             .collect();

@@ -20,6 +20,7 @@ fn layers(vars: &[(&str, &str)], overrides: PersonalOverrides) -> ProjectEnvLaye
     ProjectEnvLayers {
         vars: map(vars),
         overrides: std::sync::Arc::new(overrides),
+        overrides_identity: None,
         composed: None,
         vault_count: 0,
         vault_values: map(vars),

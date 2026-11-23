@@ -38,7 +38,31 @@ pub fn read_all(project_dir: &Path) -> Result<BTreeMap<String, PersonalOverrides
     let Some(vault_id) = crate::linked_vault_id(project_dir)? else {
         return Ok(BTreeMap::new());
     };
-    in_overrides_lock(|directory| read_all_unlocked(directory, &vault_id))
+    reported(in_overrides_lock(|directory| {
+        read_all_unlocked(directory, &vault_id)
+    })?)
+}
+
+/// `overrides`, once the `lpm` that started this one knows they were read.
+fn reported(
+    overrides: BTreeMap<String, PersonalOverrides>,
+) -> Result<BTreeMap<String, PersonalOverrides>, String> {
+    if !overrides.is_empty() {
+        crate::override_marker::report_read()?;
+    }
+    Ok(overrides)
+}
+
+/// `change`'s result, once the `lpm` that started this one knows overrides
+/// were changed: what a change reports is this computer's own.
+fn reported_change(change: Result<ChangePlan, String>) -> Result<Change, String> {
+    let plan = change?;
+    crate::override_marker::report_read()?;
+    Ok(Change {
+        effects: plan.effects,
+        activated: plan.activated,
+        over_admission_target: plan.over_admission_target,
+    })
 }
 
 /// The env project a command checked or read before it asked for anything,
@@ -76,7 +100,9 @@ pub fn review_all(project_dir: &Path) -> Result<Option<Reviewed>, String> {
     let Some(vault_id) = crate::linked_vault_id(project_dir)? else {
         return Ok(None);
     };
-    let overrides = in_overrides_lock(|directory| read_all_unlocked(directory, &vault_id))?;
+    let overrides = reported(in_overrides_lock(|directory| {
+        read_all_unlocked(directory, &vault_id)
+    })?)?;
     Ok(Some(Reviewed {
         project: Project { vault_id },
         overrides,
@@ -106,13 +132,9 @@ pub fn remove_reviewed(
         overrides: &reviewed.overrides,
         removals,
     };
-    in_overrides_lock(|directory| change_unlocked(directory, vault_id, &edits, expect)).map(
-        |plan| Change {
-            effects: plan.effects,
-            activated: plan.activated,
-            over_admission_target: plan.over_admission_target,
-        },
-    )
+    reported_change(in_overrides_lock(|directory| {
+        change_unlocked(directory, vault_id, &edits, expect)
+    }))
 }
 
 /// What a change requires of the overrides it plans from, checked against
@@ -194,15 +216,11 @@ pub fn change_checked(
 ) -> Result<Change, String> {
     let vault_id = project.still_named(
         project_dir,
-        "while its values were asked for; nothing was stored",
+        "while its values were read or asked for; nothing was stored",
     )?;
-    in_overrides_lock(|directory| change_unlocked(directory, vault_id, edits, Expect::Nothing)).map(
-        |plan| Change {
-            effects: plan.effects,
-            activated: plan.activated,
-            over_admission_target: plan.over_admission_target,
-        },
-    )
+    reported_change(in_overrides_lock(|directory| {
+        change_unlocked(directory, vault_id, edits, Expect::Nothing)
+    }))
 }
 
 /// Apply `edits` to the personal overrides of the env project at
@@ -220,12 +238,9 @@ pub fn change(project_dir: &Path, edits: &[Edit]) -> Result<Change, String> {
             None => Err(NO_PROJECT.to_owned()),
         };
     };
-    in_overrides_lock(|directory| change_unlocked(directory, &vault_id, edits, Expect::Nothing))
-        .map(|plan| Change {
-            effects: plan.effects,
-            activated: plan.activated,
-            over_admission_target: plan.over_admission_target,
-        })
+    reported_change(in_overrides_lock(|directory| {
+        change_unlocked(directory, &vault_id, edits, Expect::Nothing)
+    }))
 }
 
 /// Refuse what `edits` are refused for whatever project they change: an

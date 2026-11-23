@@ -1,72 +1,60 @@
-//! Whether an `lpm` a task started applied this computer's personal
-//! overrides, which a task cache that shares outputs must know: the task's
-//! own environment can't show what a nested `lpm run` or `lpm env print`
-//! read for another environment.
-//!
-//! An `lpm` that may share task outputs passes its tasks a marker path. An
-//! `lpm` that inherits one creates that file once it applies an override,
-//! and passes the same path on, so every depth reports to the outermost.
+//! The markers a cached task's processes report to when an `lpm` they start
+//! reads personal overrides (see [`lpm_vault::override_marker`]): each
+//! cached task has its own, so only that task, and what depends on it, stays
+//! out of the task caches.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, OnceLock};
 
-/// The variable that carries the marker path to a task's process.
-pub const MARKER_ENV: &str = "LPM_PERSONAL_OVERRIDES_MARKER";
+pub use lpm_vault::override_marker::MARKER_ENV;
 
-/// The marker this process inherited from the `lpm` that started it.
-static INHERITED: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
-    std::env::var_os(MARKER_ENV)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-});
+thread_local! {
+    /// The marker of the task this thread starts, while it's watched.
+    static WATCHED: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
 
-/// The marker this process made for its own tasks, when it inherited none.
-static OWN: OnceLock<PathBuf> = OnceLock::new();
+/// A task's own marker, watched until it's dropped: the processes the task
+/// starts on this thread report to it, not to the marker this process
+/// inherited.
+#[must_use]
+pub struct TaskMarker {
+    path: PathBuf,
+    previous: Option<PathBuf>,
+}
 
-static RECORDED: AtomicBool = AtomicBool::new(false);
+impl TaskMarker {
+    /// A marker of its own for the task this thread starts next.
+    pub fn watch() -> Self {
+        let path = new_marker_path();
+        let previous = WATCHED.with_borrow_mut(|watched| watched.replace(path.clone()));
+        Self { path, previous }
+    }
 
-/// Have the tasks this process starts report personal overrides they apply
-/// through a nested `lpm`, before the first of them starts.
-pub fn watch_nested_personal_overrides() {
-    if INHERITED.is_none() {
-        OWN.get_or_init(new_marker_path);
+    /// Whether an `lpm` the task started read personal overrides: its marker
+    /// is there, can't be told absent, or couldn't be passed to the task.
+    pub fn read_overrides(&self) -> bool {
+        self.path.to_str().is_none()
+            || !matches!(
+                self.path.symlink_metadata(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
     }
 }
 
-/// The marker path this process's tasks get, when it has one.
-pub(crate) fn marker() -> Option<&'static Path> {
-    INHERITED
-        .as_deref()
-        .or_else(|| OWN.get().map(PathBuf::as_path))
-}
-
-/// Report to the `lpm` that started this one that it applied a personal
-/// override. The file is only ever created, never followed or written to,
-/// so whatever lies at the path is left alone.
-pub(crate) fn record_personal_overrides_applied() {
-    let Some(path) = INHERITED.as_deref() else {
-        return;
-    };
-    if RECORDED.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    if let Err(error) = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        && error.kind() != std::io::ErrorKind::AlreadyExists
-    {
-        tracing::warn!(
-            "couldn't tell the lpm that started this one that personal overrides apply: {error}"
-        );
+impl Drop for TaskMarker {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let previous = self.previous.take();
+        WATCHED.with_borrow_mut(|watched| *watched = previous);
     }
 }
 
-/// Whether an `lpm` this process's tasks started applied a personal
-/// override, or, under an outer `lpm`, any `lpm` that reports to it did.
-pub fn nested_personal_overrides_applied() -> bool {
-    marker().is_some_and(|path| path.symlink_metadata().is_ok())
+/// The marker the processes this thread starts report to: the watched
+/// task's, or the one this process inherited.
+pub(crate) fn marker() -> Option<PathBuf> {
+    WATCHED
+        .with_borrow(Clone::clone)
+        .or_else(|| lpm_vault::override_marker::inherited().map(Path::to_path_buf))
 }
 
 /// A path no file is at yet, private to this process: in the user's
@@ -83,9 +71,23 @@ fn new_marker_path() -> PathBuf {
     ))
 }
 
-/// Remove this process's own marker once its tasks have all ended.
-pub fn forget_nested_personal_overrides() {
-    if let Some(path) = OWN.get() {
-        let _ = std::fs::remove_file(path);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_task_reports_to_its_own_marker_while_it_is_watched() {
+        let outer = marker();
+        let task = TaskMarker::watch();
+        assert_eq!(marker().as_deref(), Some(task.path.as_path()));
+        assert!(!task.read_overrides());
+
+        std::fs::write(&task.path, "").expect("a nested lpm reports");
+        assert!(task.read_overrides());
+        let path = task.path.clone();
+        drop(task);
+
+        assert!(!path.exists(), "the marker goes with the task");
+        assert_eq!(marker(), outer);
     }
 }

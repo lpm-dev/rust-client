@@ -409,10 +409,14 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
     let schema = config.as_ref().and_then(|c| c.env_schema.as_ref());
     // Status is what each environment would run with on this machine, so it
     // includes the personal overrides.
-    let (vault_envs, overrides_by_env) = match vault_id.as_deref() {
+    let lpm_vault::AllRunEnvironments {
+        values: vault_envs,
+        overrides: overrides_by_env,
+        ..
+    } = match vault_id.as_deref() {
         Some(vault_id) => lpm_vault::try_get_all_run_environments_for_vault_id(vault_id)
             .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?,
-        None => (HashMap::new(), HashMap::new()),
+        None => lpm_vault::AllRunEnvironments::default(),
     };
     let all_envs = lpm_env::resolver::list_all_from_vault_names(
         env_map,

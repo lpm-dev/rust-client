@@ -89,8 +89,9 @@ pub(super) struct CompletedTaskCacheIdentity {
     value: String,
     output_validation: Option<lpm_task::hasher::FilesystemValidation>,
     dependencies: Vec<Arc<Self>>,
-    /// The task, or one it depends on, ran with this computer's personal
-    /// overrides, so nothing built from its outputs leaves this computer.
+    /// The task's project has personal overrides on this computer, or a
+    /// task it depends on does, so nothing built from its outputs leaves
+    /// this computer.
     local_only: bool,
 }
 
@@ -171,6 +172,8 @@ pub(super) struct CacheContext {
 }
 
 pub(super) struct CacheStoreRequest<'a> {
+    /// What the task's processes reported to while it ran.
+    pub(super) task: &'a lpm_runner::override_marker::TaskMarker,
     pub(super) project_dir: &'a Path,
     pub(super) workspace_contract: Option<&'a WorkspaceCacheContract>,
     pub(super) script_name: &'a str,
@@ -397,6 +400,7 @@ fn build_task_context(
     let lpm_runner::script::ScriptChildEnv {
         vars: env_vars,
         personal_overrides,
+        project_overrides,
     } = lpm_runner::script::load_script_child_env_with_config(
         project_dir,
         script_name,
@@ -442,9 +446,7 @@ fn build_task_context(
     );
     // Where a nested lpm reports personal overrides differs every run and
     // changes nothing a task builds.
-    child_env.remove(std::ffi::OsStr::new(
-        lpm_runner::override_marker::MARKER_ENV,
-    ));
+    child_env.retain(|key, _| !is_override_marker(key));
     let root = cache_key_root(project_dir, workspace_contract);
     if task_config.is_cache_portable() {
         match script_context.portable_manifest_path(&root) {
@@ -503,6 +505,11 @@ fn build_task_context(
             .map_err(|error| LpmError::EnvValidation(error.to_string()))?;
     }
     let mut dependency_pairs = dependency_identity_pairs(dependency_identities);
+    // A command the task starts can read any environment's overrides, so
+    // all of them key what it builds here.
+    if let Some(overrides) = project_overrides {
+        dependency_pairs.push(("lpm-personal-overrides:v1".into(), overrides.to_hex()));
+    }
     if let Some(snapshot) = &schema_snapshot {
         dependency_pairs.push((
             "lpm-env-schema-closure:v1".into(),
@@ -526,14 +533,17 @@ fn build_task_context(
             .verify_dependencies()
             .map_err(|error| LpmError::EnvValidation(error.to_string()))?;
     }
-    // Outputs and logs built with this computer's personal overrides, or
-    // from a task's that were, stay on it: they're never shared, and the
-    // team's never stand in for them.
-    let local_only = personal_overrides > 0 || any_local_only(dependency_identities);
+    // Outputs and logs a project's tasks build where it has personal
+    // overrides, which a command a task starts can read for any
+    // environment, or built from such a task's, stay on this computer:
+    // they're never shared, and the team's never stand in for them.
+    let local_only = personal_overrides > 0
+        || project_overrides.is_some()
+        || any_local_only(dependency_identities);
     let remote_cache = match remote_cache {
         RemoteCacheResolution::Resolve(_) if local_only => {
             tracing::debug!(
-                "task '{}' runs with personal overrides, or after a task that did; not using the remote cache for it",
+                "task '{}' is in a project with personal overrides, or runs after a task that is; not using the remote cache for it",
                 lpm_common::sanitize_terminal_inline(script_name)
             );
             None
@@ -543,11 +553,8 @@ fn build_task_context(
         }
         RemoteCacheResolution::Omit => None,
     };
-    if remote_cache.is_some() {
-        lpm_runner::override_marker::watch_nested_personal_overrides();
-        if task_config.cache_env.is_none() {
-            crate::commands::remote_cache::warn_task_without_cache_env(script_name);
-        }
+    if remote_cache.is_some() && task_config.cache_env.is_none() {
+        crate::commands::remote_cache::warn_task_without_cache_env(script_name);
     }
     Ok(Some(CacheContext {
         command_preference,
@@ -567,6 +574,17 @@ fn build_task_context(
         dependencies: dependency_identities.to_vec(),
         local_only,
     }))
+}
+
+/// The variable that carries where a nested lpm reports personal overrides,
+/// spelled as the host compares names.
+fn is_override_marker(key: &std::ffi::OsStr) -> bool {
+    let marker = lpm_runner::override_marker::MARKER_ENV;
+    if cfg!(windows) {
+        key.eq_ignore_ascii_case(marker)
+    } else {
+        key == marker
+    }
 }
 
 /// The variables that name the directory a command was run from.
@@ -764,12 +782,24 @@ pub(super) fn complete_task_cache_identity(
     }
 }
 
+/// Store a successful task's outputs, unless an `lpm` it started read
+/// personal overrides, which its key doesn't hold: then neither cache keeps
+/// it, and the `lpm` that started this one, if any, is told. Only telling it
+/// fails: what this one built would be shared otherwise.
 pub(super) fn try_cache_store_with_context(
     request: CacheStoreRequest<'_>,
     expected: &CacheContext,
-) -> bool {
+) -> Result<bool, LpmError> {
     let script_name = request.script_name;
-    match store_cache_with_context(request, expected) {
+    if request.task.read_overrides() {
+        lpm_vault::override_marker::report_read().map_err(LpmError::Task)?;
+        tracing::debug!(
+            "an lpm that task '{}' started read personal overrides; not caching it",
+            lpm_common::sanitize_terminal_inline(script_name)
+        );
+        return Ok(false);
+    }
+    Ok(match store_cache_with_context(request, expected) {
         Ok(stored) => stored,
         Err(error) => {
             tracing::warn!(
@@ -778,7 +808,7 @@ pub(super) fn try_cache_store_with_context(
             );
             false
         }
-    }
+    })
 }
 
 fn warn_execution_context_changed(script_name: &str, expected: &CacheContext) {
@@ -865,24 +895,15 @@ fn store_cache_with_context(
     if let (Some(remote_cache), lpm_task::cache::StoredCacheEntry::Published(published)) =
         (&expected.remote_cache, stored)
     {
-        // A nested lpm the task started may have built its outputs with
-        // this computer's personal overrides, which never leave it.
-        if lpm_runner::override_marker::nested_personal_overrides_applied() {
-            tracing::debug!(
-                "an lpm that task '{}' started applied personal overrides; not uploading it to the remote cache",
-                lpm_common::sanitize_terminal_inline(request.script_name)
-            );
-        } else {
-            crate::commands::remote_cache::try_store(
-                remote_cache,
-                published,
-                request.stdout,
-                request.stderr,
-                request.duration_ms,
-                &expected.env_vars,
-                &expected.inherited_env,
-            );
-        }
+        crate::commands::remote_cache::try_store(
+            remote_cache,
+            published,
+            request.stdout,
+            request.stderr,
+            request.duration_ms,
+            &expected.env_vars,
+            &expected.inherited_env,
+        );
     }
 
     tracing::debug!(
@@ -897,6 +918,20 @@ fn store_cache_with_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_override_marker_is_left_out_of_keys_as_the_host_spells_names() {
+        let marker = lpm_runner::override_marker::MARKER_ENV;
+        assert!(is_override_marker(std::ffi::OsStr::new(marker)));
+        assert_eq!(
+            is_override_marker(std::ffi::OsStr::new(&marker.to_ascii_lowercase())),
+            cfg!(windows),
+            "Windows passes names without case"
+        );
+        assert!(!is_override_marker(std::ffi::OsStr::new(
+            "LPM_PERSONAL_OVERRIDES"
+        )));
+    }
 
     /// The overlap warning names the file as an `inputs` pattern would, so
     /// it reads the same on Windows, whose paths join with `\`.

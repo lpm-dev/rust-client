@@ -712,29 +712,29 @@ pub(crate) fn read_run_environment_unlocked(
     vault_id: &str,
     env: &str,
     default_fallback: bool,
-) -> Result<(Option<SecretMap>, crate::PersonalOverrides), String> {
+) -> Result<crate::StoredRunEnvironment, String> {
     let read = companion::read_for_run_unlocked(directory, vault_id)?;
     let overrides = read.overrides(vault_id, env)?;
+    let identity = read.overrides_identity();
     let Some((name, content)) = &read.values else {
-        return Ok((None, overrides));
+        return Ok((None, overrides, identity));
     };
     let json = decrypt_vault_content(directory, vault_id, &read.vaults, name, content)?;
-    Ok((select_environment(&json, env, default_fallback)?, overrides))
+    Ok((
+        select_environment(&json, env, default_fallback)?,
+        overrides,
+        identity,
+    ))
 }
 
 /// Every environment's values and personal overrides, in the caller's lock.
 pub(crate) fn read_all_run_environments_unlocked(
     directory: &crate::storage_transaction::VaultStorageDirectory,
     vault_id: &str,
-) -> Result<
-    (
-        Option<EnvironmentMap>,
-        std::collections::BTreeMap<String, crate::PersonalOverrides>,
-    ),
-    String,
-> {
+) -> Result<crate::StoredRunEnvironments, String> {
     let read = companion::read_for_run_unlocked(directory, vault_id)?;
     let overrides = read.all_overrides(vault_id)?;
+    let identity = read.overrides_identity();
     let environments = read
         .values
         .as_ref()
@@ -744,7 +744,7 @@ pub(crate) fn read_all_run_environments_unlocked(
         })
         .transpose()?;
     crate::history::scope::observe_read(vault_id, environments.as_ref());
-    Ok((environments, overrides))
+    Ok((environments, overrides, identity))
 }
 
 /// Read all environments from encrypted file.
@@ -1404,15 +1404,16 @@ pub(crate) mod tests {
             });
 
             ENTRY_LISTINGS.with(|listings| listings.set(0));
-            let (values, overrides) = with_storage_directory(|directory| {
+            let (values, overrides, identity) = with_storage_directory(|directory| {
                 read_run_environment_unlocked(directory, "legacy-run", "default", false)
             });
             assert_eq!(values, Some(secrets("value")));
             assert!(overrides.is_empty());
+            assert!(identity.is_none());
             assert_eq!(ENTRY_LISTINGS.with(std::cell::Cell::get), 1);
 
             ENTRY_LISTINGS.with(|listings| listings.set(0));
-            let (environments, all_overrides) = with_storage_directory(|directory| {
+            let (environments, all_overrides, _) = with_storage_directory(|directory| {
                 read_all_run_environments_unlocked(directory, "legacy-run")
             });
             assert_eq!(

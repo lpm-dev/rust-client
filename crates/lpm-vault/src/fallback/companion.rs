@@ -1104,6 +1104,15 @@ pub(crate) fn read_for_run_unlocked(
 }
 
 impl RunRead {
+    /// What identifies the project's overrides in every environment, when
+    /// they apply: there are values, and a record beside them.
+    pub(crate) fn overrides_identity(&self) -> Option<crate::OverridesIdentity> {
+        self.values.as_ref()?;
+        self.record
+            .as_deref()
+            .map(|record| crate::OverridesIdentity::of(record))
+    }
+
     /// `environment`'s personal overrides.
     pub(crate) fn overrides(
         &self,

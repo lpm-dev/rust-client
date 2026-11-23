@@ -239,6 +239,7 @@ pub(super) fn run_tasks_parallel(
 
             // Use captured execution when caching is enabled.
             let caching_enabled = cache_context.is_some();
+            let task_marker = caching_enabled.then(lpm_runner::override_marker::TaskMarker::watch);
 
             if caching_enabled || json_output {
                 match run_task_captured_with_reserved_stdout(
@@ -253,9 +254,10 @@ pub(super) fn run_tasks_parallel(
                 ) {
                     Ok(output) => {
                         let duration_ms = start.elapsed().as_millis() as u64;
-                        if let Some(context) = &cache_context
+                        if let (Some(context), Some(task)) = (&cache_context, &task_marker)
                             && try_cache_store_with_context(
                                 CacheStoreRequest {
+                                    task,
                                     project_dir,
                                     workspace_contract: workspace_contract.as_ref(),
                                     script_name: task_name,
@@ -267,7 +269,7 @@ pub(super) fn run_tasks_parallel(
                                     stderr: &output.stderr,
                                 },
                                 context,
-                            )
+                            )?
                             && let Some(identity) =
                                 complete_task_cache_identity(project_dir, task_name, context)
                         {
@@ -461,6 +463,9 @@ pub(super) fn run_tasks_parallel(
                                 ));
                             }
 
+                            let task_marker = cache_context
+                                .is_some()
+                                .then(lpm_runner::override_marker::TaskMarker::watch);
                             // Resolve command from lpm.json or package.json
                             let command_override =
                                 tasks_clone.get(&name).and_then(|tc| tc.command.clone());
@@ -517,10 +522,13 @@ pub(super) fn run_tasks_parallel(
 
                             match result {
                                 Ok(output) => {
-                                    let cache_identity = if let Some(context) = &cache_context {
+                                    let cache_identity = if let (Some(context), Some(task)) =
+                                        (&cache_context, &task_marker)
+                                    {
                                         let duration_ms = start.elapsed().as_millis() as u64;
                                         if try_cache_store_with_context(
                                             CacheStoreRequest {
+                                                task,
                                                 project_dir: &dir,
                                                 workspace_contract: workspace_contract.as_ref(),
                                                 script_name: &name,
@@ -532,7 +540,7 @@ pub(super) fn run_tasks_parallel(
                                                 stderr: &output.stderr,
                                             },
                                             context,
-                                        ) {
+                                        )? {
                                             complete_task_cache_identity(&dir, &name, context)
                                         } else {
                                             None

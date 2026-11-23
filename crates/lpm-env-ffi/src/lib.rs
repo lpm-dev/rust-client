@@ -24,8 +24,16 @@ mod overrides;
 
 /// The engine holds env values, decrypted backups and passphrases, so all
 /// memory it frees is wiped first, including what its dependencies free.
+#[cfg(not(test))]
 #[global_allocator]
 static ALLOCATOR: lpm_env_backup::WipingAllocator = lpm_env_backup::WipingAllocator;
+
+#[cfg(test)]
+mod allocation_probe;
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: allocation_probe::Tracking = allocation_probe::Tracking;
 
 const ABI_VERSION: u32 = 2;
 const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;

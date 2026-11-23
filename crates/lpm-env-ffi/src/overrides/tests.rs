@@ -323,29 +323,8 @@ fn a_read_lists_no_overrides_beside_no_values_after_the_marker_s_refusals() {
     );
 }
 
-/// The most memory this process has held at once, in bytes.
-#[cfg(unix)]
-fn peak_resident_bytes() -> usize {
-    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-    // SAFETY: `getrusage` fills `usage` when it returns zero.
-    assert_eq!(
-        unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
-        0
-    );
-    // SAFETY: The call above succeeded.
-    let peak = usize::try_from(unsafe { usage.assume_init() }.ru_maxrss).unwrap_or(0);
-    if cfg!(target_os = "macos") {
-        peak
-    } else {
-        peak * 1024
-    }
-}
-
-/// How much the peak memory grew while a plan refused `request`, a JSON
-/// object of nearly the whole input limit, built as `head`, `item`s and
-/// `tail`. Each test runs in a process of its own, so the peak is the
-/// call's alone.
-#[cfg(unix)]
+/// The most a plan held at once while it refused `request`, a JSON object of
+/// nearly the whole input limit, built as `head`, `item`s and `tail`.
 fn peak_growth_refusing(head: &str, item: &str, tail: &str) -> usize {
     let room = OVERRIDES_INPUT_LIMIT - 1024;
     let mut request = Vec::with_capacity(room);
@@ -364,17 +343,18 @@ fn peak_growth_refusing(head: &str, item: &str, tail: &str) -> usize {
     input.extend_from_slice(&request);
     drop(request);
 
-    let before = peak_resident_bytes();
-    // SAFETY: The input stays alive for the synchronous call.
-    let result = unsafe { lpm_env_overrides_plan(input.as_ptr(), input.len()) };
-    let status = result.status;
-    // SAFETY: Released exactly once.
-    unsafe { lpm_env_release(result) };
+    let (status, held) = crate::allocation_probe::peak_during(|| {
+        // SAFETY: The input stays alive for the synchronous call.
+        let result = unsafe { lpm_env_overrides_plan(input.as_ptr(), input.len()) };
+        let status = result.status;
+        // SAFETY: Released exactly once.
+        unsafe { lpm_env_release(result) };
+        status
+    });
     assert_eq!(status, 2, "refused as invalid input");
-    peak_resident_bytes().saturating_sub(before)
+    held
 }
 
-#[cfg(unix)]
 #[test]
 fn edits_past_the_limit_are_refused_before_they_are_held() {
     let grown = peak_growth_refusing(
@@ -382,10 +362,9 @@ fn edits_past_the_limit_are_refused_before_they_are_held() {
         r#"{"action":"clearAll"}"#,
         "]}",
     );
-    assert!(grown < 8 * 1024 * 1024, "{grown} bytes held");
+    assert!(grown < 1024 * 1024, "{grown} bytes held");
 }
 
-#[cfg(unix)]
 #[test]
 fn renames_past_the_limit_are_refused_before_they_are_held() {
     let grown = peak_growth_refusing(
@@ -393,7 +372,7 @@ fn renames_past_the_limit_are_refused_before_they_are_held() {
         r#"{"from":"a","to":"b"}"#,
         "]}]}",
     );
-    assert!(grown < 8 * 1024 * 1024, "{grown} bytes held");
+    assert!(grown < 1024 * 1024, "{grown} bytes held");
 }
 
 #[test]
@@ -1068,4 +1047,30 @@ fn requests_take_only_their_documented_objects_and_leave_out_what_is_absent() {
         );
         assert_eq!(status, 2, "{overrides}: {refused}");
     }
+}
+
+#[test]
+fn an_edit_s_refusal_comes_before_the_record_s_damage() {
+    let marker = OVERRIDES_MARKER.as_bytes();
+    let (status, refused, _) = call(
+        lpm_env_overrides_plan,
+        &json!({"vaultId": VAULT, "hasValues": true, "marker": 1, "record": 2, "edits": [
+            {"action": "remove", "environment": "dev", "key": "A"},
+            {"action": "unset", "environment": "dev", "key": "1BAD"},
+        ]}),
+        &[marker, b"not a record"],
+    );
+    assert_eq!(status, 5, "{refused}");
+    assert_eq!(refused["code"], "overrides.invalid_key");
+    assert_eq!(refused["edit"], 1);
+
+    let (status, refused, _) = call(
+        lpm_env_overrides_plan,
+        &json!({"vaultId": VAULT, "hasValues": true, "marker": 1, "record": 2, "edits": [
+            {"action": "remove", "environment": "dev", "key": "A"},
+        ]}),
+        &[marker, b"not a record"],
+    );
+    assert_eq!(status, 5, "{refused}");
+    assert_eq!(refused["code"], "overrides.damaged");
 }

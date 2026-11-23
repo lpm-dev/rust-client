@@ -2122,11 +2122,15 @@ pub(crate) fn read_for_run_unlocked(
     vault_id: &str,
     env: &str,
     default_fallback: bool,
-) -> Result<(Option<SecretMap>, crate::PersonalOverrides), String> {
+) -> Result<crate::StoredRunEnvironment, String> {
     let read = companion_gate::read_for_run(&mut KeychainProjectStorage, vault_id)?;
     let overrides = read.overrides(vault_id, env)?;
+    let identity = read
+        .overrides_record
+        .as_deref()
+        .map(|record| crate::OverridesIdentity::of(record));
     let Some(bytes) = read.values else {
-        return Ok((None, overrides));
+        return Ok((None, overrides, identity));
     };
     let json = String::from_utf8(bytes)
         .map_err(|_| "vault keychain data is not valid UTF-8".to_owned())?;
@@ -2138,22 +2142,20 @@ pub(crate) fn read_for_run_unlocked(
     let values = parsed
         .map(crate::selected_environment::SelectedVaultPayload::into_selected)
         .map_err(|error| format!("vault keychain data is not valid JSON: {error}"))?;
-    Ok((values, overrides))
+    Ok((values, overrides, identity))
 }
 
 /// Every environment's values and personal overrides, read together inside
 /// one lock on this thread.
 pub(crate) fn read_all_for_run_unlocked(
     vault_id: &str,
-) -> Result<
-    (
-        Option<EnvironmentMap>,
-        std::collections::BTreeMap<String, crate::PersonalOverrides>,
-    ),
-    String,
-> {
+) -> Result<crate::StoredRunEnvironments, String> {
     let read = companion_gate::read_for_run(&mut KeychainProjectStorage, vault_id)?;
     let overrides = read.all_overrides(vault_id)?;
+    let identity = read
+        .overrides_record
+        .as_deref()
+        .map(|record| crate::OverridesIdentity::of(record));
     let values = read
         .values
         .map(|bytes| {
@@ -2163,7 +2165,7 @@ pub(crate) fn read_all_for_run_unlocked(
                 .map_err(|error| format!("vault keychain data is not valid JSON: {error}"))
         })
         .transpose()?;
-    Ok((values, overrides))
+    Ok((values, overrides, identity))
 }
 
 /// Authorize `operation` on `vault_id` against its Keychain feature marker,

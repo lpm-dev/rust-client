@@ -496,7 +496,16 @@ LPMEnvResult lpm_env_overrides_read(const uint8_t *input, size_t input_length);
  * to, moved, replaced, kept} | {kind: "notCopied", from, to, count, existing} |
  * {kind: "existing", environment, count} | {kind: "environmentsChanged",
  * moved: [{from, to, moved, replaced, kept}], removed: [{environment,
- * removed}]}. Refusals, with edit (its index, from 0) for one edit's:
+ * removed}]}. A set's value blob holds UTF-8 text: a value blob past the
+ * input's blobs, or one that isn't UTF-8, is invalid input, refused with the
+ * rest of the input's shape. Refusals then come in this order: the marker's
+ * (overrides.damaged, overrides.unsupported, overrides.needs_resume); each
+ * edit's, in edit order and every one of an edit's before the next edit's
+ * (its environment and name, then a NUL in a set's value, then, with values,
+ * the value's size and the batch's); overrides.no_values without values; and
+ * then, with values, the record's damage and size, the budget, admission and
+ * a removal that needs repair. Refusals, with edit (its index, from 0) for
+ * one edit's:
  * overrides.invalid_environment {environment}, overrides.invalid_key (the name
  * is never repeated: it may be a value; a set's name is checked before its
  * value's size), overrides.denied_name {key} (a name LPM never passes to a

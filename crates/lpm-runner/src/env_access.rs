@@ -11,7 +11,7 @@ use lpm_common::LpmError;
 /// A project's vault values for one environment, and its personal overrides:
 /// one snapshot the run's reads and each task's pin share, copied only by
 /// the reader that takes it.
-pub(crate) type VaultValues = Arc<(HashMap<String, String>, lpm_vault::PersonalOverrides)>;
+pub(crate) type VaultValues = Arc<lpm_vault::RunEnvironment>;
 
 /// Which vault values a read asks for: the project, the environment, and
 /// whether personal overrides apply.
@@ -363,10 +363,10 @@ mod tests {
 
     fn counted(reads: &AtomicUsize) -> VaultValues {
         let read = reads.fetch_add(1, Ordering::SeqCst);
-        Arc::new((
-            HashMap::from([("READ".to_owned(), read.to_string())]),
-            lpm_vault::PersonalOverrides::default(),
-        ))
+        Arc::new(lpm_vault::RunEnvironment {
+            values: HashMap::from([("READ".to_owned(), read.to_string())]),
+            ..lpm_vault::RunEnvironment::default()
+        })
     }
 
     #[test]

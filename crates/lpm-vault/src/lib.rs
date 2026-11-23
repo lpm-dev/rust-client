@@ -31,6 +31,7 @@ mod fallback;
 mod freed_memory_probe;
 pub mod history;
 mod links;
+pub mod override_marker;
 pub mod overrides;
 mod selected_environment;
 pub mod signature;
@@ -200,7 +201,42 @@ pub fn plant_debug_companion_state(
 pub struct RunEnvironment {
     pub values: HashMap<String, String>,
     pub overrides: PersonalOverrides,
+    /// The project's personal overrides in every environment, when it has
+    /// any: a command a run starts can read any of them.
+    pub overrides_identity: Option<OverridesIdentity>,
 }
+
+/// What a project's personal overrides on this computer are, in every
+/// environment: a digest of their record, which any change to them changes.
+/// It never leaves this computer.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OverridesIdentity([u8; 32]);
+
+impl OverridesIdentity {
+    pub(crate) fn of(record: &[u8]) -> Self {
+        use sha2::Digest as _;
+        Self(sha2::Sha256::digest(record).into())
+    }
+
+    pub fn to_hex(self) -> String {
+        hex::encode(self.0)
+    }
+}
+
+/// A digest of secrets: shown, it would let a guess of them be checked.
+impl std::fmt::Debug for OverridesIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OverridesIdentity(..)")
+    }
+}
+
+/// The selected environment's values, its personal overrides, and what
+/// identifies the project's overrides in every environment.
+pub(crate) type StoredRunEnvironment = (
+    Option<SecretMap>,
+    PersonalOverrides,
+    Option<OverridesIdentity>,
+);
 
 /// Authorize `operation` on `vault_id` against the feature marker of the
 /// store that holds its companion records, finishing any interrupted
@@ -645,14 +681,19 @@ pub fn try_get_run_environment_for_vault_id(
         Some(env) => (env, true),
         None => (lpm_env::DEFAULT_ENVIRONMENT, false),
     };
-    with_project_vault_transaction(|directory| {
-        let (values, overrides) =
+    let read = with_project_vault_transaction(|directory| {
+        let (values, overrides, overrides_identity) =
             read_run_environment_unlocked(directory, vault_id, environment, default_fallback)?;
         Ok(RunEnvironment {
             values: values.unwrap_or_default(),
             overrides,
+            overrides_identity,
         })
-    })
+    })?;
+    if read.overrides_identity.is_some() {
+        override_marker::report_read()?;
+    }
+    Ok(read)
 }
 
 /// Every environment's values and personal overrides from one read of the
@@ -661,6 +702,8 @@ pub fn try_get_run_environment_for_vault_id(
 pub struct AllRunEnvironments {
     pub values: EnvironmentMap,
     pub overrides: HashMap<String, PersonalOverrides>,
+    /// See [`RunEnvironment::overrides_identity`].
+    pub overrides_identity: Option<OverridesIdentity>,
 }
 
 impl AllRunEnvironments {
@@ -680,6 +723,7 @@ impl AllRunEnvironments {
         RunEnvironment {
             values: selected.cloned().unwrap_or_default(),
             overrides: self.overrides.get(name).cloned().unwrap_or_default(),
+            overrides_identity: self.overrides_identity,
         }
     }
 
@@ -711,25 +755,32 @@ pub fn try_get_all_run_environments(project_dir: &Path) -> Result<AllRunEnvironm
     let Some(vault_id) = linked_vault_id(project_dir)? else {
         return Ok(AllRunEnvironments::default());
     };
-    let (values, overrides) = try_get_all_run_environments_for_vault_id(&vault_id)?;
-    Ok(AllRunEnvironments { values, overrides })
+    try_get_all_run_environments_for_vault_id(&vault_id)
 }
 
 /// Every environment's values and personal overrides, read together in one
 /// lock, for a view of what each environment would run with.
 pub fn try_get_all_run_environments_for_vault_id(
     vault_id: &str,
-) -> Result<(EnvironmentMap, HashMap<String, PersonalOverrides>), String> {
+) -> Result<AllRunEnvironments, String> {
     validate_explicit_vault_id(vault_id)?;
-    with_project_vault_transaction(|directory| {
-        let (values, overrides) = read_all_run_environments_unlocked(directory, vault_id)?;
-        Ok((values.unwrap_or_default(), overrides.into_iter().collect()))
+    let (values, overrides, overrides_identity) = with_project_vault_transaction(|directory| {
+        read_all_run_environments_unlocked(directory, vault_id)
+    })?;
+    if overrides_identity.is_some() {
+        override_marker::report_read()?;
+    }
+    Ok(AllRunEnvironments {
+        values: values.unwrap_or_default(),
+        overrides: overrides.into_iter().collect(),
+        overrides_identity,
     })
 }
 
-type StoredRunEnvironments = (
+pub(crate) type StoredRunEnvironments = (
     Option<EnvironmentMap>,
     std::collections::BTreeMap<String, PersonalOverrides>,
+    Option<OverridesIdentity>,
 );
 
 fn read_all_run_environments_unlocked(
@@ -741,12 +792,12 @@ fn read_all_run_environments_unlocked(
     }
     #[cfg(target_os = "macos")]
     {
-        let (values, overrides) = keychain::read_all_for_run_unlocked(vault_id)?;
+        let (values, overrides, identity) = keychain::read_all_for_run_unlocked(vault_id)?;
         let values = match values {
             Some(values) => Some(values),
             None => fallback::read_all_environments_unlocked(directory, vault_id)?,
         };
-        Ok((values, overrides))
+        Ok((values, overrides, identity))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -759,7 +810,7 @@ fn read_run_environment_unlocked(
     vault_id: &str,
     environment: &str,
     default_fallback: bool,
-) -> Result<(Option<SecretMap>, PersonalOverrides), String> {
+) -> Result<StoredRunEnvironment, String> {
     if force_file_vault_backend() {
         return fallback::read_run_environment_unlocked(
             directory,
@@ -770,7 +821,7 @@ fn read_run_environment_unlocked(
     }
     #[cfg(target_os = "macos")]
     {
-        let (values, overrides) =
+        let (values, overrides, identity) =
             keychain::read_for_run_unlocked(vault_id, environment, default_fallback)?;
         let values = match values {
             Some(values) => Some(values),
@@ -781,7 +832,7 @@ fn read_run_environment_unlocked(
                 default_fallback,
             )?,
         };
-        Ok((values, overrides))
+        Ok((values, overrides, identity))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -2555,6 +2606,61 @@ mod tests {
             assert_eq!(
                 all.run_environment(Some("preview")).values["SHARED"],
                 "default"
+            );
+            cleanup_vault(project.path());
+        });
+    }
+
+    #[test]
+    fn every_reader_of_stored_values_alone_leaves_personal_overrides_out() {
+        crate::fallback::tests::with_temp_vault_home(|_| {
+            crate::fallback::tests::force_file_vault();
+            let project = tempfile::tempdir().unwrap();
+            set_env(project.path(), "default", &[("API_KEY", "team")]).unwrap();
+            set_env(project.path(), "staging", &[("API_KEY", "team")]).unwrap();
+            for environment in ["default", "staging"] {
+                overrides::change(
+                    project.path(),
+                    &[
+                        overrides::Edit::Set {
+                            environment: environment.to_owned(),
+                            key: "API_KEY".to_owned(),
+                            value: zeroize::Zeroizing::new("fixture-mine".to_owned()),
+                        },
+                        overrides::Edit::Set {
+                            environment: environment.to_owned(),
+                            key: "ONLY_MINE".to_owned(),
+                            value: zeroize::Zeroizing::new("fixture-mine".to_owned()),
+                        },
+                    ],
+                )
+                .unwrap();
+            }
+            let vault_id = vault_id::read_vault_id(project.path()).unwrap();
+            let team = HashMap::from([("API_KEY".to_owned(), "team".to_owned())]);
+
+            assert_eq!(
+                try_get(project.path(), "API_KEY").unwrap().as_deref(),
+                Some("team")
+            );
+            assert_eq!(
+                try_get_env(project.path(), "staging", "API_KEY")
+                    .unwrap()
+                    .as_deref(),
+                Some("team")
+            );
+            assert_eq!(try_get_all(project.path()).unwrap(), team);
+            assert_eq!(try_get_all_env(project.path(), "staging").unwrap(), team);
+            assert_eq!(
+                try_get_all_env_for_vault_id(&vault_id, "staging").unwrap(),
+                team
+            );
+            assert_eq!(
+                try_get_all_environments_for_vault_id(&vault_id).unwrap(),
+                HashMap::from([
+                    ("default".to_owned(), team.clone()),
+                    ("staging".to_owned(), team)
+                ])
             );
             cleanup_vault(project.path());
         });

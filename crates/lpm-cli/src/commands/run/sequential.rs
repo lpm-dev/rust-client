@@ -154,6 +154,7 @@ pub(super) fn run_tasks_sequential(
         ));
 
         let caching_enabled = cache_context.is_some();
+        let task_marker = caching_enabled.then(lpm_runner::override_marker::TaskMarker::watch);
         let task_start = std::time::Instant::now();
 
         // Resolve command: lpm.json task command > package.json script
@@ -170,9 +171,10 @@ pub(super) fn run_tasks_sequential(
             ) {
                 Ok(captured) => {
                     let duration_ms = task_start.elapsed().as_millis() as u64;
-                    if let Some(context) = &cache_context
+                    if let (Some(context), Some(task)) = (&cache_context, &task_marker)
                         && try_cache_store_with_context(
                             CacheStoreRequest {
+                                task,
                                 project_dir,
                                 workspace_contract,
                                 script_name: script,
@@ -184,7 +186,7 @@ pub(super) fn run_tasks_sequential(
                                 stderr: &captured.stderr,
                             },
                             context,
-                        )
+                        )?
                         && let Some(identity) =
                             complete_task_cache_identity(project_dir, script, context)
                     {
