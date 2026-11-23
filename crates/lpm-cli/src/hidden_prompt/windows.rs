@@ -79,6 +79,7 @@ fn clipboard_text(limit: usize) -> Option<Zeroizing<Vec<u16>>> {
 /// The console's input mode for as long as it lives.
 pub(super) struct Terminal {
     input: HANDLE,
+    output: Output,
     original_mode: CONSOLE_MODE,
     utf16: Utf16,
     /// The most bytes the value may hold, which bounds a clipboard paste.
@@ -87,7 +88,7 @@ pub(super) struct Terminal {
 }
 
 impl Terminal {
-    pub(super) fn enter(_output: Output, limit: usize) -> io::Result<Self> {
+    pub(super) fn enter(output: Output, limit: usize) -> io::Result<Self> {
         // SAFETY: the call takes a constant and returns a handle the process
         // owns, or none.
         let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
@@ -116,11 +117,18 @@ impl Terminal {
         })?;
         Ok(Self {
             input,
+            output,
             original_mode,
             utf16: Utf16::default(),
             limit,
             _control_events: control_events,
         })
+    }
+
+    /// Shows `prompt`. A console has no job control that could stop the
+    /// prompt, so it's shown once.
+    pub(super) fn show(&mut self, prompt: &[u8]) -> io::Result<()> {
+        self.output.write(prompt)
     }
 
     /// Characters as the console types them, waiting for at least one.
@@ -266,6 +274,10 @@ impl ControlEvents {
         let registered =
             held.is_none() && unsafe { SetConsoleCtrlHandler(Some(put_back_console), TRUE) } != 0;
         if let Err(error) = enter() {
+            // A control event the console dispatches meanwhile waits for
+            // this lock while the console holds its own, which removing the
+            // routine waits for.
+            drop(held);
             if registered {
                 // SAFETY: removing the routine added above.
                 unsafe { SetConsoleCtrlHandler(Some(put_back_console), FALSE) };

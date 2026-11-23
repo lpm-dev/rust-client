@@ -3,7 +3,7 @@
 use std::cell::UnsafeCell;
 use std::io;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
@@ -101,6 +101,14 @@ impl Terminal {
             }
         }
         Ok(terminal)
+    }
+
+    /// Shows `prompt`, which the prompt shows again when it continues after
+    /// a stop.
+    pub(super) fn show(&mut self, prompt: &[u8]) -> io::Result<()> {
+        self.output.write(prompt)?;
+        self.signals.show_again(prompt, descriptor(self.output));
+        Ok(())
     }
 }
 
@@ -203,8 +211,22 @@ impl Drop for Terminal {
         } else {
             -1
         };
-        put_back(&self.original, paste_output);
+        if terminal_is_ours() {
+            put_back(&self.original, paste_output);
+        }
     }
+}
+
+/// Whether standard input is this process's to change: a terminal whose
+/// foreground process group is this one's, or one that isn't its
+/// controlling terminal. A job in the background that changed it would be
+/// stopped by `SIGTTOU`, and the terminal is the shell's then, in the
+/// shell's mode. It makes only async-signal-safe calls.
+fn terminal_is_ours() -> bool {
+    // SAFETY: neither call takes a pointer, and both are async-signal-safe.
+    let foreground = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
+    // SAFETY: as above.
+    foreground < 0 || foreground == unsafe { libc::getpgrp() }
 }
 
 /// The descriptor `output` writes to.
@@ -285,9 +307,9 @@ fn write_within(output: libc::c_int, bytes: &[u8]) {
 /// The signals readline puts the terminal back for before they end the
 /// process. In raw mode no key sends one, but `kill`, a terminal that
 /// closes or a supervisor still can, and the process would end with echo
-/// off. A stop signal isn't among them, since the process goes on: bash and
-/// zsh give a job they resume cooked mode with echo, so `SIGCONT` gives the
-/// prompt's raw mode back instead.
+/// off. `SIGTSTP` puts it back before it stops the process, and `SIGCONT`
+/// gives the prompt's raw mode back: bash and zsh give a job they resume
+/// cooked mode with echo.
 const ENDING_SIGNALS: [libc::c_int; 5] = [
     libc::SIGHUP,
     libc::SIGINT,
@@ -342,6 +364,20 @@ static SAVED_RAW: SavedTermios = SavedTermios(UnsafeCell::new(MaybeUninit::unini
 /// The descriptor bracketed paste was turned on through, or -1.
 static PASTE_OUTPUT: AtomicI32 = AtomicI32::new(-1);
 
+/// The most of a prompt `SIGCONT` shows again; a longer one isn't.
+const PROMPT_CAPACITY: usize = 1024;
+
+/// The prompt the person was shown, which `SIGCONT` shows again: its first
+/// [`PROMPT_LENGTH`] bytes, written once a prompt, before the length says
+/// they're there.
+static PROMPT: SavedPrompt = SavedPrompt(UnsafeCell::new([0; PROMPT_CAPACITY]));
+
+/// How much of [`PROMPT`] holds the prompt; 0 while none is shown.
+static PROMPT_LENGTH: AtomicUsize = AtomicUsize::new(0);
+
+/// The descriptor the prompt was shown through.
+static PROMPT_OUTPUT: AtomicI32 = AtomicI32::new(-1);
+
 /// The handler, read from one place so the address an installed action
 /// holds compares equal to it.
 static HANDLER: extern "C" fn(libc::c_int) = put_back_and_end;
@@ -349,14 +385,72 @@ static HANDLER: extern "C" fn(libc::c_int) = put_back_and_end;
 /// The handler of `SIGCONT`, read from one place for the same reason.
 static CONTINUE_HANDLER: extern "C" fn(libc::c_int) = give_raw_mode_back;
 
+/// The handler of `SIGTSTP`, read from one place for the same reason.
+static STOP_HANDLER: extern "C" fn(libc::c_int) = put_back_and_stop;
+
+/// Every signal the prompt handles, which each of its handlers blocks on
+/// its thread, and the prompt blocks while it gives raw mode.
+const HANDLED_SIGNALS: [libc::c_int; ENDING_SIGNALS.len() + 2] = [
+    libc::SIGHUP,
+    libc::SIGINT,
+    libc::SIGQUIT,
+    libc::SIGTERM,
+    libc::SIGALRM,
+    libc::SIGCONT,
+    libc::SIGTSTP,
+];
+
 struct SavedTermios(UnsafeCell<MaybeUninit<libc::termios>>);
 
 // SAFETY: `HANDLER_STATE` keeps every write before the read that follows
 // it, and none during a read.
 unsafe impl Sync for SavedTermios {}
 
+struct SavedPrompt(UnsafeCell<[u8; PROMPT_CAPACITY]>);
+
+// SAFETY: `PROMPT_LENGTH` is 0 while the bytes are written, and a handler
+// reads only as many as it says, after it says them.
+unsafe impl Sync for SavedPrompt {}
+
+/// The set of [`HANDLED_SIGNALS`].
+fn handled_signals() -> libc::sigset_t {
+    // SAFETY: an all-zero sigset_t is a valid value for `sigemptyset` to
+    // initialize, and these calls only change it.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for signal in HANDLED_SIGNALS {
+            libc::sigaddset(&mut set, signal);
+        }
+        set
+    }
+}
+
+/// [`HANDLED_SIGNALS`] blocked on this thread for as long as it lives; any
+/// that arrives meanwhile is handled once they're unblocked, or by another
+/// thread.
+struct BlockedSignals(libc::sigset_t);
+
+impl BlockedSignals {
+    fn block() -> Self {
+        let handled = handled_signals();
+        // SAFETY: an all-zero sigset_t is a valid value the call overwrites.
+        let mut previous: libc::sigset_t = unsafe { std::mem::zeroed() };
+        // SAFETY: both sets are valid for the call.
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &handled, &mut previous) };
+        Self(previous)
+    }
+}
+
+impl Drop for BlockedSignals {
+    fn drop(&mut self) {
+        // SAFETY: the set is the thread's mask from before.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut()) };
+    }
+}
+
 /// The prompt's handler of each of [`ENDING_SIGNALS`] that would end the
-/// process, and of `SIGCONT`, for as long as it lives.
+/// process, and of `SIGCONT` and `SIGTSTP`, for as long as it lives.
 struct PromptSignals {
     /// Whether this prompt saved its terminal's state for the handler.
     armed: bool,
@@ -364,19 +458,22 @@ struct PromptSignals {
     replaced: [Option<libc::sigaction>; ENDING_SIGNALS.len()],
     /// The action `SIGCONT` had before its handler took it.
     continued: Option<libc::sigaction>,
+    /// The action `SIGTSTP` had before its handler took it.
+    stopped: Option<libc::sigaction>,
 }
 
 impl PromptSignals {
     /// Gives the handler each signal whose default action would end the
-    /// process, once `original` is saved for it, and `SIGCONT`, with `raw`
-    /// to give back. A signal that's ignored or handled, as under `nohup`,
-    /// keeps its action. Nothing is taken while another prompt has the
-    /// handler, or a handler is ending the process.
+    /// process, once `original` is saved for it, `SIGCONT`, with `raw` to
+    /// give back, and `SIGTSTP`. A signal that's ignored or handled, as
+    /// under `nohup`, keeps its action. Nothing is taken while another
+    /// prompt has the handler, or a handler is ending the process.
     fn take(original: &libc::termios, raw: &libc::termios) -> Self {
         let mut taken = Self {
             armed: false,
             replaced: [None; ENDING_SIGNALS.len()],
             continued: None,
+            stopped: None,
         };
         if HANDLER_STATE
             .compare_exchange(IDLE, SAVING, Ordering::SeqCst, Ordering::SeqCst)
@@ -401,42 +498,74 @@ impl PromptSignals {
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
         action.sa_sigaction = HANDLER as libc::sighandler_t;
         action.sa_flags = libc::SA_RESTART;
-        // SAFETY: `sa_mask` is a valid signal set for these calls. Each
-        // handler blocks the others on its thread, so neither interrupts
-        // the other there.
-        unsafe {
-            libc::sigemptyset(&mut action.sa_mask);
-            for signal in ENDING_SIGNALS.iter().chain([&libc::SIGCONT]) {
-                libc::sigaddset(&mut action.sa_mask, *signal);
-            }
-        }
+        // Each handler blocks the others on its thread, so none interrupts
+        // another there.
+        action.sa_mask = handled_signals();
         for (replaced, signal) in taken.replaced.iter_mut().zip(ENDING_SIGNALS) {
             *replaced = take_default(signal, &action);
         }
         let mut continued = action;
         continued.sa_sigaction = CONTINUE_HANDLER as libc::sighandler_t;
         taken.continued = take_default(libc::SIGCONT, &continued);
+        let mut stopped = action;
+        stopped.sa_sigaction = STOP_HANDLER as libc::sighandler_t;
+        taken.stopped = take_default(libc::SIGTSTP, &stopped);
         taken
     }
 
     /// Gives standard input raw mode with `enter`, unless a handler is
     /// ending the process already, which then gives the saved state back
-    /// after it.
+    /// after it. Raw mode is wanted before it's given, so a stop in between
+    /// finds it wanted, and the handled signals wait on this thread
+    /// meanwhile, since a handler that interrupted it here would wait for
+    /// it.
     fn enter(&self, enter: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
         if !self.armed {
             return enter();
         }
+        let blocked = BlockedSignals::block();
         RAW_MODE_WRITERS.fetch_add(1, Ordering::SeqCst);
+        RAW_WANTED.store(true, Ordering::SeqCst);
         let entered = if HANDLER_STATE.load(Ordering::SeqCst) == ENDING {
             Err(io::Error::from(io::ErrorKind::Interrupted))
         } else {
             enter()
         };
-        if entered.is_ok() {
-            RAW_WANTED.store(true, Ordering::SeqCst);
-        }
         RAW_MODE_WRITERS.fetch_sub(1, Ordering::SeqCst);
+        if entered.is_err() {
+            // `SIGCONT` may have given raw mode meanwhile, and no prompt
+            // will end to undo it.
+            self.leave();
+            // SAFETY: the prompt is armed, so the saved state is written,
+            // and standard input is open.
+            unsafe {
+                libc::tcsetattr(
+                    libc::STDIN_FILENO,
+                    libc::TCSANOW,
+                    (*SAVED_TERMIOS.0.get()).assume_init_ref(),
+                )
+            };
+        }
+        drop(blocked);
         entered
+    }
+
+    /// Has `SIGCONT` show `prompt` again through `output`, when it fits.
+    fn show_again(&self, prompt: &[u8], output: libc::c_int) {
+        if !self.armed || prompt.len() > PROMPT_CAPACITY {
+            return;
+        }
+        // SAFETY: the length is 0 until the bytes are written, so no handler
+        // reads them meanwhile, and only the armed prompt writes them.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                prompt.as_ptr(),
+                PROMPT.0.get().cast::<u8>(),
+                prompt.len(),
+            );
+        };
+        PROMPT_OUTPUT.store(output, Ordering::SeqCst);
+        PROMPT_LENGTH.store(prompt.len(), Ordering::SeqCst);
     }
 
     /// Stops `SIGCONT` giving raw mode back, once a handler doing so ends,
@@ -467,12 +596,14 @@ impl Drop for PromptSignals {
         if !self.armed {
             return;
         }
+        PROMPT_LENGTH.store(0, Ordering::SeqCst);
         let _ = HANDLER_STATE.compare_exchange(ARMED, IDLE, Ordering::SeqCst, Ordering::SeqCst);
         PASTE_OUTPUT.store(-1, Ordering::SeqCst);
         for (replaced, signal) in self.replaced.iter().zip(ENDING_SIGNALS) {
             give_back(signal, replaced.as_ref(), HANDLER);
         }
         give_back(libc::SIGCONT, self.continued.as_ref(), CONTINUE_HANDLER);
+        give_back(libc::SIGTSTP, self.stopped.as_ref(), STOP_HANDLER);
     }
 }
 
@@ -532,16 +663,18 @@ extern "C" fn put_back_and_end(signal: libc::c_int) {
     }
     match HANDLER_STATE.swap(ENDING, Ordering::SeqCst) {
         ARMED => {
-            // SAFETY: the state was `ARMED`, so the saved state is written,
-            // and `ENDING` keeps it from being written again.
-            let original = unsafe { (*SAVED_TERMIOS.0.get()).assume_init_ref() };
-            put_back_input(original);
-            // Raw mode the prompt or `SIGCONT` was giving standard input
-            // meanwhile is undone once it's given.
-            if wait_for_writers() {
+            if terminal_is_ours() {
+                // SAFETY: the state was `ARMED`, so the saved state is
+                // written, and `ENDING` keeps it from being written again.
+                let original = unsafe { (*SAVED_TERMIOS.0.get()).assume_init_ref() };
                 put_back_input(original);
+                // Raw mode the prompt or `SIGCONT` was giving standard input
+                // meanwhile is undone once it's given.
+                if wait_for_writers() {
+                    put_back_input(original);
+                }
+                turn_paste_off(PASTE_OUTPUT.load(Ordering::SeqCst));
             }
-            turn_paste_off(PASTE_OUTPUT.load(Ordering::SeqCst));
             TERMINAL_PUT_BACK.store(true, Ordering::SeqCst);
         }
         ENDING => {
@@ -560,23 +693,63 @@ extern "C" fn put_back_and_end(signal: libc::c_int) {
 }
 
 /// Gives standard input the prompt's raw mode, and bracketed paste, back
-/// once the process continues after it was stopped: bash and zsh give a job
-/// they resume cooked mode with echo, which would show what's typed. Only
-/// while the prompt wants raw mode, and no handler is ending the process;
-/// either waits for this handler, then gives the terminal its state back.
-/// It returns to what the signal interrupted, so `errno` is left as it was.
+/// once the process continues after it was stopped, and shows the prompt
+/// again: bash and zsh give a job they resume cooked mode with echo, which
+/// would show what's typed, and print its command line. Only while the
+/// prompt wants raw mode, no handler is ending the process, and the
+/// terminal is this process's; a job continued in the background gets raw
+/// mode back from the `SIGCONT` that brings it to the foreground. The
+/// prompt, or a handler ending the process, waits for this handler, then
+/// gives the terminal its state back. It returns to what the signal
+/// interrupted, so `errno` is left as it was.
 extern "C" fn give_raw_mode_back(_: libc::c_int) {
     let errno = errno::errno();
     RAW_MODE_WRITERS.fetch_add(1, Ordering::SeqCst);
-    if HANDLER_STATE.load(Ordering::SeqCst) == ARMED && RAW_WANTED.load(Ordering::SeqCst) {
+    if HANDLER_STATE.load(Ordering::SeqCst) == ARMED
+        && RAW_WANTED.load(Ordering::SeqCst)
+        && terminal_is_ours()
+    {
         // SAFETY: the state is `ARMED`, so the raw mode is saved, and it's
         // written only while no handler can read it.
         let raw = unsafe { (*SAVED_RAW.0.get()).assume_init_ref() };
         // SAFETY: standard input is open and `raw` is a valid termios.
         unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, raw) };
         turn_paste_on(PASTE_OUTPUT.load(Ordering::SeqCst));
+        let shown = PROMPT_LENGTH.load(Ordering::SeqCst);
+        if shown > 0 {
+            let output = PROMPT_OUTPUT.load(Ordering::SeqCst);
+            // SAFETY: the first `shown` bytes are written, and stay so while
+            // the length isn't 0.
+            let prompt = unsafe {
+                std::slice::from_raw_parts(PROMPT.0.get().cast::<u8>().cast_const(), shown)
+            };
+            write_within(output, b"\r");
+            write_within(output, prompt);
+        }
     }
     RAW_MODE_WRITERS.fetch_sub(1, Ordering::SeqCst);
+    errno::set_errno(errno);
+}
+
+/// Gives standard input the state it had outside the prompt, with what's
+/// typed and not read yet discarded and bracketed paste off, then stops the
+/// process as `SIGTSTP`'s default action would, so the shell the job stops
+/// in has its terminal as it left it. `SIGSTOP`, which no handler can take,
+/// stops it, so this handler keeps the signal throughout. `SIGCONT` gives
+/// raw mode back once the process continues. It leaves `errno` as it was.
+extern "C" fn put_back_and_stop(_: libc::c_int) {
+    let errno = errno::errno();
+    if HANDLER_STATE.load(Ordering::SeqCst) == ARMED
+        && RAW_WANTED.load(Ordering::SeqCst)
+        && terminal_is_ours()
+    {
+        // SAFETY: the state is `ARMED`, so the saved state is written, and
+        // it's written only while no handler can read it.
+        put_back_input(unsafe { (*SAVED_TERMIOS.0.get()).assume_init_ref() });
+        turn_paste_off(PASTE_OUTPUT.load(Ordering::SeqCst));
+    }
+    // SAFETY: `raise` is async-signal-safe.
+    unsafe { libc::raise(libc::SIGSTOP) };
     errno::set_errno(errno);
 }
 
@@ -696,6 +869,10 @@ mod tests {
             handler_of(libc::SIGCONT),
             CONTINUE_HANDLER as libc::sighandler_t
         );
+        assert_eq!(
+            handler_of(libc::SIGTSTP),
+            STOP_HANDLER as libc::sighandler_t
+        );
 
         let another = PromptSignals::take(&original, &original);
         assert!(!another.armed && another.replaced.iter().all(Option::is_none));
@@ -706,6 +883,7 @@ mod tests {
         drop(prompt);
         assert_eq!(handler_of(libc::SIGQUIT), libc::SIG_DFL);
         assert_eq!(handler_of(libc::SIGCONT), libc::SIG_DFL);
+        assert_eq!(handler_of(libc::SIGTSTP), libc::SIG_DFL);
         assert_eq!(handler_of(libc::SIGHUP), libc::SIG_IGN);
         assert_eq!(
             handler_of(libc::SIGALRM),
@@ -730,6 +908,190 @@ mod tests {
             // SAFETY: `previous` is the action the signal had.
             unsafe { libc::sigaction(signal, &previous, std::ptr::null_mut()) };
         }
+    }
+
+    fn blocked_on_this_thread(signal: libc::c_int) -> bool {
+        // SAFETY: an all-zero sigset_t is a valid value the call overwrites,
+        // and a null new set only reads the mask.
+        unsafe {
+            let mut mask: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask);
+            libc::sigismember(&mask, signal) == 1
+        }
+    }
+
+    #[test]
+    fn the_prompt_wants_raw_mode_before_giving_it_and_holds_its_signals_off_this_thread_meanwhile()
+    {
+        // SAFETY: an all-zero termios is a valid value of its plain fields,
+        // and nothing gives it to a terminal.
+        let original: libc::termios = unsafe { std::mem::zeroed() };
+        let prompt = PromptSignals::take(&original, &original);
+        assert!(prompt.armed);
+        let mut seen = None;
+
+        prompt
+            .enter(|| {
+                seen = Some((
+                    RAW_WANTED.load(Ordering::SeqCst),
+                    HANDLED_SIGNALS
+                        .iter()
+                        .all(|signal| blocked_on_this_thread(*signal)),
+                ));
+                Ok(())
+            })
+            .expect("raw mode");
+        prompt.leave();
+        drop(prompt);
+
+        assert_eq!(seen, Some((true, true)));
+        assert!(
+            HANDLED_SIGNALS
+                .iter()
+                .all(|signal| !blocked_on_this_thread(*signal)),
+            "the thread's mask comes back"
+        );
+    }
+
+    /// How a prompt ended when its standard input is the controlling
+    /// terminal of its session, and another process group has it in the
+    /// foreground, as a job in the background: `work` runs in a process of
+    /// such a group, whose session leader reports how it ended. A stop is
+    /// reported, and the job killed.
+    fn in_the_background(work: fn() -> !) -> Ended {
+        // SAFETY: the children make only async-signal-safe calls, or calls
+        // to code that allocates nothing, until they exit.
+        let status = unsafe {
+            let leader = libc::fork();
+            assert!(leader >= 0, "fork a session leader");
+            if leader == 0 {
+                libc::_exit(lead_a_session(work));
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(leader, &mut status, 0), leader);
+            status
+        };
+        assert!(libc::WIFEXITED(status), "the session leader exited");
+        match libc::WEXITSTATUS(status) {
+            code @ 0..50 => Ended::Exited(code),
+            code @ 50..100 => Ended::Stopped(code - 50),
+            code => Ended::Signaled(code - 100),
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Ended {
+        Exited(libc::c_int),
+        Stopped(libc::c_int),
+        Signaled(libc::c_int),
+    }
+
+    /// Runs `work` as a job in the background of a new session whose
+    /// terminal is a new PTY, returning how it ended as an exit code.
+    ///
+    /// # Safety
+    /// Only in a child process, which exits with the code it returns.
+    unsafe fn lead_a_session(work: fn() -> !) -> libc::c_int {
+        // SAFETY: async-signal-safe calls on descriptors this process owns.
+        unsafe {
+            let (mut master, mut terminal) = (-1, -1);
+            if libc::setsid() < 0
+                || libc::openpty(
+                    &mut master,
+                    &mut terminal,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ) != 0
+                || libc::ioctl(terminal, libc::TIOCSCTTY as _, 0) != 0
+                || libc::tcsetpgrp(terminal, libc::getpgrp()) != 0
+            {
+                return 40;
+            }
+            let job = libc::fork();
+            if job == 0 {
+                if libc::setpgid(0, 0) != 0 || libc::dup2(terminal, libc::STDIN_FILENO) < 0 {
+                    libc::_exit(41);
+                }
+                work();
+            }
+            let mut status = 0;
+            if libc::waitpid(job, &mut status, libc::WUNTRACED) != job {
+                return 42;
+            }
+            if libc::WIFSTOPPED(status) {
+                libc::kill(job, libc::SIGKILL);
+                libc::waitpid(job, std::ptr::null_mut(), 0);
+                return 50 + libc::WSTOPSIG(status);
+            }
+            if libc::WIFSIGNALED(status) {
+                return 100 + libc::WTERMSIG(status);
+            }
+            libc::WEXITSTATUS(status)
+        }
+    }
+
+    /// Arms the prompt's handlers over standard input, as a prompt that
+    /// wants raw mode, then raises `signal`.
+    fn arm_and_raise(signal: libc::c_int) {
+        for taken in [libc::SIGALRM, libc::SIGCONT, libc::SIGTSTP, libc::SIGTTOU] {
+            set_action(taken, libc::SIG_DFL);
+        }
+        let mut original = MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: standard input is the PTY, and `tcgetattr` initializes
+        // `original` when it returns zero.
+        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, original.as_mut_ptr()) } != 0 {
+            // SAFETY: exiting the child.
+            unsafe { libc::_exit(43) };
+        }
+        // SAFETY: the successful `tcgetattr` initialized it.
+        let original = unsafe { original.assume_init() };
+        let prompt = PromptSignals::take(&original, &original);
+        if !prompt.armed {
+            // SAFETY: exiting the child.
+            unsafe { libc::_exit(44) };
+        }
+        RAW_WANTED.store(true, Ordering::SeqCst);
+        // SAFETY: raising a signal this process handles.
+        unsafe { libc::raise(signal) };
+        std::mem::forget(prompt);
+    }
+
+    #[test]
+    fn a_signal_that_ends_a_prompt_in_the_background_ends_it_without_its_terminal() {
+        let ended = in_the_background(|| {
+            arm_and_raise(libc::SIGALRM);
+            // SAFETY: exiting the child.
+            unsafe { libc::_exit(1) }
+        });
+
+        assert_eq!(
+            ended,
+            Ended::Signaled(libc::SIGALRM),
+            "the terminal is the shell's, and SIGTTOU would stop lpm"
+        );
+    }
+
+    #[test]
+    fn a_prompt_continued_in_the_background_leaves_the_terminal_to_the_shell() {
+        let ended = in_the_background(|| {
+            arm_and_raise(libc::SIGCONT);
+            // SAFETY: exiting the child.
+            unsafe { libc::_exit(0) }
+        });
+
+        assert_eq!(ended, Ended::Exited(0));
+    }
+
+    #[test]
+    fn a_prompt_stopped_in_the_background_stops_without_its_terminal() {
+        let ended = in_the_background(|| {
+            arm_and_raise(libc::SIGTSTP);
+            // SAFETY: exiting the child.
+            unsafe { libc::_exit(1) }
+        });
+
+        assert_eq!(ended, Ended::Stopped(libc::SIGSTOP));
     }
 
     #[test]

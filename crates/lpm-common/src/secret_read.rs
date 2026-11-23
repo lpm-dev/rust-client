@@ -132,8 +132,6 @@ impl SecretSource {
     }
 }
 
-/// The file or pipe at `path`, its size when it's a file, and whether it's a
-/// pipe.
 /// Whether opening a source may wait for a named pipe's writer.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Waiting {
@@ -143,6 +141,8 @@ enum Waiting {
     ForWriter,
 }
 
+/// The file or pipe at `path`, its size when it's a file, and whether it's a
+/// pipe; opening a named pipe waits for its writer only as `waiting` lets it.
 fn open_file_or_pipe(
     path: &Path,
     limit: usize,

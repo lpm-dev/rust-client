@@ -79,8 +79,8 @@ pub(crate) fn read_hidden(prompt: &str, limit: usize) -> Result<Zeroizing<String
     let result = {
         let mut terminal =
             platform::Terminal::enter(output, limit).map_err(PromptError::Terminal)?;
-        output
-            .write(prompt.as_bytes())
+        terminal
+            .show(prompt.as_bytes())
             .map_err(PromptError::Terminal)?;
         read_line(&mut terminal, limit)
     };

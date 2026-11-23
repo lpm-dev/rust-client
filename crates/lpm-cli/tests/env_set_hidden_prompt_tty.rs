@@ -684,7 +684,7 @@ mod tty {
             &[(b"Value for TOKEN (default, hidden): ", b"fixture-typed\r")],
             &PtyOptions::default(),
             &mut |answering| {
-                signal(answering.pid, libc::SIGTSTP);
+                signal(answering.pid, libc::SIGSTOP);
                 answering.wait_until_stopped();
                 answering.set_cooked();
                 signal(answering.pid, libc::SIGCONT);
@@ -703,6 +703,59 @@ mod tty {
             "{}",
             session.transcript
         );
+        assert_eq!(
+            stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
+            Some("fixture-typed")
+        );
+    }
+
+    #[test]
+    fn sigtstp_gives_the_terminal_back_before_the_prompt_stops_and_it_shows_again_once_continued() {
+        let (project, lpm_home) = project();
+        let prompt = "Value for TOKEN (default, hidden): ";
+        let mut cooked_while_stopped = false;
+        let mut hidden_again = false;
+        let session = run_in_pty_controlled(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(prompt.as_bytes(), b"fixture-typed\r")],
+            &PtyOptions::default(),
+            &mut |answering| {
+                signal(answering.pid, libc::SIGTSTP);
+                answering.wait_until_stopped();
+                cooked_while_stopped = !answering.echo_is_disabled();
+                signal(answering.pid, libc::SIGCONT);
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while !answering.echo_is_disabled() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                hidden_again = answering.echo_is_disabled();
+            },
+        );
+
+        assert!(
+            cooked_while_stopped,
+            "the shell gets its terminal as it left it"
+        );
+        assert!(hidden_again, "raw mode again once lpm continues");
+        assert!(session.status.success(), "{}", session.transcript);
+        assert_eq!(
+            session.transcript.matches(prompt).count(),
+            2,
+            "the prompt shows again: {}",
+            session.transcript
+        );
+        assert!(
+            session
+                .raw
+                .windows(b"\x1b[?2004l".len())
+                .filter(|window| *window == b"\x1b[?2004l")
+                .count()
+                >= 2,
+            "bracketed paste goes off for the stop, and again at the end"
+        );
+        assert!(!session.transcript.contains("fixture-typed"));
         assert_eq!(
             stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
             Some("fixture-typed")
