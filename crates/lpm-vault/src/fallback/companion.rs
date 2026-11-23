@@ -1153,16 +1153,20 @@ impl RunRead {
 pub(crate) fn read_all_overrides_unlocked(
     directory: &VaultStorageDirectory,
     vault_id: &str,
-) -> Result<std::collections::BTreeMap<String, PersonalOverrides>, String> {
+) -> Result<crate::overrides::AllOverrides, String> {
     let Some((gate, record)) = read_overrides_record_unlocked(directory, vault_id)? else {
-        return Ok(std::collections::BTreeMap::new());
+        return Ok((std::collections::BTreeMap::new(), None));
     };
-    crate::companion::overrides::evaluate_all(
+    let overrides = crate::companion::overrides::evaluate_all(
         &gate,
         vault_id,
         record.as_ref().map(|bytes| bytes.as_slice()),
     )
-    .map_err(damaged)
+    .map_err(damaged)?;
+    Ok((
+        overrides,
+        record.map(|record| crate::OverridesIdentity::of(&record)),
+    ))
 }
 
 /// Refuse what `edits` to `vault_id`'s overrides are refused for whatever

@@ -197,18 +197,17 @@ pub(crate) fn resolve_and_load_env_with_schema_validation(
         let validator = config
             .and_then(|config| config.env_schema.as_ref())
             .map(lpm_env::EnvValidator::new);
-        let vault_count = layers.vault_count();
-        let mut child = layers.compose(None, None)?;
-        dotenv::validate_project_env_with_plan(
-            &mut child,
-            validator.as_ref(),
-            lpm_env::EvalContext {
-                environment: env_name.unwrap_or("default"),
-                stage: lpm_env::EnvStage::for_script(script_name),
-                service: None,
-            },
-        )?;
-        layers = dotenv::ProjectEnvLayers::already_composed(child, vault_count);
+        layers = layers.into_validated(|child| {
+            dotenv::validate_project_env_with_plan(
+                child,
+                validator.as_ref(),
+                lpm_env::EvalContext {
+                    environment: env_name.unwrap_or("default"),
+                    stage: lpm_env::EnvStage::for_script(script_name),
+                    service: None,
+                },
+            )
+        })?;
     }
 
     Ok(LoadedEnv {
@@ -259,6 +258,9 @@ pub struct ScriptChildEnv {
     /// The environment whose values the vault gave, `default` when none
     /// was resolved.
     pub vault_environment: String,
+    /// What identifies the values the vault gave, as an lpm the script
+    /// starts reads them; `None` when it gave none.
+    pub vault_values: Option<lpm_vault::ValuesIdentity>,
 }
 
 /// Load the validated final script environment for task-cache fingerprinting.
@@ -284,6 +286,7 @@ pub fn load_script_child_env_with_config(
         policy,
     )?;
     let mut vars = loaded.take_child_env()?;
+    let vault_values = loaded.layers.vault_values_identity();
     let personal_overrides = vars.override_count();
     let project_overrides = vars.overrides_identity();
     mark_script_child_env(&mut vars);
@@ -312,6 +315,7 @@ pub fn load_script_child_env_with_config(
             .vault_environment
             .take()
             .unwrap_or_else(|| lpm_env::DEFAULT_ENVIRONMENT.to_owned()),
+        vault_values,
     })
 }
 

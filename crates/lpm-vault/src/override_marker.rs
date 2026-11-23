@@ -65,17 +65,23 @@ pub fn inherited() -> &'static [PathBuf] {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access<'a> {
     /// It read `environment`'s values with the project's personal overrides
-    /// applied; `overrides` when the project had any.
+    /// applied: `values` identifies the values it read, when there were any,
+    /// and `overrides` the project's overrides, when it had any.
     Environment {
         vault_id: &'a str,
         environment: &'a str,
-        overrides: bool,
+        values: Option<crate::ValuesIdentity>,
+        overrides: Option<crate::OverridesIdentity>,
     },
     /// It read every environment's values with the project's overrides
     /// applied.
     Environments { vault_id: &'a str, overrides: bool },
-    /// It read the project's overrides of every environment.
-    Overrides { vault_id: &'a str, overrides: bool },
+    /// It read the project's overrides of every environment, which
+    /// `overrides` identifies when it had any.
+    Overrides {
+        vault_id: &'a str,
+        overrides: Option<crate::OverridesIdentity>,
+    },
     /// It changed the project's overrides.
     Change { vault_id: &'a str },
     /// What it used can't be told: it couldn't pass a marker to a task.
@@ -89,28 +95,30 @@ const UNCERTAIN: &str = "uncertain";
 const KINDS: [&str; 4] = ["environment", "environments", "overrides", "change"];
 
 impl Access<'_> {
-    /// The name of the entry that reports it.
+    /// The name of the entry that reports it. A read's names what it read
+    /// by digest, so it's one a task's key holds only when the key holds
+    /// exactly that, even after the project changed back by the task's end.
     pub fn entry(self) -> String {
-        let (kind, vault_id, environment, overrides) = match self {
+        use sha2::Digest as _;
+        fn identified(hasher: sha2::Sha256, digest: Option<&[u8; 32]>) -> sha2::Sha256 {
+            match digest {
+                None => hasher.chain_update([0]),
+                Some(digest) => hasher.chain_update([1]).chain_update(digest),
+            }
+        }
+        let (kind, vault_id, environment) = match self {
             Self::Environment {
                 vault_id,
                 environment,
-                overrides,
-            } => (KINDS[0], vault_id, environment, overrides),
-            Self::Environments {
-                vault_id,
-                overrides,
-            } => (KINDS[1], vault_id, "", overrides),
-            Self::Overrides {
-                vault_id,
-                overrides,
-            } => (KINDS[2], vault_id, "", overrides),
-            Self::Change { vault_id } => (KINDS[3], vault_id, "", false),
+                ..
+            } => (KINDS[0], vault_id, environment),
+            Self::Environments { vault_id, .. } => (KINDS[1], vault_id, ""),
+            Self::Overrides { vault_id, .. } => (KINDS[2], vault_id, ""),
+            Self::Change { vault_id } => (KINDS[3], vault_id, ""),
             Self::Uncertain => return UNCERTAIN.to_owned(),
         };
-        use sha2::Digest as _;
         // No part holds a NUL: a path, a vault ID or an environment can't.
-        let digest = sha2::Sha256::new()
+        let named = sha2::Sha256::new()
             .chain_update(kind)
             .chain_update([0])
             .chain_update(STORE.as_slice())
@@ -118,21 +126,40 @@ impl Access<'_> {
             .chain_update(vault_id)
             .chain_update([0])
             .chain_update(environment)
-            .chain_update([0])
-            .chain_update([u8::from(overrides)])
-            .finalize();
+            .chain_update([0]);
+        let digest = match self {
+            Self::Environment {
+                values, overrides, ..
+            } => identified(
+                identified(named, values.as_ref().map(|values| &values.0)),
+                overrides.as_ref().map(|overrides| &overrides.0),
+            ),
+            Self::Environments { overrides, .. } => named.chain_update([u8::from(overrides)]),
+            Self::Overrides { overrides, .. } => {
+                identified(named, overrides.as_ref().map(|overrides| &overrides.0))
+            }
+            Self::Change { .. } | Self::Uncertain => named,
+        }
+        .finalize();
         format!("{kind}-{}", hex::encode(digest))
     }
 
     /// The entries of the reads a task's key holds, when it holds
-    /// `environment`'s values of the project with `vault_id`, read with its
-    /// overrides, which it has when `overrides`: that read, and one of its
+    /// `environment`'s values of the project with `vault_id`, which `values`
+    /// identifies when there are any, read with its overrides, which
+    /// `overrides` identifies when it has any: that read, and one of its
     /// overrides alone, which the key holds in every environment.
-    pub fn keyed(vault_id: &str, environment: &str, overrides: bool) -> [String; 2] {
+    pub fn keyed(
+        vault_id: &str,
+        environment: &str,
+        values: Option<crate::ValuesIdentity>,
+        overrides: Option<crate::OverridesIdentity>,
+    ) -> [String; 2] {
         [
             Access::Environment {
                 vault_id,
                 environment,
+                values,
                 overrides,
             }
             .entry(),
@@ -174,27 +201,34 @@ impl Reported {
 /// Tell every `lpm` above this one about `access`, before anything uses
 /// what it read, or before it changes overrides.
 pub fn report_access(access: Access<'_>) -> Result<(), String> {
+    report(|| access)
+}
+
+/// [`report_access`] for an access that takes work to describe, such as a
+/// digest of the values read, which is done only when an `lpm` above this
+/// one watches.
+pub fn report_access_with<'a>(access: impl FnOnce() -> Access<'a>) -> Result<(), String> {
     report(access)
 }
 
 /// Tell every `lpm` above this one that it can't tell what a task it
 /// started reads.
 pub fn report_uncertain() -> Result<(), String> {
-    report(Access::Uncertain)
+    report(|| Access::Uncertain)
 }
 
 /// Add `access`'s entry to every inherited marker, once a process. One that
 /// can't be told would share what this one builds, so the access fails
 /// instead.
-fn report(access: Access<'_>) -> Result<(), String> {
+fn report<'a>(access: impl FnOnce() -> Access<'a>) -> Result<(), String> {
     #[cfg(test)]
     if let Some(markers) = REPORTING_TO.with_borrow(Clone::clone) {
-        return report_to(&markers, &access.entry());
+        return report_to(&markers, &access().entry());
     }
     if inherited().is_empty() {
         return Ok(());
     }
-    let entry = access.entry();
+    let entry = access().entry();
     let mut reported = REPORTED.lock().unwrap_or_else(PoisonError::into_inner);
     if reported.contains(&entry) {
         return Ok(());
@@ -264,21 +298,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_entry_names_what_was_done_and_to_what_and_nothing_read() {
-        let read = |vault_id, environment, overrides| {
+    fn an_entry_names_what_was_done_to_what_and_by_digest_what_was_read() {
+        let values = |value: &str| {
+            Some(crate::ValuesIdentity::of(&std::collections::HashMap::from(
+                [("API_URL".to_owned(), value.to_owned())],
+            )))
+        };
+        let overrides = |record: &[u8]| Some(crate::OverridesIdentity::of(record));
+        let read = |vault_id, environment, values, overrides| {
             Access::Environment {
                 vault_id,
                 environment,
+                values,
                 overrides,
             }
             .entry()
         };
         let entries = [
-            read("vault-1", "default", false),
-            read("vault-1", "default", true),
-            read("vault-1", "staging", false),
-            read("Vault-1", "default", false),
-            read("vault-2", "default", false),
+            read("vault-1", "default", None, None),
+            read("vault-1", "default", values("one"), None),
+            read("vault-1", "default", values("two"), None),
+            read("vault-1", "default", None, overrides(b"first")),
+            read("vault-1", "default", None, overrides(b"second")),
+            read("vault-1", "default", values("one"), overrides(b"first")),
+            read("vault-1", "staging", None, None),
+            read("Vault-1", "default", None, None),
+            read("vault-2", "default", None, None),
             Access::Environments {
                 vault_id: "vault-1",
                 overrides: false,
@@ -286,7 +331,12 @@ mod tests {
             .entry(),
             Access::Overrides {
                 vault_id: "vault-1",
-                overrides: false,
+                overrides: None,
+            }
+            .entry(),
+            Access::Overrides {
+                vault_id: "vault-1",
+                overrides: overrides(b"first"),
             }
             .entry(),
             Access::Change {
@@ -305,8 +355,12 @@ mod tests {
             Some(Reported::Uncertain)
         );
         assert_eq!(
-            Access::keyed("vault-1", "default", false),
-            [entries[0].clone(), entries[6].clone()]
+            Access::keyed("vault-1", "default", None, None),
+            [entries[0].clone(), entries[10].clone()]
+        );
+        assert_eq!(
+            Access::keyed("vault-1", "default", values("one"), overrides(b"first")),
+            [entries[5].clone(), entries[11].clone()]
         );
         for unknown in [
             "read-vault-1",
@@ -328,7 +382,8 @@ mod tests {
             let entry = Access::Environment {
                 vault_id,
                 environment: "default",
-                overrides: true,
+                values: None,
+                overrides: Some(crate::OverridesIdentity::of(b"record")),
             }
             .entry();
             report_to(std::slice::from_ref(&marker), &entry).expect("reported");

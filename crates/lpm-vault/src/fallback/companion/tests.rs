@@ -946,6 +946,7 @@ fn change_overrides(
 
 fn read_overrides() -> Result<std::collections::BTreeMap<String, PersonalOverrides>, String> {
     with_vault_transaction(|directory| read_all_overrides_unlocked(directory, VAULT))
+        .map(|(overrides, _)| overrides)
 }
 
 #[test]
@@ -1020,7 +1021,7 @@ fn a_journal_whose_folder_sync_failed_is_finished_before_the_next_read_in_the_sa
         force_file_vault();
         seed_values();
         with_vault_transaction(|directory| {
-            assert!(read_all_overrides_unlocked(directory, VAULT)?.is_empty());
+            assert!(read_all_overrides_unlocked(directory, VAULT)?.0.is_empty());
             assert!(crate::companion::is_open(VAULT));
             crate::storage_transaction::FAIL_DIRECTORY_SYNC_OF
                 .with(|failing| failing.set(Some("env file journal")));
@@ -1038,7 +1039,7 @@ fn a_journal_whose_folder_sync_failed_is_finished_before_the_next_read_in_the_sa
                 !crate::companion::is_open(VAULT),
                 "a journal that may be in place leaves the project to open again"
             );
-            let read = read_all_overrides_unlocked(directory, VAULT)?;
+            let (read, _) = read_all_overrides_unlocked(directory, VAULT)?;
             assert_eq!(read["default"].set["API_URL"], "mine");
             Ok(())
         })

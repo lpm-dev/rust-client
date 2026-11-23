@@ -156,6 +156,41 @@ fn an_override_of_the_marker_variable_is_neither_applied_nor_counted() {
 }
 
 #[test]
+fn a_schema_rule_never_sees_the_marker_lpm_passes_a_task() {
+    let (project, _) = project_with_team_value(r#"{"marker":"node marker.cjs"}"#);
+    project.write_file(
+        "marker.cjs",
+        "console.log(`marker=${process.env.LPM_PERSONAL_OVERRIDES_MARKER ?? 'none'}`)",
+    );
+    extend_lpm_json(
+        &project,
+        serde_json::json!({"envSchema": {"vars": {
+            "LPM_PERSONAL_OVERRIDES_MARKER": {"enum": ["fixture-only"]}
+        }}}),
+    );
+    let inherited = project.path().join("outer-marker");
+    std::fs::create_dir_all(&inherited).expect("an outer lpm's marker");
+
+    let output = lpm(&project)
+        .env("LPM_PERSONAL_OVERRIDES_MARKER", &inherited)
+        .args(["run", "marker", "--no-cache"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains(&format!("marker={}", inherited.display())),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        !stderr(&output).contains("outer-marker"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn neither_a_project_value_nor_a_schema_default_names_the_marker_variable() {
     let (project, _) = project_with_team_value(r#"{"marker":"node marker.cjs"}"#);
     project.write_file(

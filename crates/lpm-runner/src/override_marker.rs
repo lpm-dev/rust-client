@@ -190,12 +190,17 @@ mod tests {
         Access::Environment {
             vault_id,
             environment,
-            overrides,
+            values: None,
+            overrides: overrides.then(record),
         }
     }
 
+    fn record() -> lpm_vault::OverridesIdentity {
+        lpm_vault::OverridesIdentity::of(b"record")
+    }
+
     fn keyed() -> [String; 2] {
-        Access::keyed("vault-1", "default", false)
+        Access::keyed("vault-1", "default", None, None)
     }
 
     #[test]
@@ -218,7 +223,7 @@ mod tests {
             &directory,
             Access::Overrides {
                 vault_id: "vault-1",
-                overrides: false,
+                overrides: None,
             },
         );
         assert_eq!(task.unkeyed(&keyed()), None, "reads the key holds");
@@ -241,6 +246,20 @@ mod tests {
             (read("vault-1", "staging", false), Unkeyed::Used),
             (read("vault-1", "default", true), Unkeyed::Used),
             (
+                Access::Environment {
+                    vault_id: "vault-1",
+                    environment: "default",
+                    values: Some(lpm_vault::ValuesIdentity::of(
+                        &std::collections::HashMap::from([(
+                            "API_URL".to_owned(),
+                            "one".to_owned(),
+                        )]),
+                    )),
+                    overrides: None,
+                },
+                Unkeyed::Used,
+            ),
+            (
                 Access::Environments {
                     vault_id: "vault-1",
                     overrides: false,
@@ -250,7 +269,7 @@ mod tests {
             (
                 Access::Overrides {
                     vault_id: "vault-1",
-                    overrides: true,
+                    overrides: Some(record()),
                 },
                 Unkeyed::Used,
             ),

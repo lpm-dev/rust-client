@@ -173,7 +173,7 @@ pub(super) fn run_tasks_sequential(
                 Ok(captured) => {
                     let duration_ms = task_start.elapsed().as_millis() as u64;
                     if let (Some(context), Some(task)) = (&cache_context, &task_marker)
-                        && try_cache_store_with_context(
+                        && let Some(identity) = try_cache_store_with_context(
                             CacheStoreRequest {
                                 task,
                                 project_dir,
@@ -188,8 +188,6 @@ pub(super) fn run_tasks_sequential(
                             },
                             context,
                         )
-                        && let Some(identity) =
-                            complete_task_cache_identity(project_dir, script, context)
                     {
                         cache_identities.insert(script.clone(), identity);
                     }

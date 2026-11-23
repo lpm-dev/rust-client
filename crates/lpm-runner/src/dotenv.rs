@@ -378,15 +378,17 @@ impl ChildEnv {
         }
         self.insert_runtime("PATH".into(), path.into());
         self.validated.push("PATH".into());
+        let verdict = self.evaluate(validator, context)?;
+        validation_result(verdict)?;
         // Where an lpm the child starts reports what it uses, which only LPM
-        // sets, like PATH, after the names no project may set are gone.
+        // sets, once the names no project may set are gone, and after the
+        // schema's checks, which never see it.
         if let Some(marker) = crate::override_marker::marker() {
             let name = crate::override_marker::MARKER_ENV.to_owned();
             self.insert_runtime(name.clone(), marker);
             self.validated.push(name);
         }
-        let verdict = self.evaluate(validator, context)?;
-        validation_result(verdict)
+        Ok(())
     }
 }
 
@@ -457,18 +459,43 @@ impl ProjectEnvLayers {
         self.vault_count
     }
 
+    /// What identifies the values read from the vault, as stored: an lpm
+    /// the child starts reads them so, even those the run replaces, such as
+    /// `npm_lifecycle_event`. `None` when the vault gave none.
+    pub(crate) fn vault_values_identity(&self) -> Option<lpm_vault::ValuesIdentity> {
+        (!self.vault_values.is_empty()).then(|| lpm_vault::ValuesIdentity::of(&self.vault_values))
+    }
+
+    /// These layers composed without service values and checked by
+    /// `validate`, kept with the values read from the vault.
+    pub(crate) fn into_validated(
+        mut self,
+        validate: impl FnOnce(&mut ChildEnv) -> Result<(), LpmError>,
+    ) -> Result<Self, LpmError> {
+        let vault_values = std::mem::take(&mut self.vault_values);
+        let vault_count = self.vault_count;
+        let mut child = self.compose(None, None)?;
+        validate(&mut child)?;
+        Ok(Self {
+            vault_values,
+            ..Self::already_composed(child, vault_count)
+        })
+    }
+
     /// The environment of a child without service values, layers 1, 2 and 4.
     pub(crate) fn take_child_env(&mut self) -> Result<ChildEnv, LpmError> {
         match self.composed.take() {
             Some(child) => Ok(child),
             None => {
-                let layers = std::mem::take(self);
+                let mut layers = std::mem::take(self);
                 let overrides = layers.overrides.clone();
                 let vault_count = layers.vault_count;
+                let vault_values = std::mem::take(&mut layers.vault_values);
                 let child = layers.compose(None, None)?;
                 *self = Self {
                     overrides,
                     vault_count,
+                    vault_values,
                     ..Self::default()
                 };
                 Ok(child)
@@ -1000,6 +1027,16 @@ fn validate_project_env_with_case_policy(
 /// Validate effective values without converting inherited values into
 /// project overrides, attributing each error while the inherited values
 /// it counted are still there.
+/// Whether `key` is the marker variable, as the host compares names.
+fn is_override_marker(key: &str) -> bool {
+    let marker = crate::override_marker::MARKER_ENV;
+    if cfg!(windows) {
+        key.eq_ignore_ascii_case(marker)
+    } else {
+        key == marker
+    }
+}
+
 fn evaluate_child_env_with_case_policy(
     child: &mut ChildEnv,
     validator: Option<&lpm_env::EnvValidator<'_>>,
@@ -1022,8 +1059,11 @@ fn evaluate_child_env_with_case_policy(
             std::collections::BTreeMap::new()
         };
         let mut inherited_values = Vec::with_capacity(schema.vars.len().min(32));
-        let eligible =
-            |key: &str| !vars.contains_key(key) && !crate::shell::inherited_env_is_stripped(key);
+        // The marker an outer lpm passed this one is LPM's, never a value the
+        // schema checks.
+        let inherited_is_checked =
+            |key: &str| !crate::shell::inherited_env_is_stripped(key) && !is_override_marker(key);
+        let eligible = |key: &str| !vars.contains_key(key) && inherited_is_checked(key);
         if schema
             .vars
             .keys()
@@ -1040,7 +1080,7 @@ fn evaluate_child_env_with_case_policy(
                     schema.vars.get_key_value(name).map(|(key, _)| key.as_str())
                 };
                 let Some(key) = key else { continue };
-                if vars.contains_key(key) || crate::shell::inherited_env_is_stripped(key) {
+                if vars.contains_key(key) || !inherited_is_checked(key) {
                     continue;
                 }
                 let value = value.into_string().map_err(|_| {
@@ -1053,7 +1093,7 @@ fn evaluate_child_env_with_case_policy(
             }
         } else {
             for key in schema.vars.keys() {
-                if !vars.contains_key(key) && !crate::shell::inherited_env_is_stripped(key) {
+                if !vars.contains_key(key) && inherited_is_checked(key) {
                     match std::env::var(key) {
                         Ok(value) => {
                             inherited_values.push((key.as_str(), value.is_empty()));

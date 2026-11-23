@@ -779,7 +779,7 @@ fn publish_cache_entry(
     let (staging_name, staging) = create_private_cache_directory(&cache.tasks)?;
     #[cfg(test)]
     wait_for_cache_race_barrier(&CACHE_STORE_STAGING_RACE_BARRIER, &cache.path);
-    wait_while_a_test_holds_staging();
+    hold_for_test("staging");
     let mut staging = Some(staging);
     let mut staged_identity = None;
     let result = (|| {
@@ -833,24 +833,31 @@ fn publish_cache_entry(
     Ok(published)
 }
 
-/// The variable that makes a debug build wait while it stages a task cache
-/// entry: it creates `<path>.staging`, then waits until `<path>.go` exists,
-/// so a test can act between a task's end and its outputs being taken.
-const TEST_STAGING_PAUSE_ENV: &str = "LPM_TEST_TASK_CACHE_STAGING_PAUSE";
+/// The variable that makes a debug build wait at one point of storing a
+/// task's outputs, `<phase>:<path>`: at that phase it creates
+/// `<path>.<phase>`, then waits until `<path>.go` exists, so a test can act
+/// there: before a task's outputs are taken and any cache lock is held
+/// (`storing`), once its staging directory exists and before the outputs go
+/// into it (`staging`), or once they're stored (`stored`).
+const TEST_PAUSE_ENV: &str = "LPM_TEST_TASK_CACHE_PAUSE";
 
-fn wait_while_a_test_holds_staging() {
+/// Waits at `phase` while a test holds it (see [`TEST_PAUSE_ENV`]); does
+/// nothing in a release build.
+pub fn hold_for_test(phase: &str) {
     if !cfg!(debug_assertions) {
         return;
     }
-    let Some(path) = std::env::var_os(TEST_STAGING_PAUSE_ENV) else {
+    let Some(pause) = std::env::var(TEST_PAUSE_ENV).ok() else {
         return;
     };
-    let named = |suffix: &str| {
-        let mut name = path.clone();
-        name.push(suffix);
-        PathBuf::from(name)
+    let Some(path) = pause
+        .split_once(':')
+        .and_then(|(held, path)| (held == phase).then_some(path))
+    else {
+        return;
     };
-    if std::fs::write(named(".staging"), "").is_err() {
+    let named = |suffix: &str| PathBuf::from(format!("{path}{suffix}"));
+    if std::fs::write(named(&format!(".{phase}")), "").is_err() {
         return;
     }
     let go = named(".go");
@@ -2809,6 +2816,19 @@ mod tests {
         let key = unique_key("withdrawn-entry");
         let outputs = ["dist/**".to_string()];
         let checked = std::cell::Cell::new(false);
+        let cache_path = cache_dir_with_root(&cache.root);
+        // The check sees the outputs already taken into the stage.
+        let staged_outputs = || {
+            fs::read_dir(&cache_path).unwrap().any(|entry| {
+                let entry = entry.unwrap();
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".task-cache-stage-")
+                    && fs::metadata(entry.path().join("outputs.tar.gz"))
+                        .is_ok_and(|archive| archive.len() > 0)
+            })
+        };
 
         let stored = store_cache_with_root(
             &cache.root,
@@ -2820,13 +2840,13 @@ mod tests {
             "",
             1,
             &|| {
-                checked.set(true);
+                checked.set(staged_outputs());
                 false
             },
         )
         .unwrap();
 
-        assert!(checked.get());
+        assert!(checked.get(), "checked once the outputs were staged");
         assert!(matches!(stored, StoredCacheEntry::Withdrawn));
         let target = tempfile::tempdir().unwrap();
         assert!(

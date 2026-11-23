@@ -256,7 +256,7 @@ pub(super) fn run_tasks_parallel(
                     Ok(output) => {
                         let duration_ms = start.elapsed().as_millis() as u64;
                         if let (Some(context), Some(task)) = (&cache_context, &task_marker)
-                            && try_cache_store_with_context(
+                            && let Some(identity) = try_cache_store_with_context(
                                 CacheStoreRequest {
                                     task,
                                     project_dir,
@@ -271,8 +271,6 @@ pub(super) fn run_tasks_parallel(
                                 },
                                 context,
                             )
-                            && let Some(identity) =
-                                complete_task_cache_identity(project_dir, task_name, context)
                         {
                             cache_identities.insert(task_name.clone(), identity);
                         }
@@ -526,7 +524,7 @@ pub(super) fn run_tasks_parallel(
                                         (&cache_context, &task_marker)
                                     {
                                         let duration_ms = start.elapsed().as_millis() as u64;
-                                        if try_cache_store_with_context(
+                                        try_cache_store_with_context(
                                             CacheStoreRequest {
                                                 task,
                                                 project_dir: &dir,
@@ -540,11 +538,7 @@ pub(super) fn run_tasks_parallel(
                                                 stderr: &output.stderr,
                                             },
                                             context,
-                                        ) {
-                                            complete_task_cache_identity(&dir, &name, context)
-                                        } else {
-                                            None
-                                        }
+                                        )
                                     } else {
                                         None
                                     };

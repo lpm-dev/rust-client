@@ -38,19 +38,28 @@ pub fn read_all(project_dir: &Path) -> Result<BTreeMap<String, PersonalOverrides
     let Some(vault_id) = crate::checked_linked_vault_id(project_dir)? else {
         return Ok(BTreeMap::new());
     };
-    let overrides = in_overrides_lock(|directory| read_all_unlocked(directory, &vault_id))?;
-    reported(&vault_id, overrides)
+    let (overrides, identity) =
+        in_overrides_lock(|directory| read_all_unlocked(directory, &vault_id))?;
+    reported(&vault_id, overrides, identity)
 }
 
 /// The overrides of the env project `vault_id`, once every `lpm` above this
 /// one knows they were read.
+/// Every environment's personal overrides of a project, with what
+/// identifies them, when it has any (see [`crate::OverridesIdentity`]).
+pub(crate) type AllOverrides = (
+    BTreeMap<String, PersonalOverrides>,
+    Option<crate::OverridesIdentity>,
+);
+
 fn reported(
     vault_id: &str,
     overrides: BTreeMap<String, PersonalOverrides>,
+    identity: Option<crate::OverridesIdentity>,
 ) -> Result<BTreeMap<String, PersonalOverrides>, String> {
     crate::override_marker::report_access(crate::override_marker::Access::Overrides {
         vault_id,
-        overrides: !overrides.is_empty(),
+        overrides: identity,
     })?;
     Ok(overrides)
 }
@@ -105,8 +114,9 @@ pub fn review_all(project_dir: &Path) -> Result<Option<Reviewed>, String> {
     let Some(vault_id) = crate::checked_linked_vault_id(project_dir)? else {
         return Ok(None);
     };
-    let overrides = in_overrides_lock(|directory| read_all_unlocked(directory, &vault_id))?;
-    let overrides = reported(&vault_id, overrides)?;
+    let (overrides, identity) =
+        in_overrides_lock(|directory| read_all_unlocked(directory, &vault_id))?;
+    let overrides = reported(&vault_id, overrides, identity)?;
     Ok(Some(Reviewed {
         project: Project { vault_id },
         overrides,
@@ -351,7 +361,7 @@ fn in_overrides_lock<T>(
 fn read_all_unlocked(
     directory: &VaultStorageDirectory,
     vault_id: &str,
-) -> Result<BTreeMap<String, PersonalOverrides>, String> {
+) -> Result<AllOverrides, String> {
     if crate::force_file_vault_backend() {
         return crate::fallback::companion::read_all_overrides_unlocked(directory, vault_id);
     }

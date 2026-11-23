@@ -246,7 +246,9 @@ fn compute_cache_key_inner(
 ) -> Result<String, LpmError> {
     let mut hasher = Sha256::new();
 
-    hash_record(&mut hasher, 0, &[b"cache-v8"]);
+    // An entry an earlier version stored may hold what a nested lpm read
+    // of another project with personal overrides, which it didn't track.
+    hash_record(&mut hasher, 0, &[b"cache-v9"]);
 
     hash_record(&mut hasher, 1, &[command.as_bytes()]);
 
@@ -1435,6 +1437,39 @@ mod hex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The key an earlier LPM CLI computes for these inputs, which tracked
+    /// no nested lpm's reads of other projects, so its entries could hold
+    /// what one read with personal overrides.
+    const EARLIER_KEY: &str = "93bbb556a34dcfe39fba94369e1918ac7ad46990fe3f1df0628c8bb68b40c2e7";
+
+    #[test]
+    fn an_entry_an_earlier_lpm_stored_is_never_this_one_s() {
+        let project = tempfile::tempdir().unwrap();
+        let first = super::compute_cache_key(
+            project.path(),
+            "node build.js",
+            &[],
+            &[],
+            &[],
+            &HashMap::new(),
+            r#"{"name":"earlier"}"#,
+        )
+        .unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let second = super::compute_cache_key(
+            elsewhere.path(),
+            "node build.js",
+            &[],
+            &[],
+            &[],
+            &HashMap::new(),
+            r#"{"name":"earlier"}"#,
+        )
+        .unwrap();
+        assert_eq!(first, second, "the key doesn't name the project's folder");
+        assert_ne!(first, EARLIER_KEY);
+    }
     use std::fs;
 
     #[cfg(unix)]

@@ -52,6 +52,7 @@ fn read_all(
     let _scope = crate::companion::LockScope::enter();
     recover_project_transaction(storage)?;
     crate::keychain::overrides::read_all_with_storage(storage, VAULT)
+        .map(|(overrides, _)| overrides)
 }
 
 fn overrides_account() -> String {

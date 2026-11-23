@@ -407,6 +407,7 @@ fn build_task_context(
         personal_overrides,
         project_overrides,
         vault_environment,
+        vault_values,
     } = lpm_runner::script::load_script_child_env_with_config(
         project_dir,
         script_name,
@@ -428,7 +429,8 @@ fn build_task_context(
             lpm_vault::override_marker::Access::keyed(
                 vault_id,
                 &vault_environment,
-                project_overrides.is_some(),
+                vault_values,
+                project_overrides,
             )
             .to_vec()
         })
@@ -531,6 +533,11 @@ fn build_task_context(
     // all of them key what it builds here.
     if let Some(overrides) = project_overrides {
         dependency_pairs.push(("lpm-personal-overrides:v1".into(), overrides.to_hex()));
+    }
+    // A command the task starts reads the environment's values as stored,
+    // including those the run replaced, which its own environment lacks.
+    if let Some(values) = vault_values {
+        dependency_pairs.push(("lpm-vault-values:v1".into(), values.to_hex()));
     }
     if let Some(snapshot) = &schema_snapshot {
         dependency_pairs.push((
@@ -818,24 +825,25 @@ pub(super) fn complete_task_cache_identity(
 /// what its key doesn't hold: another env project, whose values and
 /// personal overrides can change without changing the key, or a change to
 /// overrides. Then neither cache keeps it. That `lpm` told every `lpm` above
-/// this one itself.
+/// this one itself. Returns the outputs' identity for the tasks that depend
+/// on it, when they may use them under a key.
 pub(super) fn try_cache_store_with_context(
     request: CacheStoreRequest<'_>,
     expected: &CacheContext,
-) -> bool {
+) -> Option<Arc<CompletedTaskCacheIdentity>> {
     let script_name = request.script_name;
     if let Some(unkeyed) = request.task.unkeyed(&expected.keyed_entries) {
         say_not_cached(script_name, unkeyed, request.task.unwatched());
-        return false;
+        return None;
     }
     match store_cache_with_context(request, expected) {
-        Ok(stored) => stored,
+        Ok(identity) => identity,
         Err(error) => {
             tracing::warn!(
                 "failed to publish cache for successful task '{}': {error}",
                 lpm_common::sanitize_terminal_inline(script_name)
             );
-            false
+            None
         }
     }
 }
@@ -909,7 +917,7 @@ fn pattern_spelling(path: &Path) -> String {
 fn store_cache_with_context(
     request: CacheStoreRequest<'_>,
     expected: &CacheContext,
-) -> Result<bool, LpmError> {
+) -> Result<Option<Arc<CompletedTaskCacheIdentity>>, LpmError> {
     // The rebuild rereads what the input snapshot doesn't cover, such as env
     // files and vault values, from disk and the vault rather than from the
     // run's earlier reads. The execution context is checked after it, so that
@@ -928,38 +936,44 @@ fn store_cache_with_context(
         expected.command_preference,
     )? {
         Some(current) => current,
-        None => return Ok(false),
+        None => return Ok(None),
     };
     drop(fresh_vault_reads);
     if current.keyed_entries != expected.keyed_entries {
         tracing::warn!(
-            "the env project or environment of task '{}', or whether it has personal overrides, changed while it ran; skipping cache publication",
+            "the env project, environment, stored values or personal overrides of task '{}' changed while it ran; skipping cache publication",
             lpm_common::sanitize_terminal_inline(request.script_name)
         );
-        return Ok(false);
+        return Ok(None);
     }
     if !execution_context_is_unchanged(expected)? {
         warn_execution_context_changed(request.script_name, expected);
-        return Ok(false);
+        return Ok(None);
     }
     if current.cache_key != expected.cache_key {
         tracing::warn!(
             "task cache inputs changed while task '{}' ran; skipping cache publication",
             request.script_name
         );
-        return Ok(false);
+        return Ok(None);
     }
     if current.task_config != expected.task_config {
         tracing::warn!(
             "task output contract changed while task '{}' ran; skipping cache publication",
             request.script_name
         );
-        return Ok(false);
+        return Ok(None);
     }
 
+    lpm_task::cache::hold_for_test("storing");
     // An lpm the task left running can report a use until the outputs are
     // taken, and it reports before it uses what it read, so a use reported
-    // after this check left nothing in them.
+    // after this check left nothing in them. What the dependents see of the
+    // outputs is taken before it too, rather than once they're stored.
+    let output_validation = lpm_task::hasher::capture_task_output_validation(
+        request.project_dir,
+        &expected.task_config.outputs,
+    )?;
     let unkeyed = std::cell::Cell::new(None);
     let stored = lpm_task::cache::store_cache_checked(
         &expected.cache_key,
@@ -974,10 +988,16 @@ fn store_cache_with_context(
             unkeyed.get().is_none()
         },
     )?;
+    // A kept entry is another run's, so no check covered this run's
+    // outputs, which the dependents use: check them now.
+    if matches!(stored, lpm_task::cache::StoredCacheEntry::KeptExisting) {
+        unkeyed.set(request.task.unkeyed(&expected.keyed_entries));
+    }
     if let Some(unkeyed) = unkeyed.get() {
         say_not_cached(request.script_name, unkeyed, request.task.unwatched());
-        return Ok(false);
+        return Ok(None);
     }
+    lpm_task::cache::hold_for_test("stored");
 
     // A kept entry is another run's result, which this run's upload checks
     // don't cover.
@@ -1001,7 +1021,12 @@ fn store_cache_with_context(
         expected.cache_key,
         request.stdout.len()
     );
-    Ok(true)
+    Ok(Some(Arc::new(CompletedTaskCacheIdentity {
+        value: expected.cache_key.clone(),
+        output_validation: Some(output_validation),
+        dependencies: Vec::new(),
+        local_only: expected.local_only,
+    })))
 }
 
 #[cfg(test)]

@@ -5,7 +5,6 @@
 
 use std::collections::BTreeMap;
 
-use crate::PersonalOverrides;
 use crate::companion::account::record_account;
 use crate::companion::gate::{Operation, ProjectGate};
 use crate::companion::lifecycle::LifecycleStore as _;
@@ -20,29 +19,31 @@ use super::companion_gate::{
 };
 use super::{ListedStorage, ProjectStorage};
 
-pub(crate) fn read_all_unlocked(
-    vault_id: &str,
-) -> Result<BTreeMap<String, PersonalOverrides>, String> {
+pub(crate) fn read_all_unlocked(vault_id: &str) -> Result<crate::overrides::AllOverrides, String> {
     read_all_with_storage(&mut super::KeychainProjectStorage, vault_id)
 }
 
 pub(super) fn read_all_with_storage(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
-) -> Result<BTreeMap<String, PersonalOverrides>, String> {
+) -> Result<crate::overrides::AllOverrides, String> {
     super::validate_vault_id(vault_id)?;
     let gate = authorize(storage, vault_id, Operation::ReadApplyingOverrides)?;
     // Overrides live beside values: a project without them has none.
     let Some(protected_values) = values_demand_approval(storage, vault_id)? else {
-        return Ok(BTreeMap::new());
+        return Ok((BTreeMap::new(), None));
     };
     let record = read_overrides_record(storage, vault_id, protected_values)?;
-    overrides::evaluate_all(
+    let overrides = overrides::evaluate_all(
         &gate,
         vault_id,
         record.as_ref().map(|bytes| bytes.as_slice()),
     )
-    .map_err(crate::companion::damaged)
+    .map_err(crate::companion::damaged)?;
+    Ok((
+        overrides,
+        record.map(|record| crate::OverridesIdentity::of(&record)),
+    ))
 }
 
 /// Refuse what `edits` to `vault_id`'s overrides are refused for whatever

@@ -217,7 +217,7 @@ pub struct RunEnvironment {
 pub struct OverridesIdentity([u8; 32]);
 
 impl OverridesIdentity {
-    pub(crate) fn of(record: &[u8]) -> Self {
+    pub fn of(record: &[u8]) -> Self {
         use sha2::Digest as _;
         Self(sha2::Sha256::digest(record).into())
     }
@@ -231,6 +231,39 @@ impl OverridesIdentity {
 impl std::fmt::Debug for OverridesIdentity {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("OverridesIdentity(..)")
+    }
+}
+
+/// What an environment's values are as stored: a digest of every name and
+/// value, which any change to them changes. Like the values a run passes,
+/// it leaves this computer only inside a task's cache key.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ValuesIdentity([u8; 32]);
+
+impl ValuesIdentity {
+    pub fn of(values: &HashMap<String, String>) -> Self {
+        use sha2::Digest as _;
+        let mut entries: Vec<(&String, &String)> = values.iter().collect();
+        entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        let mut hasher = sha2::Sha256::new();
+        for (name, value) in entries {
+            for part in [name.as_bytes(), value.as_bytes()] {
+                hasher.update((part.len() as u64).to_le_bytes());
+                hasher.update(part);
+            }
+        }
+        Self(hasher.finalize().into())
+    }
+
+    pub fn to_hex(self) -> String {
+        hex::encode(self.0)
+    }
+}
+
+/// A digest of secrets: shown, it would let a guess of them be checked.
+impl std::fmt::Debug for ValuesIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ValuesIdentity(..)")
     }
 }
 
@@ -706,10 +739,11 @@ pub fn try_get_run_environment_for_vault_id(
             overrides_identity,
         })
     })?;
-    override_marker::report_access(override_marker::Access::Environment {
+    override_marker::report_access_with(|| override_marker::Access::Environment {
         vault_id,
         environment,
-        overrides: read.overrides_identity.is_some(),
+        values: (!read.values.is_empty()).then(|| ValuesIdentity::of(&read.values)),
+        overrides: read.overrides_identity,
     })?;
     Ok(read)
 }
@@ -2526,6 +2560,30 @@ mod tests {
             &[("TOKEN", "value")],
             &history::Source::new(history::Action::Set),
         )
+    }
+
+    #[test]
+    fn a_values_identity_changes_with_any_name_or_value_and_never_with_their_order() {
+        let of = |pairs: &[(&str, &str)]| {
+            ValuesIdentity::of(
+                &pairs
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+            )
+        };
+        let first = of(&[("API_URL", "one"), ("TOKEN", "two")]);
+
+        assert_eq!(first, of(&[("TOKEN", "two"), ("API_URL", "one")]));
+        for other in [
+            of(&[("API_URL", "one"), ("TOKEN", "three")]),
+            of(&[("API_URL", "one"), ("TOKENS", "two")]),
+            of(&[("API_URL", "one")]),
+            of(&[("API_URLo", "ne"), ("TOKEN", "two")]),
+        ] {
+            assert_ne!(first, other);
+        }
+        assert_eq!(format!("{first:?}"), "ValuesIdentity(..)");
     }
 
     #[test]
