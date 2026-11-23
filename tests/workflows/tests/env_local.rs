@@ -2336,6 +2336,20 @@ fn an_import_checks_the_project_first_only_from_a_source_that_can_wait() {
         0,
         "a regular file waits on no one, so the import's own write checks the project"
     );
+    std::fs::create_dir_all(project.path().join("a-folder")).unwrap();
+    for missing in ["nope.env", "a-folder"] {
+        let output = lpm(&project)
+            .env("LPM_TEST_VAULT_TRANSACTION_LOG", &log)
+            .args(["env", "import", missing])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{missing}");
+    }
+    assert_eq!(
+        vault_transactions(&log),
+        0,
+        "a source that can't be read is refused before the project is checked"
+    );
 
     let output = lpm(&project)
         .env("LPM_TEST_VAULT_TRANSACTION_LOG", &log)

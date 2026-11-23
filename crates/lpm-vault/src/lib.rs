@@ -258,11 +258,13 @@ impl CheckedValues {
 }
 
 /// Refuse what a write of `project_dir`'s values is refused for, before
-/// they're read or asked for: newer data that refuses writes, or an
-/// interrupted step that can't be finished. Nothing for a folder without an
+/// they're read or asked for: a `vault` field in its lpm.json that no write
+/// could use, newer data that refuses writes, or an interrupted step that
+/// can't be finished. Nothing for a folder without an
 /// env project yet, which the write creates. [`set_checked`] writes to the
 /// project it checked.
 pub fn check_values_writable(project_dir: &Path) -> Result<CheckedValues, String> {
+    vault_id::check_vault_field(project_dir)?;
     let vault_id = linked_vault_id(project_dir)?;
     if let Some(vault_id) = &vault_id {
         with_project_vault_transaction(|directory| {
@@ -2363,6 +2365,29 @@ mod tests {
                     .unwrap_or_else(|error| panic!("{vault_id}: {error}"));
                 assert_eq!(read.values["TOKEN"], "value", "{vault_id}");
                 cleanup_vault(project.path());
+            }
+        });
+    }
+
+    #[test]
+    fn a_vault_field_no_write_could_use_is_refused_before_any_value_is_read() {
+        crate::fallback::tests::with_temp_vault_home(|_| {
+            crate::fallback::tests::force_file_vault();
+            for (field, said) in [
+                (r#""../outside""#, "path-traversal"),
+                ("123", "must be a string"),
+            ] {
+                let project = tempfile::tempdir().unwrap();
+                std::fs::write(
+                    project.path().join("lpm.json"),
+                    format!(r#"{{"vault":{field}}}"#),
+                )
+                .unwrap();
+
+                let refused = check_values_writable(project.path())
+                    .expect_err("no write could use this vault field");
+
+                assert!(refused.contains(said), "{field}: {refused}");
             }
         });
     }

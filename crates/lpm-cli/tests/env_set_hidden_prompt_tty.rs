@@ -4,9 +4,9 @@
 //! The workflow tier covers standard input, files and the refusal without a
 //! terminal. These tests use a real PTY to cover what only a terminal shows:
 //! that nothing typed is echoed, that a paste of several lines arrives as one
-//! value, that Ctrl+C restores the terminal, and that lines a terminal sends
-//! after Enter, or after Ctrl+C, are refused or discarded instead of left for
-//! the shell.
+//! value, that Ctrl+C, or a signal that ends lpm, restores the terminal, and
+//! that lines a terminal sends after Enter, or after Ctrl+C, are refused or
+//! discarded instead of left for the shell.
 
 mod common;
 
@@ -575,7 +575,8 @@ mod tty {
             lpm_home.path(),
             &["env", "set", "TOKEN"],
             &[(b"Value for TOKEN (default, hidden): ", b"fixture-mine\r")],
-            &mut |_| std::fs::write(&lpm_json, another_project).expect("switch projects"),
+            &PtyOptions::default(),
+            &mut |_, _| std::fs::write(&lpm_json, another_project).expect("switch projects"),
         );
 
         assert!(!answered.status.success(), "{}", answered.transcript);
@@ -587,6 +588,75 @@ mod tty {
         assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
         std::fs::write(&lpm_json, &checked_project).expect("the checked project");
         assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
+    }
+
+    /// Sends `signal` to lpm's process `pid`.
+    fn signal(pid: u32, signal: libc::c_int) {
+        let pid = libc::pid_t::try_from(pid).expect("a process ID");
+        // SAFETY: `kill` takes a process ID and a signal number.
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0, "signal lpm");
+    }
+
+    #[test]
+    fn a_signal_at_the_prompt_puts_the_terminal_back_before_it_ends_lpm() {
+        use std::os::unix::process::ExitStatusExt as _;
+        const BRACKETED_PASTE_OFF: &[u8] = b"\x1b[?2004l";
+
+        for ending in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+            let (project, lpm_home) = project();
+            let session = run_in_pty_answering(
+                project.path(),
+                lpm_home.path(),
+                &["env", "set", "TOKEN"],
+                &[(b"Value for TOKEN (default, hidden): ", b"")],
+                &PtyOptions::default(),
+                &mut |_, pid| signal(pid, ending),
+            );
+
+            assert_eq!(
+                session.status.signal(),
+                Some(ending),
+                "lpm ends by the signal: {}",
+                session.transcript
+            );
+            assert!(session.echo_restored, "signal {ending}: echo is back");
+            let paste_on = session
+                .raw
+                .windows(BRACKETED_PASTE_ON.len())
+                .position(|window| window == BRACKETED_PASTE_ON)
+                .expect("the prompt turned bracketed paste on");
+            assert!(
+                session.raw[paste_on..]
+                    .windows(BRACKETED_PASTE_OFF.len())
+                    .any(|window| window == BRACKETED_PASTE_OFF),
+                "signal {ending}: bracketed paste is off again: {:?}",
+                String::from_utf8_lossy(&session.raw)
+            );
+            assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
+        }
+    }
+
+    #[test]
+    fn a_signal_lpm_was_started_ignoring_leaves_the_prompt_waiting() {
+        let (project, lpm_home) = project();
+        let options = PtyOptions {
+            ignored_signals: &[libc::SIGHUP],
+            ..PtyOptions::default()
+        };
+        let session = run_in_pty_answering(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(b"Value for TOKEN (default, hidden): ", b"fixture-typed\r")],
+            &options,
+            &mut |_, pid| signal(pid, libc::SIGHUP),
+        );
+
+        assert!(session.status.success(), "{}", session.transcript);
+        assert_eq!(
+            stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
+            Some("fixture-typed")
+        );
     }
 
     #[test]
@@ -746,6 +816,26 @@ mod tty {
             session.transcript
         );
         assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
+    }
+
+    #[test]
+    fn text_typed_once_alt_p_went_quiet_is_the_value() {
+        let (project, lpm_home) = project();
+        let session = run_in_pty_chunked(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(
+                b"Value for TOKEN (default, hidden): ",
+                vec![b"fixture-", b"\x1bP", b"key\r"],
+            )],
+            Duration::from_millis(700),
+        );
+        assert!(session.status.success(), "{}", session.transcript);
+        assert_eq!(
+            stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
+            Some("fixture-key")
+        );
     }
 
     #[test]

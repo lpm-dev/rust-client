@@ -47,13 +47,17 @@ enum State {
     /// A string a terminal sends, such as an `ESC ]` reply, which ends with
     /// BEL or `ESC \\`; `escape` once an `ESC` of that end was read. A
     /// terminal sends a string with what it holds, so one that `held`
-    /// nothing when its read ended began with a key: `introducer` after the
-    /// Escape key, or with it as a Meta chord when `chord`.
+    /// nothing when its read ended began with a key: its introducer after
+    /// the Escape key, or with it as a Meta chord when `chord`.
     TerminalString {
         escape: bool,
         held: bool,
-        introducer: u8,
         chord: bool,
+    },
+    /// In a Meta chord with a character outside ASCII, such as Alt+\u{e9},
+    /// with `remaining` bytes of its UTF-8 to skip.
+    MetaCharacter {
+        remaining: u8,
     },
     /// After a Meta chord with a string's introducer, such as Alt+P, that
     /// ended its read: a key that's no text acts, and text can't be told
@@ -63,6 +67,13 @@ enum State {
     Paste {
         matched: u8,
     },
+}
+
+/// Whether `byte` is a key that acts rather than text: a control, other
+/// than the Tab and the NUL, which the prompt takes as text.
+#[cfg(any(unix, test))]
+fn acts(byte: u8) -> bool {
+    matches!(byte, 0x00..=0x1f | 0x7f) && !matches!(control(byte), Event::Typed(_))
 }
 
 #[cfg(any(unix, test))]
@@ -76,6 +87,15 @@ impl Bytes {
                 // doesn't.
                 0x20..=0x7e if self.escape_in_read && !b"[O]P_^X".contains(&byte) => {
                     self.state = State::Ground;
+                }
+                0xc2..=0xf4 if self.escape_in_read => {
+                    self.state = State::MetaCharacter {
+                        remaining: match byte {
+                            0xc2..=0xdf => 1,
+                            0xe0..=0xef => 2,
+                            _ => 3,
+                        },
+                    };
                 }
                 // An escape that ended an earlier read may have been the
                 // Escape key, so its introducer and what follows may have
@@ -98,7 +118,6 @@ impl Bytes {
                     self.state = State::TerminalString {
                         escape: false,
                         held: false,
-                        introducer: byte,
                         chord: self.escape_in_read,
                     };
                 }
@@ -180,13 +199,11 @@ impl Bytes {
             State::TerminalString {
                 escape,
                 held,
-                introducer,
                 chord,
             } => {
                 let string = |escape, held| State::TerminalString {
                     escape,
                     held,
-                    introducer,
                     chord,
                 };
                 // An introducer that came after its escape's read may have
@@ -200,7 +217,8 @@ impl Bytes {
                     (_, 0x18 | 0x1a) => self.end_string(typed, each),
                     // A string a terminal sends holds no other control, so
                     // one is a key that ends it: Enter or Ctrl+C after Alt+P.
-                    (_, 0x00..=0x1f | 0x7f) => {
+                    // A Tab or a NUL is text, which the string may hold.
+                    (_, 0x00..=0x1f | 0x7f) if acts(byte) => {
                         self.end_string(typed, each);
                         self.ground(byte, each);
                     }
@@ -210,11 +228,27 @@ impl Bytes {
             State::Paste { matched } => self.paste(byte, matched, each),
             State::AfterChord => {
                 self.state = State::Ground;
-                if !matches!(byte, 0x00..=0x1f | 0x7f) {
+                if !acts(byte) {
                     each(Event::Lost);
                 }
                 self.ground(byte, each);
             }
+            State::MetaCharacter { remaining } => match byte {
+                0x80..=0xbf => {
+                    self.state = match remaining {
+                        0 | 1 => State::Ground,
+                        _ => State::MetaCharacter {
+                            remaining: remaining - 1,
+                        },
+                    };
+                }
+                // A character cut short ends at what follows, which is read
+                // on its own.
+                _ => {
+                    self.state = State::Ground;
+                    self.ground(byte, each);
+                }
+            },
         }
     }
 
@@ -295,6 +329,21 @@ impl Bytes {
     /// Whether the last byte was an escape that may start a sequence.
     pub(super) fn after_escape(&self) -> bool {
         matches!(self.state, State::Escape)
+    }
+
+    /// Whether a Meta chord with a string's introducer ended the last read,
+    /// so what follows soon can't be told from the rest of a terminal's
+    /// string.
+    pub(super) fn after_chord(&self) -> bool {
+        matches!(self.state, State::AfterChord)
+    }
+
+    /// The chord was a key: nothing followed soon, as the rest of a
+    /// terminal's string would have.
+    pub(super) fn chord_key(&mut self) {
+        if self.after_chord() {
+            self.state = State::Ground;
+        }
     }
 
     /// The escape just read was the Escape key, which edits nothing, rather
@@ -655,6 +704,55 @@ mod tests {
             "a<Lost><Enter>",
             "text read with Alt+P can't be told from a terminal's string"
         );
+    }
+
+    #[test]
+    fn a_tab_or_a_nul_after_a_string_introducer_is_text() {
+        assert_eq!(
+            decoded(&[b"a\x1bP", b"\tb\r"]),
+            "a<Lost>\tb<Enter>",
+            "a Tab after Alt+P is typed text"
+        );
+        assert_eq!(
+            decoded(&[b"a\x1bP\t", b"\r"]),
+            "a<Lost><Enter>",
+            "a Tab inside what may be a terminal's string may have been typed"
+        );
+        assert_eq!(decoded(&[b"a\x1bP", b"\x00\r"]), "a<Lost>\u{0}<Enter>");
+    }
+
+    #[test]
+    fn alt_with_a_key_outside_ascii_adds_nothing() {
+        assert_eq!(decoded(&[b"a\x1b\xc3\xa9b"]), "ab", "Alt+\u{e9}");
+        assert_eq!(decoded(&[b"a\x1b\xe2\x82\xacb"]), "ab", "Alt+\u{20ac}");
+        assert_eq!(
+            decoded(&[b"a\x1b", b"\xc3\xa9b"]),
+            "a\u{e9}b",
+            "\u{e9} typed after the Escape key is text"
+        );
+        assert_eq!(
+            decoded(&[b"a\x1b\xc3\r"]),
+            "a<Enter>",
+            "a character cut short ends at a key"
+        );
+    }
+
+    #[test]
+    fn a_chord_with_a_string_introducer_that_went_quiet_was_a_key() {
+        let mut bytes = Bytes::default();
+        let mut shown = Shown::default();
+        for &byte in b"a\x1bP" {
+            bytes.feed(byte, &mut |event| shown.take(event));
+        }
+        bytes.end_of_read(&mut |event| shown.take(event));
+        assert!(bytes.after_chord());
+        bytes.chord_key();
+        assert!(!bytes.after_chord());
+        bytes.next_read();
+        for &byte in b"bc" {
+            bytes.feed(byte, &mut |event| shown.take(event));
+        }
+        assert_eq!(shown.finish(), "abc");
     }
 
     #[test]

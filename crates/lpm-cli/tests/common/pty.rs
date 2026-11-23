@@ -54,6 +54,8 @@ pub struct PtyOptions {
     pub nonblocking_stdin: bool,
     /// `TERM` for lpm; `None` leaves it unset.
     pub term: Option<&'static str>,
+    /// Signals lpm starts out ignoring, as under `nohup`.
+    pub ignored_signals: &'static [libc::c_int],
 }
 
 impl Default for PtyOptions {
@@ -63,6 +65,7 @@ impl Default for PtyOptions {
             capture_stdout: false,
             nonblocking_stdin: false,
             term: Some("xterm-256color"),
+            ignored_signals: &[],
         }
     }
 }
@@ -120,25 +123,19 @@ pub fn run_in_pty_with_stdout_captured(
     (session, stdout.unwrap_or_default())
 }
 
-/// [`run_in_pty`], calling `before_answer` with each step's index once its
-/// prompt shows and before it's answered, such as to change what the
-/// command is asking about.
+/// [`run_in_pty`] with `options`, calling `before_answer` with each step's
+/// index and lpm's process ID once its prompt shows and before it's
+/// answered, such as to change what the command is asking about or to send
+/// it a signal.
 pub fn run_in_pty_answering(
     cwd: &Path,
     lpm_home: &Path,
     args: &[&str],
     steps: &[(&[u8], &[u8])],
-    before_answer: &mut dyn FnMut(usize),
+    options: &PtyOptions,
+    before_answer: &mut dyn FnMut(usize, u32),
 ) -> PtySession {
-    run(
-        cwd,
-        lpm_home,
-        args,
-        &whole(steps),
-        &PtyOptions::default(),
-        before_answer,
-    )
-    .0
+    run(cwd, lpm_home, args, &whole(steps), options, before_answer).0
 }
 
 /// [`run_in_pty`] with `options`, returning what lpm wrote to its standard
@@ -150,7 +147,7 @@ pub fn run_in_pty_with(
     steps: &[(&[u8], Vec<&[u8]>)],
     options: &PtyOptions,
 ) -> (PtySession, Option<String>) {
-    run(cwd, lpm_home, args, steps, options, &mut |_| {})
+    run(cwd, lpm_home, args, steps, options, &mut |_, _| {})
 }
 
 fn run(
@@ -159,7 +156,7 @@ fn run(
     args: &[&str],
     steps: &[(&[u8], Vec<&[u8]>)],
     options: &PtyOptions,
-    before_answer: &mut dyn FnMut(usize),
+    before_answer: &mut dyn FnMut(usize, u32),
 ) -> (PtySession, Option<String>) {
     let mut master_fd = -1;
     let mut slave_fd = -1;
@@ -211,6 +208,23 @@ fn run(
         Some(term) => command.env("TERM", term),
         None => command.env_remove("TERM"),
     };
+    let ignored_signals = options.ignored_signals;
+    if !ignored_signals.is_empty() {
+        use std::os::unix::process::CommandExt as _;
+        // SAFETY: between fork and exec the closure makes only `signal`
+        // calls, which are async-signal-safe, and an ignored signal stays
+        // ignored across exec.
+        unsafe {
+            command.pre_exec(move || {
+                for &signal in ignored_signals {
+                    if libc::signal(signal, libc::SIG_IGN) == libc::SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
     command
         .stdin(Stdio::from(slave.try_clone().expect("clone PTY stdin")))
         .stdout(if options.capture_stdout {
@@ -248,7 +262,7 @@ fn run(
                 .position(|window| window == *prompt)
             && terminal_echo_is_disabled(&master)
         {
-            before_answer(answered);
+            before_answer(answered, child.id());
             for (index, chunk) in response.iter().enumerate() {
                 if index > 0 {
                     std::thread::sleep(options.pause);

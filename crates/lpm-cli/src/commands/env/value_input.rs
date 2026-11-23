@@ -19,8 +19,9 @@ use zeroize::Zeroizing;
 use super::prelude::*;
 use crate::hidden_prompt::PromptError;
 
-/// The most one value may hold: what one macOS Keychain item stores, which
-/// holds every value of a project.
+/// The most one value from the prompt, standard input or a file may hold:
+/// far more than a secret needs, and what one personal overrides record
+/// holds, so the same value can be an override.
 pub(super) const MAX_VALUE_BYTES: usize = 100 * 1024;
 
 const KEY_RULE: &str = "env keys must match [A-Za-z_][A-Za-z0-9_]*";
@@ -448,7 +449,7 @@ fn prompted(
                 "the paste of the value for {key} never ended, so nothing was stored. Paste it again, pipe it in with `{command} {key} --stdin`, or read it from a file with `{command} --from-file {key}=PATH`"
             )),
             PromptError::TypedTextLost => LpmError::Env(format!(
-                "nothing was stored for {key}: after the Escape or an Alt key, or a key whose sequence arrived in pieces, as over a slow connection, what followed can't be told from typed text. Type the value again, pipe it in with `{command} {key} --stdin`, or read it from a file with `{command} --from-file {key}=PATH`"
+                "nothing was stored for {key}. Type the value again, pipe it in with `{command} {key} --stdin`, or read it from a file with `{command} --from-file {key}=PATH`. What followed the Escape key, an Alt key, or a key whose sequence arrived in pieces, as over a slow connection, can't be told from typed text"
             )),
             PromptError::NotText => LpmError::Env(format!(
                 "the value entered for {key} isn't UTF-8 text, so this terminal may use another encoding. Nothing was stored. Pipe it in with `{command} {key} --stdin`"
@@ -684,7 +685,7 @@ mod tests {
         let mut fake = Fake {
             files: HashMap::from([
                 ("line".to_owned(), Ok("0123456789\n".to_owned())),
-                ("nul".to_owned(), Ok("0123\u{0}56789".to_owned())),
+                ("nul".to_owned(), Ok("0123\u{0}567890".to_owned())),
             ]),
             ..Fake::default()
         };

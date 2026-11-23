@@ -5,19 +5,23 @@
 //! paste.
 
 use std::io;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{
+    FALSE, HANDLE, INVALID_HANDLE_VALUE, STATUS_CONTROL_C_EXIT, TRUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows_sys::Win32::System::Console::{
-    CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT, ENABLE_PROCESSED_INPUT,
-    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_WINDOW_INPUT, FlushConsoleInputBuffer, GetConsoleMode,
-    GetStdHandle, INPUT_RECORD, KEY_EVENT, ReadConsoleInputW, ReadConsoleW, STD_INPUT_HANDLE,
-    SetConsoleMode,
+    CONSOLE_MODE, CTRL_BREAK_EVENT, CTRL_C_EVENT, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
+    ENABLE_MOUSE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_WINDOW_INPUT,
+    FlushConsoleInputBuffer, GetConsoleMode, GetStdHandle, INPUT_RECORD, KEY_EVENT,
+    ReadConsoleInputW, ReadConsoleW, STD_INPUT_HANDLE, SetConsoleCtrlHandler, SetConsoleMode,
 };
 use windows_sys::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
 use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
-use windows_sys::Win32::System::Threading::WaitForSingleObject;
+use windows_sys::Win32::System::Threading::{ExitProcess, WaitForSingleObject};
+use windows_sys::core::BOOL;
 use zeroize::Zeroizing;
 
 use super::decode::{Utf16, clipboard_units, paste_units, typed_unit};
@@ -79,6 +83,7 @@ pub(super) struct Terminal {
     utf16: Utf16,
     /// The most bytes the value may hold, which bounds a clipboard paste.
     limit: usize,
+    _control_events: ControlEvents,
 }
 
 impl Terminal {
@@ -95,6 +100,7 @@ impl Terminal {
         if unsafe { GetConsoleMode(input, &mut original_mode) } == 0 {
             return Err(io::Error::last_os_error());
         }
+        let control_events = ControlEvents::take(input, original_mode);
         let mode = original_mode
             & !(ENABLE_LINE_INPUT
                 | ENABLE_ECHO_INPUT
@@ -111,6 +117,7 @@ impl Terminal {
             original_mode,
             utf16: Utf16::default(),
             limit,
+            _control_events: control_events,
         })
     }
 
@@ -221,4 +228,72 @@ impl Drop for Terminal {
             SetConsoleMode(self.input, self.original_mode);
         }
     }
+}
+
+/// The console a control event puts back, while a prompt has it.
+struct HeldConsole {
+    input: HANDLE,
+    mode: CONSOLE_MODE,
+}
+
+// SAFETY: a console input handle is the process's, for any thread to use.
+unsafe impl Send for HeldConsole {}
+
+static HELD_CONSOLE: Mutex<Option<HeldConsole>> = Mutex::new(None);
+
+/// The prompt's handler of the console's control events, for as long as it
+/// lives. Without processed input Ctrl+C is a key, but Ctrl+Break, closing
+/// the console, logging off or shutting down still end the process, which
+/// would leave the console without echo.
+struct ControlEvents {
+    held: bool,
+}
+
+impl ControlEvents {
+    /// Has the handler give `input` back `mode`, unless another prompt has
+    /// it.
+    fn take(input: HANDLE, mode: CONSOLE_MODE) -> Self {
+        let mut held = HELD_CONSOLE.lock().unwrap_or_else(PoisonError::into_inner);
+        if held.is_some() {
+            return Self { held: false };
+        }
+        // SAFETY: the handler is a valid routine for the process's lifetime.
+        if unsafe { SetConsoleCtrlHandler(Some(put_back_console), TRUE) } == 0 {
+            return Self { held: false };
+        }
+        *held = Some(HeldConsole { input, mode });
+        Self { held: true }
+    }
+}
+
+impl Drop for ControlEvents {
+    fn drop(&mut self) {
+        if self.held {
+            *HELD_CONSOLE.lock().unwrap_or_else(PoisonError::into_inner) = None;
+            // SAFETY: removing the routine added above.
+            unsafe { SetConsoleCtrlHandler(Some(put_back_console), FALSE) };
+        }
+    }
+}
+
+/// Gives the console its mode back before a control event ends the
+/// process. Ctrl+Break, or a Ctrl+C a program sends, ends it here as the
+/// default handler would: a handler added before this one that kept the
+/// process going would leave the prompt reading with echo on. The other
+/// events end the process whatever the handlers return.
+unsafe extern "system" fn put_back_console(event: u32) -> BOOL {
+    let held = HELD_CONSOLE.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(console) = held.as_ref() {
+        // SAFETY: `input` is the console input handle and `mode` the mode
+        // read from it.
+        unsafe {
+            FlushConsoleInputBuffer(console.input);
+            SetConsoleMode(console.input, console.mode);
+        }
+        if matches!(event, CTRL_C_EVENT | CTRL_BREAK_EVENT) {
+            // SAFETY: ending the process, as the default handler does.
+            unsafe { ExitProcess(STATUS_CONTROL_C_EXIT as u32) };
+        }
+    }
+    FALSE
 }
