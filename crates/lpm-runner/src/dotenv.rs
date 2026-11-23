@@ -26,6 +26,8 @@ pub fn vault_error(other: fn(String) -> LpmError) -> impl Fn(String) -> LpmError
     move |message| {
         if lpm_vault::is_env_project_refusal(&message) {
             LpmError::EnvProjectRefused(message)
+        } else if lpm_vault::override_marker::describes(&message) {
+            LpmError::PersonalOverridesUnreported(message)
         } else {
             other(message)
         }

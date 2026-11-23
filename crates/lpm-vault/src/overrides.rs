@@ -38,26 +38,27 @@ pub fn read_all(project_dir: &Path) -> Result<BTreeMap<String, PersonalOverrides
     let Some(vault_id) = crate::linked_vault_id(project_dir)? else {
         return Ok(BTreeMap::new());
     };
-    reported(in_overrides_lock(|directory| {
-        read_all_unlocked(directory, &vault_id)
-    })?)
+    let overrides = in_overrides_lock(|directory| read_all_unlocked(directory, &vault_id))?;
+    reported(&vault_id, overrides)
 }
 
-/// `overrides`, once the `lpm` that started this one knows they were read.
+/// The overrides of the env project `vault_id`, once every `lpm` above this
+/// one knows they were read.
 fn reported(
+    vault_id: &str,
     overrides: BTreeMap<String, PersonalOverrides>,
 ) -> Result<BTreeMap<String, PersonalOverrides>, String> {
-    if !overrides.is_empty() {
-        crate::override_marker::report_read()?;
-    }
+    crate::override_marker::report_read(vault_id)?;
     Ok(overrides)
 }
 
-/// Change this computer's overrides with `commit`, once every `lpm` above
-/// this one knows: what a change reports is this computer's own, and one
-/// that can't be told changes nothing.
-fn reported_change(commit: impl FnOnce() -> Result<ChangePlan, String>) -> Result<Change, String> {
-    crate::override_marker::report_read()?;
+/// Change the overrides of the env project `vault_id` with `commit`, once
+/// every `lpm` above this one knows: one that can't be told changes nothing.
+fn reported_change(
+    vault_id: &str,
+    commit: impl FnOnce() -> Result<ChangePlan, String>,
+) -> Result<Change, String> {
+    crate::override_marker::report_change(vault_id)?;
     let plan = commit()?;
     Ok(Change {
         effects: plan.effects,
@@ -101,9 +102,8 @@ pub fn review_all(project_dir: &Path) -> Result<Option<Reviewed>, String> {
     let Some(vault_id) = crate::linked_vault_id(project_dir)? else {
         return Ok(None);
     };
-    let overrides = reported(in_overrides_lock(|directory| {
-        read_all_unlocked(directory, &vault_id)
-    })?)?;
+    let overrides = in_overrides_lock(|directory| read_all_unlocked(directory, &vault_id))?;
+    let overrides = reported(&vault_id, overrides)?;
     Ok(Some(Reviewed {
         project: Project { vault_id },
         overrides,
@@ -133,7 +133,7 @@ pub fn remove_reviewed(
         overrides: &reviewed.overrides,
         removals,
     };
-    reported_change(|| {
+    reported_change(vault_id, || {
         in_overrides_lock(|directory| change_unlocked(directory, vault_id, &edits, expect))
     })
 }
@@ -219,7 +219,7 @@ pub fn change_checked(
         project_dir,
         "while its values were read or asked for; nothing was stored",
     )?;
-    reported_change(|| {
+    reported_change(vault_id, || {
         in_overrides_lock(|directory| change_unlocked(directory, vault_id, edits, Expect::Nothing))
     })
 }
@@ -239,7 +239,7 @@ pub fn change(project_dir: &Path, edits: &[Edit]) -> Result<Change, String> {
             None => Err(NO_PROJECT.to_owned()),
         };
     };
-    reported_change(|| {
+    reported_change(&vault_id, || {
         in_overrides_lock(|directory| change_unlocked(directory, &vault_id, edits, Expect::Nothing))
     })
 }

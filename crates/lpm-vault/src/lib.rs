@@ -690,9 +690,7 @@ pub fn try_get_run_environment_for_vault_id(
             overrides_identity,
         })
     })?;
-    if read.overrides_identity.is_some() {
-        override_marker::report_read()?;
-    }
+    override_marker::report_read(vault_id)?;
     Ok(read)
 }
 
@@ -767,9 +765,7 @@ pub fn try_get_all_run_environments_for_vault_id(
     let (values, overrides, overrides_identity) = with_project_vault_transaction(|directory| {
         read_all_run_environments_unlocked(directory, vault_id)
     })?;
-    if overrides_identity.is_some() {
-        override_marker::report_read()?;
-    }
+    override_marker::report_read(vault_id)?;
     Ok(AllRunEnvironments {
         values: values.unwrap_or_default(),
         overrides: overrides.into_iter().collect(),

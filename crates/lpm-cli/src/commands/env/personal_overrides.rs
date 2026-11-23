@@ -567,7 +567,7 @@ fn report_cleared(selected: &Option<String>, scope: &str, removed: usize, json_o
             serde_json::json!({"success": true, "env": selected, "removed": removed})
         );
     } else if removed == 0 {
-        output::info(&format!("No personal overrides to remove ({scope})"));
+        output::info(&format!("no personal overrides to remove ({scope})"));
     } else {
         output::success_line(install_ui::terminal_line!(
             "removed {} personal override{} on {} ({})",

@@ -8087,28 +8087,50 @@ fn extend_lpm_json(project: &TempProject, fields: serde_json::Value) {
     project.write_file("lpm.json", &config.to_string());
 }
 
-/// A project with one stored value whose `staging` environment this computer
-/// overrides, at `dir`, sharing `home`'s LPM home.
-fn overridden_project(home: &TempProject, dir: &std::path::Path, name: &str) {
+/// A project with one stored value and no personal overrides, at `dir`,
+/// sharing `home`'s LPM home.
+fn team_project(home: &TempProject, dir: &std::path::Path, name: &str) {
     std::fs::create_dir_all(dir).expect("project folder");
     std::fs::write(
         dir.join("package.json"),
         format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
     )
     .expect("package.json");
-    for args in [
-        &["env", "set", "API_URL=team"][..],
-        &[
+    lpm(home)
+        .current_dir(dir)
+        .args(["env", "set", "API_URL=team"])
+        .assert()
+        .success();
+}
+
+/// Override the `staging` value of the project at `dir` on this computer.
+fn override_staging(home: &TempProject, dir: &std::path::Path) {
+    lpm(home)
+        .current_dir(dir)
+        .args([
             "env",
             "override",
             "set",
             "--env",
             "staging",
             "API_URL=fixture-mine",
-        ],
-    ] {
-        lpm(home).current_dir(dir).args(args).assert().success();
-    }
+        ])
+        .assert()
+        .success();
+}
+
+/// A project with one stored value whose `staging` environment this computer
+/// overrides, at `dir`, sharing `home`'s LPM home.
+fn overridden_project(home: &TempProject, dir: &std::path::Path, name: &str) {
+    team_project(home, dir, name);
+    override_staging(home, dir);
+}
+
+/// How many times stderr says `notice`.
+fn times_said(output: &std::process::Output, notice: &str) -> usize {
+    String::from_utf8_lossy(&output.stderr)
+        .matches(notice)
+        .count()
 }
 
 /// A script that runs `lpm` with `args` in `dir`, counts its runs in
@@ -8208,9 +8230,19 @@ async fn a_project_with_personal_overrides_keeps_every_task_and_its_dependents_o
         }),
     );
 
-    run_with_remote_cache(&project, &["run", "build"]);
-    project.write_file("build.js", &format!("{}\n", project.read_file("build.js")));
-    run_with_remote_cache(&project, &["run", "build"]);
+    for _ in 0..2 {
+        let output = run_with_remote_cache(&project, &["run", "build"]);
+        assert_eq!(
+            times_said(
+                &output,
+                "the remote cache is off for tasks of a project with personal overrides"
+            ),
+            1,
+            "said once a command: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        project.write_file("build.js", &format!("{}\n", project.read_file("build.js")));
+    }
 
     assert!(project.read_file("out/app.txt").contains("fixture-mine"));
     assert_eq!(
@@ -8257,6 +8289,12 @@ fn a_changed_override_of_any_environment_runs_the_project_s_tasks_again() {
     };
 
     run();
+    run();
+    assert_eq!(
+        runs(&project, "gen"),
+        1,
+        "the nested lpm read the project whose overrides the key holds, so the second run is a local hit"
+    );
     lpm(&project)
         .args([
             "env",
@@ -8272,6 +8310,45 @@ fn a_changed_override_of_any_environment_runs_the_project_s_tasks_again() {
 
     assert_eq!(runs(&project, "gen"), 2);
     assert!(project.read_file("dist/gen.txt").contains("fixture-second"));
+}
+
+#[tokio::test]
+async fn another_project_read_through_lpm_keeps_the_task_out_of_every_cache_before_it_has_overrides()
+ {
+    let server = MockServer::start().await;
+    mount_stateful_remote_cache(&server, RemoteCacheState::default()).await;
+    let project = cached_gen_project(
+        &server,
+        &nested_lpm_script("gen", "other", &["env", "print", "--env", "staging"]),
+    );
+    let other = project.path().join("other");
+    team_project(&project, &other, "other");
+
+    for _ in 0..2 {
+        let output = run_with_remote_cache(&project, &["run", "gen"]);
+        assert_eq!(
+            times_said(&output, "task 'gen' isn't cached"),
+            1,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(
+        runs(&project, "gen"),
+        2,
+        "the task's key doesn't hold the other project, whose overrides can change"
+    );
+    assert_eq!(artifact_requests(&server, "PUT").await, 0);
+
+    override_staging(&project, &other);
+    run_with_remote_cache(&project, &["run", "gen"]);
+
+    assert_eq!(runs(&project, "gen"), 3);
+    assert!(
+        project.read_file("dist/gen.txt").contains("fixture-mine"),
+        "the other project's first override applies"
+    );
+    assert_eq!(artifact_requests(&server, "PUT").await, 0);
 }
 
 #[tokio::test]
@@ -8364,11 +8441,29 @@ fn a_nested_lpm_that_can_t_report_the_overrides_it_read_fails() {
         !String::from_utf8_lossy(&output.stdout).contains("fixture-mine"),
         "nothing it read is printed"
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("couldn't tell an lpm that started this one"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        stderr.contains("couldn't tell an lpm that started this one")
+            && stderr.contains("LPM_PERSONAL_OVERRIDES_MARKER names"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("--no-env-check"),
+        "no env check failed: {stderr}"
+    );
+
+    let json = lpm(&project)
+        .env(
+            "LPM_PERSONAL_OVERRIDES_MARKER",
+            project.path().join("missing-folder").join("marker"),
+        )
+        .args(["--json", "env", "print", "--env", "staging"])
+        .output()
+        .expect("print");
+    let envelope: serde_json::Value = serde_json::from_slice(&json.stdout).expect("a JSON failure");
+    assert_eq!(
+        envelope["error_code"], "personal_overrides_unreported",
+        "{envelope}"
     );
 }
 
@@ -8431,6 +8526,8 @@ async fn a_script_run_by_its_name_leaves_no_marker_behind() {
 
     let output = lpm(&project)
         .env("TMPDIR", &temp)
+        .env("TMP", &temp)
+        .env("TEMP", &temp)
         .env("LPM_TEST_BIN", support::lpm_binary())
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
@@ -8647,4 +8744,49 @@ process.stdout.write(printed.stdout);
     assert!(shown.contains("fixture-mine"), "{shown}");
     assert!(!elsewhere.exists(), "the project's value named the marker");
     assert_eq!(artifact_requests(&server, "PUT").await, 0);
+}
+
+#[test]
+fn a_stored_value_never_names_the_marker_an_uncached_script_gets() {
+    let project = TempProject::empty(
+        r#"{"name":"stored-marker","version":"1.0.0","scripts":{"show":"node show.js"}}"#,
+    );
+    project.write_file(
+        "show.js",
+        "console.log('marker=' + (process.env.LPM_PERSONAL_OVERRIDES_MARKER ?? 'none'));",
+    );
+    let elsewhere = project.path().join("elsewhere-marker");
+    lpm(&project)
+        .args([
+            "env",
+            "set",
+            &format!("LPM_PERSONAL_OVERRIDES_MARKER={}", elsewhere.display()),
+        ])
+        .assert()
+        .success();
+    let inherited = project.path().join("outer-marker");
+    std::fs::create_dir_all(&inherited).expect("an outer lpm's marker");
+    let shown = |marker: Option<&std::path::Path>| {
+        let mut command = lpm(&project);
+        command.env_remove("LPM_PERSONAL_OVERRIDES_MARKER");
+        if let Some(marker) = marker {
+            command.env("LPM_PERSONAL_OVERRIDES_MARKER", marker);
+        }
+        let output = command.args(["run", "show"]).output().expect("run show");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    assert!(
+        shown(Some(&inherited)).contains(&format!("marker={}", inherited.display())),
+        "the script reports where the lpm above it watches"
+    );
+    assert!(
+        shown(None).contains("marker=none"),
+        "without an lpm above, the project's value doesn't name one"
+    );
 }

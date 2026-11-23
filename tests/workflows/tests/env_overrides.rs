@@ -1260,6 +1260,15 @@ fn removing_or_clearing_without_overrides_or_values_removes_nothing_and_says_so(
     assert!(cleared.status.success(), "{}", stderr(&cleared));
     let envelope: serde_json::Value = serde_json::from_slice(&cleared.stdout).unwrap();
     assert_eq!(envelope["removed"], 0);
+    let cleared = lpm(&project)
+        .args(["env", "override", "clear", "--all", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&cleared).contains("no personal overrides to remove (every environment)"),
+        "lower case, as its sibling lines are: {}",
+        stderr(&cleared)
+    );
     let asked = lpm(&project)
         .args(["env", "override", "clear", "--env", "default"])
         .output()
@@ -1337,6 +1346,7 @@ fn the_override_commands_say_what_env_and_their_keys_mean() {
         ("list", "every environment when left out"),
         ("clear", "The environment whose overrides to remove"),
         ("set", "default when left out"),
+        ("set", "don't use the remote"),
         ("unset", "The keys to leave out"),
         ("remove", "The keys whose override to remove"),
     ] {

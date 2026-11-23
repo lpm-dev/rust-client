@@ -139,11 +139,9 @@ impl EnvAccessScope {
             LpmError::EnvValidation("env approval state is unavailable".to_string())
         })?;
         failure.as_ref().map_or(Ok(()), |error| {
-            Err(if lpm_vault::is_env_project_refusal(error) {
-                LpmError::EnvProjectRefused(error.clone())
-            } else {
-                LpmError::EnvValidation(error.clone())
-            })
+            Err(crate::dotenv::vault_error(LpmError::EnvValidation)(
+                error.clone(),
+            ))
         })
     }
 

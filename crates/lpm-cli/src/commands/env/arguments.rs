@@ -92,10 +92,11 @@ Examples:
 
 A personal override is this computer's own value for a key. LPM applies it when
 it runs, prints or checks the project here. It never syncs, and LPM leaves it
-out when it pushes values or sends them to CI or a platform. LPM CLI 0.82.0 to
-0.88.0 apply overrides but can share outputs built with them, through the remote
-task cache and `env print --format=github-actions`; an older version runs with
-team values.",
+out when it pushes values or sends them to CI or a platform. Once the project
+has one, its tasks, and the tasks that run after them, don't use the remote task
+cache on this computer. LPM CLI 0.82.0 to 0.88.0 apply overrides but can share
+outputs built with them, through the remote task cache and
+`env print --format=github-actions`; an older version runs with team values.",
     value_entry_help!()
 );
 

@@ -1097,6 +1097,11 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         lpm_common::LpmError::EnvProjectRefused(reason) => {
             diagnostic_lines("This env project needs attention", Some(reason), error)
         }
+        lpm_common::LpmError::PersonalOverridesUnreported(reason) => diagnostic_lines(
+            "Couldn't tell the lpm above this one what it uses",
+            Some(reason),
+            error,
+        ),
         lpm_common::LpmError::EnvGeneration { reason, .. } => {
             diagnostic_lines("Environment generation failed", Some(reason), error)
         }
