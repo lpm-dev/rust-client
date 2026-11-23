@@ -5035,6 +5035,175 @@ async fn fusion_exact_documents_use_the_wider_bounded_fanout() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn fusion_prefetches_children_while_blocked_behind_slow_earlier_manifest() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let started_at = std::time::Instant::now();
+    let child_request_elapsed_ms = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+
+    Mock::given(method("GET"))
+        .and(path("/a-slow"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(200))
+                .set_body_json(metadata_json("a-slow", &[])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/b-fast"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(metadata_json("b-fast", &[("c-child", "^1.0.0")])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let child_elapsed_hook = Arc::clone(&child_request_elapsed_ms);
+    Mock::given(method("GET"))
+        .and(path("/c-child"))
+        .respond_with(move |_: &wiremock::Request| {
+            child_elapsed_hook.store(
+                started_at.elapsed().as_millis() as u64,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            ResponseTemplate::new(200).set_body_json(metadata_json("c-child", &[]))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_npm_registry_url(server.uri())
+            .with_cache_dir(None),
+    );
+    let result = resolve_greedy_fused(
+        client,
+        HashMap::from([
+            ("a-slow".to_string(), "^1.0.0".to_string()),
+            ("b-fast".to_string(), "^1.0.0".to_string()),
+        ]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        true,
+    )
+    .await
+    .expect("blocked manifest child prefetch should resolve cleanly");
+
+    let child_ms = child_request_elapsed_ms.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        child_ms < 150,
+        "c-child should be prefetched while b-fast is blocked behind 200ms a-slow (observed at {child_ms}ms)"
+    );
+    let mut names: Vec<String> = result.packages.iter().map(|p| p.package.to_string()).collect();
+    names.sort();
+    assert_eq!(names, vec!["a-slow", "b-fast", "c-child"]);
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn exact_version_linux_platform_hydration_uses_version_doc_under_release_age() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/linux-native"))
+        .and(header("accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "linux-native",
+            "modified": "2020-01-01T00:00:00.000Z",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "linux-native",
+                    "version": "1.0.0",
+                    "os": ["linux"],
+                    "cpu": ["x64"],
+                    "dist": {
+                        "tarball": "https://example.invalid/linux-native-1.0.0.tgz",
+                        "integrity": "sha512-linux-native"
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/linux-native/1.0.0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "linux-native",
+            "version": "1.0.0",
+            "os": ["linux"],
+            "cpu": ["x64"],
+            "libc": ["glibc"],
+            "dist": {
+                "tarball": "https://example.invalid/linux-native-1.0.0.tgz",
+                "integrity": "sha512-linux-native"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Must NOT request the full packument when the exact version doc supplies libc.
+    Mock::given(method("GET"))
+        .and(path("/linux-native"))
+        .and(header("accept", "application/json"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_npm_registry_url(server.uri())
+            .with_cache_dir(None),
+    );
+    let policy = ResolverPolicy::with_cutoff_unix(
+        7 * 86_400,
+        1_700_000_000,
+        crate::TrustPolicyMode::Off,
+    );
+    let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+    let result = resolve_greedy_fused_with_cache_options_policy_and_selected_events(
+        client,
+        HashMap::from([("linux-native".to_string(), "1.0.0".to_string())]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        shared_cache,
+        true,
+        true,
+        policy,
+        None,
+    )
+    .await
+    .expect("exact version Linux platform package should hydrate libc via version doc");
+
+    let info = result
+        .cache
+        .get(&CanonicalKey::npm("linux-native"))
+        .expect("linux-native cached");
+    assert_eq!(
+        info.platform("1.0.0").expect("platform metadata").libc,
+        vec!["glibc".to_string()]
+    );
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn fusion_trace_attributes_edge_expansion_and_graph_finalization() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

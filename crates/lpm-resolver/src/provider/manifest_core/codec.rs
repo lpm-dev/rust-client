@@ -378,6 +378,7 @@ impl CachedPackageInfo {
             covered_ranges,
             workspace_versions,
             platform_metadata_complete: flags & PLATFORM_METADATA_COMPLETE != 0,
+            platform_hydrated_versions: HashSet::new(),
             latest_version,
             latest_version_hint,
             preferred_latest,

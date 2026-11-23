@@ -546,7 +546,7 @@ impl SpeculativeKeyTracker {
 /// speculation doesn't ask for manifests the worker won't send.
 pub(super) const SPECULATION_MAX_DEPTH: u32 = 5;
 pub(super) const DEFAULT_FUSION_NPM_FANOUT: usize = lpm_resolver::DEFAULT_NPM_FANOUT;
-pub(super) const DEFAULT_FUSION_OVERLAP_NPM_FANOUT: usize = 16;
+pub(super) const DEFAULT_FUSION_OVERLAP_NPM_FANOUT: usize = 32;
 pub(super) const MAX_NPM_FANOUT: usize = lpm_resolver::MAX_NPM_FANOUT;
 pub(super) const DEFAULT_FUSION_SPECULATION_PERMITS: usize = DEFAULT_MAX_CONCURRENT_DOWNLOADS;
 pub(super) const ENV_FUSION_SPECULATION_PERMITS: &str = "LPM_FUSION_SPECULATION_PERMITS";
@@ -1890,12 +1890,12 @@ mod tests {
 
     #[test]
     fn default_fusion_npm_fanout_uses_overlap_scheduling_cap_when_overlap_enabled() {
-        assert_eq!(default_fusion_npm_fanout(true, 0), 16);
+        assert_eq!(default_fusion_npm_fanout(true, 0), 32);
     }
 
     #[test]
     fn default_fusion_npm_fanout_uses_overlap_scheduling_cap_with_release_age() {
-        assert_eq!(default_fusion_npm_fanout(true, 86_400), 16);
+        assert_eq!(default_fusion_npm_fanout(true, 86_400), 32);
     }
 
     #[test]

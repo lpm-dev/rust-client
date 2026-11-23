@@ -68,6 +68,7 @@ pub struct CachedPackageInfo {
     pub covered_ranges: HashSet<String>,
     pub workspace_versions: HashSet<NpmVersion>,
     pub platform_metadata_complete: bool,
+    pub(crate) platform_hydrated_versions: HashSet<String>,
     pub latest_version: Option<NpmVersion>,
     pub latest_version_hint: Option<NpmVersion>,
     pub(crate) preferred_latest: Option<NpmVersion>,
@@ -456,6 +457,7 @@ impl CachedPackageInfo {
             covered_ranges: HashSet::new(),
             workspace_versions: HashSet::new(),
             platform_metadata_complete: false,
+            platform_hydrated_versions: HashSet::new(),
             latest_version: None,
             latest_version_hint: None,
             preferred_latest: None,
@@ -971,14 +973,57 @@ impl CachedPackageInfo {
 
     pub fn needs_platform_metadata(&self) -> bool {
         !self.platform_metadata_complete
-            && self.platform.records.iter().any(|record| {
-                let os = platform_value_refs(&self.platform, record.os);
-                let cpu_is_empty = record.cpu.len == 0;
-                let libc_is_empty = record.libc.len == 0;
-                libc_is_empty
-                    && (record.os.len != 0 || !cpu_is_empty)
-                    && platform_may_target_linux(os)
-            })
+            && self
+                .platform
+                .records
+                .iter()
+                .any(|record| self.platform_record_needs_libc(record))
+    }
+
+    fn platform_record_needs_libc(&self, record: &PlatformRecord) -> bool {
+        let os = platform_value_refs(&self.platform, record.os);
+        let cpu_is_empty = record.cpu.len == 0;
+        let libc_is_empty = record.libc.len == 0;
+        libc_is_empty && (record.os.len != 0 || !cpu_is_empty) && platform_may_target_linux(os)
+    }
+
+    pub fn needs_platform_metadata_for_version(&self, version: &str) -> bool {
+        if self.platform_metadata_complete || self.platform_hydrated_versions.contains(version) {
+            return false;
+        }
+        let Some(version_id) = self.core.version_id(version) else {
+            return false;
+        };
+        let Some(record) =
+            find_version_record(&self.platform.records, version_id as u32, |r| r.version)
+        else {
+            return false;
+        };
+        self.platform_record_needs_libc(record)
+    }
+
+    pub fn merge_exact_version_platform(
+        &mut self,
+        version: &str,
+        os: &[String],
+        cpu: &[String],
+        libc: &[String],
+    ) {
+        if let Some(version_id) = self.core.version_id(version) {
+            let mut platforms = self.platforms_owned();
+            let platform = platforms.entry(version_id).or_default();
+            if platform.os.is_empty() && !os.is_empty() {
+                platform.os = os.to_vec();
+            }
+            if platform.cpu.is_empty() && !cpu.is_empty() {
+                platform.cpu = cpu.to_vec();
+            }
+            if platform.libc.is_empty() && !libc.is_empty() {
+                platform.libc = libc.to_vec();
+            }
+            self.platform = Arc::new(build_platform_overlay(platforms));
+            self.platform_hydrated_versions.insert(version.to_owned());
+        }
     }
 
     pub fn needs_supplemental_metadata(
@@ -1150,6 +1195,7 @@ impl ManifestCacheBuilder {
             covered_ranges: self.covered_ranges,
             workspace_versions: self.workspace_versions,
             platform_metadata_complete: self.platform_metadata_complete,
+            platform_hydrated_versions: HashSet::new(),
             latest_version_hint: None,
             latest_version: self.latest_version,
             preferred_latest: None,

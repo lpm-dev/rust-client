@@ -8,6 +8,7 @@ pub(crate) fn is_up_to_date(
     mode: &crate::install_state::FastLaneMode,
 ) -> Result<bool, LpmError> {
     let json_output = mode.json;
+    let suppression_warnings = crate::security_floor::defer_suppression_warnings();
     let package_json = lpm_common::strip_utf8_bom_str(package_json);
     let Ok(cached_state) = lpm_common::read_text_file_capped(
         &project_dir.join(".lpm/install-hash"),
@@ -295,6 +296,7 @@ pub(crate) fn is_up_to_date(
             crate::cli::keep_state_ignored_at_exit();
         }
     }
+    suppression_warnings.flush(json_output);
     Ok(true)
 }
 

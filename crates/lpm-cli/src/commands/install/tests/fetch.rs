@@ -411,6 +411,19 @@ async fn count_dispatched_speculative_frames(
     dependencies: HashMap<String, String>,
     frames: Vec<(&str, SpeculativePackageMetadata)>,
 ) -> u64 {
+    count_dispatched_speculative_frames_with_policy(
+        dependencies,
+        frames,
+        lpm_resolver::ResolverPolicy::default(),
+    )
+    .await
+}
+
+async fn count_dispatched_speculative_frames_with_policy(
+    dependencies: HashMap<String, String>,
+    frames: Vec<(&str, SpeculativePackageMetadata)>,
+    policy: lpm_resolver::ResolverPolicy,
+) -> u64 {
     let store_root = tempfile::tempdir().unwrap();
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     let (dispatcher, counters) = spawn_speculation_dispatcher(
@@ -422,7 +435,7 @@ async fn count_dispatched_speculative_frames(
         Some(Arc::new(Semaphore::new(0))),
         Arc::new(FetchCoordinator::default()),
         dependencies,
-        lpm_resolver::ResolverPolicy::default(),
+        policy,
         Arc::new(
             crate::engine_check::prepare_dependency_policy(store_root.path(), true, true).unwrap(),
         ),
@@ -638,6 +651,94 @@ async fn speculation_resumes_when_complete_platform_metadata_arrives() {
     .await;
 
     assert_eq!(dispatched, 1);
+}
+
+#[tokio::test]
+async fn speculation_parks_and_resumes_when_release_time_metadata_arrives() {
+    let recent_modified = "2023-11-14T22:00:00.000Z";
+    let incomplete = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
+        "name": "delayed-pkg",
+        "modified": recent_modified,
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "delayed-pkg",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.invalid/delayed-pkg-1.0.0.tgz",
+                    "integrity": "sha512-test"
+                }
+            }
+        }
+    })));
+    let complete = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
+        "name": "delayed-pkg",
+        "modified": recent_modified,
+        "dist-tags": { "latest": "1.0.0" },
+        "time": {
+            "modified": recent_modified,
+            "1.0.0": "2020-01-01T00:00:00.000Z"
+        },
+        "versions": {
+            "1.0.0": {
+                "name": "delayed-pkg",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.invalid/delayed-pkg-1.0.0.tgz",
+                    "integrity": "sha512-test"
+                }
+            }
+        }
+    })));
+    let policy = lpm_resolver::ResolverPolicy::new_with_release_age_excludes_at_unix(
+        7 * 86_400,
+        lpm_resolver::TrustPolicyMode::Off,
+        std::iter::empty(),
+        1_700_000_000,
+    );
+    let dispatched = count_dispatched_speculative_frames_with_policy(
+        HashMap::from([("delayed-pkg".to_string(), "^1.0.0".to_string())]),
+        vec![("delayed-pkg", incomplete), ("delayed-pkg", complete)],
+        policy,
+    )
+    .await;
+
+    assert_eq!(
+        dispatched, 1,
+        "unhydrated release-time manifests must park and resume when timestamps arrive"
+    );
+}
+
+#[tokio::test]
+async fn speculation_refuses_version_without_trust_metadata_under_trust_policy() {
+    let incomplete = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
+        "name": "trusted-pkg",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "trusted-pkg",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.invalid/trusted-pkg-1.0.0.tgz",
+                    "integrity": "sha512-test"
+                }
+            }
+        }
+    })));
+    let policy =
+        lpm_resolver::ResolverPolicy::new(0, lpm_resolver::TrustPolicyMode::NoDowngrade);
+    assert!(
+        pick_speculative_version_with_policy("trusted-pkg", &incomplete, "^1.0.0", &policy)
+            .is_none()
+    );
+    let dispatched = count_dispatched_speculative_frames_with_policy(
+        HashMap::from([("trusted-pkg".to_string(), "^1.0.0".to_string())]),
+        vec![("trusted-pkg", incomplete)],
+        policy,
+    )
+    .await;
+
+    assert_eq!(dispatched, 0);
 }
 
 #[tokio::test]

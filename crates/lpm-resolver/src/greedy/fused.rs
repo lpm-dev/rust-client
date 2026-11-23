@@ -2,9 +2,10 @@ use super::edge::process_edge_with_preferred;
 use super::manifest::{
     ExactMetadataFetchOutcome, FetchResult, FetchedMetadata, MetadataFetchCompletion,
     MetadataFetchKey, cached_manifest_from_importer_or_facts, complete_metadata_fetch,
-    ensure_policy_metadata_for_cached_manifest, exact_metadata_fast_path_eligible,
-    fetch_metadata_for_resolver_with_permit, fetch_metadata_for_resolver_with_trace_detail,
-    fetch_preferred_metadata_for_resolver,
+    ensure_policy_metadata_for_cached_manifest, ensure_policy_metadata_for_cached_manifest_for_edge,
+    exact_metadata_fast_path_eligible, fetch_metadata_for_resolver_with_permit,
+    fetch_metadata_for_resolver_with_permit_and_exact,
+    fetch_metadata_for_resolver_with_trace_detail, fetch_preferred_metadata_for_resolver,
     parse_cached_metadata_for_resolver, parse_fetched_metadata, parse_partial_fetched_metadata,
     publish_direct_base_fact, reads_public_npm, try_fetch_exact_metadata_for_resolver,
 };
@@ -539,6 +540,12 @@ impl OrderedMetadataFetches {
         self.committed.contains(canonical)
     }
 
+    fn is_blocked_behind_earlier(&self, request: &MetadataFetchKey) -> bool {
+        self.sequences
+            .get(request)
+            .is_some_and(|&sequence| sequence > self.next_commit_sequence)
+    }
+
     fn inflight(&self) -> &AHashSet<CanonicalKey> {
         &self.inflight
     }
@@ -761,11 +768,18 @@ struct PendingMetadataFetch {
     queued_at: Instant,
 }
 
+const MAX_PREFETCHED_READY_CACHE: usize = 256;
+
 struct MetadataFetchScheduler {
     semaphore: Arc<tokio::sync::Semaphore>,
     exact_document_semaphore: Arc<tokio::sync::Semaphore>,
     policy_semaphore: Arc<tokio::sync::Semaphore>,
     jobs: tokio::task::JoinSet<(MetadataFetchKey, FetchResult)>,
+    prefetch_jobs: tokio::task::JoinSet<(CanonicalKey, FetchResult)>,
+    prefetch_inflight: AHashSet<CanonicalKey>,
+    prefetched_ready: AHashMap<CanonicalKey, FetchResult>,
+    promoted_prefetches: AHashMap<CanonicalKey, Vec<MetadataFetchKey>>,
+    prefetch_cap: usize,
     pending: VecDeque<PendingMetadataFetch>,
     pending_exact_documents: VecDeque<PendingMetadataFetch>,
     ready: VecDeque<(MetadataFetchKey, FetchResult)>,
@@ -807,15 +821,81 @@ impl MetadataFetchScheduler {
         exact_document_semaphore: Arc<tokio::sync::Semaphore>,
         policy_semaphore: Arc<tokio::sync::Semaphore>,
     ) -> Self {
+        let prefetch_cap = (semaphore.available_permits() / 2).clamp(1, 12);
         Self {
             semaphore,
             exact_document_semaphore,
             policy_semaphore,
             jobs: tokio::task::JoinSet::new(),
+            prefetch_jobs: tokio::task::JoinSet::new(),
+            prefetch_inflight: AHashSet::with_capacity(prefetch_cap),
+            prefetched_ready: AHashMap::new(),
+            promoted_prefetches: AHashMap::new(),
+            prefetch_cap,
             pending: VecDeque::new(),
             pending_exact_documents: VecDeque::new(),
             ready: VecDeque::new(),
             fallback_metadata: Arc::default(),
+        }
+    }
+
+    fn enqueue_prefetch(
+        &mut self,
+        dispatch: &MetadataFetchDispatch<'_>,
+        canonical: CanonicalKey,
+        exact_version: Option<String>,
+        include_speculation: bool,
+    ) {
+        let CanonicalKey::Npm { name } = &canonical else {
+            return;
+        };
+        if !matches!(
+            dispatch.route_table.route_for_package(name),
+            UpstreamRoute::NpmDirect
+        ) {
+            return;
+        }
+        if !self.pending.is_empty()
+            || self.prefetch_inflight.len() >= self.prefetch_cap
+            || self.prefetched_ready.len() >= MAX_PREFETCHED_READY_CACHE
+            || self.semaphore.available_permits() <= 1
+            || self.prefetch_inflight.contains(&canonical)
+            || self.prefetched_ready.contains_key(&canonical)
+        {
+            return;
+        }
+        let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() else {
+            return;
+        };
+        self.prefetch_inflight.insert(canonical.clone());
+        let client = dispatch.client.clone();
+        let route_table = dispatch.route_table.clone();
+        let policy = dispatch.policy.clone();
+        let policy_semaphore = Arc::clone(&self.policy_semaphore);
+        let telemetry = Arc::clone(dispatch.telemetry);
+        let trace_metadata_fetches = dispatch.trace_metadata_fetches;
+        self.prefetch_jobs.spawn(async move {
+            let _active_fetch = telemetry.enter();
+            let result = fetch_metadata_for_resolver_with_permit_and_exact(
+                &client,
+                &route_table,
+                &canonical,
+                &policy,
+                include_speculation,
+                trace_metadata_fetches,
+                permit,
+                &policy_semaphore,
+                exact_version.as_deref(),
+            )
+            .await;
+            (canonical, result)
+        });
+    }
+
+    fn abort_unpromoted_prefetches(&mut self) {
+        if self.promoted_prefetches.is_empty() && !self.prefetch_jobs.is_empty() {
+            self.prefetch_jobs.abort_all();
+            self.prefetch_inflight.clear();
         }
     }
 
@@ -864,6 +944,33 @@ impl MetadataFetchScheduler {
         let client = dispatch.client.clone();
         let route_table = dispatch.route_table.clone();
         let policy = dispatch.policy.clone();
+        let request_key = MetadataFetchKey::for_request(
+            canonical.clone(),
+            exact_version.clone(),
+            &client,
+            &route_table,
+            &policy,
+        );
+        if let Some(prefetched_result) = self.prefetched_ready.remove(&canonical) {
+            let usable = match &prefetched_result {
+                Ok(fetched) => match exact_version.as_deref() {
+                    Some(version) => !fetched.info.needs_platform_metadata_for_version(version),
+                    None => !fetched.info.needs_platform_metadata(),
+                },
+                Err(_) => false,
+            };
+            if usable {
+                self.ready.push_back((request_key, prefetched_result));
+                return;
+            }
+        }
+        if self.prefetch_inflight.contains(&canonical) {
+            self.promoted_prefetches
+                .entry(canonical)
+                .or_default()
+                .push(request_key);
+            return;
+        }
         if !dispatch.trace_metadata_fetches
             && let CanonicalKey::Npm { name } = &canonical
             && let route = route_table.route_for_package(name)
@@ -876,16 +983,7 @@ impl MetadataFetchScheduler {
             )
         {
             tracing::event!(name: "metadata_memory_hit", target: "lpm_install_timeline", parent: &timeline, tracing::Level::TRACE, {});
-            self.ready.push_back((
-                MetadataFetchKey::for_request(
-                    canonical,
-                    exact_version,
-                    &client,
-                    &route_table,
-                    &policy,
-                ),
-                Ok(fetched),
-            ));
+            self.ready.push_back((request_key, Ok(fetched)));
             return;
         }
 
@@ -1043,7 +1141,7 @@ impl MetadataFetchScheduler {
                 {
                     lpm_registry::timing::record_exact_document_policy_bypass();
                 }
-                fetch_metadata_for_resolver_with_permit(
+                fetch_metadata_for_resolver_with_permit_and_exact(
                     &pending.client,
                     &pending.route_table,
                     &pending.canonical,
@@ -1052,6 +1150,7 @@ impl MetadataFetchScheduler {
                     pending.trace_metadata_fetches,
                     permit,
                     &policy_semaphore,
+                    pending.exact_version.as_deref(),
                 )
                 .await
             };
@@ -1100,58 +1199,89 @@ impl MetadataFetchScheduler {
     async fn join_next(
         &mut self,
     ) -> Option<Result<(MetadataFetchKey, FetchResult), tokio::task::JoinError>> {
-        if let Some(ready) = self.ready.pop_front() {
-            return Some(Ok(ready));
-        }
-        self.fill_available();
-        if self.jobs.is_empty()
-            && (!self.pending.is_empty() || !self.pending_exact_documents.is_empty())
-        {
-            let (pending, permit) = match (
-                self.pending.is_empty(),
-                self.pending_exact_documents.is_empty(),
-            ) {
-                (false, true) => {
-                    let permit = Arc::clone(&self.semaphore)
-                        .acquire_owned()
-                        .await
-                        .expect("metadata semaphore must outlive the resolver");
-                    (self.pending.pop_front().expect("checked non-empty"), permit)
+        loop {
+            if let Some(ready) = self.ready.pop_front() {
+                return Some(Ok(ready));
+            }
+            self.fill_available();
+            if self.jobs.is_empty() && self.promoted_prefetches.is_empty() {
+                if self.pending.is_empty() && self.pending_exact_documents.is_empty() {
+                    return None;
                 }
-                (true, false) => {
-                    let permit = Arc::clone(&self.exact_document_semaphore)
-                        .acquire_owned()
-                        .await
-                        .expect("exact document semaphore must outlive the resolver");
-                    (
-                        self.pending_exact_documents
-                            .pop_front()
-                            .expect("checked non-empty"),
-                        permit,
-                    )
+                let (pending, permit) = match (
+                    self.pending.is_empty(),
+                    self.pending_exact_documents.is_empty(),
+                ) {
+                    (false, true) => {
+                        let permit = Arc::clone(&self.semaphore)
+                            .acquire_owned()
+                            .await
+                            .expect("metadata semaphore must outlive the resolver");
+                        (self.pending.pop_front().expect("checked non-empty"), permit)
+                    }
+                    (true, false) => {
+                        let permit = Arc::clone(&self.exact_document_semaphore)
+                            .acquire_owned()
+                            .await
+                            .expect("exact document semaphore must outlive the resolver");
+                        (
+                            self.pending_exact_documents
+                                .pop_front()
+                                .expect("checked non-empty"),
+                            permit,
+                        )
+                    }
+                    (false, false) => {
+                        let metadata_permit = Arc::clone(&self.semaphore).acquire_owned();
+                        let exact_document_permit =
+                            Arc::clone(&self.exact_document_semaphore).acquire_owned();
+                        tokio::select! {
+                            permit = metadata_permit => (
+                                self.pending.pop_front().expect("checked non-empty"),
+                                permit.expect("metadata semaphore must outlive the resolver"),
+                            ),
+                            permit = exact_document_permit => (
+                                self.pending_exact_documents.pop_front().expect("checked non-empty"),
+                                permit.expect("exact document semaphore must outlive the resolver"),
+                            ),
+                        }
+                    }
+                    (true, true) => unreachable!("pending work was checked above"),
+                };
+                self.spawn(pending, permit);
+            }
+            tokio::select! {
+                Some(joined) = self.jobs.join_next(), if !self.jobs.is_empty() => {
+                    self.fill_available();
+                    return Some(joined);
                 }
-                (false, false) => {
-                    let metadata_permit = Arc::clone(&self.semaphore).acquire_owned();
-                    let exact_document_permit =
-                        Arc::clone(&self.exact_document_semaphore).acquire_owned();
-                    tokio::select! {
-                        permit = metadata_permit => (
-                            self.pending.pop_front().expect("checked non-empty"),
-                            permit.expect("metadata semaphore must outlive the resolver"),
-                        ),
-                        permit = exact_document_permit => (
-                            self.pending_exact_documents.pop_front().expect("checked non-empty"),
-                            permit.expect("exact document semaphore must outlive the resolver"),
-                        ),
+                Some(joined) = self.prefetch_jobs.join_next(), if !self.prefetch_jobs.is_empty() => {
+                    self.fill_available();
+                    match joined {
+                        Ok((canonical, result)) => {
+                            self.prefetch_inflight.remove(&canonical);
+                            if let Some(mut keys) = self.promoted_prefetches.remove(&canonical) {
+                                if let Some(first_key) = keys.pop() {
+                                    for extra_key in keys {
+                                        self.ready.push_back((extra_key, result.clone()));
+                                    }
+                                    return Some(Ok((first_key, result)));
+                                }
+                            } else if result.is_ok()
+                                && self.prefetched_ready.len() < MAX_PREFETCHED_READY_CACHE
+                            {
+                                self.prefetched_ready.insert(canonical, result);
+                            }
+                        }
+                        Err(join_error) => {
+                            if !self.promoted_prefetches.is_empty() {
+                                return Some(Err(join_error));
+                            }
+                        }
                     }
                 }
-                (true, true) => unreachable!("pending work was checked above"),
-            };
-            self.spawn(pending, permit);
+            }
         }
-        let joined = self.jobs.join_next().await;
-        self.fill_available();
-        joined
     }
 
     #[cfg(test)]
@@ -1169,6 +1299,7 @@ impl MetadataFetchScheduler {
             && self.pending.is_empty()
             && self.pending_exact_documents.is_empty()
             && self.ready.is_empty()
+            && self.promoted_prefetches.is_empty()
     }
 }
 
@@ -1489,6 +1620,63 @@ fn spawn_metadata_fetch_job(
     include_speculation: bool,
 ) {
     metadata_jobs.enqueue(dispatch, canonical, exact_version, include_speculation);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prefetch_children_of_blocked_manifest(
+    edges: &[Edge],
+    canonical: &CanonicalKey,
+    info: &CachedPackageInfo,
+    overrides: &OverrideSet,
+    policy: &ResolverPolicy,
+    shared_cache: &SharedCache,
+    shared_fact_cache: Option<&SharedCache>,
+    ordered_metadata: &OrderedMetadataFetches,
+    metadata_jobs: &mut MetadataFetchScheduler,
+    dispatch: &MetadataFetchDispatch<'_>,
+    include_speculation: bool,
+) {
+    for edge in edges {
+        let super::version::VersionPick::Picked(version) =
+            super::version::find_best_version_with_policy_unprofiled(
+                canonical,
+                info,
+                &edge.range,
+                policy,
+            )
+        else {
+            continue;
+        };
+        let Some(dependencies) = info.dependencies(&version.to_string()) else {
+            continue;
+        };
+        for dep in dependencies {
+            if dep.bundled || dep.optional || super::version::is_workspace_specifier(dep.range) {
+                continue;
+            }
+            let Ok(parsed_range) = NpmRange::parse_registry_spec(dep.range) else {
+                continue;
+            };
+            let child_canonical = CanonicalKey::from_dep_name(dep.alias.unwrap_or(dep.name));
+            if !overrides.is_empty() && overrides.may_match_package(&child_canonical.to_string()) {
+                continue;
+            }
+            if shared_cache.contains_key(&child_canonical)
+                || shared_fact_cache.is_some_and(|facts| facts.contains_key(&child_canonical))
+                || ordered_metadata.inflight().contains(&child_canonical)
+                || ordered_metadata.has_committed(&child_canonical)
+            {
+                continue;
+            }
+            let child_exact = parsed_range.exact_version().map(|v| v.to_string());
+            metadata_jobs.enqueue_prefetch(
+                dispatch,
+                child_canonical,
+                child_exact,
+                include_speculation,
+            );
+        }
+    }
 }
 
 fn release_age_names_from_root_deps(
@@ -2319,9 +2507,10 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     }
                     continue;
                 }
+                let edge_exact_version = edge.range.exact_version().map(|v| v.to_string());
                 if !ordered_metadata.has_committed(&edge.canonical) {
                     let policy_hydration_started = trace_metadata_fetches.then(Instant::now);
-                    let info_result = ensure_policy_metadata_for_cached_manifest(
+                    let info_result = ensure_policy_metadata_for_cached_manifest_for_edge(
                         &edge.canonical,
                         info_arc,
                         &client,
@@ -2329,6 +2518,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                         &shared_cache,
                         &policy,
                         trace_metadata_fetches,
+                        edge_exact_version.as_deref(),
                     )
                     .await;
                     if let Some(started) = policy_hydration_started {
@@ -2368,7 +2558,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     continue;
                 }
                 let policy_hydration_started = trace_metadata_fetches.then(Instant::now);
-                let info_result = ensure_policy_metadata_for_cached_manifest(
+                let info_result = ensure_policy_metadata_for_cached_manifest_for_edge(
                     &edge.canonical,
                     info_arc,
                     &client,
@@ -2376,6 +2566,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     &shared_cache,
                     &policy,
                     trace_metadata_fetches,
+                    edge_exact_version.as_deref(),
                 )
                 .await;
                 if let Some(started) = policy_hydration_started {
@@ -3005,6 +3196,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             .await?;
 
             if synthesized.is_empty() {
+                metadata_jobs.abort_unpromoted_prefetches();
                 // Fixed point reached: no more edges, no more peer
                 // requirements that needed synthesis. Done.
                 break;
@@ -3046,6 +3238,27 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
                 }
+            }
+            // When this manifest is blocked from deterministic commit behind an
+            // earlier in-flight sequence, warm its likely direct children's
+            // metadata concurrently without mutating resolution state or cache.
+            if let Ok(fetched) = &result
+                && ordered_metadata.is_blocked_behind_earlier(&request)
+                && let Some(edges) = parked.get(&request)
+            {
+                prefetch_children_of_blocked_manifest(
+                    edges,
+                    &request.canonical,
+                    &fetched.info,
+                    &state.overrides,
+                    &policy,
+                    &shared_cache,
+                    shared_fact_cache.as_ref(),
+                    &ordered_metadata,
+                    &mut metadata_jobs,
+                    &metadata_dispatch,
+                    spec_tx.is_some(),
+                );
             }
             ordered_metadata.queue_tracked(request, result)?;
             let mut completion = MetadataFetchCompletion {

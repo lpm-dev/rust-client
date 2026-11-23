@@ -69,6 +69,8 @@ pub(crate) fn merge_cached_package_info(
     covered_ranges.extend(incoming.covered_ranges.iter().cloned());
     let mut workspace_versions = existing.workspace_versions.clone();
     workspace_versions.extend(incoming.workspace_versions.iter().cloned());
+    let mut platform_hydrated_versions = existing.platform_hydrated_versions.clone();
+    platform_hydrated_versions.extend(incoming.platform_hydrated_versions.iter().cloned());
 
     let incoming_adds_versions = incoming.versions.iter().any(|version| {
         existing
@@ -123,6 +125,7 @@ pub(crate) fn merge_cached_package_info(
         merged.versions_complete = versions_complete;
         merged.trust_metadata_complete = trust_metadata_complete;
         merged.platform_metadata_complete = platform_metadata_complete;
+        merged.platform_hydrated_versions = platform_hydrated_versions;
         merged.release_metadata_complete = release_metadata_complete;
         merged.latest_version_hint = latest_version_hint;
         merged.preferred_latest = merged_preferred_latest(existing, incoming, &merged);
@@ -174,6 +177,7 @@ pub(crate) fn merge_cached_package_info(
         }
     }
     let mut merged = builder.finish();
+    merged.platform_hydrated_versions = platform_hydrated_versions;
     merged.release_metadata_complete |= release_metadata_complete;
     merged.latest_version_hint = latest_version_hint;
     merged.preferred_latest = merged_preferred_latest(existing, incoming, &merged);

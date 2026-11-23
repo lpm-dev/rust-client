@@ -107,11 +107,67 @@ impl SuppressionRecord {
 struct SuppressionState {
     seen: HashSet<(GuardedControl, SuppressionSource, String, String)>,
     records: Vec<SuppressionRecord>,
+    defer_warnings: bool,
+    deferred_warnings: Vec<SuppressionRecord>,
 }
 
 fn suppression_state() -> &'static Mutex<SuppressionState> {
     static STATE: OnceLock<Mutex<SuppressionState>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(SuppressionState::default()))
+}
+
+pub struct DeferredSuppressionWarningsGuard {
+    committed: bool,
+}
+
+impl DeferredSuppressionWarningsGuard {
+    pub fn flush(mut self, json_output: bool) {
+        self.committed = true;
+        let warnings = {
+            let mut state = suppression_state()
+                .lock()
+                .expect("security-floor suppression state mutex poisoned");
+            state.defer_warnings = false;
+            std::mem::take(&mut state.deferred_warnings)
+        };
+        if !json_output {
+            for record in warnings {
+                output::warn(&record.warning_line());
+            }
+        }
+    }
+}
+
+impl Drop for DeferredSuppressionWarningsGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut state = suppression_state()
+            .lock()
+            .expect("security-floor suppression state mutex poisoned");
+        state.defer_warnings = false;
+        let discarded = std::mem::take(&mut state.deferred_warnings);
+        for record in discarded {
+            let key = (
+                record.control,
+                record.source,
+                record.requested.clone(),
+                record.enforced.clone(),
+            );
+            state.seen.remove(&key);
+            state.records.retain(|existing| existing != &record);
+        }
+    }
+}
+
+pub fn defer_suppression_warnings() -> DeferredSuppressionWarningsGuard {
+    let mut state = suppression_state()
+        .lock()
+        .expect("security-floor suppression state mutex poisoned");
+    state.defer_warnings = true;
+    state.deferred_warnings.clear();
+    DeferredSuppressionWarningsGuard { committed: false }
 }
 
 pub fn record_suppression(record: SuppressionRecord, json_output: bool) {
@@ -125,7 +181,9 @@ pub fn record_suppression(record: SuppressionRecord, json_output: bool) {
         .lock()
         .expect("security-floor suppression state mutex poisoned");
     if state.seen.insert(key) {
-        if !json_output {
+        if state.defer_warnings {
+            state.deferred_warnings.push(record.clone());
+        } else if !json_output {
             output::warn(&record.warning_line());
         }
         state.records.push(record);
@@ -424,6 +482,32 @@ mod tests {
         let got = recorded_suppressions();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].control, GuardedControl::CooldownWindow);
+        clear_recorded_suppressions_for_tests();
+    }
+
+    #[test]
+    fn deferred_suppression_warnings_discard_on_drop_and_keep_on_flush() {
+        clear_recorded_suppressions_for_tests();
+        let record = SuppressionRecord::new(
+            GuardedControl::CooldownWindow,
+            SuppressionSource::Cli,
+            "0",
+            "86400",
+        );
+        {
+            let _guard = defer_suppression_warnings();
+            record_suppression(record.clone(), true);
+            assert_eq!(recorded_suppressions().len(), 1);
+        }
+        assert!(
+            recorded_suppressions().is_empty(),
+            "dropped deferred guard must discard unsent suppression records"
+        );
+
+        let guard = defer_suppression_warnings();
+        record_suppression(record, true);
+        guard.flush(true);
+        assert_eq!(recorded_suppressions().len(), 1);
         clear_recorded_suppressions_for_tests();
     }
 }

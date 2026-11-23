@@ -1137,7 +1137,7 @@ pub(super) async fn build_blocked_set_metadata(
     // consume this enrichment. Fetch those candidates concurrently.
     // Each manifest's first read after linking waits on lookups in the
     // directories linking just created, so the scan runs in parallel.
-    const PARALLEL_METADATA_SCAN_THRESHOLD: usize = 512;
+    const PARALLEL_METADATA_SCAN_THRESHOLD: usize = 32;
     let metadata_packages: Vec<&InstallPackage> =
         if packages.len() >= PARALLEL_METADATA_SCAN_THRESHOLD {
             packages

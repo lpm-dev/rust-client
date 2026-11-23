@@ -3712,6 +3712,9 @@ pub(super) fn pick_speculative_version_with_policy(
     policy: &lpm_resolver::ResolverPolicy,
 ) -> Option<(String, String, Option<String>)> {
     let canonical = lpm_resolver::CanonicalKey::from_dep_name(package_name);
+    if meta.info.needs_trust_metadata(policy) {
+        return None;
+    }
     let check_release_age = !package_name.is_empty() && policy.release_age_applies_to_package(&canonical);
     if check_release_age && meta.info.needs_release_time_metadata(&canonical, policy) {
         return None;
@@ -4006,6 +4009,15 @@ pub(super) fn spawn_speculation_dispatcher(
                     return;
                 }
 
+                let canonical = lpm_resolver::CanonicalKey::from_dep_name(&name);
+                if meta.info.needs_policy_metadata(&canonical, &resolver_policy) {
+                    parked
+                        .entry(name)
+                        .or_default()
+                        .push((range, depth, is_root));
+                    return;
+                }
+
                 let Some((version, url, integrity)) =
                     pick_speculative_version_with_policy(&name, meta, &range, &resolver_policy)
                 else {
@@ -4024,7 +4036,7 @@ pub(super) fn spawn_speculation_dispatcher(
                 {
                     return;
                 }
-                if meta.info.needs_platform_metadata() {
+                if meta.info.needs_platform_metadata_for_version(&version) {
                     parked
                         .entry(name)
                         .or_default()
