@@ -346,6 +346,57 @@ fn a_repair_review_never_reads_a_record_whose_contents_decide_nothing() {
 }
 
 #[test]
+fn a_repair_review_shows_a_record_whose_approval_contradicts_itself_as_damage_only_lpm_vault_repairs()
+ {
+    const MARKER: &str = r#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{"overrides":{"version":1,"ifUnsupported":"refuse","kinds":["overrides"],"state":"active"}}}"#;
+    for values in [true, false] {
+        let mut storage = if values {
+            storage_with_values()
+        } else {
+            MemoryProjectStorage::default()
+        };
+        storage.values.insert(marker_account(VAULT), MARKER);
+        storage
+            .values
+            .insert(overrides_account(), "fixture-damaged-record");
+        storage
+            .claims
+            .insert(overrides_account(), ClaimedAccess::Contradictory);
+        storage
+            .values
+            .insert(record_account("notes", VAULT, None), "fixture-stray");
+        storage.reads.clear();
+
+        let reviewed = review_companion_data_with_storage(&mut storage, VAULT)
+            .unwrap_or_else(|error| panic!("values {values}: {error}"));
+
+        let contradiction = reviewed
+            .problems
+            .iter()
+            .find(|problem| problem.description.contains("contradict"));
+        if values {
+            assert_eq!(
+                contradiction.map(|problem| &problem.repair),
+                Some(&None),
+                "only LPM Vault sets approval again: {reviewed:?}"
+            );
+        } else {
+            assert!(
+                contradiction.is_none(),
+                "a record left without values is never read: {reviewed:?}"
+            );
+        }
+        assert!(
+            reviewed
+                .repairs()
+                .contains(&CompanionRepair::RemoveUnlisted),
+            "values {values}: the other damage is still repaired: {reviewed:?}"
+        );
+        assert_eq!(storage.reads.get(&overrides_account()), None);
+    }
+}
+
+#[test]
 fn a_record_weakened_while_it_is_read_is_refused_rather_than_used() {
     let mut storage = storage_with_values();
     change(&mut storage, &[set("API_URL", "fixture-mine")]).expect("set");

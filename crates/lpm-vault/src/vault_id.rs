@@ -473,22 +473,25 @@ fn validate_vault_id(vault_id: &str) -> Result<(), String> {
     ))
 }
 
-/// The vault ID `project_dir`'s lpm.json names, from one read, refusing a
-/// `vault` field no write could use, as [`get_or_create_vault_id`] would:
-/// one that isn't a string, or isn't a safe ID. `None` without one, or
-/// without an lpm.json that reads as JSON, which reads elsewhere refuse.
+/// The vault ID `project_dir`'s lpm.json names, from one read, refusing an
+/// lpm.json that can't be read or doesn't parse, or a `vault` field no write
+/// could use, as [`get_or_create_vault_id`] would: one that isn't a string,
+/// or isn't a safe ID. `None` without an lpm.json, or without the field.
 pub fn checked_vault_id(project_dir: &Path) -> Result<Option<String>, String> {
-    let Ok(content) = lpm_common::read_text_file_capped(
+    let content = match lpm_common::read_text_file_capped(
         &project_dir.join("lpm.json"),
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    ) else {
-        return Ok(None);
+    ) {
+        Ok(content) => content,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(format!("failed to read lpm.json: {error}")),
     };
-    let Ok(config) =
+    let config =
         serde_json::from_str::<serde_json::Value>(lpm_common::strip_utf8_bom_str(&content))
-    else {
-        return Ok(None);
-    };
+            .map_err(|error| format!("failed to parse lpm.json: {error}"))?;
+    let config = config
+        .as_object()
+        .ok_or_else(|| "failed to parse lpm.json: top-level config must be an object".to_owned())?;
     match config.get("vault").filter(|value| !value.is_null()) {
         None => Ok(None),
         Some(value) => {

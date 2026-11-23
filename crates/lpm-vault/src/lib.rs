@@ -136,9 +136,14 @@ pub fn is_env_project_refusal(message: &str) -> bool {
 /// after any interrupted step was finished, or `None` when the directory has
 /// no env project.
 pub fn review_companion_data(project_dir: &Path) -> Result<Option<CompanionReview>, String> {
-    let Some(vault_id) = linked_vault_id(project_dir)? else {
+    let Some(vault_id) = checked_linked_vault_id(project_dir)? else {
         return Ok(None);
     };
+    // What a review says depends on the project's overrides, and the repair
+    // it leads to can remove them.
+    override_marker::report_access(override_marker::Access::Change {
+        vault_id: &vault_id,
+    })?;
     #[cfg(target_os = "macos")]
     if !force_file_vault_backend() {
         return keychain::review_companion_data(&vault_id).map(Some);
@@ -156,7 +161,7 @@ pub fn repair_companion_data(
     project_dir: &Path,
     reviewed: &CompanionReview,
 ) -> Result<Vec<CompanionRepair>, String> {
-    let Some(vault_id) = linked_vault_id(project_dir)? else {
+    let Some(vault_id) = checked_linked_vault_id(project_dir)? else {
         return Err("this directory has no env project".to_owned());
     };
     if vault_id != reviewed.vault_id() {

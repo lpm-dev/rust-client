@@ -1947,7 +1947,10 @@ pub(crate) fn repair_companion_data(
 
 /// Finish `vault_id`'s interrupted step if it can be finished, then report
 /// why its access is damaged, if it is, and why the step can never be
-/// finished, if it can't.
+/// finished, if it can't. Access is damaged when the values' approval
+/// attributes contradict each other, or, beside values, the overrides
+/// record's do; a record left without values is never read, whatever it
+/// claims.
 fn open_for_repair(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
@@ -1960,8 +1963,16 @@ fn open_for_repair(
         crate::companion::Opened::Unfinished(reason) => Some(reason),
         crate::companion::Opened::Gate(_) => None,
     };
-    let access = (storage.claimed_access(vault_id)? == Some(ClaimedAccess::Contradictory))
-        .then_some(companion_gate::CONTRADICTORY_VALUES);
+    let access = match storage.claimed_access(vault_id)? {
+        Some(ClaimedAccess::Contradictory) => Some(companion_gate::CONTRADICTORY_VALUES),
+        None => None,
+        Some(_) => (storage.claimed_access(&crate::companion::account::record_account(
+            crate::companion::overrides::OVERRIDES_KIND,
+            vault_id,
+            None,
+        ))? == Some(ClaimedAccess::Contradictory))
+        .then_some(companion_gate::CONTRADICTORY_RECORD),
+    };
     Ok((access, unfinished))
 }
 

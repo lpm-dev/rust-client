@@ -1229,6 +1229,36 @@ fn a_record_left_without_values_is_never_applied_or_listed() {
 }
 
 #[test]
+fn a_list_and_a_run_identify_a_record_without_environments_alike() {
+    with_temp_vault_home(|_| {
+        force_file_vault();
+        seed_values();
+        commit(vec![
+            write(marker_account(), marker_with_overrides()),
+            write(
+                record("overrides", None),
+                br#"{"schemaVersion":1,"vaultId":"proj","environments":{}}"#.to_vec(),
+            ),
+        ]);
+        crate::companion::forget(VAULT);
+
+        let run = crate::try_get_run_environment_for_vault_id(VAULT, None)
+            .expect("a run")
+            .overrides_identity;
+        let (listed, identity) =
+            with_vault_transaction(|directory| read_all_overrides_unlocked(directory, VAULT))
+                .expect("a list");
+
+        assert!(listed.is_empty());
+        assert!(run.is_some());
+        assert_eq!(
+            identity, run,
+            "an lpm that lists them reports what the key holds"
+        );
+    });
+}
+
+#[test]
 fn a_repair_review_never_reads_a_record_left_without_values() {
     with_temp_vault_home(|home| {
         force_file_vault();

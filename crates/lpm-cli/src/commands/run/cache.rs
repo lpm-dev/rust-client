@@ -161,7 +161,7 @@ pub(super) struct CacheContext {
     /// The entries of the reads a nested lpm can make that the key holds:
     /// its project's environment and its overrides (see
     /// [`lpm_vault::override_marker::Access::keyed`]); none without a project.
-    keyed_entries: Vec<String>,
+    pub(super) keyed_entries: Vec<String>,
     pub(super) command: String,
     pub(super) env_vars: HashMap<String, String>,
     pub(super) inherited_env: HashMap<std::ffi::OsString, std::ffi::OsString>,
@@ -581,7 +581,7 @@ fn build_task_context(
                 });
             }
             tracing::debug!(
-                "task '{}' is in a project with personal overrides, or runs after a task that is; not using the remote cache for it",
+                "task '{}' is in a project with personal overrides, or depends on a task that is; not using the remote cache for it",
                 lpm_common::sanitize_terminal_inline(script_name)
             );
             None
@@ -858,9 +858,18 @@ fn say_not_cached(
 ) {
     use lpm_runner::override_marker::Unkeyed;
     static SHOWN: AtomicBool = AtomicBool::new(false);
+    const NOT_CACHED_ALWAYS: &str = "if it always does, set `cache` to false for it in lpm.json";
     let reason = match unkeyed {
-        Unkeyed::Used => "an lpm it started used another env project or environment, or changed personal overrides, which its cache key doesn't hold; if it always does, set `cache` to false for it in lpm.json".to_owned(),
-        Unkeyed::Unknown => "what the lpm processes it started used can't be told".to_owned(),
+        Unkeyed::Changed => format!(
+            "an lpm it started changed personal overrides, which its cache key doesn't hold; {NOT_CACHED_ALWAYS}"
+        ),
+        Unkeyed::Used => format!(
+            "an lpm it started used another env project or environment, or values or personal overrides other than those its cache key holds; {NOT_CACHED_ALWAYS}"
+        ),
+        Unkeyed::EveryEnvironment => "an lpm it started read every environment of an env project, as `lpm env ls` and `lpm env check` without `--env` do, while its cache key holds one; `lpm env check --env` with the task's environment keeps it cached".to_owned(),
+        Unkeyed::Untold => "an lpm it started couldn't make the marker a task of its own reports to, so what that task used can't be told; check the temporary folder".to_owned(),
+        Unkeyed::Unlisted => "the marker that the lpm processes it started report to was gone or couldn't be read once it ended, as when a task empties the temporary folder".to_owned(),
+        Unkeyed::Foreign => "the marker that the lpm processes it started report to holds a file no lpm adds".to_owned(),
         Unkeyed::Unwatched => format!(
             "lpm couldn't make the marker that the lpm processes it starts report to ({}); check the temporary folder",
             lpm_common::sanitize_terminal_inline(unwatched.unwrap_or_default())

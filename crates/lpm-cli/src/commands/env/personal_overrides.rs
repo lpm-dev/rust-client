@@ -489,7 +489,7 @@ fn clear(
         return Err(LpmError::ConfirmationRequired {
             command: "lpm env override clear",
             change: format!("remove the personal overrides on {THIS_MACHINE} ({scope})"),
-            help: "Run it again with `--yes`. It asks only in an interactive terminal, and never with `--json`.",
+            help: "Check them with `lpm env override list`, then run it again with `--yes`. It asks only in an interactive terminal, and never with `--json`.",
         });
     }
     super::links::ensure_folder_linked(project_dir, json_output)?;

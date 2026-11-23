@@ -1,8 +1,8 @@
 //! The unit tests' allocator, which can watch whether a heap block holding a
-//! marker is ever freed or moved without being wiped first. It watches only
-//! the thread that asks, so tests running alongside don't count. It reads
-//! blocks with inline assembly, which Miri can't run, so Miri builds leave it
-//! out.
+//! marker is ever freed or moved without being wiped first, and measure the
+//! most a piece of work holds at once. It watches only the thread that asks,
+//! so tests running alongside don't count. It reads blocks with inline
+//! assembly, which Miri can't run, so Miri builds leave it out.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -18,6 +18,24 @@ struct Probe;
 
 thread_local! {
     static WATCHED: Cell<bool> = const { Cell::new(false) };
+    /// Whether this thread's allocations are measured, how many bytes it
+    /// has allocated less freed since, and the most that came to.
+    static MEASURED: Cell<bool> = const { Cell::new(false) };
+    static HELD: Cell<isize> = const { Cell::new(0) };
+    static MOST_HELD: Cell<isize> = const { Cell::new(0) };
+}
+
+/// Notes that this thread now holds `change` more bytes, while measured.
+fn hold(change: isize) {
+    if MEASURED.try_with(Cell::get).unwrap_or(false) {
+        let held = HELD.with(Cell::get) + change;
+        HELD.with(|cell| cell.set(held));
+        MOST_HELD.with(|most| most.set(most.get().max(held)));
+    }
+}
+
+fn size_of(layout: Layout) -> isize {
+    isize::try_from(layout.size()).unwrap_or(isize::MAX)
 }
 static FOUND: AtomicBool = AtomicBool::new(false);
 /// Only one test watches at a time.
@@ -35,14 +53,17 @@ fn watched() -> bool {
 // never holds what an earlier one left.
 unsafe impl GlobalAlloc for Probe {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        hold(size_of(layout));
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        hold(size_of(layout));
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn dealloc(&self, block: *mut u8, layout: Layout) {
+        hold(-size_of(layout));
         unsafe {
             scan(block, layout.size());
             System.dealloc(block, layout);
@@ -61,6 +82,7 @@ unsafe impl GlobalAlloc for Probe {
             if moved.is_null() {
                 return moved;
             }
+            hold(isize::try_from(new_size).unwrap_or(isize::MAX) - size_of(layout));
             scan(block, layout.size());
             std::ptr::copy_nonoverlapping(block, moved, layout.size().min(new_size));
             System.dealloc(block, layout);
@@ -211,6 +233,20 @@ pub(crate) fn watch<T>(body: impl FnOnce() -> T) -> (T, bool) {
     (output, FOUND.load(Ordering::Relaxed))
 }
 
+/// Runs `body`, returning the most it held on this thread at once beyond
+/// what the thread held before: bytes allocated less those freed.
+pub(crate) fn most_held<T>(body: impl FnOnce() -> T) -> (T, usize) {
+    HELD.with(|held| held.set(0));
+    MOST_HELD.with(|most| most.set(0));
+    MEASURED.with(|measured| measured.set(true));
+    let output = body();
+    MEASURED.with(|measured| measured.set(false));
+    (
+        output,
+        usize::try_from(MOST_HELD.with(Cell::get)).unwrap_or_default(),
+    )
+}
+
 /// This thread's watch, which ends when it's dropped, even by a panic.
 struct Watching;
 
@@ -254,6 +290,18 @@ fn the_probe_finds_the_marker_only_in_a_block_freed_or_moved_holding_it() {
         drop(wiped);
     });
     assert!(!found, "a block wiped before it's freed isn't found");
+}
+
+#[test]
+fn the_most_held_counts_what_was_alive_at_once() {
+    let ((), most) = most_held(|| {
+        let first = vec![1u8; 1 << 20];
+        drop(first);
+        let second = vec![1u8; 2 << 20];
+        let third = vec![1u8; 1 << 20];
+        drop((second, third));
+    });
+    assert!((3 << 20..(3 << 20) + 4096).contains(&most), "{most}");
 }
 
 #[test]

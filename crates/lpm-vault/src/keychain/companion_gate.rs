@@ -138,10 +138,13 @@ pub(super) const CONTRADICTORY_VALUES: &str =
 /// Why an approval couldn't be verified while the Keychain is locked.
 pub(super) const APPROVAL_UNCONFIRMED: &str = "the macOS Keychain is unavailable, so env approval couldn't be confirmed; retry once the Mac is unlocked";
 
+/// Why the overrides record damages a project's access, when its approval
+/// attributes contradict each other.
+pub(super) const CONTRADICTORY_RECORD: &str =
+    "the personal overrides' approval attributes contradict each other";
+
 pub(super) fn contradictory_record() -> String {
-    damaged(Damage::Access(
-        "the personal overrides' approval attributes contradict each other".to_owned(),
-    ))
+    damaged(Damage::Access(CONTRADICTORY_RECORD.to_owned()))
 }
 
 /// The values item's bytes with the approval they claim, read in one call.

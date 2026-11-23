@@ -566,6 +566,54 @@ fn a_repair_that_can_t_report_its_change_to_overrides_changes_nothing() {
 }
 
 #[test]
+fn an_interrupted_override_removal_is_finished_only_by_an_lpm_that_can_report_it() {
+    let (project, vault_id) = project_with_team_value(r#"{"show":"node show.cjs"}"#);
+    let removing = OVERRIDES_MARKER.replace(r#""state":"active"}"#, r#""state":"removing"}"#);
+    seed(
+        &project,
+        &vault_id,
+        Some(&removing),
+        Some(&overrides_record(
+            &vault_id,
+            "default",
+            r#""API_URL":"fixture-mine""#,
+            "",
+        )),
+    );
+
+    for args in [
+        &["env", "repair", "--json"][..],
+        &["env", "set", "OTHER=1", "--json"],
+        &["env", "override", "list", "--json"],
+    ] {
+        let refused = lpm(&project)
+            .env("LPM_PERSONAL_OVERRIDES_MARKER", not_a_marker(&project))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!refused.status.success(), "{args:?}");
+        let json: serde_json::Value = serde_json::from_slice(&refused.stdout)
+            .unwrap_or_else(|_| panic!("{args:?}: {}", stdout(&refused)));
+        assert_eq!(
+            json["error_code"], "personal_overrides_unreported",
+            "{args:?}: {json}"
+        );
+    }
+    let finished = lpm(&project)
+        .env_remove("LPM_PERSONAL_OVERRIDES_MARKER")
+        .args(["env", "override", "list"])
+        .output()
+        .unwrap();
+
+    assert!(finished.status.success(), "{}", stderr(&finished));
+    assert!(
+        stderr(&finished).contains("finished removing"),
+        "the removal waited for an lpm that could report it: {}",
+        stderr(&finished)
+    );
+}
+
+#[test]
 fn env_repair_reviews_then_repairs_a_damaged_feature() {
     let (project, vault_id) = project_with_team_value(r#"{"show":"node show.cjs"}"#);
     seed(&project, &vault_id, Some(OVERRIDES_MARKER), None);
@@ -1448,6 +1496,7 @@ fn an_unusable_vault_field_is_named_by_every_override_command() {
         &["env", "override", "remove", "API_URL"],
         &["env", "override", "list"],
         &["env", "override", "clear", "--all", "--yes"],
+        &["env", "repair"],
     ] {
         let output = lpm(&project).args(args).output().unwrap();
         assert!(!output.status.success(), "{args:?}: {}", stdout(&output));
@@ -1455,6 +1504,41 @@ fn an_unusable_vault_field_is_named_by_every_override_command() {
         assert!(said.contains("path-traversal"), "{args:?}: {said}");
         assert!(!said.contains("no env project"), "{args:?}: {said}");
     }
+}
+
+#[test]
+fn an_lpm_json_that_doesn_t_parse_is_named_by_every_override_command_and_repair() {
+    let (project, _) = project_with_team_value("{}");
+    lpm(&project)
+        .args(["env", "override", "set", "API_URL=fixture-mine"])
+        .assert()
+        .success();
+    let lpm_json = project.read_file("lpm.json");
+    let unclosed = lpm_json.trim_end().trim_end_matches('}');
+    project.write_file("lpm.json", unclosed);
+
+    for args in [
+        &["env", "override", "list"][..],
+        &["env", "override", "clear", "--all", "--yes"],
+        &["env", "repair"],
+    ] {
+        let output = lpm(&project).args(args).output().unwrap();
+        assert!(!output.status.success(), "{args:?}: {}", stdout(&output));
+        let said = stderr(&output);
+        assert!(said.contains("lpm.json"), "{args:?}: {said}");
+        assert!(!said.contains("no personal overrides"), "{args:?}: {said}");
+        assert!(!said.contains("no env project"), "{args:?}: {said}");
+    }
+    project.write_file("lpm.json", &lpm_json);
+    let listed = lpm(&project)
+        .args(["env", "override", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        stdout(&listed).contains("API_URL"),
+        "nothing was removed: {}",
+        stdout(&listed)
+    );
 }
 
 #[test]

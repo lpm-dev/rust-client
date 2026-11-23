@@ -8887,6 +8887,65 @@ fn a_task_whose_nested_lpm_reads_another_environment_runs_again_after_its_values
 }
 
 #[test]
+fn a_task_whose_nested_lpm_checks_every_environment_says_so_and_one_that_checks_its_own_is_cached()
+{
+    let project = TempProject::empty(
+        r#"{"name":"every-environment","version":"1.0.0","scripts":{"every":"node every.js","own":"node own.js"}}"#,
+    );
+    project.write_file(
+        "every.js",
+        &nested_lpm_script("every", ".", &["env", "check"]),
+    );
+    project.write_file(
+        "own.js",
+        &nested_lpm_script("own", ".", &["env", "check", "--env", "default"]),
+    );
+    lpm(&project)
+        .args(["env", "set", "API_URL=team"])
+        .assert()
+        .success();
+    extend_lpm_json(
+        &project,
+        serde_json::json!({
+            "envSchema": {"vars": {"API_URL": {"required": true}}},
+            "tasks": {
+                "every": {"cache": true, "inputs": ["every.js"], "outputs": ["dist/every.txt"]},
+                "own": {"cache": true, "inputs": ["own.js"], "outputs": ["dist/own.txt"]}
+            }
+        }),
+    );
+    let run = |task: &str| {
+        let output = lpm(&project)
+            .env("LPM_TEST_BIN", support::lpm_binary())
+            .args(["run", task])
+            .output()
+            .expect("run the task");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+
+    let said = run("every");
+    run("every");
+    run("own");
+    run("own");
+
+    assert!(
+        said.contains("read every environment") && said.contains("`lpm env check --env`"),
+        "{said}"
+    );
+    assert_eq!(runs(&project, "every"), 2, "never cached");
+    assert_eq!(
+        runs(&project, "own"),
+        1,
+        "its own environment is what its key holds"
+    );
+}
+
+#[test]
 fn a_task_whose_nested_lpm_read_overrides_changed_and_put_back_while_it_ran_isn_t_cached() {
     let project = TempProject::empty(
         r#"{"name":"put-back","version":"1.0.0","scripts":{"gen":"node gen.js"}}"#,
@@ -9130,6 +9189,19 @@ waitFor('finish');
         artifact_requests(&server, "PUT").await,
         0,
         "the read saw an override neither key holds"
+    );
+    lpm(&project)
+        .env("LPM_TEST_BIN", support::lpm_binary())
+        .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+        .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
+        .args(["run", "gen"])
+        .assert()
+        .success();
+    assert_eq!(runs(&project, "gen"), 2, "nor is it in the local cache");
+    assert!(
+        !project
+            .read_file("dist/gen.txt")
+            .contains("fixture-transient")
     );
 }
 

@@ -87,40 +87,53 @@ impl TaskMarker {
     }
 }
 
-/// Why what a task built can't be cached under its key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why what a task built can't be cached under its key, the most specific
+/// reason first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Unkeyed {
-    /// An `lpm` the task started used another env project, or changed
-    /// personal overrides.
+    /// An `lpm` the task started changed personal overrides.
+    Changed,
+    /// An `lpm` the task started read, with personal overrides applied,
+    /// what the key doesn't hold: another env project or environment, or
+    /// values or overrides other than the key's.
     Used,
-    /// What the task's `lpm` processes used can't be told: its marker
-    /// couldn't be listed, or holds an entry no `lpm` adds.
-    Unknown,
+    /// An `lpm` the task started read every environment of an env project,
+    /// as `lpm env ls` and `lpm env check` without `--env` do.
+    EveryEnvironment,
+    /// An `lpm` the task started couldn't make a marker for a task of its
+    /// own, so what that task used can't be told.
+    Untold,
+    /// The marker was gone, or couldn't be listed, once the task ended, as
+    /// when the task empties the temporary folder.
+    Unlisted,
+    /// The marker holds a file no `lpm` adds.
+    Foreign,
     /// The task has no marker of its own (see [`TaskMarker::unwatched`]).
     Unwatched,
 }
 
-/// [`TaskMarker::unkeyed`] for the entries in `directory`. A use the key
-/// doesn't hold is named before what can't be told.
+/// [`TaskMarker::unkeyed`] for the entries in `directory`.
 fn unkeyed(directory: &Path, keyed: &[String]) -> Option<Unkeyed> {
     let Ok(entries) = std::fs::read_dir(directory) else {
-        return Some(Unkeyed::Unknown);
+        return Some(Unkeyed::Unlisted);
     };
-    let mut found = None;
+    let mut found: Option<Unkeyed> = None;
     for entry in entries {
-        let name = entry.map(|entry| entry.file_name());
-        let reason = match name.as_ref().ok().and_then(|name| name.to_str()) {
-            Some(name) if keyed.iter().any(|keyed| keyed == name) => continue,
-            Some(name) => match Reported::of_entry(name) {
-                Some(Reported::Access) => Unkeyed::Used,
-                Some(Reported::Uncertain) | None => Unkeyed::Unknown,
+        let reason = match entry {
+            Err(_) => Unkeyed::Unlisted,
+            Ok(entry) => match entry.file_name().to_str() {
+                Some(name) if keyed.iter().any(|keyed| keyed == name) => continue,
+                Some(name) => match Reported::of_entry(name) {
+                    Some(Reported::Change) => return Some(Unkeyed::Changed),
+                    Some(Reported::Environment | Reported::Overrides) => Unkeyed::Used,
+                    Some(Reported::Environments) => Unkeyed::EveryEnvironment,
+                    Some(Reported::Uncertain) => Unkeyed::Untold,
+                    None => Unkeyed::Foreign,
+                },
+                None => Unkeyed::Foreign,
             },
-            None => Unkeyed::Unknown,
         };
-        if reason == Unkeyed::Used {
-            return Some(reason);
-        }
-        found = Some(reason);
+        found = Some(found.map_or(reason, |found| found.min(reason)));
     }
     found
 }
@@ -264,7 +277,7 @@ mod tests {
                     vault_id: "vault-1",
                     overrides: false,
                 },
-                Unkeyed::Used,
+                Unkeyed::EveryEnvironment,
             ),
             (
                 Access::Overrides {
@@ -277,9 +290,9 @@ mod tests {
                 Access::Change {
                     vault_id: "vault-1",
                 },
-                Unkeyed::Used,
+                Unkeyed::Changed,
             ),
-            (Access::Uncertain, Unkeyed::Unknown),
+            (Access::Uncertain, Unkeyed::Untold),
         ] {
             let task = TaskMarker::watch().expect("watch");
             report(task.directory.as_deref().expect("marker"), access);
@@ -292,22 +305,42 @@ mod tests {
         let root = tempfile::tempdir().expect("temporary folder");
         assert_eq!(
             unkeyed(&root.path().join("gone"), &keyed()),
-            Some(Unkeyed::Unknown)
+            Some(Unkeyed::Unlisted)
         );
 
         let unknown = root.path().join("unknown");
         std::fs::create_dir(&unknown).expect("marker");
         std::fs::write(unknown.join("read-vault-1"), "").expect("entry");
-        assert_eq!(unkeyed(&unknown, &keyed()), Some(Unkeyed::Unknown));
+        assert_eq!(unkeyed(&unknown, &keyed()), Some(Unkeyed::Foreign));
 
         let both = root.path().join("both");
         std::fs::create_dir(&both).expect("marker");
         std::fs::write(both.join("read-vault-1"), "").expect("entry");
-        report(&both, read("vault-2", "default", false));
+        report(&both, Access::Uncertain);
+        report(
+            &both,
+            Access::Environments {
+                vault_id: "vault-1",
+                overrides: false,
+            },
+        );
         assert_eq!(
             unkeyed(&both, &keyed()),
-            Some(Unkeyed::Used),
-            "a use the key doesn't hold is named first"
+            Some(Unkeyed::EveryEnvironment),
+            "a use is named before what can't be told"
+        );
+        report(&both, read("vault-2", "default", false));
+        assert_eq!(unkeyed(&both, &keyed()), Some(Unkeyed::Used));
+        report(
+            &both,
+            Access::Change {
+                vault_id: "vault-2",
+            },
+        );
+        assert_eq!(
+            unkeyed(&both, &keyed()),
+            Some(Unkeyed::Changed),
+            "a change is named first"
         );
 
         #[cfg(unix)]
@@ -321,7 +354,7 @@ mod tests {
             std::fs::create_dir(&not_utf8).expect("marker");
             if std::fs::write(not_utf8.join(std::ffi::OsStr::from_bytes(b"read-\xff")), "").is_ok()
             {
-                assert_eq!(unkeyed(&not_utf8, &keyed()), Some(Unkeyed::Unknown));
+                assert_eq!(unkeyed(&not_utf8, &keyed()), Some(Unkeyed::Foreign));
             }
 
             let unreadable = root.path().join("unreadable");
@@ -329,7 +362,7 @@ mod tests {
             std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o300))
                 .expect("make it unreadable");
             let listed = std::fs::read_dir(&unreadable).is_ok();
-            assert!(listed || unkeyed(&unreadable, &keyed()) == Some(Unkeyed::Unknown));
+            assert!(listed || unkeyed(&unreadable, &keyed()) == Some(Unkeyed::Unlisted));
             std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o700))
                 .expect("make it readable again");
         }

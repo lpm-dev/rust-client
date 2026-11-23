@@ -632,6 +632,25 @@ mod api {
     /// A project whose `default` environment was renamed `prod` and given a
     /// personal override, `large` enough to pass a file journal's payload
     /// when asked, and the review of the rollback that renames it back.
+    // Measured at about 5.3 times the values on the file store: the values
+    // read, the target built from them, their JSON and ciphertext, and the
+    // journal that carries it.
+    #[cfg(not(miri))]
+    #[test]
+    fn a_rollback_that_moves_overrides_holds_at_most_six_times_the_values_at_once() {
+        with_temp_vault_home(|home| {
+            let (dir, _vault_id, plan) = renamed_with_an_override(home, true);
+            let values = 11 * 100 * 1024;
+
+            let (committed, most) = crate::freed_memory_probe::most_held(|| {
+                crate::history::commit_rollback(&dir, &plan, &Choices::default())
+            });
+
+            committed.expect("rolled back");
+            assert!(most < 6 * values, "{most} bytes at once");
+        });
+    }
+
     fn renamed_with_an_override(
         home: &std::path::Path,
         large: bool,

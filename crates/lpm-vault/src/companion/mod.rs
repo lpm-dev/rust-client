@@ -189,6 +189,11 @@ pub(crate) fn open_project_or_unfinished(
         Checked::Present(bytes) => match Marker::parse(vault_id, &bytes) {
             Err(error) => ProjectGate::Damaged(error.into()),
             Ok(marker) if lifecycle::needs_resume(&marker) => {
+                // Finishing or undoing a step can change the project's
+                // overrides, so every lpm above this one is told first.
+                crate::override_marker::report_access(crate::override_marker::Access::Change {
+                    vault_id,
+                })?;
                 let notice = resume_notice(&marker);
                 let inventory = backend.inventory(vault_id)?;
                 let gate = match lifecycle::resume(backend, marker, inventory) {

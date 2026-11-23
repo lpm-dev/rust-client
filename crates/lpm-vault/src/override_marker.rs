@@ -45,14 +45,24 @@ static INHERITED: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
 /// The entries this process added to every inherited marker.
 static REPORTED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
 
-/// The store this process reads env projects from: its LPM home, which
-/// chooses both the file store and the Keychain's services, as one
-/// comparable value. Empty when there's none, and then nothing is read.
+/// The store this process reads env projects from, as one comparable value
+/// (see [`store_of`]). Empty when there's none, and then nothing is read.
 static STORE: LazyLock<Vec<u8>> = LazyLock::new(|| {
     lpm_common::paths::LpmRoot::from_env()
-        .map(|root| root.identity().into_os_string().into_encoded_bytes())
+        .map(|root| store_of(root.identity(), root.credential_scope().as_deref()))
         .unwrap_or_default()
 });
+
+/// The store of the LPM home whose identity is `identity`, read with the
+/// credential scope `scope`: the home chooses the file store, and the scope
+/// the Keychain's services, which also follow `HOME`. The scope is always a
+/// part, empty for the default home, so no two stores read alike.
+fn store_of(identity: PathBuf, scope: Option<&str>) -> Vec<u8> {
+    let mut store = identity.into_os_string().into_encoded_bytes();
+    store.push(0);
+    store.extend_from_slice(scope.unwrap_or_default().as_bytes());
+    store
+}
 
 /// The markers this process inherited, which the tasks it starts report to
 /// as well.
@@ -99,6 +109,11 @@ impl Access<'_> {
     /// by digest, so it's one a task's key holds only when the key holds
     /// exactly that, even after the project changed back by the task's end.
     pub fn entry(self) -> String {
+        self.entry_in(&STORE)
+    }
+
+    /// [`Self::entry`] for an `lpm` reading `store`.
+    fn entry_in(self, store: &[u8]) -> String {
         use sha2::Digest as _;
         fn identified(hasher: sha2::Sha256, digest: Option<&[u8; 32]>) -> sha2::Sha256 {
             match digest {
@@ -121,7 +136,7 @@ impl Access<'_> {
         let named = sha2::Sha256::new()
             .chain_update(kind)
             .chain_update([0])
-            .chain_update(STORE.as_slice())
+            .chain_update(store)
             .chain_update([0])
             .chain_update(vault_id)
             .chain_update([0])
@@ -172,12 +187,14 @@ impl Access<'_> {
     }
 }
 
-/// What the entry named `entry` says, when an `lpm` adds such an entry.
+/// What the entry named `entry` says, when an `lpm` adds such an entry: the
+/// kind of [`Access`] it reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reported {
-    /// An access that can be told.
-    Access,
-    /// An access no `lpm` can tell.
+    Environment,
+    Environments,
+    Overrides,
+    Change,
     Uncertain,
 }
 
@@ -189,12 +206,22 @@ impl Reported {
             return Some(Self::Uncertain);
         }
         let (kind, digest) = entry.rsplit_once('-')?;
-        (KINDS.contains(&kind)
-            && digest.len() == 64
-            && digest
+        if digest.len() != 64
+            || !digest
                 .bytes()
-                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
-        .then_some(Self::Access)
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return None;
+        }
+        [
+            Self::Environment,
+            Self::Environments,
+            Self::Overrides,
+            Self::Change,
+        ]
+        .into_iter()
+        .zip(KINDS)
+        .find_map(|(reported, name)| (name == kind).then_some(reported))
     }
 }
 
@@ -254,12 +281,20 @@ pub(crate) fn reporting_to<T>(markers: Vec<PathBuf>, work: impl FnOnce() -> T) -
     result
 }
 
+/// How to run an `lpm` without the variable, in the shell the platform's
+/// commands are typed in.
+const WITHOUT_MARKER: &str = if cfg!(windows) {
+    "run it once `set LPM_PERSONAL_OVERRIDES_MARKER=` (cmd) or `Remove-Item Env:LPM_PERSONAL_OVERRIDES_MARKER` (PowerShell) removed the variable"
+} else {
+    "run it as `env -u LPM_PERSONAL_OVERRIDES_MARKER lpm ...`"
+};
+
 /// Create `entry` in each of `markers`, where an `lpm` above watches.
 fn report_to(markers: &[PathBuf], entry: &str) -> Result<(), String> {
     for marker in markers {
         add_entry(marker, entry).map_err(|reason| {
             format!(
-                "{UNREPORTED}{}, {reason}, so the lpm that set it couldn't be told which env project this one uses, and this one used nothing. If no lpm above this one caches what it builds, run it as `env -u {MARKER_ENV} lpm ...`",
+                "{UNREPORTED}{}, {reason}, so the lpm that set it couldn't be told which env project this one uses, and this one used nothing. If no lpm above this one caches what it builds, {WITHOUT_MARKER}",
                 lpm_common::sanitize_terminal_inline(&marker.display().to_string())
             )
         })?;
@@ -347,9 +382,22 @@ mod tests {
         let distinct: HashSet<String> = entries.iter().map(|entry| entry.to_lowercase()).collect();
         assert_eq!(distinct.len(), entries.len(), "{entries:?}");
         for entry in &entries {
-            assert_eq!(Reported::of_entry(entry), Some(Reported::Access), "{entry}");
+            assert!(
+                Reported::of_entry(entry).is_some_and(|reported| reported != Reported::Uncertain),
+                "{entry}"
+            );
             assert!(!entry.contains("vault"), "names no project: {entry}");
         }
+        assert_eq!(
+            [&entries[0], &entries[9], &entries[10], &entries[12]]
+                .map(|entry| Reported::of_entry(entry)),
+            [
+                Some(Reported::Environment),
+                Some(Reported::Environments),
+                Some(Reported::Overrides),
+                Some(Reported::Change)
+            ]
+        );
         assert_eq!(
             Reported::of_entry(&Access::Uncertain.entry()),
             Some(Reported::Uncertain)
@@ -371,6 +419,27 @@ mod tests {
         ] {
             assert_eq!(Reported::of_entry(unknown), None, "{unknown}");
         }
+    }
+
+    #[test]
+    fn an_lpm_home_read_with_another_credential_scope_is_another_store() {
+        let read = Access::Environment {
+            vault_id: "vault-1",
+            environment: "default",
+            values: None,
+            overrides: None,
+        };
+        let home = PathBuf::from("/home/someone/.lpm");
+        let entries: HashSet<String> = [
+            store_of(home.clone(), None),
+            store_of(home, Some("0123456789abcdef")),
+            store_of(PathBuf::from("/home/someone/.lpm2"), None),
+        ]
+        .iter()
+        .map(|store| read.entry_in(store))
+        .collect();
+
+        assert_eq!(entries.len(), 3);
     }
 
     #[test]
@@ -429,10 +498,12 @@ mod tests {
             assert!(describes(&error), "{error}");
             assert!(error.starts_with(MARKER_ENV), "{error}");
             assert!(error.contains(reason), "{}: {error}", marker.display());
-            assert!(
-                error.contains("env -u LPM_PERSONAL_OVERRIDES_MARKER"),
-                "{error}"
-            );
+            let remedy = if cfg!(windows) {
+                "Remove-Item Env:LPM_PERSONAL_OVERRIDES_MARKER"
+            } else {
+                "env -u LPM_PERSONAL_OVERRIDES_MARKER"
+            };
+            assert!(error.contains(remedy), "{error}");
         }
     }
 
