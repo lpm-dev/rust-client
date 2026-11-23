@@ -35,6 +35,11 @@ insta = { version = "1", features = ["json", "toml", "filters", "redactions"] }
 tempfile = "3"
 libc = "0.2"
 wiremock = "0.6"
+# The request gate in `support` holds chosen requests in front of a mock
+# server until a test lets each one through, which wiremock can't do.
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1", "http2"] }
+http-body-util = "0.1"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.30"
 futures-util = "0.3"

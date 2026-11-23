@@ -19,6 +19,7 @@ use support::mock_registry::{
     MockRegistry, RegistrySigningFixture, compute_integrity, make_tarball,
     make_tarball_from_pkg_json, make_tarball_with_files,
 };
+use support::request_gate::{RequestGate, run_while};
 use support::{
     TempProject, VALID_TEST_INTEGRITY, lpm, lpm_spawnable_with_registry, lpm_with_registry,
 };
@@ -1435,50 +1436,43 @@ async fn audit_starts_registry_and_osv_requests_concurrently() {
     );
 
     let mock = MockRegistry::start().await;
-    let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let registry_starts = std::sync::Arc::clone(&starts);
+    let registry_body = format!(
+        "{}\n",
+        serde_json::json!({
+            "name": package,
+            "metadata": {
+                "name": package,
+                "dist-tags": {"latest": "1.0.0"},
+                "versions": {"1.0.0": {"name": package, "version": "1.0.0"}}
+            }
+        })
+    );
     Mock::given(method("POST"))
         .and(path("/api/registry/batch-metadata"))
-        .respond_with(move |_: &wiremock::Request| {
-            registry_starts
-                .lock()
-                .unwrap()
-                .push(("registry", std::time::Instant::now()));
-            let body = format!(
-                "{}\n",
-                serde_json::json!({
-                    "name": package,
-                    "metadata": {
-                        "name": package,
-                        "dist-tags": {"latest": "1.0.0"},
-                        "versions": {"1.0.0": {"name": package, "version": "1.0.0"}}
-                    }
-                })
-            );
-            ResponseTemplate::new(200)
-                .set_delay(std::time::Duration::from_millis(800))
-                .set_body_raw(body, "application/x-ndjson")
-        })
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(registry_body, "application/x-ndjson"),
+        )
         .with_priority(1)
         .mount(mock.server())
         .await;
-    let osv_starts = std::sync::Arc::clone(&starts);
     Mock::given(method("POST"))
         .and(path("/v1/querybatch"))
-        .respond_with(move |_: &wiremock::Request| {
-            osv_starts
-                .lock()
-                .unwrap()
-                .push(("osv", std::time::Instant::now()));
-            ResponseTemplate::new(200)
-                .set_delay(std::time::Duration::from_millis(800))
-                .set_body_json(serde_json::json!({"results": [{}]}))
-        })
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"results": [{}]})),
+        )
         .with_priority(1)
         .mount(mock.server())
         .await;
+    let mut gate = RequestGate::start(&mock.url(), |request| {
+        let path = request.uri.path();
+        path == "/api/registry/batch-metadata" || path == "/v1/querybatch"
+    });
 
-    let output = run_audit_json(&project, &mock, &[]);
+    let mut command = lpm_spawnable_with_registry(&project, gate.url());
+    command
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", gate.url()))
+        .args(["--json", "audit"]);
+    let output = run_while(command, gate.hold_a_bounded_pool(2, 2)).await;
 
     assert!(
         output.status.success(),
@@ -1486,19 +1480,7 @@ async fn audit_starts_registry_and_osv_requests_concurrently() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    let starts = starts.lock().unwrap();
-    assert_eq!(
-        starts.len(),
-        2,
-        "unexpected request starts: {starts:?}\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let separation = starts[1].1.duration_since(starts[0].1);
-    assert!(
-        separation < std::time::Duration::from_millis(500),
-        "registry and OSV requests started serially: {starts:?}"
-    );
+    gate.assert_held(2);
 }
 
 #[tokio::test]

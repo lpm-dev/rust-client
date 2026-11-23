@@ -10,42 +10,29 @@
 mod support;
 
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
+use support::request_gate::{RequestGate, run_while};
 use support::{TempProject, lpm, lpm_spawnable_with_registry, lpm_with_registry};
 use wiremock::matchers::{method, path as wiremock_path, query_param};
 use wiremock::{Mock, Request, Respond, ResponseTemplate};
 
-#[derive(Clone)]
-struct RecordDelayedUpgradeMetadataStart {
-    starts: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
-    delay: std::time::Duration,
-}
-
-impl Respond for RecordDelayedUpgradeMetadataStart {
-    fn respond(&self, request: &Request) -> ResponseTemplate {
-        self.starts
-            .lock()
-            .expect("record upgrade metadata request start")
-            .push(std::time::Instant::now());
-        let name = request
-            .url
-            .path()
-            .strip_prefix("/api/registry/")
-            .unwrap_or_default();
-        ResponseTemplate::new(200)
-            .set_delay(self.delay)
-            .set_body_json(serde_json::json!({
-                "name": name,
-                "dist-tags": { "latest": "1.1.0" },
-                "versions": {
-                    "1.0.0": { "name": name, "version": "1.0.0" },
-                    "1.1.0": { "name": name, "version": "1.1.0" }
-                },
-                "time": {
-                    "1.0.0": "2025-01-01T00:00:00.000Z",
-                    "1.1.0": "2025-01-01T00:00:00.000Z"
-                }
-            }))
-    }
+fn upgradeable_metadata(request: &Request) -> ResponseTemplate {
+    let name = request
+        .url
+        .path()
+        .strip_prefix("/api/registry/")
+        .unwrap_or_default();
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "name": name,
+        "dist-tags": { "latest": "1.1.0" },
+        "versions": {
+            "1.0.0": { "name": name, "version": "1.0.0" },
+            "1.1.0": { "name": name, "version": "1.1.0" }
+        },
+        "time": {
+            "1.0.0": "2025-01-01T00:00:00.000Z",
+            "1.1.0": "2025-01-01T00:00:00.000Z"
+        }
+    }))
 }
 
 #[derive(Clone)]
@@ -1204,8 +1191,9 @@ async fn upgrade_hydrates_missing_release_times_before_planning() {
 }
 
 #[tokio::test]
-async fn upgrade_plans_metadata_in_bounded_parallel_waves() {
+async fn upgrade_plans_metadata_sixteen_at_a_time_and_refills_each_freed_slot() {
     const PACKAGE_COUNT: usize = 20;
+    const PLANNING_LIMIT: usize = 16;
     let mut dependencies = serde_json::Map::with_capacity(PACKAGE_COUNT);
     let mut lockfile =
         String::from("[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n");
@@ -1227,45 +1215,38 @@ async fn upgrade_plans_metadata_in_bounded_parallel_waves() {
     project.write_file("lpm.lock", &lockfile);
 
     let mock = MockRegistry::start().await;
-    let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     Mock::given(method("GET"))
         .and(wiremock::matchers::path_regex(
             r"^/api/registry/@lpm\.dev/owner\.parallel-upgrade-[0-9]+$",
         ))
-        .respond_with(RecordDelayedUpgradeMetadataStart {
-            starts: std::sync::Arc::clone(&starts),
-            delay: std::time::Duration::from_millis(250),
-        })
+        .respond_with(upgradeable_metadata)
+        .expect(PACKAGE_COUNT as u64)
         .mount(mock.server())
         .await;
+    let mut gate = RequestGate::start(&mock.url(), |request| {
+        request
+            .uri
+            .path()
+            .starts_with("/api/registry/@lpm.dev/owner.parallel-upgrade-")
+    });
 
-    let output = lpm_with_registry(&project, &mock.url())
-        .args(["upgrade", "-y", "--dry-run", "--json"])
-        .output()
-        .expect("run bounded upgrade plan");
+    let mut command = lpm_spawnable_with_registry(&project, gate.url());
+    command.args(["upgrade", "-y", "--dry-run", "--json"]);
+    let output = run_while(
+        command,
+        gate.hold_a_bounded_pool(PLANNING_LIMIT, PACKAGE_COUNT),
+    )
+    .await;
     assert!(
         output.status.success(),
         "bounded upgrade plan should succeed\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    let starts = starts.lock().expect("read upgrade request starts");
-    assert_eq!(starts.len(), PACKAGE_COUNT);
-    let first = *starts.iter().min().unwrap();
-    let mut offsets = starts
-        .iter()
-        .map(|start| start.duration_since(first))
-        .collect::<Vec<_>>();
-    offsets.sort();
-    assert!(offsets[15] < std::time::Duration::from_millis(150));
-    assert!(
-        offsets[16] >= std::time::Duration::from_millis(200),
-        "more than sixteen metadata requests ran in the first wave: {offsets:?}"
-    );
-    assert!(
-        offsets[19] < std::time::Duration::from_millis(450),
-        "the planner did not refill promptly for the second wave: {offsets:?}"
-    );
+    gate.assert_held(PACKAGE_COUNT);
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid upgrade envelope");
+    assert_eq!(envelope["upgraded"], serde_json::json!(PACKAGE_COUNT));
 }
 
 #[tokio::test]

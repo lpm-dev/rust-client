@@ -16,67 +16,66 @@
 //! - `lpm uninstall -g <pkg>` error path (alias parity)
 //! - `lpm global update --dry-run` on an empty manifest (idempotent)
 
-#[path = "global/concurrency.rs"]
-mod concurrency;
 mod support;
 
 use lpm_common::Timestamp;
 use lpm_global::{GlobalManifest, PackageEntry, PackageSource, WalReader, WalRecord};
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
-use support::{TempProject, lpm, lpm_with_registry};
+use support::request_gate::{RequestGate, run_while};
+use support::{TempProject, lpm, lpm_spawnable, lpm_spawnable_with_registry, lpm_with_registry};
 use wiremock::matchers::{method, path as wm_path};
-use wiremock::{Mock, Request, Respond, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-#[derive(Clone)]
-struct RecordDelayedGlobalUpdateMetadataStart {
-    starts: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
-    /// Response delay by arrival order; later requests take the last one.
-    delays: Vec<std::time::Duration>,
+fn global_update_metadata(request: &Request) -> ResponseTemplate {
+    let name = request
+        .url
+        .path()
+        .strip_prefix("/api/registry/")
+        .unwrap_or_default();
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "name": name,
+        "dist-tags": { "latest": "1.1.0" },
+        "versions": {
+            "1.0.0": { "name": name, "version": "1.0.0" },
+            "1.1.0": {
+                "name": name,
+                "version": "1.1.0",
+                "dist": {
+                    "tarball": "https://example.invalid/package.tgz",
+                    "integrity": "sha512-test"
+                }
+            }
+        },
+        "time": {
+            "1.0.0": "2025-01-01T00:00:00.000Z",
+            "1.1.0": "2025-01-01T00:00:00.000Z"
+        }
+    }))
 }
 
-impl Respond for RecordDelayedGlobalUpdateMetadataStart {
-    fn respond(&self, request: &Request) -> ResponseTemplate {
-        let arrival = {
-            let mut starts = self
-                .starts
-                .lock()
-                .expect("record global-update metadata request start");
-            starts.push(std::time::Instant::now());
-            starts.len() - 1
-        };
-        let delay = self
-            .delays
-            .get(arrival)
-            .or(self.delays.last())
-            .copied()
-            .unwrap_or_default();
-        let name = request
-            .url
-            .path()
-            .strip_prefix("/api/registry/")
-            .unwrap_or_default();
-        ResponseTemplate::new(200)
-            .set_delay(delay)
-            .set_body_json(serde_json::json!({
-                "name": name,
-                "dist-tags": { "latest": "1.1.0" },
-                "versions": {
-                    "1.0.0": { "name": name, "version": "1.0.0" },
-                    "1.1.0": {
-                        "name": name,
-                        "version": "1.1.0",
-                        "dist": {
-                            "tarball": "https://example.invalid/package.tgz",
-                            "integrity": "sha512-test"
-                        }
-                    }
-                },
-                "time": {
-                    "1.0.0": "2025-01-01T00:00:00.000Z",
-                    "1.1.0": "2025-01-01T00:00:00.000Z"
-                }
-            }))
+/// An npm packument for `request`'s package; the full document, which the
+/// client asks for as `application/json`, carries release times.
+fn global_outdated_packument(request: &Request) -> ResponseTemplate {
+    let name = request.url.path().trim_start_matches('/');
+    let mut packument = serde_json::json!({
+        "name": name,
+        "dist-tags": { "latest": "1.1.0" },
+        "versions": {
+            "1.0.0": { "name": name, "version": "1.0.0" },
+            "1.1.0": { "name": name, "version": "1.1.0" }
+        }
+    });
+    if request
+        .headers
+        .get("accept")
+        .is_some_and(|accept| accept == "application/json")
+    {
+        packument["time"] = serde_json::json!({
+            "1.0.0": "2025-01-01T00:00:00.000Z",
+            "1.1.0": "2025-01-01T00:00:00.000Z"
+        });
     }
+    ResponseTemplate::new(200).set_body_json(packument)
 }
 
 #[derive(Clone)]
@@ -566,8 +565,9 @@ async fn global_list_outdated_routes_upstream_npm_packages_directly_to_npm() {
 }
 
 #[tokio::test]
-async fn global_list_outdated_hydrates_release_times_in_bounded_parallel_waves() {
+async fn global_list_outdated_hydrates_release_times_four_at_a_time_and_refills_each_freed_slot() {
     const PACKAGE_COUNT: usize = 8;
+    const HYDRATION_LIMIT: usize = 4;
     let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
     lpm(&project)
         .args(["config", "release-age", "--set", "1d"])
@@ -592,7 +592,39 @@ async fn global_list_outdated_hydrates_release_times_in_bounded_parallel_waves()
     }
     lpm_global::write_for(&root, &manifest).expect("write parallel outdated manifest fixture");
 
-    let output = concurrency::check_outdated_hydration(&project, PACKAGE_COUNT).await;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path_regex(
+            r"^/parallel-outdated-[0-9]+$",
+        ))
+        .respond_with(global_outdated_packument)
+        .mount(&server)
+        .await;
+    let mut gate = RequestGate::start(&server.uri(), |request| {
+        request.uri.path().starts_with("/parallel-outdated-")
+            && request
+                .headers
+                .get("accept")
+                .is_some_and(|accept| accept == "application/json")
+    });
+
+    let mut command = lpm_spawnable(&project);
+    command
+        .args([
+            "--registry",
+            gate.url(),
+            "--insecure",
+            "--json",
+            "global",
+            "list",
+            "--outdated",
+        ])
+        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", gate.url());
+    let output = run_while(
+        command,
+        gate.hold_a_bounded_pool(HYDRATION_LIMIT, PACKAGE_COUNT),
+    )
+    .await;
     assert!(
         output.status.success(),
         "parallel outdated check should succeed\nstdout: {}\nstderr: {}",
@@ -1601,10 +1633,9 @@ async fn global_update_dry_run_does_not_plan_an_implicit_registry_rollback() {
 }
 
 #[tokio::test]
-async fn bulk_global_update_plans_metadata_in_bounded_parallel_waves() {
+async fn bulk_global_update_plans_metadata_four_at_a_time_and_refills_each_freed_slot() {
     const PACKAGE_COUNT: usize = 8;
-    const QUICK: std::time::Duration = std::time::Duration::from_millis(100);
-    const SLOW: std::time::Duration = std::time::Duration::from_secs(2);
+    const PLANNING_LIMIT: usize = 4;
     let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
     let root = isolated_lpm_root(&project);
     let mut manifest = GlobalManifest::default();
@@ -1626,47 +1657,35 @@ async fn bulk_global_update_plans_metadata_in_bounded_parallel_waves() {
     lpm_global::write_for(&root, &manifest).expect("write bulk global manifest fixture");
 
     let mock = MockRegistry::start().await;
-    let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     Mock::given(method("GET"))
         .and(wiremock::matchers::path_regex(
             r"^/api/registry/@lpm\.dev/acme\.parallel-update-[0-9]+$",
         ))
-        // The first request answers quickly and the next three slowly, so
-        // refilling the freed slot and waiting for the whole first wave are
-        // seconds apart rather than milliseconds.
-        .respond_with(RecordDelayedGlobalUpdateMetadataStart {
-            starts: std::sync::Arc::clone(&starts),
-            delays: vec![QUICK, SLOW, SLOW, SLOW, QUICK],
-        })
+        .respond_with(global_update_metadata)
+        .expect(PACKAGE_COUNT as u64)
         .mount(mock.server())
         .await;
+    let mut gate = RequestGate::start(&mock.url(), |request| {
+        request
+            .uri
+            .path()
+            .starts_with("/api/registry/@lpm.dev/acme.parallel-update-")
+    });
 
-    let output = lpm_with_registry(&project, &mock.url())
-        .args(["--json", "global", "update", "--dry-run"])
-        .output()
-        .expect("run bounded bulk global update plan");
+    let mut command = lpm_spawnable_with_registry(&project, gate.url());
+    command.args(["--json", "global", "update", "--dry-run"]);
+    let output = run_while(
+        command,
+        gate.hold_a_bounded_pool(PLANNING_LIMIT, PACKAGE_COUNT),
+    )
+    .await;
     assert!(
         output.status.success(),
         "bounded bulk plan should succeed\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    let starts = starts.lock().expect("read global-update request starts");
-    assert_eq!(starts.len(), PACKAGE_COUNT);
-    let first = *starts.iter().min().unwrap();
-    let mut offsets = starts
-        .iter()
-        .map(|start| start.duration_since(first))
-        .collect::<Vec<_>>();
-    offsets.sort();
-    assert!(
-        offsets[4] >= QUICK,
-        "a fifth metadata request started before any response: {offsets:?}"
-    );
-    assert!(
-        offsets[4] < SLOW,
-        "the planner waited for the slow requests instead of refilling the free slot: {offsets:?}"
-    );
+    gate.assert_held(PACKAGE_COUNT);
 }
 
 #[tokio::test]
