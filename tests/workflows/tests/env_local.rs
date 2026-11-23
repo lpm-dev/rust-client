@@ -2789,6 +2789,63 @@ fn denied_process_hooks_cannot_satisfy_requirements_through_defaults() {
     assert!(!project.path().join("child.marker").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn a_projects_bash_prompt_hooks_never_run_in_a_traced_script_but_the_shells_own_do() {
+    let project = TempProject::empty(
+        r#"{"scripts":{"traced":"bash -xc 'echo \"PROMPT_COMMAND=${PROMPT_COMMAND-unset}\"'"}}"#,
+    );
+    lpm(&project)
+        .args([
+            "env",
+            "set",
+            "PS4=$(touch ps4.marker)+ ",
+            "PROMPT_COMMAND=touch prompt.marker",
+            "TEAM_VALUE=kept",
+        ])
+        .assert()
+        .success();
+
+    let output = lpm(&project)
+        .args(["run", "traced", "--no-cache"])
+        .env_remove("PS4")
+        .env_remove("PROMPT_COMMAND")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !project.path().join("ps4.marker").exists(),
+        "bash ran the project's PS4 while tracing"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("PROMPT_COMMAND=unset"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ignored PROMPT_COMMAND and PS4 from project env: LPM never passes a project's value for them to processes"),
+        "{stderr}"
+    );
+
+    let output = lpm(&project)
+        .args(["run", "traced", "--no-cache"])
+        .env("PS4", "inherited+ ")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("inherited+ echo"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn team_values_that_run_code_never_reach_a_script_but_the_shells_own_do() {
     let project = TempProject::empty(r#"{"scripts":{"show":"node show.cjs"}}"#);

@@ -7,9 +7,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 pub const DEFAULT_ENVIRONMENT: &str = "default";
 
 /// Names that make a process run code it wasn't asked to run: libraries the
-/// dynamic linker preloads, interpreter options and startup files, the module
-/// search paths, profilers and libraries a runtime loads, and the helpers and
-/// configuration files Git, SSH, Cargo, npm and Yarn execute. Build settings a
+/// dynamic linker preloads, interpreter options and startup files, the
+/// commands Bash runs before a prompt and expands in prompts and `set -x`
+/// traces, the module search paths, profilers and libraries a runtime loads,
+/// and the helpers and configuration files Git, SSH, Cargo, npm and Yarn
+/// execute. Build settings a
 /// project deliberately hands its own toolchain, such as `CC`, `RUSTFLAGS` or
 /// `JAVA_HOME`, aren't among them.
 ///
@@ -71,6 +73,11 @@ const CODE_RUNNING_ENV_VARS: &[&str] = &[
     "BASH_ENV",
     "ENV",
     "ZDOTDIR",
+    "PROMPT_COMMAND",
+    "PS0",
+    "PS1",
+    "PS2",
+    "PS4",
     "GIT_SSH",
     "GIT_SSH_COMMAND",
     "GIT_PROXY_COMMAND",
@@ -330,8 +337,9 @@ mod tests {
     }
 
     /// Names that make a process run code it wasn't asked to run, beyond
-    /// the dynamic linker's: interpreter options and startup files, module
-    /// search paths, and the helpers Git, SSH, Cargo and npm execute.
+    /// the dynamic linker's: interpreter options and startup files, the
+    /// commands Bash runs around a prompt and in a trace, module search
+    /// paths, and the helpers Git, SSH, Cargo and npm execute.
     const CODE_RUNNING: &[&str] = &[
         "JAVA_TOOL_OPTIONS",
         "_JAVA_OPTIONS",
@@ -362,6 +370,11 @@ mod tests {
         "NPM_CONFIG_SCRIPT_SHELL",
         "NPM_CONFIG_NODE_OPTIONS",
         "ZDOTDIR",
+        "PROMPT_COMMAND",
+        "PS0",
+        "PS1",
+        "PS2",
+        "PS4",
         "DOTNET_STARTUP_HOOKS",
         "CORECLR_ENABLE_PROFILING",
         "COR_ENABLE_PROFILING",
@@ -450,6 +463,9 @@ mod tests {
             "DOTNET_gcServer",
             "YARN_ENABLE_IMMUTABLE_INSTALLS",
             "NPM_CONFIG_GIT_TAG_VERSION",
+            "PROMPT",
+            "SYSTEM_PROMPT",
+            "PS3",
         ] {
             assert!(!is_denied_env_var(name), "{name}");
         }
