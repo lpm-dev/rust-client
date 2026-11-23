@@ -139,6 +139,10 @@ trait Keyboard {
 
     /// Stop the prompt as Ctrl+Z asks, until it's continued.
     fn suspend(&mut self) {}
+
+    /// The line ended: a stop from now on gives the keyboard back for what
+    /// follows it, but doesn't start the value over or show the prompt.
+    fn line_ended(&mut self) {}
 }
 
 /// One key, or one byte of text, read from the terminal.
@@ -182,8 +186,9 @@ enum Event {
     /// Ctrl+Z on a Unix terminal: stop the prompt, as a shell stops the job
     /// it runs.
     Suspend,
-    /// The prompt continued after a stop and showed itself again, so the
-    /// value starts over.
+    /// The prompt continued after a stop, or found the terminal changed
+    /// under it, and said so as it showed itself again: the value starts
+    /// over.
     #[cfg_attr(
         all(not(unix), not(test)),
         expect(
@@ -356,7 +361,7 @@ struct Reading {
     line: HiddenLine,
     ended: Option<Ending>,
     text_left: bool,
-    /// Ctrl+Z was pressed, so the prompt stops once the keys read with it
+    /// Ctrl+Z was pressed, so the prompt stops once the keys read before it
     /// are taken.
     suspend: bool,
 }
@@ -364,6 +369,9 @@ struct Reading {
 impl Reading {
     fn take(&mut self, event: Event) {
         match self.ended {
+            // Keys read with Ctrl+Z after it were typed before the stop,
+            // which the value starts over from, Enter included.
+            None if self.suspend => {}
             None => {
                 self.suspend |= event == Event::Suspend;
                 if let Step::End(ending) = self.line.apply(event) {
@@ -388,6 +396,7 @@ fn read_line(keyboard: &mut impl Keyboard, limit: usize) -> Result<Zeroizing<Str
             keyboard.suspend();
         }
         if let Some(ending) = reading.ended {
+            keyboard.line_ended();
             break ending;
         }
         // Inside a paste or a terminal string every key is part of it,
@@ -561,6 +570,8 @@ mod tests {
         pasting: bool,
         /// How many keys were read when the prompt suspended, each time.
         suspended_after: Vec<usize>,
+        /// How many events had been read each time the line ended.
+        line_ended_after: Vec<usize>,
         read: usize,
     }
 
@@ -571,6 +582,7 @@ mod tests {
                 waits: Vec::new(),
                 pasting: false,
                 suspended_after: Vec::new(),
+                line_ended_after: Vec::new(),
                 read: 0,
             }
         }
@@ -613,19 +625,39 @@ mod tests {
         fn suspend(&mut self) {
             self.suspended_after.push(self.read);
         }
+
+        fn line_ended(&mut self) {
+            self.line_ended_after.push(self.read);
+        }
     }
 
     #[test]
-    fn ctrl_z_stops_the_prompt_once_the_keys_read_with_it_are_taken_and_it_goes_on() {
+    fn ctrl_z_stops_the_prompt_once_the_keys_read_before_it_are_taken_and_drops_those_after() {
         let mut script = Script::new([
             typed("fix")
-                .chain([Event::Suspend, Event::Typed(b't')])
+                .chain([Event::Suspend, Event::Typed(b't'), Event::Enter])
                 .collect(),
-            typed("ure").chain([Event::Enter]).collect(),
+            [Event::Restart]
+                .into_iter()
+                .chain(typed("fixture"))
+                .chain([Event::Enter])
+                .collect(),
         ]);
 
         assert_eq!(outcome(&mut script).as_deref(), Ok("fixture"));
-        assert_eq!(script.suspended_after, [5]);
+        assert_eq!(
+            script.suspended_after,
+            [6],
+            "Enter after Ctrl+Z submits nothing"
+        );
+    }
+
+    #[test]
+    fn the_keyboard_learns_the_line_ended_before_what_follows_it_is_read() {
+        let mut script = Script::new([typed("a").chain([Event::Enter]).collect()]);
+
+        assert_eq!(outcome(&mut script).as_deref(), Ok("a"));
+        assert_eq!(script.line_ended_after, [2]);
     }
 
     #[test]

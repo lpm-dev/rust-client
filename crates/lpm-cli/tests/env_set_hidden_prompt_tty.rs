@@ -21,6 +21,10 @@ mod tty {
 
     use tempfile::TempDir;
 
+    /// What the prompt says when it starts the value over after a stop.
+    const STARTS_OVER: &str =
+        "What was typed before the stop is gone: enter the whole value again.";
+
     const BRACKETED_PASTE_ON: &[u8] = b"\x1b[?2004h";
 
     fn project() -> (TempDir, TempDir) {
@@ -757,10 +761,17 @@ mod tty {
             "bracketed paste goes off for the stop, and again at the end"
         );
         assert!(!session.transcript.contains("fixture-"));
+        assert!(
+            session.transcript.contains(STARTS_OVER),
+            "the prompt says the value starts over: {}",
+            session.transcript
+        );
+        // Whether lpm read fixture-a before the stop or the stop dropped it
+        // unread, only fixture-b is stored; the Ctrl+Z test reads it first.
         assert_eq!(
             stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
             Some("fixture-b"),
-            "the prompt shown again starts the value over"
+            "the value is what was typed after the stop"
         );
     }
 
@@ -796,10 +807,47 @@ mod tty {
         assert!(hidden_again, "raw mode again once lpm continues");
         assert!(session.status.success(), "{}", session.transcript);
         assert_eq!(session.transcript.matches(prompt).count(), 2);
+        assert!(
+            session.transcript.contains(STARTS_OVER),
+            "{}",
+            session.transcript
+        );
         assert_eq!(
             stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
             Some("fixture-b"),
-            "the prompt shown again starts the value over"
+            "fixture-a, read before Ctrl+Z, is gone once the prompt says it starts over"
+        );
+    }
+
+    #[test]
+    fn a_continue_nothing_stopped_lets_the_value_go_on() {
+        let (project, lpm_home) = project();
+        let prompt = "Value for TOKEN (default, hidden): ";
+        let session = run_in_pty_controlled(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(prompt.as_bytes(), b"a\r")],
+            &PtyOptions::default(),
+            &mut |answering| {
+                answering.type_keys(b"fixture-");
+                // Time for lpm to read it, so a value that started over
+                // would lose it, and for the handler to run before the rest.
+                std::thread::sleep(Duration::from_millis(300));
+                signal(answering.pid, libc::SIGCONT);
+                std::thread::sleep(Duration::from_millis(300));
+            },
+        );
+
+        assert!(session.status.success(), "{}", session.transcript);
+        assert!(
+            !session.transcript.contains(STARTS_OVER),
+            "{}",
+            session.transcript
+        );
+        assert_eq!(
+            stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
+            Some("fixture-a")
         );
     }
 

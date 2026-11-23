@@ -332,6 +332,18 @@ impl Bytes {
         }
     }
 
+    /// Whether a paste the terminal marked has begun and not ended.
+    #[cfg(unix)]
+    pub(super) fn in_paste(&self) -> bool {
+        matches!(self.state, State::Paste { .. })
+    }
+
+    /// Whether no paste, sequence or string is under way.
+    #[cfg(unix)]
+    pub(super) fn at_ground(&self) -> bool {
+        matches!(self.state, State::Ground)
+    }
+
     /// Whether the last byte was an escape that may start a sequence.
     pub(super) fn after_escape(&self) -> bool {
         matches!(self.state, State::Escape)
