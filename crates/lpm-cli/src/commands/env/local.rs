@@ -244,8 +244,8 @@ pub(super) fn env_import(
     let env_label = resolved_env.as_deref().unwrap_or("default");
 
     // Reading a pipe waits on its writer, so what refuses the write whatever
-    // the file holds is found first, and the import goes to the project
-    // that was checked.
+    // it holds is found first, and the import goes to the project that was
+    // checked. A regular file is read at once, so the import's write checks.
     let checked_values = || {
         lpm_vault::check_values_writable(project_dir)
             .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))
@@ -267,7 +267,8 @@ pub(super) fn env_import(
         (imported, Vec::new())
     } else {
         let path = invocation_relative(file)?;
-        let checked = checked_values()?;
+        let can_wait = std::fs::metadata(&path).map_or(true, |metadata| !metadata.is_file());
+        let checked = can_wait.then(checked_values).transpose()?;
         let source = lpm_vault::history::Source::with_detail(
             lpm_vault::history::Action::Import,
             lpm_vault::history::SourceDetail {
@@ -279,14 +280,23 @@ pub(super) fn env_import(
                 ..lpm_vault::history::SourceDetail::default()
             },
         );
-        let imported = lpm_vault::import_env_file_checked(
-            project_dir,
-            &checked,
-            resolved_env.as_deref(),
-            &path,
-            overwrite,
-            &source,
-        )
+        let imported = match &checked {
+            Some(checked) => lpm_vault::import_env_file_checked(
+                project_dir,
+                checked,
+                resolved_env.as_deref(),
+                &path,
+                overwrite,
+                &source,
+            ),
+            None => lpm_vault::import_env_file(
+                project_dir,
+                resolved_env.as_deref(),
+                &path,
+                overwrite,
+                &source,
+            ),
+        }
         .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
         let warnings = keep_env_source_ignored(project_dir, &path)?;
         (imported, warnings)

@@ -32,9 +32,11 @@ enum State {
         /// A parameter came after a read ended inside the sequence.
         taken: bool,
     },
-    /// `ESC O` and the one byte that ends it.
+    /// `ESC O` and the one byte that ends it; `late` when the `O` came in a
+    /// later read than its escape, so it may have been typed.
     SingleShift {
         crossed: bool,
+        late: bool,
     },
     /// The three bytes of an X10 mouse report, `ESC [ M` and its button and
     /// position, left to skip.
@@ -53,6 +55,10 @@ enum State {
         introducer: u8,
         chord: bool,
     },
+    /// After a Meta chord with a string's introducer, such as Alt+P, that
+    /// ended its read: a key that's no text acts, and text can't be told
+    /// from the rest of a terminal's string.
+    AfterChord,
     /// In a bracketed paste, with `matched` bytes of its end marker read.
     Paste {
         matched: u8,
@@ -72,18 +78,20 @@ impl Bytes {
                     self.state = State::Ground;
                 }
                 // An escape that ended an earlier read may have been the
-                // Escape key, so what follows it may have been typed.
+                // Escape key, so its introducer and what follows may have
+                // been typed.
                 b'[' => {
                     self.state = State::ControlSequence {
                         parameters: [0; 3],
                         length: 0,
                         crossed: !self.escape_in_read,
-                        taken: false,
+                        taken: !self.escape_in_read,
                     };
                 }
                 b'O' => {
                     self.state = State::SingleShift {
                         crossed: !self.escape_in_read,
+                        late: !self.escape_in_read,
                     }
                 }
                 b']' | b'P' | b'_' | b'^' | b'X' => {
@@ -134,20 +142,29 @@ impl Bytes {
                     };
                 }
                 // A byte no sequence holds ends it unfinished, and is read
-                // on its own.
+                // on its own. A terminal ends every sequence it sends, so
+                // what this one took was typed.
                 _ => {
-                    self.took_after_read(taken, each);
+                    self.took_after_read(taken || length > 0, each);
                     self.state = State::Ground;
                     self.ground(byte, each);
                 }
             },
-            State::SingleShift { crossed } => {
+            State::SingleShift { crossed, late } => {
                 self.state = State::Ground;
                 if (0x40..=0x7e).contains(&byte) {
                     self.took_after_read(crossed, each);
                 } else {
+                    self.took_after_read(late, each);
                     self.ground(byte, each);
                 }
+            }
+            // A report holds no control byte, so one shows the report was
+            // typed text, and acts.
+            State::MouseReport { .. } if matches!(byte, 0x00..=0x1f | 0x7f) => {
+                self.state = State::Ground;
+                each(Event::Lost);
+                self.ground(byte, each);
             }
             State::MouseReport { remaining, crossed } => {
                 // The report took a byte after a read ended inside it.
@@ -187,6 +204,13 @@ impl Bytes {
                 }
             }
             State::Paste { matched } => self.paste(byte, matched, each),
+            State::AfterChord => {
+                self.state = State::Ground;
+                if !matches!(byte, 0x00..=0x1f | 0x7f) {
+                    each(Event::Lost);
+                }
+                self.ground(byte, each);
+            }
         }
     }
 
@@ -228,26 +252,29 @@ impl Bytes {
     }
 
     /// The read being fed ended. A terminal string that holds nothing yet
-    /// began with a key: Escape and the key in one read are a Meta chord,
-    /// which edits nothing, and a key typed after the Escape key is text.
-    /// A terminal sends a key's sequence whole, so what a sequence takes
-    /// from a later read may have been typed, such as digits after Alt+[.
+    /// may have begun with a key: Escape and the key in one read are a Meta
+    /// chord, which edits nothing, though text after it can't be told from
+    /// the rest of a string; a key that came after the Escape key's read may
+    /// have been typed. A terminal sends a key's sequence whole, so what a
+    /// sequence takes from a later read may have been typed, such as digits
+    /// after Alt+[.
     pub(super) fn end_of_read(&mut self, each: &mut dyn FnMut(Event)) {
         match &mut self.state {
             State::TerminalString {
                 escape: false,
                 held: false,
-                introducer,
                 chord,
+                ..
             } => {
-                let (introducer, chord) = (*introducer, *chord);
-                self.state = State::Ground;
-                if !chord {
-                    each(Event::Typed(introducer));
+                if *chord {
+                    self.state = State::AfterChord;
+                } else {
+                    self.state = State::Ground;
+                    each(Event::Lost);
                 }
             }
             State::ControlSequence { crossed, .. }
-            | State::SingleShift { crossed }
+            | State::SingleShift { crossed, .. }
             | State::MouseReport { crossed, .. } => *crossed = true,
             _ => {}
         }
@@ -520,7 +547,11 @@ mod tests {
             "<Enter>",
             "a control after it is its key"
         );
-        assert_eq!(decoded(&[b"\x1b[1\x03"]), "<Interrupt>");
+        assert_eq!(
+            decoded(&[b"\x1b[1\x03"]),
+            "<Lost><Interrupt>",
+            "the 1 Alt+[ took may have been typed, and Ctrl+C still cancels"
+        );
     }
 
     #[test]
@@ -584,18 +615,72 @@ mod tests {
     }
 
     #[test]
-    fn a_string_introducer_that_ends_its_read_is_a_key() {
-        assert_eq!(decoded(&[b"a", b"\x1bP", b"b"]), "ab", "Alt+P adds nothing");
+    fn a_string_introducer_that_ends_its_read_leaves_what_follows_unclear() {
         assert_eq!(
-            decoded(&[b"\x1b", b"P", b"b"]),
-            "Pb",
-            "P typed after the Escape key is text"
+            decoded(&[b"a", b"\x1bP", b"\r"]),
+            "a<Enter>",
+            "Alt+P, then a key that's no text, adds nothing"
+        );
+        assert_eq!(
+            decoded(&[b"a", b"\x1bP", b"b"]),
+            "a<Lost>b",
+            "text after Alt+P can't be told from the rest of a terminal's string"
+        );
+        assert_eq!(
+            decoded(&[b"ab", b"\x1b]", b"11;x\x07", b"\r"]),
+            "ab<Lost>11;x<Ignored><Enter>",
+            "a terminal's reply split after its start"
+        );
+        assert_eq!(
+            decoded(&[b"ab", b"\x1b", b"]", b"11;x\x07", b"\r"]),
+            "ab<Lost>11;x<Ignored><Enter>",
+            "] after the Escape key, or a reply split twice"
         );
         assert_eq!(
             decoded(&[b"a", b"\x1bPb", b"\r"]),
             "a<Lost><Enter>",
             "text read with Alt+P can't be told from a terminal's string"
         );
+    }
+
+    #[test]
+    fn a_sequence_that_ends_unfinished_may_have_taken_typed_text() {
+        for (chunks, shown, what) in [
+            (
+                &[&b"ab"[..], b"\x1b", b"[", b"\r"][..],
+                "ab<Lost><Enter>",
+                "[ after the Escape key",
+            ),
+            (
+                &[b"ab", b"\x1b", b"O", b"\r"],
+                "ab<Lost><Enter>",
+                "O after the Escape key",
+            ),
+            (
+                &[b"abc", b"\x1b", b"[", b"\x7f", b"\r"],
+                "abc<Lost><Backspace><Enter>",
+                "[ after the Escape key, then Backspace",
+            ),
+            (
+                &[b"a\x1b[123", b"\r"],
+                "a<Lost><Enter>",
+                "Alt+[ and digits, then Enter",
+            ),
+            (&[b"a\x1b[123\r"], "a<Lost><Enter>", "the same in one read"),
+            (&[b"a\x1b[\r"], "a<Enter>", "Alt+[, then Enter"),
+            (
+                &[b"a\x1b[M\x03"],
+                "a<Lost><Interrupt>",
+                "Alt+[ and M, then Ctrl+C",
+            ),
+            (
+                &[b"a\x1b[M !\r"],
+                "a<Lost><Enter>",
+                "a control key ends a mouse report",
+            ),
+        ] {
+            assert_eq!(decoded(chunks), shown, "{what}");
+        }
     }
 
     #[test]

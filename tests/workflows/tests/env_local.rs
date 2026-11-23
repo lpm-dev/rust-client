@@ -2312,6 +2312,46 @@ fn env_check_reads_the_vault_once_for_every_environment() {
 }
 
 #[test]
+fn an_import_checks_the_project_first_only_from_a_source_that_can_wait() {
+    let project = TempProject::empty(r#"{"name":"import-checks","version":"1.0.0"}"#);
+    lpm(&project)
+        .args(["env", "set", "TOKEN=value"])
+        .assert()
+        .success();
+    project.write_file("values.env", "IMPORTED=value\n");
+    let log = project.path().join("vault-transactions.log");
+
+    let output = lpm(&project)
+        .env("LPM_TEST_VAULT_TRANSACTION_LOG", &log)
+        .args(["env", "import", "values.env"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        vault_transactions(&log),
+        0,
+        "a regular file waits on no one, so the import's own write checks the project"
+    );
+
+    let output = lpm(&project)
+        .env("LPM_TEST_VAULT_TRANSACTION_LOG", &log)
+        .args(["env", "import", "-"])
+        .write_stdin("PIPED=value\n")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(vault_transactions(&log), 1, "standard input can wait");
+}
+
+#[test]
 fn a_run_reads_the_vault_once_for_all_its_tasks() {
     let project = TempProject::empty(
         r#"{"name":"run-vault-reads","scripts":{"first":"echo first","second":"echo second","third":"echo third"}}"#,

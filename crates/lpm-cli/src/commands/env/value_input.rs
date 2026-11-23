@@ -249,10 +249,11 @@ pub(super) fn collect(
         let text = sources
             .read_file(path, MAX_VALUE_BYTES)
             .map_err(|error| file_error(path, &error))?;
-        total.add(text.len())?;
+        let value = finish(key, text, Origin::File(path), request.command)?;
+        total.add(value.len())?;
         from_files.push(Assignment {
             key: (*key).to_owned(),
-            value: finish(key, text, Origin::File(path), request.command)?,
+            value,
         });
     }
 
@@ -263,8 +264,9 @@ pub(super) fn collect(
         let text = sources
             .read_stdin(MAX_VALUE_BYTES)
             .map_err(|error| stdin_error(key, &error))?;
-        total.add(text.len())?;
-        piped = Some(finish(key, text, Origin::Stdin, request.command)?);
+        let value = finish(key, text, Origin::Stdin, request.command)?;
+        total.add(value.len())?;
+        piped = Some(value);
     }
 
     let mut assignments = Vec::with_capacity(entries.len() + from_files.len());
@@ -446,7 +448,7 @@ fn prompted(
                 "the paste of the value for {key} never ended, so nothing was stored. Paste it again, pipe it in with `{command} {key} --stdin`, or read it from a file with `{command} --from-file {key}=PATH`"
             )),
             PromptError::TypedTextLost => LpmError::Env(format!(
-                "some of what was typed for {key} after the Escape or an Alt key may have been taken for the terminal's own reply, so nothing was stored. Type the value again, pipe it in with `{command} {key} --stdin`, or read it from a file with `{command} --from-file {key}=PATH`"
+                "nothing was stored for {key}: after the Escape or an Alt key, or a key whose sequence arrived in pieces, as over a slow connection, what followed can't be told from typed text. Type the value again, pipe it in with `{command} {key} --stdin`, or read it from a file with `{command} --from-file {key}=PATH`"
             )),
             PromptError::NotText => LpmError::Env(format!(
                 "the value entered for {key} isn't UTF-8 text, so this terminal may use another encoding. Nothing was stored. Pipe it in with `{command} {key} --stdin`"
@@ -675,6 +677,44 @@ mod tests {
             "the values given total more than 100 bytes, the most `lpm env set` stores at once; nothing was stored"
         );
         assert_eq!(fake.file_reads, 2, "the third file is never read");
+    }
+
+    #[test]
+    fn what_a_file_counts_toward_the_limit_is_the_value_it_stores() {
+        let mut fake = Fake {
+            files: HashMap::from([
+                ("line".to_owned(), Ok("0123456789\n".to_owned())),
+                ("nul".to_owned(), Ok("0123\u{0}56789".to_owned())),
+            ]),
+            ..Fake::default()
+        };
+        fn request(from_files: &[String]) -> Request<'_> {
+            Request {
+                entries: &[],
+                stdin: false,
+                from_files,
+                json_output: false,
+                command: "lpm env set",
+                asking: Asking {
+                    what: "Value",
+                    environment: "default",
+                },
+                total_limit: 10,
+            }
+        }
+        let line = strings(&["A=line"]);
+        let nul = strings(&["A=nul"]);
+
+        let checked = check(&request(&line), &fake).expect("valid arguments");
+        let stored = collect(&request(&line), checked, &mut fake)
+            .unwrap_or_else(|_| panic!("the line's end isn't stored"));
+        assert_eq!(stored[0].value.as_str(), "0123456789");
+
+        let checked = check(&request(&nul), &fake).expect("valid arguments");
+        let Err(LpmError::Env(refused)) = collect(&request(&nul), checked, &mut fake) else {
+            panic!("a NUL is refused");
+        };
+        assert!(!refused.contains("total more than"), "{refused}");
     }
 
     #[test]

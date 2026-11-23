@@ -825,7 +825,7 @@ pub fn set_checked(
     source: &history::Source,
 ) -> Result<(), String> {
     reject_invalid_keys(pairs.iter().map(|(k, _)| *k))?;
-    let vault_id = checked.vault_id(project_dir, "its values were asked for")?;
+    let vault_id = checked.vault_id(project_dir, "its values were read or asked for")?;
     write_env(project_dir, &vault_id, env, pairs, source)
 }
 
@@ -1735,12 +1735,13 @@ pub fn delete_env(
 /// Import secrets from a .env file into the vault, as they're written there.
 pub fn import_env_file(
     project_dir: &Path,
+    env: Option<&str>,
     env_path: &Path,
     overwrite: bool,
     source: &history::Source,
 ) -> Result<EnvFileImport, String> {
     let content = read_env_file_to_import(env_path)?;
-    import_env_content(project_dir, None, &content, overwrite, source)
+    import_env_content(project_dir, env, &content, overwrite, source)
 }
 
 /// [`import_env_file`] into `env`, or `default` when it's `None`, of the
@@ -2425,6 +2426,7 @@ mod tests {
     ) -> Result<EnvFileImport, String> {
         super::import_env_file(
             project_dir,
+            None,
             env_path,
             overwrite,
             &history::Source::new(history::Action::Import),

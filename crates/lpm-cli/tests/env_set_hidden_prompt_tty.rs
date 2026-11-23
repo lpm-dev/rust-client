@@ -727,7 +727,7 @@ mod tty {
     }
 
     #[test]
-    fn alt_p_between_typed_text_keeps_the_text_on_both_sides() {
+    fn text_after_alt_p_stores_nothing_rather_than_a_guess() {
         let (project, lpm_home) = project();
         let session = run_in_pty_chunked(
             project.path(),
@@ -738,6 +738,28 @@ mod tty {
                 vec![b"fixture-", b"\x1bP", b"key\r"],
             )],
             Duration::from_millis(120),
+        );
+        assert!(!session.status.success(), "{}", session.transcript);
+        assert!(
+            session.transcript.contains("slow connection"),
+            "{}",
+            session.transcript
+        );
+        assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
+    }
+
+    #[test]
+    fn text_typed_once_an_unfinished_terminal_string_went_quiet_is_the_value() {
+        let (project, lpm_home) = project();
+        let session = run_in_pty_chunked(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(
+                b"Value for TOKEN (default, hidden): ",
+                vec![b"\x1b]\x1b", b"fixture-key\r"],
+            )],
+            Duration::from_millis(700),
         );
         assert!(session.status.success(), "{}", session.transcript);
         assert_eq!(
