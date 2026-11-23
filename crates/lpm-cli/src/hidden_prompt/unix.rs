@@ -3,7 +3,7 @@
 use std::cell::UnsafeCell;
 use std::io;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
@@ -79,10 +79,13 @@ impl Terminal {
         unsafe { libc::cfmakeraw(&mut raw) };
         raw.c_cc[libc::VMIN] = 1;
         raw.c_cc[libc::VTIME] = 0;
-        // SAFETY: standard input is open and `raw` is a valid termios.
-        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        ending_signals.enter(|| {
+            // SAFETY: standard input is open and `raw` is a valid termios.
+            if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        })?;
         let mut terminal = Self {
             original,
             output,
@@ -211,28 +214,58 @@ fn descriptor(output: Output) -> libc::c_int {
     }
 }
 
-/// Turns bracketed paste off through `paste_output` (-1 when it isn't on),
-/// discards input not read yet rather than leave it for the shell, or show
-/// it once echo returns, and gives standard input `original` back. It makes
-/// only async-signal-safe calls, since a signal handler makes it too.
+/// Gives standard input `original` back, once input not read yet is
+/// discarded rather than left for the shell, then turns bracketed paste off
+/// through `paste_output` (-1 when it isn't on), waiting at most
+/// [`PASTE_OFF_WAIT`] for the terminal to take it. Echo comes back first, so
+/// a terminal that takes no output can't keep it off. It makes only
+/// async-signal-safe calls, since a signal handler makes it too.
 fn put_back(original: &libc::termios, paste_output: libc::c_int) {
-    if paste_output >= 0 {
-        let mut rest = BRACKETED_PASTE_OFF;
-        while !rest.is_empty() {
-            // SAFETY: `rest` is valid for reads of its whole length.
-            let written = unsafe { libc::write(paste_output, rest.as_ptr().cast(), rest.len()) };
-            match usize::try_from(written) {
-                Ok(written) => rest = &rest[written..],
-                Err(_) if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
-        }
-    }
+    put_back_input(original);
+    turn_paste_off(paste_output);
+}
+
+/// How long turning bracketed paste off waits for the terminal to take it.
+const PASTE_OFF_WAIT: libc::c_int = 1000;
+
+fn put_back_input(original: &libc::termios) {
     // SAFETY: standard input is open and `original` is the termios read
     // from it.
     unsafe {
         libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
         libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, original);
+    }
+}
+
+fn turn_paste_off(paste_output: libc::c_int) {
+    if paste_output < 0 {
+        return;
+    }
+    let mut rest = BRACKETED_PASTE_OFF;
+    while !rest.is_empty() {
+        let mut writable = libc::pollfd {
+            fd: paste_output,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: `writable` is one valid pollfd for the call.
+        match unsafe { libc::poll(&mut writable, 1, PASTE_OFF_WAIT) } {
+            0 => return,
+            ready if ready < 0 => {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return;
+            }
+            _ => {}
+        }
+        // SAFETY: `rest` is valid for reads of its whole length.
+        let written = unsafe { libc::write(paste_output, rest.as_ptr().cast(), rest.len()) };
+        match usize::try_from(written) {
+            Ok(written) => rest = &rest[written..],
+            Err(_) if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
     }
 }
 
@@ -262,6 +295,22 @@ const ENDING: u8 = 3;
 /// read only by the handler that moved this from `ARMED` to `ENDING`, which
 /// nothing leaves.
 static HANDLER_STATE: AtomicU8 = AtomicU8::new(IDLE);
+
+/// Set once the handler that is ending the process gave standard input its
+/// state back, or found none to give back.
+static INPUT_PUT_BACK: AtomicBool = AtomicBool::new(false);
+
+/// Set while the prompt gives standard input raw mode, which the handler
+/// that is ending the process waits for, then undoes.
+static ENTERING_RAW_MODE: AtomicBool = AtomicBool::new(false);
+
+/// How long a handler that finds another ending the process waits for it to
+/// give standard input back, in steps of [`PUT_BACK_STEP`].
+const PUT_BACK_STEPS: u32 = 2000;
+const PUT_BACK_STEP: libc::timespec = libc::timespec {
+    tv_sec: 0,
+    tv_nsec: 1_000_000,
+};
 
 /// The terminal's state outside the prompt, for the handler.
 static SAVED_TERMIOS: SavedTermios = SavedTermios(UnsafeCell::new(MaybeUninit::uninit()));
@@ -317,7 +366,7 @@ impl EndingSignals {
         // integer fields.
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
         action.sa_sigaction = HANDLER as libc::sighandler_t;
-        action.sa_flags = libc::SA_RESETHAND | libc::SA_RESTART;
+        action.sa_flags = libc::SA_RESTART;
         // SAFETY: `sa_mask` is a valid signal set for these calls.
         unsafe {
             libc::sigemptyset(&mut action.sa_mask);
@@ -336,6 +385,23 @@ impl EndingSignals {
             }
         }
         taken
+    }
+
+    /// Gives standard input raw mode with `enter`, unless a handler is
+    /// ending the process already, which then gives the saved state back
+    /// after it.
+    fn enter(&self, enter: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        if !self.armed {
+            return enter();
+        }
+        ENTERING_RAW_MODE.store(true, Ordering::SeqCst);
+        let entered = if HANDLER_STATE.load(Ordering::SeqCst) == ENDING {
+            Err(io::Error::from(io::ErrorKind::Interrupted))
+        } else {
+            enter()
+        };
+        ENTERING_RAW_MODE.store(false, Ordering::SeqCst);
+        entered
     }
 
     /// Has the handler turn bracketed paste off through `output`, or not
@@ -379,23 +445,63 @@ fn current_action(signal: libc::c_int) -> Option<libc::sigaction> {
 }
 
 /// Puts the terminal back, then ends the process by `signal` as its
-/// default action would have: `SA_RESETHAND` restored that action on
-/// entry, and the signal raised here takes it once the handler returns. A
+/// default action would have: the handler gives the signal that action and
+/// raises it, and it takes the process once the handler returns. A second
+/// signal, on another thread, waits until standard input is back first. A
 /// handler that took the signal over since and calls this one in turn, as
 /// signal-hook calls the one it replaced, gets nothing done, since for it
 /// the signal doesn't end the process.
 extern "C" fn put_back_and_end(signal: libc::c_int) {
-    if current_action(signal).is_none_or(|current| current.sa_sigaction != libc::SIG_DFL) {
+    // Ours while the prompt has the signal, or the default action once a
+    // handler ending the process gave it back.
+    if current_action(signal).is_none_or(|current| {
+        current.sa_sigaction != HANDLER as libc::sighandler_t
+            && current.sa_sigaction != libc::SIG_DFL
+    }) {
         return;
     }
-    if HANDLER_STATE.swap(ENDING, Ordering::SeqCst) == ARMED {
-        // SAFETY: the state was `ARMED`, so the saved state is written, and
-        // `ENDING` keeps it from being written again.
-        let original = unsafe { (*SAVED_TERMIOS.0.get()).assume_init_ref() };
-        put_back(original, PASTE_OUTPUT.load(Ordering::SeqCst));
+    match HANDLER_STATE.swap(ENDING, Ordering::SeqCst) {
+        ARMED => {
+            // SAFETY: the state was `ARMED`, so the saved state is written,
+            // and `ENDING` keeps it from being written again.
+            let original = unsafe { (*SAVED_TERMIOS.0.get()).assume_init_ref() };
+            put_back_input(original);
+            // Raw mode the prompt was giving standard input meanwhile is
+            // undone once it's given.
+            if wait_while(&ENTERING_RAW_MODE, true) {
+                put_back_input(original);
+            }
+            INPUT_PUT_BACK.store(true, Ordering::SeqCst);
+            turn_paste_off(PASTE_OUTPUT.load(Ordering::SeqCst));
+        }
+        ENDING => {
+            wait_while(&INPUT_PUT_BACK, false);
+        }
+        _ => INPUT_PUT_BACK.store(true, Ordering::SeqCst),
     }
-    // SAFETY: raising a signal is async-signal-safe.
-    unsafe { libc::raise(signal) };
+    // SAFETY: an all-zero sigaction with SIG_DFL is the default action, and
+    // these calls are async-signal-safe.
+    unsafe {
+        let mut default: libc::sigaction = std::mem::zeroed();
+        default.sa_sigaction = libc::SIG_DFL;
+        libc::sigaction(signal, &default, std::ptr::null_mut());
+        libc::raise(signal);
+    }
+}
+
+/// Waits, at most [`PUT_BACK_STEPS`] steps, while `flag` is `value`; true
+/// when it was at first. It makes only async-signal-safe calls.
+fn wait_while(flag: &AtomicBool, value: bool) -> bool {
+    let was = flag.load(Ordering::SeqCst) == value;
+    for _ in 0..PUT_BACK_STEPS {
+        if flag.load(Ordering::SeqCst) != value {
+            break;
+        }
+        // SAFETY: `nanosleep` is async-signal-safe, and a null remainder is
+        // allowed.
+        unsafe { libc::nanosleep(&PUT_BACK_STEP, std::ptr::null_mut()) };
+    }
+    was
 }
 
 #[cfg(test)]

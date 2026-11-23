@@ -135,7 +135,73 @@ pub fn run_in_pty_answering(
     options: &PtyOptions,
     before_answer: &mut dyn FnMut(usize, u32),
 ) -> PtySession {
-    run(cwd, lpm_home, args, &whole(steps), options, before_answer).0
+    run(
+        cwd,
+        lpm_home,
+        args,
+        &whole(steps),
+        options,
+        &mut |answering: &Answering<'_>| before_answer(answering.index, answering.pid),
+    )
+    .0
+}
+
+/// A step whose prompt shows, before it's answered.
+pub struct Answering<'pty> {
+    pub index: usize,
+    pub pid: u32,
+    master: &'pty File,
+}
+
+impl Answering<'_> {
+    /// Whether the terminal hides what's typed.
+    pub fn echo_is_disabled(&self) -> bool {
+        terminal_echo_is_disabled(self.master)
+    }
+
+    /// Fill what the terminal holds of lpm's output until it's read, so
+    /// lpm's next write to the terminal waits. The run reads it all after
+    /// the step.
+    pub fn fill_output(&self) {
+        // SAFETY: `master` is a valid PTY master, whose slave `ptsname`
+        // names in a buffer the call returns.
+        let name = unsafe { libc::ptsname(self.master.as_raw_fd()) };
+        assert!(!name.is_null(), "name the PTY slave");
+        // SAFETY: `ptsname` returned a valid C string.
+        let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_owned();
+        // SAFETY: `name` is a valid C string, and the call opens a new
+        // descriptor of the slave, whose flags lpm's don't share.
+        let fd = unsafe {
+            libc::open(
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
+            )
+        };
+        assert!(fd >= 0, "open the PTY slave to fill its output");
+        // SAFETY: `open` returned a descriptor owned here alone.
+        let mut slave = unsafe { File::from_raw_fd(fd) };
+        let chunk = [b'.'; 1024];
+        loop {
+            match slave.write(&chunk) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill the PTY's output: {error}"),
+            }
+        }
+    }
+}
+
+/// [`run_in_pty`] with `options`, calling `control` once each step's prompt
+/// shows and before it's answered.
+pub fn run_in_pty_controlled(
+    cwd: &Path,
+    lpm_home: &Path,
+    args: &[&str],
+    steps: &[(&[u8], &[u8])],
+    options: &PtyOptions,
+    control: &mut dyn FnMut(&Answering<'_>),
+) -> PtySession {
+    run(cwd, lpm_home, args, &whole(steps), options, control).0
 }
 
 /// [`run_in_pty`] with `options`, returning what lpm wrote to its standard
@@ -147,7 +213,9 @@ pub fn run_in_pty_with(
     steps: &[(&[u8], Vec<&[u8]>)],
     options: &PtyOptions,
 ) -> (PtySession, Option<String>) {
-    run(cwd, lpm_home, args, steps, options, &mut |_, _| {})
+    run(cwd, lpm_home, args, steps, options, &mut |_: &Answering<
+        '_,
+    >| {})
 }
 
 fn run(
@@ -156,7 +224,7 @@ fn run(
     args: &[&str],
     steps: &[(&[u8], Vec<&[u8]>)],
     options: &PtyOptions,
-    before_answer: &mut dyn FnMut(usize, u32),
+    before_answer: &mut dyn FnMut(&Answering<'_>),
 ) -> (PtySession, Option<String>) {
     let mut master_fd = -1;
     let mut slave_fd = -1;
@@ -262,7 +330,11 @@ fn run(
                 .position(|window| window == *prompt)
             && terminal_echo_is_disabled(&master)
         {
-            before_answer(answered, child.id());
+            before_answer(&Answering {
+                index: answered,
+                pid: child.id(),
+                master: &master,
+            });
             for (index, chunk) in response.iter().enumerate() {
                 if index > 0 {
                     std::thread::sleep(options.pause);

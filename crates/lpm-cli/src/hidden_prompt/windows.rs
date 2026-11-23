@@ -100,7 +100,6 @@ impl Terminal {
         if unsafe { GetConsoleMode(input, &mut original_mode) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        let control_events = ControlEvents::take(input, original_mode);
         let mode = original_mode
             & !(ENABLE_LINE_INPUT
                 | ENABLE_ECHO_INPUT
@@ -108,10 +107,13 @@ impl Terminal {
                 | ENABLE_VIRTUAL_TERMINAL_INPUT
                 | ENABLE_MOUSE_INPUT
                 | ENABLE_WINDOW_INPUT);
-        // SAFETY: `input` is the console input handle.
-        if unsafe { SetConsoleMode(input, mode) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let control_events = ControlEvents::take(input, original_mode, || {
+            // SAFETY: `input` is the console input handle.
+            if unsafe { SetConsoleMode(input, mode) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        })?;
         Ok(Self {
             input,
             original_mode,
@@ -250,19 +252,30 @@ struct ControlEvents {
 }
 
 impl ControlEvents {
-    /// Has the handler give `input` back `mode`, unless another prompt has
-    /// it.
-    fn take(input: HANDLE, mode: CONSOLE_MODE) -> Self {
+    /// Gives `input` the prompt's mode with `enter`, and has the handler give
+    /// it back `mode`, unless another prompt has it. The handler waits while
+    /// the prompt's mode is set, so it can't put the console back before the
+    /// prompt's mode replaces it.
+    fn take(
+        input: HANDLE,
+        mode: CONSOLE_MODE,
+        enter: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<Self> {
         let mut held = HELD_CONSOLE.lock().unwrap_or_else(PoisonError::into_inner);
-        if held.is_some() {
-            return Self { held: false };
-        }
         // SAFETY: the handler is a valid routine for the process's lifetime.
-        if unsafe { SetConsoleCtrlHandler(Some(put_back_console), TRUE) } == 0 {
-            return Self { held: false };
+        let registered =
+            held.is_none() && unsafe { SetConsoleCtrlHandler(Some(put_back_console), TRUE) } != 0;
+        if let Err(error) = enter() {
+            if registered {
+                // SAFETY: removing the routine added above.
+                unsafe { SetConsoleCtrlHandler(Some(put_back_console), FALSE) };
+            }
+            return Err(error);
         }
-        *held = Some(HeldConsole { input, mode });
-        Self { held: true }
+        if registered {
+            *held = Some(HeldConsole { input, mode });
+        }
+        Ok(Self { held: registered })
     }
 }
 

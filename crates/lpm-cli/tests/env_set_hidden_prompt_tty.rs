@@ -15,7 +15,7 @@ mod tty {
     use crate::common;
     use crate::common::pty::{
         PtyOptions, PtySession, run_in_pty, run_in_pty_answering, run_in_pty_chunked,
-        run_in_pty_with, run_in_pty_with_stdout_captured,
+        run_in_pty_controlled, run_in_pty_with, run_in_pty_with_stdout_captured,
     };
     use std::time::Duration;
 
@@ -634,6 +634,43 @@ mod tty {
             );
             assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
         }
+    }
+
+    #[test]
+    fn a_signal_restores_echo_even_while_the_terminal_takes_no_output() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let (project, lpm_home) = project();
+        let mut restored = false;
+        let session = run_in_pty_controlled(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(b"Value for TOKEN (default, hidden): ", b"")],
+            &PtyOptions::default(),
+            &mut |answering| {
+                answering.fill_output();
+                // A second signal comes while the first is handled.
+                signal(answering.pid, libc::SIGTERM);
+                signal(answering.pid, libc::SIGHUP);
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while answering.echo_is_disabled() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                restored = !answering.echo_is_disabled();
+            },
+        );
+
+        assert!(
+            restored,
+            "echo returns before lpm writes anything more to the terminal"
+        );
+        assert!(
+            matches!(session.status.signal(), Some(libc::SIGTERM | libc::SIGHUP)),
+            "lpm ends by a signal: {:?}",
+            session.status
+        );
+        assert_eq!(stored(project.path(), lpm_home.path(), "TOKEN"), None);
     }
 
     #[test]

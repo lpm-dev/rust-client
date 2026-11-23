@@ -45,14 +45,16 @@ enum State {
         crossed: bool,
     },
     /// A string a terminal sends, such as an `ESC ]` reply, which ends with
-    /// BEL or `ESC \\`; `escape` once an `ESC` of that end was read. A
-    /// terminal sends a string with what it holds, so one that `held`
-    /// nothing when its read ended began with a key: its introducer after
-    /// the Escape key, or with it as a Meta chord when `chord`.
+    /// `ESC \\`, or with BEL when it's an OSC string (`bel_ends`), as xterm
+    /// ends one; `escape` once an `ESC` of that end was read. A terminal
+    /// sends a string with what it holds, so one that `held` nothing when
+    /// its read ended began with a key: its introducer after the Escape key,
+    /// or with it as a Meta chord when `chord`.
     TerminalString {
         escape: bool,
         held: bool,
         chord: bool,
+        bel_ends: bool,
     },
     /// In a Meta chord with a character outside ASCII, such as Alt+\u{e9},
     /// with `remaining` bytes of its UTF-8 to skip.
@@ -119,6 +121,7 @@ impl Bytes {
                         escape: false,
                         held: false,
                         chord: self.escape_in_read,
+                        bel_ends: byte == b']',
                     };
                 }
                 // An escape that starts no sequence edits nothing, and what
@@ -200,18 +203,21 @@ impl Bytes {
                 escape,
                 held,
                 chord,
+                bel_ends,
             } => {
                 let string = |escape, held| State::TerminalString {
                     escape,
                     held,
                     chord,
+                    bel_ends,
                 };
                 // An introducer that came after its escape's read may have
                 // been typed, as what the string held may have been, unless
                 // the string ends as only a terminal ends one.
                 let typed = held || !chord;
                 match (escape, byte) {
-                    (_, 0x07) | (true, b'\\') => self.state = State::Ground,
+                    (_, 0x07) if bel_ends => self.state = State::Ground,
+                    (true, b'\\') => self.state = State::Ground,
                     (_, 0x1b) => self.state = string(true, held),
                     // CAN and SUB cancel the string, as ECMA-48 has them.
                     (_, 0x18 | 0x1a) => self.end_string(typed, each),
@@ -962,6 +968,30 @@ mod tests {
                 "what it held may have been typed; a key after it is a key again"
             );
         }
+    }
+
+    #[test]
+    fn bel_ends_only_an_osc_string_as_a_terminal_would() {
+        assert_eq!(
+            decoded(&[b"ab", b"\x1b", b"Ptyped\x07\r"]),
+            "ab<Lost><Ignored><Enter>",
+            "P after the Escape key, text, then Ctrl+G and Enter"
+        );
+        assert_eq!(
+            decoded(&[b"a\x1bP1$r\x07b"]),
+            "a<Lost><Ignored>b",
+            "a terminal ends a DCS string only with ST"
+        );
+        assert_eq!(
+            decoded(&[b"a\x1b]11;rgb:0/0/0\x07b"]),
+            "ab",
+            "an OSC reply ended by BEL"
+        );
+        assert_eq!(
+            decoded(&[b"a\x1bP1$r\x1b\\b"]),
+            "ab",
+            "a DCS reply ended by ST"
+        );
     }
 
     #[test]

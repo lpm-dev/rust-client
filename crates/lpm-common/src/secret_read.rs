@@ -97,7 +97,9 @@ pub fn open_secret_source(path: &Path, limit: usize) -> Result<SecretSource, Sec
             return Ok(source(None, true));
         }
     }
-    let (file, size, pipe) = open_file_or_pipe(path, limit)?;
+    #[cfg(test)]
+    tests::BEFORE_OPEN.with_borrow_mut(|before| before.take().map(|before| before()));
+    let (file, size, pipe) = open_file_or_pipe(path, limit, Waiting::Never)?;
     // One that became a named pipe once it was looked at was opened without
     // waiting for a writer, so it reads nothing until opened again.
     if pipe && cfg!(unix) {
@@ -117,7 +119,8 @@ impl SecretSource {
         let (file, size) = match self.opened {
             Some(opened) => opened,
             None => {
-                let (file, size, _) = open_file_or_pipe(&self.path, self.limit)?;
+                let (file, size, _) =
+                    open_file_or_pipe(&self.path, self.limit, Waiting::ForWriter)?;
                 (file, size)
             }
         };
@@ -131,7 +134,20 @@ impl SecretSource {
 
 /// The file or pipe at `path`, its size when it's a file, and whether it's a
 /// pipe.
-fn open_file_or_pipe(path: &Path, limit: usize) -> Result<(File, usize, bool), SecretReadError> {
+/// Whether opening a source may wait for a named pipe's writer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Waiting {
+    /// Never: the source is being told apart before its read may wait.
+    Never,
+    /// For a named pipe's writer, once reading may wait.
+    ForWriter,
+}
+
+fn open_file_or_pipe(
+    path: &Path,
+    limit: usize,
+    waiting: Waiting,
+) -> Result<(File, usize, bool), SecretReadError> {
     // Windows opens no directory as a file, and says only that access is
     // denied.
     #[cfg(windows)]
@@ -140,15 +156,20 @@ fn open_file_or_pipe(path: &Path, limit: usize) -> Result<(File, usize, bool), S
     }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
+    // A named pipe can't be told apart before it's open on Windows, where
+    // opening one never waits.
+    #[cfg(not(unix))]
+    let _ = waiting;
     // Opening a device can wait for it, so only a named pipe, which waits
-    // for its writer, is opened in a way that can. Whatever the path names
-    // once it's open decides.
+    // for its writer, is opened in a way that can, and only once reading may
+    // wait: a path looked at again can name something else by then.
+    // Whatever the path names once it's open decides.
     #[cfg(unix)]
     {
         use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
 
-        let named_pipe =
-            std::fs::metadata(path).is_ok_and(|metadata| metadata.file_type().is_fifo());
+        let named_pipe = waiting == Waiting::ForWriter
+            && std::fs::metadata(path).is_ok_and(|metadata| metadata.file_type().is_fifo());
         options.custom_flags(if named_pipe {
             libc::O_CLOEXEC
         } else {
@@ -370,6 +391,48 @@ mod tests {
     /// What the reader that waits for input does each time it finds none.
     #[cfg(unix)]
     pub(super) static WAITING_FOR_INPUT: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+    thread_local! {
+        /// What happens on this thread between a source's first look at its
+        /// path and its open.
+        pub(super) static BEFORE_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_becomes_a_named_pipe_once_looked_at_is_not_opened_to_wait() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("values.env");
+        std::fs::write(&path, "TOKEN=fixture\n").unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let (opened, classified) = std::sync::mpsc::channel();
+        let classifying = path.clone();
+        std::thread::spawn(move || {
+            let swapped = classifying.clone();
+            BEFORE_OPEN.with_borrow_mut(|before| {
+                *before = Some(Box::new(move || {
+                    std::fs::remove_file(&swapped).unwrap();
+                    // SAFETY: `name` is a valid C string naming a path no
+                    // file is at.
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                }));
+            });
+            let source = open_secret_source(&classifying, 1024);
+            let _ = opened.send(source.map(|source| source.can_wait()));
+        });
+
+        match classified.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(can_wait) => assert!(can_wait.unwrap(), "read later, as a named pipe"),
+            Err(_) => {
+                // A writer lets the waiting open end before the test fails.
+                let _writer = std::fs::OpenOptions::new().write(true).open(&path);
+                panic!("the source waited for the named pipe's writer");
+            }
+        }
+    }
 
     #[cfg(windows)]
     #[test]
