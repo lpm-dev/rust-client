@@ -12,28 +12,57 @@ use serde::de::{DeserializeSeed, Deserializer, Error as _, MapAccess, Visitor};
 use super::SelectedVaultPayload;
 use crate::{EnvironmentMap, SecretMap};
 
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CompleteVaultPayload {
-    #[serde(deserialize_with = "deserialize_environment_map")]
-    environments: EnvironmentMap,
+/// The payload's one field. A derived struct would also take the
+/// positional `[{…}]`, which the stored format never is.
+struct CompleteVaultPayloadVisitor;
+
+impl<'de> Visitor<'de> for CompleteVaultPayloadVisitor {
+    type Value = EnvironmentMap;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an object with exactly an environments field")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut environments = None;
+        while let Some(field) = map.next_key::<Cow<'de, str>>()? {
+            if field != "environments" {
+                return Err(A::Error::unknown_field(&field, &["environments"]));
+            }
+            if environments.is_some() {
+                return Err(A::Error::duplicate_field("environments"));
+            }
+            environments = Some(map.next_value_seed(EnvironmentMapSeed)?);
+        }
+        environments.ok_or_else(|| A::Error::missing_field("environments"))
+    }
+}
+
+struct EnvironmentMapSeed;
+
+impl<'de> DeserializeSeed<'de> for EnvironmentMapSeed {
+    type Value = EnvironmentMap;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(EnvironmentMapVisitor)
+    }
 }
 
 /// `parse_all` as serde parses it.
 pub(super) fn parse_all_with_serde(json: &str) -> Result<EnvironmentMap, serde_json::Error> {
-    let payload = serde_json::from_str::<CompleteVaultPayload>(json)?;
-    let mut environments = payload.environments;
+    let mut deserializer = serde_json::Deserializer::from_str(json);
+    let mut environments = deserializer.deserialize_map(CompleteVaultPayloadVisitor)?;
+    deserializer.end()?;
     if environments.is_empty() {
         environments.insert(DEFAULT_ENVIRONMENT.to_owned(), HashMap::new());
     }
     Ok(environments)
-}
-
-fn deserialize_environment_map<'de, D>(deserializer: D) -> Result<EnvironmentMap, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserializer.deserialize_map(EnvironmentMapVisitor)
 }
 
 struct EnvironmentMapVisitor;

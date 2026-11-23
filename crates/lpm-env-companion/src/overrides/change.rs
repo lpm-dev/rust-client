@@ -28,7 +28,7 @@ use crate::gate::{Damage, GateError, Operation, ProjectGate};
 use crate::lifecycle::{Mutation, needs_resume, plan_feature_removal};
 use crate::marker::{MAX_RECORD_BYTES, Marker, ProjectState};
 
-use super::{OVERRIDES_KIND, OverridesRecord, VERSION, feature_entry};
+use super::{EnvironmentEntry, Keep, OVERRIDES_KIND, VERSION, feature_entry};
 
 /// One change to a project's personal overrides.
 #[derive(Clone)]
@@ -696,27 +696,30 @@ impl Overrides {
         case_insensitive: bool,
     ) -> Result<Self, PlanError> {
         let mut stored = super::evaluate_with(gate, record, |bytes, version| {
-            super::parse_record(bytes, vault_id, version, case_insensitive)
-                .map(|record| Self::from_record(record, case_insensitive))
+            super::read_record(bytes, vault_id, version, case_insensitive, Keep::Every)
+                .map(|environments| Self::from_record(environments, case_insensitive))
         })
         .map_err(|damage| PlanError::Refused(GateError::Damaged(damage)))?;
         stored.case_insensitive = case_insensitive;
         Ok(stored)
     }
 
-    fn from_record(record: OverridesRecord, case_insensitive: bool) -> Self {
+    fn from_record(
+        environments: BTreeMap<String, EnvironmentEntry>,
+        case_insensitive: bool,
+    ) -> Self {
         let mut overrides = Self {
             environments: BTreeMap::new(),
             case_insensitive,
         };
-        for (environment, entry) in record.environments {
+        for (environment, entry) in environments {
             let names = overrides.environments.entry(environment).or_default();
             for (key, value) in entry.set {
                 names.insert(
                     match_key(&key, case_insensitive),
                     Named {
                         spelling: key,
-                        decision: Decision::Set(Zeroizing::new(value)),
+                        decision: Decision::Set(value),
                     },
                 );
             }

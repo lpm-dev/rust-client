@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 
+use lpm_common::stored_env::json::{ReadError, Reader};
 use zeroize::Zeroizing;
 
 use crate::{EnvironmentMap, SecretMap};
@@ -9,15 +9,9 @@ pub(crate) use lpm_common::stored_env::is_valid_environment_name;
 use lpm_common::stored_env::is_valid_variable_name;
 use lpm_env::{DEFAULT_ENVIRONMENT, reads_default_environment};
 
-/// Why a stored payload didn't parse.
-#[derive(Debug)]
-pub(crate) struct PayloadError(String);
-
-impl fmt::Display for PayloadError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
+/// Why a stored payload didn't parse. It names keys and environments,
+/// never a value.
+pub(crate) type PayloadError = ReadError;
 
 #[cfg(test)]
 mod serde_oracle;
@@ -25,10 +19,11 @@ mod serde_oracle;
 /// Every environment of the stored payload, as [`parse_payload`] reads it.
 pub(crate) fn parse_all(json: &str) -> Result<EnvironmentMap, PayloadError> {
     let mut environments = crate::history::ZeroizingValues::default();
-    let any = parse_payload(json, |parser, environment| {
-        parser.secrets(Some(
-            environments.entry(environment.into_owned()).or_default(),
-        ))
+    let any = parse_payload(json, |reader, environment| {
+        secrets(
+            reader,
+            Some(environments.entry(environment.into_owned()).or_default()),
+        )
     })?;
     if !any {
         environments.insert(DEFAULT_ENVIRONMENT.to_owned(), HashMap::new());
@@ -61,7 +56,7 @@ fn select(
 ) -> Result<SelectedVaultPayload, PayloadError> {
     let mut selected = None::<crate::wiping::ParsedValues>;
     let mut fallback = None::<crate::wiping::ParsedValues>;
-    let any = parse_payload(json, |parser, environment| {
+    let any = parse_payload(json, |reader, environment| {
         let kept = if environment == selected_environment {
             Some(&mut selected)
         } else if default_fallback && environment == DEFAULT_ENVIRONMENT {
@@ -69,7 +64,10 @@ fn select(
         } else {
             None
         };
-        parser.secrets(kept.map(|slot| &mut **slot.insert(Default::default())))
+        secrets(
+            reader,
+            kept.map(|slot| &mut **slot.insert(Default::default())),
+        )
     })?;
     let take = |mut values: crate::wiping::ParsedValues| std::mem::take(&mut *values);
     let selected = if !any && selected_environment == DEFAULT_ENVIRONMENT {
@@ -91,297 +89,68 @@ fn select(
 /// rules serde applies to it: one `environments` field, unique valid
 /// environment and variable names, and string values. `environment` reads
 /// each environment's variables, given its name once that's checked, and
-/// the result says whether there was any environment. A parser of its own,
-/// because serde_json decodes escaped strings through a scratch buffer it
-/// never wipes: here each string is decoded into a buffer sized to its
-/// encoded length, and only a string kept is decoded at all.
+/// the result says whether there was any environment. It reads with
+/// [`Reader`], which leaves no copy of a value.
 fn parse_payload<'a>(
     json: &'a str,
-    mut environment: impl FnMut(&mut PayloadParser<'a>, Cow<'a, str>) -> Result<(), PayloadError>,
+    mut environment: impl FnMut(&mut Reader<'a>, Cow<'a, str>) -> Result<(), PayloadError>,
 ) -> Result<bool, PayloadError> {
-    let mut parser = PayloadParser { text: json, at: 0 };
+    let mut reader = Reader::new(json);
     let mut names = HashSet::new();
     let mut found = false;
-    parser.object(|parser, field| {
+    reader.object(|reader, field| {
         if field != "environments" {
-            return Err(parser.error(&format!("unknown field `{field}`, expected `environments`")));
+            return Err(
+                reader.unexpected(&format!("unknown field `{field}`, expected `environments`"))
+            );
         }
         if std::mem::replace(&mut found, true) {
-            return Err(parser.error("duplicate field `environments`"));
+            return Err(reader.unexpected("duplicate field `environments`"));
         }
-        parser.object(|parser, name| {
+        reader.object(|reader, name| {
             if !is_valid_environment_name(&name) {
-                return Err(parser.error(&format!("environment name {name:?} is invalid")));
+                return Err(reader.unexpected(&format!("environment name {name:?} is invalid")));
             }
             if !names.insert(name.clone()) {
-                return Err(parser.error(&format!("duplicate environment name {name:?}")));
+                return Err(reader.unexpected(&format!("duplicate environment name {name:?}")));
             }
-            environment(parser, name)
+            environment(reader, name)
         })
     })?;
-    parser.skip_whitespace();
-    if parser.at != json.len() {
-        return Err(parser.error("trailing characters"));
-    }
+    reader.end()?;
     if !found {
-        return Err(parser.error("missing field `environments`"));
+        return Err(reader.unexpected("missing field `environments`"));
     }
     Ok(!names.is_empty())
 }
 
-struct PayloadParser<'a> {
-    text: &'a str,
-    at: usize,
-}
-
-impl<'a> PayloadParser<'a> {
-    fn error(&self, message: &str) -> PayloadError {
-        PayloadError(format!("{message} at byte {}", self.at))
-    }
-
-    fn skip_whitespace(&mut self) {
-        while matches!(
-            self.text.as_bytes().get(self.at),
-            Some(b' ' | b'\t' | b'\n' | b'\r')
-        ) {
-            self.at += 1;
+/// An environment's variables: valid, unique names with string values,
+/// decoded into `kept` or, without it, only checked.
+fn secrets(reader: &mut Reader<'_>, mut kept: Option<&mut SecretMap>) -> Result<(), PayloadError> {
+    let mut checked = HashSet::new();
+    reader.object(|reader, variable| {
+        if !is_valid_variable_name(&variable) {
+            return Err(reader.unexpected(&format!("env variable name {variable:?} is invalid")));
         }
-    }
-
-    fn next_is(&mut self, byte: u8) -> bool {
-        self.skip_whitespace();
-        if self.text.as_bytes().get(self.at) == Some(&byte) {
-            self.at += 1;
-            true
-        } else {
-            false
+        let seen = kept.as_deref().map_or_else(
+            || checked.contains(&variable),
+            |secrets| secrets.contains_key(&*variable),
+        );
+        if seen {
+            return Err(reader.unexpected(&format!("duplicate env variable name {variable:?}")));
         }
-    }
-
-    /// An object, calling `member` with each key once its colon is read.
-    fn object(
-        &mut self,
-        mut member: impl FnMut(&mut Self, Cow<'a, str>) -> Result<(), PayloadError>,
-    ) -> Result<(), PayloadError> {
-        if !self.next_is(b'{') {
-            return Err(self.error("expected an object"));
-        }
-        if self.next_is(b'}') {
-            return Ok(());
-        }
-        loop {
-            let key = self.key()?;
-            if !self.next_is(b':') {
-                return Err(self.error("expected `:`"));
+        match kept.as_deref_mut() {
+            Some(secrets) => {
+                let value = reader.string()?;
+                secrets.insert(variable.into_owned(), value);
             }
-            member(self, key)?;
-            if self.next_is(b'}') {
-                return Ok(());
-            }
-            if !self.next_is(b',') {
-                return Err(self.error("expected `,` or `}`"));
+            None => {
+                reader.skip_string()?;
+                checked.insert(variable);
             }
         }
-    }
-
-    /// An environment's variables: valid, unique names with string values,
-    /// decoded into `kept` or, without it, only checked.
-    fn secrets(&mut self, mut kept: Option<&mut SecretMap>) -> Result<(), PayloadError> {
-        let mut checked = HashSet::new();
-        self.object(|parser, variable| {
-            if !is_valid_variable_name(&variable) {
-                return Err(parser.error(&format!("env variable name {variable:?} is invalid")));
-            }
-            let seen = kept.as_deref().map_or_else(
-                || checked.contains(&variable),
-                |secrets| secrets.contains_key(&*variable),
-            );
-            if seen {
-                return Err(parser.error(&format!("duplicate env variable name {variable:?}")));
-            }
-            match kept.as_deref_mut() {
-                Some(secrets) => {
-                    let value = parser.string()?;
-                    secrets.insert(variable.into_owned(), value);
-                }
-                None => {
-                    parser.skip_string()?;
-                    checked.insert(variable);
-                }
-            }
-            Ok(())
-        })
-    }
-
-    /// An object's key, borrowed from the payload unless it has escapes.
-    fn key(&mut self) -> Result<Cow<'a, str>, PayloadError> {
-        self.skip_whitespace();
-        let text = self.text;
-        let bytes = text.as_bytes();
-        if bytes.get(self.at) == Some(&b'"') {
-            let end = special_byte(bytes, self.at + 1);
-            if bytes.get(end) == Some(&b'"') {
-                let key = &text[self.at + 1..end];
-                self.at = end + 1;
-                return Ok(Cow::Borrowed(key));
-            }
-        }
-        self.string().map(Cow::Owned)
-    }
-
-    /// A string, decoded into a buffer the size of its encoded form, which
-    /// a decoded string never exceeds, so it's never moved.
-    fn string(&mut self) -> Result<String, PayloadError> {
-        let mut decoded = Zeroizing::new(String::new());
-        self.decode_string(Some(&mut decoded))?;
-        Ok(std::mem::take(&mut *decoded))
-    }
-
-    /// A string checked as [`string`](Self::string) decodes it, keeping
-    /// nothing of it.
-    fn skip_string(&mut self) -> Result<(), PayloadError> {
-        self.decode_string(None)
-    }
-
-    /// Reads a string in one pass, decoding it into `decoded` when given,
-    /// which first takes room for the whole encoded string.
-    fn decode_string(&mut self, mut decoded: Option<&mut String>) -> Result<(), PayloadError> {
-        if !self.next_is(b'"') {
-            return Err(self.error("expected a string"));
-        }
-        if let Some(decoded) = decoded.as_deref_mut() {
-            decoded.reserve_exact(self.encoded_length()?);
-        }
-        let bytes = self.text.as_bytes();
-        loop {
-            let run = special_byte(bytes, self.at);
-            if let Some(decoded) = decoded.as_deref_mut() {
-                decoded.push_str(&self.text[self.at..run]);
-            }
-            self.at = run;
-            let character = match bytes.get(self.at) {
-                None => return Err(self.error("unterminated string")),
-                Some(b'"') => {
-                    self.at += 1;
-                    return Ok(());
-                }
-                Some(b'\\') => {
-                    self.at += 1;
-                    self.escape()?
-                }
-                Some(_) => return Err(self.error("control character in a string")),
-            };
-            if let Some(decoded) = decoded.as_deref_mut() {
-                decoded.push(character);
-            }
-        }
-    }
-
-    /// The length of the string from here to its closing quote, which a
-    /// decoded string never exceeds.
-    fn encoded_length(&mut self) -> Result<usize, PayloadError> {
-        let bytes = self.text.as_bytes();
-        let mut end = self.at;
-        loop {
-            end = special_byte(bytes, end);
-            match bytes.get(end) {
-                None => {
-                    self.at = bytes.len();
-                    return Err(self.error("unterminated string"));
-                }
-                Some(b'"') => return Ok(end - self.at),
-                Some(b'\\') => end += 2,
-                Some(_) => end += 1,
-            }
-        }
-    }
-
-    /// The character an escape names, after its backslash.
-    fn escape(&mut self) -> Result<char, PayloadError> {
-        let escaped = self.text.as_bytes().get(self.at).copied();
-        self.at += 1;
-        Ok(match escaped {
-            Some(b'"') => '"',
-            Some(b'\\') => '\\',
-            Some(b'/') => '/',
-            Some(b'b') => '\u{8}',
-            Some(b'f') => '\u{c}',
-            Some(b'n') => '\n',
-            Some(b'r') => '\r',
-            Some(b't') => '\t',
-            Some(b'u') => self.unicode_escape()?,
-            _ => return Err(self.error("invalid escape")),
-        })
-    }
-
-    /// The character a `\u` escape names, after its `\u`: a surrogate pair
-    /// takes two escapes, and a lone surrogate is refused.
-    fn unicode_escape(&mut self) -> Result<char, PayloadError> {
-        let high = self.hex4()?;
-        let code = match high {
-            0xD800..=0xDBFF => {
-                if self.text.as_bytes().get(self.at..self.at + 2) != Some(b"\\u") {
-                    return Err(self.error("lone leading surrogate in a \\u escape"));
-                }
-                self.at += 2;
-                let low = self.hex4()?;
-                if !(0xDC00..=0xDFFF).contains(&low) {
-                    return Err(self.error("lone leading surrogate in a \\u escape"));
-                }
-                0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00)
-            }
-            0xDC00..=0xDFFF => return Err(self.error("lone trailing surrogate in a \\u escape")),
-            code => code,
-        };
-        char::from_u32(code).ok_or_else(|| self.error("invalid \\u escape"))
-    }
-
-    /// Four hex digits, which a string's closing quote is never one of.
-    fn hex4(&mut self) -> Result<u32, PayloadError> {
-        let digits = self
-            .text
-            .get(self.at..self.at + 4)
-            .filter(|digits| digits.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            .ok_or_else(|| self.error("invalid \\u escape"))?;
-        self.at += 4;
-        u32::from_str_radix(digits, 16).map_err(|_| self.error("invalid \\u escape"))
-    }
-}
-
-/// Where the first quote, backslash or control character at or after
-/// `from` is, or the end of `bytes`. Most of a payload is plain value bytes,
-/// so it skips whole chunks first.
-fn special_byte(bytes: &[u8], from: usize) -> usize {
-    let at = skip_plain::<16>(bytes, skip_plain::<64>(bytes, from.min(bytes.len())));
-    bytes[at..]
-        .iter()
-        .position(|&byte| is_special(byte))
-        .map_or(bytes.len(), |offset| at + offset)
-}
-
-/// `at` moved past every whole `N`-byte chunk with no special byte in it.
-fn skip_plain<const N: usize>(bytes: &[u8], mut at: usize) -> usize {
-    while let Some(chunk) = bytes
-        .get(at..at + N)
-        .and_then(|chunk| <&[u8; N]>::try_from(chunk).ok())
-    {
-        // Folding every byte, without stopping early, is what compiles to
-        // vector compares: a scan that stops at the first special byte runs
-        // a byte at a time, four times slower than serde_json's.
-        if chunk
-            .iter()
-            .fold(0_u8, |found, &byte| found | u8::from(is_special(byte)))
-            != 0
-        {
-            break;
-        }
-        at += N;
-    }
-    at
-}
-
-fn is_special(byte: u8) -> bool {
-    (byte == b'"') | (byte == b'\\') | (byte < 0x20)
+        Ok(())
+    })
 }
 
 pub(crate) enum SelectedVaultPayload {
@@ -448,8 +217,8 @@ mod tests {
     use super::*;
 
     /// Payloads with an escape, or a byte a string can't hold, at every
-    /// offset of values longer than the parser's 16-byte steps, in
-    /// `environment` and in another one.
+    /// offset of values long enough to cross the reader's 16- and 64-byte
+    /// steps twice, in `environment` and in another one.
     fn special_bytes_at_every_offset(environment: &str) -> Vec<String> {
         let mut payloads = Vec::new();
         for special in [
@@ -463,8 +232,12 @@ mod tests {
             "\"",
             "\\",
         ] {
-            for offset in 0..40 {
-                let value = format!("{}{special}{}", "x".repeat(offset), "y".repeat(40 - offset));
+            for offset in 0..140 {
+                let value = format!(
+                    "{}{special}{}",
+                    "x".repeat(offset),
+                    "y".repeat(140 - offset)
+                );
                 payloads.push(format!(
                     r#"{{"environments":{{"{environment}":{{"A":"{value}"}},"other":{{"B":"{value}"}}}}}}"#
                 ));
@@ -515,6 +288,10 @@ mod tests {
             r#"{"environments":{"default":{"A":"unterminated}}}"#,
             r#"{"environments":{"default":{"A":"ends in a backslash\"#,
             "\u{feff}{\"environments\":{}}",
+            r#"[{"default":{"A":"1"}}]"#,
+            r#"{"environments":[{"A":"1"}]}"#,
+            r#"{"environments":{"default":{"A":"1","\u0041":"2"}}}"#,
+            r#"{"environments":{"default":{"A":"1"},"\u0064efault":{}}}"#,
         ];
         let long = special_bytes_at_every_offset("default");
         for case in cases.into_iter().chain(long.iter().map(String::as_str)) {
@@ -554,6 +331,10 @@ mod tests {
             "",
             "{}",
             "\u{feff}{\"environments\":{}}",
+            r#"[{"live":{"B":"1"}}]"#,
+            r#"{"environments":{"live":[{"B":"1"}]}}"#,
+            r#"{"environments":{"other":{"B":"1","\u0042":"2"},"live":{"A":"1"}}}"#,
+            r#"{"environments":{"live":{"A":"1"},"\u006cive":{"A":"2"}}}"#,
         ];
         let long = special_bytes_at_every_offset("live");
         for case in cases.into_iter().chain(long.iter().map(String::as_str)) {

@@ -562,6 +562,44 @@
       }
     },
     {
+      "name": "a record written as an array is damaged",
+      "vaultId": "proj",
+      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "record": "[1,\"proj\",{\"development\":{\"set\":{\"A\":\"old\"},\"unset\":[]}}]",
+      "names": null,
+      "edits": [
+        {
+          "action": "set",
+          "environment": "development",
+          "key": "A",
+          "value": "1"
+        }
+      ],
+      "expect": {
+        "result": "refused",
+        "code": "overrides.damaged"
+      }
+    },
+    {
+      "name": "an environment written as an array is damaged",
+      "vaultId": "proj",
+      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "record": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"development\":[{\"A\":\"old\"},[]]}}",
+      "names": null,
+      "edits": [
+        {
+          "action": "set",
+          "environment": "development",
+          "key": "A",
+          "value": "1"
+        }
+      ],
+      "expect": {
+        "result": "refused",
+        "code": "overrides.damaged"
+      }
+    },
+    {
       "name": "a record no marker lists refuses every change",
       "vaultId": "proj",
       "marker": null,

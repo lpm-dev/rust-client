@@ -3092,6 +3092,64 @@ KEY3=no-quotes"#;
 
     #[cfg(not(miri))]
     #[test]
+    fn reading_personal_overrides_leaves_no_copy_of_any_value() {
+        use crate::companion::overrides::{change, evaluate, evaluate_all};
+        use crate::freed_memory_probe::{MARKER, watch};
+        let marker = br#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{"overrides":{"version":1,"ifUnsupported":"refuse","kinds":["overrides"],"state":"active"}}}"#;
+        let gate = crate::companion::assessment::gate_of("proj", Some(marker));
+        // Escaped, as in a PEM private key, in the environment read and in
+        // one only checked.
+        let record = format!(
+            r#"{{"schemaVersion":1,"vaultId":"proj","environments":{{"default":{{"set":{{"TOKEN":"{MARKER}\n-----END-----"}},"unset":[]}},"live":{{"set":{{"OTHER":"{MARKER}\n","QUOTED":"say \"{MARKER}\""}},"unset":["GONE"]}}}}}}"#
+        );
+
+        let (read, found) = watch(|| {
+            let mut overrides =
+                evaluate(&gate, "proj", "default", Some(record.as_bytes())).expect("valid");
+            let read = overrides.set["TOKEN"].starts_with(MARKER);
+            history::wipe_environment(&mut overrides.set);
+            read
+        });
+        assert!(read);
+        assert!(!found, "one environment's overrides leave nothing behind");
+
+        let (read, found) = watch(|| {
+            let mut every = evaluate_all(&gate, "proj", Some(record.as_bytes())).expect("valid");
+            let read = every["live"].set["OTHER"].starts_with(MARKER);
+            for overrides in every.values_mut() {
+                history::wipe_environment(&mut overrides.set);
+            }
+            read
+        });
+        assert!(read);
+        assert!(!found, "every environment's overrides leave nothing behind");
+
+        let ((), found) = watch(|| {
+            let planned = change::plan_change(
+                "proj",
+                &gate,
+                Some(record.as_bytes()),
+                &[change::Edit::Remove {
+                    environment: "live".to_owned(),
+                    key: "GONE".to_owned(),
+                }],
+                None,
+            );
+            drop(planned);
+        });
+        assert!(!found, "a plan's read of the record leaves nothing behind");
+
+        let damaged = format!(
+            r#"{{"schemaVersion":1,"vaultId":"proj","environments":{{"default":{{"set":{{"TOKEN":"{MARKER}\n"}},"unset":[]}},"live":{{"set":{{"OTHER":1}},"unset":[]}}}}}}"#
+        );
+        let (refused, found) =
+            watch(|| evaluate_all(&gate, "proj", Some(damaged.as_bytes())).is_err());
+        assert!(refused);
+        assert!(!found, "a record that doesn't read leaves nothing behind");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
     fn parsing_leaves_no_copy_of_a_value_a_later_line_replaces_or_a_quoted_value_outgrows() {
         use crate::freed_memory_probe::{MARKER, watch};
         let continued = "x".repeat(4096);

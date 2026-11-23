@@ -7,18 +7,20 @@
 //! }}
 //! ```
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
+use lpm_common::stored_env::json::{ReadError, Reader, line_and_column};
 use lpm_common::stored_env::{is_valid_environment_name, is_valid_variable_name};
-use serde::{Deserialize, Deserializer};
+use zeroize::Zeroizing;
 
 use crate::gate::{Damage, ProjectGate};
-use crate::marker::{
-    FeatureEntry, FeatureState, Level, MAX_RECORD_BYTES, UniqueMapVisitor, describe_json_error,
-};
+use crate::marker::{FeatureEntry, FeatureState, Level, MAX_RECORD_BYTES};
 
 pub mod change;
+#[cfg(test)]
+mod serde_oracle;
 
 pub const OVERRIDES_KIND: &str = "overrides";
 /// The version of the record this client writes.
@@ -86,37 +88,42 @@ fn invalid(reason: impl Into<String>) -> InvalidOverrides {
     InvalidOverrides(reason.into())
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct OverridesRecord {
-    schema_version: u16,
-    vault_id: String,
-    #[serde(deserialize_with = "unique_environments")]
-    environments: BTreeMap<String, EnvironmentEntry>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+/// An environment's overrides as the record holds them. Values are wiped
+/// when dropped, so a record that fails to read leaves none behind.
+#[derive(Default)]
 struct EnvironmentEntry {
-    #[serde(deserialize_with = "unique_values")]
-    set: BTreeMap<String, String>,
+    set: BTreeMap<String, Zeroizing<String>>,
     unset: Vec<String>,
 }
 
-fn unique_environments<'de, D>(
-    deserializer: D,
-) -> Result<BTreeMap<String, EnvironmentEntry>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserializer.deserialize_map(UniqueMapVisitor(std::marker::PhantomData))
+impl EnvironmentEntry {
+    fn into_overrides(self) -> PersonalOverrides {
+        PersonalOverrides {
+            set: self
+                .set
+                .into_iter()
+                .map(|(key, mut value)| (key, std::mem::take(&mut *value)))
+                .collect(),
+            unset: self.unset,
+        }
+    }
 }
 
-fn unique_values<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserializer.deserialize_map(UniqueMapVisitor(std::marker::PhantomData))
+/// What every environment of a record names, which the record's rules
+/// judge whether or not its values are kept: each set name with whether
+/// its value holds a NUL, and the unset names.
+#[derive(Default)]
+struct EntryNames<'a> {
+    set: BTreeMap<Cow<'a, str>, bool>,
+    unset: Vec<String>,
+}
+
+/// Which environments a read of the record keeps the values of. Every other
+/// one is checked in place.
+#[derive(Clone, Copy)]
+enum Keep<'a> {
+    Every,
+    One(&'a str),
 }
 
 /// Validate the whole record stored for `vault_id`, then keep only
@@ -137,20 +144,12 @@ pub fn parse_all(
     vault_id: &str,
     version: u16,
 ) -> Result<BTreeMap<String, PersonalOverrides>, InvalidOverrides> {
-    let record = parse_record(bytes, vault_id, version, cfg!(windows))?;
-    Ok(record
-        .environments
-        .into_iter()
-        .map(|(name, entry)| {
-            (
-                name,
-                PersonalOverrides {
-                    set: entry.set.into_iter().collect(),
-                    unset: entry.unset,
-                },
-            )
-        })
-        .collect())
+    Ok(
+        read_record(bytes, vault_id, version, cfg!(windows), Keep::Every)?
+            .into_iter()
+            .map(|(name, entry)| (name, entry.into_overrides()))
+            .collect(),
+    )
 }
 
 /// The selected environment's personal overrides, from the overrides record
@@ -204,33 +203,133 @@ fn evaluate_with<T: Default>(
     }
 }
 
-fn parse_record(
+/// Reads the record stored for `vault_id` by the rules serde applies to it,
+/// objects only: the fields `schemaVersion` (the marker's `version`),
+/// `vaultId` and `environments`, each environment's `set` and `unset`, no
+/// other field and none twice. Every environment is judged, and the values
+/// of those `keep` names are kept. It reads with [`Reader`], which leaves no
+/// copy of a value.
+fn read_record(
     bytes: &[u8],
     vault_id: &str,
     version: u16,
     case_insensitive: bool,
-) -> Result<OverridesRecord, InvalidOverrides> {
+    keep: Keep<'_>,
+) -> Result<BTreeMap<String, EnvironmentEntry>, InvalidOverrides> {
     if bytes.len() > MAX_RECORD_BYTES {
         return Err(invalid("the personal overrides are too large"));
     }
-    let record: OverridesRecord = serde_json::from_slice(bytes).map_err(|error| {
-        invalid(format!(
-            "the personal overrides are malformed: {}",
-            describe_json_error(&error)
-        ))
-    })?;
-    if record.schema_version != version {
+    let text =
+        std::str::from_utf8(bytes).map_err(|error| malformed(bytes, error.valid_up_to(), true))?;
+    let mut kept = BTreeMap::new();
+    let mut names = BTreeMap::new();
+    let (mut schema_version, mut record_vault_id, mut found_environments) = (None, None, false);
+    let mut reader = Reader::new(text);
+    reader
+        .object(|reader, field| match &*field {
+            "schemaVersion" if schema_version.is_none() => {
+                schema_version = Some(reader.u16()?);
+                Ok(())
+            }
+            "vaultId" if record_vault_id.is_none() => {
+                record_vault_id = Some(reader.string()?);
+                Ok(())
+            }
+            "environments" if !std::mem::replace(&mut found_environments, true) => {
+                reader.object(|reader, name| {
+                    if names.contains_key(&name) {
+                        return Err(reader.unexpected("an environment named twice"));
+                    }
+                    let keeps = match keep {
+                        Keep::Every => true,
+                        Keep::One(selected) => name == selected,
+                    };
+                    let (entry_names, entry) = read_entry(reader, keeps)?;
+                    if let Some(entry) = entry {
+                        kept.insert(name.clone().into_owned(), entry);
+                    }
+                    names.insert(name, entry_names);
+                    Ok(())
+                })
+            }
+            _ => Err(reader.unexpected("an unknown or repeated field")),
+        })
+        .and_then(|()| reader.end())
+        .map_err(|error| malformed_at(bytes, &error))?;
+    let (Some(schema_version), Some(record_vault_id), true) =
+        (schema_version, record_vault_id, found_environments)
+    else {
+        return Err(malformed(bytes, bytes.len(), false));
+    };
+    if schema_version != version {
         return Err(invalid(
             "the personal overrides' version differs from the feature marker's",
         ));
     }
-    if record.vault_id != vault_id {
+    if record_vault_id != vault_id {
         return Err(invalid("the personal overrides name another env project"));
     }
-    for (name, entry) in &record.environments {
-        validate_environment(name, entry, case_insensitive)?;
+    for (name, entry_names) in &names {
+        validate_environment(name, entry_names, case_insensitive)?;
     }
-    Ok(record)
+    Ok(kept)
+}
+
+/// One environment's `set` and `unset`, with its values kept when `keep`.
+fn read_entry<'a>(
+    reader: &mut Reader<'a>,
+    keep: bool,
+) -> Result<(EntryNames<'a>, Option<EnvironmentEntry>), ReadError> {
+    let mut names = EntryNames::default();
+    let mut entry = keep.then(EnvironmentEntry::default);
+    let (mut found_set, mut found_unset) = (false, false);
+    reader.object(|reader, field| match &*field {
+        "set" if !std::mem::replace(&mut found_set, true) => reader.object(|reader, key| {
+            if names.set.contains_key(&key) {
+                return Err(reader.unexpected("a name set twice"));
+            }
+            let nul = match entry.as_mut() {
+                Some(entry) => {
+                    let value = Zeroizing::new(reader.string()?);
+                    let nul = value.contains('\0');
+                    entry.set.insert(key.clone().into_owned(), value);
+                    nul
+                }
+                None => reader.skip_string()?,
+            };
+            names.set.insert(key, nul);
+            Ok(())
+        }),
+        "unset" if !std::mem::replace(&mut found_unset, true) => reader.array(|reader| {
+            names.unset.push(reader.string()?);
+            Ok(())
+        }),
+        _ => Err(reader.unexpected("an unknown or repeated field")),
+    })?;
+    if !(found_set && found_unset) {
+        return Err(reader.unexpected("a missing field"));
+    }
+    if let Some(entry) = entry.as_mut() {
+        entry.unset.clone_from(&names.unset);
+    }
+    Ok((names, entry))
+}
+
+fn malformed_at(bytes: &[u8], error: &ReadError) -> InvalidOverrides {
+    malformed(bytes, error.offset(), error.is_syntax())
+}
+
+/// Where the record stopped reading, never what it holds.
+fn malformed(bytes: &[u8], offset: usize, syntax: bool) -> InvalidOverrides {
+    let (line, column) = line_and_column(bytes, offset);
+    let problem = if syntax {
+        "invalid JSON"
+    } else {
+        "an unexpected field or value"
+    };
+    invalid(format!(
+        "the personal overrides are malformed: {problem} at line {line}, column {column}"
+    ))
 }
 
 fn parse_selected_with_case_policy(
@@ -240,20 +339,21 @@ fn parse_selected_with_case_policy(
     environment: &str,
     case_insensitive: bool,
 ) -> Result<PersonalOverrides, InvalidOverrides> {
-    let mut record = parse_record(bytes, vault_id, version, case_insensitive)?;
-    Ok(record
-        .environments
-        .remove(environment)
-        .map(|entry| PersonalOverrides {
-            set: entry.set.into_iter().collect(),
-            unset: entry.unset,
-        })
-        .unwrap_or_default())
+    Ok(read_record(
+        bytes,
+        vault_id,
+        version,
+        case_insensitive,
+        Keep::One(environment),
+    )?
+    .remove(environment)
+    .map(EnvironmentEntry::into_overrides)
+    .unwrap_or_default())
 }
 
 fn validate_environment(
     name: &str,
-    entry: &EnvironmentEntry,
+    entry: &EntryNames<'_>,
     case_insensitive: bool,
 ) -> Result<(), InvalidOverrides> {
     if !is_valid_environment_name(name) {
@@ -274,9 +374,9 @@ fn validate_environment(
             seen.insert(key.to_owned())
         }
     };
-    for (key, value) in &entry.set {
+    for (key, &nul) in &entry.set {
         validate_key(key)?;
-        if value.contains('\0') {
+        if nul {
             return Err(invalid(format!(
                 "the personal override of {key} contains a NUL character"
             )));
@@ -310,7 +410,194 @@ fn validate_key(key: &str) -> Result<(), InvalidOverrides> {
 
 #[cfg(test)]
 mod tests {
+    use super::serde_oracle::parse_all_with_serde;
     use super::*;
+
+    const ACTIVE_MARKER: &str = r#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{"overrides":{"version":1,"ifUnsupported":"refuse","kinds":["overrides"],"state":"active"}}}"#;
+
+    fn record(environments: &str) -> String {
+        format!(r#"{{"schemaVersion":1,"vaultId":"proj","environments":{{{environments}}}}}"#)
+    }
+
+    /// Records the reader and serde must agree on: valid ones, every rule a
+    /// record breaks, and escapes or bytes a string can't hold at every
+    /// offset of values that cross the reader's 16- and 64-byte steps, in
+    /// an environment read and one only checked.
+    fn records() -> Vec<Vec<u8>> {
+        let mut records: Vec<Vec<u8>> = [
+            record(""),
+            record(r#""development":{"set":{"A":"1","B":""},"unset":["C"]},"staging":{"set":{},"unset":["D"]}"#),
+            record(r#""development":{"set":{"A":"line\nbreak \"quoted\" back\\slash \/ \b\f\r\t é中😀 é 😀"},"unset":[]}"#),
+            record(r#""development":{"set":{"A":"a\u0000b"},"unset":[]}"#),
+            record(r#""staging":{"set":{"A":"a\u0000b"},"unset":[]},"development":{"set":{"B":"1"},"unset":[]}"#),
+            record(r#""development":{"set":{},"unset":[]}"#),
+            record(r#""bad name":{"set":{"A":"1"},"unset":[]}"#),
+            record(r#""development":{"set":{"1BAD":"1"},"unset":[]}"#),
+            record(r#""development":{"set":{},"unset":["BAD-NAME"]}"#),
+            record(r#""development":{"set":{"A":"1"},"unset":["A"]}"#),
+            record(r#""development":{"set":{"A":"1","a":"2"},"unset":[]}"#),
+            record(r#""development":{"set":{"A":"1"},"unset":["a"]}"#),
+            record(r#""development":{"set":{"A":"1","A":"2"},"unset":[]}"#),
+            record(r#""development":{"set":{"A":"1","A":"2"},"unset":[]}"#),
+            record(r#""development":{"set":{"A":"1"},"unset":[]},"development":{"set":{"B":"1"},"unset":[]}"#),
+            record(r#""development":{"set":{"A":"1"},"unset":[]},"development":{"set":{"B":"1"},"unset":[]}"#),
+            record(r#""development":{"set":{"A":1},"unset":[]}"#),
+            record(r#""development":{"set":{"A":null},"unset":[]}"#),
+            record(r#""development":{"set":{"A":"1"},"unset":"B"}"#),
+            record(r#""development":{"set":{"A":"1"},"unset":[1]}"#),
+            record(r#""development":{"set":{"A":"1"},"unset":["B",]}"#),
+            record(r#""development":{"set":{"A":"1"}}"#),
+            record(r#""development":{"unset":[]}"#),
+            record(r#""development":{"set":{"A":"1"},"unset":[],"extra":true}"#),
+            record(r#""development":{"set":{"A":"1"},"set":{"B":"1"},"unset":[]}"#),
+            record(r#""development":{"set":{"A":"1"},"unset":[],"unset":[]}"#),
+            r#"{"schemaVersion":2,"vaultId":"proj","environments":{}}"#.to_owned(),
+            r#"{"schemaVersion":1,"vaultId":"other","environments":{}}"#.to_owned(),
+            r#"{"schemaVersion":1.0,"vaultId":"proj","environments":{}}"#.to_owned(),
+            r#"{"schemaVersion":01,"vaultId":"proj","environments":{}}"#.to_owned(),
+            r#"{"schemaVersion":-1,"vaultId":"proj","environments":{}}"#.to_owned(),
+            r#"{"schemaVersion":"1","vaultId":"proj","environments":{}}"#.to_owned(),
+            r#"{"schemaVersion":70000,"vaultId":"proj","environments":{}}"#.to_owned(),
+            r#"{"vaultId":"proj","environments":{}}"#.to_owned(),
+            r#"{"schemaVersion":1,"environments":{}}"#.to_owned(),
+            r#"{"schemaVersion":1,"vaultId":"proj"}"#.to_owned(),
+            r#"{"schemaVersion":1,"vaultId":"proj","environments":{},"extra":1}"#.to_owned(),
+            r#"{"schemaVersion":1,"vaultId":"proj","vaultId":"proj","environments":{}}"#.to_owned(),
+            r#"{"schemaVersion":1,"vaultId":"proj","environments":{}} x"#.to_owned(),
+            " {\n \"schemaVersion\" : 1 ,\t\"vaultId\" : \"proj\" , \"environments\" : { } }\r\n".to_owned(),
+            r#"{"schemaVersion":1,"vaultId":"proj","environments":{}}"#.to_owned(),
+            "\u{feff}{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{}}".to_owned(),
+            String::new(),
+            "{".to_owned(),
+            "null".to_owned(),
+            "[]".to_owned(),
+        ]
+        .into_iter()
+        .map(String::into_bytes)
+        .collect();
+        records
+            .push(b"{\"schemaVersion\":1,\"vaultId\":\"proj\xff\",\"environments\":{}}".to_vec());
+        records.push(
+            record(&format!(
+                r#""development":{{"set":{{"A":"{}"}},"unset":[]}}"#,
+                "x".repeat(MAX_RECORD_BYTES)
+            ))
+            .into_bytes(),
+        );
+        for special in [
+            "\\n",
+            "\\\"",
+            "\\\\",
+            "\\u00e9",
+            "\\ud83d\\ude00",
+            "\\u0000",
+            "\n",
+            "\u{1f}",
+            "\"",
+            "\\",
+        ] {
+            for offset in 0..140 {
+                let value = format!(
+                    "{}{special}{}",
+                    "x".repeat(offset),
+                    "y".repeat(140 - offset)
+                );
+                records.push(
+                    record(&format!(
+                        r#""development":{{"set":{{"A":"{value}"}},"unset":[]}},"staging":{{"set":{{"B":"{value}"}},"unset":[]}}"#
+                    ))
+                    .into_bytes(),
+                );
+            }
+        }
+        records
+    }
+
+    fn agree<T: PartialEq + fmt::Debug>(
+        case: &[u8],
+        ours: Result<T, InvalidOverrides>,
+        serde: Result<T, InvalidOverrides>,
+    ) {
+        let malformed =
+            |error: &InvalidOverrides| error.0.starts_with("the personal overrides are malformed");
+        match (ours, serde) {
+            (Ok(ours), Ok(serde)) => assert_eq!(ours, serde, "{}", String::from_utf8_lossy(case)),
+            (Err(ours), Err(serde)) if malformed(&serde) => {
+                assert!(
+                    malformed(&ours),
+                    "{}: {ours}",
+                    String::from_utf8_lossy(case)
+                );
+            }
+            (Err(ours), Err(serde)) => {
+                assert_eq!(ours, serde, "{}", String::from_utf8_lossy(case));
+            }
+            (ours, serde) => panic!(
+                "{}: ours {ours:?}, serde {serde:?}",
+                String::from_utf8_lossy(case)
+            ),
+        }
+    }
+
+    #[test]
+    fn the_record_reader_agrees_with_serde_on_every_record() {
+        for case in records() {
+            for case_insensitive in [false, true] {
+                let serde = parse_all_with_serde(&case, "proj", 1, case_insensitive);
+                agree(
+                    &case,
+                    read_record(&case, "proj", 1, case_insensitive, Keep::Every).map(|every| {
+                        every
+                            .into_iter()
+                            .map(|(name, entry)| (name, entry.into_overrides()))
+                            .collect::<BTreeMap<_, _>>()
+                    }),
+                    serde.clone(),
+                );
+                for environment in ["development", "staging", "missing"] {
+                    agree(
+                        &case,
+                        parse_selected_with_case_policy(
+                            &case,
+                            "proj",
+                            1,
+                            environment,
+                            case_insensitive,
+                        ),
+                        serde
+                            .clone()
+                            .map(|mut every| every.remove(environment).unwrap_or_default()),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_record_or_an_environment_written_as_an_array_is_refused() {
+        for case in [
+            r#"[1,"proj",{}]"#.to_owned(),
+            record(r#""development":[{"A":"1"},[]]"#),
+        ] {
+            assert!(
+                parse_all_with_serde(case.as_bytes(), "proj", 1, false).is_ok(),
+                "serde's derived structs take {case}"
+            );
+            let refused = parse_all(case.as_bytes(), "proj", 1).expect_err("objects only");
+            assert!(
+                refused.0.starts_with("the personal overrides are malformed: an unexpected field or value at line 1, column "),
+                "{refused}"
+            );
+            let gate = crate::assessment::gate_of("proj", Some(ACTIVE_MARKER.as_bytes()));
+            assert!(
+                matches!(
+                    evaluate(&gate, "proj", "development", Some(case.as_bytes())),
+                    Err(Damage::InvalidRecord { .. })
+                ),
+                "an Apply read finds it damaged"
+            );
+        }
+    }
 
     fn parse(json: &str, environment: &str) -> Result<PersonalOverrides, InvalidOverrides> {
         parse_selected_with_case_policy(json.as_bytes(), "proj", 1, environment, false)

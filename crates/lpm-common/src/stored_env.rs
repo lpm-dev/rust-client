@@ -1,6 +1,8 @@
 //! The names the CLI and the LPM Vault app accept for the env projects they
 //! keep in the credential store.
 
+pub mod json;
+
 /// The longest vault ID.
 pub const MAX_VAULT_ID_BYTES: usize = 128;
 /// The longest environment name.
