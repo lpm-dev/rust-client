@@ -597,7 +597,18 @@ async fn global_list_outdated_hydrates_release_times_four_at_a_time_and_refills_
         .and(wiremock::matchers::path_regex(
             r"^/parallel-outdated-[0-9]+$",
         ))
+        .and(wiremock::matchers::header("accept", "application/json"))
         .respond_with(global_outdated_packument)
+        .with_priority(1)
+        .expect(PACKAGE_COUNT as u64)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path_regex(
+            r"^/parallel-outdated-[0-9]+$",
+        ))
+        .respond_with(global_outdated_packument)
+        .with_priority(2)
         .mount(&server)
         .await;
     let mut gate = RequestGate::start(&server.uri(), |request| {
@@ -631,6 +642,7 @@ async fn global_list_outdated_hydrates_release_times_four_at_a_time_and_refills_
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+    gate.assert_held(PACKAGE_COUNT);
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["count_outdated"], PACKAGE_COUNT);
 }

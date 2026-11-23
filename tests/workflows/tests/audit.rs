@@ -19,7 +19,7 @@ use support::mock_registry::{
     MockRegistry, RegistrySigningFixture, compute_integrity, make_tarball,
     make_tarball_from_pkg_json, make_tarball_with_files,
 };
-use support::request_gate::{RequestGate, run_while};
+use support::request_gate::{HeldRequest, RequestGate, run_while};
 use support::{
     TempProject, VALID_TEST_INTEGRITY, lpm, lpm_spawnable_with_registry, lpm_with_registry,
 };
@@ -1452,6 +1452,7 @@ async fn audit_starts_registry_and_osv_requests_concurrently() {
         .respond_with(
             ResponseTemplate::new(200).set_body_raw(registry_body, "application/x-ndjson"),
         )
+        .expect(1)
         .with_priority(1)
         .mount(mock.server())
         .await;
@@ -1472,7 +1473,20 @@ async fn audit_starts_registry_and_osv_requests_concurrently() {
     command
         .env("LPM_OSV_URL", format!("{}/v1/querybatch", gate.url()))
         .args(["--json", "audit"]);
-    let output = run_while(command, gate.hold_a_bounded_pool(2, 2)).await;
+    let output = run_while(command, async {
+        let held = [gate.next().await, gate.next().await];
+        let mut targets = held.each_ref().map(|request| request.target().to_owned());
+        targets.sort();
+        assert_eq!(
+            targets,
+            ["/api/registry/batch-metadata", "/v1/querybatch"],
+            "the registry and OSV requests were in flight together"
+        );
+        gate.assert_quiet("more than the registry and OSV requests were in flight")
+            .await;
+        held.into_iter().for_each(HeldRequest::release);
+    })
+    .await;
 
     assert!(
         output.status.success(),

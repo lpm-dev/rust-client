@@ -288,8 +288,9 @@ impl RequestGate {
 
     /// Holds the first `limit` requests and checks that no other starts
     /// while they're held. Then, until `total` have started, it lets the
-    /// oldest through and waits for another to start while the rest are
-    /// still held; then it lets the rest through.
+    /// oldest through, waits for another to start while the rest are still
+    /// held, and checks again that no other starts; then it lets the rest
+    /// through.
     ///
     /// A command that runs fewer than `limit` at once, or waits for a whole
     /// wave before it starts more, never sends a request this waits for,
@@ -299,15 +300,16 @@ impl RequestGate {
             (1..=total).contains(&limit),
             "a pool of {limit} for {total} requests"
         );
+        let over_the_limit = format!("more than {limit} requests were in flight");
         let mut held = VecDeque::with_capacity(limit);
         for _ in 0..limit {
             held.push_back(self.next().await);
         }
-        self.assert_quiet(&format!("more than {limit} requests were in flight"))
-            .await;
+        self.assert_quiet(&over_the_limit).await;
         for _ in limit..total {
             held.pop_front().expect("a held request").release();
             held.push_back(self.next().await);
+            self.assert_quiet(&over_the_limit).await;
         }
         held.into_iter().for_each(HeldRequest::release);
         assert_eq!(self.peak(), limit, "the most requests in flight at once");
@@ -449,32 +451,76 @@ pub fn query_value(parts: &Parts, key: &str) -> Option<String> {
 
 /// Runs `command` while `drive` lets the requests it holds through, and
 /// returns the command's output once both are done. The test fails, showing
-/// that output, if the command exits before `drive` is done.
+/// that output, if the command exits before `drive` is done, if `drive`
+/// fails, or if the command doesn't finish after it.
 pub async fn run_while(command: std::process::Command, drive: impl Future<Output = ()>) -> Output {
+    use futures_util::FutureExt as _;
     let mut command = tokio::process::Command::from(command);
     command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let output = command.spawn().expect("spawn lpm").wait_with_output();
-    tokio::pin!(output);
-    tokio::select! {
+    let mut child = command.spawn().expect("spawn lpm");
+    let stdout = read_to_end(child.stdout.take().expect("piped stdout"));
+    let stderr = read_to_end(child.stderr.take().expect("piped stderr"));
+    let driven = std::panic::AssertUnwindSafe(drive).catch_unwind();
+    tokio::pin!(driven);
+    let early = tokio::select! {
         biased;
-        () = drive => {}
-        finished = &mut output => {
-            let output = finished.expect("wait for lpm");
-            panic!(
-                "lpm exited ({}) before the test let its requests through\nstdout: {}\nstderr: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-        }
+        driven = &mut driven => match driven {
+            Ok(()) => None,
+            Err(panic) => Some(format!("the test failed: {}", panic_message(&*panic))),
+        },
+        status = child.wait() => Some(format!(
+            "lpm exited ({}) before the test let its requests through",
+            status.expect("wait for lpm")
+        )),
+    };
+    let status = match early {
+        Some(reason) => Err(reason),
+        None => tokio::time::timeout(WAIT_LIMIT, child.wait())
+            .await
+            .map_err(|_| format!("lpm didn't finish within {WAIT_LIMIT:?} of the test's last step"))
+            .map(|status| status.expect("wait for lpm")),
+    };
+    if status.is_err() {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
     }
-    tokio::time::timeout(WAIT_LIMIT, output)
-        .await
-        .unwrap_or_else(|_| {
-            panic!("lpm didn't finish within {WAIT_LIMIT:?} of the test's last step")
-        })
-        .expect("wait for lpm")
+    let output = Output {
+        status: match &status {
+            Ok(status) => *status,
+            Err(_) => child.wait().await.expect("wait for lpm"),
+        },
+        stdout: stdout.await.expect("read lpm's stdout"),
+        stderr: stderr.await.expect("read lpm's stderr"),
+    };
+    if let Err(reason) = status {
+        panic!(
+            "{reason}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    output
+}
+
+/// Everything `pipe` gives until it closes, read alongside the command.
+fn read_to_end(
+    mut pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+) -> tokio::task::JoinHandle<Vec<u8>> {
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt as _;
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes).await;
+        bytes
+    })
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("a panic without a message")
 }

@@ -123,21 +123,6 @@ fn preflight_for_a_new_version(request: &Request) -> ResponseTemplate {
     }))
 }
 
-/// The first package's preflight answers without saying whether the
-/// version exists, which fails it; the others answer normally.
-fn preflight_failing_for_the_first_package(request: &Request) -> ResponseTemplate {
-    let query: std::collections::HashMap<_, _> = request.url.query_pairs().into_owned().collect();
-    let name = query.get("name").cloned().unwrap_or_default();
-    if name.ends_with("package-0") {
-        return ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "success": true,
-            "name": name,
-            "version": "1.0.0"
-        }));
-    }
-    preflight_for_a_new_version(request)
-}
-
 fn npm_packument_without_versions(request: &Request) -> ResponseTemplate {
     let name = request.url.path().trim_start_matches('/');
     ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1168,14 +1153,26 @@ async fn release_publish_preflight_stops_the_delayed_tail_after_the_first_error(
         );
     }
     let server = MockServer::start().await;
+    let (answered, mut first_answered) = tokio::sync::mpsc::unbounded_channel();
+    // The first package's preflight answers without saying whether the
+    // version exists, which fails it.
     Mock::given(method("GET"))
         .and(path(PUBLISH_PREFLIGHT_PATH))
-        .respond_with(preflight_failing_for_the_first_package)
+        .and(query_param("name", "@lpm.dev/acme.package-0"))
+        .respond_with(move |_: &Request| {
+            let _ = answered.send(());
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "name": "@lpm.dev/acme.package-0",
+                "version": "1.0.0"
+            }))
+        })
+        .expect(1)
         .mount(&server)
         .await;
     let gate = RequestGate::stalling(&server.uri(), |request| {
         request.uri.path() == PUBLISH_PREFLIGHT_PATH
-            && query_value(request, "name").is_none_or(|name| !name.ends_with("package-0"))
+            && query_value(request, "name").as_deref() != Some("@lpm.dev/acme.package-0")
     });
 
     let mut command = lpm_spawnable_with_registry(&project, gate.url());
@@ -1187,12 +1184,26 @@ async fn release_publish_preflight_stops_the_delayed_tail_after_the_first_error(
         "--dry-run",
         "--json",
     ]);
-    let output = run_while(command, std::future::ready(())).await;
+    let output = run_while(command, async {
+        tokio::time::timeout(support::request_gate::WAIT_LIMIT, first_answered.recv())
+            .await
+            .expect("the first package's preflight, which starts the first window, never started")
+            .expect("the mock answered");
+    })
+    .await;
 
     assert!(
         !output.status.success(),
         "a failed first preflight must fail the release\nstdout: {}",
         String::from_utf8_lossy(&output.stdout),
+    );
+    let envelope = parse_json_output(&output.stdout);
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("publish preflight response")
+                && error.contains("packageExists")),
+        "the release failed for the first package's answer: {envelope:#}"
     );
     assert!(
         gate.held() <= 3,
