@@ -192,7 +192,7 @@ mod tty {
     }
 
     #[test]
-    fn override_clear_of_every_environment_counts_each_one_it_asks_about() {
+    fn override_clear_of_every_environment_names_each_one_it_asks_about() {
         let (project, lpm_home) = project();
         for args in [
             &["env", "override", "set", "API_URL=mine", "OTHER=mine"][..],
@@ -218,7 +218,9 @@ mod tty {
 
         assert!(declined.status.success(), "{}", declined.transcript);
         assert!(
-            declined.transcript.contains("(default: 2, staging: 1)?"),
+            declined
+                .transcript
+                .contains("(default: API_URL, OTHER; staging: API_URL)?"),
             "{}",
             declined.transcript
         );

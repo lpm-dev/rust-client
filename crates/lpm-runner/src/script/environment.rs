@@ -285,8 +285,8 @@ pub fn load_script_child_env_with_config(
         false,
         policy,
     )?;
-    let mut vars = loaded.take_child_env()?;
     let vault_values = loaded.layers.vault_values_identity();
+    let mut vars = loaded.take_child_env()?;
     let personal_overrides = vars.override_count();
     let project_overrides = vars.overrides_identity();
     mark_script_child_env(&mut vars);

@@ -334,3 +334,23 @@ fn debug_output_of_the_layers_and_the_composed_child_names_keys_and_never_values
     assert!(!printed.contains("fixture-"), "{printed}");
     assert!(printed.contains("API_URL"), "{printed}");
 }
+
+#[test]
+fn the_vault_s_values_go_once_the_child_s_environment_is_taken() {
+    let values = map(&[("API_URL", "team")]);
+    let mut layers = ProjectEnvLayers {
+        vars: values.clone(),
+        vault_count: 1,
+        vault_values: values,
+        ..ProjectEnvLayers::default()
+    };
+    let identity = layers.vault_values_identity();
+
+    layers.take_child_env().expect("the child's environment");
+
+    assert!(identity.is_some());
+    assert!(
+        layers.vault_values.is_empty(),
+        "no copy of the values is held while the child runs"
+    );
+}

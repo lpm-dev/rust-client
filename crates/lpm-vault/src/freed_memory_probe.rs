@@ -236,11 +236,20 @@ pub(crate) fn watch<T>(body: impl FnOnce() -> T) -> (T, bool) {
 /// Runs `body`, returning the most it held on this thread at once beyond
 /// what the thread held before: bytes allocated less those freed.
 pub(crate) fn most_held<T>(body: impl FnOnce() -> T) -> (T, usize) {
+    /// This thread's measuring, which ends when it's dropped, even by a
+    /// panic.
+    struct Measuring;
+    impl Drop for Measuring {
+        fn drop(&mut self) {
+            MEASURED.with(|measured| measured.set(false));
+        }
+    }
     HELD.with(|held| held.set(0));
     MOST_HELD.with(|most| most.set(0));
     MEASURED.with(|measured| measured.set(true));
+    let measuring = Measuring;
     let output = body();
-    MEASURED.with(|measured| measured.set(false));
+    drop(measuring);
     (
         output,
         usize::try_from(MOST_HELD.with(Cell::get)).unwrap_or_default(),
@@ -302,6 +311,13 @@ fn the_most_held_counts_what_was_alive_at_once() {
         drop((second, third));
     });
     assert!((3 << 20..(3 << 20) + 4096).contains(&most), "{most}");
+}
+
+#[test]
+fn a_panic_while_measuring_leaves_the_thread_unmeasured() {
+    let unwound = std::panic::catch_unwind(|| most_held(|| panic!("measured")));
+    assert!(unwound.is_err());
+    assert!(!MEASURED.with(Cell::get));
 }
 
 #[test]

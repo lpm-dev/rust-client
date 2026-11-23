@@ -13,7 +13,7 @@ use lpm_common::stored_env::is_safe_vault_id;
 use lpm_env_companion::budgets::ADMISSION_CAP;
 use lpm_env_companion::gate::{GateError, Operation, ProjectGate};
 use lpm_env_companion::lifecycle::{Mutation, needs_resume};
-use lpm_env_companion::marker::{MAX_RECORD_BYTES, Marker};
+use lpm_env_companion::marker::MAX_RECORD_BYTES;
 use lpm_env_companion::overrides::change::{
     ChangePlan, Edit, EditError, Effect, EnvironmentMove, Inventory, InventoryNeed, PlanError,
     check_edit, check_set, check_writable, plan_change, plan_without_values,
@@ -43,16 +43,7 @@ const DOMAIN: Domain = Domain {
     input_blobs: MAX_EDITS + 2,
 };
 
-/// The gate the marker read in the caller's lock gives.
-pub(crate) fn gate_of(vault_id: &str, marker: Option<&[u8]>) -> ProjectGate {
-    match marker {
-        None => ProjectGate::Plain,
-        Some(bytes) => match Marker::parse(vault_id, bytes) {
-            Ok(marker) => ProjectGate::Marked(marker),
-            Err(error) => ProjectGate::Damaged(error.into()),
-        },
-    }
-}
+pub(crate) use lpm_env_companion::assessment::gate_of;
 
 fn gate_code(error: &GateError) -> &'static str {
     match error {

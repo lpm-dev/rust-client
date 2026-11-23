@@ -89,7 +89,7 @@ impl TaskMarker {
 
 /// Why what a task built can't be cached under its key, the most specific
 /// reason first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Unkeyed {
     /// An `lpm` the task started changed personal overrides.
     Changed,
@@ -106,8 +106,9 @@ pub enum Unkeyed {
     /// The marker was gone, or couldn't be listed, once the task ended, as
     /// when the task empties the temporary folder.
     Unlisted,
-    /// The marker holds a file no `lpm` adds.
-    Foreign,
+    /// The marker holds a file no `lpm` adds, named here, as the file
+    /// system gave it.
+    Foreign(String),
     /// The task has no marker of its own (see [`TaskMarker::unwatched`]).
     Unwatched,
 }
@@ -121,19 +122,25 @@ fn unkeyed(directory: &Path, keyed: &[String]) -> Option<Unkeyed> {
     for entry in entries {
         let reason = match entry {
             Err(_) => Unkeyed::Unlisted,
-            Ok(entry) => match entry.file_name().to_str() {
-                Some(name) if keyed.iter().any(|keyed| keyed == name) => continue,
-                Some(name) => match Reported::of_entry(name) {
-                    Some(Reported::Change) => return Some(Unkeyed::Changed),
-                    Some(Reported::Environment | Reported::Overrides) => Unkeyed::Used,
-                    Some(Reported::Environments) => Unkeyed::EveryEnvironment,
-                    Some(Reported::Uncertain) => Unkeyed::Untold,
-                    None => Unkeyed::Foreign,
-                },
-                None => Unkeyed::Foreign,
-            },
+            Ok(entry) => {
+                let name = entry.file_name();
+                match name.to_str() {
+                    Some(name) if keyed.iter().any(|keyed| keyed == name) => continue,
+                    Some(name) => match Reported::of_entry(name) {
+                        Some(Reported::Change) => return Some(Unkeyed::Changed),
+                        Some(Reported::Environment | Reported::Overrides) => Unkeyed::Used,
+                        Some(Reported::Environments) => Unkeyed::EveryEnvironment,
+                        Some(Reported::Uncertain) => Unkeyed::Untold,
+                        None => Unkeyed::Foreign(name.to_owned()),
+                    },
+                    None => Unkeyed::Foreign(name.to_string_lossy().into_owned()),
+                }
+            }
         };
-        found = Some(found.map_or(reason, |found| found.min(reason)));
+        found = Some(match found {
+            Some(found) => found.min(reason),
+            None => reason,
+        });
     }
     found
 }
@@ -311,7 +318,10 @@ mod tests {
         let unknown = root.path().join("unknown");
         std::fs::create_dir(&unknown).expect("marker");
         std::fs::write(unknown.join("read-vault-1"), "").expect("entry");
-        assert_eq!(unkeyed(&unknown, &keyed()), Some(Unkeyed::Foreign));
+        assert_eq!(
+            unkeyed(&unknown, &keyed()),
+            Some(Unkeyed::Foreign("read-vault-1".to_owned()))
+        );
 
         let both = root.path().join("both");
         std::fs::create_dir(&both).expect("marker");
@@ -354,7 +364,10 @@ mod tests {
             std::fs::create_dir(&not_utf8).expect("marker");
             if std::fs::write(not_utf8.join(std::ffi::OsStr::from_bytes(b"read-\xff")), "").is_ok()
             {
-                assert_eq!(unkeyed(&not_utf8, &keyed()), Some(Unkeyed::Foreign));
+                assert_eq!(
+                    unkeyed(&not_utf8, &keyed()),
+                    Some(Unkeyed::Foreign("read-\u{fffd}".to_owned()))
+                );
             }
 
             let unreadable = root.path().join("unreadable");

@@ -1251,9 +1251,9 @@ pub(crate) fn write_values_following_unlocked(
             recording,
         );
     }
-    // History reads the values as they were before the new ones are built,
-    // and the plain text goes once it's encrypted, so neither copy of the
-    // new values is held while the old ones are.
+    // History gets the values as they were, when its caller hasn't read
+    // them, before the new ones are built; the plain text goes once it's
+    // encrypted.
     crate::history::scope::observe_before(recording, || {
         super::read_environments_with_digest(directory, vault_id).map(|(before, _)| before)
     });

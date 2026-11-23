@@ -11,9 +11,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use lpm_common::stored_env::is_safe_vault_id;
 use lpm_env_companion::account::CompanionAccount;
-use lpm_env_companion::assessment::{
-    Assessment, Observed, Repair, assess, judges_overrides_content,
-};
+use lpm_env_companion::assessment::{Assessment, Observed, Repair, assess};
 use lpm_env_companion::gate::{Damage, Operation, ProjectGate};
 use lpm_env_companion::graph::{AccessClass, record_access_class};
 use lpm_env_companion::invariants::{Refusal, check_transaction};
@@ -478,7 +476,7 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
                     read_applying_overrides: allows(Operation::ReadApplyingOverrides),
                     write: allows(Operation::Write),
                 },
-                judges_overrides: judges_overrides_content(&request.vault_id, marker_bytes),
+                judges_overrides: assessment.judges_overrides(),
             })
         })
     }

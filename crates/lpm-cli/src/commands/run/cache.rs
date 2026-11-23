@@ -470,7 +470,7 @@ fn build_task_context(
     );
     // Where a nested lpm reports what it uses differs every run and
     // changes nothing a task builds.
-    child_env.retain(|key, _| !is_override_marker(key));
+    child_env.retain(|key, _| !lpm_vault::override_marker::names_the_marker(key));
     let root = cache_key_root(project_dir, workspace_contract);
     if task_config.is_cache_portable() {
         match script_context.portable_manifest_path(&root) {
@@ -613,17 +613,6 @@ fn build_task_context(
         dependencies: dependency_identities.to_vec(),
         local_only,
     }))
-}
-
-/// The variable that carries where a nested lpm reports what it uses,
-/// spelled as the host compares names.
-fn is_override_marker(key: &std::ffi::OsStr) -> bool {
-    let marker = lpm_runner::override_marker::MARKER_ENV;
-    if cfg!(windows) {
-        key.eq_ignore_ascii_case(marker)
-    } else {
-        key == marker
-    }
 }
 
 /// The variables that name the directory a command was run from.
@@ -861,7 +850,7 @@ fn say_not_cached(
     const NOT_CACHED_ALWAYS: &str = "if it always does, set `cache` to false for it in lpm.json";
     let reason = match unkeyed {
         Unkeyed::Changed => format!(
-            "an lpm it started changed personal overrides, which its cache key doesn't hold; {NOT_CACHED_ALWAYS}"
+            "an lpm it started changed, or may have changed, an env project's personal overrides or other newer data; {NOT_CACHED_ALWAYS}"
         ),
         Unkeyed::Used => format!(
             "an lpm it started used another env project or environment, or values or personal overrides other than those its cache key holds; {NOT_CACHED_ALWAYS}"
@@ -869,7 +858,10 @@ fn say_not_cached(
         Unkeyed::EveryEnvironment => "an lpm it started read every environment of an env project, as `lpm env ls` and `lpm env check` without `--env` do, while its cache key holds one; `lpm env check --env` with the task's environment keeps it cached".to_owned(),
         Unkeyed::Untold => "an lpm it started couldn't make the marker a task of its own reports to, so what that task used can't be told; check the temporary folder".to_owned(),
         Unkeyed::Unlisted => "the marker that the lpm processes it started report to was gone or couldn't be read once it ended, as when a task empties the temporary folder".to_owned(),
-        Unkeyed::Foreign => "the marker that the lpm processes it started report to holds a file no lpm adds".to_owned(),
+        Unkeyed::Foreign(file) => format!(
+            "the marker that the lpm processes it started report to holds a file no lpm adds, `{}`",
+            lpm_common::sanitize_terminal_inline(&file)
+        ),
         Unkeyed::Unwatched => format!(
             "lpm couldn't make the marker that the lpm processes it starts report to ({}); check the temporary folder",
             lpm_common::sanitize_terminal_inline(unwatched.unwrap_or_default())
@@ -993,8 +985,10 @@ fn store_cache_with_context(
         request.stderr,
         request.duration_ms,
         &|| {
-            unkeyed.set(request.task.unkeyed(&expected.keyed_entries));
-            unkeyed.get().is_none()
+            let found = request.task.unkeyed(&expected.keyed_entries);
+            let publishable = found.is_none();
+            unkeyed.set(found);
+            publishable
         },
     )?;
     // A kept entry is another run's, so no check covered this run's
@@ -1002,7 +996,7 @@ fn store_cache_with_context(
     if matches!(stored, lpm_task::cache::StoredCacheEntry::KeptExisting) {
         unkeyed.set(request.task.unkeyed(&expected.keyed_entries));
     }
-    if let Some(unkeyed) = unkeyed.get() {
+    if let Some(unkeyed) = unkeyed.take() {
         say_not_cached(request.script_name, unkeyed, request.task.unwatched());
         return Ok(None);
     }
@@ -1041,20 +1035,6 @@ fn store_cache_with_context(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_override_marker_is_left_out_of_keys_as_the_host_spells_names() {
-        let marker = lpm_runner::override_marker::MARKER_ENV;
-        assert!(is_override_marker(std::ffi::OsStr::new(marker)));
-        assert_eq!(
-            is_override_marker(std::ffi::OsStr::new(&marker.to_ascii_lowercase())),
-            cfg!(windows),
-            "Windows passes names without case"
-        );
-        assert!(!is_override_marker(std::ffi::OsStr::new(
-            "LPM_PERSONAL_OVERRIDES"
-        )));
-    }
 
     /// The overlap warning names the file as an `inputs` pattern would, so
     /// it reads the same on Windows, whose paths join with `\`.

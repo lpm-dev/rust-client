@@ -461,41 +461,42 @@ impl ProjectEnvLayers {
 
     /// What identifies the values read from the vault, as stored: an lpm
     /// the child starts reads them so, even those the run replaces, such as
-    /// `npm_lifecycle_event`. `None` when the vault gave none.
+    /// `npm_lifecycle_event`. `None` when the vault gave none. Asked for
+    /// before the layers are composed, which drops the values.
     pub(crate) fn vault_values_identity(&self) -> Option<lpm_vault::ValuesIdentity> {
+        debug_assert!(
+            self.composed.is_none(),
+            "composed layers no longer hold the vault's values"
+        );
         (!self.vault_values.is_empty()).then(|| lpm_vault::ValuesIdentity::of(&self.vault_values))
     }
 
     /// These layers composed without service values and checked by
-    /// `validate`, kept with the values read from the vault.
+    /// `validate`.
     pub(crate) fn into_validated(
-        mut self,
+        self,
         validate: impl FnOnce(&mut ChildEnv) -> Result<(), LpmError>,
     ) -> Result<Self, LpmError> {
-        let vault_values = std::mem::take(&mut self.vault_values);
         let vault_count = self.vault_count;
         let mut child = self.compose(None, None)?;
         validate(&mut child)?;
-        Ok(Self {
-            vault_values,
-            ..Self::already_composed(child, vault_count)
-        })
+        Ok(Self::already_composed(child, vault_count))
     }
 
     /// The environment of a child without service values, layers 1, 2 and 4.
+    /// The values read from the vault go with the layers, so no copy of them
+    /// is held while the child runs.
     pub(crate) fn take_child_env(&mut self) -> Result<ChildEnv, LpmError> {
         match self.composed.take() {
             Some(child) => Ok(child),
             None => {
-                let mut layers = std::mem::take(self);
+                let layers = std::mem::take(self);
                 let overrides = layers.overrides.clone();
                 let vault_count = layers.vault_count;
-                let vault_values = std::mem::take(&mut layers.vault_values);
                 let child = layers.compose(None, None)?;
                 *self = Self {
                     overrides,
                     vault_count,
-                    vault_values,
                     ..Self::default()
                 };
                 Ok(child)
@@ -1027,16 +1028,6 @@ fn validate_project_env_with_case_policy(
 /// Validate effective values without converting inherited values into
 /// project overrides, attributing each error while the inherited values
 /// it counted are still there.
-/// Whether `key` is the marker variable, as the host compares names.
-fn is_override_marker(key: &str) -> bool {
-    let marker = crate::override_marker::MARKER_ENV;
-    if cfg!(windows) {
-        key.eq_ignore_ascii_case(marker)
-    } else {
-        key == marker
-    }
-}
-
 fn evaluate_child_env_with_case_policy(
     child: &mut ChildEnv,
     validator: Option<&lpm_env::EnvValidator<'_>>,
@@ -1061,8 +1052,10 @@ fn evaluate_child_env_with_case_policy(
         let mut inherited_values = Vec::with_capacity(schema.vars.len().min(32));
         // The marker an outer lpm passed this one is LPM's, never a value the
         // schema checks.
-        let inherited_is_checked =
-            |key: &str| !crate::shell::inherited_env_is_stripped(key) && !is_override_marker(key);
+        let inherited_is_checked = |key: &str| {
+            !crate::shell::inherited_env_is_stripped(key)
+                && !lpm_vault::override_marker::names_the_marker(std::ffi::OsStr::new(key))
+        };
         let eligible = |key: &str| !vars.contains_key(key) && inherited_is_checked(key);
         if schema
             .vars

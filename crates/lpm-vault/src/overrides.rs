@@ -43,8 +43,6 @@ pub fn read_all(project_dir: &Path) -> Result<BTreeMap<String, PersonalOverrides
     reported(&vault_id, overrides, identity)
 }
 
-/// The overrides of the env project `vault_id`, once every `lpm` above this
-/// one knows they were read.
 /// Every environment's personal overrides of a project, with what
 /// identifies them, when it has any (see [`crate::OverridesIdentity`]).
 pub(crate) type AllOverrides = (
@@ -52,6 +50,8 @@ pub(crate) type AllOverrides = (
     Option<crate::OverridesIdentity>,
 );
 
+/// The overrides of the env project `vault_id`, once every `lpm` above this
+/// one knows they were read.
 fn reported(
     vault_id: &str,
     overrides: BTreeMap<String, PersonalOverrides>,

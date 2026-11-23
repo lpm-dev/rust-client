@@ -501,7 +501,6 @@ fn clear(
     // an override another command adds while it waits stays, and one it
     // changes stops the removal.
     let mut removals: Vec<(String, String)> = Vec::new();
-    let mut counted = Vec::new();
     for (environment, overrides) in &reviewed.overrides {
         if selected
             .as_ref()
@@ -509,7 +508,6 @@ fn clear(
         {
             continue;
         }
-        let before = removals.len();
         removals.extend(
             overrides
                 .set
@@ -517,22 +515,16 @@ fn clear(
                 .chain(&overrides.unset)
                 .map(|key| (environment.clone(), key.clone())),
         );
-        if removals.len() > before {
-            counted.push(format!("{environment}: {}", removals.len() - before));
-        }
     }
     if removals.is_empty() {
         report_cleared(&selected, &scope, 0, json_output);
         return Ok(());
     }
     let count = removals.len();
-    let counts = match &selected {
-        Some(_) => std::borrow::Cow::Borrowed(scope.as_str()),
-        None => std::borrow::Cow::Owned(counted.join(", ")),
-    };
     let question = format!(
-        "Remove {count} personal override{} on {THIS_MACHINE} ({counts})?",
+        "Remove {count} personal override{} on {THIS_MACHINE} ({})?",
         if count == 1 { "" } else { "s" },
+        removal_summary(&removals),
     );
     let confirmed = cliclack::confirm(&question)
         .initial_value(false)
@@ -546,6 +538,40 @@ fn clear(
         .map_err(vault_error)?;
     report_cleared(&selected, &scope, removed(&change), json_output);
     Ok(())
+}
+
+/// The most keys the clear question names; past it, it counts them.
+const NAMED_IN_QUESTION: usize = 8;
+
+/// What the clear question says it removes, environment by environment, in
+/// `removals`' order: the keys, sorted, when it removes no more than
+/// [`NAMED_IN_QUESTION`], or else how many in each.
+fn removal_summary(removals: &[(String, String)]) -> String {
+    let mut environments: Vec<(&str, Vec<&str>)> = Vec::new();
+    for (environment, key) in removals {
+        match environments.last_mut() {
+            Some((last, keys)) if *last == environment.as_str() => keys.push(key),
+            _ => environments.push((environment, vec![key])),
+        }
+    }
+    let named = removals.len() <= NAMED_IN_QUESTION;
+    environments
+        .iter_mut()
+        .map(|(environment, keys)| {
+            let environment = lpm_common::sanitize_terminal_inline(environment);
+            if named {
+                keys.sort_unstable();
+                let keys: Vec<_> = keys
+                    .iter()
+                    .map(|key| lpm_common::sanitize_terminal_inline(key))
+                    .collect();
+                format!("{environment}: {}", keys.join(", "))
+            } else {
+                format!("{environment}: {}", keys.len())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(if named { "; " } else { ", " })
 }
 
 /// How many overrides a clear removed.
@@ -577,5 +603,28 @@ fn report_cleared(selected: &Option<String>, scope: &str, removed: usize, json_o
             THIS_MACHINE,
             scope,
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_clear_question_names_a_few_keys_and_counts_many() {
+        let few = [
+            ("default".to_owned(), "OTHER".to_owned()),
+            ("default".to_owned(), "API_URL".to_owned()),
+            ("staging".to_owned(), "API_URL".to_owned()),
+        ];
+        assert_eq!(
+            removal_summary(&few),
+            "default: API_URL, OTHER; staging: API_URL"
+        );
+        let many: Vec<(String, String)> = (0..NAMED_IN_QUESTION)
+            .map(|index| ("default".to_owned(), format!("KEY_{index}")))
+            .chain([("staging".to_owned(), "API_URL".to_owned())])
+            .collect();
+        assert_eq!(removal_summary(&many), "default: 8, staging: 1");
     }
 }

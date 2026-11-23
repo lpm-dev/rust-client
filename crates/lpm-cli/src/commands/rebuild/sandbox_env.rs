@@ -62,12 +62,7 @@ fn collect_environment(
         let requested = approved.contains(text);
         // LPM's own, which no package may ask for: an lpm a script starts
         // reports what it uses through it to the tasks above it.
-        let reports_to = if cfg!(windows) {
-            text.eq_ignore_ascii_case(lpm_vault::override_marker::MARKER_ENV)
-        } else {
-            text == lpm_vault::override_marker::MARKER_ENV
-        };
-        if reports_to
+        if lpm_vault::override_marker::names_the_marker(&name)
             || (!crate::capability::reserved_env_name(text)
                 && (requested
                     || BASELINE_ENV

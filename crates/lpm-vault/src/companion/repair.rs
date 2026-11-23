@@ -4,7 +4,7 @@
 //! repair runs only against the state the person reviewed.
 
 use super::account::CompanionAccount;
-use super::assessment::{Observed, Repair, assess, judges_overrides_content};
+use super::assessment::{Observed, Repair, assess_gate, gate_of, judges_overrides};
 use super::lifecycle::{FoundMarker, execute, plan_discard};
 use super::marker::Marker;
 use super::overrides::OVERRIDES_KIND;
@@ -122,10 +122,11 @@ pub(crate) fn review(
         vault_id: vault_id.to_owned(),
         part: None,
     };
+    let gate = gate_of(vault_id, marker.as_deref());
     let contents_are_judged = unfinished.is_none()
         && access.is_none()
         && inventory.contains(&overrides_account)
-        && judges_overrides_content(vault_id, marker.as_deref());
+        && judges_overrides(&gate);
     let mut unreadable_overrides = None;
     let overrides = if contents_are_judged {
         backend
@@ -143,12 +144,13 @@ pub(crate) fn review(
     } else {
         None
     };
-    let history = match (unfinished, marker.as_deref()) {
-        (None, Some(bytes)) => history_damage(backend, vault_id, bytes)?,
+    let history = match (unfinished, gate.marker()) {
+        (None, Some(parsed)) => history_damage(backend, vault_id, parsed)?,
         _ => Vec::new(),
     };
-    let assessment = assess(
+    let assessment = assess_gate(
         vault_id,
+        gate,
         Observed {
             marker: marker.as_deref(),
             inventory: Some(&inventory),
@@ -196,14 +198,11 @@ pub(crate) fn review(
 fn history_damage(
     backend: &mut impl CompanionBackend,
     vault_id: &str,
-    marker: &[u8],
+    marker: &Marker,
 ) -> Result<Vec<super::gate::Damage>, String> {
     use lpm_env_companion::history::switch::MarkerHistory;
     use lpm_env_companion::history::{head_account, key_account, part_account};
-    let Ok(marker) = Marker::parse(vault_id, marker) else {
-        return Ok(Vec::new());
-    };
-    if MarkerHistory::of(Some(&marker)) != MarkerHistory::On {
+    if MarkerHistory::of(Some(marker)) != MarkerHistory::On {
         return Ok(Vec::new());
     }
     let unreadable = |kind: &str, reason: String| super::gate::Damage::InvalidRecord {

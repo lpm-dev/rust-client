@@ -22,6 +22,16 @@ use std::sync::{LazyLock, Mutex, PoisonError};
 /// The variable that carries the marker directories to a task's process.
 pub const MARKER_ENV: &str = "LPM_PERSONAL_OVERRIDES_MARKER";
 
+/// Whether `name` is [`MARKER_ENV`] as the host compares variable names:
+/// without case on Windows.
+pub fn names_the_marker(name: &std::ffi::OsStr) -> bool {
+    if cfg!(windows) {
+        name.eq_ignore_ascii_case(MARKER_ENV)
+    } else {
+        name == MARKER_ENV
+    }
+}
+
 /// How the message of an access that couldn't be reported starts: with
 /// [`MARKER_ENV`] and the marker it names.
 const UNREPORTED: &str = "LPM_PERSONAL_OVERRIDES_MARKER names ";
@@ -284,7 +294,7 @@ pub(crate) fn reporting_to<T>(markers: Vec<PathBuf>, work: impl FnOnce() -> T) -
 /// How to run an `lpm` without the variable, in the shell the platform's
 /// commands are typed in.
 const WITHOUT_MARKER: &str = if cfg!(windows) {
-    "run it once `set LPM_PERSONAL_OVERRIDES_MARKER=` (cmd) or `Remove-Item Env:LPM_PERSONAL_OVERRIDES_MARKER` (PowerShell) removed the variable"
+    "remove the variable with `set LPM_PERSONAL_OVERRIDES_MARKER=` (cmd) or `Remove-Item Env:LPM_PERSONAL_OVERRIDES_MARKER` (PowerShell), then run it again"
 } else {
     "run it as `env -u LPM_PERSONAL_OVERRIDES_MARKER lpm ...`"
 };
@@ -419,6 +429,19 @@ mod tests {
         ] {
             assert_eq!(Reported::of_entry(unknown), None, "{unknown}");
         }
+    }
+
+    #[test]
+    fn the_marker_variable_is_named_as_the_host_spells_names() {
+        assert!(names_the_marker(std::ffi::OsStr::new(MARKER_ENV)));
+        assert_eq!(
+            names_the_marker(std::ffi::OsStr::new(&MARKER_ENV.to_ascii_lowercase())),
+            cfg!(windows),
+            "Windows passes names without case"
+        );
+        assert!(!names_the_marker(std::ffi::OsStr::new(
+            "LPM_PERSONAL_OVERRIDES"
+        )));
     }
 
     #[test]
