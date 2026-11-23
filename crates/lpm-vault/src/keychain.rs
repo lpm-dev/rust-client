@@ -356,10 +356,15 @@ impl<'storage, S: ProjectStorage> ListedStorage<'storage, S> {
         }
     }
 
-    fn wrote(&mut self, account: &str) {
+    /// Notes a write to `account` that ended with `written`: what it claims
+    /// and how it probes may have changed either way, and a write that failed
+    /// may or may not have left the item, so the listing is read again.
+    fn wrote(&mut self, account: &str, written: &Result<(), String>) {
         self.claims.remove(account);
         self.probes.remove(account);
-        if let Some(listing) = self.listing.as_mut() {
+        if written.is_err() {
+            self.listing = None;
+        } else if let Some(listing) = self.listing.as_mut() {
             listing.insert(account.to_owned(), None);
         }
     }
@@ -385,7 +390,7 @@ impl<S: ProjectStorage> ProjectStorage for ListedStorage<'_, S> {
 
     fn write(&mut self, account: &str, value: &[u8]) -> Result<(), String> {
         let written = self.storage.write(account, value);
-        self.wrote(account);
+        self.wrote(account, &written);
         written
     }
 
@@ -492,13 +497,13 @@ impl<S: ProjectStorage> ProjectStorage for ListedStorage<'_, S> {
 
     fn require_approval(&mut self, account: &str, open_accounts: &[&str]) -> Result<(), String> {
         let approved = self.storage.require_approval(account, open_accounts);
-        self.wrote(account);
+        self.wrote(account, &approved);
         approved
     }
 
     fn write_verified(&mut self, account: &str, value: &[u8]) -> Result<(), String> {
         let written = self.storage.write_verified(account, value);
-        self.wrote(account);
+        self.wrote(account, &written);
         written
     }
 
@@ -511,7 +516,7 @@ impl<S: ProjectStorage> ProjectStorage for ListedStorage<'_, S> {
         let written = self
             .storage
             .write_verified_with_access_from(account, value, source);
-        self.wrote(account);
+        self.wrote(account, &written);
         written
     }
 
@@ -524,7 +529,7 @@ impl<S: ProjectStorage> ProjectStorage for ListedStorage<'_, S> {
         let written = self
             .storage
             .write_verified_with_access(account, value, access);
-        self.wrote(account);
+        self.wrote(account, &written);
         written
     }
 }
@@ -3019,6 +3024,22 @@ mod tests {
         });
         assert!(read);
         assert!(!found, "the payload read from the Keychain is wiped");
+    }
+
+    #[test]
+    fn a_write_that_fails_leaves_no_account_in_the_listing_it_kept() {
+        let mut storage = MemoryProjectStorage::default();
+        storage.values.insert("kept", "value".to_owned());
+        storage.rejected_writes.insert("refused".to_owned());
+        let mut listed = ListedStorage::new(&mut storage);
+        assert_eq!(listed.account_names().expect("listed"), ["kept"]);
+
+        assert!(listed.write("refused", b"value").is_err());
+        listed.write("written", b"value").expect("written");
+
+        let mut names = listed.account_names().expect("listed");
+        names.sort();
+        assert_eq!(names, ["kept", "written"]);
     }
 
     #[cfg(not(miri))]
