@@ -247,7 +247,7 @@ fn writes_are_refused_while_a_feature_needs_a_newer_client() {
     storage.values.insert(
         marker_account(VAULT),
         marker(
-            r#""overrides":{"version":2,"ifUnsupported":"ignore","kinds":["overrides"],"state":"active"}"#,
+            r#""overrides":{"version":3,"ifUnsupported":"ignore","kinds":["overrides"],"state":"active"}"#,
             "active",
         ),
     );

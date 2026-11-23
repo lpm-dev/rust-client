@@ -7,7 +7,7 @@ use crate::{lpm_env_check, lpm_env_release};
 const VAULT: &str = "proj";
 const MARKER_ACCOUNT: &str = "__vault_features_v1__:cHJvag";
 const RECORD_ACCOUNT: &str = "__vault_companion_v1__:overrides:cHJvag";
-const OVERRIDES_MARKER: &str = r#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{"overrides":{"version":1,"ifUnsupported":"refuse","kinds":["overrides"],"state":"active"}}}"#;
+const OVERRIDES_MARKER: &str = r#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{"overrides":{"version":2,"ifUnsupported":"refuse","kinds":["overrides"],"state":"active"}}}"#;
 
 fn frame(request: &Value, blobs: &[&[u8]]) -> Vec<u8> {
     let request = serde_json::to_vec(request).expect("json");
@@ -463,7 +463,7 @@ fn reading_a_name_lpm_never_passes_says_so() {
     );
     store.0.insert(
         RECORD_ACCOUNT.to_owned(),
-        br#"{"schemaVersion":1,"vaultId":"proj","environments":{"default":{"set":{"NODE_OPTIONS":"--inspect"},"unset":["CLASSPATH"]}}}"#.to_vec(),
+        br#"{"schemaVersion":2,"vaultId":"proj","environments":{"default":{"set":{"NODE_OPTIONS":"--inspect"},"unset":["CLASSPATH"]}}}"#.to_vec(),
     );
     let (status, read, _) = store.read(false);
     assert_eq!(status, 0, "{read}");
@@ -481,11 +481,11 @@ fn reading_damaged_unsupported_or_unfinished_overrides_is_refused() {
         ),
         (
             None,
-            Some(r#"{"schemaVersion":1,"vaultId":"proj","environments":{}}"#),
+            Some(r#"{"schemaVersion":2,"vaultId":"proj","environments":{}}"#),
             "overrides.damaged",
         ),
         (
-            Some(&OVERRIDES_MARKER.replace(r#""version":1"#, r#""version":2"#)),
+            Some(&OVERRIDES_MARKER.replace(r#""version":2"#, r#""version":3"#)),
             None,
             "overrides.unsupported",
         ),
@@ -665,7 +665,7 @@ fn base64(bytes: &[u8]) -> String {
 #[test]
 fn the_check_judges_what_a_run_gets_with_the_overrides_and_names_them() {
     let schema = r#"{"vars":{"API_URL":{"format":"url"},"TOKEN":{"required":true}}}"#;
-    let record = br#"{"schemaVersion":1,"vaultId":"proj","environments":{"staging":{"set":{"API_URL":"not a url"},"unset":["TOKEN"]}}}"#;
+    let record = br#"{"schemaVersion":2,"vaultId":"proj","environments":{"staging":{"set":{"API_URL":"not a url"},"unset":["TOKEN"]}}}"#;
     let environments = json!({
         "default": {"API_URL": "https://team.example", "TOKEN": "team"},
         "staging": {},
@@ -703,7 +703,7 @@ fn the_check_judges_what_a_run_gets_with_the_overrides_and_names_them() {
 #[test]
 fn the_check_applies_no_overrides_beside_no_values_after_the_marker_s_refusals() {
     let schema = r#"{"vars":{"TOKEN":{"required":true}}}"#;
-    let record = br#"{"schemaVersion":1,"vaultId":"proj","environments":{"staging":{"set":{},"unset":["TOKEN"]}}}"#;
+    let record = br#"{"schemaVersion":2,"vaultId":"proj","environments":{"staging":{"set":{},"unset":["TOKEN"]}}}"#;
     let environments = json!({"default": {"TOKEN": "team"}, "staging": {}});
     let overrides = |marker: &[u8], has_values: Option<bool>| {
         let mut overrides =

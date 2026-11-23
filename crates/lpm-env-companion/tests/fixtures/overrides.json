@@ -17,6 +17,21 @@
       ]
     },
     {
+      "name": "version 2 reads like version 1",
+      "vaultId": "proj",
+      "version": 2,
+      "environment": "development",
+      "json": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\",\"EMPTY\":\"\"},\"unset\":[\"SENTRY_DSN\"]},\"staging\":{\"set\":{\"API_URL\":\"https://staging\"},\"unset\":[]}}}",
+      "valid": true,
+      "set": {
+        "API_URL": "http://localhost:4000",
+        "EMPTY": ""
+      },
+      "unset": [
+        "SENTRY_DSN"
+      ]
+    },
+    {
       "name": "other environment selects nothing",
       "vaultId": "proj",
       "version": 1,
@@ -32,6 +47,14 @@
       "version": 1,
       "environment": "default",
       "json": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{}}",
+      "valid": false
+    },
+    {
+      "name": "a version 1 record under a version 2 marker",
+      "vaultId": "proj",
+      "version": 2,
+      "environment": "default",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{}}",
       "valid": false
     },
     {

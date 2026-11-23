@@ -1,8 +1,9 @@
-//! Personal overrides, version 1: values one Mac sets or unsets on top of an
-//! env project's team values, per environment.
+//! Personal overrides: values one Mac sets or unsets on top of an env
+//! project's team values, per environment. Versions 1 and 2 differ only in
+//! the version the record and its marker entry give.
 //!
 //! ```json
-//! {"schemaVersion": 1, "vaultId": "…", "environments": {
+//! {"schemaVersion": 2, "vaultId": "…", "environments": {
 //!   "development": {"set": {"API_URL": "http://localhost:4000"}, "unset": ["SENTRY_DSN"]}
 //! }}
 //! ```
@@ -23,12 +24,13 @@ pub mod change;
 mod serde_oracle;
 
 pub const OVERRIDES_KIND: &str = "overrides";
-/// The version of the record this client writes.
-pub const VERSION: u16 = 1;
+/// The version of overrides this client writes, in the marker entry and as
+/// the record's `schemaVersion`.
+pub const VERSION: u16 = 2;
 
-/// The marker entry for overrides v1. A client that doesn't support a
-/// version refuses the project: running with team values instead of this
-/// computer's overrides would quietly run something else.
+/// The marker entry for the overrides this client writes. A client that
+/// doesn't support its version refuses the project: running with team values
+/// instead of this computer's overrides would quietly run something else.
 pub fn feature_entry() -> FeatureEntry {
     FeatureEntry {
         version: VERSION,
@@ -38,7 +40,10 @@ pub fn feature_entry() -> FeatureEntry {
     }
 }
 
-const _: () = assert!(crate::graph::OVERRIDES.supported_versions[0] == VERSION);
+const _: () = {
+    let supported = crate::graph::OVERRIDES.supported_versions;
+    assert!(supported[supported.len() - 1] == VERSION);
+};
 
 /// The overrides of the selected environment.
 #[derive(Clone, Default, PartialEq, Eq)]

@@ -71,7 +71,7 @@ fn the_first_override_is_journaled_with_its_marker_and_reads_back() {
         .values
         .get(&marker_account(VAULT))
         .expect("the marker lists overrides");
-    assert!(marker.contains(r#""overrides":{"version":1,"ifUnsupported":"refuse""#));
+    assert!(marker.contains(r#""overrides":{"version":2,"ifUnsupported":"refuse""#));
     assert!(
         !storage.values.contains_key(TRANSACTION_MARKER_ACCOUNT),
         "the journal is gone once the change is applied"

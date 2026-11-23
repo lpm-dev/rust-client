@@ -10,7 +10,7 @@
       "needsResume": false
     },
     {
-      "name": "supported overrides",
+      "name": "overrides v1, which every release since 0.82.0 supports",
       "vaultId": "proj",
       "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
       "valid": true,
@@ -18,9 +18,17 @@
       "needsResume": false
     },
     {
+      "name": "overrides v2, which this client writes and older releases refuse",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "valid": true,
+      "level": "ignore",
+      "needsResume": false
+    },
+    {
       "name": "unsupported overrides refuse whatever the marker says",
       "vaultId": "proj",
-      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"ignore\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":3,\"ifUnsupported\":\"ignore\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
       "valid": true,
       "level": "refuse",
       "needsResume": false
@@ -28,7 +36,7 @@
     {
       "name": "unsupported overrides version may add a kind",
       "vaultId": "proj",
-      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"ignore\",\"kinds\":[\"overrides\",\"overrides-index\"],\"state\":\"active\"}}}",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":3,\"ifUnsupported\":\"ignore\",\"kinds\":[\"overrides\",\"overrides-index\"],\"state\":\"active\"}}}",
       "valid": true,
       "level": "refuse",
       "needsResume": false

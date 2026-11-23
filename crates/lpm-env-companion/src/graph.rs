@@ -18,12 +18,15 @@ pub struct KnownFeature {
     pub supported_versions: &'static [u16],
 }
 
+/// Versions 1 and 2 have the same record. Releases 0.82.0 to 0.88.0 apply
+/// version 1 but can share what they build with it, through the remote task
+/// cache or CI emission, so this client writes version 2, which they refuse.
 pub const OVERRIDES: KnownFeature = KnownFeature {
     name: "overrides",
     kinds: &["overrides"],
     required: &["overrides"],
     minimum: Level::Refuse,
-    supported_versions: &[1],
+    supported_versions: &[1, 2],
 };
 
 pub const HISTORY: KnownFeature = KnownFeature {
@@ -140,10 +143,11 @@ mod tests {
     }
 
     #[test]
-    fn this_client_supports_overrides_history_and_history_off_version_one() {
+    fn this_client_supports_overrides_one_and_two_and_history_and_history_off_one() {
         for feature in KNOWN_FEATURES {
             let expected: &[u16] = match feature.name {
-                "overrides" | "history" | "history-off" => &[1],
+                "overrides" => &[1, 2],
+                "history" | "history-off" => &[1],
                 _ => &[],
             };
             assert_eq!(feature.supported_versions, expected, "{}", feature.name);

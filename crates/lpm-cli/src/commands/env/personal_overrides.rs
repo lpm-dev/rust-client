@@ -13,11 +13,11 @@ use lpm_runner::dotenv::THIS_MACHINE;
 /// What a value shows as when it's hidden.
 const HIDDEN: &str = "••••••••";
 
-/// The releases that apply personal overrides without keeping what they
-/// build with them on this computer: their remote task cache and their
-/// GitHub Actions print share it. An older LPM CLI runs a project with team
-/// values only.
-const RELEASES_SHARING_OVERRIDES: (&str, &str) = ("0.82.0", "0.88.0");
+/// The releases that support only personal overrides v1. They apply it but
+/// can share what they build with it, through their remote task cache and
+/// their GitHub Actions print, so this client writes v2, which they refuse.
+/// An older LPM CLI runs a project with team values only.
+const RELEASES_THAT_REFUSE_OVERRIDES: (&str, &str) = ("0.82.0", "0.88.0");
 
 pub(super) fn run(
     action: OverrideAction,
@@ -307,9 +307,9 @@ fn key_changes_json(environment: &str, change: &lpm_vault::overrides::Change) ->
 /// it, and when the computer holds more newer data than it should.
 fn report_storage(change: &lpm_vault::overrides::Change) {
     if change.activated {
-        let (first, last) = RELEASES_SHARING_OVERRIDES;
+        let (first, last) = RELEASES_THAT_REFUSE_OVERRIDES;
         output::warn_line(install_ui::terminal_line!(
-            "LPM CLI releases {} to {} apply personal overrides but can share outputs built with them, through the remote task cache and `lpm env print --format=github-actions`; this build and later releases keep them on this computer, and an LPM CLI older than {} runs this project with team values",
+            "LPM CLI releases {} to {} refuse this project now that it has personal overrides, until they're updated with `lpm self-update`; an LPM CLI older than {} runs it with team values",
             first,
             last,
             first,

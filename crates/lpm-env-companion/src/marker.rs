@@ -456,7 +456,7 @@ mod tests {
     fn an_unsupported_version_of_a_known_feature_may_add_a_kind() {
         let marker = marker(&[(
             "overrides",
-            entry(2, Level::Ignore, &["overrides", "overrides-index"]),
+            entry(3, Level::Ignore, &["overrides", "overrides-index"]),
         )]);
         assert!(marker.validate().is_ok());
         assert_eq!(marker.level(), Level::Refuse);
@@ -535,7 +535,7 @@ mod tests {
                 Level::Ignore,
             ),
             (
-                vec![("overrides", entry(2, Level::Ignore, &["overrides"]))],
+                vec![("overrides", entry(3, Level::Ignore, &["overrides"]))],
                 Level::Refuse,
             ),
             (

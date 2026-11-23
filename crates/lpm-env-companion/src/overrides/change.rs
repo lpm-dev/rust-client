@@ -500,8 +500,27 @@ pub(super) fn plan_change_with_case_policy(
         value: next.encode(vault_id)?,
     };
     if record.is_some() {
+        // The record is written at this client's version, so a marker entry
+        // that gives an older one moves with it in the same transaction.
+        let Some(marker) = gate
+            .marker()
+            .filter(|marker| {
+                marker
+                    .feature(OVERRIDES_KIND)
+                    .is_some_and(|entry| entry.version != VERSION)
+            })
+            .cloned()
+        else {
+            return Ok(ChangePlan {
+                mutations: vec![write],
+                effects,
+                ..unchanged
+            });
+        };
+        let (marker_write, gate) = with_this_clients_entry(vault_id, marker)?;
         return Ok(ChangePlan {
-            mutations: vec![write],
+            mutations: vec![marker_write, write],
+            gate,
             effects,
             ..unchanged
         });
@@ -519,7 +538,7 @@ pub(super) fn plan_change_with_case_policy(
     };
     budgets::check_project(project.iter().chain(std::iter::once(&account)))
         .map_err(PlanError::OverBudget)?;
-    let mut marker = gate
+    let marker = gate
         .marker()
         .cloned()
         .unwrap_or_else(|| Marker::empty(vault_id, ProjectState::Active));
@@ -537,26 +556,34 @@ pub(super) fn plan_change_with_case_policy(
             return Err(PlanError::AdmissionRefused(*service_records));
         }
     };
+    let (marker_write, gate) = with_this_clients_entry(vault_id, marker)?;
+    Ok(ChangePlan {
+        mutations: vec![marker_write, write],
+        gate,
+        effects,
+        activated: true,
+        over_admission_target,
+    })
+}
+
+/// `marker` with its overrides entry at this client's version: the write
+/// that stores it, and the gate it leaves.
+fn with_this_clients_entry(
+    vault_id: &str,
+    mut marker: Marker,
+) -> Result<(Mutation, ProjectGate), PlanError> {
     marker
         .features
         .insert(OVERRIDES_KIND.to_owned(), feature_entry());
     let marker_bytes = marker
         .encode()
         .map_err(|error| PlanError::Refused(GateError::Damaged(error.into())))?;
-    Ok(ChangePlan {
-        mutations: vec![
-            Mutation::Write {
-                account: CompanionAccount::parse(&marker_account(vault_id))
-                    .expect("the marker account is spelled the one valid way"),
-                value: Zeroizing::new(marker_bytes),
-            },
-            write,
-        ],
-        gate: ProjectGate::Marked(marker),
-        effects,
-        activated: true,
-        over_admission_target,
-    })
+    let write = Mutation::Write {
+        account: CompanionAccount::parse(&marker_account(vault_id))
+            .expect("the marker account is spelled the one valid way"),
+        value: Zeroizing::new(marker_bytes),
+    };
+    Ok((write, ProjectGate::Marked(marker)))
 }
 
 /// Delete the record and its feature entry, and the marker when nothing

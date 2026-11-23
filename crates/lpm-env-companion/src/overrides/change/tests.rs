@@ -151,7 +151,7 @@ fn passes_the_commit_check(
     .unwrap_or_else(|refusal| panic!("{}", refusal.describe("overrides change")));
 }
 
-const ONE_OVERRIDE: &str = r#"{"schemaVersion":1,"vaultId":"proj","environments":{"development":{"set":{"API_URL":"http://localhost:4000"},"unset":[]}}}"#;
+const ONE_OVERRIDE: &str = r#"{"schemaVersion":2,"vaultId":"proj","environments":{"development":{"set":{"API_URL":"http://localhost:4000"},"unset":[]}}}"#;
 
 #[test]
 fn the_first_override_adds_the_feature_and_creates_the_marker_once_the_inventory_is_known() {
@@ -191,6 +191,69 @@ fn the_first_override_adds_the_feature_and_creates_the_marker_once_the_inventory
 }
 
 #[test]
+fn overrides_are_written_as_version_two_which_releases_that_apply_only_version_one_refuse() {
+    let planned = plan(
+        &ProjectGate::Plain,
+        None,
+        vec![set("development", "API_URL", "http://localhost:4000")],
+        Some(&inventory(Vec::new())),
+    )
+    .unwrap();
+    let marker = written_marker(&planned).expect("a marker");
+    assert_eq!(marker.features[OVERRIDES_KIND].version, 2);
+    let record = written_record(&planned).expect("a record");
+    assert!(
+        record.starts_with(r#"{"schemaVersion":2,"#),
+        "the record's version is the marker's: {record}"
+    );
+    assert!(!crate::graph::OVERRIDES.supported_versions.contains(&3));
+}
+
+const ONE_OVERRIDE_V1: &str = r#"{"schemaVersion":1,"vaultId":"proj","environments":{"development":{"set":{"API_URL":"http://localhost:4000"},"unset":[]}}}"#;
+
+#[test]
+fn a_change_to_version_one_overrides_moves_the_marker_and_the_record_to_version_two_together() {
+    let mut marker_v1 = overrides_marker();
+    marker_v1
+        .features
+        .get_mut(OVERRIDES_KIND)
+        .expect("the overrides entry")
+        .version = 1;
+    let gate = ProjectGate::Marked(marker_v1.clone());
+    let planned = plan(
+        &gate,
+        Some(ONE_OVERRIDE_V1),
+        vec![set("development", "API_URL", "http://localhost:5000")],
+        None,
+    )
+    .unwrap();
+    assert!(!planned.activated);
+    assert_eq!(planned.mutations.len(), 2);
+    let marker = written_marker(&planned).expect("the marker moves to version 2");
+    assert_eq!(marker.features[OVERRIDES_KIND].version, 2);
+    assert_eq!(planned.gate, ProjectGate::Marked(marker));
+    assert_eq!(
+        written_record(&planned).as_deref(),
+        Some(
+            r#"{"schemaVersion":2,"vaultId":"proj","environments":{"development":{"set":{"API_URL":"http://localhost:5000"},"unset":[]}}}"#
+        )
+    );
+    passes_the_commit_check(&planned, Some(&marker_v1), &[overrides_account()]);
+
+    let unchanged = plan(
+        &gate,
+        Some(ONE_OVERRIDE_V1),
+        vec![set("development", "API_URL", "http://localhost:4000")],
+        None,
+    )
+    .unwrap();
+    assert!(
+        unchanged.mutations.is_empty(),
+        "edits that change nothing write nothing, the marker included"
+    );
+}
+
+#[test]
 fn the_first_override_keeps_every_feature_already_in_the_marker() {
     let marker = with_history(Marker::empty(VAULT, ProjectState::Active));
     let gate = ProjectGate::Marked(marker.clone());
@@ -225,7 +288,7 @@ fn a_change_to_existing_overrides_rewrites_only_the_record_and_needs_no_inventor
     assert_eq!(
         written_record(&planned).as_deref(),
         Some(
-            r#"{"schemaVersion":1,"vaultId":"proj","environments":{"development":{"set":{"API_URL":"http://localhost:5000","EMPTY":""},"unset":["SENTRY_DSN"]}}}"#
+            r#"{"schemaVersion":2,"vaultId":"proj","environments":{"development":{"set":{"API_URL":"http://localhost:5000","EMPTY":""},"unset":["SENTRY_DSN"]}}}"#
         )
     );
     assert_eq!(planned.gate, gate);
@@ -307,7 +370,7 @@ fn an_unset_replaces_a_set_and_a_set_replaces_an_unset() {
     assert_eq!(
         written_record(&planned).as_deref(),
         Some(
-            r#"{"schemaVersion":1,"vaultId":"proj","environments":{"development":{"set":{},"unset":["API_URL"]}}}"#
+            r#"{"schemaVersion":2,"vaultId":"proj","environments":{"development":{"set":{},"unset":["API_URL"]}}}"#
         )
     );
     let unset_record = written_record(&planned).unwrap();
@@ -329,7 +392,7 @@ fn an_unset_replaces_a_set_and_a_set_replaces_an_unset() {
     assert_eq!(
         written_record(&planned).as_deref(),
         Some(
-            r#"{"schemaVersion":1,"vaultId":"proj","environments":{"development":{"set":{"API_URL":"mine"},"unset":[]}}}"#
+            r#"{"schemaVersion":2,"vaultId":"proj","environments":{"development":{"set":{"API_URL":"mine"},"unset":[]}}}"#
         )
     );
 }
@@ -395,12 +458,12 @@ fn removing_the_last_override_keeps_the_marker_for_other_features() {
     passes_the_commit_check(&planned, Some(&marker), &before);
 }
 
-const TWO_ENVIRONMENTS: &str = r#"{"schemaVersion":1,"vaultId":"proj","environments":{"stage":{"set":{"A":"1","B":"2"},"unset":["C"]},"staging":{"set":{"OLD":"x"},"unset":[]}}}"#;
+const TWO_ENVIRONMENTS: &str = r#"{"schemaVersion":2,"vaultId":"proj","environments":{"stage":{"set":{"A":"1","B":"2"},"unset":["C"]},"staging":{"set":{"OLD":"x"},"unset":[]}}}"#;
 
 #[test]
 fn a_rename_merges_into_what_the_new_name_has_the_moved_overrides_winning() {
     let gate = ProjectGate::Marked(overrides_marker());
-    let record = r#"{"schemaVersion":1,"vaultId":"proj","environments":{"stage":{"set":{"A":"1","B":"2"},"unset":["C"]},"staging":{"set":{"A":"old","OWN":"x"},"unset":[]}}}"#;
+    let record = r#"{"schemaVersion":2,"vaultId":"proj","environments":{"stage":{"set":{"A":"1","B":"2"},"unset":["C"]},"staging":{"set":{"A":"old","OWN":"x"},"unset":[]}}}"#;
     let planned = plan(
         &gate,
         Some(record),
@@ -414,7 +477,7 @@ fn a_rename_merges_into_what_the_new_name_has_the_moved_overrides_winning() {
     assert_eq!(
         written_record(&planned).as_deref(),
         Some(
-            r#"{"schemaVersion":1,"vaultId":"proj","environments":{"staging":{"set":{"A":"1","B":"2","OWN":"x"},"unset":["C"]}}}"#
+            r#"{"schemaVersion":2,"vaultId":"proj","environments":{"staging":{"set":{"A":"1","B":"2","OWN":"x"},"unset":["C"]}}}"#
         )
     );
     assert_eq!(
@@ -498,7 +561,7 @@ fn only_removing_an_environment_removes_its_overrides() {
     assert_eq!(
         written_record(&planned).as_deref(),
         Some(
-            r#"{"schemaVersion":1,"vaultId":"proj","environments":{"stage":{"set":{"A":"1","B":"2"},"unset":["C"]}}}"#
+            r#"{"schemaVersion":2,"vaultId":"proj","environments":{"stage":{"set":{"A":"1","B":"2"},"unset":["C"]}}}"#
         )
     );
 }
@@ -582,7 +645,7 @@ fn names_lpm_never_passes_are_refused_when_written_but_can_be_removed() {
         );
         assert_eq!(error.code(), "denied_name");
     }
-    let stored_before_the_rule = r#"{"schemaVersion":1,"vaultId":"proj","environments":{"development":{"set":{"API_URL":"x","NODE_OPTIONS":"--inspect"},"unset":[]}}}"#;
+    let stored_before_the_rule = r#"{"schemaVersion":2,"vaultId":"proj","environments":{"development":{"set":{"API_URL":"x","NODE_OPTIONS":"--inspect"},"unset":[]}}}"#;
     let planned = plan(
         &gate,
         Some(stored_before_the_rule),
@@ -593,7 +656,7 @@ fn names_lpm_never_passes_are_refused_when_written_but_can_be_removed() {
     assert_eq!(
         written_record(&planned).as_deref(),
         Some(
-            r#"{"schemaVersion":1,"vaultId":"proj","environments":{"development":{"set":{"API_URL":"x"},"unset":[]}}}"#
+            r#"{"schemaVersion":2,"vaultId":"proj","environments":{"development":{"set":{"API_URL":"x"},"unset":[]}}}"#
         )
     );
 }
@@ -713,7 +776,7 @@ fn names_the_host_cant_tell_apart_replace_each_other_where_it_ignores_case() {
     assert_eq!(
         written_record(&insensitive).as_deref(),
         Some(
-            r#"{"schemaVersion":1,"vaultId":"proj","environments":{"development":{"set":{"api_url":"mine"},"unset":[]}}}"#
+            r#"{"schemaVersion":2,"vaultId":"proj","environments":{"development":{"set":{"api_url":"mine"},"unset":[]}}}"#
         )
     );
     assert!(matches!(
@@ -728,7 +791,7 @@ fn names_the_host_cant_tell_apart_replace_each_other_where_it_ignores_case() {
     assert_eq!(
         written_record(&sensitive).as_deref(),
         Some(
-            r#"{"schemaVersion":1,"vaultId":"proj","environments":{"development":{"set":{"API_URL":"http://localhost:4000","api_url":"mine"},"unset":[]}}}"#
+            r#"{"schemaVersion":2,"vaultId":"proj","environments":{"development":{"set":{"API_URL":"http://localhost:4000","api_url":"mine"},"unset":[]}}}"#
         )
     );
     let removed = plan_change_with_case_policy(
@@ -764,7 +827,7 @@ fn the_gate_refuses_damaged_unsupported_and_unfinished_projects() {
     );
 
     let mut newer = overrides_marker();
-    newer.features.get_mut(OVERRIDES_KIND).unwrap().version = 2;
+    newer.features.get_mut(OVERRIDES_KIND).unwrap().version = VERSION + 1;
     let unsupported = plan(
         &ProjectGate::Marked(newer),
         Some(ONE_OVERRIDE),
@@ -959,7 +1022,7 @@ fn removing_the_last_override_beside_staged_records_is_one_transaction_that_keep
 #[test]
 fn a_record_with_no_overrides_left_is_deleted_by_the_next_change() {
     let gate = ProjectGate::Marked(overrides_marker());
-    let empty = r#"{"schemaVersion":1,"vaultId":"proj","environments":{}}"#;
+    let empty = r#"{"schemaVersion":2,"vaultId":"proj","environments":{}}"#;
     let edits = || vec![remove("development", "NOTHING")];
     assert_eq!(
         needed(plan(&gate, Some(empty), edits(), None)),
@@ -1096,7 +1159,7 @@ fn changed(renamed: &[(&str, &str)], removed: &[&str]) -> Edit {
     }
 }
 
-const SWAP_RECORD: &str = r#"{"schemaVersion":1,"vaultId":"proj","environments":{"a":{"set":{"K":"from-a","X":"1"},"unset":[]},"b":{"set":{"K":"from-b","Y":"2"},"unset":[]},"c":{"set":{"Z":"3"},"unset":[]}}}"#;
+const SWAP_RECORD: &str = r#"{"schemaVersion":2,"vaultId":"proj","environments":{"a":{"set":{"K":"from-a","X":"1"},"unset":[]},"b":{"set":{"K":"from-b","Y":"2"},"unset":[]},"c":{"set":{"Z":"3"},"unset":[]}}}"#;
 
 #[test]
 fn environments_renamed_together_keep_their_own_overrides_when_names_swap_or_chain() {
@@ -1111,7 +1174,7 @@ fn environments_renamed_together_keep_their_own_overrides_when_names_swap_or_cha
     assert_eq!(
         written_record(&swapped).as_deref(),
         Some(
-            r#"{"schemaVersion":1,"vaultId":"proj","environments":{"a":{"set":{"K":"from-b","Y":"2"},"unset":[]},"b":{"set":{"K":"from-a","X":"1"},"unset":[]},"c":{"set":{"Z":"3"},"unset":[]}}}"#
+            r#"{"schemaVersion":2,"vaultId":"proj","environments":{"a":{"set":{"K":"from-b","Y":"2"},"unset":[]},"b":{"set":{"K":"from-a","X":"1"},"unset":[]},"c":{"set":{"Z":"3"},"unset":[]}}}"#
         )
     );
     let into_a_removed_name = plan(
@@ -1140,7 +1203,7 @@ fn environments_renamed_together_keep_their_own_overrides_when_names_swap_or_cha
     assert_eq!(
         written_record(&chained).as_deref(),
         Some(
-            r#"{"schemaVersion":1,"vaultId":"proj","environments":{"b":{"set":{"K":"from-a","X":"1"},"unset":[]},"c":{"set":{"K":"from-b","Y":"2","Z":"3"},"unset":[]}}}"#
+            r#"{"schemaVersion":2,"vaultId":"proj","environments":{"b":{"set":{"K":"from-a","X":"1"},"unset":[]},"c":{"set":{"K":"from-b","Y":"2","Z":"3"},"unset":[]}}}"#
         )
     );
     match &chained.effects[..] {
@@ -1169,7 +1232,7 @@ fn environments_changed_together_take_removals_out_with_the_renames() {
     assert_eq!(
         written_record(&planned).as_deref(),
         Some(
-            r#"{"schemaVersion":1,"vaultId":"proj","environments":{"c":{"set":{"K":"from-a","X":"1","Z":"3"},"unset":[]}}}"#
+            r#"{"schemaVersion":2,"vaultId":"proj","environments":{"c":{"set":{"K":"from-a","X":"1","Z":"3"},"unset":[]}}}"#
         )
     );
     for edit in [
@@ -1287,7 +1350,7 @@ fn a_project_without_values_removes_nothing_and_refuses_the_rest() {
 fn a_project_without_values_keeps_the_gate_a_plan_with_values_keeps() {
     let edits = [remove("development", "A")];
     let mut newer = overrides_marker();
-    newer.features.get_mut(OVERRIDES_KIND).unwrap().version = 2;
+    newer.features.get_mut(OVERRIDES_KIND).unwrap().version = VERSION + 1;
     assert_eq!(
         plan_without_values(&ProjectGate::Marked(newer), &edits)
             .unwrap_err()

@@ -7,12 +7,13 @@ use serde_json::{Value, json};
 
 use super::account::CompanionAccount;
 use super::lifecycle::Mutation;
-use super::overrides::OVERRIDES_KIND;
+use super::overrides::{OVERRIDES_KIND, VERSION as OVERRIDES_VERSION};
 
 /// A companion storage state to plant for one project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DebugCompanionState {
-    /// Valid personal overrides of `environment`'s values.
+    /// Valid personal overrides of `environment`'s values, of the version
+    /// this LPM writes.
     Overrides {
         environment: String,
         set: Vec<(String, String)>,
@@ -159,7 +160,7 @@ pub(crate) fn planting(
 ) -> Planting {
     use DebugCompanionState as State;
     let mut planting = Planting::default();
-    let overrides_v1 = feature(1, "refuse", &[OVERRIDES_KIND]);
+    let overrides_entry = feature(OVERRIDES_VERSION, "refuse", &[OVERRIDES_KIND]);
     let (marker_bytes, records, description): (Option<Vec<u8>>, Records, String) = match state {
         State::Clear => (
             None,
@@ -171,7 +172,7 @@ pub(crate) fn planting(
             set,
             unset,
         } => (
-            Some(marker(vault_id, "active", json!({ "overrides": overrides_v1 }), None)),
+            Some(marker(vault_id, "active", json!({ "overrides": overrides_entry }), None)),
             vec![(
                 record(vault_id, OVERRIDES_KIND, None),
                 overrides_record(vault_id, environment, set, unset),
@@ -182,7 +183,7 @@ pub(crate) fn planting(
             ),
         ),
         State::MissingRecord => (
-            Some(marker(vault_id, "active", json!({ "overrides": overrides_v1 }), None)),
+            Some(marker(vault_id, "active", json!({ "overrides": overrides_entry }), None)),
             Vec::new(),
             "Planted a feature marker listing personal overrides, with no overrides record. lpm run refuses until it's repaired; lpm env repair removes the feature. LPM Vault shows the damage and refuses edits; Repair… removes personal overrides.".to_owned(),
         ),
@@ -195,7 +196,7 @@ pub(crate) fn planting(
             "Planted a feature marker that doesn't parse. Every read refuses until it's repaired; lpm env repair and LPM Vault's Repair… discard the newer data and keep the values.".to_owned(),
         ),
         State::UnlistedRecords => (
-            Some(marker(vault_id, "active", json!({ "overrides": overrides_v1 }), None)),
+            Some(marker(vault_id, "active", json!({ "overrides": overrides_entry }), None)),
             vec![
                 (
                     record(vault_id, OVERRIDES_KIND, None),
@@ -205,19 +206,24 @@ pub(crate) fn planting(
             ],
             "Planted valid overrides and a \"notes\" record no feature lists. The CLI doesn't list the store, so it sees nothing wrong. LPM Vault shows the damage, refuses edits, and Repair… deletes only the stray record.".to_owned(),
         ),
-        State::NewerVersion => (
-            Some(marker(
-                vault_id,
-                "active",
-                json!({ "overrides": feature(2, "refuse", &[OVERRIDES_KIND]) }),
-                None,
-            )),
-            vec![(
-                record(vault_id, OVERRIDES_KIND, None),
-                br#"{"schemaVersion":2}"#.to_vec(),
-            )],
-            "Planted personal overrides v2. lpm refuses to read, run or write the project and asks for lpm self-update. LPM Vault hides its values and offers Check for Updates…; rename, approval and delete still work.".to_owned(),
-        ),
+        State::NewerVersion => {
+            let newer = OVERRIDES_VERSION + 1;
+            (
+                Some(marker(
+                    vault_id,
+                    "active",
+                    json!({ "overrides": feature(newer, "refuse", &[OVERRIDES_KIND]) }),
+                    None,
+                )),
+                vec![(
+                    record(vault_id, OVERRIDES_KIND, None),
+                    json!({ "schemaVersion": newer }).to_string().into_bytes(),
+                )],
+                format!(
+                    "Planted personal overrides v{newer}. lpm refuses to read, run or write the project and asks for lpm self-update. LPM Vault hides its values and offers Check for Updates…; rename, approval and delete still work."
+                ),
+            )
+        }
         State::ReadOnly => (
             Some(marker(
                 vault_id,
@@ -243,7 +249,7 @@ pub(crate) fn planting(
                 Some(json!({
                     "phase": "activating",
                     "replaces": [],
-                    "features": { "overrides": overrides_v1 },
+                    "features": { "overrides": overrides_entry },
                 })),
             )),
             vec![(
@@ -258,7 +264,7 @@ pub(crate) fn planting(
                 .claims
                 .push((overrides.name(), PlantedClaim::UnknownPolicy));
             (
-                Some(marker(vault_id, "active", json!({ "overrides": overrides_v1 }), None)),
+                Some(marker(vault_id, "active", json!({ "overrides": overrides_entry }), None)),
                 vec![(overrides, placeholder_overrides(vault_id))],
                 "Planted overrides whose record names an approval policy LPM doesn't know. lpm run refuses the record. LPM Vault shows damaged approval settings and sets them at its next unlock.".to_owned(),
             )
@@ -268,7 +274,7 @@ pub(crate) fn planting(
                 .claims
                 .push((vault_id.to_owned(), PlantedClaim::ApprovalNotEnforced));
             (
-                Some(marker(vault_id, "active", json!({ "overrides": overrides_v1 }), None)),
+                Some(marker(vault_id, "active", json!({ "overrides": overrides_entry }), None)),
                 vec![(record(vault_id, OVERRIDES_KIND, None), placeholder_overrides(vault_id))],
                 "Planted CLI approval on this project's values without the protection behind it: they still read without asking, while newer data written from now on takes the approval they claim, so lpm asks before reading it. LPM Vault gives the values that approval at its next unlock. clear undoes the claim.".to_owned(),
             )
@@ -280,7 +286,7 @@ pub(crate) fn planting(
                 vec![
                     Mutation::Write {
                         account: marker_account(&orphan),
-                        value: marker(&orphan, "active", json!({ "overrides": overrides_v1 }), None)
+                        value: marker(&orphan, "active", json!({ "overrides": overrides_entry }), None)
                             .into(),
                     },
                     Mutation::Write {
@@ -398,7 +404,7 @@ fn overrides_record(
         .map(|(name, value)| (name.clone(), Value::String(value.clone())))
         .collect();
     json!({
-        "schemaVersion": 1,
+        "schemaVersion": OVERRIDES_VERSION,
         "vaultId": vault_id,
         "environments": { environment: { "set": set, "unset": unset } },
     })

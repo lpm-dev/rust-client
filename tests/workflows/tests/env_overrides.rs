@@ -673,7 +673,7 @@ fn env_repair_reviews_then_repairs_a_damaged_feature() {
 #[test]
 fn an_unsupported_overrides_version_refuses_runs_and_writes() {
     let (project, vault_id) = project_with_team_value(r#"{"show":"node show.cjs"}"#);
-    let newer = OVERRIDES_MARKER.replace(r#""version":1"#, r#""version":2"#);
+    let newer = OVERRIDES_MARKER.replace(r#""version":1"#, r#""version":3"#);
     seed(&project, &vault_id, Some(&newer), None);
 
     let run = lpm(&project)
@@ -682,7 +682,7 @@ fn an_unsupported_overrides_version_refuses_runs_and_writes() {
         .unwrap();
     assert!(!run.status.success());
     assert!(
-        stderr(&run).contains("personal overrides v2, which this LPM CLI doesn't support"),
+        stderr(&run).contains("personal overrides v3, which this LPM CLI doesn't support"),
         "{}",
         stderr(&run)
     );
@@ -698,7 +698,7 @@ fn an_unsupported_overrides_version_refuses_runs_and_writes() {
 #[test]
 fn every_command_gives_a_refusal_its_own_error_code() {
     let (project, vault_id) = project_with_team_value(r#"{"show":"node show.cjs"}"#);
-    let newer = OVERRIDES_MARKER.replace(r#""version":1"#, r#""version":2"#);
+    let newer = OVERRIDES_MARKER.replace(r#""version":1"#, r#""version":3"#);
     seed(&project, &vault_id, Some(&newer), None);
 
     for args in [
@@ -948,7 +948,7 @@ fn check_reports_hidden_characters_in_a_personal_override_as_one() {
 
 // ─── lpm env override ─────────────────────────────────────────────────
 
-const ACTIVATION_NOTICE: &str = "LPM CLI releases 0.82.0 to 0.88.0 apply personal overrides but can share outputs built with them, through the remote task cache and `lpm env print --format=github-actions`; this build and later releases keep them on this computer, and an LPM CLI older than 0.82.0 runs this project with team values";
+const ACTIVATION_NOTICE: &str = "LPM CLI releases 0.82.0 to 0.88.0 refuse this project now that it has personal overrides, until they're updated with `lpm self-update`; an LPM CLI older than 0.82.0 runs it with team values";
 
 fn shown(project: &TempProject, script: &str) -> String {
     let output = lpm(project).args(["run", script]).output().unwrap();

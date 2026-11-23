@@ -36,8 +36,8 @@
       "expect": {
         "result": "planned",
         "writes": {
-          "__vault_features_v1__:cHJvag": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
-          "__vault_companion_v1__:overrides:cHJvag": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\"},\"unset\":[]}}}"
+          "__vault_features_v1__:cHJvag": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+          "__vault_companion_v1__:overrides:cHJvag": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\"},\"unset\":[]}}}"
         },
         "deletes": [],
         "markerAfter": "present",
@@ -71,8 +71,8 @@
       "expect": {
         "result": "planned",
         "writes": {
-          "__vault_features_v1__:cHJvag": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"history-off\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-off\"],\"state\":\"active\"},\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
-          "__vault_companion_v1__:overrides:cHJvag": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{},\"unset\":[\"SENTRY_DSN\"]}}}"
+          "__vault_features_v1__:cHJvag": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"history-off\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-off\"],\"state\":\"active\"},\"overrides\":{\"version\":2,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+          "__vault_companion_v1__:overrides:cHJvag": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{},\"unset\":[\"SENTRY_DSN\"]}}}"
         },
         "deletes": [],
         "markerAfter": "present",
@@ -91,8 +91,8 @@
     {
       "name": "a change to existing overrides rewrites only the record",
       "vaultId": "proj",
-      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
-      "record": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\"},\"unset\":[]}}}",
+      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "record": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\"},\"unset\":[]}}}",
       "names": null,
       "edits": [
         {
@@ -116,7 +116,7 @@
       "expect": {
         "result": "planned",
         "writes": {
-          "__vault_companion_v1__:overrides:cHJvag": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:5000\",\"EMPTY\":\"\"},\"unset\":[\"SENTRY_DSN\"]}}}"
+          "__vault_companion_v1__:overrides:cHJvag": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:5000\",\"EMPTY\":\"\"},\"unset\":[\"SENTRY_DSN\"]}}}"
         },
         "deletes": [],
         "markerAfter": "present",
@@ -147,10 +147,44 @@
       }
     },
     {
-      "name": "edits that change nothing write nothing",
+      "name": "a change to version 1 overrides moves the marker and the record to version 2",
       "vaultId": "proj",
       "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
       "record": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\"},\"unset\":[]}}}",
+      "names": null,
+      "edits": [
+        {
+          "action": "set",
+          "environment": "development",
+          "key": "API_URL",
+          "value": "http://localhost:5000"
+        }
+      ],
+      "expect": {
+        "result": "planned",
+        "writes": {
+          "__vault_features_v1__:cHJvag": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+          "__vault_companion_v1__:overrides:cHJvag": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:5000\"},\"unset\":[]}}}"
+        },
+        "deletes": [],
+        "markerAfter": "present",
+        "activated": false,
+        "effects": [
+          {
+            "kind": "key",
+            "environment": "development",
+            "key": "API_URL",
+            "previous": "set",
+            "changed": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "edits that change nothing write nothing",
+      "vaultId": "proj",
+      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "record": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\"},\"unset\":[]}}}",
       "names": null,
       "edits": [
         {
@@ -188,8 +222,8 @@
     {
       "name": "the last removal deletes the record and the marker",
       "vaultId": "proj",
-      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
-      "record": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\"},\"unset\":[]}}}",
+      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "record": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\"},\"unset\":[]}}}",
       "names": [
         "__vault_features_v1__:cHJvag",
         "__vault_companion_v1__:overrides:cHJvag"
@@ -224,8 +258,8 @@
     {
       "name": "clearing everything keeps a marker other features need",
       "vaultId": "proj",
-      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"history-off\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-off\"],\"state\":\"active\"},\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
-      "record": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\"},\"unset\":[]}}}",
+      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"history-off\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-off\"],\"state\":\"active\"},\"overrides\":{\"version\":2,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "record": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\"},\"unset\":[]}}}",
       "names": [
         "__vault_features_v1__:cHJvag",
         "__vault_companion_v1__:overrides:cHJvag"
@@ -257,8 +291,8 @@
     {
       "name": "a rename merges the overrides into what the new name has, the moved ones winning",
       "vaultId": "proj",
-      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
-      "record": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"stage\":{\"set\":{\"A\":\"1\",\"B\":\"2\"},\"unset\":[\"C\"]},\"staging\":{\"set\":{\"A\":\"old\",\"OWN\":\"x\"},\"unset\":[]}}}",
+      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "record": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"stage\":{\"set\":{\"A\":\"1\",\"B\":\"2\"},\"unset\":[\"C\"]},\"staging\":{\"set\":{\"A\":\"old\",\"OWN\":\"x\"},\"unset\":[]}}}",
       "names": null,
       "edits": [
         {
@@ -270,7 +304,7 @@
       "expect": {
         "result": "planned",
         "writes": {
-          "__vault_companion_v1__:overrides:cHJvag": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"staging\":{\"set\":{\"A\":\"1\",\"B\":\"2\",\"OWN\":\"x\"},\"unset\":[\"C\"]}}}"
+          "__vault_companion_v1__:overrides:cHJvag": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"staging\":{\"set\":{\"A\":\"1\",\"B\":\"2\",\"OWN\":\"x\"},\"unset\":[\"C\"]}}}"
         },
         "deletes": [],
         "markerAfter": "present",
@@ -290,8 +324,8 @@
     {
       "name": "only removing an environment removes its overrides; a duplicate or a new one changes none",
       "vaultId": "proj",
-      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
-      "record": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"stage\":{\"set\":{\"A\":\"1\",\"B\":\"2\"},\"unset\":[\"C\"]},\"staging\":{\"set\":{\"OLD\":\"x\"},\"unset\":[]}}}",
+      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "record": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"stage\":{\"set\":{\"A\":\"1\",\"B\":\"2\"},\"unset\":[\"C\"]},\"staging\":{\"set\":{\"OLD\":\"x\"},\"unset\":[]}}}",
       "names": null,
       "edits": [
         {
@@ -311,7 +345,7 @@
       "expect": {
         "result": "planned",
         "writes": {
-          "__vault_companion_v1__:overrides:cHJvag": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"stage\":{\"set\":{\"A\":\"1\",\"B\":\"2\"},\"unset\":[\"C\"]}}}"
+          "__vault_companion_v1__:overrides:cHJvag": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"stage\":{\"set\":{\"A\":\"1\",\"B\":\"2\"},\"unset\":[\"C\"]}}}"
         },
         "deletes": [],
         "markerAfter": "present",
@@ -340,8 +374,8 @@
     {
       "name": "environments changed together swap, chain and go, each keeping its own overrides",
       "vaultId": "proj",
-      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
-      "record": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"a\":{\"set\":{\"K\":\"1\"},\"unset\":[]},\"b\":{\"set\":{\"K\":\"2\"},\"unset\":[]},\"c\":{\"set\":{\"L\":\"3\"},\"unset\":[]},\"gone\":{\"set\":{\"M\":\"4\"},\"unset\":[]}}}",
+      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "record": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"a\":{\"set\":{\"K\":\"1\"},\"unset\":[]},\"b\":{\"set\":{\"K\":\"2\"},\"unset\":[]},\"c\":{\"set\":{\"L\":\"3\"},\"unset\":[]},\"gone\":{\"set\":{\"M\":\"4\"},\"unset\":[]}}}",
       "names": null,
       "edits": [
         {
@@ -368,7 +402,7 @@
       "expect": {
         "result": "planned",
         "writes": {
-          "__vault_companion_v1__:overrides:cHJvag": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"a\":{\"set\":{\"K\":\"2\"},\"unset\":[]},\"b\":{\"set\":{\"K\":\"1\"},\"unset\":[]},\"d\":{\"set\":{\"L\":\"3\"},\"unset\":[]}}}"
+          "__vault_companion_v1__:overrides:cHJvag": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"a\":{\"set\":{\"K\":\"2\"},\"unset\":[]},\"b\":{\"set\":{\"K\":\"1\"},\"unset\":[]},\"d\":{\"set\":{\"L\":\"3\"},\"unset\":[]}}}"
         },
         "deletes": [],
         "markerAfter": "present",
@@ -412,8 +446,8 @@
     {
       "name": "an environment renamed and removed at once is refused",
       "vaultId": "proj",
-      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
-      "record": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"a\":{\"set\":{\"K\":\"1\"},\"unset\":[]}}}",
+      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "record": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"a\":{\"set\":{\"K\":\"1\"},\"unset\":[]}}}",
       "names": null,
       "edits": [
         {
@@ -437,8 +471,8 @@
     {
       "name": "the last removal deletes the record even when the names missed it",
       "vaultId": "proj",
-      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
-      "record": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\"},\"unset\":[]}}}",
+      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "record": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\"},\"unset\":[]}}}",
       "names": [
         "__vault_features_v1__:cHJvag"
       ],
@@ -472,8 +506,8 @@
     {
       "name": "a record with no overrides left is deleted by the next change",
       "vaultId": "proj",
-      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
-      "record": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{}}",
+      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "record": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{}}",
       "names": [
         "__vault_features_v1__:cHJvag",
         "__vault_companion_v1__:overrides:cHJvag"
@@ -508,8 +542,8 @@
     {
       "name": "a rename or a copy onto the environment itself is refused",
       "vaultId": "proj",
-      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
-      "record": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\"},\"unset\":[]}}}",
+      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "record": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\"},\"unset\":[]}}}",
       "names": null,
       "edits": [
         {
@@ -526,8 +560,8 @@
     {
       "name": "a name LPM never passes to a process is refused",
       "vaultId": "proj",
-      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
-      "record": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\"},\"unset\":[]}}}",
+      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "record": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\"},\"unset\":[]}}}",
       "names": null,
       "edits": [
         {
@@ -545,7 +579,7 @@
     {
       "name": "a damaged record refuses every change",
       "vaultId": "proj",
-      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
       "record": "{not json",
       "names": null,
       "edits": [
@@ -564,7 +598,7 @@
     {
       "name": "a record written as an array is damaged",
       "vaultId": "proj",
-      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
       "record": "[1,\"proj\",{\"development\":{\"set\":{\"A\":\"old\"},\"unset\":[]}}]",
       "names": null,
       "edits": [
@@ -583,8 +617,8 @@
     {
       "name": "an environment written as an array is damaged",
       "vaultId": "proj",
-      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
-      "record": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"development\":[{\"A\":\"old\"},[]]}}",
+      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "record": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"development\":[{\"A\":\"old\"},[]]}}",
       "names": null,
       "edits": [
         {
@@ -603,7 +637,7 @@
       "name": "a record no marker lists refuses every change",
       "vaultId": "proj",
       "marker": null,
-      "record": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\"},\"unset\":[]}}}",
+      "record": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\"},\"unset\":[]}}}",
       "names": null,
       "edits": [
         {
@@ -621,8 +655,8 @@
     {
       "name": "a newer overrides version refuses changes",
       "vaultId": "proj",
-      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
-      "record": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\"},\"unset\":[]}}}",
+      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":3,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "record": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\"},\"unset\":[]}}}",
       "names": null,
       "edits": [
         {

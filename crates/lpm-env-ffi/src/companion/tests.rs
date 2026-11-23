@@ -221,7 +221,7 @@ fn every_marker_fixture_assesses_with_its_recorded_level() {
 
 #[test]
 fn the_assessment_says_when_to_read_the_overrides_record() {
-    let newer = OVERRIDES_MARKER.replace(r#""version":1"#, r#""version":2"#);
+    let newer = OVERRIDES_MARKER.replace(r#""version":1"#, r#""version":3"#);
     let removing = OVERRIDES_MARKER.replace(r#""state":"active"}"#, r#""state":"removing"}"#);
     let listed = json!([record_name("overrides", None)]);
     let read = |marker: Option<&str>, extra: Value| {
@@ -319,14 +319,14 @@ fn a_record_handed_over_is_judged_only_where_the_assessment_says_to_read_it() {
 
 #[test]
 fn an_unsupported_feature_names_itself_and_its_level() {
-    let newer = OVERRIDES_MARKER.replace(r#""version":1"#, r#""version":2"#);
+    let newer = OVERRIDES_MARKER.replace(r#""version":1"#, r#""version":3"#);
     let (_, output) = call(
         lpm_env_companion_assess,
         &json!({ "vaultId": "proj", "marker": base64(newer.as_bytes()) }),
     );
     assert_eq!(
         output["unsupported"],
-        json!({ "feature": "overrides", "version": 2, "level": "refuse" })
+        json!({ "feature": "overrides", "version": 3, "level": "refuse" })
     );
     assert_eq!(output["features"][0]["supported"], false);
     assert_eq!(

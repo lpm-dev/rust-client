@@ -8,8 +8,11 @@
 //! a journal.
 //!
 //! Given the personal override change fixtures too, every transaction a
-//! change plans must pass that check, and the project it leaves must be one
-//! the older engine reads overrides from and writes to without damage.
+//! change plans must pass that check, and the project it leaves must never
+//! be damaged. While it has overrides, which this release writes as a
+//! version the older engine doesn't support, the older engine must refuse
+//! its values and still maintain it; once it has none, the older engine
+//! reads and writes it as before.
 //!
 //! The source uses only API the older engine has, so it builds against it.
 
@@ -19,7 +22,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use lpm_env_companion::account::{CompanionAccount, marker_account, record_account};
 use lpm_env_companion::assessment::{Observed, assess};
-use lpm_env_companion::gate::Operation;
+use lpm_env_companion::gate::{GateError, Operation};
 use lpm_env_companion::invariants::check_transaction;
 use lpm_env_companion::lifecycle::{self, LifecycleStore, Mutation};
 use lpm_env_companion::marker::{Level, Marker};
@@ -130,7 +133,8 @@ fn replay_check(transaction: &serde_json::Value) -> Result<(), String> {
 
 /// Plan by plan, the project a personal override change leaves, through
 /// the older engine: its transaction passes the check recovery runs, and the
-/// overrides it leaves read and allow writes without damage.
+/// project is never damaged. One that still has overrides is refused for its
+/// values and maintained; one without reads and allows writes.
 fn override_change_check(case: &serde_json::Value) -> Result<(), String> {
     let name = case["name"].as_str().expect("name");
     let vault_id = case["vaultId"].as_str().expect("vaultId");
@@ -192,6 +196,31 @@ fn override_change_check(case: &serde_json::Value) -> Result<(), String> {
     );
     if let Some(damage) = assessment.every_damage().next() {
         return Err(format!("{name}: damaged: {damage}"));
+    }
+    let has_overrides = match after.get(&marker_name) {
+        Some(bytes) => Marker::parse(vault_id, bytes)
+            .map_err(|error| format!("{name}: {error}"))?
+            .feature("overrides")
+            .is_some(),
+        None => false,
+    };
+    if has_overrides {
+        for operation in [Operation::ReadApplyingOverrides, Operation::Write] {
+            match assessment.authorize(operation) {
+                Err(GateError::Unsupported {
+                    level: Level::Refuse,
+                    ..
+                }) => {}
+                other => {
+                    return Err(format!(
+                        "{name}: {operation:?} wasn't refused as unsupported: {other:?}"
+                    ));
+                }
+            }
+        }
+        return assessment
+            .authorize(Operation::Maintenance)
+            .map_err(|error| format!("{name}: maintenance refused: {error}"));
     }
     for operation in [Operation::ReadApplyingOverrides, Operation::Write] {
         assessment

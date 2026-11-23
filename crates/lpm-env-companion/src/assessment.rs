@@ -488,10 +488,10 @@ mod tests {
 
     #[test]
     fn overrides_of_a_version_this_client_doesnt_support_are_never_judged() {
-        let marker = br#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{"overrides":{"version":2,"ifUnsupported":"refuse","kinds":["overrides"],"state":"active"}}}"#;
+        let marker = br#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{"overrides":{"version":3,"ifUnsupported":"refuse","kinds":["overrides"],"state":"active"}}}"#;
         let inventory = [record("overrides", None)];
         for overrides in [
-            Some(&br#"{"schemaVersion":2,"vaultId":"proj","layers":[]}"#[..]),
+            Some(&br#"{"schemaVersion":3,"vaultId":"proj","layers":[]}"#[..]),
             None,
         ] {
             let assessment = assess(
@@ -703,7 +703,7 @@ mod tests {
 
     #[test]
     fn an_unsupported_version_has_no_required_records_this_client_knows() {
-        let newer = br#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{"overrides":{"version":2,"ifUnsupported":"refuse","kinds":["overrides"],"state":"active"}}}"#;
+        let newer = br#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{"overrides":{"version":3,"ifUnsupported":"refuse","kinds":["overrides"],"state":"active"}}}"#;
         let assessment = assess(
             "proj",
             Observed {
