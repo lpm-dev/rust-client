@@ -13,11 +13,13 @@ use lpm_runner::dotenv::THIS_MACHINE;
 /// What a value shows as when it's hidden.
 const HIDDEN: &str = "••••••••";
 
-/// The releases that support only personal overrides v1. They apply it but
-/// can share what they build with it, through their remote task cache and
-/// their GitHub Actions print, so this client writes v2, which they refuse.
-/// An older LPM CLI runs a project with team values only.
+/// The releases that support only personal overrides v1. The CLIs apply it
+/// but can share what they build with it, through their remote task cache
+/// and their GitHub Actions print, so this client writes v2, which they
+/// refuse, and which those LPM Vault releases hide the values of. An older
+/// LPM CLI runs a project with team values only.
 const RELEASES_THAT_REFUSE_OVERRIDES: (&str, &str) = ("0.82.0", "0.88.0");
+const VAULT_RELEASES_THAT_REFUSE_OVERRIDES: (&str, &str) = ("1.1.0", "1.3.0");
 
 pub(super) fn run(
     action: OverrideAction,
@@ -303,15 +305,19 @@ fn key_changes_json(environment: &str, change: &lpm_vault::overrides::Change) ->
     })
 }
 
-/// Say once, when a project gets its first override, which LPM CLIs apply
-/// it, and when the computer holds more newer data than it should.
+/// Say once, when a project gets its first override, which releases of LPM
+/// CLI and LPM Vault can't use it any more, and when the computer holds more
+/// newer data than it should.
 fn report_storage(change: &lpm_vault::overrides::Change) {
     if change.activated {
         let (first, last) = RELEASES_THAT_REFUSE_OVERRIDES;
+        let (first_vault, last_vault) = VAULT_RELEASES_THAT_REFUSE_OVERRIDES;
         output::warn_line(install_ui::terminal_line!(
-            "LPM CLI releases {} to {} refuse this project now that it has personal overrides, until they're updated with `lpm self-update`; an LPM CLI older than {} runs it with team values",
+            "LPM CLI {} to {} and LPM Vault {} to {} can't use this project now that it has personal overrides until they're updated, with `lpm self-update` and LPM Vault's Check for Updates; an LPM CLI older than {} runs it with team values",
             first,
             last,
+            first_vault,
+            last_vault,
             first,
         ));
     }

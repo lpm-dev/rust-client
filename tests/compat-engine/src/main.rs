@@ -8,10 +8,11 @@
 //! a journal.
 //!
 //! Given the personal override change fixtures too, every transaction a
-//! change plans must pass that check, and the project it leaves must never
-//! be damaged. While it has overrides, which this release writes as a
-//! version the older engine doesn't support, the older engine must refuse
-//! its values and still maintain it; once it has none, the older engine
+//! change plans must pass that check, and the project it leaves, or one a
+//! change leaves as it was, must never be damaged. While it has overrides of
+//! a version the older engine doesn't support, as this release writes them,
+//! the older engine must refuse its values, for any read or write, and still
+//! maintain it; with none, or with a version it supports, the older engine
 //! reads and writes it as before.
 //!
 //! The source uses only API the older engine has, so it builds against it.
@@ -25,7 +26,7 @@ use lpm_env_companion::assessment::{Observed, assess};
 use lpm_env_companion::gate::{GateError, Operation};
 use lpm_env_companion::invariants::check_transaction;
 use lpm_env_companion::lifecycle::{self, LifecycleStore, Mutation};
-use lpm_env_companion::marker::{Level, Marker};
+use lpm_env_companion::marker::{Level, Marker, is_supported};
 
 struct Store(BTreeMap<String, Vec<u8>>);
 
@@ -133,8 +134,9 @@ fn replay_check(transaction: &serde_json::Value) -> Result<(), String> {
 
 /// Plan by plan, the project a personal override change leaves, through
 /// the older engine: its transaction passes the check recovery runs, and the
-/// project is never damaged. One that still has overrides is refused for its
-/// values and maintained; one without reads and allows writes.
+/// project is never damaged. One whose overrides the older engine doesn't
+/// support is refused for its values and maintained; any other reads and
+/// allows writes.
 fn override_change_check(case: &serde_json::Value) -> Result<(), String> {
     let name = case["name"].as_str().expect("name");
     let vault_id = case["vaultId"].as_str().expect("vaultId");
@@ -147,8 +149,9 @@ fn override_change_check(case: &serde_json::Value) -> Result<(), String> {
         }
     }
     let expect = &case["expect"];
-    let writes = expect["writes"].as_object().expect("writes");
-    let deletes = expect["deletes"].as_array().expect("deletes");
+    let none = serde_json::Map::new();
+    let writes = expect["writes"].as_object().unwrap_or(&none);
+    let deletes = expect["deletes"].as_array().map_or(&[][..], Vec::as_slice);
     let mut changes: Vec<(String, Option<Vec<u8>>)> = writes
         .iter()
         .map(|(account, text)| {
@@ -197,15 +200,19 @@ fn override_change_check(case: &serde_json::Value) -> Result<(), String> {
     if let Some(damage) = assessment.every_damage().next() {
         return Err(format!("{name}: damaged: {damage}"));
     }
-    let has_overrides = match after.get(&marker_name) {
+    let unsupported = match after.get(&marker_name) {
         Some(bytes) => Marker::parse(vault_id, bytes)
             .map_err(|error| format!("{name}: {error}"))?
             .feature("overrides")
-            .is_some(),
+            .is_some_and(|entry| !is_supported("overrides", entry.version)),
         None => false,
     };
-    if has_overrides {
-        for operation in [Operation::ReadApplyingOverrides, Operation::Write] {
+    if unsupported {
+        for operation in [
+            Operation::ReadExcludingOverrides,
+            Operation::ReadApplyingOverrides,
+            Operation::Write,
+        ] {
             match assessment.authorize(operation) {
                 Err(GateError::Unsupported {
                     level: Level::Refuse,
@@ -265,7 +272,7 @@ fn main() {
             serde_json::from_str(&std::fs::read_to_string(&path).expect("read fixtures"))
                 .expect("fixtures are JSON");
         for case in fixture["cases"].as_array().expect("cases") {
-            if case["expect"]["result"] != "planned" {
+            if case["expect"]["result"] != "planned" && case["expect"]["result"] != "unchanged" {
                 continue;
             }
             override_changes += 1;
@@ -282,7 +289,7 @@ fn main() {
         std::process::exit(1);
     }
     println!(
-        "{} states read, {} transactions and {override_changes} personal override changes accepted by the older engine",
+        "{} states read, {} transactions and {override_changes} personal override changes checked against the older engine",
         states.len(),
         transactions.len()
     );

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Prove that an older release's companion engine reads every local history
-# state and every personal override change this release writes: build
-# tests/compat-engine against that release's engine and run the history and
-# override change fixtures through it.
+# state this release writes, and keeps every project a personal override
+# change leaves undamaged and recoverable, refusing the values of overrides
+# of a version it doesn't support: build tests/compat-engine against that
+# release's engine and run the history and override change fixtures through
+# it.
 #
 # Usage: scripts/ci/check-engine-compatibility.sh [tag]   (default v0.84.0)
 set -euo pipefail

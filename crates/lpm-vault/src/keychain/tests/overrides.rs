@@ -127,6 +127,28 @@ fn a_first_override_whose_approval_is_cancelled_leaves_the_project_as_it_was() {
 }
 
 #[test]
+fn a_first_override_under_approved_values_asks_in_the_project_s_name_not_its_staging_item_s() {
+    let mut storage = storage_with_values();
+    storage
+        .claims
+        .insert(VAULT.to_owned(), ClaimedAccess::RequireApproval);
+    storage.protected.insert(VAULT.to_owned());
+    crate::macos_keychain::note_requester(VAULT, std::path::Path::new("/srv/proj"), || {
+        Some("Project".to_owned())
+    });
+
+    change(&mut storage, &[set("API_URL", "mine")]).expect("set");
+
+    assert!(!storage.prompts.is_empty(), "writing it reads it back");
+    for prompt in &storage.prompts {
+        assert_eq!(
+            prompt,
+            "Allow LPM CLI in \"/srv/proj\" to access env project \"Project\"'s personal overrides"
+        );
+    }
+}
+
+#[test]
 fn an_override_of_values_without_approval_stays_automatic() {
     let mut storage = storage_with_values();
     change(&mut storage, &[set("API_URL", "mine")]).expect("set");
@@ -851,9 +873,9 @@ fn a_change_that_fails_before_its_journal_commits_leaves_the_overrides_as_they_w
 }
 
 /// A first override under values that need approval, on this Mac's own
-/// Keychain. How many times macOS asks is what a person counts, which no
-/// memory store shows. Run it with an empty LPM home, so it touches none of
-/// this Mac's env projects:
+/// Keychain. How many times macOS asks is what a person counts and types,
+/// which no memory store shows. Run it with an empty LPM home, so it touches
+/// none of this Mac's env projects:
 ///
 /// ```text
 /// LPM_HOME="$(mktemp -d)" LPM_RUN_KEYCHAIN_TESTS=1 scripts/build-signed-macos.sh --vault-tests -- \
@@ -861,13 +883,20 @@ fn a_change_that_fails_before_its_journal_commits_leaves_the_overrides_as_they_w
 ///     --ignored --exact --nocapture
 /// ```
 #[test]
-#[ignore = "requires a signed macOS test bundle with the shared Keychain entitlement, an empty LPM_HOME and a person to approve"]
+#[ignore = "requires a signed macOS test bundle with the shared Keychain entitlement, an empty LPM_HOME and a person to approve and count the prompts"]
 fn a_first_override_under_values_that_need_approval_asks_once_on_this_macs_keychain() {
     assert_eq!(std::env::var("LPM_RUN_KEYCHAIN_TESTS").as_deref(), Ok("1"));
+    let home_service = service();
     assert_ne!(
-        service(),
-        SERVICE,
+        home_service, SERVICE,
         "set LPM_HOME to an empty folder, so the test touches none of this Mac's env projects"
+    );
+    let existing = crate::macos_keychain::accounts_with_access(&home_service)
+        .expect("list the LPM home's items");
+    assert!(
+        existing.is_empty(),
+        "the Keychain already holds {} items for this LPM home: set LPM_HOME to an empty folder, so the test touches none of this Mac's env projects",
+        existing.len()
     );
     struct RemoveEverything;
     impl Drop for RemoveEverything {
@@ -916,4 +945,11 @@ fn a_first_override_under_values_that_need_approval_asks_once_on_this_macs_keych
     }
     .expect("read the overrides back without another approval");
     assert_eq!(read.0["default"].set["API_URL"], "fixture-mine");
+
+    eprint!("How many times did macOS ask? ");
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .expect("read the count from the terminal");
+    assert_eq!(answer.trim(), "1", "a first override asks once");
 }

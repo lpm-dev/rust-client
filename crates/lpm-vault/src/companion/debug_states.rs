@@ -19,6 +19,13 @@ pub enum DebugCompanionState {
         set: Vec<(String, String)>,
         unset: Vec<String>,
     },
+    /// The same, as version 1, which LPM CLI 0.82.0 to 0.88.0 also apply; the
+    /// next change moves them to the version this LPM writes.
+    OverridesV1 {
+        environment: String,
+        set: Vec<(String, String)>,
+        unset: Vec<String>,
+    },
     /// A marker listing personal overrides with no overrides record.
     MissingRecord,
     /// A marker that doesn't parse, next to an overrides record.
@@ -59,23 +66,33 @@ impl DebugCompanionState {
         set: &[String],
         unset: &[String],
     ) -> Result<Self, String> {
-        if name != "overrides" && (!set.is_empty() || !unset.is_empty()) {
-            return Err("--set and --unset only go with the overrides state".to_owned());
+        let plants_overrides = matches!(name, "overrides" | "overrides-v1");
+        if !plants_overrides && (!set.is_empty() || !unset.is_empty()) {
+            return Err("--set and --unset only go with the overrides states".to_owned());
         }
-        if name == "overrides" && set.is_empty() && unset.is_empty() {
-            return Err("the overrides state needs --set NAME=VALUE or --unset NAME".to_owned());
+        if plants_overrides && set.is_empty() && unset.is_empty() {
+            return Err(format!(
+                "the {name} state needs --set NAME=VALUE or --unset NAME"
+            ));
         }
+        let pairs = || {
+            set.iter()
+                .map(|pair| {
+                    pair.split_once('=')
+                        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                        .ok_or_else(|| format!("--set {pair:?} isn't NAME=VALUE"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        };
         Ok(match name {
             "overrides" => Self::Overrides {
                 environment: environment.unwrap_or("default").to_owned(),
-                set: set
-                    .iter()
-                    .map(|pair| {
-                        pair.split_once('=')
-                            .map(|(name, value)| (name.to_owned(), value.to_owned()))
-                            .ok_or_else(|| format!("--set {pair:?} isn't NAME=VALUE"))
-                    })
-                    .collect::<Result<_, _>>()?,
+                set: pairs()?,
+                unset: unset.to_vec(),
+            },
+            "overrides-v1" => Self::OverridesV1 {
+                environment: environment.unwrap_or("default").to_owned(),
+                set: pairs()?,
                 unset: unset.to_vec(),
             },
             "missing-record" => Self::MissingRecord,
@@ -101,6 +118,7 @@ impl DebugCompanionState {
 
     pub const NAMES: &'static [&'static str] = &[
         "overrides",
+        "overrides-v1",
         "missing-record",
         "invalid-marker",
         "unlisted-records",
@@ -191,10 +209,30 @@ pub(crate) fn planting(
             Some(marker(vault_id, "active", json!({ "overrides": overrides_entry }), None)),
             vec![(
                 record(vault_id, OVERRIDES_KIND, None),
-                overrides_record(vault_id, environment, set, unset),
+                overrides_record(vault_id, OVERRIDES_VERSION, environment, set, unset),
             )],
             format!(
                 "Planted personal overrides of {environment}: {}. lpm run, dev, exec, print, check and env ls apply them and say how many; CI emission and platform pushes leave them out. LPM Vault shows no banner, and a backup says it leaves them out.",
+                overrides_summary(set, unset)
+            ),
+        ),
+        State::OverridesV1 {
+            environment,
+            set,
+            unset,
+        } => (
+            Some(marker(
+                vault_id,
+                "active",
+                json!({ "overrides": feature(1, "refuse", &[OVERRIDES_KIND]) }),
+                None,
+            )),
+            vec![(
+                record(vault_id, OVERRIDES_KIND, None),
+                overrides_record(vault_id, 1, environment, set, unset),
+            )],
+            format!(
+                "Planted personal overrides v1 of {environment}: {}. lpm, LPM CLI 0.82.0 to 0.88.0 and LPM Vault 1.1.0 to 1.3.0 apply them; the next change of the project's overrides moves them to v{OVERRIDES_VERSION}, which those releases can't use.",
                 overrides_summary(set, unset)
             ),
         ),
@@ -411,6 +449,7 @@ fn marker(vault_id: &str, state: &str, features: Value, restore: Option<Value>) 
 
 fn overrides_record(
     vault_id: &str,
+    version: u16,
     environment: &str,
     set: &[(String, String)],
     unset: &[String],
@@ -420,7 +459,7 @@ fn overrides_record(
         .map(|(name, value)| (name.clone(), Value::String(value.clone())))
         .collect();
     json!({
-        "schemaVersion": OVERRIDES_VERSION,
+        "schemaVersion": version,
         "vaultId": vault_id,
         "environments": { environment: { "set": set, "unset": unset } },
     })
@@ -433,6 +472,7 @@ fn overrides_record(
 fn placeholder_overrides(vault_id: &str) -> Vec<u8> {
     overrides_record(
         vault_id,
+        OVERRIDES_VERSION,
         "default",
         &[],
         &["LPM_DEBUG_COMPANION_UNSET".to_owned()],
@@ -495,7 +535,11 @@ mod tests {
     /// The state `name` chooses, overrides planting one set.
     fn named(name: &str) -> DebugCompanionState {
         let set = ["A=1".to_owned()];
-        let set = if name == "overrides" { &set[..] } else { &[] };
+        let set = if matches!(name, "overrides" | "overrides-v1") {
+            &set[..]
+        } else {
+            &[]
+        };
         DebugCompanionState::named(name, None, set, &[]).expect(name)
     }
 
@@ -572,6 +616,25 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn overrides_v1_plant_version_one_which_reads_as_healthy() {
+        let planting = planted(named("overrides-v1"));
+        let assessment = assessed(&planting);
+        assert!(assessment.damage.is_empty(), "{:?}", assessment.damage);
+        assert_eq!(
+            assessment
+                .gate
+                .marker()
+                .and_then(|marker| marker.feature(OVERRIDES_KIND))
+                .map(|entry| entry.version),
+            Some(1)
+        );
+        assert!(planting.writes.iter().any(|(account, value)| {
+            matches!(account, CompanionAccount::Record { .. })
+                && value.starts_with(br#"{"schemaVersion":1,"#)
+        }));
     }
 
     #[test]

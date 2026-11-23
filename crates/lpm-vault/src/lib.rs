@@ -122,6 +122,34 @@ pub mod acceptance {
             crate::fallback::companion::commit_unchecked(directory, vault_id, mutations)
         })
     }
+
+    /// `vault_id`'s feature marker and personal overrides, as text, from the
+    /// file store of the LPM home at `lpm_home`.
+    pub fn file_companion_records(
+        lpm_home: &Path,
+        vault_id: &str,
+    ) -> Result<(Option<String>, Option<String>), String> {
+        crate::storage_transaction::with_vault_transaction_at(lpm_home, |directory| {
+            crate::fallback::use_file_data_key_in_scope(directory)?;
+            let text = |account: CompanionAccount| {
+                crate::fallback::companion::read_unchecked(directory, &account)?
+                    .map(|bytes| {
+                        String::from_utf8(bytes).map_err(|_| "a record isn't UTF-8".to_owned())
+                    })
+                    .transpose()
+            };
+            Ok((
+                text(CompanionAccount::Marker {
+                    vault_id: vault_id.to_owned(),
+                })?,
+                text(CompanionAccount::Record {
+                    kind: crate::companion::overrides::OVERRIDES_KIND.to_owned(),
+                    vault_id: vault_id.to_owned(),
+                    part: None,
+                })?,
+            ))
+        })
+    }
 }
 
 /// Whether `message` is an env project's refusal of an operation, by a

@@ -1318,6 +1318,41 @@ fn planting_approved_values_gives_the_values_enforced_approval_and_keeps_the_new
     );
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn planting_approved_values_protects_values_that_only_claim_approval_and_needs_values() {
+    use crate::companion::debug_states::{DebugCompanionState, PlantedClaim};
+    let no_claim = |_: &mut MemoryProjectStorage, account: &str, _: PlantedClaim| {
+        Err(format!("no claim is planted, yet one was on {account}"))
+    };
+    let mut storage = storage_with_values();
+    storage
+        .claims
+        .insert(VAULT.to_owned(), ClaimedAccess::RequireApproval);
+
+    plant_debug_companion_state_with_storage(
+        &mut storage,
+        VAULT,
+        &DebugCompanionState::ApprovedValues,
+        no_claim,
+    )
+    .expect("plant approved values");
+    assert!(
+        storage.protected.contains(VAULT),
+        "a claim the Keychain doesn't enforce gets the approval it claims"
+    );
+
+    let mut without_values = MemoryProjectStorage::default();
+    let refused = plant_debug_companion_state_with_storage(
+        &mut without_values,
+        VAULT,
+        &DebugCompanionState::ApprovedValues,
+        no_claim,
+    )
+    .expect_err("no values to approve");
+    assert!(refused.contains("lpm env set"), "{refused}");
+}
+
 #[test]
 fn a_restore_that_can_never_finish_is_damage_only_a_discard_repairs() {
     let mut storage = storage_with_values();

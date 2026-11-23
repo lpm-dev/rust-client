@@ -191,7 +191,7 @@ fn the_first_override_adds_the_feature_and_creates_the_marker_once_the_inventory
 }
 
 #[test]
-fn overrides_are_written_as_version_two_which_releases_that_apply_only_version_one_refuse() {
+fn overrides_are_written_as_version_two_in_the_marker_and_the_record() {
     let planned = plan(
         &ProjectGate::Plain,
         None,
@@ -206,7 +206,6 @@ fn overrides_are_written_as_version_two_which_releases_that_apply_only_version_o
         record.starts_with(r#"{"schemaVersion":2,"#),
         "the record's version is the marker's: {record}"
     );
-    assert!(!crate::graph::OVERRIDES.supported_versions.contains(&3));
 }
 
 const ONE_OVERRIDE_V1: &str = r#"{"schemaVersion":1,"vaultId":"proj","environments":{"development":{"set":{"API_URL":"http://localhost:4000"},"unset":[]}}}"#;

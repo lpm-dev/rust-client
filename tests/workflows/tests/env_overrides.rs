@@ -68,6 +68,37 @@ fn stderr(output: &std::process::Output) -> String {
 }
 
 #[test]
+fn a_change_to_version_one_overrides_stores_the_marker_and_the_record_as_version_two() {
+    let (project, vault_id) = project_with_team_value(r#"{"show":"node show.cjs"}"#);
+    seed(
+        &project,
+        &vault_id,
+        Some(OVERRIDES_MARKER),
+        Some(&overrides_record(
+            &vault_id,
+            "default",
+            r#""API_URL":"fixture-one""#,
+            "",
+        )),
+    );
+
+    let set = lpm(&project)
+        .args(["env", "override", "set", "API_URL=fixture-two"])
+        .output()
+        .unwrap();
+    assert!(set.status.success(), "{}", stderr(&set));
+
+    let (marker, record) =
+        lpm_vault::acceptance::file_companion_records(&project.home().join(".lpm"), &vault_id)
+            .expect("read the stored records");
+    let marker = marker.expect("a marker");
+    let record = record.expect("a record");
+    assert!(marker.contains(r#""overrides":{"version":2,"#), "{marker}");
+    assert!(record.starts_with(r#"{"schemaVersion":2,"#), "{record}");
+    assert!(record.contains("fixture-two"));
+}
+
+#[test]
 fn run_applies_a_personal_override_and_reports_only_its_count() {
     let (project, vault_id) = project_with_team_value(r#"{"show":"node show.cjs"}"#);
     seed(
@@ -948,7 +979,7 @@ fn check_reports_hidden_characters_in_a_personal_override_as_one() {
 
 // ─── lpm env override ─────────────────────────────────────────────────
 
-const ACTIVATION_NOTICE: &str = "LPM CLI releases 0.82.0 to 0.88.0 refuse this project now that it has personal overrides, until they're updated with `lpm self-update`; an LPM CLI older than 0.82.0 runs it with team values";
+const ACTIVATION_NOTICE: &str = "LPM CLI 0.82.0 to 0.88.0 and LPM Vault 1.1.0 to 1.3.0 can't use this project now that it has personal overrides until they're updated, with `lpm self-update` and LPM Vault's Check for Updates; an LPM CLI older than 0.82.0 runs it with team values";
 
 fn shown(project: &TempProject, script: &str) -> String {
     let output = lpm(project).args(["run", script]).output().unwrap();

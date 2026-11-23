@@ -70,8 +70,8 @@ LPM_RUN_KEYCHAIN_TESTS=1 ./scripts/build-signed-macos.sh --vault-tests -- native
 ```
 
 The first override test also needs an empty LPM home, so it touches none of
-this Mac's env projects, and a person to approve the prompt it raises and
-count them:
+this Mac's env projects, and a person to approve each prompt it raises and type
+how many there were:
 
 ```bash
 LPM_HOME="$(mktemp -d)" LPM_RUN_KEYCHAIN_TESTS=1 ./scripts/build-signed-macos.sh --vault-tests -- \

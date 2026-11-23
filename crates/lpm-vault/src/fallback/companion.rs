@@ -1535,6 +1535,15 @@ impl FileCompanion<'_> {
     }
 }
 
+/// What the file store holds for `account`, as tests that seeded it read it.
+#[cfg(any(test, feature = "acceptance-test-hooks"))]
+pub(crate) fn read_unchecked(
+    directory: &VaultStorageDirectory,
+    account: &CompanionAccount,
+) -> Result<Option<Vec<u8>>, String> {
+    crate::companion::lifecycle::LifecycleStore::read(&mut FileCompanion::open(directory)?, account)
+}
+
 /// Write `mutations` without the invariant check, as only damaged data
 /// would be stored, for tests that read it.
 #[cfg(any(test, feature = "acceptance-test-hooks"))]

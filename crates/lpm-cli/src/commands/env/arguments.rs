@@ -94,9 +94,9 @@ A personal override is this computer's own value for a key. LPM applies it when
 it runs, prints or checks the project here. It never syncs, and LPM leaves it
 out when it pushes values or sends them to CI or a platform. Once the project
 has one, its tasks, and the tasks that depend on them, don't use the remote task
-cache on this computer. LPM CLI releases 0.82.0 to 0.88.0 refuse a project with
-overrides until they're updated, and an LPM CLI older than 0.82.0 runs it with
-team values.",
+cache on this computer. LPM CLI 0.82.0 to 0.88.0 and LPM Vault 1.1.0 to 1.3.0
+can't use a project with overrides until they're updated, and an LPM CLI older
+than 0.82.0 runs it with team values.",
     value_entry_help!()
 );
 
@@ -272,16 +272,17 @@ pub(super) enum LocalAction {
     #[cfg(debug_assertions)]
     #[command(name = "debug-companion", hide = true)]
     DebugCompanion {
-        /// overrides, missing-record, invalid-marker, unlisted-records,
-        /// newer-version, approved-values, read-only, interrupted-deletion,
-        /// stuck-restore, contradictory-record, weak-values, orphans or clear.
+        /// overrides, overrides-v1, missing-record, invalid-marker,
+        /// unlisted-records, newer-version, approved-values, read-only,
+        /// interrupted-deletion, stuck-restore, contradictory-record,
+        /// weak-values, orphans or clear.
         state: String,
         #[command(flatten)]
         environment: Environment,
-        /// A personal override to plant, for the overrides state.
+        /// A personal override to plant, for the overrides states.
         #[arg(long = "set", value_name = "NAME=VALUE")]
         set: Vec<String>,
-        /// A name the overrides state unsets.
+        /// A name the overrides states unset.
         #[arg(long = "unset", value_name = "NAME")]
         unset: Vec<String>,
     },

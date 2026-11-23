@@ -806,9 +806,13 @@ fn stage_write(
                 access
             }
         };
-        return storage.write_verified_with_access(stage, value, access);
+        return crate::macos_keychain::prompting_as(target, || {
+            storage.write_verified_with_access(stage, value, access)
+        });
     }
-    storage.write_verified_with_access_from(stage, value, target)
+    crate::macos_keychain::prompting_as(target, || {
+        storage.write_verified_with_access_from(stage, value, target)
+    })
 }
 
 /// The values item's CLI approval, verified by a probe rather than read
@@ -1086,7 +1090,10 @@ fn read_validated_stage(
     operation: &TransactionJournalOperation,
     stage: &str,
 ) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, String> {
-    let Some(value) = storage.read(stage)?.map(zeroize::Zeroizing::new) else {
+    let Some(value) =
+        crate::macos_keychain::prompting_as(&operation.target_account, || storage.read(stage))?
+            .map(zeroize::Zeroizing::new)
+    else {
         return Ok(None);
     };
     if value.len() > MAX_TRANSACTION_VALUE_BYTES
@@ -1195,7 +1202,10 @@ fn transaction_is_fully_applied(
     }
     for operation in &journal.operations {
         if let Some(stage) = &operation.staged_account
-            && storage.read(stage)?.is_some()
+            && crate::macos_keychain::prompting_as(&operation.target_account, || {
+                storage.read(stage)
+            })?
+            .is_some()
         {
             return Ok(false);
         }
@@ -2077,7 +2087,13 @@ fn plant_debug_companion_state_with_storage<S: ProjectStorage>(
         return Err("turn this project's CLI approval off first".to_owned());
     }
     if planting.approve_values {
-        if storage.claimed_access(vault_id)? == Some(ClaimedAccess::RequireApproval) {
+        if storage.claimed_access(vault_id)?.is_none() {
+            return Err(
+                "this project has no values on this computer to approve; store one with lpm env set first"
+                    .to_owned(),
+            );
+        }
+        if storage.probe(vault_id, &[PROJECT_INDEX_MARKER_ACCOUNT]) == ProbeOutcome::Protected {
             return Ok("This project's values already need CLI approval.".to_owned());
         }
         storage.require_approval(vault_id, &[PROJECT_INDEX_MARKER_ACCOUNT])?;
@@ -3123,6 +3139,9 @@ mod tests {
         keychain_unavailable: bool,
         probes: Vec<String>,
         approvals_required: Vec<String>,
+        /// What the approval prompt said each time reading an item, or
+        /// reading back a protected item just written, would ask.
+        prompts: Vec<String>,
         listings: usize,
         reads: HashMap<String, usize>,
         /// Attributes-only reads, by account.
@@ -3155,6 +3174,10 @@ mod tests {
             if self.rejected_access_sources.contains(source) {
                 return Err("env access approval was cancelled".to_owned());
             }
+            if self.protected.contains(source) {
+                self.prompts
+                    .push(crate::macos_keychain::operation_prompt(account));
+            }
             self.access_sources
                 .push((account.to_owned(), source.to_owned()));
             if !self.values.contains_key(account) {
@@ -3174,6 +3197,10 @@ mod tests {
             value: &[u8],
             access: CliAccess,
         ) -> Result<(), String> {
+            if access == CliAccess::RequireApproval {
+                self.prompts
+                    .push(crate::macos_keychain::operation_prompt(account));
+            }
             if !self.values.contains_key(account) && access == CliAccess::RequireApproval {
                 self.claims
                     .insert(account.to_owned(), ClaimedAccess::RequireApproval);

@@ -38,6 +38,23 @@ struct Requester {
 
 thread_local! {
     static REQUESTER: std::cell::RefCell<Option<Requester>> = const { std::cell::RefCell::new(None) };
+    /// The account a transaction's staged item stands for, which approval
+    /// prompts name while the staged item is written and read back.
+    static STAGED_FOR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `run` with approval prompts naming `target`, the account a staged
+/// item stands for, in place of the staging account they read.
+pub(crate) fn prompting_as<T>(target: &str, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            STAGED_FOR.with_borrow_mut(|staged| *staged = previous);
+        }
+    }
+    let _restore = Restore(STAGED_FOR.with_borrow_mut(|staged| staged.replace(target.to_owned())));
+    run()
 }
 
 /// Name `folder`, which may use the vault `vault_id`, in the approval
@@ -132,10 +149,11 @@ fn prompting_for<T>(purpose: &'static str, run: impl FnOnce() -> T) -> T {
     run()
 }
 
-/// What an approval names for reading `account`: the project's recorded
-/// name and the folder asking when a link check noted them, else its vault
-/// ID; a companion record also by what it holds, and either by what the
-/// running command reads for when it says.
+/// What an approval names for reading `account`, or for the account a
+/// staged item stands for: the project's recorded name and the folder asking
+/// when a link check noted them, else its vault ID; a companion record also
+/// by what it holds, and either by what the running command reads for when
+/// it says.
 struct PromptSubject {
     project: String,
     holds: Option<&'static str>,
@@ -145,6 +163,8 @@ struct PromptSubject {
 impl PromptSubject {
     fn of(account: &str) -> Self {
         use crate::companion::account::CompanionAccount;
+        let staged_for = STAGED_FOR.with_borrow(Clone::clone);
+        let account = staged_for.as_deref().unwrap_or(account);
         let history = lpm_env_companion::append_log::HISTORY;
         let record = CompanionAccount::parse(account);
         let vault_id = record.as_ref().map_or(account, CompanionAccount::vault_id);
@@ -179,7 +199,7 @@ impl PromptSubject {
 
 /// The Keychain's own prompt for reading `account`, which macOS shows only
 /// if the run's approved context doesn't cover the item.
-fn operation_prompt(account: &str) -> String {
+pub(crate) fn operation_prompt(account: &str) -> String {
     let subject = PromptSubject::of(account);
     let requester = subject
         .folder

@@ -220,6 +220,45 @@
       }
     },
     {
+      "name": "edits that change nothing leave version 1 overrides as they are",
+      "vaultId": "proj",
+      "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "record": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\"},\"unset\":[]}}}",
+      "names": null,
+      "edits": [
+        {
+          "action": "set",
+          "environment": "development",
+          "key": "API_URL",
+          "value": "http://localhost:4000"
+        },
+        {
+          "action": "remove",
+          "environment": "development",
+          "key": "NEVER_SET"
+        }
+      ],
+      "expect": {
+        "result": "unchanged",
+        "effects": [
+          {
+            "kind": "key",
+            "environment": "development",
+            "key": "API_URL",
+            "previous": "set",
+            "changed": false
+          },
+          {
+            "kind": "key",
+            "environment": "development",
+            "key": "NEVER_SET",
+            "previous": "none",
+            "changed": false
+          }
+        ]
+      }
+    },
+    {
       "name": "the last removal deletes the record and the marker",
       "vaultId": "proj",
       "marker": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",

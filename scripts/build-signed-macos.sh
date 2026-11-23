@@ -71,9 +71,10 @@ fi
 
 PROFILE_PLIST="$(mktemp)"
 SIGNED_ENTITLEMENTS="$(mktemp)"
+BUILD_LOG="$(mktemp)"
 STAGING_DIR=""
 cleanup() {
-	rm -f "$PROFILE_PLIST" "$SIGNED_ENTITLEMENTS"
+	rm -f "$PROFILE_PLIST" "$SIGNED_ENTITLEMENTS" "$BUILD_LOG"
 	if [ -n "$STAGING_DIR" ] && [ -d "$STAGING_DIR" ]; then
 		rm -rf -- "$STAGING_DIR"
 	fi
@@ -106,7 +107,7 @@ fi
 TARGET_ROOT="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 BUILD_ARGS=(build --locked -p lpm-cli --bin lpm-rs)
 if [ "$VAULT_TESTS" = 1 ]; then
-	BUILD_ARGS=(test --locked -p lpm-vault --lib --no-run --message-format=json)
+	BUILD_ARGS=(test --locked -p lpm-vault --lib --no-run --message-format=json-render-diagnostics)
 fi
 if [ "$PROFILE" = "release" ]; then
 	BUILD_ARGS+=(--release)
@@ -122,13 +123,21 @@ fi
 
 cd "$REPO_ROOT"
 if [ "$VAULT_TESTS" = 1 ]; then
-	BINARY="$(
-		cargo "${BUILD_ARGS[@]}" |
-			grep '"name":"lpm_vault"' |
-			grep '"test":true' |
-			sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' |
-			tail -n 1
-	)"
+	# Cargo renders its diagnostics on stderr and writes one JSON message a
+	# line here; plutil decodes the strings, which may hold any character.
+	cargo "${BUILD_ARGS[@]}" >"$BUILD_LOG"
+	BINARY=""
+	field() { printf '%s' "$2" | plutil -extract "$1" raw -o - - 2>/dev/null || true; }
+	while IFS= read -r message; do
+		case "$message" in
+		*lpm_vault*) ;;
+		*) continue ;;
+		esac
+		if [ "$(field target.name "$message")" = "lpm_vault" ] &&
+			[ "$(field profile.test "$message")" = "true" ]; then
+			BINARY="$(field executable "$message")"
+		fi
+	done <"$BUILD_LOG"
 	if [ -z "$BINARY" ]; then
 		echo "error: cargo built no lpm-vault test executable" >&2
 		exit 1
