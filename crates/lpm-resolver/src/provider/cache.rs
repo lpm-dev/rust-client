@@ -69,6 +69,8 @@ pub(crate) fn merge_cached_package_info(
     covered_ranges.extend(incoming.covered_ranges.iter().cloned());
     let mut workspace_versions = existing.workspace_versions.clone();
     workspace_versions.extend(incoming.workspace_versions.iter().cloned());
+    let mut platform_hydrated_versions = existing.platform_hydrated_versions.clone();
+    platform_hydrated_versions.extend(incoming.platform_hydrated_versions.iter().cloned());
 
     let incoming_adds_versions = incoming.versions.iter().any(|version| {
         existing
@@ -90,6 +92,9 @@ pub(crate) fn merge_cached_package_info(
     let platform_metadata_complete = (existing.platform_metadata_complete
         && (incoming.platform_metadata_complete || !incoming_adds_versions))
         || (incoming.platform_metadata_complete && !existing_adds_versions);
+    let release_metadata_complete = (existing.release_metadata_complete
+        && (incoming.release_metadata_complete || !incoming_adds_versions))
+        || (incoming.release_metadata_complete && !existing_adds_versions);
 
     if !incoming_adds_versions
         && incoming
@@ -120,6 +125,8 @@ pub(crate) fn merge_cached_package_info(
         merged.versions_complete = versions_complete;
         merged.trust_metadata_complete = trust_metadata_complete;
         merged.platform_metadata_complete = platform_metadata_complete;
+        merged.platform_hydrated_versions = platform_hydrated_versions;
+        merged.release_metadata_complete = release_metadata_complete;
         merged.latest_version_hint = latest_version_hint;
         merged.preferred_latest = merged_preferred_latest(existing, incoming, &merged);
         return merged;
@@ -170,6 +177,8 @@ pub(crate) fn merge_cached_package_info(
         }
     }
     let mut merged = builder.finish();
+    merged.platform_hydrated_versions = platform_hydrated_versions;
+    merged.release_metadata_complete |= release_metadata_complete;
     merged.latest_version_hint = latest_version_hint;
     merged.preferred_latest = merged_preferred_latest(existing, incoming, &merged);
     merged
@@ -212,8 +221,22 @@ fn merge_manifest_version(
             if incoming.node_engine.is_none() {
                 incoming.node_engine.clone_from(&existing.node_engine);
             }
-            if incoming.platform.is_none() {
-                incoming.platform.clone_from(&existing.platform);
+            match (&existing.platform, &mut incoming.platform) {
+                (Some(existing_platform), Some(incoming_platform)) => {
+                    if incoming_platform.os.is_empty() {
+                        incoming_platform.os.clone_from(&existing_platform.os);
+                    }
+                    if incoming_platform.cpu.is_empty() {
+                        incoming_platform.cpu.clone_from(&existing_platform.cpu);
+                    }
+                    if incoming_platform.libc.is_empty() {
+                        incoming_platform.libc.clone_from(&existing_platform.libc);
+                    }
+                }
+                (Some(existing_platform), None) => {
+                    incoming.platform = Some(existing_platform.clone());
+                }
+                (None, _) => {}
             }
             incoming.dist = merge_cached_dist_info(&existing.dist, &incoming.dist);
             Some(incoming)

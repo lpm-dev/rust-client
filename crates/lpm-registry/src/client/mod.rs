@@ -36,6 +36,7 @@ mod mcp;
 mod metadata;
 mod projection;
 mod public_npm;
+mod release_time_stream;
 mod second_factor;
 mod state;
 mod tarball;
@@ -61,14 +62,15 @@ pub use self::install_accounting::{
 };
 pub use self::manifest::ManifestVersionMetadata;
 pub use self::mcp::{HostedMcpAnswer, HostedMcpRequest, MAX_HOSTED_MCP_RESPONSE_BYTES};
-pub use self::metadata::BatchMetadataEntryStream;
+pub use self::metadata::{BatchMetadataEntryStream, ReleaseTimeSuffixHint};
 pub use self::projection::{MetadataProjection, NoProjection, ProjectionSlot, ResolutionMetadata};
 pub use self::public_npm::PublicNpmAccess;
 pub use self::second_factor::SecondFactorProof;
 pub use self::state::{
     CompressedTarballSpoolReservation, DownloadedTarball, FanOutStats, HttpClients,
-    PackageMetadataFetchError, PackageMetadataFetchTimings, RegistryClient, TimedPackageMetadata,
-    TimedPreferredMetadata, TimedPreferredResolution, TimedReleaseTimeMetadata,
+    PackageMetadataFetchError, PackageMetadataFetchTimings, RegistryClient, TimedDirectResolution,
+    TimedPackageMetadata, TimedPreferredMetadata, TimedPreferredResolution,
+    TimedReleaseTimeMetadata,
 };
 pub use self::tarball::{
     MAX_COMPRESSED_TARBALL_SIZE, MAX_COMPRESSED_TARBALL_SPOOL_BYTES, TARBALL_BODY_ATTEMPTS,

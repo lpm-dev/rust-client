@@ -280,6 +280,7 @@ async fn hold_client_build_open(
         tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
         per_origin_identity_certs: HashMap::new(),
         next_request_lane: AtomicUsize::new(0),
+        next_policy_metadata_lane: AtomicUsize::new(0),
     });
     let (building_tx, building_rx) = tokio::sync::oneshot::channel();
     let http = Arc::clone(&client.http);

@@ -63,10 +63,12 @@ pub struct CachedPackageInfo {
     pub modified: Option<String>,
     pub modified_unix: Option<i64>,
     pub trust_metadata_complete: bool,
+    pub release_metadata_complete: bool,
     pub versions_complete: bool,
     pub covered_ranges: HashSet<String>,
     pub workspace_versions: HashSet<NpmVersion>,
     pub platform_metadata_complete: bool,
+    pub(crate) platform_hydrated_versions: HashSet<String>,
     pub latest_version: Option<NpmVersion>,
     pub latest_version_hint: Option<NpmVersion>,
     pub(crate) preferred_latest: Option<NpmVersion>,
@@ -450,10 +452,12 @@ impl CachedPackageInfo {
             modified: None,
             modified_unix: None,
             trust_metadata_complete: false,
+            release_metadata_complete: false,
             versions_complete: true,
             covered_ranges: HashSet::new(),
             workspace_versions: HashSet::new(),
             platform_metadata_complete: false,
+            platform_hydrated_versions: HashSet::new(),
             latest_version: None,
             latest_version_hint: None,
             preferred_latest: None,
@@ -629,7 +633,7 @@ impl CachedPackageInfo {
         }
     }
 
-    pub(super) fn dist_tags(&self) -> &HashMap<String, NpmVersion> {
+    pub(crate) fn dist_tags(&self) -> &HashMap<String, NpmVersion> {
         &self.dist_tags
     }
 
@@ -685,6 +689,15 @@ impl CachedPackageInfo {
         !self.platform.records.is_empty()
     }
 
+    #[inline]
+    pub(crate) fn version_strs(&self) -> Vec<&str> {
+        self.core
+            .versions
+            .iter()
+            .map(|record| self.core.strings.get(record.text))
+            .collect()
+    }
+
     pub fn merge_release_times(&mut self, release_times: &lpm_registry::ReleaseTimeMetadata) {
         let mut releases = self
             .release
@@ -715,6 +728,14 @@ impl CachedPackageInfo {
             }
         }
         self.release = Arc::new(build_release_overlay(releases));
+        let modified_matches = self.modified.as_deref().is_some_and(|expected| {
+            release_times.time.get("modified").map(String::as_str) == Some(expected)
+        });
+        let all_versions_covered = self.core.versions.is_empty()
+            || (0..self.core.versions.len()).all(|idx| known_release_versions.contains(&idx));
+        if !release_times.time.is_empty() && (all_versions_covered || modified_matches) {
+            self.release_metadata_complete = true;
+        }
 
         if let Some(release_platforms) = &release_times.versions {
             let mut platforms = self.platforms_owned();
@@ -934,6 +955,9 @@ impl CachedPackageInfo {
         if !policy.release_age_active() || policy.release_age_excluded(package) {
             return false;
         }
+        if self.release_metadata_complete {
+            return false;
+        }
         let missing_version_time = self.release.records.len() < self.core.versions.len();
         missing_version_time
             && policy.metadata_modified_after_cutoff_for_package(
@@ -949,14 +973,57 @@ impl CachedPackageInfo {
 
     pub fn needs_platform_metadata(&self) -> bool {
         !self.platform_metadata_complete
-            && self.platform.records.iter().any(|record| {
-                let os = platform_value_refs(&self.platform, record.os);
-                let cpu_is_empty = record.cpu.len == 0;
-                let libc_is_empty = record.libc.len == 0;
-                libc_is_empty
-                    && (record.os.len != 0 || !cpu_is_empty)
-                    && platform_may_target_linux(os)
-            })
+            && self
+                .platform
+                .records
+                .iter()
+                .any(|record| self.platform_record_needs_libc(record))
+    }
+
+    fn platform_record_needs_libc(&self, record: &PlatformRecord) -> bool {
+        let os = platform_value_refs(&self.platform, record.os);
+        let cpu_is_empty = record.cpu.len == 0;
+        let libc_is_empty = record.libc.len == 0;
+        libc_is_empty && (record.os.len != 0 || !cpu_is_empty) && platform_may_target_linux(os)
+    }
+
+    pub fn needs_platform_metadata_for_version(&self, version: &str) -> bool {
+        if self.platform_metadata_complete || self.platform_hydrated_versions.contains(version) {
+            return false;
+        }
+        let Some(version_id) = self.core.version_id(version) else {
+            return false;
+        };
+        let Some(record) =
+            find_version_record(&self.platform.records, version_id as u32, |r| r.version)
+        else {
+            return false;
+        };
+        self.platform_record_needs_libc(record)
+    }
+
+    pub fn merge_exact_version_platform(
+        &mut self,
+        version: &str,
+        os: &[String],
+        cpu: &[String],
+        libc: &[String],
+    ) {
+        if let Some(version_id) = self.core.version_id(version) {
+            let mut platforms = self.platforms_owned();
+            let platform = platforms.entry(version_id).or_default();
+            if platform.os.is_empty() && !os.is_empty() {
+                platform.os = os.to_vec();
+            }
+            if platform.cpu.is_empty() && !cpu.is_empty() {
+                platform.cpu = cpu.to_vec();
+            }
+            if platform.libc.is_empty() && !libc.is_empty() {
+                platform.libc = libc.to_vec();
+            }
+            self.platform = Arc::new(build_platform_overlay(platforms));
+            self.platform_hydrated_versions.insert(version.to_owned());
+        }
     }
 
     pub fn needs_supplemental_metadata(
@@ -1122,10 +1189,13 @@ impl ManifestCacheBuilder {
             modified: self.modified,
             modified_unix,
             trust_metadata_complete: self.trust_metadata_complete,
+            release_metadata_complete: !version_records.is_empty()
+                && release_inputs.len() >= version_records.len(),
             versions_complete: self.versions_complete,
             covered_ranges: self.covered_ranges,
             workspace_versions: self.workspace_versions,
             platform_metadata_complete: self.platform_metadata_complete,
+            platform_hydrated_versions: HashSet::new(),
             latest_version_hint: None,
             latest_version: self.latest_version,
             preferred_latest: None,
@@ -1409,6 +1479,31 @@ mod tests {
         assert!(!changed.share_manifest_core_from_if_equivalent(&base));
         assert!(Arc::ptr_eq(&changed.core, &changed_core));
         assert!(!Arc::ptr_eq(&changed.core, &base.core));
+    }
+
+    #[test]
+    fn skewed_partial_release_times_do_not_mark_release_metadata_complete() {
+        let mut info = info_from(vec![manifest("1.0.0"), manifest("2.0.0")]);
+        info.modified = Some("2026-11-22T12:00:00.000Z".to_string());
+        info.modified_unix = Some(1_795_348_800);
+        let skewed = lpm_registry::ReleaseTimeMetadata {
+            name: Some("fixture".to_string()),
+            time: HashMap::from([
+                (
+                    "modified".to_string(),
+                    "2026-11-20T00:00:00.000Z".to_string(),
+                ),
+                ("1.0.0".to_string(), "2025-01-01T00:00:00.000Z".to_string()),
+            ]),
+            versions: None,
+        };
+
+        info.merge_release_times(&skewed);
+
+        assert!(
+            !info.release_metadata_complete,
+            "missing timestamp for 2.0.0 with mismatched modified must not mark release metadata complete"
+        );
     }
 
     #[test]

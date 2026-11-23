@@ -1607,6 +1607,44 @@ pub(crate) fn write_install_hash_with_integrity_and_platform(
     )
 }
 
+pub(crate) fn release_age_freshness_key(
+    min_age_secs: u64,
+    policy: crate::release_age_config::ReleaseAgePolicy,
+    excludes: &[String],
+    allow_new: bool,
+) -> Option<String> {
+    if !policy.is_strict() || min_age_secs == 0 || allow_new {
+        return None;
+    }
+    let mut normalized: Vec<&str> = excludes.iter().map(String::as_str).collect();
+    normalized.sort_unstable();
+    normalized.dedup();
+    let mut hasher = Sha256::new();
+    for selector in normalized {
+        hasher.update(selector.as_bytes());
+        hasher.update(b"\x00");
+    }
+    let digest = hasher.finalize();
+    Some(format!(
+        "strict:{min_age_secs}:{}",
+        hex::encode(&digest[..8])
+    ))
+}
+
+pub(crate) fn parse_release_age_policy_line(content: &str) -> Option<&str> {
+    let mut found = None;
+    for line in content.lines() {
+        let Some(rest) = line.strip_prefix("g:") else {
+            continue;
+        };
+        if found.is_some() || rest.is_empty() {
+            return None;
+        }
+        found = Some(rest);
+    }
+    found
+}
+
 pub(crate) fn write_install_hash_with_integrity_platform_and_dependency_engine(
     project_dir: &Path,
     hash: &str,
@@ -1629,6 +1667,7 @@ pub(crate) fn write_install_hash_with_integrity_platform_and_dependency_engine(
             security_analysis_policy:
                 crate::source_analysis_config::DEFAULT_SECURITY_ANALYSIS_POLICY,
             sync_noop_proof: None,
+            release_age_policy_key: None,
         },
     )
 }
@@ -1638,6 +1677,7 @@ pub(crate) struct KnownInstallHashRuntimeState<'a> {
     pub(crate) node_runtime_fingerprint: Option<&'a str>,
     pub(crate) security_analysis_policy: SecurityAnalysisPolicy,
     pub(crate) sync_noop_proof: Option<&'a SyncNoopLockfileProofInput>,
+    pub(crate) release_age_policy_key: Option<&'a str>,
 }
 
 pub(crate) fn write_install_hash_with_known_runtime_state(
@@ -1661,6 +1701,7 @@ pub(crate) fn write_install_hash_with_known_runtime_state(
             node_runtime_fingerprint: runtime_state.node_runtime_fingerprint,
             security_analysis_policy: runtime_state.security_analysis_policy,
             sync_noop_proof: runtime_state.sync_noop_proof,
+            release_age_policy_key: runtime_state.release_age_policy_key,
         },
     )
 }
@@ -1670,6 +1711,7 @@ struct InstallHashWriteMetadata<'a> {
     node_runtime_fingerprint: Option<&'a str>,
     security_analysis_policy: SecurityAnalysisPolicy,
     sync_noop_proof: Option<&'a SyncNoopLockfileProofInput>,
+    release_age_policy_key: Option<&'a str>,
 }
 
 fn write_install_hash_with_metadata(
@@ -1717,6 +1759,11 @@ fn write_install_hash_with_metadata(
         let proof = SyncNoopLockfileProof::from_input(proof_input);
         content.push_str("f:");
         content.push_str(&proof.format_line_value());
+        content.push('\n');
+    }
+    if let Some(release_age_policy_key) = metadata.release_age_policy_key {
+        content.push_str("g:");
+        content.push_str(release_age_policy_key);
         content.push('\n');
     }
     write_state_file_owner_only(&hash_dir.join("install-hash"), content.as_bytes())?;
@@ -1773,7 +1820,7 @@ fn write_install_hash_with_metadata(
 /// the full pipeline. This guarantees the fast lane never produces wrong
 /// results — false negatives (falling through) are safe, false positives
 /// (exiting early when we shouldn't) are not.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FastLaneMode {
     pub json: bool,
     pub timing: bool,
@@ -1784,6 +1831,10 @@ pub struct FastLaneMode {
     /// `--no-skills`: the install neither materializes package skills nor
     /// restores managed ones, so their state doesn't decide freshness.
     pub(crate) no_skills: bool,
+    /// Raw `--min-release-age` argument forwarded to release-age validation.
+    pub(crate) min_release_age: Option<String>,
+    /// Raw `--min-release-age-exclude` arguments forwarded to release-age validation.
+    pub(crate) min_release_age_exclude: Vec<String>,
 }
 
 pub fn argv_qualifies_for_fast_lane() -> Option<FastLaneMode> {
@@ -1807,20 +1858,60 @@ fn fast_lane_mode_from_args(args: &[&str]) -> Option<FastLaneMode> {
     let mut timing = false;
     let mut frozen_lockfile = None;
     let mut no_skills = false;
+    let mut min_release_age: Option<String> = None;
+    let mut min_release_age_exclude: Vec<String> = Vec::new();
     let mut found_install = false;
     let mut is_ci = false;
-    // clap refuses a flag given twice on one side of `install`, so the fast
-    // lane must not answer for it.
+    // clap refuses a non-repeatable flag given twice on one side of `install`,
+    // so the fast lane must not answer for it.
     let mut seen: Vec<&str> = Vec::with_capacity(args.len());
 
-    for arg in args {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i];
+        if found_install {
+            if let Some(value) = arg.strip_prefix("--min-release-age=") {
+                if min_release_age.is_some() {
+                    return None;
+                }
+                min_release_age = Some(value.to_string());
+                i += 1;
+                continue;
+            }
+            if arg == "--min-release-age" {
+                if min_release_age.is_some() {
+                    return None;
+                }
+                let value = *args.get(i + 1)?;
+                if value.starts_with('-') {
+                    return None;
+                }
+                min_release_age = Some(value.to_string());
+                i += 2;
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("--min-release-age-exclude=") {
+                min_release_age_exclude.push(value.to_string());
+                i += 1;
+                continue;
+            }
+            if arg == "--min-release-age-exclude" {
+                let value = *args.get(i + 1)?;
+                if value.starts_with('-') {
+                    return None;
+                }
+                min_release_age_exclude.push(value.to_string());
+                i += 2;
+                continue;
+            }
+        }
         if arg.starts_with('-') {
-            if seen.contains(arg) {
+            if seen.contains(&arg) {
                 return None;
             }
             seen.push(arg);
         }
-        match *arg {
+        match arg {
             "--json" => json = true,
             "--timing" if found_install && !is_ci => timing = true,
 
@@ -1849,7 +1940,7 @@ fn fast_lane_mode_from_args(args: &[&str]) -> Option<FastLaneMode> {
             // Flags the check honours. Both frozen flags at once are left to
             // clap to refuse.
             "--frozen-lockfile" | "--no-frozen-lockfile" if found_install && !is_ci => {
-                let mode = if *arg == "--frozen-lockfile" {
+                let mode = if arg == "--frozen-lockfile" {
                     FrozenLockfileMode::Always
                 } else {
                     FrozenLockfileMode::Never
@@ -1889,6 +1980,7 @@ fn fast_lane_mode_from_args(args: &[&str]) -> Option<FastLaneMode> {
 
             _ => return None,
         }
+        i += 1;
     }
 
     if is_ci && json {
@@ -1900,6 +1992,8 @@ fn fast_lane_mode_from_args(args: &[&str]) -> Option<FastLaneMode> {
         timing,
         frozen_lockfile: frozen_lockfile.unwrap_or_default(),
         no_skills,
+        min_release_age,
+        min_release_age_exclude,
     })
 }
 
@@ -2027,8 +2121,57 @@ mod tests {
                 timing: true,
                 frozen_lockfile: crate::commands::install::FrozenLockfileMode::Auto,
                 no_skills: false,
+                min_release_age: None,
+                min_release_age_exclude: Vec::new(),
             })
         );
+    }
+
+    #[test]
+    fn fast_lane_mode_from_args_handles_min_release_age_and_excludes() {
+        use crate::commands::install::FrozenLockfileMode;
+
+        assert_eq!(
+            fast_lane_mode_from_args(&[
+                "install",
+                "--min-release-age=7d",
+                "--min-release-age-exclude=lodash",
+                "--min-release-age-exclude",
+                "@types/*",
+            ]),
+            Some(FastLaneMode {
+                json: false,
+                timing: false,
+                frozen_lockfile: FrozenLockfileMode::Auto,
+                no_skills: false,
+                min_release_age: Some("7d".to_string()),
+                min_release_age_exclude: vec!["lodash".to_string(), "@types/*".to_string()],
+            })
+        );
+        assert_eq!(
+            fast_lane_mode_from_args(&["ci", "--min-release-age", "3d"]),
+            Some(FastLaneMode {
+                json: false,
+                timing: false,
+                frozen_lockfile: FrozenLockfileMode::Always,
+                no_skills: false,
+                min_release_age: Some("3d".to_string()),
+                min_release_age_exclude: Vec::new(),
+            })
+        );
+        // Duplicate --min-release-age, missing values, or flag before subcommand bail to clap.
+        for rejected in [
+            &["--min-release-age=7d", "install"][..],
+            &["install", "--min-release-age"][..],
+            &["install", "--min-release-age", "--json"][..],
+            &["install", "--min-release-age=7d", "--min-release-age=3d"][..],
+            &["install", "--min-release-age", "7d", "--min-release-age=3d"][..],
+            &["install", "--min-release-age-exclude"][..],
+            &["install", "--min-release-age-exclude", "--no-skills"][..],
+            &["install", "--min-release-age=7d", "--allow-new"][..],
+        ] {
+            assert_eq!(fast_lane_mode_from_args(rejected), None, "{rejected:?}");
+        }
     }
 
     #[test]
@@ -3885,6 +4028,8 @@ mod tests {
                 timing: false,
                 frozen_lockfile: FrozenLockfileMode::Always,
                 no_skills: false,
+                min_release_age: None,
+                min_release_age_exclude: Vec::new(),
             })
         );
         assert_eq!(
@@ -3894,6 +4039,8 @@ mod tests {
                 timing: false,
                 frozen_lockfile: FrozenLockfileMode::Always,
                 no_skills: true,
+                min_release_age: None,
+                min_release_age_exclude: Vec::new(),
             })
         );
         // `lpm ci --json` must fall through to emit the full JSON envelope.

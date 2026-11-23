@@ -479,6 +479,8 @@ fn the_up_to_date_check_refuses_a_lockfile_whose_roots_miss_the_manifest() {
         timing: false,
         frozen_lockfile: crate::commands::install::FrozenLockfileMode::Never,
         no_skills: true,
+        min_release_age: None,
+        min_release_age_exclude: Vec::new(),
     };
 
     for (root_version, up_to_date) in [("1.0.0", true), ("2.0.0", false)] {
@@ -487,7 +489,8 @@ fn the_up_to_date_check_refuses_a_lockfile_whose_roots_miss_the_manifest() {
         let pkg = std::fs::read_to_string(project.path().join("package.json")).unwrap();
 
         assert_eq!(
-            crate::commands::install::sync_noop::is_up_to_date(project.path(), &pkg, mode).unwrap(),
+            crate::commands::install::sync_noop::is_up_to_date(project.path(), &pkg, &mode)
+                .unwrap(),
             up_to_date,
             "leaf rooted at {root_version} for a manifest asking for 1.0.0"
         );
@@ -507,6 +510,8 @@ fn the_up_to_date_check_compares_catalog_dependencies_with_the_lockfiles_catalog
         timing: false,
         frozen_lockfile: crate::commands::install::FrozenLockfileMode::Never,
         no_skills: true,
+        min_release_age: None,
+        min_release_age_exclude: Vec::new(),
     };
     let snapshot = |specifier: &str, version: &str| {
         lpm_lockfile::CatalogSnapshots::from([(
@@ -567,7 +572,7 @@ fn the_up_to_date_check_compares_catalog_dependencies_with_the_lockfiles_catalog
         installed_project(project.path(), pkg, "1.0.0", catalogs);
 
         assert_eq!(
-            crate::commands::install::sync_noop::is_up_to_date(project.path(), pkg, mode).unwrap(),
+            crate::commands::install::sync_noop::is_up_to_date(project.path(), pkg, &mode).unwrap(),
             up_to_date,
             "{case}"
         );
@@ -587,6 +592,8 @@ fn the_up_to_date_check_accepts_a_catalog_override_of_a_transitive_dependency() 
         timing: false,
         frozen_lockfile: crate::commands::install::FrozenLockfileMode::Never,
         no_skills: true,
+        min_release_age: None,
+        min_release_age_exclude: Vec::new(),
     };
     let source = "registry+https://registry.npmjs.org";
     let locked = |name: &str, path: &str| lpm_lockfile::LockedPackage {
@@ -630,7 +637,9 @@ fn the_up_to_date_check_accepts_a_catalog_override_of_a_transitive_dependency() 
     let project = tempfile::tempdir().unwrap();
     installed_project_locked_as(project.path(), pkg, &lockfile);
 
-    assert!(crate::commands::install::sync_noop::is_up_to_date(project.path(), pkg, mode).unwrap());
+    assert!(
+        crate::commands::install::sync_noop::is_up_to_date(project.path(), pkg, &mode).unwrap()
+    );
 }
 
 #[test]
@@ -646,6 +655,8 @@ fn the_up_to_date_check_accepts_an_unapplied_catalog_override_of_a_direct_depend
         timing: false,
         frozen_lockfile: crate::commands::install::FrozenLockfileMode::Never,
         no_skills: true,
+        min_release_age: None,
+        min_release_age_exclude: Vec::new(),
     };
     // The override doesn't change what the dependency's range selects, so
     // the lockfile records no snapshot for it.
@@ -658,5 +669,85 @@ fn the_up_to_date_check_accepts_an_unapplied_catalog_override_of_a_direct_depend
         lpm_lockfile::CatalogSnapshots::new(),
     );
 
-    assert!(crate::commands::install::sync_noop::is_up_to_date(project.path(), pkg, mode).unwrap());
+    assert!(
+        crate::commands::install::sync_noop::is_up_to_date(project.path(), pkg, &mode).unwrap()
+    );
+}
+
+#[test]
+fn sync_noop_bails_out_when_global_config_enables_strict_release_age() {
+    let home = tempfile::tempdir().unwrap();
+    let _env = crate::test_env::ScopedEnv::update(npm_env_under(home.path()).into_iter().chain([
+        ("LPM_LINKER", None),
+        (lpm_store::StoreVersion::ENV_VAR, None),
+        (lpm_store::v2::ENV_V2_OBJECT_INTEGRITY, None),
+    ]));
+    let mode = crate::install_state::FastLaneMode {
+        json: true,
+        timing: false,
+        frozen_lockfile: crate::commands::install::FrozenLockfileMode::Never,
+        no_skills: true,
+        min_release_age: None,
+        min_release_age_exclude: Vec::new(),
+    };
+    let pkg = r#"{"name":"consumer","dependencies":{"leaf":"^1.0.0"}}"#;
+    let project = tempfile::tempdir().unwrap();
+    installed_project(
+        project.path(),
+        pkg,
+        "1.0.0",
+        lpm_lockfile::CatalogSnapshots::new(),
+    );
+
+    assert!(
+        crate::commands::install::sync_noop::is_up_to_date(project.path(), pkg, &mode).unwrap()
+    );
+
+    let lpm_dir = home.path().join(".lpm");
+    std::fs::create_dir_all(&lpm_dir).unwrap();
+    std::fs::write(
+        lpm_dir.join("config.toml"),
+        "minimum-release-age-secs = 604800\nrelease-age-policy = \"strict\"\n",
+    )
+    .unwrap();
+    assert!(
+        !crate::commands::install::sync_noop::is_up_to_date(project.path(), pkg, &mode).unwrap(),
+        "enabling strict minimum-release-age must force lockfile revalidation"
+    );
+
+    // Once `.lpm/install-hash` records the verified strict release-age key,
+    // matching invocations fast-exit while tighter CLI windows re-enter the pipeline.
+    let verified_key = crate::install_state::release_age_freshness_key(
+        604_800,
+        crate::release_age_config::ReleaseAgePolicy::Strict,
+        &[],
+        false,
+    )
+    .unwrap();
+    let hash_path = project.path().join(".lpm/install-hash");
+    let mut hash_state = std::fs::read_to_string(&hash_path).unwrap();
+    hash_state.push_str(&format!("g:{verified_key}\n"));
+    std::fs::write(&hash_path, hash_state).unwrap();
+
+    assert!(
+        crate::commands::install::sync_noop::is_up_to_date(project.path(), pkg, &mode).unwrap(),
+        "verified strict release-age policy should allow sync no-op"
+    );
+    let cli_same = crate::install_state::FastLaneMode {
+        min_release_age: Some("7d".to_string()),
+        ..mode.clone()
+    };
+    assert!(
+        crate::commands::install::sync_noop::is_up_to_date(project.path(), pkg, &cli_same).unwrap(),
+        "matching CLI --min-release-age=7d should stay on the sync no-op fast lane"
+    );
+    let cli_tighter = crate::install_state::FastLaneMode {
+        min_release_age: Some("30d".to_string()),
+        ..mode
+    };
+    assert!(
+        !crate::commands::install::sync_noop::is_up_to_date(project.path(), pkg, &cli_tighter)
+            .unwrap(),
+        "tightening --min-release-age via CLI must invalidate the sync no-op fast lane"
+    );
 }

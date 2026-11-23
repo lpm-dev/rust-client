@@ -386,9 +386,18 @@ impl From<TimedPreferredResolution<super::NoProjection>> for TimedPreferredMetad
     }
 }
 
+/// Direct npm package history answered by a document or by its stored projection.
+#[derive(Debug)]
+pub struct TimedDirectResolution<P> {
+    pub metadata: super::ResolutionMetadata<P>,
+    /// Slot for writing or upgrading the cached projection bound to this document.
+    pub projection_slot: Option<super::ProjectionSlot>,
+    pub timings: PackageMetadataFetchTimings,
+}
+
 #[derive(Debug)]
 pub struct TimedReleaseTimeMetadata {
-    pub metadata: ReleaseTimeMetadata,
+    pub metadata: Arc<ReleaseTimeMetadata>,
     pub timings: PackageMetadataFetchTimings,
 }
 
@@ -526,7 +535,9 @@ pub struct RegistryClient {
 #[derive(Clone)]
 pub(super) struct CachedClient {
     pub(super) client: reqwest::Client,
-    pub(super) policy_metadata_client: reqwest::Client,
+    /// Redirect-disabled clients for large policy/release-time packuments, each
+    /// with its own connection pool. Never empty.
+    pub(super) policy_metadata_lanes: Arc<[reqwest::Client]>,
     /// Redirect-disabled clients that carry registry requests in turn, each
     /// with its own connection pool. Never empty.
     pub(super) request_lanes: Arc<[reqwest::Client]>,
@@ -539,11 +550,11 @@ pub(super) struct CachedClient {
 /// The client set for origins without TLS configuration of their own. A
 /// registry client without TLS overrides builds only the exact client pool
 /// each request uses, so short or single-RPC commands do not construct all
-/// eleven HTTP clients up front.
+/// HTTP clients up front.
 pub(super) struct LazyDefaultClient {
     proxy_warning: std::sync::Once,
     client: std::sync::OnceLock<reqwest::Client>,
-    policy_metadata_client: std::sync::OnceLock<reqwest::Client>,
+    policy_metadata_lanes: std::sync::OnceLock<Arc<[std::sync::OnceLock<reqwest::Client>]>>,
     request_lanes: std::sync::OnceLock<Arc<[std::sync::OnceLock<reqwest::Client>]>>,
     transfer_client: std::sync::OnceLock<reqwest::Client>,
 }
@@ -553,7 +564,7 @@ impl LazyDefaultClient {
         Self {
             proxy_warning: std::sync::Once::new(),
             client: std::sync::OnceLock::new(),
-            policy_metadata_client: std::sync::OnceLock::new(),
+            policy_metadata_lanes: std::sync::OnceLock::new(),
             request_lanes: std::sync::OnceLock::new(),
             transfer_client: std::sync::OnceLock::new(),
         }
@@ -573,10 +584,20 @@ impl LazyDefaultClient {
     fn select(&self, pool: super::http::ClientPool) -> reqwest::Client {
         match pool {
             super::http::ClientPool::General => self.general().clone(),
-            super::http::ClientPool::PolicyMetadata => self
-                .policy_metadata_client
-                .get_or_init(|| self.build(super::http::ClientPool::PolicyMetadata))
-                .clone(),
+            super::http::ClientPool::PolicyMetadata(lane) => {
+                let lanes = self.policy_metadata_lanes.get_or_init(|| {
+                    let count = super::http::policy_metadata_lane_count(
+                        std::env::var("LPM_HTTP").ok().as_deref(),
+                    );
+                    (0..count)
+                        .map(|_| std::sync::OnceLock::new())
+                        .collect::<Vec<_>>()
+                        .into()
+                });
+                lanes[lane % lanes.len()]
+                    .get_or_init(|| self.build(super::http::ClientPool::PolicyMetadata(lane)))
+                    .clone()
+            }
             super::http::ClientPool::ManualRedirect(lane) => {
                 let lanes = self.request_lanes.get_or_init(|| {
                     let count =
@@ -600,7 +621,10 @@ impl LazyDefaultClient {
     #[cfg(test)]
     fn is_built(&self) -> bool {
         self.client.get().is_some()
-            || self.policy_metadata_client.get().is_some()
+            || self
+                .policy_metadata_lanes
+                .get()
+                .is_some_and(|lanes| lanes.iter().any(|slot| slot.get().is_some()))
             || self.transfer_client.get().is_some()
             || self
                 .request_lanes
@@ -670,7 +694,7 @@ mod lazy_default_client_tests {
             panic!("expected lazy default client");
         };
         assert!(lazy.client.get().is_some());
-        assert!(lazy.policy_metadata_client.get().is_none());
+        assert!(lazy.policy_metadata_lanes.get().is_none());
         assert!(lazy.request_lanes.get().is_none());
         assert!(lazy.transfer_client.get().is_none());
 
@@ -678,8 +702,27 @@ mod lazy_default_client_tests {
         let lanes = lazy.request_lanes.get().expect("request lanes initialized");
         let built_lanes = lanes.iter().filter(|slot| slot.get().is_some()).count();
         assert_eq!(built_lanes, 1);
-        assert!(lazy.policy_metadata_client.get().is_none());
+        assert!(lazy.policy_metadata_lanes.get().is_none());
         assert!(lazy.transfer_client.get().is_none());
+
+        let _ = default.select(super::super::http::ClientPool::PolicyMetadata(0));
+        let policy_lanes = lazy
+            .policy_metadata_lanes
+            .get()
+            .expect("policy metadata lanes initialized");
+        let built_policy_lanes = policy_lanes
+            .iter()
+            .filter(|slot| slot.get().is_some())
+            .count();
+        assert_eq!(built_policy_lanes, 1);
+        let _ = default.select(super::super::http::ClientPool::PolicyMetadata(1));
+        if policy_lanes.len() > 1 {
+            let built_policy_lanes = policy_lanes
+                .iter()
+                .filter(|slot| slot.get().is_some())
+                .count();
+            assert_eq!(built_policy_lanes, 2);
+        }
     }
 }
 
@@ -732,4 +775,5 @@ pub struct HttpClients {
     pub(super) tls_material_budget: Arc<TlsMaterialBudget>,
     pub(super) per_origin_identity_certs: HashMap<OriginKey, LazyIdentityCert>,
     pub(super) next_request_lane: std::sync::atomic::AtomicUsize,
+    pub(super) next_policy_metadata_lane: std::sync::atomic::AtomicUsize,
 }

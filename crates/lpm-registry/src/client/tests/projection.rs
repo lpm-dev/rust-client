@@ -78,7 +78,7 @@ async fn a_bound_projection_answers_without_decoding_the_document() {
     replace_payload(&client, "entry", b"not a document");
 
     match resolve::<Label>(&client, "entry").await {
-        CachedResolution::Projected { value, facts } => {
+        CachedResolution::Projected { value, facts, .. } => {
             assert_eq!(value, Label("projected".to_owned()));
             assert!(facts.versions_complete);
         }

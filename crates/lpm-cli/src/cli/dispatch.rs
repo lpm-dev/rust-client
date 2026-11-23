@@ -111,7 +111,7 @@ pub(crate) fn run() -> Result<()> {
                 || install_state::has_pnpm_workspace_yaml(&cwd);
 
             if !workspace_root_install && let Some(pkg_content) = pkg_content_opt.as_deref() {
-                match commands::install::sync_noop::is_up_to_date(&cwd, pkg_content, fast_lane) {
+                match commands::install::sync_noop::is_up_to_date(&cwd, pkg_content, &fast_lane) {
                     Ok(true) => {
                         if !cwd.join(".lpm").join(".gitignore").exists() {
                             keep_state_ignored_at_exit_from(&cwd);

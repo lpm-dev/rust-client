@@ -207,14 +207,14 @@ impl<P: MetadataProjection> CachedHistory<P> {
             CachedResolution::Document { value, source } => {
                 Self::document(value.metadata, value.versions_complete, source)
             }
-            CachedResolution::Projected { value, facts } => Self::projected(value, facts),
+            CachedResolution::Projected { value, facts, .. } => Self::projected(value, facts),
         }
     }
 
     fn from_complete(resolution: CachedResolution<PackageMetadata, P>) -> Self {
         match resolution {
             CachedResolution::Document { value, source } => Self::document(value, true, source),
-            CachedResolution::Projected { value, facts } => Self::projected(value, facts),
+            CachedResolution::Projected { value, facts, .. } => Self::projected(value, facts),
         }
     }
 
@@ -292,7 +292,7 @@ impl RegistryClient {
             .await?
             .value
         {
-            CachedResolution::Projected { value, facts } => {
+            CachedResolution::Projected { value, facts, .. } => {
                 Some(CachedHistory::projected(value, facts))
             }
             CachedResolution::Document { value, source } => {
@@ -325,7 +325,7 @@ impl RegistryClient {
             .await?
             .value
         {
-            CachedResolution::Projected { value, facts } => {
+            CachedResolution::Projected { value, facts, .. } => {
                 Some(CachedHistory::projected(value, facts))
             }
             CachedResolution::Document { value, source } => {
@@ -572,6 +572,271 @@ impl RegistryClient {
         .await;
         crate::timing::record_rpc(rpc_start.elapsed());
         result
+    }
+
+    /// Fetch complete direct npm history, answering from its stored projection
+    /// `P` when present and returning the projection slot so callers can write
+    /// or upgrade the projection (for example after hydrating release times).
+    pub async fn get_npm_metadata_direct_resolution_with_timings<P: MetadataProjection>(
+        &self,
+        name: &str,
+        access: PublicNpmAccess<'_>,
+    ) -> Result<TimedDirectResolution<P>, LpmError> {
+        crate::timing::record_metadata_request(name);
+        let cache_key = self.npm_direct_metadata_cache_key(name, access);
+        let memory_cache_key = self.direct_metadata_memory_cache_key(&cache_key);
+        let mut timings = PackageMetadataFetchTimings::default();
+
+        let cache_read_start = std::time::Instant::now();
+        if let Some(hit) = self
+            .read_direct_complete_resolution::<P>(name, &cache_key)
+            .await
+        {
+            timings.cache_read_ms = cache_read_start.elapsed().as_millis();
+            timings.cache_hit = true;
+            crate::timing::record_metadata_cache_hit();
+            return Ok(TimedDirectResolution {
+                metadata: hit.0,
+                projection_slot: hit.1,
+                timings,
+            });
+        }
+        if let Some(cached) = self.read_metadata_memory_cache(&memory_cache_key)
+            && batch_metadata_entry_matches_name(name, &cached)
+        {
+            timings.cache_read_ms = cache_read_start.elapsed().as_millis();
+            timings.cache_hit = true;
+            crate::timing::record_metadata_cache_hit();
+            return Ok(TimedDirectResolution {
+                metadata: ResolutionMetadata::Document {
+                    metadata: Box::new(cached),
+                    projection: None,
+                },
+                projection_slot: None,
+                timings,
+            });
+        }
+        timings.cache_read_ms = cache_read_start.elapsed().as_millis();
+        crate::timing::record_metadata_cache_miss();
+
+        let _flight = metadata_fetch_flight_guard(&cache_key).await;
+        let coalesced_read_start = std::time::Instant::now();
+        if let Some(hit) = self
+            .read_direct_complete_resolution::<P>(name, &cache_key)
+            .await
+        {
+            timings.cache_read_ms = timings
+                .cache_read_ms
+                .saturating_add(coalesced_read_start.elapsed().as_millis());
+            timings.cache_hit = true;
+            return Ok(TimedDirectResolution {
+                metadata: hit.0,
+                projection_slot: hit.1,
+                timings,
+            });
+        }
+        if let Some(cached) = self.read_metadata_memory_cache(&memory_cache_key)
+            && batch_metadata_entry_matches_name(name, &cached)
+        {
+            timings.cache_read_ms = timings
+                .cache_read_ms
+                .saturating_add(coalesced_read_start.elapsed().as_millis());
+            timings.cache_hit = true;
+            return Ok(TimedDirectResolution {
+                metadata: ResolutionMetadata::Document {
+                    metadata: Box::new(cached),
+                    projection: None,
+                },
+                projection_slot: None,
+                timings,
+            });
+        }
+        timings.cache_read_ms = timings
+            .cache_read_ms
+            .saturating_add(coalesced_read_start.elapsed().as_millis());
+
+        let rpc_start = std::time::Instant::now();
+        macro_rules! finish {
+            ($expr:expr) => {{
+                let r = $expr;
+                crate::timing::record_rpc(rpc_start.elapsed());
+                r
+            }};
+        }
+
+        let validator_start = std::time::Instant::now();
+        let cache_validator = self.read_cache_validator(&cache_key);
+        timings.validator_read_ms = validator_start.elapsed().as_millis();
+        timings.cache_age_seconds = cache_validator
+            .as_ref()
+            .and_then(|validator| validator.age_seconds);
+
+        let npm_url = format!("{}/{}", self.npm_registry_url, name);
+        let req = self
+            .npm_registry_get(&npm_url, "application/vnd.npm.install-v1+json", access)
+            .await?;
+        let req = Self::apply_cached_etag(req, cache_validator.as_ref());
+        let http_start = std::time::Instant::now();
+        let mut response = match self
+            .send_package_metadata_request_with_npmrc_auth(req, access.auth())
+            .await
+        {
+            Ok(r) => {
+                timings.http_ms = timings
+                    .http_ms
+                    .saturating_add(http_start.elapsed().as_millis());
+                r
+            }
+            Err(e) => return finish!(Err(Self::identify_empty_metadata_not_found(name, e))),
+        };
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            timings.not_modified = true;
+            let cache_304_start = std::time::Instant::now();
+            if let Some(cached) = self
+                .cached_resolution_after_304::<PackageMetadata, P>(
+                    &cache_key,
+                    &response,
+                    cache_validator.as_ref(),
+                    |metadata| batch_metadata_entry_matches_name(name, metadata),
+                    |facts| facts.versions_complete,
+                )
+                .await
+            {
+                timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
+                let (metadata, projection_slot) = match cached.value {
+                    CachedResolution::Projected {
+                        value,
+                        facts,
+                        source,
+                    } => (
+                        ResolutionMetadata::Projected(value),
+                        source.slot::<P>(facts),
+                    ),
+                    CachedResolution::Document { value, source } => {
+                        let facts = ProjectionFacts {
+                            versions_complete: true,
+                            latest: value.dist_tags.get("latest").cloned(),
+                        };
+                        let slot = source.and_then(|s| s.slot::<P>(facts));
+                        (
+                            ResolutionMetadata::Document {
+                                metadata: Box::new(value),
+                                projection: slot.clone(),
+                            },
+                            slot,
+                        )
+                    }
+                };
+                return finish!(Ok(TimedDirectResolution {
+                    metadata,
+                    projection_slot,
+                    timings,
+                }));
+            }
+            timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
+            timings.not_modified = false;
+            let req = self
+                .npm_registry_get(&npm_url, "application/vnd.npm.install-v1+json", access)
+                .await?;
+            let retry_http_start = std::time::Instant::now();
+            response = match self
+                .send_package_metadata_request_with_npmrc_auth(req, access.auth())
+                .await
+            {
+                Ok(r) => {
+                    timings.http_ms = timings
+                        .http_ms
+                        .saturating_add(retry_http_start.elapsed().as_millis());
+                    r
+                }
+                Err(e) => return finish!(Err(Self::identify_empty_metadata_not_found(name, e))),
+            };
+        }
+
+        let etag = Self::response_etag(&response);
+        let cache_directive = Self::metadata_cache_directive(response.headers());
+        let (metadata, body_timings) = match parse_capped_metadata_with_timing::<PackageMetadata>(
+            response,
+            &format!("get_npm_metadata_direct {name}"),
+        )
+        .await
+        {
+            Ok(parsed) => parsed,
+            Err(e) => return finish!(Err(e)),
+        };
+        let metadata =
+            match Self::validate_package_metadata_identity(name, metadata, "direct npm registry") {
+                Ok(metadata) => metadata,
+                Err(error) => return finish!(Err(error)),
+            };
+        timings.body_read_ms = body_timings.body_read_ms;
+        timings.json_decode_ms = body_timings.json_parse_ms;
+        timings.body_bytes = body_timings.body_bytes;
+        let cache_write_start = std::time::Instant::now();
+        let written = self.write_metadata_cache_entry(
+            &cache_key,
+            &metadata,
+            etag.as_deref(),
+            cache_directive,
+        );
+        timings.cache_write_dispatch_ms = cache_write_start.elapsed().as_millis();
+        self.remember_metadata_for_command(
+            &memory_cache_key,
+            &metadata,
+            cache_directive.local_freshness().unwrap_or_default(),
+        );
+        let facts = ProjectionFacts {
+            versions_complete: true,
+            latest: metadata.dist_tags.get("latest").cloned(),
+        };
+        let projection_slot = written
+            .and_then(|write| write.source)
+            .and_then(|source| source.slot::<P>(facts));
+        finish!(Ok(TimedDirectResolution {
+            metadata: ResolutionMetadata::Document {
+                metadata: Box::new(metadata),
+                projection: projection_slot.clone(),
+            },
+            projection_slot,
+            timings,
+        }))
+    }
+
+    async fn read_direct_complete_resolution<P: MetadataProjection>(
+        &self,
+        name: &str,
+        key: &str,
+    ) -> Option<(ResolutionMetadata<P>, Option<ProjectionSlot>)> {
+        match self
+            .read_metadata_cache_resolution_async::<resolver_cache::ResolverMetadata, P>(key)
+            .await?
+            .value
+        {
+            CachedResolution::Projected {
+                value,
+                facts,
+                source,
+            } => Some((
+                ResolutionMetadata::Projected(value),
+                source.slot::<P>(facts),
+            )),
+            CachedResolution::Document { value, source } => {
+                batch_metadata_entry_matches_name(name, &value.0).then(|| {
+                    let facts = ProjectionFacts {
+                        versions_complete: true,
+                        latest: value.0.dist_tags.get("latest").cloned(),
+                    };
+                    let slot = source.and_then(|s| s.slot::<P>(facts));
+                    (
+                        ResolutionMetadata::Document {
+                            metadata: Box::new(value.0),
+                            projection: slot.clone(),
+                        },
+                        slot,
+                    )
+                })
+            }
+        }
     }
 }
 

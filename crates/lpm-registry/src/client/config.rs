@@ -187,7 +187,7 @@ impl RegistryClient {
         identity: Option<reqwest::Identity>,
     ) -> Result<HttpClientSet, LpmError> {
         let roots = Self::prepare_tls_roots(tls)?;
-        let build = |read_timeout, redirect| {
+        let build = |read_timeout, redirect, adaptive_h2_window| {
             Self::build_http_client_with_prepared_tls_identity_and_transport(
                 connect_timeout,
                 read_timeout,
@@ -196,15 +196,21 @@ impl RegistryClient {
                 identity.clone(),
                 HttpTransportMode::Default,
                 redirect,
+                adaptive_h2_window,
             )
         };
+        let lpm_http = std::env::var("LPM_HTTP").ok();
+        let lane_count = request_lane_count(lpm_http.as_deref());
+        let policy_lane_count = super::http::policy_metadata_lane_count(lpm_http.as_deref());
         Ok(HttpClientSet {
-            client: build(Some(read_timeout), HttpRedirectMode::Automatic)?,
-            policy_metadata_client: build(Some(read_timeout), HttpRedirectMode::Manual)?,
-            request_lanes: (0..request_lane_count(std::env::var("LPM_HTTP").ok().as_deref()))
-                .map(|_| build(Some(read_timeout), HttpRedirectMode::Manual))
+            client: build(Some(read_timeout), HttpRedirectMode::Automatic, false)?,
+            policy_metadata_lanes: (0..policy_lane_count)
+                .map(|_| build(Some(read_timeout), HttpRedirectMode::Manual, true))
                 .collect::<Result<_, _>>()?,
-            transfer_client: build(None, HttpRedirectMode::Manual)?,
+            request_lanes: (0..lane_count)
+                .map(|_| build(Some(read_timeout), HttpRedirectMode::Manual, false))
+                .collect::<Result<_, _>>()?,
+            transfer_client: build(None, HttpRedirectMode::Manual, false)?,
         })
     }
 
@@ -276,9 +282,11 @@ impl RegistryClient {
             identity,
             transport,
             redirect,
+            false,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_http_client_with_prepared_tls_identity_and_transport(
         connect_timeout: Duration,
         read_timeout: Option<Duration>,
@@ -287,6 +295,7 @@ impl RegistryClient {
         identity: Option<reqwest::Identity>,
         transport: HttpTransportMode,
         redirect: HttpRedirectMode,
+        large_h2_window: bool,
     ) -> Result<reqwest::Client, LpmError> {
         let mut b = roots
             .client_builder()
@@ -309,6 +318,13 @@ impl RegistryClient {
                 .pool_idle_timeout(Duration::from_secs(120))
                 .tcp_keepalive(Duration::from_secs(60))
                 .tcp_nodelay(true);
+        } else if large_h2_window {
+            // Hyper's adaptive_window(true) resets initial windows to 64 KiB,
+            // stalling large full packuments across extra RTTs; wide static
+            // windows let multi-MiB packuments stream at full rate immediately.
+            b = b
+                .http2_initial_stream_window_size(2 * 1024 * 1024)
+                .http2_initial_connection_window_size(8 * 1024 * 1024);
         }
         b = Self::apply_tls_settings(b, tls, identity);
         b.build().map_err(|e| {
@@ -377,13 +393,17 @@ impl RegistryClient {
     }
 
     pub(super) fn build_default_pool_client(pool: super::http::ClientPool) -> reqwest::Client {
-        let (read_timeout, redirect) = match pool {
-            super::http::ClientPool::General => (Some(READ_TIMEOUT), HttpRedirectMode::Automatic),
-            super::http::ClientPool::PolicyMetadata
-            | super::http::ClientPool::ManualRedirect(_) => {
-                (Some(READ_TIMEOUT), HttpRedirectMode::Manual)
+        let (read_timeout, redirect, adaptive_h2_window) = match pool {
+            super::http::ClientPool::General => {
+                (Some(READ_TIMEOUT), HttpRedirectMode::Automatic, false)
             }
-            super::http::ClientPool::Transfer => (None, HttpRedirectMode::Manual),
+            super::http::ClientPool::PolicyMetadata(_) => {
+                (Some(READ_TIMEOUT), HttpRedirectMode::Manual, true)
+            }
+            super::http::ClientPool::ManualRedirect(_) => {
+                (Some(READ_TIMEOUT), HttpRedirectMode::Manual, false)
+            }
+            super::http::ClientPool::Transfer => (None, HttpRedirectMode::Manual, false),
         };
         Self::build_http_client_with_prepared_tls_identity_and_transport(
             CONNECT_TIMEOUT,
@@ -393,6 +413,7 @@ impl RegistryClient {
             None,
             HttpTransportMode::Default,
             redirect,
+            adaptive_h2_window,
         )
         .expect("default TLS config never fails to build")
     }
@@ -776,6 +797,7 @@ impl RegistryClient {
             tls_material_budget,
             per_origin_identity_certs,
             next_request_lane: std::sync::atomic::AtomicUsize::new(0),
+            next_policy_metadata_lane: std::sync::atomic::AtomicUsize::new(0),
         });
         self.history_cache = Arc::new(super::history_cache::HistoryCache::default());
         self.http = http;

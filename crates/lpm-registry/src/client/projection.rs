@@ -216,8 +216,20 @@ impl RegistryClient {
             );
             return;
         };
+        let mutation = self.metadata_cache_mutation(&projection_path(&slot.entry));
+        let revision = mutation
+            .revision
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
         let write = move || {
             let _reservation = reservation;
+            let _operation = mutation
+                .operation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if mutation.revision.load(std::sync::atomic::Ordering::Acquire) != revision {
+                return;
+            }
             if let Err(error) = write_projection_file(&slot.entry, &header, &body) {
                 tracing::debug!(%error, "failed to write metadata projection");
             }

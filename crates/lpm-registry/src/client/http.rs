@@ -3,7 +3,7 @@ use super::*;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ClientPool {
     General,
-    PolicyMetadata,
+    PolicyMetadata(usize),
     ManualRedirect(usize),
     Transfer,
 }
@@ -17,6 +17,8 @@ pub(super) enum ClientPool {
 const REQUEST_LANES: usize = 8;
 
 /// HTTP/1.1 pools already open a connection per concurrent request.
+pub(super) const POLICY_METADATA_LANES: usize = 4;
+
 pub(super) fn request_lane_count(lpm_http: Option<&str>) -> usize {
     if lpm_http == Some("h1-pool") {
         1
@@ -25,10 +27,14 @@ pub(super) fn request_lane_count(lpm_http: Option<&str>) -> usize {
     }
 }
 
+pub(super) fn policy_metadata_lane_count(lpm_http: Option<&str>) -> usize {
+    request_lane_count(lpm_http).min(POLICY_METADATA_LANES)
+}
+
 /// The clients built for one TLS configuration.
 pub(super) struct HttpClientSet {
     pub(super) client: reqwest::Client,
-    pub(super) policy_metadata_client: reqwest::Client,
+    pub(super) policy_metadata_lanes: Arc<[reqwest::Client]>,
     pub(super) request_lanes: Arc<[reqwest::Client]>,
     pub(super) transfer_client: reqwest::Client,
 }
@@ -37,7 +43,7 @@ impl HttpClientSet {
     pub(super) fn cached(self, identity_fp: Option<Arc<str>>) -> CachedClient {
         CachedClient {
             client: self.client,
-            policy_metadata_client: self.policy_metadata_client,
+            policy_metadata_lanes: self.policy_metadata_lanes,
             request_lanes: self.request_lanes,
             transfer_client: self.transfer_client,
             identity_fp,
@@ -139,7 +145,7 @@ impl HttpClients {
     ) -> Arc<Self> {
         Self::from_default_client_set(HttpClientSet {
             client: default,
-            policy_metadata_client: policy_metadata,
+            policy_metadata_lanes: Arc::from([policy_metadata]),
             request_lanes: Arc::from([manual_redirect.clone()]),
             transfer_client: manual_redirect,
         })
@@ -169,6 +175,7 @@ impl HttpClients {
             tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
             per_origin_identity_certs: HashMap::new(),
             next_request_lane: std::sync::atomic::AtomicUsize::new(0),
+            next_policy_metadata_lane: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -339,10 +346,28 @@ impl HttpClients {
             .await
     }
 
+    /// Allocate the next dedicated policy metadata lane index once per
+    /// logical request so redirects and send retries stay pinned to one lane.
+    pub(super) fn next_policy_lane(&self) -> usize {
+        self.next_policy_metadata_lane
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(super) async fn for_policy_metadata_url_lane(
+        &self,
+        url: &str,
+        lane: usize,
+    ) -> Result<reqwest::Client, LpmError> {
+        self.for_url_pool(url, ClientPool::PolicyMetadata(lane))
+            .await
+    }
+
     /// Resolve the configuration-equivalent client from the dedicated
-    /// policy metadata connection pool.
+    /// policy metadata connection pool, rotating across lanes to avoid
+    /// single-connection HTTP/2 flow-control serialization on large packuments.
     pub async fn for_policy_metadata_url(&self, url: &str) -> Result<reqwest::Client, LpmError> {
-        self.for_url_pool(url, ClientPool::PolicyMetadata).await
+        let lane = self.next_policy_lane();
+        self.for_policy_metadata_url_lane(url, lane).await
     }
 
     /// Resolve the redirect-disabled client for a request that moves a
@@ -455,7 +480,9 @@ impl lpm_auth::RefreshClientSource for HttpClients {
 pub(super) fn select_pool(cached: &CachedClient, pool: ClientPool) -> reqwest::Client {
     match pool {
         ClientPool::General => cached.client.clone(),
-        ClientPool::PolicyMetadata => cached.policy_metadata_client.clone(),
+        ClientPool::PolicyMetadata(lane) => {
+            cached.policy_metadata_lanes[lane % cached.policy_metadata_lanes.len()].clone()
+        }
         ClientPool::ManualRedirect(lane) => {
             cached.request_lanes[lane % cached.request_lanes.len()].clone()
         }
@@ -678,7 +705,10 @@ impl lpm_http::ReplayableHttpClientProvider for HttpClients {
     }
 }
 
-pub(super) struct PolicyMetadataClientProvider<'a>(pub(super) &'a HttpClients);
+pub(super) struct PolicyMetadataClientProvider<'a> {
+    pub(super) http: &'a HttpClients,
+    pub(super) lane: usize,
+}
 
 impl lpm_http::ReplayableHttpClientProvider for PolicyMetadataClientProvider<'_> {
     type Error = LpmError;
@@ -687,7 +717,8 @@ impl lpm_http::ReplayableHttpClientProvider for PolicyMetadataClientProvider<'_>
         &self,
         url: &reqwest::Url,
     ) -> impl std::future::Future<Output = Result<reqwest::Client, Self::Error>> + Send {
-        self.0.for_policy_metadata_url(url.as_str())
+        self.http
+            .for_policy_metadata_url_lane(url.as_str(), self.lane)
     }
 }
 

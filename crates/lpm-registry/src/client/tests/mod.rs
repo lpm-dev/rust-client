@@ -310,7 +310,7 @@ fn cached(client: reqwest::Client) -> CachedClient {
         .build()
         .expect("build redirect-disabled test client");
     CachedClient {
-        policy_metadata_client: client.clone(),
+        policy_metadata_lanes: std::sync::Arc::from([client.clone()]),
         client,
         request_lanes: std::sync::Arc::from([manual_redirect_client.clone()]),
         transfer_client: manual_redirect_client,

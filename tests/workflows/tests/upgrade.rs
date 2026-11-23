@@ -1205,12 +1205,12 @@ async fn upgrade_hydrates_missing_release_times_before_planning() {
 
 #[tokio::test]
 async fn upgrade_plans_metadata_in_bounded_parallel_waves() {
-    const PACKAGE_COUNT: usize = 8;
+    const PACKAGE_COUNT: usize = 20;
     let mut dependencies = serde_json::Map::with_capacity(PACKAGE_COUNT);
     let mut lockfile =
         String::from("[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n");
     for index in 0..PACKAGE_COUNT {
-        let name = format!("@lpm.dev/owner.parallel-upgrade-{index}");
+        let name = format!("@lpm.dev/owner.parallel-upgrade-{index:02}");
         dependencies.insert(name.clone(), serde_json::json!("^1.0.0"));
         lockfile.push_str(&format!(
             "\n[[packages]]\nname = \"{name}\"\nversion = \"1.0.0\"\nsource = \"registry+https://lpm.dev\"\n"
@@ -1257,13 +1257,13 @@ async fn upgrade_plans_metadata_in_bounded_parallel_waves() {
         .map(|start| start.duration_since(first))
         .collect::<Vec<_>>();
     offsets.sort();
-    assert!(offsets[3] < std::time::Duration::from_millis(150));
+    assert!(offsets[15] < std::time::Duration::from_millis(150));
     assert!(
-        offsets[4] >= std::time::Duration::from_millis(200),
-        "more than four metadata requests ran in the first wave: {offsets:?}"
+        offsets[16] >= std::time::Duration::from_millis(200),
+        "more than sixteen metadata requests ran in the first wave: {offsets:?}"
     );
     assert!(
-        offsets[7] < std::time::Duration::from_millis(450),
+        offsets[19] < std::time::Duration::from_millis(450),
         "the planner did not refill promptly for the second wave: {offsets:?}"
     );
 }

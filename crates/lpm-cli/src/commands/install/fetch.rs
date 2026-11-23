@@ -3692,12 +3692,57 @@ mod tests {
 /// Pick a concrete version for speculative fetching with the resolver's
 /// satisfying-latest preference and highest-version fallback.
 /// Named dist-tags resolve directly; invalid ranges return `None`.
+#[cfg(test)]
 pub(super) fn pick_speculative_version(
     meta: &SpeculativePackageMetadata,
     range_str: &str,
 ) -> Option<(String, String, Option<String>)> {
+    pick_speculative_version_with_policy(
+        "",
+        meta,
+        range_str,
+        &lpm_resolver::ResolverPolicy::default(),
+    )
+}
+
+pub(super) fn pick_speculative_version_with_policy(
+    package_name: &str,
+    meta: &SpeculativePackageMetadata,
+    range_str: &str,
+    policy: &lpm_resolver::ResolverPolicy,
+) -> Option<(String, String, Option<String>)> {
+    let canonical = lpm_resolver::CanonicalKey::from_dep_name(package_name);
+    if meta.info.needs_trust_metadata(policy) {
+        return None;
+    }
+    let check_release_age =
+        !package_name.is_empty() && policy.release_age_applies_to_package(&canonical);
+    if check_release_age && meta.info.needs_release_time_metadata(&canonical, policy) {
+        return None;
+    }
+    let version_allowed = |v_str: &str| {
+        if !check_release_age {
+            return true;
+        }
+        let Ok(parsed) = lpm_resolver::NpmVersion::parse(v_str) else {
+            return false;
+        };
+        match policy.release_time_status_for_package_version(
+            &canonical,
+            &parsed,
+            meta.info.published_at(v_str),
+        ) {
+            lpm_resolver::ReleaseTimeStatus::Allowed => true,
+            lpm_resolver::ReleaseTimeStatus::Missing => {
+                !policy.metadata_may_need_release_times(&canonical, meta.info.modified.as_deref())
+            }
+            lpm_resolver::ReleaseTimeStatus::TooNew { .. } => false,
+        }
+    };
+
     // dist-tag path (e.g. "latest", "next", "beta")
     if let Some(pinned) = meta.dist_tags.get(range_str)
+        && version_allowed(pinned)
         && let Some(url) = meta.info.tarball_url(pinned)
     {
         return Some((
@@ -3708,17 +3753,16 @@ pub(super) fn pick_speculative_version(
     }
 
     let range = lpm_resolver::NpmRange::parse(range_str).ok()?;
-    let version = meta
-        .info
-        .latest_version
-        .as_ref()
-        .filter(|version| range.satisfies(version))
-        .or_else(|| {
-            meta.info
-                .versions
-                .iter()
-                .find(|version| range.satisfies(version))
-        })?;
+    let version =
+        meta.info
+            .latest_version
+            .as_ref()
+            .filter(|version| range.satisfies(version) && version_allowed(&version.to_string()))
+            .or_else(|| {
+                meta.info.versions.iter().find(|version| {
+                    range.satisfies(version) && version_allowed(&version.to_string())
+                })
+            })?;
     let v_str = version.to_string();
     let url = meta.info.tarball_url(&v_str)?.to_owned();
     let integrity = meta.info.integrity(&v_str).map(str::to_owned);
@@ -3853,6 +3897,7 @@ pub(super) fn spawn_speculation_dispatcher(
     speculation_semaphore: Option<Arc<Semaphore>>,
     coord: Arc<FetchCoordinator>,
     deps: HashMap<String, String>,
+    resolver_policy: lpm_resolver::ResolverPolicy,
     dependency_engine_policy: Arc<crate::engine_check::DependencyEnginePolicy>,
     v2_streaming_lane: Option<Arc<V2StreamingLane>>,
     spec_tracker: SpeculativeKeyTracker,
@@ -3964,7 +4009,18 @@ pub(super) fn spawn_speculation_dispatcher(
                     return;
                 }
 
-                let Some((version, url, integrity)) = pick_speculative_version(meta, &range) else {
+                let canonical = lpm_resolver::CanonicalKey::from_dep_name(&name);
+                if meta.info.needs_policy_metadata(&canonical, &resolver_policy) {
+                    parked
+                        .entry(name)
+                        .or_default()
+                        .push((range, depth, is_root));
+                    return;
+                }
+
+                let Some((version, url, integrity)) =
+                    pick_speculative_version_with_policy(&name, meta, &range, &resolver_policy)
+                else {
                     // Range didn't match any arrived version — count it so we
                     // can tell "dispatcher worked but range was too tight"
                     // apart from "dispatcher never saw this package".
@@ -3980,7 +4036,7 @@ pub(super) fn spawn_speculation_dispatcher(
                 {
                     return;
                 }
-                if meta.info.needs_platform_metadata() {
+                if meta.info.needs_platform_metadata_for_version(&version) {
                     parked
                         .entry(name)
                         .or_default()

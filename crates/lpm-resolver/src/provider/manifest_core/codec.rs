@@ -9,7 +9,11 @@ use super::*;
 const TRUST_METADATA_COMPLETE: u8 = 1;
 const VERSIONS_COMPLETE: u8 = 1 << 1;
 const PLATFORM_METADATA_COMPLETE: u8 = 1 << 2;
-const KNOWN_FLAGS: u8 = TRUST_METADATA_COMPLETE | VERSIONS_COMPLETE | PLATFORM_METADATA_COMPLETE;
+const RELEASE_METADATA_COMPLETE: u8 = 1 << 3;
+const KNOWN_FLAGS: u8 = TRUST_METADATA_COMPLETE
+    | VERSIONS_COMPLETE
+    | PLATFORM_METADATA_COMPLETE
+    | RELEASE_METADATA_COMPLETE;
 
 const TRUSTED_PUBLISHER: u8 = 0;
 const STAGED_PUBLISH: u8 = 1;
@@ -48,7 +52,7 @@ impl ManifestProjection {
 impl lpm_registry::MetadataProjection for ManifestProjection {
     /// Includes the crate version, so a release that changes how metadata is
     /// parsed never reads projections an older parser derived.
-    const FORMAT: &'static str = concat!("lpm-resolver-manifest/", env!("CARGO_PKG_VERSION"), "/1");
+    const FORMAT: &'static str = concat!("lpm-resolver-manifest/", env!("CARGO_PKG_VERSION"), "/2");
 
     fn decode(bytes: &[u8]) -> Option<Self> {
         let mut reader = Reader(bytes);
@@ -75,6 +79,7 @@ impl CachedPackageInfo {
             (self.trust_metadata_complete, TRUST_METADATA_COMPLETE),
             (self.versions_complete, VERSIONS_COMPLETE),
             (self.platform_metadata_complete, PLATFORM_METADATA_COMPLETE),
+            (self.release_metadata_complete, RELEASE_METADATA_COMPLETE),
         ] {
             if set {
                 flags |= flag;
@@ -368,10 +373,12 @@ impl CachedPackageInfo {
             modified,
             modified_unix,
             trust_metadata_complete: flags & TRUST_METADATA_COMPLETE != 0,
+            release_metadata_complete: flags & RELEASE_METADATA_COMPLETE != 0,
             versions_complete: flags & VERSIONS_COMPLETE != 0,
             covered_ranges,
             workspace_versions,
             platform_metadata_complete: flags & PLATFORM_METADATA_COMPLETE != 0,
+            platform_hydrated_versions: HashSet::new(),
             latest_version,
             latest_version_hint,
             preferred_latest,

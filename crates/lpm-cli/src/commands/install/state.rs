@@ -14,6 +14,7 @@ pub(super) fn write_post_install_hash(
         security_analysis_policy,
         dependency_engine_policy,
         None,
+        None,
     );
 }
 
@@ -28,6 +29,7 @@ pub(super) fn write_post_install_hash_with_proof(
     object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
     security_analysis_policy: lpm_store::SecurityAnalysisPolicy,
     dependency_engine_policy: &crate::engine_check::DependencyEnginePolicy,
+    release_age_policy_key: Option<&str>,
     proof_context: Option<PostInstallSyncNoopProofContext<'_>>,
 ) {
     let lock = workspace_lockfile::active_lockfile_snapshot(project_dir);
@@ -43,6 +45,7 @@ pub(super) fn write_post_install_hash_with_proof(
         security_analysis_policy,
         &dependency_engine_key,
         node_runtime_fingerprint,
+        release_age_policy_key,
         &lock,
         proof_context,
     ) {
@@ -53,6 +56,7 @@ pub(super) fn write_post_install_hash_with_proof(
     }
 }
 
+#[cfg(test)]
 pub(super) fn write_post_install_hash_with_context(
     project_dir: &Path,
     linker_mode: lpm_linker::LinkerMode,
@@ -69,6 +73,7 @@ pub(super) fn write_post_install_hash_with_context(
         security_analysis_policy,
         dependency_engine_key,
         node_runtime_fingerprint,
+        None,
         lock,
         None,
     )
@@ -82,6 +87,7 @@ fn write_post_install_hash_with_context_and_proof(
     security_analysis_policy: lpm_store::SecurityAnalysisPolicy,
     dependency_engine_key: &str,
     node_runtime_fingerprint: Option<&str>,
+    release_age_policy_key: Option<&str>,
     lock: &workspace_lockfile::ActiveLockfileSnapshot,
     proof_context: Option<PostInstallSyncNoopProofContext<'_>>,
 ) -> std::io::Result<()> {
@@ -150,6 +156,7 @@ fn write_post_install_hash_with_context_and_proof(
             node_runtime_fingerprint,
             security_analysis_policy,
             sync_noop_proof: sync_noop_proof.as_ref(),
+            release_age_policy_key,
         },
     )
 }
@@ -220,15 +227,18 @@ pub(super) fn refresh_post_install_hash_after_manifest_finalize(
         .next()
         .and_then(|line| line.strip_prefix("n:"))
         .filter(|value| *value != "none");
+    let release_age_policy_key = crate::install_state::parse_release_age_policy_line(&content);
 
-    write_post_install_hash_with_context(
+    write_post_install_hash_with_context_and_proof(
         project_dir,
         linker_mode,
         object_integrity_policy,
         security_analysis_policy,
         dependency_engine_key,
         node_runtime_fingerprint,
+        release_age_policy_key,
         &workspace_lockfile::active_lockfile_snapshot(project_dir),
+        None,
     )
     .map_err(|e| {
         LpmError::Registry(format!(
@@ -262,6 +272,7 @@ pub(super) struct InstallFreshnessInput<'a> {
     pub(super) object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
     pub(super) security_analysis_policy: lpm_store::SecurityAnalysisPolicy,
     pub(super) dependency_engine_policy: &'a crate::engine_check::DependencyEnginePolicy,
+    pub(super) release_age_policy_key: Option<&'a str>,
     pub(super) store_version: lpm_store::StoreVersion,
     pub(super) compatibility_bin_names: &'a [String],
     pub(super) requested_add_count: Option<usize>,
@@ -319,6 +330,23 @@ pub(super) async fn run_install_freshness_phase(
             cleanup_catalogs_in_pipeline,
             completed: false,
         });
+    }
+    if input.release_age_policy_key.is_some() {
+        let cached_state = lpm_common::read_text_file_capped(
+            &input.project_dir.join(".lpm/install-hash"),
+            lpm_common::STATE_FILE_SIZE_CAP_BYTES,
+        )
+        .ok();
+        let stored_key = cached_state
+            .as_deref()
+            .and_then(crate::install_state::parse_release_age_policy_line);
+        if stored_key != input.release_age_policy_key {
+            return Ok(InstallFreshnessResult {
+                setup_install_state_ms: 0,
+                cleanup_catalogs_in_pipeline,
+                completed: false,
+            });
+        }
     }
     let pkg_content_for_state = lpm_common::read_text_file_capped(
         input.pkg_json_path,

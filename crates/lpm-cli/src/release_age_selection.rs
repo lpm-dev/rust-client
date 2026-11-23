@@ -251,27 +251,46 @@ pub(crate) async fn hydrate_release_times_if_needed(
         return Ok(());
     }
 
+    let expected_modified = metadata.modified.as_deref();
+    let known_versions: Vec<&str> = metadata.versions.keys().map(String::as_str).collect();
+    let suffix_hint =
+        expected_modified.map(|expected_modified| lpm_registry::ReleaseTimeSuffixHint {
+            expected_modified,
+            known_versions: &known_versions,
+        });
     let release_times = match source {
         ReleaseTimeMetadataSource::NpmDirect => {
             client
-                .get_npm_release_times_routed_full(
+                .get_npm_release_times_routed_full_with_hint(
                     &metadata.name,
                     lpm_registry::UpstreamRoute::NpmDirect,
+                    expected_modified,
+                    suffix_hint,
                 )
                 .await?
         }
         ReleaseTimeMetadataSource::Routed(route) => {
             client
-                .get_npm_release_times_routed_full(&metadata.name, route.clone())
+                .get_npm_release_times_routed_full_with_hint(
+                    &metadata.name,
+                    route.clone(),
+                    expected_modified,
+                    suffix_hint,
+                )
                 .await?
         }
-        ReleaseTimeMetadataSource::WorkerOnly => {
+        ReleaseTimeMetadataSource::WorkerOnly => std::sync::Arc::new(
             client
                 .get_npm_release_times_proxy_only(&metadata.name)
-                .await?
-        }
+                .await?,
+        ),
     };
-    metadata.time.extend(release_times.time);
+    metadata.time.extend(
+        release_times
+            .time
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone())),
+    );
 
     if let Some(version) = metadata
         .versions

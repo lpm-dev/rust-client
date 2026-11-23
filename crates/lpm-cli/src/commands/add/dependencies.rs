@@ -233,6 +233,33 @@ fn build_save_decisions(
     Ok(out)
 }
 
+async fn fetch_npm_source_dependency_metadata(
+    client: &RegistryClient,
+    name: &str,
+    route: &lpm_registry::UpstreamRoute,
+    resolver_policy: &lpm_resolver::ResolverPolicy,
+) -> Result<lpm_registry::PackageMetadata, LpmError> {
+    let mut metadata = client
+        .get_npm_metadata_routed(name, route.clone())
+        .await
+        .map_err(|error| {
+            LpmError::Registry(format!(
+                "could not resolve '{name}' against the registry: {error}. The package \
+                 may not exist there or your authentication may not grant access. Pin an \
+                 explicit version (for example, \"{name}@^1.0\") in \
+                 lpm.config.json#dependencies."
+            ))
+        })?;
+    crate::release_age_selection::hydrate_release_times_if_needed(
+        client,
+        &mut metadata,
+        resolver_policy,
+        crate::release_age_selection::ReleaseTimeMetadataSource::Routed(route),
+    )
+    .await?;
+    Ok(metadata)
+}
+
 fn resolve_source_dependency_version(
     metadata: &lpm_registry::PackageMetadata,
     intent: &crate::save_spec::UserSaveIntent,
@@ -352,17 +379,7 @@ pub(super) async fn handle_dependencies(
             })?
         } else {
             let route = route_table.route_for_package(name);
-            client
-                .get_npm_metadata_routed(name, route)
-                .await
-                .map_err(|error| {
-                    LpmError::Registry(format!(
-                        "could not resolve '{name}' against the registry: {error}. The package \
-                         may not exist there or your authentication may not grant access. Pin an \
-                         explicit version (for example, \"{name}@^1.0\") in \
-                         lpm.config.json#dependencies."
-                    ))
-                })?
+            fetch_npm_source_dependency_metadata(client, name, &route, resolver_policy).await?
         };
         let resolved_version =
             resolve_source_dependency_version(&package_metadata, intent, resolver_policy).map_err(
@@ -1455,6 +1472,79 @@ mod tests {
             assert!(pm_lockfile_paths("unknown", dir.path()).is_empty());
             assert!(pm_lockfile_paths("auto", dir.path()).is_empty());
             assert!(pm_lockfile_paths("", dir.path()).is_empty());
+        }
+
+        #[tokio::test]
+        async fn source_dependency_resolution_hydrates_release_times_for_recently_modified_npm_pkg()
+        {
+            use wiremock::matchers::{header, method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let client = RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(Some(tmp.path().to_path_buf()));
+
+            let abbreviated = serde_json::json!({
+                "name": "recent-dep",
+                "modified": "2025-01-03T00:00:00.000Z",
+                "dist-tags": { "latest": "2.0.0" },
+                "versions": {
+                    "1.0.0": { "name": "recent-dep", "version": "1.0.0" },
+                    "2.0.0": { "name": "recent-dep", "version": "2.0.0" }
+                }
+            });
+            let full = serde_json::json!({
+                "name": "recent-dep",
+                "modified": "2025-01-03T00:00:00.000Z",
+                "versions": {
+                    "1.0.0": { "name": "recent-dep", "version": "1.0.0" },
+                    "2.0.0": { "name": "recent-dep", "version": "2.0.0" }
+                },
+                "time": {
+                    "modified": "2025-01-03T00:00:00.000Z",
+                    "1.0.0": "2024-12-01T00:00:00.000Z",
+                    "2.0.0": "2025-01-03T00:00:00.000Z"
+                }
+            });
+
+            Mock::given(method("GET"))
+                .and(path("/recent-dep"))
+                .and(header("Accept", "application/vnd.npm.install-v1+json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(abbreviated))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/recent-dep"))
+                .and(header("Accept", "application/json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(full))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let policy = lpm_resolver::ResolverPolicy::new_with_release_age_excludes_at_unix(
+                86_400,
+                Default::default(),
+                std::iter::empty(),
+                1_735_862_400,
+            );
+            let metadata = fetch_npm_source_dependency_metadata(
+                &client,
+                "recent-dep",
+                &lpm_registry::UpstreamRoute::NpmDirect,
+                &policy,
+            )
+            .await
+            .expect("should fetch and hydrate release times");
+            let selected = resolve_source_dependency_version(
+                &metadata,
+                &crate::save_spec::UserSaveIntent::Bare,
+                &policy,
+            )
+            .expect("should select cooldown-allowed 1.0.0 instead of failing closed");
+            assert_eq!(selected, "1.0.0");
         }
     }
 }
