@@ -1041,6 +1041,55 @@ fn a_committed_override_change_is_replayed_only_by_an_lpm_that_can_report_it() {
 }
 
 #[test]
+fn a_committed_journal_of_values_alone_is_replayed_without_a_report() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        change_overrides(&[set_override("API_URL", "mine")]).expect("set");
+        // Every journal a write takes changes companion records too, so this
+        // one is committed by hand.
+        CRASH_AFTER_CHANGES.with(|crash| crash.set(Some(0)));
+        with_vault_transaction(|directory| {
+            let json = crate::selected_environment::serialize(&HashMap::from([(
+                "default".to_owned(),
+                HashMap::from([("TOKEN".to_owned(), "replayed".to_owned())]),
+            )]))?;
+            let encrypted = zeroize::Zeroizing::new(
+                crate::fallback::encrypt_with_store_unlocked(
+                    directory,
+                    VAULT,
+                    &json,
+                    &crate::fallback::KeyringNativeDataKeyStore,
+                )?
+                .into_bytes(),
+            );
+            FileCompanion::open(directory)?.commit_changes(
+                VAULT,
+                vec![FileChange::ReplaceValues(encrypted)],
+                true,
+            )
+        })
+        .expect_err("the simulated crash");
+        assert!(
+            journal_path(home, VAULT).exists(),
+            "the crash left it committed"
+        );
+        let not_a_marker = home.join("not-a-marker");
+        std::fs::write(&not_a_marker, "").expect("a file where a marker would be");
+
+        let values = crate::override_marker::reporting_to(vec![not_a_marker], || {
+            with_vault_transaction(|directory| {
+                crate::fallback::read_all_environments_unlocked(directory, VAULT)
+            })
+        })
+        .expect("a journal that changes values alone has nothing to report");
+
+        assert_eq!(values.expect("values")["default"]["TOKEN"], "replayed");
+        assert!(!journal_path(home, VAULT).exists());
+    });
+}
+
+#[test]
 fn a_journal_whose_folder_sync_failed_is_finished_before_the_next_read_in_the_same_lock() {
     with_temp_vault_home(|home| {
         force_file_vault();

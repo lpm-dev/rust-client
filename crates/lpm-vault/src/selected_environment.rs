@@ -292,6 +292,9 @@ mod tests {
             r#"{"environments":[{"A":"1"}]}"#,
             r#"{"environments":{"default":{"A":"1","\u0041":"2"}}}"#,
             r#"{"environments":{"default":{"A":"1"},"\u0064efault":{}}}"#,
+            r#"{"\u0065nvironments":{"default":{"A":"1"}}}"#,
+            "{\"environments\":{\"default\":{\"A\u{1}\":\"1\"}}}",
+            r#"{"environments":{"default":{"A\u0001":"1"}}}"#,
         ];
         let long = special_bytes_at_every_offset("default");
         for case in cases.into_iter().chain(long.iter().map(String::as_str)) {

@@ -222,6 +222,28 @@ fn a_committed_override_change_is_replayed_only_by_an_lpm_that_can_report_it() {
 }
 
 #[test]
+fn a_committed_journal_of_values_alone_is_replayed_without_a_report() {
+    let mut storage = storage_with_values();
+    change(&mut storage, &[set("FIRST", "1")]).expect("set");
+    let replayed = VALUES.replace("team", "replayed");
+    super::companion::committed_journal(&mut storage, &[(VAULT, Some(replayed.as_bytes()))]);
+    let root = tempfile::tempdir().expect("temporary folder");
+    let not_a_marker = root.path().join("not-a-marker");
+    std::fs::write(&not_a_marker, "").expect("a file where a marker would be");
+
+    let values = crate::override_marker::reporting_to(vec![not_a_marker], || {
+        let _scope = crate::companion::LockScope::enter();
+        recover_project_transaction(&mut storage)?;
+        companion_gate::read_values_excluding_overrides(&mut storage, VAULT)
+    })
+    .expect("a journal that changes values alone has nothing to report")
+    .expect("values");
+
+    assert!(values.contains("replayed"));
+    assert!(!storage.values.contains_key(TRANSACTION_MARKER_ACCOUNT));
+}
+
+#[test]
 fn a_damaged_record_refuses_changes_and_writes_nothing() {
     let mut storage = storage_with_values();
     change(&mut storage, &[set("API_URL", "mine")]).expect("set");
