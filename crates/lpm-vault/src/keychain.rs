@@ -998,11 +998,7 @@ fn discard_preparing_project_transaction(
     storage: &mut impl ProjectStorage,
     journal: &TransactionJournal,
 ) -> Result<(), String> {
-    for operation in &journal.operations {
-        if let Some(stage) = &operation.staged_account {
-            delete_verified(storage, stage)?;
-        }
-    }
+    delete_stages(storage, journal)?;
     delete_verified(storage, TRANSACTION_MARKER_ACCOUNT)
 }
 
@@ -1185,12 +1181,24 @@ fn finish_project_transaction(
     storage: &mut impl ProjectStorage,
     journal: &TransactionJournal,
 ) -> Result<(), String> {
+    delete_stages(storage, journal)?;
+    delete_verified(storage, TRANSACTION_MARKER_ACCOUNT)
+}
+
+/// Delete `journal`'s stages, each read back, as it's checked gone, in the
+/// name of the item it stands for, which an approval prompt shows.
+fn delete_stages(
+    storage: &mut impl ProjectStorage,
+    journal: &TransactionJournal,
+) -> Result<(), String> {
     for operation in &journal.operations {
         if let Some(stage) = &operation.staged_account {
-            delete_verified(storage, stage)?;
+            crate::macos_keychain::prompting_as(&operation.target_account, || {
+                delete_verified(storage, stage)
+            })?;
         }
     }
-    delete_verified(storage, TRANSACTION_MARKER_ACCOUNT)
+    Ok(())
 }
 
 fn transaction_is_fully_applied(
@@ -3139,9 +3147,12 @@ mod tests {
         keychain_unavailable: bool,
         probes: Vec<String>,
         approvals_required: Vec<String>,
-        /// What the approval prompt said each time reading an item, or
-        /// reading back a protected item just written, would ask.
+        /// What the approval prompt said each time reading a protected item,
+        /// or reading back one just written, would ask.
         prompts: Vec<String>,
+        /// Whether a write is reading back what it wrote, which its own
+        /// prompt covers.
+        reading_back: bool,
         listings: usize,
         reads: HashMap<String, usize>,
         /// Attributes-only reads, by account.
@@ -3152,6 +3163,8 @@ mod tests {
         deletes: HashMap<String, usize>,
         rejected_writes: HashSet<String>,
         ignored_writes: HashSet<String>,
+        /// Accounts whose deletes report success but leave them.
+        ignored_deletes: HashSet<String>,
         mutation_attempts: usize,
         fail_once_at_mutation: Option<usize>,
         injected_failure: bool,
@@ -3217,6 +3230,13 @@ mod tests {
             if self.approval_cancelled && self.protected.contains(account) {
                 return Err("env access approval was cancelled".to_owned());
             }
+            if !self.reading_back
+                && self.protected.contains(account)
+                && self.values.contains_key(account)
+            {
+                self.prompts
+                    .push(crate::macos_keychain::operation_prompt(account));
+            }
             if account == TRANSACTION_MARKER_ACCOUNT
                 && self.fail_committed_marker_verification_once
                 && self
@@ -3243,7 +3263,10 @@ mod tests {
             let verified = if self.verifies_writes_itself {
                 self.values.get_bytes(account) == Some(value)
             } else {
-                self.read(account)?.as_deref() == Some(value)
+                self.reading_back = true;
+                let read = self.read(account);
+                self.reading_back = false;
+                read?.as_deref() == Some(value)
             };
             if verified {
                 Ok(())
@@ -3275,6 +3298,9 @@ mod tests {
             if self.fail_once_at_mutation == Some(self.mutation_attempts) {
                 self.injected_failure = true;
                 return Err(format!("injected mutation failure for {account}"));
+            }
+            if self.ignored_deletes.contains(account) {
+                return Ok(true);
             }
             let marker_was_committed = account == TRANSACTION_MARKER_ACCOUNT
                 && self

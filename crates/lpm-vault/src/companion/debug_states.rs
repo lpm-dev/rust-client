@@ -232,7 +232,7 @@ pub(crate) fn planting(
                 overrides_record(vault_id, 1, environment, set, unset),
             )],
             format!(
-                "Planted personal overrides v1 of {environment}: {}. lpm, LPM CLI 0.82.0 to 0.88.0 and LPM Vault 1.1.0 to 1.3.0 apply them; the next change of the project's overrides moves them to v{OVERRIDES_VERSION}, which those releases can't use.",
+                "Planted personal overrides v1 of {environment}: {}. lpm and LPM CLI 0.82.0 to 0.88.0 apply them, and LPM Vault 1.1.0 to 1.3.0 show the project's team values; the next change of the project's overrides moves them to v{OVERRIDES_VERSION}, which those releases can't use.",
                 overrides_summary(set, unset)
             ),
         ),
@@ -573,6 +573,19 @@ mod tests {
                 set: vec![("API_URL".to_owned(), "mine".to_owned())],
                 unset: vec!["X".to_owned()],
             })
+        );
+    }
+
+    #[test]
+    fn version_one_overrides_are_said_to_apply_in_the_cli_alone() {
+        let summary = planted(named("overrides-v1")).description;
+        assert!(
+            summary.contains("LPM Vault 1.1.0 to 1.3.0 show the project's team values"),
+            "{summary}"
+        );
+        assert!(
+            !summary.contains("LPM Vault 1.1.0 to 1.3.0 apply"),
+            "{summary}"
         );
     }
 

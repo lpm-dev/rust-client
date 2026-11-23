@@ -166,5 +166,8 @@ else
 	echo "Signed LPM CLI: $SIGNED_BINARY"
 fi
 if [ "${#RUN_ARGS[@]}" -gt 0 ]; then
+	# exec replaces this shell, so its EXIT trap never runs.
+	cleanup
+	trap - EXIT
 	exec "$SIGNED_BINARY" "${RUN_ARGS[@]}"
 fi

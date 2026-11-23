@@ -149,6 +149,86 @@ fn a_first_override_under_approved_values_asks_in_the_project_s_name_not_its_sta
 }
 
 #[test]
+fn finishing_an_interrupted_override_change_asks_in_the_project_s_name_not_its_staging_item_s() {
+    let mut storage = storage_with_values();
+    storage
+        .claims
+        .insert(VAULT.to_owned(), ClaimedAccess::RequireApproval);
+    storage.protected.insert(VAULT.to_owned());
+    change(&mut storage, &[set("FIRST", "1")]).expect("set");
+    let record = storage
+        .values
+        .get(&overrides_account())
+        .expect("the record")
+        .replace(r#""FIRST":"1""#, r#""FIRST":"1","INTERRUPTED":"2""#);
+    super::companion::committed_journal(
+        &mut storage,
+        &[(overrides_account().as_str(), Some(record.as_bytes()))],
+    );
+    // The stage of a record that follows approved values is approved too.
+    let stage =
+        crate::keychain::transaction_stage_account("00000000-0000-4000-8000-0000000000aa", 0);
+    assert!(storage.values.contains_key(&stage));
+    storage.protected.insert(stage);
+    crate::macos_keychain::note_requester(VAULT, std::path::Path::new("/srv/proj"), || {
+        Some("Project".to_owned())
+    });
+    storage.prompts.clear();
+
+    let read = read_all(&mut storage).expect("the change is finished, then read");
+
+    assert_eq!(read["default"].set["INTERRUPTED"], "2");
+    assert!(
+        !storage.prompts.is_empty(),
+        "the stage is read with approval"
+    );
+    for prompt in &storage.prompts {
+        assert_eq!(
+            prompt,
+            "Allow LPM CLI in \"/srv/proj\" to access env project \"Project\"'s personal overrides"
+        );
+    }
+}
+
+#[test]
+fn a_stage_left_after_it_was_deleted_is_read_back_in_the_project_s_name() {
+    let mut storage = storage_with_values();
+    storage
+        .claims
+        .insert(VAULT.to_owned(), ClaimedAccess::RequireApproval);
+    storage.protected.insert(VAULT.to_owned());
+    change(&mut storage, &[set("FIRST", "1")]).expect("set");
+    let record = storage
+        .values
+        .get(&overrides_account())
+        .expect("the record")
+        .to_owned();
+    super::companion::committed_journal(
+        &mut storage,
+        &[(overrides_account().as_str(), Some(record.as_bytes()))],
+    );
+    let stage =
+        crate::keychain::transaction_stage_account("00000000-0000-4000-8000-0000000000aa", 0);
+    storage.protected.insert(stage.clone());
+    storage.ignored_deletes.insert(stage);
+    crate::macos_keychain::note_requester(VAULT, std::path::Path::new("/srv/proj"), || {
+        Some("Project".to_owned())
+    });
+    storage.prompts.clear();
+
+    let refused = read_all(&mut storage).expect_err("the stage isn't gone");
+
+    assert!(refused.contains("could not delete"), "{refused}");
+    assert!(!storage.prompts.is_empty());
+    for prompt in &storage.prompts {
+        assert_eq!(
+            prompt,
+            "Allow LPM CLI in \"/srv/proj\" to access env project \"Project\"'s personal overrides"
+        );
+    }
+}
+
+#[test]
 fn an_override_of_values_without_approval_stays_automatic() {
     let mut storage = storage_with_values();
     change(&mut storage, &[set("API_URL", "mine")]).expect("set");
@@ -872,6 +952,38 @@ fn a_change_that_fails_before_its_journal_commits_leaves_the_overrides_as_they_w
     assert!(!storage.values.contains_key(TRANSACTION_MARKER_ACCOUNT));
 }
 
+/// Whether `account` is one of [`VAULT`]'s items: its values, marker or a
+/// companion record.
+#[cfg(target_os = "macos")]
+fn names_the_project(account: &str) -> bool {
+    account == VAULT
+        || crate::companion::account::CompanionAccount::parse(account)
+            .is_some_and(|record| record.vault_id() == VAULT)
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn the_signed_test_removes_its_own_items_and_nothing_else() {
+    use crate::companion::account::CompanionAccount;
+    let marker = CompanionAccount::Marker {
+        vault_id: VAULT.to_owned(),
+    };
+    assert!(names_the_project(VAULT));
+    assert!(names_the_project(marker.name().as_ref()));
+    assert!(names_the_project(&overrides_account()));
+    let other = CompanionAccount::Marker {
+        vault_id: "another-project".to_owned(),
+    };
+    for account in [
+        "another-project",
+        other.name().as_ref(),
+        "__vault_transaction_v3__",
+        "lpm-cli",
+    ] {
+        assert!(!names_the_project(account), "{account}");
+    }
+}
+
 /// A first override under values that need approval, on this Mac's own
 /// Keychain. How many times macOS asks is what a person counts and types,
 /// which no memory store shows. Run it with an empty LPM home, so it touches
@@ -898,18 +1010,22 @@ fn a_first_override_under_values_that_need_approval_asks_once_on_this_macs_keych
         "the Keychain already holds {} items for this LPM home: set LPM_HOME to an empty folder, so the test touches none of this Mac's env projects",
         existing.len()
     );
-    struct RemoveEverything;
-    impl Drop for RemoveEverything {
+    /// Deletes the test's own items, and none another process adds to the
+    /// LPM home meanwhile.
+    struct RemoveTheProject;
+    impl Drop for RemoveTheProject {
         fn drop(&mut self) {
             let service = service();
             if let Ok(accounts) = crate::macos_keychain::accounts_with_access(&service) {
                 for (account, _) in accounts {
-                    let _ = crate::macos_keychain::delete(&service, &account);
+                    if names_the_project(&account) {
+                        let _ = crate::macos_keychain::delete(&service, &account);
+                    }
                 }
             }
         }
     }
-    let _cleanup = RemoveEverything;
+    let _cleanup = RemoveTheProject;
     let mut storage = KeychainProjectStorage;
     save_vault_data_with_storage(&mut storage, VAULT, "Project", "/project", VALUES)
         .expect("create the project");

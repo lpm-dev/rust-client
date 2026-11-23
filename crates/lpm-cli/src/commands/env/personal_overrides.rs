@@ -310,21 +310,36 @@ fn key_changes_json(environment: &str, change: &lpm_vault::overrides::Change) ->
 /// newer data than it should.
 fn report_storage(change: &lpm_vault::overrides::Change) {
     if change.activated {
-        let (first, last) = RELEASES_THAT_REFUSE_OVERRIDES;
-        let (first_vault, last_vault) = VAULT_RELEASES_THAT_REFUSE_OVERRIDES;
+        output::warn_line(refusing_releases(cfg!(target_os = "macos")));
+    }
+    if change.over_admission_target {
         output::warn_line(install_ui::terminal_line!(
+            "this computer's env storage holds more newer data than it should; delete env projects you no longer use"
+        ));
+    }
+}
+
+/// Which releases can't use a project once it has personal overrides, and
+/// how to update them: LPM Vault's only on a Mac, which alone has it.
+fn refusing_releases(mac: bool) -> install_ui::TerminalLine {
+    let (first, last) = RELEASES_THAT_REFUSE_OVERRIDES;
+    let (first_vault, last_vault) = VAULT_RELEASES_THAT_REFUSE_OVERRIDES;
+    if mac {
+        install_ui::terminal_line!(
             "LPM CLI {} to {} and LPM Vault {} to {} can't use this project now that it has personal overrides until they're updated, with `lpm self-update` and LPM Vault's Check for Updates; an LPM CLI older than {} runs it with team values",
             first,
             last,
             first_vault,
             last_vault,
             first,
-        ));
-    }
-    if change.over_admission_target {
-        output::warn_line(install_ui::terminal_line!(
-            "this computer's env storage holds more newer data than it should; delete env projects you no longer use"
-        ));
+        )
+    } else {
+        install_ui::terminal_line!(
+            "LPM CLI {} to {} can't use this project now that it has personal overrides until it's updated, with `lpm self-update`; an LPM CLI older than {} runs it with team values",
+            first,
+            last,
+            first,
+        )
     }
 }
 
@@ -616,6 +631,18 @@ fn report_cleared(selected: &Option<String>, scope: &str, removed: usize, json_o
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_releases_that_can_t_use_a_project_with_overrides_name_lpm_vault_on_a_mac_alone() {
+        let mac = refusing_releases(true).to_string();
+        assert!(
+            mac.contains("LPM Vault 1.1.0 to 1.3.0") && mac.contains("Check for Updates"),
+            "{mac}"
+        );
+        let other = refusing_releases(false).to_string();
+        assert!(!other.contains("LPM Vault"), "{other}");
+        assert!(other.contains("LPM CLI 0.82.0 to 0.88.0"), "{other}");
+    }
 
     #[test]
     fn the_clear_question_names_a_few_keys_and_counts_many() {

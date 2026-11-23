@@ -82,6 +82,25 @@ Examples:
     value_entry_help!()
 );
 
+/// Which releases can't use a project with personal overrides: LPM Vault's
+/// only on a Mac, which alone has it.
+#[cfg(target_os = "macos")]
+macro_rules! refusing_releases_help {
+    () => {
+        "LPM CLI 0.82.0 to 0.88.0 and LPM Vault 1.1.0 to 1.3.0
+can't use a project with overrides until they're updated, and an LPM CLI older
+than 0.82.0 runs it with team values."
+    };
+}
+#[cfg(not(target_os = "macos"))]
+macro_rules! refusing_releases_help {
+    () => {
+        "LPM CLI 0.82.0 to 0.88.0 can't use
+a project with overrides until it's updated, and an LPM CLI older than 0.82.0
+runs it with team values."
+    };
+}
+
 const OVERRIDE_SET_AFTER_HELP: &str = concat!(
     "\
 Examples:
@@ -94,9 +113,8 @@ A personal override is this computer's own value for a key. LPM applies it when
 it runs, prints or checks the project here. It never syncs, and LPM leaves it
 out when it pushes values or sends them to CI or a platform. Once the project
 has one, its tasks, and the tasks that depend on them, don't use the remote task
-cache on this computer. LPM CLI 0.82.0 to 0.88.0 and LPM Vault 1.1.0 to 1.3.0
-can't use a project with overrides until they're updated, and an LPM CLI older
-than 0.82.0 runs it with team values.",
+cache on this computer. ",
+    refusing_releases_help!(),
     value_entry_help!()
 );
 
@@ -463,8 +481,8 @@ fn source_group(value: &str) -> Result<lpm_vault::history::SourceGroup, String> 
 
 const LOCAL_SYNC_SUBCOMMANDS: &[&str] = &[
     "set", "get", "list", "delete", "import", "export", "print", "example", "check", "validate",
-    "schema", "generate", "init", "repair", "override", "ls", "copy", "cp", "history", "rollback", "link",
-    "unlink", "links",
+    "schema", "generate", "init", "repair", "override", "ls", "copy", "cp", "history", "rollback",
+    "link", "unlink", "links",
 ];
 
 const LOCAL_ASYNC_SUBCOMMANDS: &[&str] = &["log", "unpair", "diff"];
@@ -535,6 +553,15 @@ fn print_format(value: &str) -> Result<lpm_env::PrintFormat, String> {
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
+
+    #[test]
+    fn override_set_help_names_lpm_vault_on_a_mac_alone() {
+        assert_eq!(
+            super::OVERRIDE_SET_AFTER_HELP.contains("LPM Vault"),
+            cfg!(target_os = "macos")
+        );
+        assert!(super::OVERRIDE_SET_AFTER_HELP.contains("LPM CLI 0.82.0 to 0.88.0"));
+    }
 
     /// The long help of the subcommand at `path`, its whitespace collapsed.
     fn long_help(path: &[&str]) -> String {

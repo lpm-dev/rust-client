@@ -979,7 +979,13 @@ fn check_reports_hidden_characters_in_a_personal_override_as_one() {
 
 // ─── lpm env override ─────────────────────────────────────────────────
 
-const ACTIVATION_NOTICE: &str = "LPM CLI 0.82.0 to 0.88.0 and LPM Vault 1.1.0 to 1.3.0 can't use this project now that it has personal overrides until they're updated, with `lpm self-update` and LPM Vault's Check for Updates; an LPM CLI older than 0.82.0 runs it with team values";
+/// What a project's first override says, which names LPM Vault on a Mac
+/// alone.
+const ACTIVATION_NOTICE: &str = if cfg!(target_os = "macos") {
+    "LPM CLI 0.82.0 to 0.88.0 and LPM Vault 1.1.0 to 1.3.0 can't use this project now that it has personal overrides until they're updated, with `lpm self-update` and LPM Vault's Check for Updates; an LPM CLI older than 0.82.0 runs it with team values"
+} else {
+    "LPM CLI 0.82.0 to 0.88.0 can't use this project now that it has personal overrides until it's updated, with `lpm self-update`; an LPM CLI older than 0.82.0 runs it with team values"
+};
 
 fn shown(project: &TempProject, script: &str) -> String {
     let output = lpm(project).args(["run", script]).output().unwrap();
