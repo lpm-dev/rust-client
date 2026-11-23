@@ -14,6 +14,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const LIMIT: usize = 3;
 const TOTAL: usize = 6;
 
+/// How long a test that must see a pool go over its limit watches for the
+/// extra request at each step: twenty quiet periods, so only a runner that
+/// stalls that long hides it, and well inside the clients' read timeouts.
+const WATCH: Duration = Duration::from_secs(5);
+
 /// How a test client schedules its requests.
 #[derive(Clone, Copy)]
 enum Pool {
@@ -23,6 +28,9 @@ enum Pool {
     GrowsOnRefill,
     /// `LIMIT` at a time, each batch only once the one before has ended.
     Waves,
+    /// `LIMIT` at once, and one more request this long after the first
+    /// answer, while the others are still held.
+    LateExtra(Duration),
 }
 
 /// Start a client that sends `TOTAL` requests to `url` as `pool` says, and
@@ -47,10 +55,14 @@ fn client(url: &str, pool: Pool, read_timeout: Duration) -> tokio::task::JoinHan
             }
         };
         match pool {
-            Pool::Bounded(_) | Pool::GrowsOnRefill => {
+            Pool::Bounded(_) | Pool::GrowsOnRefill | Pool::LateExtra(_) => {
                 let initial = match pool {
                     Pool::Bounded(n) => n,
                     _ => LIMIT,
+                };
+                let mut late_extra = match pool {
+                    Pool::LateExtra(delay) => Some((delay, get(TOTAL))),
+                    _ => None,
                 };
                 let permits = Arc::new(Semaphore::new(initial));
                 let grow = matches!(pool, Pool::GrowsOnRefill);
@@ -59,10 +71,17 @@ fn client(url: &str, pool: Pool, read_timeout: Duration) -> tokio::task::JoinHan
                     let permit = Arc::clone(&permits).acquire_owned().await.expect("permit");
                     let request = get(index);
                     let permits = Arc::clone(&permits);
+                    let extra = if index == 0 { late_extra.take() } else { None };
                     tasks.push(tokio::spawn(async move {
                         request.await;
                         if grow && index == 0 {
                             permits.add_permits(1);
+                        }
+                        if let Some((delay, extra)) = extra {
+                            tokio::spawn(async move {
+                                tokio::time::sleep(delay).await;
+                                extra.await;
+                            });
                         }
                         drop(permit);
                     }));
@@ -110,7 +129,7 @@ async fn a_pool_that_runs_more_than_its_limit_from_the_start_fails() {
         Pool::Bounded(LIMIT + 1),
         Duration::from_secs(60),
     );
-    gate.hold_a_bounded_pool(LIMIT, TOTAL).await;
+    gate.hold_a_bounded_pool_watching(LIMIT, TOTAL, WATCH).await;
 }
 
 #[tokio::test]
@@ -118,7 +137,37 @@ async fn a_pool_that_runs_more_than_its_limit_from_the_start_fails() {
 async fn a_pool_that_goes_past_its_limit_only_when_it_refills_fails() {
     let (_server, mut gate) = gate().await;
     let _client = client(gate.url(), Pool::GrowsOnRefill, Duration::from_secs(60));
-    gate.hold_a_bounded_pool(LIMIT, TOTAL).await;
+    gate.hold_a_bounded_pool_watching(LIMIT, TOTAL, WATCH).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "more than 3 requests were in flight")]
+async fn a_pool_whose_extra_request_starts_seconds_after_a_refill_fails() {
+    let (_server, mut gate) = gate().await;
+    let _client = client(
+        gate.url(),
+        Pool::LateExtra(Duration::from_secs(2)),
+        Duration::from_secs(60),
+    );
+    gate.hold_a_bounded_pool_watching(LIMIT, TOTAL, WATCH).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "more than 3 requests were in flight: 4 at once")]
+async fn a_gate_that_held_more_than_the_limit_at_once_says_the_limit_was_passed() {
+    let (_server, mut gate) = gate().await;
+    let _client = client(
+        gate.url(),
+        Pool::Bounded(LIMIT + 1),
+        Duration::from_secs(60),
+    );
+    let mut held = Vec::with_capacity(LIMIT + 1);
+    for _ in 0..=LIMIT {
+        held.push(gate.next().await);
+    }
+    held.into_iter()
+        .for_each(support::request_gate::HeldRequest::release);
+    gate.assert_peak(LIMIT).await;
 }
 
 #[tokio::test]

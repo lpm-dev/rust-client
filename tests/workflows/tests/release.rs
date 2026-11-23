@@ -1138,7 +1138,7 @@ async fn release_publish_preflight_refills_slots_behind_a_slow_first_request() {
         String::from_utf8_lossy(&output.stderr)
     );
     gate.assert_held(8);
-    assert_eq!(gate.peak(), 4);
+    gate.assert_peak(4).await;
 }
 
 #[tokio::test]

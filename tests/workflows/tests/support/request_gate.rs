@@ -2,6 +2,9 @@
 //! test lets each one through, so a test can tell how many requests a
 //! command keeps in flight from the order of events alone. The times
 //! requests start measure the runner's scheduling as much as the command.
+//! The one time left is lpm's own read timeout, 30 seconds without a byte:
+//! a runner that stalls the test that long before it lets a held request
+//! through fails the test, which says lpm gave up on that request.
 //! It can stall the requests a test picks instead, for a command that must
 //! finish without waiting for them.
 
@@ -28,6 +31,12 @@ pub const WAIT_LIMIT: Duration = Duration::from_secs(60);
 /// are held. One that starts later goes unseen here, so a slow runner can
 /// only hide an extra request, never fail a command that keeps its limit.
 pub const QUIET_PERIOD: Duration = Duration::from_millis(250);
+
+/// How long a failing step waits to hear that lpm gave up on a request the
+/// gate held, before it says lpm ran too many at once. lpm starts more only
+/// after it closes the one it gave up on, but the gate can hear of the close
+/// after the new request. It only delays a failure.
+const SETTLE: Duration = Duration::from_secs(1);
 
 /// How often a stalled response sends a byte, well inside lpm's own read
 /// timeout, which each byte starts again.
@@ -292,13 +301,50 @@ impl RequestGate {
     /// Fails the test, saying `claim`, if the gate holds another request
     /// within [`QUIET_PERIOD`].
     pub async fn assert_quiet(&mut self, claim: &str) {
-        match tokio::time::timeout(QUIET_PERIOD, self.events.recv()).await {
-            Ok(Some(Event::Held(extra))) => panic!("{claim}: {} started too", extra.target()),
+        self.assert_quiet_for(claim, QUIET_PERIOD).await;
+    }
+
+    async fn assert_quiet_for(&mut self, claim: &str, watch: Duration) {
+        match tokio::time::timeout(watch, self.events.recv()).await {
+            Ok(Some(Event::Held(extra))) => {
+                let claim = format!("{claim}: {} started too", extra.target());
+                self.fail_over_the_limit(claim).await;
+            }
             Ok(Some(Event::Abandoned(target))) => {
                 panic!("{}", abandoned(&target, self.held()))
             }
             Ok(None) | Err(_) => {}
         }
+    }
+
+    /// Fails unless the most held requests in flight at once was `limit`.
+    pub async fn assert_peak(&mut self, limit: usize) {
+        let peak = self.peak();
+        if peak > limit {
+            let claim = format!("more than {limit} requests were in flight: {peak} at once");
+            self.fail_over_the_limit(claim).await;
+        }
+        assert_eq!(peak, limit, "the most requests in flight at once");
+    }
+
+    /// Fails the test for a request past the limit: as lpm giving up on a
+    /// request the gate held, if the gate hears of that within [`SETTLE`],
+    /// or else saying `claim`.
+    async fn fail_over_the_limit(&mut self, claim: String) {
+        let gave_up = tokio::time::timeout(SETTLE, async {
+            loop {
+                match self.events.recv().await {
+                    Some(Event::Abandoned(target)) => return Some(target),
+                    Some(Event::Held(_)) => {}
+                    None => return None,
+                }
+            }
+        })
+        .await;
+        if let Ok(Some(target)) = gave_up {
+            panic!("{}", abandoned(&target, self.held()));
+        }
+        panic!("{claim}");
     }
 
     /// Fails unless the command waited for every request the gate held, and
@@ -322,6 +368,21 @@ impl RequestGate {
     /// wave before it starts more, never sends a request this waits for,
     /// and one that runs more than `limit` at once sends one this sees.
     pub async fn hold_a_bounded_pool(&mut self, limit: usize, total: usize) {
+        self.hold_a_bounded_pool_watching(limit, total, QUIET_PERIOD)
+            .await;
+    }
+
+    /// [`Self::hold_a_bounded_pool`], watching for an extra request for
+    /// `watch` at each step rather than [`QUIET_PERIOD`]. A test that must
+    /// see a pool go over its limit watches longer, so only a runner that
+    /// stalls that long can hide the extra request from the watch; one held
+    /// with the others still fails the final count.
+    pub async fn hold_a_bounded_pool_watching(
+        &mut self,
+        limit: usize,
+        total: usize,
+        watch: Duration,
+    ) {
         assert!(
             (1..=total).contains(&limit),
             "a pool of {limit} for {total} requests"
@@ -331,14 +392,14 @@ impl RequestGate {
         for _ in 0..limit {
             held.push_back(self.next().await);
         }
-        self.assert_quiet(&over_the_limit).await;
+        self.assert_quiet_for(&over_the_limit, watch).await;
         for _ in limit..total {
             held.pop_front().expect("a held request").release();
             held.push_back(self.next().await);
-            self.assert_quiet(&over_the_limit).await;
+            self.assert_quiet_for(&over_the_limit, watch).await;
         }
         held.into_iter().for_each(HeldRequest::release);
-        assert_eq!(self.peak(), limit, "the most requests in flight at once");
+        self.assert_peak(limit).await;
     }
 }
 
