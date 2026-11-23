@@ -674,6 +674,42 @@ mod tty {
     }
 
     #[test]
+    fn a_prompt_stopped_and_continued_hides_what_s_typed_again() {
+        let (project, lpm_home) = project();
+        let mut hidden_again = false;
+        let session = run_in_pty_controlled(
+            project.path(),
+            lpm_home.path(),
+            &["env", "set", "TOKEN"],
+            &[(b"Value for TOKEN (default, hidden): ", b"fixture-typed\r")],
+            &PtyOptions::default(),
+            &mut |answering| {
+                signal(answering.pid, libc::SIGTSTP);
+                answering.wait_until_stopped();
+                answering.set_cooked();
+                signal(answering.pid, libc::SIGCONT);
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while !answering.echo_is_disabled() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                hidden_again = answering.echo_is_disabled();
+            },
+        );
+
+        assert!(hidden_again, "raw mode again once lpm continues");
+        assert!(session.status.success(), "{}", session.transcript);
+        assert!(
+            !session.transcript.contains("fixture-typed"),
+            "{}",
+            session.transcript
+        );
+        assert_eq!(
+            stored(project.path(), lpm_home.path(), "TOKEN").as_deref(),
+            Some("fixture-typed")
+        );
+    }
+
+    #[test]
     fn a_signal_lpm_was_started_ignoring_leaves_the_prompt_waiting() {
         let (project, lpm_home) = project();
         let options = PtyOptions {
@@ -866,7 +902,8 @@ mod tty {
                 b"Value for TOKEN (default, hidden): ",
                 vec![b"fixture-", b"\x1bP", b"key\r"],
             )],
-            Duration::from_millis(700),
+            // Well past the Escape key's 500 ms wait, however late lpm reads.
+            Duration::from_millis(2000),
         );
         assert!(session.status.success(), "{}", session.transcript);
         assert_eq!(

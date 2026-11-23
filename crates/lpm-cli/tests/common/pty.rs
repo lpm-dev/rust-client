@@ -159,6 +159,41 @@ impl Answering<'_> {
         terminal_echo_is_disabled(self.master)
     }
 
+    /// Give the terminal cooked mode with echo, as a shell leaves it for a
+    /// job it stopped.
+    pub fn set_cooked(&self) {
+        let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: `master` is a valid PTY descriptor, and `tcgetattr`
+        // initializes `attributes` when it returns zero.
+        let read = unsafe { libc::tcgetattr(self.master.as_raw_fd(), attributes.as_mut_ptr()) };
+        assert_eq!(read, 0, "read the PTY's attributes");
+        // SAFETY: the successful `tcgetattr` initialized it.
+        let mut attributes = unsafe { attributes.assume_init() };
+        attributes.c_lflag |= libc::ECHO | libc::ICANON;
+        // SAFETY: `master` is a valid PTY descriptor and `attributes` a
+        // valid termios.
+        let set = unsafe { libc::tcsetattr(self.master.as_raw_fd(), libc::TCSANOW, &attributes) };
+        assert_eq!(set, 0, "give the PTY cooked mode");
+    }
+
+    /// Wait, at most 30 seconds, until lpm is stopped by a signal.
+    pub fn wait_until_stopped(&self) {
+        let pid = libc::pid_t::try_from(self.pid).expect("a process ID");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let mut status = 0;
+            // SAFETY: `pid` is this run's child; WUNTRACED with WNOHANG
+            // reports a stop without reaping it.
+            let changed =
+                unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+            if changed == pid && libc::WIFSTOPPED(status) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "lpm was never stopped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Fill what the terminal holds of lpm's output until it's read, so
     /// lpm's next write to the terminal waits. The run reads it all after
     /// the step.

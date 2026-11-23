@@ -3546,6 +3546,7 @@ dependencies = [
  "dirs",
  "ecdsa",
  "ed25519-dalek",
+ "errno",
  "ferralk-glob",
  "flate2",
  "futures",

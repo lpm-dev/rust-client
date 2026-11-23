@@ -397,8 +397,14 @@ mod tests {
     /// (`secret_read::read_secret_stdin`) and never through std's reader.
     #[test]
     fn secret_input_never_reads_through_std_s_buffered_stdin() {
-        let production =
-            |source: &'static str| source.split("#[cfg(test)]").next().unwrap_or(source);
+        // What a file holds before its tests: a test hook in production code
+        // carries `#[cfg(test)]` too.
+        let production = |source: &'static str| {
+            source
+                .split("#[cfg(test)]\nmod tests")
+                .next()
+                .unwrap_or(source)
+        };
         // Here std's stdin only says whether it's a terminal.
         for (name, source) in [
             ("value_input.rs", include_str!("value_input.rs")),
