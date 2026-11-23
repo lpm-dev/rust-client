@@ -597,9 +597,14 @@ mod tests {
 
     #[test]
     fn typed_text_and_control_keys() {
+        // Ctrl+Z stops the prompt on Unix; Windows reads it from the
+        // console as the end of input, before bytes reach this.
+        let ctrl_z = if cfg!(unix) { "<Suspend>" } else { "<Ignored>" };
         assert_eq!(
             decoded(&[b"ab\tc\x7f\x08\x17\x15\x03\x04\x1a\r\n"]),
-            "ab\tc<Backspace><Backspace><EraseWord><ClearLine><Interrupt><EndOfFile><Suspend><Enter><Enter>"
+            format!(
+                "ab\tc<Backspace><Backspace><EraseWord><ClearLine><Interrupt><EndOfFile>{ctrl_z}<Enter><Enter>"
+            )
         );
         assert_eq!(decoded(&["é€".as_bytes()]), "é€");
     }
