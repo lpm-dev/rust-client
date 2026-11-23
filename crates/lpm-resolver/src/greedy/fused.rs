@@ -2,12 +2,12 @@ use super::edge::process_edge_with_preferred;
 use super::manifest::{
     ExactMetadataFetchOutcome, FetchResult, FetchedMetadata, MetadataFetchCompletion,
     MetadataFetchKey, cached_manifest_from_importer_or_facts, complete_metadata_fetch,
-    ensure_policy_metadata_for_cached_manifest, ensure_policy_metadata_for_cached_manifest_for_edge,
-    exact_metadata_fast_path_eligible, fetch_metadata_for_resolver_with_permit,
-    fetch_metadata_for_resolver_with_permit_and_exact,
+    ensure_policy_metadata_for_cached_manifest, exact_metadata_fast_path_eligible,
+    fetch_metadata_for_resolver_with_permit, fetch_metadata_for_resolver_with_permit_and_exact,
     fetch_metadata_for_resolver_with_trace_detail, fetch_preferred_metadata_for_resolver,
-    parse_cached_metadata_for_resolver, parse_fetched_metadata, parse_partial_fetched_metadata,
-    publish_direct_base_fact, reads_public_npm, try_fetch_exact_metadata_for_resolver,
+    hydrate_cached_manifest_for_edge, parse_cached_metadata_for_resolver, parse_fetched_metadata,
+    parse_partial_fetched_metadata, publish_direct_base_fact, reads_public_npm,
+    try_fetch_exact_metadata_for_resolver,
 };
 use super::peer::{drain_peer_requirements_one_pass, pick_peer_prefetch_candidates};
 use super::prelude::*;
@@ -889,6 +889,35 @@ impl MetadataFetchScheduler {
             )
             .await;
             (canonical, result)
+        });
+    }
+
+    fn enqueue_hydration(
+        &mut self,
+        dispatch: &MetadataFetchDispatch<'_>,
+        request: MetadataFetchKey,
+        info: Arc<CachedPackageInfo>,
+        include_speculation: bool,
+    ) {
+        let client = dispatch.client.clone();
+        let route_table = dispatch.route_table.clone();
+        let policy = dispatch.policy.clone();
+        let policy_semaphore = Arc::clone(&self.policy_semaphore);
+        let trace_metadata_fetches = dispatch.trace_metadata_fetches;
+        self.jobs.spawn(async move {
+            let _policy_permit = policy_semaphore.acquire_owned().await.ok();
+            let result = hydrate_cached_manifest_for_edge(
+                &request.canonical,
+                info,
+                &client,
+                &route_table,
+                &policy,
+                trace_metadata_fetches,
+                request.exact_version.as_deref(),
+                include_speculation,
+            )
+            .await;
+            (request, result)
         });
     }
 
@@ -2203,7 +2232,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     // `StageTiming.peer_prefetch_count`.
     let mut peer_prefetch_count: u64 = 0;
     let mut tree_policy_ns = 0u64;
-    let mut policy_hydration_ns = 0u64;
+    let policy_hydration_ns = 0u64;
     let mut manifest_wait_ns = 0u64;
     let mut edge_drain_ns = 0u64;
 
@@ -2508,24 +2537,31 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     continue;
                 }
                 let edge_exact_version = edge.range.exact_version().map(|v| v.to_string());
-                if !ordered_metadata.has_committed(&edge.canonical) {
-                    let policy_hydration_started = trace_metadata_fetches.then(Instant::now);
-                    let info_result = ensure_policy_metadata_for_cached_manifest_for_edge(
-                        &edge.canonical,
-                        info_arc,
-                        &client,
-                        &route_table,
-                        &shared_cache,
-                        &policy,
-                        trace_metadata_fetches,
-                        edge_exact_version.as_deref(),
-                    )
-                    .await;
-                    if let Some(started) = policy_hydration_started {
-                        policy_hydration_ns =
-                            policy_hydration_ns.saturating_add(duration_ns(started.elapsed()));
+                let needs_platform = match edge_exact_version.as_deref() {
+                    Some(version) => info_arc.needs_platform_metadata_for_version(version),
+                    None => info_arc.needs_platform_metadata(),
+                };
+                let needs_supplemental =
+                    info_arc.needs_policy_metadata(&edge.canonical, &policy) || needs_platform;
+                if needs_supplemental && matches!(&edge.canonical, CanonicalKey::Npm { .. }) {
+                    let request = MetadataFetchKey {
+                        canonical: edge.canonical.clone(),
+                        exact_version: edge_exact_version,
+                    };
+                    let request = ordered_metadata.coalesce_request(request);
+                    let new_fetch = ordered_metadata.start_request(&request)?;
+                    parked.entry(request.clone()).or_default().push(edge);
+                    if new_fetch {
+                        metadata_jobs.enqueue_hydration(
+                            &metadata_dispatch,
+                            request,
+                            info_arc,
+                            spec_tx.is_some(),
+                        );
                     }
-                    let info_arc = info_result?;
+                    continue;
+                }
+                if !ordered_metadata.has_committed(&edge.canonical) {
                     let canonical = edge.canonical.clone();
                     let request = MetadataFetchKey::packument(canonical.clone());
                     let new_completion = ordered_metadata.start_request(&request)?;
@@ -2557,23 +2593,6 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     }
                     continue;
                 }
-                let policy_hydration_started = trace_metadata_fetches.then(Instant::now);
-                let info_result = ensure_policy_metadata_for_cached_manifest_for_edge(
-                    &edge.canonical,
-                    info_arc,
-                    &client,
-                    &route_table,
-                    &shared_cache,
-                    &policy,
-                    trace_metadata_fetches,
-                    edge_exact_version.as_deref(),
-                )
-                .await;
-                if let Some(started) = policy_hydration_started {
-                    policy_hydration_ns =
-                        policy_hydration_ns.saturating_add(duration_ns(started.elapsed()));
-                }
-                let info_arc = info_result?;
                 let info_arc = match super::manifest::refresh_missing_range(
                     &edge,
                     info_arc,

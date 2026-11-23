@@ -5172,7 +5172,7 @@ async fn exact_version_linux_platform_hydration_uses_version_doc_under_release_a
     );
     let policy = ResolverPolicy::with_cutoff_unix(
         7 * 86_400,
-        1_700_000_000,
+        1_900_000_000,
         crate::TrustPolicyMode::Off,
     );
     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
@@ -5200,6 +5200,136 @@ async fn exact_version_linux_platform_hydration_uses_version_doc_under_release_a
         info.platform("1.0.0").expect("platform metadata").libc,
         vec!["glibc".to_string()]
     );
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_hydrates_multiple_exact_platform_versions_concurrently() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    // Parent A depends on native@1.0.0, Parent B depends on native@2.0.0,
+    // Parent C depends on native@3.0.0. All three exact-version docs have a
+    // 120ms delay; hydrating them concurrently keeps total time well under 300ms
+    // and preserves libc for every version.
+    for (parent, dep_ver) in [
+        ("parent-a", "1.0.0"),
+        ("parent-b", "2.0.0"),
+        ("parent-c", "3.0.0"),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{parent}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": parent,
+                "modified": "2020-01-01T00:00:00.000Z",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": parent,
+                        "version": "1.0.0",
+                        "optionalDependencies": { "linux-multi": dep_ver },
+                        "dist": {
+                            "tarball": format!("https://example.invalid/{parent}-1.0.0.tgz"),
+                            "integrity": "sha512-parent"
+                        }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    Mock::given(method("GET"))
+        .and(path("/linux-multi"))
+        .and(header("accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "linux-multi",
+            "modified": "2020-01-01T00:00:00.000Z",
+            "dist-tags": { "latest": "3.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "linux-multi", "version": "1.0.0",
+                    "os": ["linux"], "cpu": ["x64"],
+                    "dist": { "tarball": "https://example.invalid/lm-1.tgz", "integrity": "sha512-1" }
+                },
+                "2.0.0": {
+                    "name": "linux-multi", "version": "2.0.0",
+                    "os": ["linux"], "cpu": ["x64"],
+                    "dist": { "tarball": "https://example.invalid/lm-2.tgz", "integrity": "sha512-2" }
+                },
+                "3.0.0": {
+                    "name": "linux-multi", "version": "3.0.0",
+                    "os": ["linux"], "cpu": ["x64"],
+                    "dist": { "tarball": "https://example.invalid/lm-3.tgz", "integrity": "sha512-3" }
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    for (ver, libc) in [("1.0.0", "glibc"), ("2.0.0", "musl"), ("3.0.0", "glibc")] {
+        Mock::given(method("GET"))
+            .and(path(format!("/linux-multi/{ver}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(120))
+                    .set_body_json(serde_json::json!({
+                        "name": "linux-multi", "version": ver,
+                        "os": ["linux"], "cpu": ["x64"], "libc": [libc],
+                        "dist": { "tarball": format!("https://example.invalid/lm-{ver}.tgz"), "integrity": "sha512-x" }
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_npm_registry_url(server.uri())
+            .with_cache_dir(None),
+    );
+    let policy = ResolverPolicy::with_cutoff_unix(
+        7 * 86_400,
+        1_900_000_000,
+        crate::TrustPolicyMode::Off,
+    );
+    let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+    let started = std::time::Instant::now();
+    let result = resolve_greedy_fused_with_cache_options_policy_and_selected_events(
+        client,
+        HashMap::from([
+            ("parent-a".to_string(), "^1.0.0".to_string()),
+            ("parent-b".to_string(), "^1.0.0".to_string()),
+            ("parent-c".to_string(), "^1.0.0".to_string()),
+        ]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        shared_cache,
+        true,
+        true,
+        policy,
+        None,
+    )
+    .await
+    .expect("concurrent exact platform hydrations should resolve");
+    let elapsed_ms = started.elapsed().as_millis();
+    assert!(
+        elapsed_ms < 320,
+        "three 120ms exact-version hydrations should overlap concurrently (took {elapsed_ms}ms)"
+    );
+    let info = result
+        .cache
+        .get(&CanonicalKey::npm("linux-multi"))
+        .expect("linux-multi cached");
+    assert_eq!(info.platform("1.0.0").unwrap().libc, vec!["glibc".to_string()]);
+    assert_eq!(info.platform("2.0.0").unwrap().libc, vec!["musl".to_string()]);
+    assert_eq!(info.platform("3.0.0").unwrap().libc, vec!["glibc".to_string()]);
     server.verify().await;
 }
 

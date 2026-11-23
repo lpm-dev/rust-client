@@ -1172,27 +1172,31 @@ pub(super) async fn ensure_policy_metadata_for_cached_manifest(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn ensure_policy_metadata_for_cached_manifest_for_edge(
+pub(super) async fn hydrate_cached_manifest_for_edge(
     canonical: &CanonicalKey,
     info: Arc<CachedPackageInfo>,
     client: &RegistryClient,
     route_table: &RouteTable,
-    shared_cache: &SharedCache,
     policy: &ResolverPolicy,
     trace_metadata_fetches: bool,
     exact_version: Option<&str>,
-) -> Result<Arc<CachedPackageInfo>, ResolveError> {
+    include_speculation: bool,
+) -> FetchResult {
     let needs_trust = info.needs_trust_metadata(policy);
     let needs_release_time = info.needs_release_time_metadata(canonical, policy);
     let needs_platform = match exact_version {
         Some(version) => info.needs_platform_metadata_for_version(version),
         None => info.needs_platform_metadata(),
     };
-    if !needs_trust && !needs_release_time && !needs_platform {
-        return Ok(info);
-    }
-    if !matches!(canonical, CanonicalKey::Npm { .. }) {
-        return Ok(info);
+    if (!needs_trust && !needs_release_time && !needs_platform)
+        || !matches!(canonical, CanonicalKey::Npm { .. })
+    {
+        return Ok(FetchedMetadata {
+            speculation: None,
+            latest_version: info.latest_version.clone(),
+            info,
+            shared_fact: None,
+        });
     }
     if !needs_trust {
         let mut merged = (*info).clone();
@@ -1307,16 +1311,34 @@ pub(super) async fn ensure_policy_metadata_for_cached_manifest_for_edge(
                 ),
             );
         }
-        let merged = Arc::new(merged);
-        shared_cache.insert(canonical.clone(), merged.clone());
-        return Ok(merged);
+        let dist_tags = if include_speculation {
+            merged
+                .dist_tags()
+                .iter()
+                .map(|(tag, version)| (tag.clone(), version.to_string()))
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
+        let latest_version = merged.latest_version.clone();
+        return Ok(fetched_metadata_from_info(
+            latest_version,
+            dist_tags,
+            merged,
+            include_speculation,
+        ));
     }
     let policy_start = trace_metadata_fetches.then(Instant::now);
-    let mut fetched =
-        fetch_full_metadata_for_policy(client, route_table, canonical, policy, false, false)
-            .await?;
+    let mut fetched = fetch_full_metadata_for_policy(
+        client,
+        route_table,
+        canonical,
+        policy,
+        include_speculation,
+        false,
+    )
+    .await?;
     share_manifest_core_with_base(&mut fetched, &info);
-    let full_info = fetched.info;
     if let Some(start) = policy_start {
         let elapsed = start.elapsed().as_millis();
         lpm_registry::timing::record_metadata_fetch_detail(
@@ -1326,13 +1348,50 @@ pub(super) async fn ensure_policy_metadata_for_cached_manifest_for_edge(
                 elapsed,
                 0,
                 elapsed,
-                full_info.versions.len() as u64,
+                fetched.info.versions.len() as u64,
                 None,
             ),
         );
     }
-    shared_cache.insert(canonical.clone(), full_info.clone());
-    Ok(full_info)
+    Ok(fetched)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn ensure_policy_metadata_for_cached_manifest_for_edge(
+    canonical: &CanonicalKey,
+    info: Arc<CachedPackageInfo>,
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    shared_cache: &SharedCache,
+    policy: &ResolverPolicy,
+    trace_metadata_fetches: bool,
+    exact_version: Option<&str>,
+) -> Result<Arc<CachedPackageInfo>, ResolveError> {
+    let needs_trust = info.needs_trust_metadata(policy);
+    let needs_release_time = info.needs_release_time_metadata(canonical, policy);
+    let needs_platform = match exact_version {
+        Some(version) => info.needs_platform_metadata_for_version(version),
+        None => info.needs_platform_metadata(),
+    };
+    if (!needs_trust && !needs_release_time && !needs_platform)
+        || !matches!(canonical, CanonicalKey::Npm { .. })
+    {
+        return Ok(info);
+    }
+    let fetched = hydrate_cached_manifest_for_edge(
+        canonical,
+        info,
+        client,
+        route_table,
+        policy,
+        trace_metadata_fetches,
+        exact_version,
+        false,
+    )
+    .await?;
+    let merged = fetched.info;
+    shared_cache.insert(canonical.clone(), merged.clone());
+    Ok(merged)
 }
 
 fn cached_policy_metadata_fetch_detail_record(

@@ -633,7 +633,7 @@ impl CachedPackageInfo {
         }
     }
 
-    pub(super) fn dist_tags(&self) -> &HashMap<String, NpmVersion> {
+    pub(crate) fn dist_tags(&self) -> &HashMap<String, NpmVersion> {
         &self.dist_tags
     }
 

@@ -221,8 +221,22 @@ fn merge_manifest_version(
             if incoming.node_engine.is_none() {
                 incoming.node_engine.clone_from(&existing.node_engine);
             }
-            if incoming.platform.is_none() {
-                incoming.platform.clone_from(&existing.platform);
+            match (&existing.platform, &mut incoming.platform) {
+                (Some(existing_platform), Some(incoming_platform)) => {
+                    if incoming_platform.os.is_empty() {
+                        incoming_platform.os.clone_from(&existing_platform.os);
+                    }
+                    if incoming_platform.cpu.is_empty() {
+                        incoming_platform.cpu.clone_from(&existing_platform.cpu);
+                    }
+                    if incoming_platform.libc.is_empty() {
+                        incoming_platform.libc.clone_from(&existing_platform.libc);
+                    }
+                }
+                (Some(existing_platform), None) => {
+                    incoming.platform = Some(existing_platform.clone());
+                }
+                (None, _) => {}
             }
             incoming.dist = merge_cached_dist_info(&existing.dist, &incoming.dist);
             Some(incoming)
