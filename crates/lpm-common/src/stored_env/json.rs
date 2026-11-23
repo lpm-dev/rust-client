@@ -182,17 +182,20 @@ impl<'a> Reader<'a> {
             .map_err(|_| self.unexpected("a number out of range"))
     }
 
+    /// An object's key, which JSON writes as a string, or the text isn't
+    /// JSON.
     fn key(&mut self) -> Result<Cow<'a, str>, ReadError> {
         self.skip_whitespace();
         let text = self.text;
         let bytes = text.as_bytes();
-        if bytes.get(self.at) == Some(&b'"') {
-            let end = special_byte(bytes, self.at + 1);
-            if bytes.get(end) == Some(&b'"') {
-                let key = &text[self.at + 1..end];
-                self.at = end + 1;
-                return Ok(Cow::Borrowed(key));
-            }
+        if bytes.get(self.at) != Some(&b'"') {
+            return Err(self.syntax("expected a key"));
+        }
+        let end = special_byte(bytes, self.at + 1);
+        if bytes.get(end) == Some(&b'"') {
+            let key = &text[self.at + 1..end];
+            self.at = end + 1;
+            return Ok(Cow::Borrowed(key));
         }
         self.string().map(Cow::Owned)
     }
@@ -211,9 +214,10 @@ impl<'a> Reader<'a> {
         self.decode_string(None)
     }
 
-    /// Reads a string in one pass, decoding it into `decoded` when given,
-    /// which first takes room for the whole encoded string; true when it
-    /// holds a NUL, which only an escape can write.
+    /// Reads a string, decoding it into `decoded` when given, which first
+    /// takes room for the whole encoded string, measured in a pass of its
+    /// own; a string only checked is read in one pass. True when it holds a
+    /// NUL, which only an escape can write.
     fn decode_string(&mut self, mut decoded: Option<&mut String>) -> Result<bool, ReadError> {
         if !self.next_is(b'"') {
             return Err(self.unexpected("expected a string"));

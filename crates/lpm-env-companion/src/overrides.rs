@@ -282,10 +282,17 @@ fn read_record(
     for (name, entry_names) in &names {
         validate_environment(name, entry_names, case_insensitive)?;
     }
+    for (name, entry_names) in names {
+        if let Some(entry) = kept.get_mut(&*name) {
+            entry.unset = entry_names.unset;
+        }
+    }
     Ok(kept)
 }
 
-/// One environment's `set` and `unset`, with its values kept when `keep`.
+/// One environment's `set` and `unset`, with its values kept when `keep`;
+/// the unset names, which the record's rules judge first, join a kept entry
+/// once they have.
 fn read_entry<'a>(
     reader: &mut Reader<'a>,
     keep: bool,
@@ -318,9 +325,6 @@ fn read_entry<'a>(
     })?;
     if !(found_set && found_unset) {
         return Err(reader.unexpected("a missing field"));
-    }
-    if let Some(entry) = entry.as_mut() {
-        entry.unset.clone_from(&names.unset);
     }
     Ok((names, entry))
 }
@@ -581,6 +585,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_record_that_isn_t_json_says_so() {
+        let refused = parse_all(
+            record(r#""development":{"set":{"A":"1",},"unset":[]}"#).as_bytes(),
+            "proj",
+            1,
+        )
+        .expect_err("a trailing comma");
+        assert!(
+            refused.0.starts_with(
+                "the personal overrides are malformed: invalid JSON at line 1, column "
+            ),
+            "{refused}"
+        );
     }
 
     #[test]
