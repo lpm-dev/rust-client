@@ -749,8 +749,14 @@ pub(super) fn spawn_fetch_overlap_for_packages(
                 stats.skipped_platform_count = stats.skipped_platform_count.saturating_add(1);
                 continue;
             }
-            if object_already_stored(&package, store_v2_handle.as_deref()) {
-                stats.cache_hit_count = stats.cache_hit_count.saturating_add(1);
+            if !admit(
+                &package,
+                &mut seen,
+                &route_table,
+                &client,
+                store_v2_handle.as_deref(),
+                &mut stats,
+            ) {
                 continue;
             }
             if tasks.len() >= task_limit {
@@ -772,7 +778,6 @@ pub(super) fn spawn_fetch_overlap_for_packages(
                 install_accounting,
                 streaming_fetch,
                 artifact_selection,
-                &mut seen,
                 &mut tasks,
                 &mut stats,
             );
@@ -834,20 +839,21 @@ fn dispatch_selected_event(
         stats.skipped_platform_count = stats.skipped_platform_count.saturating_add(1);
         return;
     }
-    if object_already_stored(&package, store_v2_handle.as_deref()) {
-        stats.cache_hit_count = stats.cache_hit_count.saturating_add(1);
+    if !admit(
+        &package,
+        seen,
+        route_table,
+        client,
+        store_v2_handle.as_deref(),
+        stats,
+    ) {
         return;
     }
     let qualifies_for_streaming = !package.optional
         && super::resolve::is_streaming_candidate(&package)
         && package
             .unpacked_size
-            .is_some_and(|size| size.get() >= super::fetch::LARGE_V2_STREAMING_OBJECT_BYTES)
-        && !seen.contains(&install_pkg_key(&package))
-        && !super::fetch::credentialed_private_registry(
-            &route_table.route_for_package(&package.name),
-            client,
-        );
+            .is_some_and(|size| size.get() >= super::fetch::LARGE_V2_STREAMING_OBJECT_BYTES);
     let package_streaming_lane = if qualifies_for_streaming {
         streaming_lane.take()
     } else {
@@ -868,10 +874,40 @@ fn dispatch_selected_event(
         install_accounting,
         streaming_fetch,
         ArtifactSelection::FreshResolution,
-        seen,
         tasks,
         stats,
     );
+}
+
+/// Whether the overlap fetches `package`: one it hasn't taken yet, from a
+/// registry that needs none of the credentials the install's own fetch
+/// handles, and not stored already. Credentials are decided before the
+/// store is looked in, so what the overlap says of a private registry's
+/// package doesn't depend on whether the install's own fetch stored it
+/// first.
+fn admit(
+    package: &InstallPackage,
+    seen: &mut HashSet<String>,
+    route_table: &RouteTable,
+    client: &RegistryClient,
+    store_v2: Option<&lpm_store::v2::Store>,
+    stats: &mut FetchOverlapStats,
+) -> bool {
+    if !seen.insert(install_pkg_key(package)) {
+        return false;
+    }
+    if super::fetch::credentialed_private_registry(
+        &route_table.route_for_package(&package.name),
+        client,
+    ) {
+        stats.skipped_auth_count = stats.skipped_auth_count.saturating_add(1);
+        return false;
+    }
+    if object_already_stored(package, store_v2) {
+        stats.cache_hit_count = stats.cache_hit_count.saturating_add(1);
+        return false;
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -890,21 +926,9 @@ fn dispatch_install_package(
     install_accounting: ManagedInstallAccounting,
     streaming_fetch: bool,
     artifact_selection: ArtifactSelection,
-    seen: &mut HashSet<String>,
     tasks: &mut tokio::task::JoinSet<FetchOverlapTaskStatus>,
     stats: &mut FetchOverlapStats,
 ) {
-    let key = install_pkg_key(&package);
-    if !seen.insert(key) {
-        return;
-    }
-    if super::fetch::credentialed_private_registry(
-        &route_table.route_for_package(&package.name),
-        client,
-    ) {
-        stats.skipped_auth_count = stats.skipped_auth_count.saturating_add(1);
-        return;
-    }
     stats.dispatched_count = stats.dispatched_count.saturating_add(1);
     tasks.spawn(
         fetch_selected_package(
@@ -1331,6 +1355,64 @@ mod tests {
         assert_eq!(result.stats.completed_count, 2);
         assert_eq!(result.stats.failed_count, 0);
         assert!(!lane.try_claim(), "the overlap streams a package");
+    }
+
+    /// The overlap decides on credentials before it looks in the store, so
+    /// what it says of a private registry's package doesn't depend on
+    /// whether the install's own fetch stored it first.
+    #[tokio::test]
+    async fn a_private_registry_s_package_is_skipped_for_its_credentials_even_once_stored() {
+        let manifest = br#"{"name":"shared-package","version":"1.0.0"}"#;
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "package/package.json", &manifest[..])
+            .unwrap();
+        let body = archive.into_inner().unwrap().finish().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store_v2 = Arc::new(lpm_store::v2::Store::at(directory.path().join("store-v2")));
+        let (_, integrity, _) = store_v2.extract_object_from_bytes(&body, None).unwrap();
+        let registry = "https://npm.internal.example";
+        let npmrc = lpm_registry::NpmrcConfig::parse(
+            &format!("registry={registry}/\n//npm.internal.example/:_authToken=test-token\n"),
+            "test-npmrc",
+            &|_| None,
+        );
+        let route_table =
+            RouteTable::new(lpm_registry::RouteMode::Direct, npmrc).expect("route table");
+        let stored = workspace_fetch_package(&integrity, &format!("{registry}/stored.tgz"));
+        assert!(super::super::fetch::credentialed_private_registry(
+            &route_table.route_for_package(&stored.name),
+            &RegistryClient::new(),
+        ));
+
+        let result = spawn_fetch_overlap_for_packages(
+            vec![stored],
+            Arc::new(RegistryClient::new().with_cache_dir(None)),
+            route_table,
+            PackageStore::at(directory.path().join("store")),
+            Some(store_v2),
+            Arc::new(Semaphore::new(4)),
+            Arc::new(FetchCoordinator::default()),
+            directory.path().to_path_buf(),
+            Arc::new(GateStats::default()),
+            None,
+            ManagedInstallAccounting,
+            true,
+            ArtifactSelection::FreshResolution,
+            None,
+        )
+        .drain()
+        .await
+        .unwrap();
+
+        assert_eq!(result.stats.skipped_auth_count, 1);
+        assert_eq!(result.stats.cache_hit_count, 0);
+        assert_eq!(result.stats.dispatched_count, 0);
     }
 
     #[tokio::test]

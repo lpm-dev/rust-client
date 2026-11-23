@@ -11783,18 +11783,23 @@ async fn install_fetch_overlap_skips_auth_bearing_custom_registry_tarballs() {
 }
 
 #[tokio::test]
-async fn install_fetch_overlap_dispatches_credentialed_npm_registry_tarballs() {
+async fn install_fetch_overlap_never_skips_npm_registry_tarballs_for_their_credentials() {
     let (overlap, tarball_requests) = credentialed_registry_overlap_install(true).await;
     assert_eq!(
         overlap["skipped_auth_count"].as_u64(),
         Some(0),
         "the public npm registry is not a private mirror; got {overlap:#}"
     );
-    let early_handled = overlap["dispatched_count"].as_u64().unwrap_or(0)
-        + overlap["cache_hit_count"].as_u64().unwrap_or(0);
-    assert!(
-        early_handled >= 1,
-        "credentialed npm registry selections must overlap resolution; got {overlap:#}"
+    // Which fetch gets the tarball first is the scheduler's to say: the
+    // overlap's, or the install's own when the overlap gets to the
+    // package once it's stored. Either way the overlap took it.
+    let taken = ["dispatched_count", "cache_hit_count"]
+        .iter()
+        .filter_map(|count| overlap[count].as_u64())
+        .sum::<u64>();
+    assert_eq!(
+        taken, 1,
+        "the overlap fetches the npm registry's tarball, or finds it stored; got {overlap:#}"
     );
     assert_eq!(tarball_requests.len(), 1);
     assert_eq!(
