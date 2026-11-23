@@ -53,11 +53,12 @@ fn reported(
     Ok(overrides)
 }
 
-/// `change`'s result, once the `lpm` that started this one knows overrides
-/// were changed: what a change reports is this computer's own.
-fn reported_change(change: Result<ChangePlan, String>) -> Result<Change, String> {
-    let plan = change?;
+/// Change this computer's overrides with `commit`, once every `lpm` above
+/// this one knows: what a change reports is this computer's own, and one
+/// that can't be told changes nothing.
+fn reported_change(commit: impl FnOnce() -> Result<ChangePlan, String>) -> Result<Change, String> {
     crate::override_marker::report_read()?;
+    let plan = commit()?;
     Ok(Change {
         effects: plan.effects,
         activated: plan.activated,
@@ -132,9 +133,9 @@ pub fn remove_reviewed(
         overrides: &reviewed.overrides,
         removals,
     };
-    reported_change(in_overrides_lock(|directory| {
-        change_unlocked(directory, vault_id, &edits, expect)
-    }))
+    reported_change(|| {
+        in_overrides_lock(|directory| change_unlocked(directory, vault_id, &edits, expect))
+    })
 }
 
 /// What a change requires of the overrides it plans from, checked against
@@ -218,9 +219,9 @@ pub fn change_checked(
         project_dir,
         "while its values were read or asked for; nothing was stored",
     )?;
-    reported_change(in_overrides_lock(|directory| {
-        change_unlocked(directory, vault_id, edits, Expect::Nothing)
-    }))
+    reported_change(|| {
+        in_overrides_lock(|directory| change_unlocked(directory, vault_id, edits, Expect::Nothing))
+    })
 }
 
 /// Apply `edits` to the personal overrides of the env project at
@@ -238,9 +239,9 @@ pub fn change(project_dir: &Path, edits: &[Edit]) -> Result<Change, String> {
             None => Err(NO_PROJECT.to_owned()),
         };
     };
-    reported_change(in_overrides_lock(|directory| {
-        change_unlocked(directory, &vault_id, edits, Expect::Nothing)
-    }))
+    reported_change(|| {
+        in_overrides_lock(|directory| change_unlocked(directory, &vault_id, edits, Expect::Nothing))
+    })
 }
 
 /// Refuse what `edits` are refused for whatever project they change: an

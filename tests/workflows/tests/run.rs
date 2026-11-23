@@ -8314,9 +8314,18 @@ async fn another_project_s_overrides_read_through_lpm_keep_the_task_out_of_every
         "lint": {"cache": true, "inputs": ["lint.js"], "outputs": ["lint/**"]},
         "build": {"cache": true, "dependsOn": ["gen"], "inputs": ["build.js"], "outputs": ["out/**"]}
     });
-    // The first run has no remote cache, as offline or in another workspace.
+    // The first runs have no remote cache, as offline or in another
+    // workspace, and the same key, so a stored entry would be reused.
     project.write_file("lpm.json", &serde_json::json!({"tasks": tasks}).to_string());
-    run_with_remote_cache(&project, &["run", "fmt", "gen", "list", "lint", "build"]);
+    for _ in 0..2 {
+        run_with_remote_cache(&project, &["run", "fmt", "gen", "list", "lint", "build"]);
+    }
+    assert_eq!(
+        runs(&project, "gen"),
+        2,
+        "gen's local entry would hold the overrides' value"
+    );
+    assert_eq!(runs(&project, "list"), 2);
     project.write_file(
         "lpm.json",
         &serde_json::json!({
@@ -8327,12 +8336,7 @@ async fn another_project_s_overrides_read_through_lpm_keep_the_task_out_of_every
     );
     run_with_remote_cache(&project, &["run", "fmt", "gen", "list", "lint", "build"]);
 
-    assert_eq!(
-        runs(&project, "gen"),
-        2,
-        "gen's local entry would hold the overrides' value"
-    );
-    assert_eq!(runs(&project, "list"), 2);
+    assert_eq!(runs(&project, "gen"), 3);
     assert!(project.read_file("dist/list.txt").contains("fixture-mine"));
     assert_eq!(
         artifact_requests(&server, "PUT").await,
@@ -8362,10 +8366,43 @@ fn a_nested_lpm_that_can_t_report_the_overrides_it_read_fails() {
     );
     assert!(
         String::from_utf8_lossy(&output.stderr)
-            .contains("couldn't tell the lpm that started this one"),
+            .contains("couldn't tell an lpm that started this one"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn an_override_write_that_can_t_be_reported_changes_nothing() {
+    let project = TempProject::empty(r#"{"name":"report-before-write","version":"1.0.0"}"#);
+    overridden_project(&project, project.path(), "report-before-write");
+
+    let output = lpm(&project)
+        .env(
+            "LPM_PERSONAL_OVERRIDES_MARKER",
+            project.path().join("missing-folder").join("marker"),
+        )
+        .args([
+            "env",
+            "override",
+            "set",
+            "--env",
+            "staging",
+            "API_URL=fixture-new",
+        ])
+        .output()
+        .expect("override set");
+
+    assert!(!output.status.success());
+    let listed = lpm(&project)
+        .args([
+            "--json", "env", "override", "list", "--env", "staging", "--reveal",
+        ])
+        .output()
+        .expect("override list");
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(listed.contains("fixture-mine"), "{listed}");
+    assert!(!listed.contains("fixture-new"), "{listed}");
 }
 
 #[tokio::test]
@@ -8460,4 +8497,154 @@ fn a_task_is_cached_here_under_every_environment_s_overrides() {
         "another environment's override changed, which a command could read"
     );
     assert_eq!(project.read_file("dist/out.txt"), "team");
+}
+
+/// A project whose cached `gen` task runs `script`, with the remote cache
+/// at `server`.
+fn cached_gen_project(server: &MockServer, script: &str) -> TempProject {
+    let project = TempProject::empty(
+        r#"{"name":"nested-gen","version":"1.0.0","scripts":{"gen":"node gen.js"}}"#,
+    );
+    project.write_file("gen.js", script);
+    project.write_file(
+        "lpm.json",
+        &serde_json::json!({
+            "remoteCache": {"enabled": true, "url": format!("{}/v8", server.uri())},
+            "tasks": {"gen": {"cache": true, "inputs": ["gen.js"], "outputs": ["dist/**"]}}
+        })
+        .to_string(),
+    );
+    project
+}
+
+#[tokio::test]
+async fn a_failed_inner_task_still_keeps_an_outer_task_that_used_its_output_off_the_remote_cache() {
+    let server = MockServer::start().await;
+    mount_stateful_remote_cache(&server, RemoteCacheState::default()).await;
+    let project = cached_gen_project(
+        &server,
+        r#"const fs = require('fs');
+const { spawnSync } = require('child_process');
+spawnSync(process.env.LPM_TEST_BIN, ['run', 'inner'], { cwd: 'inner', stdio: 'inherit' });
+fs.mkdirSync('dist', { recursive: true });
+fs.copyFileSync('inner/dist/inner.txt', 'dist/gen.txt');
+"#,
+    );
+    overridden_project(&project, &project.path().join("other"), "other");
+    let inner = project.path().join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::write(
+        inner.join("package.json"),
+        r#"{"name":"inner","version":"1.0.0","scripts":{"inner":"node inner.js"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        inner.join("lpm.json"),
+        r#"{"tasks":{"inner":{"cache":true,"inputs":["inner.js"],"outputs":["dist/**"]}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        inner.join("inner.js"),
+        r#"const fs = require('fs');
+const { spawnSync } = require('child_process');
+const printed = spawnSync(process.env.LPM_TEST_BIN, ['env', 'print', '--env', 'staging'], { cwd: '../other', encoding: 'utf8' });
+fs.mkdirSync('dist', { recursive: true });
+fs.writeFileSync('dist/inner.txt', printed.stdout);
+process.exit(1);
+"#,
+    )
+    .unwrap();
+
+    run_with_remote_cache(&project, &["run", "gen"]);
+
+    assert!(project.read_file("dist/gen.txt").contains("fixture-mine"));
+    assert_eq!(
+        artifact_requests(&server, "PUT").await,
+        0,
+        "the inner task failed after its lpm read the overrides, and the outer one kept what it wrote"
+    );
+}
+
+#[tokio::test]
+async fn a_relative_temporary_directory_still_reports_to_the_task_s_marker() {
+    let server = MockServer::start().await;
+    mount_stateful_remote_cache(&server, RemoteCacheState::default()).await;
+    let project = cached_gen_project(
+        &server,
+        &nested_lpm_script("gen", "other", &["env", "print", "--env", "staging"]),
+    );
+    overridden_project(&project, &project.path().join("other"), "other");
+    for folder in ["tmp", "other/tmp"] {
+        std::fs::create_dir_all(project.path().join(folder)).unwrap();
+    }
+
+    let output = lpm(&project)
+        .env("TMPDIR", "tmp")
+        .env("LPM_TEST_BIN", support::lpm_binary())
+        .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+        .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
+        .args(["run", "gen"])
+        .output()
+        .expect("run gen");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(project.read_file("dist/gen.txt").contains("fixture-mine"));
+    assert_eq!(artifact_requests(&server, "PUT").await, 0);
+}
+
+#[tokio::test]
+async fn a_stored_value_can_t_take_the_place_of_the_marker_a_task_reports_to() {
+    let server = MockServer::start().await;
+    mount_stateful_remote_cache(&server, RemoteCacheState::default()).await;
+    let project = cached_gen_project(
+        &server,
+        r#"const fs = require('fs');
+const { spawnSync } = require('child_process');
+const ran = spawnSync(process.env.LPM_TEST_BIN, ['exec', 'print-staging'], { cwd: 'middle', encoding: 'utf8' });
+fs.mkdirSync('dist', { recursive: true });
+fs.writeFileSync('dist/gen.txt', ran.stdout + ran.stderr);
+"#,
+    );
+    project.write_file(
+        "middle/node_modules/.bin/print-staging",
+        r#"#!/usr/bin/env node
+const { spawnSync } = require('child_process');
+const printed = spawnSync(process.env.LPM_TEST_BIN, ['env', 'print', '--env', 'staging'], { cwd: '../other', encoding: 'utf8' });
+process.stdout.write(printed.stdout);
+"#,
+    );
+    overridden_project(&project, &project.path().join("other"), "other");
+    let middle = project.path().join("middle");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let bin = middle.join("node_modules/.bin/print-staging");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(
+        middle.join("package.json"),
+        r#"{"name":"middle","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let elsewhere = project.path().join("elsewhere-marker");
+    lpm(&project)
+        .current_dir(&middle)
+        .args([
+            "env",
+            "set",
+            &format!("LPM_PERSONAL_OVERRIDES_MARKER={}", elsewhere.display()),
+        ])
+        .assert()
+        .success();
+
+    run_with_remote_cache(&project, &["run", "gen"]);
+
+    let shown = project.read_file("dist/gen.txt");
+    assert!(shown.contains("fixture-mine"), "{shown}");
+    assert!(!elsewhere.exists(), "the project's value named the marker");
+    assert_eq!(artifact_requests(&server, "PUT").await, 0);
 }

@@ -709,7 +709,7 @@ fn check_reports_hidden_characters_in_a_personal_override_as_one() {
 
 // ─── lpm env override ─────────────────────────────────────────────────
 
-const ACTIVATION_NOTICE: &str = "LPM CLI 0.82.0 or later applies personal overrides; an older LPM CLI runs this project with team values";
+const ACTIVATION_NOTICE: &str = "LPM CLI 0.82.0 to 0.88.0 apply personal overrides but can share outputs built with them, through the remote task cache and `lpm env print --format=github-actions`, and an older LPM CLI runs this project with team values; use a later LPM CLI to run it on this computer";
 
 fn shown(project: &TempProject, script: &str) -> String {
     let output = lpm(project).args(["run", script]).output().unwrap();

@@ -784,22 +784,20 @@ pub(super) fn complete_task_cache_identity(
 
 /// Store a successful task's outputs, unless an `lpm` it started read
 /// personal overrides, which its key doesn't hold: then neither cache keeps
-/// it, and the `lpm` that started this one, if any, is told. Only telling it
-/// fails: what this one built would be shared otherwise.
+/// it. That `lpm` told every `lpm` above this one itself.
 pub(super) fn try_cache_store_with_context(
     request: CacheStoreRequest<'_>,
     expected: &CacheContext,
-) -> Result<bool, LpmError> {
+) -> bool {
     let script_name = request.script_name;
     if request.task.read_overrides() {
-        lpm_vault::override_marker::report_read().map_err(LpmError::Task)?;
         tracing::debug!(
             "an lpm that task '{}' started read personal overrides; not caching it",
             lpm_common::sanitize_terminal_inline(script_name)
         );
-        return Ok(false);
+        return false;
     }
-    Ok(match store_cache_with_context(request, expected) {
+    match store_cache_with_context(request, expected) {
         Ok(stored) => stored,
         Err(error) => {
             tracing::warn!(
@@ -808,7 +806,12 @@ pub(super) fn try_cache_store_with_context(
             );
             false
         }
-    })
+    }
+}
+
+/// A marker of its own for a cached task about to start.
+pub(super) fn watch_task() -> Result<lpm_runner::override_marker::TaskMarker, LpmError> {
+    lpm_runner::override_marker::TaskMarker::watch().map_err(LpmError::Task)
 }
 
 fn warn_execution_context_changed(script_name: &str, expected: &CacheContext) {

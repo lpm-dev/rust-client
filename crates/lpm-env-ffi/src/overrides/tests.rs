@@ -1037,6 +1037,11 @@ fn requests_take_only_their_documented_objects_and_leave_out_what_is_absent() {
         assert_eq!(status, 2, "{read}: {refused}");
     }
     let schema = r#"{"vars":{}}"#;
+    let (status, refused) = check(
+        schema,
+        &json!([{"default": {}}, {"vaultId": VAULT, "hasValues": true}]),
+    );
+    assert_eq!(status, 2, "the check's input is an object too: {refused}");
     for overrides in [
         json!([VAULT, null, null, true]),
         json!({"vaultId": VAULT, "hasValues": true, "marker": null}),

@@ -2,6 +2,7 @@ use super::cache::{
     CacheStoreRequest, CompletedTaskCacheIdentity, WorkspaceCacheContract,
     WorkspaceDependencyIdentities, complete_task_cache_identity, prepare_cache_context_with_config,
     resolve_task_dependency_identities, try_cache_hit_with_context, try_cache_store_with_context,
+    watch_task,
 };
 use super::format::{
     TaskOutputPolicy, TaskResult, TaskRunReport, format_failed_task_output_footer,
@@ -239,7 +240,7 @@ pub(super) fn run_tasks_parallel(
 
             // Use captured execution when caching is enabled.
             let caching_enabled = cache_context.is_some();
-            let task_marker = caching_enabled.then(lpm_runner::override_marker::TaskMarker::watch);
+            let task_marker = caching_enabled.then(watch_task).transpose()?;
 
             if caching_enabled || json_output {
                 match run_task_captured_with_reserved_stdout(
@@ -269,7 +270,7 @@ pub(super) fn run_tasks_parallel(
                                     stderr: &output.stderr,
                                 },
                                 context,
-                            )?
+                            )
                             && let Some(identity) =
                                 complete_task_cache_identity(project_dir, task_name, context)
                         {
@@ -463,9 +464,8 @@ pub(super) fn run_tasks_parallel(
                                 ));
                             }
 
-                            let task_marker = cache_context
-                                .is_some()
-                                .then(lpm_runner::override_marker::TaskMarker::watch);
+                            let task_marker =
+                                cache_context.is_some().then(watch_task).transpose()?;
                             // Resolve command from lpm.json or package.json
                             let command_override =
                                 tasks_clone.get(&name).and_then(|tc| tc.command.clone());
@@ -540,7 +540,7 @@ pub(super) fn run_tasks_parallel(
                                                 stderr: &output.stderr,
                                             },
                                             context,
-                                        )? {
+                                        ) {
                                             complete_task_cache_identity(&dir, &name, context)
                                         } else {
                                             None

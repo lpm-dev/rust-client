@@ -122,6 +122,26 @@ fn invalid_value_arguments_are_refused_before_an_unlinked_folder_is_asked_about(
             ],
             "environment",
         ),
+        (
+            &["env", "override", "set", "NODE_OPTIONS=--inspect"],
+            "NODE_OPTIONS",
+        ),
+        (
+            &["env", "override", "list", "--env", "not an environment"],
+            "environment",
+        ),
+        (
+            &[
+                "env",
+                "override",
+                "clear",
+                "--env",
+                "not an environment",
+                "--yes",
+            ],
+            "environment",
+        ),
+        (&["env", "override", "clear", "--all"], "--yes"),
     ] {
         let output = lpm_in(&project, &other, args);
 

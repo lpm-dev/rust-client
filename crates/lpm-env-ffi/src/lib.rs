@@ -550,7 +550,8 @@ pub unsafe extern "C" fn lpm_env_check(
         let Ok(schema) = serde_json::from_slice::<lpm_env::EnvSchema>(schema) else {
             return flat_definition_failure(schema);
         };
-        let Ok(input) = serde_json::from_slice::<CheckInput>(input) else {
+        let Ok(frame::Object(input)) = serde_json::from_slice::<frame::Object<CheckInput>>(input)
+        else {
             return failure(2, "env.invalid_input");
         };
         if input.environments.iter().any(|(name, values)| {

@@ -2,6 +2,7 @@ use super::cache::{
     CacheStoreRequest, CompletedTaskCacheIdentity, WorkspaceCacheContract,
     WorkspaceDependencyIdentities, complete_task_cache_identity, prepare_cache_context_with_config,
     resolve_task_dependency_identities, try_cache_hit_with_context, try_cache_store_with_context,
+    watch_task,
 };
 use super::format::{
     TaskOutputPolicy, TaskResult, TaskRunReport, format_run_failure_detail, print_captured_stderr,
@@ -154,7 +155,7 @@ pub(super) fn run_tasks_sequential(
         ));
 
         let caching_enabled = cache_context.is_some();
-        let task_marker = caching_enabled.then(lpm_runner::override_marker::TaskMarker::watch);
+        let task_marker = caching_enabled.then(watch_task).transpose()?;
         let task_start = std::time::Instant::now();
 
         // Resolve command: lpm.json task command > package.json script
@@ -186,7 +187,7 @@ pub(super) fn run_tasks_sequential(
                                 stderr: &captured.stderr,
                             },
                             context,
-                        )?
+                        )
                         && let Some(identity) =
                             complete_task_cache_identity(project_dir, script, context)
                     {

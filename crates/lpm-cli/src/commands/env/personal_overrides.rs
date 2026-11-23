@@ -13,9 +13,11 @@ use lpm_runner::dotenv::THIS_MACHINE;
 /// What a value shows as when it's hidden.
 const HIDDEN: &str = "••••••••";
 
-/// The release that first applied personal overrides; an older LPM CLI
-/// runs a project with team values only.
-const FIRST_RELEASE_APPLYING_OVERRIDES: &str = "0.82.0";
+/// The releases that apply personal overrides without keeping what they
+/// build with them on this computer: their remote task cache and their
+/// GitHub Actions print share it. An older LPM CLI runs a project with team
+/// values only.
+const RELEASES_SHARING_OVERRIDES: (&str, &str) = ("0.82.0", "0.88.0");
 
 pub(super) fn run(
     action: OverrideAction,
@@ -47,11 +49,9 @@ pub(super) fn run(
             json_output,
         ),
         OverrideAction::List { env, reveal } => {
-            super::links::ensure_folder_linked(project_dir, json_output)?;
             list(env.as_deref(), reveal, project_dir, json_output)
         }
         OverrideAction::Clear { env, all: _, yes } => {
-            super::links::ensure_folder_linked(project_dir, json_output)?;
             clear(env.as_deref(), yes, project_dir, json_output)
         }
     }
@@ -89,6 +89,15 @@ fn set(
         total_limit: lpm_vault::overrides::MAX_RECORD_BYTES,
     };
     let checked = super::value_input::check(&request, &super::value_input::ProcessSources)?;
+    let named: Vec<Edit> = checked
+        .keys()
+        .into_iter()
+        .map(|key| Edit::Unset {
+            environment: environment.clone(),
+            key: key.to_owned(),
+        })
+        .collect();
+    lpm_vault::overrides::check_edits(&named).map_err(vault_error)?;
     super::links::ensure_folder_linked(project_dir, json_output)?;
     // Only a value that's typed, piped or read waits on the person; one in
     // the arguments needs no check before it.
@@ -298,9 +307,11 @@ fn key_changes_json(environment: &str, change: &lpm_vault::overrides::Change) ->
 /// it, and when the computer holds more newer data than it should.
 fn report_storage(change: &lpm_vault::overrides::Change) {
     if change.activated {
+        let (first, last) = RELEASES_SHARING_OVERRIDES;
         output::warn_line(install_ui::terminal_line!(
-            "LPM CLI {} or later applies personal overrides; an older LPM CLI runs this project with team values",
-            FIRST_RELEASE_APPLYING_OVERRIDES,
+            "LPM CLI {} to {} apply personal overrides but can share outputs built with them, through the remote task cache and `lpm env print --format=github-actions`, and an older LPM CLI runs this project with team values; use a later LPM CLI to run it on this computer",
+            first,
+            last,
         ));
     }
     if change.over_admission_target {
@@ -319,6 +330,7 @@ fn list(
     let selected = env_input
         .map(|_| environment(env_input, project_dir))
         .transpose()?;
+    super::links::ensure_folder_linked(project_dir, json_output)?;
     let mut all = lpm_vault::overrides::read_all(project_dir).map_err(vault_error)?;
     if let Some(selected) = &selected {
         all.retain(|name, _| name == selected);
@@ -462,6 +474,8 @@ fn clear(
             },
             None => Edit::ClearAll,
         };
+        lpm_vault::overrides::check_edits(std::slice::from_ref(&edit)).map_err(vault_error)?;
+        super::links::ensure_folder_linked(project_dir, json_output)?;
         let change = lpm_vault::overrides::change(project_dir, &[edit]).map_err(vault_error)?;
         report_cleared(&selected, &scope, removed(&change), json_output);
         return Ok(());
@@ -477,6 +491,7 @@ fn clear(
             help: "Run it again with `--yes`. It asks only in an interactive terminal, and never with `--json`.",
         });
     }
+    super::links::ensure_folder_linked(project_dir, json_output)?;
     let Some(reviewed) = lpm_vault::overrides::review_all(project_dir).map_err(vault_error)? else {
         report_cleared(&selected, &scope, 0, json_output);
         return Ok(());
