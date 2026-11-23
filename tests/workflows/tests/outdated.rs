@@ -1537,12 +1537,12 @@ async fn outdated_human_failure_does_not_claim_every_dependency_is_up_to_date() 
 
 #[tokio::test]
 async fn outdated_hydrates_release_times_in_bounded_parallel_waves() {
-    const PACKAGE_COUNT: usize = 8;
+    const PACKAGE_COUNT: usize = 20;
     let mut manifest_dependencies = serde_json::Map::with_capacity(PACKAGE_COUNT);
     let mut lockfile =
         String::from("[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n");
     for index in 0..PACKAGE_COUNT {
-        let name = format!("@lpm.dev/owner.hydration-wave-{index}");
+        let name = format!("@lpm.dev/owner.hydration-wave-{index:02}");
         manifest_dependencies.insert(name.clone(), serde_json::json!("^1.0.0"));
         lockfile.push_str(&format!(
             "\n[[packages]]\nname = \"{name}\"\nversion = \"1.0.0\"\nsource = \"registry+https://lpm.dev\"\n"
@@ -1562,7 +1562,7 @@ async fn outdated_hydrates_release_times_in_bounded_parallel_waves() {
     let server = MockServer::start().await;
     let recent_modified = iso8601_n_secs_ago(60);
     for index in 0..PACKAGE_COUNT {
-        let name = format!("@lpm.dev/owner.hydration-wave-{index}");
+        let name = format!("@lpm.dev/owner.hydration-wave-{index:02}");
         Mock::given(method("GET"))
             .and(path(format!("/api/registry/{name}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1613,15 +1613,15 @@ async fn outdated_hydrates_release_times_in_bounded_parallel_waves() {
         .collect::<Vec<_>>();
     offsets.sort();
     assert!(
-        offsets[3] < std::time::Duration::from_millis(150),
-        "the first four hydration slots did not start together: {offsets:?}",
+        offsets[15] < std::time::Duration::from_millis(150),
+        "the first sixteen hydration slots did not start together: {offsets:?}",
     );
     assert!(
-        offsets[4] >= std::time::Duration::from_millis(200),
-        "more than four hydration requests ran in the first wave: {offsets:?}",
+        offsets[16] >= std::time::Duration::from_millis(200),
+        "more than sixteen hydration requests ran in the first wave: {offsets:?}",
     );
     assert!(
-        offsets[7] < std::time::Duration::from_millis(450),
+        offsets[19] < std::time::Duration::from_millis(450),
         "the hydration scheduler did not refill promptly: {offsets:?}",
     );
 }
@@ -1672,12 +1672,12 @@ async fn outdated_bounds_one_shared_metadata_failure_across_many_aliases() {
 
 #[tokio::test]
 async fn outdated_runs_metadata_lookups_in_bounded_parallel_waves() {
-    const PACKAGE_COUNT: usize = 8;
+    const PACKAGE_COUNT: usize = 20;
     let mut manifest_dependencies = serde_json::Map::with_capacity(PACKAGE_COUNT);
     let mut lockfile =
         String::from("[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n");
     for index in 0..PACKAGE_COUNT {
-        let name = format!("@lpm.dev/owner.bounded-{index}");
+        let name = format!("@lpm.dev/owner.bounded-{index:02}");
         manifest_dependencies.insert(name.clone(), serde_json::json!("^1.0.0"));
         lockfile.push_str(&format!(
             "\n[[packages]]\nname = \"{name}\"\nversion = \"1.0.0\"\nsource = \"registry+https://lpm.dev\"\n"
@@ -1725,15 +1725,15 @@ async fn outdated_runs_metadata_lookups_in_bounded_parallel_waves() {
         .collect::<Vec<_>>();
     offsets.sort();
     assert!(
-        offsets[3] < std::time::Duration::from_millis(150),
-        "the first four bounded slots did not start together: {offsets:?}"
+        offsets[15] < std::time::Duration::from_millis(150),
+        "the first sixteen bounded slots did not start together: {offsets:?}"
     );
     assert!(
-        offsets[4] >= std::time::Duration::from_millis(200),
-        "more than four metadata requests ran in the first wave: {offsets:?}"
+        offsets[16] >= std::time::Duration::from_millis(200),
+        "more than sixteen metadata requests ran in the first wave: {offsets:?}"
     );
     assert!(
-        offsets[7] < std::time::Duration::from_millis(450),
+        offsets[19] < std::time::Duration::from_millis(450),
         "the bounded scheduler did not refill promptly for the second wave: {offsets:?}"
     );
 }
