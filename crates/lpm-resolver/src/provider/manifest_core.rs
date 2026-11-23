@@ -687,6 +687,15 @@ impl CachedPackageInfo {
         !self.platform.records.is_empty()
     }
 
+    #[inline]
+    pub(crate) fn version_strs(&self) -> Vec<&str> {
+        self.core
+            .versions
+            .iter()
+            .map(|record| self.core.strings.get(record.text))
+            .collect()
+    }
+
     pub fn merge_release_times(&mut self, release_times: &lpm_registry::ReleaseTimeMetadata) {
         let mut releases = self
             .release

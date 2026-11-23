@@ -62,7 +62,7 @@ pub use self::install_accounting::{
 };
 pub use self::manifest::ManifestVersionMetadata;
 pub use self::mcp::{HostedMcpAnswer, HostedMcpRequest, MAX_HOSTED_MCP_RESPONSE_BYTES};
-pub use self::metadata::BatchMetadataEntryStream;
+pub use self::metadata::{BatchMetadataEntryStream, ReleaseTimeSuffixHint};
 pub use self::projection::{MetadataProjection, NoProjection, ProjectionSlot, ResolutionMetadata};
 pub use self::public_npm::PublicNpmAccess;
 pub use self::second_factor::SecondFactorProof;

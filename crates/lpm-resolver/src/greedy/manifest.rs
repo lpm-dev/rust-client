@@ -1212,13 +1212,26 @@ async fn fetch_release_times_for_policy(
     };
     let route = route_table.route_for_package(name);
     let expected_modified = info.modified.as_deref();
+    let needs_platform = info.needs_platform_metadata();
+    let version_strs = if !needs_platform && expected_modified.is_some() {
+        info.version_strs()
+    } else {
+        Vec::new()
+    };
+    let suffix_hint = (!needs_platform).then_some(()).and_then(|()| {
+        expected_modified.map(|expected_modified| lpm_registry::ReleaseTimeSuffixHint {
+            expected_modified,
+            known_versions: &version_strs,
+        })
+    });
     let release_times = if capture_timings {
         let start = Instant::now();
         let timed = client
-            .get_npm_release_times_routed_full_with_timings_for_modified(
+            .get_npm_release_times_routed_full_with_timings_and_hint(
                 name,
                 route,
                 expected_modified,
+                suffix_hint,
             )
             .await
             .map_err(|e| ResolveError::DependencyFetch {
@@ -1235,7 +1248,12 @@ async fn fetch_release_times_for_policy(
         return Ok(Some(detail));
     } else {
         client
-            .get_npm_release_times_routed_full_for_modified(name, route, expected_modified)
+            .get_npm_release_times_routed_full_with_hint(
+                name,
+                route,
+                expected_modified,
+                suffix_hint,
+            )
             .await
             .map_err(|e| ResolveError::DependencyFetch {
                 package: canonical.to_string(),

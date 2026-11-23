@@ -1827,6 +1827,159 @@ async fn direct_full_release_time_response_rejects_omitted_package_name() {
 }
 
 #[tokio::test]
+async fn direct_release_times_uses_206_suffix_range_and_preserves_none_versions() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+
+    let npm_name = "suffix-fast-pkg";
+    let modified = "2026-11-22T00:00:00.000Z";
+    let version_strings: Vec<String> = (1..=25).map(|n| format!("1.0.{n}")).collect();
+    let known_versions: Vec<&str> = version_strings.iter().map(String::as_str).collect();
+    let mut time_map = serde_json::Map::new();
+    time_map.insert("modified".to_string(), serde_json::json!(modified));
+    for v in &version_strings {
+        time_map.insert(v.clone(), serde_json::json!("2025-01-01T00:00:00.000Z"));
+    }
+    let full_body = serde_json::to_vec(&serde_json::json!({
+        "name": npm_name,
+        "versions": { "1.0.1": { "name": npm_name, "licenseText": "a".repeat(8192) } },
+        "time": time_map,
+        "readme": "short"
+    }))
+    .unwrap();
+    let tail_start = full_body.len() - 1024;
+    let tail = full_body[tail_start..].to_vec();
+    let content_range = format!(
+        "bytes {}-{}/{}",
+        tail_start,
+        full_body.len() - 1,
+        full_body.len()
+    );
+
+    Mock::given(method("GET"))
+        .and(path("/suffix-fast-pkg"))
+        .and(header("accept-encoding", "identity"))
+        .and(header("range", "bytes=-99904"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("Content-Range", content_range.as_str())
+                .set_body_bytes(tail),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fetched = client
+        .get_npm_release_times_routed_full_with_hint(
+            npm_name,
+            crate::UpstreamRoute::NpmDirect,
+            Some(modified),
+            Some(crate::ReleaseTimeSuffixHint {
+                expected_modified: modified,
+                known_versions: &known_versions,
+            }),
+        )
+        .await
+        .expect("206 suffix fast path should succeed");
+    assert_eq!(fetched.name.as_deref(), Some(npm_name));
+    assert!(
+        fetched.versions.is_none(),
+        "time-only 206 suffix response must leave versions as None"
+    );
+    assert_eq!(
+        fetched.time.get("1.0.25").map(String::as_str),
+        Some("2025-01-01T00:00:00.000Z")
+    );
+}
+
+#[tokio::test]
+async fn direct_release_times_consumes_200_inline_and_falls_back_on_416() {
+    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let client = RegistryClient::new().with_npm_registry_url(server.uri());
+    let modified = "2026-11-22T00:00:00.000Z";
+    let version_strings: Vec<String> = (1..=25).map(|n| format!("1.0.{n}")).collect();
+    let known_versions: Vec<&str> = version_strings.iter().map(String::as_str).collect();
+    let mut time_map = serde_json::Map::new();
+    time_map.insert("modified".to_string(), serde_json::json!(modified));
+    for v in &version_strings {
+        time_map.insert(v.clone(), serde_json::json!("2025-01-01T00:00:00.000Z"));
+    }
+    let full_doc = serde_json::json!({
+        "name": "ignores-range",
+        "time": time_map,
+    });
+
+    // Server ignores Range and answers 200 OK — must consume inline in 1 request.
+    Mock::given(method("GET"))
+        .and(path("/ignores-range"))
+        .and(header_exists("range"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&full_doc))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let res = client
+        .get_npm_release_times_routed_full_with_hint(
+            "ignores-range",
+            crate::UpstreamRoute::NpmDirect,
+            Some(modified),
+            Some(crate::ReleaseTimeSuffixHint {
+                expected_modified: modified,
+                known_versions: &known_versions,
+            }),
+        )
+        .await
+        .expect("200 OK to Range request must succeed inline");
+    assert_eq!(res.time.get("modified").map(String::as_str), Some(modified));
+
+    // Server returns 416 to Range request — must fall back to un-ranged full GET.
+    let fallback_doc = serde_json::json!({
+        "name": "rejects-range",
+        "time": time_map,
+    });
+    Mock::given(method("GET"))
+        .and(path("/rejects-range"))
+        .and(header_exists("range"))
+        .respond_with(ResponseTemplate::new(416))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rejects-range"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&fallback_doc))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fallback = client
+        .get_npm_release_times_routed_full_with_hint(
+            "rejects-range",
+            crate::UpstreamRoute::NpmDirect,
+            Some(modified),
+            Some(crate::ReleaseTimeSuffixHint {
+                expected_modified: modified,
+                known_versions: &known_versions,
+            }),
+        )
+        .await
+        .expect("416 to Range request must fall back to full GET");
+    assert_eq!(
+        fallback.time.get("modified").map(String::as_str),
+        Some(modified)
+    );
+}
+
+#[tokio::test]
 async fn direct_npm_full_refetch_ignores_fresh_cache_and_overwrites_it() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

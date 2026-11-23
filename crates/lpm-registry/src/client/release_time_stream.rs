@@ -17,6 +17,168 @@ const MAX_KEY_CAPTURE_BYTES: usize = 64;
 const MAX_NAME_CAPTURE_BYTES: usize = 8 * 1024;
 const MAX_PLATFORM_FIELD_CAPTURE_BYTES: usize = 64 * 1024;
 
+pub(super) const SUFFIX_RANGE_MIN_VERSIONS: usize = 20;
+const SUFFIX_RANGE_MIN_BYTES: usize = 64 * 1024;
+const SUFFIX_RANGE_MAX_BYTES: usize = 1024 * 1024;
+const SUFFIX_RANGE_BYTES_PER_VERSION: usize = 64;
+const SUFFIX_RANGE_OVERHEAD_BYTES: usize = 96 * 1024;
+
+#[inline]
+pub(super) fn compute_suffix_range_bytes(known_version_count: usize) -> usize {
+    known_version_count
+        .saturating_mul(SUFFIX_RANGE_BYTES_PER_VERSION)
+        .saturating_add(SUFFIX_RANGE_OVERHEAD_BYTES)
+        .clamp(SUFFIX_RANGE_MIN_BYTES, SUFFIX_RANGE_MAX_BYTES)
+}
+
+/// Parse an HTTP `Content-Range: bytes <start>-<end>/<total>` header and ensure
+/// it describes a valid contiguous suffix reaching the exact end of the entity.
+pub(super) fn parse_suffix_content_range(header: &str) -> Option<(u64, u64, u64)> {
+    let rest = header.trim().strip_prefix("bytes ")?;
+    let (range_part, total_part) = rest.split_once('/')?;
+    let (start_str, end_str) = range_part.split_once('-')?;
+    let start: u64 = start_str.trim().parse().ok()?;
+    let end: u64 = end_str.trim().parse().ok()?;
+    let total: u64 = total_part.trim().parse().ok()?;
+    if start > end || end.checked_add(1)? != total {
+        return None;
+    }
+    Some((start, end, total))
+}
+
+struct SuffixTailDoc {
+    time: Option<HashMap<String, String>>,
+}
+
+impl<'de> serde::Deserialize<'de> for SuffixTailDoc {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = SuffixTailDoc;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a top-level npm packument tail object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut time: Option<HashMap<String, String>> = None;
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    if key == "time" {
+                        if time.is_some() {
+                            return Err(serde::de::Error::duplicate_field("time"));
+                        }
+                        time = Some(map.next_value::<HashMap<String, String>>()?);
+                    } else {
+                        let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(SuffixTailDoc { time })
+            }
+        }
+
+        deserializer.deserialize_map(Visitor)
+    }
+}
+
+/// Extract and strictly verify the top-level `"time"` object from a `206`
+/// packument suffix slice.
+///
+/// Security invariants:
+/// - The candidate `"time"` key must be preceded by `,` (or `{` at byte 0).
+/// - Every byte from `"time"` through EOF must parse cleanly as valid top-level
+///   JSON object members ending at the document's closing `}` (preventing any
+///   match inside a string such as `"readme"`).
+/// - `time["modified"]` must match `expected_modified` from the abbreviated doc.
+/// - Every version key in `known_versions` must be present in `time`.
+pub(super) fn extract_verified_time_from_packument_suffix(
+    raw_suffix: &[u8],
+    starts_at_zero: bool,
+    expected_modified: &str,
+    known_versions: &[&str],
+) -> Option<HashMap<String, String>> {
+    if known_versions.is_empty() || raw_suffix.is_empty() {
+        return None;
+    }
+    let suffix = if starts_at_zero {
+        raw_suffix.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(raw_suffix)
+    } else {
+        raw_suffix
+    };
+
+    const NEEDLE: &[u8] = b"\"time\"";
+    let mut search_end = suffix.len();
+    while search_end >= NEEDLE.len() {
+        let Some(pos) = suffix[..search_end]
+            .windows(NEEDLE.len())
+            .rposition(|window| window == NEEDLE)
+        else {
+            break;
+        };
+        search_end = pos;
+
+        // Require a top-level delimiter (',' or leading '{' at offset 0) before `"time"`,
+        // skipping optional JSON whitespace.
+        let mut prev = pos;
+        while prev > 0 && matches!(suffix[prev - 1], b' ' | b'\t' | b'\r' | b'\n') {
+            prev -= 1;
+        }
+        let valid_prefix = if prev > 0 {
+            suffix[prev - 1] == b',' || (starts_at_zero && suffix[prev - 1] == b'{')
+        } else {
+            false
+        };
+        if !valid_prefix {
+            continue;
+        }
+
+        // Require `:` then `{` after `"time"` (allowing optional whitespace).
+        let mut after = pos + NEEDLE.len();
+        while after < suffix.len() && matches!(suffix[after], b' ' | b'\t' | b'\r' | b'\n') {
+            after += 1;
+        }
+        if suffix.get(after) != Some(&b':') {
+            continue;
+        }
+        after += 1;
+        while after < suffix.len() && matches!(suffix[after], b' ' | b'\t' | b'\r' | b'\n') {
+            after += 1;
+        }
+        if suffix.get(after) != Some(&b'{') {
+            continue;
+        }
+
+        // Parse `{` + suffix[pos..] strictly to EOF as top-level object members.
+        let mut synthetic = Vec::with_capacity(1 + (suffix.len() - pos));
+        synthetic.push(b'{');
+        synthetic.extend_from_slice(&suffix[pos..]);
+        let mut de = serde_json::Deserializer::from_slice(&synthetic);
+        let Ok(doc) = <SuffixTailDoc as serde::Deserialize>::deserialize(&mut de) else {
+            continue;
+        };
+        if de.end().is_err() {
+            continue;
+        }
+        let Some(time) = doc.time else {
+            continue;
+        };
+        if time.get("modified").map(String::as_str) != Some(expected_modified) {
+            continue;
+        }
+        if !known_versions.iter().all(|ver| time.contains_key(*ver)) {
+            continue;
+        }
+        return Some(time);
+    }
+    None
+}
+
 #[derive(serde::Deserialize)]
 struct PlatformFieldValue(
     #[serde(deserialize_with = "crate::types::deserialize_string_or_string_list")] Vec<String>,
@@ -1244,5 +1406,88 @@ mod tests {
         assert!(parse_chunked(br#"{"name":"truncated""#, 5).is_err());
         assert!(parse_chunked(br#"{"name":"trailing"} garbage"#, 5).is_err());
         assert!(parse_chunked(br#"[]"#, 1).is_err());
+    }
+
+    #[test]
+    fn suffix_range_extracts_verified_time_map_and_rejects_spoofed_readme_strings() {
+        let modified = "2026-11-20T00:00:00.000Z";
+        let full = serde_json::to_vec(&serde_json::json!({
+            "name": "vite",
+            "versions": {
+                "1.0.0": { "name": "vite", "licenseText": "x".repeat(4096) },
+                "5.4.21": { "name": "vite", "licenseText": "y".repeat(4096) }
+            },
+            "time": {
+                "created": "2020-01-01T00:00:00.000Z",
+                "modified": modified,
+                "1.0.0": "2020-01-01T00:00:00.000Z",
+                "5.4.21": "2025-10-20T00:00:00.000Z"
+            },
+            "readme": "example ,\"time\":{\"modified\":\"2026-11-20T00:00:00.000Z\",\"1.0.0\":\"1999-01-01T00:00:00.000Z\",\"5.4.21\":\"1999-01-01T00:00:00.000Z\"}}",
+            "readmeFilename": "README.md"
+        }))
+        .unwrap();
+
+        // Suffix starting inside versions must extract the real top-level time map,
+        // NOT the spoofed one inside readme.
+        let tail = &full[full.len() - 512..];
+        let extracted =
+            extract_verified_time_from_packument_suffix(tail, false, modified, &["1.0.0", "5.4.21"])
+                .expect("real top-level time map should extract cleanly");
+        assert_eq!(
+            extracted.get("5.4.21").map(String::as_str),
+            Some("2025-10-20T00:00:00.000Z")
+        );
+
+        // Suffix that starts AFTER the real "time" (only containing readme) must fail closed.
+        let readme_only = &full[full.len() - 200..];
+        assert!(
+            extract_verified_time_from_packument_suffix(
+                readme_only,
+                false,
+                modified,
+                &["1.0.0", "5.4.21"]
+            )
+            .is_none(),
+            "spoofed time inside readme must be rejected"
+        );
+
+        // Wrong expected_modified or missing version key must fail closed.
+        assert!(
+            extract_verified_time_from_packument_suffix(
+                tail,
+                false,
+                "2026-11-22T00:00:00.000Z",
+                &["1.0.0", "5.4.21"]
+            )
+            .is_none()
+        );
+        assert!(
+            extract_verified_time_from_packument_suffix(
+                tail,
+                false,
+                modified,
+                &["1.0.0", "5.4.21", "6.0.0"]
+            )
+            .is_none()
+        );
+
+        // Full document starting at byte 0 (with BOM) also works.
+        let mut with_bom = vec![0xEF, 0xBB, 0xBF];
+        with_bom.extend_from_slice(
+            br#"{"time":{"modified":"2026-11-20T00:00:00.000Z","1.0.0":"2025-01-01T00:00:00.000Z"}}"#,
+        );
+        assert!(
+            extract_verified_time_from_packument_suffix(&with_bom, true, modified, &["1.0.0"])
+                .is_some()
+        );
+
+        // Content-Range validation.
+        assert_eq!(
+            parse_suffix_content_range("bytes 100-199/200"),
+            Some((100, 199, 200))
+        );
+        assert_eq!(parse_suffix_content_range("bytes 100-198/200"), None);
+        assert_eq!(parse_suffix_content_range("bytes 200-199/200"), None);
     }
 }
