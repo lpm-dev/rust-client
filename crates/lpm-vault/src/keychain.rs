@@ -1969,15 +1969,12 @@ pub(crate) fn repair_companion_data(
 fn open_for_repair(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
-) -> Result<(Option<&'static str>, Option<String>), String> {
+) -> Result<(Option<&'static str>, crate::companion::Opened), String> {
     validate_vault_id(vault_id)?;
-    let unfinished = match crate::companion::open_project_or_unfinished(
+    let opened = crate::companion::open_project_or_unfinished(
         &mut companion_gate::KeychainCompanion(&mut *storage),
         vault_id,
-    )? {
-        crate::companion::Opened::Unfinished(reason) => Some(reason),
-        crate::companion::Opened::Gate(_) => None,
-    };
+    )?;
     let access = match storage.claimed_access(vault_id)? {
         Some(ClaimedAccess::Contradictory) => Some(companion_gate::CONTRADICTORY_VALUES),
         None => None,
@@ -1988,7 +1985,7 @@ fn open_for_repair(
         ))? == Some(ClaimedAccess::Contradictory))
         .then_some(companion_gate::CONTRADICTORY_RECORD),
     };
-    Ok((access, unfinished))
+    Ok((access, opened))
 }
 
 fn review_companion_data_with_storage(
@@ -1996,12 +1993,12 @@ fn review_companion_data_with_storage(
     vault_id: &str,
 ) -> Result<crate::companion::repair::CompanionReview, String> {
     let storage = &mut ListedStorage::new(storage);
-    let (access, unfinished) = open_for_repair(storage, vault_id)?;
+    let (access, opened) = open_for_repair(storage, vault_id)?;
     crate::companion::repair::review(
         &mut companion_gate::KeychainCompanion(storage),
         vault_id,
         access,
-        unfinished.as_deref(),
+        opened,
     )
 }
 
@@ -2011,12 +2008,12 @@ fn repair_companion_data_with_storage(
     reviewed: &crate::companion::repair::CompanionReview,
 ) -> Result<Vec<crate::companion::repair::CompanionRepair>, String> {
     let storage = &mut ListedStorage::new(storage);
-    let (access, unfinished) = open_for_repair(storage, vault_id)?;
+    let (access, opened) = open_for_repair(storage, vault_id)?;
     crate::companion::repair::repair(
         &mut companion_gate::KeychainCompanion(storage),
         vault_id,
         access,
-        unfinished.as_deref(),
+        opened,
         reviewed,
     )
 }

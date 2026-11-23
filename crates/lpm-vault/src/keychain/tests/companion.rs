@@ -940,6 +940,24 @@ fn deleting_a_project_lists_the_service_once_however_many_transactions_it_takes(
 }
 
 #[test]
+fn a_repair_review_reads_the_marker_once() {
+    let mut storage = storage_with_values();
+    storage
+        .values
+        .insert(marker_account(VAULT), marker(OVERRIDES_FEATURE, "active"));
+    storage.values.insert(
+        record_account("overrides", VAULT, None),
+        overrides_record(r#""TOKEN":"mine""#),
+    );
+    storage.reads.clear();
+
+    let review = review_companion_data_with_storage(&mut storage, VAULT).expect("a review");
+
+    assert!(review.problems.is_empty(), "{:?}", review.problems);
+    assert_eq!(storage.reads.get(&marker_account(VAULT)).copied(), Some(1));
+}
+
+#[test]
 fn a_missing_record_is_reviewed_and_repaired_by_removing_its_feature() {
     use crate::companion::repair::CompanionRepair;
     let mut storage = storage_with_values();

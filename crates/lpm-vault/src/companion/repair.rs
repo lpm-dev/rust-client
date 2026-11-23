@@ -8,7 +8,7 @@ use super::assessment::{Observed, Repair, assess_gate, gate_of, reads_overrides_
 use super::lifecycle::{FoundMarker, execute, plan_discard};
 use super::marker::Marker;
 use super::overrides::OVERRIDES_KIND;
-use super::{Checked, CompanionBackend};
+use super::{Checked, CompanionBackend, Opened};
 
 /// What's damaged in one project's newer data, and how each problem is
 /// repaired, in the order the engine found them. A repair runs it only on
@@ -103,21 +103,31 @@ fn marker_account(vault_id: &str) -> CompanionAccount {
 
 /// Review `vault_id`'s companion data as the engine judges it, after its
 /// interrupted steps were finished. `access` is why the store found the
-/// project's access damaged, if it did, and `unfinished` why its interrupted
-/// step can never be finished, if it can't; its records aren't read then,
-/// since the approval that protects them can't be told, or what they hold
-/// can't be trusted. Otherwise the overrides record is read only where the
-/// listing shows it and the engine judges what it holds, and only beside
+/// project's access damaged, if it did, and `opened` what opening the
+/// project found in this lock scope: its gate, or why its interrupted step
+/// can never be finished. Records aren't read with damaged access or such a
+/// step, since the approval that protects them can't be told, or what they
+/// hold can't be trusted. Otherwise the overrides record is read only where
+/// the listing shows it and the engine judges what it holds, and only beside
 /// values.
 pub(crate) fn review(
     backend: &mut impl CompanionBackend,
     vault_id: &str,
     access: Option<&str>,
-    unfinished: Option<&str>,
+    opened: Opened,
 ) -> Result<CompanionReview, String> {
-    let marker = backend.read(&marker_account(vault_id))?;
+    let (gate, unfinished) = match opened {
+        Opened::Gate(gate) => (gate, None),
+        Opened::Unfinished(reason) => (
+            gate_of(
+                vault_id,
+                backend.read(&marker_account(vault_id))?.as_deref(),
+            ),
+            Some(reason),
+        ),
+    };
+    let unfinished = unfinished.as_deref();
     let inventory = backend.inventory(vault_id)?;
-    let gate = gate_of(vault_id, marker.as_deref());
     let contents_are_judged =
         reads_overrides_record(vault_id, &gate, Some(&inventory), access, unfinished);
     let mut unreadable_overrides = None;
@@ -145,7 +155,7 @@ pub(crate) fn review(
         vault_id,
         gate,
         Observed {
-            marker: marker.as_deref(),
+            marker: None,
             inventory: Some(&inventory),
             overrides: overrides
                 .as_ref()
@@ -244,18 +254,29 @@ fn history_damage(
 }
 
 /// Run every repair `reviewed` lists, after checking `vault_id` still shows
-/// exactly that damage. Returns the repairs it ran. A discard runs on the
-/// marker as it stands, so it never needs the interrupted step finished.
+/// exactly that damage. Returns the repairs it ran.
+#[cfg(target_os = "macos")]
 pub(crate) fn repair(
     backend: &mut impl CompanionBackend,
     vault_id: &str,
     access: Option<&str>,
-    unfinished: Option<&str>,
+    opened: Opened,
     reviewed: &CompanionReview,
 ) -> Result<Vec<CompanionRepair>, String> {
-    if review(backend, vault_id, access, unfinished)? != *reviewed {
+    if review(backend, vault_id, access, opened)? != *reviewed {
         return Err(CHANGED_SINCE_REVIEW.to_owned());
     }
+    run_repairs(backend, vault_id, reviewed)
+}
+
+/// Run every repair `reviewed` lists, for a caller that checked in this lock
+/// scope that `vault_id` still shows exactly that damage. A discard runs on
+/// the marker as it stands, so it never needs the interrupted step finished.
+pub(crate) fn run_repairs(
+    backend: &mut impl CompanionBackend,
+    vault_id: &str,
+    reviewed: &CompanionReview,
+) -> Result<Vec<CompanionRepair>, String> {
     let repairs = reviewed.repairs().to_vec();
     for repair in &repairs {
         let marker = backend
