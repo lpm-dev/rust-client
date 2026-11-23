@@ -11791,14 +11791,15 @@ async fn install_fetch_overlap_never_skips_npm_registry_tarballs_for_their_crede
         "the public npm registry is not a private mirror; got {overlap:#}"
     );
     // Which fetch gets the tarball first is the scheduler's to say: the
-    // overlap's, or the install's own when the overlap gets to the
-    // package once it's stored. Either way the overlap took it.
+    // overlap's, or the install's own, which the overlap then finds stored,
+    // before it dispatches the package or once its task starts. Either way
+    // the overlap took it.
     let taken = ["dispatched_count", "cache_hit_count"]
         .iter()
         .filter_map(|count| overlap[count].as_u64())
         .sum::<u64>();
-    assert_eq!(
-        taken, 1,
+    assert!(
+        taken >= 1,
         "the overlap fetches the npm registry's tarball, or finds it stored; got {overlap:#}"
     );
     assert_eq!(tarball_requests.len(), 1);
