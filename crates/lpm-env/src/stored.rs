@@ -130,10 +130,18 @@ const CODE_RUNNING_ENV_PREFIXES: &[&str] = &[
 ];
 
 /// Names that describe the process's own environment, which project env
-/// never replaces. `COMSPEC` is Windows' command processor, which cmd and
-/// Node start for a shell.
+/// never replaces, and the one LPM sets for the processes of a cached task,
+/// which says where an `lpm` they start reports what it uses. `COMSPEC` is
+/// Windows' command processor, which cmd and Node start for a shell.
 const PROCESS_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "LPM_HOME", "USER", "SHELL", "TERM", "COMSPEC",
+    "PATH",
+    "HOME",
+    "LPM_HOME",
+    "USER",
+    "SHELL",
+    "TERM",
+    "COMSPEC",
+    "LPM_PERSONAL_OVERRIDES_MARKER",
 ];
 
 /// Runtime hooks LPM also removes from the environment a process inherits,

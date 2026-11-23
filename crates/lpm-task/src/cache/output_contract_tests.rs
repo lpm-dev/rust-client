@@ -171,6 +171,7 @@ fn local_restore_enforces_output_declarations_and_preserves_existing_files() {
         "",
         "",
         1,
+        &|| true,
     )
     .unwrap();
     for globs in [vec![], vec!["other.txt".into()]] {
@@ -204,6 +205,7 @@ fn local_output_can_be_a_regular_file_named_outputs() {
         "",
         "",
         1,
+        &|| true,
     )
     .unwrap();
     fs::remove_file(project.path().join("outputs")).unwrap();
@@ -249,6 +251,7 @@ fn a_cache_entry_drops_access_its_directory_hands_down() {
         "PRIVATE_TOKEN=stdout-secret\n",
         "",
         1,
+        &|| true,
     )
     .unwrap();
 
@@ -285,6 +288,7 @@ fn a_cache_entry_open_to_other_accounts_is_not_restored() {
         "",
         "",
         1,
+        &|| true,
     )
     .unwrap();
     grant_everyone_access(&root.cache_tasks().join("deadbeef"), false);

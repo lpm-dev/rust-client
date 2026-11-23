@@ -8,8 +8,8 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-use lpm_vault::override_marker::Access;
 pub use lpm_vault::override_marker::MARKER_ENV;
+use lpm_vault::override_marker::Reported;
 
 thread_local! {
     /// The marker list the task this thread starts gets, while it's watched.
@@ -21,9 +21,9 @@ thread_local! {
 /// inherited.
 #[must_use]
 pub struct TaskMarker {
-    /// The task's directory; `None` when it couldn't be made or passed to
-    /// the task, so what the task reads can't be told.
-    directory: Option<PathBuf>,
+    /// The task's directory, or why it couldn't be made or passed to the
+    /// task, so what the task reads can't be told.
+    directory: Result<PathBuf, String>,
     previous: Option<String>,
 }
 
@@ -37,26 +37,31 @@ impl TaskMarker {
 
     /// [`Self::watch`] with the marker in `temporary`.
     fn watch_in(temporary: &Path) -> Result<Self, String> {
-        let directory = new_marker_directory(temporary);
-        let list = directory.as_ref().and_then(|directory| {
-            std::env::join_paths(
+        let directory = new_marker_directory(temporary).and_then(|directory| {
+            let list = std::env::join_paths(
                 lpm_vault::override_marker::inherited()
                     .iter()
-                    .chain(std::iter::once(directory)),
+                    .chain(std::iter::once(&directory)),
             )
-            .ok()?
-            .into_string()
             .ok()
-        });
-        let directory = match (directory, &list) {
-            (Some(directory), Some(_)) => Some(directory),
-            (directory, _) => {
-                if let Some(directory) = directory {
-                    let _ = std::fs::remove_dir(directory);
+            .and_then(|list| list.into_string().ok());
+            match list {
+                Some(list) => Ok((directory, list)),
+                None => {
+                    let _ = std::fs::remove_dir(&directory);
+                    Err(format!(
+                        "{} can't be passed to a process in a list of paths",
+                        directory.display()
+                    ))
                 }
-                lpm_vault::override_marker::report_uncertain()?;
-                None
             }
+        });
+        if directory.is_err() {
+            lpm_vault::override_marker::report_uncertain()?;
+        }
+        let (directory, list) = match directory {
+            Ok((directory, list)) => (Ok(directory), Some(list)),
+            Err(reason) => (Err(reason), None),
         };
         let previous = WATCHED.with_borrow_mut(|watched| std::mem::replace(watched, list));
         Ok(Self {
@@ -65,14 +70,19 @@ impl TaskMarker {
         })
     }
 
+    /// Why the task has no marker of its own, when it has none.
+    pub fn unwatched(&self) -> Option<&str> {
+        self.directory.as_ref().err().map(String::as_str)
+    }
+
     /// What keeps what the task built out of a cache whose key holds the
-    /// values and personal overrides of the env project `keyed_vault`;
-    /// `None` when every `lpm` the task started, if any, only read that
-    /// project.
-    pub fn unkeyed(&self, keyed_vault: Option<&str>) -> Option<Unkeyed> {
+    /// reads that `keyed` entries report (see
+    /// [`lpm_vault::override_marker::Access::keyed`]); `None`
+    /// when every `lpm` the task started, if any, made only such reads.
+    pub fn unkeyed(&self, keyed: &[String]) -> Option<Unkeyed> {
         match &self.directory {
-            Some(directory) => unkeyed(directory, keyed_vault),
-            None => Some(Unkeyed::Unknown),
+            Ok(directory) => unkeyed(directory, keyed),
+            Err(_) => Some(Unkeyed::Unwatched),
         }
     }
 }
@@ -84,25 +94,28 @@ pub enum Unkeyed {
     /// personal overrides.
     Used,
     /// What the task's `lpm` processes used can't be told: its marker
-    /// couldn't be made, passed or listed, or holds an entry no `lpm` adds.
+    /// couldn't be listed, or holds an entry no `lpm` adds.
     Unknown,
+    /// The task has no marker of its own (see [`TaskMarker::unwatched`]).
+    Unwatched,
 }
 
 /// [`TaskMarker::unkeyed`] for the entries in `directory`. A use the key
 /// doesn't hold is named before what can't be told.
-fn unkeyed(directory: &Path, keyed_vault: Option<&str>) -> Option<Unkeyed> {
+fn unkeyed(directory: &Path, keyed: &[String]) -> Option<Unkeyed> {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return Some(Unkeyed::Unknown);
     };
     let mut found = None;
     for entry in entries {
-        let reason = match entry {
-            Ok(entry) => match entry.file_name().to_str().and_then(Access::of_entry) {
-                Some(Access::Read(vault_id)) if keyed_vault == Some(vault_id) => continue,
-                Some(Access::Read(_) | Access::Change(_)) => Unkeyed::Used,
-                Some(Access::Uncertain) | None => Unkeyed::Unknown,
+        let name = entry.map(|entry| entry.file_name());
+        let reason = match name.as_ref().ok().and_then(|name| name.to_str()) {
+            Some(name) if keyed.iter().any(|keyed| keyed == name) => continue,
+            Some(name) => match Reported::of_entry(name) {
+                Some(Reported::Access) => Unkeyed::Used,
+                Some(Reported::Uncertain) | None => Unkeyed::Unknown,
             },
-            Err(_) => Unkeyed::Unknown,
+            None => Unkeyed::Unknown,
         };
         if reason == Unkeyed::Used {
             return Some(reason);
@@ -114,7 +127,7 @@ fn unkeyed(directory: &Path, keyed_vault: Option<&str>) -> Option<Unkeyed> {
 
 impl Drop for TaskMarker {
     fn drop(&mut self) {
-        if let Some(directory) = &self.directory {
+        if let Ok(directory) = &self.directory {
             let _ = std::fs::remove_dir_all(directory);
         }
         let previous = self.previous.take();
@@ -137,19 +150,20 @@ pub(crate) fn marker() -> Option<String> {
 
 /// A new directory only this user can add to, in `temporary`, the user's
 /// temporary directory, named by the process and a random number, absolute
-/// so a process in another folder reports to the same one. `None` when it
-/// can't be made.
-fn new_marker_directory(temporary: &Path) -> Option<PathBuf> {
+/// so a process in another folder reports to the same one, or why it can't
+/// be made.
+fn new_marker_directory(temporary: &Path) -> Result<PathBuf, String> {
     use std::hash::{BuildHasher as _, Hasher as _};
 
     let random = std::collections::hash_map::RandomState::new()
         .build_hasher()
         .finish();
-    let directory = std::path::absolute(temporary.join(format!(
+    let directory = temporary.join(format!(
         "lpm-personal-overrides-{}-{random:016x}",
         std::process::id()
-    )))
-    .ok()?;
+    ));
+    let directory = std::path::absolute(&directory)
+        .map_err(|error| format!("{}: {error}", directory.display()))?;
     let builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     let builder = {
@@ -157,16 +171,31 @@ fn new_marker_directory(temporary: &Path) -> Option<PathBuf> {
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
         builder
     };
-    builder.create(&directory).ok()?;
-    Some(directory)
+    builder
+        .create(&directory)
+        .map_err(|error| format!("{}: {error}", directory.display()))?;
+    Ok(directory)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lpm_vault::override_marker::Access;
 
     fn report(directory: &Path, access: Access<'_>) {
         std::fs::write(directory.join(access.entry()), "").expect("a nested lpm reports");
+    }
+
+    fn read(vault_id: &'static str, environment: &'static str, overrides: bool) -> Access<'static> {
+        Access::Environment {
+            vault_id,
+            environment,
+            overrides,
+        }
+    }
+
+    fn keyed() -> [String; 2] {
+        Access::keyed("vault-1", "default", false)
     }
 
     #[test]
@@ -175,14 +204,26 @@ mod tests {
         let task = TaskMarker::watch().expect("watch");
         let directory = task.directory.clone().expect("a marker of its own");
         assert!(directory.is_absolute());
-        assert_eq!(marker().as_deref(), directory.to_str());
-        assert_eq!(task.unkeyed(Some("vault-1")), None, "nothing read yet");
-        assert_eq!(task.unkeyed(None), None);
+        assert!(
+            marker().is_some_and(|list| {
+                std::env::split_paths(&list).last().as_deref() == Some(directory.as_path())
+            }),
+            "its own marker comes after the ones this process inherited"
+        );
+        assert_eq!(task.unkeyed(&keyed()), None, "nothing read yet");
+        assert_eq!(task.unkeyed(&[]), None);
 
-        report(&directory, Access::Read("vault-1"));
-        assert_eq!(task.unkeyed(Some("vault-1")), None, "a read the key holds");
+        report(&directory, read("vault-1", "default", false));
+        report(
+            &directory,
+            Access::Overrides {
+                vault_id: "vault-1",
+                overrides: false,
+            },
+        );
+        assert_eq!(task.unkeyed(&keyed()), None, "reads the key holds");
         assert_eq!(
-            task.unkeyed(None),
+            task.unkeyed(&[]),
             Some(Unkeyed::Used),
             "a task of a project without one"
         );
@@ -193,38 +234,61 @@ mod tests {
     }
 
     #[test]
-    fn a_read_of_another_project_or_a_change_or_an_uncertain_one_is_reported() {
+    fn a_use_the_key_doesn_t_hold_keeps_the_task_out() {
         for (access, reason) in [
-            (Access::Read("vault-2"), Unkeyed::Used),
-            (Access::Change("vault-1"), Unkeyed::Used),
+            (read("vault-2", "default", false), Unkeyed::Used),
+            (read("Vault-1", "default", false), Unkeyed::Used),
+            (read("vault-1", "staging", false), Unkeyed::Used),
+            (read("vault-1", "default", true), Unkeyed::Used),
+            (
+                Access::Environments {
+                    vault_id: "vault-1",
+                    overrides: false,
+                },
+                Unkeyed::Used,
+            ),
+            (
+                Access::Overrides {
+                    vault_id: "vault-1",
+                    overrides: true,
+                },
+                Unkeyed::Used,
+            ),
+            (
+                Access::Change {
+                    vault_id: "vault-1",
+                },
+                Unkeyed::Used,
+            ),
             (Access::Uncertain, Unkeyed::Unknown),
         ] {
             let task = TaskMarker::watch().expect("watch");
             report(task.directory.as_deref().expect("marker"), access);
-            assert_eq!(task.unkeyed(Some("vault-1")), Some(reason), "{access:?}");
+            assert_eq!(task.unkeyed(&keyed()), Some(reason), "{access:?}");
         }
     }
 
     #[test]
-    fn a_marker_that_can_t_be_listed_or_an_unknown_entry_counts_as_read() {
+    fn a_marker_that_can_t_be_listed_or_holds_an_unknown_entry_can_t_be_told() {
         let root = tempfile::tempdir().expect("temporary folder");
         assert_eq!(
-            unkeyed(&root.path().join("gone"), Some("vault-1")),
+            unkeyed(&root.path().join("gone"), &keyed()),
             Some(Unkeyed::Unknown)
         );
 
         let unknown = root.path().join("unknown");
         std::fs::create_dir(&unknown).expect("marker");
-        std::fs::write(unknown.join("write-vault-1"), "").expect("entry");
-        assert_eq!(unkeyed(&unknown, Some("vault-1")), Some(Unkeyed::Unknown));
+        std::fs::write(unknown.join("read-vault-1"), "").expect("entry");
+        assert_eq!(unkeyed(&unknown, &keyed()), Some(Unkeyed::Unknown));
 
-        let similar = root.path().join("similar");
-        std::fs::create_dir(&similar).expect("marker");
-        std::fs::write(similar.join("read-vault-1.tmp"), "").expect("entry");
+        let both = root.path().join("both");
+        std::fs::create_dir(&both).expect("marker");
+        std::fs::write(both.join("read-vault-1"), "").expect("entry");
+        report(&both, read("vault-2", "default", false));
         assert_eq!(
-            unkeyed(&similar, Some("vault-1")),
+            unkeyed(&both, &keyed()),
             Some(Unkeyed::Used),
-            "a read of the project vault-1.tmp"
+            "a use the key doesn't hold is named first"
         );
 
         #[cfg(unix)]
@@ -238,7 +302,7 @@ mod tests {
             std::fs::create_dir(&not_utf8).expect("marker");
             if std::fs::write(not_utf8.join(std::ffi::OsStr::from_bytes(b"read-\xff")), "").is_ok()
             {
-                assert_eq!(unkeyed(&not_utf8, Some("vault-1")), Some(Unkeyed::Unknown));
+                assert_eq!(unkeyed(&not_utf8, &keyed()), Some(Unkeyed::Unknown));
             }
 
             let unreadable = root.path().join("unreadable");
@@ -246,7 +310,7 @@ mod tests {
             std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o300))
                 .expect("make it unreadable");
             let listed = std::fs::read_dir(&unreadable).is_ok();
-            assert!(listed || unkeyed(&unreadable, Some("vault-1")) == Some(Unkeyed::Unknown));
+            assert!(listed || unkeyed(&unreadable, &keyed()) == Some(Unkeyed::Unknown));
             std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o700))
                 .expect("make it readable again");
         }
@@ -262,15 +326,34 @@ mod tests {
 
         let task = TaskMarker::watch_in(&separated).expect("watch");
 
-        assert!(task.directory.is_none());
-        assert_eq!(task.unkeyed(Some("vault-1")), Some(Unkeyed::Unknown));
-        assert_eq!(task.unkeyed(None), Some(Unkeyed::Unknown));
+        assert!(
+            task.unwatched()
+                .is_some_and(|reason| reason.contains("a:b"))
+        );
+        assert_eq!(task.unkeyed(&keyed()), Some(Unkeyed::Unwatched));
+        assert_eq!(task.unkeyed(&[]), Some(Unkeyed::Unwatched));
         assert_eq!(marker(), outer, "the task gets the inherited markers");
         assert_eq!(
             std::fs::read_dir(&separated).expect("folder").count(),
             0,
             "the marker that couldn't be passed is gone"
         );
+    }
+
+    #[test]
+    fn a_marker_that_can_t_be_made_says_why() {
+        let root = tempfile::tempdir().expect("temporary folder");
+        let gone = root.path().join("gone");
+
+        let task = TaskMarker::watch_in(&gone).expect("watch");
+
+        assert!(
+            task.unwatched()
+                .is_some_and(|reason| reason.contains("gone")),
+            "{:?}",
+            task.unwatched()
+        );
+        assert_eq!(task.unkeyed(&keyed()), Some(Unkeyed::Unwatched));
     }
 
     #[cfg(unix)]

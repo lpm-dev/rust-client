@@ -593,6 +593,9 @@ pub enum StoredCacheEntry {
     /// A valid entry was already stored under the key, so it was kept and
     /// holds another run's result.
     KeptExisting,
+    /// The check given to [`store_cache_checked`] refused the result once
+    /// its outputs were taken, so nothing was published.
+    Withdrawn,
 }
 
 /// The cache entry one [`store_cache`] call published. A remote artifact is
@@ -627,6 +630,34 @@ pub fn store_cache(
     stderr: &str,
     duration_ms: u64,
 ) -> Result<StoredCacheEntry, LpmError> {
+    store_cache_checked(
+        key,
+        project_dir,
+        command,
+        output_globs,
+        stdout,
+        stderr,
+        duration_ms,
+        &|| true,
+    )
+}
+
+/// [`store_cache`], publishing the result only if `publishable` still says
+/// so once its outputs were taken.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "cache publication needs the complete entry payload"
+)]
+pub fn store_cache_checked(
+    key: &str,
+    project_dir: &Path,
+    command: &str,
+    output_globs: &[String],
+    stdout: &str,
+    stderr: &str,
+    duration_ms: u64,
+    publishable: &dyn Fn() -> bool,
+) -> Result<StoredCacheEntry, LpmError> {
     let root = LpmRoot::from_env()
         .map_err(|error| LpmError::Task(format!("could not determine LPM home: {error}")))?;
     store_cache_with_root(
@@ -638,6 +669,7 @@ pub fn store_cache(
         stdout,
         stderr,
         duration_ms,
+        publishable,
     )
 }
 
@@ -654,6 +686,7 @@ fn store_cache_with_root(
     stdout: &str,
     stderr: &str,
     duration_ms: u64,
+    publishable: &dyn Fn() -> bool,
 ) -> Result<StoredCacheEntry, LpmError> {
     validate_cache_key(key)?;
     validate_cache_log_len("stdout.log", stdout.as_bytes())?;
@@ -678,8 +711,9 @@ fn store_cache_with_root(
             stdout,
             stderr,
             duration_ms,
+            publishable,
         )
-        .map(StoredCacheEntry::Published)
+        .map(|published| published.map_or(StoredCacheEntry::Withdrawn, StoredCacheEntry::Published))
     })
 }
 
@@ -696,8 +730,9 @@ fn store_cache_locked(
     stdout: &str,
     stderr: &str,
     duration_ms: u64,
-) -> Result<PublishedCacheEntry, LpmError> {
-    publish_cache_entry(cache, key, |open| {
+    publishable: &dyn Fn() -> bool,
+) -> Result<Option<PublishedCacheEntry>, LpmError> {
+    publish_cache_entry(cache, key, publishable, |open| {
         write_private_cache_file(open, "stdout.log", stdout.as_bytes())?;
         write_private_cache_file(open, "stderr.log", stderr.as_bytes())?;
         let output_file_count = if output_globs.is_empty() {
@@ -731,23 +766,29 @@ fn directory_identity(directory: &Dir) -> Result<(u64, u64), LpmError> {
 }
 
 /// Writes a cache entry into a private staging directory with `write`, then
-/// publishes it under `key`, replacing any entry already there. The caller
-/// holds the entry's exclusive lock.
+/// publishes it under `key`, replacing any entry already there, unless
+/// `publishable` says otherwise once it's written. The caller holds the
+/// entry's exclusive lock.
 fn publish_cache_entry(
     cache: &OpenTaskCache,
     key: &str,
+    publishable: &dyn Fn() -> bool,
     write: impl FnOnce(&Dir) -> Result<(), LpmError>,
-) -> Result<PublishedCacheEntry, LpmError> {
+) -> Result<Option<PublishedCacheEntry>, LpmError> {
     let entry = cache.path.join(key);
     let (staging_name, staging) = create_private_cache_directory(&cache.tasks)?;
     #[cfg(test)]
     wait_for_cache_race_barrier(&CACHE_STORE_STAGING_RACE_BARRIER, &cache.path);
+    wait_while_a_test_holds_staging();
     let mut staging = Some(staging);
     let mut staged_identity = None;
     let result = (|| {
         let open = staging.as_ref().expect("the staging directory is open");
         write(open)?;
         sync_open_directory(open)?;
+        if !publishable() {
+            return Ok(None);
+        }
         let staged = directory_identity(open)?;
         staged_identity = Some(staged);
         // Windows can't rename a directory a handle holds open, so the
@@ -766,14 +807,14 @@ fn publish_cache_entry(
                 entry.display()
             )));
         }
-        Ok(PublishedCacheEntry {
+        Ok(Some(PublishedCacheEntry {
             key: key.to_owned(),
             identity: staged,
             #[cfg(unix)]
             _held_open: published,
-        })
+        }))
     })();
-    if result.is_err() {
+    if !matches!(result, Ok(Some(_))) {
         // Closed for the publication, the staging directory is cleaned up
         // only while its name still holds the one staged.
         let staging = staging.or_else(|| {
@@ -786,8 +827,37 @@ fn publish_cache_entry(
         }
     }
     let published = result?;
-    tracing::debug!("cached task output to {}", entry.display());
+    if published.is_some() {
+        tracing::debug!("cached task output to {}", entry.display());
+    }
     Ok(published)
+}
+
+/// The variable that makes a debug build wait while it stages a task cache
+/// entry: it creates `<path>.staging`, then waits until `<path>.go` exists,
+/// so a test can act between a task's end and its outputs being taken.
+const TEST_STAGING_PAUSE_ENV: &str = "LPM_TEST_TASK_CACHE_STAGING_PAUSE";
+
+fn wait_while_a_test_holds_staging() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let Some(path) = std::env::var_os(TEST_STAGING_PAUSE_ENV) else {
+        return;
+    };
+    let named = |suffix: &str| {
+        let mut name = path.clone();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    if std::fs::write(named(".staging"), "").is_err() {
+        return;
+    }
+    let go = named(".go");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !go.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 fn cleanup_private_cache_directory(parent: &Dir, name: &str, staging: Dir) -> Result<(), LpmError> {
@@ -2127,6 +2197,7 @@ mod tests {
                 stdout,
                 stderr,
                 duration_ms,
+                &|| true,
             )
         }
 
@@ -2498,6 +2569,7 @@ mod tests {
                     "",
                     "",
                     1,
+                    &|| true,
                 );
                 stored.send(()).unwrap();
                 result
@@ -2549,6 +2621,7 @@ mod tests {
                 "",
                 "",
                 1,
+                &|| true,
             )
         });
 
@@ -2726,6 +2799,48 @@ mod tests {
             (hit.stdout.as_str(), hit.stderr.as_str()),
             ("out\n", "err\n")
         );
+    }
+
+    #[test]
+    fn a_result_its_check_refuses_once_its_outputs_are_taken_is_never_published() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        write_build_outputs(project.path());
+        let key = unique_key("withdrawn-entry");
+        let outputs = ["dist/**".to_string()];
+        let checked = std::cell::Cell::new(false);
+
+        let stored = store_cache_with_root(
+            &cache.root,
+            &key,
+            project.path(),
+            "build",
+            &outputs,
+            "",
+            "",
+            1,
+            &|| {
+                checked.set(true);
+                false
+            },
+        )
+        .unwrap();
+
+        assert!(checked.get());
+        assert!(matches!(stored, StoredCacheEntry::Withdrawn));
+        let target = tempfile::tempdir().unwrap();
+        assert!(
+            cache.restore(&key, target.path(), &outputs).is_err(),
+            "a miss"
+        );
+        let left: Vec<_> = fs::read_dir(cache_dir_with_root(&cache.root))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| {
+                name.to_string_lossy().starts_with(".task-cache-stage-") || *name == *key.as_str()
+            })
+            .collect();
+        assert!(left.is_empty(), "nothing staged is left: {left:?}");
     }
 
     #[test]
@@ -3676,6 +3791,7 @@ mod tests {
                 "",
                 "",
                 1,
+                &|| true,
             )
         });
 
@@ -5479,6 +5595,7 @@ mod tests {
                 "",
                 "",
                 1,
+                &|| true,
             );
             completed_tx.send(()).unwrap();
             result

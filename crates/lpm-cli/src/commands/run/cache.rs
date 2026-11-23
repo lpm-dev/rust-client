@@ -158,8 +158,10 @@ pub(super) fn is_task_cached_with_config(
 pub(super) struct CacheContext {
     pub(super) task_config: lpm_runner::lpm_json::TaskConfig,
     pub(super) cache_key: String,
-    /// The env project whose values and personal overrides the key holds.
-    vault_id: Option<String>,
+    /// The entries of the reads a nested lpm can make that the key holds:
+    /// its project's environment and its overrides (see
+    /// [`lpm_vault::override_marker::Access::keyed`]); none without a project.
+    keyed_entries: Vec<String>,
     pub(super) command: String,
     pub(super) env_vars: HashMap<String, String>,
     pub(super) inherited_env: HashMap<std::ffi::OsString, std::ffi::OsString>,
@@ -404,6 +406,7 @@ fn build_task_context(
         vars: env_vars,
         personal_overrides,
         project_overrides,
+        vault_environment,
     } = lpm_runner::script::load_script_child_env_with_config(
         project_dir,
         script_name,
@@ -415,8 +418,21 @@ fn build_task_context(
         lpm_runner::dotenv::OverridePolicy::Apply,
     )?;
     // The project a nested lpm reports reading is the one lpm.json names: a
-    // folder that may not use it failed the read above.
-    let vault_id = lpm_vault::vault_id::read_vault_id(project_dir);
+    // folder that may not use it failed the read above. A name read before
+    // lpm.json changed only keeps the task out; the store's rebuild compares
+    // these entries again.
+    let keyed_entries = config_ref
+        .and_then(|config| config.vault.as_deref())
+        .filter(|vault_id| lpm_vault::vault_id::is_safe_vault_id(vault_id))
+        .map(|vault_id| {
+            lpm_vault::override_marker::Access::keyed(
+                vault_id,
+                &vault_environment,
+                project_overrides.is_some(),
+            )
+            .to_vec()
+        })
+        .unwrap_or_default();
 
     let inherited_env = lpm_runner::shell::inherited_child_env();
     let cache_env = task_config.cache_env.as_ref().map(|names| {
@@ -552,7 +568,7 @@ fn build_task_context(
                 static SHOWN: AtomicBool = AtomicBool::new(false);
                 announce_once(&SHOWN, || {
                     format!(
-                        "the remote cache is off for tasks of a project with personal overrides on {}, and for the tasks that run after them",
+                        "the remote cache is off for tasks of a project with personal overrides on {}, and for the tasks that depend on them",
                         lpm_runner::dotenv::THIS_MACHINE
                     )
                 });
@@ -575,7 +591,7 @@ fn build_task_context(
         command_preference,
         task_config,
         cache_key: cache_snapshot.key,
-        vault_id,
+        keyed_entries,
         command,
         env_vars,
         inherited_env,
@@ -808,27 +824,8 @@ pub(super) fn try_cache_store_with_context(
     expected: &CacheContext,
 ) -> bool {
     let script_name = request.script_name;
-    if let Some(unkeyed) = request.task.unkeyed(expected.vault_id.as_deref()) {
-        use lpm_runner::override_marker::Unkeyed;
-        static USED_SHOWN: AtomicBool = AtomicBool::new(false);
-        static UNKNOWN_SHOWN: AtomicBool = AtomicBool::new(false);
-        let (shown, reason) = match unkeyed {
-            Unkeyed::Used => (
-                &USED_SHOWN,
-                "an lpm it started used another env project or changed personal overrides, which its cache key doesn't hold",
-            ),
-            Unkeyed::Unknown => (
-                &UNKNOWN_SHOWN,
-                "what the lpm processes it started used can't be told",
-            ),
-        };
-        let script_name = lpm_common::sanitize_terminal_inline(script_name);
-        announce_once(shown, || {
-            format!(
-                "task '{script_name}' isn't cached: {reason} (`lpm --verbose` names each task this keeps out of the cache)"
-            )
-        });
-        tracing::debug!("task '{script_name}' isn't cached: {reason}");
+    if let Some(unkeyed) = request.task.unkeyed(&expected.keyed_entries) {
+        say_not_cached(script_name, unkeyed, request.task.unwatched());
         return false;
     }
     match store_cache_with_context(request, expected) {
@@ -841,6 +838,33 @@ pub(super) fn try_cache_store_with_context(
             false
         }
     }
+}
+
+/// Say, once a command, that a task isn't cached because of what an lpm it
+/// started used, or because it had no marker of its own (`unwatched` says
+/// why), and for each task under `--verbose`.
+fn say_not_cached(
+    script_name: &str,
+    unkeyed: lpm_runner::override_marker::Unkeyed,
+    unwatched: Option<&str>,
+) {
+    use lpm_runner::override_marker::Unkeyed;
+    static SHOWN: AtomicBool = AtomicBool::new(false);
+    let reason = match unkeyed {
+        Unkeyed::Used => "an lpm it started used another env project or environment, or changed personal overrides, which its cache key doesn't hold; if it always does, set `cache` to false for it in lpm.json".to_owned(),
+        Unkeyed::Unknown => "what the lpm processes it started used can't be told".to_owned(),
+        Unkeyed::Unwatched => format!(
+            "lpm couldn't make the marker that the lpm processes it starts report to ({}); check the temporary folder",
+            lpm_common::sanitize_terminal_inline(unwatched.unwrap_or_default())
+        ),
+    };
+    let script_name = lpm_common::sanitize_terminal_inline(script_name);
+    announce_once(&SHOWN, || {
+        format!(
+            "task '{script_name}' isn't cached: {reason} (`lpm --verbose` names each task this keeps out of the cache)"
+        )
+    });
+    tracing::debug!("task '{script_name}' isn't cached: {reason}");
 }
 
 /// Print the notice `shown` stands for once a command, however many tasks
@@ -907,9 +931,9 @@ fn store_cache_with_context(
         None => return Ok(false),
     };
     drop(fresh_vault_reads);
-    if current.vault_id != expected.vault_id {
+    if current.keyed_entries != expected.keyed_entries {
         tracing::warn!(
-            "the env project of task '{}' changed while it ran; skipping cache publication",
+            "the env project or environment of task '{}', or whether it has personal overrides, changed while it ran; skipping cache publication",
             lpm_common::sanitize_terminal_inline(request.script_name)
         );
         return Ok(false);
@@ -933,7 +957,11 @@ fn store_cache_with_context(
         return Ok(false);
     }
 
-    let stored = lpm_task::cache::store_cache(
+    // An lpm the task left running can report a use until the outputs are
+    // taken, and it reports before it uses what it read, so a use reported
+    // after this check left nothing in them.
+    let unkeyed = std::cell::Cell::new(None);
+    let stored = lpm_task::cache::store_cache_checked(
         &expected.cache_key,
         request.project_dir,
         &expected.command,
@@ -941,7 +969,15 @@ fn store_cache_with_context(
         request.stdout,
         request.stderr,
         request.duration_ms,
+        &|| {
+            unkeyed.set(request.task.unkeyed(&expected.keyed_entries));
+            unkeyed.get().is_none()
+        },
     )?;
+    if let Some(unkeyed) = unkeyed.get() {
+        say_not_cached(request.script_name, unkeyed, request.task.unwatched());
+        return Ok(false);
+    }
 
     // A kept entry is another run's result, which this run's upload checks
     // don't cover.

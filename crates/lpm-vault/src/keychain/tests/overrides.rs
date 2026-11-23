@@ -260,6 +260,26 @@ fn a_weaker_record_under_approved_values_is_never_read_without_their_approval() 
 }
 
 #[test]
+fn a_repair_review_never_reads_a_weaker_record_without_the_values_approval() {
+    let mut storage = storage_with_values();
+    change(&mut storage, &[set("API_URL", "fixture-mine")]).expect("set");
+    storage
+        .values
+        .insert(overrides_account(), "fixture-damaged-record");
+    storage
+        .claims
+        .insert(VAULT.to_owned(), ClaimedAccess::RequireApproval);
+    storage.protected.insert(VAULT.to_owned());
+    storage.approval_cancelled = true;
+
+    let error = review_companion_data_with_storage(&mut storage, VAULT)
+        .expect_err("no review, and no removal, from a record read without approval");
+
+    assert!(error.contains("cancelled"), "{error}");
+    assert!(!error.contains("malformed"), "{error}");
+}
+
+#[test]
 fn a_record_weakened_while_it_is_read_is_refused_rather_than_used() {
     let mut storage = storage_with_values();
     change(&mut storage, &[set("API_URL", "fixture-mine")]).expect("set");

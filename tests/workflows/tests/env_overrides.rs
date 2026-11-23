@@ -102,6 +102,99 @@ fn run_applies_a_personal_override_and_reports_only_its_count() {
 }
 
 #[test]
+fn an_override_of_the_marker_variable_is_neither_applied_nor_counted() {
+    let (project, vault_id) = project_with_team_value(r#"{"marker":"node marker.cjs"}"#);
+    project.write_file(
+        "marker.cjs",
+        "console.log(`marker=${process.env.LPM_PERSONAL_OVERRIDES_MARKER ?? 'none'}`)",
+    );
+    let refused = lpm(&project)
+        .args([
+            "env",
+            "override",
+            "set",
+            "LPM_PERSONAL_OVERRIDES_MARKER=fixture-elsewhere",
+        ])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("LPM never passes a value for LPM_PERSONAL_OVERRIDES_MARKER"),
+        "{}",
+        stderr(&refused)
+    );
+    // As an earlier LPM CLI could have stored it.
+    seed(
+        &project,
+        &vault_id,
+        Some(OVERRIDES_MARKER),
+        Some(&overrides_record(
+            &vault_id,
+            "default",
+            r#""LPM_PERSONAL_OVERRIDES_MARKER":"fixture-elsewhere""#,
+            "",
+        )),
+    );
+
+    let output = lpm(&project)
+        .env_remove("LPM_PERSONAL_OVERRIDES_MARKER")
+        .args(["run", "marker", "--no-cache"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("marker=none"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        !stderr(&output).contains(&personal_overrides_here(1)),
+        "nothing it changed reached the script: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn neither_a_project_value_nor_a_schema_default_names_the_marker_variable() {
+    let (project, _) = project_with_team_value(r#"{"marker":"node marker.cjs"}"#);
+    project.write_file(
+        "marker.cjs",
+        "console.log(`marker=${process.env.LPM_PERSONAL_OVERRIDES_MARKER ?? 'none'}`)",
+    );
+    let stored = lpm(&project)
+        .args(["env", "set", "LPM_PERSONAL_OVERRIDES_MARKER=fixture-stored"])
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&stored).contains(
+            "LPM never passes a project's value for LPM_PERSONAL_OVERRIDES_MARKER to processes"
+        ),
+        "{}",
+        stderr(&stored)
+    );
+    extend_lpm_json(
+        &project,
+        serde_json::json!({"envSchema": {"vars": {
+            "LPM_PERSONAL_OVERRIDES_MARKER": {"default": "fixture-default"}
+        }}}),
+    );
+
+    let output = lpm(&project)
+        .env_remove("LPM_PERSONAL_OVERRIDES_MARKER")
+        .args(["run", "marker", "--no-cache"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("marker=none"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
 fn an_override_of_the_team_value_changes_nothing_and_goes_unannounced() {
     let (project, vault_id) = project_with_team_value(r#"{"show":"node show.cjs"}"#);
     seed(
@@ -409,6 +502,35 @@ fn a_marker_listing_missing_overrides_stops_runs() {
 }
 
 #[test]
+fn a_repair_that_can_t_report_its_change_to_overrides_changes_nothing() {
+    let (project, vault_id) = project_with_team_value(r#"{"show":"node show.cjs"}"#);
+    seed(&project, &vault_id, Some(OVERRIDES_MARKER), None);
+
+    let refused = lpm(&project)
+        .env("LPM_PERSONAL_OVERRIDES_MARKER", not_a_marker(&project))
+        .args(["env", "repair", "--yes", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(!refused.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&refused.stdout).expect("JSON");
+    assert_eq!(
+        json["error_code"], "personal_overrides_unreported",
+        "{json}"
+    );
+    let review = lpm(&project)
+        .env_remove("LPM_PERSONAL_OVERRIDES_MARKER")
+        .args(["env", "repair", "--json"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&review.stdout).expect("JSON");
+    assert_eq!(
+        json["problems"][0]["damage"], "missing record \"overrides\"",
+        "the damage is still there: {json}"
+    );
+}
+
+#[test]
 fn env_repair_reviews_then_repairs_a_damaged_feature() {
     let (project, vault_id) = project_with_team_value(r#"{"show":"node show.cjs"}"#);
     seed(&project, &vault_id, Some(OVERRIDES_MARKER), None);
@@ -709,7 +831,7 @@ fn check_reports_hidden_characters_in_a_personal_override_as_one() {
 
 // ─── lpm env override ─────────────────────────────────────────────────
 
-const ACTIVATION_NOTICE: &str = "LPM CLI 0.82.0 to 0.88.0 apply personal overrides but can share outputs built with them, through the remote task cache and `lpm env print --format=github-actions`, and an older LPM CLI runs this project with team values; use a later LPM CLI to run it on this computer";
+const ACTIVATION_NOTICE: &str = "LPM CLI releases 0.82.0 to 0.88.0 apply personal overrides but can share outputs built with them, through the remote task cache and `lpm env print --format=github-actions`; this build and later releases keep them on this computer, and an LPM CLI older than 0.82.0 runs this project with team values";
 
 fn shown(project: &TempProject, script: &str) -> String {
     let output = lpm(project).args(["run", script]).output().unwrap();
@@ -1282,6 +1404,25 @@ fn removing_or_clearing_without_overrides_or_values_removes_nothing_and_says_so(
 }
 
 #[test]
+fn an_unusable_vault_field_is_named_by_every_override_command() {
+    let project = TempProject::empty(r#"{"name":"bad-vault-field","version":"1.0.0"}"#);
+    project.write_file("lpm.json", r#"{"vault":"../outside"}"#);
+    for args in [
+        &["env", "override", "set", "API_URL=fixture-mine"][..],
+        &["env", "override", "unset", "API_URL"],
+        &["env", "override", "remove", "API_URL"],
+        &["env", "override", "list"],
+        &["env", "override", "clear", "--all", "--yes"],
+    ] {
+        let output = lpm(&project).args(args).output().unwrap();
+        assert!(!output.status.success(), "{args:?}: {}", stdout(&output));
+        let said = stderr(&output);
+        assert!(said.contains("path-traversal"), "{args:?}: {said}");
+        assert!(!said.contains("no env project"), "{args:?}: {said}");
+    }
+}
+
+#[test]
 fn a_key_named_twice_in_unset_or_remove_is_one_change() {
     let (project, _) = project_with_team_value("{}");
     lpm(&project)
@@ -1560,4 +1701,11 @@ fn a_failure_an_override_caused_never_shows_its_value() {
         assert!(text.contains("API_URL"), "{args:?}: {text}");
         assert!(!text.contains("fixture-not-a-url"), "{args:?}: {text}");
     }
+}
+
+/// A regular file where a marker would be, which no entry can be added to.
+fn not_a_marker(project: &TempProject) -> std::path::PathBuf {
+    let path = project.path().join("not-a-marker");
+    std::fs::write(&path, "").expect("a file where a marker would be");
+    path
 }

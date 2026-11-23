@@ -1226,19 +1226,24 @@ pub(crate) fn write_values_following_unlocked(
             recording,
         );
     }
-    let json = crate::selected_environment::serialize(environments)?;
-    let encrypted = zeroize::Zeroizing::new(
-        super::encrypt_with_store_unlocked(
-            directory,
-            vault_id,
-            &json,
-            &super::KeyringNativeDataKeyStore,
-        )?
-        .into_bytes(),
-    );
+    // History reads the values as they were before the new ones are built,
+    // and the plain text goes once it's encrypted, so neither copy of the
+    // new values is held while the old ones are.
     crate::history::scope::observe_before(recording, || {
         super::read_environments_with_digest(directory, vault_id).map(|(before, _)| before)
     });
+    let encrypted = {
+        let json = crate::selected_environment::serialize(environments)?;
+        zeroize::Zeroizing::new(
+            super::encrypt_with_store_unlocked(
+                directory,
+                vault_id,
+                &json,
+                &super::KeyringNativeDataKeyStore,
+            )?
+            .into_bytes(),
+        )
+    };
     let mutations = std::mem::take(&mut plan.mutations);
     let mut changes = Vec::with_capacity(mutations.len() + 2);
     changes.push(FileChange::ReplaceValues(encrypted));

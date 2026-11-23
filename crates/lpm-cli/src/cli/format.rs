@@ -1098,7 +1098,7 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             diagnostic_lines("This env project needs attention", Some(reason), error)
         }
         lpm_common::LpmError::PersonalOverridesUnreported(reason) => diagnostic_lines(
-            "Couldn't tell the lpm above this one what it uses",
+            "Couldn't report to the lpm that started this one",
             Some(reason),
             error,
         ),

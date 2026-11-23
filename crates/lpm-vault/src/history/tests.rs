@@ -506,6 +506,70 @@ mod api {
     }
 
     #[test]
+    fn a_rollback_that_can_t_report_its_override_change_changes_nothing() {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            let dir = home.join("project");
+            std::fs::create_dir_all(&dir).expect("project dir");
+            project_set(&dir, "A", "1");
+            let vault_id = crate::vault_id::read_vault_id(&dir).expect("vault id");
+            with_vault_transaction(|directory| {
+                let recording = crate::history::scope::begin(
+                    &vault_id,
+                    &Source::new(Action::RenameEnvironment),
+                );
+                crate::history::scope::renamed_environment(&recording, "default", "prod");
+                let renamed = std::collections::HashMap::from([(
+                    "prod".to_owned(),
+                    std::collections::HashMap::from([("A".to_owned(), "1".to_owned())]),
+                )]);
+                crate::write_all_environments_unlocked(
+                    directory, &vault_id, "project", "/project", &renamed, &recording,
+                )
+            })
+            .expect("renamed");
+            crate::overrides::change(
+                &dir,
+                &[crate::overrides::Edit::Set {
+                    environment: "prod".to_owned(),
+                    key: "A".to_owned(),
+                    value: zeroize::Zeroizing::new("mine".to_owned()),
+                }],
+            )
+            .expect("an override of prod");
+            take_outcomes();
+            let entries = ids(&dir);
+            let (_, plan) = crate::history::review_rollback(&dir, &hex::encode(entries[0]), |_| {
+                Ok(Target::Environment {
+                    environment: EnvironmentName::AtPoint("default".to_owned()),
+                    side: RelatedSide::After,
+                })
+            })
+            .expect("review");
+
+            let not_a_marker = home.join("not-a-marker");
+            std::fs::write(&not_a_marker, "").expect("a file where a marker would be");
+            let refused = crate::override_marker::reporting_to(vec![not_a_marker], || {
+                crate::history::commit_rollback(&dir, &plan, &Choices::default())
+            })
+            .expect_err("a change no lpm above can be told of");
+
+            assert!(
+                matches!(&refused, HistoryError::Storage(message)
+                    if crate::override_marker::describes(message)),
+                "{refused:?}"
+            );
+            let overrides = crate::overrides::read_all(&dir).expect("overrides");
+            assert_eq!(overrides.keys().collect::<Vec<_>>(), ["prod"]);
+            assert_eq!(
+                crate::try_get_all(&dir).map(|_| ()).ok(),
+                Some(()),
+                "the values are readable as they were"
+            );
+        });
+    }
+
+    #[test]
     fn a_rollback_whose_overrides_cannot_follow_leaves_the_values_as_they_were() {
         with_temp_vault_home(|home| {
             force_file_vault();

@@ -35,7 +35,7 @@ pub struct Change {
 /// Every environment's personal overrides of the env project at
 /// `project_dir`, by environment; empty when it has none or no env project.
 pub fn read_all(project_dir: &Path) -> Result<BTreeMap<String, PersonalOverrides>, String> {
-    let Some(vault_id) = crate::linked_vault_id(project_dir)? else {
+    let Some(vault_id) = crate::checked_linked_vault_id(project_dir)? else {
         return Ok(BTreeMap::new());
     };
     let overrides = in_overrides_lock(|directory| read_all_unlocked(directory, &vault_id))?;
@@ -48,7 +48,10 @@ fn reported(
     vault_id: &str,
     overrides: BTreeMap<String, PersonalOverrides>,
 ) -> Result<BTreeMap<String, PersonalOverrides>, String> {
-    crate::override_marker::report_read(vault_id)?;
+    crate::override_marker::report_access(crate::override_marker::Access::Overrides {
+        vault_id,
+        overrides: !overrides.is_empty(),
+    })?;
     Ok(overrides)
 }
 
@@ -58,7 +61,7 @@ fn reported_change(
     vault_id: &str,
     commit: impl FnOnce() -> Result<ChangePlan, String>,
 ) -> Result<Change, String> {
-    crate::override_marker::report_change(vault_id)?;
+    crate::override_marker::report_access(crate::override_marker::Access::Change { vault_id })?;
     let plan = commit()?;
     Ok(Change {
         effects: plan.effects,
@@ -99,7 +102,7 @@ pub struct Reviewed {
 /// `project_dir`, for removals reviewed against them (see
 /// [`remove_reviewed`]); `None` without an env project.
 pub fn review_all(project_dir: &Path) -> Result<Option<Reviewed>, String> {
-    let Some(vault_id) = crate::linked_vault_id(project_dir)? else {
+    let Some(vault_id) = crate::checked_linked_vault_id(project_dir)? else {
         return Ok(None);
     };
     let overrides = in_overrides_lock(|directory| read_all_unlocked(directory, &vault_id))?;
@@ -229,7 +232,7 @@ pub fn change_checked(
 /// overrides, which take their approval and live beside them; without
 /// either, edits that give no key an override remove nothing and say so.
 pub fn change(project_dir: &Path, edits: &[Edit]) -> Result<Change, String> {
-    let Some(vault_id) = crate::linked_vault_id(project_dir)? else {
+    let Some(vault_id) = crate::checked_linked_vault_id(project_dir)? else {
         return match effects_without_overrides(edits).map_err(|error| error.to_string())? {
             Some(effects) => Ok(Change {
                 effects,
@@ -274,7 +277,7 @@ pub fn check_before_values(
         })
         .collect();
     check_edits(&edits)?;
-    let Some(vault_id) = crate::linked_vault_id(project_dir)? else {
+    let Some(vault_id) = crate::checked_linked_vault_id(project_dir)? else {
         return Err(NO_PROJECT.to_owned());
     };
     crate::with_project_vault_transaction(|directory| {

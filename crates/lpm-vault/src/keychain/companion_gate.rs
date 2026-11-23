@@ -30,6 +30,27 @@ impl<S: ProjectStorage> LifecycleStore for KeychainCompanion<'_, S> {
 }
 
 impl<S: ProjectStorage> CompanionBackend for KeychainCompanion<'_, S> {
+    /// The personal overrides record is read as every reader of it reads
+    /// it: never with less approval than the values demand.
+    fn read_checked(
+        &mut self,
+        account: &CompanionAccount,
+    ) -> Result<crate::companion::Checked, String> {
+        use crate::companion::Checked;
+        let bytes = match account {
+            CompanionAccount::Record {
+                kind,
+                vault_id,
+                part: None,
+            } if kind == OVERRIDES_KIND => {
+                let protected = values_demand_approval(self.0, vault_id)?.unwrap_or(false);
+                read_overrides_record(self.0, vault_id, protected)?
+            }
+            _ => self.read(account)?.map(zeroize::Zeroizing::new),
+        };
+        Ok(bytes.map_or(Checked::Absent, Checked::Present))
+    }
+
     fn inventory(&mut self, vault_id: &str) -> Result<Vec<CompanionAccount>, String> {
         let encoded = lpm_env_companion::account::encode_vault_id(vault_id);
         Ok(self

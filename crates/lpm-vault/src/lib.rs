@@ -159,6 +159,10 @@ pub fn repair_companion_data(
     let Some(vault_id) = linked_vault_id(project_dir)? else {
         return Err("this directory has no env project".to_owned());
     };
+    // A repair can remove the project's overrides.
+    override_marker::report_access(override_marker::Access::Change {
+        vault_id: &vault_id,
+    })?;
     #[cfg(target_os = "macos")]
     if !force_file_vault_backend() {
         return keychain::repair_companion_data(&vault_id, reviewed);
@@ -301,8 +305,7 @@ impl CheckedValues {
 /// env project yet, which the write creates. [`set_checked`] writes to the
 /// project it checked.
 pub fn check_values_writable(project_dir: &Path) -> Result<CheckedValues, String> {
-    vault_id::check_vault_field(project_dir)?;
-    let vault_id = linked_vault_id(project_dir)?;
+    let vault_id = checked_linked_vault_id(project_dir)?;
     if let Some(vault_id) = &vault_id {
         with_project_vault_transaction(|directory| {
             authorize_companion(directory, vault_id, companion::gate::Operation::Write)
@@ -371,9 +374,22 @@ fn with_link_transaction<T>(
 /// The vault ID `project_dir`'s lpm.json names, when this machine lets the
 /// folder use that vault. See [`links`].
 fn linked_vault_id(project_dir: &Path) -> Result<Option<String>, String> {
-    let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
-        return Ok(None);
-    };
+    vault_id::read_vault_id(project_dir)
+        .map(|vault_id| link_checked(project_dir, vault_id))
+        .transpose()
+}
+
+/// [`linked_vault_id`], refusing a `vault` field no write could use (see
+/// [`vault_id::checked_vault_id`]), for a command that changes or lists what
+/// the project holds.
+pub(crate) fn checked_linked_vault_id(project_dir: &Path) -> Result<Option<String>, String> {
+    vault_id::checked_vault_id(project_dir)?
+        .map(|vault_id| link_checked(project_dir, vault_id))
+        .transpose()
+}
+
+/// `vault_id`, once this machine lets `project_dir` use it.
+fn link_checked(project_dir: &Path, vault_id: String) -> Result<String, String> {
     if !is_listed(&vault_id, &links::link_folder_path(project_dir)) {
         let listed =
             with_link_transaction(|directory| links::require(directory, project_dir, &vault_id))?;
@@ -381,7 +397,7 @@ fn linked_vault_id(project_dir: &Path) -> Result<Option<String>, String> {
             remember_listed(&vault_id, folder);
         }
     }
-    Ok(Some(vault_id))
+    Ok(vault_id)
 }
 
 /// The vault ID `project_dir` stores values under, created when lpm.json
@@ -690,7 +706,11 @@ pub fn try_get_run_environment_for_vault_id(
             overrides_identity,
         })
     })?;
-    override_marker::report_read(vault_id)?;
+    override_marker::report_access(override_marker::Access::Environment {
+        vault_id,
+        environment,
+        overrides: read.overrides_identity.is_some(),
+    })?;
     Ok(read)
 }
 
@@ -765,7 +785,10 @@ pub fn try_get_all_run_environments_for_vault_id(
     let (values, overrides, overrides_identity) = with_project_vault_transaction(|directory| {
         read_all_run_environments_unlocked(directory, vault_id)
     })?;
-    override_marker::report_read(vault_id)?;
+    override_marker::report_access(override_marker::Access::Environments {
+        vault_id,
+        overrides: overrides_identity.is_some(),
+    })?;
     Ok(AllRunEnvironments {
         values: values.unwrap_or_default(),
         overrides: overrides.into_iter().collect(),
@@ -1777,6 +1800,8 @@ fn write_all_environments_following_unlocked(
             recording,
         );
     }
+    // The overrides of an environment it renames or removes move or go.
+    override_marker::report_access(override_marker::Access::Change { vault_id })?;
     let edits = [companion::overrides::change::Edit::EnvironmentsChanged { renamed, removed }];
     if force_file_vault_backend() {
         return fallback::companion::write_values_following_unlocked(

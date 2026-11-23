@@ -96,7 +96,9 @@ fn marker_account(vault_id: &str) -> CompanionAccount {
 /// Review `vault_id`'s companion data as the engine judges it, after its
 /// interrupted steps were finished. `access` is why the store found the
 /// project's access damaged, if it did, and `unfinished` why its interrupted
-/// step can never be finished, if it can't; its records aren't read then.
+/// step can never be finished, if it can't; its records aren't read then,
+/// since the approval that protects them can't be told, or what they hold
+/// can't be trusted.
 pub(crate) fn review(
     backend: &mut impl CompanionBackend,
     vault_id: &str,
@@ -106,9 +108,9 @@ pub(crate) fn review(
     let marker = backend.read(&marker_account(vault_id))?;
     let inventory = backend.inventory(vault_id)?;
     let mut unreadable_overrides = None;
-    let overrides = match unfinished {
-        Some(_) => None,
-        None => Some(
+    let overrides = match (unfinished, access) {
+        (Some(_), _) | (_, Some(_)) => None,
+        (None, None) => Some(
             match backend.read_checked(&CompanionAccount::Record {
                 kind: OVERRIDES_KIND.to_owned(),
                 vault_id: vault_id.to_owned(),

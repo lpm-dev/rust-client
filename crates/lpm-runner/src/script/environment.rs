@@ -79,6 +79,9 @@ pub(crate) struct LoadedEnv {
     /// The canonical environment name (e.g., "development", "production").
     /// `None` if no env was resolved (just .env + .env.local).
     pub(crate) env_name: Option<String>,
+    /// The environment the vault was read for, `None` for `default` without
+    /// a fallback.
+    vault_environment: Option<String>,
     /// The alias that resolved to this env (e.g., "dev" → "development").
     alias: Option<String>,
     /// How the env was determined.
@@ -211,6 +214,7 @@ pub(crate) fn resolve_and_load_env_with_schema_validation(
     Ok(LoadedEnv {
         layers,
         env_name: env_name.map(str::to_string),
+        vault_environment: load_mode.map(str::to_owned),
         alias: resolved.and_then(|env| env.alias),
         source,
     })
@@ -252,6 +256,9 @@ pub struct ScriptChildEnv {
     pub personal_overrides: usize,
     /// See [`lpm_vault::RunEnvironment::overrides_identity`].
     pub project_overrides: Option<lpm_vault::OverridesIdentity>,
+    /// The environment whose values the vault gave, `default` when none
+    /// was resolved.
+    pub vault_environment: String,
 }
 
 /// Load the validated final script environment for task-cache fingerprinting.
@@ -301,6 +308,10 @@ pub fn load_script_child_env_with_config(
         vars: vars.into_vars(),
         personal_overrides,
         project_overrides,
+        vault_environment: loaded
+            .vault_environment
+            .take()
+            .unwrap_or_else(|| lpm_env::DEFAULT_ENVIRONMENT.to_owned()),
     })
 }
 

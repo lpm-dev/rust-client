@@ -371,13 +371,20 @@ impl ChildEnv {
             remove_project_env(&mut self.vars, &key);
         }
         remove_dangerous_env_vars(&mut self.vars, "child env");
-        self.validated.reserve(trusted.len() + 1);
+        self.validated.reserve(trusted.len() + 2);
         for (key, value) in trusted {
             self.insert_runtime(key.clone(), value.clone());
             self.validated.push(key.clone());
         }
         self.insert_runtime("PATH".into(), path.into());
         self.validated.push("PATH".into());
+        // Where an lpm the child starts reports what it uses, which only LPM
+        // sets, like PATH, after the names no project may set are gone.
+        if let Some(marker) = crate::override_marker::marker() {
+            let name = crate::override_marker::MARKER_ENV.to_owned();
+            self.insert_runtime(name.clone(), marker);
+            self.validated.push(name);
+        }
         let verdict = self.evaluate(validator, context)?;
         validation_result(verdict)
     }
@@ -543,9 +550,6 @@ fn apply_layer_four(
         Vec::new()
     };
     apply_personal_overrides(&mut vars, overrides);
-    // Where a nested lpm reports overrides is lpm's alone to say; a
-    // project's value could send the report where no lpm looks.
-    remove_override_marker(&mut vars);
     ChildEnv {
         vars,
         overrides: Arc::clone(overrides),
@@ -554,15 +558,6 @@ fn apply_layer_four(
         origins,
         applied_names,
         validated: Vec::new(),
-    }
-}
-
-fn remove_override_marker(vars: &mut HashMap<String, String>) {
-    let marker = crate::override_marker::MARKER_ENV;
-    if cfg!(windows) {
-        vars.retain(|name, _| !name.eq_ignore_ascii_case(marker));
-    } else {
-        vars.remove(marker);
     }
 }
 

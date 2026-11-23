@@ -309,9 +309,10 @@ fn report_storage(change: &lpm_vault::overrides::Change) {
     if change.activated {
         let (first, last) = RELEASES_SHARING_OVERRIDES;
         output::warn_line(install_ui::terminal_line!(
-            "LPM CLI {} to {} apply personal overrides but can share outputs built with them, through the remote task cache and `lpm env print --format=github-actions`, and an older LPM CLI runs this project with team values; use a later LPM CLI to run it on this computer",
+            "LPM CLI releases {} to {} apply personal overrides but can share outputs built with them, through the remote task cache and `lpm env print --format=github-actions`; this build and later releases keep them on this computer, and an LPM CLI older than {} runs this project with team values",
             first,
             last,
+            first,
         ));
     }
     if change.over_admission_target {
