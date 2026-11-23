@@ -1245,6 +1245,79 @@ fn a_planted_state_leaves_no_claim_of_the_state_before() {
     );
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn planting_approved_values_gives_the_values_enforced_approval_and_keeps_the_newer_data() {
+    use crate::companion::debug_states::{DebugCompanionState, PlantedClaim};
+    let mut storage = storage_with_values();
+    let no_claim = |_: &mut MemoryProjectStorage, account: &str, _: PlantedClaim| {
+        Err(format!("no claim is planted, yet one was on {account}"))
+    };
+    plant_debug_companion_state_with_storage(
+        &mut storage,
+        VAULT,
+        &DebugCompanionState::Overrides {
+            environment: "default".to_owned(),
+            set: vec![("API_URL".to_owned(), "fixture-mine".to_owned())],
+            unset: Vec::new(),
+        },
+        no_claim,
+    )
+    .expect("plant overrides");
+    let newer_data = |storage: &MemoryProjectStorage| {
+        let mut newer: Vec<(String, Vec<u8>)> = storage
+            .values
+            .keys()
+            .filter(|account| account.starts_with("__vault_"))
+            .map(|account| {
+                let value = storage.values.get_bytes(account).expect("a listed item");
+                (account.clone(), value.to_vec())
+            })
+            .collect();
+        newer.sort_unstable();
+        newer
+    };
+    let before = newer_data(&storage);
+
+    let planted = plant_debug_companion_state_with_storage(
+        &mut storage,
+        VAULT,
+        &DebugCompanionState::ApprovedValues,
+        no_claim,
+    )
+    .expect("plant approved values");
+    assert!(planted.contains("CLI approval"), "{planted}");
+    assert!(
+        storage.protected.contains(VAULT),
+        "the Keychain enforces it"
+    );
+    assert_eq!(
+        storage.claims.get(VAULT),
+        Some(&ClaimedAccess::RequireApproval)
+    );
+    assert_eq!(
+        newer_data(&storage),
+        before,
+        "the newer data stays as it was"
+    );
+
+    assert_eq!(
+        plant_debug_companion_state_with_storage(
+            &mut storage,
+            VAULT,
+            &DebugCompanionState::ApprovedValues,
+            no_claim,
+        )
+        .expect("plant again"),
+        "This project's values already need CLI approval."
+    );
+    assert_eq!(
+        storage.approvals_required,
+        [VAULT],
+        "approval is given once"
+    );
+}
+
 #[test]
 fn a_restore_that_can_never_finish_is_damage_only_a_discard_repairs() {
     let mut storage = storage_with_values();

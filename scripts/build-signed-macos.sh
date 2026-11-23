@@ -13,6 +13,7 @@ EXPECTED_APPLICATION_ID="$EXPECTED_TEAM_ID.dev.lpm.cli"
 EXPECTED_PROFILE_ACCESS_GROUP="$EXPECTED_TEAM_ID.*"
 PROFILE="debug"
 TARGET_TRIPLE=""
+VAULT_TESTS=0
 RUN_ARGS=()
 
 if [ "$(uname -s)" != "Darwin" ]; then
@@ -24,6 +25,13 @@ while [ "$#" -gt 0 ]; do
 	case "$1" in
 	--release)
 		PROFILE="release"
+		shift
+		;;
+	--vault-tests)
+		# Sign lpm-vault's unit tests in place of the CLI, so the tests that
+		# need the shared Keychain group can run; arguments after -- go to
+		# the test harness.
+		VAULT_TESTS=1
 		shift
 		;;
 	--target)
@@ -97,6 +105,9 @@ fi
 
 TARGET_ROOT="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 BUILD_ARGS=(build --locked -p lpm-cli --bin lpm-rs)
+if [ "$VAULT_TESTS" = 1 ]; then
+	BUILD_ARGS=(test --locked -p lpm-vault --lib --no-run --message-format=json)
+fi
 if [ "$PROFILE" = "release" ]; then
 	BUILD_ARGS+=(--release)
 fi
@@ -104,15 +115,30 @@ if [ -n "$TARGET_TRIPLE" ]; then
 	BUILD_ARGS+=(--target "$TARGET_TRIPLE")
 fi
 
-cd "$REPO_ROOT"
-cargo "${BUILD_ARGS[@]}"
-
 TARGET_PROFILE_ROOT="$TARGET_ROOT/$PROFILE"
 if [ -n "$TARGET_TRIPLE" ]; then
 	TARGET_PROFILE_ROOT="$TARGET_ROOT/$TARGET_TRIPLE/$PROFILE"
 fi
-BINARY="$TARGET_PROFILE_ROOT/lpm-rs"
-APP_BUNDLE="$TARGET_PROFILE_ROOT/LPM CLI.app"
+
+cd "$REPO_ROOT"
+if [ "$VAULT_TESTS" = 1 ]; then
+	BINARY="$(
+		cargo "${BUILD_ARGS[@]}" |
+			grep '"name":"lpm_vault"' |
+			grep '"test":true' |
+			sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' |
+			tail -n 1
+	)"
+	if [ -z "$BINARY" ]; then
+		echo "error: cargo built no lpm-vault test executable" >&2
+		exit 1
+	fi
+	APP_BUNDLE="$TARGET_PROFILE_ROOT/LPM CLI Tests.app"
+else
+	cargo "${BUILD_ARGS[@]}"
+	BINARY="$TARGET_PROFILE_ROOT/lpm-rs"
+	APP_BUNDLE="$TARGET_PROFILE_ROOT/LPM CLI.app"
+fi
 STAGING_DIR="$(mktemp -d "$TARGET_PROFILE_ROOT/.lpm-cli-app.XXXXXX")"
 "$APP_ASSEMBLER" "$BINARY" "$STAGING_DIR" "$PROVISIONING_PROFILE"
 
@@ -140,7 +166,11 @@ mv "$STAGING_DIR" "$APP_BUNDLE"
 STAGING_DIR=""
 
 SIGNED_BINARY="$APP_BUNDLE/Contents/MacOS/lpm-rs"
-echo "Signed LPM CLI: $SIGNED_BINARY"
+if [ "$VAULT_TESTS" = 1 ]; then
+	echo "Signed lpm-vault tests: $SIGNED_BINARY"
+else
+	echo "Signed LPM CLI: $SIGNED_BINARY"
+fi
 if [ "${#RUN_ARGS[@]}" -gt 0 ]; then
 	exec "$SIGNED_BINARY" "${RUN_ARGS[@]}"
 fi

@@ -2076,6 +2076,13 @@ fn plant_debug_companion_state_with_storage<S: ProjectStorage>(
     {
         return Err("turn this project's CLI approval off first".to_owned());
     }
+    if planting.approve_values {
+        if storage.claimed_access(vault_id)? == Some(ClaimedAccess::RequireApproval) {
+            return Ok("This project's values already need CLI approval.".to_owned());
+        }
+        storage.require_approval(vault_id, &[PROJECT_INDEX_MARKER_ACCOUNT])?;
+        return Ok(planting.description);
+    }
     let apply = |storage: &mut S, owner: &str, mutations: Vec<Mutation>| -> Result<(), String> {
         for mutation in mutations {
             match mutation {

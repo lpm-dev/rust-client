@@ -27,6 +27,9 @@ pub enum DebugCompanionState {
     UnlistedRecords,
     /// Personal overrides of a version this LPM doesn't support.
     NewerVersion,
+    /// Values that need CLI approval, as LPM Vault's approval switch leaves
+    /// them; the project's newer data stays as it is. Keychain only.
+    ApprovedValues,
     /// A feature this LPM doesn't support, which lets it read but not write.
     ReadOnly,
     /// A deletion of the project's newer data that a crash left unfinished.
@@ -79,6 +82,7 @@ impl DebugCompanionState {
             "invalid-marker" => Self::InvalidMarker,
             "unlisted-records" => Self::UnlistedRecords,
             "newer-version" => Self::NewerVersion,
+            "approved-values" => Self::ApprovedValues,
             "read-only" => Self::ReadOnly,
             "interrupted-deletion" => Self::InterruptedDeletion,
             "stuck-restore" => Self::StuckRestore,
@@ -101,6 +105,7 @@ impl DebugCompanionState {
         "invalid-marker",
         "unlisted-records",
         "newer-version",
+        "approved-values",
         "read-only",
         "interrupted-deletion",
         "stuck-restore",
@@ -114,7 +119,11 @@ impl DebugCompanionState {
     pub(crate) fn needs_keychain(&self) -> bool {
         matches!(
             self,
-            Self::StuckRestore | Self::ContradictoryRecord | Self::WeakValues | Self::Orphans
+            Self::StuckRestore
+                | Self::ContradictoryRecord
+                | Self::WeakValues
+                | Self::ApprovedValues
+                | Self::Orphans
         )
     }
 }
@@ -144,6 +153,8 @@ pub(crate) struct Planting {
     pub(crate) claims: Vec<(String, PlantedClaim)>,
     /// Another project's newer data, with the vault ID it's under.
     pub(crate) orphans: Option<(String, Vec<Mutation>)>,
+    /// Whether the project's values get CLI approval, past every other change.
+    pub(crate) approve_values: bool,
     /// What was planted, and what each client should show for it.
     pub(crate) description: String,
 }
@@ -162,6 +173,11 @@ pub(crate) fn planting(
     let mut planting = Planting::default();
     let overrides_entry = feature(OVERRIDES_VERSION, "refuse", &[OVERRIDES_KIND]);
     let (marker_bytes, records, description): (Option<Vec<u8>>, Records, String) = match state {
+        State::ApprovedValues => {
+            planting.approve_values = true;
+            planting.description = "Gave this project's values the CLI approval LPM Vault's approval switch gives them; its newer data stays as it was. lpm asks for approval before it reads them, once for each command, and newer data written from now on takes it too. LPM Vault shows the project as needing approval.".to_owned();
+            return planting;
+        }
         State::Clear => (
             None,
             Vec::new(),
@@ -545,7 +561,7 @@ mod tests {
     fn every_state_first_clears_what_the_project_had() {
         for name in DebugCompanionState::NAMES
             .iter()
-            .filter(|name| **name != "orphans")
+            .filter(|name| !["orphans", "approved-values"].contains(name))
         {
             let planting = planted(named(name));
             assert!(
@@ -556,6 +572,16 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn approving_values_changes_none_of_the_newer_data() {
+        let planting = planted(DebugCompanionState::ApprovedValues);
+        assert!(planting.approve_values);
+        assert!(planting.one_transaction().is_empty());
+        assert!(planting.claims.is_empty());
+        assert!(planting.orphans.is_none());
+        assert!(DebugCompanionState::ApprovedValues.needs_keychain());
     }
 
     #[test]

@@ -58,6 +58,27 @@ identity from Apple team `823S8YKMRW` is configured with that profile.
 Contributors without that signing identity can use the debug-only file backend
 with `LPM_FORCE_FILE_VAULT=1`. It is isolated from the production Keychain.
 
+## Tests that need the shared Keychain
+
+A few `lpm-vault` tests read and write the real Keychain through the shared
+access group, so they're ignored unless a signed bundle runs them. With the
+same profile set, `--vault-tests` signs `lpm-vault`'s unit tests in place of
+the CLI and passes everything after `--` to the test harness:
+
+```bash
+LPM_RUN_KEYCHAIN_TESTS=1 ./scripts/build-signed-macos.sh --vault-tests -- native_ --ignored
+```
+
+The first override test also needs an empty LPM home, so it touches none of
+this Mac's env projects, and a person to approve the prompt it raises and
+count them:
+
+```bash
+LPM_HOME="$(mktemp -d)" LPM_RUN_KEYCHAIN_TESTS=1 ./scripts/build-signed-macos.sh --vault-tests -- \
+    keychain::tests::overrides::a_first_override_under_values_that_need_approval_asks_once_on_this_macs_keychain \
+    --ignored --exact --nocapture
+```
+
 ## Icon asset
 
 `assets/lpm-icon.svg` is the canonical blue CLI icon. Regenerate and validate

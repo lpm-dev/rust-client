@@ -273,8 +273,8 @@ pub(super) enum LocalAction {
     #[command(name = "debug-companion", hide = true)]
     DebugCompanion {
         /// overrides, missing-record, invalid-marker, unlisted-records,
-        /// newer-version, read-only, interrupted-deletion, stuck-restore,
-        /// contradictory-record, weak-values, orphans or clear.
+        /// newer-version, approved-values, read-only, interrupted-deletion,
+        /// stuck-restore, contradictory-record, weak-values, orphans or clear.
         state: String,
         #[command(flatten)]
         environment: Environment,

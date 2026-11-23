@@ -849,3 +849,71 @@ fn a_change_that_fails_before_its_journal_commits_leaves_the_overrides_as_they_w
     assert_eq!(read["default"].set["API_URL"], "mine");
     assert!(!storage.values.contains_key(TRANSACTION_MARKER_ACCOUNT));
 }
+
+/// A first override under values that need approval, on this Mac's own
+/// Keychain. How many times macOS asks is what a person counts, which no
+/// memory store shows. Run it with an empty LPM home, so it touches none of
+/// this Mac's env projects:
+///
+/// ```text
+/// LPM_HOME="$(mktemp -d)" LPM_RUN_KEYCHAIN_TESTS=1 scripts/build-signed-macos.sh --vault-tests -- \
+///     keychain::tests::overrides::a_first_override_under_values_that_need_approval_asks_once_on_this_macs_keychain \
+///     --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "requires a signed macOS test bundle with the shared Keychain entitlement, an empty LPM_HOME and a person to approve"]
+fn a_first_override_under_values_that_need_approval_asks_once_on_this_macs_keychain() {
+    assert_eq!(std::env::var("LPM_RUN_KEYCHAIN_TESTS").as_deref(), Ok("1"));
+    assert_ne!(
+        service(),
+        SERVICE,
+        "set LPM_HOME to an empty folder, so the test touches none of this Mac's env projects"
+    );
+    struct RemoveEverything;
+    impl Drop for RemoveEverything {
+        fn drop(&mut self) {
+            let service = service();
+            if let Ok(accounts) = crate::macos_keychain::accounts_with_access(&service) {
+                for (account, _) in accounts {
+                    let _ = crate::macos_keychain::delete(&service, &account);
+                }
+            }
+        }
+    }
+    let _cleanup = RemoveEverything;
+    let mut storage = KeychainProjectStorage;
+    save_vault_data_with_storage(&mut storage, VAULT, "Project", "/project", VALUES)
+        .expect("create the project");
+    storage
+        .require_approval(VAULT, &[PROJECT_INDEX_MARKER_ACCOUNT])
+        .expect("the values need approval");
+
+    eprintln!(
+        "\nmacOS asks to approve the first override now. Approve every prompt and count them: one is expected.\n"
+    );
+    let planned = {
+        let _scope = crate::companion::LockScope::enter();
+        crate::macos_keychain::prompting_for_personal_overrides(|| {
+            recover_project_transaction(&mut storage)?;
+            crate::keychain::overrides::change_with_storage(
+                &mut storage,
+                VAULT,
+                &[set("API_URL", "fixture-mine")],
+                crate::overrides::Expect::Nothing,
+            )
+        })
+    }
+    .expect("set the first override");
+    assert!(planned.activated);
+    assert_eq!(
+        storage.probe(&overrides_account(), &[PROJECT_INDEX_MARKER_ACCOUNT]),
+        ProbeOutcome::Protected,
+        "the record takes the values' approval"
+    );
+    let read = {
+        let _scope = crate::companion::LockScope::enter();
+        crate::keychain::overrides::read_all_with_storage(&mut storage, VAULT)
+    }
+    .expect("read the overrides back without another approval");
+    assert_eq!(read.0["default"].set["API_URL"], "fixture-mine");
+}
