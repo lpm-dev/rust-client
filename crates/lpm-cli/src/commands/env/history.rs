@@ -92,10 +92,11 @@ pub(super) fn with_history_field(mut json: serde_json::Value) -> serde_json::Val
 /// The CLI's error for `error`, which its error handler prints: the shared
 /// envelope with the `history.*` code in JSON, "Local history error" in text.
 fn fail(error: &HistoryError) -> LpmError {
-    if let HistoryError::Storage(message) = error
-        && lpm_vault::override_marker::describes(message)
-    {
-        return LpmError::PersonalOverridesUnreported(message.clone());
+    if let HistoryError::Storage(message) = error {
+        let classified = lpm_runner::dotenv::vault_error(LpmError::Env)(message.clone());
+        if !matches!(classified, LpmError::Env(_)) {
+            return classified;
+        }
     }
     LpmError::History {
         code: error.qualified_code(),

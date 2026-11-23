@@ -585,6 +585,8 @@ fn an_interrupted_override_removal_is_finished_only_by_an_lpm_that_can_report_it
         &["env", "repair", "--json"][..],
         &["env", "set", "OTHER=1", "--json"],
         &["env", "override", "list", "--json"],
+        &["env", "copy", "default", "staging", "--json"],
+        &["env", "history", "--json"],
     ] {
         let refused = lpm(&project)
             .env("LPM_PERSONAL_OVERRIDES_MARKER", not_a_marker(&project))
@@ -691,6 +693,38 @@ fn an_unsupported_overrides_version_refuses_runs_and_writes() {
         .unwrap();
     assert!(!set.status.success());
     assert!(stderr(&set).contains("lpm self-update"), "{}", stderr(&set));
+}
+
+#[test]
+fn every_command_gives_a_refusal_its_own_error_code() {
+    let (project, vault_id) = project_with_team_value(r#"{"show":"node show.cjs"}"#);
+    let newer = OVERRIDES_MARKER.replace(r#""version":1"#, r#""version":2"#);
+    seed(&project, &vault_id, Some(&newer), None);
+
+    for args in [
+        &["env", "set", "OTHER=1", "--json"][..],
+        &["env", "copy", "default", "staging", "--json"],
+        &["env", "history", "--json"],
+        &["env", "override", "list", "--json"],
+    ] {
+        let refused = lpm(&project).args(args).output().unwrap();
+        assert!(!refused.status.success(), "{args:?}");
+        let json: serde_json::Value = serde_json::from_slice(&refused.stdout)
+            .unwrap_or_else(|_| panic!("{args:?}: {}", stdout(&refused)));
+        assert_eq!(
+            json["error_code"], "env_project_refused",
+            "{args:?}: {json}"
+        );
+    }
+    let copy = lpm(&project)
+        .args(["env", "copy", "default", "staging"])
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&copy).contains("This env project needs attention"),
+        "{}",
+        stderr(&copy)
+    );
 }
 
 #[test]

@@ -110,7 +110,7 @@ fn perform_init_actions(
         snapshot,
         &lpm_vault::history::Source::new(lpm_vault::history::Action::InitFromFiles),
     )
-    .map_err(LpmError::Env)
+    .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))
     .map(|results| {
         results
             .into_iter()
@@ -701,7 +701,7 @@ pub(super) fn vars_copy(
         overwrite,
         &lpm_vault::history::Source::new(lpm_vault::history::Action::CopyEnvironment),
     )
-    .map_err(LpmError::Env)?;
+    .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
     let Some(copy) = copy else {
         return Err(LpmError::Env(format!(
             "no secrets in source environment \"{}\"",

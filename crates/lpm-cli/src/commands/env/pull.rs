@@ -140,7 +140,7 @@ pub(super) async fn vars_pull(
                 principal_id: &pulled.principal_id,
             },
         )
-        .map_err(LpmError::Env)?;
+        .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
         let committed_environments = match committed {
             lpm_vault::RemoteEnvironmentCommit::Committed(environments) => environments,
             lpm_vault::RemoteEnvironmentCommit::Conflict(_) => {
@@ -242,7 +242,7 @@ pub(super) async fn vars_pull(
             principal_id: &pulled.principal_id,
         },
     )
-    .map_err(LpmError::Env)?;
+    .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
     let committed_environments = match committed {
         lpm_vault::RemoteEnvironmentCommit::Committed(environments) => environments,
         lpm_vault::RemoteEnvironmentCommit::Conflict(_) => {
