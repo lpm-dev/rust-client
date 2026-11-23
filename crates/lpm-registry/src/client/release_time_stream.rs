@@ -222,6 +222,35 @@ impl ReleaseTimeStreamParser {
     }
 
     #[inline]
+    fn find_quote_or_backslash(bytes: &[u8]) -> Option<usize> {
+        const LO: u64 = 0x0101_0101_0101_0101;
+        const HI: u64 = 0x8080_8080_8080_8080;
+        const QUOTE: u64 = 0x2222_2222_2222_2222;
+        const BACKSLASH: u64 = 0x5c5c_5c5c_5c5c_5c5c;
+
+        let mut i = 0;
+        let len = bytes.len();
+        while i + 8 <= len {
+            let word = u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
+            let q = word ^ QUOTE;
+            let b = word ^ BACKSLASH;
+            let mask = (q.wrapping_sub(LO) & !q & HI) | (b.wrapping_sub(LO) & !b & HI);
+            if mask != 0 {
+                #[cfg(target_endian = "little")]
+                let offset = (mask.trailing_zeros() / 8) as usize;
+                #[cfg(target_endian = "big")]
+                let offset = (mask.leading_zeros() / 8) as usize;
+                return Some(i + offset);
+            }
+            i += 8;
+        }
+        bytes[i..]
+            .iter()
+            .position(|&b| b == b'"' || b == b'\\')
+            .map(|rel| i + rel)
+    }
+
+    #[inline]
     fn is_ws(b: u8) -> bool {
         matches!(b, b' ' | b'\t' | b'\r' | b'\n')
     }
@@ -246,7 +275,7 @@ impl ReleaseTimeStreamParser {
                             i += 1;
                             continue;
                         }
-                        if let Some(rel) = bytes[i..].iter().position(|&b| b == b'"' || b == b'\\')
+                        if let Some(rel) = Self::find_quote_or_backslash(&bytes[i..])
                         {
                             i += rel;
                             if bytes[i] == b'\\' {
@@ -279,8 +308,7 @@ impl ReleaseTimeStreamParser {
                                 i += 1;
                                 continue;
                             }
-                            if let Some(rel) =
-                                bytes[i..].iter().position(|&b| b == b'"' || b == b'\\')
+                            if let Some(rel) = Self::find_quote_or_backslash(&bytes[i..])
                             {
                                 i += rel;
                                 if bytes[i] == b'\\' {
@@ -485,7 +513,9 @@ impl ReleaseTimeStreamParser {
                     let slice = &bytes[start..i];
                     match ctx {
                         KeyContext::Versions => {
-                            if self.version_key_buf.len() + slice.len() > MAX_NAME_CAPTURE_BYTES {
+                            if self.version_key_buf.len() + slice.len() + 1
+                                > MAX_NAME_CAPTURE_BYTES
+                            {
                                 return Err("version key exceeds length cap".to_string());
                             }
                             self.version_key_buf.extend_from_slice(slice);
@@ -594,6 +624,7 @@ impl ReleaseTimeStreamParser {
                                     self.state = State::VersionsExpectKeyOrEnd;
                                 }
                                 b'n' => {
+                                    self.versions = None;
                                     self.state = State::SkipNull {
                                         remaining: 3,
                                         ret: ReturnLevel::TopAfterValue,
@@ -1190,6 +1221,13 @@ mod tests {
         let parsed = parse_chunked(no_platform_versions, 3).unwrap();
         assert!(parsed.versions.is_some());
         assert!(parsed.versions.unwrap().is_empty());
+
+        let duplicate_null_versions = br#"{"name":"a","versions":{"1.0.0":{"os":["linux"]}},"versions":null,"time":{"1.0.0":"2025-01-01T00:00:00.000Z"}}"#;
+        let parsed = parse_chunked(duplicate_null_versions, 7).unwrap();
+        assert!(
+            parsed.versions.is_none(),
+            "later versions:null must clear earlier versions map"
+        );
     }
 
     #[test]

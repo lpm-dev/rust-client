@@ -1734,6 +1734,99 @@ async fn worker_release_time_fallback_reuses_direct_cache() {
 }
 
 #[tokio::test]
+async fn fresh_release_time_cache_is_bypassed_when_expected_modified_advances() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+
+    let npm_name = "skewed-rt";
+    let t0 = "2026-11-20T00:00:00.000Z";
+    let t1 = "2026-11-22T12:00:00.000Z";
+    Mock::given(method("GET"))
+        .and(path("/skewed-rt"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": npm_name,
+            "time": {
+                "modified": t0,
+                "1.0.0": "2025-01-01T00:00:00.000Z"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let first = client
+        .get_npm_release_times_routed_full_for_modified(
+            npm_name,
+            crate::UpstreamRoute::NpmDirect,
+            Some(t0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.time.get("modified").map(String::as_str), Some(t0));
+
+    // Even while the T0 entry is still fresh in both memory and disk cache,
+    // advancing expected_modified to T1 must bypass the stale T0 cache and fetch T1.
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/skewed-rt"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": npm_name,
+            "time": {
+                "modified": t1,
+                "1.0.0": "2025-01-01T00:00:00.000Z",
+                "2.0.0": t1
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let second = client
+        .get_npm_release_times_routed_full_for_modified(
+            npm_name,
+            crate::UpstreamRoute::NpmDirect,
+            Some(t1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.time.get("2.0.0").map(String::as_str), Some(t1));
+}
+
+#[tokio::test]
+async fn direct_full_release_time_response_rejects_omitted_package_name() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let client = RegistryClient::new().with_npm_registry_url(server.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/missing-name-pkg"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let err = client
+        .get_npm_release_times_routed_full("missing-name-pkg", crate::UpstreamRoute::NpmDirect)
+        .await
+        .expect_err("full packument without top-level name must be rejected");
+    assert!(
+        err.to_string().contains("<missing>"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
 async fn direct_npm_full_refetch_ignores_fresh_cache_and_overwrites_it() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

@@ -268,6 +268,7 @@ fn http_clients_eager_hit_overrides_default() {
         tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
         per_origin_identity_certs: HashMap::new(),
         next_request_lane: std::sync::atomic::AtomicUsize::new(0),
+        next_policy_metadata_lane: std::sync::atomic::AtomicUsize::new(0),
     });
     let mut client = RegistryClient::new();
     client.http = http;
@@ -430,6 +431,7 @@ async fn manual_redirect_dispatch_reselects_the_client_for_each_origin() {
         tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
         per_origin_identity_certs: HashMap::new(),
         next_request_lane: std::sync::atomic::AtomicUsize::new(0),
+        next_policy_metadata_lane: std::sync::atomic::AtomicUsize::new(0),
     };
     let request = reqwest::Request::new(
         reqwest::Method::GET,
@@ -511,6 +513,7 @@ async fn retry_transport_reselects_origin_specific_clients_across_redirects() {
         tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
         per_origin_identity_certs: HashMap::new(),
         next_request_lane: std::sync::atomic::AtomicUsize::new(0),
+        next_policy_metadata_lane: std::sync::atomic::AtomicUsize::new(0),
     });
     let mut client = RegistryClient::new();
     client.http = http;
@@ -552,6 +555,7 @@ fn http_clients_eager_portless_scope_excludes_explicit_non_default_ports() {
         tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
         per_origin_identity_certs: HashMap::new(),
         next_request_lane: std::sync::atomic::AtomicUsize::new(0),
+        next_policy_metadata_lane: std::sync::atomic::AtomicUsize::new(0),
     });
     let mut client = RegistryClient::new();
     client.http = http;
@@ -606,6 +610,7 @@ async fn http_clients_lazy_builds_and_memoizes() {
         tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
         per_origin_identity_certs: HashMap::new(),
         next_request_lane: std::sync::atomic::AtomicUsize::new(0),
+        next_policy_metadata_lane: std::sync::atomic::AtomicUsize::new(0),
     });
     // First call must build + insert.
     let c1 = http.for_url("https://lazy.internal/pkg").await.expect("ok");
@@ -660,6 +665,7 @@ async fn unrelated_origins_bypass_a_busy_lazy_tls_builder() {
         tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
         per_origin_identity_certs: HashMap::new(),
         next_request_lane: std::sync::atomic::AtomicUsize::new(0),
+        next_policy_metadata_lane: std::sync::atomic::AtomicUsize::new(0),
     });
     let blocked_clients = Arc::clone(&clients);
     let blocked_origin = configured_origin.clone();
@@ -697,6 +703,7 @@ async fn http_clients_no_per_origin_tls_falls_through_to_default() {
         tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
         per_origin_identity_certs: HashMap::new(),
         next_request_lane: std::sync::atomic::AtomicUsize::new(0),
+        next_policy_metadata_lane: std::sync::atomic::AtomicUsize::new(0),
     });
     let _ = http
         .for_url("https://anywhere.example/foo")
@@ -745,6 +752,7 @@ async fn http_clients_per_origin_certfile_xor_is_fatal_at_build() {
         built_client_sets: std::sync::atomic::AtomicUsize::new(0),
         per_origin_identity_certs: lazy_identity_certs(&tls),
         next_request_lane: std::sync::atomic::AtomicUsize::new(0),
+        next_policy_metadata_lane: std::sync::atomic::AtomicUsize::new(0),
         tls_overrides: Arc::new(tls),
         passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
         global_identity: None,
@@ -801,6 +809,7 @@ async fn http_clients_unreached_half_config_does_not_break_unrelated_lookup() {
         built_client_sets: std::sync::atomic::AtomicUsize::new(0),
         per_origin_identity_certs: lazy_identity_certs(&tls),
         next_request_lane: std::sync::atomic::AtomicUsize::new(0),
+        next_policy_metadata_lane: std::sync::atomic::AtomicUsize::new(0),
         tls_overrides: Arc::new(tls),
         passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
         global_identity: None,

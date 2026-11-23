@@ -717,7 +717,12 @@ impl CachedPackageInfo {
             }
         }
         self.release = Arc::new(build_release_overlay(releases));
-        if !release_times.time.is_empty() {
+        let modified_matches = self.modified.as_deref().is_some_and(|expected| {
+            release_times.time.get("modified").map(String::as_str) == Some(expected)
+        });
+        let all_versions_covered = self.core.versions.is_empty()
+            || (0..self.core.versions.len()).all(|idx| known_release_versions.contains(&idx));
+        if !release_times.time.is_empty() && (all_versions_covered || modified_matches) {
             self.release_metadata_complete = true;
         }
 
@@ -1419,6 +1424,28 @@ mod tests {
         assert!(!changed.share_manifest_core_from_if_equivalent(&base));
         assert!(Arc::ptr_eq(&changed.core, &changed_core));
         assert!(!Arc::ptr_eq(&changed.core, &base.core));
+    }
+
+    #[test]
+    fn skewed_partial_release_times_do_not_mark_release_metadata_complete() {
+        let mut info = info_from(vec![manifest("1.0.0"), manifest("2.0.0")]);
+        info.modified = Some("2026-11-22T12:00:00.000Z".to_string());
+        info.modified_unix = Some(1_795_348_800);
+        let skewed = lpm_registry::ReleaseTimeMetadata {
+            name: Some("fixture".to_string()),
+            time: HashMap::from([
+                ("modified".to_string(), "2026-11-20T00:00:00.000Z".to_string()),
+                ("1.0.0".to_string(), "2025-01-01T00:00:00.000Z".to_string()),
+            ]),
+            versions: None,
+        };
+
+        info.merge_release_times(&skewed);
+
+        assert!(
+            !info.release_metadata_complete,
+            "missing timestamp for 2.0.0 with mismatched modified must not mark release metadata complete"
+        );
     }
 
     #[test]

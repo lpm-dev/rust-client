@@ -775,4 +775,5 @@ pub struct HttpClients {
     pub(super) tls_material_budget: Arc<TlsMaterialBudget>,
     pub(super) per_origin_identity_certs: HashMap<OriginKey, LazyIdentityCert>,
     pub(super) next_request_lane: std::sync::atomic::AtomicUsize,
+    pub(super) next_policy_metadata_lane: std::sync::atomic::AtomicUsize,
 }

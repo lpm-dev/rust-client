@@ -175,6 +175,7 @@ impl HttpClients {
             tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
             per_origin_identity_certs: HashMap::new(),
             next_request_lane: std::sync::atomic::AtomicUsize::new(0),
+            next_policy_metadata_lane: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -345,15 +346,28 @@ impl HttpClients {
             .await
     }
 
+    /// Allocate the next dedicated policy metadata lane index once per
+    /// logical request so redirects and send retries stay pinned to one lane.
+    pub(super) fn next_policy_lane(&self) -> usize {
+        self.next_policy_metadata_lane
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(super) async fn for_policy_metadata_url_lane(
+        &self,
+        url: &str,
+        lane: usize,
+    ) -> Result<reqwest::Client, LpmError> {
+        self.for_url_pool(url, ClientPool::PolicyMetadata(lane))
+            .await
+    }
+
     /// Resolve the configuration-equivalent client from the dedicated
     /// policy metadata connection pool, rotating across lanes to avoid
     /// single-connection HTTP/2 flow-control serialization on large packuments.
     pub async fn for_policy_metadata_url(&self, url: &str) -> Result<reqwest::Client, LpmError> {
-        let lane = self
-            .next_request_lane
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.for_url_pool(url, ClientPool::PolicyMetadata(lane))
-            .await
+        let lane = self.next_policy_lane();
+        self.for_policy_metadata_url_lane(url, lane).await
     }
 
     /// Resolve the redirect-disabled client for a request that moves a
@@ -691,7 +705,10 @@ impl lpm_http::ReplayableHttpClientProvider for HttpClients {
     }
 }
 
-pub(super) struct PolicyMetadataClientProvider<'a>(pub(super) &'a HttpClients);
+pub(super) struct PolicyMetadataClientProvider<'a> {
+    pub(super) http: &'a HttpClients,
+    pub(super) lane: usize,
+}
 
 impl lpm_http::ReplayableHttpClientProvider for PolicyMetadataClientProvider<'_> {
     type Error = LpmError;
@@ -700,7 +717,7 @@ impl lpm_http::ReplayableHttpClientProvider for PolicyMetadataClientProvider<'_>
         &self,
         url: &reqwest::Url,
     ) -> impl std::future::Future<Output = Result<reqwest::Client, Self::Error>> + Send {
-        self.0.for_policy_metadata_url(url.as_str())
+        self.http.for_policy_metadata_url_lane(url.as_str(), self.lane)
     }
 }
 

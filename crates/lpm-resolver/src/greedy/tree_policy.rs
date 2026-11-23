@@ -222,7 +222,10 @@ where
                         return TreeStatus::Unknown;
                     }
                 }
-            } else if let Some(info) = provider.cached_manifest(&child_canonical) {
+            } else if let Some(info) = provider
+                .cached_manifest(&child_canonical)
+                .filter(|info| !info.needs_policy_metadata(&child_canonical, policy))
+            {
                 info
             } else if release_age_tree_policy && cache.try_spend_release_age_lookahead_fetch() {
                 match provider.ensure_manifest(&child_canonical).await {

@@ -797,6 +797,7 @@ impl RegistryClient {
             tls_material_budget,
             per_origin_identity_certs,
             next_request_lane: std::sync::atomic::AtomicUsize::new(0),
+            next_policy_metadata_lane: std::sync::atomic::AtomicUsize::new(0),
         });
         self.history_cache = Arc::new(super::history_cache::HistoryCache::default());
         self.http = http;

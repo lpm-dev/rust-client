@@ -27,6 +27,7 @@ const MAX_SELECTED_HISTORY_CONCURRENCY: usize = 32;
 pub struct SharedMetadataConcurrency {
     semaphore: Arc<tokio::sync::Semaphore>,
     exact_document_semaphore: Arc<tokio::sync::Semaphore>,
+    policy_semaphore: Arc<tokio::sync::Semaphore>,
     limit: usize,
     exact_document_limit: usize,
 }
@@ -41,6 +42,7 @@ impl SharedMetadataConcurrency {
         Self {
             semaphore: Arc::new(tokio::sync::Semaphore::new(limit)),
             exact_document_semaphore: Arc::new(tokio::sync::Semaphore::new(exact_document_limit)),
+            policy_semaphore: Arc::new(tokio::sync::Semaphore::new(24)),
             limit,
             exact_document_limit,
         }
@@ -66,6 +68,7 @@ impl SharedMetadataConcurrency {
                 &self.exact_document_semaphore,
                 &other.exact_document_semaphore,
             )
+            && Arc::ptr_eq(&self.policy_semaphore, &other.policy_semaphore)
     }
 
     fn semaphore(&self) -> Arc<tokio::sync::Semaphore> {
@@ -74,6 +77,10 @@ impl SharedMetadataConcurrency {
 
     fn exact_document_semaphore(&self) -> Arc<tokio::sync::Semaphore> {
         Arc::clone(&self.exact_document_semaphore)
+    }
+
+    fn policy_semaphore(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.policy_semaphore)
     }
 }
 
@@ -255,6 +262,8 @@ struct FusedTreeProvider<'a> {
     shared_cache: &'a SharedCache,
     shared_fact_cache: Option<&'a SharedCache>,
     policy: &'a ResolverPolicy,
+    metadata_sem: &'a Arc<tokio::sync::Semaphore>,
+    policy_sem: &'a Arc<tokio::sync::Semaphore>,
     spec_tx: Option<&'a tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
     dispatcher_rpc_count: AtomicU64,
     tarball_dispatched_count: AtomicU64,
@@ -578,13 +587,19 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
                 .await;
             }
 
-            let fetched = fetch_metadata_for_resolver_with_trace_detail(
+            let permit = Arc::clone(self.metadata_sem)
+                .acquire_owned()
+                .await
+                .map_err(|_| ResolveError::Cancelled("metadata semaphore closed".to_string()))?;
+            let fetched = fetch_metadata_for_resolver_with_permit(
                 self.client,
                 self.route_table,
                 canonical,
                 self.policy,
                 self.spec_tx.is_some(),
                 self.trace_metadata_fetches,
+                permit,
+                self.policy_sem,
             )
             .await?;
             let FetchedMetadata {
@@ -630,7 +645,11 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
             let mut worker_names = Vec::new();
             let mut direct_canonicals = Vec::new();
             for canonical in canonicals {
-                if self.shared_cache.contains_key(canonical) {
+                if self.shared_cache.contains_key(canonical)
+                    || self
+                        .shared_fact_cache
+                        .is_some_and(|facts| facts.contains_key(canonical))
+                {
                     continue;
                 }
                 if !seen.insert(canonical.clone()) {
@@ -717,13 +736,13 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
             let direct_count = direct_canonicals.len();
             let concurrency = direct_count.clamp(1, 8);
             futures::stream::iter(direct_canonicals)
-                .map(|canonical| async move {
-                    let _ = self.ensure_manifest(&canonical).await;
-                })
+                .map(|canonical| async move { self.ensure_manifest(&canonical).await.is_ok() })
                 .buffer_unordered(concurrency)
-                .collect::<Vec<()>>()
-                .await;
-            direct_count
+                .collect::<Vec<bool>>()
+                .await
+                .into_iter()
+                .filter(|ok| *ok)
+                .count()
         })
     }
 }
@@ -771,14 +790,27 @@ impl FallbackMetadata {
 }
 
 impl MetadataFetchScheduler {
+    #[cfg(test)]
     fn new(
         semaphore: Arc<tokio::sync::Semaphore>,
         exact_document_semaphore: Arc<tokio::sync::Semaphore>,
     ) -> Self {
+        Self::with_policy_semaphore(
+            semaphore,
+            exact_document_semaphore,
+            Arc::new(tokio::sync::Semaphore::new(24)),
+        )
+    }
+
+    fn with_policy_semaphore(
+        semaphore: Arc<tokio::sync::Semaphore>,
+        exact_document_semaphore: Arc<tokio::sync::Semaphore>,
+        policy_semaphore: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
         Self {
             semaphore,
             exact_document_semaphore,
-            policy_semaphore: Arc::new(tokio::sync::Semaphore::new(24)),
+            policy_semaphore,
             jobs: tokio::task::JoinSet::new(),
             pending: VecDeque::new(),
             pending_exact_documents: VecDeque::new(),
@@ -1931,20 +1963,6 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
         release_age_names_from_root_deps(&state.root_deps, &policy)
     };
     let release_age_cutoff_unix = policy.release_age_cutoff_unix();
-    let tree_provider = FusedTreeProvider {
-        client: &client,
-        route_table: &route_table,
-        shared_cache: &shared_cache,
-        shared_fact_cache: shared_fact_cache.as_ref(),
-        policy: &policy,
-        spec_tx: spec_tx.as_ref(),
-        dispatcher_rpc_count: AtomicU64::new(0),
-        tarball_dispatched_count: AtomicU64::new(0),
-        worker_batch_disabled: &worker_batch_disabled,
-        release_age_package_names: &release_age_package_names,
-        release_age_all_packages,
-        trace_metadata_fetches,
-    };
     let mut tree_status_cache = super::tree_policy::TreeStatusCache::default();
     let mut refreshed_metadata = AHashSet::new();
 
@@ -1956,7 +1974,24 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     let metadata_concurrency =
         shared_metadata_concurrency.unwrap_or_else(|| SharedMetadataConcurrency::new(npm_fanout));
     let metadata_sem = metadata_concurrency.semaphore();
+    let policy_sem = metadata_concurrency.policy_semaphore();
     let exact_document_sem = metadata_concurrency.exact_document_semaphore();
+    let tree_provider = FusedTreeProvider {
+        client: &client,
+        route_table: &route_table,
+        shared_cache: &shared_cache,
+        shared_fact_cache: shared_fact_cache.as_ref(),
+        policy: &policy,
+        metadata_sem: &metadata_sem,
+        policy_sem: &policy_sem,
+        spec_tx: spec_tx.as_ref(),
+        dispatcher_rpc_count: AtomicU64::new(0),
+        tarball_dispatched_count: AtomicU64::new(0),
+        worker_batch_disabled: &worker_batch_disabled,
+        release_age_package_names: &release_age_package_names,
+        release_age_all_packages,
+        trace_metadata_fetches,
+    };
     let metadata_fetch_telemetry = Arc::new(MetadataFetchTelemetry::default());
     let timeline = tracing::enabled!(target: "lpm_install_timeline", tracing::Level::TRACE)
         .then(|| Arc::new(MetadataTimeline::default()));
@@ -1997,8 +2032,11 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     let mut parked: AHashMap<MetadataFetchKey, Vec<Edge>> = AHashMap::with_capacity(npm_fanout);
     let mut counted_metadata_edge_misses =
         trace_metadata_fetches.then(|| AHashSet::with_capacity(npm_fanout));
-    let mut metadata_jobs =
-        MetadataFetchScheduler::new(Arc::clone(&metadata_sem), exact_document_sem);
+    let mut metadata_jobs = MetadataFetchScheduler::with_policy_semaphore(
+        Arc::clone(&metadata_sem),
+        exact_document_sem,
+        Arc::clone(&policy_sem),
+    );
     let mut worker_batch_stream = None;
     let mut worker_batch_stream_package_specs: Vec<(String, String)> = Vec::new();
     let mut worker_stream_can_batch_waiting = false;

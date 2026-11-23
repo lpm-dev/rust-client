@@ -1400,6 +1400,59 @@ impl RegistryClient {
         Some(fresh_for)
     }
 
+    pub(super) fn refresh_metadata_cache_freshness_async(
+        &self,
+        key: &str,
+        fresh_for: std::time::Duration,
+    ) -> std::time::Duration {
+        use std::sync::atomic::Ordering;
+
+        let fresh_for = fresh_for.min(METADATA_CACHE_TTL);
+        if fresh_for.is_zero() {
+            return fresh_for;
+        }
+        if self.synchronous_cache_writes {
+            return self
+                .refresh_metadata_cache_freshness(key, fresh_for)
+                .unwrap_or(fresh_for);
+        }
+        self.remember_command_cache_policy(
+            key,
+            MetadataCommandCachePolicy::StoreUntil(std::time::Instant::now() + fresh_for),
+        );
+        let Some(path) = self.cache_path(key) else {
+            return fresh_for;
+        };
+        let mutation = self.metadata_cache_mutation(&path);
+        let revision = mutation.revision.fetch_add(1, Ordering::AcqRel) + 1;
+        let refresh = move || {
+            let _operation = mutation
+                .operation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if mutation.revision.load(Ordering::Acquire) != revision {
+                return;
+            }
+            let now = std::time::SystemTime::now();
+            let expires_at = now.checked_add(fresh_for).unwrap_or(now);
+            if let Err(error) =
+                filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(expires_at))
+            {
+                tracing::warn!(%error, "failed to refresh metadata cache freshness");
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                let join = runtime.spawn_blocking(refresh);
+                if let Ok(mut pending) = self.pending_cache_writes.lock() {
+                    pending.push(join);
+                }
+            }
+            Err(_) => refresh(),
+        }
+        fresh_for
+    }
+
     fn remember_command_cache_policy(&self, key: &str, policy: MetadataCommandCachePolicy) {
         if let Some(policies) = &self.metadata_command_cache_policies {
             policies

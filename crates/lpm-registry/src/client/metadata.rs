@@ -764,11 +764,34 @@ impl RegistryClient {
         }
     }
 
+    #[inline]
+    fn release_times_match_expected_modified(
+        metadata: &ReleaseTimeMetadata,
+        expected_modified: Option<&str>,
+    ) -> bool {
+        expected_modified.is_none_or(|expected| {
+            metadata.time.get("modified").map(String::as_str) == Some(expected)
+        })
+    }
+
     fn validate_release_time_metadata(
         name: &str,
         metadata: ReleaseTimeMetadata,
     ) -> Result<ReleaseTimeMetadata, LpmError> {
         if metadata.matches_package(name) {
+            return Ok(metadata);
+        }
+        Err(LpmError::Registry(format!(
+            "registry returned release times for unexpected package '{}' when requesting '{name}'",
+            metadata.name.as_deref().unwrap_or("<missing>")
+        )))
+    }
+
+    fn validate_full_packument_release_time_metadata(
+        name: &str,
+        metadata: ReleaseTimeMetadata,
+    ) -> Result<ReleaseTimeMetadata, LpmError> {
+        if metadata.name.as_deref() == Some(name) {
             return Ok(metadata);
         }
         Err(LpmError::Registry(format!(
@@ -802,14 +825,18 @@ impl RegistryClient {
         name = "metadata_request",
         skip_all
     )]
-    async fn send_policy_metadata_request(
+    async fn send_policy_metadata_request_on_lane(
         &self,
         request_builder: reqwest::RequestBuilder,
+        lane: usize,
     ) -> Result<reqwest::Response, LpmError> {
         let request = request_builder
             .build()
             .map_err(|error| LpmError::Network(format!("failed to build request: {error}")))?;
-        let provider = super::http::PolicyMetadataClientProvider(self.http.as_ref());
+        let provider = super::http::PolicyMetadataClientProvider {
+            http: self.http.as_ref(),
+            lane,
+        };
         let response = self
             .send_request_with_retry_and_client_provider(
                 request,
@@ -3102,7 +3129,12 @@ impl RegistryClient {
                 .map(|timed| timed.metadata)
             }
             crate::UpstreamRoute::Custom { target, auth } => self
-                .get_npm_release_times_from_full(&target.base_url, name, auth.as_deref())
+                .get_npm_release_times_from_full_for_modified(
+                    &target.base_url,
+                    name,
+                    auth.as_deref(),
+                    expected_modified,
+                )
                 .await
                 .map(Arc::new),
         }
@@ -3373,14 +3405,18 @@ impl RegistryClient {
         let memory_cache_key = self.direct_metadata_memory_cache_key(&cache_key);
         let mut timings = PackageMetadataFetchTimings::default();
         let memory_read_start = std::time::Instant::now();
+        let mut modified_skew_detected = false;
         if use_cache && let Some(cached) = self.read_release_time_memory_cache(&memory_cache_key) {
-            timings.cache_read_ms = memory_read_start.elapsed().as_millis();
-            timings.cache_hit = true;
-            crate::timing::record_metadata_cache_hit();
-            return Ok(TimedReleaseTimeMetadata {
-                metadata: cached,
-                timings,
-            });
+            if Self::release_times_match_expected_modified(&cached, expected_modified) {
+                timings.cache_read_ms = memory_read_start.elapsed().as_millis();
+                timings.cache_hit = true;
+                crate::timing::record_metadata_cache_hit();
+                return Ok(TimedReleaseTimeMetadata {
+                    metadata: cached,
+                    timings,
+                });
+            }
+            modified_skew_detected = true;
         }
         if use_cache {
             let cache_read_start = std::time::Instant::now();
@@ -3389,16 +3425,19 @@ impl RegistryClient {
                 .await
                 && cached.value.matches_package(name)
             {
-                timings.cache_read_ms = cache_read_start.elapsed().as_millis();
-                timings.cache_hit = true;
-                crate::timing::record_metadata_cache_hit();
-                let metadata = Arc::new(cached.value);
-                self.remember_release_times_for_command(
-                    &memory_cache_key,
-                    Arc::clone(&metadata),
-                    cached.remaining_freshness,
-                );
-                return Ok(TimedReleaseTimeMetadata { metadata, timings });
+                if Self::release_times_match_expected_modified(&cached.value, expected_modified) {
+                    timings.cache_read_ms = cache_read_start.elapsed().as_millis();
+                    timings.cache_hit = true;
+                    crate::timing::record_metadata_cache_hit();
+                    let metadata = Arc::new(cached.value);
+                    self.remember_release_times_for_command(
+                        &memory_cache_key,
+                        Arc::clone(&metadata),
+                        cached.remaining_freshness,
+                    );
+                    return Ok(TimedReleaseTimeMetadata { metadata, timings });
+                }
+                modified_skew_detected = true;
             }
             let full_cache_key = self.npm_direct_full_metadata_cache_key(name);
             if let Some(cached) = self
@@ -3406,6 +3445,7 @@ impl RegistryClient {
                 .await
                 && cached.value.matches_package(name)
                 && !cached.value.time.is_empty()
+                && Self::release_times_match_expected_modified(&cached.value, expected_modified)
             {
                 timings.cache_read_ms = cache_read_start.elapsed().as_millis();
                 timings.cache_hit = true;
@@ -3422,7 +3462,8 @@ impl RegistryClient {
             // abbreviated packument reports the exact same `modified` timestamp
             // as an expired release-time cache entry, no new versions were
             // published and we can skip re-fetching the multi-MB full packument.
-            if let Some(expected_mod) = expected_modified
+            if !modified_skew_detected
+                && let Some(expected_mod) = expected_modified
                 && let Some(stale) = self
                     .read_stale_metadata_cache_entry_as_async::<ReleaseTimeMetadata>(&cache_key)
                     .await
@@ -3433,12 +3474,10 @@ impl RegistryClient {
                 timings.cache_read_ms = cache_read_start.elapsed().as_millis();
                 timings.cache_hit = true;
                 crate::timing::record_metadata_cache_hit();
-                let fresh_for = self
-                    .refresh_metadata_cache_freshness(
-                        &cache_key,
-                        super::cache::METADATA_CACHE_TTL,
-                    )
-                    .unwrap_or(super::cache::METADATA_CACHE_TTL);
+                let allowed_ttl = stale
+                    .remaining_freshness
+                    .min(super::cache::METADATA_CACHE_TTL);
+                let fresh_for = self.refresh_metadata_cache_freshness_async(&cache_key, allowed_ttl);
                 let metadata = Arc::new(stale.value);
                 self.remember_release_times_for_command(
                     &memory_cache_key,
@@ -3452,7 +3491,10 @@ impl RegistryClient {
         crate::timing::record_metadata_cache_miss();
 
         let _flight = metadata_fetch_flight_guard(&memory_cache_key).await;
-        if use_cache && let Some(cached) = self.read_release_time_memory_cache(&memory_cache_key) {
+        if use_cache
+            && let Some(cached) = self.read_release_time_memory_cache(&memory_cache_key)
+            && Self::release_times_match_expected_modified(&cached, expected_modified)
+        {
             timings.cache_hit = true;
             return Ok(TimedReleaseTimeMetadata {
                 metadata: cached,
@@ -3465,6 +3507,7 @@ impl RegistryClient {
                 .read_metadata_cache_entry_as_async::<ReleaseTimeMetadata>(&cache_key)
                 .await
                 && cached.value.matches_package(name)
+                && Self::release_times_match_expected_modified(&cached.value, expected_modified)
             {
                 timings.cache_read_ms = timings
                     .cache_read_ms
@@ -3484,7 +3527,7 @@ impl RegistryClient {
         }
 
         let validator_start = std::time::Instant::now();
-        let cache_validator = use_cache
+        let cache_validator = (use_cache && !modified_skew_detected)
             .then(|| self.read_cache_validator(&cache_key))
             .flatten();
         timings.validator_read_ms = validator_start.elapsed().as_millis();
@@ -3498,15 +3541,16 @@ impl RegistryClient {
         }
 
         let npm_url = format!("{}/{}", self.npm_registry_url, name);
+        let lane = self.http.next_policy_lane();
         let req = self
             .http
-            .for_policy_metadata_url(&npm_url)
+            .for_policy_metadata_url_lane(&npm_url, lane)
             .await?
             .get(&npm_url)
             .header("Accept", "application/json");
         let req = Self::apply_cached_etag(req, cache_validator.as_ref());
         let http_start = std::time::Instant::now();
-        let mut response = match self.send_policy_metadata_request(req).await {
+        let mut response = match self.send_policy_metadata_request_on_lane(req, lane).await {
             Ok(response) => {
                 timings.http_ms = timings
                     .http_ms
@@ -3523,7 +3567,13 @@ impl RegistryClient {
                     &cache_key,
                     &response,
                     cache_validator.as_ref(),
-                    |metadata| metadata.matches_package(name),
+                    |metadata| {
+                        metadata.matches_package(name)
+                            && Self::release_times_match_expected_modified(
+                                metadata,
+                                expected_modified,
+                            )
+                    },
                 )
                 .await
             {
@@ -3539,12 +3589,13 @@ impl RegistryClient {
             timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
             let retry_http_start = std::time::Instant::now();
             response = match self
-                .send_policy_metadata_request(
+                .send_policy_metadata_request_on_lane(
                     self.http
-                        .for_policy_metadata_url(&npm_url)
+                        .for_policy_metadata_url_lane(&npm_url, lane)
                         .await?
                         .get(&npm_url)
                         .header("Accept", "application/json"),
+                    lane,
                 )
                 .await
             {
@@ -3573,7 +3624,7 @@ impl RegistryClient {
         timings.body_read_ms = body_timings.body_read_ms;
         timings.json_decode_ms = body_timings.json_parse_ms;
         timings.body_bytes = body_timings.body_bytes;
-        let metadata = match Self::validate_release_time_metadata(name, metadata) {
+        let metadata = match Self::validate_full_packument_release_time_metadata(name, metadata) {
             Ok(metadata) => metadata,
             Err(err) => return finish!(Err(err)),
         };
@@ -3600,6 +3651,17 @@ impl RegistryClient {
         name: &str,
         auth: Option<&crate::npmrc::RegistryAuth>,
     ) -> Result<ReleaseTimeMetadata, LpmError> {
+        self.get_npm_release_times_from_full_for_modified(base_url, name, auth, None)
+            .await
+    }
+
+    pub async fn get_npm_release_times_from_full_for_modified(
+        &self,
+        base_url: &str,
+        name: &str,
+        auth: Option<&crate::npmrc::RegistryAuth>,
+        expected_modified: Option<&str>,
+    ) -> Result<ReleaseTimeMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
         let destination = RequestDestination::parse(&format!("{base_url}/{name}"))?;
         let url = destination.as_str();
@@ -3607,10 +3669,14 @@ impl RegistryClient {
             principal_fingerprint(auth, self.http.identity_fp_for_destination(&destination));
         let cache_key = format!("npm-release-times:{principal}:{url}");
         let memory_cache_key = format!("custom:{cache_key}");
+        let mut modified_skew_detected = false;
 
         if let Some(cached) = self.read_release_time_memory_cache(&memory_cache_key) {
-            crate::timing::record_metadata_cache_hit();
-            return Ok(Arc::unwrap_or_clone(cached));
+            if Self::release_times_match_expected_modified(&cached, expected_modified) {
+                crate::timing::record_metadata_cache_hit();
+                return Ok(Arc::unwrap_or_clone(cached));
+            }
+            modified_skew_detected = true;
         }
 
         if let Some(cached) = self
@@ -3618,14 +3684,17 @@ impl RegistryClient {
             .await
             && cached.value.matches_package(name)
         {
-            crate::timing::record_metadata_cache_hit();
-            let metadata = Arc::new(cached.value);
-            self.remember_release_times_for_command(
-                &memory_cache_key,
-                Arc::clone(&metadata),
-                cached.remaining_freshness,
-            );
-            return Ok(Arc::unwrap_or_clone(metadata));
+            if Self::release_times_match_expected_modified(&cached.value, expected_modified) {
+                crate::timing::record_metadata_cache_hit();
+                let metadata = Arc::new(cached.value);
+                self.remember_release_times_for_command(
+                    &memory_cache_key,
+                    Arc::clone(&metadata),
+                    cached.remaining_freshness,
+                );
+                return Ok(Arc::unwrap_or_clone(metadata));
+            }
+            modified_skew_detected = true;
         }
         let full_cache_key = format!("npm-full:{principal}:{url}");
         if let Some(cached) = self
@@ -3633,6 +3702,7 @@ impl RegistryClient {
             .await
             && cached.value.matches_package(name)
             && !cached.value.time.is_empty()
+            && Self::release_times_match_expected_modified(&cached.value, expected_modified)
         {
             crate::timing::record_metadata_cache_hit();
             let metadata = Arc::new(cached.value);
@@ -3646,13 +3716,16 @@ impl RegistryClient {
         crate::timing::record_metadata_cache_miss();
 
         let _flight = metadata_fetch_flight_guard(&memory_cache_key).await;
-        if let Some(cached) = self.read_release_time_memory_cache(&memory_cache_key) {
+        if let Some(cached) = self.read_release_time_memory_cache(&memory_cache_key)
+            && Self::release_times_match_expected_modified(&cached, expected_modified)
+        {
             return Ok(Arc::unwrap_or_clone(cached));
         }
         if let Some(cached) = self
             .read_metadata_cache_entry_as_async::<ReleaseTimeMetadata>(&cache_key)
             .await
             && cached.value.matches_package(name)
+            && Self::release_times_match_expected_modified(&cached.value, expected_modified)
         {
             let metadata = Arc::new(cached.value);
             self.remember_release_times_for_command(
@@ -3663,7 +3736,9 @@ impl RegistryClient {
             return Ok(Arc::unwrap_or_clone(metadata));
         }
 
-        let cache_validator = self.read_cache_validator(&cache_key);
+        let cache_validator = (!modified_skew_detected)
+            .then(|| self.read_cache_validator(&cache_key))
+            .flatten();
         let rpc_start = std::time::Instant::now();
         macro_rules! finish {
             ($expr:expr) => {{
@@ -3694,7 +3769,13 @@ impl RegistryClient {
                     &cache_key,
                     &response,
                     cache_validator.as_ref(),
-                    |metadata| metadata.matches_package(name),
+                    |metadata| {
+                        metadata.matches_package(name)
+                            && Self::release_times_match_expected_modified(
+                                metadata,
+                                expected_modified,
+                            )
+                    },
                 )
                 .await
             {
@@ -3734,7 +3815,7 @@ impl RegistryClient {
                 Ok(parsed) => parsed,
                 Err(err) => return finish!(Err(err)),
             };
-        let metadata = match Self::validate_release_time_metadata(name, metadata) {
+        let metadata = match Self::validate_full_packument_release_time_metadata(name, metadata) {
             Ok(metadata) => metadata,
             Err(err) => return finish!(Err(err)),
         };
