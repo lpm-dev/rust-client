@@ -8,8 +8,17 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-pub use lpm_vault::override_marker::MARKER_ENV;
 use lpm_vault::override_marker::Reported;
+pub use lpm_vault::override_marker::{FolderWithoutEnvProject, MARKER_ENV};
+
+/// The most folders without an env project a task's cache entry keeps, so
+/// the check each hit makes of them stays brief. A task whose `lpm`
+/// processes report more isn't cached.
+pub const MAX_FOLDERS_WITHOUT_ENV_PROJECT: usize = 4096;
+
+/// How the temporary file an `lpm` writes an entry to before the entry
+/// takes its name starts (see `lpm_common::atomic_write`).
+const UNFINISHED_ENTRY: &str = ".lpm-";
 
 thread_local! {
     /// The marker list the task this thread starts gets, while it's watched.
@@ -90,9 +99,9 @@ impl TaskMarker {
 /// What a task's `lpm` processes reported, all of which its key holds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Keyed {
-    /// The canonical folders they found no env project for, sorted, each
-    /// once. What the task built is reused only while each still has none.
-    pub folders_without_env_project: Vec<PathBuf>,
+    /// The folders they found no env project for, sorted. What the task
+    /// built is reused only while each still has none.
+    pub folders_without_env_project: Vec<FolderWithoutEnvProject>,
 }
 
 /// Why what a task built can't be cached under its key, the most specific
@@ -124,6 +133,12 @@ pub enum Unkeyed {
     /// An `lpm` the task left running found no env project for another
     /// folder once the cache had taken what the task built.
     LateFolder,
+    /// An `lpm` the task left running was adding an entry, or one that was
+    /// stopped left the file it wrote the entry to, named here.
+    Unfinished(String),
+    /// The task's `lpm` processes found no env project for more folders
+    /// than an entry keeps (see [`MAX_FOLDERS_WITHOUT_ENV_PROJECT`]).
+    TooManyFolders,
     /// The task has no marker of its own (see [`TaskMarker::unwatched`]).
     Unwatched,
 }
@@ -142,19 +157,24 @@ fn judge(directory: &Path, keyed: &[String]) -> Result<Keyed, Unkeyed> {
                 let name = entry.file_name();
                 match name.to_str() {
                     Some(name) if keyed.iter().any(|keyed| keyed == name) => continue,
+                    Some(name) if name.starts_with(UNFINISHED_ENTRY) => {
+                        Unkeyed::Unfinished(name.to_owned())
+                    }
                     Some(name) => match Reported::of_entry(name) {
                         Some(Reported::Change) => return Err(Unkeyed::Changed),
                         Some(Reported::NoProject) => {
-                            let added = entry.file_type().is_ok_and(|kind| kind.is_file())
-                                && lpm_vault::override_marker::folder_without_env_project(
+                            if folders.len() == MAX_FOLDERS_WITHOUT_ENV_PROJECT {
+                                Unkeyed::TooManyFolders
+                            } else if let Some(folder) =
+                                lpm_vault::override_marker::folder_without_env_project(
                                     directory, name,
                                 )
-                                .map(|folder| folders.push(folder))
-                                .is_some();
-                            if added {
+                            {
+                                folders.push(folder);
                                 continue;
+                            } else {
+                                Unkeyed::Foreign(name.to_owned())
                             }
-                            Unkeyed::Foreign(name.to_owned())
                         }
                         Some(Reported::Environment | Reported::Overrides) => Unkeyed::Used,
                         Some(Reported::Environments) => Unkeyed::EveryEnvironment,
@@ -173,8 +193,8 @@ fn judge(directory: &Path, keyed: &[String]) -> Result<Keyed, Unkeyed> {
     match found {
         Some(unkeyed) => Err(unkeyed),
         None => {
+            // An entry's name is its folder's digest, so each is there once.
             folders.sort_unstable();
-            folders.dedup();
             Ok(Keyed {
                 folders_without_env_project: folders,
             })
@@ -344,34 +364,85 @@ mod tests {
         }
     }
 
+    /// Add the entry of a folder without an env project, as an `lpm` does.
+    fn report_folder(directory: &Path, folder: &str, from: Option<&str>) {
+        let content = match from {
+            Some(from) => format!("{folder}\0{from}"),
+            None => folder.to_owned(),
+        };
+        std::fs::write(
+            directory.join(Access::NoProject { folder, from }.entry()),
+            content,
+        )
+        .expect("report");
+    }
+
     #[test]
     fn folders_an_lpm_found_no_env_project_for_go_with_the_task_but_a_planted_one_doesn_t() {
         let folder = tempfile::tempdir().expect("folder");
         let canonical = std::fs::canonicalize(folder.path()).expect("canonical");
         let name = canonical.to_str().expect("UTF-8");
+        let start = canonical.join("tools");
         let task = TaskMarker::watch().expect("watch");
         let directory = task.directory.clone().expect("a marker of its own");
         for _ in 0..2 {
-            std::fs::write(
-                directory.join(Access::NoProject { folder: name }.entry()),
-                name,
-            )
-            .expect("report");
+            report_folder(&directory, name, None);
         }
+        report_folder(&directory, name, start.to_str());
         report(&directory, read("vault-1", "default", false));
+        let mut expected = vec![
+            FolderWithoutEnvProject {
+                folder: canonical.clone(),
+                from: None,
+            },
+            FolderWithoutEnvProject {
+                folder: canonical.clone(),
+                from: Some(start),
+            },
+        ];
+        expected.sort_unstable();
         assert_eq!(
             task.judge(&keyed()),
             Ok(Keyed {
-                folders_without_env_project: vec![canonical.clone()]
+                folders_without_env_project: expected
             })
         );
 
         let elsewhere = Access::NoProject {
             folder: "/elsewhere",
+            from: None,
         }
         .entry();
         std::fs::write(directory.join(&elsewhere), name).expect("plant");
         assert_eq!(task.judge(&keyed()), Err(Unkeyed::Foreign(elsewhere)));
+    }
+
+    #[test]
+    fn an_entry_an_lpm_is_still_adding_or_left_half_written_keeps_the_task_out() {
+        let task = TaskMarker::watch().expect("watch");
+        let directory = task.directory.clone().expect("a marker of its own");
+        std::fs::write(directory.join(".lpm-AbCd_123"), "/repo").expect("unfinished");
+        assert_eq!(
+            task.judge(&keyed()),
+            Err(Unkeyed::Unfinished(".lpm-AbCd_123".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_task_whose_lpm_processes_find_too_many_folders_without_an_env_project_isn_t_cached() {
+        let task = TaskMarker::watch().expect("watch");
+        let directory = task.directory.clone().expect("a marker of its own");
+        let root = if cfg!(windows) { r"C:\repo" } else { "/repo" };
+        for index in 0..MAX_FOLDERS_WITHOUT_ENV_PROJECT {
+            report_folder(&directory, &format!("{root}{index}"), None);
+        }
+        assert_eq!(
+            task.judge(&keyed())
+                .map(|keyed| keyed.folders_without_env_project.len()),
+            Ok(MAX_FOLDERS_WITHOUT_ENV_PROJECT)
+        );
+        report_folder(&directory, &format!("{root}-one-more"), None);
+        assert_eq!(task.judge(&keyed()), Err(Unkeyed::TooManyFolders));
     }
 
     #[test]

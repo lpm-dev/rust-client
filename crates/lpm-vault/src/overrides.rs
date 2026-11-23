@@ -113,6 +113,7 @@ pub struct Reviewed {
 /// [`remove_reviewed`]); `None` without an env project.
 pub fn review_all(project_dir: &Path) -> Result<Option<Reviewed>, String> {
     let Some(vault_id) = crate::checked_linked_vault_id(project_dir)? else {
+        crate::override_marker::report_no_project(project_dir)?;
         return Ok(None);
     };
     let (overrides, identity) =
@@ -244,6 +245,7 @@ pub fn change_checked(
 /// either, edits that give no key an override remove nothing and say so.
 pub fn change(project_dir: &Path, edits: &[Edit]) -> Result<Change, String> {
     let Some(vault_id) = crate::checked_linked_vault_id(project_dir)? else {
+        crate::override_marker::report_no_project(project_dir)?;
         return match effects_without_overrides(edits).map_err(|error| error.to_string())? {
             Some(effects) => Ok(Change {
                 effects,
@@ -289,6 +291,7 @@ pub fn check_before_values(
         .collect();
     check_edits(&edits)?;
     let Some(vault_id) = crate::checked_linked_vault_id(project_dir)? else {
+        crate::override_marker::report_no_project(project_dir)?;
         return Err(NO_PROJECT.to_owned());
     };
     crate::with_project_vault_transaction(|directory| {
@@ -435,6 +438,54 @@ mod tests {
             }],
         )
         .expect("an override");
+    }
+
+    #[test]
+    fn every_read_and_override_command_in_a_folder_without_an_env_project_reports_the_folder() {
+        use crate::override_marker::{Reported, reporting_to};
+        let folder = tempfile::tempdir().expect("folder");
+        let dir = folder.path();
+        let remove = [Edit::Remove {
+            environment: "default".to_owned(),
+            key: "A".to_owned(),
+        }];
+        let commands: [(&str, &dyn Fn()); 7] = [
+            ("run", &|| {
+                let read = crate::try_get_run_environment(dir, None).expect("run");
+                assert!(read.values.is_empty());
+            }),
+            ("check", &|| {
+                let read = crate::try_get_all_run_environments(dir).expect("check");
+                assert!(read.values.is_empty());
+            }),
+            ("list", &|| assert!(read_all(dir).expect("list").is_empty())),
+            ("clear", &|| {
+                assert!(review_all(dir).expect("review").is_none())
+            }),
+            ("remove", &|| {
+                drop(change(dir, &remove).expect("nothing to remove"))
+            }),
+            ("set", &|| {
+                assert_eq!(
+                    check_before_values(dir, "default", &["A"]).map(drop),
+                    Err(NO_PROJECT.to_owned())
+                );
+            }),
+            ("repair", &|| {
+                assert!(crate::review_companion_data(dir).expect("review").is_none());
+            }),
+        ];
+        for (command, run) in commands {
+            let marker = tempfile::tempdir().expect("marker");
+            reporting_to(vec![marker.path().to_owned()], run);
+            let reported: Vec<_> = std::fs::read_dir(marker.path())
+                .expect("list")
+                .map(|entry| {
+                    Reported::of_entry(&entry.expect("entry").file_name().to_string_lossy())
+                })
+                .collect();
+            assert_eq!(reported, [Some(Reported::NoProject)], "{command}");
+        }
     }
 
     #[test]

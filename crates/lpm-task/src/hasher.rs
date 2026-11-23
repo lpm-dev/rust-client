@@ -229,6 +229,13 @@ pub fn compute_cache_key_snapshot_with_workspace_contract(
     ))
 }
 
+/// The version of what a key stands for. It moves whenever an entry an
+/// earlier version stored can't stand for one this version stores: an
+/// earlier entry may hold what a nested `lpm` read of another project with
+/// personal overrides, which it didn't track, or name no folder an `lpm`
+/// found no env project for, which this version checks still has none.
+const KEY_VERSION: &[u8] = b"cache-v10";
+
 #[expect(
     clippy::too_many_arguments,
     reason = "cache identity inputs are separate typed domains"
@@ -246,9 +253,7 @@ fn compute_cache_key_inner(
 ) -> Result<String, LpmError> {
     let mut hasher = Sha256::new();
 
-    // An entry an earlier version stored may hold what a nested lpm read
-    // of another project with personal overrides, which it didn't track.
-    hash_record(&mut hasher, 0, &[b"cache-v9"]);
+    hash_record(&mut hasher, 0, &[KEY_VERSION]);
 
     hash_record(&mut hasher, 1, &[command.as_bytes()]);
 
@@ -1538,6 +1543,20 @@ mod tests {
 
     fn collect_input_files(project_dir: &Path, globs: &[String]) -> Vec<(PathBuf, String)> {
         super::collect_input_files(project_dir, globs).unwrap()
+    }
+
+    /// What an empty project's key is. It moves with what a key hashes, and
+    /// with [`KEY_VERSION`], which moves whenever an entry an earlier version
+    /// stored can't stand for one this version stores: as an entry that
+    /// names no folder an `lpm` the task started found no env project for.
+    #[test]
+    fn an_entry_stored_before_entries_named_folders_without_an_env_project_is_never_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = compute_cache_key(dir.path(), "build", &[], &[], &[], &HashMap::new(), "{}");
+        assert_eq!(
+            key,
+            "d3b2a1bcebe04b9fc98188966738004448d07cd1471580d4d485082fb64e8a45"
+        );
     }
 
     #[test]

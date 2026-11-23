@@ -482,22 +482,24 @@ pub fn restore_cache(
     project_dir: &Path,
     output_globs: &[String],
 ) -> Result<CacheHit, LpmError> {
-    restore_cache_if(key, project_dir, output_globs, |_| Ok(true))?.ok_or_else(|| {
+    restore_cache_if(key, project_dir, output_globs, |_| true, |_| Ok(true))?.ok_or_else(|| {
         LpmError::Task("unconditional task cache restore was unexpectedly rejected".into())
     })
 }
 
-/// Restore the entry under `key` if `validate`, given its metadata, still
-/// accepts it once the outputs are staged.
+/// Restore the entry under `key` if `applies`, given its metadata, accepts
+/// it before anything else of it is read, and `validate` still does once
+/// the outputs are staged.
 pub fn restore_cache_if(
     key: &str,
     project_dir: &Path,
     output_globs: &[String],
+    applies: impl FnOnce(&CacheMeta) -> bool,
     validate: impl FnOnce(&CacheMeta) -> Result<bool, LpmError>,
 ) -> Result<Option<CacheHit>, LpmError> {
     let root = LpmRoot::from_env()
         .map_err(|error| LpmError::Task(format!("could not determine LPM home: {error}")))?;
-    restore_cache_with_root_if(&root, key, project_dir, output_globs, validate)
+    restore_cache_with_root_if(&root, key, project_dir, output_globs, applies, validate)
 }
 
 #[cfg(test)]
@@ -507,9 +509,10 @@ fn restore_cache_with_root(
     project_dir: &Path,
     output_globs: &[String],
 ) -> Result<CacheHit, LpmError> {
-    restore_cache_with_root_if(root, key, project_dir, output_globs, |_| Ok(true))?.ok_or_else(
-        || LpmError::Task("unconditional task cache restore was unexpectedly rejected".into()),
-    )
+    restore_cache_with_root_if(root, key, project_dir, output_globs, |_| true, |_| Ok(true))?
+        .ok_or_else(|| {
+            LpmError::Task("unconditional task cache restore was unexpectedly rejected".into())
+        })
 }
 
 fn restore_cache_with_root_if(
@@ -517,6 +520,7 @@ fn restore_cache_with_root_if(
     key: &str,
     project_dir: &Path,
     output_globs: &[String],
+    applies: impl FnOnce(&CacheMeta) -> bool,
     validate: impl FnOnce(&CacheMeta) -> Result<bool, LpmError>,
 ) -> Result<Option<CacheHit>, LpmError> {
     validate_cache_key(key)?;
@@ -536,7 +540,7 @@ fn restore_cache_with_root_if(
         #[cfg(test)]
         wait_for_cache_race_barrier(&PROJECT_PATH_RACE_BARRIER, &project.path);
         verify_open_project(&project)?;
-        restore_cache_locked_if(root, &cache, key, &project, output_globs, validate)
+        restore_cache_locked_if(root, &cache, key, &project, output_globs, applies, validate)
     })
 }
 
@@ -546,10 +550,14 @@ fn restore_cache_locked_if(
     key: &str,
     project: &OpenProject,
     output_globs: &[String],
+    applies: impl FnOnce(&CacheMeta) -> bool,
     validate: impl FnOnce(&CacheMeta) -> Result<bool, LpmError>,
 ) -> Result<Option<CacheHit>, LpmError> {
     let entry = open_cache_entry(cache, key)?;
     let meta = read_cache_meta(&entry, key)?;
+    if !applies(&meta) {
+        return Ok(None);
+    }
     let stdout = read_cache_log(&entry, "stdout.log")?;
     let stderr = read_cache_log(&entry, "stderr.log")?;
     let archive = open_cache_entry_file(&entry, "outputs.tar.gz", "task cache archive")?;
@@ -660,7 +668,7 @@ pub fn store_cache_checked(
     stdout: &str,
     stderr: &str,
     duration_ms: u64,
-    folders_without_env_project: &[String],
+    folders_without_env_project: &[FolderWithoutEnvProject],
     publishable: &dyn Fn() -> bool,
 ) -> Result<StoredCacheEntry, LpmError> {
     let root = LpmRoot::from_env()
@@ -692,7 +700,7 @@ fn store_cache_with_root(
     stdout: &str,
     stderr: &str,
     duration_ms: u64,
-    folders_without_env_project: &[String],
+    folders_without_env_project: &[FolderWithoutEnvProject],
     publishable: &dyn Fn() -> bool,
 ) -> Result<StoredCacheEntry, LpmError> {
     validate_cache_key(key)?;
@@ -703,7 +711,12 @@ fn store_cache_with_root(
     lpm_common::with_shared_lock(root.cache_clean_lock(), || {
         let _entry_lock =
             lpm_common::acquire_single_file_exclusive_lock(cache_entry_lock_path(root, key)?)?;
-        if validate_local_cache_entry(&cache, key).is_ok() {
+        // An entry another run stored is kept only while it names the same
+        // folders: one a hit just turned down for a folder that has an env
+        // project now is replaced by a run that names that folder no more.
+        if validate_local_cache_entry(&cache, key)
+            .is_ok_and(|kept| kept.folders_without_env_project == folders_without_env_project)
+        {
             return Ok(StoredCacheEntry::KeptExisting);
         }
         let _project_lock = lpm_common::acquire_single_file_shared_lock(
@@ -738,7 +751,7 @@ fn store_cache_locked(
     stdout: &str,
     stderr: &str,
     duration_ms: u64,
-    folders_without_env_project: &[String],
+    folders_without_env_project: &[FolderWithoutEnvProject],
     publishable: &dyn Fn() -> bool,
 ) -> Result<Option<PublishedCacheEntry>, LpmError> {
     publish_cache_entry(cache, key, publishable, |open| {
@@ -764,9 +777,21 @@ fn store_cache_locked(
 }
 
 fn write_cache_meta(dir: &Dir, meta: &CacheMeta) -> Result<(), LpmError> {
+    write_private_cache_file(dir, "meta.json", &cache_meta_json(meta)?)
+}
+
+/// `meta` as an entry holds it, refused when it's more than a restore reads.
+fn cache_meta_json(meta: &CacheMeta) -> Result<Vec<u8>, LpmError> {
     let meta_json = serde_json::to_vec_pretty(meta)
         .map_err(|error| LpmError::Task(format!("failed to serialize cache meta: {error}")))?;
-    write_private_cache_file(dir, "meta.json", &meta_json)
+    if meta_json.len() as u64 > lpm_common::STATE_FILE_SIZE_CAP_BYTES {
+        return Err(LpmError::Task(format!(
+            "cache meta is {} bytes, more than the {} a restore reads",
+            meta_json.len(),
+            lpm_common::STATE_FILE_SIZE_CAP_BYTES
+        )));
+    }
+    Ok(meta_json)
 }
 
 fn directory_identity(directory: &Dir) -> Result<(u64, u64), LpmError> {
@@ -1021,7 +1046,7 @@ fn require_cache_entry_file(
     })
 }
 
-fn validate_local_cache_entry(cache: &OpenTaskCache, key: &str) -> Result<(), LpmError> {
+fn validate_local_cache_entry(cache: &OpenTaskCache, key: &str) -> Result<CacheMeta, LpmError> {
     let entry = open_cache_entry(cache, key)?;
     let meta = read_cache_meta(&entry, key)?;
     drop(read_cache_log(&entry, "stdout.log")?);
@@ -1042,7 +1067,7 @@ fn validate_local_cache_entry(cache: &OpenTaskCache, key: &str) -> Result<(), Lp
             meta.output_file_count
         )));
     }
-    Ok(())
+    Ok(meta)
 }
 
 fn read_cache_meta(entry: &OpenCacheEntry, expected_key: &str) -> Result<CacheMeta, LpmError> {
@@ -1116,7 +1141,10 @@ fn ensure_real_file(path: &Path, label: &str) -> Result<(), LpmError> {
     Ok(())
 }
 
-pub struct RemoteArtifactCreate<'a> {
+/// A remote-cache artifact built from the project's outputs, with its
+/// metadata after them, as releases before metadata came first wrote it.
+#[cfg(test)]
+struct RemoteArtifactCreate<'a> {
     pub key: &'a str,
     pub project_dir: &'a Path,
     pub command: &'a str,
@@ -1127,13 +1155,7 @@ pub struct RemoteArtifactCreate<'a> {
     pub artifact_path: &'a Path,
 }
 
-/// Create a portable remote-cache artifact for a successful task run.
-pub fn create_remote_artifact(args: RemoteArtifactCreate<'_>) -> Result<(), LpmError> {
-    let root = LpmRoot::from_env()
-        .map_err(|error| LpmError::Task(format!("could not determine LPM home: {error}")))?;
-    create_remote_artifact_with_root(&root, args)
-}
-
+#[cfg(test)]
 fn create_remote_artifact_with_root(
     root: &LpmRoot,
     args: RemoteArtifactCreate<'_>,
@@ -1159,6 +1181,7 @@ fn create_remote_artifact_with_root(
     })
 }
 
+#[cfg(test)]
 fn create_remote_artifact_locked(args: RemoteArtifactCreate<'_>) -> Result<(), LpmError> {
     if std::fs::symlink_metadata(args.artifact_path)
         .is_ok_and(|metadata| lpm_common::is_symlink_or_junction(&metadata))
@@ -1180,6 +1203,7 @@ fn create_remote_artifact_locked(args: RemoteArtifactCreate<'_>) -> Result<(), L
     )
 }
 
+#[cfg(test)]
 fn remote_artifact_output_files(
     project_dir: &Path,
     output_globs: &[String],
@@ -1199,6 +1223,7 @@ fn remote_artifact_output_files(
     Ok(output_files)
 }
 
+#[cfg(test)]
 fn write_remote_artifact(
     args: &RemoteArtifactCreate<'_>,
     artifact: &mut std::fs::File,
@@ -1285,19 +1310,28 @@ pub fn restore_remote_artifact_from_file(
     project_dir: &Path,
     output_globs: &[String],
 ) -> Result<CacheHit, LpmError> {
-    restore_remote_artifact_from_file_if(expected_key, artifact, project_dir, output_globs, |_| {
-        Ok(true)
-    })?
+    restore_remote_artifact_from_file_if(
+        expected_key,
+        artifact,
+        project_dir,
+        output_globs,
+        |_| true,
+        |_| Ok(true),
+    )?
     .ok_or_else(|| {
         LpmError::Task("unconditional remote cache restore was unexpectedly rejected".into())
     })
 }
 
+/// Restore a portable remote-cache artifact from an already-verified file
+/// if `applies`, given its metadata, accepts it once that's read, and
+/// `validate` still does once the outputs are staged.
 pub fn restore_remote_artifact_from_file_if(
     expected_key: &str,
     artifact: std::fs::File,
     project_dir: &Path,
     output_globs: &[String],
+    applies: impl FnOnce(&CacheMeta) -> bool,
     validate: impl FnOnce(&CacheMeta) -> Result<bool, LpmError>,
 ) -> Result<Option<CacheHit>, LpmError> {
     let root = LpmRoot::from_env()
@@ -1308,6 +1342,7 @@ pub fn restore_remote_artifact_from_file_if(
         artifact,
         project_dir,
         output_globs,
+        applies,
         validate,
     )
 }
@@ -1337,6 +1372,7 @@ fn restore_remote_artifact_file_with_root(
         artifact,
         project_dir,
         output_globs,
+        |_| true,
         |_| Ok(true),
     )?
     .ok_or_else(|| {
@@ -1350,6 +1386,7 @@ fn restore_remote_artifact_file_with_root_if(
     mut artifact: std::fs::File,
     project_dir: &Path,
     output_globs: &[String],
+    applies: impl FnOnce(&CacheMeta) -> bool,
     validate: impl FnOnce(&CacheMeta) -> Result<bool, LpmError>,
 ) -> Result<Option<CacheHit>, LpmError> {
     validate_cache_key(expected_key)?;
@@ -1366,9 +1403,23 @@ fn restore_remote_artifact_file_with_root_if(
             artifact,
             &project,
             output_globs,
+            applies,
             validate,
         )
     })
+}
+
+/// The metadata `json` of a remote artifact for `expected_key`.
+fn parse_remote_cache_meta(json: &str, expected_key: &str) -> Result<CacheMeta, LpmError> {
+    let meta: CacheMeta = serde_json::from_str(json)
+        .map_err(|e| LpmError::Task(format!("failed to parse remote cache meta: {e}")))?;
+    if meta.cache_key != expected_key {
+        return Err(LpmError::Task(format!(
+            "remote cache artifact key mismatch (expected {expected_key}, got {})",
+            meta.cache_key
+        )));
+    }
+    Ok(meta)
 }
 
 fn restore_remote_artifact_locked_if(
@@ -1377,11 +1428,13 @@ fn restore_remote_artifact_locked_if(
     file: std::fs::File,
     project: &OpenProject,
     output_globs: &[String],
+    applies: impl FnOnce(&CacheMeta) -> bool,
     validate: impl FnOnce(&CacheMeta) -> Result<bool, LpmError>,
 ) -> Result<Option<CacheHit>, LpmError> {
     let dec = flate2::read::GzDecoder::new(file);
     let mut total_bytes: u64 = 0;
-    let mut meta_json: Option<String> = None;
+    let mut meta: Option<CacheMeta> = None;
+    let mut applies = Some(applies);
     let mut stdout: Option<String> = None;
     let mut stderr: Option<String> = None;
     let mut staged_outputs = StagedOutputs::new_with_project(root, project)?;
@@ -1390,7 +1443,10 @@ fn restore_remote_artifact_locked_if(
         ..lpm_extractor::TarArchiveLimits::new(MAX_CACHE_ARCHIVE_ENTRIES)
     };
 
-    lpm_extractor::visit_tar_archive(dec, archive_limits, |mut entry| {
+    // An artifact names its metadata first, so one the check refuses is
+    // turned down before any output is staged; an older one, which names it
+    // after them, before any is applied.
+    let (_, refused) = lpm_extractor::visit_tar_archive(dec, archive_limits, |mut entry| {
         let path = entry.path().to_path_buf();
         validate_archive_path(&path, "remote cache artifact")?;
         validate_archive_entry_type(entry.header().entry_type(), &path, "remote cache artifact")?;
@@ -1399,14 +1455,19 @@ fn restore_remote_artifact_locked_if(
         check_archive_size_limits(entry_size, &mut total_bytes, &path, "remote cache artifact")?;
 
         if path == Path::new(".lpm-cache/meta.json") {
-            if meta_json.is_some() {
+            if meta.is_some() {
                 return Err(LpmError::Task(
                     "remote cache artifact contains duplicate metadata".into(),
                 ));
             }
             validate_text_entry_size(entry_size, lpm_common::STATE_FILE_SIZE_CAP_BYTES, &path)?;
-            meta_json = Some(read_entry_to_string(&mut entry, &path)?);
-            return Ok(std::ops::ControlFlow::<()>::Continue(()));
+            let read =
+                parse_remote_cache_meta(&read_entry_to_string(&mut entry, &path)?, expected_key)?;
+            if !applies.take().is_some_and(|applies| applies(&read)) {
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
+            meta = Some(read);
+            return Ok(std::ops::ControlFlow::Continue(()));
         }
         if path == Path::new(".lpm-cache/stdout.log") {
             if stdout.is_some() {
@@ -1443,21 +1504,15 @@ fn restore_remote_artifact_locked_if(
 
         let header = entry.header().clone();
         staged_outputs.append(&mut entry, &header, rel)?;
-        Ok(std::ops::ControlFlow::<()>::Continue(()))
+        Ok(std::ops::ControlFlow::Continue(()))
     })?;
+    if refused.is_some() {
+        return Ok(None);
+    }
 
-    let meta_json = meta_json.ok_or_else(|| {
+    let meta = meta.ok_or_else(|| {
         LpmError::Task("remote cache artifact is missing .lpm-cache/meta.json".into())
     })?;
-    let meta: CacheMeta = serde_json::from_str(&meta_json)
-        .map_err(|e| LpmError::Task(format!("failed to parse remote cache meta: {e}")))?;
-
-    if meta.cache_key != expected_key {
-        return Err(LpmError::Task(format!(
-            "remote cache artifact key mismatch (expected {expected_key}, got {})",
-            meta.cache_key
-        )));
-    }
     if meta.output_file_count != staged_outputs.file_count() {
         return Err(LpmError::Task(format!(
             "remote cache artifact output count mismatch (expected {}, found {})",
@@ -1615,11 +1670,24 @@ pub struct CacheMeta {
     /// Number of output files archived (for integrity check on restore).
     #[serde(default)]
     pub output_file_count: usize,
-    /// The folders, from the task's own and written with `/`, that an `lpm`
-    /// the task started found no env project for. The entry is used only
-    /// while each still has none.
+    /// The folders an `lpm` the task started found no env project for,
+    /// sorted. The entry is used only while each still has none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub folders_without_env_project: Vec<String>,
+    pub folders_without_env_project: Vec<FolderWithoutEnvProject>,
+}
+
+/// A folder an `lpm` a cached task started found no env project for, named
+/// from the task's own folder: `.`, or names, each after any `..`, joined
+/// with `/` on every platform.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct FolderWithoutEnvProject {
+    pub folder: String,
+    /// The folder the `lpm` started in, when it found `folder` by looking
+    /// up from there, as a project-scoped command does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
 }
 
 /// Create a .tar.gz archive of files matching output globs.
@@ -2770,6 +2838,37 @@ mod tests {
         );
     }
 
+    fn folders(spellings: &[(&str, Option<&str>)]) -> Vec<FolderWithoutEnvProject> {
+        spellings
+            .iter()
+            .map(|(folder, from)| FolderWithoutEnvProject {
+                folder: (*folder).to_owned(),
+                from: from.map(str::to_owned),
+            })
+            .collect()
+    }
+
+    fn store_with_folders(
+        cache: &TestCache,
+        key: &str,
+        project: &Path,
+        folders: &[FolderWithoutEnvProject],
+    ) -> StoredCacheEntry {
+        store_cache_with_root(
+            &cache.root,
+            key,
+            project,
+            "build",
+            &["dist/**".to_string()],
+            "",
+            "",
+            1,
+            folders,
+            &|| true,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn an_entry_hands_its_folders_without_an_env_project_to_every_restore_that_checks_it() {
         let cache = TestCache::new();
@@ -2777,30 +2876,26 @@ mod tests {
         write_build_outputs(project.path());
         let key = unique_key("folders-without-env-project");
         let outputs = ["dist/**".to_string()];
-        let folders = ["../other".to_owned(), ".".to_owned()];
-        let StoredCacheEntry::Published(published) = store_cache_with_root(
-            &cache.root,
-            &key,
-            project.path(),
-            "build",
-            &outputs,
-            "",
-            "",
-            1,
-            &folders,
-            &|| true,
-        )
-        .unwrap() else {
+        let folders = folders(&[("../other", Some("../other/tools")), (".", None)]);
+        let StoredCacheEntry::Published(published) =
+            store_with_folders(&cache, &key, project.path(), &folders)
+        else {
             panic!("the first store of a key publishes its entry");
         };
 
         let seen = std::cell::RefCell::new(Vec::new());
-        let refused =
-            restore_cache_with_root_if(&cache.root, &key, project.path(), &outputs, |meta| {
+        let refused = restore_cache_with_root_if(
+            &cache.root,
+            &key,
+            project.path(),
+            &outputs,
+            |meta| {
                 seen.replace(meta.folders_without_env_project.clone());
-                Ok(false)
-            })
-            .unwrap();
+                false
+            },
+            |_| panic!("a refused entry goes no further"),
+        )
+        .unwrap();
         assert!(refused.is_none(), "a refusing check is a miss");
         assert_eq!(seen.take(), folders);
         assert_build_outputs(project.path());
@@ -2822,8 +2917,9 @@ mod tests {
             &outputs,
             |meta| {
                 seen.replace(meta.folders_without_env_project.clone());
-                Ok(true)
+                true
             },
+            |meta| Ok(meta.folders_without_env_project == folders),
         )
         .unwrap()
         .expect("an accepted remote hit");
@@ -2832,11 +2928,200 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_entry_is_turned_down_before_its_archive_is_read() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        write_build_outputs(project.path());
+        let key = unique_key("refused-before-archive");
+        let outputs = ["dist/**".to_string()];
+        store_with_folders(
+            &cache,
+            &key,
+            project.path(),
+            &folders(&[("../other", None)]),
+        );
+        fs::write(cache.entry(&key).join("outputs.tar.gz"), b"not an archive").unwrap();
+
+        let refused = restore_cache_with_root_if(
+            &cache.root,
+            &key,
+            project.path(),
+            &outputs,
+            |_| false,
+            |_| Ok(true),
+        );
+
+        assert!(
+            matches!(refused, Ok(None)),
+            "turned down without reading the archive: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_remote_artifact_names_its_metadata_before_its_outputs_so_a_refusal_reads_none() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        write_build_outputs(project.path());
+        let key = unique_key("metadata-first");
+        let StoredCacheEntry::Published(published) = store_with_folders(
+            &cache,
+            &key,
+            project.path(),
+            &folders(&[("../other", None)]),
+        ) else {
+            panic!("the first store of a key publishes its entry");
+        };
+        let artifact = artifact::write_remote_artifact_from_local_entry_with_root(
+            &cache.root,
+            &published,
+            Vec::new(),
+        )
+        .unwrap();
+        let mut names = Vec::new();
+        lpm_extractor::visit_tar_archive(
+            flate2::read::GzDecoder::new(artifact.as_slice()),
+            lpm_extractor::TarArchiveLimits::new(64),
+            |entry| {
+                names.push(entry.path().to_string_lossy().into_owned());
+                Ok(std::ops::ControlFlow::<()>::Continue(()))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            names[..3],
+            [
+                ".lpm-cache/meta.json",
+                ".lpm-cache/stdout.log",
+                ".lpm-cache/stderr.log"
+            ]
+        );
+        assert!(names[3..].iter().all(|name| name.starts_with("outputs/")));
+
+        // What follows the metadata of an artifact a check refuses is never
+        // read, so an entry no artifact holds there fails nothing.
+        let artifact_path = project.path().join("artifact.tar.gz");
+        {
+            let encoder = flate2::write::GzEncoder::new(
+                fs::File::create(&artifact_path).unwrap(),
+                flate2::Compression::fast(),
+            );
+            let mut archive = tar::Builder::new(encoder);
+            let meta = CacheMeta {
+                command: "build".into(),
+                cache_key: key.clone(),
+                duration_ms: 1,
+                output_file_count: 1,
+                folders_without_env_project: folders(&[("../other", None)]),
+            };
+            append_bytes(
+                &mut archive,
+                Path::new(".lpm-cache/meta.json"),
+                &serde_json::to_vec(&meta).unwrap(),
+            )
+            .unwrap();
+            append_bytes(&mut archive, Path::new("unexpected/entry"), b"x").unwrap();
+            archive.into_inner().unwrap().finish().unwrap();
+        }
+        let restore = |applies: bool| {
+            restore_remote_artifact_file_with_root_if(
+                &cache.root,
+                &key,
+                fs::File::open(&artifact_path).unwrap(),
+                project.path(),
+                &["dist/**".to_string()],
+                |_| applies,
+                |_| Ok(true),
+            )
+        };
+        assert!(matches!(restore(false), Ok(None)));
+        assert!(restore(true).is_err(), "an accepted one is read to its end");
+        assert_build_outputs(project.path());
+    }
+
+    #[test]
+    fn a_kept_entry_is_replaced_by_a_run_whose_folders_without_an_env_project_differ() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        write_build_outputs(project.path());
+        let key = unique_key("replaced-for-folders");
+        let before = folders(&[("tools", None)]);
+        assert!(matches!(
+            store_with_folders(&cache, &key, project.path(), &before),
+            StoredCacheEntry::Published(_)
+        ));
+        assert!(matches!(
+            store_with_folders(&cache, &key, project.path(), &before),
+            StoredCacheEntry::KeptExisting
+        ));
+
+        assert!(matches!(
+            store_with_folders(&cache, &key, project.path(), &[]),
+            StoredCacheEntry::Published(_)
+        ));
+        let hit = restore_cache_with_root_if(
+            &cache.root,
+            &key,
+            project.path(),
+            &["dist/**".to_string()],
+            |_| true,
+            |_| Ok(true),
+        )
+        .unwrap()
+        .expect("a hit");
+        assert!(hit.meta.folders_without_env_project.is_empty());
+    }
+
+    #[test]
+    fn metadata_more_than_a_restore_reads_is_never_stored() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        write_build_outputs(project.path());
+        let key = unique_key("oversized-metadata");
+        let long = "a".repeat(64 * 1024);
+        let count =
+            usize::try_from(lpm_common::STATE_FILE_SIZE_CAP_BYTES).unwrap() / long.len() + 1;
+        let oversized: Vec<FolderWithoutEnvProject> = (0..count)
+            .map(|index| FolderWithoutEnvProject {
+                folder: format!("{long}{index}"),
+                from: None,
+            })
+            .collect();
+
+        let stored = store_cache_with_root(
+            &cache.root,
+            &key,
+            project.path(),
+            "build",
+            &["dist/**".to_string()],
+            "",
+            "",
+            1,
+            &oversized,
+            &|| true,
+        );
+
+        assert!(stored.is_err(), "{stored:?}");
+        assert!(!cache.has_hit(&key));
+    }
+
+    #[test]
     fn metadata_without_folders_reads_and_writes_as_it_did() {
         let older = r#"{"command":"build","cache_key":"k","duration_ms":1,"output_file_count":0}"#;
         let meta: CacheMeta = serde_json::from_str(older).unwrap();
         assert!(meta.folders_without_env_project.is_empty());
         assert_eq!(serde_json::to_string(&meta).unwrap(), older);
+
+        let meta = CacheMeta {
+            folders_without_env_project: folders(&[
+                ("../other", Some("../other/tools")),
+                (".", None),
+            ]),
+            ..meta
+        };
+        assert_eq!(
+            serde_json::to_string(&meta.folders_without_env_project).unwrap(),
+            r#"[{"folder":"../other","from":"../other/tools"},{"folder":"."}]"#
+        );
     }
 
     #[test]

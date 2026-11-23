@@ -504,6 +504,57 @@ pub fn checked_vault_id(project_dir: &Path) -> Result<Option<String>, String> {
     }
 }
 
+/// Whether `content`, an lpm.json, is a JSON object that names no vault: one
+/// without a `vault` member, or with a null one. Members are skipped as
+/// they're read, so nothing of them is kept.
+pub(crate) fn names_no_vault(content: &str) -> bool {
+    use serde::de::{Deserializer as _, IgnoredAny, MapAccess, Visitor};
+
+    /// Whether a member's name is `vault`, however it's escaped.
+    struct IsVault(bool);
+    impl<'de> serde::Deserialize<'de> for IsVault {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct Name;
+            impl Visitor<'_> for Name {
+                type Value = IsVault;
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("a member name")
+                }
+                fn visit_str<E>(self, name: &str) -> Result<IsVault, E> {
+                    Ok(IsVault(name == "vault"))
+                }
+            }
+            deserializer.deserialize_str(Name)
+        }
+    }
+
+    struct NoVault;
+    impl<'de> Visitor<'de> for NoVault {
+        type Value = bool;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut members: A) -> Result<bool, A::Error> {
+            let mut no_vault = true;
+            while let Some(IsVault(vault)) = members.next_key()? {
+                if vault {
+                    no_vault &= members.next_value::<Option<IgnoredAny>>()?.is_none();
+                } else {
+                    members.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(no_vault)
+        }
+    }
+
+    let mut deserializer =
+        serde_json::Deserializer::from_str(lpm_common::strip_utf8_bom_str(content));
+    deserializer
+        .deserialize_map(NoVault)
+        .and_then(|no_vault| deserializer.end().map(|()| no_vault))
+        .unwrap_or(false)
+}
+
 /// Read the vault ID from lpm.json without creating one.
 /// Returns `None` when the field is missing or fails [`is_safe_vault_id`].
 pub fn read_vault_id(project_dir: &Path) -> Option<String> {

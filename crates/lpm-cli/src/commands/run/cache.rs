@@ -5,6 +5,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 
+mod folders;
+
+use folders::{TaskFolders, Unstood};
+use lpm_runner::override_marker::Unkeyed;
+
 /// Runtime versions probed for task-cache keys, shared by every task of this
 /// process.
 static TASK_RUNTIME_VERSIONS: LazyLock<TaskRuntimeVersions> =
@@ -174,6 +179,8 @@ pub(super) struct CacheContext {
     command_preference: CommandPreference,
     /// See [`CompletedTaskCacheIdentity::local_only`].
     local_only: bool,
+    /// The folder the key names paths from (see [`cache_key_root`]).
+    key_root: PathBuf,
 }
 
 pub(super) struct CacheStoreRequest<'a> {
@@ -612,6 +619,7 @@ fn build_task_context(
         schema_snapshot,
         dependencies: dependency_identities.to_vec(),
         local_only,
+        key_root: root,
     }))
 }
 
@@ -705,13 +713,17 @@ pub(super) fn try_cache_hit_with_context(
     if !cache_context_is_unchanged(ctx)? {
         return Ok(None);
     }
+    let check = HitCheck::new(project_dir, ctx);
     if lpm_task::cache::has_cache_hit(&ctx.cache_key) {
-        match lpm_task::cache::restore_cache_if(
+        let restored = lpm_task::cache::restore_cache_if(
             &ctx.cache_key,
             project_dir,
             &ctx.task_config.outputs,
-            |meta| entry_still_applies(project_dir, ctx, meta),
-        ) {
+            |meta| check.verdict(meta, Source::Local) == Verdict::Use,
+            |meta| check.still_applies(meta, Source::Local),
+        );
+        check.reported()?;
+        match restored {
             Ok(Some(hit)) => return Ok(Some(hit)),
             Ok(None) => return Ok(None),
             Err(error) => {
@@ -723,99 +735,129 @@ pub(super) fn try_cache_hit_with_context(
         }
     }
 
-    // A remote hit also fills the local cache, from the downloaded artifact.
-    Ok(ctx.remote_cache.as_ref().and_then(|remote_cache| {
-        crate::commands::remote_cache::try_restore(
-            remote_cache,
-            &ctx.cache_key,
-            project_dir,
-            &ctx.task_config.outputs,
-            |meta| entry_still_applies(project_dir, ctx, meta),
-        )
-    }))
-}
-
-/// Whether a cache entry, with `meta`, still holds what the task would build
-/// now: its execution context is unchanged, and each folder an `lpm` it
-/// started found no env project for still has none.
-fn entry_still_applies(
-    project_dir: &Path,
-    ctx: &CacheContext,
-    meta: &lpm_task::cache::CacheMeta,
-) -> Result<bool, LpmError> {
-    Ok(execution_context_is_unchanged(ctx)?
-        && folders_still_without_env_project(project_dir, &meta.folders_without_env_project))
-}
-
-/// Whether each of `folders`, named from `project_dir` as a cache entry
-/// names them, still has no env project.
-fn folders_still_without_env_project(project_dir: &Path, folders: &[String]) -> bool {
-    if folders.is_empty() {
-        return true;
-    }
-    let Ok(base) = std::fs::canonicalize(project_dir) else {
-        return false;
+    let Some(remote_cache) = &ctx.remote_cache else {
+        return Ok(None);
     };
-    folders
-        .iter()
-        .all(|folder| !lpm_vault::names_an_env_project(&base.join(folder)))
+    // A remote hit also fills the local cache, from the downloaded artifact,
+    // as an entry turned down for a folder that has an env project now does:
+    // the next lookup turns it down there, without a download, until the
+    // folder has none again or a run replaces it.
+    let hit = crate::commands::remote_cache::try_restore(
+        remote_cache,
+        &ctx.cache_key,
+        project_dir,
+        &ctx.task_config.outputs,
+        |meta| match check.verdict(meta, Source::Remote) {
+            Verdict::Use => crate::commands::remote_cache::Applies::Yes,
+            Verdict::NotNow => crate::commands::remote_cache::Applies::NotNow,
+            Verdict::Never => crate::commands::remote_cache::Applies::Never,
+        },
+        |meta| check.still_applies(meta, Source::Remote),
+    );
+    check.reported()?;
+    Ok(hit)
 }
 
-/// The folders an `lpm` the task started found no env project for, named
-/// from the task's own folder with `..` and `/`, as its cache entry keeps
-/// them. One no path from there reaches keeps the task out.
-fn folders_from_task(
-    project_dir: &Path,
-    keyed: &lpm_runner::override_marker::Keyed,
-) -> Result<Vec<String>, lpm_runner::override_marker::Unkeyed> {
-    use lpm_runner::override_marker::Unkeyed;
-    if keyed.folders_without_env_project.is_empty() {
-        return Ok(Vec::new());
-    }
-    let base = std::fs::canonicalize(project_dir)
-        .map_err(|_| Unkeyed::Unreachable(project_dir.to_owned()))?;
-    keyed
-        .folders_without_env_project
-        .iter()
-        .map(|folder| {
-            relative_spelling(&base, folder).ok_or_else(|| Unkeyed::Unreachable(folder.clone()))
-        })
-        .collect()
+/// Where a cache entry a hit checks comes from.
+#[derive(Clone, Copy)]
+enum Source {
+    /// This computer's cache, which only this computer's runs fill.
+    Local,
+    /// A remote cache, whose entries name only folders below the one the
+    /// key names paths from.
+    Remote,
 }
 
-/// `folder` from `base`, both canonical, as `..` and names joined with `/`,
-/// `.` for `base` itself; `None` when they don't share a root or a name
-/// isn't UTF-8.
-fn relative_spelling(base: &Path, folder: &Path) -> Option<String> {
-    use std::path::Component;
-    let is_root =
-        |component: &Component<'_>| matches!(component, Component::Prefix(_) | Component::RootDir);
-    let base: Vec<Component<'_>> = base.components().collect();
-    let folder: Vec<Component<'_>> = folder.components().collect();
-    let roots = base
-        .iter()
-        .take_while(|component| is_root(component))
-        .count();
-    if roots == 0 || base[..roots] != folder[..roots.min(folder.len())] {
-        return None;
-    }
-    let shared = base
-        .iter()
-        .zip(&folder)
-        .take_while(|(from, to)| from == to)
-        .count();
-    let mut parts: Vec<&str> = std::iter::repeat_n("..", base.len() - shared).collect();
-    for component in &folder[shared..] {
-        match component {
-            Component::Normal(name) => parts.push(name.to_str()?),
-            _ => return None,
+/// What a hit does with an entry, once the folders it names are checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Use it: each folder still stands.
+    Use,
+    /// Not now: one has an env project, or is found from where its `lpm`
+    /// started no more, so the task runs.
+    NotNow,
+    /// Never: it names folders as no entry this version stores does, or
+    /// this `lpm` couldn't tell the ones above it about them.
+    Never,
+}
+
+/// What a hit checks of an entry beyond its key: that each folder an `lpm`
+/// the task started found no env project for still has none and is found
+/// as it was (see [`folders::FolderCheck::holds`]), before anything else of
+/// the entry is read, and that the
+/// task's execution context is unchanged once its outputs are staged.
+struct HitCheck<'a> {
+    ctx: &'a CacheContext,
+    folders: folders::FolderCheck,
+    /// The canonical [`CacheContext::key_root`], unless it's gone.
+    key_root: Option<PathBuf>,
+    /// Why the `lpm` processes above couldn't be told about a folder.
+    unreported: std::cell::RefCell<Option<String>>,
+}
+
+impl<'a> HitCheck<'a> {
+    fn new(project_dir: &Path, ctx: &'a CacheContext) -> Self {
+        Self {
+            ctx,
+            folders: folders::FolderCheck::new(project_dir),
+            key_root: std::fs::canonicalize(&ctx.key_root).ok(),
+            unreported: std::cell::RefCell::new(None),
         }
     }
-    Some(if parts.is_empty() {
-        ".".to_owned()
-    } else {
-        parts.join("/")
-    })
+
+    /// What to do with the entry `meta` describes. A use tells every `lpm`
+    /// above this one about each folder it names, as the `lpm` that found
+    /// no env project there did, since what this one reuses depends on it.
+    fn verdict(&self, meta: &lpm_task::cache::CacheMeta, source: Source) -> Verdict {
+        let named = &meta.folders_without_env_project;
+        if named.is_empty() {
+            return Verdict::Use;
+        }
+        let within = match source {
+            Source::Local => None,
+            Source::Remote => match &self.key_root {
+                Some(key_root) => Some(key_root.as_path()),
+                None => return Verdict::Never,
+            },
+        };
+        let resolved = match self.folders.resolve(named, within) {
+            Ok(resolved) => resolved,
+            Err(Unstood::Changed) => return Verdict::NotNow,
+            Err(Unstood::Malformed) => return Verdict::Never,
+        };
+        if !resolved.iter().all(|found| self.folders.holds(found)) {
+            return Verdict::NotNow;
+        }
+        for found in &resolved {
+            if let Err(error) = lpm_vault::override_marker::report_folder_without_env_project(
+                &found.folder,
+                found.from.as_deref(),
+            ) {
+                self.unreported.replace(Some(error));
+                return Verdict::Never;
+            }
+        }
+        Verdict::Use
+    }
+
+    /// Whether the entry `meta` describes still holds what the task would
+    /// build now, once its outputs are staged.
+    fn still_applies(
+        &self,
+        meta: &lpm_task::cache::CacheMeta,
+        source: Source,
+    ) -> Result<bool, LpmError> {
+        Ok(execution_context_is_unchanged(self.ctx)? && self.verdict(meta, source) == Verdict::Use)
+    }
+
+    /// Fails as a read that couldn't be reported fails, when a folder
+    /// couldn't be.
+    fn reported(&self) -> Result<(), LpmError> {
+        match self.unreported.take() {
+            Some(error) => Err(lpm_runner::dotenv::vault_error(LpmError::Task)(error)),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Whether the task's inputs and the runtimes its key names are unchanged.
@@ -904,11 +946,7 @@ pub(super) fn try_cache_store_with_context(
     expected: &CacheContext,
 ) -> Option<Arc<CompletedTaskCacheIdentity>> {
     let script_name = request.script_name;
-    let folders = match request
-        .task
-        .judge(&expected.keyed_entries)
-        .and_then(|keyed| folders_from_task(request.project_dir, &keyed))
-    {
+    let folders = match judge(&request, expected) {
         Ok(folders) => folders,
         Err(unkeyed) => {
             say_not_cached(script_name, unkeyed, request.task.unwatched());
@@ -930,12 +968,7 @@ pub(super) fn try_cache_store_with_context(
 /// Say, once a command, that a task isn't cached because of what an lpm it
 /// started used, or because it had no marker of its own (`unwatched` says
 /// why), and for each task under `--verbose`.
-fn say_not_cached(
-    script_name: &str,
-    unkeyed: lpm_runner::override_marker::Unkeyed,
-    unwatched: Option<&str>,
-) {
-    use lpm_runner::override_marker::Unkeyed;
+fn say_not_cached(script_name: &str, unkeyed: Unkeyed, unwatched: Option<&str>) {
     static SHOWN: AtomicBool = AtomicBool::new(false);
     const NOT_CACHED_ALWAYS: &str = "if it always does, set `cache` to false for it in lpm.json";
     let reason = match unkeyed {
@@ -953,11 +986,19 @@ fn say_not_cached(
             lpm_common::sanitize_terminal_inline(&file)
         ),
         Unkeyed::Unreachable(folder) => format!(
-            "an lpm it started found no env project for {}, which no path from the task's folder reaches, so the cache couldn't check it still has none; {NOT_CACHED_ALWAYS}",
+            "an lpm it started found no env project for {}, which a cache entry can't name from the task's own folder, as it can't name one on another drive or one whose name holds `\\` or `:`, so a later run couldn't check that folder still has none; {NOT_CACHED_ALWAYS}",
             lpm_common::sanitize_terminal_inline(&folder.display().to_string())
         ),
         Unkeyed::LateFolder => format!(
-            "an lpm it left running found no env project for another folder after the cache took its outputs; {NOT_CACHED_ALWAYS}"
+            "an lpm it left running found no env project for one more folder once the cache had taken its outputs, which may depend on that; {NOT_CACHED_ALWAYS}"
+        ),
+        Unkeyed::Unfinished(file) => format!(
+            "an lpm it left running was still adding `{}` to the marker that the lpm processes it started report to, or one that was stopped left it there",
+            lpm_common::sanitize_terminal_inline(&file)
+        ),
+        Unkeyed::TooManyFolders => format!(
+            "the lpm processes it started found no env project for more than {} folders, more than a cache entry keeps; {NOT_CACHED_ALWAYS}",
+            lpm_runner::override_marker::MAX_FOLDERS_WITHOUT_ENV_PROJECT
         ),
         Unkeyed::Unwatched => format!(
             "lpm couldn't make the marker that the lpm processes it starts report to ({}); check the temporary folder",
@@ -971,6 +1012,22 @@ fn say_not_cached(
         )
     });
     tracing::debug!("task '{script_name}' isn't cached: {reason}");
+}
+
+/// Say that the remote cache gets no entry for `script_name`, which an `lpm`
+/// it started found no env project for a folder outside the workspace in:
+/// the entry names that folder.
+fn say_kept_on_this_computer(script_name: &str) {
+    static SHOWN: AtomicBool = AtomicBool::new(false);
+    let script_name = lpm_common::sanitize_terminal_inline(script_name);
+    announce_once(&SHOWN, || {
+        format!(
+            "task '{script_name}' is cached on this computer only: an lpm it started found no env project for a folder outside the workspace, which its cache entry names, so the remote cache doesn't get it (`lpm --verbose` names each task this keeps off the remote cache)"
+        )
+    });
+    tracing::debug!(
+        "task '{script_name}' is cached on this computer only: an lpm it started found no env project for a folder outside the workspace"
+    );
 }
 
 /// Print the notice `shown` stands for once a command, however many tasks
@@ -1012,12 +1069,27 @@ fn pattern_spelling(path: &Path) -> String {
         .join("/")
 }
 
+/// What the task's `lpm` processes reported, when its key holds all of it:
+/// the folders they found no env project for, as its entry names them.
+fn judge(request: &CacheStoreRequest<'_>, expected: &CacheContext) -> Result<TaskFolders, Unkeyed> {
+    request
+        .task
+        .judge(&expected.keyed_entries)
+        .and_then(|keyed| {
+            folders::name_from_task(
+                request.project_dir,
+                &expected.key_root,
+                &keyed.folders_without_env_project,
+            )
+        })
+}
+
 /// Store the task's outputs, its entry keeping `folders`, which an `lpm` it
-/// started found no env project for (see [`folders_from_task`]).
+/// started found no env project for (see [`judge`]).
 fn store_cache_with_context(
     request: CacheStoreRequest<'_>,
     expected: &CacheContext,
-    folders: &[String],
+    folders: &TaskFolders,
 ) -> Result<Option<Arc<CompletedTaskCacheIdentity>>, LpmError> {
     // The rebuild rereads what the input snapshot doesn't cover, such as env
     // files and vault values, from disk and the vault rather than from the
@@ -1075,6 +1147,19 @@ fn store_cache_with_context(
         request.project_dir,
         &expected.task_config.outputs,
     )?;
+    // The entry is written with `folders`, so one reported since isn't in
+    // it.
+    let still_judged = || {
+        judge(&request, expected)
+            .and_then(|now| {
+                if now == *folders {
+                    Ok(())
+                } else {
+                    Err(Unkeyed::LateFolder)
+                }
+            })
+            .err()
+    };
     let unkeyed = std::cell::Cell::new(None);
     let stored = lpm_task::cache::store_cache_checked(
         &expected.cache_key,
@@ -1084,31 +1169,19 @@ fn store_cache_with_context(
         request.stdout,
         request.stderr,
         request.duration_ms,
-        folders,
+        &folders.named,
         &|| {
-            // The entry was written with `folders`, so one reported since
-            // isn't in it.
-            let found = request
-                .task
-                .judge(&expected.keyed_entries)
-                .and_then(|keyed| folders_from_task(request.project_dir, &keyed))
-                .and_then(|now| {
-                    if now == folders {
-                        Ok(())
-                    } else {
-                        Err(lpm_runner::override_marker::Unkeyed::LateFolder)
-                    }
-                })
-                .err();
+            let found = still_judged();
             let publishable = found.is_none();
             unkeyed.set(found);
             publishable
         },
     )?;
-    // A kept entry is another run's, so no check covered this run's
-    // outputs, which the dependents use: check them now.
+    // A kept entry is another run's, which names the same folders, so no
+    // check covered this run's outputs, which the dependents use: check
+    // them now.
     if matches!(stored, lpm_task::cache::StoredCacheEntry::KeptExisting) {
-        unkeyed.set(request.task.judge(&expected.keyed_entries).err());
+        unkeyed.set(still_judged());
     }
     if let Some(unkeyed) = unkeyed.take() {
         say_not_cached(request.script_name, unkeyed, request.task.unwatched());
@@ -1121,15 +1194,19 @@ fn store_cache_with_context(
     if let (Some(remote_cache), lpm_task::cache::StoredCacheEntry::Published(published)) =
         (&expected.remote_cache, stored)
     {
-        crate::commands::remote_cache::try_store(
-            remote_cache,
-            published,
-            request.stdout,
-            request.stderr,
-            request.duration_ms,
-            &expected.env_vars,
-            &expected.inherited_env,
-        );
+        if folders.outside_key_root {
+            say_kept_on_this_computer(request.script_name);
+        } else {
+            crate::commands::remote_cache::try_store(
+                remote_cache,
+                published,
+                request.stdout,
+                request.stderr,
+                request.duration_ms,
+                &expected.env_vars,
+                &expected.inherited_env,
+            );
+        }
     }
 
     tracing::debug!(
@@ -1149,57 +1226,6 @@ fn store_cache_with_context(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_folder_is_named_from_the_task_s_folder_by_a_relative_path_with_slashes() {
-        let root = if cfg!(windows) { r"C:\repo" } else { "/repo" };
-        let base = Path::new(root).join("packages").join("app");
-        let named = |folder: PathBuf| relative_spelling(&base, &folder);
-        assert_eq!(named(base.clone()).as_deref(), Some("."));
-        assert_eq!(
-            named(Path::new(root).join("packages").join("lib")).as_deref(),
-            Some("../lib")
-        );
-        assert_eq!(
-            named(base.join("tools").join("gen")).as_deref(),
-            Some("tools/gen")
-        );
-        assert_eq!(
-            named(Path::new(root).join("other")).as_deref(),
-            Some("../../other")
-        );
-        if cfg!(windows) {
-            assert_eq!(named(PathBuf::from(r"D:\repo\lib")), None, "another drive");
-        }
-    }
-
-    #[test]
-    fn an_entry_applies_while_each_of_its_folders_still_has_no_env_project() {
-        let root = tempfile::tempdir().expect("temporary folder");
-        let task = root.path().join("app");
-        let other = root.path().join("other");
-        std::fs::create_dir_all(&task).expect("task folder");
-        std::fs::create_dir_all(&other).expect("other folder");
-        let folders = ["../other".to_owned(), ".".to_owned()];
-
-        assert!(folders_still_without_env_project(&task, &[]));
-        assert!(folders_still_without_env_project(&task, &folders));
-        std::fs::write(other.join("lpm.json"), r#"{"tasks":{}}"#).expect("lpm.json");
-        assert!(
-            folders_still_without_env_project(&task, &folders),
-            "an lpm.json that names no vault is still no env project"
-        );
-        std::fs::write(
-            other.join("lpm.json"),
-            r#"{"vault":"550e8400-e29b-41d4-a716-446655440000"}"#,
-        )
-        .expect("lpm.json");
-        assert!(!folders_still_without_env_project(&task, &folders));
-        assert!(
-            !folders_still_without_env_project(&root.path().join("gone"), &folders),
-            "a task folder that's gone checks nothing"
-        );
-    }
 
     /// The overlap warning names the file as an `inputs` pattern would, so
     /// it reads the same on Windows, whose paths join with `\`.

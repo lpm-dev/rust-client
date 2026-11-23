@@ -9080,6 +9080,405 @@ async fn a_remote_entry_built_while_a_folder_had_no_env_project_is_reused_only_w
         "{}",
         project.read_file("dist/gen.txt")
     );
+
+    let downloads = artifact_requests(&server, "GET").await;
+    run_with_remote_cache(&project, &["run", "gen"]);
+    assert_eq!(
+        runs(&project, "gen"),
+        2,
+        "the task still reads other's project"
+    );
+    assert_eq!(
+        artifact_requests(&server, "GET").await,
+        downloads,
+        "the local cache kept the entry it turned down, which it turns down again without a download"
+    );
+}
+
+/// What `show` prints: the `API_URL` a run gets.
+const SHOW_API_URL: &str =
+    r#"node -e \"console.log('API_URL=' + (process.env.API_URL || 'none'))\""#;
+
+/// Run `script` in `project`, which must succeed.
+fn run_script(project: &TempProject, script: &str) -> std::process::Output {
+    let output = lpm(project)
+        .env("LPM_TEST_BIN", support::lpm_binary())
+        .args(["run", script])
+        .output()
+        .expect("run the task");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+/// Give `dir` in `project` an env project with `API_URL=team` and this
+/// computer's override `API_URL=mine`.
+fn give_an_env_project_with_an_override(project: &TempProject, dir: &str) {
+    for args in [
+        &["env", "set", "API_URL=team"][..],
+        &["env", "override", "set", "API_URL=mine"],
+    ] {
+        lpm(project)
+            .current_dir(project.path().join(dir))
+            .args(args)
+            .assert()
+            .success();
+    }
+}
+
+#[test]
+fn a_task_whose_lpm_found_its_project_from_a_folder_below_runs_again_once_that_folder_is_one() {
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"found-from-below","version":"1.0.0","scripts":{{"gen":"node gen.js","show":"{SHOW_API_URL}"}}}}"#
+    ));
+    project.write_file("tools/gen/.keep", "");
+    project.write_file(
+        "gen.js",
+        &nested_lpm_script("gen", "tools/gen", &["run", "show"]),
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{"tasks":{"gen":{"cache":true,"inputs":["gen.js"],"outputs":["dist/gen.txt"]}}}"#,
+    );
+
+    run_script(&project, "gen");
+    run_script(&project, "gen");
+    assert_eq!(
+        runs(&project, "gen"),
+        1,
+        "the nested lpm found the task's own folder, which has no env project"
+    );
+
+    project.write_file(
+        "tools/gen/package.json",
+        &format!(
+            r#"{{"name":"gen-tools","version":"1.0.0","scripts":{{"show":"{SHOW_API_URL}"}}}}"#
+        ),
+    );
+    run_script(&project, "gen");
+    assert_eq!(
+        runs(&project, "gen"),
+        2,
+        "a look from where the nested lpm started ends at tools/gen now"
+    );
+    run_script(&project, "gen");
+    assert_eq!(
+        runs(&project, "gen"),
+        2,
+        "the run that found tools/gen replaced the entry it turned down"
+    );
+
+    give_an_env_project_with_an_override(&project, "tools/gen");
+    run_script(&project, "gen");
+    assert_eq!(runs(&project, "gen"), 3);
+    assert!(
+        project.read_file("dist/gen.txt").contains("API_URL=mine"),
+        "{}",
+        project.read_file("dist/gen.txt")
+    );
+}
+
+#[test]
+fn a_cached_task_reused_inside_another_tells_it_the_folders_its_entry_names() {
+    let project = TempProject::empty(
+        r#"{"name":"reused-inside","version":"1.0.0","scripts":{"outer":"node outer.js","inner":"node inner.js"}}"#,
+    );
+    project.write_file(
+        "other/package.json",
+        &format!(r#"{{"name":"other","version":"1.0.0","scripts":{{"show":"{SHOW_API_URL}"}}}}"#),
+    );
+    project.write_file(
+        "inner.js",
+        &nested_lpm_script("inner", "other", &["run", "show"]),
+    );
+    project.write_file(
+        "outer.js",
+        &nested_lpm_script("outer", ".", &["run", "inner"]),
+    );
+    project.write_file(
+        "lpm.json",
+        // Without `cacheEnv`, what the outer run sets in the inner run's
+        // environment would key inner apart from a run of its own.
+        r#"{"tasks":{
+            "inner":{"cache":true,"cacheEnv":[],"inputs":["inner.js"],"outputs":["dist/inner.txt"]},
+            "outer":{"cache":true,"cacheEnv":[],"inputs":["outer.js"],"outputs":["dist/outer.txt"]}
+        }}"#,
+    );
+
+    run_script(&project, "inner");
+    run_script(&project, "outer");
+    run_script(&project, "outer");
+    assert_eq!(
+        runs(&project, "inner"),
+        1,
+        "outer's lpm reused inner's entry"
+    );
+    assert_eq!(runs(&project, "outer"), 1);
+
+    give_an_env_project_with_an_override(&project, "other");
+    run_script(&project, "outer");
+    assert_eq!(
+        runs(&project, "outer"),
+        2,
+        "outer's entry names other, which inner's reused entry named"
+    );
+    assert_eq!(runs(&project, "inner"), 2);
+    assert!(
+        project.read_file("dist/inner.txt").contains("API_URL=mine"),
+        "{}",
+        project.read_file("dist/inner.txt")
+    );
+}
+
+#[test]
+fn every_command_that_reads_or_changes_overrides_where_there_s_no_env_project_names_that_folder() {
+    for command in [
+        &["env", "ls", "--json"][..],
+        &["env", "override", "list", "--json"],
+        &["env", "override", "clear", "--all", "--yes", "--json"],
+        &["env", "override", "remove", "API_URL", "--json"],
+        &["env", "override", "set", "API_URL=mine"],
+        &["env", "repair", "--json"],
+    ] {
+        let project = TempProject::empty(
+            r#"{"name":"no-project-commands","version":"1.0.0","scripts":{"gen":"node gen.js"}}"#,
+        );
+        project.write_file(
+            "other/package.json",
+            r#"{"name":"other","version":"1.0.0"}"#,
+        );
+        // A task may go on whatever the command says, as one that tries
+        // `lpm env override set` and falls back without a project does.
+        project.write_file(
+            "gen.js",
+            &format!(
+                r#"const fs = require('fs');
+const {{ spawnSync }} = require('child_process');
+fs.appendFileSync('runs.txt', 'gen\n');
+const printed = spawnSync(process.env.LPM_TEST_BIN, {args}, {{ cwd: 'other', encoding: 'utf8' }});
+fs.mkdirSync('dist', {{ recursive: true }});
+fs.writeFileSync('dist/gen.txt', String(printed.status));
+"#,
+                args = serde_json::to_string(command).expect("arguments"),
+            ),
+        );
+        project.write_file(
+            "lpm.json",
+            r#"{"tasks":{"gen":{"cache":true,"inputs":["gen.js"],"outputs":["dist/gen.txt"]}}}"#,
+        );
+
+        run_script(&project, "gen");
+        run_script(&project, "gen");
+        assert_eq!(runs(&project, "gen"), 1, "{command:?}");
+        give_an_env_project_with_an_override(&project, "other");
+        run_script(&project, "gen");
+        assert_eq!(
+            runs(&project, "gen"),
+            2,
+            "{command:?} found no env project in other, which has one now"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_task_whose_lpm_found_no_env_project_outside_the_workspace_is_cached_here_alone() {
+    let server = MockServer::start().await;
+    mount_stateful_remote_cache(&server, RemoteCacheState::default()).await;
+    let outside = tempfile::tempdir().expect("a folder outside the project");
+    let outside = std::fs::canonicalize(outside.path()).expect("canonical");
+    let project = cached_gen_project(
+        &server,
+        &nested_lpm_script("gen", outside.to_str().expect("UTF-8"), &["env", "print"]),
+    );
+
+    let first = run_with_remote_cache(&project, &["run", "gen"]);
+    assert_eq!(
+        times_said(&first, "task 'gen' is cached on this computer only"),
+        1,
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(
+        artifact_requests(&server, "PUT").await,
+        0,
+        "its entry names a folder outside the workspace"
+    );
+    run_with_remote_cache(&project, &["run", "gen"]);
+    assert_eq!(runs(&project, "gen"), 1, "cached on this computer");
+}
+
+#[tokio::test]
+async fn a_folder_without_an_env_project_reported_while_a_task_s_outputs_are_taken_keeps_them_out()
+{
+    let server = MockServer::start().await;
+    mount_stateful_remote_cache(&server, RemoteCacheState::default()).await;
+    let project = cached_gen_project(
+        &server,
+        r#"const fs = require('fs');
+const { spawn } = require('child_process');
+fs.mkdirSync('dist', { recursive: true });
+fs.writeFileSync('dist/gen.txt', 'built');
+spawn(process.execPath, ['late.js'], { detached: true, stdio: 'ignore' }).unref();
+"#,
+    );
+    project.write_file("bare/package.json", r#"{"name":"bare","version":"1.0.0"}"#);
+    let pause = project.path().join("staging-pause");
+    project.write_file(
+        "late.js",
+        &format!(
+            r#"{WAIT_FOR_FILE_JS}const {{ spawnSync }} = require('child_process');
+const fs = require('fs');
+const pause = {pause};
+waitFor(pause + '.staging');
+spawnSync(process.env.LPM_TEST_BIN, ['env', 'print'], {{ cwd: 'bare', encoding: 'utf8' }});
+fs.writeFileSync(pause + '.go', '');
+"#,
+            pause = serde_json::to_string(&pause).expect("pause path"),
+        ),
+    );
+
+    let output = lpm(&project)
+        .env(
+            "LPM_TEST_TASK_CACHE_PAUSE",
+            format!("staging:{}", pause.display()),
+        )
+        .env("LPM_TEST_BIN", support::lpm_binary())
+        .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+        .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
+        .args(["run", "gen"])
+        .output()
+        .expect("run gen");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        times_said(
+            &output,
+            "found no env project for one more folder once the cache had taken its outputs"
+        ),
+        1,
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(artifact_requests(&server, "PUT").await, 0);
+}
+
+#[tokio::test]
+async fn a_kept_entry_is_checked_for_a_folder_reported_late_before_a_dependent_builds_on_it() {
+    let server = MockServer::start().await;
+    mount_stateful_remote_cache(&server, RemoteCacheState::default()).await;
+    let scripts = r#"{"name":"kept-late-folder","version":"1.0.0","scripts":{"gen":"node gen.js","build":"node build.js"}}"#;
+    let project = TempProject::empty(scripts);
+    project.write_file("bare/package.json", r#"{"name":"bare","version":"1.0.0"}"#);
+    let pause = project.path().join("storing-pause");
+    let go = project.path().join("late-go");
+    let done = project.path().join("late-done");
+    project.write_file(
+        "gen.js",
+        r#"const fs = require('fs');
+const { spawn } = require('child_process');
+fs.mkdirSync('dist', { recursive: true });
+fs.writeFileSync('dist/gen.txt', 'built');
+if (fs.existsSync('arm-late')) {
+  fs.unlinkSync('arm-late');
+  spawn(process.execPath, ['late.js'], { detached: true, stdio: 'ignore' }).unref();
+}
+"#,
+    );
+    project.write_file(
+        "late.js",
+        &format!(
+            r#"{WAIT_FOR_FILE_JS}const fs = require('fs');
+const {{ spawnSync }} = require('child_process');
+waitFor({go});
+spawnSync(process.env.LPM_TEST_BIN, ['env', 'print'], {{ cwd: 'bare', encoding: 'utf8' }});
+fs.writeFileSync({done}, '');
+"#,
+            go = serde_json::to_string(&go).expect("go path"),
+            done = serde_json::to_string(&done).expect("done path"),
+        ),
+    );
+    project.write_file(
+        "build.js",
+        "require('fs').mkdirSync('out',{recursive:true});require('fs').copyFileSync('dist/gen.txt','out/app.txt');",
+    );
+    project.write_file(
+        "lpm.json",
+        &serde_json::json!({
+            "remoteCache": {"enabled": true, "url": format!("{}/v8", server.uri())},
+            "tasks": {
+                "gen": {"cache": true, "cacheEnv": [], "inputs": ["gen.js", "late.js"], "outputs": ["dist/gen.txt"]},
+                "build": {"cache": true, "cacheEnv": [], "dependsOn": ["gen"], "inputs": ["build.js"], "outputs": ["out/**"]}
+            }
+        })
+        .to_string(),
+    );
+    project.write_file("arm-late", "");
+    let held = lpm_spawnable(&project)
+        .env("LPM_TEST_BIN", support::lpm_binary())
+        .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+        .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
+        .env(
+            "LPM_TEST_TASK_CACHE_PAUSE",
+            format!("storing:{}", pause.display()),
+        )
+        .args(["run", "build"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("start the held run");
+    wait_for_path(&project.path().join("storing-pause.storing"));
+
+    run_with_remote_cache(&project, &["run", "gen"]);
+    std::fs::write(&go, "").expect("let the late lpm run");
+    wait_for_path(&done);
+    std::fs::write(project.path().join("storing-pause.go"), "").expect("release the held run");
+    let held = held.wait_with_output().expect("the held run ends");
+
+    assert!(
+        held.status.success(),
+        "{}",
+        String::from_utf8_lossy(&held.stderr)
+    );
+    assert_eq!(
+        artifact_requests(&server, "PUT").await,
+        1,
+        "only the first run's gen is shared; the held run's names a folder its kept entry doesn't, so build isn't cached either"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_task_whose_lpm_started_in_a_folder_an_entry_can_t_name_isn_t_cached() {
+    let project = TempProject::empty(
+        r#"{"name":"unnamed-folder","version":"1.0.0","scripts":{"gen":"node gen.js"}}"#,
+    );
+    project.write_file("odd:name/.keep", "");
+    project.write_file(
+        "gen.js",
+        &nested_lpm_script("gen", "odd:name", &["env", "print"]),
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{"tasks":{"gen":{"cache":true,"inputs":["gen.js"],"outputs":["dist/gen.txt"]}}}"#,
+    );
+
+    let first = run_script(&project, "gen");
+    run_script(&project, "gen");
+
+    assert_eq!(runs(&project, "gen"), 2);
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(
+        stderr.contains("task 'gen' isn't cached")
+            && stderr.contains("which a cache entry can't name from the task's own folder"),
+        "{stderr}"
+    );
 }
 
 #[test]

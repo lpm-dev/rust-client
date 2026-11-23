@@ -13,6 +13,7 @@ lpm-env = { workspace = true }
 lpm-env-companion = { workspace = true }
 lpm-http = { workspace = true }
 lpm-keyring = { workspace = true }
+lpm-workspace = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 dirs = { workspace = true }
