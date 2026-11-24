@@ -37,7 +37,7 @@ oxc_semantic = "=0.158.0"
 oxc_transformer = "=0.158.0"
 oxc_codegen = "=0.158.0"
 oxc_span = "=0.158.0"
-oxc_ast = "=0.158.0"
+oxc_ast = "=0.159.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
