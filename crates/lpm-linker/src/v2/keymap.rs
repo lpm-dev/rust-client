@@ -8,7 +8,7 @@ use lpm_common::{LpmError, PackageInstanceId};
 use lpm_store::v2::{GraphKey, LinkerModeTag, PlatformTuple};
 
 use super::V2Target;
-use crate::{LinkDependency, LinkTarget};
+use crate::LinkDependency;
 
 /// Per-install lookup table from exact package-instance identity to the
 /// derived `GraphKey`.
@@ -54,11 +54,8 @@ impl GraphKeyCacheInput {
             && &self.platform == platform
             && self.linker_tag == linker_tag
             && cached_link_target.dependencies == link_target.dependencies
-            && cached_target.dependency_targets == target.dependency_targets
             && cached_link_target.aliases == link_target.aliases
             && cached_link_target.peers == link_target.peers
-            && cached_target.peer_targets == target.peer_targets
-            && root_link_identity(cached_link_target) == root_link_identity(link_target)
             && cached_link_target.wrapper_id == link_target.wrapper_id
             && cached_link_target.patch_fingerprint == link_target.patch_fingerprint
     }
@@ -184,16 +181,6 @@ fn fingerprint_optional(fingerprint: &mut u64, value: Option<&str>) {
     }
 }
 
-// Implicit transitive roots are absent in V2/V3. Cold source resolution can
-// explicitly suppress them, while lockfile replay leaves them implicit. Keep that legacy
-// linker distinction out of the virtual-store identity and its cache inputs.
-fn root_link_identity(target: &LinkTarget) -> Option<&[String]> {
-    match target.root_link_names.as_deref() {
-        Some([]) if !target.is_direct => None,
-        names => names,
-    }
-}
-
 fn graph_key_input_fingerprint(
     target: &V2Target,
     platform: &PlatformTuple,
@@ -226,9 +213,6 @@ fn graph_key_input_fingerprint(
             fingerprint_bytes(&mut fingerprint, value.as_bytes());
         }
         fingerprint_optional(&mut fingerprint, dependency.target_wrapper_id.as_deref());
-        if let Some(instance_id) = target.dependency_targets.get(&dependency.local) {
-            fingerprint_bytes(&mut fingerprint, instance_id.as_bytes());
-        }
     }
     let mut aliases_fingerprint = 0u64;
     for (local, canonical) in &link_target.aliases {
@@ -243,18 +227,6 @@ fn graph_key_input_fingerprint(
         fingerprint_bytes(&mut fingerprint, peer.target_name.as_bytes());
         fingerprint_bytes(&mut fingerprint, peer.target_version.as_bytes());
         fingerprint_optional(&mut fingerprint, peer.target_wrapper_id.as_deref());
-        if let Some(instance_id) = target.peer_targets.get(&peer.local_name) {
-            fingerprint_bytes(&mut fingerprint, instance_id.as_bytes());
-        }
-    }
-    match root_link_identity(link_target) {
-        None => fingerprint_bytes(&mut fingerprint, b"none"),
-        Some(names) => {
-            fingerprint_bytes(&mut fingerprint, b"some");
-            for name in names {
-                fingerprint_bytes(&mut fingerprint, name.as_bytes());
-            }
-        }
     }
     fingerprint_optional(&mut fingerprint, link_target.wrapper_id.as_deref());
     fingerprint_optional(&mut fingerprint, link_target.patch_fingerprint.as_deref());
@@ -271,17 +243,23 @@ fn own_digest(target: &V2Target, platform: &PlatformTuple, linker_tag: LinkerMod
             .iter()
             .map(|dep| (dep.local.clone(), dep.graph_key_value().to_string())),
     );
+    let empty_targets = HashMap::new();
+    // V2 link directories only materialize the package's files and sibling
+    // dependency/peer symlinks, never project root symlinks. Exact dependency
+    // and peer target identities are folded structurally by slot and target
+    // GraphKey digest inside `closure_digest`, so content-identical link trees
+    // across workspace targets share one store entry.
     GraphKey::own_digest_raw(
         &link_target.name,
         &link_target.version,
         platform,
         linker_tag,
         &graph_key_deps,
-        &target.dependency_targets,
+        &empty_targets,
         &link_target.aliases,
         &link_target.peers,
-        &target.peer_targets,
-        root_link_identity(link_target),
+        &empty_targets,
+        None,
         link_target.wrapper_id.as_deref(),
         link_target.patch_fingerprint.as_deref(),
     )
@@ -382,8 +360,8 @@ fn linked_digests(targets: &[Arc<V2Target>], own_digests: &[[u8; 32]]) -> Vec<[u
             let members = open.split_off(start);
             let closure = closure_digest(
                 targets,
+                &by_instance,
                 &members,
-                &linked,
                 &completed,
                 own_digests,
                 &digests,
@@ -402,39 +380,81 @@ fn linked_digests(targets: &[Arc<V2Target>], own_digests: &[[u8; 32]]) -> Vec<[u
 /// tells the targets they link to outside the cycle from each other.
 fn closure_digest(
     targets: &[Arc<V2Target>],
+    by_instance: &HashMap<PackageInstanceId, usize>,
     members: &[usize],
-    linked: &[Vec<usize>],
     completed: &[bool],
     own_digests: &[[u8; 32]],
     digests: &[[u8; 32]],
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"lpm-link-closure-v1\0");
+    hasher.update(b"lpm-link-closure-v2\0");
     if let [member] = members {
         hasher.update([0]);
-        hash_source(&mut hasher, &targets[*member].source_sri);
+        let target = &targets[*member];
+        hash_source(&mut hasher, &target.source_sri);
+        let mut edges: Vec<(u8, &str, [u8; 32])> =
+            Vec::with_capacity(target.dependency_targets.len() + target.peer_targets.len());
+        for (edge_kind, map) in [
+            (0u8, &target.dependency_targets),
+            (1u8, &target.peer_targets),
+        ] {
+            for (slot, instance_id) in map {
+                match by_instance.get(instance_id).copied() {
+                    Some(other) if other == *member => {
+                        edges.push((edge_kind + 2, slot.as_str(), [0u8; 32]));
+                    }
+                    Some(other) if completed[other] => {
+                        edges.push((edge_kind, slot.as_str(), digests[other]));
+                    }
+                    _ => {
+                        edges.push((edge_kind + 4, slot.as_str(), *instance_id.as_bytes()));
+                    }
+                }
+            }
+        }
+        edges.sort_unstable();
+        for (kind, slot, target_digest) in edges {
+            hasher.update([kind]);
+            hasher.update((slot.len() as u64).to_le_bytes());
+            hasher.update(slot.as_bytes());
+            hasher.update(target_digest);
+        }
     } else {
         let mut sorted = members.to_vec();
         sorted.sort_unstable_by_key(|&member| targets[member].instance_id);
         hasher.update([1]);
         hasher.update((sorted.len() as u64).to_le_bytes());
-        for member in sorted {
-            hasher.update(targets[member].instance_id.as_bytes());
+        for &member in &sorted {
+            let target = &targets[member];
+            hasher.update(target.instance_id.as_bytes());
             hasher.update(own_digests[member]);
-            hash_source(&mut hasher, &targets[member].source_sri);
+            hash_source(&mut hasher, &target.source_sri);
+            let mut edges: Vec<(u8, &str, [u8; 32])> =
+                Vec::with_capacity(target.dependency_targets.len() + target.peer_targets.len());
+            for (edge_kind, map) in [
+                (0u8, &target.dependency_targets),
+                (1u8, &target.peer_targets),
+            ] {
+                for (slot, instance_id) in map {
+                    match by_instance.get(instance_id).copied() {
+                        Some(other) if completed[other] => {
+                            edges.push((edge_kind, slot.as_str(), digests[other]));
+                        }
+                        _ => {
+                            edges.push((edge_kind + 2, slot.as_str(), *instance_id.as_bytes()));
+                        }
+                    }
+                }
+            }
+            edges.sort_unstable();
+            hasher.update((edges.len() as u64).to_le_bytes());
+            for (kind, slot, target_digest) in edges {
+                hasher.update([kind]);
+                hasher.update((slot.len() as u64).to_le_bytes());
+                hasher.update(slot.as_bytes());
+                hasher.update(target_digest);
+            }
         }
-    }
-    let mut outside: Vec<_> = members
-        .iter()
-        .flat_map(|&member| &linked[member])
-        .filter(|&&other| completed[other])
-        .map(|&other| (targets[other].instance_id, &digests[other]))
-        .collect();
-    outside.sort_unstable();
-    outside.dedup();
-    for (instance_id, digest) in outside {
-        hasher.update(instance_id.as_bytes());
-        hasher.update(digest);
     }
     hasher.finalize().into()
 }
@@ -669,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_key_cache_preserves_direct_empty_and_alias_root_names() {
+    fn graph_key_cache_shares_keys_across_root_link_names_and_non_cycle_dep_instance_ids() {
         let cache = GraphKeyCache::default();
         let platform = PlatformTuple::new("darwin", "arm64", None);
         let transitive = target();
@@ -682,9 +702,33 @@ mod tests {
             &platform,
             LinkerModeTag::Isolated,
         );
-        assert_eq!(cache.len(), 3);
-        assert_ne!(keys[0], keys[1]);
-        assert_ne!(keys[1], keys[2]);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(keys[0], keys[1]);
+        assert_eq!(keys[1], keys[2]);
+
+        let child_a = graph_node("child");
+        let mut child_b = graph_node("child");
+        child_b.instance_id =
+            PackageInstanceId::derive("child", "1.0.0", "registry+npm", "other-importer-path");
+        let mut parent_a = graph_node("parent");
+        parent_a
+            .dependency_targets
+            .insert("child".to_owned(), child_a.instance_id);
+        let mut parent_b = graph_node("parent");
+        parent_b.instance_id =
+            PackageInstanceId::derive("parent", "1.0.0", "registry+npm", "other-importer-path");
+        parent_b
+            .dependency_targets
+            .insert("child".to_owned(), child_b.instance_id);
+        let graph = [
+            Arc::new(parent_a),
+            Arc::new(child_a),
+            Arc::new(parent_b),
+            Arc::new(child_b),
+        ];
+        let map = keys_of(&graph, None);
+        assert_eq!(map.get_for(&graph[1]), map.get_for(&graph[3]));
+        assert_eq!(map.get_for(&graph[0]), map.get_for(&graph[2]));
     }
 
     #[test]
@@ -746,7 +790,7 @@ mod tests {
             LinkerModeTag::Isolated,
         );
 
-        assert_eq!(cache.len(), 9);
+        assert_eq!(cache.len(), 8);
     }
 
     #[test]
@@ -874,23 +918,23 @@ mod tests {
     }
 
     #[test]
-    fn a_dependency_linked_another_way_changes_the_key_of_what_links_to_it() {
+    fn a_dependency_with_different_patch_changes_the_key_of_what_links_to_it() {
         let mut parent = graph_node("parent");
         let child = graph_node("child");
         parent
             .dependency_targets
             .insert("child".to_owned(), child.instance_id);
         let original: Vec<_> = [parent, child].into_iter().map(Arc::new).collect();
-        let mut exposed = original.clone();
-        Arc::make_mut(&mut Arc::make_mut(&mut exposed[1]).target).root_link_names =
-            Some(vec!["child".to_owned(), "also-child".to_owned()]);
+        let mut patched = original.clone();
+        Arc::make_mut(&mut Arc::make_mut(&mut patched[1]).target).patch_fingerprint =
+            Some("p-patched".to_owned());
         let cache = GraphKeyCache::default();
 
         let before = keys_of(&original, Some(&cache));
-        let after = keys_of(&exposed, Some(&cache));
+        let after = keys_of(&patched, Some(&cache));
 
-        assert_ne!(before.get_for(&original[1]), after.get_for(&exposed[1]));
-        assert_ne!(before.get_for(&original[0]), after.get_for(&exposed[0]));
+        assert_ne!(before.get_for(&original[1]), after.get_for(&patched[1]));
+        assert_ne!(before.get_for(&original[0]), after.get_for(&patched[0]));
     }
 
     #[test]

@@ -1024,6 +1024,14 @@ async fn run_with_options_under_store_lock(
             ..V2WorkspaceRootPreResolveResult::default()
         }
     };
+    let promoted_workspace_registry_roots: HashSet<String> = if requested_v2_mode {
+        deps.keys()
+            .filter(|name| !direct_dependency_snapshot.contains_key(name.as_str()))
+            .cloned()
+            .collect()
+    } else {
+        HashSet::new()
+    };
     if requested_v2_mode {
         workspace_member_deps.retain(WorkspaceMemberLink::needs_publish_projection_link);
     }
@@ -1407,6 +1415,7 @@ async fn run_with_options_under_store_lock(
         json_output,
         requested_v2_mode,
         v2_workspace_root_pre_resolve: &v2_workspace_root_pre_resolve,
+        promoted_workspace_registry_roots: &promoted_workspace_registry_roots,
         workspace_member_deps: &mut workspace_member_deps,
         all_workspace_members: &all_workspace_members,
         store: store.clone(),

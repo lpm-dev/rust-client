@@ -14,6 +14,7 @@ pub(in crate::commands::install) struct OnlineResolutionPhaseInput<'a> {
     pub(in crate::commands::install) requested_v2_mode: bool,
     pub(in crate::commands::install) v2_workspace_root_pre_resolve:
         &'a V2WorkspaceRootPreResolveResult,
+    pub(in crate::commands::install) promoted_workspace_registry_roots: &'a HashSet<String>,
     pub(in crate::commands::install) workspace_member_deps: &'a mut Vec<WorkspaceMemberLink>,
     pub(in crate::commands::install) all_workspace_members: &'a [WorkspaceMemberLink],
     pub(in crate::commands::install) store: PackageStore,
@@ -104,6 +105,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         json_output,
         requested_v2_mode,
         v2_workspace_root_pre_resolve,
+        promoted_workspace_registry_roots,
         workspace_member_deps,
         all_workspace_members,
         store,
@@ -664,6 +666,29 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         packages.extend(v2_workspace_root_pre_resolve.install_pkgs.iter().cloned());
         dedupe_install_packages_by_identity(&mut packages)?;
         apply_post_resolve_directory_link_fixup(&mut packages, v2_source_deps)?;
+    }
+    if requested_v2_mode && !used_lockfile && !promoted_workspace_registry_roots.is_empty() {
+        // Workspace-member registry dependencies were promoted into `deps` so the
+        // resolver resolves them and `apply_post_resolve_directory_link_fixup` wires
+        // the member wrappers. Strip those transitive names from project root links
+        // so cold installs match lockfile replay and never leak undeclared deps into
+        // the consumer's top-level `node_modules/`.
+        let ambient_roots: HashSet<&str> = ambient_peer_installs_for_lockfile
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for package in &mut packages {
+            if let Some(names) = &mut package.root_link_names {
+                names.retain(|name| {
+                    !promoted_workspace_registry_roots.contains(name.as_str())
+                        || ambient_roots.contains(name.as_str())
+                });
+                if names.is_empty() {
+                    package.root_link_names = None;
+                    package.is_direct = false;
+                }
+            }
+        }
     }
     dedupe_install_packages_by_identity(&mut packages)?;
 
