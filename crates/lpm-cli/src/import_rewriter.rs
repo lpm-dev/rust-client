@@ -208,20 +208,23 @@ fn resolve_and_rewrite(
 ) -> Option<String> {
     match classify_specifier(specifier, author_alias) {
         SpecifierKind::Relative => {
+            // An import that climbs above the source package points into the
+            // author's project, whatever it lands on after delivery.
+            if leaves_the_root(file_src_dir, specifier) {
+                return None;
+            }
             let folder = names_a_folder(specifier);
-            if !leaves_the_root(file_src_dir, specifier) {
-                let resolved_src = normalize_path(&join_path(file_src_dir, specifier));
-                if let Some(src_match) = try_resolve_map_key(&resolved_src, folder, src_to_dest)
-                    && let Some(dest_path) = src_to_dest.get(src_match)
-                {
-                    return compute_new_specifier(
-                        dest_path,
-                        file_dest_dir,
-                        buyer_alias,
-                        Some(specifier),
-                        dest_files,
-                    );
-                }
+            let resolved_src = normalize_path(&join_path(file_src_dir, specifier));
+            if let Some(src_match) = try_resolve_map_key(&resolved_src, folder, src_to_dest)
+                && let Some(dest_path) = src_to_dest.get(src_match)
+            {
+                return compute_new_specifier(
+                    dest_path,
+                    file_dest_dir,
+                    buyer_alias,
+                    Some(specifier),
+                    dest_files,
+                );
             }
 
             if !leaves_the_root(file_dest_dir, specifier) {
@@ -259,13 +262,17 @@ fn resolve_and_rewrite(
                 );
             }
 
-            if try_resolve_set(path, folder, dest_files).is_some() {
+            if let Some(dest_match) = try_resolve_set(path, folder, dest_files) {
                 if buyer_alias == author_alias {
                     return None;
                 }
-                if let Some(b_alias) = buyer_alias {
-                    return Some(format!("{b_alias}{path}"));
-                }
+                return compute_new_specifier(
+                    dest_match,
+                    file_dest_dir,
+                    buyer_alias,
+                    None,
+                    dest_files,
+                );
             }
 
             if buyer_alias != author_alias
@@ -556,13 +563,21 @@ fn compute_new_specifier(
         return Some(format!("{alias}{clean_path}"));
     }
 
-    if let Some(original) = original_relative {
+    // The original import stays when it still reaches the same file: a folder
+    // import through that folder's index, any other through the same path
+    // with or without its extension.
+    if let Some(original) = original_relative
+        && !leaves_the_root(file_dest_dir, original)
+    {
         let original_target = normalize_path(&join_path(file_dest_dir, original));
-        if original_target == clean_path
-            || (!runtime_extension && strip_import_extension(&original_target) == clean_path)
-            || (names_a_folder(original)
-                && clean_path.strip_suffix("/index") == Some(original_target.as_str()))
-        {
+        let unchanged = if names_a_folder(original) {
+            try_resolve_set(&original_target, true, dest_files) == Some(resolved_dest_path)
+        } else {
+            original_target == clean_path
+                || (!runtime_extension
+                    && import_path_without_extension(&original_target, dest_files) == clean_path)
+        };
+        if unchanged {
             return None;
         }
     }
@@ -605,7 +620,10 @@ fn names_a_folder(specifier: &str) -> bool {
 /// root. Such an import points outside the delivered files, so LPM CLI leaves
 /// it as written.
 fn leaves_the_root(dir: &str, specifier: &str) -> bool {
-    let mut depth = dir.split('/').filter(|part| !part.is_empty()).count();
+    let mut depth = dir
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .count();
     for segment in specifier.split('/') {
         match segment {
             "" | "." => {}
@@ -682,6 +700,10 @@ fn try_resolve_file(candidate: &str, files: &HashSet<String>) -> Option<String> 
 /// The import path for a delivered file: without its extension, and without a
 /// trailing `/index` unless a file of the folder's name ships beside it, since
 /// `a` would then load `a.ts` instead of `a/index.ts`.
+/// Files that bundlers or TypeScript also pick for an extensionless import,
+/// though LPM CLI doesn't rewrite them.
+const SIBLING_ONLY_EXTENSIONS: &[&str] = &[".json", ".d.ts", ".d.mts", ".d.cts"];
+
 fn import_path_without_extension(path: &str, dest_files: &HashSet<&str>) -> String {
     let stripped = strip_import_extension(path);
     let Some(extension) = EXTENSIONS
@@ -693,13 +715,16 @@ fn import_path_without_extension(path: &str, dest_files: &HashSet<&str>) -> Stri
     let Some(folder) = path[..path.len() - extension.len()].strip_suffix("/index") else {
         return stripped;
     };
-    let mut sibling = String::with_capacity(folder.len() + 4);
-    let has_sibling = EXTENSIONS.iter().any(|extension| {
-        sibling.clear();
-        sibling.push_str(folder);
-        sibling.push_str(extension);
-        dest_files.contains(sibling.as_str())
-    });
+    let mut sibling = String::with_capacity(folder.len() + 6);
+    let has_sibling = EXTENSIONS
+        .iter()
+        .chain(SIBLING_ONLY_EXTENSIONS)
+        .any(|extension| {
+            sibling.clear();
+            sibling.push_str(folder);
+            sibling.push_str(extension);
+            dest_files.contains(sibling.as_str())
+        });
     if has_sibling {
         format!("{folder}/index")
     } else {
@@ -1464,6 +1489,145 @@ import { c } from "react";
                 "{source}: {content}"
             );
         }
+    }
+
+    fn rewrite(
+        content: &str,
+        source: &str,
+        destination: &str,
+        author_alias: Option<&str>,
+        buyer_alias: Option<&str>,
+        mapping: &[(&str, &str)],
+        extra_destinations: &[&str],
+    ) -> Option<String> {
+        let src_to_dest: HashMap<String, String> = mapping
+            .iter()
+            .map(|(src, dest)| ((*src).to_string(), (*dest).to_string()))
+            .collect();
+        let src_files = src_to_dest.keys().cloned().collect();
+        let mut dest_files: HashSet<String> = src_to_dest.values().cloned().collect();
+        dest_files.extend(extra_destinations.iter().map(|dest| (*dest).to_string()));
+        rewrite_imports(
+            content,
+            source,
+            destination,
+            author_alias,
+            buyer_alias,
+            &src_to_dest,
+            &src_files,
+            &dest_files,
+        )
+    }
+
+    #[test]
+    fn an_unchanged_import_is_judged_by_what_it_resolves_to() {
+        let unmoved = [
+            ("a.ts", "a.ts"),
+            ("a/index.ts", "a/index.ts"),
+            ("x.ts", "x.ts"),
+        ];
+        for import in ["./a/index.ts", "./a/index.js", "./a/", "./a/index"] {
+            assert_eq!(
+                rewrite(
+                    &format!("import v from \"{import}\";"),
+                    "x.ts",
+                    "x.ts",
+                    None,
+                    None,
+                    &unmoved,
+                    &[]
+                ),
+                None,
+                "{import}"
+            );
+        }
+
+        let moved = [
+            ("a/index/index.ts", "a/index.ts"),
+            ("a.ts", "a.ts"),
+            ("x.ts", "x.ts"),
+        ];
+        assert_eq!(
+            rewrite(
+                "import v from \"./a/index/\";",
+                "x.ts",
+                "x.ts",
+                None,
+                None,
+                &moved,
+                &[]
+            )
+            .as_deref(),
+            Some("import v from \"./a/index\";")
+        );
+    }
+
+    #[test]
+    fn a_folder_index_keeps_index_beside_a_json_or_declaration_file() {
+        for sibling in ["a.json", "a.d.ts"] {
+            assert_eq!(
+                rewrite(
+                    "import v from \"@/a/\";",
+                    "x.ts",
+                    "x.ts",
+                    Some("@/"),
+                    Some("~/"),
+                    &[("a/index.ts", "a/index.ts"), ("x.ts", "x.ts")],
+                    &[sibling],
+                )
+                .as_deref(),
+                Some("import v from \"~/a/index\";"),
+                "{sibling}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_import_that_leaves_the_source_package_stays_unchanged_wherever_it_lands() {
+        assert_eq!(
+            rewrite(
+                "import x from \"../x\";",
+                "app.ts",
+                "ui/app.ts",
+                None,
+                Some("@/"),
+                &[("app.ts", "ui/app.ts"), ("x.ts", "x.ts")],
+                &[],
+            ),
+            None
+        );
+        assert_eq!(
+            rewrite(
+                "import o from \"../../other\";",
+                "ui/x.ts",
+                "./ui/x.ts",
+                None,
+                Some("~/"),
+                &[("ui/x.ts", "./ui/x.ts"), ("pkg/other.ts", "other.ts")],
+                &[],
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn an_author_alias_import_found_only_among_delivered_files_becomes_relative() {
+        assert_eq!(
+            rewrite(
+                "import c from \"@/lib/config.json\";",
+                "ui/app.ts",
+                "ui/app.ts",
+                Some("@/"),
+                None,
+                &[
+                    ("ui/app.ts", "ui/app.ts"),
+                    ("data/config.json", "lib/config.json")
+                ],
+                &[],
+            )
+            .as_deref(),
+            Some("import c from \"../lib/config.json\";")
+        );
     }
 
     #[test]
