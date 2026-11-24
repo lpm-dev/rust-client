@@ -325,25 +325,37 @@ pub fn redact_exact_secret<'a>(text: &'a str, secret: &str) -> std::borrow::Cow<
 }
 
 pub fn safe_url_origin(raw: &str) -> String {
-    let Some((scheme, rest)) = raw.split_once("://") else {
+    if raw.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return "remote-url".to_string();
+    }
+    let Ok(parsed) = url::Url::parse(raw) else {
         return "remote-url".to_string();
     };
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+    if !matches!(parsed.scheme(), "http" | "https") {
         return "remote-url".to_string();
     }
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("")
-        .rsplit_once('@')
-        .map_or_else(
-            || rest.split(['/', '?', '#']).next().unwrap_or(""),
-            |(_, host)| host,
-        );
-    if authority.is_empty() {
-        return "remote-url".to_string();
+    let origin = parsed.origin().ascii_serialization();
+    if origin == "null" {
+        "remote-url".to_string()
+    } else {
+        origin
     }
-    format!("{}://{authority}", scheme.to_ascii_lowercase())
+}
+
+/// Returns true when `candidate` shares the same origin as `base` and its
+/// normalized path lies within `base`'s path prefix on a segment boundary.
+pub fn url_matches_base_scope(candidate: &url::Url, base: &url::Url) -> bool {
+    if candidate.origin() != base.origin() {
+        return false;
+    }
+    let base_path = base.path().trim_end_matches('/');
+    if base_path.is_empty() {
+        return true;
+    }
+    candidate
+        .path()
+        .strip_prefix(base_path)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// Loopback host detection covering the shapes that appear in tests
@@ -1156,5 +1168,50 @@ mod tests {
         assert!(!is_loopback_host("8.8.8.8"));
         assert!(!is_loopback_host("registry.npmjs.org"));
         assert!(!is_loopback_host(""));
+    }
+
+    #[test]
+    fn safe_url_origin_handles_backslashes_userinfo_and_control_chars() {
+        assert_eq!(
+            safe_url_origin("https://user:secret@registry.example:8443/private?token=abc#frag"),
+            "https://registry.example:8443"
+        );
+        assert_eq!(
+            safe_url_origin("https://registry.example\\secret/path"),
+            "https://registry.example"
+        );
+        assert_eq!(
+            safe_url_origin("https://registry.example/\x1b[31mred"),
+            "remote-url"
+        );
+        assert_eq!(
+            safe_url_origin("https://registry.example\r\nX-Injected: 1"),
+            "remote-url"
+        );
+    }
+
+    #[test]
+    fn url_matches_base_scope_enforces_origin_and_segment_prefix() {
+        let base = url::Url::parse("https://corp.example/lpm").unwrap();
+        assert!(url_matches_base_scope(
+            &url::Url::parse("https://corp.example/lpm/api/registry/pkg").unwrap(),
+            &base
+        ));
+        assert!(url_matches_base_scope(
+            &url::Url::parse("https://corp.example/lpm").unwrap(),
+            &base
+        ));
+        assert!(!url_matches_base_scope(
+            &url::Url::parse("https://corp.example/lpm-other/api").unwrap(),
+            &base
+        ));
+        assert!(!url_matches_base_scope(
+            &url::Url::parse("https://corp.example/other/api").unwrap(),
+            &base
+        ));
+        assert!(!url_matches_base_scope(
+            &url::Url::parse("https://other.example/lpm/api").unwrap(),
+            &base
+        ));
     }
 }

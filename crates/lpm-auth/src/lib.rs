@@ -1359,17 +1359,40 @@ pub fn set_custom_registry_token_with_backend(
     registry_url: &str,
     token: &str,
 ) -> Result<AuthStorageBackend, String> {
+    validate_custom_registry_url_for_storage(registry_url)?;
     with_custom_registry_tracking_lock(|| {
         let path = custom_registries_path()
             .ok_or_else(|| "could not determine custom registry tracking path".to_string())?;
         let mut registries = read_custom_registries_checked_from(&path)?;
         if !registries.iter().any(|registry| registry == registry_url) {
             registries.push(registry_url.to_string());
-            write_custom_registries_checked(&path, &registries, HomeWrite::Adds)?;
+            write_custom_registry_list(&path, &registries)?;
         }
 
         set_token_with_backend(registry_url, token)
     })
+}
+
+fn validate_custom_registry_url_for_storage(registry_url: &str) -> Result<(), String> {
+    if registry_url.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err("custom registry URL must not contain control characters".to_string());
+    }
+    let parsed =
+        reqwest::Url::parse(registry_url).map_err(|_| "invalid custom registry URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("custom registry URL must use http or https".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(lpm_http::URL_CREDENTIALS_REFUSAL.to_string());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("custom registry URL must not include a query string or fragment".to_string());
+    }
+    Ok(())
+}
+
+fn write_custom_registry_list(path: &Path, registries: &[String]) -> Result<(), String> {
+    write_custom_registries_checked(path, registries, HomeWrite::Adds)
 }
 
 /// Clear stored custom registry token and remove from tracking.
@@ -6839,5 +6862,23 @@ mod tests {
             .unwrap(),
             r#"{"https://registry.lpm.dev":"kat-token"}"#
         );
+    }
+
+    #[test]
+    fn custom_registry_storage_rejects_userinfo_query_and_fragment() {
+        for bad in [
+            "https://user:secret@registry.example/npm",
+            "https://token@registry.example/npm",
+            "https://registry.example/npm?token=abc",
+            "https://registry.example/npm#frag",
+            "https://registry.example/npm\n",
+            "ftp://registry.example/npm",
+        ] {
+            assert!(
+                validate_custom_registry_url_for_storage(bad).is_err(),
+                "expected rejection for {bad}"
+            );
+        }
+        assert!(validate_custom_registry_url_for_storage("https://registry.example/npm").is_ok());
     }
 }

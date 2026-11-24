@@ -788,12 +788,23 @@ pub struct LockedPackage {
 }
 
 /// Whether a lockfile may record `url` as a package's tarball hint. A URL
-/// with a query or a fragment isn't: a registry that signs its download
-/// URLs puts the signature there, which would reach version control and
-/// stop working once it expires.
+/// with a query, a fragment, or embedded userinfo isn't: signed URLs carry
+/// expiring credentials in the query, and embedded userinfo would persist
+/// secrets into version control.
 #[inline]
 pub fn is_recordable_tarball_hint(url: &str) -> bool {
-    !url.contains(['?', '#'])
+    if url.contains(['?', '#']) {
+        return false;
+    }
+    // Reject embedded userinfo (`scheme://user[:pass]@host/...`) without
+    // requiring a full URL parser dependency in `lpm-lockfile`.
+    if let Some((_, rest)) = url.split_once("://") {
+        let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or("");
+        if authority.contains('@') {
+            return false;
+        }
+    }
+    true
 }
 
 impl LockedPackage {

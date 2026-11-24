@@ -25,6 +25,46 @@ pub const HTTPS_DOWNGRADE_REFUSAL: &str = "refused HTTPS-to-HTTP redirect";
 /// URL userinfo must not bypass explicitly scoped registry authentication.
 pub const URL_CREDENTIALS_REFUSAL: &str = "credentials in registry URLs are not supported; remove the username and password from the URL and use registry-scoped .npmrc authentication";
 
+/// Single inventory of non-standard second-factor and step-up proof headers
+/// that must be stripped on cross-origin or out-of-scope redirects and redacted
+/// from reflected error text.
+pub const SENSITIVE_PROOF_HEADERS: [&str; 4] =
+    ["x-otp", "npm-otp", "x-lpm-approval", "x-lpm-step-up-proof"];
+
+/// Redirect policy that follows only same-origin redirects while preserving
+/// HTTPS-downgrade protection and rejecting embedded URL credentials.
+pub fn same_origin_redirect_policy() -> Policy {
+    Policy::custom(|attempt| {
+        if attempt.previous().len() > DEFAULT_REDIRECT_LIMIT {
+            return attempt.error("too many redirects");
+        }
+        let next = attempt.url();
+        if !matches!(next.scheme(), "http" | "https") {
+            return attempt.error("refused redirect to unsupported URL scheme");
+        }
+        if !next.username().is_empty() || next.password().is_some() {
+            return attempt.error(URL_CREDENTIALS_REFUSAL);
+        }
+        if attempt
+            .previous()
+            .iter()
+            .any(|prev| prev.scheme() == "https")
+            && next.scheme() != "https"
+        {
+            return attempt.error(HTTPS_DOWNGRADE_REFUSAL);
+        }
+        if attempt
+            .previous()
+            .first()
+            .is_some_and(|first| first.origin() == next.origin())
+        {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
 /// A streaming HTTP request body that can be reconstructed for retries.
 #[derive(Debug)]
 pub struct ReplayableRequestBody {
@@ -624,10 +664,11 @@ fn remove_cross_origin_credentials(headers: &mut HeaderMap) {
         PROXY_AUTHORIZATION,
         WWW_AUTHENTICATE,
         reqwest::header::HeaderName::from_static("cookie2"),
-        reqwest::header::HeaderName::from_static("x-otp"),
-        reqwest::header::HeaderName::from_static("npm-otp"),
     ] {
         headers.remove(header);
+    }
+    for header in SENSITIVE_PROOF_HEADERS {
+        headers.remove(reqwest::header::HeaderName::from_static(header));
     }
 }
 
@@ -901,24 +942,45 @@ pub struct ErrorDisplay<'a> {
     error: &'a reqwest::Error,
 }
 
+fn format_reqwest_error_without_url_secrets(error: &reqwest::Error) -> String {
+    let raw = error.to_string();
+    let Some(url) = error.url() else {
+        return raw;
+    };
+    if url.query().is_none()
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+    {
+        return raw;
+    }
+    let mut sanitized = url.clone();
+    let _ = sanitized.set_username("");
+    let _ = sanitized.set_password(None);
+    sanitized.set_query(None);
+    sanitized.set_fragment(None);
+    raw.replace(url.as_str(), sanitized.as_str())
+}
+
 impl fmt::Display for ErrorDisplay<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(message) = refusal_message(self.error) {
             formatter.write_str(message)
         } else {
-            self.error.fmt(formatter)
+            formatter.write_str(&format_reqwest_error_without_url_secrets(self.error))
         }
     }
 }
 
-/// Render a full error chain while redacting downgrade-refusal URLs.
+/// Render a full error chain while redacting downgrade-refusal URLs and URL secrets.
 pub fn error_chain(error: &reqwest::Error) -> String {
     if let Some(message) = refusal_message(error) {
         return message.to_string();
     }
 
     let mut messages = Vec::with_capacity(4);
-    let mut source: Option<&dyn std::error::Error> = Some(error);
+    messages.push(format_reqwest_error_without_url_secrets(error));
+    let mut source: Option<&dyn std::error::Error> = error.source();
     while let Some(current) = source {
         messages.push(current.to_string());
         source = current.source();
@@ -2111,5 +2173,57 @@ mod permanent_tls_failure_tests {
             provider.kx_groups[0].name(),
             rustls::NamedGroup::X25519MLKEM768
         );
+    }
+
+    #[test]
+    fn remove_cross_origin_credentials_strips_all_proof_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer secret-bearer".parse().unwrap());
+        for header in SENSITIVE_PROOF_HEADERS {
+            headers.insert(
+                reqwest::header::HeaderName::from_static(header),
+                "secret-proof".parse().unwrap(),
+            );
+        }
+        headers.insert("x-benign", "keep-me".parse().unwrap());
+
+        remove_cross_origin_credentials(&mut headers);
+
+        assert!(!headers.contains_key(AUTHORIZATION));
+        for header in SENSITIVE_PROOF_HEADERS {
+            assert!(
+                !headers.contains_key(header),
+                "expected {header} to be stripped"
+            );
+        }
+        assert_eq!(
+            headers.get("x-benign").and_then(|v| v.to_str().ok()),
+            Some("keep-me")
+        );
+    }
+
+    #[tokio::test]
+    async fn display_error_and_error_chain_strip_query_and_userinfo_from_url() {
+        let (listener, port) = listener().await;
+        drop(listener);
+
+        let url =
+            format!("http://user:secret-pass@127.0.0.1:{port}/pkg.tgz?sig=signed-secret#frag");
+        let error = request_error(url).await;
+        let displayed = display_error(&error).to_string();
+        let chained = error_chain(&error);
+
+        for rendered in [&displayed, &chained] {
+            for secret in ["secret-pass", "signed-secret", "frag"] {
+                assert!(
+                    !rendered.contains(secret),
+                    "transport error leaked {secret}: {rendered}"
+                );
+            }
+            assert!(
+                rendered.contains(&format!("http://127.0.0.1:{port}/pkg.tgz")),
+                "expected sanitized URL to remain readable: {rendered}"
+            );
+        }
     }
 }

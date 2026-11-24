@@ -623,18 +623,18 @@ impl SessionManager {
             Some(source) => source.refresh_client_builder(refresh_url).await?,
             None => lpm_http::client_builder(),
         };
-        let origin = reqwest::Url::parse(refresh_url)
-            .map_err(|e| LpmError::Network(format!("refresh client init: {e}")))?
-            .origin();
+        let base_scope = reqwest::Url::parse(&self.registry_url)
+            .or_else(|_| reqwest::Url::parse(refresh_url))
+            .map_err(|e| LpmError::Network(format!("refresh client init: {e}")))?;
         // A refresh carries the refresh token, and the registry's client
         // certificate when `.npmrc` names one: neither may follow a
-        // redirect to another origin.
+        // redirect outside the configured registry's origin and base path.
         let client = builder
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                 // `previous` holds the first URL too, as in `Policy::limited`.
                 if attempt.previous().len() > lpm_http::DEFAULT_REDIRECT_LIMIT {
                     attempt.error("too many redirects")
-                } else if attempt.url().origin() == origin {
+                } else if lpm_common::url_matches_base_scope(attempt.url(), &base_scope) {
                     attempt.follow()
                 } else {
                     attempt.stop()
