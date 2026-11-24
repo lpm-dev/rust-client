@@ -1533,7 +1533,7 @@ mod metadata_fetch_scheduler_tests {
             }
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
-                    if server.received_requests().await.unwrap().len() == 16
+                    if server.received_requests().await.unwrap().len() == 8
                         && telemetry.active.load(Ordering::Relaxed) == 0
                     {
                         break;
@@ -2462,12 +2462,12 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                 shared_fact_cache.as_ref(),
                 &edge.canonical,
             ) {
-                let override_needs_history = !info_arc.versions_complete
-                    && !state.overrides.is_empty()
+                let overrides_match = !state.overrides.is_empty()
                     && state
                         .overrides
                         .may_match_package(&edge.canonical.to_string());
-                let preferred_covers_range = state.overrides.is_empty()
+                let override_needs_history = !info_arc.versions_complete && overrides_match;
+                let preferred_covers_range = !overrides_match
                     && exact_metadata_fast_path_eligible(
                         &client,
                         &route_table,
@@ -2633,13 +2633,12 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             // drain are grouped into one batch below; direct/custom
             // routes keep the existing per-package fetch path.
             let canonical = edge.canonical.clone();
+            let overrides_match = !state.overrides.is_empty()
+                && state.overrides.may_match_package(&canonical.to_string());
             let exact_version = edge
                 .range
                 .exact_version()
-                .filter(|_| {
-                    state.overrides.is_empty()
-                        || !state.overrides.may_match_package(&canonical.to_string())
-                })
+                .filter(|_| !overrides_match)
                 .map(|version| version.to_string());
             let request = MetadataFetchKey::for_request(
                 canonical.clone(),
@@ -2660,7 +2659,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                 }
             }
             let preferred_range = (exact_version.is_none()
-                && state.overrides.is_empty()
+                && !overrides_match
                 && exact_metadata_fast_path_eligible(&client, &route_table, &canonical, &policy)
                 && edge.range.dist_tag().is_none_or(|tag| tag == "latest"))
             .then(|| edge.range.clone());

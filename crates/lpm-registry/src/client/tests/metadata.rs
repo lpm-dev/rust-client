@@ -2869,6 +2869,59 @@ async fn get_npm_version_metadata_direct_fetches_and_caches_version_document() {
 }
 
 #[tokio::test]
+async fn get_npm_version_metadata_direct_reuses_stale_immutable_version_without_network() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let npm_server = MockServer::start().await;
+    let pkg = "stale-exact-immutable";
+    let version = "1.2.3";
+    let body = serde_json::json!({
+        "name": pkg,
+        "version": version,
+        "dist": {
+            "tarball": format!("{}/{pkg}/-/{pkg}-{version}.tgz", npm_server.uri()),
+            "integrity": format!("sha512-{}==", "A".repeat(86)),
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path(format!("/{pkg}/{version}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Cache-Control", "max-age=300")
+                .set_body_json(body),
+        )
+        .expect(1)
+        .mount(&npm_server)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tmp");
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(npm_server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+
+    let first = client
+        .get_npm_version_metadata_direct_with_timings(pkg, version)
+        .await
+        .expect("initial version document fetch should succeed");
+    assert!(!first.timings.cache_hit);
+
+    let key = client.npm_direct_version_metadata_cache_key(pkg, version, PublicNpmAccess::ANONYMOUS);
+    let path = client.cache_path(&key).unwrap();
+    filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+
+    let second = client
+        .get_npm_version_metadata_direct_with_timings(pkg, version)
+        .await
+        .expect("stale immutable version document should reuse cache without network");
+    assert!(second.timings.cache_hit);
+    assert!(second.metadata.versions.contains_key(version));
+    npm_server.verify().await;
+}
+
+#[tokio::test]
 async fn get_npm_version_metadata_direct_rejects_wrong_network_version_document() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

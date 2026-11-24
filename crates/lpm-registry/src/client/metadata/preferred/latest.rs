@@ -173,8 +173,13 @@ impl RegistryClient {
             }
             None => {
                 crate::timing::record_metadata_cache_miss();
-                self.race_latest_and_history(name, access, &latest_key, accepts, timings)
-                    .await
+                if self.has_stale_preferred_history_validator(name, access) {
+                    self.fetch_npm_preferred_history::<_, true, P>(name, access, accepts, timings)
+                        .await
+                } else {
+                    self.race_latest_and_history(name, access, &latest_key, accepts, timings)
+                        .await
+                }
             }
         }
     }
@@ -236,6 +241,19 @@ impl RegistryClient {
         fetched.timings.add_concurrent_attempt(&latest_timings);
         fetched.timings.add_attempt(&timings);
         Ok(fetched)
+    }
+
+    fn has_stale_preferred_history_validator(&self, name: &str, access: PublicNpmAccess<'_>) -> bool {
+        let preferred_key = self.npm_preferred_metadata_cache_key(name, access);
+        if self
+            .read_cache_validator(&preferred_key)
+            .is_some_and(|v| v.etag.is_some())
+        {
+            return true;
+        }
+        let complete_key = self.npm_direct_metadata_cache_key(name, access);
+        self.read_cache_validator(&complete_key)
+            .is_some_and(|v| v.etag.is_some())
     }
 
     async fn read_preference_cache<P: MetadataProjection>(

@@ -90,7 +90,8 @@ impl RegistryClient {
             .for_url(url)
             .await?
             .get(url)
-            .header("Accept", accept);
+            .header("Accept", accept)
+            .header(reqwest::header::ACCEPT_ENCODING, "gzip");
         apply_npmrc_auth(request, url, access.auth)
     }
 }

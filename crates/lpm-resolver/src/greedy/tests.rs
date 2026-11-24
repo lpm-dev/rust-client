@@ -5584,7 +5584,7 @@ async fn fusion_fetches_distinct_exact_versions_concurrently() {
     let (requested_tx, mut requested_rx) = tokio::sync::mpsc::channel(4);
     let server = tokio::spawn(async move {
         let mut requests = tokio::task::JoinSet::new();
-        for _ in 0..4 {
+        for _ in 0..2 {
             let (mut socket, _) = listener.accept().await.unwrap();
             let gate = Arc::clone(&gate);
             let tx = requested_tx.clone();
@@ -5599,10 +5599,6 @@ async fn fusion_fetches_distinct_exact_versions_concurrently() {
                 }
                 let request = String::from_utf8(request).unwrap();
                 let path = request.split_whitespace().nth(1).unwrap();
-                if path == "/shared-exact" {
-                    socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
-                    return;
-                }
                 let version = path.strip_prefix("/shared-exact/").unwrap().to_owned();
                 tx.send(version.clone()).await.unwrap();
                 if version == "1.0.0" {
@@ -5755,15 +5751,21 @@ async fn resolve_direct_and_transitive_overlap_with_seeded_cache(
         .expect(u64::from(!seed_parent))
         .mount(&server)
         .await;
-    for accept in ["application/json", "application/vnd.npm.install-v1+json"] {
-        Mock::given(method("GET"))
-            .and(path("/shared-child"))
-            .and(header("accept", accept))
-            .respond_with(ResponseTemplate::new(200).set_body_json(shared_metadata.clone()))
-            .expect(u64::from(!seed_shared))
-            .mount(&server)
-            .await;
-    }
+    Mock::given(method("GET"))
+        .and(path("/shared-child/1.0.0"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(shared_metadata["versions"]["1.0.0"].clone()),
+        )
+        .expect(u64::from(!seed_shared))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/shared-child"))
+        .and(header("accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(shared_metadata.clone()))
+        .expect(u64::from(!seed_shared))
+        .mount(&server)
+        .await;
 
     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
     if seed_parent {
@@ -7830,16 +7832,8 @@ async fn trace_metadata_keeps_failed_exact_attempts_before_packument_recovery() 
     let _timing_guard = crate::metadata_fetch_detail_test_lock().lock().await;
     lpm_registry::timing::reset_metadata_detail();
     let server = MockServer::start().await;
-    let broken_history = b"{broken history";
     let broken_exact = b"{broken version";
     let complete = serde_json::to_vec(&metadata_json("failed-exact-trace", &[])).unwrap();
-    Mock::given(method("GET"))
-        .and(path("/failed-exact-trace"))
-        .and(header("accept", "application/json"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(broken_history.to_vec()))
-        .expect(1)
-        .mount(&server)
-        .await;
     Mock::given(method("GET"))
         .and(path("/failed-exact-trace/1.0.0"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(broken_exact.to_vec()))
@@ -7879,10 +7873,66 @@ async fn trace_metadata_keeps_failed_exact_attempts_before_packument_recovery() 
     );
     assert_eq!(
         snapshot.body_bytes_sum as usize,
-        broken_history.len() + broken_exact.len() + complete.len()
+        broken_exact.len() + complete.len()
     );
     assert_eq!(snapshot.route_npm_direct_count, 1);
     lpm_registry::timing::reset_metadata_detail();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unrelated_override_keeps_preferred_latest_fast_path_for_other_packages() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let mut latest = version_document_json("unrelated-pkg", "1.5.0", &[]);
+    latest["dist"]["integrity"] = serde_json::json!(format!("sha512-{}==", "A".repeat(86)));
+    Mock::given(method("GET"))
+        .and(path("/unrelated-pkg/latest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(latest))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/unrelated-pkg"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(150))
+                .set_body_json(metadata_json("unrelated-pkg", &[])),
+        )
+        .mount(&server)
+        .await;
+
+    let overrides = OverrideSet::parse(
+        &HashMap::new(),
+        &HashMap::from([("some-other-pkg".to_string(), "9.9.9".to_string())]),
+        &HashMap::new(),
+    )
+    .expect("parse unrelated override");
+
+    let result = resolve_greedy_fused(
+        Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        ),
+        HashMap::from([("unrelated-pkg".to_string(), "^1.0.0".to_string())]),
+        overrides,
+        RouteTable::from_mode_only(RouteMode::Direct),
+        4,
+        None,
+        true,
+    )
+    .await
+    .expect("resolve with unrelated override");
+
+    assert_eq!(result.packages.len(), 1);
+    assert_eq!(result.packages[0].version.to_string(), "1.5.0");
+    assert!(
+        !result.cache[&CanonicalKey::npm("unrelated-pkg")].versions_complete,
+        "unrelated override must not disable preferred latest resolution"
+    );
+    server.verify().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
