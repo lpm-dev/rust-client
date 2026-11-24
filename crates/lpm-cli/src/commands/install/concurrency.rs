@@ -386,7 +386,7 @@ mod cached_link_tests {
     fn fully_cached_link_width_bounds_macos_metadata_contention() {
         let _env = crate::test_env::ScopedEnv::update([("LPM_V2_LINK_TASKS", None)]);
         let expected = if cfg!(target_os = "macos") {
-            v2_link_task_concurrency(100).min(4)
+            v2_link_task_concurrency(100).min(16)
         } else {
             v2_link_task_concurrency(100)
         };
