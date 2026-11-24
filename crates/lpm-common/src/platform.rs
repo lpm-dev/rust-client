@@ -155,20 +155,42 @@ fn classify_keychain_denial(
 pub fn detect_libc() -> Option<&'static str> {
     static CACHED: OnceLock<Option<&'static str>> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        if has_musl_loader() {
-            return Some("musl");
-        }
-        if has_glibc_loader() {
-            return Some("glibc");
-        }
-        if cfg!(target_env = "musl") {
-            Some("musl")
-        } else if cfg!(target_env = "gnu") {
-            Some("glibc")
-        } else {
-            None
-        }
+        detect_libc_from_probes(has_glibc_loader(), has_musl_loader(), env_libc_hint())
     })
+}
+
+#[cfg(target_os = "linux")]
+fn env_libc_hint() -> &'static str {
+    if cfg!(target_env = "musl") {
+        "musl"
+    } else if cfg!(target_env = "gnu") {
+        "glibc"
+    } else {
+        ""
+    }
+}
+
+/// Prefer same-architecture glibc when both glibc and musl loaders exist on
+/// disk (for example a glibc host with `musl-tools` installed). Pure musl
+/// systems (such as Alpine) have no same-arch glibc `libc.so.6`, so they
+/// resolve to `"musl"`.
+#[cfg(any(target_os = "linux", test))]
+fn detect_libc_from_probes(
+    has_glibc: bool,
+    has_musl: bool,
+    compiled_env: &str,
+) -> Option<&'static str> {
+    if has_glibc {
+        return Some("glibc");
+    }
+    if has_musl {
+        return Some("musl");
+    }
+    match compiled_env {
+        "musl" => Some("musl"),
+        "glibc" => Some("glibc"),
+        _ => None,
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -177,14 +199,62 @@ pub fn detect_libc() -> Option<&'static str> {
 }
 
 #[cfg(target_os = "linux")]
+fn musl_loader_candidates() -> &'static [&'static str] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        &["/lib/ld-musl-x86_64.so.1"]
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        &["/lib/ld-musl-aarch64.so.1"]
+    }
+    #[cfg(target_arch = "arm")]
+    {
+        &["/lib/ld-musl-armhf.so.1", "/lib/ld-musl-arm.so.1"]
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        &["/lib/ld-musl-i386.so.1"]
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        &["/lib/ld-musl-riscv64.so.1"]
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        &["/lib/ld-musl-loongarch64.so.1"]
+    }
+    #[cfg(target_arch = "s390x")]
+    {
+        &["/lib/ld-musl-s390x.so.1"]
+    }
+    #[cfg(target_arch = "powerpc64")]
+    {
+        &[
+            "/lib/ld-musl-powerpc64le.so.1",
+            "/lib/ld-musl-powerpc64.so.1",
+        ]
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "x86",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "s390x",
+        target_arch = "powerpc64"
+    )))]
+    {
+        &[]
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn has_musl_loader() -> bool {
-    const CANDIDATES: &[&str] = &[
-        "/lib/ld-musl-x86_64.so.1",
-        "/lib/ld-musl-aarch64.so.1",
-        "/lib/ld-musl-armhf.so.1",
-        "/lib/ld-musl-i386.so.1",
-    ];
-    CANDIDATES.iter().any(|p| Path::new(p).exists())
+    musl_loader_candidates()
+        .iter()
+        .any(|p| Path::new(p).exists())
 }
 
 /// Whether Rosetta translates this process: an x86_64 build of LPM on an
@@ -252,14 +322,60 @@ pub fn windows_system_directory() -> std::io::Result<std::path::PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
+fn glibc_loader_candidates() -> &'static [&'static str] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        &[
+            "/lib/x86_64-linux-gnu/libc.so.6",
+            "/lib64/ld-linux-x86-64.so.2",
+            "/lib64/libc.so.6",
+            "/usr/lib64/libc.so.6",
+            "/lib/libc.so.6",
+        ]
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        &[
+            "/lib/aarch64-linux-gnu/libc.so.6",
+            "/lib/ld-linux-aarch64.so.1",
+            "/lib64/libc.so.6",
+            "/usr/lib64/libc.so.6",
+            "/lib/libc.so.6",
+        ]
+    }
+    #[cfg(target_arch = "arm")]
+    {
+        &[
+            "/lib/arm-linux-gnueabihf/libc.so.6",
+            "/lib/arm-linux-gnueabi/libc.so.6",
+            "/lib/ld-linux-armhf.so.3",
+            "/lib/libc.so.6",
+        ]
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        &[
+            "/lib/i386-linux-gnu/libc.so.6",
+            "/lib/ld-linux.so.2",
+            "/lib/libc.so.6",
+        ]
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "x86"
+    )))]
+    {
+        &["/lib64/libc.so.6", "/usr/lib64/libc.so.6", "/lib/libc.so.6"]
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn has_glibc_loader() -> bool {
-    const CANDIDATES: &[&str] = &[
-        "/lib/x86_64-linux-gnu/libc.so.6",
-        "/lib64/libc.so.6",
-        "/lib/aarch64-linux-gnu/libc.so.6",
-        "/lib/libc.so.6",
-    ];
-    CANDIDATES.iter().any(|p| Path::new(p).exists())
+    glibc_loader_candidates()
+        .iter()
+        .any(|p| Path::new(p).exists())
 }
 
 #[cfg(test)]
@@ -367,5 +483,20 @@ mod tests {
         let first = detect_libc();
         let second = detect_libc();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn detect_libc_prefers_glibc_over_coinstalled_musl_tools_and_keeps_pure_musl() {
+        assert_eq!(detect_libc_from_probes(true, false, "glibc"), Some("glibc"));
+        assert_eq!(detect_libc_from_probes(true, true, "glibc"), Some("glibc"));
+        assert_eq!(detect_libc_from_probes(true, true, "musl"), Some("glibc"));
+        assert_eq!(detect_libc_from_probes(false, true, "musl"), Some("musl"));
+        assert_eq!(detect_libc_from_probes(false, true, "glibc"), Some("musl"));
+        assert_eq!(
+            detect_libc_from_probes(false, false, "glibc"),
+            Some("glibc")
+        );
+        assert_eq!(detect_libc_from_probes(false, false, "musl"), Some("musl"));
+        assert_eq!(detect_libc_from_probes(false, false, ""), None);
     }
 }

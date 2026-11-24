@@ -1627,7 +1627,11 @@ async fn fetch_platform_metadata_from_route(
         if capture_timings {
             let start = Instant::now();
             let timed = client
-                .get_npm_platform_metadata_routed_full_with_timings(name, route)
+                .get_npm_platform_metadata_routed_full_with_timings(
+                    name,
+                    route,
+                    info.modified.as_deref(),
+                )
                 .await
                 .map_err(|error| ResolveError::DependencyFetch {
                     package: canonical.to_string(),
@@ -1647,7 +1651,7 @@ async fn fetch_platform_metadata_from_route(
             Ok(Some(detail))
         } else {
             let metadata = client
-                .get_npm_platform_metadata_routed_full(name, route)
+                .get_npm_platform_metadata_routed_full(name, route, info.modified.as_deref())
                 .await
                 .map_err(|error| ResolveError::DependencyFetch {
                     package: canonical.to_string(),

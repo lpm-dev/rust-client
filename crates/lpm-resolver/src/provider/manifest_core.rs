@@ -739,10 +739,13 @@ impl CachedPackageInfo {
 
         if let Some(release_platforms) = &release_times.versions {
             let mut platforms = self.platforms_owned();
-            for (version, incoming) in release_platforms {
-                let Some(version) = self.core.version_id(version) else {
+            let mut known_platform_versions = HashSet::with_capacity(release_platforms.len());
+            for (version_text, incoming) in release_platforms {
+                let Some(version) = self.core.version_id(version_text) else {
                     continue;
                 };
+                known_platform_versions.insert(version);
+                self.platform_hydrated_versions.insert(version_text.clone());
                 let platform = platforms.entry(version).or_default();
                 if platform.os.is_empty() {
                     platform.os.clone_from(&incoming.os);
@@ -755,7 +758,11 @@ impl CachedPackageInfo {
                 }
             }
             self.platform = Arc::new(build_platform_overlay(platforms));
-            self.platform_metadata_complete = true;
+            let all_platform_versions_covered = self.core.versions.is_empty()
+                || (0..self.core.versions.len()).all(|idx| known_platform_versions.contains(&idx));
+            if all_platform_versions_covered || modified_matches {
+                self.platform_metadata_complete = true;
+            }
         }
     }
 
@@ -1504,6 +1511,72 @@ mod tests {
             !info.release_metadata_complete,
             "missing timestamp for 2.0.0 with mismatched modified must not mark release metadata complete"
         );
+    }
+
+    #[test]
+    fn skewed_partial_platform_metadata_does_not_mark_platform_metadata_complete() {
+        let mut m1 = manifest("1.0.0");
+        m1.platform = Some(PlatformMeta {
+            os: vec!["linux".to_string()],
+            cpu: vec!["x64".to_string()],
+            libc: Vec::new(),
+        });
+        let mut m2 = manifest("2.0.0");
+        m2.platform = Some(PlatformMeta {
+            os: vec!["linux".to_string()],
+            cpu: vec!["x64".to_string()],
+            libc: Vec::new(),
+        });
+        let mut info = info_from(vec![m1, m2]);
+        info.platform_metadata_complete = false;
+        info.modified = Some("2026-11-22T12:00:00.000Z".to_string());
+        info.modified_unix = Some(1_795_348_800);
+        let skewed = lpm_registry::ReleaseTimeMetadata {
+            name: Some("fixture".to_string()),
+            time: HashMap::from([(
+                "modified".to_string(),
+                "2026-11-20T00:00:00.000Z".to_string(),
+            )]),
+            versions: Some(HashMap::from([(
+                "1.0.0".to_string(),
+                lpm_registry::ReleaseTimeVersionMetadata {
+                    os: vec!["linux".to_string()],
+                    cpu: vec!["x64".to_string()],
+                    libc: vec!["glibc".to_string()],
+                },
+            )])),
+        };
+
+        info.merge_release_times(&skewed);
+
+        assert!(
+            !info.platform_metadata_complete,
+            "stale platform map missing 2.0.0 must not mark platform metadata complete"
+        );
+        assert!(!info.needs_platform_metadata_for_version("1.0.0"));
+        assert!(info.needs_platform_metadata_for_version("2.0.0"));
+    }
+
+    #[test]
+    fn manifest_projection_codec_persists_platform_hydrated_versions() {
+        use lpm_registry::MetadataProjection as _;
+
+        let mut m1 = manifest("1.0.0");
+        m1.platform = Some(PlatformMeta {
+            os: vec!["linux".to_string()],
+            cpu: vec!["x64".to_string()],
+            libc: Vec::new(),
+        });
+        let mut info = info_from(vec![m1]);
+        info.platform_metadata_complete = false;
+        assert!(info.needs_platform_metadata_for_version("1.0.0"));
+        info.merge_exact_version_platform("1.0.0", &["linux".to_string()], &[], &[]);
+        assert!(!info.needs_platform_metadata_for_version("1.0.0"));
+
+        let encoded = ManifestProjection::encode(&info, &HashMap::new(), 1);
+        let decoded = ManifestProjection::decode(&encoded).expect("valid projection");
+        assert!(decoded.info.platform_hydrated_versions.contains("1.0.0"));
+        assert!(!decoded.info.needs_platform_metadata_for_version("1.0.0"));
     }
 
     #[test]

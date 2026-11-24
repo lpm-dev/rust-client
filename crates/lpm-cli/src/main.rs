@@ -106,26 +106,112 @@ pub(crate) use cli::{BundleFormat, BundlePlatform, CheckEngine, Cli};
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 // mimalloc replaces the system allocator in non-profiling builds for Unix
-// targets other than macOS (comparison builds: `--features no-mimalloc`).
-// macOS and Windows keep their system allocators: on macOS, installs peaked
-// 40-60% lower in RSS under the system allocator, with no wall-clock loss,
-// as mimalloc kept freed memory committed in its per-thread arenas.
+// targets other than macOS and Linux GNU (comparison builds:
+// `--features no-mimalloc`). macOS, Windows, and Linux GNU keep their system
+// allocators: on both macOS and Linux glibc (with `M_ARENA_MAX=8`), installs
+// peak 40-56% lower in RSS under the system allocator without regressing
+// throughput, whereas mimalloc retains freed memory committed in its per-thread
+// arenas. Linux musl keeps mimalloc (with `purge_delay=0`) because musl's
+// mallocng contends heavily across Tokio/rayon worker threads.
 #[cfg(all(
     unix,
     not(target_os = "macos"),
+    not(all(target_os = "linux", target_env = "gnu")),
     not(feature = "dhat-heap"),
     not(feature = "no-mimalloc")
 ))]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Bound glibc's per-thread arena proliferation before worker threads start.
+/// glibc defaults to `8 * nproc` arenas, which inflates peak RSS across
+/// short-lived Tokio and rayon threads; capping at 8 arenas cuts Linux GNU
+/// peak RSS by ~55% while avoiding warm-lock arena contention across parallel
+/// workspace lanes, and still honors an explicit `MALLOC_ARENA_MAX` set by the
+/// caller.
+#[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "dhat-heap")))]
+fn configure_process_allocator() {
+    if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+        // SAFETY: `mallopt` is thread-safe before worker threads spawn and
+        // ignores unsupported options safely.
+        unsafe {
+            libc::mallopt(libc::M_ARENA_MAX, 8);
+        }
+    }
+}
+
+/// Immediately return freed mimalloc pages on musl/other Unix targets unless
+/// the caller explicitly overrides `MIMALLOC_PURGE_DELAY`.
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(all(target_os = "linux", target_env = "gnu")),
+    not(feature = "dhat-heap"),
+    not(feature = "no-mimalloc")
+))]
+fn configure_process_allocator() {
+    if std::env::var_os("MIMALLOC_PURGE_DELAY").is_none() {
+        // `mi_option_purge_delay` in mimalloc v2 (`libmimalloc-sys` 0.1.x).
+        const MI_OPTION_PURGE_DELAY: libc::c_int = 15;
+        unsafe extern "C" {
+            fn mi_option_set_default(option: libc::c_int, value: libc::c_long);
+        }
+        // SAFETY: `mi_option_set_default` updates mimalloc's default option
+        // before any worker threads spawn.
+        unsafe {
+            mi_option_set_default(MI_OPTION_PURGE_DELAY, 0);
+        }
+    }
+}
+
+#[cfg(not(any(
+    all(target_os = "linux", target_env = "gnu", not(feature = "dhat-heap")),
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(all(target_os = "linux", target_env = "gnu")),
+        not(feature = "dhat-heap"),
+        not(feature = "no-mimalloc")
+    )
+)))]
+fn configure_process_allocator() {}
+
 fn main() -> Result<()> {
+    configure_process_allocator();
+
     // dhat profiler must be the first live value because it instruments the
     // allocator for the whole process and flushes when dropped.
     #[cfg(feature = "dhat-heap")]
     let _dhat = dhat::Profiler::new_heap();
 
     cli::run()
+}
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    target_env = "gnu",
+    not(feature = "dhat-heap")
+))]
+mod linux_gnu_allocator_tests {
+    unsafe extern "C" {
+        fn malloc_usable_size(ptr: *mut std::ffi::c_void) -> libc::size_t;
+    }
+
+    #[test]
+    fn linux_gnu_heap_allocations_use_glibc_and_accept_arena_cap() {
+        let mut allocation = Box::new([0_u8; 256]);
+        // SAFETY: `allocation` was allocated by the global allocator; under
+        // glibc `malloc_usable_size` returns at least the requested size.
+        let usable = unsafe { malloc_usable_size(allocation.as_mut_ptr().cast()) };
+        assert!(
+            usable >= 256,
+            "linux-gnu allocations must come from glibc malloc"
+        );
+        // SAFETY: `mallopt(M_ARENA_MAX, 8)` returns 1 on glibc.
+        let status = unsafe { libc::mallopt(libc::M_ARENA_MAX, 8) };
+        assert_eq!(status, 1);
+    }
 }
 
 #[cfg(all(test, target_os = "macos", not(feature = "dhat-heap")))]

@@ -319,21 +319,25 @@ pub(crate) fn materialize_into_with_integrity(
     src: &Path,
     dst: &Path,
     allow_source_symlinks: bool,
+    warm_source: bool,
 ) -> Result<Option<String>, LpmError> {
     #[cfg(target_os = "macos")]
     {
+        let _ = warm_source;
         if try_clonefile(src, dst) {
             remove_materialized_object_sidecars(dst)?;
             return Ok(None);
         }
     }
-    materialize_into_portable_with_integrity_inner(src, dst, allow_source_symlinks).map(Some)
+    materialize_into_portable_with_integrity_inner(src, dst, allow_source_symlinks, warm_source)
+        .map(Some)
 }
 
 fn materialize_into_portable_with_integrity_inner(
     src: &Path,
     dst: &Path,
     allow_source_symlinks: bool,
+    warm_source: bool,
 ) -> Result<String, LpmError> {
     let mut metadata = TreeMetadataBuilder::new();
     materialize_into_inner_impl(
@@ -343,6 +347,7 @@ fn materialize_into_portable_with_integrity_inner(
         dst,
         allow_source_symlinks,
         false,
+        warm_source,
         Some(&mut metadata),
     )?;
     Ok(metadata.finish())
@@ -353,7 +358,15 @@ pub(crate) fn materialize_into_portable_with_integrity(
     src: &Path,
     dst: &Path,
 ) -> Result<String, LpmError> {
-    materialize_into_portable_with_integrity_inner(src, dst, has_local_source_sentinel(src))
+    materialize_into_portable_with_integrity_inner(src, dst, has_local_source_sentinel(src), false)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn materialize_into_portable_with_integrity_warm(
+    src: &Path,
+    dst: &Path,
+) -> Result<String, LpmError> {
+    materialize_into_portable_with_integrity_inner(src, dst, has_local_source_sentinel(src), true)
 }
 
 #[cfg(all(test, unix))]
@@ -362,7 +375,7 @@ pub(crate) fn materialize_into_portable_with_integrity_and_symlink_policy(
     dst: &Path,
     allow_source_symlinks: bool,
 ) -> Result<String, LpmError> {
-    materialize_into_portable_with_integrity_inner(src, dst, allow_source_symlinks)
+    materialize_into_portable_with_integrity_inner(src, dst, allow_source_symlinks, false)
 }
 
 pub(crate) fn materialize_into_inner(
@@ -371,9 +384,10 @@ pub(crate) fn materialize_into_inner(
     dst: &Path,
     allow_source_symlinks: bool,
 ) -> Result<(), LpmError> {
-    materialize_into_inner_impl(root, src, dst, dst, allow_source_symlinks, true, None)
+    materialize_into_inner_impl(root, src, dst, dst, allow_source_symlinks, true, true, None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn materialize_into_inner_impl(
     root: &Path,
     src: &Path,
@@ -381,6 +395,7 @@ fn materialize_into_inner_impl(
     destination_root: &Path,
     allow_source_symlinks: bool,
     allow_clonefile: bool,
+    warm_source: bool,
     mut tree_metadata: Option<&mut TreeMetadataBuilder>,
 ) -> Result<(), LpmError> {
     #[cfg(target_os = "macos")]
@@ -443,6 +458,7 @@ fn materialize_into_inner_impl(
                 destination_root,
                 allow_source_symlinks,
                 allow_clonefile,
+                warm_source,
                 tree_metadata.as_deref_mut(),
             )?;
             if let (Some(metadata), Some(record)) = (tree_metadata.as_deref_mut(), record) {
@@ -483,16 +499,26 @@ fn materialize_into_inner_impl(
                 )?;
             }
         } else {
-            materialize_regular_file(&src_path, &dst_path)?;
+            let file_metadata = materialize_regular_file(&src_path, &dst_path, warm_source)?;
             if let Some(metadata) = tree_metadata.as_deref_mut() {
-                // Stat by path once the copy is closed: NFS and some FUSE
-                // mounts settle mtime at close, after any handle stat.
-                metadata.record(
-                    destination_root,
-                    &dst_path,
-                    TreeMetadataKind::File,
-                    Vec::new(),
-                )?;
+                if let Some(dst_meta) = file_metadata {
+                    metadata.record_with_metadata(
+                        destination_root,
+                        &dst_path,
+                        TreeMetadataKind::File,
+                        &dst_meta,
+                        Vec::new(),
+                    )?;
+                } else {
+                    // Stat by path once the copy is closed: NFS and some FUSE
+                    // mounts settle mtime at close, after any handle stat.
+                    metadata.record(
+                        destination_root,
+                        &dst_path,
+                        TreeMetadataKind::File,
+                        Vec::new(),
+                    )?;
+                }
             }
         }
     }
@@ -500,13 +526,18 @@ fn materialize_into_inner_impl(
     Ok(())
 }
 
-fn materialize_regular_file(src: &Path, dst: &Path) -> Result<(), LpmError> {
+fn materialize_regular_file(
+    src: &Path,
+    dst: &Path,
+    warm_source: bool,
+) -> Result<Option<std::fs::Metadata>, LpmError> {
     #[cfg(target_os = "linux")]
     {
-        linux_copy::copy_file(src, dst)
+        linux_copy::copy_file_with_metadata(src, dst, warm_source)
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = warm_source;
         std::fs::copy(src, dst).map_err(|copy_err| {
             LpmError::Store(format!(
                 "failed to copy virtual-store source file {} → {}: {copy_err}",
@@ -514,7 +545,7 @@ fn materialize_regular_file(src: &Path, dst: &Path) -> Result<(), LpmError> {
                 dst.display()
             ))
         })?;
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -548,27 +579,126 @@ pub(crate) mod linux_copy {
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Smaller files are copied rather than reflinked. Cloning a file
-    /// written moments earlier first forces its dirty pages to disk, which
-    /// on XFS and btrfs costs more than copying a small file. `copy_file_range`
-    /// can't stand in for the copy: on those file systems it clones too.
+    /// Freshly extracted objects below this size are copied through user space
+    /// rather than reflinked. Cloning a file written moments earlier forces its
+    /// dirty pages to disk, which on XFS and btrfs costs more than copying a
+    /// small file; `copy_file_range` clones too on those filesystems.
     pub(crate) const MIN_REFLINK_BYTES: u64 = 64 * 1024;
 
-    const COPY_BUFFER_BYTES: usize = 64 * 1024;
+    /// Warm objects (already flushed from an earlier install) benefit from
+    /// reflinks / `copy_file_range` down to 4 KiB without touching btrfs
+    /// sub-4 KiB inline extents.
+    pub(crate) const WARM_MIN_REFLINK_BYTES: u64 = 4 * 1024;
 
-    /// The last device that refused a reflink, or `u64::MAX`.
-    static NO_REFLINK_DEVICE: AtomicU64 = AtomicU64::new(u64::MAX);
-    /// The last `(src_dev, dst_dev)` pair where `FICLONE` returned `EXDEV`, or `u64::MAX`.
-    static REFLINK_EXDEV_PAIR: AtomicU64 = AtomicU64::new(u64::MAX);
-    /// The last `(src_dev, dst_dev)` pair where `copy_file_range` returned `EXDEV`, or `u64::MAX`.
-    static COPY_FILE_RANGE_EXDEV_PAIR: AtomicU64 = AtomicU64::new(u64::MAX);
-    /// The last `(src_dev, dst_dev)` pair that refused `copy_file_range`, or `u64::MAX`.
-    static NO_COPY_FILE_RANGE_PAIR: AtomicU64 = AtomicU64::new(u64::MAX);
+    const COPY_BUFFER_BYTES: usize = 64 * 1024;
+    const DEVICE_FLAG_SET_SLOTS: usize = 16;
+
+    /// Fixed-size lock-free set of device IDs or `(src_dev, dst_dev)` tags so
+    /// multi-mount containers and btrfs subvolumes do not thrash a single slot.
+    struct DeviceFlagSet {
+        slots: [AtomicU64; DEVICE_FLAG_SET_SLOTS],
+    }
+
+    impl DeviceFlagSet {
+        const EMPTY: u64 = u64::MAX;
+
+        const fn new() -> Self {
+            Self {
+                slots: [const { AtomicU64::new(Self::EMPTY) }; DEVICE_FLAG_SET_SLOTS],
+            }
+        }
+
+        #[inline]
+        fn normalize(key: u64) -> u64 {
+            if key == Self::EMPTY { 0 } else { key }
+        }
+
+        #[inline]
+        fn contains(&self, raw_key: u64) -> bool {
+            let key = Self::normalize(raw_key);
+            for slot in &self.slots {
+                let value = slot.load(Ordering::Relaxed);
+                if value == key {
+                    return true;
+                }
+                if value == Self::EMPTY {
+                    return false;
+                }
+            }
+            false
+        }
+
+        fn insert(&self, raw_key: u64) {
+            let key = Self::normalize(raw_key);
+            for slot in &self.slots {
+                let value = slot.load(Ordering::Relaxed);
+                if value == key {
+                    return;
+                }
+                if value == Self::EMPTY {
+                    match slot.compare_exchange(
+                        Self::EMPTY,
+                        key,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => return,
+                        Err(existing) if existing == key => return,
+                        Err(_) => continue,
+                    }
+                }
+            }
+        }
+    }
+
+    static NO_REFLINK_DEVICES: DeviceFlagSet = DeviceFlagSet::new();
+    static REFLINK_BLOCKED_PAIRS: DeviceFlagSet = DeviceFlagSet::new();
+    static NO_COPY_FILE_RANGE_PAIRS: DeviceFlagSet = DeviceFlagSet::new();
+    static LOCAL_LINUX_FS_DEVICES: DeviceFlagSet = DeviceFlagSet::new();
+    static NON_LOCAL_LINUX_FS_DEVICES: DeviceFlagSet = DeviceFlagSet::new();
 
     #[inline]
     fn device_pair_tag(src_dev: u64, dst_dev: u64) -> u64 {
         let mixed = src_dev.rotate_left(17) ^ dst_dev.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        if mixed == u64::MAX { 0 } else { mixed }
+        DeviceFlagSet::normalize(mixed)
+    }
+
+    /// Local Linux filesystems settle file `mtime`/`ctime` synchronously on
+    /// write/clone/chmod, so `fstat(dst)` matches post-close `statx`. NFS and
+    /// FUSE mounts are excluded so callers fall back to post-close path stats.
+    fn is_local_linux_fs(fd: libc::c_int, dev: u64) -> bool {
+        if LOCAL_LINUX_FS_DEVICES.contains(dev) {
+            return true;
+        }
+        if NON_LOCAL_LINUX_FS_DEVICES.contains(dev) {
+            return false;
+        }
+        let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: `fd` is a valid open file descriptor and `stats` is writable.
+        if unsafe { libc::fstatfs(fd, stats.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        // SAFETY: `fstatfs` initialized `stats` on success.
+        let fs_type = unsafe { stats.assume_init().f_type } as u64;
+        const EXT4_SUPER_MAGIC: u64 = 0xef53;
+        const XFS_SUPER_MAGIC: u64 = 0x5846_5342;
+        const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
+        const TMPFS_SUPER_MAGIC: u64 = 0x0102_1994;
+        const OVERLAYFS_SUPER_MAGIC: u64 = 0x794c_7630;
+        let is_local = matches!(
+            fs_type,
+            EXT4_SUPER_MAGIC
+                | XFS_SUPER_MAGIC
+                | BTRFS_SUPER_MAGIC
+                | TMPFS_SUPER_MAGIC
+                | OVERLAYFS_SUPER_MAGIC
+        );
+        if is_local {
+            LOCAL_LINUX_FS_DEVICES.insert(dev);
+        } else {
+            NON_LOCAL_LINUX_FS_DEVICES.insert(dev);
+        }
+        is_local
     }
 
     #[cfg(test)]
@@ -578,7 +708,23 @@ pub(crate) mod linux_copy {
     }
 
     pub fn copy_file(src: &Path, dst: &Path) -> Result<(), LpmError> {
-        copy_file_io(src, dst).map_err(|(action, error)| {
+        copy_file_io(src, dst, false)
+            .map(|_| ())
+            .map_err(|(action, error)| {
+                LpmError::Store(format!(
+                    "failed to {action} virtual-store source file {} → {}: {error}",
+                    src.display(),
+                    dst.display()
+                ))
+            })
+    }
+
+    pub fn copy_file_with_metadata(
+        src: &Path,
+        dst: &Path,
+        warm_source: bool,
+    ) -> Result<Option<Metadata>, LpmError> {
+        copy_file_io(src, dst, warm_source).map_err(|(action, error)| {
             LpmError::Store(format!(
                 "failed to {action} virtual-store source file {} → {}: {error}",
                 src.display(),
@@ -588,10 +734,16 @@ pub(crate) mod linux_copy {
     }
 
     pub fn copy_file_plain_io(src: &Path, dst: &Path) -> std::io::Result<()> {
-        copy_file_io(src, dst).map_err(|(_, error)| error)
+        copy_file_io(src, dst, false)
+            .map(|_| ())
+            .map_err(|(_, error)| error)
     }
 
-    fn copy_file_io(src: &Path, dst: &Path) -> Result<(), (&'static str, std::io::Error)> {
+    fn copy_file_io(
+        src: &Path,
+        dst: &Path,
+        warm_source: bool,
+    ) -> Result<Option<Metadata>, (&'static str, std::io::Error)> {
         let mut source = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
@@ -608,11 +760,18 @@ pub(crate) mod linux_copy {
         let mut destination = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .mode(mode)
             .open(dst)
             .map_err(|error| ("create", error))?;
-        let copied = fill(&mut source, &mut destination, &source_metadata)
-            .and_then(|()| destination.set_permissions(std::fs::Permissions::from_mode(mode)));
+        let copied = (|| -> std::io::Result<Option<Metadata>> {
+            fill(&mut source, &mut destination, &source_metadata, warm_source)?;
+            let mut dst_meta = destination.metadata()?;
+            if (dst_meta.permissions().mode() & 0o7777) != mode {
+                destination.set_permissions(std::fs::Permissions::from_mode(mode))?;
+                dst_meta = destination.metadata()?;
+            }
+            Ok(is_local_linux_fs(destination.as_raw_fd(), dst_meta.dev()).then_some(dst_meta))
+        })();
         copied.map_err(|error| {
             drop(destination);
             let _ = std::fs::remove_file(dst);
@@ -624,9 +783,15 @@ pub(crate) mod linux_copy {
         source: &mut File,
         destination: &mut File,
         source_metadata: &Metadata,
+        warm_source: bool,
     ) -> std::io::Result<()> {
         let len = source_metadata.len();
-        if len >= MIN_REFLINK_BYTES {
+        let threshold = if warm_source {
+            WARM_MIN_REFLINK_BYTES
+        } else {
+            MIN_REFLINK_BYTES
+        };
+        if len >= threshold {
             let src_dev = source_metadata.dev();
             let mut cached_pair: Option<u64> = None;
             let mut pair_for = || -> std::io::Result<u64> {
@@ -655,11 +820,10 @@ pub(crate) mod linux_copy {
     ) -> std::io::Result<bool> {
         #[cfg(test)]
         REFLINK_CANDIDATES.with(|candidates| candidates.set(candidates.get() + 1));
-        if NO_REFLINK_DEVICE.load(Ordering::Relaxed) == device {
+        if NO_REFLINK_DEVICES.contains(device) {
             return Ok(false);
         }
-        let exdev_cached = REFLINK_EXDEV_PAIR.load(Ordering::Relaxed);
-        if exdev_cached != u64::MAX && exdev_cached == pair_for()? {
+        if REFLINK_BLOCKED_PAIRS.contains(pair_for()?) {
             return Ok(false);
         }
         const FICLONE: libc::Ioctl = 0x4004_9409;
@@ -671,13 +835,12 @@ pub(crate) mod linux_copy {
         let error = std::io::Error::last_os_error();
         match error.raw_os_error() {
             Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL | libc::ENOSYS) => {
-                NO_REFLINK_DEVICE.store(device, Ordering::Relaxed);
+                NO_REFLINK_DEVICES.insert(device);
                 Ok(false)
             }
-            Some(libc::EPERM) => Ok(false),
-            Some(libc::EXDEV) => {
+            Some(libc::EXDEV | libc::EPERM) => {
                 if let Ok(pair) = pair_for() {
-                    REFLINK_EXDEV_PAIR.store(pair, Ordering::Relaxed);
+                    REFLINK_BLOCKED_PAIRS.insert(pair);
                 }
                 Ok(false)
             }
@@ -691,16 +854,10 @@ pub(crate) mod linux_copy {
         len: u64,
         pair_for: &mut impl FnMut() -> std::io::Result<u64>,
     ) -> std::io::Result<bool> {
-        let exdev_cached = COPY_FILE_RANGE_EXDEV_PAIR.load(Ordering::Relaxed);
-        let unsupported_cached = NO_COPY_FILE_RANGE_PAIR.load(Ordering::Relaxed);
-        if (exdev_cached != u64::MAX || unsupported_cached != u64::MAX) && {
-            let pair = pair_for()?;
-            pair == exdev_cached || pair == unsupported_cached
-        } {
+        let pair = pair_for()?;
+        if NO_COPY_FILE_RANGE_PAIRS.contains(pair) {
             return Ok(false);
         }
-        let mut saw_exdev = false;
-        let mut saw_unsupported = false;
         let copied = copy_in_kernel(len, |requested| {
             // SAFETY: both descriptors are live; null offsets use and advance
             // each file's own position.
@@ -714,24 +871,10 @@ pub(crate) mod linux_copy {
                     0,
                 )
             };
-            usize::try_from(written).map_err(|_| {
-                let err = std::io::Error::last_os_error();
-                match err.raw_os_error() {
-                    Some(libc::EXDEV) => saw_exdev = true,
-                    Some(libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL) => saw_unsupported = true,
-                    _ => {}
-                }
-                err
-            })
+            usize::try_from(written).map_err(|_| std::io::Error::last_os_error())
         })?;
         if !copied {
-            if saw_exdev {
-                if let Ok(pair) = pair_for() {
-                    COPY_FILE_RANGE_EXDEV_PAIR.store(pair, Ordering::Relaxed);
-                }
-            } else if saw_unsupported && let Ok(pair) = pair_for() {
-                NO_COPY_FILE_RANGE_PAIR.store(pair, Ordering::Relaxed);
-            }
+            NO_COPY_FILE_RANGE_PAIRS.insert(pair);
         }
         Ok(copied)
     }
@@ -784,6 +927,9 @@ pub(crate) mod linux_copy {
         destination: &mut File,
         len: u64,
     ) -> std::io::Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
         thread_local! {
             static BUFFER: std::cell::RefCell<Vec<u8>> =
                 std::cell::RefCell::new(vec![0; COPY_BUFFER_BYTES + 1]);
@@ -805,13 +951,16 @@ pub(crate) mod linux_copy {
                     if copied > len_usize {
                         return Err(source_changed());
                     }
+                    // `buffer[copied..=len_usize]` requests one byte past EOF, so
+                    // returning exactly `len_usize` proves EOF in a single read.
+                    if copied == len_usize {
+                        break;
+                    }
                 }
                 if copied != len_usize {
                     return Err(source_changed());
                 }
-                if copied > 0 {
-                    destination.write_all(&buffer[..copied])?;
-                }
+                destination.write_all(&buffer[..copied])?;
                 return Ok(());
             }
 
@@ -839,7 +988,7 @@ pub(crate) mod linux_copy {
 
     #[cfg(test)]
     mod tests {
-        use super::copy_in_kernel;
+        use super::{DeviceFlagSet, WARM_MIN_REFLINK_BYTES, copy_in_kernel};
 
         fn os_error(code: i32) -> std::io::Result<usize> {
             Err(std::io::Error::from_raw_os_error(code))
@@ -852,7 +1001,13 @@ pub(crate) mod linux_copy {
 
         #[test]
         fn a_refusal_before_any_byte_moved_falls_back() {
-            for code in [libc::EXDEV, libc::EBADF, libc::EOVERFLOW, libc::EOPNOTSUPP] {
+            for code in [
+                libc::EXDEV,
+                libc::EBADF,
+                libc::EOVERFLOW,
+                libc::EOPNOTSUPP,
+                libc::EPERM,
+            ] {
                 assert!(!copy_in_kernel(100, |_| os_error(code)).unwrap(), "{code}");
             }
         }
@@ -869,6 +1024,48 @@ pub(crate) mod linux_copy {
         fn an_interrupted_copy_is_retried() {
             let mut calls = [os_error(libc::EINTR), Ok(40), Ok(60)].into_iter();
             assert!(copy_in_kernel(100, |_| calls.next().unwrap()).unwrap());
+        }
+
+        #[test]
+        fn device_flag_set_remembers_multiple_devices_without_thrashing() {
+            let set = DeviceFlagSet::new();
+            for dev in [1_u64, 2, 42, 99, u64::MAX] {
+                assert!(!set.contains(dev));
+                set.insert(dev);
+                assert!(set.contains(dev));
+            }
+            for dev in [1_u64, 2, 42, 99, u64::MAX] {
+                assert!(set.contains(dev));
+            }
+            assert!(!set.contains(777));
+        }
+
+        #[test]
+        fn zero_byte_and_warm_threshold_copies_preserve_bytes_and_metadata() {
+            use std::os::unix::fs::MetadataExt;
+
+            let dir = tempfile::tempdir().unwrap();
+            let empty_src = dir.path().join("empty.txt");
+            let empty_dst = dir.path().join("empty-copy.txt");
+            std::fs::write(&empty_src, b"").unwrap();
+            let meta = super::copy_file_with_metadata(&empty_src, &empty_dst, true)
+                .unwrap()
+                .expect("local linux tmpdir should return inline destination metadata");
+            assert_eq!(std::fs::read(&empty_dst).unwrap(), b"");
+            let stat_meta = std::fs::symlink_metadata(&empty_dst).unwrap();
+            assert_eq!(meta.len(), stat_meta.len());
+            assert_eq!(meta.mode(), stat_meta.mode());
+            assert_eq!(meta.mtime_nsec(), stat_meta.mtime_nsec());
+
+            let warm_src = dir.path().join("warm-4k.js");
+            let warm_dst = dir.path().join("warm-4k-copy.js");
+            let payload = vec![0x5au8; usize::try_from(WARM_MIN_REFLINK_BYTES).unwrap()];
+            std::fs::write(&warm_src, &payload).unwrap();
+            let before = super::REFLINK_CANDIDATES.with(std::cell::Cell::get);
+            super::copy_file_with_metadata(&warm_src, &warm_dst, true).unwrap();
+            let after = super::REFLINK_CANDIDATES.with(std::cell::Cell::get);
+            assert_eq!(after - before, 1);
+            assert_eq!(std::fs::read(&warm_dst).unwrap(), payload);
         }
 
         #[test]
