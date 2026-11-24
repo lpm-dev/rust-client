@@ -648,7 +648,9 @@ fn registry_url_contains_parsed(candidate: &str, registry: &reqwest::Url) -> boo
     let Ok(candidate) = reqwest::Url::parse(candidate) else {
         return false;
     };
-    if candidate.scheme() != registry.scheme()
+    if !candidate.username().is_empty()
+        || candidate.password().is_some()
+        || candidate.scheme() != registry.scheme()
         || candidate.host_str().map(str::to_ascii_lowercase)
             != registry.host_str().map(str::to_ascii_lowercase)
         || candidate.port_or_known_default() != registry.port_or_known_default()
@@ -659,12 +661,23 @@ fn registry_url_contains_parsed(candidate: &str, registry: &reqwest::Url) -> boo
 }
 
 fn path_lies_under(candidate: &str, base: &str) -> bool {
-    let base = base.trim_end_matches('/');
-    base.is_empty()
-        || candidate == base
-        || candidate
-            .strip_prefix(base)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+    lpm_common::path_matches_base_scope(candidate, base)
+}
+
+pub(crate) fn registry_serves_tarball(candidate: &reqwest::Url, registry: &reqwest::Url) -> bool {
+    if !candidate.username().is_empty()
+        || candidate.password().is_some()
+        || lpm_common::path_has_encoded_traversal(candidate.path())
+        || candidate.scheme() != registry.scheme()
+        || candidate.port_or_known_default() != registry.port_or_known_default()
+        || candidate.host_str().map(str::to_ascii_lowercase)
+            != registry.host_str().map(str::to_ascii_lowercase)
+    {
+        return false;
+    }
+    path_lies_under(candidate.path(), registry.path())
+        || gitlab_project_tarball_under(candidate.path(), registry.path())
+        || github_packages_download(candidate)
 }
 
 fn registry_serves(candidate: &str, registry: &str) -> bool {
@@ -674,6 +687,12 @@ fn registry_serves(candidate: &str, registry: &str) -> bool {
     ) else {
         return false;
     };
+    if !candidate.username().is_empty()
+        || candidate.password().is_some()
+        || lpm_common::path_has_encoded_traversal(candidate.path())
+    {
+        return false;
+    }
     let same_endpoint = if candidate.scheme() == registry.scheme() {
         candidate.port_or_known_default() == registry.port_or_known_default()
     } else {
@@ -1607,5 +1626,68 @@ mod tests {
             UpstreamRoute::Custom { auth: None, .. } => {}
             other => panic!("expected anonymous custom route, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn registry_path_containment_rejects_encoded_separator_traversal() {
+        let table = make_table(
+            concat!(
+                "@high:registry=https://corp.example/high/\n",
+                "//corp.example/high/:_authToken=HIGH\n",
+            ),
+            RouteMode::Direct,
+        );
+        for candidate in [
+            "https://corp.example/high/..%2Flow/@high/pkg/-/pkg-1.0.0.tgz",
+            "https://corp.example/high/%2e%2e%2flow/@high/pkg/-/pkg-1.0.0.tgz",
+            "https://corp.example/high/%252e%252e%252flow/@high/pkg/-/pkg-1.0.0.tgz",
+            "https://corp.example/high/..%5Clow/@high/pkg/-/pkg-1.0.0.tgz",
+        ] {
+            assert!(
+                table
+                    .custom_route_for_package_url("@high/pkg", candidate)
+                    .is_none(),
+                "custom_route_for_package_url must reject encoded traversal: {candidate}"
+            );
+            assert!(
+                !table.fetches_package_from("@high/pkg", candidate),
+                "fetches_package_from must reject encoded traversal: {candidate}"
+            );
+            assert!(
+                table.auth_for_url(candidate).is_none(),
+                "auth_for_url must reject encoded traversal: {candidate}"
+            );
+            let parsed = reqwest::Url::parse(candidate).unwrap();
+            let base = reqwest::Url::parse("https://corp.example/high/").unwrap();
+            assert!(
+                !registry_serves_tarball(&parsed, &base),
+                "registry_serves_tarball must reject encoded traversal: {candidate}"
+            );
+        }
+
+        let userinfo = "https://user:pass@corp.example/high/@high/pkg/-/pkg-1.0.0.tgz";
+        assert!(
+            table
+                .custom_route_for_package_url("@high/pkg", userinfo)
+                .is_none()
+        );
+        assert!(!table.fetches_package_from("@high/pkg", userinfo));
+        assert!(!registry_serves_tarball(
+            &reqwest::Url::parse(userinfo).unwrap(),
+            &reqwest::Url::parse("https://corp.example/high/").unwrap(),
+        ));
+
+        let gh_base = reqwest::Url::parse("https://npm.pkg.github.com/org/").unwrap();
+        let gh_traversal =
+            reqwest::Url::parse("https://npm.pkg.github.com/download/..%2Fsecret/pkg.tgz").unwrap();
+        assert!(!registry_serves_tarball(&gh_traversal, &gh_base));
+
+        let gl_base =
+            reqwest::Url::parse("https://gitlab.example/api/v4/groups/1/-/packages/npm/").unwrap();
+        let gl_traversal = reqwest::Url::parse(
+            "https://gitlab.example/api/v4/projects/9/packages/npm/..%2F..%2Fsecret.tgz",
+        )
+        .unwrap();
+        assert!(!registry_serves_tarball(&gl_traversal, &gl_base));
     }
 }

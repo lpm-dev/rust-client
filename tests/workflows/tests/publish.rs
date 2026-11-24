@@ -4663,6 +4663,7 @@ async fn publish_npm_uses_trusted_publishing_token_exchange() {
 
     let output = lpm(&project)
         .env("NPM_ID_TOKEN", NPM_ID_TOKEN)
+        .env("LPM_INTERNAL_TEST_NPM_OIDC_REGISTRY_URL", mock.url())
         .args(["--json", "publish", "--npm", "--yes"])
         .output()
         .expect("failed to run lpm publish --npm with npm OIDC");
@@ -6010,4 +6011,88 @@ async fn a_mock_registry_fails_its_test_when_a_mock_expectation_is_unmet() {
         .expect(1)
         .mount(registry.server())
         .await;
+}
+
+#[tokio::test]
+async fn npm_publish_rejects_body_preserving_encoded_path_traversal_redirect() {
+    let server = MockServer::start().await;
+    let package = "encoded-redirect-publish-pkg";
+    let token = "publish-encoded-traversal-secret";
+    let traversal_target = format!("{}/npm/..%2Fsibling/capture", server.uri());
+
+    Mock::given(method("PUT"))
+        .and(path(format!("/npm/{package}")))
+        .respond_with(ResponseTemplate::new(307).insert_header("location", traversal_target))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/sibling/capture"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let registry = format!("{}/npm", server.uri());
+    let project = TempProject::empty(&format!(
+        r#"{{
+        "name": "{package}",
+        "version": "1.0.0",
+        "description": "Tests encoded traversal redirect rejection during npm publish",
+        "main": "index.js",
+        "license": "MIT"
+    }}"#
+    ));
+    project.write_file("index.js", "module.exports = {};\n");
+    project.write_file(
+        "lpm.json",
+        &format!(r#"{{"publish":{{"npm":{{"registry":"{registry}","access":"public"}}}}}}"#),
+    );
+    let login = lpm(&project)
+        .args([
+            "--json",
+            "login",
+            "--login-registry",
+            &registry,
+            "--token",
+            token,
+        ])
+        .output()
+        .expect("store registry-scoped token");
+    assert!(login.status.success(), "{login:?}");
+
+    let output = lpm(&project)
+        .args(["publish", "--npm", "--yes"])
+        .output()
+        .expect("failed to run lpm publish --npm");
+
+    assert!(
+        !output.status.success(),
+        "body-preserving 307 redirect with encoded traversal must fail\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = server.received_requests().await.expect("received requests");
+    let put_requests: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method.as_str() == "PUT")
+        .collect();
+    assert_eq!(
+        put_requests.len(),
+        1,
+        "client must refuse the 307 traversal redirect without replaying body or credentials; got {} PUT requests: {:?}",
+        put_requests.len(),
+        put_requests
+            .iter()
+            .map(|r| r.url.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path().contains("sibling")),
+        "encoded traversal redirect must never reach sibling path; got: {:?}",
+        requests.iter().map(|r| r.url.as_str()).collect::<Vec<_>>()
+    );
+    server.verify().await;
 }

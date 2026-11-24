@@ -981,7 +981,7 @@ async fn publish_to_npm_impl(
         req = req.header("npm-otp", code);
     }
 
-    let response = execute_npm_publish_request(hop_clients, req, &payload)
+    let response = execute_npm_publish_request(hop_clients, registry_url, req, &payload)
         .await
         .map_err(|e| LpmError::Registry(format!("npm publish request failed: {e}")))?;
 
@@ -1012,11 +1012,13 @@ async fn publish_to_npm_impl(
             let retry_req =
                 npm_publish_request(client, &url, &payload, token, timeout).header("npm-otp", &otp);
 
-            let retry_response = execute_npm_publish_request(hop_clients, retry_req, &payload)
-                .await
-                .map_err(|e| LpmError::Registry(format!("npm publish retry failed: {e}")))?;
+            let retry_response =
+                execute_npm_publish_request(hop_clients, registry_url, retry_req, &payload)
+                    .await
+                    .map_err(|e| LpmError::Registry(format!("npm publish retry failed: {e}")))?;
 
-            return handle_npm_response(retry_response, token, npm_name, version, start).await;
+            let secrets = [token, otp_code.as_deref().unwrap_or(""), otp.as_str()];
+            return handle_npm_response(retry_response, &secrets, npm_name, version, start).await;
         }
 
         if is_otp_required(status, &headers) {
@@ -1038,19 +1040,23 @@ async fn publish_to_npm_impl(
             let retry_req =
                 npm_publish_request(client, &url, &payload, token, timeout).header("npm-otp", &otp);
 
-            let retry_response = execute_npm_publish_request(hop_clients, retry_req, &payload)
-                .await
-                .map_err(|e| LpmError::Registry(format!("npm publish retry failed: {e}")))?;
+            let retry_response =
+                execute_npm_publish_request(hop_clients, registry_url, retry_req, &payload)
+                    .await
+                    .map_err(|e| LpmError::Registry(format!("npm publish retry failed: {e}")))?;
 
-            return handle_npm_response(retry_response, token, npm_name, version, start).await;
+            let secrets = [token, otp_code.as_deref().unwrap_or(""), otp.as_str()];
+            return handle_npm_response(retry_response, &secrets, npm_name, version, start).await;
         }
 
+        let secrets = [token, otp_code.as_deref().unwrap_or("")];
         return Ok(handle_npm_response_body(
-            status, body, token, npm_name, version, start,
+            status, body, &secrets, npm_name, version, start,
         ));
     }
 
-    handle_npm_response(response, token, npm_name, version, start).await
+    let secrets = [token, otp_code.as_deref().unwrap_or("")];
+    handle_npm_response(response, &secrets, npm_name, version, start).await
 }
 
 fn build_npm_publish_request_client(
@@ -1092,23 +1098,17 @@ fn npm_publish_request(
 
 async fn execute_npm_publish_request(
     hop_clients: &NpmRegistryClients,
+    registry_url: &str,
     request: reqwest::RequestBuilder,
     payload: &crate::commands::publish_common::PreparedPublishBody,
 ) -> Result<reqwest::Response, lpm_http::ReplayableRequestError<LpmError>> {
     let request = request
         .build()
         .map_err(lpm_http::ReplayableRequestError::request)?;
-    let original = request.url().clone();
-    let registry_path = original
-        .path()
-        .rsplit_once('/')
-        .map_or("", |(parent, _)| parent);
+    let base = reqwest::Url::parse(registry_url).ok();
     let authorization_allowed = |url: &reqwest::Url| {
-        url.origin() == original.origin()
-            && url
-                .path()
-                .strip_prefix(registry_path)
-                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+        base.as_ref()
+            .is_some_and(|base| lpm_common::url_matches_base_scope(url, base))
     };
     lpm_http::send_with_replayable_redirects_and_authorization_scope(
         hop_clients,
@@ -1122,7 +1122,7 @@ async fn execute_npm_publish_request(
 /// Handle npm publish response, mapping HTTP status codes to clear errors.
 async fn handle_npm_response(
     response: reqwest::Response,
-    token: &str,
+    secrets: &[&str],
     npm_name: &str,
     version: &str,
     start: std::time::Instant,
@@ -1131,14 +1131,14 @@ async fn handle_npm_response(
     let body = response_json_or_empty(response).await?;
 
     Ok(handle_npm_response_body(
-        status, body, token, npm_name, version, start,
+        status, body, secrets, npm_name, version, start,
     ))
 }
 
 fn handle_npm_response_body(
     status: reqwest::StatusCode,
     body: serde_json::Value,
-    token: &str,
+    secrets: &[&str],
     npm_name: &str,
     version: &str,
     start: std::time::Instant,
@@ -1146,7 +1146,7 @@ fn handle_npm_response_body(
     let duration = start.elapsed();
 
     let error_msg = body.get("error").and_then(|e| e.as_str()).unwrap_or("");
-    let error_msg = lpm_common::redact_exact_secret(error_msg, token);
+    let error_msg = lpm_common::redact_exact_secrets(error_msg, secrets);
 
     if status.is_success() {
         return NpmPublishResult {
@@ -1944,6 +1944,88 @@ mod tests {
         assert!(
             err.to_string().contains("npm OTP required"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn npm_publish_reflected_otp_and_web_auth_proof_are_redacted_from_error() {
+        let server = MockServer::start().await;
+        let token_secret = "npm-publish-secret-token";
+        let web_proof = "npm-web-auth-proof-secret";
+        let auth_url = format!("{}/auth/start", server.uri());
+        let done_url = format!("{}/auth/done", server.uri());
+
+        Mock::given(method("PUT"))
+            .and(path("/plain-pkg"))
+            .and(header("npm-otp", web_proof))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": format!("denied proof={web_proof} token={token_secret}")
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/plain-pkg"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "authUrl": auth_url,
+                "doneUrl": done_url,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/auth/done"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": web_proof,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tarball = Arc::new(b"fake-tarball".to_vec());
+        let hashes = crate::commands::publish_common::compute_hashes(&tarball);
+        let result = publish_to_npm_impl(
+            token_secret,
+            "plain-pkg",
+            "1.0.0",
+            &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
+            &tarball,
+            &hashes,
+            None,
+            "public",
+            "latest",
+            &server.uri(),
+            false,
+            false,
+            false,
+            NpmPublishRuntime::test(),
+            NpmPublishClientSource::Build(&lpm_registry::RegistryClient::new()),
+        )
+        .await
+        .expect("403 returns structured publish failure");
+
+        assert!(!result.success);
+        let error = result.error.expect("403 must carry error text");
+        assert!(!error.contains(web_proof), "web-auth proof leaked: {error}");
+        assert!(!error.contains(token_secret), "token leaked: {error}");
+        assert!(
+            error.contains("<redacted>"),
+            "expected redaction marker: {error}"
+        );
+
+        let direct = handle_npm_response_body(
+            reqwest::StatusCode::BAD_REQUEST,
+            serde_json::json!({ "error": "invalid otp 123456 for npm-publish-secret-token" }),
+            &[token_secret, "123456"],
+            "plain-pkg",
+            "1.0.0",
+            std::time::Instant::now(),
+        );
+        let direct_err = direct.error.expect("400 must carry error text");
+        assert!(!direct_err.contains("123456"), "OTP leaked: {direct_err}");
+        assert!(
+            !direct_err.contains(token_secret),
+            "token leaked: {direct_err}"
         );
     }
 }

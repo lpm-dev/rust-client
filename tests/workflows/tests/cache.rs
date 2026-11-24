@@ -1380,3 +1380,86 @@ fn cache_clean_on_empty_cache_succeeds_idempotently() {
         "empty cache clean must use a slim completion line, got:\n{stderr}"
     );
 }
+
+#[tokio::test]
+async fn remote_cache_download_does_not_follow_redirects_to_internal_hosts() {
+    let cache_server = MockServer::start().await;
+    let hop_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path_regex(r"^/v8/artifacts/[0-9a-f]+$"))
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("location", format!("{}/hop1", hop_server.uri()))
+                .insert_header(
+                    "x-artifact-sha",
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                )
+                .insert_header("x-artifact-tag", "sha256=dummy"),
+        )
+        .expect(1)
+        .mount(&cache_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/hop1"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", "http://169.254.169.254/latest/meta-data/"),
+        )
+        .expect(1)
+        .mount(&hop_server)
+        .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "remote-cache-ssrf-guard",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "node -e \"require('fs').writeFileSync('out.txt', 'local-run')\""
+  }
+}"#,
+    );
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+  "tasks": {{
+    "build": {{
+      "cache": true,
+      "outputs": ["out.txt"]
+    }}
+  }},
+  "remoteCache": {{
+    "enabled": true,
+    "readOnly": true,
+    "signature": true,
+    "url": "{}/v8"
+  }}
+}}"#,
+            cache_server.uri()
+        ),
+    );
+
+    let output = lpm(&project)
+        .env("LPM_REMOTE_CACHE_URL", format!("{}/v8", cache_server.uri()))
+        .env("LPM_REMOTE_CACHE_TOKEN", "remote-cache-token")
+        .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
+        .args(["run", "build"])
+        .output()
+        .expect("failed to run lpm run build with remote cache");
+
+    assert!(
+        output.status.success(),
+        "disallowed internal redirect must be treated as a miss and fall back to local task execution\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(project.read_file("out.txt"), "local-run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("disallowed internal address"),
+        "expected internal redirect warning in stderr, got:\n{stderr}"
+    );
+    cache_server.verify().await;
+    hop_server.verify().await;
+}

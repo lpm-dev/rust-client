@@ -288,14 +288,8 @@ impl AuthScope {
     }
 
     pub(super) fn matches(&self, origin: &OriginKey, path: &str) -> bool {
-        if self.origin != *origin {
-            return false;
-        }
-        if self.path_prefix.as_ref() == "/" {
-            return true;
-        }
-        let without_trailing_slash = self.path_prefix.trim_end_matches('/');
-        path == without_trailing_slash || path.starts_with(self.path_prefix.as_ref())
+        self.origin == *origin
+            && lpm_common::path_matches_base_scope(path, self.path_prefix.as_ref())
     }
 }
 

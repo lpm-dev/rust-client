@@ -70,6 +70,8 @@ struct NpmStageRuntime {
     open_browser: bool,
     web_auth_timeout: Duration,
     web_auth_poll_interval: Duration,
+    #[cfg(test)]
+    assume_interactive: bool,
 }
 
 impl NpmStageRuntime {
@@ -78,6 +80,18 @@ impl NpmStageRuntime {
             open_browser: true,
             web_auth_timeout: Duration::from_secs(5 * 60),
             web_auth_poll_interval: Duration::from_secs(1),
+            #[cfg(test)]
+            assume_interactive: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn test() -> Self {
+        Self {
+            open_browser: false,
+            web_auth_timeout: Duration::from_secs(5),
+            web_auth_poll_interval: Duration::from_millis(10),
+            assume_interactive: true,
         }
     }
 }
@@ -258,7 +272,7 @@ pub(crate) async fn fetch_package_metadata(
         "npm package metadata request",
         status,
         &body,
-        token,
+        &[token],
     )))
 }
 
@@ -372,7 +386,7 @@ async fn stage_publish_impl(
         "npm stage publish",
         status,
         &body,
-        token,
+        &[token],
     )))
 }
 
@@ -418,7 +432,7 @@ pub(crate) async fn list_staged_packages(
                 "npm stage list",
                 status,
                 &body,
-                token,
+                &[token],
             )));
         }
 
@@ -565,7 +579,7 @@ pub(crate) async fn download_staged_package(
             "npm stage download",
             status,
             &body,
-            token,
+            &[token],
         )));
     }
 
@@ -681,7 +695,10 @@ async fn stage_json_get(
     }
 
     Err(LpmError::Registry(stage_error_message(
-        action, status, &body, token,
+        action,
+        status,
+        &body,
+        &[token],
     )))
 }
 
@@ -728,13 +745,13 @@ async fn stage_otp_mutation(
     if status == reqwest::StatusCode::UNAUTHORIZED {
         let body = response_json_or_empty(response, action).await?;
         if let Some(challenge) = web_auth::parse_web_auth_challenge_from_body(&body, registry_url) {
-            if !can_prompt(json_output, yes) {
+            if !can_prompt(json_output, yes, runtime) {
                 return Err(LpmError::Registry(format!(
                     "npm requires browser authentication to {action}, but this command is running in non-interactive mode"
                 )));
             }
 
-            let otp = web_auth::complete_web_auth_challenge(
+            let retry_otp = web_auth::complete_web_auth_challenge(
                 tls,
                 &challenge,
                 action,
@@ -750,16 +767,17 @@ async fn stage_otp_mutation(
                 registry_url,
                 route,
                 method,
-                Some(&otp),
+                Some(&retry_otp),
                 timeout,
             )
             .await
             .map_err(|e| LpmError::Registry(format!("{action} retry failed: {e}")))?;
-            return stage_mutation_response(action, registry_url, retry, token).await;
+            let secrets = [token, otp.unwrap_or(""), retry_otp.as_str()];
+            return stage_mutation_response(action, registry_url, retry, &secrets).await;
         }
 
         if is_otp_required(&headers) {
-            if !can_prompt(json_output, yes) {
+            if !can_prompt(json_output, yes, runtime) {
                 return Err(LpmError::Registry(format!(
                     "npm OTP required to {action}. Pass --otp <code> or rerun in an interactive TTY."
                 )));
@@ -769,27 +787,30 @@ async fn stage_otp_mutation(
                 output::warn("npm requires a one-time password");
             }
 
-            let otp = prompt_npm_otp()?;
+            let retry_otp = prompt_npm_otp()?;
             let retry = send_stage_mutation(
                 &mutation_clients,
                 token,
                 registry_url,
                 route,
                 method,
-                Some(&otp),
+                Some(&retry_otp),
                 timeout,
             )
             .await
             .map_err(|e| LpmError::Registry(format!("{action} retry failed: {e}")))?;
-            return stage_mutation_response(action, registry_url, retry, token).await;
+            let secrets = [token, otp.unwrap_or(""), retry_otp.as_str()];
+            return stage_mutation_response(action, registry_url, retry, &secrets).await;
         }
 
+        let secrets = [token, otp.unwrap_or("")];
         return Err(LpmError::Registry(stage_error_message(
-            action, status, &body, token,
+            action, status, &body, &secrets,
         )));
     }
 
-    stage_mutation_response(action, registry_url, response, token).await
+    let secrets = [token, otp.unwrap_or("")];
+    stage_mutation_response(action, registry_url, response, &secrets).await
 }
 
 async fn send_stage_mutation(
@@ -831,7 +852,7 @@ async fn stage_mutation_response(
     action: &str,
     registry_url: &str,
     response: reqwest::Response,
-    token: &str,
+    secrets: &[&str],
 ) -> Result<serde_json::Value, LpmError> {
     if !stage_authorization_allowed(registry_url)(response.url()) {
         return Err(LpmError::Registry(format!(
@@ -846,7 +867,7 @@ async fn stage_mutation_response(
     }
 
     Err(LpmError::Registry(stage_error_message(
-        action, status, &body, token,
+        action, status, &body, secrets,
     )))
 }
 
@@ -910,8 +931,15 @@ pub(crate) fn endpoint_url(registry_url: &str, route: &str) -> String {
     )
 }
 
-fn can_prompt(json_output: bool, yes: bool) -> bool {
-    !json_output && !yes && web_auth::terminal_is_interactive()
+fn can_prompt(json_output: bool, yes: bool, runtime: NpmStageRuntime) -> bool {
+    #[cfg(test)]
+    let interactive = runtime.assume_interactive || web_auth::terminal_is_interactive();
+    #[cfg(not(test))]
+    let interactive = {
+        let _ = runtime;
+        web_auth::terminal_is_interactive()
+    };
+    !json_output && !yes && interactive
 }
 
 fn is_otp_required(headers: &reqwest::header::HeaderMap) -> bool {
@@ -968,14 +996,14 @@ fn stage_error_message(
     action: &str,
     status: reqwest::StatusCode,
     body: &serde_json::Value,
-    token: &str,
+    secrets: &[&str],
 ) -> String {
     let error = body
         .get("error")
         .or_else(|| body.get("message"))
         .and_then(|value| value.as_str())
         .unwrap_or("");
-    let error = lpm_common::redact_exact_secret(error, token);
+    let error = lpm_common::redact_exact_secrets(error, secrets);
     match status.as_u16() {
         401 => format!(
             "{action} failed: authentication failed. For public npm, run `lpm login --npm` or set NPM_TOKEN. For a custom registry, run `lpm login --login-registry <configured-registry-url> --token <token>`."
@@ -1697,6 +1725,103 @@ mod tests {
                 .get("npm-otp")
                 .and_then(|v| v.to_str().ok()),
             Some("123456")
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_mutation_reflected_otp_is_redacted_from_error() {
+        let server = MockServer::start().await;
+        let otp_secret = "654321";
+        let token_secret = "npm-stage-secret-token";
+        Mock::given(method("POST"))
+            .and(path("/-/stage/stage-id/approve"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": format!("rejected otp={otp_secret} bearer={token_secret}")
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let err = stage_otp_mutation(
+            &lpm_registry::RegistryClient::new(),
+            token_secret,
+            &server.uri(),
+            "-/stage/stage-id/approve",
+            Method::POST,
+            "approve staged package",
+            Some(otp_secret),
+            false,
+            false,
+            NpmStageRuntime::production(),
+        )
+        .await
+        .expect_err("403 stage mutation must fail")
+        .to_string();
+
+        assert!(!err.contains(otp_secret), "OTP leaked in error: {err}");
+        assert!(!err.contains(token_secret), "token leaked in error: {err}");
+        assert!(
+            err.contains("<redacted>"),
+            "expected redaction marker: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_mutation_reflected_web_auth_proof_is_redacted_from_error() {
+        let server = MockServer::start().await;
+        let token_secret = "npm-stage-web-token";
+        let web_proof = "web-auth-proof-secret-999";
+        let auth_url = format!("{}/auth/start", server.uri());
+        let done_url = format!("{}/auth/done", server.uri());
+
+        Mock::given(method("POST"))
+            .and(path("/-/stage/stage-id/approve"))
+            .and(header("npm-otp", web_proof))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": format!("denied proof={web_proof} token={token_secret}")
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/-/stage/stage-id/approve"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "authUrl": auth_url,
+                "doneUrl": done_url,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/auth/done"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": web_proof,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let err = stage_otp_mutation(
+            &lpm_registry::RegistryClient::new(),
+            token_secret,
+            &server.uri(),
+            "-/stage/stage-id/approve",
+            Method::POST,
+            "approve staged package",
+            None,
+            false,
+            false,
+            NpmStageRuntime::test(),
+        )
+        .await
+        .expect_err("reflected web-auth proof failure must return an error")
+        .to_string();
+
+        assert!(!err.contains(web_proof), "web-auth proof leaked: {err}");
+        assert!(!err.contains(token_secret), "token leaked: {err}");
+        assert!(
+            err.contains("<redacted>"),
+            "expected redaction marker: {err}"
         );
     }
 }

@@ -1190,3 +1190,95 @@ async fn fetch_resolves_from_the_routed_registry_when_the_locked_hint_names_an_u
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[tokio::test]
+async fn fetch_never_uses_tarball_url_to_select_an_unrelated_registry_credential() {
+    let server = MockServer::start().await;
+    let name = "@low/pkg";
+    let version = "1.0.0";
+    let tarball = make_tarball(name, version);
+    let integrity = compute_integrity(&tarball);
+    let capture_url = format!("{}/high/capture/-/pkg-{version}.tgz", server.uri());
+
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path_regex(r"^/low/@low(%2[Ff]|/)pkg$"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer LOW_SECRET",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": name,
+            "dist-tags": { "latest": version },
+            "versions": {
+                version: {
+                    "name": name,
+                    "version": version,
+                    "dist": {
+                        "tarball": capture_url,
+                        "integrity": integrity,
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/high/capture/-/pkg-{version}.tgz")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let authority = server
+        .uri()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .to_string();
+    let project = project_with_single_fetch_artifact(
+        name,
+        version,
+        format!("registry+{}/low", server.uri()),
+        integrity,
+        None,
+    );
+    project.write_file(
+        ".npmrc",
+        &format!(
+            "@low:registry={}/low/\n//{authority}/low/:_authToken=LOW_SECRET\n//{authority}/high/:_authToken=HIGH_SECRET\n",
+            server.uri()
+        ),
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(
+            project.path().join(".npmrc"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod 0600 .npmrc");
+    }
+
+    let output = lpm(&project)
+        .args(["fetch"])
+        .output()
+        .expect("failed to run lpm fetch");
+    assert!(
+        output.status.success(),
+        "lpm fetch should complete anonymously when metadata points outside the package route:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let requests = server.received_requests().await.expect("received requests");
+    let capture = requests
+        .iter()
+        .find(|req| req.url.path() == format!("/high/capture/-/pkg-{version}.tgz"))
+        .expect("tarball request must hit /high/capture/");
+    assert!(
+        capture.headers.get("authorization").is_none(),
+        "tarball request outside /low/ must never attach HIGH_SECRET or LOW_SECRET, got: {:?}",
+        capture.headers.get("authorization")
+    );
+    server.verify().await;
+}
