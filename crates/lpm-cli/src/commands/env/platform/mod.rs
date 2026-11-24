@@ -1290,6 +1290,12 @@ fn response_error(status: reqwest::StatusCode, body: &[u8], fallback: &str) -> L
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return LpmError::AuthRequired;
     }
+    if status.is_redirection() {
+        return LpmError::Env(format!(
+            "{fallback} (the server answered with a redirect HTTP {}, which this command does not follow; check the configured URL)",
+            status.as_u16()
+        ));
+    }
     let message = serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|value| value["error"].as_str().map(str::to_owned))
@@ -1457,6 +1463,12 @@ async fn record_platform_audit_with_recovery(
 }
 
 fn vercel_api_error(operation: &str, status: reqwest::StatusCode, body: &[u8]) -> LpmError {
+    if status.is_redirection() {
+        return LpmError::Env(format!(
+            "Vercel {operation} refused redirect (HTTP {}); check the configured Vercel endpoint",
+            status.as_u16()
+        ));
+    }
     let detail = String::from_utf8_lossy(body);
     let detail = detail.trim();
     let suffix = if detail.is_empty() {
@@ -3808,5 +3820,64 @@ mod tests {
 
         assert!(empty.to_string().contains("cannot be empty"));
         assert!(oversized.to_string().contains("at most 128 characters"));
+    }
+
+    #[tokio::test]
+    async fn vercel_and_vault_platform_clients_refuse_redirects_without_forwarding_secrets() {
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        let target = format!("{}/collect", second.uri());
+        Mock::given(method("GET"))
+            .and(path("/v10/projects/test-project/env"))
+            .respond_with(ResponseTemplate::new(307).insert_header("location", target.as_str()))
+            .mount(&first)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/vault/platforms/connect"))
+            .respond_with(ResponseTemplate::new(307).insert_header("location", target.as_str()))
+            .mount(&first)
+            .await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&second)
+            .await;
+
+        let mut vercel = VercelClient::new(
+            "test-token".into(),
+            VercelConnectionConfig {
+                project_id: "test-project".into(),
+                team_id: None,
+                target: Some(vec!["production".into()]),
+                linked_env: None,
+            },
+        )
+        .expect("VercelClient::new builds with Policy::none()");
+        vercel.api_url = first.uri();
+        let vercel_err = vercel
+            .list()
+            .await
+            .expect_err("307 on VercelClient must be rejected");
+        assert!(
+            vercel_err.to_string().contains("redirect (HTTP 307)"),
+            "{vercel_err}"
+        );
+
+        let connect_err = save_platform_connection(
+            &first.uri(),
+            "lpm-bearer",
+            &serde_json::json!({ "token": "provider-secret" }),
+            "vault-1",
+            "vercel",
+            PlatformRequestScope::Personal,
+            "principal-1",
+        )
+        .await
+        .expect_err("307 on save_platform_connection must be rejected");
+        assert!(
+            connect_err.to_string().contains("redirect HTTP 307"),
+            "{connect_err}"
+        );
+        second.verify().await;
     }
 }

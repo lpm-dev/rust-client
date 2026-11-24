@@ -363,13 +363,33 @@ async fn fetch_artifact(
             crate::commands::install::download_github_archive_to_file(url, Some(&integrity)).await?
         }
         FetchSource::Registry { tarball_url, .. } => {
+            let gated_tarball_url = tarball_url.as_deref().filter(|url| {
+                if !lpm_lockfile::is_recordable_tarball_hint(url) {
+                    return false;
+                }
+                match route_table.route_for_package(routing_name) {
+                    lpm_registry::UpstreamRoute::Custom { .. } => {
+                        route_table.fetches_package_from(routing_name, url)
+                            && matches!(
+                                lpm_registry::evaluate_cached_url(url, &client),
+                                lpm_registry::GateDecision::Accepted
+                                    | lpm_registry::GateDecision::RejectedOrigin
+                            )
+                    }
+                    lpm_registry::UpstreamRoute::LpmWorker
+                    | lpm_registry::UpstreamRoute::NpmDirect => {
+                        lpm_registry::evaluate_cached_url(url, &client)
+                            == lpm_registry::GateDecision::Accepted
+                    }
+                }
+            });
             let resolved = crate::commands::install::resolve_tarball_url(
                 &client,
                 &route_table,
                 routing_name,
                 &first_target.version,
                 routing_name.starts_with("@lpm.dev/"),
-                tarball_url.as_deref(),
+                gated_tarball_url,
                 false,
             )
             .await?;

@@ -342,18 +342,78 @@ pub fn safe_url_origin(raw: &str) -> String {
     }
 }
 
+/// Normalize RFC 3986 percent-encoding for path-scope comparison:
+/// - Unreserved characters (`ALPHA / DIGIT / "-" / "." / "_" / "~"`) are decoded
+///   except `.` (`%2e`/`%2E`), which is kept uppercase as `%2E` so encoded dot
+///   segments remain distinguishable for traversal rejection.
+/// - Remaining valid `%XX` escapes are uppercased so `%2f` and `%2F` compare equal.
+fn normalize_scope_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut out = String::with_capacity(path.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h1 = (bytes[i + 1] as char).to_digit(16);
+            let h2 = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (h1, h2) {
+                let decoded = ((hi << 4) | lo) as u8;
+                let is_unreserved_non_dot =
+                    decoded.is_ascii_alphanumeric() || matches!(decoded, b'-' | b'_' | b'~');
+                if is_unreserved_non_dot {
+                    out.push(decoded as char);
+                } else {
+                    out.push('%');
+                    out.push(bytes[i + 1].to_ascii_uppercase() as char);
+                    out.push(bytes[i + 2].to_ascii_uppercase() as char);
+                }
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Reject encoded backslashes (`%5C`) and any dot-segment (`.` or `..`, literal
+/// or `%2E`-encoded) separated by `/` or `%2F` so reverse proxies that decode
+/// `%2F` before routing cannot traverse out of the base path.
+fn has_encoded_path_traversal(normalized_path: &str) -> bool {
+    if normalized_path.contains("%5C") {
+        return true;
+    }
+    for slash_part in normalized_path.split('/') {
+        for segment in slash_part.split("%2F") {
+            let unescaped = if segment.contains("%2E") {
+                segment.replace("%2E", ".")
+            } else {
+                segment.to_owned()
+            };
+            if unescaped == "." || unescaped == ".." {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Returns true when `candidate` shares the same origin as `base` and its
 /// normalized path lies within `base`'s path prefix on a segment boundary.
 pub fn url_matches_base_scope(candidate: &url::Url, base: &url::Url) -> bool {
     if candidate.origin() != base.origin() {
         return false;
     }
-    let base_path = base.path().trim_end_matches('/');
+    let candidate_path = normalize_scope_path(candidate.path());
+    if has_encoded_path_traversal(&candidate_path) {
+        return false;
+    }
+    let base_normalized = normalize_scope_path(base.path());
+    let base_path = base_normalized.trim_end_matches('/');
     if base_path.is_empty() {
         return true;
     }
-    candidate
-        .path()
+    candidate_path
         .strip_prefix(base_path)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
@@ -1212,6 +1272,45 @@ mod tests {
         assert!(!url_matches_base_scope(
             &url::Url::parse("https://other.example/lpm/api").unwrap(),
             &base
+        ));
+    }
+
+    #[test]
+    fn url_matches_base_scope_rejects_encoded_separator_traversal_and_keeps_scoped_npm() {
+        let base = url::Url::parse("https://corp.example/lpm").unwrap();
+        assert!(url_matches_base_scope(
+            &url::Url::parse("https://corp.example/lpm/@scope%2fpkg").unwrap(),
+            &base
+        ));
+        for traversal in [
+            "https://corp.example/lpm/..%2Fother/x",
+            "https://corp.example/lpm/..%2fother/x",
+            "https://corp.example/lpm/%2e%2e%2fother/x",
+            "https://corp.example/lpm/..%5Cother/x",
+            "https://corp.example/lpm/a/%5c/b",
+        ] {
+            assert!(
+                !url_matches_base_scope(&url::Url::parse(traversal).unwrap(), &base),
+                "expected encoded traversal to be rejected: {traversal}"
+            );
+        }
+    }
+
+    #[test]
+    fn base_scope_accepts_equivalent_unreserved_encodings_and_preserves_reserved_delimiters() {
+        let base = url::Url::parse("https://corp.example/my%2Dorg/npm").unwrap();
+        assert!(url_matches_base_scope(
+            &url::Url::parse("https://corp.example/my-org/npm/pkg").unwrap(),
+            &base
+        ));
+        let encoded_delim_base = url::Url::parse("https://corp.example/a%2Fb/npm").unwrap();
+        assert!(url_matches_base_scope(
+            &url::Url::parse("https://corp.example/a%2fb/npm/pkg").unwrap(),
+            &encoded_delim_base
+        ));
+        assert!(!url_matches_base_scope(
+            &url::Url::parse("https://corp.example/a/b/npm/pkg").unwrap(),
+            &encoded_delim_base
         ));
     }
 }

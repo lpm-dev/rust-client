@@ -215,17 +215,18 @@ impl RegistryClient {
     }
 
     /// A client builder that trusts `tls`'s roots, keeps its `strict-ssl`
-    /// setting and presents `identity`, with nothing else configured.
+    /// setting and presents `identity`, with same-origin redirect isolation
+    /// when a client certificate or custom CA trust roots are attached.
     pub(super) fn tls_client_builder(
         tls: &TlsOverrides,
         identity: Option<reqwest::Identity>,
     ) -> Result<reqwest::ClientBuilder, LpmError> {
         let roots = Self::prepare_tls_roots(tls)?;
-        Ok(Self::apply_tls_settings(
-            roots.client_builder(),
-            tls,
-            identity,
-        ))
+        let mut builder = roots.client_builder();
+        if identity.is_some() || !tls.extra_roots.is_empty() {
+            builder = builder.redirect(lpm_http::same_origin_redirect_policy());
+        }
+        Ok(Self::apply_tls_settings(builder, tls, identity))
     }
 
     fn apply_tls_settings(
@@ -543,14 +544,18 @@ impl RegistryClient {
         parsed_origin == self.base_url_origin || parsed_origin == self.npm_registry_url_origin
     }
 
+    pub(super) fn is_base_url_scope_parsed(&self, candidate: &reqwest::Url) -> bool {
+        let Ok(base) = reqwest::Url::parse(&self.base_url) else {
+            return false;
+        };
+        lpm_common::url_matches_base_scope(candidate, &base)
+    }
+
     pub(super) fn is_base_url_scope(&self, url: &str) -> bool {
         let Ok(candidate) = reqwest::Url::parse(url) else {
             return false;
         };
-        let Ok(base) = reqwest::Url::parse(&self.base_url) else {
-            return false;
-        };
-        lpm_common::url_matches_base_scope(&candidate, &base)
+        self.is_base_url_scope_parsed(&candidate)
     }
 
     /// Set the registry base URL.
@@ -928,11 +933,14 @@ impl RegistryClient {
         Ok(())
     }
 
-    fn detach_metadata_memory_cache(&mut self) {
-        self.metadata_memory_cache = None;
-        self.release_time_memory_cache = None;
-        self.metadata_route_overrides = None;
-        self.metadata_command_cache_policies = None;
+    fn reset_metadata_memory_cache_if_enabled(&mut self) {
+        if self.metadata_memory_cache.is_some() {
+            self.metadata_memory_cache = Some(Arc::new(std::sync::Mutex::new(HashMap::new())));
+            self.release_time_memory_cache = Some(Arc::new(std::sync::Mutex::new(HashMap::new())));
+            self.metadata_route_overrides = Some(Arc::new(std::sync::Mutex::new(HashMap::new())));
+            self.metadata_command_cache_policies =
+                Some(Arc::new(std::sync::Mutex::new(HashMap::new())));
+        }
     }
 
     /// Set the bearer token for authenticated requests.
@@ -940,8 +948,16 @@ impl RegistryClient {
     /// The token is stored as a `SecretString` (S5) — it will not appear
     /// in `Debug` output and is zeroized on drop.
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
-        self.token = Some(SecretString::from(token.into()));
-        self.detach_metadata_memory_cache();
+        let token = token.into();
+        let same_static_principal = self.session.is_none()
+            && self
+                .token
+                .as_ref()
+                .is_some_and(|existing| existing.expose_secret() == token);
+        self.token = Some(SecretString::from(token));
+        if !same_static_principal {
+            self.reset_metadata_memory_cache_if_enabled();
+        }
         self
     }
 
@@ -951,9 +967,17 @@ impl RegistryClient {
     /// attached session otherwise takes precedence over `self.token`, which
     /// would cause subsequent requests to keep using the pre-exchange bearer.
     pub fn with_token_override(mut self, token: impl Into<String>) -> Self {
-        self.token = Some(SecretString::from(token.into()));
+        let token = token.into();
+        let same_static_principal = self.session.is_none()
+            && self
+                .token
+                .as_ref()
+                .is_some_and(|existing| existing.expose_secret() == token);
+        self.token = Some(SecretString::from(token));
         self.session = None;
-        self.detach_metadata_memory_cache();
+        if !same_static_principal {
+            self.reset_metadata_memory_cache_if_enabled();
+        }
         self
     }
 
@@ -961,9 +985,15 @@ impl RegistryClient {
     /// token / trigger silent refresh on demand. Idempotent — subsequent
     /// calls replace the prior session reference.
     pub fn with_session(mut self, session: Arc<SessionManager>) -> Self {
+        let same_session = self
+            .session
+            .as_ref()
+            .is_some_and(|existing| Arc::ptr_eq(existing, &session));
         self.session = Some(session);
         self.package_read_recovery = Arc::new(tokio::sync::Mutex::new(false));
-        self.detach_metadata_memory_cache();
+        if !same_session {
+            self.reset_metadata_memory_cache_if_enabled();
+        }
         self.share_tls_settings_with_session();
         self
     }
@@ -1043,9 +1073,12 @@ impl RegistryClient {
     /// credential-store prompt merely to enrich an anonymous request.
     pub fn clone_anonymous(&self) -> Self {
         let mut client = self.clone_with_config();
+        let already_anonymous = client.session.is_none() && client.token.is_none();
         client.session = None;
         client.token = None;
-        client.detach_metadata_memory_cache();
+        if !already_anonymous {
+            client.reset_metadata_memory_cache_if_enabled();
+        }
         client
     }
 
@@ -1056,10 +1089,18 @@ impl RegistryClient {
     /// request itself. An attached session otherwise takes precedence over
     /// `with_token`, which would authorize the request as the wrong principal.
     pub fn clone_with_static_token(&self, token: impl Into<String>) -> Self {
+        let token = token.into();
         let mut client = self.clone_with_config();
+        let same_static_principal = client.session.is_none()
+            && client
+                .token
+                .as_ref()
+                .is_some_and(|existing| existing.expose_secret() == token);
         client.session = None;
-        client.token = Some(SecretString::from(token.into()));
-        client.detach_metadata_memory_cache();
+        client.token = Some(SecretString::from(token));
+        if !same_static_principal {
+            client.reset_metadata_memory_cache_if_enabled();
+        }
         client
     }
 
@@ -1071,10 +1112,17 @@ impl RegistryClient {
     /// the supplied session expires.
     pub fn clone_with_session_only(&self, session: Arc<SessionManager>) -> Self {
         let mut client = self.clone_with_config();
+        let same_session = client.token.is_none()
+            && client
+                .session
+                .as_ref()
+                .is_some_and(|existing| Arc::ptr_eq(existing, &session));
         client.session = Some(session);
         client.package_read_recovery = Arc::new(tokio::sync::Mutex::new(false));
         client.token = None;
-        client.detach_metadata_memory_cache();
+        if !same_session {
+            client.reset_metadata_memory_cache_if_enabled();
+        }
         client.share_tls_settings_with_session();
         client
     }
@@ -1100,7 +1148,7 @@ impl RegistryClient {
     }
 }
 
-fn safe_url_for_diagnostic(value: &str) -> String {
+pub(super) fn safe_url_for_diagnostic(value: &str) -> String {
     let Ok(url) = reqwest::Url::parse(value) else {
         return "<invalid-url>".to_string();
     };

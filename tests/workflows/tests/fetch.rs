@@ -1150,16 +1150,43 @@ async fn fetch_refuses_mismatched_lockfile_tarball_hint_before_authenticated_req
         .args(["fetch"])
         .output()
         .expect("failed to run lpm fetch");
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
-        "lpm fetch must refuse a lockfile tarball hint that disagrees with registry metadata:\nstdout: {}\nstderr: {}",
+        "lpm fetch must refuse a lockfile tarball hint that disagrees with registry metadata:\nstdout: {}\nstderr: {stderr}",
         String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stderr.contains("refusing lockfile hint") && stderr.contains("lpm.lock"),
+        "mismatch error should name the refused hint and lpm.lock remedy, got:\n{stderr}"
     );
     let requests = mock.server().received_requests().await.unwrap();
     assert!(
         !requests.iter().any(|req| req.url.path() == tampered_path),
         "tampered lockfile hint must receive zero HTTP requests; got: {:?}",
         requests.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn fetch_resolves_from_the_routed_registry_when_the_locked_hint_names_an_unconfigured_origin()
+{
+    let mock = MockRegistry::start().await;
+    mount_ms(&mock).await;
+    let lockfile = seed_lockfile(&mock).await;
+    let served = mock.tarball_url("ms", "2.1.3");
+    let old_origin_hint = "https://old-registry.example/ms/-/ms-2.1.3.tgz";
+    assert!(lockfile.contains(&served), "{lockfile}");
+
+    let project = project_with_lockfile(&lockfile.replace(&served, old_origin_hint));
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["fetch"])
+        .output()
+        .expect("failed to run lpm fetch after registry migration");
+    assert!(
+        output.status.success(),
+        "lpm fetch should drop unconfigured-origin hints and resolve cleanly from metadata like install:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }

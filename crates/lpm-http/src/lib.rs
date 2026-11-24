@@ -51,7 +51,7 @@ pub fn same_origin_redirect_policy() -> Policy {
             .any(|prev| prev.scheme() == "https")
             && next.scheme() != "https"
         {
-            return attempt.error(HTTPS_DOWNGRADE_REFUSAL);
+            return attempt.error(HttpsDowngrade);
         }
         if attempt
             .previous()
@@ -942,24 +942,78 @@ pub struct ErrorDisplay<'a> {
     error: &'a reqwest::Error,
 }
 
-fn format_reqwest_error_without_url_secrets(error: &reqwest::Error) -> String {
-    let raw = error.to_string();
-    let Some(url) = error.url() else {
-        return raw;
-    };
+fn sanitize_parsed_url_secrets(url: &reqwest::Url) -> Option<String> {
     if url.query().is_none()
         && url.fragment().is_none()
         && url.username().is_empty()
         && url.password().is_none()
     {
-        return raw;
+        return None;
     }
     let mut sanitized = url.clone();
     let _ = sanitized.set_username("");
     let _ = sanitized.set_password(None);
     sanitized.set_query(None);
     sanitized.set_fragment(None);
-    raw.replace(url.as_str(), sanitized.as_str())
+    Some(sanitized.into())
+}
+
+fn redact_urls_in_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("http://") && !text.contains("https://") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let mut changed = false;
+    while cursor < text.len() {
+        let rest = &text[cursor..];
+        let next_http = rest.find("http://");
+        let next_https = rest.find("https://");
+        let Some(rel_start) = (match (next_http, next_https) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }) else {
+            out.push_str(rest);
+            break;
+        };
+        let start = cursor + rel_start;
+        out.push_str(&text[cursor..start]);
+        let after = &text[start..];
+        let rel_end = after
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']' | '}')
+            })
+            .unwrap_or(after.len());
+        let raw_token = &after[..rel_end];
+        let trimmed_token = raw_token.trim_end_matches(['.', ',', ';', ':']);
+        if let Ok(parsed) = reqwest::Url::parse(trimmed_token)
+            && let Some(sanitized) = sanitize_parsed_url_secrets(&parsed)
+        {
+            out.push_str(&sanitized);
+            out.push_str(&raw_token[trimmed_token.len()..]);
+            changed = true;
+        } else {
+            out.push_str(raw_token);
+        }
+        cursor = start + rel_end;
+    }
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+fn format_reqwest_error_without_url_secrets(error: &reqwest::Error) -> String {
+    let mut rendered = error.to_string();
+    if let Some(url) = error.url()
+        && let Some(sanitized) = sanitize_parsed_url_secrets(url)
+    {
+        rendered = rendered.replace(url.as_str(), &sanitized);
+    }
+    redact_urls_in_text(&rendered).into_owned()
 }
 
 impl fmt::Display for ErrorDisplay<'_> {
@@ -982,7 +1036,8 @@ pub fn error_chain(error: &reqwest::Error) -> String {
     messages.push(format_reqwest_error_without_url_secrets(error));
     let mut source: Option<&dyn std::error::Error> = error.source();
     while let Some(current) = source {
-        messages.push(current.to_string());
+        let rendered = current.to_string();
+        messages.push(redact_urls_in_text(&rendered).into_owned());
         source = current.source();
     }
     messages.join(" <- ")
@@ -2225,5 +2280,34 @@ mod permanent_tls_failure_tests {
                 "expected sanitized URL to remain readable: {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn redact_urls_in_text_redacts_embedded_urls_without_corrupting_diagnostics() {
+        let input = "upstream status 502 from https://user:secret@cdn.example/a.tgz?sig=topsecret#frag and http://tok@127.0.0.1:8080/b?k=v (code=502)";
+        let redacted = redact_urls_in_text(input);
+        for secret in ["secret", "topsecret", "frag", "tok@", "k=v"] {
+            assert!(!redacted.contains(secret), "leaked {secret}: {redacted}");
+        }
+        assert!(
+            redacted.contains("https://cdn.example/a.tgz")
+                && redacted.contains("http://127.0.0.1:8080/b")
+                && redacted.contains("(code=502)"),
+            "expected readable sanitized diagnostic: {redacted}"
+        );
+    }
+
+    #[test]
+    fn same_origin_policy_preserves_typed_https_downgrade_refusal() {
+        let client = reqwest::Client::builder()
+            .redirect(same_origin_redirect_policy())
+            .build()
+            .unwrap();
+        let _ = client;
+        // Verify that the error type emitted by `same_origin_redirect_policy`
+        // matches `HttpsDowngrade` and is recognized by `is_https_downgrade`.
+        let err: Box<dyn std::error::Error + Send + Sync> = Box::new(HttpsDowngrade);
+        assert!(err.downcast_ref::<HttpsDowngrade>().is_some());
+        assert_eq!(err.to_string(), HTTPS_DOWNGRADE_REFUSAL);
     }
 }

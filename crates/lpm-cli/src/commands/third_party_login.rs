@@ -191,24 +191,23 @@ pub fn run_custom(
     token: Option<String>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    validate_custom_registry_base(registry_url)?;
-    let display_origin = lpm_common::safe_url_origin(registry_url);
+    lpm_auth::validate_custom_registry_url_for_storage(registry_url).map_err(LpmError::Registry)?;
     let token = match token {
         Some(token) => token,
         None if json_output => {
             return Err(LpmError::Registry(format!(
-                "--token <token> required in JSON mode for custom registry {display_origin}"
+                "--token <token> required in JSON mode for custom registry {registry_url}"
             )));
         }
         None if !std::io::stdin().is_terminal() => {
             return Err(LpmError::Registry(format!(
-                "--token <token> required in non-interactive mode for custom registry {display_origin}"
+                "--token <token> required in non-interactive mode for custom registry {registry_url}"
             )));
         }
         None => {
             install_ui::phase("Provide the registry auth token");
             cliclack::password(crate::prompt::untrusted(format!(
-                "Paste {display_origin} token"
+                "Paste {registry_url} token"
             )))
             .mask('*')
             .interact()
@@ -217,37 +216,13 @@ pub fn run_custom(
     };
 
     store_builtin_token(
-        &display_origin,
+        registry_url,
         &token,
         "explicit-token",
         json_output,
         false,
         |token| auth::set_custom_registry_token_with_backend(registry_url, token),
     )
-}
-
-fn validate_custom_registry_base(registry_url: &str) -> Result<(), LpmError> {
-    if registry_url.bytes().any(|b| b < 0x20 || b == 0x7f) {
-        return Err(LpmError::Registry(
-            "custom registry URL must not contain control characters".into(),
-        ));
-    }
-    let parsed = reqwest::Url::parse(registry_url)
-        .map_err(|_| LpmError::Registry("invalid custom registry URL".into()))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(LpmError::Registry(
-            "custom registry URL must use http or https".into(),
-        ));
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(LpmError::Registry(lpm_http::URL_CREDENTIALS_REFUSAL.into()));
-    }
-    if parsed.query().is_some() || parsed.fragment().is_some() {
-        return Err(LpmError::Registry(
-            "custom registry URL must not include a query string or fragment".into(),
-        ));
-    }
-    Ok(())
 }
 
 fn store_builtin_token(
@@ -448,10 +423,8 @@ fn npm_web_auth_client(builder: reqwest::ClientBuilder) -> Result<reqwest::Clien
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
-    fn validate_custom_registry_base_rejects_userinfo_query_and_fragment() {
+    fn custom_registry_storage_validator_rejects_userinfo_query_and_fragment() {
         for bad in [
             "https://user:secret@registry.example/npm",
             "https://registry.example/npm?token=abc",
@@ -459,10 +432,13 @@ mod tests {
             "ftp://registry.example/npm",
         ] {
             assert!(
-                validate_custom_registry_base(bad).is_err(),
+                lpm_auth::validate_custom_registry_url_for_storage(bad).is_err(),
                 "expected rejection for {bad}"
             );
         }
-        assert!(validate_custom_registry_base("https://registry.example/npm").is_ok());
+        assert!(
+            lpm_auth::validate_custom_registry_url_for_storage("https://registry.example/npm")
+                .is_ok()
+        );
     }
 }

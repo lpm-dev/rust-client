@@ -1047,7 +1047,7 @@ fn resolve_client(
         }
         None => {
             return Err(
-                "remote cache is configured for a host other than the LPM registry; set LPM_REMOTE_CACHE_TOKEN to authenticate (the registry login token is never sent to third-party cache hosts)"
+                "remote cache is configured for a host other than the LPM registry; set LPM_REMOTE_CACHE_TOKEN and LPM_REMOTE_CACHE_URL to authenticate (the registry login token is never sent to third-party cache hosts)"
                     .to_string(),
             );
         }
@@ -1132,7 +1132,7 @@ fn remote_status(
         }
     };
 
-    let url = lpm_common::safe_url_origin(&client.base_url);
+    let url = client.base_url.clone();
     let team = client.team.clone();
     match client.fetch_status() {
         Ok(remote) => RemoteStatus {
@@ -1750,7 +1750,7 @@ fn resolve_base_url(
 }
 
 fn cache_origin_matches_registry(base_url: &str, active_registry: Option<&str>) -> bool {
-    let Some(cache_origin) = registry_origin_for_auth(base_url) else {
+    let Ok(cache_url) = reqwest::Url::parse(base_url) else {
         return false;
     };
     let resolved_registry;
@@ -1761,8 +1761,10 @@ fn cache_origin_matches_registry(base_url: &str, active_registry: Option<&str>) 
             &resolved_registry
         }
     };
-    registry_origin_for_auth(registry)
-        .is_some_and(|registry_origin| cache_origin.eq_ignore_ascii_case(&registry_origin))
+    let Ok(registry_url) = reqwest::Url::parse(registry) else {
+        return false;
+    };
+    lpm_common::url_matches_base_scope(&cache_url, &registry_url)
 }
 
 fn registry_origin_for_auth(base_url: &str) -> Option<String> {
@@ -3592,5 +3594,17 @@ mod tests {
             err.contains("LPM_REMOTE_CACHE_URL"),
             "expected guidance to pin LPM_REMOTE_CACHE_URL; got: {err}"
         );
+    }
+
+    #[test]
+    fn project_remote_cache_url_on_registry_sibling_path_is_third_party() {
+        assert!(!cache_origin_matches_registry(
+            "https://corp.example/evil-tenant/v8",
+            Some("https://corp.example/lpm")
+        ));
+        assert!(cache_origin_matches_registry(
+            "https://corp.example/lpm/v8",
+            Some("https://corp.example/lpm")
+        ));
     }
 }

@@ -323,6 +323,56 @@ impl RouteTable {
         }
     }
 
+    /// Route a search query to its registry and select `.npmrc` credentials for
+    /// the registry's `/-/v1/search` endpoint rather than treating free-text
+    /// query input as a package path.
+    pub fn route_for_search(&self, query: &str) -> UpstreamRoute {
+        let routing_hint = query
+            .trim()
+            .strip_prefix('@')
+            .and_then(|rest| rest.split_once('/'))
+            .filter(|(scope, _)| {
+                !scope.is_empty()
+                    && scope
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            })
+            .map(|(scope, _)| format!("@{scope}/search"));
+        let hint = routing_hint.as_deref().unwrap_or("search");
+        match self.selected_route_for_package(hint) {
+            SelectedRoute::Mode(mode) => match mode.route_for_package(hint) {
+                UpstreamRoute::NpmDirect => {
+                    let Some(auth) = self
+                        .npmrc
+                        .shared_auth_for_origin_path(&NPM_ORIGIN, "/-/v1/search")
+                        .cloned()
+                    else {
+                        return UpstreamRoute::NpmDirect;
+                    };
+                    UpstreamRoute::Custom {
+                        target: NPM_TARGET.clone(),
+                        auth: Some(auth),
+                    }
+                }
+                route => route,
+            },
+            SelectedRoute::Custom(target) => {
+                let search_url = format!("{}/-/v1/search", target.base_url.trim_end_matches('/'));
+                UpstreamRoute::Custom {
+                    target: target.clone(),
+                    auth: self.npmrc.shared_auth_for_url(&search_url).cloned(),
+                }
+            }
+            SelectedRoute::Jsr => UpstreamRoute::Custom {
+                target: JSR_TARGET.clone(),
+                auth: self
+                    .npmrc
+                    .shared_auth_for_origin_path(&JSR_ORIGIN, "/-/v1/search")
+                    .cloned(),
+            },
+        }
+    }
+
     /// Return the configured npm-compatible route only when `candidate`
     /// is within the registry path authorized for `name`.
     pub fn custom_route_for_package_url(
@@ -331,25 +381,31 @@ impl RouteTable {
         candidate: &str,
     ) -> Option<UpstreamRoute> {
         if let Some(target) = self.npmrc_scope_target_for_package(name) {
+            let package_url = format!("{}/{name}", target.base_url.trim_end_matches('/'));
             return registry_url_contains(candidate, &target.base_url).then(|| {
                 UpstreamRoute::Custom {
                     target: target.clone(),
-                    auth: self.npmrc.shared_auth_for_url(candidate).cloned(),
+                    auth: self.npmrc.shared_auth_for_url(&package_url).cloned(),
                 }
             });
         }
         if name.starts_with("@jsr/") {
+            let package_path = format!("/{name}");
             return registry_url_contains_parsed(candidate, &JSR_URL).then(|| {
                 UpstreamRoute::Custom {
                     target: JSR_TARGET.clone(),
-                    auth: self.npmrc.shared_auth_for_url(candidate).cloned(),
+                    auth: self
+                        .npmrc
+                        .shared_auth_for_origin_path(&JSR_ORIGIN, &package_path)
+                        .cloned(),
                 }
             });
         }
         let target = self.npmrc.default_registry.as_ref()?;
+        let package_url = format!("{}/{name}", target.base_url.trim_end_matches('/'));
         registry_url_contains(candidate, &target.base_url).then(|| UpstreamRoute::Custom {
             target: target.clone(),
-            auth: self.npmrc.shared_auth_for_url(candidate).cloned(),
+            auth: self.npmrc.shared_auth_for_url(&package_url).cloned(),
         })
     }
 

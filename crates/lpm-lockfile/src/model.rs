@@ -793,18 +793,17 @@ pub struct LockedPackage {
 /// secrets into version control.
 #[inline]
 pub fn is_recordable_tarball_hint(url: &str) -> bool {
-    if url.contains(['?', '#']) {
+    if url.bytes().any(|b| b < 0x20 || b == 0x7f) || url.contains(['?', '#']) {
         return false;
     }
-    // Reject embedded userinfo (`scheme://user[:pass]@host/...`) without
-    // requiring a full URL parser dependency in `lpm-lockfile`.
-    if let Some((_, rest)) = url.split_once("://") {
-        let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or("");
-        if authority.contains('@') {
-            return false;
-        }
-    }
-    true
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "http" | "https")
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
 }
 
 impl LockedPackage {
@@ -2604,4 +2603,31 @@ fn is_safe_github_component(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+#[cfg(test)]
+mod tarball_hint_tests {
+    use super::is_recordable_tarball_hint;
+
+    #[test]
+    fn tarball_hint_rejects_every_supported_authority_spelling_with_userinfo() {
+        for bad in [
+            "https://user:pass@cdn.example/pkg/-/pkg-1.0.0.tgz",
+            "https://token@cdn.example/pkg/-/pkg-1.0.0.tgz",
+            "https:user:pass@cdn.example/pkg/-/pkg-1.0.0.tgz",
+            "https:\\user:pass@cdn.example/pkg/-/pkg-1.0.0.tgz",
+            "https:/user@cdn.example/pkg/-/pkg-1.0.0.tgz",
+            "https://cdn.example/pkg/-/pkg-1.0.0.tgz?sig=abc",
+            "https://cdn.example/pkg/-/pkg-1.0.0.tgz#frag",
+            "ftp://cdn.example/pkg/-/pkg-1.0.0.tgz",
+        ] {
+            assert!(
+                !is_recordable_tarball_hint(bad),
+                "expected tarball hint to be rejected: {bad}"
+            );
+        }
+        assert!(is_recordable_tarball_hint(
+            "https://registry.npmjs.org/@scope/pkg/-/pkg-1.0.0.tgz"
+        ));
+    }
 }

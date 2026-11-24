@@ -292,32 +292,33 @@ fn npm_oidc_exchange_url(registry_url: &str, npm_name: &str) -> String {
     )
 }
 
-fn registry_supports_npm_trusted_publishing_production(registry_url: &str) -> bool {
+fn registry_supports_npm_trusted_publishing_with_loopback(
+    registry_url: &str,
+    allow_loopback: bool,
+) -> bool {
     let trimmed = normalized_registry_url(registry_url);
-    trimmed.eq_ignore_ascii_case(NPM_REGISTRY_URL)
+    if trimmed.eq_ignore_ascii_case(NPM_REGISTRY_URL) {
+        return true;
+    }
+    if !allow_loopback {
+        return false;
+    }
+    reqwest::Url::parse(&trimmed)
+        .ok()
+        .and_then(|url| url.host_str().map(lpm_common::is_loopback_host))
+        .unwrap_or(false)
 }
 
 fn registry_supports_npm_trusted_publishing(registry_url: &str) -> bool {
-    if registry_supports_npm_trusted_publishing_production(registry_url) {
-        return true;
-    }
-
     // Production builds pin the npm Trusted Publishing OIDC exchange to
     // registry.npmjs.org so a project-configured loopback registry can never
-    // receive an npm-audience OIDC JWT. Debug/test builds allow loopback
-    // mocks for local workflow testing.
-    #[cfg(any(test, debug_assertions))]
-    {
-        let trimmed = normalized_registry_url(registry_url);
-        reqwest::Url::parse(&trimmed)
-            .ok()
-            .and_then(|url| url.host_str().map(lpm_common::is_loopback_host))
-            .unwrap_or(false)
-    }
-    #[cfg(not(any(test, debug_assertions)))]
-    {
-        false
-    }
+    // receive an npm-audience OIDC JWT.
+    const ALLOW_LOOPBACK: bool = cfg!(any(
+        test,
+        debug_assertions,
+        feature = "acceptance-test-hooks"
+    ));
+    registry_supports_npm_trusted_publishing_with_loopback(registry_url, ALLOW_LOOPBACK)
 }
 
 async fn read_response_body_capped(
@@ -414,15 +415,16 @@ mod tests {
         assert!(!registry_supports_npm_trusted_publishing(
             "https://registry.example.test"
         ));
-        assert!(registry_supports_npm_trusted_publishing_production(
-            "https://registry.npmjs.org/"
+        assert!(registry_supports_npm_trusted_publishing_with_loopback(
+            "https://registry.npmjs.org/",
+            false
         ));
         assert!(
-            !registry_supports_npm_trusted_publishing_production("http://127.0.0.1:4873"),
+            !registry_supports_npm_trusted_publishing_with_loopback("http://127.0.0.1:4873", false),
             "production gate must never allow arbitrary loopback hosts to receive npm OIDC JWTs"
         );
         assert!(
-            !registry_supports_npm_trusted_publishing_production("http://localhost:4873"),
+            !registry_supports_npm_trusted_publishing_with_loopback("http://localhost:4873", false),
             "production gate must never allow localhost to receive npm OIDC JWTs"
         );
     }
@@ -554,5 +556,29 @@ mod tests {
 
         assert!(message.contains("https://registry.example.test"));
         assert!(!message.contains("path-secret"));
+    }
+
+    #[test]
+    fn trusted_publishing_gate_refuses_loopback_when_loopback_is_not_allowed() {
+        assert!(registry_supports_npm_trusted_publishing_with_loopback(
+            "https://registry.npmjs.org",
+            false
+        ));
+        assert!(!registry_supports_npm_trusted_publishing_with_loopback(
+            "http://127.0.0.1:4873",
+            false
+        ));
+        assert!(!registry_supports_npm_trusted_publishing_with_loopback(
+            "http://localhost:4873",
+            false
+        ));
+        assert!(registry_supports_npm_trusted_publishing_with_loopback(
+            "http://127.0.0.1:4873",
+            true
+        ));
+        assert!(!registry_supports_npm_trusted_publishing_with_loopback(
+            "https://attacker.example",
+            true
+        ));
     }
 }

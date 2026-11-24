@@ -196,6 +196,9 @@ pub fn evaluate_cached_url(url: &str, client: &RegistryClient) -> GateDecision {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return GateDecision::RejectedShape;
     };
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return GateDecision::RejectedShape;
+    }
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return GateDecision::RejectedQuery;
     }

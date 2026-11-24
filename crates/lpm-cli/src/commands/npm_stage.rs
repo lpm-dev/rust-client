@@ -712,6 +712,12 @@ async fn stage_otp_mutation(
     )
     .await
     .map_err(|e| LpmError::Registry(format!("{action} request failed: {e}")))?;
+    if !stage_authorization_allowed(registry_url)(response.url()) {
+        return Err(LpmError::Registry(format!(
+            "refused {action} response redirected outside configured registry scope ({})",
+            lpm_common::safe_url_origin(response.url().as_str())
+        )));
+    }
     let status = response.status();
     let headers = response.headers().clone();
 
@@ -749,7 +755,7 @@ async fn stage_otp_mutation(
             )
             .await
             .map_err(|e| LpmError::Registry(format!("{action} retry failed: {e}")))?;
-            return stage_mutation_response(action, retry, token).await;
+            return stage_mutation_response(action, registry_url, retry, token).await;
         }
 
         if is_otp_required(&headers) {
@@ -775,7 +781,7 @@ async fn stage_otp_mutation(
             )
             .await
             .map_err(|e| LpmError::Registry(format!("{action} retry failed: {e}")))?;
-            return stage_mutation_response(action, retry, token).await;
+            return stage_mutation_response(action, registry_url, retry, token).await;
         }
 
         return Err(LpmError::Registry(stage_error_message(
@@ -783,7 +789,7 @@ async fn stage_otp_mutation(
         )));
     }
 
-    stage_mutation_response(action, response, token).await
+    stage_mutation_response(action, registry_url, response, token).await
 }
 
 async fn send_stage_mutation(
@@ -823,9 +829,16 @@ async fn send_stage_mutation(
 
 async fn stage_mutation_response(
     action: &str,
+    registry_url: &str,
     response: reqwest::Response,
     token: &str,
 ) -> Result<serde_json::Value, LpmError> {
+    if !stage_authorization_allowed(registry_url)(response.url()) {
+        return Err(LpmError::Registry(format!(
+            "refused {action} response redirected outside configured registry scope ({})",
+            lpm_common::safe_url_origin(response.url().as_str())
+        )));
+    }
     let status = response.status();
     let body = response_json_or_empty(response, action).await?;
     if status.is_success() {
@@ -1551,7 +1564,7 @@ mod tests {
             .mount(&redirector)
             .await;
 
-        let result = stage_otp_mutation(
+        let err = stage_otp_mutation(
             &lpm_registry::RegistryClient::new(),
             "npm-token",
             &redirector.uri(),
@@ -1564,9 +1577,13 @@ mod tests {
             NpmStageRuntime::production(),
         )
         .await
-        .expect("cross-origin 303 should complete without forwarding credentials");
+        .expect_err("cross-origin 303 must not trust out-of-scope success response");
 
-        assert_eq!(result["success"], true);
+        assert!(
+            err.to_string()
+                .contains("outside configured registry scope"),
+            "{err}"
+        );
         let requests = target.received_requests().await.unwrap();
         let redirected = requests.first().expect("redirect target request");
         assert!(redirected.headers.get("authorization").is_none());
@@ -1575,7 +1592,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stage_mutation_strips_credentials_on_same_origin_sibling_path_redirect() {
+    async fn stage_mutation_strips_credentials_and_rejects_same_origin_sibling_path_redirect() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/npm/-/stage/stage-id/approve"))
@@ -1588,6 +1605,57 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/sibling/capture"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let registry_url = format!("{}/npm", server.uri());
+        let err = stage_otp_mutation(
+            &lpm_registry::RegistryClient::new(),
+            "npm-token",
+            &registry_url,
+            "-/stage/stage-id/approve",
+            Method::POST,
+            "approve staged package",
+            Some("123456"),
+            false,
+            false,
+            NpmStageRuntime::production(),
+        )
+        .await
+        .expect_err("same-origin sibling 303 must not trust out-of-scope success response");
+
+        assert!(
+            err.to_string()
+                .contains("outside configured registry scope"),
+            "{err}"
+        );
+        let requests = server.received_requests().await.unwrap();
+        let sibling = requests
+            .iter()
+            .find(|r| r.url.path() == "/sibling/capture")
+            .expect("sibling request captured");
+        assert!(sibling.headers.get("authorization").is_none());
+        assert!(sibling.headers.get("npm-otp").is_none());
+    }
+
+    #[tokio::test]
+    async fn stage_redirect_within_the_registry_path_keeps_credentials() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/npm/-/stage/stage-id/approve"))
+            .respond_with(ResponseTemplate::new(307).insert_header(
+                "location",
+                format!("{}/npm/v2/-/stage/stage-id/approve", server.uri()),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/npm/v2/-/stage/stage-id/approve"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true})),
             )
@@ -1609,15 +1677,26 @@ mod tests {
             NpmStageRuntime::production(),
         )
         .await
-        .expect("same-origin sibling 303 should complete without forwarding credentials");
-
+        .expect("in-scope redirect under registry path should succeed");
         assert_eq!(result["success"], true);
         let requests = server.received_requests().await.unwrap();
-        let sibling = requests
+        let redirected = requests
             .iter()
-            .find(|r| r.url.path() == "/sibling/capture")
-            .expect("sibling request captured");
-        assert!(sibling.headers.get("authorization").is_none());
-        assert!(sibling.headers.get("npm-otp").is_none());
+            .find(|r| r.url.path() == "/npm/v2/-/stage/stage-id/approve")
+            .expect("in-scope redirected request");
+        assert_eq!(
+            redirected
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer npm-token")
+        );
+        assert_eq!(
+            redirected
+                .headers
+                .get("npm-otp")
+                .and_then(|v| v.to_str().ok()),
+            Some("123456")
+        );
     }
 }

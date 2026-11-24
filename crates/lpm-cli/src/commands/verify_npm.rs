@@ -622,7 +622,24 @@ fn validate_cleanup_tarball_url(
         )));
     }
     let path = tarball.path();
-    if !path.starts_with('/') || !path.contains("/-/") || !path.ends_with(".tgz") {
+    let base_prefix = registry_base.path().trim_end_matches('/');
+    let basename = package_name
+        .rsplit_once('/')
+        .map_or(package_name, |(_, unscoped)| unscoped);
+    let expected_unencoded = format!("{base_prefix}/{package_name}/-/{basename}-{version}.tgz");
+    let expected_slash_encoded = format!(
+        "{base_prefix}/{}/-/{basename}-{version}.tgz",
+        package_name.replace('/', "%2F")
+    );
+    let expected_full_encoded = format!(
+        "{base_prefix}/{}/-/{basename}-{version}.tgz",
+        urlencoding::encode(package_name)
+    );
+    let matches_canonical = path == expected_unencoded
+        || ((path.eq_ignore_ascii_case(&expected_slash_encoded)
+            || path.eq_ignore_ascii_case(&expected_full_encoded))
+            && path.ends_with(&format!("/-/{basename}-{version}.tgz")));
+    if !matches_canonical {
         return Err(LpmError::Registry(format!(
             "npm sent a non-canonical tarball path for {package_name}@{version}; refusing cleanup"
         )));
@@ -1420,12 +1437,31 @@ mod tests {
             "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz?sig=1",
             "https://registry.npmjs.org/admin/delete.tgz",
             "https://registry.npmjs.org/pkg/-/pkg-1.0.0.zip",
+            "https://registry.npmjs.org/other/-/other-9.9.9.tgz",
+            "https://registry.npmjs.org/pkg/-/pkg-2.0.0.tgz",
         ] {
             assert!(
                 validate_cleanup_tarball_url(registry, bad, "pkg", "1.0.0").is_err(),
                 "expected rejection for {bad}"
             );
         }
+
+        let (_, scoped_path) = validate_cleanup_tarball_url(
+            registry,
+            "https://registry.npmjs.org/@scope/pkg/-/pkg-1.0.0.tgz",
+            "@scope/pkg",
+            "1.0.0",
+        )
+        .expect("canonical scoped tarball accepted");
+        assert_eq!(scoped_path, "/@scope/pkg/-/pkg-1.0.0.tgz");
+        let (_, encoded_scoped_path) = validate_cleanup_tarball_url(
+            registry,
+            "https://registry.npmjs.org/@scope%2Fpkg/-/pkg-1.0.0.tgz",
+            "@scope/pkg",
+            "1.0.0",
+        )
+        .expect("percent-encoded scoped tarball accepted");
+        assert_eq!(encoded_scoped_path, "/@scope%2Fpkg/-/pkg-1.0.0.tgz");
 
         let (base, path) = validate_cleanup_tarball_url(
             "https://corp.example/npm",

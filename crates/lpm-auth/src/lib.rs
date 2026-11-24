@@ -1373,8 +1373,17 @@ pub fn set_custom_registry_token_with_backend(
     })
 }
 
-fn validate_custom_registry_url_for_storage(registry_url: &str) -> Result<(), String> {
-    if registry_url.bytes().any(|b| b < 0x20 || b == 0x7f) {
+fn is_disallowed_url_control_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// Validate a custom registry base URL before storing credentials or tracking metadata.
+pub fn validate_custom_registry_url_for_storage(registry_url: &str) -> Result<(), String> {
+    if registry_url.chars().any(is_disallowed_url_control_char) {
         return Err("custom registry URL must not contain control characters".to_string());
     }
     let parsed =
@@ -1389,6 +1398,30 @@ fn validate_custom_registry_url_for_storage(registry_url: &str) -> Result<(), St
         return Err("custom registry URL must not include a query string or fragment".to_string());
     }
     Ok(())
+}
+
+/// Render a tracked custom registry URL safely for display (`whoami` text/JSON)
+/// without exposing legacy embedded userinfo, query strings, or fragments.
+pub fn sanitize_custom_registry_url_for_display(registry_url: &str) -> String {
+    if registry_url.chars().any(is_disallowed_url_control_char) {
+        return lpm_common::safe_url_origin(registry_url);
+    }
+    let Ok(mut parsed) = reqwest::Url::parse(registry_url) else {
+        return lpm_common::safe_url_origin(registry_url);
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return lpm_common::safe_url_origin(registry_url);
+    }
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    let rendered = parsed.to_string();
+    if !registry_url.ends_with('/') && parsed.path() == "/" {
+        rendered.trim_end_matches('/').to_string()
+    } else {
+        rendered
+    }
 }
 
 fn write_custom_registry_list(path: &Path, registries: &[String]) -> Result<(), String> {
@@ -1661,7 +1694,7 @@ pub fn list_registry_auth_statuses() -> Vec<RegistryAuthStatus> {
     for url in list_custom_registries() {
         if let Some(stored) = get_custom_registry_token_with_backend(&url) {
             result.push(RegistryAuthStatus {
-                name: url,
+                name: sanitize_custom_registry_url_for_display(&url),
                 status: stored.backend.registry_status_label().into(),
                 storage: AuthStorageStatus::from_backend(stored.backend),
             });
@@ -6872,6 +6905,7 @@ mod tests {
             "https://registry.example/npm?token=abc",
             "https://registry.example/npm#frag",
             "https://registry.example/npm\n",
+            "https://registry.example/\u{202E}npm",
             "ftp://registry.example/npm",
         ] {
             assert!(
@@ -6880,5 +6914,15 @@ mod tests {
             );
         }
         assert!(validate_custom_registry_url_for_storage("https://registry.example/npm").is_ok());
+        assert_eq!(
+            sanitize_custom_registry_url_for_display(
+                "https://user:secret@registry.example/team/npm?token=abc#frag"
+            ),
+            "https://registry.example/team/npm"
+        );
+        assert_eq!(
+            sanitize_custom_registry_url_for_display("https://registry.example"),
+            "https://registry.example"
+        );
     }
 }

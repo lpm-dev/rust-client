@@ -141,9 +141,18 @@ fn edit_task(project: &TempProject, edit: impl FnOnce(&mut serde_json::Value)) {
     project.write_file("lpm.json", &config.to_string());
 }
 
+fn project_remote_cache_url(project: &TempProject) -> String {
+    let config: serde_json::Value = serde_json::from_str(&project.read_file("lpm.json")).unwrap();
+    config["remoteCache"]["url"]
+        .as_str()
+        .expect("lpm.json remoteCache.url")
+        .to_owned()
+}
+
 fn run_build(project: &TempProject, path: Option<&OsString>, envs: &[(&str, &str)]) -> String {
     let mut command = lpm(project);
     command
+        .env("LPM_REMOTE_CACHE_URL", project_remote_cache_url(project))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["run", "build"]);
@@ -448,6 +457,7 @@ async fn portable_workspace_cache_restores_prerequisites_in_another_checkout() {
         }
         let run = |project: &TempProject| {
             lpm(project)
+                .env("LPM_REMOTE_CACHE_URL", project_remote_cache_url(project))
                 .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
                 .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
                 .args(["run", "build", "--filter", "app"])
@@ -667,6 +677,7 @@ fn lpm_in(project: &TempProject, dir: &str) -> assert_cmd::Command {
     let mut command = lpm(project);
     command
         .current_dir(project.path().join(dir))
+        .env("LPM_REMOTE_CACHE_URL", project_remote_cache_url(project))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key");
     command

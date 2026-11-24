@@ -241,7 +241,7 @@ pub(super) fn sync_request_timeout(default: std::time::Duration) -> std::time::D
 }
 
 pub(super) fn sync_http_client_builder() -> reqwest::ClientBuilder {
-    lpm_http::client_builder()
+    lpm_http::client_builder().redirect(reqwest::redirect::Policy::none())
 }
 
 pub(super) fn sync_http_client() -> Result<&'static reqwest::Client, SyncError> {
@@ -552,5 +552,37 @@ mod tests {
         }
 
         assert_eq!(timeout, std::time::Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn step_up_proof_and_body_not_forwarded_on_cross_origin_307() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        let redirect_target = format!("{}/collect", second.uri());
+
+        Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/users/me/public-key"))
+            .respond_with(
+                ResponseTemplate::new(307).insert_header("location", redirect_target.as_str()),
+            )
+            .mount(&first)
+            .await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&second)
+            .await;
+
+        let client = sync_http_client_builder().build().unwrap();
+        let response = client
+            .post(format!("{}/api/users/me/public-key", first.uri()))
+            .header(crate::sync::CLI_STEP_UP_HEADER_NAME, "secret-step-up-proof")
+            .json(&serde_json::json!({ "secret": "vault-body" }))
+            .send()
+            .await
+            .expect("redirect response returned without following");
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
     }
 }

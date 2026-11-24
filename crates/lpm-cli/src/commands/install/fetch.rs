@@ -4708,7 +4708,7 @@ pub(crate) async fn resolve_tarball_url(
         if url != metadata_url {
             return Err(LpmError::Registry(format!(
                 "registry lockfile tarball for {name}@{version} does not match registry metadata \
-                 dist.tarball; refusing lockfile hint"
+                 dist.tarball; refusing lockfile hint (refresh lpm.lock with `lpm install`)"
             )));
         }
         return Ok(ResolvedRegistryTarballUrl {

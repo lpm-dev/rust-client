@@ -517,9 +517,14 @@ impl RegistryClient {
                 self.ensure_lpm_tarball_origin(url)?;
                 self.download_tarball_to_file(url).await
             }
-            crate::route::UpstreamRoute::LpmWorker | crate::route::UpstreamRoute::NpmDirect => {
+            crate::route::UpstreamRoute::LpmWorker => {
                 self.ensure_configured_tarball_origin(url)?;
                 self.download_tarball_to_file_with_auth(url, None).await
+            }
+            crate::route::UpstreamRoute::NpmDirect => {
+                self.ensure_configured_tarball_origin(url)?;
+                let auth = route_table.auth_for_url(url);
+                self.download_tarball_to_file_with_auth(url, auth).await
             }
         }
     }
@@ -612,9 +617,14 @@ impl RegistryClient {
                 self.ensure_lpm_tarball_origin(url)?;
                 self.download_tarball_streaming(url).await
             }
-            crate::route::UpstreamRoute::LpmWorker | crate::route::UpstreamRoute::NpmDirect => {
+            crate::route::UpstreamRoute::LpmWorker => {
                 self.ensure_configured_tarball_origin(url)?;
                 self.download_tarball_streaming_with_auth(url, None).await
+            }
+            crate::route::UpstreamRoute::NpmDirect => {
+                self.ensure_configured_tarball_origin(url)?;
+                let auth = route_table.auth_for_url(url);
+                self.download_tarball_streaming_with_auth(url, auth).await
             }
         }
     }

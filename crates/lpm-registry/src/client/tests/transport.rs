@@ -776,3 +776,101 @@ fn credential_changing_clone_does_not_reuse_seeded_memory_metadata_cache() {
         "credential-changing clone must not inherit seeded metadata from another principal"
     );
 }
+
+#[tokio::test]
+async fn first_party_tarball_redirect_to_sibling_path_drops_bearer() {
+    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/lpm/api/registry/@lpm.dev/owner.pkg/-/pkg-1.0.0.tgz"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", "/storage/blob.tgz"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/storage/blob.tgz"))
+        .and(header_exists("authorization"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/storage/blob.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tarball-bytes".as_slice()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClient::new()
+        .with_base_url(format!("{}/lpm", server.uri()))
+        .with_token("secret-lpm-bearer");
+    let bytes = client
+        .download_tarball(&format!(
+            "{}/lpm/api/registry/@lpm.dev/owner.pkg/-/pkg-1.0.0.tgz",
+            server.uri()
+        ))
+        .await
+        .expect("anonymous follow to sibling path should succeed without bearer");
+    assert_eq!(bytes, b"tarball-bytes");
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn diagnostic_health_check_follows_in_scope_redirect_within_registry_base() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/lpm/api/registry/health"))
+        .respond_with(
+            ResponseTemplate::new(308).insert_header("location", "/lpm/api/registry/health/v2"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/lpm/api/registry/health/v2"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClient::new().with_base_url(format!("{}/lpm", server.uri()));
+    assert!(
+        client.diagnostic_health_check_once().await.unwrap(),
+        "in-scope canonical health redirect should report healthy"
+    );
+    server.verify().await;
+}
+
+#[test]
+fn evaluate_cached_url_rejects_userinfo_hint() {
+    let client = RegistryClient::new().with_base_url("https://registry.lpm.dev");
+    assert_ne!(
+        crate::evaluate_cached_url(
+            "https://user:pass@registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+            &client,
+        ),
+        crate::GateDecision::Accepted,
+        "legacy userinfo tarball hints must be rejected at the read gate"
+    );
+}
+
+#[test]
+fn https_loopback_npm_transport_is_accepted_and_non_loopback_is_rejected() {
+    let https_client = RegistryClient::new().with_npm_transport_url("https://127.0.0.1:8443");
+    let req_url = reqwest::Url::parse("https://registry.npmjs.org/lodash").unwrap();
+    let rewritten = https_client.npm_transport_url_for(&req_url);
+    assert_eq!(
+        rewritten.as_ref().map(reqwest::Url::as_str),
+        Some("https://127.0.0.1:8443/lodash"),
+        "HTTPS loopback npm transport should be accepted"
+    );
+
+    let remote_client = RegistryClient::new().with_npm_transport_url("https://evil.example");
+    assert!(
+        remote_client.npm_transport_url_for(&req_url).is_none(),
+        "non-loopback npm transport must remain rejected"
+    );
+}

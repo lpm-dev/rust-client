@@ -107,6 +107,7 @@ async fn cache_status_json_reports_local_usage_and_remote_status() {
     );
 
     let output = lpm(&project)
+        .env("LPM_REMOTE_CACHE_URL", format!("{}/v8", server.uri()))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["--json", "cache", "status"])
@@ -153,6 +154,7 @@ async fn cache_status_with_a_rejected_token_ends_on_the_warning_not_on_success()
     let run = |json: bool| {
         let mut command = lpm(&project);
         command
+            .env("LPM_REMOTE_CACHE_URL", format!("{}/v8", server.uri()))
             .env("LPM_REMOTE_CACHE_TOKEN", "revoked-token")
             .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key");
         if json {
@@ -223,6 +225,7 @@ async fn cache_status_reads_an_unlimited_cache_s_usage_in_gib_against_no_limit()
     let run = |json: bool| {
         let mut command = lpm(&project);
         command
+            .env("LPM_REMOTE_CACHE_URL", format!("{}/v8", server.uri()))
             .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
             .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key");
         if json {
@@ -280,6 +283,7 @@ async fn cache_status_rejects_an_oversized_remote_response() {
     );
 
     let output = lpm(&project)
+        .env("LPM_REMOTE_CACHE_URL", format!("{}/v8", server.uri()))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["--json", "cache", "status"])
@@ -329,6 +333,7 @@ async fn cache_status_reports_a_request_limit_and_when_to_try_again() {
     );
 
     let output = lpm(&project)
+        .env("LPM_REMOTE_CACHE_URL", format!("{}/v8", server.uri()))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["--json", "cache", "status"])
@@ -683,6 +688,7 @@ async fn cache_status_human_renders_tables_and_slim_completion() {
     );
 
     let output = lpm(&project)
+        .env("LPM_REMOTE_CACHE_URL", format!("{}/v8", server.uri()))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["cache", "status"])
@@ -745,6 +751,7 @@ async fn cache_status_human_applies_slim_color_roles_when_forced() {
     );
 
     let output = lpm(&project)
+        .env("LPM_REMOTE_CACHE_URL", format!("{}/v8", server.uri()))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["--color=always", "cache", "status"])
@@ -825,6 +832,45 @@ async fn cache_status_does_not_send_registry_token_to_third_party_host() {
 }
 
 #[tokio::test]
+async fn remote_cache_env_token_is_not_sent_to_a_project_config_host_without_env_url() {
+    let server = MockServer::start().await;
+    let project = TempProject::empty(r#"{"name":"cache-env-token-binding","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+            "remoteCache": {{
+                "enabled": true,
+                "url": "{}/v8"
+            }}
+        }}"#,
+            server.uri(),
+        ),
+    );
+
+    let output = lpm(&project)
+        .env("LPM_REMOTE_CACHE_TOKEN", "operator-secret-token")
+        .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
+        .args(["--json", "cache", "status"])
+        .output()
+        .expect("failed to run lpm cache status --json");
+
+    assert!(output.status.success());
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests.is_empty(),
+        "LPM_REMOTE_CACHE_TOKEN must not be sent to a project-configured host without LPM_REMOTE_CACHE_URL, got {} request(s)",
+        requests.len(),
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let error = envelope["remote"]["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("LPM_REMOTE_CACHE_URL"),
+        "expected error explaining LPM_REMOTE_CACHE_URL binding, got: {error}",
+    );
+}
+
+#[tokio::test]
 async fn cache_status_requires_signing_key_for_third_party_cache_host() {
     let server = MockServer::start().await;
 
@@ -843,6 +889,7 @@ async fn cache_status_requires_signing_key_for_third_party_cache_host() {
     );
 
     let output = lpm(&project)
+        .env("LPM_REMOTE_CACHE_URL", format!("{}/v8", server.uri()))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .args(["--json", "cache", "status"])
         .output()

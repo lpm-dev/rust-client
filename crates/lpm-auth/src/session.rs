@@ -633,8 +633,24 @@ impl SessionManager {
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                 // `previous` holds the first URL too, as in `Policy::limited`.
                 if attempt.previous().len() > lpm_http::DEFAULT_REDIRECT_LIMIT {
-                    attempt.error("too many redirects")
-                } else if lpm_common::url_matches_base_scope(attempt.url(), &base_scope) {
+                    return attempt.error("too many redirects");
+                }
+                let next = attempt.url();
+                if !matches!(next.scheme(), "http" | "https") {
+                    return attempt.error("refused redirect to unsupported URL scheme");
+                }
+                if !next.username().is_empty() || next.password().is_some() {
+                    return attempt.error(lpm_http::URL_CREDENTIALS_REFUSAL);
+                }
+                if attempt
+                    .previous()
+                    .iter()
+                    .any(|prev| prev.scheme() == "https")
+                    && next.scheme() != "https"
+                {
+                    return attempt.error(lpm_http::HTTPS_DOWNGRADE_REFUSAL);
+                }
+                if lpm_common::url_matches_base_scope(next, &base_scope) {
                     attempt.follow()
                 } else {
                     attempt.stop()
@@ -3411,5 +3427,43 @@ mod refresh_http_tests {
             .await
             .expect("missing metadata should refresh the stored session");
         assert_eq!(bearer, "at-rotated");
+    }
+
+    #[tokio::test]
+    async fn refresh_refuses_same_scope_redirect_with_userinfo() {
+        let server = MockServer::start().await;
+        let parsed = reqwest::Url::parse(&server.uri()).unwrap();
+        let userinfo_target = format!(
+            "http://attacker:secret@{}:{}/api/cli/refresh-v2",
+            parsed.host_str().unwrap(),
+            parsed.port().unwrap()
+        );
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(
+                ResponseTemplate::new(307).insert_header("location", userinfo_target.as_str()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh-v2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "should-not-follow",
+                "refreshToken": "rt-rotated",
+                "expiresAt": "2099-01-01T00:00:00Z",
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let _isolated = isolate_test_env();
+        let mgr = manager_for(&server.uri());
+        crate::clear_token_expiry(&server.uri());
+
+        let result = mgr.bearer_string_for(AuthRequirement::TokenRequired).await;
+        assert!(
+            result.is_err(),
+            "refresh must refuse a same-scope redirect carrying userinfo: {result:?}"
+        );
     }
 }
