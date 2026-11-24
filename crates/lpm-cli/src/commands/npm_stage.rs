@@ -219,6 +219,7 @@ pub(crate) async fn fetch_package_metadata(
     let url = endpoint_url(registry_url, &urlencoding::encode(npm_name));
     let response = send_stage_get(
         &clients,
+        registry_url,
         web_auth::add_npm_web_auth_headers(client.get(url), NPM_COMMAND_STAGE)
             .header(
                 reqwest::header::ACCEPT,
@@ -339,10 +340,15 @@ async fn stage_publish_impl(
         .bearer_auth(token)
         .build()
         .map_err(|e| LpmError::Registry(format!("failed to build npm stage request: {e}")))?;
-    let response =
-        lpm_http::send_with_replayable_redirects(&hop_clients, request, Some(payload.replayable()))
-            .await
-            .map_err(|e| LpmError::Registry(format!("npm stage publish request failed: {e}")))?;
+    let authorization_allowed = stage_authorization_allowed(registry_url);
+    let response = lpm_http::send_with_replayable_redirects_and_authorization_scope(
+        &hop_clients,
+        request,
+        Some(payload.replayable()),
+        Some(&authorization_allowed),
+    )
+    .await
+    .map_err(|e| LpmError::Registry(format!("npm stage publish request failed: {e}")))?;
 
     let status = response.status();
     let body = response_json_or_empty(response, "npm stage publish").await?;
@@ -393,6 +399,7 @@ pub(crate) async fn list_staged_packages(
 
         let response = send_stage_get(
             &clients,
+            registry_url,
             web_auth::add_npm_web_auth_headers(
                 client.get(endpoint_url(registry_url, "-/stage")),
                 NPM_COMMAND_STAGE,
@@ -537,6 +544,7 @@ pub(crate) async fn download_staged_package(
     let client = clients.for_registry(registry_url).await?;
     let response = send_stage_get(
         &clients,
+        registry_url,
         web_auth::add_npm_web_auth_headers(
             client.get(endpoint_url(
                 registry_url,
@@ -655,6 +663,7 @@ async fn stage_json_get(
     let client = clients.for_registry(registry_url).await?;
     let response = send_stage_get(
         &clients,
+        registry_url,
         web_auth::add_npm_web_auth_headers(
             client.get(endpoint_url(registry_url, route)),
             NPM_COMMAND_STAGE,
@@ -802,7 +811,14 @@ async fn send_stage_mutation(
         .timeout(timeout)
         .build()
         .map_err(lpm_http::ReplayableRequestError::request)?;
-    lpm_http::send_with_replayable_redirects(clients, request, None).await
+    let authorization_allowed = stage_authorization_allowed(registry_url);
+    lpm_http::send_with_replayable_redirects_and_authorization_scope(
+        clients,
+        request,
+        None,
+        Some(&authorization_allowed),
+    )
+    .await
 }
 
 async fn stage_mutation_response(
@@ -832,9 +848,18 @@ fn stage_hop_clients(
     })
 }
 
+fn stage_authorization_allowed(registry_url: &str) -> impl Fn(&reqwest::Url) -> bool {
+    let base = reqwest::Url::parse(registry_url).ok();
+    move |url: &reqwest::Url| {
+        base.as_ref()
+            .is_some_and(|base| lpm_common::url_matches_base_scope(url, base))
+    }
+}
+
 /// Sends a stage GET, following its redirects within one `timeout`.
 async fn send_stage_get(
     clients: &crate::commands::publish_npm::NpmRegistryClients,
+    registry_url: &str,
     request: reqwest::RequestBuilder,
     timeout: Duration,
 ) -> Result<reqwest::Response, lpm_http::ReplayableRequestError<LpmError>> {
@@ -842,7 +867,14 @@ async fn send_stage_get(
         .timeout(timeout)
         .build()
         .map_err(lpm_http::ReplayableRequestError::request)?;
-    lpm_http::send_with_replayable_redirects(clients, request, None).await
+    let authorization_allowed = stage_authorization_allowed(registry_url);
+    lpm_http::send_with_replayable_redirects_and_authorization_scope(
+        clients,
+        request,
+        None,
+        Some(&authorization_allowed),
+    )
+    .await
 }
 
 fn stage_manual_redirect_http_client(
@@ -1540,5 +1572,52 @@ mod tests {
         assert!(redirected.headers.get("authorization").is_none());
         assert!(redirected.headers.get("x-otp").is_none());
         assert!(redirected.headers.get("npm-otp").is_none());
+    }
+
+    #[tokio::test]
+    async fn stage_mutation_strips_credentials_on_same_origin_sibling_path_redirect() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/npm/-/stage/stage-id/approve"))
+            .respond_with(
+                ResponseTemplate::new(303)
+                    .insert_header("location", format!("{}/sibling/capture", server.uri())),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/sibling/capture"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let registry_url = format!("{}/npm", server.uri());
+        let result = stage_otp_mutation(
+            &lpm_registry::RegistryClient::new(),
+            "npm-token",
+            &registry_url,
+            "-/stage/stage-id/approve",
+            Method::POST,
+            "approve staged package",
+            Some("123456"),
+            false,
+            false,
+            NpmStageRuntime::production(),
+        )
+        .await
+        .expect("same-origin sibling 303 should complete without forwarding credentials");
+
+        assert_eq!(result["success"], true);
+        let requests = server.received_requests().await.unwrap();
+        let sibling = requests
+            .iter()
+            .find(|r| r.url.path() == "/sibling/capture")
+            .expect("sibling request captured");
+        assert!(sibling.headers.get("authorization").is_none());
+        assert!(sibling.headers.get("npm-otp").is_none());
     }
 }

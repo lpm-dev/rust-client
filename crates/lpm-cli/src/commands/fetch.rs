@@ -363,24 +363,23 @@ async fn fetch_artifact(
             crate::commands::install::download_github_archive_to_file(url, Some(&integrity)).await?
         }
         FetchSource::Registry { tarball_url, .. } => {
-            let looked_up;
-            let url = match tarball_url {
-                Some(url) => url.as_str(),
-                None => {
-                    looked_up = crate::commands::install::metadata_tarball_url_for_package(
-                        &client,
-                        &route_table,
-                        routing_name,
-                        &first_target.version,
-                        routing_name.starts_with("@lpm.dev/"),
-                    )
-                    .await?
-                    .0;
-                    looked_up.as_str()
-                }
-            };
+            let resolved = crate::commands::install::resolve_tarball_url(
+                &client,
+                &route_table,
+                routing_name,
+                &first_target.version,
+                routing_name.starts_with("@lpm.dev/"),
+                tarball_url.as_deref(),
+                false,
+            )
+            .await?;
             client
-                .download_tarball_routed_with_integrity(&route_table, routing_name, url, &integrity)
+                .download_tarball_routed_with_integrity(
+                    &route_table,
+                    routing_name,
+                    &resolved.url,
+                    &integrity,
+                )
                 .await?
         }
         FetchSource::RemoteTarball { url } => {

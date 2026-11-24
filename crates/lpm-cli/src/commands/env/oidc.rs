@@ -727,6 +727,7 @@ async fn create_oidc_policy(
     step_up_proof: Option<&str>,
 ) -> Result<PolicyWrite, LpmError> {
     let client = lpm_http::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| LpmError::Network(format!("failed to build HTTP client: {error}")))?;
     let mut request = client
@@ -774,6 +775,7 @@ async fn list_oidc_policies(
     org: Option<&str>,
 ) -> Result<serde_json::Value, LpmError> {
     let client = lpm_http::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| LpmError::Network(format!("failed to build HTTP client: {error}")))?;
     let mut request = client
@@ -956,6 +958,7 @@ pub(super) async fn vars_oidc_pull(
 
     // Exchange OIDC token for short-lived LPM token
     let client = lpm_http::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| LpmError::Network(format!("failed to build HTTP client: {error}")))?;
     let exchange_response = client

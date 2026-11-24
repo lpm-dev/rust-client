@@ -680,7 +680,8 @@ fn cyclonedx_component(component: &SbomComponent) -> Value {
 
     let mut properties = Vec::new();
     if let Some(source) = &component.package.source {
-        properties.push(property("lpm:source", source));
+        let sanitized = sanitize_sbom_source(source);
+        properties.push(property("lpm:source", sanitized.as_ref()));
     }
     if let Some(integrity) = &component.package.integrity {
         properties.push(property("lpm:integrity", integrity));
@@ -957,10 +958,35 @@ fn spdx_package(component: &SbomComponent) -> Value {
     package
 }
 
+fn sanitize_sbom_source(source: &str) -> std::borrow::Cow<'_, str> {
+    let Some((prefix, raw_url)) = source.split_once('+') else {
+        return std::borrow::Cow::Borrowed(source);
+    };
+    let Ok(mut parsed) = reqwest::Url::parse(raw_url) else {
+        return std::borrow::Cow::Borrowed(source);
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    if parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+    {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    std::borrow::Cow::Owned(format!("{prefix}+{parsed}"))
+}
+
 fn spdx_attribution(component: &SbomComponent) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(source) = &component.package.source {
-        out.push(format!("lpm:source={source}"));
+        let sanitized = sanitize_sbom_source(source);
+        out.push(format!("lpm:source={sanitized}"));
     }
     if let Some(integrity) = &component.package.integrity {
         out.push(format!("lpm:integrity={integrity}"));
@@ -1351,5 +1377,21 @@ mod tests {
             Some("git+https://example.test/repo.git")
         );
         assert_eq!(metadata.author.as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn sanitize_sbom_source_strips_userinfo_query_and_fragment() {
+        assert_eq!(
+            sanitize_sbom_source("tarball+https://user:secret@cdn.example/pkg.tgz?sig=tok#frag"),
+            "tarball+https://cdn.example/pkg.tgz"
+        );
+        assert_eq!(
+            sanitize_sbom_source("registry+https://registry.npmjs.org"),
+            "registry+https://registry.npmjs.org"
+        );
+        assert_eq!(
+            sanitize_sbom_source("file:./vendor/local.tgz"),
+            "file:./vendor/local.tgz"
+        );
     }
 }

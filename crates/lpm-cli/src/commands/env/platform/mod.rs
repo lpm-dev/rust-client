@@ -536,7 +536,8 @@ struct VercelClient {
 
 impl VercelClient {
     fn new(token: String, config: VercelConnectionConfig) -> Result<Self, LpmError> {
-        let http = lpm_http::client_builder_with_redirect_limit(5)
+        let http = lpm_http::client_builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(PLATFORM_TIMEOUT)
             .build()
             .map_err(|error| {
@@ -1369,6 +1370,7 @@ async fn save_platform_connection(
 ) -> Result<PlatformConnectResponse, LpmError> {
     let request_nonce = generate_platform_request_nonce()?;
     let client = lpm_http::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| LpmError::Network(format!("failed to build LPM client: {error}")))?;
     let response = client
@@ -1484,6 +1486,7 @@ async fn fetch_connections(
         request_body["org"] = serde_json::Value::String(org_slug.to_owned());
     }
     let client = lpm_http::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| LpmError::Network(format!("failed to build LPM client: {error}")))?;
     let response = client
@@ -1539,6 +1542,7 @@ async fn fetch_platform_context(
         request_body["org"] = serde_json::Value::String(org_slug.to_owned());
     }
     let client = lpm_http::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| LpmError::Network(format!("failed to build LPM client: {error}")))?;
     let response = client
@@ -1598,6 +1602,7 @@ async fn record_platform_audit(
     body["expectedPrincipalId"] = expected_principal_id.into();
     let request_nonce = generate_platform_request_nonce()?;
     let client = lpm_http::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| LpmError::Network(format!("failed to build LPM client: {error}")))?;
     let response = client

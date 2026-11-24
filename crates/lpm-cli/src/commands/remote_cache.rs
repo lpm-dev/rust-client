@@ -1011,12 +1011,21 @@ fn resolve_client(
 
     let config = lpm_config.and_then(|cfg| cfg.remote_cache.as_ref());
     let active_registry = session.as_ref().map(|session| session.registry_url());
+    let env_url_set = std::env::var("LPM_REMOTE_CACHE_URL")
+        .ok()
+        .is_some_and(|url| !url.trim().is_empty());
     let base_url = resolve_base_url(config.and_then(|cfg| cfg.url.as_deref()), active_registry)?;
     let cache_matches_registry = cache_origin_matches_registry(&base_url, active_registry);
     let auth = match std::env::var("LPM_REMOTE_CACHE_TOKEN")
         .ok()
         .filter(|token| !token.trim().is_empty())
     {
+        Some(_token) if !env_url_set && !cache_matches_registry => {
+            return Err(
+                "remote cache URL in project config points to a host other than the active LPM registry; set LPM_REMOTE_CACHE_URL explicitly to bind LPM_REMOTE_CACHE_TOKEN to that host"
+                    .to_string(),
+            );
+        }
         Some(token) => RemoteCacheAuth::Static(token),
         // The ambient registry login token (keychain / LPM_TOKEN) is only sent
         // when the cache lives on the LPM registry origin. A cache URL from a
@@ -1123,7 +1132,7 @@ fn remote_status(
         }
     };
 
-    let url = client.base_url.clone();
+    let url = lpm_common::safe_url_origin(&client.base_url);
     let team = client.team.clone();
     match client.fetch_status() {
         Ok(remote) => RemoteStatus {
@@ -1464,7 +1473,7 @@ fn upload_request(
 }
 
 /// Where a lookup's redirect leads: its location, resolved against the
-/// lookup's URL, which may not leave HTTPS.
+/// lookup's URL, which may not leave HTTPS or carry embedded credentials.
 fn redirect_target(
     lookup_url: &reqwest::Url,
     location: Option<&str>,
@@ -1474,6 +1483,16 @@ fn redirect_target(
     let target = lookup_url
         .join(location)
         .map_err(|e| format!("remote cache redirect has an invalid location: {e}"))?;
+    if !matches!(target.scheme(), "http" | "https") {
+        return Err(
+            "remote cache redirect uses an unsupported scheme; treating it as a miss".into(),
+        );
+    }
+    if !target.username().is_empty() || target.password().is_some() {
+        return Err(
+            "remote cache redirect contains embedded URL credentials; treating it as a miss".into(),
+        );
+    }
     if lookup_url.scheme() == "https" && target.scheme() != "https" {
         return Err("remote cache redirect leaves HTTPS; treating it as a miss".into());
     }
@@ -1510,6 +1529,7 @@ fn build_lookup_client() -> Result<Client, String> {
 
 fn build_http_client() -> Result<Client, String> {
     lpm_http::client_builder()
+        .referer(false)
         .connect_timeout(REMOTE_CACHE_CONNECT_TIMEOUT)
         .timeout(REMOTE_CACHE_TIMEOUT)
         .build()
@@ -1710,6 +1730,15 @@ fn resolve_base_url(
     };
     let parsed =
         reqwest::Url::parse(&with_v8).map_err(|e| format!("invalid remote cache URL: {e}"))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(
+            "remote cache URL must not contain embedded credentials; set LPM_REMOTE_CACHE_TOKEN instead"
+                .into(),
+        );
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("remote cache URL must not include a query string or fragment".into());
+    }
     match parsed.scheme() {
         "https" => Ok(with_v8),
         "http" if parsed.host().is_some_and(is_loopback_host) => Ok(with_v8),
@@ -3506,6 +3535,62 @@ mod tests {
         assert_eq!(
             digests.hmac_tag.as_deref(),
             Some("sha256=SL8Jsc6nTpiW4RTia2huwm4BPtwf4lhRa-5UOd1AKcM")
+        );
+    }
+
+    #[test]
+    fn redirect_target_rejects_userinfo_and_non_http_schemes() {
+        let lookup = reqwest::Url::parse("https://cache.example/v8/artifacts/abc").unwrap();
+        assert!(
+            redirect_target(
+                &lookup,
+                Some("https://user:secret@cdn.example/blob.tar.zst")
+            )
+            .is_err()
+        );
+        assert!(redirect_target(&lookup, Some("file:///etc/passwd")).is_err());
+        assert!(redirect_target(&lookup, Some("https://cdn.example/blob.tar.zst?sig=ok")).is_ok());
+    }
+
+    #[test]
+    fn resolve_base_url_rejects_embedded_credentials_query_and_fragment() {
+        for bad in [
+            "https://user:pass@cache.example",
+            "https://cache.example?token=abc",
+            "https://cache.example#frag",
+        ] {
+            assert!(
+                resolve_base_url(Some(bad), Some("https://lpm.dev")).is_err(),
+                "expected rejection for {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_config_remote_cache_url_cannot_capture_env_token_without_env_url() {
+        let _guard = crate::test_env::ScopedEnv::update([
+            ("LPM_REMOTE_CACHE", Some("1".into())),
+            (
+                "LPM_REMOTE_CACHE_TOKEN",
+                Some("operator-secret-token".into()),
+            ),
+            ("LPM_REMOTE_CACHE_SIGNATURE_KEY", Some("sig-key".into())),
+            ("LPM_REMOTE_CACHE_URL", None),
+        ]);
+        let cfg = lpm_runner::lpm_json::LpmJsonConfig {
+            remote_cache: Some(lpm_runner::lpm_json::RemoteCacheConfig {
+                enabled: true,
+                url: Some("https://attacker.example".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = resolve_client(Some(&cfg), None)
+            .err()
+            .expect("project-only remoteCache.url must not capture LPM_REMOTE_CACHE_TOKEN");
+        assert!(
+            err.contains("LPM_REMOTE_CACHE_URL"),
+            "expected guidance to pin LPM_REMOTE_CACHE_URL; got: {err}"
         );
     }
 }

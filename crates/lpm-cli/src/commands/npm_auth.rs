@@ -292,16 +292,32 @@ fn npm_oidc_exchange_url(registry_url: &str, npm_name: &str) -> String {
     )
 }
 
-fn registry_supports_npm_trusted_publishing(registry_url: &str) -> bool {
+fn registry_supports_npm_trusted_publishing_production(registry_url: &str) -> bool {
     let trimmed = normalized_registry_url(registry_url);
-    if trimmed.eq_ignore_ascii_case(NPM_REGISTRY_URL) {
+    trimmed.eq_ignore_ascii_case(NPM_REGISTRY_URL)
+}
+
+fn registry_supports_npm_trusted_publishing(registry_url: &str) -> bool {
+    if registry_supports_npm_trusted_publishing_production(registry_url) {
         return true;
     }
 
-    reqwest::Url::parse(&trimmed)
-        .ok()
-        .and_then(|url| url.host_str().map(lpm_common::is_loopback_host))
-        .unwrap_or(false)
+    // Production builds pin the npm Trusted Publishing OIDC exchange to
+    // registry.npmjs.org so a project-configured loopback registry can never
+    // receive an npm-audience OIDC JWT. Debug/test builds allow loopback
+    // mocks for local workflow testing.
+    #[cfg(any(test, debug_assertions))]
+    {
+        let trimmed = normalized_registry_url(registry_url);
+        reqwest::Url::parse(&trimmed)
+            .ok()
+            .and_then(|url| url.host_str().map(lpm_common::is_loopback_host))
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
 }
 
 async fn read_response_body_capped(
@@ -398,6 +414,17 @@ mod tests {
         assert!(!registry_supports_npm_trusted_publishing(
             "https://registry.example.test"
         ));
+        assert!(registry_supports_npm_trusted_publishing_production(
+            "https://registry.npmjs.org/"
+        ));
+        assert!(
+            !registry_supports_npm_trusted_publishing_production("http://127.0.0.1:4873"),
+            "production gate must never allow arbitrary loopback hosts to receive npm OIDC JWTs"
+        );
+        assert!(
+            !registry_supports_npm_trusted_publishing_production("http://localhost:4873"),
+            "production gate must never allow localhost to receive npm OIDC JWTs"
+        );
     }
 
     #[tokio::test]

@@ -191,22 +191,24 @@ pub fn run_custom(
     token: Option<String>,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    validate_custom_registry_base(registry_url)?;
+    let display_origin = lpm_common::safe_url_origin(registry_url);
     let token = match token {
         Some(token) => token,
         None if json_output => {
             return Err(LpmError::Registry(format!(
-                "--token <token> required in JSON mode for custom registry {registry_url}"
+                "--token <token> required in JSON mode for custom registry {display_origin}"
             )));
         }
         None if !std::io::stdin().is_terminal() => {
             return Err(LpmError::Registry(format!(
-                "--token <token> required in non-interactive mode for custom registry {registry_url}"
+                "--token <token> required in non-interactive mode for custom registry {display_origin}"
             )));
         }
         None => {
             install_ui::phase("Provide the registry auth token");
             cliclack::password(crate::prompt::untrusted(format!(
-                "Paste {registry_url} token"
+                "Paste {display_origin} token"
             )))
             .mask('*')
             .interact()
@@ -215,13 +217,37 @@ pub fn run_custom(
     };
 
     store_builtin_token(
-        registry_url,
+        &display_origin,
         &token,
         "explicit-token",
         json_output,
         false,
         |token| auth::set_custom_registry_token_with_backend(registry_url, token),
     )
+}
+
+fn validate_custom_registry_base(registry_url: &str) -> Result<(), LpmError> {
+    if registry_url.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(LpmError::Registry(
+            "custom registry URL must not contain control characters".into(),
+        ));
+    }
+    let parsed = reqwest::Url::parse(registry_url)
+        .map_err(|_| LpmError::Registry("invalid custom registry URL".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(LpmError::Registry(
+            "custom registry URL must use http or https".into(),
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(LpmError::Registry(lpm_http::URL_CREDENTIALS_REFUSAL.into()));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(LpmError::Registry(
+            "custom registry URL must not include a query string or fragment".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn store_builtin_token(
@@ -418,4 +444,25 @@ fn npm_web_auth_client(builder: reqwest::ClientBuilder) -> Result<reqwest::Clien
         .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
         .build()
         .map_err(|e| LpmError::Registry(format!("failed to create HTTP client: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_custom_registry_base_rejects_userinfo_query_and_fragment() {
+        for bad in [
+            "https://user:secret@registry.example/npm",
+            "https://registry.example/npm?token=abc",
+            "https://registry.example/npm#frag",
+            "ftp://registry.example/npm",
+        ] {
+            assert!(
+                validate_custom_registry_base(bad).is_err(),
+                "expected rejection for {bad}"
+            );
+        }
+        assert!(validate_custom_registry_base("https://registry.example/npm").is_ok());
+    }
 }

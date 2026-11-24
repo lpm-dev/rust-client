@@ -227,9 +227,10 @@ async fn fetch_public_registry_tarball_never_sends_the_lpm_bearer() {
     let name = "public-fetch-package";
     let version = "1.0.0";
     let tarball = make_tarball(name, version);
-    let tarball_url = mock.tarball_url(name, version);
+    let tarball_path = format!("/{name}/-/{name}-{version}.tgz");
+    let tarball_url = format!("https://registry.npmjs.org{tarball_path}");
     Mock::given(method("GET"))
-        .and(path(MockRegistry::tarball_path(name, version)))
+        .and(path(&tarball_path))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.clone()))
         .expect(1)
         .mount(mock.server())
@@ -237,7 +238,7 @@ async fn fetch_public_registry_tarball_never_sends_the_lpm_bearer() {
     let project = project_with_single_fetch_artifact(
         name,
         version,
-        format!("registry+{}", mock.url()),
+        "registry+https://registry.npmjs.org".to_string(),
         compute_integrity(&tarball),
         Some(tarball_url),
     );
@@ -254,9 +255,14 @@ async fn fetch_public_registry_tarball_never_sends_the_lpm_bearer() {
     );
 
     let requests = mock.server().received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "canonical public registry tarball hint must skip metadata lookup"
+    );
     let tarball_request = requests
         .iter()
-        .find(|request| request.url.path() == MockRegistry::tarball_path(name, version))
+        .find(|request| request.url.path() == tarball_path)
         .expect("fetch must request the tarball");
     assert!(
         tarball_request.headers.get("Authorization").is_none(),
@@ -314,12 +320,14 @@ async fn fetch_remote_tarball_ignores_lpm_and_matching_npmrc_bearers() {
 #[tokio::test]
 async fn fetch_lpm_registry_tarball_keeps_the_lpm_bearer() {
     let mock = MockRegistry::start().await;
-    let name = "@lpm.dev/private-fetch-package";
+    let name = "@lpm.dev/owner.private-fetch-package";
     let version = "1.0.0";
     let tarball = make_tarball(name, version);
-    let tarball_url = format!("{}/private-fetch-package-1.0.0.tgz", mock.url());
+    let tarball_path =
+        "/api/registry/@lpm.dev/owner.private-fetch-package/-/private-fetch-package-1.0.0.tgz";
+    let tarball_url = format!("{}{tarball_path}", mock.url());
     Mock::given(method("GET"))
-        .and(path("/private-fetch-package-1.0.0.tgz"))
+        .and(path(tarball_path))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.clone()))
         .expect(1)
         .mount(mock.server())
@@ -1118,4 +1126,40 @@ async fn fetch_does_not_download_from_a_locked_url_with_a_query() {
         .map(|request| request.url.query().map(str::to_owned))
         .collect();
     assert_eq!(queries, [None]);
+}
+
+#[tokio::test]
+async fn fetch_refuses_mismatched_lockfile_tarball_hint_before_authenticated_request() {
+    let mock = MockRegistry::start().await;
+    mount_ms(&mock).await;
+    let lockfile = seed_lockfile(&mock).await;
+    let served = mock.tarball_url("ms", "2.1.3");
+    let tampered_path = "/api/admin/steal-token/-/ms-2.1.3.tgz";
+    let tampered = format!("{}{tampered_path}", mock.url());
+    assert!(lockfile.contains(&served), "{lockfile}");
+
+    Mock::given(method("GET"))
+        .and(path(tampered_path))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(mock.server())
+        .await;
+
+    let project = project_with_lockfile(&lockfile.replace(&served, &tampered));
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["fetch"])
+        .output()
+        .expect("failed to run lpm fetch");
+    assert!(
+        !output.status.success(),
+        "lpm fetch must refuse a lockfile tarball hint that disagrees with registry metadata:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    assert!(
+        !requests.iter().any(|req| req.url.path() == tampered_path),
+        "tampered lockfile hint must receive zero HTTP requests; got: {:?}",
+        requests.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+    );
 }
