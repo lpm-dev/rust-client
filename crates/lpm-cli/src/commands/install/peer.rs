@@ -75,24 +75,30 @@ pub(super) fn retain_peer_issues_for_packages(
     peer_conflicts: &mut Vec<PeerConflictReport>,
     packages: &[InstallPackage],
 ) {
-    let consumer_identities = packages
-        .iter()
-        .map(|package| (package.name.as_str(), package.version.as_str()))
-        .collect::<HashSet<_>>();
-    let consumer_names = packages
-        .iter()
-        .map(|package| package.name.as_str())
-        .collect::<HashSet<_>>();
-
-    peer_warnings.retain(|warning| {
-        consumer_identities.contains(&(warning.package.as_str(), warning.version.as_str()))
-    });
-    for conflict in peer_conflicts.iter_mut() {
-        conflict
-            .unsatisfied_consumers
-            .retain(|(consumer, _)| consumer_names.contains(consumer.as_str()));
+    if peer_warnings.is_empty() && peer_conflicts.is_empty() {
+        return;
     }
-    peer_conflicts.retain(|conflict| !conflict.unsatisfied_consumers.is_empty());
+    if !peer_warnings.is_empty() {
+        let mut consumer_identities = HashSet::with_capacity(packages.len());
+        consumer_identities.extend(
+            packages
+                .iter()
+                .map(|package| (package.name.as_str(), package.version.as_str())),
+        );
+        peer_warnings.retain(|warning| {
+            consumer_identities.contains(&(warning.package.as_str(), warning.version.as_str()))
+        });
+    }
+    if !peer_conflicts.is_empty() {
+        let mut consumer_names = HashSet::with_capacity(packages.len());
+        consumer_names.extend(packages.iter().map(|package| package.name.as_str()));
+        for conflict in peer_conflicts.iter_mut() {
+            conflict
+                .unsatisfied_consumers
+                .retain(|(consumer, _)| consumer_names.contains(consumer.as_str()));
+        }
+        peer_conflicts.retain(|conflict| !conflict.unsatisfied_consumers.is_empty());
+    }
 }
 
 pub(super) fn peer_warning_json_value(warning: &PeerWarning) -> serde_json::Value {
@@ -177,6 +183,31 @@ pub(super) fn lockfile_has_auto_isolated_peer_conflicts(lockfile_path: &Path) ->
     reader_has_auto_isolated_peer_conflicts(file)
 }
 
+fn metadata_section_end_offset(bytes: &[u8]) -> Option<usize> {
+    const POST_METADATA_SECTIONS: &[&[u8]] = &[
+        b"\n[[packages]]",
+        b"\n[workspace-packages",
+        b"\n[root-resolutions",
+        b"\n[importers",
+        b"\n[catalogs",
+        b"\n[patches",
+        b"\n[provenance",
+    ];
+    let mut earliest: Option<usize> = None;
+    for marker in POST_METADATA_SECTIONS {
+        if let Some(pos) = bytes
+            .windows(marker.len())
+            .position(|window| window == *marker)
+        {
+            earliest = Some(match earliest {
+                Some(current) => current.min(pos),
+                None => pos,
+            });
+        }
+    }
+    earliest
+}
+
 fn reader_has_auto_isolated_peer_conflicts(mut reader: impl Read) -> bool {
     let mut buffer = [0u8; LOCKFILE_PEER_CONFLICT_SCAN_CHUNK_SIZE];
     let mut carry = [0u8; AUTO_ISOLATED_PEER_CONFLICTS_NEEDLE_LEN - 1];
@@ -189,6 +220,12 @@ fn reader_has_auto_isolated_peer_conflicts(mut reader: impl Read) -> bool {
             Err(_) => return false,
         };
         let chunk = &buffer[..bytes_read];
+        if let Some(end_offset) = metadata_section_end_offset(chunk) {
+            return chunk_has_auto_isolated_peer_conflicts(
+                &carry[..carry_len],
+                &chunk[..end_offset],
+            );
+        }
         if chunk_has_auto_isolated_peer_conflicts(&carry[..carry_len], chunk) {
             return true;
         }
@@ -343,6 +380,33 @@ mod tests {
         let found = reader_has_auto_isolated_peer_conflicts(&mut reader);
 
         assert!(found);
+        assert_eq!(reader.reads, 1);
+    }
+
+    #[test]
+    fn reader_has_auto_isolated_peer_conflicts_stops_at_first_post_metadata_section() {
+        struct FailsAfterHeader {
+            reads: usize,
+        }
+
+        impl std::io::Read for FailsAfterHeader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                if self.reads > 1 {
+                    return Err(std::io::Error::other(
+                        "reader should stop once [[packages]] starts",
+                    ));
+                }
+                let header =
+                    b"[metadata]\nlockfile-version = 10\n\n[[packages]]\nname = \"react\"\n";
+                buf[..header.len()].copy_from_slice(header);
+                Ok(header.len())
+            }
+        }
+
+        let mut reader = FailsAfterHeader { reads: 0 };
+        let found = reader_has_auto_isolated_peer_conflicts(&mut reader);
+        assert!(!found);
         assert_eq!(reader.reads, 1);
     }
 }

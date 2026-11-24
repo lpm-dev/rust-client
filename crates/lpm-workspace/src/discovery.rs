@@ -248,12 +248,13 @@ pub fn workspace_manifest_paths_from_open_root(
 /// under `root_path` (including `""` for the workspace root itself). A change to
 /// any returned directory's metadata invalidates cached member discovery.
 pub fn workspace_discovery_watch_dirs(root_path: &Path) -> Result<Vec<PathBuf>, WorkspaceError> {
-    let root_dir =
-        open_directory_nofollow(root_path).map_err(|error| WorkspaceError::Io(error.to_string()))?;
+    let root_dir = open_directory_nofollow(root_path)
+        .map_err(|error| WorkspaceError::Io(error.to_string()))?;
     let (root_package, pnpm_workspace) = read_workspace_root_from_open_dir(root_path, &root_dir)?;
     let globs = workspace_member_globs(&root_package, pnpm_workspace.as_ref());
     let (inclusions, exclusions) = compile_workspace_globs(root_path, &globs)?;
-    let scan = discover_member_paths_from_open_root(root_path, &root_dir, &inclusions, &exclusions)?;
+    let scan =
+        discover_member_paths_from_open_root(root_path, &root_dir, &inclusions, &exclusions)?;
     let mut dirs = scan.directory_paths;
     dirs.sort_unstable();
     dirs.dedup();
@@ -1344,6 +1345,8 @@ struct PnpmWorkspaceManifest {
     catalogs: HashMap<String, HashMap<String, String>>,
     #[serde(default, rename = "cleanupUnusedCatalogs")]
     cleanup_unused_catalogs: Option<bool>,
+    #[serde(default)]
+    overrides: HashMap<String, serde_yaml::Value>,
 }
 
 #[derive(Debug, Default)]
@@ -1351,6 +1354,8 @@ struct PnpmWorkspaceConfig {
     packages: Vec<String>,
     catalogs: HashMap<String, HashMap<String, String>>,
     cleanup_unused_catalogs: Option<bool>,
+    overrides: HashMap<String, String>,
+    unsupported_override_values: Vec<String>,
 }
 
 impl PnpmWorkspaceManifest {
@@ -1363,10 +1368,23 @@ impl PnpmWorkspaceManifest {
             }
         }
 
+        let mut overrides = HashMap::with_capacity(self.overrides.len());
+        let mut unsupported_override_values = Vec::new();
+        for (selector, value) in self.overrides {
+            if let Some(target) = value.as_str() {
+                overrides.insert(selector, target.to_string());
+            } else {
+                unsupported_override_values.push(selector);
+            }
+        }
+        unsupported_override_values.sort_unstable();
+
         PnpmWorkspaceConfig {
             packages: self.packages,
             catalogs,
             cleanup_unused_catalogs: self.cleanup_unused_catalogs,
+            overrides,
+            unsupported_override_values,
         }
     }
 }
@@ -1417,6 +1435,26 @@ fn merge_pnpm_workspace_config(root_package: &mut PackageJson, config: &PnpmWork
         let lpm = root_package.lpm.get_or_insert_with(LpmConfig::default);
         if lpm.cleanup_unused_catalogs.is_none() {
             lpm.cleanup_unused_catalogs = Some(cleanup_unused_catalogs);
+        }
+    }
+
+    for (selector, target) in &config.overrides {
+        if root_package.overrides.contains_key(selector) {
+            tracing::warn!(
+                selector = %selector,
+                "package.json overrides entry takes precedence over pnpm-workspace.yaml overrides entry",
+            );
+        } else {
+            root_package
+                .overrides
+                .insert(selector.clone(), target.clone());
+        }
+    }
+    for selector in &config.unsupported_override_values {
+        if !root_package.unsupported_override_values.contains(selector) {
+            root_package
+                .unsupported_override_values
+                .push(selector.clone());
         }
     }
 }
@@ -2975,5 +3013,57 @@ catalog:
         assert_eq!(ws.root_package.catalogs["default"]["is-positive"], "^2.0.0");
         assert_eq!(ws.members.len(), 1);
         assert_eq!(ws.members[0].package.name.as_deref(), Some("leaf"));
+    }
+
+    #[test]
+    fn pnpm_workspace_yaml_overrides_merge_into_root_package_with_package_json_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "root-overrides",
+                "workspaces": ["packages/*"],
+                "overrides": {
+                    "react": "19.1.4"
+                }
+            }"#,
+        );
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            r#"packages:
+  - "packages/*"
+overrides:
+  react: "18.0.0"
+  lodash: "4.17.21"
+  nested:
+    child: "1.0.0"
+"#,
+        )
+        .unwrap();
+        let member_dir = dir.path().join("packages/app");
+        fs::create_dir_all(&member_dir).unwrap();
+        create_package_json(&member_dir, r#"{"name": "app", "version": "1.0.0"}"#);
+
+        let ws = discover_workspace(dir.path())
+            .expect("discovery must parse pnpm-workspace.yaml overrides")
+            .expect("workspace must be discovered");
+
+        assert_eq!(
+            ws.root_package.overrides.get("react").map(String::as_str),
+            Some("19.1.4"),
+            "package.json override must take precedence over pnpm-workspace.yaml"
+        );
+        assert_eq!(
+            ws.root_package.overrides.get("lodash").map(String::as_str),
+            Some("4.17.21"),
+            "pnpm-workspace.yaml override must feed root_package.overrides"
+        );
+        assert!(
+            ws.root_package
+                .unsupported_override_values
+                .iter()
+                .any(|key| key == "nested"),
+            "non-string YAML override must be recorded as unsupported rather than failing discovery"
+        );
     }
 }

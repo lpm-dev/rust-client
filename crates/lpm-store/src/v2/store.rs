@@ -3693,10 +3693,13 @@ fn link_entry_is_reusable(
     policy: ObjectIntegrityPolicy,
 ) -> Result<Option<Option<std::time::SystemTime>>, LpmError> {
     harden_tier_of(dir, "links")?;
-    if !is_complete_link_entry(dir, key) {
+    let Some((sidecar, sidecar_mtime)) = LinkMeta::read_from_with_mtime_if_present(dir)? else {
+        return Ok(None);
+    };
+    let package_dir = link_entry_package_dir(dir, key);
+    if !package_dir.join("package.json").is_file() {
         return Ok(None);
     }
-    let (sidecar, sidecar_mtime) = LinkMeta::read_from_with_mtime(dir)?;
     if sidecar.graph_key_digest_hex != key.digest_hex()
         || sidecar.source_sri != source_sri
         || sidecar.tree_digest.as_deref() != tree_digest
@@ -3708,7 +3711,6 @@ fn link_entry_is_reusable(
         Some(digest) => Cow::Borrowed(digest.as_str()),
         None => Cow::Owned(object_integrity_for_link(object_dir, source_sri, policy)?),
     };
-    let package_dir = link_entry_package_dir(dir, key);
     let source_shallow_eligible = source_policy_uses_source_integrity(object_dir, policy)
         && package_dir
             .join(LINK_BUILD_MARKER)

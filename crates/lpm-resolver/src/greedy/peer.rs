@@ -461,44 +461,27 @@ pub(super) fn pick_peer_prefetch_candidates(
         return Vec::new();
     }
 
-    // Group reqs by canonical so the all-optional check is per-group,
-    // not per-individual-requirement (an optional consumer alone
-    // shouldn't keep a prefetch from happening when a sibling
-    // required-consumer for the SAME canonical exists).
-    let mut grouped: HashMap<&CanonicalKey, Vec<&PeerRequirement>> = HashMap::new();
+    let mut picked_set: AHashSet<&CanonicalKey> = AHashSet::new();
     for req in &state.peer_requirements {
-        grouped.entry(&req.canonical).or_default().push(req);
+        if req.optional
+            || picked_set.contains(&req.canonical)
+            || cached_canonicals.contains_key(&req.canonical)
+            || inflight_canonicals.contains(&req.canonical)
+        {
+            continue;
+        }
+        let satisfied = state.resolved.get(&req.canonical).is_some_and(|nodes| {
+            nodes
+                .iter()
+                .any(|(version, _)| req.range.satisfies(version))
+        });
+        if !satisfied {
+            picked_set.insert(&req.canonical);
+        }
     }
 
-    let mut picks: Vec<CanonicalKey> = Vec::new();
-    for (canonical, reqs) in grouped {
-        // All-optional → no auto-install regardless of cache state.
-        if reqs.iter().all(|r| r.optional) {
-            continue;
-        }
-        if reqs.iter().filter(|req| !req.optional).all(|requirement| {
-            newest_existing_version_for_requirement(state, canonical, requirement, None).is_some()
-        }) {
-            continue;
-        }
-        // Manifest already in cache — drain pass will hit the fast
-        // path; no prefetch needed.
-        if cached_canonicals.contains_key(canonical) {
-            continue;
-        }
-        // Some sibling dispatch already started a fetch for this
-        // canonical (regular transitive dep is racing with us). The
-        // dispatcher's `inflight` guard would dedup our spawn anyway;
-        // skipping here saves the spawn allocation + the redundant
-        // `dispatcher_rpc_count` bump.
-        if inflight_canonicals.contains(canonical) {
-            continue;
-        }
-        picks.push(canonical.clone());
-    }
-
-    // Deterministic dispatch order. With ~tens of peer requirements
-    // even on bench/fixture-large, sort cost is negligible.
+    let mut picks: Vec<CanonicalKey> = picked_set.into_iter().cloned().collect();
+    // Deterministic dispatch order.
     picks.sort_by_key(|c| c.to_string());
     picks
 }
@@ -782,16 +765,12 @@ where
         );
         return Ok(outcome);
     }
-    if let Some((chosen, target)) = state
-        .resolved
-        .get(canonical)
-        .and_then(|nodes| {
-            nodes
-                .iter()
-                .max_by(|(left, _), (right, _)| left.cmp(right))
-                .map(|(version, node_id)| (version.clone(), *node_id))
-        })
-    {
+    if let Some((chosen, target)) = state.resolved.get(canonical).and_then(|nodes| {
+        nodes
+            .iter()
+            .max_by(|(left, _), (right, _)| left.cmp(right))
+            .map(|(version, node_id)| (version.clone(), *node_id))
+    }) {
         let required_indices = reqs
             .iter()
             .enumerate()

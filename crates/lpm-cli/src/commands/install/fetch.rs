@@ -5865,7 +5865,15 @@ pub(super) async fn read_buffered_tarball_body(
         ))
         .into());
     }
-    let initial_capacity = usize::try_from(max_compressed_size.min(64 * 1024)).unwrap_or(64 * 1024);
+    const MAX_PREALLOC_CAPACITY: u64 = 8 * 1024 * 1024;
+    let initial_capacity = usize::try_from(
+        response
+            .content_length()
+            .unwrap_or(64 * 1024)
+            .min(max_compressed_size)
+            .min(MAX_PREALLOC_CAPACITY),
+    )
+    .unwrap_or(64 * 1024);
     let mut body = Vec::with_capacity(initial_capacity);
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {

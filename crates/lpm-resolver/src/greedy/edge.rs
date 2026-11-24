@@ -116,16 +116,12 @@ fn newest_satisfying_root_node(
     edge: &Edge,
     info: &CachedPackageInfo,
 ) -> Option<NodeId> {
-    state
-        .nodes
-        .first()?
-        .children
-        .iter()
-        .filter(|(local_name, _)| state.root_deps.contains_key(local_name))
-        .filter_map(|(_, id)| {
-            let node = state.nodes.get(*id as usize)?;
-            (node.canonical == edge.canonical && info.range_satisfies(&edge.range, &node.version))
-                .then_some((&node.version, *id))
+    let ids = state.declared_root_nodes.get(&edge.canonical)?;
+    ids.iter()
+        .filter_map(|&id| {
+            let node = state.nodes.get(id as usize)?;
+            info.range_satisfies(&edge.range, &node.version)
+                .then_some((&node.version, id))
         })
         .max_by(|(left, _), (right, _)| left.cmp(right))
         .map(|(_, id)| id)
@@ -295,6 +291,13 @@ fn process_edge_inner(
         .children
         .push((edge.local_name.clone(), child_id));
     if is_root_edge {
+        if state.root_deps.contains_key(&edge.local_name) {
+            state
+                .declared_root_nodes
+                .entry(edge.canonical.clone())
+                .or_default()
+                .push(child_id);
+        }
         state.resolve_pending_peer_bindings(&edge.canonical, &target_version, child_id);
     }
 
