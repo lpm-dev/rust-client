@@ -2222,6 +2222,7 @@ impl Store {
             })?;
         }
 
+        #[cfg(target_os = "macos")]
         let _apfs_populate_permit = acquire_apfs_populate_permit();
         let materialize_dir = self
             .file_cas
@@ -4036,9 +4037,6 @@ fn acquire_apfs_populate_permit() -> ApfsPopulatePermit {
     *active += 1;
     ApfsPopulatePermit
 }
-
-#[cfg(not(target_os = "macos"))]
-fn acquire_apfs_populate_permit() {}
 
 mod checked_pins;
 
