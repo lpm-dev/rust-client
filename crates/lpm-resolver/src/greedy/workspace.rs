@@ -535,13 +535,15 @@ fn project_importer(
             return Ok(ImporterProjection::RequiresIsolatedResolution);
         }
     };
-    let mut ambient_peer_installs = ambient_root_resolutions.keys().cloned().collect::<Vec<_>>();
+    let mut ambient_peer_installs = Vec::with_capacity(ambient_root_resolutions.len());
+    for (name, resolution) in ambient_root_resolutions {
+        if skipped_optional_roots.contains(name.as_str()) || root_resolutions.contains_key(&name) {
+            continue;
+        }
+        ambient_peer_installs.push(name.clone());
+        root_resolutions.insert(name, resolution);
+    }
     ambient_peer_installs.sort_unstable();
-    root_resolutions.extend(
-        ambient_root_resolutions
-            .into_iter()
-            .filter(|(name, _)| !skipped_optional_roots.contains(name.as_str())),
-    );
 
     let mut packages = included
         .iter()
@@ -558,6 +560,14 @@ fn project_importer(
             package
         })
         .collect::<Vec<_>>();
+    if !all_projected_packages_reachable(&packages, &root_resolutions) {
+        tracing::debug!(
+            importer_index,
+            reason = "unreachable-projected-package",
+            "workspace union importer requires isolated resolution"
+        );
+        return Ok(ImporterProjection::RequiresIsolatedResolution);
+    }
     packages.sort_by_cached_key(|package| (package.package.to_string(), package.version.clone()));
     let package_names = packages
         .iter()
@@ -595,6 +605,40 @@ fn project_importer(
 
 fn usize_to_u64_saturating(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn all_projected_packages_reachable(
+    packages: &[ResolvedPackage],
+    root_resolutions: &HashMap<String, RootResolution>,
+) -> bool {
+    let mut by_id = HashMap::with_capacity(packages.len());
+    for (index, package) in packages.iter().enumerate() {
+        by_id.insert(package.resolution_id, index);
+    }
+    let mut visited = HashSet::with_capacity(packages.len());
+    let mut queue = VecDeque::with_capacity(root_resolutions.len());
+    for root in root_resolutions.values() {
+        if let Some(&index) = by_id.get(&root.target)
+            && visited.insert(index)
+        {
+            queue.push_back(index);
+        }
+    }
+    while let Some(index) = queue.pop_front() {
+        let package = &packages[index];
+        for target in package
+            .dependency_targets
+            .values()
+            .chain(package.peer_targets.values())
+        {
+            if let Some(&child_index) = by_id.get(target)
+                && visited.insert(child_index)
+            {
+                queue.push_back(child_index);
+            }
+        }
+    }
+    visited.len() == packages.len()
 }
 
 fn add_dependency_closure(
@@ -806,14 +850,11 @@ fn project_peer_context(
                 );
                 return Ok(PeerProjectionOutcome::RequiresIsolatedResolution);
             };
-            ambient.insert(
-                identity.0.clone(),
-                RootResolution {
-                    target: *target,
-                    package: identity.0,
-                    version: identity.1,
-                },
-            );
+            ambient.entry(identity.0.clone()).or_insert(RootResolution {
+                target: *target,
+                package: identity.0,
+                version: identity.1,
+            });
             synthesized_targets.push((*target, required_path));
         }
         if !add_dependency_closure(
@@ -1912,5 +1953,82 @@ mod tests {
         };
         assert!(results[0].is_none());
         assert!(results[1].is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn union_projection_keeps_declared_root_when_ambient_peer_synthesizes_newer_same_name() {
+        let roots = vec![
+            RootDependencies::required(HashMap::from([
+                ("react".to_string(), "19.1.4".to_string()),
+                ("ui".to_string(), "1.0.0".to_string()),
+            ])),
+            RootDependencies::required(HashMap::from([
+                ("react".to_string(), "19.1.4".to_string()),
+            ])),
+        ];
+        let outcome = resolve_roots_with_policies(
+            roots,
+            vec![
+                ("ui", cached_package(&[("1.0.0", &[], &[("react-dom", "^19.0.0")])])),
+                (
+                    "react-dom",
+                    cached_package(&[("19.3.1", &[], &[("react", "^19.3.1")])]),
+                ),
+                (
+                    "react",
+                    cached_package(&[("19.3.1", &[], &[]), ("19.1.4", &[], &[])]),
+                ),
+            ],
+            vec![ResolverPolicy::default(); 2],
+        )
+        .await;
+
+        let WorkspaceResolveOutcome::Projected { results, .. } = outcome else {
+            panic!("workspace union should project importers")
+        };
+        let ui_result = results[0]
+            .as_ref()
+            .expect("ui importer should be projected");
+        let root_react = ui_result
+            .root_resolutions
+            .get("react")
+            .expect("declared react root must remain present");
+        assert_eq!(
+            root_react.version, "19.1.4",
+            "ambient peer synthesis must not overwrite manifest-declared root_resolutions"
+        );
+        assert!(
+            !ui_result.ambient_peer_installs.iter().any(|name| name == "react"),
+            "manifest-declared root must not be recorded as an ambient peer install"
+        );
+
+        let mut reachable = HashSet::new();
+        let mut queue: std::collections::VecDeque<_> = ui_result
+            .root_resolutions
+            .values()
+            .map(|res| res.target)
+            .collect();
+        let by_id: HashMap<_, _> = ui_result
+            .packages
+            .iter()
+            .map(|pkg| (pkg.resolution_id, pkg))
+            .collect();
+        while let Some(id) = queue.pop_front() {
+            if !reachable.insert(id) {
+                continue;
+            }
+            if let Some(pkg) = by_id.get(&id) {
+                queue.extend(pkg.dependency_targets.values().copied());
+                queue.extend(pkg.peer_targets.values().copied());
+            }
+        }
+        for pkg in &ui_result.packages {
+            assert!(
+                reachable.contains(&pkg.resolution_id),
+                "projected package {}@{} must be reachable from exact roots",
+                pkg.package,
+                pkg.version
+            );
+        }
     }
 }

@@ -3678,6 +3678,42 @@ async fn peer_drain_hard_errors_when_no_required_consumer_satisfiable() {
 }
 
 #[tokio::test]
+async fn peer_drain_warns_and_reuses_existing_provider_when_required_range_matches_no_published_version() {
+    let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+    let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+    let server = push_node(&mut state, CanonicalKey::npm("@trpc/server"), "11.30.3");
+    let client = push_node(&mut state, CanonicalKey::npm("@trpc/client"), "11.30.4");
+
+    state.peer_requirements.push(mk_peer_req(
+        client,
+        "@trpc/server",
+        CanonicalKey::npm("@trpc/server"),
+        "11.30.4",
+        false,
+    ));
+
+    let info_arc = mk_info_arc(&["11.30.3", "11.30.2"], &[]);
+    let synthesized = drain_peer_requirements_one_pass(&mut state, true, |_canonical| {
+        let info = info_arc.clone();
+        async move { Ok(info) }
+    })
+    .await
+    .expect("existing provider should produce a peer conflict warning rather than a hard abort");
+
+    assert!(synthesized.is_empty());
+    assert_eq!(
+        state
+            .peer_bindings
+            .get(&client)
+            .and_then(|bindings| bindings.get("@trpc/server")),
+        Some(&server)
+    );
+    assert_eq!(state.peer_conflicts.len(), 1);
+    assert_eq!(state.peer_conflicts[0].canonical, "@trpc/server");
+    assert_eq!(state.peer_conflicts[0].chosen_version, "11.30.3");
+}
+
+#[tokio::test]
 async fn peer_drain_best_effort_picks_version_satisfying_most_consumers() {
     // Three required consumers; two want ^18, one wants ^17.
     // Best-effort picks 18.2.0 (satisfies 2 of 3) over 17.x

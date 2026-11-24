@@ -1797,6 +1797,82 @@ fn peer_check_aliased_missing_warning_preserves_local_and_canonical_names() {
 }
 
 #[test]
+fn optional_aliased_peer_does_not_warn_when_target_package_does_not_satisfy_alias_range() {
+    let consumer = ResolverPackage::npm("@typescript-eslint/typescript-estree");
+    let typescript = ResolverPackage::npm("typescript");
+    let ts_id = lpm_common::ResolutionNodeId::new(1);
+    let resolved = vec![
+        ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::new(2),
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::from([("typescript".to_string(), ts_id)]),
+            package: consumer.clone(),
+            version: NpmVersion::parse("8.74.0").unwrap(),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            peers: vec![lpm_common::PeerEdge::registry(
+                "typescript",
+                "typescript",
+                "5.9.3",
+            )],
+            tarball_url: None,
+            integrity: None,
+            platform: None,
+            node_engine: None,
+            optional: false,
+        },
+        ResolvedPackage {
+            resolution_id: ts_id,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
+            package: typescript,
+            version: NpmVersion::parse("5.9.3").unwrap(),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            peers: Vec::new(),
+            tarball_url: None,
+            integrity: None,
+            platform: None,
+            node_engine: None,
+            optional: false,
+        },
+    ];
+
+    let mut info = make_cached_info(
+        &["8.74.0"],
+        vec![],
+        vec![(
+            "8.74.0",
+            vec![
+                ("typescript", ">=4.8.4 <6.1.0"),
+                ("@typescript/native", ">=7.1.0-dev.20261009.1"),
+            ],
+        )],
+    );
+    assert!(
+        Arc::make_mut(&mut info).update_manifest_version("8.74.0", |manifest| {
+            let native = manifest
+                .peer_dependencies
+                .iter_mut()
+                .find(|peer| peer.name == "@typescript/native")
+                .expect("aliased optional peer fixture");
+            native.alias = Some("typescript".to_string());
+            native.optional = true;
+        })
+    );
+    let mut cache = HashMap::new();
+    cache.insert(CanonicalKey::from(&consumer), info);
+
+    let warnings = check_unmet_peers(&resolved, &cache, &CompiledPeerRules::default());
+    assert!(
+        warnings.is_empty(),
+        "unbound optional npm: peer alias must not emit a spurious mismatch warning: {warnings:?}"
+    );
+}
+
+#[test]
 fn peer_check_multiple_satisfying_versions_do_not_report_peer_missing() {
     let plugin_pkg = ResolverPackage::npm("esbuild-plugins-node-modules-polyfill");
     let esbuild_nested_a = ResolverPackage::npm("esbuild").with_context("vite");

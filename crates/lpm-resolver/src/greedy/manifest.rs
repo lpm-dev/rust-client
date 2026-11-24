@@ -25,10 +25,11 @@ pub(super) async fn ensure_manifest(
     // This is the load-bearing fix for the resolver wall — previously the
     // greedy resolver cloned popular packuments per edge, burning ~5 sec
     // per cold install.
-    if let Some(entry) = shared_cache.get(canonical) {
+    let cached = shared_cache.get(canonical).map(|entry| entry.value().clone());
+    if let Some(info) = cached {
         return ensure_policy_metadata_for_cached_manifest(
             canonical,
-            entry.value().clone(),
+            info,
             &client,
             route_table,
             shared_cache,
@@ -52,10 +53,11 @@ pub(super) async fn ensure_manifest(
 
         // Re-check: walker may have inserted between the fast-path miss
         // and now.
-        if let Some(entry) = shared_cache.get(canonical) {
+        let cached = shared_cache.get(canonical).map(|entry| entry.value().clone());
+        if let Some(info) = cached {
             return ensure_policy_metadata_for_cached_manifest(
                 canonical,
-                entry.value().clone(),
+                info,
                 &client,
                 route_table,
                 shared_cache,
@@ -70,10 +72,11 @@ pub(super) async fn ensure_manifest(
         if !walker_done.load(Ordering::Acquire) {
             match tokio::time::timeout(fetch_wait_timeout, notified).await {
                 Ok(()) => {
-                    if let Some(entry) = shared_cache.get(canonical) {
+                    let cached = shared_cache.get(canonical).map(|entry| entry.value().clone());
+                    if let Some(info) = cached {
                         return ensure_policy_metadata_for_cached_manifest(
                             canonical,
-                            entry.value().clone(),
+                            info,
                             &client,
                             route_table,
                             shared_cache,

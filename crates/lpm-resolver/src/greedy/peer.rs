@@ -93,6 +93,15 @@ enum PeerDrainOutcome {
         chosen: NpmVersion,
         unsatisfied: Vec<(String, String)>, // (consumer_canonical, range)
     },
+    /// No published version satisfies any unsatisfied required consumer range,
+    /// but the canonical already has a resolved provider in the graph. Bind to
+    /// the newest existing provider and record a [`PeerConflictReport`] rather
+    /// than aborting the install.
+    ReuseExistingUnsatisfied {
+        chosen: NpmVersion,
+        target: NodeId,
+        unsatisfied: Vec<(String, String)>,
+    },
 }
 
 /// Walk `info.versions` newest-first, return the first version that
@@ -628,6 +637,30 @@ where
                     unsatisfied_consumers: unsatisfied,
                 });
             }
+            PeerDrainOutcome::ReuseExistingUnsatisfied {
+                chosen,
+                target,
+                unsatisfied,
+            } => {
+                mark_node_required_closure(state, target);
+                record_peer_bindings(state, &reqs, &chosen, Some(target));
+                tracing::warn!(
+                    "peer dependency mismatch: {} @ {} reused for {} unsatisfied required consumer(s): {}",
+                    canonical,
+                    chosen,
+                    unsatisfied.len(),
+                    unsatisfied
+                        .iter()
+                        .map(|(c, r)| format!("{c} wants {r}"))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                );
+                state.peer_conflicts.push(PeerConflictReport {
+                    canonical: canonical.to_string(),
+                    chosen_version: chosen.to_string(),
+                    unsatisfied_consumers: unsatisfied,
+                });
+            }
         }
     }
 
@@ -749,10 +782,30 @@ where
         );
         return Ok(outcome);
     }
+    if let Some((chosen, target)) = state
+        .resolved
+        .get(canonical)
+        .and_then(|nodes| {
+            nodes
+                .iter()
+                .max_by(|(left, _), (right, _)| left.cmp(right))
+                .map(|(version, node_id)| (version.clone(), *node_id))
+        })
+    {
+        let required_indices = reqs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| (!r.optional).then_some(i))
+            .collect();
+        let unsatisfied = unsatisfied_required_consumers_at_indices(state, reqs, required_indices);
+        return Ok(PeerDrainOutcome::ReuseExistingUnsatisfied {
+            chosen,
+            target,
+            unsatisfied,
+        });
+    }
     // Truly irreconcilable: no platform-compatible version satisfies
-    // any required consumer's range. Hard error — this means the
-    // canonical's published versions don't include anything any
-    // required consumer accepts, which the resolver can't paper over.
+    // any required consumer's range and no provider exists in the graph.
     Err(ResolveError::PeerConflict {
         canonical: canonical.to_string(),
         requirements: reqs

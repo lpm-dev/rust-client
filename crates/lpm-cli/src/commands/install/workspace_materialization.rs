@@ -227,6 +227,7 @@ impl Default for UnionObjectValidationOperation {
 pub(super) struct WorkspaceLinkHandle {
     operation: Arc<RetainedOperation<LinkMaterialization>>,
     performed: bool,
+    target_instance_id: lpm_common::PackageInstanceId,
 }
 
 impl WorkspaceLinkHandle {
@@ -235,12 +236,16 @@ impl WorkspaceLinkHandle {
     }
 
     pub(super) async fn wait(self) -> Result<Coordinated<LinkMaterialization>, LpmError> {
+        let target_instance_id = self.target_instance_id;
         self.operation
             .wait()
             .await
-            .map(|value| Coordinated {
-                value,
-                performed: self.performed,
+            .map(|mut value| {
+                value.materialized.instance_id = Some(target_instance_id);
+                Coordinated {
+                    value,
+                    performed: self.performed,
+                }
             })
             .map_err(LpmError::from)
     }
@@ -607,6 +612,7 @@ impl WorkspaceMaterializationCoordinator {
         target: Arc<lpm_linker::v2::V2Target>,
         store: Arc<lpm_store::v2::Store>,
     ) -> Result<WorkspaceLinkHandle, LpmError> {
+        let target_instance_id = target.instance_id;
         let graph_key = plan.graph_key_for(&target)?;
         let key = LinkMaterializationKey { graph_key };
         let (operation, performed) = {
@@ -670,6 +676,7 @@ impl WorkspaceMaterializationCoordinator {
         Ok(WorkspaceLinkHandle {
             operation,
             performed,
+            target_instance_id,
         })
     }
 }
@@ -1246,5 +1253,95 @@ mod tests {
         );
         first.wait().await.unwrap();
         second.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deduplicated_workspace_link_returns_each_requesters_instance_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_project = temp.path().join("member-a");
+        let second_project = temp.path().join("member-b");
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(&first_project).unwrap();
+        std::fs::create_dir_all(&second_project).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("package.json"),
+            br#"{"name":"ms","version":"2.1.3"}"#,
+        )
+        .unwrap();
+        let store = Arc::new(lpm_store::v2::Store::at(temp.path().join("store")));
+        let sri = lpm_store::compute_sri_hash(b"ms-2.1.3-tarball");
+        store.populate_object_from_local_source(&source, &sri).unwrap();
+
+        let first_id =
+            lpm_common::PackageInstanceId::derive("ms", "2.1.3", "registry+npm", "member-a/debug@3");
+        let second_id =
+            lpm_common::PackageInstanceId::derive("ms", "2.1.3", "registry+npm", "member-b/debug@4");
+        assert_ne!(first_id, second_id);
+
+        let mk_target = |instance_id| lpm_linker::v2::V2Target {
+            instance_id,
+            target: Arc::new(lpm_linker::LinkTarget {
+                name: "ms".to_string(),
+                version: "2.1.3".to_string(),
+                store_path: std::path::PathBuf::new(),
+                dependencies: Vec::new(),
+                aliases: HashMap::new(),
+                is_direct: false,
+                root_link_names: None,
+                wrapper_id: None,
+                materialization: lpm_linker::Materialization::CasBacked,
+                peers: Vec::new(),
+                patch_fingerprint: None,
+            }),
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
+            source_sri: sri.clone(),
+            verified_object_integrity: None,
+            fresh_object: None,
+        };
+        let first_target = mk_target(first_id);
+        let second_target = mk_target(second_id);
+        let first_plan = Arc::new(
+            lpm_linker::v2::link_v2_prepare_with_authoritative_peer_context(
+                &first_project,
+                vec![first_target.clone()],
+                &store,
+                lpm_linker::LinkerMode::Isolated,
+            )
+            .unwrap(),
+        );
+        let second_plan = Arc::new(
+            lpm_linker::v2::link_v2_prepare_with_authoritative_peer_context(
+                &second_project,
+                vec![second_target.clone()],
+                &store,
+                lpm_linker::LinkerMode::Isolated,
+            )
+            .unwrap(),
+        );
+        let coordinator = WorkspaceMaterializationCoordinator::new(Vec::new());
+
+        let first = coordinator
+            .materialize_link(first_plan, Arc::new(first_target), Arc::clone(&store))
+            .await
+            .unwrap();
+        let second = coordinator
+            .materialize_link(second_plan, Arc::new(second_target), store)
+            .await
+            .unwrap();
+
+        assert!(first.performed);
+        assert!(!second.performed);
+        assert_eq!(first.value.materialized.instance_id, Some(first_id));
+        assert_eq!(
+            second.value.materialized.instance_id,
+            Some(second_id),
+            "deduplicated link consumer must receive its own PackageInstanceId"
+        );
+        assert_eq!(
+            first.value.materialized.destination,
+            second.value.materialized.destination
+        );
     }
 }
