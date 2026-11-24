@@ -244,6 +244,22 @@ pub fn workspace_manifest_paths_from_open_root(
     Ok(manifests)
 }
 
+/// Return every relative directory traversed when discovering workspace members
+/// under `root_path` (including `""` for the workspace root itself). A change to
+/// any returned directory's metadata invalidates cached member discovery.
+pub fn workspace_discovery_watch_dirs(root_path: &Path) -> Result<Vec<PathBuf>, WorkspaceError> {
+    let root_dir =
+        open_directory_nofollow(root_path).map_err(|error| WorkspaceError::Io(error.to_string()))?;
+    let (root_package, pnpm_workspace) = read_workspace_root_from_open_dir(root_path, &root_dir)?;
+    let globs = workspace_member_globs(&root_package, pnpm_workspace.as_ref());
+    let (inclusions, exclusions) = compile_workspace_globs(root_path, &globs)?;
+    let scan = discover_member_paths_from_open_root(root_path, &root_dir, &inclusions, &exclusions)?;
+    let mut dirs = scan.directory_paths;
+    dirs.sort_unstable();
+    dirs.dedup();
+    Ok(dirs)
+}
+
 pub fn read_publish_projection_from_open_root(
     root_path: &Path,
     root_dir: &cap_std::fs::Dir,

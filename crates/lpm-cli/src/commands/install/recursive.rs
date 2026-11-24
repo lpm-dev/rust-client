@@ -506,11 +506,14 @@ pub(crate) async fn run_recursive_workspace_install(
 
             match first_error {
                 Some(error) => Err(error),
-                None => Ok(outcomes.into_iter().flatten().collect::<Vec<_>>()),
+                None => Ok((
+                    active_workspace,
+                    outcomes.into_iter().flatten().collect::<Vec<_>>(),
+                )),
             }
         };
-        let outcomes = match scheduler.await {
-            Ok(outcomes) => outcomes,
+        let (active_workspace, outcomes) = match scheduler.await {
+            Ok(result) => result,
             Err(error) => {
                 return Err(rollback_workspace_project_state(
                     &workspace_project_state_coordinator,
@@ -535,6 +538,35 @@ pub(crate) async fn run_recursive_workspace_install(
         if lockfile_committed {
             workspace_lockfile::remove_member_lockfiles(&legacy_importers);
         }
+
+        let target_has_scripts: HashMap<&Path, bool> = targets
+            .iter()
+            .map(|target| (target.path.as_path(), target.lifecycle.has_scripts()))
+            .collect();
+        let sync_noop_targets: Vec<sync_noop::WorkspaceSyncNoopTargetInput<'_>> = outcomes
+            .iter()
+            .map(|outcome| sync_noop::WorkspaceSyncNoopTargetInput {
+                name: outcome.name.as_str(),
+                path: outcome.path.as_path(),
+                kind: outcome.kind,
+                has_scripts: target_has_scripts
+                    .get(outcome.path.as_path())
+                    .copied()
+                    .unwrap_or(true),
+                no_dependencies: outcome
+                    .report
+                    .as_ref()
+                    .and_then(|report| report.get("no_dependencies"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            })
+            .collect();
+        sync_noop::write_workspace_sync_noop_state(
+            &active_workspace,
+            &sync_noop_targets,
+            &options,
+            filters.is_empty() && filter_prod.is_empty(),
+        );
 
         if options.emit_summary {
             emit_workspace_install_report(

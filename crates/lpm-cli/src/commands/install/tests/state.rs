@@ -481,6 +481,8 @@ fn the_up_to_date_check_refuses_a_lockfile_whose_roots_miss_the_manifest() {
         no_skills: true,
         min_release_age: None,
         min_release_age_exclude: Vec::new(),
+        linker: None,
+        no_engine_strict: false,
     };
 
     for (root_version, up_to_date) in [("1.0.0", true), ("2.0.0", false)] {
@@ -512,6 +514,8 @@ fn the_up_to_date_check_compares_catalog_dependencies_with_the_lockfiles_catalog
         no_skills: true,
         min_release_age: None,
         min_release_age_exclude: Vec::new(),
+        linker: None,
+        no_engine_strict: false,
     };
     let snapshot = |specifier: &str, version: &str| {
         lpm_lockfile::CatalogSnapshots::from([(
@@ -594,6 +598,8 @@ fn the_up_to_date_check_accepts_a_catalog_override_of_a_transitive_dependency() 
         no_skills: true,
         min_release_age: None,
         min_release_age_exclude: Vec::new(),
+        linker: None,
+        no_engine_strict: false,
     };
     let source = "registry+https://registry.npmjs.org";
     let locked = |name: &str, path: &str| lpm_lockfile::LockedPackage {
@@ -657,6 +663,8 @@ fn the_up_to_date_check_accepts_an_unapplied_catalog_override_of_a_direct_depend
         no_skills: true,
         min_release_age: None,
         min_release_age_exclude: Vec::new(),
+        linker: None,
+        no_engine_strict: false,
     };
     // The override doesn't change what the dependency's range selects, so
     // the lockfile records no snapshot for it.
@@ -689,6 +697,8 @@ fn sync_noop_bails_out_when_global_config_enables_strict_release_age() {
         no_skills: true,
         min_release_age: None,
         min_release_age_exclude: Vec::new(),
+        linker: None,
+        no_engine_strict: false,
     };
     let pkg = r#"{"name":"consumer","dependencies":{"leaf":"^1.0.0"}}"#;
     let project = tempfile::tempdir().unwrap();

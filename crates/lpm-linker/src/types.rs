@@ -50,7 +50,7 @@ pub struct FinalizeResult {
 /// or `--linker isolated`. Use it when you want strict
 /// no-phantom-deps semantics — the layout that catches "I forgot
 /// to declare this dep" bugs early.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LinkerMode {
     /// pnpm-style isolated layout. Strict, no phantom deps.
     /// Available via explicit `--linker isolated` /
