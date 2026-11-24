@@ -43,7 +43,7 @@ pub(super) fn check(project_dir: &Path, package: &PackageJson) -> Result<(), Lpm
     for import in &imports {
         if let Some(name) = import.package_name.as_deref()
             && !declared.contains(name)
-            && !builtins.contains(name)
+            && !crate::intelligence::is_node_builtin_specifier(&import.specifier, &builtins)
         {
             missing.entry(name).or_insert(import);
         }

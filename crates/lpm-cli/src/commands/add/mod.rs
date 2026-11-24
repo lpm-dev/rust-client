@@ -31,8 +31,9 @@ use paths::{
     validate_extracted_paths, validate_source_delivery_namespace,
 };
 use project::{
-    alias_from_prompt, detect_buyer_alias, detect_default_install_dir, detect_framework,
-    detect_package_manager, planned_target_root, resolve_target_dir, validate_target_dir,
+    RELATIVE_IMPORTS_ANSWER, alias_from_prompt, detect_buyer_alias, detect_default_install_dir,
+    detect_framework, detect_package_manager, planned_target_root, resolve_target_dir,
+    validate_target_dir,
 };
 use serde::ser::SerializeSeq;
 use serde::{Serialize, Serializer};
@@ -102,7 +103,9 @@ fn classify_external_imports(specifiers: &HashSet<String>) -> (Vec<String>, Vec<
     let mut packages = BTreeSet::new();
     let mut unresolved = BTreeSet::new();
     for specifier in specifiers {
-        if crate::intelligence::is_node_builtin_specifier(specifier, &builtins) {
+        if specifier.is_empty()
+            || crate::intelligence::is_node_builtin_specifier(specifier, &builtins)
+        {
             continue;
         }
         if let Some(name) = crate::intelligence::extract_package_name(specifier) {
@@ -117,11 +120,20 @@ fn classify_external_imports(specifiers: &HashSet<String>) -> (Vec<String>, Vec<
     )
 }
 
+/// A protocol-relative URL, or a specifier that starts with a URI scheme such
+/// as `https:`, `data:` or `bun:`. `#internal:feature` names a subpath import.
 fn is_url_or_scheme(specifier: &str) -> bool {
-    specifier.starts_with("//")
-        || specifier
-            .find(':')
-            .is_some_and(|colon| colon < specifier.find('/').unwrap_or(usize::MAX))
+    if specifier.starts_with("//") {
+        return true;
+    }
+    let Some((scheme, _)) = specifier.split_once(':') else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 fn ensure_unique_destinations(files: &[(String, String)]) -> Result<(), LpmError> {
@@ -1015,14 +1027,21 @@ async fn run_locked(
                 String::new()
             };
 
-            let input: String = cliclack::input(
-                "Import alias for this directory? (leave empty for relative imports)",
-            )
-            .default_input(&default_alias)
-            .placeholder(&default_alias)
-            .required(false)
-            .interact()
-            .map_err(prompt_err)?;
+            let question = match detected.as_deref() {
+                Some(alias) => format!(
+                    "Import alias for this directory? (Enter keeps {}, {RELATIVE_IMPORTS_ANSWER} for relative imports)",
+                    lpm_common::sanitize_terminal_inline(alias)
+                ),
+                None => {
+                    "Import alias for this directory? (leave empty for relative imports)".into()
+                }
+            };
+            let input: String = cliclack::input(question)
+                .default_input(&default_alias)
+                .placeholder(&default_alias)
+                .required(false)
+                .interact()
+                .map_err(prompt_err)?;
 
             alias_from_prompt(&input, detected.as_deref())
         } else {
@@ -1250,12 +1269,10 @@ async fn run_locked(
     for ((src_rel, dest_rel), dest_path) in files.iter().zip(final_dest_paths.iter()) {
         let src_path = temp_dir.path().join(src_rel);
 
-        let content = source_content.prepare(
-            &src_path,
-            src_rel,
-            dest_rel,
-            &mut collected_external_imports,
-        )?;
+        // A file kept because of a conflict leaves its imports out of the
+        // notice: they never reach the project.
+        let mut file_imports = HashSet::new();
+        let content = source_content.prepare(&src_path, src_rel, dest_rel, &mut file_imports)?;
         let final_content = content.as_deref();
 
         let dest_existed = dest_path.exists();
@@ -1288,6 +1305,7 @@ async fn run_locked(
                 let mut tracked = previous.clone();
                 tracked.source = Some(PathBuf::from(src_rel));
                 tracked_files.push((manifest_path, tracked));
+                collected_external_imports.extend(file_imports);
                 skipped += 1;
                 file_actions.push((src_rel.as_str(), dest_rel.as_str(), "skip"));
                 continue;
@@ -1299,7 +1317,10 @@ async fn run_locked(
             let action =
                 handle_file_conflict(&src_path, dest_path, final_content, force, yes, json_output)?;
             match action {
-                ConflictAction::Skip => {
+                ConflictAction::Unchanged | ConflictAction::Skip => {
+                    if matches!(action, ConflictAction::Unchanged) {
+                        collected_external_imports.extend(file_imports);
+                    }
                     skipped += 1;
                     if let Some(previous) = previous_package_record
                         .as_ref()
@@ -1408,6 +1429,7 @@ async fn run_locked(
         };
         tx.restore_only_if_current(dest_path)
             .map_err(LpmError::Io)?;
+        collected_external_imports.extend(file_imports);
         copied += 1;
         tracked_files.push((
             manifest_path,
@@ -1560,15 +1582,17 @@ async fn run_locked(
         };
         if !external_imports.is_empty() {
             output::info(&format!(
-                "Source uses external imports: {}\n  Make sure these are in your project's dependencies.",
+                "Source uses external imports: {}",
                 terminal_list(&external_imports),
             ));
+            output::info("Make sure these are in your project's dependencies.");
         }
         if !unresolved_imports.is_empty() {
             output::info(&format!(
-                "Source uses imports that name no package: {}\n  Make sure these resolve in your project.",
+                "Source uses imports that name no package: {}",
                 terminal_list(&unresolved_imports),
             ));
+            output::info("Make sure these resolve in your project.");
         }
     }
 

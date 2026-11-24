@@ -433,7 +433,7 @@ impl ImportUsage {
             if !seen.insert((package_name.clone(), import.file.clone(), import.line)) {
                 continue;
             }
-            if node_builtins.contains(package_name.as_str()) {
+            if crate::intelligence::is_node_builtin_specifier(&import.specifier, &node_builtins) {
                 uses_node_builtin = true;
             } else {
                 used_packages.insert(package_name.clone());

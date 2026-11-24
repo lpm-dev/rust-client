@@ -1091,6 +1091,29 @@ async fn add_writes_imports_through_a_consumer_alias_without_a_slash() {
         .success();
     let button = explicit.read_file("src/components/Button.ts");
     assert!(button.contains("from '#util'"), "{button}");
+}
+
+#[tokio::test]
+async fn add_with_an_empty_alias_writes_relative_imports() {
+    let mock = MockRegistry::start().await;
+    let package = "empty-consumer-alias-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "importAlias": "@/",
+            "files": [{"src": "Button.ts"}, {"src": "util.ts"}]
+        }),
+        &[
+            (
+                "Button.ts",
+                b"import { util } from '@/util';\nexport { util };\n",
+            ),
+            ("util.ts", b"export const util = true;\n"),
+        ],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
 
     let disabled = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
     disabled.write_file(
@@ -2162,13 +2185,18 @@ import { stat } from "fs/promises";
 import http2 from "http2";
 import inspector from "inspector";
 import punycode from "punycode/";
+import polyfill from "process/browser";
+import http2Polyfill from "http2/browser";
+import self from ".";
+import test from "bun:test";
 import internal from "#internal";
+import feature from "#internal:feature";
 import { cn } from "@/lib/utils";
 import cdn from "//cdn.example.com/lib.js";
 import local from "/abs/thing.js";
 import preact from "https://esm.sh/preact";
 import { helper } from "./utils.js";
-export { useState, jsx, createRoot, Slot, readFile, path, stat, http2, inspector, punycode, internal, cn, cdn, local, preact, helper };
+export { useState, jsx, createRoot, Slot, readFile, path, stat, http2, inspector, punycode, polyfill, http2Polyfill, self, test, internal, feature, cn, cdn, local, preact, helper };
 "##;
     mock.with_package(
         pkg,
@@ -2200,16 +2228,14 @@ export { useState, jsx, createRoot, Slot, readFile, path, stat, http2, inspector
         .expect("spawn lpm add");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "stderr:\n{stderr}");
-    for line in [
-        "Source uses external imports: @radix-ui/react-slot, punycode, react, react-dom",
-        "Source uses imports that name no package: #internal, /abs/thing.js, @/lib/utils",
+    let lines: Vec<&str> = stderr.lines().map(str::trim).collect();
+    for expected in [
+        "Source uses external imports: @radix-ui/react-slot, http2, process, punycode, react, react-dom",
+        "Source uses imports that name no package: #internal, #internal:feature, /abs/thing.js, @/lib/utils",
     ] {
-        let at = stderr
-            .find(line)
-            .unwrap_or_else(|| panic!("{line}\nstderr:\n{stderr}"));
         assert!(
-            !stderr[at + line.len()..].starts_with(','),
-            "extra entries after {line}\nstderr:\n{stderr}"
+            lines.iter().any(|line| line.ends_with(expected)),
+            "{expected}\nstderr:\n{stderr}"
         );
     }
 
@@ -2227,12 +2253,75 @@ export { useState, jsx, createRoot, Slot, readFile, path, stat, http2, inspector
     let body: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(
         body["external_imports"],
-        json!(["@radix-ui/react-slot", "punycode", "react", "react-dom"])
+        json!([
+            "@radix-ui/react-slot",
+            "http2",
+            "process",
+            "punycode",
+            "react",
+            "react-dom"
+        ])
     );
     assert_eq!(
         body["unresolved_imports"],
-        json!(["#internal", "/abs/thing.js", "@/lib/utils"])
+        json!([
+            "#internal",
+            "#internal:feature",
+            "/abs/thing.js",
+            "@/lib/utils"
+        ])
     );
+}
+
+#[tokio::test]
+async fn add_leaves_imports_of_a_file_it_does_not_write_out_of_the_lists() {
+    let pkg = "add-npm-import-notice-conflict";
+    let mock = MockRegistry::start().await;
+    mock.with_package(
+        pkg,
+        "1.0.0",
+        &make_tarball_with_files(
+            pkg,
+            "1.0.0",
+            &[
+                ("index.js", b"import _ from \"lodash\";\nimport { h } from \"#hidden\";\nexport { _, h };\n"),
+                ("utils.js", b"import React from \"react\";\nexport { React };\n"),
+            ],
+        ),
+    )
+    .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{}}"#);
+    project.write_file("src/copied/index.js", "export const mine = true;\n");
+    project.write_file(
+        "src/copied/utils.js",
+        "import React from \"react\";\nexport { React };\n",
+    );
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            pkg,
+            "--yes",
+            "--path",
+            "src/copied",
+            "--no-install-deps",
+            "--no-skills",
+            "--json",
+        ])
+        .output()
+        .expect("spawn lpm add --json");
+    assert!(
+        out.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        project.read_file("src/copied/index.js"),
+        "export const mine = true;\n"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(body["external_imports"], json!(["react"]));
+    assert_eq!(body["unresolved_imports"], json!([]));
 }
 
 // ─── NPM simple-path source delivery (full pipeline) ────────────────────

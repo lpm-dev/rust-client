@@ -6,6 +6,8 @@ use std::path::Path;
 
 /// Result of handling a file conflict.
 pub(super) enum ConflictAction {
+    /// The destination already holds the incoming content.
+    Unchanged,
     Skip,
     Overwrite,
 }
@@ -100,7 +102,7 @@ pub(super) fn handle_file_conflict(
     }
 
     if destination_matches_incoming(source_path, target_path, new_content)? {
-        return Ok(ConflictAction::Skip);
+        return Ok(ConflictAction::Unchanged);
     }
 
     if yes || json_output || !std::io::IsTerminal::is_terminal(&std::io::stdin()) {

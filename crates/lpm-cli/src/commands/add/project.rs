@@ -129,17 +129,26 @@ pub(super) fn detect_buyer_alias(project_dir: &Path, target_dir: &Path) -> Optio
             .unwrap_or(".");
         // TypeScript tries a key's targets in order, so only the first can
         // stand behind an import LPM CLI writes.
-        let mappings: Vec<(&str, &str)> = paths
+        let entries: Vec<(&str, Option<&str>)> = paths
             .iter()
-            .filter_map(|(key, targets)| {
-                // A catch-all `*` key maps bare specifiers, so it names no alias.
-                let key_prefix = key.strip_suffix('*').filter(|prefix| !prefix.is_empty())?;
-                let target_prefix = targets.as_array()?.first()?.as_str()?.strip_suffix('*')?;
-                Some((key_prefix, target_prefix))
+            .map(|(key, targets)| {
+                let first = targets
+                    .as_array()
+                    .and_then(|targets| targets.first())
+                    .and_then(serde_json::Value::as_str);
+                (key.as_str(), first)
             })
             .collect();
         let mut best: Option<(usize, String)> = None;
-        for &(key_prefix, target_prefix) in &mappings {
+        for &(key, first_target) in &entries {
+            // A catch-all `*` key maps bare specifiers, so it names no alias.
+            let Some(key_prefix) = suffix_wildcard_prefix(key).filter(|prefix| !prefix.is_empty())
+            else {
+                continue;
+            };
+            let Some(target_prefix) = first_target.and_then(suffix_wildcard_prefix) else {
+                continue;
+            };
             let Some(mapped_base) = normalize_relative_mapping(base_url, target_prefix) else {
                 continue;
             };
@@ -165,7 +174,7 @@ pub(super) fn detect_buyer_alias(project_dir: &Path, target_dir: &Path) -> Optio
             if separator {
                 alias.push('/');
             }
-            if is_shadowed(&alias, key_prefix, target_prefix, &mappings, base_url) {
+            if is_shadowed(&alias, key, key_prefix, target_prefix, &entries, base_url) {
                 continue;
             }
             let depth = mapped_base.components().count();
@@ -183,36 +192,67 @@ pub(super) fn detect_buyer_alias(project_dir: &Path, target_dir: &Path) -> Optio
     None
 }
 
-fn maps_a_directory(target_prefix: &str) -> bool {
-    matches!(target_prefix, "" | "." | "..") || target_prefix.ends_with('/')
+/// The text before a `paths` pattern's only `*`, when the `*` ends it.
+fn suffix_wildcard_prefix(pattern: &str) -> Option<&str> {
+    pattern
+        .strip_suffix('*')
+        .filter(|prefix| !prefix.contains('*'))
 }
 
-/// Whether a longer `paths` key would claim some of the imports `alias`
-/// produces and send them somewhere other than `target_prefix` does.
+/// TypeScript pastes the `*` text straight after the target, so only an empty
+/// target or one that ends in `/` maps a folder. `.*` maps `.src/x`, not
+/// `./src/x`.
+fn maps_a_directory(target_prefix: &str) -> bool {
+    target_prefix.is_empty() || target_prefix.ends_with('/')
+}
+
+/// Whether another `paths` key that TypeScript prefers would claim some of the
+/// imports `alias` produces and send them somewhere other than `key` does. An
+/// exact key, a key with text after its `*`, or a key whose first target is a
+/// fixed file always counts, since LPM CLI can't follow it.
 fn is_shadowed(
     alias: &str,
+    key: &str,
     key_prefix: &str,
     target_prefix: &str,
-    mappings: &[(&str, &str)],
+    entries: &[(&str, Option<&str>)],
     base_url: &str,
 ) -> bool {
-    mappings.iter().any(|&(other_key, other_target)| {
-        other_key.len() > key_prefix.len()
-            && other_key.starts_with(key_prefix)
-            && (alias.starts_with(other_key) || other_key.starts_with(alias))
-            && normalize_relative_mapping(
-                base_url,
-                &format!("{target_prefix}{}", &other_key[key_prefix.len()..]),
-            ) != normalize_relative_mapping(base_url, other_target)
+    entries.iter().any(|&(other_key, other_target)| {
+        let literal = other_key.split('*').next().unwrap_or(other_key);
+        if other_key == key
+            || literal.len() <= key_prefix.len()
+            || !literal.starts_with(key_prefix)
+            || !(alias.starts_with(literal) || literal.starts_with(alias))
+        {
+            return false;
+        }
+        let expected = format!("{target_prefix}{}", &literal[key_prefix.len()..]);
+        let consistent = suffix_wildcard_prefix(other_key).is_some()
+            && other_target
+                .and_then(suffix_wildcard_prefix)
+                .is_some_and(|other_target| {
+                    maps_a_directory(&expected) == maps_a_directory(other_target)
+                        && normalize_relative_mapping(base_url, &expected)
+                            == normalize_relative_mapping(base_url, other_target)
+                });
+        !consistent
     })
 }
 
+/// The prompt answer that asks for relative imports. An empty answer takes the
+/// prompt's default, which is the detected alias when there is one.
+pub(super) const RELATIVE_IMPORTS_ANSWER: &str = "-";
+
 /// The consumer alias a prompt answer gives. Accepting the detected alias
 /// keeps it exactly, since it already follows the project's `paths`. Typed
-/// input follows the `importAlias` boundary rule, and an empty answer means
-/// relative imports.
+/// input follows the `importAlias` boundary rule, and an empty answer or
+/// [`RELATIVE_IMPORTS_ANSWER`] means relative imports.
 pub(super) fn alias_from_prompt(answer: &str, detected: Option<&str>) -> Option<String> {
     let answer = answer.trim();
+    if answer == RELATIVE_IMPORTS_ANSWER {
+        return None;
+    }
     if detected == Some(answer) {
         return Some(answer.to_owned());
     }
@@ -546,6 +586,63 @@ mod tests {
         );
         assert_eq!(alias_from_prompt("#", None).as_deref(), Some("#"));
         assert_eq!(alias_from_prompt("", Some("@/")), None);
+        assert_eq!(alias_from_prompt("-", Some("@/")), None);
+    }
+
+    #[test]
+    fn buyer_alias_puts_a_slash_after_a_dot_target() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("tsconfig.json"),
+            r##"{"compilerOptions":{"paths":{"#*":[".*"]}}}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_buyer_alias(project.path(), &project.path().join("src/components")).as_deref(),
+            Some("#/src/components/")
+        );
+
+        std::fs::write(
+            project.path().join("tsconfig.json"),
+            r##"{"compilerOptions":{"baseUrl":"./src","paths":{"#*":["..*"]}}}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_buyer_alias(project.path(), &project.path().join("lib")).as_deref(),
+            Some("#/lib/")
+        );
+    }
+
+    #[test]
+    fn buyer_alias_skips_an_alias_a_longer_key_maps_without_its_slash() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{"@/*":["./src/*"],"@/components/*":["./src/components*"]}}}"#,
+        )
+        .unwrap();
+        assert!(detect_buyer_alias(project.path(), &project.path().join("src")).is_none());
+    }
+
+    #[test]
+    fn buyer_alias_skips_an_alias_an_exact_or_inner_wildcard_key_overlaps() {
+        let project = tempfile::tempdir().unwrap();
+        for paths in [
+            r#"{"@/*":["./src/*"],"@/components/util":["./other.ts"]}"#,
+            r#"{"@/*":["./src/*"],"@/components/*.js":["./other/*.js"]}"#,
+            r#"{"@/*":["./src/*"],"@/components/*":["./src/index.ts"]}"#,
+        ] {
+            std::fs::write(
+                project.path().join("tsconfig.json"),
+                format!(r#"{{"compilerOptions":{{"paths":{paths}}}}}"#),
+            )
+            .unwrap();
+            assert!(
+                detect_buyer_alias(project.path(), &project.path().join("src/components"))
+                    .is_none(),
+                "{paths}"
+            );
+        }
     }
 
     #[test]

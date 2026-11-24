@@ -18,7 +18,11 @@ enum SpecifierKind {
 }
 
 fn classify_specifier(specifier: &str, author_alias: Option<&str>) -> SpecifierKind {
-    if specifier.starts_with("./") || specifier.starts_with("../") {
+    if specifier.starts_with("./")
+        || specifier.starts_with("../")
+        || specifier == "."
+        || specifier == ".."
+    {
         return SpecifierKind::Relative;
     }
     // A protocol-relative URL, never a path into the package, even under `/`.
@@ -1250,7 +1254,7 @@ import { c } from "react";
             HashSet::from(["shared/util.ts".to_string(), "shared/extra.ts".to_string()]);
 
         let rewritten = rewrite_imports(
-            "import a from \"@/util\";\nimport b from \"@/shared/extra\";\nimport c from \"@/missing\";",
+            "import a from \"@/util\";\nimport b from \"@/shared/extra\";\nimport c from \"@/missing\";\nimport d from \"./util\";\nimport e from \"./shared/extra\";",
             "index.ts",
             "index.ts",
             Some("@/"),
@@ -1261,15 +1265,25 @@ import { c } from "react";
         )
         .expect("aliased imports must be rewritten");
 
-        assert!(
-            rewritten.contains(r#"from "@uishared/util""#),
-            "{rewritten}"
+        for expected in [
+            r#"import a from "@uishared/util""#,
+            r#"import b from "@uishared/extra""#,
+            r#"import c from "@uimissing""#,
+            r#"import d from "@uishared/util""#,
+            r#"import e from "@uishared/extra""#,
+        ] {
+            assert!(rewritten.contains(expected), "{expected}\n{rewritten}");
+        }
+    }
+
+    #[test]
+    fn dot_and_dot_dot_specifiers_are_relative() {
+        assert_eq!(classify_specifier(".", Some("@/")), SpecifierKind::Relative);
+        assert_eq!(
+            classify_specifier("..", Some("@/")),
+            SpecifierKind::Relative
         );
-        assert!(
-            rewritten.contains(r#"from "@uishared/extra""#),
-            "{rewritten}"
-        );
-        assert!(rewritten.contains(r#"from "@uimissing""#), "{rewritten}");
+        assert_eq!(classify_specifier(".", None), SpecifierKind::Relative);
     }
 
     #[test]
