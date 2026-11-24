@@ -127,7 +127,7 @@ pub struct VersionMetadata {
     /// and `bundledDependencies` spellings. When both occur, the canonical
     /// `bundleDependencies` field takes precedence. Consumers skip these names —
     /// they're already provided by the parent's tarball.
-    #[serde(rename = "bundleDependencies", skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "bundleDependencies")]
     pub bundle_dependencies: Vec<String>,
 
     #[serde(default, rename = "optionalDependencies")]
