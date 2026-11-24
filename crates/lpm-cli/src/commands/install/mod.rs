@@ -8,7 +8,6 @@ use lpm_common::color::Painted;
 use lpm_linker::LinkTarget;
 use lpm_registry::{
     GateDecision, ManagedInstallAccounting, RegistryClient, RouteTable, UpstreamRoute,
-    evaluate_cached_url,
 };
 use lpm_resolver::{
     CachedPackageInfo, CanonicalKey, CompiledPeerRules, OverrideHit, OverrideSet,
@@ -755,6 +754,7 @@ async fn run_with_options_under_store_lock(
         no_skills,
         restore_managed_skills,
         omit_policy,
+        strict_integrity,
         strict_peer_dependencies,
         linker_mode,
         object_integrity_policy,

@@ -194,6 +194,7 @@ async fn dispatcher_body_lifetime(abort: bool, complete: bool) {
         None,
         Arc::new(FetchCoordinator::default()),
         HashMap::from([("test-tarball-pkg".to_owned(), "1.0.0".to_owned())]),
+        lpm_resolver::OverrideSet::empty(),
         lpm_resolver::ResolverPolicy::default(),
         Arc::new(crate::engine_check::prepare_dependency_policy(root.path(), true, true).unwrap()),
         None,
@@ -382,6 +383,7 @@ fn task_probe_dispatcher(
         Some(Arc::new(Semaphore::new(0))),
         coordinator,
         dependencies,
+        lpm_resolver::OverrideSet::empty(),
         lpm_resolver::ResolverPolicy::default(),
         Arc::new(crate::engine_check::prepare_dependency_policy(root, true, true).unwrap()),
         None,
@@ -521,6 +523,7 @@ async fn assert_online_phase_cancellation(pubgrub_opt_out: bool) {
     let home = tempfile::tempdir().unwrap();
     let _env = crate::test_env::ScopedEnv::set([
         ("LPM_GREEDY_FUSION", "1".into()),
+        ("LPM_FETCH_OVERLAP", "0".into()),
         ("LPM_HOME", home.path().into()),
     ]);
     let body = build_test_tarball();
@@ -632,7 +635,7 @@ async fn assert_online_phase_cancellation(pubgrub_opt_out: bool) {
         npm_firewall_chunk_size: 64,
         locked_integrities: None,
         tarball_prefetch_held: false,
-        force: true,
+        force: false,
         offline: false,
         omit_policy: Default::default(),
         root_optional_dependency_names: &no_names,
@@ -670,5 +673,151 @@ async fn assert_online_phase_cancellation(pubgrub_opt_out: bool) {
     assert!(
         cancelled,
         "phase cancellation before tail handoff must stop speculative work"
+    );
+}
+
+#[tokio::test]
+async fn speculation_dispatcher_skips_overridden_packages_and_reuses_root_selected_version() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let body = build_test_tarball();
+    let integrity = lpm_common::integrity::Integrity::from_bytes(
+        lpm_common::integrity::HashAlgorithm::Sha512,
+        &body,
+    )
+    .to_string();
+
+    Mock::given(method("GET"))
+        .and(path("/overridden-1.0.0.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/pinned-root-2.0.0.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/pinned-root-1.0.0.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    let store_v2 = Arc::new(lpm_store::v2::Store::at(root.path().join("objects")));
+    let downloads = Arc::new(Semaphore::new(4));
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let overrides = lpm_resolver::OverrideSet::parse(
+        &HashMap::new(),
+        &HashMap::from([("overridden".to_owned(), "1.0.0".to_owned())]),
+        &HashMap::new(),
+    )
+    .unwrap();
+    let (dispatcher, counters) = spawn_speculation_dispatcher(
+        rx,
+        Arc::new(RegistryClient::new().with_npm_registry_url(server.uri())),
+        RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        PackageStore::at(root.path()),
+        downloads,
+        None,
+        Arc::new(FetchCoordinator::default()),
+        HashMap::from([
+            ("overridden".to_owned(), "^1.0.0".to_owned()),
+            ("pinned-root".to_owned(), "^1.0.0".to_owned()),
+            ("consumer".to_owned(), "^1.0.0".to_owned()),
+        ]),
+        overrides,
+        lpm_resolver::ResolverPolicy::default(),
+        Arc::new(crate::engine_check::prepare_dependency_policy(root.path(), true, true).unwrap()),
+        None,
+        SpeculativeKeyTracker::default(),
+        Some(store_v2),
+        None,
+        ManagedInstallAccounting,
+    );
+
+    tx.send((
+        "overridden".to_owned(),
+        SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
+            "name": "overridden",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "overridden",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": format!("{}/overridden-1.0.0.tgz", server.uri()),
+                        "integrity": integrity
+                    }
+                }
+            }
+        }))),
+    ))
+    .await
+    .unwrap();
+
+    // Consumer arrives before pinned-root and declares a transitive dep on pinned-root;
+    // speculation must wait for pinned-root's root selection (1.0.0) instead of fetching latest (2.0.0).
+    tx.send((
+        "consumer".to_owned(),
+        SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
+            "name": "consumer",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "consumer",
+                    "version": "1.0.0",
+                    "dependencies": { "pinned-root": ">=1.0.0" }
+                }
+            }
+        }))),
+    ))
+    .await
+    .unwrap();
+
+    tx.send((
+        "pinned-root".to_owned(),
+        SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
+            "name": "pinned-root",
+            "dist-tags": { "latest": "2.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "pinned-root",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": format!("{}/pinned-root-1.0.0.tgz", server.uri()),
+                        "integrity": integrity
+                    }
+                },
+                "2.0.0": {
+                    "name": "pinned-root",
+                    "version": "2.0.0",
+                    "dist": {
+                        "tarball": format!("{}/pinned-root-2.0.0.tgz", server.uri()),
+                        "integrity": integrity
+                    }
+                }
+            }
+        }))),
+    ))
+    .await
+    .unwrap();
+
+    drop(tx);
+    dispatcher.await.unwrap();
+    assert_eq!(
+        counters
+            .completed
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        counters.failed.load(std::sync::atomic::Ordering::Relaxed),
+        0
     );
 }

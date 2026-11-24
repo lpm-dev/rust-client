@@ -280,6 +280,7 @@ pub(super) struct InstallFreshnessInput<'a> {
     pub(super) no_skills: bool,
     pub(super) restore_managed_skills: bool,
     pub(super) omit_policy: InstallOmitPolicy,
+    pub(super) strict_integrity: bool,
     pub(super) strict_peer_dependencies: bool,
     pub(super) linker_mode: lpm_linker::LinkerMode,
     pub(super) object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
@@ -416,7 +417,7 @@ pub(super) async fn run_install_freshness_phase(
                             && lockfile_deps.is_empty()
                             && workspace_lockfile::exists(input.lockfile_path)
                         {
-                            return Some(Vec::new());
+                            return Some((Vec::new(), None));
                         }
                         let route_table = route_table.as_ref()?;
                         // A plain install outside `--recursive` has no active
@@ -470,21 +471,35 @@ pub(super) async fn run_install_freshness_phase(
                             if expected.as_deref().map(AsRef::as_ref) == locked
                                 && keeps_only_recordable_urls
                             {
-                                Some(fast.packages)
+                                Some((fast.packages, Some(fast.lockfile)))
                             } else {
                                 None
                             }
                         })
                     });
-            if let Some(mut packages) = fast {
+            if let Some((mut packages, fast_lockfile)) = fast {
+                let ambient_peer_installs: &[String] = fast_lockfile
+                    .as_deref()
+                    .map_or(&[], |lf| lf.ambient_peer_installs.as_slice());
                 if input.omit_policy.dev {
                     filter_dev_packages(&mut packages, input.production_dependency_names);
                 }
                 if input.omit_policy.optional {
-                    filter_optional_packages(&mut packages, input.root_optional_dependency_names);
+                    filter_optional_packages_for_install(
+                        &mut packages,
+                        input.root_optional_dependency_names,
+                        ambient_peer_installs,
+                    );
                 }
-                filter_platform_packages(&mut packages)?;
-                filter_dependency_engine_packages(&mut packages, input.dependency_engine_policy)?;
+                if input.strict_integrity {
+                    enforce_registry_integrity_policy(&packages, true, input.json_output)?;
+                }
+                filter_platform_packages_for_install(&mut packages, ambient_peer_installs)?;
+                filter_dependency_engine_packages_for_install(
+                    &mut packages,
+                    input.dependency_engine_policy,
+                    ambient_peer_installs,
+                )?;
                 let skills_ready = input.no_skills
                     || selected_package_skills(&packages)?
                         .iter()

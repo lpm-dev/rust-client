@@ -1793,12 +1793,42 @@ fn extend_covered_ranges_from_metadata(
     package_specs: &mut Vec<(String, String)>,
     metadata: &lpm_registry::PackageMetadata,
 ) {
+    let mut bundled: AHashSet<&str> = AHashSet::new();
     for version in metadata.versions.values() {
+        let bundle_slice = version.bundle_dependencies.as_slice();
+        if bundle_slice.is_empty() {
+            for (name, range) in &version.dependencies {
+                push_covered_range(package_specs, name, range);
+            }
+            for (name, range) in &version.optional_dependencies {
+                push_covered_range(package_specs, name, range);
+            }
+            continue;
+        }
+        if bundle_slice.len() <= 8 {
+            for (name, range) in &version.dependencies {
+                if !bundle_slice.iter().any(|b| b == name) {
+                    push_covered_range(package_specs, name, range);
+                }
+            }
+            for (name, range) in &version.optional_dependencies {
+                if !bundle_slice.iter().any(|b| b == name) {
+                    push_covered_range(package_specs, name, range);
+                }
+            }
+            continue;
+        }
+        bundled.clear();
+        bundled.extend(bundle_slice.iter().map(String::as_str));
         for (name, range) in &version.dependencies {
-            push_covered_range(package_specs, name, range);
+            if !bundled.contains(name.as_str()) {
+                push_covered_range(package_specs, name, range);
+            }
         }
         for (name, range) in &version.optional_dependencies {
-            push_covered_range(package_specs, name, range);
+            if !bundled.contains(name.as_str()) {
+                push_covered_range(package_specs, name, range);
+            }
         }
     }
 }

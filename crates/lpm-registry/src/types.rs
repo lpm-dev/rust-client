@@ -127,12 +127,7 @@ pub struct VersionMetadata {
     /// and `bundledDependencies` spellings. When both occur, the canonical
     /// `bundleDependencies` field takes precedence. Consumers skip these names —
     /// they're already provided by the parent's tarball.
-    #[serde(
-        default,
-        rename = "bundleDependencies",
-        alias = "bundledDependencies",
-        deserialize_with = "deserialize_bundle_dependencies"
-    )]
+    #[serde(rename = "bundleDependencies")]
     pub bundle_dependencies: Vec<String>,
 
     #[serde(default, rename = "optionalDependencies")]
@@ -1647,62 +1642,49 @@ pub struct MarketplaceEarningsResponse {
     pub net_revenue_cents: Option<u64>,
 }
 
-/// Deserializer for `bundleDependencies` / `bundledDependencies`.
+/// Parse npm's `bundleDependencies` / `bundledDependencies` value against the
+/// package's regular `dependencies` names.
 ///
-/// The npm spec accepts two shapes:
-///   - `["foo", "bar"]` — list of canonical names (the canonical form).
-///   - `true` — historical alias meaning "bundle every entry in
-///     `dependencies`" (rare in practice).
-///
-/// We preserve string entries from the list shape. Legacy booleans
-/// collapse to an empty list, including old dirty packuments that
-/// encoded the boolean inside the array (`[true]`).
-fn deserialize_bundle_dependencies<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::{self, Visitor};
-    use std::fmt;
-
-    struct BundleVisitor;
-
-    impl<'de> Visitor<'de> for BundleVisitor {
-        type Value = Vec<String>;
-
-        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("a list of dependency names, a boolean, or null")
+/// npm manifests accept:
+/// - `["foo", "bar"]` — explicit bundled dependency names (non-string entries
+///   in dirty legacy packuments such as `[true]` are ignored)
+/// - `true` — bundle every entry in `dependencies` (not `optionalDependencies`
+///   or `devDependencies`)
+/// - `{"foo": true, ...}` — legacy object form treated as its keys
+/// - `false`, `null`, or other unexpected shapes — empty list (never fails the
+///   whole packument)
+pub fn parse_bundle_dependencies_value<'a>(
+    raw: &serde_json::Value,
+    dependencies: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    match raw {
+        serde_json::Value::Bool(true) => {
+            let mut names: Vec<String> = dependencies.into_iter().map(str::to_owned).collect();
+            names.sort_unstable();
+            names.dedup();
+            names
         }
-
-        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(Vec::new())
-        }
-
-        fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
-            if value {
-                tracing::debug!(
-                    "bundleDependencies: true — collapsing to empty list \
-                     (whole-deps bundling is rare and not yet implemented; \
-                     pre-R4 behavior preserved)"
-                );
-            }
-            Ok(Vec::new())
-        }
-
-        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-        where
-            A: de::SeqAccess<'de>,
-        {
-            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-            while let Some(value) = seq.next_element::<serde_json::Value>()? {
-                if let Some(name) = value.as_str() {
-                    out.push(name.to_string());
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                if let Some(name) = item.as_str() {
+                    out.push(name.to_owned());
                 }
             }
-            Ok(out)
+            out.sort_unstable();
+            out.dedup();
+            out
         }
+        serde_json::Value::Object(map) => {
+            let mut names: Vec<String> = map.keys().cloned().collect();
+            names.sort_unstable();
+            names
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(false)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => Vec::new(),
     }
-
-    deserializer.deserialize_any(BundleVisitor)
 }
 
 fn deserialize_peer_dependencies_meta<'de, D>(
@@ -2727,6 +2709,63 @@ mod tests {
             serde_json::to_value(decoded).unwrap(),
             serde_json::to_value(original).unwrap()
         );
+    }
+
+    #[test]
+    fn bundle_dependencies_boolean_true_expands_regular_dependencies_only() {
+        for field in ["bundleDependencies", "bundledDependencies"] {
+            let document = format!(
+                r#"{{
+                    "name": "pkg",
+                    "version": "1.0.0",
+                    "dependencies": {{"b": "^1.0.0", "a": "^2.0.0"}},
+                    "optionalDependencies": {{"opt": "^1.0.0"}},
+                    "devDependencies": {{"dev": "^1.0.0"}},
+                    "peerDependencies": {{"peer": "^1.0.0"}},
+                    "{field}": true
+                }}"#
+            );
+            let version: VersionMetadata = serde_json::from_str(&document).unwrap();
+            assert_eq!(version.bundle_dependencies, vec!["a", "b"], "{document}");
+            let packument = format!(r#"{{"name":"pkg","versions":{{"1.0.0":{document}}}}}"#);
+            let full: PackageMetadata = serde_json::from_str(&packument).unwrap();
+            assert_eq!(full.versions["1.0.0"].bundle_dependencies, vec!["a", "b"]);
+            let cache: VersionMetadata =
+                rmp_serde::from_slice(&rmp_serde::to_vec_named(&version).unwrap()).unwrap();
+            assert_eq!(cache.bundle_dependencies, vec!["a", "b"]);
+        }
+
+        let canonical_false: VersionMetadata = serde_json::from_str(
+            r#"{
+                "name": "pkg",
+                "version": "1.0.0",
+                "dependencies": {"a": "^1.0.0"},
+                "bundleDependencies": false,
+                "bundledDependencies": true
+            }"#,
+        )
+        .unwrap();
+        assert!(canonical_false.bundle_dependencies.is_empty());
+    }
+
+    #[test]
+    fn bundle_dependencies_object_and_unexpected_shapes_do_not_fail_packument() {
+        let object_form: VersionMetadata = serde_json::from_str(
+            r#"{
+                "name": "pkg",
+                "version": "1.0.0",
+                "bundleDependencies": {"z-pkg": true, "a-pkg": "^1.0.0"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(object_form.bundle_dependencies, vec!["a-pkg", "z-pkg"]);
+
+        for raw in [r#""not-an-array""#, "42", "false", "null"] {
+            let document =
+                format!(r#"{{"name":"pkg","version":"1.0.0","bundleDependencies":{raw}}}"#);
+            let version: VersionMetadata = serde_json::from_str(&document).unwrap();
+            assert!(version.bundle_dependencies.is_empty(), "{document}");
+        }
     }
 
     #[test]

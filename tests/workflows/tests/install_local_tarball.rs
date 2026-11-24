@@ -69,12 +69,37 @@ async fn assert_archive_registry_dependencies(v1: bool) {
             .iter()
             .any(|name| name.starts_with("archive-child@"))
     );
-    assert!(
-        project
-            .path()
-            .join("node_modules/archive-child/package.json")
-            .is_file()
-    );
+    if v1 {
+        assert!(
+            project
+                .path()
+                .join("node_modules/archive-child/package.json")
+                .is_file()
+        );
+    } else {
+        assert!(
+            !project.path().join("node_modules/archive-child").exists(),
+            "v2 default store must not leak an archive's transitive dependency into top-level node_modules"
+        );
+        assert!(
+            !lockfile.root_resolutions.contains_key("archive-child"),
+            "v2 lockfile must not record an archive's transitive dependency as a root resolution"
+        );
+        let output = std::process::Command::new("node")
+            .current_dir(project.path())
+            .args([
+                "-e",
+                "const {createRequire}=require('node:module');const r=createRequire(require.resolve('archive-alias'));if(r('archive-child/package.json').version!=='1.0.0')process.exit(1)",
+            ])
+            .output()
+            .expect("node must resolve archive-child from archive-alias");
+        assert!(
+            output.status.success(),
+            "archive-alias must resolve its transitive dependency archive-child@1.0.0 in v2:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[tokio::test]

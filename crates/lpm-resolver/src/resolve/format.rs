@@ -120,6 +120,9 @@ pub(super) fn format_solution(
                 .map(|dependencies| {
                     dependencies
                         .filter_map(|dependency| {
+                            if dependency.bundled {
+                                return None;
+                            }
                             let local_name = dependency.name;
                             let target_name = dependency.alias.unwrap_or(local_name);
                             let target = ResolverPackage::from_dep_name(target_name);
@@ -485,6 +488,99 @@ mod root_resolution_tests {
                 package: "peer-host".to_string(),
                 version: "1.0.0".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn pubgrub_format_solution_omits_bundled_dependency_edges_even_when_resolved_elsewhere() {
+        let parent_meta: lpm_registry::PackageMetadata =
+            serde_json::from_value(serde_json::json!({
+                "name": "parent-pkg",
+                "versions": {
+                    "1.0.0": {
+                        "name": "parent-pkg",
+                        "version": "1.0.0",
+                        "dependencies": {
+                            "shared-dep": "^1.0.0",
+                            "external-dep": "^1.0.0"
+                        },
+                        "bundleDependencies": ["shared-dep"]
+                    }
+                }
+            }))
+            .expect("parse parent metadata");
+        let shared_meta: lpm_registry::PackageMetadata =
+            serde_json::from_value(serde_json::json!({
+                "name": "shared-dep",
+                "versions": {
+                    "1.0.0": { "name": "shared-dep", "version": "1.0.0" }
+                }
+            }))
+            .expect("parse shared metadata");
+        let external_meta: lpm_registry::PackageMetadata =
+            serde_json::from_value(serde_json::json!({
+                "name": "external-dep",
+                "versions": {
+                    "1.0.0": { "name": "external-dep", "version": "1.0.0" }
+                }
+            }))
+            .expect("parse external metadata");
+
+        let cache = HashMap::from([
+            (
+                CanonicalKey::npm("parent-pkg"),
+                std::sync::Arc::new(crate::provider::parse_metadata_to_cache_info(&parent_meta)),
+            ),
+            (
+                CanonicalKey::npm("shared-dep"),
+                std::sync::Arc::new(crate::provider::parse_metadata_to_cache_info(&shared_meta)),
+            ),
+            (
+                CanonicalKey::npm("external-dep"),
+                std::sync::Arc::new(crate::provider::parse_metadata_to_cache_info(
+                    &external_meta,
+                )),
+            ),
+        ]);
+        let solution: PubGrubSolution = [
+            (
+                ResolverPackage::npm("parent-pkg"),
+                NpmVersion::parse("1.0.0").unwrap(),
+            ),
+            (
+                ResolverPackage::npm("shared-dep"),
+                NpmVersion::parse("1.0.0").unwrap(),
+            ),
+            (
+                ResolverPackage::npm("external-dep"),
+                NpmVersion::parse("1.0.0").unwrap(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let root_deps = RootDependencies::required(HashMap::from([
+            ("parent-pkg".to_string(), "^1.0.0".to_string()),
+            ("shared-dep".to_string(), "^1.0.0".to_string()),
+        ]));
+
+        let (packages, _) =
+            format_solution(solution, &cache, &root_deps, &HashMap::new(), Vec::new())
+                .expect("format solution");
+        let parent = packages
+            .iter()
+            .find(|pkg| pkg.package.canonical_name() == "parent-pkg")
+            .expect("parent-pkg present");
+        assert!(
+            !parent
+                .dependencies
+                .iter()
+                .any(|(name, _)| name == "shared-dep"),
+            "bundled dependency must not be linked to an external shared copy: {:?}",
+            parent.dependencies
+        );
+        assert_eq!(
+            parent.dependencies,
+            vec![("external-dep".to_string(), "1.0.0".to_string())]
         );
     }
 }

@@ -22,8 +22,8 @@ pub use client::{
     ReleaseTimeSuffixHint, ResolutionMetadata, SecondFactorProof, TARBALL_BODY_ATTEMPTS,
     TarballBodyError, TarballBodyRetry, TimedDirectResolution, TimedPackageMetadata,
     TimedPreferredMetadata, TimedPreferredResolution, TimedReleaseTimeMetadata,
-    evaluate_cached_url, is_https_url, is_localhost_url, parse_capped_api_json,
-    reserve_compressed_tarball_spool,
+    evaluate_cached_url, evaluate_cached_url_for_package, is_https_url, is_localhost_url,
+    parse_capped_api_json, reserve_compressed_tarball_spool,
 };
 pub use npmrc::{
     NpmrcConfig, OriginKey, OriginTlsOverrides, RegistryAuth, RegistryKind, RegistryTarget,

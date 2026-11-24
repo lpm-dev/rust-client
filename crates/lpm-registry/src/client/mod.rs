@@ -77,7 +77,8 @@ pub use self::tarball::{
     TarballBodyError, TarballBodyRetry, reserve_compressed_tarball_spool,
 };
 pub use self::url_gate::{
-    GateDecision, evaluate_cached_url, is_http_url, is_https_url, is_localhost_url,
+    GateDecision, evaluate_cached_url, evaluate_cached_url_for_package, is_http_url, is_https_url,
+    is_localhost_url,
 };
 
 use self::auth::{

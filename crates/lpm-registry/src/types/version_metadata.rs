@@ -1,5 +1,169 @@
 use super::*;
 
+#[derive(Debug)]
+enum WireBundleDependencies {
+    All,
+    List(Vec<String>),
+    Empty,
+}
+
+struct WireBundleDependenciesVisitor;
+
+impl<'de> serde::de::Visitor<'de> for WireBundleDependenciesVisitor {
+    type Value = WireBundleDependencies;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a boolean, list, or object of bundled dependency names")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(if value {
+            WireBundleDependencies::All
+        } else {
+            WireBundleDependencies::Empty
+        })
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(WireBundleDependencies::Empty)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(WireBundleDependencies::Empty)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(WireBundleDependencies::Empty)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(WireBundleDependencies::Empty)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(WireBundleDependencies::Empty)
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(WireBundleDependencies::Empty)
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        struct OptionalString(Option<String>);
+
+        impl<'de> serde::Deserialize<'de> for OptionalString {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct ItemVisitor;
+                impl<'de> serde::de::Visitor<'de> for ItemVisitor {
+                    type Value = OptionalString;
+
+                    fn expecting(
+                        &self,
+                        formatter: &mut std::fmt::Formatter<'_>,
+                    ) -> std::fmt::Result {
+                        formatter.write_str("a bundled dependency entry")
+                    }
+
+                    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+                        Ok(OptionalString(Some(v.to_owned())))
+                    }
+
+                    fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+                        Ok(OptionalString(Some(v)))
+                    }
+
+                    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                        Ok(OptionalString(None))
+                    }
+
+                    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                        Ok(OptionalString(None))
+                    }
+
+                    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                        Ok(OptionalString(None))
+                    }
+
+                    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                        Ok(OptionalString(None))
+                    }
+
+                    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                        Ok(OptionalString(None))
+                    }
+
+                    fn visit_none<E>(self) -> Result<Self::Value, E> {
+                        Ok(OptionalString(None))
+                    }
+
+                    fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+                    where
+                        S: serde::de::SeqAccess<'de>,
+                    {
+                        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                        Ok(OptionalString(None))
+                    }
+
+                    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+                    where
+                        M: serde::de::MapAccess<'de>,
+                    {
+                        while map
+                            .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                            .is_some()
+                        {}
+                        Ok(OptionalString(None))
+                    }
+                }
+                deserializer.deserialize_any(ItemVisitor)
+            }
+        }
+
+        let mut names = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+        while let Some(OptionalString(entry)) = seq.next_element::<OptionalString>()? {
+            if let Some(name) = entry {
+                names.push(name);
+            }
+        }
+        names.sort_unstable();
+        names.dedup();
+        Ok(if names.is_empty() {
+            WireBundleDependencies::Empty
+        } else {
+            WireBundleDependencies::List(names)
+        })
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut names = Vec::with_capacity(map.size_hint().unwrap_or(0));
+        while let Some((key, _)) = map.next_entry::<String, serde::de::IgnoredAny>()? {
+            names.push(key);
+        }
+        names.sort_unstable();
+        Ok(if names.is_empty() {
+            WireBundleDependencies::Empty
+        } else {
+            WireBundleDependencies::List(names)
+        })
+    }
+}
+
 #[derive(Deserialize)]
 pub(super) struct VersionMetadataWire<const OMIT_DEV: bool = false> {
     name: String,
@@ -43,7 +207,7 @@ pub(super) struct VersionMetadataWire<const OMIT_DEV: bool = false> {
         rename = "bundleDependencies",
         deserialize_with = "deserialize_present_bundle_dependencies"
     )]
-    bundle_dependencies: Option<serde_json::Value>,
+    bundle_dependencies: Option<WireBundleDependencies>,
 
     #[serde(default, rename = "optionalDependencies")]
     optional_dependencies: HashMap<String, String>,
@@ -108,28 +272,33 @@ pub(super) struct VersionMetadataWire<const OMIT_DEV: bool = false> {
         rename = "bundledDependencies",
         deserialize_with = "deserialize_present_bundle_dependencies"
     )]
-    bundled_dependencies: Option<serde_json::Value>,
+    bundled_dependencies: Option<WireBundleDependencies>,
 }
 
 fn deserialize_present_bundle_dependencies<'de, D>(
     deserializer: D,
-) -> Result<Option<serde_json::Value>, D::Error>
+) -> Result<Option<WireBundleDependencies>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    serde_json::Value::deserialize(deserializer).map(Some)
+    deserializer
+        .deserialize_any(WireBundleDependenciesVisitor)
+        .map(Some)
 }
 
 impl<const OMIT_DEV: bool> TryFrom<VersionMetadataWire<OMIT_DEV>> for VersionMetadata {
     type Error = serde_json::Error;
 
     fn try_from(wire: VersionMetadataWire<OMIT_DEV>) -> Result<Self, Self::Error> {
-        let bundle_dependencies = wire
-            .bundle_dependencies
-            .or(wire.bundled_dependencies)
-            .map(deserialize_bundle_dependencies)
-            .transpose()?
-            .unwrap_or_default();
+        let bundle_dependencies = match wire.bundle_dependencies.or(wire.bundled_dependencies) {
+            Some(WireBundleDependencies::All) => {
+                let mut names: Vec<String> = wire.dependencies.keys().cloned().collect();
+                names.sort_unstable();
+                names
+            }
+            Some(WireBundleDependencies::List(names)) => names,
+            Some(WireBundleDependencies::Empty) | None => Vec::new(),
+        };
         Ok(Self {
             name: wire.name,
             version: wire.version,

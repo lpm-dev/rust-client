@@ -1041,10 +1041,19 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
             .map_err(|error| {
                 LpmError::Registry(format!("GitHub extract task panicked: {error}"))
             })??;
-        let (real_name, real_version, node_engine) = read_pkg_json_name_version(
+        let (
+            ArchiveManifestMetadata {
+                name: real_name,
+                version: real_version,
+                node_engine,
+                platform,
+            },
+            pkg_json,
+        ) = read_archive_manifest_with_json(
             &package_dir,
             &format!("GitHub dependency {}", resolved.locked_source),
         )?;
+        let is_optional = inherited_optional_registry_roots.contains(&local_name);
         if local_name != real_name && !json_output {
             output::warn(&format!(
                 "dep '{}' resolves to package '{}' from GitHub; using the dependency key as the node_modules link name",
@@ -1052,12 +1061,18 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
                 lpm_common::sanitize_terminal_inline(&real_name),
             ));
         }
-        collect_archive_source_dependencies(
+        let platform_compatible = platform
+            .as_ref()
+            .is_none_or(lpm_resolver::is_platform_compatible);
+        collect_archive_source_dependencies_from_value(
             &package_dir,
+            &pkg_json,
             &resolved.locked_source,
             deps,
             &mut archive_source_deps,
-            auto_install_peers,
+            auto_install_peers && (!is_optional || platform_compatible),
+            is_optional && !platform_compatible,
+            &dependency_names_before_expansion,
         )?;
         resolved_git_sources.insert(raw_spec, resolved.locked_source.clone());
         let promoted = promoted_git_root_names.contains(&local_name);
@@ -1082,9 +1097,9 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
             unpacked_size: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
-            platform: None,
+            platform,
             node_engine,
-            optional: false,
+            optional: is_optional,
             tarball_url: Some(resolved.archive_url),
             metadata_checked_for_tarball: false,
             manifest_fingerprint: None,
@@ -1094,6 +1109,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
     // ── Arm 1: — remote tarball URLs ──────────────────────
     for (local_name, url, declared_integrity) in tarball_url_specs {
         let display_url = install_ui::safe_url_origin(&url);
+        let is_optional = inherited_optional_registry_roots.contains(&local_name);
         // () — strict-integrity gate. When set,
         // a tarball-URL dep without a manifest-declared SRI is a
         // hard error rather than trust-on-first-use. Recommended
@@ -1137,17 +1153,54 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         // Step 1+2: download (with optional SRI verify) and extract
         // into the CAS. If the CAS dir already exists for the same
         // computed SRI, store_tarball_at_cas_path's fast path skips
-        // re-extraction.
-        let downloaded = match declared_integrity.as_deref() {
-            Some(expected) => {
-                client
-                    .download_tarball_to_file_with_auth_and_integrity(&url, None, expected)
-                    .await?
+        // re-extraction. For optional remote tarballs, network/extract/manifest
+        // failures warn and skip, but a manifest-declared SRI mismatch always
+        // fails hard so tampering is never silently bypassed.
+        let downloaded = if is_optional {
+            match client.download_tarball_to_file_with_auth(&url, None).await {
+                Ok(downloaded) => {
+                    if let Some(expected) = declared_integrity.as_deref()
+                        && downloaded.sri != expected
+                    {
+                        lpm_extractor::verify_integrity_file(downloaded.file.path(), expected)
+                            .map_err(|error| {
+                                LpmError::Registry(format!(
+                                    "integrity verification failed for optional tarball dep '{local_name}' at {display_url}: {error}"
+                                ))
+                            })?;
+                    }
+                    downloaded
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        dependency = %local_name,
+                        tarball_url = %display_url,
+                        error = %error,
+                        "skipping unavailable optional remote tarball dependency"
+                    );
+                    if !json_output {
+                        output::warn(&format!(
+                            "skipping unavailable optional tarball dependency '{}' ({}): {}",
+                            lpm_common::sanitize_terminal_inline(&local_name),
+                            lpm_common::sanitize_terminal_inline(&display_url),
+                            lpm_common::sanitize_terminal_inline(&error.to_string()),
+                        ));
+                    }
+                    continue;
+                }
             }
-            None => {
-                client
-                    .download_tarball_to_file_with_auth(&url, None)
-                    .await?
+        } else {
+            match declared_integrity.as_deref() {
+                Some(expected) => {
+                    client
+                        .download_tarball_to_file_with_auth_and_integrity(&url, None, expected)
+                        .await?
+                }
+                None => {
+                    client
+                        .download_tarball_to_file_with_auth(&url, None)
+                        .await?
+                }
             }
         };
         if let Some(locked) = locked_integrities {
@@ -1156,14 +1209,59 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         let computed_sri = downloaded.sri.clone();
         let store_sri = computed_sri.clone();
         let store = store.clone();
-        let cas_path = tokio::task::spawn_blocking(move || {
+        let extract_result = tokio::task::spawn_blocking(move || {
             store.store_tarball_at_cas_path_from_file(&store_sri, downloaded.file.path())
         })
         .await
-        .map_err(|error| LpmError::Registry(format!("tarball extract task panicked: {error}")))??;
+        .map_err(|error| LpmError::Registry(format!("tarball extract task panicked: {error}")))?;
+        let cas_path = match extract_result {
+            Ok(cas_path) => cas_path,
+            Err(error) if is_optional => {
+                tracing::warn!(
+                    dependency = %local_name,
+                    tarball_url = %display_url,
+                    error = %error,
+                    "skipping unreadable optional remote tarball dependency"
+                );
+                if !json_output {
+                    output::warn(&format!(
+                        "skipping unreadable optional tarball dependency '{}' ({}): {}",
+                        lpm_common::sanitize_terminal_inline(&local_name),
+                        lpm_common::sanitize_terminal_inline(&display_url),
+                        lpm_common::sanitize_terminal_inline(&error.to_string()),
+                    ));
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
 
-        let (real_name, real_version, node_engine) =
-            read_pkg_json_name_version(&cas_path, &format!("tarball at {display_url}"))?;
+        let ArchiveManifestMetadata {
+            name: real_name,
+            version: real_version,
+            node_engine,
+            platform,
+        } = match read_archive_manifest_metadata(&cas_path, &format!("tarball at {display_url}")) {
+            Ok(metadata) => metadata,
+            Err(error) if is_optional => {
+                tracing::warn!(
+                    dependency = %local_name,
+                    tarball_url = %display_url,
+                    error = %error,
+                    "skipping optional remote tarball dependency with unreadable manifest"
+                );
+                if !json_output {
+                    output::warn(&format!(
+                        "skipping optional tarball dependency '{}' ({}) with unreadable package.json: {}",
+                        lpm_common::sanitize_terminal_inline(&local_name),
+                        lpm_common::sanitize_terminal_inline(&display_url),
+                        lpm_common::sanitize_terminal_inline(&error.to_string()),
+                    ));
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
 
         // Dep-key vs fetched-name policy: warn rather than reject. The manifest dep key
         // controls node_modules layout (via `root_link_names`); the
@@ -1196,9 +1294,9 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
             unpacked_size: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
-            platform: None,
+            platform,
             node_engine,
-            optional: false,
+            optional: is_optional,
             tarball_url: Some(url),
             metadata_checked_for_tarball: false,
             manifest_fingerprint: None,
@@ -1214,6 +1312,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
     // same bytes dedupe. Strict-integrity has no effect here — the
     // content hash IS the integrity, computed every time.
     for (local_name, raw_path) in file_tarball_specs {
+        let is_optional = inherited_optional_registry_roots.contains(&local_name);
         // Reject relative paths that escape the project root via `..`
         // components. The lockfile parser allows the `tarball+file:`
         // shape with `../`, so a tampered manifest could otherwise
@@ -1254,7 +1353,15 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
             store.store_local_tarball_at_cas_path(&content_hash, &data)?
         };
 
-        let (real_name, real_version, node_engine) = read_pkg_json_name_version(
+        let (
+            ArchiveManifestMetadata {
+                name: real_name,
+                version: real_version,
+                node_engine,
+                platform,
+            },
+            pkg_json,
+        ) = read_archive_manifest_with_json(
             &cas_path,
             &format!("local tarball at {}", abs_path.display()),
         )?;
@@ -1278,12 +1385,18 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         // entry remains per-consumer.
         let source = format!("tarball+file:{raw_path}");
 
-        collect_archive_source_dependencies(
+        let platform_compatible = platform
+            .as_ref()
+            .is_none_or(lpm_resolver::is_platform_compatible);
+        collect_archive_source_dependencies_from_value(
             &cas_path,
+            &pkg_json,
             &source,
             deps,
             &mut archive_source_deps,
-            auto_install_peers,
+            auto_install_peers && (!is_optional || platform_compatible),
+            is_optional && !platform_compatible,
+            &dependency_names_before_expansion,
         )?;
 
         install_pkgs.push(InstallPackage {
@@ -1303,9 +1416,9 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
             unpacked_size: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
-            platform: None,
+            platform,
             node_engine,
-            optional: false,
+            optional: is_optional,
             // Local archives retain their file source and have no remote fetch URL.
             tarball_url: None,
             metadata_checked_for_tarball: false,
@@ -1770,11 +1883,44 @@ pub(super) async fn read_local_tarball_bounded(
 /// inline this logic with identical error shapes. `source_label` is
 /// embedded in error messages so the user knows which arm produced
 /// them (`"tarball at https://..."` vs `"local tarball at ..."`).
-pub(super) fn read_pkg_json_name_version(
+#[derive(Debug)]
+pub(super) struct ArchiveManifestMetadata {
+    pub(super) name: String,
+    pub(super) version: String,
+    pub(super) node_engine: Option<String>,
+    pub(super) platform: Option<lpm_resolver::PlatformMeta>,
+}
+
+pub(super) fn read_archive_manifest_metadata(
     cas_path: &Path,
     source_label: &str,
-) -> Result<(String, String, Option<String>), LpmError> {
+) -> Result<ArchiveManifestMetadata, LpmError> {
+    read_archive_manifest_with_json(cas_path, source_label).map(|(meta, _)| meta)
+}
+
+fn read_archive_manifest_with_json(
+    cas_path: &Path,
+    source_label: &str,
+) -> Result<(ArchiveManifestMetadata, serde_json::Value), LpmError> {
     let pkg_json = read_pkg_json(cas_path, source_label)?;
+    let (name, version, node_engine) =
+        parse_archive_pkg_json_name_version(&pkg_json, source_label)?;
+    let platform = package_json_platform(&pkg_json);
+    Ok((
+        ArchiveManifestMetadata {
+            name,
+            version,
+            node_engine,
+            platform,
+        },
+        pkg_json,
+    ))
+}
+
+fn parse_archive_pkg_json_name_version(
+    pkg_json: &serde_json::Value,
+    source_label: &str,
+) -> Result<(String, String, Option<String>), LpmError> {
     let name = pkg_json
         .get("name")
         .and_then(|v| v.as_str())
@@ -1814,8 +1960,34 @@ pub(super) fn read_pkg_json_name_version(
             )),
         },
     )?;
-    let node_engine = package_json_node_engine(&pkg_json);
+    let node_engine = package_json_node_engine(pkg_json);
     Ok((name, version, node_engine))
+}
+
+fn package_json_platform_field(pkg_json: &serde_json::Value, key: &str) -> Vec<String> {
+    let Some(value) = pkg_json.get(key) else {
+        return Vec::new();
+    };
+    let values = match value {
+        serde_json::Value::String(single) => vec![single.clone()],
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_owned))
+            .collect(),
+        _ => Vec::new(),
+    };
+    normalize_local_platform_values(values)
+}
+
+fn package_json_platform(pkg_json: &serde_json::Value) -> Option<lpm_resolver::PlatformMeta> {
+    let os = package_json_platform_field(pkg_json, "os");
+    let cpu = package_json_platform_field(pkg_json, "cpu");
+    let libc = package_json_platform_field(pkg_json, "libc");
+    (!os.is_empty() || !cpu.is_empty() || !libc.is_empty()).then_some(lpm_resolver::PlatformMeta {
+        os,
+        cpu,
+        libc,
+    })
 }
 
 pub(super) fn read_pkg_json_node_engine(
@@ -1918,6 +2090,14 @@ pub(super) fn source_dep_specs_from_value(
     source_dir: &Path,
     pkg_json: &serde_json::Value,
 ) -> Result<Vec<SourceDep>, LpmError> {
+    source_dep_specs_from_value_with_bundled(source_dir, pkg_json, None)
+}
+
+fn source_dep_specs_from_value_with_bundled(
+    source_dir: &Path,
+    pkg_json: &serde_json::Value,
+    bundled_names: Option<&HashSet<&str>>,
+) -> Result<Vec<SourceDep>, LpmError> {
     let dependency_fields = ["dependencies", "peerDependencies", "optionalDependencies"];
     let has_catalog_references = dependency_fields.iter().any(|field| {
         pkg_json
@@ -2001,6 +2181,11 @@ pub(super) fn source_dep_specs_from_value(
             if field == "dependencies" && optional_names.contains(local_name.as_str()) {
                 continue;
             }
+            if field != "peerDependencies"
+                && bundled_names.is_some_and(|names| names.contains(local_name.as_str()))
+            {
+                continue;
+            }
             let Some(original_raw) = raw.as_str() else {
                 continue;
             };
@@ -2042,6 +2227,7 @@ pub(super) fn source_dep_specs_from_value(
     Ok(out)
 }
 
+#[cfg(test)]
 pub(super) fn collect_archive_source_dependencies(
     package_dir: &Path,
     parent_source: &str,
@@ -2049,7 +2235,58 @@ pub(super) fn collect_archive_source_dependencies(
     source_dependencies: &mut HashMap<String, Vec<SourceDep>>,
     auto_install_peers: bool,
 ) -> Result<(), LpmError> {
-    let mut specs = read_source_dep_specs(package_dir)?;
+    let pkg_json = read_pkg_json(
+        package_dir,
+        &format!("archive source at {}", package_dir.display()),
+    )?;
+    let existing_roots: HashSet<String> = resolver_dependencies.keys().cloned().collect();
+    collect_archive_source_dependencies_from_value(
+        package_dir,
+        &pkg_json,
+        parent_source,
+        resolver_dependencies,
+        source_dependencies,
+        auto_install_peers,
+        false,
+        &existing_roots,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_archive_source_dependencies_from_value(
+    package_dir: &Path,
+    pkg_json: &serde_json::Value,
+    parent_source: &str,
+    resolver_dependencies: &mut HashMap<String, String>,
+    source_dependencies: &mut HashMap<String, Vec<SourceDep>>,
+    auto_install_peers: bool,
+    is_optional_foreign: bool,
+    dependency_names_before_expansion: &HashSet<String>,
+) -> Result<(), LpmError> {
+    if is_optional_foreign {
+        // An optional archive incompatible with the current platform will be
+        // skipped on this host; do not promote its dependencies or peers into
+        // the registry resolver graph.
+        return Ok(());
+    }
+    let bundled_list: Vec<String> = pkg_json
+        .get("bundleDependencies")
+        .or_else(|| pkg_json.get("bundledDependencies"))
+        .map(|raw| {
+            let regular_deps = pkg_json
+                .get("dependencies")
+                .and_then(serde_json::Value::as_object)
+                .into_iter()
+                .flat_map(|map| map.keys().map(String::as_str));
+            lpm_registry::parse_bundle_dependencies_value(raw, regular_deps)
+        })
+        .unwrap_or_default();
+    let bundled_set: HashSet<&str> = bundled_list.iter().map(String::as_str).collect();
+    let mut specs = source_dep_specs_from_value_with_bundled(
+        package_dir,
+        pkg_json,
+        (!bundled_set.is_empty()).then_some(&bundled_set),
+    )?;
     if !auto_install_peers {
         for spec in &mut specs {
             if matches!(spec.role, SourceDepRole::Peer) {
@@ -2060,12 +2297,14 @@ pub(super) fn collect_archive_source_dependencies(
     for spec in &mut specs {
         match spec.kind {
             DepKind::Registry if spec.auto_install => {
-                if parent_source.starts_with("tarball+file:")
-                    && matches!(spec.role, SourceDepRole::Dependency)
-                    && resolver_dependencies
-                        .get(&spec.local_name)
-                        .is_some_and(|existing| existing != &spec.raw_spec)
-                {
+                let needs_synthetic_root = matches!(spec.role, SourceDepRole::Dependency)
+                    && (parent_source.starts_with("tarball+file:")
+                        || parent_source.starts_with("git+"))
+                    && (!dependency_names_before_expansion.contains(&spec.local_name)
+                        || resolver_dependencies
+                            .get(&spec.local_name)
+                            .is_some_and(|existing| existing != &spec.raw_spec));
+                if needs_synthetic_root {
                     use sha2::{Digest, Sha256};
                     let digest = Sha256::digest(
                         format!("{parent_source}\0{}\0{}", spec.local_name, spec.raw_spec)
@@ -3253,6 +3492,7 @@ pub(super) fn apply_post_resolve_directory_link_fixup(
         if let Some(names) = &mut package.root_link_names {
             names.retain(|name| !internal_roots.contains(name.as_str()));
             if names.is_empty() {
+                package.root_link_names = None;
                 package.is_direct = false;
             }
         }

@@ -1310,6 +1310,9 @@ fn process_edge_reuses_node_when_edges_select_the_same_version() {
         canonical: CanonicalKey::npm("react"),
         version: NpmVersion::parse("18.0.0").unwrap(),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
     state.resolved.insert(
@@ -1498,6 +1501,9 @@ fn process_edge_records_work_stats_for_allocation_and_reuse() {
         canonical: CanonicalKey::npm("react"),
         version: NpmVersion::parse("18.0.0").unwrap(),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
     state.resolved.insert(
@@ -1632,6 +1638,9 @@ fn process_edge_emits_selected_package_event_only_for_new_nodes() {
         canonical: CanonicalKey::npm("react"),
         version: NpmVersion::parse("18.0.0").unwrap(),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
     state.resolved.insert(
@@ -1676,6 +1685,9 @@ fn process_edge_allocates_second_version_on_incompatible_range() {
         canonical: CanonicalKey::npm("legacy-shim"),
         version: NpmVersion::parse("1.0.0").unwrap(),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
     state.resolved.insert(
@@ -1889,6 +1901,9 @@ fn process_edge_path_selector_splits_two_parents() {
         canonical: CanonicalKey::Root,
         version: NpmVersion::new(0, 0, 0),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
     state
@@ -1898,6 +1913,9 @@ fn process_edge_path_selector_splits_two_parents() {
         canonical: CanonicalKey::npm("react"),
         version: NpmVersion::parse("18.0.0").unwrap(),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
     state.resolved.insert(
@@ -1998,6 +2016,9 @@ fn process_edge_path_selector_does_not_leak_to_sibling_parent() {
         canonical: CanonicalKey::Root,
         version: NpmVersion::new(0, 0, 0),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
     state
@@ -2007,6 +2028,9 @@ fn process_edge_path_selector_does_not_leak_to_sibling_parent() {
         canonical: CanonicalKey::npm("react"),
         version: NpmVersion::parse("18.0.0").unwrap(),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
     state.resolved.insert(
@@ -2017,6 +2041,9 @@ fn process_edge_path_selector_does_not_leak_to_sibling_parent() {
         canonical: CanonicalKey::npm("redux"),
         version: NpmVersion::parse("4.0.0").unwrap(),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
     state.resolved.insert(
@@ -2107,6 +2134,9 @@ fn enqueue_child_deps_skips_bundled_names() {
         canonical: CanonicalKey::npm("parent"),
         version: NpmVersion::parse("1.0.0").unwrap(),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
     enqueue_child_deps(
@@ -2143,6 +2173,9 @@ fn enqueue_child_deps_no_bundled_names_unchanged() {
         canonical: CanonicalKey::npm("parent"),
         version: NpmVersion::parse("1.0.0").unwrap(),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
     enqueue_child_deps(
@@ -2183,6 +2216,9 @@ fn enqueue_child_deps_omits_optional_dependencies_when_disabled() {
         canonical: CanonicalKey::npm("parent"),
         version: NpmVersion::parse("1.0.0").unwrap(),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
     enqueue_child_deps(
@@ -2237,6 +2273,9 @@ fn enqueue_child_deps_rejects_required_workspace_specifier() {
         canonical: CanonicalKey::npm("parent"),
         version: NpmVersion::parse("1.0.0").unwrap(),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
     let error = enqueue_child_deps(
@@ -2267,6 +2306,9 @@ fn enqueue_child_deps_skips_workspace_edge_for_selected_workspace_version() {
         canonical: CanonicalKey::npm("workspace-parent"),
         version: NpmVersion::parse("1.0.0").unwrap(),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
 
@@ -2293,6 +2335,9 @@ fn enqueue_child_deps_rejects_workspace_edge_for_unmarked_selected_version() {
         canonical: CanonicalKey::npm("registry-parent"),
         version: NpmVersion::parse("2.0.0").unwrap(),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
 
@@ -2316,6 +2361,9 @@ fn enqueue_child_deps_rejects_invalid_required_range() {
         canonical: CanonicalKey::npm("parent"),
         version: NpmVersion::parse("1.0.0").unwrap(),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
 
@@ -2404,6 +2452,9 @@ fn enqueue_for_parent(parent_canonical: CanonicalKey, info: &CachedPackageInfo) 
         canonical: parent_canonical.clone(),
         version: NpmVersion::parse("1.0.0").unwrap(),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
     enqueue_child_deps(
@@ -2581,6 +2632,9 @@ fn peer_collection_rejects_required_workspace_specifier() {
         canonical: CanonicalKey::npm("parent"),
         version: NpmVersion::parse("1.0.0").unwrap(),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
     let error = enqueue_child_deps(
@@ -2612,6 +2666,9 @@ fn peer_collection_skips_workspace_peer_for_selected_workspace_version() {
         canonical: CanonicalKey::npm("workspace-parent"),
         version: NpmVersion::parse("1.0.0").unwrap(),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
 
@@ -2641,6 +2698,9 @@ fn peer_collection_rejects_invalid_required_range() {
         canonical: CanonicalKey::npm("parent"),
         version: NpmVersion::parse("1.0.0").unwrap(),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
     let error = enqueue_child_deps(
@@ -2793,6 +2853,9 @@ fn push_node(state: &mut ResolveState, canonical: CanonicalKey, version: &str) -
         canonical: canonical.clone(),
         version: NpmVersion::parse(version).unwrap(),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
     state
@@ -2933,12 +2996,18 @@ fn into_resolved_packages_recomputes_required_reachability_from_the_final_graph(
         canonical: CanonicalKey::npm("required-parent"),
         version: NpmVersion::parse("1.0.0").expect("valid parent version"),
         optional: false,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: vec![("required-child".to_string(), 2)],
     });
     state.nodes.push(ResolvedNodeBuilder {
         canonical: CanonicalKey::npm("required-child"),
         version: NpmVersion::parse("1.0.0").expect("valid child version"),
         optional: true,
+        self_platform_compatible: true,
+        host_materializable: true,
+        deferred_selected_event: None,
         children: Vec::new(),
     });
     state.nodes[0].children = vec![("required-parent".to_string(), 1)];
@@ -8047,4 +8116,129 @@ async fn fetch_metadata_persists_hydrated_release_times_into_manifest_projection
         second.info.published_at("1.0.0"),
         Some("2025-01-01T00:00:00.000Z")
     );
+}
+
+#[test]
+fn process_edge_defers_selected_event_under_incompatible_optional_and_promotes_on_diamond() {
+    let foreign_os = if cfg!(target_os = "macos") {
+        "linux"
+    } else {
+        "darwin"
+    };
+    let foreign_meta: lpm_registry::PackageMetadata = serde_json::from_value(serde_json::json!({
+        "name": "foreign-opt",
+        "versions": {
+            "1.0.0": {
+                "name": "foreign-opt",
+                "version": "1.0.0",
+                "os": [foreign_os],
+                "dependencies": {
+                    "shared-child": "^1.0.0",
+                    "orphan-child": "^1.0.0"
+                },
+                "dist": {
+                    "tarball": "https://example.invalid/foreign-opt-1.0.0.tgz",
+                    "integrity": "sha512-foreign"
+                }
+            }
+        }
+    }))
+    .unwrap();
+    let foreign_info = crate::provider::parse_metadata_to_cache_info(&foreign_meta);
+    let shared_info = mk_info(&["1.0.0"], &[]);
+    let orphan_info = mk_info(&["1.0.0"], &[]);
+    let compat_info = mk_info(&["1.0.0"], &[]);
+
+    let mut state = ResolveState::new_with_root_dependencies_and_policy(
+        crate::resolve::RootDependencies::with_optional_names(
+            HashMap::from([
+                ("foreign-opt".to_string(), "^1.0.0".to_string()),
+                ("compat-parent".to_string(), "^1.0.0".to_string()),
+            ]),
+            HashSet::from(["foreign-opt".to_string()]),
+        ),
+        OverrideSet::empty(),
+        true,
+        ResolverPolicy::default(),
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    state.set_selected_package_tx(Some(tx));
+    state.seed_root_edges().unwrap();
+
+    // Resolve foreign-opt (optional, incompatible os) -> must NOT emit selected event.
+    let foreign_edge = Edge {
+        parent: 0,
+        local_name: "foreign-opt".to_string(),
+        canonical: CanonicalKey::npm("foreign-opt"),
+        range: NpmRange::parse("^1.0.0").unwrap(),
+        behavior: DepBehavior {
+            required: false,
+            peer: false,
+            optional: true,
+        },
+    };
+    process_edge(&foreign_edge, &foreign_info, &mut state).unwrap();
+    let foreign_id = state.resolved[&CanonicalKey::npm("foreign-opt")][0].1;
+    assert!(!state.nodes[foreign_id as usize].host_materializable);
+
+    // Resolve shared-child and orphan-child under foreign-opt -> events must be deferred.
+    for (name, info) in [
+        ("shared-child", &shared_info),
+        ("orphan-child", &orphan_info),
+    ] {
+        let edge = Edge {
+            parent: foreign_id,
+            local_name: name.to_string(),
+            canonical: CanonicalKey::npm(name),
+            range: NpmRange::parse("^1.0.0").unwrap(),
+            behavior: DepBehavior {
+                required: true,
+                peer: false,
+                optional: false,
+            },
+        };
+        process_edge(&edge, info, &mut state).unwrap();
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "foreign-platform optional and its descendants must not emit prefetch events"
+    );
+
+    // Now resolve compat-parent (compatible) -> emits compat-parent, then adds a diamond
+    // edge to shared-child -> promotes shared-child and emits its deferred event, while
+    // orphan-child stays unmaterializable and un-emitted.
+    let compat_edge = Edge {
+        parent: 0,
+        local_name: "compat-parent".to_string(),
+        canonical: CanonicalKey::npm("compat-parent"),
+        range: NpmRange::parse("^1.0.0").unwrap(),
+        behavior: DepBehavior {
+            required: true,
+            peer: false,
+            optional: false,
+        },
+    };
+    process_edge(&compat_edge, &compat_info, &mut state).unwrap();
+    let compat_id = state.resolved[&CanonicalKey::npm("compat-parent")][0].1;
+
+    let diamond_edge = Edge {
+        parent: compat_id,
+        local_name: "shared-child".to_string(),
+        canonical: CanonicalKey::npm("shared-child"),
+        range: NpmRange::parse("^1.0.0").unwrap(),
+        behavior: DepBehavior {
+            required: true,
+            peer: false,
+            optional: false,
+        },
+    };
+    process_edge(&diamond_edge, &shared_info, &mut state).unwrap();
+
+    let mut emitted = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        emitted.push(event.name);
+    }
+    assert_eq!(emitted, vec!["compat-parent", "shared-child"]);
+    let orphan_id = state.resolved[&CanonicalKey::npm("orphan-child")][0].1;
+    assert!(!state.nodes[orphan_id as usize].host_materializable);
 }

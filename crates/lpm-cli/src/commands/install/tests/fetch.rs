@@ -434,6 +434,7 @@ async fn count_dispatched_speculative_frames_with_policy(
         Some(Arc::new(Semaphore::new(0))),
         Arc::new(FetchCoordinator::default()),
         dependencies,
+        lpm_resolver::OverrideSet::empty(),
         policy,
         Arc::new(
             crate::engine_check::prepare_dependency_policy(store_root.path(), true, true).unwrap(),

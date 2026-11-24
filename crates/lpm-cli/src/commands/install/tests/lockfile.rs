@@ -1013,6 +1013,110 @@ fn optional_filter_restores_ambient_root_to_its_exact_contextual_instance() {
     );
 }
 
+#[test]
+fn optional_filter_preserves_required_ambient_peer_and_its_dependencies() {
+    let source = "registry+https://registry.npmjs.org";
+    let consumer_id =
+        lpm_common::PackageInstanceId::derive("consumer", "1.0.0", source, "root/consumer");
+    let peer_id = lpm_common::PackageInstanceId::derive("peer", "1.0.0", source, "root/peer");
+    let helper_id =
+        lpm_common::PackageInstanceId::derive("helper", "1.0.0", source, "root/peer/helper");
+    let opt_only_id =
+        lpm_common::PackageInstanceId::derive("opt-only", "1.0.0", source, "root/opt-only");
+    let orphan_peer_id =
+        lpm_common::PackageInstanceId::derive("orphan-peer", "1.0.0", source, "root/orphan-peer");
+
+    let mut consumer = filter_fixture_package("consumer", source, Some("consumer"), false);
+    consumer.instance_id = Some(consumer_id);
+    consumer
+        .peers
+        .push(lpm_common::PeerEdge::registry("peer", "peer", "1.0.0"));
+    consumer.peer_targets.insert("peer".to_string(), peer_id);
+
+    let mut peer = filter_fixture_package("peer", source, Some("peer"), false);
+    peer.instance_id = Some(peer_id);
+    peer.is_direct = false;
+    peer.optional = true;
+    peer.dependencies
+        .push(("helper".to_string(), "1.0.0".to_string()));
+    peer.dependency_targets
+        .insert("helper".to_string(), helper_id);
+
+    let mut helper = filter_fixture_package("helper", source, None, false);
+    helper.instance_id = Some(helper_id);
+    helper.is_direct = false;
+    helper.optional = true;
+
+    let mut opt_only = filter_fixture_package("opt-only", source, Some("opt-only"), true);
+    opt_only.instance_id = Some(opt_only_id);
+    opt_only.peers.push(lpm_common::PeerEdge::registry(
+        "orphan-peer",
+        "orphan-peer",
+        "1.0.0",
+    ));
+    opt_only
+        .peer_targets
+        .insert("orphan-peer".to_string(), orphan_peer_id);
+
+    let mut orphan_peer = filter_fixture_package("orphan-peer", source, Some("orphan-peer"), false);
+    orphan_peer.instance_id = Some(orphan_peer_id);
+    orphan_peer.is_direct = false;
+    orphan_peer.optional = true;
+
+    let mut packages = vec![consumer, peer, helper, opt_only, orphan_peer];
+    let optional_roots = HashSet::from(["opt-only".to_string()]);
+    filter_optional_packages_for_install(
+        &mut packages,
+        &optional_roots,
+        &["peer".to_string(), "orphan-peer".to_string()],
+    );
+
+    let names: Vec<&str> = packages.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec!["consumer", "peer", "helper"]);
+}
+
+#[test]
+fn engine_independent_registry_packages_excludes_ambient_peer_of_optional_engine_package() {
+    let source = "registry+https://registry.npmjs.org";
+    let direct_id = lpm_common::PackageInstanceId::derive("direct", "1.0.0", source, "root/direct");
+    let opt_engine_id =
+        lpm_common::PackageInstanceId::derive("opt-engine", "1.0.0", source, "root/opt-engine");
+    let orphan_peer_id =
+        lpm_common::PackageInstanceId::derive("orphan-peer", "1.0.0", source, "root/orphan-peer");
+
+    let mut direct = filter_fixture_package("direct", source, Some("direct"), false);
+    direct.instance_id = Some(direct_id);
+    direct
+        .dependencies
+        .push(("opt-engine".to_string(), "1.0.0".to_string()));
+    direct
+        .dependency_targets
+        .insert("opt-engine".to_string(), opt_engine_id);
+
+    let mut opt_engine = filter_fixture_package("opt-engine", source, None, true);
+    opt_engine.instance_id = Some(opt_engine_id);
+    opt_engine.is_direct = false;
+    opt_engine.node_engine = Some(">=99.0.0".to_string());
+    opt_engine.peers.push(lpm_common::PeerEdge::registry(
+        "orphan-peer",
+        "orphan-peer",
+        "1.0.0",
+    ));
+    opt_engine
+        .peer_targets
+        .insert("orphan-peer".to_string(), orphan_peer_id);
+
+    let mut orphan_peer = filter_fixture_package("orphan-peer", source, Some("orphan-peer"), false);
+    orphan_peer.instance_id = Some(orphan_peer_id);
+    orphan_peer.is_direct = false;
+
+    let packages = vec![direct, opt_engine, orphan_peer];
+    let unconstrained =
+        engine_independent_registry_packages(&packages, &["orphan-peer".to_string()]);
+    let names: Vec<&str> = unconstrained.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec!["direct"]);
+}
+
 // ──.5 lockfile repair gate ─────────────────
 //
 // The gate's contract:

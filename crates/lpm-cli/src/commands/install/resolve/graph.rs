@@ -56,7 +56,7 @@ pub(super) fn load_lockfile_graph_packages(
     client: &RegistryClient,
     gate_stats: &GateStats,
     auto_install_peers: bool,
-) -> Result<Vec<InstallPackage>, LpmError> {
+) -> Result<(Vec<InstallPackage>, Vec<String>), LpmError> {
     let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
     let fast = try_lockfile_fast_path_with_optional_roots(
         TryLockfileFastPathInput {
@@ -91,7 +91,7 @@ pub(super) fn load_lockfile_graph_packages(
             fast.lockfile.metadata.lockfile_version
         )));
     }
-    Ok(fast.packages)
+    Ok((fast.packages, fast.lockfile.ambient_peer_installs.clone()))
 }
 
 pub(super) fn root_resolve_requests(
@@ -708,7 +708,7 @@ pub(super) fn normalize_install_package_optional_reachability(
     let mut required: HashSet<PackageIdentity> = HashSet::new();
     let mut queue = VecDeque::new();
     for package in packages.iter() {
-        if package.root_link_names.is_some() || package.is_direct {
+        if (package.root_link_names.is_some() || package.is_direct) && !package.optional {
             let identity = (package.name.clone(), package.version.clone());
             required.insert(identity.clone());
             queue.push_back(identity);
@@ -730,6 +730,12 @@ pub(super) fn normalize_install_package_optional_reachability(
                         .unwrap_or(local_name)
                         .clone();
                     let next = (target_name, version.clone());
+                    if by_identity.contains_key(&next) && required.insert(next.clone()) {
+                        queue.push_back(next);
+                    }
+                }
+                for peer in &package.peers {
+                    let next = (peer.target_name.clone(), peer.target_version.clone());
                     if by_identity.contains_key(&next) && required.insert(next.clone()) {
                         queue.push_back(next);
                     }

@@ -676,16 +676,32 @@ fn object_already_stored(
         .is_ok_and(|object_dir| object_dir.exists())
 }
 
-/// Whether the install's streamed package, its largest download, has no
-/// engine requirement, so an overlap of such packages downloads it; otherwise
-/// the fetch phase keeps the streaming lane for it.
-pub(super) fn streaming_candidate_is_unconstrained(packages: &[InstallPackage]) -> bool {
-    super::resolve::streaming_candidate(
+/// Whether the install's streamed package, its largest download, belongs to the
+/// engine-independent overlap slice; otherwise the fetch phase keeps the
+/// streaming lane for it.
+pub(super) fn streaming_candidate_is_unconstrained(
+    packages: &[InstallPackage],
+    unconstrained: &[InstallPackage],
+) -> bool {
+    let Some(overall) = super::resolve::streaming_candidate(
         packages
             .iter()
             .filter(|package| package_platform_compatible(package)),
-    )
-    .is_some_and(|package| package.node_engine.is_none())
+    ) else {
+        return false;
+    };
+    if overall.node_engine.is_some() {
+        return false;
+    }
+    unconstrained.iter().any(|candidate| {
+        if let (Some(left), Some(right)) = (candidate.instance_id, overall.instance_id) {
+            left == right
+        } else {
+            candidate.name == overall.name
+                && candidate.version == overall.version
+                && candidate.source == overall.source
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1394,16 +1410,36 @@ mod tests {
             ..Default::default()
         });
 
-        assert!(streaming_candidate_is_unconstrained(&[
+        let keep_pkgs = vec![
             sized("library", 1 << 20, None),
             sized("small-engine", 16, Some(">=18")),
             foreign.clone(),
-        ]));
-        assert!(!streaming_candidate_is_unconstrained(&[
+        ];
+        assert!(streaming_candidate_is_unconstrained(
+            &keep_pkgs,
+            &[keep_pkgs[0].clone()],
+        ));
+        let engine_largest = vec![
             sized("library", 1 << 20, None),
             sized("engine-binary", 1 << 24, Some(">=18")),
+            foreign.clone(),
+        ];
+        assert!(!streaming_candidate_is_unconstrained(
+            &engine_largest,
+            &[engine_largest[0].clone()],
+        ));
+        // A large unconstrained descendant reachable only through an optional
+        // engine-constrained ancestor is absent from `unconstrained` and must
+        // keep the streaming lane for the post-probe fetch phase.
+        let orphan_largest = vec![
+            sized("small-direct", 1 << 10, None),
+            sized("huge-orphan-child", 1 << 24, None),
             foreign,
-        ]));
+        ];
+        assert!(!streaming_candidate_is_unconstrained(
+            &orphan_largest,
+            &[orphan_largest[0].clone()],
+        ));
     }
 
     #[test]
