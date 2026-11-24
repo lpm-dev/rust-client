@@ -624,48 +624,54 @@ pub(super) fn write_workspace_sync_noop_state(
             .all(|member| !member_has_custom_lpm_install_policy(&member.package));
 
     if !eligible {
+        tracing::debug!("workspace sync-noop ineligible; clearing cached state");
         remove_workspace_sync_noop_state(root);
         return;
     }
 
-    let state = (|| -> Option<WorkspaceSyncNoopState> {
-        let global = crate::commands::config::GlobalConfig::load_checked().ok()?;
-        crate::npm_firewall_config::config_policy_profile(&global).ok()?;
-        crate::lpm_insights_config::read_fetch_lpm_security_insights(&global).ok()?;
+    let state = (|| -> Result<WorkspaceSyncNoopState, String> {
+        let global = crate::commands::config::GlobalConfig::load_checked()
+            .map_err(|e| format!("global config: {e}"))?;
+        crate::npm_firewall_config::config_policy_profile(&global)
+            .map_err(|e| format!("firewall config: {e}"))?;
+        crate::lpm_insights_config::read_fetch_lpm_security_insights(&global)
+            .map_err(|e| format!("insights config: {e}"))?;
         if super::peer::resolve_strict_peer_dependencies(
             options.strict_peer_dependencies_override,
             &workspace.root_package,
             &global,
         ) {
-            return None;
+            return Err("strict-peer-dependencies enabled".into());
         }
         if crate::source_analysis_config::resolve_install_time_source_analysis(
             &global,
             root,
             options.json_output,
         )
-        .ok()?
+        .map_err(|e| format!("source analysis config: {e}"))?
         {
-            return None;
+            return Err("source analysis enabled".into());
         }
         if !super::policy_extensions::load_policy_extension_configs(&global)
-            .ok()?
+            .map_err(|e| format!("policy extensions: {e}"))?
             .is_empty()
         {
-            return None;
+            return Err("policy extensions active".into());
         }
 
         let lock_path = root.join(lpm_lockfile::LOCKFILE_NAME);
-        let lockfile_stamp = FileStamp::from_path(&lock_path)?;
+        let lockfile_stamp =
+            FileStamp::from_path(&lock_path).ok_or_else(|| "missing lockfile stamp".to_string())?;
         let lock_raw = lpm_common::read_file_capped(
             &lock_path,
             lpm_common::STATE_FILE_SIZE_CAP_BYTES.max(64 * 1024 * 1024),
         )
-        .ok()?;
+        .map_err(|e| format!("read lockfile: {e}"))?;
         if raw_lockfile_mentions_lpm_scope(&lock_raw) {
-            return None;
+            return Err("lockfile references @lpm.dev/".into());
         }
-        let lock_text = std::str::from_utf8(&lock_raw).ok()?;
+        let lock_text =
+            std::str::from_utf8(&lock_raw).map_err(|e| format!("lockfile utf8: {e}"))?;
         let has_node_engines = crate::engine_check::lockfile_has_dependency_node_engines(lock_text);
 
         let (linker, _) = crate::linker_config::resolve_effective_linker_with_source_and_workspace(
@@ -674,13 +680,15 @@ pub(super) fn write_workspace_sync_noop_state(
             &global,
             true,
         )
-        .ok()?;
-        let integrity = crate::commands::config::resolve_object_integrity_policy(&global).ok()?;
+        .map_err(|e| format!("linker: {e}"))?;
+        let integrity = crate::commands::config::resolve_object_integrity_policy(&global)
+            .map_err(|e| format!("integrity: {e}"))?;
         let store_version = lpm_store::StoreVersion::from_env();
         let platform = current_platform_key();
         let auto_install_peers =
             super::setup::resolve_auto_install_peers(&workspace.root_package, &global);
-        let routes = lpm_registry::RouteTable::from_env_and_filesystem(root).ok()?;
+        let routes = lpm_registry::RouteTable::from_env_and_filesystem(root)
+            .map_err(|e| format!("routes: {e}"))?;
         let resolved_age =
             crate::release_age_config::ReleaseAgeResolver::resolve_config_with_context(
                 &global,
@@ -690,7 +698,7 @@ pub(super) fn write_workspace_sync_noop_state(
                 &options.min_release_age_exclude,
                 options.json_output,
             )
-            .ok()?;
+            .map_err(|e| format!("release age: {e}"))?;
         let release_age_policy_key = crate::install_state::release_age_freshness_key(
             resolved_age.minimum_release_age_secs,
             resolved_age.minimum_release_age_policy,
@@ -705,7 +713,7 @@ pub(super) fn write_workspace_sync_noop_state(
             options.json_output,
             crate::engine_check::NodeVersionReuse::recorded(None),
         )
-        .ok()?;
+        .map_err(|e| format!("engine policy: {e}"))?;
         let dependency_engine_key = engine_policy.freshness_key_from_flags(true, has_node_engines);
 
         let state_path = workspace_sync_noop_state_path(root);
@@ -713,10 +721,14 @@ pub(super) fn write_workspace_sync_noop_state(
             let _ = std::fs::create_dir_all(parent);
         }
 
-        let watch_dirs = lpm_workspace::workspace_discovery_watch_dirs(root).ok()?;
+        let watch_dirs = lpm_workspace::workspace_discovery_watch_dirs(root)
+            .map_err(|e| format!("watch_dirs: {e}"))?;
         let mut glob_parent_dirs = Vec::with_capacity(watch_dirs.len());
         for rel in watch_dirs {
-            glob_parent_dirs.push(DirStamp::from_path(root, &rel)?);
+            glob_parent_dirs.push(
+                DirStamp::from_path(root, &rel)
+                    .ok_or_else(|| format!("dir stamp missing for {}", rel.display()))?,
+            );
         }
 
         let mut targets = Vec::with_capacity(target_inputs.len());
@@ -726,9 +738,9 @@ pub(super) fn write_workspace_sync_noop_state(
                 &pkg_path,
                 lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
             )
-            .ok()?;
+            .map_err(|e| format!("read pkg {}: {e}", pkg_path.display()))?;
             if manifest_has_local_file_or_link(&pkg_content) {
-                return None;
+                return Err(format!("local file/link dep in {}", pkg_path.display()));
             }
             let rel_path = if input.path == root {
                 ".".to_string()
@@ -736,7 +748,7 @@ pub(super) fn write_workspace_sync_noop_state(
                 input
                     .path
                     .strip_prefix(root)
-                    .ok()?
+                    .map_err(|e| format!("strip_prefix: {e}"))?
                     .to_string_lossy()
                     .into_owned()
             };
@@ -744,7 +756,8 @@ pub(super) fn write_workspace_sync_noop_state(
                 name: input.name.to_string(),
                 rel_path,
                 kind: input.kind.to_string(),
-                pkg_stamp: FileStamp::from_path(&pkg_path)?,
+                pkg_stamp: FileStamp::from_path(&pkg_path)
+                    .ok_or_else(|| format!("pkg stamp missing for {}", pkg_path.display()))?,
                 has_node_modules: input.path.join("node_modules").is_dir(),
                 no_dependencies: input.no_dependencies,
             });
@@ -752,12 +765,15 @@ pub(super) fn write_workspace_sync_noop_state(
 
         let pnpm_yaml_path = root.join("pnpm-workspace.yaml");
         let pnpm_workspace_yaml = if pnpm_yaml_path.exists() {
-            Some(FileStamp::from_path(&pnpm_yaml_path)?)
+            Some(
+                FileStamp::from_path(&pnpm_yaml_path)
+                    .ok_or_else(|| "pnpm-workspace.yaml stamp missing".to_string())?,
+            )
         } else {
             None
         };
 
-        Some(WorkspaceSyncNoopState {
+        Ok(WorkspaceSyncNoopState {
             schema: WORKSPACE_SYNC_NOOP_SCHEMA,
             lockfile_version: lpm_lockfile::LOCKFILE_VERSION,
             bin_shim_format: lpm_linker::BIN_SHIM_FORMAT.to_string(),
@@ -781,9 +797,13 @@ pub(super) fn write_workspace_sync_noop_state(
         })
     })();
 
-    let Some(state) = state else {
-        remove_workspace_sync_noop_state(root);
-        return;
+    let state = match state {
+        Ok(state) => state,
+        Err(reason) => {
+            tracing::debug!("skipping workspace sync-noop state: {reason}");
+            remove_workspace_sync_noop_state(root);
+            return;
+        }
     };
 
     if let Ok(bytes) = serde_json::to_vec(&state) {

@@ -389,6 +389,10 @@ pub(crate) async fn run_recursive_workspace_install(
         // Read once, before any member's install can replace the lockfile.
         let locked_integrities = super::LockedIntegrities::detect(&workspace_root)?;
         let options = Arc::new(options);
+        let target_has_scripts: HashMap<PathBuf, bool> = targets
+            .iter()
+            .map(|target| (target.path.clone(), target.lifecycle.has_scripts()))
+            .collect();
         let workspace_freshness_cache =
             Arc::new(crate::workspace_discovery_cache::WorkspaceFreshnessCache::default());
         let scheduler = async {
@@ -539,10 +543,6 @@ pub(crate) async fn run_recursive_workspace_install(
             workspace_lockfile::remove_member_lockfiles(&legacy_importers);
         }
 
-        let target_has_scripts: HashMap<&Path, bool> = targets
-            .iter()
-            .map(|target| (target.path.as_path(), target.lifecycle.has_scripts()))
-            .collect();
         let sync_noop_targets: Vec<sync_noop::WorkspaceSyncNoopTargetInput<'_>> = outcomes
             .iter()
             .map(|outcome| sync_noop::WorkspaceSyncNoopTargetInput {
