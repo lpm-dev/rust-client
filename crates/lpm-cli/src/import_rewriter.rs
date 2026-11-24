@@ -7,9 +7,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-/// File extensions to try when resolving import paths.
-const EXTENSIONS: &[&str] = &[".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpecifierKind {
     Relative,
@@ -621,9 +618,17 @@ fn leaves_the_root(dir: &str, specifier: &str) -> bool {
     false
 }
 
+/// The extensions LPM CLI's lookup tries, in order: the source files it
+/// rewrites, then JSON and declaration files, which bundlers and TypeScript
+/// also load for an extensionless import.
+const LOOKUP_EXTENSIONS: &[&str] = &[
+    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts", ".json", ".d.ts", ".d.mts",
+    ".d.cts",
+];
+
 /// LPM CLI's lookup for `candidate`, a path from the package root: the file
 /// itself, then the TypeScript source a runtime extension stands for
-/// (`x.js` for `x.ts`), then with each supported extension, then the folder's
+/// (`x.js` for `x.ts`), then with each lookup extension, then the folder's
 /// index. A `folder` candidate only tries the index, and an empty one is the
 /// package root.
 fn try_resolve<'a>(
@@ -649,7 +654,7 @@ fn try_resolve<'a>(
                 }
             }
         }
-        for ext in EXTENSIONS {
+        for ext in LOOKUP_EXTENSIONS {
             scratch.clear();
             scratch.push_str(candidate);
             scratch.push_str(ext);
@@ -659,7 +664,7 @@ fn try_resolve<'a>(
         }
     }
 
-    for ext in EXTENSIONS {
+    for ext in LOOKUP_EXTENSIONS {
         scratch.clear();
         if !candidate.is_empty() {
             scratch.push_str(candidate);
@@ -695,13 +700,14 @@ fn try_resolve_file(candidate: &str, files: &HashSet<String>) -> Option<String> 
     try_resolve_set(candidate, false, &borrowed).map(str::to_string)
 }
 
-/// Extensions an import must name, since an extensionless import never reaches
-/// them: runtime files and TypeScript's module-format sources.
+/// Extensions a rewritten import keeps: runtime files, named the way their
+/// authors import them, and TypeScript's module-format sources, which
+/// TypeScript can't reach through an extensionless import.
 const NAMED_EXTENSIONS: &[&str] = &[".js", ".mjs", ".cjs", ".json", ".mts", ".cts"];
 
-/// Files that bundlers or TypeScript pick for an extensionless import before a
-/// folder's index, though LPM CLI doesn't rewrite them.
-const SIBLING_ONLY_EXTENSIONS: &[&str] = &[".json", ".d.ts", ".d.mts", ".d.cts"];
+/// Source extensions a rewritten import drops: importing them by name needs
+/// `allowImportingTsExtensions` in the consumer's tsconfig.
+const TYPESCRIPT_SOURCE_EXTENSIONS: &[&str] = &[".ts", ".tsx"];
 
 /// The TypeScript sources a runtime extension stands for: `./x.js` loads
 /// `x.ts` or `x.tsx`.
@@ -715,25 +721,33 @@ fn typescript_sources_for(runtime: &str) -> &'static [&'static str] {
     }
 }
 
-/// The extension of a path's last segment, with its dot.
+/// The extension of a path's last segment, with its dot. A declaration file's
+/// extension is the whole `.d.ts`, `.d.mts` or `.d.cts`.
 fn file_extension(path: &str) -> Option<&str> {
     let name = path.rsplit('/').next()?;
+    for declaration in [".d.ts", ".d.mts", ".d.cts"] {
+        if name.len() > declaration.len() && name.ends_with(declaration) {
+            return Some(&name[name.len() - declaration.len()..]);
+        }
+    }
     name.rfind('.')
         .filter(|&dot| dot > 0)
         .map(|dot| &name[dot..])
 }
 
 /// The import path for `resolved`, a delivered file, in the style the author
-/// wrote `requested`: with the same extension, or with the runtime extension
-/// TypeScript maps to it (`x.js` for `x.ts`). Otherwise it is the shortest
-/// path that LPM CLI's lookup takes back to the same file, keeping `/index`
-/// or the extension when a shorter path would reach another file.
+/// wrote `requested`: with the same runtime extension, or with the runtime
+/// extension TypeScript maps to it (`x.js` for `x.ts`). Otherwise it is the
+/// shortest path that LPM CLI's lookup takes back to the same file, keeping
+/// `/index` or the extension when a shorter path would reach another file.
 fn import_path_for(resolved: &str, requested: &str, dest_files: &HashSet<&str>) -> String {
     let resolved_extension = file_extension(resolved);
     if let (Some(requested_extension), Some(resolved_extension)) =
         (file_extension(requested), resolved_extension)
     {
-        if requested_extension == resolved_extension {
+        if requested_extension == resolved_extension
+            && !TYPESCRIPT_SOURCE_EXTENSIONS.contains(&resolved_extension)
+        {
             return resolved.to_owned();
         }
         if typescript_sources_for(requested_extension).contains(&resolved_extension) {
@@ -750,17 +764,10 @@ fn import_path_for(resolved: &str, requested: &str, dest_files: &HashSet<&str>) 
         return resolved.to_owned();
     };
     let stem = &resolved[..resolved.len() - extension.len()];
-    if let Some(folder) = stem.strip_suffix("/index") {
-        let mut sibling = String::with_capacity(folder.len() + 6);
-        let has_sibling_only = SIBLING_ONLY_EXTENSIONS.iter().any(|sibling_extension| {
-            sibling.clear();
-            sibling.push_str(folder);
-            sibling.push_str(sibling_extension);
-            dest_files.contains(sibling.as_str())
-        });
-        if !has_sibling_only && try_resolve_set(folder, false, dest_files) == Some(resolved) {
-            return folder.to_owned();
-        }
+    if let Some(folder) = stem.strip_suffix("/index")
+        && try_resolve_set(folder, false, dest_files) == Some(resolved)
+    {
+        return folder.to_owned();
     }
     if try_resolve_set(stem, false, dest_files) == Some(resolved) {
         return stem.to_owned();
@@ -1644,11 +1651,7 @@ import { c } from "react";
                 &[("util.ts", "lib/util.ts"), ("x.ts", "x.ts")],
                 "./lib/util.js",
             ),
-            (
-                "./a.ts",
-                &[("a.ts", "a/index.ts"), ("x.ts", "x.ts")],
-                "./a/index.ts",
-            ),
+            ("./a.ts", &[("a.ts", "a/index.ts"), ("x.ts", "x.ts")], "./a"),
             (
                 "./a/index.ts",
                 &[
@@ -1694,6 +1697,65 @@ import { c } from "react";
             )
             .as_deref(),
             Some("import v from \"~/lib/view.jsx\";")
+        );
+    }
+
+    #[test]
+    fn a_rewritten_import_drops_a_typescript_source_extension() {
+        assert_eq!(
+            rewrite(
+                "import u from \"./util.ts\";\nimport c from \"./C.tsx\";",
+                "x.ts",
+                "x.ts",
+                None,
+                Some("@/c/"),
+                &[
+                    ("util.ts", "util.ts"),
+                    ("C.tsx", "C/index.tsx"),
+                    ("x.ts", "x.ts")
+                ],
+                &[],
+            )
+            .as_deref(),
+            Some("import u from \"@/c/util\";\nimport c from \"@/c/C\";")
+        );
+    }
+
+    #[test]
+    fn an_import_is_rewritten_when_a_declaration_file_lands_beside_its_folder() {
+        assert_eq!(
+            rewrite(
+                "import c from \"./config\";",
+                "x.ts",
+                "x.ts",
+                None,
+                None,
+                &[
+                    ("config/index.ts", "config/index.ts"),
+                    ("types/config.d.ts", "config.d.ts"),
+                    ("x.ts", "x.ts"),
+                ],
+                &[],
+            )
+            .as_deref(),
+            Some("import c from \"./config/index\";")
+        );
+    }
+
+    #[test]
+    fn a_moved_declaration_file_is_imported_without_its_extension() {
+        assert_eq!(
+            rewrite(
+                "import type { T } from \"./types\";",
+                "x.ts",
+                "x.ts",
+                None,
+                None,
+                &[("types.d.ts", "lib/types.d.ts"), ("x.ts", "x.ts")],
+                &[],
+            )
+            .as_deref(),
+            Some("import type { T } from \"./lib/types\";")
         );
     }
 
