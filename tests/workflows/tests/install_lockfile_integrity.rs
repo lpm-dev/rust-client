@@ -739,3 +739,93 @@ async fn an_install_of_one_workspace_member_removes_every_member_s_locked_url_wi
     let locked = project.read_file("lpm.lock");
     assert!(!locked.contains("dummy-signature"), "{locked}");
 }
+
+#[tokio::test]
+async fn frozen_replay_from_npmrc_registry_reuses_cached_tarball_urls_without_refetching_metadata()
+{
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let registry = MockRegistry::start().await;
+    let tarball = make_tarball("custom-mirror-pkg", "1.0.0");
+    let integrity = compute_integrity(&tarball);
+    let canonical_tarball_path = "/custom-mirror-pkg/-/custom-mirror-pkg-1.0.0.tgz";
+    let canonical_tarball_url = format!("{}{canonical_tarball_path}", registry.url());
+
+    Mock::given(method("GET"))
+        .and(path("/custom-mirror-pkg"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "custom-mirror-pkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "custom-mirror-pkg",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": canonical_tarball_url,
+                        "integrity": integrity
+                    }
+                }
+            }
+        })))
+        .mount(registry.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path(canonical_tarball_path))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(tarball)
+                .insert_header("content-type", "application/octet-stream"),
+        )
+        .mount(registry.server())
+        .await;
+
+    let project = TempProject::empty(
+        r#"{"name":"npmrc-replay","version":"1.0.0","dependencies":{"custom-mirror-pkg":"1.0.0"}}"#,
+    );
+    project.write_file(".npmrc", &format!("registry={}/\n", registry.url()));
+
+    // Use default LPM client (NOT LPM_NPM_REGISTRY_URL pointing at mock) so the custom
+    // `.npmrc` registry is the sole route to `registry`.
+    support::lpm(&project).args(INSTALL).assert().success();
+
+    let lockfile = project.read_file("lpm.lock");
+    assert!(
+        lockfile.contains(&canonical_tarball_url),
+        "first install should record custom registry tarball URL: {lockfile}"
+    );
+    let requests_before_replay = registry.server().received_requests().await.unwrap().len();
+
+    // Clear node_modules, .lpm, store, and metadata cache, then replay with --frozen-lockfile.
+    forget_install(&project);
+    std::fs::remove_dir_all(project.store_dir()).unwrap();
+    let cache_dir = project.home().join(".lpm/cache");
+    if cache_dir.exists() {
+        std::fs::remove_dir_all(&cache_dir).unwrap();
+    }
+
+    support::lpm(&project)
+        .args([
+            "install",
+            "--frozen-lockfile",
+            "--no-skills",
+            "--no-security-summary",
+        ])
+        .assert()
+        .success();
+
+    let replay_requests = registry
+        .server()
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .skip(requests_before_replay)
+        .map(|req| req.url.path().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        replay_requests,
+        vec![canonical_tarball_path.to_string()],
+        "frozen replay via .npmrc registry must reuse canonical locked tarball URLs without refetching packuments"
+    );
+}

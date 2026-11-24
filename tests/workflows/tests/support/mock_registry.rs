@@ -3360,6 +3360,8 @@ impl MockRegistry {
             "optionalDependencies",
             "peerDependencies",
             "peerDependenciesMeta",
+            "bundleDependencies",
+            "bundledDependencies",
             "bin",
             "scripts",
             "engines",

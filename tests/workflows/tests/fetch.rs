@@ -1119,3 +1119,131 @@ async fn fetch_does_not_download_from_a_locked_url_with_a_query() {
         .collect();
     assert_eq!(queries, [None]);
 }
+
+#[tokio::test]
+async fn fetch_platform_skips_unreachable_descendants_of_skipped_packages() {
+    let mock = MockRegistry::start().await;
+    let root_tb = make_tarball("app-root", "1.0.0");
+    let compat_tb = make_tarball("compat-dep", "1.0.0");
+    let foreign_tb = make_tarball("foreign-wasm", "1.0.0");
+    let orphan_tb = make_tarball("orphan-runtime", "1.0.0");
+    let shared_tb = make_tarball("shared-helper", "1.0.0");
+
+    for (name, tb) in [
+        ("app-root", &root_tb),
+        ("compat-dep", &compat_tb),
+        ("foreign-wasm", &foreign_tb),
+        ("orphan-runtime", &orphan_tb),
+        ("shared-helper", &shared_tb),
+    ] {
+        mock.with_package(name, "1.0.0", tb).await;
+    }
+
+    let source = format!("registry+{}", mock.url());
+    let id = |name: &str| lpm_common::PackageInstanceId::derive(name, "1.0.0", &source, name);
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.root_resolutions.insert(
+        "app-root".into(),
+        lpm_lockfile::LockedRootResolution {
+            instance_id: Some(id("app-root")),
+            package: "app-root".into(),
+            version: "1.0.0".into(),
+            source: Some(source.clone()),
+        },
+    );
+    lockfile.packages = vec![
+        lpm_lockfile::LockedPackage {
+            name: "app-root".into(),
+            version: "1.0.0".into(),
+            instance_id: Some(id("app-root")),
+            source: Some(source.clone()),
+            tarball: Some(mock.tarball_url("app-root", "1.0.0")),
+            integrity: Some(compute_integrity(&root_tb)),
+            dependencies: vec!["compat-dep@1.0.0".into(), "foreign-wasm@1.0.0".into()],
+            dependency_targets: std::collections::BTreeMap::from([
+                ("compat-dep".into(), id("compat-dep")),
+                ("foreign-wasm".into(), id("foreign-wasm")),
+            ]),
+            ..Default::default()
+        },
+        lpm_lockfile::LockedPackage {
+            name: "compat-dep".into(),
+            version: "1.0.0".into(),
+            instance_id: Some(id("compat-dep")),
+            source: Some(source.clone()),
+            tarball: Some(mock.tarball_url("compat-dep", "1.0.0")),
+            integrity: Some(compute_integrity(&compat_tb)),
+            dependencies: vec!["shared-helper@1.0.0".into()],
+            dependency_targets: std::collections::BTreeMap::from([(
+                "shared-helper".into(),
+                id("shared-helper"),
+            )]),
+            ..Default::default()
+        },
+        lpm_lockfile::LockedPackage {
+            name: "foreign-wasm".into(),
+            version: "1.0.0".into(),
+            instance_id: Some(id("foreign-wasm")),
+            source: Some(source.clone()),
+            tarball: Some(mock.tarball_url("foreign-wasm", "1.0.0")),
+            integrity: Some(compute_integrity(&foreign_tb)),
+            optional: true,
+            os: vec!["win32".into()],
+            cpu: vec!["x64".into()],
+            dependencies: vec!["orphan-runtime@1.0.0".into(), "shared-helper@1.0.0".into()],
+            dependency_targets: std::collections::BTreeMap::from([
+                ("orphan-runtime".into(), id("orphan-runtime")),
+                ("shared-helper".into(), id("shared-helper")),
+            ]),
+            ..Default::default()
+        },
+        lpm_lockfile::LockedPackage {
+            name: "orphan-runtime".into(),
+            version: "1.0.0".into(),
+            instance_id: Some(id("orphan-runtime")),
+            source: Some(source.clone()),
+            tarball: Some(mock.tarball_url("orphan-runtime", "1.0.0")),
+            integrity: Some(compute_integrity(&orphan_tb)),
+            optional: true,
+            ..Default::default()
+        },
+        lpm_lockfile::LockedPackage {
+            name: "shared-helper".into(),
+            version: "1.0.0".into(),
+            instance_id: Some(id("shared-helper")),
+            source: Some(source.clone()),
+            tarball: Some(mock.tarball_url("shared-helper", "1.0.0")),
+            integrity: Some(compute_integrity(&shared_tb)),
+            ..Default::default()
+        },
+    ];
+
+    let project = project_with_lockfile(&lockfile.to_toml().expect("serialize lockfile"));
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["fetch", "--platform", "linux/x64", "--json"])
+        .output()
+        .expect("run lpm fetch --platform linux/x64");
+    assert!(
+        output.status.success(),
+        "fetch failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(mock.tarball_request_count("app-root", "1.0.0").await, 1);
+    assert_eq!(mock.tarball_request_count("compat-dep", "1.0.0").await, 1);
+    assert_eq!(
+        mock.tarball_request_count("shared-helper", "1.0.0").await,
+        1
+    );
+    assert_eq!(
+        mock.tarball_request_count("foreign-wasm", "1.0.0").await,
+        0,
+        "win32-only optional package must not be fetched for linux-x64"
+    );
+    assert_eq!(
+        mock.tarball_request_count("orphan-runtime", "1.0.0").await,
+        0,
+        "descendant reachable only through a skipped optional package must not be fetched"
+    );
+}
