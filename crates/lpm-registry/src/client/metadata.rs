@@ -2356,6 +2356,23 @@ impl RegistryClient {
                     });
                 }
             }
+            let full_packument_key = self.npm_direct_metadata_cache_key(name, access);
+            if let Some((mut cached_packument, _)) =
+                self.read_metadata_cache_async(&full_packument_key).await
+                && batch_metadata_entry_matches_name(name, &cached_packument)
+                && cached_packument.versions.contains_key(version)
+            {
+                cached_packument.versions.retain(|v, _| v == version);
+                cached_packument.time.retain(|v, _| v == version);
+                timings.cache_read_ms = cache_read_start.elapsed().as_millis();
+                timings.cache_hit = true;
+                timings.selected_from_history = false;
+                crate::timing::record_metadata_cache_hit();
+                return Ok(TimedPackageMetadata {
+                    metadata: cached_packument,
+                    timings,
+                });
+            }
             timings.cache_read_ms = cache_read_start.elapsed().as_millis();
             crate::timing::record_metadata_cache_miss();
 

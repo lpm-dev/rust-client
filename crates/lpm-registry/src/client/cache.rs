@@ -21,7 +21,7 @@ pub(super) const METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::
 pub(super) const METADATA_CACHE_FILE_CAP: u64 = 100 * 1024 * 1024;
 pub(super) const METADATA_CACHE_ETAG_LINE_CAP: u64 = 8 * 1024;
 const METADATA_CACHE_FRESHNESS_LINE_CAP: u64 = 20;
-pub(super) const MAX_PENDING_METADATA_CACHE_BYTES: usize = 32 * 1024 * 1024;
+pub(super) const MAX_PENDING_METADATA_CACHE_BYTES: usize = 128 * 1024 * 1024;
 // MessagePack reserves 0xc1, so older readers treat JSON fallback entries as misses.
 pub(super) const METADATA_CACHE_JSON_MARKER: u8 = 0xc1;
 

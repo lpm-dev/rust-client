@@ -546,6 +546,11 @@ pub(crate) async fn run_recursive_workspace_install(
                 duration_ms(started.elapsed()),
             );
         }
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            client.flush_pending_cache_writes(),
+        )
+        .await;
         Ok(())
     })
     .await
