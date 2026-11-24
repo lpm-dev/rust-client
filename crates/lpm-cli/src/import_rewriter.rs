@@ -582,8 +582,14 @@ fn compute_new_specifier(
                 .strip_prefix(target.as_str())
                 .is_some_and(|rest| rest.starts_with("/index"))
             && has_file_named(&target, |path| dest_files.contains(path));
-        if !index_beside_a_new_file
-            && try_resolve_set(&target, folder, dest_files) == Some(resolved_dest_path)
+        let declaration = file_extension(resolved_dest_path)
+            .and_then(declaration_import_extension)
+            .is_some();
+        // TypeScript reaches a declaration file through the path `path` names,
+        // whatever runtime file shares it.
+        if (declaration && !folder && target == path)
+            || (!index_beside_a_new_file
+                && try_resolve_set(&target, folder, dest_files) == Some(resolved_dest_path))
         {
             return None;
         }
@@ -770,6 +776,18 @@ fn typescript_sources_for(runtime: &str) -> &'static [&'static str] {
     }
 }
 
+/// How an import names a declaration file: `x` for `x.d.ts`, `x.mjs` for
+/// `x.d.mts` and `x.cjs` for `x.d.cts`. TypeScript rejects a path that ends in
+/// the declaration extension itself.
+fn declaration_import_extension(extension: &str) -> Option<&'static str> {
+    match extension {
+        ".d.ts" => Some(""),
+        ".d.mts" => Some(".mjs"),
+        ".d.cts" => Some(".cjs"),
+        _ => None,
+    }
+}
+
 /// The extension of a path's last segment, with its dot. A declaration file's
 /// extension is the whole `.d.ts`, `.d.mts` or `.d.cts`.
 fn file_extension(path: &str) -> Option<&str> {
@@ -801,6 +819,10 @@ fn import_path_for(
     dest_files: &HashSet<&str>,
 ) -> String {
     let resolved_extension = file_extension(resolved);
+    if let Some(import_form) = resolved_extension.and_then(declaration_import_extension) {
+        let stem = &resolved[..resolved.len() - resolved_extension.map_or(0, str::len)];
+        return format!("{stem}{import_form}");
+    }
     if let (Some(requested_extension), Some(resolved_extension)) =
         (file_extension(requested), resolved_extension)
     {
@@ -1920,6 +1942,46 @@ import { c } from "react";
             )
             .as_deref(),
             Some("import b from \"@/c/Button.ts\";")
+        );
+    }
+
+    #[test]
+    fn a_declaration_file_is_never_imported_with_its_extension() {
+        let moved = [
+            ("types/foo.d.ts", "lib/foo.d.ts"),
+            ("foo/index.ts", "lib/foo/index.ts"),
+            ("x.ts", "x.ts"),
+        ];
+        for (alias, expected) in [(None, "./lib/foo"), (Some("@/c/"), "@/c/lib/foo")] {
+            assert_eq!(
+                rewrite(
+                    "import type { T } from \"./types/foo\";",
+                    "x.ts",
+                    "x.ts",
+                    None,
+                    alias,
+                    &moved,
+                    &[],
+                )
+                .as_deref(),
+                Some(format!("import type {{ T }} from \"{expected}\";").as_str())
+            );
+        }
+        assert_eq!(
+            rewrite(
+                "import type { T } from \"./foo\";",
+                "x.ts",
+                "x.ts",
+                None,
+                None,
+                &[
+                    ("foo.d.ts", "foo.d.ts"),
+                    ("bar/index.ts", "foo/index.ts"),
+                    ("x.ts", "x.ts")
+                ],
+                &[],
+            ),
+            None
         );
     }
 
