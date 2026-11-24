@@ -82,6 +82,29 @@ fn tidy_reports_unused_and_phantom_without_mutating_manifest() {
 }
 
 #[test]
+fn tidy_reports_an_npm_subpath_of_a_builtin_name_as_a_phantom() {
+    let project = TempProject::empty(r#"{"name":"app","version":"1.0.0"}"#);
+    project.write_file(
+        "src/index.js",
+        "import shim from \"process/browser\";\nimport fs from \"fs\";\nexport { shim, fs };\n",
+    );
+
+    let output = lpm(&project)
+        .args(["tidy", "--json"])
+        .output()
+        .expect("failed to run lpm tidy --json");
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("tidy --json must be valid JSON");
+    let phantoms: Vec<&str> = envelope["phantoms"]
+        .as_array()
+        .expect("phantoms must be an array")
+        .iter()
+        .filter_map(|phantom| phantom["name"].as_str())
+        .collect();
+    assert_eq!(phantoms, ["process"], "{envelope}");
+}
+
+#[test]
 fn tidy_json_envelope_reports_unused_and_phantom_findings() {
     let project = TempProject::empty(REPORT_PACKAGE_JSON);
     write_report_sources(&project);

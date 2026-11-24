@@ -208,8 +208,9 @@ fn resolve_and_rewrite(
 ) -> Option<String> {
     match classify_specifier(specifier, author_alias) {
         SpecifierKind::Relative => {
+            let folder = names_a_folder(specifier);
             let resolved_src = normalize_path(&join_path(file_src_dir, specifier));
-            if let Some(src_match) = try_resolve_map_key(&resolved_src, src_to_dest)
+            if let Some(src_match) = try_resolve_map_key(&resolved_src, folder, src_to_dest)
                 && let Some(dest_path) = src_to_dest.get(src_match)
             {
                 return compute_new_specifier(
@@ -221,7 +222,7 @@ fn resolve_and_rewrite(
             }
 
             let resolved_dest = normalize_path(&join_path(file_dest_dir, specifier));
-            if let Some(dest_match) = try_resolve_set(&resolved_dest, dest_files) {
+            if let Some(dest_match) = try_resolve_set(&resolved_dest, folder, dest_files) {
                 return compute_new_specifier(
                     dest_match,
                     file_dest_dir,
@@ -238,14 +239,15 @@ fn resolve_and_rewrite(
             let path = specifier.strip_prefix(alias)?;
             // A prefix kept as written, such as `#`, may be followed by `/`.
             let path = path.strip_prefix('/').unwrap_or(path);
+            let folder = path.is_empty() || path.ends_with('/');
 
-            if let Some(src_match) = try_resolve_map_key(path, src_to_dest)
+            if let Some(src_match) = try_resolve_map_key(path, folder, src_to_dest)
                 && let Some(dest_path) = src_to_dest.get(src_match)
             {
                 return compute_new_specifier(dest_path, file_dest_dir, buyer_alias, None);
             }
 
-            if try_resolve_set(path, dest_files).is_some() {
+            if try_resolve_set(path, folder, dest_files).is_some() {
                 if buyer_alias == author_alias {
                     return None;
                 }
@@ -577,29 +579,45 @@ fn relative_import_specifier(from_dir: &str, target: &str) -> String {
     result
 }
 
+/// `.`, `..` and a specifier ending in `/` name a folder, so Node and
+/// TypeScript load its index and never a file of the same name beside it.
+fn names_a_folder(specifier: &str) -> bool {
+    specifier == "." || specifier == ".." || specifier.ends_with('/')
+}
+
+/// Resolves `candidate`, a path from the package root, the way Node and
+/// TypeScript do: the file itself, then with an extension, then the folder's
+/// index. A `folder` candidate only tries the index, and an empty one is the
+/// package root.
 fn try_resolve<'a>(
     candidate: &str,
+    folder: bool,
     mut lookup: impl FnMut(&str) -> Option<&'a str>,
 ) -> Option<&'a str> {
     let candidate = candidate.strip_prefix("./").unwrap_or(candidate);
-    if let Some(path) = lookup(candidate) {
-        return Some(path);
-    }
-
+    let candidate = candidate.strip_suffix('/').unwrap_or(candidate);
     let mut scratch = String::with_capacity(candidate.len() + "/index".len() + 4);
-    for ext in EXTENSIONS {
-        scratch.clear();
-        scratch.push_str(candidate);
-        scratch.push_str(ext);
-        if let Some(path) = lookup(&scratch) {
+    if !folder && !candidate.is_empty() {
+        if let Some(path) = lookup(candidate) {
             return Some(path);
+        }
+        for ext in EXTENSIONS {
+            scratch.clear();
+            scratch.push_str(candidate);
+            scratch.push_str(ext);
+            if let Some(path) = lookup(&scratch) {
+                return Some(path);
+            }
         }
     }
 
     for ext in EXTENSIONS {
         scratch.clear();
-        scratch.push_str(candidate);
-        scratch.push_str("/index");
+        if !candidate.is_empty() {
+            scratch.push_str(candidate);
+            scratch.push('/');
+        }
+        scratch.push_str("index");
         scratch.push_str(ext);
         if let Some(path) = lookup(&scratch) {
             return Some(path);
@@ -609,20 +627,24 @@ fn try_resolve<'a>(
     None
 }
 
-fn try_resolve_map_key<'a>(candidate: &str, files: &HashMap<&'a str, &str>) -> Option<&'a str> {
-    try_resolve(candidate, |path| {
+fn try_resolve_map_key<'a>(
+    candidate: &str,
+    folder: bool,
+    files: &HashMap<&'a str, &str>,
+) -> Option<&'a str> {
+    try_resolve(candidate, folder, |path| {
         files.get_key_value(path).map(|(key, _)| *key)
     })
 }
 
-fn try_resolve_set<'a>(candidate: &str, files: &HashSet<&'a str>) -> Option<&'a str> {
-    try_resolve(candidate, |path| files.get(path).copied())
+fn try_resolve_set<'a>(candidate: &str, folder: bool, files: &HashSet<&'a str>) -> Option<&'a str> {
+    try_resolve(candidate, folder, |path| files.get(path).copied())
 }
 
 #[cfg(test)]
 fn try_resolve_file(candidate: &str, files: &HashSet<String>) -> Option<String> {
     let borrowed = files.iter().map(String::as_str).collect();
-    try_resolve_set(candidate, &borrowed).map(str::to_string)
+    try_resolve_set(candidate, false, &borrowed).map(str::to_string)
 }
 
 /// Strip file extension for import paths. Also strips /index suffixes.
@@ -1274,6 +1296,46 @@ import { c } from "react";
         ] {
             assert!(rewritten.contains(expected), "{expected}\n{rewritten}");
         }
+    }
+
+    #[test]
+    fn a_folder_import_resolves_to_the_folder_index_not_a_sibling_file() {
+        let src_to_dest = HashMap::from([
+            ("a.ts".to_string(), "x/a.ts".to_string()),
+            ("a/index.ts".to_string(), "y/a/index.ts".to_string()),
+            ("a/b.ts".to_string(), "y/a/b.ts".to_string()),
+            ("index.ts".to_string(), "lib/index.ts".to_string()),
+            ("app.ts".to_string(), "app.ts".to_string()),
+        ]);
+        let src_files = src_to_dest.keys().cloned().collect();
+        let dest_files = src_to_dest.values().cloned().collect();
+
+        let nested = rewrite_imports(
+            "import a from \".\";\nimport b from \"../a/\";",
+            "a/b.ts",
+            "y/a/b.ts",
+            None,
+            Some("@/"),
+            &src_to_dest,
+            &src_files,
+            &dest_files,
+        )
+        .expect("folder imports must be rewritten");
+        assert!(nested.contains(r#"import a from "@/y/a""#), "{nested}");
+        assert!(nested.contains(r#"import b from "@/y/a""#), "{nested}");
+
+        let root = rewrite_imports(
+            "import root from \".\";",
+            "app.ts",
+            "app.ts",
+            None,
+            Some("@/"),
+            &src_to_dest,
+            &src_files,
+            &dest_files,
+        )
+        .expect("the root index import must be rewritten");
+        assert!(root.contains(r#"import root from "@/lib""#), "{root}");
     }
 
     #[test]

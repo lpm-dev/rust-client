@@ -206,10 +206,11 @@ fn maps_a_directory(target_prefix: &str) -> bool {
     target_prefix.is_empty() || target_prefix.ends_with('/')
 }
 
-/// Whether another `paths` key that TypeScript prefers would claim some of the
-/// imports `alias` produces and send them somewhere other than `key` does. An
-/// exact key, a key with text after its `*`, or a key whose first target is a
-/// fixed file always counts, since LPM CLI can't follow it.
+/// Whether another `paths` key that TypeScript prefers, or that ties with
+/// `key`, would claim some of the imports `alias` produces and send them
+/// somewhere other than `key` does. An exact key, a key with text after its
+/// `*`, or a key whose first target is a fixed file always counts, since LPM
+/// CLI can't follow it.
 fn is_shadowed(
     alias: &str,
     key: &str,
@@ -220,8 +221,11 @@ fn is_shadowed(
 ) -> bool {
     entries.iter().any(|&(other_key, other_target)| {
         let literal = other_key.split('*').next().unwrap_or(other_key);
+        // On an equal prefix TypeScript takes the key declared first, so a
+        // pattern with text after its `*` can win either way.
+        let ties = literal.len() == key_prefix.len() && other_key.contains('*');
         if other_key == key
-            || literal.len() <= key_prefix.len()
+            || (literal.len() <= key_prefix.len() && !ties)
             || !literal.starts_with(key_prefix)
             || !(alias.starts_with(literal) || literal.starts_with(alias))
         {
@@ -631,6 +635,26 @@ mod tests {
             r#"{"@/*":["./src/*"],"@/components/util":["./other.ts"]}"#,
             r#"{"@/*":["./src/*"],"@/components/*.js":["./other/*.js"]}"#,
             r#"{"@/*":["./src/*"],"@/components/*":["./src/index.ts"]}"#,
+        ] {
+            std::fs::write(
+                project.path().join("tsconfig.json"),
+                format!(r#"{{"compilerOptions":{{"paths":{paths}}}}}"#),
+            )
+            .unwrap();
+            assert!(
+                detect_buyer_alias(project.path(), &project.path().join("src/components"))
+                    .is_none(),
+                "{paths}"
+            );
+        }
+    }
+
+    #[test]
+    fn buyer_alias_skips_an_alias_a_same_prefix_pattern_overlaps() {
+        let project = tempfile::tempdir().unwrap();
+        for paths in [
+            r#"{"@/*.js":["./legacy/*.js"],"@/*":["./src/*"]}"#,
+            r#"{"@/*":["./src/*"],"@/*.js":["./legacy/*.js"]}"#,
         ] {
             std::fs::write(
                 project.path().join("tsconfig.json"),

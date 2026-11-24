@@ -325,10 +325,7 @@ fn analyze_project(
     let workspace_names: HashSet<&str> = workspace_names.iter().map(String::as_str).collect();
     let mut phantoms = Vec::new();
     for (name, occurrences) in &import_usage.imports_by_package {
-        if import_usage.node_builtins.contains(name.as_str())
-            || declared_names.contains(name.as_str())
-            || workspace_names.contains(name.as_str())
-        {
+        if declared_names.contains(name.as_str()) || workspace_names.contains(name.as_str()) {
             continue;
         }
         if let Some(pattern) = config.match_phantom(name) {
@@ -405,7 +402,6 @@ fn collect_declared_dependencies(manifest: &Value) -> Vec<DeclaredDependency> {
 struct ImportUsage {
     used_packages: BTreeSet<String>,
     imports_by_package: BTreeMap<String, Vec<SourceImport>>,
-    node_builtins: HashSet<&'static str>,
     uses_node_builtin: bool,
 }
 
@@ -420,7 +416,10 @@ impl ImportUsage {
         let mut uses_node_builtin = false;
 
         for import in imports {
-            if import.specifier.starts_with("node:") {
+            // A type reference names a types package, not a module to load.
+            if !import.type_reference
+                && crate::intelligence::is_node_builtin_specifier(&import.specifier, &node_builtins)
+            {
                 uses_node_builtin = true;
                 continue;
             }
@@ -433,11 +432,7 @@ impl ImportUsage {
             if !seen.insert((package_name.clone(), import.file.clone(), import.line)) {
                 continue;
             }
-            if crate::intelligence::is_node_builtin_specifier(&import.specifier, &node_builtins) {
-                uses_node_builtin = true;
-            } else {
-                used_packages.insert(package_name.clone());
-            }
+            used_packages.insert(package_name.clone());
             imports_by_package
                 .entry(package_name)
                 .or_default()
@@ -447,7 +442,6 @@ impl ImportUsage {
         Self {
             used_packages,
             imports_by_package,
-            node_builtins,
             uses_node_builtin,
         }
     }
@@ -1371,6 +1365,47 @@ mod tests {
     #[test]
     fn fallback_bin_names_include_common_typescript_binary() {
         assert!(fallback_bin_names("typescript").contains("tsc"));
+    }
+
+    fn source_import(specifier: &str, line: usize, type_reference: bool) -> SourceImport {
+        SourceImport {
+            specifier: specifier.to_string(),
+            file: std::path::PathBuf::from("src/app.ts"),
+            line,
+            package_name: crate::intelligence::extract_package_name(specifier),
+            type_reference,
+        }
+    }
+
+    #[test]
+    fn import_usage_keeps_an_npm_subpath_that_shares_a_line_with_its_builtin() {
+        let usage = ImportUsage::from_imports(
+            vec![
+                source_import("process", 1, false),
+                source_import("process/browser", 1, false),
+            ],
+            &[],
+        );
+        assert!(usage.uses_node_builtin);
+        assert!(usage.used_packages.contains("process"));
+        assert_eq!(
+            usage.imports_by_package["process"]
+                .iter()
+                .map(|import| import.specifier.as_str())
+                .collect::<Vec<_>>(),
+            ["process/browser"]
+        );
+    }
+
+    #[test]
+    fn import_usage_counts_a_type_reference_to_a_builtin_name_as_its_types_package() {
+        let declared = [DeclaredDependency {
+            name: "@types/events".to_string(),
+            section: DEPENDENCY_SECTIONS[1],
+            spec: "3.0.0".to_string(),
+        }];
+        let usage = ImportUsage::from_imports(vec![source_import("events", 1, true)], &declared);
+        assert!(usage.used_packages.contains("@types/events"));
     }
 
     #[test]
