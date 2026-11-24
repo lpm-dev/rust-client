@@ -206,9 +206,9 @@ fn maps_a_directory(target_prefix: &str) -> bool {
     target_prefix.is_empty() || target_prefix.ends_with('/')
 }
 
-/// Whether another `paths` key that TypeScript prefers, or that ties with
-/// `key`, would claim some of the imports `alias` produces and send them
-/// somewhere other than `key` does. An exact key, a key with text after its
+/// Whether another `paths` key that TypeScript may prefer, a longer one or one
+/// that ties with `key`, would claim some of the imports `alias` produces and
+/// send them somewhere other than `key` does. An exact key, a key with text after its
 /// `*`, or a key whose first target is a fixed file always counts, since LPM
 /// CLI can't follow it.
 fn is_shadowed(
@@ -221,8 +221,8 @@ fn is_shadowed(
 ) -> bool {
     entries.iter().any(|&(other_key, other_target)| {
         let literal = other_key.split('*').next().unwrap_or(other_key);
-        // On an equal prefix TypeScript takes the key declared first, so a
-        // pattern with text after its `*` can win either way.
+        // TypeScript takes the key declared first on an equal prefix. Counting
+        // a tie in either order is conservative and keeps the check simple.
         let ties = literal.len() == key_prefix.len() && other_key.contains('*');
         if other_key == key
             || (literal.len() <= key_prefix.len() && !ties)
