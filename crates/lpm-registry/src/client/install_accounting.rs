@@ -164,7 +164,7 @@ impl RegistryClient {
                 .await?
                 .post(&url)
                 .json(&serde_json::json!({ "packages": chunk }));
-            let response = self.send_once_preserving_status(request).await?;
+            let response = self.send_once_following_in_scope_redirects(request).await?;
             if matches!(response.status().as_u16(), 401 | 403 | 404) {
                 return Ok(false);
             }

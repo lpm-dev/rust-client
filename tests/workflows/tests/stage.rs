@@ -285,6 +285,7 @@ async fn stage_publish_uses_npm_trusted_publishing_token_exchange() {
 
     let output = lpm(&project)
         .env("NPM_ID_TOKEN", NPM_ID_TOKEN)
+        .env("LPM_INTERNAL_TEST_NPM_OIDC_REGISTRY_URL", mock.url())
         .args([
             "--json",
             "stage",
@@ -350,6 +351,7 @@ async fn stage_publish_provenance_restricted_access_fails_before_oidc_exchange()
 
     let output = lpm(&project)
         .env("NPM_ID_TOKEN", NPM_ID_TOKEN)
+        .env("LPM_INTERNAL_TEST_NPM_OIDC_REGISTRY_URL", mock.url())
         .args([
             "stage",
             "publish",
@@ -436,6 +438,7 @@ async fn stage_publish_provenance_file_invalid_json_fails_before_npm_auth() {
 
     let output = lpm(&project)
         .env("NPM_ID_TOKEN", NPM_ID_TOKEN)
+        .env("LPM_INTERNAL_TEST_NPM_OIDC_REGISTRY_URL", mock.url())
         .args([
             "stage",
             "publish",
@@ -1214,6 +1217,7 @@ async fn stage_list_requires_npm_token_when_npm_id_token_is_present() {
 
     let output = lpm(&project)
         .env("NPM_ID_TOKEN", NPM_ID_TOKEN)
+        .env("LPM_INTERNAL_TEST_NPM_OIDC_REGISTRY_URL", mock.url())
         .args(["stage", "list", "--npm-registry", &mock.url()])
         .output()
         .expect("failed to run lpm stage list with only NPM_ID_TOKEN");

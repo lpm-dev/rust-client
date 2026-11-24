@@ -292,16 +292,50 @@ fn npm_oidc_exchange_url(registry_url: &str, npm_name: &str) -> String {
     )
 }
 
-fn registry_supports_npm_trusted_publishing(registry_url: &str) -> bool {
+#[cfg(any(test, debug_assertions, feature = "acceptance-test-hooks"))]
+const NPM_OIDC_TEST_REGISTRY_ENV: &str = "LPM_INTERNAL_TEST_NPM_OIDC_REGISTRY_URL";
+
+fn registry_supports_npm_trusted_publishing_with_test_override(
+    registry_url: &str,
+    test_override: Option<&str>,
+) -> bool {
     let trimmed = normalized_registry_url(registry_url);
     if trimmed.eq_ignore_ascii_case(NPM_REGISTRY_URL) {
         return true;
     }
+    let Some(override_url) = test_override.map(str::trim).filter(|url| !url.is_empty()) else {
+        return false;
+    };
+    let (Ok(candidate), Ok(allowed)) = (
+        reqwest::Url::parse(&trimmed),
+        reqwest::Url::parse(&normalized_registry_url(override_url)),
+    ) else {
+        return false;
+    };
+    if !matches!(allowed.scheme(), "http" | "https")
+        || !allowed.username().is_empty()
+        || allowed.password().is_some()
+        || !allowed.host_str().is_some_and(lpm_common::is_loopback_host)
+    {
+        return false;
+    }
+    lpm_common::url_matches_base_scope(&candidate, &allowed)
+        && candidate.path().trim_end_matches('/') == allowed.path().trim_end_matches('/')
+}
 
-    reqwest::Url::parse(&trimmed)
-        .ok()
-        .and_then(|url| url.host_str().map(lpm_common::is_loopback_host))
-        .unwrap_or(false)
+fn registry_supports_npm_trusted_publishing(registry_url: &str) -> bool {
+    // Pin npm Trusted Publishing OIDC exchange to registry.npmjs.org by default
+    // in every runnable build (including debug) so a repository-configured
+    // loopback registry can never receive an npm-audience OIDC JWT without an
+    // explicit test-harness opt-in.
+    #[cfg(any(test, debug_assertions, feature = "acceptance-test-hooks"))]
+    let test_override = std::env::var(NPM_OIDC_TEST_REGISTRY_ENV).ok();
+    #[cfg(not(any(test, debug_assertions, feature = "acceptance-test-hooks")))]
+    let test_override: Option<String> = None;
+    registry_supports_npm_trusted_publishing_with_test_override(
+        registry_url,
+        test_override.as_deref(),
+    )
 }
 
 async fn read_response_body_capped(
@@ -360,6 +394,7 @@ mod tests {
             "LPM_OIDC_TOKEN",
             "LPM_GITLAB_OIDC_TOKEN",
             "SIGSTORE_ID_TOKEN",
+            NPM_OIDC_TEST_REGISTRY_ENV,
         ];
         let pairs: Vec<(&'static str, Option<OsString>)> = keys
             .into_iter()
@@ -382,28 +417,57 @@ mod tests {
     }
 
     #[test]
-    fn trusted_publishing_registry_gate_accepts_npm_and_loopback_only() {
+    fn trusted_publishing_registry_gate_requires_explicit_loopback_opt_in() {
+        let _env = scoped(&[]);
         assert!(registry_supports_npm_trusted_publishing(
             "https://registry.npmjs.org/"
         ));
-        assert!(registry_supports_npm_trusted_publishing(
-            "http://127.0.0.1:4873"
-        ));
-        assert!(registry_supports_npm_trusted_publishing(
-            "http://localhost:4873"
-        ));
+        assert!(
+            !registry_supports_npm_trusted_publishing("http://127.0.0.1:4873"),
+            "default debug/test runs must refuse arbitrary loopback registries without explicit opt-in"
+        );
+        assert!(
+            !registry_supports_npm_trusted_publishing("http://localhost:4873"),
+            "default debug/test runs must refuse localhost without explicit opt-in"
+        );
         assert!(!registry_supports_npm_trusted_publishing(
             "https://npm.pkg.github.com"
         ));
         assert!(!registry_supports_npm_trusted_publishing(
             "https://registry.example.test"
         ));
+        assert!(registry_supports_npm_trusted_publishing_with_test_override(
+            "https://registry.npmjs.org/",
+            None
+        ));
+        assert!(registry_supports_npm_trusted_publishing_with_test_override(
+            "http://127.0.0.1:4873/",
+            Some("http://127.0.0.1:4873")
+        ));
+        assert!(
+            !registry_supports_npm_trusted_publishing_with_test_override(
+                "http://127.0.0.1:9999/",
+                Some("http://127.0.0.1:4873")
+            ),
+            "test override must match the exact pinned loopback origin and port"
+        );
+        assert!(
+            !registry_supports_npm_trusted_publishing_with_test_override(
+                "https://attacker.example",
+                Some("https://attacker.example")
+            ),
+            "test override must never permit non-loopback registries"
+        );
     }
 
     #[tokio::test]
     async fn resolve_publish_auth_uses_exchanged_oidc_token() {
-        let _env = scoped(&[("NPM_ID_TOKEN", NPM_ID_TOKEN)]);
         let server = MockServer::start().await;
+        let uri = server.uri();
+        let _env = scoped(&[
+            ("NPM_ID_TOKEN", NPM_ID_TOKEN),
+            (NPM_OIDC_TEST_REGISTRY_ENV, &uri),
+        ]);
         Mock::given(method("POST"))
             .and(path("/-/npm/v1/oidc/token/exchange/package/%40scope%2Fpkg"))
             .and(header("authorization", format!("Bearer {NPM_ID_TOKEN}")))
@@ -428,8 +492,12 @@ mod tests {
 
     #[tokio::test]
     async fn npm_oidc_exchange_error_does_not_echo_the_submitted_jwt() {
-        let _env = scoped(&[("NPM_ID_TOKEN", NPM_ID_TOKEN)]);
         let server = MockServer::start().await;
+        let uri = server.uri();
+        let _env = scoped(&[
+            ("NPM_ID_TOKEN", NPM_ID_TOKEN),
+            (NPM_OIDC_TEST_REGISTRY_ENV, &uri),
+        ]);
         Mock::given(method("POST"))
             .and(path("/-/npm/v1/oidc/token/exchange/package/%40scope%2Fpkg"))
             .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
@@ -455,11 +523,13 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_publish_auth_allows_ambient_token_fallback_for_explicit_custom_registry() {
+        let server = MockServer::start().await;
+        let uri = server.uri();
         let _env = scoped(&[
             ("NPM_ID_TOKEN", NPM_ID_TOKEN),
             ("NPM_TOKEN", "fallback-npm-token"),
+            (NPM_OIDC_TEST_REGISTRY_ENV, &uri),
         ]);
-        let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/-/npm/v1/oidc/token/exchange/package/%40scope%2Fpkg"))
             .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
@@ -527,5 +597,35 @@ mod tests {
 
         assert!(message.contains("https://registry.example.test"));
         assert!(!message.contains("path-secret"));
+    }
+
+    #[test]
+    fn trusted_publishing_gate_refuses_loopback_when_override_is_absent() {
+        assert!(registry_supports_npm_trusted_publishing_with_test_override(
+            "https://registry.npmjs.org",
+            None
+        ));
+        assert!(
+            !registry_supports_npm_trusted_publishing_with_test_override(
+                "http://127.0.0.1:4873",
+                None
+            )
+        );
+        assert!(
+            !registry_supports_npm_trusted_publishing_with_test_override(
+                "http://localhost:4873",
+                None
+            )
+        );
+        assert!(registry_supports_npm_trusted_publishing_with_test_override(
+            "http://127.0.0.1:4873",
+            Some("http://127.0.0.1:4873")
+        ));
+        assert!(
+            !registry_supports_npm_trusted_publishing_with_test_override(
+                "https://attacker.example",
+                Some("https://attacker.example")
+            )
+        );
     }
 }

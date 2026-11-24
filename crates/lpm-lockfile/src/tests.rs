@@ -1131,6 +1131,8 @@ fn a_tarball_url_with_a_query_or_fragment_is_not_a_recordable_hint() {
         "https://cdn.example/lodash/-/lodash-4.17.21.tgz?sig=value",
         "https://cdn.example/lodash/-/lodash-4.17.21.tgz?",
         "https://cdn.example/lodash/-/lodash-4.17.21.tgz#value",
+        "https://user:secret@cdn.example/lodash/-/lodash-4.17.21.tgz",
+        "https://token@cdn.example/lodash/-/lodash-4.17.21.tgz",
     ] {
         assert!(!crate::is_recordable_tarball_hint(url), "{url}");
     }

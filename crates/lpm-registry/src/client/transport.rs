@@ -41,12 +41,26 @@ const RETRY_ERROR_BODY_TIMEOUT: Duration = Duration::from_millis(500);
 impl RegistryClient {
     // ─── Internal: HTTP transport with retry ────────────────────────
 
+    fn ensure_base_url_scope(&self, url: &str) -> Result<(), LpmError> {
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|_| LpmError::Registry("invalid registry endpoint URL".into()))?;
+        self.validate_request_url(&parsed)?;
+        if !self.is_base_url_scope(url) {
+            return Err(LpmError::Registry(format!(
+                "refusing authenticated registry request outside configured base URL (target origin: {})",
+                lpm_common::safe_url_origin(url)
+            )));
+        }
+        Ok(())
+    }
+
     /// POST JSON with auth, returning the raw response (for callers that need status/headers).
     pub async fn post_json_raw(
         &self,
         url: &str,
         body: &serde_json::Value,
     ) -> Result<reqwest::Response, LpmError> {
+        self.ensure_base_url_scope(url)?;
         let mut req = self.http.for_url(url).await?.post(url).json(body);
         if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired)? {
             req = req.bearer_auth(bearer);
@@ -71,6 +85,7 @@ impl RegistryClient {
         command: &'static str,
         operation: &'static str,
     ) -> Result<(serde_json::Value, SecretString), LpmError> {
+        self.ensure_base_url_scope(url)?;
         self.execute_with_recovery(AuthPosture::AuthRequired, || async {
             let mut request = self
                 .http
@@ -125,6 +140,7 @@ impl RegistryClient {
         body: &serde_json::Value,
         operation: &str,
     ) -> Result<serde_json::Value, LpmError> {
+        self.ensure_base_url_scope(url)?;
         self.execute_with_recovery(AuthPosture::SessionRequired, || async {
             let bearer = self
                 .current_bearer(AuthPosture::SessionRequired)?
@@ -176,7 +192,13 @@ impl RegistryClient {
         url: &str,
         body: &serde_json::Value,
     ) -> Result<reqwest::Request, LpmError> {
-        let mut request = self.http.for_url(url).await?.post(url).json(body);
+        self.ensure_base_url_scope(url)?;
+        let mut request = self
+            .http
+            .for_manual_redirect_url(url)
+            .await?
+            .post(url)
+            .json(body);
         if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired)? {
             request = request.bearer_auth(bearer);
         }
@@ -196,13 +218,51 @@ impl RegistryClient {
         mut request: reqwest::Request,
     ) -> Result<reqwest::Response, LpmError> {
         self.validate_base_url()?;
+        if request
+            .headers()
+            .contains_key(reqwest::header::AUTHORIZATION)
+            || lpm_http::SENSITIVE_PROOF_HEADERS
+                .iter()
+                .any(|header| request.headers().contains_key(*header))
+        {
+            self.ensure_base_url_scope(request.url().as_str())?;
+        }
         self.route_to_npm_transport(&mut request);
         self.http
-            .for_url(request.url().as_str())
+            .for_manual_redirect_url(request.url().as_str())
             .await?
             .execute(request)
             .await
             .map_err(|error| LpmError::Network(lpm_http::error_chain(&error)))
+    }
+
+    /// Send one request without retries while following validated redirects
+    /// strictly within the configured registry base scope.
+    pub(super) async fn send_once_following_in_scope_redirects(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, LpmError> {
+        let mut request = build_request(request)?;
+        self.validate_base_url()?;
+        self.ensure_base_url_scope(request.url().as_str())?;
+        self.route_to_npm_transport(&mut request);
+        let provider = super::http::TransferClientProvider(self.http.as_ref());
+        let scope = |url: &reqwest::Url| self.is_base_url_scope_parsed(url);
+        lpm_http::send_with_replayable_redirects_and_authorization_scope(
+            &provider,
+            request,
+            None,
+            Some(&scope),
+        )
+        .await
+        .map_err(|error| match error {
+            lpm_http::ReplayableRequestError::Client(err) => err,
+            lpm_http::ReplayableRequestError::Request(err)
+            | lpm_http::ReplayableRequestError::RequestAfterRedirect(err) => {
+                LpmError::Network(lpm_http::error_chain(&err))
+            }
+            other => LpmError::Network(other.to_string()),
+        })
     }
 
     /// Issue one anonymous health request without install-grade retries.
@@ -222,7 +282,7 @@ impl RegistryClient {
             .build_get_with_posture(&url, AuthPosture::AnonymousOnly)
             .await?;
         Ok(self
-            .send_once_preserving_status(request)
+            .send_once_following_in_scope_redirects(request)
             .await?
             .status()
             .is_success())
@@ -546,7 +606,15 @@ impl RegistryClient {
             let headers = req.headers().clone();
 
             let transfer = super::http::TransferClientProvider(self.http.as_ref());
-            match lpm_http::send_with_replayable_redirects(&transfer, req, Some(payload)).await {
+            let first_party_scope = |url: &reqwest::Url| self.is_base_url_scope_parsed(url);
+            match lpm_http::send_with_replayable_redirects_and_authorization_scope(
+                &transfer,
+                req,
+                Some(payload),
+                Some(&first_party_scope),
+            )
+            .await
+            {
                 Ok(response) => {
                     let status = response.status().as_u16();
                     if matches!(status, 200..=299 | 304) {
@@ -899,12 +967,18 @@ impl RegistryClient {
             let response = if let Some(client) = client_override.as_ref() {
                 client.execute(req).await
             } else if can_reselect_redirect_clients {
+                let first_party_request =
+                    auth.is_none() && self.is_base_url_scope_parsed(req.url());
                 let authorization_allowed = |url: &reqwest::Url| {
-                    auth.is_none_or(|credential| credential.matches_destination(url))
+                    if let Some(credential) = auth {
+                        credential.matches_destination(url)
+                    } else {
+                        self.is_base_url_scope_parsed(url)
+                    }
                 };
-                let authorization_scope = auth.map(|_| {
-                    &authorization_allowed as &(dyn Fn(&reqwest::Url) -> bool + Send + Sync)
-                });
+                let authorization_scope = (auth.is_some() || first_party_request).then_some(
+                    &authorization_allowed as &(dyn Fn(&reqwest::Url) -> bool + Send + Sync),
+                );
                 match lpm_http::send_with_replayable_redirects_and_authorization_scope(
                     provider,
                     req,
@@ -1057,8 +1131,25 @@ impl RegistryClient {
         self.registry_origin(answered)
     }
 
-    fn npm_transport_url_for(&self, url: &reqwest::Url) -> Option<reqwest::Url> {
+    pub(super) fn npm_transport_url_for(&self, url: &reqwest::Url) -> Option<reqwest::Url> {
         let transport = self.npm_transport_url.as_deref()?;
+        let Ok(parsed_transport) = reqwest::Url::parse(transport) else {
+            tracing::warn!("ignoring invalid npm transport override URL");
+            return None;
+        };
+        let is_loopback_transport = matches!(parsed_transport.scheme(), "http" | "https")
+            && parsed_transport.username().is_empty()
+            && parsed_transport.password().is_none()
+            && parsed_transport
+                .host_str()
+                .is_some_and(lpm_common::is_loopback_host);
+        if !is_loopback_transport {
+            tracing::warn!(
+                origin = %lpm_common::safe_url_origin(transport),
+                "ignoring non-loopback npm transport override URL"
+            );
+            return None;
+        }
         let rest = url
             .as_str()
             .strip_prefix(self.npm_registry_url.trim_end_matches('/'))?;

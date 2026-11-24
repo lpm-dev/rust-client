@@ -283,26 +283,33 @@ impl RouteTable {
     pub fn route_for_package(&self, name: &str) -> UpstreamRoute {
         match self.selected_route_for_package(name) {
             SelectedRoute::Mode(mode) => self.route_for_mode(name, mode),
-            SelectedRoute::Custom(target) => UpstreamRoute::Custom {
-                target: target.clone(),
-                auth: self.npmrc.shared_auth_for_url(&target.base_url).cloned(),
-            },
-            SelectedRoute::Jsr => UpstreamRoute::Custom {
-                target: JSR_TARGET.clone(),
-                auth: self
-                    .npmrc
-                    .shared_auth_for_origin_path(&JSR_ORIGIN, "/")
-                    .cloned(),
-            },
+            SelectedRoute::Custom(target) => {
+                let package_url = format!("{}/{name}", target.base_url.trim_end_matches('/'));
+                UpstreamRoute::Custom {
+                    target: target.clone(),
+                    auth: self.npmrc.shared_auth_for_url(&package_url).cloned(),
+                }
+            }
+            SelectedRoute::Jsr => {
+                let package_path = format!("/{name}");
+                UpstreamRoute::Custom {
+                    target: JSR_TARGET.clone(),
+                    auth: self
+                        .npmrc
+                        .shared_auth_for_origin_path(&JSR_ORIGIN, &package_path)
+                        .cloned(),
+                }
+            }
         }
     }
 
     fn route_for_mode(&self, name: &str, mode: RouteMode) -> UpstreamRoute {
         match mode.route_for_package(name) {
             UpstreamRoute::NpmDirect => {
+                let package_path = format!("/{name}");
                 let Some(auth) = self
                     .npmrc
-                    .shared_auth_for_origin_path(&NPM_ORIGIN, "/")
+                    .shared_auth_for_origin_path(&NPM_ORIGIN, &package_path)
                     .cloned()
                 else {
                     return UpstreamRoute::NpmDirect;
@@ -316,6 +323,56 @@ impl RouteTable {
         }
     }
 
+    /// Route a search query to its registry and select `.npmrc` credentials for
+    /// the registry's `/-/v1/search` endpoint rather than treating free-text
+    /// query input as a package path.
+    pub fn route_for_search(&self, query: &str) -> UpstreamRoute {
+        let routing_hint = query
+            .trim()
+            .strip_prefix('@')
+            .and_then(|rest| rest.split_once('/'))
+            .filter(|(scope, _)| {
+                !scope.is_empty()
+                    && scope
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            })
+            .map(|(scope, _)| format!("@{scope}/search"));
+        let hint = routing_hint.as_deref().unwrap_or("search");
+        match self.selected_route_for_package(hint) {
+            SelectedRoute::Mode(mode) => match mode.route_for_package(hint) {
+                UpstreamRoute::NpmDirect => {
+                    let Some(auth) = self
+                        .npmrc
+                        .shared_auth_for_origin_path(&NPM_ORIGIN, "/-/v1/search")
+                        .cloned()
+                    else {
+                        return UpstreamRoute::NpmDirect;
+                    };
+                    UpstreamRoute::Custom {
+                        target: NPM_TARGET.clone(),
+                        auth: Some(auth),
+                    }
+                }
+                route => route,
+            },
+            SelectedRoute::Custom(target) => {
+                let search_url = format!("{}/-/v1/search", target.base_url.trim_end_matches('/'));
+                UpstreamRoute::Custom {
+                    target: target.clone(),
+                    auth: self.npmrc.shared_auth_for_url(&search_url).cloned(),
+                }
+            }
+            SelectedRoute::Jsr => UpstreamRoute::Custom {
+                target: JSR_TARGET.clone(),
+                auth: self
+                    .npmrc
+                    .shared_auth_for_origin_path(&JSR_ORIGIN, "/-/v1/search")
+                    .cloned(),
+            },
+        }
+    }
+
     /// Return the configured npm-compatible route only when `candidate`
     /// is within the registry path authorized for `name`.
     pub fn custom_route_for_package_url(
@@ -324,28 +381,31 @@ impl RouteTable {
         candidate: &str,
     ) -> Option<UpstreamRoute> {
         if let Some(target) = self.npmrc_scope_target_for_package(name) {
+            let package_url = format!("{}/{name}", target.base_url.trim_end_matches('/'));
             return registry_url_contains(candidate, &target.base_url).then(|| {
                 UpstreamRoute::Custom {
                     target: target.clone(),
-                    auth: self.npmrc.shared_auth_for_url(&target.base_url).cloned(),
+                    auth: self.npmrc.shared_auth_for_url(&package_url).cloned(),
                 }
             });
         }
         if name.starts_with("@jsr/") {
+            let package_path = format!("/{name}");
             return registry_url_contains_parsed(candidate, &JSR_URL).then(|| {
                 UpstreamRoute::Custom {
                     target: JSR_TARGET.clone(),
                     auth: self
                         .npmrc
-                        .shared_auth_for_origin_path(&JSR_ORIGIN, "/")
+                        .shared_auth_for_origin_path(&JSR_ORIGIN, &package_path)
                         .cloned(),
                 }
             });
         }
         let target = self.npmrc.default_registry.as_ref()?;
+        let package_url = format!("{}/{name}", target.base_url.trim_end_matches('/'));
         registry_url_contains(candidate, &target.base_url).then(|| UpstreamRoute::Custom {
             target: target.clone(),
-            auth: self.npmrc.shared_auth_for_url(&target.base_url).cloned(),
+            auth: self.npmrc.shared_auth_for_url(&package_url).cloned(),
         })
     }
 
@@ -604,7 +664,9 @@ fn registry_url_contains_parsed(candidate: &str, registry: &reqwest::Url) -> boo
     let Ok(candidate) = reqwest::Url::parse(candidate) else {
         return false;
     };
-    if candidate.scheme() != registry.scheme()
+    if !candidate.username().is_empty()
+        || candidate.password().is_some()
+        || candidate.scheme() != registry.scheme()
         || candidate.host_str().map(str::to_ascii_lowercase)
             != registry.host_str().map(str::to_ascii_lowercase)
         || candidate.port_or_known_default() != registry.port_or_known_default()
@@ -615,12 +677,23 @@ fn registry_url_contains_parsed(candidate: &str, registry: &reqwest::Url) -> boo
 }
 
 fn path_lies_under(candidate: &str, base: &str) -> bool {
-    let base = base.trim_end_matches('/');
-    base.is_empty()
-        || candidate == base
-        || candidate
-            .strip_prefix(base)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+    lpm_common::path_matches_base_scope(candidate, base)
+}
+
+pub(crate) fn registry_serves_tarball(candidate: &reqwest::Url, registry: &reqwest::Url) -> bool {
+    if !candidate.username().is_empty()
+        || candidate.password().is_some()
+        || lpm_common::path_has_encoded_traversal(candidate.path())
+        || candidate.scheme() != registry.scheme()
+        || candidate.port_or_known_default() != registry.port_or_known_default()
+        || candidate.host_str().map(str::to_ascii_lowercase)
+            != registry.host_str().map(str::to_ascii_lowercase)
+    {
+        return false;
+    }
+    path_lies_under(candidate.path(), registry.path())
+        || gitlab_project_tarball_under(candidate.path(), registry.path())
+        || github_packages_download(candidate)
 }
 
 fn registry_serves(candidate: &str, registry: &str) -> bool {
@@ -634,6 +707,12 @@ fn registry_serves(candidate: &str, registry: &str) -> bool {
 }
 
 fn registry_serves_parsed(candidate: &reqwest::Url, registry: &reqwest::Url) -> bool {
+    if !candidate.username().is_empty()
+        || candidate.password().is_some()
+        || lpm_common::path_has_encoded_traversal(candidate.path())
+    {
+        return false;
+    }
     let same_endpoint = if candidate.scheme() == registry.scheme() {
         candidate.port_or_known_default() == registry.port_or_known_default()
     } else {
@@ -1506,5 +1585,132 @@ mod tests {
             scopes_a.routing_fingerprint(),
             scopes_b.routing_fingerprint()
         );
+    }
+
+    #[test]
+    fn route_for_package_selects_narrower_package_path_credential_over_root() {
+        use secrecy::ExposeSecret as _;
+
+        let table = make_table(
+            concat!(
+                "registry=https://registry.example/npm/\n",
+                "//registry.example/npm/:_authToken=root-token\n",
+                "//registry.example/npm/@scope/secret/:_authToken=pkg-token\n",
+            ),
+            RouteMode::Direct,
+        );
+        match table.route_for_package("@scope/secret") {
+            UpstreamRoute::Custom {
+                auth: Some(auth), ..
+            } => match auth.as_ref() {
+                crate::RegistryAuth::Bearer { token, .. } => {
+                    assert_eq!(token.expose_secret(), "pkg-token")
+                }
+                other => panic!("expected bearer pkg-token, got {other:?}"),
+            },
+            other => panic!("expected package-path credential, got {other:?}"),
+        }
+        match table.route_for_package("@scope/other") {
+            UpstreamRoute::Custom {
+                auth: Some(auth), ..
+            } => match auth.as_ref() {
+                crate::RegistryAuth::Bearer { token, .. } => {
+                    assert_eq!(token.expose_secret(), "root-token")
+                }
+                other => panic!("expected bearer root-token, got {other:?}"),
+            },
+            other => panic!("expected root credential, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_for_package_finds_package_path_credential_without_root_credential() {
+        use secrecy::ExposeSecret as _;
+
+        let table = make_table(
+            concat!(
+                "registry=https://registry.example/npm/\n",
+                "//registry.example/npm/@scope/only-scoped/:_authToken=scoped-only\n",
+            ),
+            RouteMode::Direct,
+        );
+        match table.route_for_package("@scope/only-scoped") {
+            UpstreamRoute::Custom {
+                auth: Some(auth), ..
+            } => match auth.as_ref() {
+                crate::RegistryAuth::Bearer { token, .. } => {
+                    assert_eq!(token.expose_secret(), "scoped-only")
+                }
+                other => panic!("expected bearer scoped-only, got {other:?}"),
+            },
+            other => panic!("expected package-path credential, got {other:?}"),
+        }
+        match table.route_for_package("@scope/anonymous") {
+            UpstreamRoute::Custom { auth: None, .. } => {}
+            other => panic!("expected anonymous custom route, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn registry_path_containment_rejects_encoded_separator_traversal() {
+        let table = make_table(
+            concat!(
+                "@high:registry=https://corp.example/high/\n",
+                "//corp.example/high/:_authToken=HIGH\n",
+            ),
+            RouteMode::Direct,
+        );
+        for candidate in [
+            "https://corp.example/high/..%2Flow/@high/pkg/-/pkg-1.0.0.tgz",
+            "https://corp.example/high/%2e%2e%2flow/@high/pkg/-/pkg-1.0.0.tgz",
+            "https://corp.example/high/%252e%252e%252flow/@high/pkg/-/pkg-1.0.0.tgz",
+            "https://corp.example/high/..%5Clow/@high/pkg/-/pkg-1.0.0.tgz",
+        ] {
+            assert!(
+                table
+                    .custom_route_for_package_url("@high/pkg", candidate)
+                    .is_none(),
+                "custom_route_for_package_url must reject encoded traversal: {candidate}"
+            );
+            assert!(
+                !table.fetches_package_from("@high/pkg", candidate),
+                "fetches_package_from must reject encoded traversal: {candidate}"
+            );
+            assert!(
+                table.auth_for_url(candidate).is_none(),
+                "auth_for_url must reject encoded traversal: {candidate}"
+            );
+            let parsed = reqwest::Url::parse(candidate).unwrap();
+            let base = reqwest::Url::parse("https://corp.example/high/").unwrap();
+            assert!(
+                !registry_serves_tarball(&parsed, &base),
+                "registry_serves_tarball must reject encoded traversal: {candidate}"
+            );
+        }
+
+        let userinfo = "https://user:pass@corp.example/high/@high/pkg/-/pkg-1.0.0.tgz";
+        assert!(
+            table
+                .custom_route_for_package_url("@high/pkg", userinfo)
+                .is_none()
+        );
+        assert!(!table.fetches_package_from("@high/pkg", userinfo));
+        assert!(!registry_serves_tarball(
+            &reqwest::Url::parse(userinfo).unwrap(),
+            &reqwest::Url::parse("https://corp.example/high/").unwrap(),
+        ));
+
+        let gh_base = reqwest::Url::parse("https://npm.pkg.github.com/org/").unwrap();
+        let gh_traversal =
+            reqwest::Url::parse("https://npm.pkg.github.com/download/..%2Fsecret/pkg.tgz").unwrap();
+        assert!(!registry_serves_tarball(&gh_traversal, &gh_base));
+
+        let gl_base =
+            reqwest::Url::parse("https://gitlab.example/api/v4/groups/1/-/packages/npm/").unwrap();
+        let gl_traversal = reqwest::Url::parse(
+            "https://gitlab.example/api/v4/projects/9/packages/npm/..%2F..%2Fsecret.tgz",
+        )
+        .unwrap();
+        assert!(!registry_serves_tarball(&gl_traversal, &gl_base));
     }
 }

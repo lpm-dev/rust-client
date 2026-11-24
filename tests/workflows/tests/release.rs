@@ -2303,6 +2303,7 @@ async fn release_publish_fetches_the_npm_provider_jwt_once_per_command() {
             "LPM_INTERNAL_TEST_NPM_PUBLISH_CLIENT_BUILD_MARKER",
             &client_build_marker,
         )
+        .env("LPM_INTERNAL_TEST_NPM_OIDC_REGISTRY_URL", server.uri())
         .args(["release", "publish", "--all", "--npm", "--yes", "--json"])
         .output()
         .expect("run release with GitHub runtime npm OIDC");

@@ -1011,12 +1011,21 @@ fn resolve_client(
 
     let config = lpm_config.and_then(|cfg| cfg.remote_cache.as_ref());
     let active_registry = session.as_ref().map(|session| session.registry_url());
+    let env_url_set = std::env::var("LPM_REMOTE_CACHE_URL")
+        .ok()
+        .is_some_and(|url| !url.trim().is_empty());
     let base_url = resolve_base_url(config.and_then(|cfg| cfg.url.as_deref()), active_registry)?;
     let cache_matches_registry = cache_origin_matches_registry(&base_url, active_registry);
     let auth = match std::env::var("LPM_REMOTE_CACHE_TOKEN")
         .ok()
         .filter(|token| !token.trim().is_empty())
     {
+        Some(_token) if !env_url_set && !cache_matches_registry => {
+            return Err(
+                "remote cache URL in project config points to a host other than the active LPM registry; set LPM_REMOTE_CACHE_URL explicitly to bind LPM_REMOTE_CACHE_TOKEN to that host"
+                    .to_string(),
+            );
+        }
         Some(token) => RemoteCacheAuth::Static(token),
         // The ambient registry login token (keychain / LPM_TOKEN) is only sent
         // when the cache lives on the LPM registry origin. A cache URL from a
@@ -1038,7 +1047,7 @@ fn resolve_client(
         }
         None => {
             return Err(
-                "remote cache is configured for a host other than the LPM registry; set LPM_REMOTE_CACHE_TOKEN to authenticate (the registry login token is never sent to third-party cache hosts)"
+                "remote cache is configured for a host other than the LPM registry; set LPM_REMOTE_CACHE_TOKEN and LPM_REMOTE_CACHE_URL to authenticate (the registry login token is never sent to third-party cache hosts)"
                     .to_string(),
             );
         }
@@ -1375,42 +1384,214 @@ const MISSING_CONTENT_HASH: &str =
 const MISSING_SIGNATURE_TAG: &str =
     "remote cache artifact is missing a signature tag; treating it as a miss";
 
+const MAX_ARTIFACT_REDIRECTS: usize = 5;
+
+fn is_redirect_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    )
+}
+
+fn is_public_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    let is_this_network = octets[0] == 0;
+    let is_cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64;
+    let is_ietf_protocol = octets[0] == 192 && octets[1] == 0 && octets[2] == 0;
+    let is_benchmarking = octets[0] == 198 && (octets[1] & 0xfe) == 18;
+    let is_reserved = octets[0] >= 240;
+    !(ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_documentation()
+        || is_this_network
+        || is_cgnat
+        || is_ietf_protocol
+        || is_benchmarking
+        || is_reserved)
+}
+
+fn is_public_ipv6(ip: std::net::Ipv6Addr) -> bool {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return is_public_ipv4(v4);
+    }
+    let segments = ip.segments();
+    let is_unique_local = (segments[0] & 0xfe00) == 0xfc00;
+    let is_link_local = (segments[0] & 0xffc0) == 0xfe80;
+    let is_site_local = (segments[0] & 0xffc0) == 0xfec0;
+    let is_documentation = segments[0] == 0x2001 && segments[1] == 0x0db8;
+    let is_ipv4_compatible = segments[..6] == [0; 6];
+    let is_nat64_well_known =
+        segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2..6] == [0; 4];
+    if is_nat64_well_known {
+        let v4 = std::net::Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            segments[6] as u8,
+            (segments[7] >> 8) as u8,
+            segments[7] as u8,
+        );
+        return is_public_ipv4(v4);
+    }
+    !(ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || is_unique_local
+        || is_link_local
+        || is_site_local
+        || is_documentation
+        || is_ipv4_compatible)
+}
+
+fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_public_ipv4(v4),
+        std::net::IpAddr::V6(v6) => is_public_ipv6(v6),
+    }
+}
+
+fn same_redirect_host(lookup_url: &reqwest::Url, target: &reqwest::Url) -> bool {
+    match (lookup_url.host_str(), target.host_str()) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        _ => false,
+    }
+}
+
+fn is_localhost_domain(domain: &str) -> bool {
+    let trimmed = domain.trim_end_matches('.');
+    trimmed.eq_ignore_ascii_case("localhost")
+        || trimmed
+            .rsplit_once('.')
+            .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("localhost"))
+}
+
+fn allow_redirect_ip(
+    lookup_url: &reqwest::Url,
+    target: &reqwest::Url,
+    ip: std::net::IpAddr,
+) -> bool {
+    if is_public_ip(ip) || same_redirect_host(lookup_url, target) {
+        return true;
+    }
+    lookup_url.host().is_some_and(is_loopback_host) && ip.is_loopback()
+}
+
 /// Fetches an artifact a lookup was redirected to, without the token: the
 /// location is a short-lived URL on the cache's download host, which the
 /// redirect's own headers vouch for, and a redirect from HTTPS may not lead
-/// to plain HTTP. Returns None for an artifact the host no longer serves, a
-/// miss. The URL carries the download's credential, so its errors leave it
-/// out.
+/// to plain HTTP or internal/private network addresses. Returns None for an
+/// artifact the host no longer serves, a miss. The URL carries the download's
+/// credential, so its errors leave it out.
 async fn fetch_redirected_artifact(
     lookup_url: &reqwest::Url,
     redirect: &reqwest::Response,
 ) -> Result<Option<reqwest::Response>, RemoteCacheRequestError> {
-    let target = redirect_target(
-        lookup_url,
-        redirect
-            .headers()
-            .get(LOCATION)
-            .and_then(|value| value.to_str().ok()),
-    )
-    .map_err(RemoteCacheRequestError::Message)?;
-    let response = http_client()
-        .map_err(RemoteCacheRequestError::Message)?
-        .get(target)
-        .send()
-        .await
-        .map_err(|error| {
-            RemoteCacheRequestError::from_send("remote cache download failed", &error.without_url())
-        })?;
-    // The download host's refusals aren't the cache server's: a 403 there
-    // is the URL's, which may have expired, not the token's.
-    match response.status() {
-        StatusCode::OK => Ok(Some(response)),
-        StatusCode::NOT_FOUND => Ok(None),
-        status => Err(RemoteCacheRequestError::Message(format!(
-            "remote cache download returned HTTP {}; continuing without it",
-            status.as_u16()
-        ))),
+    let mut current_url = lookup_url.clone();
+    let mut next_location = redirect
+        .headers()
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+
+    for _ in 0..MAX_ARTIFACT_REDIRECTS {
+        let target = redirect_target(lookup_url, &current_url, next_location.as_deref())
+            .map_err(RemoteCacheRequestError::Message)?;
+        let response = send_redirected_artifact_hop(lookup_url, &target).await?;
+        // The download host's refusals aren't the cache server's: a 403 there
+        // is the URL's, which may have expired, not the token's.
+        match response.status() {
+            StatusCode::OK => return Ok(Some(response)),
+            StatusCode::NOT_FOUND => return Ok(None),
+            status if is_redirect_status(status) => {
+                next_location = response
+                    .headers()
+                    .get(LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToOwned::to_owned);
+                current_url = target;
+            }
+            status => {
+                return Err(RemoteCacheRequestError::Message(format!(
+                    "remote cache download returned HTTP {}; continuing without it",
+                    status.as_u16()
+                )));
+            }
+        }
     }
+
+    Err(RemoteCacheRequestError::Message(
+        "remote cache download exceeded redirect limit; continuing without it".into(),
+    ))
+}
+
+async fn send_redirected_artifact_hop(
+    lookup_url: &reqwest::Url,
+    target: &reqwest::Url,
+) -> Result<reqwest::Response, RemoteCacheRequestError> {
+    let request = match target.host() {
+        Some(url::Host::Ipv4(_) | url::Host::Ipv6(_)) => http_client()
+            .map_err(RemoteCacheRequestError::Message)?
+            .get(target.clone()),
+        Some(url::Host::Domain(domain)) => {
+            let port = target.port_or_known_default().ok_or_else(|| {
+                RemoteCacheRequestError::Message(
+                    "remote cache redirect has no port; treating it as a miss".into(),
+                )
+            })?;
+            let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host((domain, port))
+                .await
+                .map_err(|error| {
+                    RemoteCacheRequestError::Unreachable(format!(
+                        "remote cache download host resolution failed: {error}"
+                    ))
+                })?
+                .collect();
+            if resolved.is_empty() {
+                return Err(RemoteCacheRequestError::Unreachable(
+                    "remote cache download host resolved to no addresses".into(),
+                ));
+            }
+            if resolved
+                .iter()
+                .any(|addr| !allow_redirect_ip(lookup_url, target, addr.ip()))
+            {
+                return Err(RemoteCacheRequestError::Message(
+                    "remote cache redirect resolves to a disallowed internal address; treating it as a miss"
+                        .into(),
+                ));
+            }
+            // Pin the validated addresses onto the per-hop client so DNS cannot
+            // rebind between validation and connect.
+            let hop_client = lpm_http::client_builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .referer(false)
+                .connect_timeout(REMOTE_CACHE_CONNECT_TIMEOUT)
+                .timeout(REMOTE_CACHE_TIMEOUT)
+                .resolve_to_addrs(domain, &resolved)
+                .build()
+                .map_err(|e| {
+                    RemoteCacheRequestError::Message(format!(
+                        "failed to initialize remote cache HTTP client: {e}"
+                    ))
+                })?;
+            hop_client.get(target.clone())
+        }
+        None => {
+            return Err(RemoteCacheRequestError::Message(
+                "remote cache redirect has no host; treating it as a miss".into(),
+            ));
+        }
+    };
+
+    request.send().await.map_err(|error| {
+        RemoteCacheRequestError::from_send("remote cache download failed", &error.without_url())
+    })
 }
 
 /// One upload attempt's request, reading the artifact from its start.
@@ -1464,18 +1645,64 @@ fn upload_request(
 }
 
 /// Where a lookup's redirect leads: its location, resolved against the
-/// lookup's URL, which may not leave HTTPS.
+/// current hop URL, which may not leave HTTPS, carry embedded credentials, or
+/// target disallowed internal/loopback/private addresses.
 fn redirect_target(
     lookup_url: &reqwest::Url,
+    current_url: &reqwest::Url,
     location: Option<&str>,
 ) -> Result<reqwest::Url, String> {
     let location =
         location.ok_or("remote cache redirect has no location; treating it as a miss")?;
-    let target = lookup_url
+    let target = current_url
         .join(location)
         .map_err(|e| format!("remote cache redirect has an invalid location: {e}"))?;
-    if lookup_url.scheme() == "https" && target.scheme() != "https" {
+    if !matches!(target.scheme(), "http" | "https") {
+        return Err(
+            "remote cache redirect uses an unsupported scheme; treating it as a miss".into(),
+        );
+    }
+    if !target.username().is_empty() || target.password().is_some() {
+        return Err(
+            "remote cache redirect contains embedded URL credentials; treating it as a miss".into(),
+        );
+    }
+    if (lookup_url.scheme() == "https" || current_url.scheme() == "https")
+        && target.scheme() != "https"
+    {
         return Err("remote cache redirect leaves HTTPS; treating it as a miss".into());
+    }
+    match target.host() {
+        Some(url::Host::Ipv4(v4)) => {
+            if !allow_redirect_ip(lookup_url, &target, std::net::IpAddr::V4(v4)) {
+                return Err(
+                    "remote cache redirect targets a disallowed internal address; treating it as a miss"
+                        .into(),
+                );
+            }
+        }
+        Some(url::Host::Ipv6(v6)) => {
+            if !allow_redirect_ip(lookup_url, &target, std::net::IpAddr::V6(v6)) {
+                return Err(
+                    "remote cache redirect targets a disallowed internal address; treating it as a miss"
+                        .into(),
+                );
+            }
+        }
+        Some(url::Host::Domain(domain)) => {
+            if is_localhost_domain(domain)
+                && !same_redirect_host(lookup_url, &target)
+                && !lookup_url.host().is_some_and(is_loopback_host)
+            {
+                return Err(
+                    "remote cache redirect targets a disallowed loopback host; treating it as a miss"
+                        .into(),
+                );
+            }
+        }
+        None => {
+            return Err("remote cache redirect has no host; treating it as a miss".into());
+        }
     }
     Ok(target)
 }
@@ -1510,6 +1737,8 @@ fn build_lookup_client() -> Result<Client, String> {
 
 fn build_http_client() -> Result<Client, String> {
     lpm_http::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .referer(false)
         .connect_timeout(REMOTE_CACHE_CONNECT_TIMEOUT)
         .timeout(REMOTE_CACHE_TIMEOUT)
         .build()
@@ -1710,6 +1939,15 @@ fn resolve_base_url(
     };
     let parsed =
         reqwest::Url::parse(&with_v8).map_err(|e| format!("invalid remote cache URL: {e}"))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(
+            "remote cache URL must not contain embedded credentials; set LPM_REMOTE_CACHE_TOKEN instead"
+                .into(),
+        );
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("remote cache URL must not include a query string or fragment".into());
+    }
     match parsed.scheme() {
         "https" => Ok(with_v8),
         "http" if parsed.host().is_some_and(is_loopback_host) => Ok(with_v8),
@@ -1721,7 +1959,7 @@ fn resolve_base_url(
 }
 
 fn cache_origin_matches_registry(base_url: &str, active_registry: Option<&str>) -> bool {
-    let Some(cache_origin) = registry_origin_for_auth(base_url) else {
+    let Ok(cache_url) = reqwest::Url::parse(base_url) else {
         return false;
     };
     let resolved_registry;
@@ -1732,8 +1970,10 @@ fn cache_origin_matches_registry(base_url: &str, active_registry: Option<&str>) 
             &resolved_registry
         }
     };
-    registry_origin_for_auth(registry)
-        .is_some_and(|registry_origin| cache_origin.eq_ignore_ascii_case(&registry_origin))
+    let Ok(registry_url) = reqwest::Url::parse(registry) else {
+        return false;
+    };
+    lpm_common::url_matches_base_scope(&cache_url, &registry_url)
 }
 
 fn registry_origin_for_auth(base_url: &str) -> Option<String> {
@@ -2786,29 +3026,29 @@ mod tests {
         let lookup = reqwest::Url::parse("https://lpm.dev/v8/artifacts/abc?slug=acme").unwrap();
 
         assert_eq!(
-            redirect_target(&lookup, Some("/storage/abc"))
+            redirect_target(&lookup, &lookup, Some("/storage/abc"))
                 .unwrap()
                 .as_str(),
             "https://lpm.dev/storage/abc"
         );
         assert_eq!(
-            redirect_target(&lookup, Some("https://storage.example/abc?sig=1"))
+            redirect_target(&lookup, &lookup, Some("https://storage.example/abc?sig=1"))
                 .unwrap()
                 .as_str(),
             "https://storage.example/abc?sig=1"
         );
         assert!(
-            redirect_target(&lookup, Some("http://storage.example/abc"))
+            redirect_target(&lookup, &lookup, Some("http://storage.example/abc"))
                 .unwrap_err()
                 .contains("leaves HTTPS")
         );
         assert!(
-            redirect_target(&lookup, None)
+            redirect_target(&lookup, &lookup, None)
                 .unwrap_err()
                 .contains("no location")
         );
         let plain = reqwest::Url::parse("http://127.0.0.1:3000/v8/artifacts/abc").unwrap();
-        assert!(redirect_target(&plain, Some("http://127.0.0.1:3000/storage/abc")).is_ok());
+        assert!(redirect_target(&plain, &plain, Some("http://127.0.0.1:3000/storage/abc")).is_ok());
     }
 
     #[tokio::test]
@@ -3507,5 +3747,179 @@ mod tests {
             digests.hmac_tag.as_deref(),
             Some("sha256=SL8Jsc6nTpiW4RTia2huwm4BPtwf4lhRa-5UOd1AKcM")
         );
+    }
+
+    #[test]
+    fn redirect_target_rejects_userinfo_and_non_http_schemes() {
+        let lookup = reqwest::Url::parse("https://cache.example/v8/artifacts/abc").unwrap();
+        assert!(
+            redirect_target(
+                &lookup,
+                &lookup,
+                Some("https://user:secret@cdn.example/blob.tar.zst")
+            )
+            .is_err()
+        );
+        assert!(redirect_target(&lookup, &lookup, Some("file:///etc/passwd")).is_err());
+        assert!(
+            redirect_target(
+                &lookup,
+                &lookup,
+                Some("https://cdn.example/blob.tar.zst?sig=ok")
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn remote_cache_redirect_rejects_loopback_private_and_link_local_targets() {
+        let lookup = reqwest::Url::parse("https://cache.example/v8/artifacts/abc").unwrap();
+        for blocked in [
+            "https://127.0.0.1/secret",
+            "https://127.0.0.1:8080/secret",
+            "https://localhost/secret",
+            "https://sub.localhost/secret",
+            "https://[::1]/secret",
+            "https://[::ffff:127.0.0.1]/secret",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://10.0.0.1/internal",
+            "https://172.16.0.1/internal",
+            "https://192.168.1.1/internal",
+            "https://100.64.0.1/cgnat",
+            "https://[fc00::1]/ula",
+            "https://[fe80::1]/link-local",
+        ] {
+            assert!(
+                redirect_target(&lookup, &lookup, Some(blocked)).is_err(),
+                "expected internal redirect target to be rejected: {blocked}"
+            );
+        }
+
+        // Loopback cache lookups may redirect to loopback download mocks,
+        // but still must not reach link-local or RFC1918 addresses.
+        let loopback_lookup =
+            reqwest::Url::parse("http://127.0.0.1:3000/v8/artifacts/abc").unwrap();
+        assert!(
+            redirect_target(
+                &loopback_lookup,
+                &loopback_lookup,
+                Some("http://127.0.0.1:4000/blob")
+            )
+            .is_ok()
+        );
+        for blocked in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.1/internal",
+            "http://192.168.1.1/internal",
+        ] {
+            assert!(
+                redirect_target(&loopback_lookup, &loopback_lookup, Some(blocked)).is_err(),
+                "loopback cache must still reject non-loopback internal target: {blocked}"
+            );
+        }
+
+        // A second hop from an HTTPS target back to plain HTTP must also fail.
+        let hop1 = reqwest::Url::parse("https://cdn.example/hop1").unwrap();
+        assert!(redirect_target(&loopback_lookup, &hop1, Some("http://cdn.example/hop2")).is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_redirected_artifact_rejects_second_hop_to_internal_address() {
+        let lookup_server = wiremock::MockServer::start().await;
+        let hop_server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v8/artifacts/deadbeef"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/hop1", hop_server.uri())),
+            )
+            .expect(1)
+            .mount(&lookup_server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/hop1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(302)
+                    .insert_header("location", "http://169.254.169.254/latest/meta-data/"),
+            )
+            .expect(1)
+            .mount(&hop_server)
+            .await;
+
+        let lookup_url =
+            reqwest::Url::parse(&format!("{}/v8/artifacts/deadbeef", lookup_server.uri())).unwrap();
+        let initial = lookup_client()
+            .unwrap()
+            .get(lookup_url.clone())
+            .send()
+            .await
+            .unwrap();
+        let err = match fetch_redirected_artifact(&lookup_url, &initial).await {
+            Ok(_) => panic!("second hop to metadata IP must fail"),
+            Err(err) => err,
+        };
+        let message = err.into_message("unauthorized");
+        assert!(
+            message.contains("disallowed internal address"),
+            "unexpected error: {message}"
+        );
+        lookup_server.verify().await;
+        hop_server.verify().await;
+    }
+
+    #[test]
+    fn resolve_base_url_rejects_embedded_credentials_query_and_fragment() {
+        for bad in [
+            "https://user:pass@cache.example",
+            "https://cache.example?token=abc",
+            "https://cache.example#frag",
+        ] {
+            assert!(
+                resolve_base_url(Some(bad), Some("https://lpm.dev")).is_err(),
+                "expected rejection for {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_config_remote_cache_url_cannot_capture_env_token_without_env_url() {
+        let _guard = crate::test_env::ScopedEnv::update([
+            ("LPM_REMOTE_CACHE", Some("1".into())),
+            (
+                "LPM_REMOTE_CACHE_TOKEN",
+                Some("operator-secret-token".into()),
+            ),
+            ("LPM_REMOTE_CACHE_SIGNATURE_KEY", Some("sig-key".into())),
+            ("LPM_REMOTE_CACHE_URL", None),
+        ]);
+        let cfg = lpm_runner::lpm_json::LpmJsonConfig {
+            remote_cache: Some(lpm_runner::lpm_json::RemoteCacheConfig {
+                enabled: true,
+                url: Some("https://attacker.example".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = resolve_client(Some(&cfg), None)
+            .err()
+            .expect("project-only remoteCache.url must not capture LPM_REMOTE_CACHE_TOKEN");
+        assert!(
+            err.contains("LPM_REMOTE_CACHE_URL"),
+            "expected guidance to pin LPM_REMOTE_CACHE_URL; got: {err}"
+        );
+    }
+
+    #[test]
+    fn project_remote_cache_url_on_registry_sibling_path_is_third_party() {
+        assert!(!cache_origin_matches_registry(
+            "https://corp.example/evil-tenant/v8",
+            Some("https://corp.example/lpm")
+        ));
+        assert!(cache_origin_matches_registry(
+            "https://corp.example/lpm/v8",
+            Some("https://corp.example/lpm")
+        ));
     }
 }

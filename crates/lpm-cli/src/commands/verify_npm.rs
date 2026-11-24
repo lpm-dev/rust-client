@@ -549,14 +549,14 @@ async fn unpublish_npm_version(
         object.remove("_revisions");
         object.remove("_attachments");
     }
-    let tarball_path = removed
+    let tarball_raw = removed
         .pointer("/dist/tarball")
         .and_then(serde_json::Value::as_str)
-        .and_then(|tarball| reqwest::Url::parse(tarball).ok())
-        .map(|tarball| tarball.path().to_owned())
         .ok_or_else(|| {
             LpmError::Registry(format!("npm sent no tarball for {package_name}@{version}"))
         })?;
+    let (registry_base, validated_tarball_path) =
+        validate_cleanup_tarball_url(registry_url, tarball_raw, package_name, version)?;
 
     let mut otp = None;
     let revision = revision_of(&document, package_name)?;
@@ -578,19 +578,88 @@ async fn unpublish_npm_version(
     let Some(updated) = npm_package_document(http, registry_url, package_name, token).await? else {
         return Ok(());
     };
-    let tarball_url = format!(
-        "{registry_url}{tarball_path}/-rev/{}",
-        urlencoding::encode(&revision_of(&updated, package_name)?)
+    let delete_url = build_cleanup_tarball_delete_url(
+        &registry_base,
+        &validated_tarball_path,
+        &revision_of(&updated, package_name)?,
     );
     send_npm_write(
         tls,
-        |code| npm_write(http.delete(&tarball_url), token, code),
+        |code| npm_write(http.delete(delete_url.as_str()), token, code),
         registry_url,
         package_name,
         &mut otp,
         json_output,
     )
     .await
+}
+
+fn validate_cleanup_tarball_url(
+    registry_url: &str,
+    tarball_raw: &str,
+    package_name: &str,
+    version: &str,
+) -> Result<(reqwest::Url, String), LpmError> {
+    let registry_base = reqwest::Url::parse(registry_url).map_err(|_| {
+        LpmError::Registry(format!(
+            "invalid npm registry URL for {package_name}@{version} cleanup"
+        ))
+    })?;
+    let tarball = reqwest::Url::parse(tarball_raw).map_err(|_| {
+        LpmError::Registry(format!(
+            "npm sent an invalid tarball URL for {package_name}@{version}"
+        ))
+    })?;
+    if !matches!(tarball.scheme(), "http" | "https")
+        || !tarball.username().is_empty()
+        || tarball.password().is_some()
+        || tarball.query().is_some()
+        || tarball.fragment().is_some()
+        || !lpm_common::url_matches_base_scope(&tarball, &registry_base)
+    {
+        return Err(LpmError::Registry(format!(
+            "npm sent an untrusted tarball URL for {package_name}@{version}; refusing cleanup"
+        )));
+    }
+    let path = tarball.path();
+    let base_prefix = registry_base.path().trim_end_matches('/');
+    let basename = package_name
+        .rsplit_once('/')
+        .map_or(package_name, |(_, unscoped)| unscoped);
+    let expected_unencoded = format!("{base_prefix}/{package_name}/-/{basename}-{version}.tgz");
+    let expected_slash_encoded = format!(
+        "{base_prefix}/{}/-/{basename}-{version}.tgz",
+        package_name.replace('/', "%2F")
+    );
+    let expected_full_encoded = format!(
+        "{base_prefix}/{}/-/{basename}-{version}.tgz",
+        urlencoding::encode(package_name)
+    );
+    let matches_canonical = path == expected_unencoded
+        || ((path.eq_ignore_ascii_case(&expected_slash_encoded)
+            || path.eq_ignore_ascii_case(&expected_full_encoded))
+            && path.ends_with(&format!("/-/{basename}-{version}.tgz")));
+    if !matches_canonical {
+        return Err(LpmError::Registry(format!(
+            "npm sent a non-canonical tarball path for {package_name}@{version}; refusing cleanup"
+        )));
+    }
+    Ok((registry_base, path.to_owned()))
+}
+
+fn build_cleanup_tarball_delete_url(
+    registry_base: &reqwest::Url,
+    validated_tarball_path: &str,
+    revision: &str,
+) -> reqwest::Url {
+    let mut url = registry_base.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    url.set_path(&format!(
+        "{validated_tarball_path}/-rev/{}",
+        urlencoding::encode(revision)
+    ));
+    url
 }
 
 fn npm_write(
@@ -1355,5 +1424,67 @@ mod tests {
         }));
         assert_eq!(registry_code(&refusal), Some("PACKAGE_NOT_FOUND"));
         assert_eq!(registry_code(&LpmError::AuthRequired), None);
+    }
+
+    #[test]
+    fn cleanup_tarball_validation_rejects_opaque_foreign_and_non_canonical_urls() {
+        let registry = "https://registry.npmjs.org";
+        for bad in [
+            "mailto:evil@attacker.example/pkg/-/pkg-1.0.0.tgz",
+            "data:text/plain,evil",
+            "https://attacker.example/pkg/-/pkg-1.0.0.tgz",
+            "https://user:pass@registry.npmjs.org/pkg/-/pkg-1.0.0.tgz",
+            "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz?sig=1",
+            "https://registry.npmjs.org/admin/delete.tgz",
+            "https://registry.npmjs.org/pkg/-/pkg-1.0.0.zip",
+            "https://registry.npmjs.org/other/-/other-9.9.9.tgz",
+            "https://registry.npmjs.org/pkg/-/pkg-2.0.0.tgz",
+        ] {
+            assert!(
+                validate_cleanup_tarball_url(registry, bad, "pkg", "1.0.0").is_err(),
+                "expected rejection for {bad}"
+            );
+        }
+
+        let (_, scoped_path) = validate_cleanup_tarball_url(
+            registry,
+            "https://registry.npmjs.org/@scope/pkg/-/pkg-1.0.0.tgz",
+            "@scope/pkg",
+            "1.0.0",
+        )
+        .expect("canonical scoped tarball accepted");
+        assert_eq!(scoped_path, "/@scope/pkg/-/pkg-1.0.0.tgz");
+        let (_, encoded_scoped_path) = validate_cleanup_tarball_url(
+            registry,
+            "https://registry.npmjs.org/@scope%2Fpkg/-/pkg-1.0.0.tgz",
+            "@scope/pkg",
+            "1.0.0",
+        )
+        .expect("percent-encoded scoped tarball accepted");
+        assert_eq!(encoded_scoped_path, "/@scope%2Fpkg/-/pkg-1.0.0.tgz");
+
+        let (base, path) = validate_cleanup_tarball_url(
+            "https://corp.example/npm",
+            "https://corp.example/npm/pkg/-/pkg-1.0.0.tgz",
+            "pkg",
+            "1.0.0",
+        )
+        .expect("canonical same-scope tarball accepted");
+        assert_eq!(path, "/npm/pkg/-/pkg-1.0.0.tgz");
+        let delete_url = build_cleanup_tarball_delete_url(&base, &path, "1-rev");
+        assert_eq!(
+            delete_url.as_str(),
+            "https://corp.example/npm/pkg/-/pkg-1.0.0.tgz/-rev/1-rev"
+        );
+        assert!(
+            validate_cleanup_tarball_url(
+                "https://corp.example/npm",
+                "https://corp.example/other/pkg/-/pkg-1.0.0.tgz",
+                "pkg",
+                "1.0.0",
+            )
+            .is_err(),
+            "sibling path outside registry base must be rejected"
+        );
     }
 }

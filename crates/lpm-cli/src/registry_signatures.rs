@@ -386,7 +386,21 @@ async fn verify_one_package(
     };
 
     let key_fetch_start = std::time::Instant::now();
-    let keys = match registry_signing_keys_for_route(&client, &route, &input.signatures).await {
+    let keys_route = match &route {
+        UpstreamRoute::Custom { target, .. } => {
+            let keys_url = format!("{}/-/npm/v1/keys", target.base_url.trim_end_matches('/'));
+            UpstreamRoute::Custom {
+                target: target.clone(),
+                auth: route_table
+                    .auth_for_url(&keys_url)
+                    .cloned()
+                    .map(std::sync::Arc::new),
+            }
+        }
+        other => other.clone(),
+    };
+    let keys = match registry_signing_keys_for_route(&client, &keys_route, &input.signatures).await
+    {
         Ok(keys) => keys,
         Err(error) => {
             return not_verified(

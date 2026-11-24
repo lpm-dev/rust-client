@@ -950,6 +950,7 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     cmd.remove_env("CI_JOB_JWT_V2");
     cmd.remove_env("LPM_INTERNAL_TEST_SIGSTORE_FULCIO_URL");
     cmd.remove_env("LPM_INTERNAL_TEST_SIGSTORE_REKOR_URL");
+    cmd.remove_env("LPM_INTERNAL_TEST_NPM_OIDC_REGISTRY_URL");
     cmd.remove_env("HTTP_PROXY");
     cmd.remove_env("HTTPS_PROXY");
     cmd.remove_env("ALL_PROXY");

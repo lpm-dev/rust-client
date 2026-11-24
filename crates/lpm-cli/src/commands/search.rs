@@ -12,7 +12,7 @@ pub async fn run(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let context = prepare_direct_read_context(client, project_dir, query, json_output)?;
-    let route = context.route_table.route_for_package(query);
+    let route = context.route_table.route_for_search(query);
     if !json_output {
         let registry_label = search_registry_label(&context.client, &route);
         let query_safe = sanitize_for_terminal(query);

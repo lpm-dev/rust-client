@@ -1273,8 +1273,17 @@ fn remote_cache_project(server: &MockServer, extra_remote_config: &str) -> TempP
     project
 }
 
+fn project_remote_cache_url(project: &TempProject) -> String {
+    let config: serde_json::Value = serde_json::from_str(&project.read_file("lpm.json")).unwrap();
+    config["remoteCache"]["url"]
+        .as_str()
+        .expect("lpm.json remoteCache.url")
+        .to_owned()
+}
+
 fn run_build_with_remote_token(project: &TempProject) -> std::process::Output {
     lpm(project)
+        .env("LPM_REMOTE_CACHE_URL", project_remote_cache_url(project))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["run", "build"])
@@ -3735,6 +3744,7 @@ async fn a_slow_remote_cache_upload_does_not_hold_up_the_next_task() {
 
     let started = std::time::Instant::now();
     let output = lpm(&project)
+        .env("LPM_REMOTE_CACHE_URL", format!("{}/v8", server.uri()))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["run", "first", "second"])
@@ -3980,6 +3990,7 @@ async fn run_remote_cache_doesnt_fetch_storage_for_a_redirect_without_the_tag_a_
     let project = remote_cache_project(&server, r#", "signature": true"#);
     let signed_build = || {
         lpm(&project)
+            .env("LPM_REMOTE_CACHE_URL", format!("{}/v8", server.uri()))
             .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
             .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
             .args(["run", "build"])
@@ -4413,6 +4424,7 @@ fn parallel_remote_cache_project(server: &MockServer) -> TempProject {
 
 fn run_parallel_with_remote_token(project: &TempProject) -> std::process::Output {
     lpm(project)
+        .env("LPM_REMOTE_CACHE_URL", project_remote_cache_url(project))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["run", "one", "two", "--parallel"])
@@ -4649,7 +4661,9 @@ fn run_read_only_build(project: &TempProject, registry_url: Option<&str>) -> Str
         .args(["run", "build"]);
     match registry_url {
         Some(url) => command.env("LPM_REGISTRY_URL", url),
-        None => command.env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key"),
+        None => command
+            .env("LPM_REMOTE_CACHE_URL", project_remote_cache_url(project))
+            .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key"),
     };
     let output = command.output().expect("failed to run lpm run build");
     let stderr = successful_build_stderr(&output);
@@ -4813,6 +4827,7 @@ async fn run_remote_cache_bad_signature_is_treated_as_miss() {
     let project = remote_cache_project(&server, r#", "signature": true"#);
 
     let first = lpm(&project)
+        .env("LPM_REMOTE_CACHE_URL", format!("{}/v8", server.uri()))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["run", "build"])
@@ -4827,6 +4842,7 @@ async fn run_remote_cache_bad_signature_is_treated_as_miss() {
     remove_project_file(&project, "executed-marker");
 
     let second = lpm(&project)
+        .env("LPM_REMOTE_CACHE_URL", format!("{}/v8", server.uri()))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["run", "build"])

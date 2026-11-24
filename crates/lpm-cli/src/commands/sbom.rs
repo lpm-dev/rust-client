@@ -680,7 +680,8 @@ fn cyclonedx_component(component: &SbomComponent) -> Value {
 
     let mut properties = Vec::new();
     if let Some(source) = &component.package.source {
-        properties.push(property("lpm:source", source));
+        let sanitized = sanitize_sbom_source(source);
+        properties.push(property("lpm:source", sanitized.as_ref()));
     }
     if let Some(integrity) = &component.package.integrity {
         properties.push(property("lpm:integrity", integrity));
@@ -770,10 +771,12 @@ fn merge_cyclonedx_metadata(value: &mut Value, metadata: &ManifestMetadata) {
         }
     }
     if let Some(homepage) = &metadata.homepage {
-        add_external_reference(value, "website", homepage);
+        let sanitized = sanitize_sbom_url(homepage);
+        add_external_reference(value, "website", sanitized.as_ref());
     }
     if let Some(repository) = &metadata.repository {
-        add_external_reference(value, "vcs", repository);
+        let sanitized = sanitize_sbom_url(repository);
+        add_external_reference(value, "vcs", sanitized.as_ref());
     }
 }
 
@@ -957,10 +960,59 @@ fn spdx_package(component: &SbomComponent) -> Value {
     package
 }
 
+fn sanitize_sbom_url(raw: &str) -> std::borrow::Cow<'_, str> {
+    if let Some((_, rest)) = raw.split_once('+')
+        && rest.contains("://")
+    {
+        return sanitize_sbom_source(raw);
+    }
+    let Ok(mut parsed) = reqwest::Url::parse(raw) else {
+        return std::borrow::Cow::Borrowed(raw);
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return std::borrow::Cow::Borrowed(raw);
+    }
+    if parsed.username().is_empty() && parsed.password().is_none() && parsed.query().is_none() {
+        return std::borrow::Cow::Borrowed(raw);
+    }
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    std::borrow::Cow::Owned(parsed.into())
+}
+
+fn sanitize_sbom_source(source: &str) -> std::borrow::Cow<'_, str> {
+    let Some((prefix, raw_url)) = source.split_once('+') else {
+        return std::borrow::Cow::Borrowed(source);
+    };
+    let Ok(mut parsed) = reqwest::Url::parse(raw_url) else {
+        return std::borrow::Cow::Borrowed(source);
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    let keep_fragment = prefix.eq_ignore_ascii_case("git");
+    if parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.query().is_none()
+        && (keep_fragment || parsed.fragment().is_none())
+    {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    if !keep_fragment {
+        parsed.set_fragment(None);
+    }
+    std::borrow::Cow::Owned(format!("{prefix}+{parsed}"))
+}
+
 fn spdx_attribution(component: &SbomComponent) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(source) = &component.package.source {
-        out.push(format!("lpm:source={source}"));
+        let sanitized = sanitize_sbom_source(source);
+        out.push(format!("lpm:source={sanitized}"));
     }
     if let Some(integrity) = &component.package.integrity {
         out.push(format!("lpm:integrity={integrity}"));
@@ -1017,7 +1069,8 @@ fn bom_ref_for_package(package: &LockedPackage) -> String {
     hasher.update([0]);
     hasher.update(package.version.as_bytes());
     hasher.update([0]);
-    hasher.update(package.source.as_deref().unwrap_or("").as_bytes());
+    let sanitized_source = package.source.as_deref().map(sanitize_sbom_source);
+    hasher.update(sanitized_source.as_deref().unwrap_or("").as_bytes());
     if let Some(instance_id) = package.instance_id {
         hasher.update([0]);
         hasher.update(instance_id.as_bytes());
@@ -1037,7 +1090,8 @@ fn spdx_id_for_package(package: &LockedPackage) -> String {
     hasher.update([0]);
     hasher.update(package.version.as_bytes());
     hasher.update([0]);
-    hasher.update(package.source.as_deref().unwrap_or("").as_bytes());
+    let sanitized_source = package.source.as_deref().map(sanitize_sbom_source);
+    hasher.update(sanitized_source.as_deref().unwrap_or("").as_bytes());
     if let Some(instance_id) = package.instance_id {
         hasher.update([0]);
         hasher.update(instance_id.as_bytes());
@@ -1351,5 +1405,54 @@ mod tests {
             Some("git+https://example.test/repo.git")
         );
         assert_eq!(metadata.author.as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn sanitize_sbom_source_strips_secrets_and_keeps_git_commit_fragment() {
+        assert_eq!(
+            sanitize_sbom_source("tarball+https://user:secret@cdn.example/pkg.tgz?sig=tok#frag"),
+            "tarball+https://cdn.example/pkg.tgz"
+        );
+        assert_eq!(
+            sanitize_sbom_source(
+                "git+https://user:secret@github.com/org/repo.git?token=abc#0123456789abcdef0123456789abcdef01234567"
+            ),
+            "git+https://github.com/org/repo.git#0123456789abcdef0123456789abcdef01234567"
+        );
+        assert_eq!(
+            sanitize_sbom_source("registry+https://registry.npmjs.org"),
+            "registry+https://registry.npmjs.org"
+        );
+        assert_eq!(
+            sanitize_sbom_source("file:./vendor/local.tgz"),
+            "file:./vendor/local.tgz"
+        );
+        assert_eq!(
+            sanitize_sbom_url("https://token@github.com/org/repo?secret=1"),
+            "https://github.com/org/repo"
+        );
+
+        let secret_pkg = LockedPackage {
+            name: "demo".into(),
+            version: "1.0.0".into(),
+            source: Some("tarball+https://user:secret@cdn.example/pkg.tgz?sig=tok".into()),
+            ..Default::default()
+        };
+        let clean_pkg = LockedPackage {
+            name: "demo".into(),
+            version: "1.0.0".into(),
+            source: Some("tarball+https://cdn.example/pkg.tgz".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            bom_ref_for_package(&secret_pkg),
+            bom_ref_for_package(&clean_pkg),
+            "bom-ref must hash sanitized source, never raw URL credentials"
+        );
+        assert_eq!(
+            spdx_id_for_package(&secret_pkg),
+            spdx_id_for_package(&clean_pkg),
+            "SPDXID must hash sanitized source, never raw URL credentials"
+        );
     }
 }

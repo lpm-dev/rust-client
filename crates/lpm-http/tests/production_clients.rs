@@ -470,12 +470,18 @@ fn security_sensitive_client_paths_keep_shared_builders() {
         "fn sync_http_client_builder(",
         "lpm_http::client_builder()",
     );
+    assert_body_contains(&vault, "fn sync_http_client_builder(", "Policy::none()");
 
     let platform = read_workspace_source("crates/lpm-cli/src/commands/env/platform/mod.rs");
     assert_body_contains(
         &platform,
         "fn new(token: String, config: VercelConnectionConfig)",
-        "lpm_http::client_builder_with_redirect_limit(5)",
+        "lpm_http::client_builder()",
+    );
+    assert_body_contains(
+        &platform,
+        "fn new(token: String, config: VercelConnectionConfig)",
+        "Policy::none()",
     );
     let coolify = read_workspace_source("crates/lpm-cli/src/commands/env/platform/coolify.rs");
     assert_body_contains(&coolify, "pub(super) fn new(", "lpm_http::client_builder()");
