@@ -1467,6 +1467,7 @@ mod tests {
             ),
             ("LPM_LINKER", std::ffi::OsString::from("isolated")),
             ("CI", std::ffi::OsString::from("")),
+            ("GITHUB_ACTIONS", std::ffi::OsString::from("")),
         ]);
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

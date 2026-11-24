@@ -587,11 +587,13 @@ fn project_importer(
     };
     let mut ambient_peer_installs = Vec::with_capacity(ambient_root_resolutions.len());
     for (name, resolution) in ambient_root_resolutions {
-        if skipped_optional_roots.contains(name.as_str()) || root_resolutions.contains_key(&name) {
+        if root_resolutions.contains_key(&name) {
             continue;
         }
         ambient_peer_installs.push(name.clone());
-        root_resolutions.insert(name, resolution);
+        if !skipped_optional_roots.contains(name.as_str()) {
+            root_resolutions.insert(name, resolution);
+        }
     }
     ambient_peer_installs.sort_unstable();
 

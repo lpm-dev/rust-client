@@ -248,13 +248,16 @@ pub fn workspace_manifest_paths_from_open_root(
 /// under `root_path` (including `""` for the workspace root itself). A change to
 /// any returned directory's metadata invalidates cached member discovery.
 pub fn workspace_discovery_watch_dirs(root_path: &Path) -> Result<Vec<PathBuf>, WorkspaceError> {
-    let root_dir = open_directory_nofollow(root_path)
+    let canonical_root =
+        std::fs::canonicalize(root_path).map_err(|error| WorkspaceError::Io(error.to_string()))?;
+    let root_dir = open_directory_nofollow(&canonical_root)
         .map_err(|error| WorkspaceError::Io(error.to_string()))?;
-    let (root_package, pnpm_workspace) = read_workspace_root_from_open_dir(root_path, &root_dir)?;
+    let (root_package, pnpm_workspace) =
+        read_workspace_root_from_open_dir(&canonical_root, &root_dir)?;
     let globs = workspace_member_globs(&root_package, pnpm_workspace.as_ref());
-    let (inclusions, exclusions) = compile_workspace_globs(root_path, &globs)?;
+    let (inclusions, exclusions) = compile_workspace_globs(&canonical_root, &globs)?;
     let scan =
-        discover_member_paths_from_open_root(root_path, &root_dir, &inclusions, &exclusions)?;
+        discover_member_paths_from_open_root(&canonical_root, &root_dir, &inclusions, &exclusions)?;
     let mut dirs = scan.directory_paths;
     dirs.sort_unstable();
     dirs.dedup();
