@@ -2,9 +2,9 @@
 //! stream past. LPM.dev Registry runs them on every published release with
 //! `lpm internal-package-signals`, and `lpm publish --check` runs them on the
 //! tarball it would upload, so the two always agree. The checks that need
-//! registry data (provenance, the owner's verified domain, vulnerabilities
-//! over the resolved tree, the dependency tree's size, approved Agent
-//! Skills) are LPM.dev Registry's; [`spec`] lists them with the rest.
+//! registry data (trusted publishing, signed provenance, the verified
+//! repository, the owner's verified domain, approved Agent Skills) are
+//! LPM.dev Registry's; [`spec`] lists them with the rest.
 
 mod js;
 mod js_api;
