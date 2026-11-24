@@ -71,7 +71,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn import_alias_prefix_ends_at_a_package_name_boundary_and_drops_empty_values() {
+    fn import_alias_prefix_adds_a_slash_only_after_an_ascii_package_name_character() {
         assert_eq!(import_alias_prefix("@").as_deref(), Some("@/"));
         assert_eq!(
             import_alias_prefix("@/components").as_deref(),
@@ -80,14 +80,23 @@ mod tests {
         assert_eq!(import_alias_prefix("lib.v2").as_deref(), Some("lib.v2/"));
         assert_eq!(import_alias_prefix("ui-").as_deref(), Some("ui-/"));
         assert_eq!(import_alias_prefix("ui_").as_deref(), Some("ui_/"));
+        assert_eq!(import_alias_prefix("#").as_deref(), Some("#"));
+        assert_eq!(import_alias_prefix("~").as_deref(), Some("~"));
+        assert_eq!(import_alias_prefix("café").as_deref(), Some("café"));
+    }
+
+    #[test]
+    fn import_alias_prefix_collapses_trailing_slashes_to_one() {
         assert_eq!(import_alias_prefix("@/").as_deref(), Some("@/"));
         assert_eq!(import_alias_prefix("@//").as_deref(), Some("@/"));
         assert_eq!(import_alias_prefix("lib//").as_deref(), Some("lib/"));
-        assert_eq!(import_alias_prefix("#").as_deref(), Some("#"));
         assert_eq!(import_alias_prefix("#/").as_deref(), Some("#/"));
-        assert_eq!(import_alias_prefix("~").as_deref(), Some("~"));
         assert_eq!(import_alias_prefix("/").as_deref(), Some("/"));
         assert_eq!(import_alias_prefix("//").as_deref(), Some("/"));
+    }
+
+    #[test]
+    fn import_alias_prefix_treats_an_empty_value_as_no_alias() {
         assert_eq!(import_alias_prefix(""), None);
     }
 

@@ -991,27 +991,39 @@ async fn add_with_a_slash_import_alias_rewrites_root_imports_and_keeps_protocol_
         ],
     );
     mock.with_package(package, "1.0.0", &tarball).await;
-    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
-    project.write_file(
+    let add_args = [
+        "add",
+        package,
+        "--path",
+        "src/components",
+        "--yes",
+        "--no-install-deps",
+        "--no-skills",
+    ];
+
+    let aliased = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    aliased.write_file(
         "tsconfig.json",
         r#"{"compilerOptions":{"paths":{"@/*":["./src/*"]}}}"#,
     );
-
-    lpm_with_registry(&project, &mock.url())
-        .args([
-            "add",
-            package,
-            "--path",
-            "src/components",
-            "--yes",
-            "--no-install-deps",
-            "--no-skills",
-        ])
+    lpm_with_registry(&aliased, &mock.url())
+        .args(add_args)
         .assert()
         .success();
-
-    let button = project.read_file("src/components/Button.ts");
+    let button = aliased.read_file("src/components/Button.ts");
     assert!(button.contains("from '@/components/util'"), "{button}");
+    assert!(
+        button.contains("from '//cdn.example.com/lib.js'"),
+        "{button}"
+    );
+
+    let unaliased = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    lpm_with_registry(&unaliased, &mock.url())
+        .args(add_args)
+        .assert()
+        .success();
+    let button = unaliased.read_file("src/components/Button.ts");
+    assert!(button.contains("from './util'"), "{button}");
     assert!(
         button.contains("from '//cdn.example.com/lib.js'"),
         "{button}"

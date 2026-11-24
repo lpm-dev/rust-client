@@ -1656,6 +1656,32 @@ mod tests {
     }
 
     #[test]
+    fn scan_file_filters_import_alias_prefixes_with_repeated_trailing_slashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("lpm.config.json"),
+            r#"{ "importAlias": "components//" }"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("package.json"), r#"{"name":"root"}"#).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.js"),
+            r#"
+            import { Button } from "components/Button";
+            import React from "react";
+            "#,
+        )
+        .unwrap();
+
+        let imports = scan_source_imports(root);
+        let specifiers: HashSet<&str> = imports.iter().map(|i| i.specifier.as_str()).collect();
+        assert!(specifiers.contains("react"));
+        assert!(!specifiers.contains("components/Button"));
+    }
+
+    #[test]
     fn scan_source_imports_skips_declaration_files() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
