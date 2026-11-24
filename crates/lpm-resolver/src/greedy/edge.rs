@@ -111,6 +111,31 @@ pub(super) fn mark_node_required_closure(state: &mut ResolveState, node_id: Node
     }
 }
 
+fn promote_host_materializable_closure(state: &mut ResolveState, node_id: NodeId) {
+    let start = &state.nodes[node_id as usize];
+    if start.host_materializable || !start.self_platform_compatible {
+        return;
+    }
+    let mut pending = Vec::with_capacity(32);
+    let mut events_to_emit = Vec::new();
+    pending.push(node_id);
+    while let Some(current_id) = pending.pop() {
+        let node = &mut state.nodes[current_id as usize];
+        if node.host_materializable || !node.self_platform_compatible {
+            continue;
+        }
+        node.host_materializable = true;
+        if let Some(mut event) = node.deferred_selected_event.take() {
+            event.optional = node.optional;
+            events_to_emit.push(*event);
+        }
+        pending.extend(node.children.iter().map(|(_, child_id)| *child_id));
+    }
+    for event in events_to_emit {
+        state.send_selected_event(event);
+    }
+}
+
 fn newest_satisfying_root_node(
     state: &ResolveState,
     edge: &Edge,
@@ -235,10 +260,14 @@ fn process_edge_inner(
         })
     });
 
+    let parent_materializable = state.nodes[edge.parent as usize].host_materializable;
     let child_id = match existing_id {
         Some(id) => {
             if !edge_is_optional_in_context(edge, state) {
                 mark_node_required_closure(state, id);
+            }
+            if parent_materializable {
+                promote_host_materializable_closure(state, id);
             }
             state.work_stats.edge_reuse_count = state.work_stats.edge_reuse_count.saturating_add(1);
             if state.nodes[id as usize].version == target_version {
@@ -253,12 +282,29 @@ fn process_edge_inner(
         None => {
             let new_id = state.nodes.len() as NodeId;
             let incoming_optional = edge_is_optional_in_context(edge, state);
+            let self_platform_compatible =
+                info.platform_is_compatible(&target_version.to_string()) != Some(false);
+            let host_materializable = parent_materializable && self_platform_compatible;
+            let deferred_selected_event = (!host_materializable
+                && self_platform_compatible
+                && state.has_selected_package_tx())
+            .then(|| {
+                Box::new(ResolveState::build_selected_package_event(
+                    &edge.canonical,
+                    &target_version,
+                    info,
+                    incoming_optional,
+                ))
+            });
             state.work_stats.node_allocated_count =
                 state.work_stats.node_allocated_count.saturating_add(1);
             state.nodes.push(ResolvedNodeBuilder {
                 canonical: edge.canonical.clone(),
                 version: target_version.clone(),
                 optional: incoming_optional,
+                self_platform_compatible,
+                host_materializable,
+                deferred_selected_event,
                 children: Vec::new(),
             });
             state
@@ -276,7 +322,14 @@ fn process_edge_inner(
                 state.children_enqueued.insert(key);
                 enqueue_child_deps(new_id, &edge.canonical, &target_version, info, state)?;
             }
-            state.emit_selected_package(&edge.canonical, &target_version, info, incoming_optional);
+            if host_materializable {
+                state.emit_selected_package(
+                    &edge.canonical,
+                    &target_version,
+                    info,
+                    incoming_optional,
+                );
+            }
             new_id
         }
     };
@@ -325,6 +378,9 @@ mod tests {
                     canonical: CanonicalKey::Root,
                     version: NpmVersion::new(0, 0, 0),
                     optional: true,
+                    self_platform_compatible: true,
+                    host_materializable: true,
+                    deferred_selected_event: None,
                     children,
                 });
             }

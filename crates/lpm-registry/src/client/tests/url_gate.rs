@@ -418,3 +418,49 @@ fn rejected_long_unicode_tarball_url_returns_an_error_without_panicking() {
     );
     assert!(result.unwrap().is_err());
 }
+
+#[test]
+fn gate_rejects_stored_url_with_embedded_userinfo() {
+    let client = RegistryClient::new();
+    let url = "https://user:pass@registry.npmjs.org/lodash/-/lodash-4.17.21.tgz";
+    assert_eq!(
+        evaluate_cached_url(url, &client),
+        GateDecision::RejectedShape
+    );
+    let user_only = "https://token@registry.npmjs.org/lodash/-/lodash-4.17.21.tgz";
+    assert_eq!(
+        evaluate_cached_url(user_only, &client),
+        GateDecision::RejectedShape
+    );
+}
+
+#[test]
+fn gate_for_package_accepts_custom_npmrc_registry_and_rejects_other_origins() {
+    let client = RegistryClient::new();
+    let mut config = crate::NpmrcConfig::parse_layer(
+        "registry=https://mirror.example.test/npm/\n",
+        ".npmrc",
+        &|_| None,
+    );
+    config.finalize();
+    let route_table =
+        crate::RouteTable::new(crate::RouteMode::Direct, config).expect("valid npmrc");
+
+    let custom_url = "https://mirror.example.test/npm/pkg/-/pkg-1.0.0.tgz";
+    assert_eq!(
+        evaluate_cached_url_for_package(custom_url, "pkg", &client, &route_table),
+        GateDecision::Accepted
+    );
+
+    let wrong_origin = "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz";
+    assert_eq!(
+        evaluate_cached_url_for_package(wrong_origin, "pkg", &client, &route_table),
+        GateDecision::RejectedOrigin
+    );
+
+    let userinfo_custom = "https://user:pass@mirror.example.test/npm/pkg/-/pkg-1.0.0.tgz";
+    assert_eq!(
+        evaluate_cached_url_for_package(userinfo_custom, "pkg", &client, &route_table),
+        GateDecision::RejectedShape
+    );
+}

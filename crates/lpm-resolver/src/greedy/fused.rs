@@ -1794,10 +1794,21 @@ fn extend_covered_ranges_from_metadata(
     metadata: &lpm_registry::PackageMetadata,
 ) {
     for version in metadata.versions.values() {
+        let bundled: HashSet<&str> = version
+            .bundle_dependencies
+            .iter()
+            .map(String::as_str)
+            .collect();
         for (name, range) in &version.dependencies {
+            if bundled.contains(name.as_str()) {
+                continue;
+            }
             push_covered_range(package_specs, name, range);
         }
         for (name, range) in &version.optional_dependencies {
+            if bundled.contains(name.as_str()) {
+                continue;
+            }
             push_covered_range(package_specs, name, range);
         }
     }

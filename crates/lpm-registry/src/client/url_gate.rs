@@ -179,6 +179,36 @@ pub enum GateDecision {
 /// like `/api/admin/foo.tgz` lack the `/-/` segment and are rejected
 /// before the bearer is attached.
 pub fn evaluate_cached_url(url: &str, client: &RegistryClient) -> GateDecision {
+    evaluate_cached_url_with_origin_check(url, client, |url| client.is_configured_origin(url))
+}
+
+/// Gate a lockfile-stored tarball URL for a specific package, accepting either
+/// the package's configured custom `.npmrc` / JSR registry or the client's
+/// default configured origins.
+pub fn evaluate_cached_url_for_package(
+    url: &str,
+    package_name: &str,
+    client: &RegistryClient,
+    route_table: &crate::RouteTable,
+) -> GateDecision {
+    let uses_custom_route = matches!(
+        route_table.route_for_package(package_name),
+        crate::UpstreamRoute::Custom { .. }
+    );
+    evaluate_cached_url_with_origin_check(url, client, |candidate| {
+        if uses_custom_route {
+            route_table.fetches_package_from(package_name, candidate)
+        } else {
+            client.is_configured_origin(candidate)
+        }
+    })
+}
+
+fn evaluate_cached_url_with_origin_check(
+    url: &str,
+    client: &RegistryClient,
+    origin_allowed: impl FnOnce(&str) -> bool,
+) -> GateDecision {
     // Scheme — mirrors `RegistryClient::check_tarball_url_scheme` so
     // the lockfile-read gate stays symmetric with the tarball-download
     // guards. `--insecure` specifically widens the carve-out to HTTP,
@@ -189,13 +219,16 @@ pub fn evaluate_cached_url(url: &str, client: &RegistryClient) -> GateDecision {
         return GateDecision::RejectedScheme;
     }
 
-    // Shape — `/-/` segment AND `.tgz` suffix. Suffix-only checks can
-    // be bypassed with administrative-looking paths like
-    // `/api/admin/foo.tgz`; the `/-/` segment is only ever emitted by
+    // Shape — `/-/` segment AND `.tgz` suffix, with no embedded userinfo.
+    // Suffix-only checks can be bypassed with administrative-looking paths
+    // like `/api/admin/foo.tgz`; the `/-/` segment is only ever emitted by
     // the registry tarball route.
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return GateDecision::RejectedShape;
     };
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return GateDecision::RejectedShape;
+    }
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return GateDecision::RejectedQuery;
     }
@@ -204,13 +237,7 @@ pub fn evaluate_cached_url(url: &str, client: &RegistryClient) -> GateDecision {
         return GateDecision::RejectedShape;
     }
 
-    // Origin — must match one of the origins this client talks to.
-    // After `LPM_REGISTRY_URL` is switched to a mirror, stored
-    // `@lpm.dev/*` URLs naturally mismatch and fall through to
-    // on-demand lookup against the new origin. The writeback trigger
-    // picks up the fresh URLs and rewrites the lockfile so the second
-    // install short-circuits.
-    if !client.is_configured_origin(url) {
+    if !origin_allowed(url) {
         return GateDecision::RejectedOrigin;
     }
 

@@ -450,6 +450,9 @@ pub(super) struct ResolvedNodeBuilder {
     pub(super) canonical: CanonicalKey,
     pub(super) version: NpmVersion,
     pub(super) optional: bool,
+    pub(super) self_platform_compatible: bool,
+    pub(super) host_materializable: bool,
+    pub(super) deferred_selected_event: Option<Box<SelectedPackageEvent>>,
     /// Edges going OUT of this node: (local_name, child_node_id).
     pub(super) children: Vec<(String, NodeId)>,
 }
@@ -582,18 +585,14 @@ impl ResolveState {
         }
     }
 
-    pub(super) fn emit_selected_package(
-        &mut self,
+    pub(super) fn build_selected_package_event(
         canonical: &CanonicalKey,
         version: &NpmVersion,
         info: &CachedPackageInfo,
         optional: bool,
-    ) {
-        let Some(tx) = &self.selected_package_tx else {
-            return;
-        };
+    ) -> SelectedPackageEvent {
         let version = version.to_string();
-        let event = SelectedPackageEvent {
+        SelectedPackageEvent {
             name: canonical.to_string(),
             version: version.clone(),
             is_lpm: matches!(canonical, CanonicalKey::Lpm { .. }),
@@ -603,6 +602,12 @@ impl ResolveState {
             platform: info.platform(&version),
             node_engine: info.node_engine(&version).map(str::to_owned),
             optional,
+        }
+    }
+
+    pub(super) fn send_selected_event(&mut self, event: SelectedPackageEvent) {
+        let Some(tx) = &self.selected_package_tx else {
+            return;
         };
         match tx.try_send(event) {
             Ok(()) => {}
@@ -611,6 +616,24 @@ impl ResolveState {
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
         }
+    }
+
+    pub(super) fn has_selected_package_tx(&self) -> bool {
+        self.selected_package_tx.is_some()
+    }
+
+    pub(super) fn emit_selected_package(
+        &mut self,
+        canonical: &CanonicalKey,
+        version: &NpmVersion,
+        info: &CachedPackageInfo,
+        optional: bool,
+    ) {
+        if self.selected_package_tx.is_none() {
+            return;
+        }
+        let event = Self::build_selected_package_event(canonical, version, info, optional);
+        self.send_selected_event(event);
     }
 
     pub(super) async fn flush_selected_packages(&mut self) {
@@ -639,6 +662,9 @@ impl ResolveState {
             canonical: CanonicalKey::Root,
             version: NpmVersion::new(0, 0, 0),
             optional: false,
+            self_platform_compatible: true,
+            host_materializable: true,
+            deferred_selected_event: None,
             children: Vec::new(),
         });
         // Root carries a sentinel canonical; it's never queried by an
@@ -1031,12 +1057,18 @@ mod tests {
             canonical: CanonicalKey::npm("peer-host"),
             version: NpmVersion::parse("1.0.0").expect("valid direct version"),
             optional: false,
+            self_platform_compatible: true,
+            host_materializable: true,
+            deferred_selected_event: None,
             children: Vec::new(),
         });
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::npm("peer-host"),
             version: NpmVersion::parse("1.1.0").expect("valid ambient version"),
             optional: false,
+            self_platform_compatible: true,
+            host_materializable: true,
+            deferred_selected_event: None,
             children: Vec::new(),
         });
         state.nodes[0].children = vec![("peer-host".to_string(), 1), ("peer-host".to_string(), 2)];

@@ -127,8 +127,12 @@ impl<const OMIT_DEV: bool> TryFrom<VersionMetadataWire<OMIT_DEV>> for VersionMet
         let bundle_dependencies = wire
             .bundle_dependencies
             .or(wire.bundled_dependencies)
-            .map(deserialize_bundle_dependencies)
-            .transpose()?
+            .map(|raw| {
+                super::parse_bundle_dependencies_value(
+                    &raw,
+                    wire.dependencies.keys().map(String::as_str),
+                )
+            })
             .unwrap_or_default();
         Ok(Self {
             name: wire.name,

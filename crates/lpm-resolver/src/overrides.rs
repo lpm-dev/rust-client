@@ -450,7 +450,7 @@ impl OverrideSet {
     }
 
     /// Whether any selector targets this canonical package name.
-    pub(crate) fn may_match_package(&self, canonical_name: &str) -> bool {
+    pub fn may_match_package(&self, canonical_name: &str) -> bool {
         self.target_names.contains(canonical_name)
     }
 

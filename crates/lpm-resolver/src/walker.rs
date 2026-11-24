@@ -1000,6 +1000,9 @@ fn expand_deps_from_info(
         return;
     };
     for dependency in dependencies {
+        if dependency.bundled {
+            continue;
+        }
         let target_name = dependency.alias.unwrap_or(dependency.name);
         let dep_key = CanonicalKey::from_dep_name(target_name);
         if seen.insert(dep_key) {
@@ -1689,5 +1692,32 @@ mod tests {
                  full fetch_wait_timeout (the express-install 30s stall \
                  symptom).",
             );
+    }
+
+    #[test]
+    fn expand_deps_from_info_skips_bundled_dependencies() {
+        let meta: PackageMetadata = serde_json::from_value(serde_json::json!({
+            "name": "parent-pkg",
+            "versions": {
+                "1.0.0": {
+                    "name": "parent-pkg",
+                    "version": "1.0.0",
+                    "dependencies": {
+                        "bundled-dep": "^1.0.0",
+                        "normal-dep": "^2.0.0"
+                    },
+                    "bundleDependencies": ["bundled-dep"]
+                }
+            }
+        }))
+        .expect("parse metadata");
+        let info = parse_metadata_to_cache_info(&meta);
+        let mut seen = HashSet::new();
+        let mut next = Vec::new();
+
+        expand_deps_from_info(&info, &mut seen, &mut next);
+
+        assert_eq!(next, vec!["normal-dep".to_string()]);
+        assert!(!seen.contains(&CanonicalKey::npm("bundled-dep")));
     }
 }
