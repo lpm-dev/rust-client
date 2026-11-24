@@ -30,7 +30,7 @@
     },
     "importAlias": {
       "type": "string",
-      "description": "Author's import alias prefix used in the source files (e.g., `@/components`). `lpm add` rewrites occurrences in the copied source to match the consumer project's tsconfig.json paths or the explicit `--alias` flag."
+      "description": "Author's import alias prefix used in the source files. It must end with `/` and stand for the package root, so the rest of each import is a path inside the package (e.g., with `@/`, `@/components/button` refers to `components/button`). `lpm add` rewrites matching imports in the copied source to the consumer's alias from `--alias` or the project's tsconfig.json or jsconfig.json paths."
     },
     "configSchema": {
       "type": "object",

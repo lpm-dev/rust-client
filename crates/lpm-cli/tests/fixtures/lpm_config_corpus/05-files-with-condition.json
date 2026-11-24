@@ -1,7 +1,7 @@
 {
   "$schema": "https://cli.lpm.dev/schemas/lpm.config.json",
   "ecosystem": "js",
-  "importAlias": "@/components",
+  "importAlias": "@/",
   "configSchema": {
     "withTests": {
       "type": "boolean",
