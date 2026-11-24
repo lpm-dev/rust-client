@@ -593,6 +593,15 @@ impl RegistryClient {
         }
     }
 
+    pub fn clear_metadata_memory_cache(&self) {
+        if let Some(cache) = &self.metadata_memory_cache {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+    }
+
     pub(super) fn read_release_time_memory_cache(
         &self,
         key: &str,

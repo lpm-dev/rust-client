@@ -96,6 +96,9 @@ fn edge_is_optional_in_context(edge: &Edge, state: &ResolveState) -> bool {
 }
 
 pub(super) fn mark_node_required_closure(state: &mut ResolveState, node_id: NodeId) {
+    if !state.nodes[node_id as usize].optional {
+        return;
+    }
     let mut pending = Vec::with_capacity(64);
     pending.push(node_id);
     while let Some(node_id) = pending.pop() {

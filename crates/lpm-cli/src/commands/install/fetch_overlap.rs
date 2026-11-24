@@ -131,18 +131,60 @@ impl WorkspaceFetchOverlapHub {
     }
 }
 
+struct PendingWorkspaceFetch {
+    identity: String,
+    package: InstallPackage,
+    context: Arc<WorkspaceFetchRequestContext>,
+    timeline: tracing::Span,
+}
+
 async fn run_workspace_fetch_overlap_hub(
     mut rx: tokio::sync::mpsc::Receiver<WorkspaceFetchRequest>,
     task_limit: usize,
 ) {
     let mut pool = None;
     let mut states: HashMap<String, WorkspaceFetchState> = HashMap::new();
+    let mut pending: VecDeque<PendingWorkspaceFetch> = VecDeque::new();
     let mut tasks = tokio::task::JoinSet::new();
     let mut identities_by_task = HashMap::new();
 
+    let spawn_one = |item: PendingWorkspaceFetch,
+                     pool: &mut Option<WorkspaceFetchPool>,
+                     tasks: &mut tokio::task::JoinSet<FetchOverlapTaskStatus>,
+                     identities_by_task: &mut HashMap<tokio::task::Id, String>| {
+        let shared_pool =
+            pool.get_or_insert_with(|| WorkspaceFetchPool::from_context(&item.context));
+        let context = item.context;
+        let abort_handle = tasks.spawn(
+            fetch_selected_package(
+                item.package,
+                None,
+                context.client.clone(),
+                context.route_table.clone(),
+                shared_pool.store.clone(),
+                shared_pool.store_v2_handle.clone(),
+                shared_pool.fetch_semaphore.clone(),
+                shared_pool.fetch_coord.clone(),
+                context.project_dir.clone(),
+                context.gate_stats.clone(),
+                shared_pool.fetch_extract_limiter.clone(),
+                context.install_accounting,
+                context.streaming_fetch,
+                ArtifactSelection::FreshResolution,
+            )
+            .instrument(item.timeline),
+        );
+        identities_by_task.insert(abort_handle.id(), item.identity);
+    };
+
     loop {
+        while tasks.len() < task_limit
+            && let Some(item) = pending.pop_front()
+        {
+            spawn_one(item, &mut pool, &mut tasks, &mut identities_by_task);
+        }
         tokio::select! {
-            request = rx.recv(), if tasks.len() < task_limit => {
+            request = rx.recv() => {
                 let Some(request) = request else {
                     break;
                 };
@@ -161,35 +203,24 @@ async fn run_workspace_fetch_overlap_hub(
                         });
                     }
                     None => {
-                        let shared_pool =
-                            pool.get_or_insert_with(|| WorkspaceFetchPool::from_context(&request.context));
-                        let context = request.context;
-                        let package = request.package;
-                        let identity_for_task = identity.clone();
-                        let abort_handle = tasks.spawn(fetch_selected_package(
-                            package,
-                            None,
-                            context.client.clone(),
-                            context.route_table.clone(),
-                            shared_pool.store.clone(),
-                            shared_pool.store_v2_handle.clone(),
-                            shared_pool.fetch_semaphore.clone(),
-                            shared_pool.fetch_coord.clone(),
-                            context.project_dir.clone(),
-                            context.gate_stats.clone(),
-                            shared_pool.fetch_extract_limiter.clone(),
-                            context.install_accounting,
-                            context.streaming_fetch,
-                            ArtifactSelection::FreshResolution,
-                        ).instrument(request.timeline));
-                        identities_by_task.insert(abort_handle.id(), identity_for_task);
                         states.insert(
-                            identity,
+                            identity.clone(),
                             WorkspaceFetchState::Running(vec![WorkspaceFetchSubscriber {
                                 tx: request.completion,
                                 dispatched: true,
                             }]),
                         );
+                        let item = PendingWorkspaceFetch {
+                            identity,
+                            package: request.package,
+                            context: request.context,
+                            timeline: request.timeline,
+                        };
+                        if tasks.len() < task_limit {
+                            spawn_one(item, &mut pool, &mut tasks, &mut identities_by_task);
+                        } else {
+                            pending.push_back(item);
+                        }
                     }
                 }
             }
@@ -493,7 +524,6 @@ pub(super) fn spawn_workspace_fetch_overlap_dispatcher(
     dependency_engine_policy: Arc<crate::engine_check::DependencyEnginePolicy>,
     streaming_fetch: bool,
 ) -> FetchOverlapJoin {
-    let completion_limit = fetch_overlap_queue_capacity(fetch_semaphore.available_permits());
     let context = Arc::new(WorkspaceFetchRequestContext {
         client,
         route_table,
@@ -509,58 +539,64 @@ pub(super) fn spawn_workspace_fetch_overlap_dispatcher(
     });
     let task = async move {
         let mut seen = HashSet::new();
-        let mut completions = VecDeque::new();
+        let mut completions = tokio::task::JoinSet::new();
         let mut outcomes = Vec::new();
         let mut stats = FetchOverlapStats::default();
+        let mut rx_open = true;
 
-        while let Some(event) = rx.recv().await {
-            stats.selected_count = stats.selected_count.saturating_add(1);
-            let package =
-                install_package_from_selected_event(event, &context.route_table, &context.client);
-            if package.optional {
-                stats.skipped_optional_count = stats.skipped_optional_count.saturating_add(1);
-                continue;
+        loop {
+            if !rx_open && completions.is_empty() {
+                break;
             }
-            if !dependency_engine_policy
-                .allows_dependency_materialization_on_runtime(package.node_engine.as_deref())
-            {
-                stats.skipped_engine_count = stats.skipped_engine_count.saturating_add(1);
-                continue;
-            }
-            if !package_platform_compatible(&package) {
-                stats.skipped_platform_count = stats.skipped_platform_count.saturating_add(1);
-                continue;
-            }
-            let identity = workspace_fetch_identity(&package);
-            if seen.insert(identity) {
-                completions.push_back(hub.dispatch(package, Arc::clone(&context)).await);
-                if completions.len() >= completion_limit {
-                    let completion = completions
-                        .pop_front()
-                        .expect("completion queue reached its non-zero limit");
-                    match completion.await {
-                        Ok(completion) => {
+            tokio::select! {
+                biased;
+                joined = completions.join_next(), if !completions.is_empty() => {
+                    match joined {
+                        Some(Ok(Ok(completion))) => {
                             record_workspace_fetch_completion(
                                 completion,
                                 &mut stats,
                                 &mut outcomes,
                             );
                         }
-                        Err(_) => {
+                        Some(_) => {
                             stats.failed_count = stats.failed_count.saturating_add(1);
                         }
+                        None => {}
                     }
                 }
-            }
-        }
-
-        for completion in completions {
-            match completion.await {
-                Ok(completion) => {
-                    record_workspace_fetch_completion(completion, &mut stats, &mut outcomes);
-                }
-                Err(_) => {
-                    stats.failed_count = stats.failed_count.saturating_add(1);
+                received = rx.recv(), if rx_open => {
+                    let Some(event) = received else {
+                        rx_open = false;
+                        continue;
+                    };
+                    stats.selected_count = stats.selected_count.saturating_add(1);
+                    let package = install_package_from_selected_event(
+                        event,
+                        &context.route_table,
+                        &context.client,
+                    );
+                    if package.optional {
+                        stats.skipped_optional_count =
+                            stats.skipped_optional_count.saturating_add(1);
+                        continue;
+                    }
+                    if !dependency_engine_policy
+                        .allows_dependency_materialization_on_runtime(package.node_engine.as_deref())
+                    {
+                        stats.skipped_engine_count = stats.skipped_engine_count.saturating_add(1);
+                        continue;
+                    }
+                    if !package_platform_compatible(&package) {
+                        stats.skipped_platform_count =
+                            stats.skipped_platform_count.saturating_add(1);
+                        continue;
+                    }
+                    let identity = workspace_fetch_identity(&package);
+                    if seen.insert(identity) {
+                        let rx_completion = hub.dispatch(package, Arc::clone(&context)).await;
+                        completions.spawn(rx_completion);
+                    }
                 }
             }
         }

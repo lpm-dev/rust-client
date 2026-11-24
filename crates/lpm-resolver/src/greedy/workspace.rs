@@ -62,6 +62,38 @@ pub async fn resolve_greedy_fused_workspace_with_cache_options_and_policy(
     shared_fact_cache: Option<SharedCache>,
     shared_metadata_concurrency: Option<SharedMetadataConcurrency>,
 ) -> Result<WorkspaceResolveOutcome, ResolveError> {
+    resolve_greedy_fused_workspace_with_cache_options_policy_and_selected_events(
+        client,
+        roots,
+        overrides,
+        route_table,
+        npm_fanout,
+        shared_cache,
+        auto_install_peers,
+        include_optional_dependencies,
+        policies,
+        None,
+        shared_fact_cache,
+        shared_metadata_concurrency,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_greedy_fused_workspace_with_cache_options_policy_and_selected_events(
+    client: Arc<RegistryClient>,
+    roots: Vec<RootDependencies>,
+    overrides: OverrideSet,
+    route_table: RouteTable,
+    npm_fanout: usize,
+    shared_cache: SharedCache,
+    auto_install_peers: bool,
+    include_optional_dependencies: bool,
+    policies: Vec<ResolverPolicy>,
+    selected_package_tx: Option<tokio::sync::mpsc::Sender<crate::resolve::SelectedPackageEvent>>,
+    shared_fact_cache: Option<SharedCache>,
+    shared_metadata_concurrency: Option<SharedMetadataConcurrency>,
+) -> Result<WorkspaceResolveOutcome, ResolveError> {
     if roots.len() != policies.len() {
         return Err(ResolveError::Internal(format!(
             "workspace union received {} roots but {} policies",
@@ -129,7 +161,7 @@ pub async fn resolve_greedy_fused_workspace_with_cache_options_and_policy(
             auto_install_peers,
             include_optional_dependencies,
             union_policy.clone(),
-            None,
+            selected_package_tx.clone(),
             shared_fact_cache.as_ref().map(Arc::clone),
             shared_metadata_concurrency.clone(),
         )
@@ -349,6 +381,7 @@ struct ImporterProjectionContext<'a> {
     union: &'a ResolveResult,
     package_index: &'a HashMap<ResolutionNodeId, usize>,
     artifact_index: &'a HashMap<(String, String), Vec<ResolutionNodeId>>,
+    packages_by_canonical: &'a HashMap<String, Vec<usize>>,
     overrides: &'a OverrideSet,
     auto_install_peers: bool,
     policy: &'a ResolverPolicy,
@@ -365,6 +398,7 @@ fn project_union_result(
     let union_stage_timing = union.stage_timing;
     let package_index = package_indices_by_id(&union.packages);
     let artifact_index = package_ids_by_artifact(&union.packages);
+    let packages_by_canonical = package_indices_by_canonical(&union.packages);
     let mut projected = Vec::with_capacity(slots.len());
     let mut missing_ambient_peers = Vec::new();
     let mut release_age_policy_isolated_count = 0usize;
@@ -379,6 +413,7 @@ fn project_union_result(
             union: &union,
             package_index: &package_index,
             artifact_index: &artifact_index,
+            packages_by_canonical: &packages_by_canonical,
             overrides,
             auto_install_peers,
             policy: &policies[root_index],
@@ -467,6 +502,20 @@ fn package_ids_by_artifact(
             ))
             .or_insert_with(Vec::new)
             .push(package.resolution_id);
+    }
+    index
+}
+
+fn package_indices_by_canonical(packages: &[ResolvedPackage]) -> HashMap<String, Vec<usize>> {
+    let mut index: HashMap<String, Vec<usize>> = HashMap::with_capacity(packages.len());
+    for (position, package) in packages.iter().enumerate() {
+        index
+            .entry(package.package.canonical_name())
+            .or_default()
+            .push(position);
+    }
+    for positions in index.values_mut() {
+        positions.sort_unstable_by(|left, right| packages[*right].version.cmp(&packages[*left].version));
     }
     index
 }
@@ -592,7 +641,7 @@ fn project_importer(
 
     Ok(ImporterProjection::Projected(Box::new(ResolveResult {
         packages,
-        cache: union.cache.clone(),
+        cache: Arc::clone(&union.cache),
         applied_overrides,
         platform_skipped: union.platform_skipped,
         root_aliases,
@@ -732,6 +781,7 @@ fn project_peer_context(
                 let target_info = union.cache.get(&CanonicalKey::from_dep_name(target));
                 if let Some((version, target_id)) = newest_included_provider(
                     included,
+                    context.packages_by_canonical,
                     &union.packages,
                     target,
                     &range,
@@ -942,24 +992,27 @@ fn apply_projected_peer_override(
 
 fn newest_included_provider(
     included: &HashSet<usize>,
+    packages_by_canonical: &HashMap<String, Vec<usize>>,
     packages: &[ResolvedPackage],
     canonical: &str,
     range: &NpmRange,
     info: Option<&CachedPackageInfo>,
 ) -> Option<(String, ResolutionNodeId)> {
-    included
-        .iter()
-        .filter_map(|index| {
-            let package = &packages[*index];
-            (package.package.canonical_name() == canonical
-                && info.map_or_else(
-                    || range.satisfies(&package.version),
-                    |info| info.range_satisfies(range, &package.version),
-                ))
-            .then_some((&package.version, package.resolution_id))
-        })
-        .max_by(|(left, _), (right, _)| left.cmp(right))
-        .map(|(version, target)| (version.to_string(), target))
+    let candidates = packages_by_canonical.get(canonical)?;
+    for &index in candidates {
+        if !included.contains(&index) {
+            continue;
+        }
+        let package = &packages[index];
+        let matches = info.map_or_else(
+            || range.satisfies(&package.version),
+            |info| info.range_satisfies(range, &package.version),
+        );
+        if matches {
+            return Some((package.version.to_string(), package.resolution_id));
+        }
+    }
+    None
 }
 
 enum UnionPeerCandidate<'a> {
@@ -993,7 +1046,7 @@ fn select_union_peer_candidate<'a>(
         unfetched_ranges.dedup();
         return UnionPeerCandidate::NeedsVersions(unfetched_ranges);
     }
-    let mut best = None::<(crate::NpmVersion, usize, Vec<usize>)>;
+    let mut best = None::<(&crate::NpmVersion, usize)>;
     let preferred_latest = info.latest_version.as_ref().filter(|latest| {
         requirements
             .iter()
@@ -1004,39 +1057,40 @@ fn select_union_peer_candidate<'a>(
             .iter()
             .filter(|candidate| preferred_latest != Some(*candidate)),
     ) {
-        if info
-            .platform_is_compatible(&candidate.to_string())
-            .is_some_and(|compatible| !compatible)
+        if info.has_platform_metadata()
+            && info
+                .platform_is_compatible(&candidate.to_string())
+                .is_some_and(|compatible| !compatible)
         {
             continue;
         }
         if !version_allowed_by_policy(&canonical_key, info, candidate, policy) {
             continue;
         }
-        let misses = requirements
+        let hits = requirements
             .iter()
-            .enumerate()
-            .filter_map(|(index, requirement)| {
-                (!info.range_satisfies(&requirement.2, candidate)).then_some(index)
-            })
-            .collect::<Vec<_>>();
-        let hits = requirements.len().saturating_sub(misses.len());
+            .filter(|requirement| info.range_satisfies(&requirement.2, candidate))
+            .count();
         if hits == 0 {
             continue;
         }
-        if best
-            .as_ref()
-            .is_none_or(|(_, best_hits, _)| hits > *best_hits)
-        {
-            best = Some((candidate.clone(), hits, misses));
+        if hits == requirements.len() {
+            return UnionPeerCandidate::Selected {
+                version: candidate.to_string(),
+                unsatisfied: Vec::new(),
+            };
+        }
+        if best.as_ref().is_none_or(|(_, best_hits)| hits > *best_hits) {
+            best = Some((candidate, hits));
         }
     }
     match best {
-        Some((version, _, misses)) => UnionPeerCandidate::Selected {
+        Some((version, _)) => UnionPeerCandidate::Selected {
             version: version.to_string(),
-            unsatisfied: misses
-                .into_iter()
-                .map(|index| requirements[index])
+            unsatisfied: requirements
+                .iter()
+                .copied()
+                .filter(|requirement| !info.range_satisfies(&requirement.2, version))
                 .collect(),
         },
         None => UnionPeerCandidate::Unavailable,
