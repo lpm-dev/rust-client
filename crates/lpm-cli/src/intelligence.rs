@@ -1237,6 +1237,25 @@ fn node_builtins() -> HashSet<&'static str> {
         "perf_hooks",
         "async_hooks",
         "diagnostics_channel",
+        "http2",
+        "inspector",
+        "sys",
+        "trace_events",
+        "wasi",
+        "_http_agent",
+        "_http_client",
+        "_http_common",
+        "_http_incoming",
+        "_http_outgoing",
+        "_http_server",
+        "_stream_duplex",
+        "_stream_passthrough",
+        "_stream_readable",
+        "_stream_transform",
+        "_stream_wrap",
+        "_stream_writable",
+        "_tls_common",
+        "_tls_wrap",
         // node:-prefixed
         "node:fs",
         "node:path",
@@ -1256,6 +1275,18 @@ fn node_builtins() -> HashSet<&'static str> {
     ]
     .into_iter()
     .collect()
+}
+
+/// Whether `specifier` loads a Node built-in: `node:<name>`, a built-in name,
+/// or a built-in subpath such as `fs/promises`. A trailing slash, as in
+/// `punycode/`, asks Node for the npm package of that name instead.
+pub(crate) fn is_node_builtin_specifier(specifier: &str, builtins: &HashSet<&str>) -> bool {
+    if specifier.starts_with("node:") {
+        return true;
+    }
+    let name = specifier.split('/').next().unwrap_or(specifier);
+    let rest = &specifier[name.len()..];
+    builtins.contains(name) && (rest.is_empty() || rest.len() > 1)
 }
 
 pub(crate) fn node_builtin_package_names() -> HashSet<&'static str> {

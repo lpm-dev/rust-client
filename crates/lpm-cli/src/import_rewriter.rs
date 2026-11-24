@@ -514,8 +514,10 @@ fn skip_regex(bytes: &[u8], start: usize) -> usize {
 
 /// Compute the new import specifier for a resolved internal file.
 ///
-/// If a buyer alias is set, uses alias-based path. Otherwise returns None
-/// (relative imports already work when file structure is preserved).
+/// With a buyer alias, the alias is the exact prefix of every delivered file,
+/// as `lpm add` builds it, and the file's path follows it. Without one, the
+/// specifier is relative, or `None` when the original relative import still
+/// points at the file.
 fn compute_new_specifier(
     resolved_dest_path: &str,
     file_dest_dir: &str,
@@ -532,18 +534,7 @@ fn compute_new_specifier(
     };
 
     if let Some(alias) = buyer_alias {
-        let needs_separator = alias
-            .chars()
-            .next_back()
-            .is_some_and(crate::lpm_config::continues_a_package_name);
-        let mut specifier =
-            String::with_capacity(alias.len() + usize::from(needs_separator) + clean_path.len());
-        specifier.push_str(alias);
-        if needs_separator {
-            specifier.push('/');
-        }
-        specifier.push_str(&clean_path);
-        return Some(specifier);
+        return Some(format!("{alias}{clean_path}"));
     }
 
     if let Some(original) = original_relative {
@@ -1249,6 +1240,36 @@ import { c } from "react";
             rewritten,
             r#"const value = `literal require("@/util") ${require("@/app/shared/util")}`;"#
         );
+    }
+
+    #[test]
+    fn every_rewrite_branch_prepends_the_consumer_alias_as_given() {
+        let src_to_dest = HashMap::from([("util.ts".to_string(), "shared/util.ts".to_string())]);
+        let src_files = src_to_dest.keys().cloned().collect();
+        let dest_files =
+            HashSet::from(["shared/util.ts".to_string(), "shared/extra.ts".to_string()]);
+
+        let rewritten = rewrite_imports(
+            "import a from \"@/util\";\nimport b from \"@/shared/extra\";\nimport c from \"@/missing\";",
+            "index.ts",
+            "index.ts",
+            Some("@/"),
+            Some("@ui"),
+            &src_to_dest,
+            &src_files,
+            &dest_files,
+        )
+        .expect("aliased imports must be rewritten");
+
+        assert!(
+            rewritten.contains(r#"from "@uishared/util""#),
+            "{rewritten}"
+        );
+        assert!(
+            rewritten.contains(r#"from "@uishared/extra""#),
+            "{rewritten}"
+        );
+        assert!(rewritten.contains(r#"from "@uimissing""#), "{rewritten}");
     }
 
     #[test]

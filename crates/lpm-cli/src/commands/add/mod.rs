@@ -31,8 +31,8 @@ use paths::{
     validate_extracted_paths, validate_source_delivery_namespace,
 };
 use project::{
-    detect_buyer_alias, detect_default_install_dir, detect_framework, detect_package_manager,
-    planned_target_root, resolve_target_dir, validate_target_dir,
+    alias_from_prompt, detect_buyer_alias, detect_default_install_dir, detect_framework,
+    detect_package_manager, planned_target_root, resolve_target_dir, validate_target_dir,
 };
 use serde::ser::SerializeSeq;
 use serde::{Serialize, Serializer};
@@ -84,12 +84,44 @@ struct AddJsonOutput<'a> {
     files_skipped: usize,
     dependencies_installed: usize,
     external_imports: &'a [String],
+    unresolved_imports: &'a [String],
     config: &'a HashMap<String, String>,
     alias: &'a Option<String>,
     warnings: &'a [String],
     errors: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     firewall: Option<serde_json::Value>,
+}
+
+/// Splits the bare specifiers a plain copy uses into the package names they
+/// need and the imports that name no package, such as `#internal`,
+/// `@/lib/utils` or `/abs/file.js`, each sorted and without duplicates. Node
+/// built-ins, URLs and other `scheme:` imports are in neither list.
+fn classify_external_imports(specifiers: &HashSet<String>) -> (Vec<String>, Vec<String>) {
+    let builtins = crate::intelligence::node_builtin_package_names();
+    let mut packages = BTreeSet::new();
+    let mut unresolved = BTreeSet::new();
+    for specifier in specifiers {
+        if crate::intelligence::is_node_builtin_specifier(specifier, &builtins) {
+            continue;
+        }
+        if let Some(name) = crate::intelligence::extract_package_name(specifier) {
+            packages.insert(name);
+        } else if !is_url_or_scheme(specifier) {
+            unresolved.insert(specifier.clone());
+        }
+    }
+    (
+        packages.into_iter().collect(),
+        unresolved.into_iter().collect(),
+    )
+}
+
+fn is_url_or_scheme(specifier: &str) -> bool {
+    specifier.starts_with("//")
+        || specifier
+            .find(':')
+            .is_some_and(|colon| colon < specifier.find('/').unwrap_or(usize::MAX))
 }
 
 fn ensure_unique_destinations(files: &[(String, String)]) -> Result<(), LpmError> {
@@ -992,7 +1024,7 @@ async fn run_locked(
             .interact()
             .map_err(prompt_err)?;
 
-            crate::lpm_config::import_alias_prefix(input.trim())
+            alias_from_prompt(&input, detected.as_deref())
         } else {
             detected
         }
@@ -1507,35 +1539,37 @@ async fn run_locked(
 
     // Bare-imports notice.
     //
-    // Simple path (no `lpm.config.json`) only: walk every JS/TS file we
-    // just copied, collect external/bare specifiers, and surface the
-    // packages they name so the user knows which deps they need to install
-    // themselves. URLs, absolute paths, subpath imports and Node built-ins
-    // name no package to install.
+    // Simple path (no `lpm.config.json`) only: the bare specifiers of every
+    // JS/TS file we just copied tell the user which packages to install and
+    // which imports they must make resolve themselves.
     // Anti-drift: shares the `SpecifierKind` classifier with
     // `import_rewriter::rewrite_imports` so "bare" means the same thing
     // in both places.
-    let external_imports: Vec<String> = if lpm_config.is_none() {
-        let builtins = crate::intelligence::node_builtin_package_names();
-        collected_external_imports
-            .iter()
-            .filter_map(|specifier| crate::intelligence::extract_package_name(specifier))
-            .filter(|name| !builtins.contains(name.as_str()))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
+    let (external_imports, unresolved_imports) = if lpm_config.is_none() {
+        classify_external_imports(&collected_external_imports)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
-    if !external_imports.is_empty() && !json_output {
-        let external_imports = external_imports
-            .iter()
-            .map(|name| lpm_common::sanitize_terminal_inline(name).into_owned())
-            .collect::<Vec<_>>();
-        output::info(&format!(
-            "Source uses external imports: {}\n  Make sure these are in your project's dependencies.",
-            external_imports.join(", "),
-        ));
+    if !json_output {
+        let terminal_list = |items: &[String]| {
+            items
+                .iter()
+                .map(|item| lpm_common::sanitize_terminal_inline(item).into_owned())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if !external_imports.is_empty() {
+            output::info(&format!(
+                "Source uses external imports: {}\n  Make sure these are in your project's dependencies.",
+                terminal_list(&external_imports),
+            ));
+        }
+        if !unresolved_imports.is_empty() {
+            output::info(&format!(
+                "Source uses imports that name no package: {}\n  Make sure these resolve in your project.",
+                terminal_list(&unresolved_imports),
+            ));
+        }
     }
 
     // Persist exact source-delivery outputs so `lpm remove` can reverse the
@@ -1723,6 +1757,7 @@ async fn run_locked(
             files_skipped: skipped,
             dependencies_installed: dep_count,
             external_imports: &external_imports,
+            unresolved_imports: &unresolved_imports,
             config: &inline_config,
             alias: &buyer_alias,
             warnings: swift_traversal.warnings(),

@@ -68,7 +68,7 @@ pub(crate) fn import_alias_prefix(alias: &str) -> Option<String> {
 
 /// Whether a package name can continue after `c`, so a prefix ending in it
 /// needs a `/` before a path.
-pub(crate) fn continues_a_package_name(c: char) -> bool {
+fn continues_a_package_name(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-')
 }
 

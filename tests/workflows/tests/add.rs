@@ -1091,6 +1091,28 @@ async fn add_writes_imports_through_a_consumer_alias_without_a_slash() {
         .success();
     let button = explicit.read_file("src/components/Button.ts");
     assert!(button.contains("from '#util'"), "{button}");
+
+    let disabled = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    disabled.write_file(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"paths":{"@/*":["./src/*"]}}}"#,
+    );
+    lpm_with_registry(&disabled, &mock.url())
+        .args([
+            "add",
+            package,
+            "--path",
+            "src/components",
+            "--alias",
+            "",
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+    let button = disabled.read_file("src/components/Button.ts");
+    assert!(button.contains("from './util'"), "{button}");
 }
 
 // ─── Test 1: happy path ─────────────────────────────────────────────
@@ -2123,23 +2145,30 @@ async fn add_simple_yes_with_path_succeeds_and_copies_files_directly() {
     );
 }
 
-/// The external-imports notice names the packages a copied source needs,
-/// so URLs, absolute paths, subpath imports and Node built-ins stay out of it.
+/// A plain copy lists the packages its imports need, and separately the
+/// imports that name no package, such as subpath imports and path aliases.
+/// URLs and Node built-ins appear in neither list.
 #[tokio::test]
-async fn add_without_a_source_config_lists_only_package_names_in_the_external_imports_notice() {
+async fn add_without_a_source_config_lists_package_names_and_imports_that_name_no_package() {
     let pkg = "add-npm-import-notice";
     let mock = MockRegistry::start().await;
     let index = br##"import { useState } from "react";
+import { jsx } from "react/jsx-runtime";
 import { createRoot } from "react-dom/client";
 import { Slot } from "@radix-ui/react-slot/dist/index.js";
 import { readFile } from "node:fs";
 import path from "fs";
+import { stat } from "fs/promises";
+import http2 from "http2";
+import inspector from "inspector";
+import punycode from "punycode/";
 import internal from "#internal";
+import { cn } from "@/lib/utils";
 import cdn from "//cdn.example.com/lib.js";
 import local from "/abs/thing.js";
 import preact from "https://esm.sh/preact";
-import { cn } from "./utils.js";
-export { useState, createRoot, Slot, readFile, path, internal, cdn, local, preact, cn };
+import { helper } from "./utils.js";
+export { useState, jsx, createRoot, Slot, readFile, path, stat, http2, inspector, punycode, internal, cn, cdn, local, preact, helper };
 "##;
     mock.with_package(
         pkg,
@@ -2149,44 +2178,61 @@ export { useState, createRoot, Slot, readFile, path, internal, cdn, local, preac
             "1.0.0",
             &[
                 ("index.js", &index[..]),
-                ("utils.js", b"export const cn = () => '';\n"),
+                ("utils.js", b"export const helper = () => '';\n"),
             ],
         ),
     )
     .await;
+    let add_args = [
+        "add",
+        pkg,
+        "--yes",
+        "--path",
+        "src/copied",
+        "--no-install-deps",
+        "--no-skills",
+    ];
 
-    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{}}"#);
-    let out = lpm_with_registry(&project, &mock.url())
-        .args([
-            "add",
-            pkg,
-            "--yes",
-            "--path",
-            "src/copied",
-            "--no-install-deps",
-            "--no-skills",
-        ])
+    let terminal = TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{}}"#);
+    let out = lpm_with_registry(&terminal, &mock.url())
+        .args(add_args)
         .output()
         .expect("spawn lpm add");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "stderr:\n{stderr}");
-    assert!(
-        stderr.contains("Source uses external imports: @radix-ui/react-slot, react, react-dom"),
-        "stderr:\n{stderr}"
-    );
-    for excluded in [
-        "node:fs",
-        "react-dom, fs",
-        "#internal",
-        "//cdn.example.com",
-        "/abs/thing",
-        "esm.sh",
+    for line in [
+        "Source uses external imports: @radix-ui/react-slot, punycode, react, react-dom",
+        "Source uses imports that name no package: #internal, /abs/thing.js, @/lib/utils",
     ] {
+        let at = stderr
+            .find(line)
+            .unwrap_or_else(|| panic!("{line}\nstderr:\n{stderr}"));
         assert!(
-            !stderr.contains(excluded),
-            "{excluded} listed; stderr:\n{stderr}"
+            !stderr[at + line.len()..].starts_with(','),
+            "extra entries after {line}\nstderr:\n{stderr}"
         );
     }
+
+    let json = TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{}}"#);
+    let out = lpm_with_registry(&json, &mock.url())
+        .args(add_args)
+        .arg("--json")
+        .output()
+        .expect("spawn lpm add --json");
+    assert!(
+        out.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        body["external_imports"],
+        json!(["@radix-ui/react-slot", "punycode", "react", "react-dom"])
+    );
+    assert_eq!(
+        body["unresolved_imports"],
+        json!(["#internal", "/abs/thing.js", "@/lib/utils"])
+    );
 }
 
 // ─── NPM simple-path source delivery (full pipeline) ────────────────────
@@ -2261,7 +2307,7 @@ async fn add_simple_npm_pkg_copies_files_and_surfaces_bare_imports() {
 }
 
 /// `--json` envelope on the npm simple path includes `external_imports`
-/// (sorted bare specifiers, relative imports excluded), and
+/// (sorted package names, relative imports excluded), and
 /// `package.name` is the verbatim npm spec — NOT the @lpm.dev/-prefixed
 /// form (regression check: previously the JSON always used
 /// `name.scoped()`).
