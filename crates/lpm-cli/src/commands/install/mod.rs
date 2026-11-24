@@ -62,7 +62,7 @@ mod timing;
 mod validation;
 mod workspace;
 pub(crate) mod workspace_lockfile;
-mod workspace_materialization;
+pub(crate) mod workspace_materialization;
 mod workspace_project_state;
 mod workspace_resolution;
 

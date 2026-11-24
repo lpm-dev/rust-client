@@ -878,9 +878,10 @@ pub(super) async fn preflight_catalog_policy_rejection(
     } else {
         "dependencies"
     };
-    let workspace =
-        lpm_workspace::discover_workspace(staged.pkg_json_path.parent().unwrap_or(Path::new(".")))
-            .map_err(|error| LpmError::Workspace(error.to_string()))?;
+    let workspace = crate::workspace_discovery_cache::discover_workspace(
+        staged.pkg_json_path.parent().unwrap_or(Path::new(".")),
+    )
+    .map_err(|error| LpmError::Workspace(error.to_string()))?;
     for entry in &staged.entries {
         let manifest_spec = doc
             .get(dep_key)
@@ -904,7 +905,7 @@ pub(super) async fn preflight_catalog_policy_rejection(
             let resolved = resolve_catalog_policy_candidate_version(
                 client,
                 route_table,
-                workspace.as_ref(),
+                workspace.as_deref(),
                 &entry.name,
                 &effective_spec,
             )
@@ -932,7 +933,7 @@ pub(super) async fn preflight_catalog_policy_rejection(
         let resolved = resolve_catalog_policy_candidate_version(
             client,
             route_table,
-            workspace.as_ref(),
+            workspace.as_deref(),
             &entry.name,
             &effective_spec,
         )
@@ -1196,9 +1197,10 @@ fn preserved_source_targets(
                 let package: lpm_workspace::PackageJson =
                     serde_json::from_str(lpm_common::strip_utf8_bom_str(&text))
                         .map_err(|error| LpmError::Registry(error.to_string()))?;
-                let workspace =
-                    lpm_workspace::discover_workspace(path.parent().unwrap_or(Path::new(".")))
-                        .map_err(|error| LpmError::Workspace(error.to_string()))?;
+                let workspace = crate::workspace_discovery_cache::discover_workspace(
+                    path.parent().unwrap_or(Path::new(".")),
+                )
+                .map_err(|error| LpmError::Workspace(error.to_string()))?;
                 let policy = CatalogSavePolicy::from_package(
                     workspace.as_ref().map_or(&package, |ws| &ws.root_package),
                     None,
@@ -1222,7 +1224,8 @@ fn preserved_source_targets(
                             effective = STAGE_PLACEHOLDER.to_string();
                         }
                     }
-                    if matching_workspace_version(workspace.as_ref(), name, &effective).is_some() {
+                    if matching_workspace_version(workspace.as_deref(), name, &effective).is_some()
+                    {
                         names.insert(name.clone());
                     }
                 }
@@ -1765,10 +1768,11 @@ pub async fn run_install_filtered_add(
         .iter()
         .map(|m| crate::commands::install_targets::install_root_for(m).to_path_buf())
         .collect();
-    let workspace_root_for_config: PathBuf = lpm_workspace::discover_workspace(cwd)
-        .ok()
-        .flatten()
-        .map_or_else(|| cwd.to_path_buf(), |ws| ws.root);
+    let workspace_root_for_config: PathBuf =
+        crate::workspace_discovery_cache::find_workspace_root(cwd)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| cwd.to_path_buf());
     let reviewed = crate::typosquat_guard::guard_explicit_package_specs(
         &workspace_root_for_config,
         packages,
@@ -2295,11 +2299,12 @@ pub(super) fn reconcile_finalized_add_install_state(project_dir: &Path) -> Resul
         .get(".")
         .and_then(|importer| importer.auto_install_peers)
         .unwrap_or(true);
-    let workspace = lpm_workspace::discover_workspace(project_dir).map_err(|e| {
-        LpmError::Registry(format!(
-            "failed to rediscover workspace after finalizing package.json: {e}"
-        ))
-    })?;
+    let workspace =
+        crate::workspace_discovery_cache::discover_workspace(project_dir).map_err(|e| {
+            LpmError::Registry(format!(
+                "failed to rediscover workspace after finalizing package.json: {e}"
+            ))
+        })?;
     let catalogs = workspace.as_ref().map_or(&package.catalogs, |workspace| {
         &workspace.root_package.catalogs
     });

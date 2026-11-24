@@ -940,7 +940,8 @@ pub(super) fn root_provider_fingerprint_from_projection(
     omit_policy: InstallOmitPolicy,
 ) -> Option<String> {
     let manifest = root_manifest_bytes(root_dir);
-    let package = lpm_workspace::read_workspace_root_package(root_dir).unwrap_or_default();
+    let package = crate::workspace_discovery_cache::read_workspace_root_package(root_dir)
+        .unwrap_or_default();
     let local_packages = root_workspace_install_packages(root_dir, &package)?;
     let direct = direct_provider_identities(&package, lockfile, &local_packages);
     let rows = lockfile
@@ -996,7 +997,8 @@ impl RootProviderSnapshot {
                 package,
             ));
         }
-        let package = lpm_workspace::read_workspace_root_package(root_dir).unwrap_or_default();
+        let package = crate::workspace_discovery_cache::read_workspace_root_package(root_dir)
+        .unwrap_or_default();
         let deps = super::manifest_install_deps(&package);
         lockfile.root_aliases = super::root_aliases_for_lockfile(&packages, &deps);
         lockfile.root_resolutions = super::root_resolutions_for_lockfile(&packages);

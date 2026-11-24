@@ -428,7 +428,8 @@ pub(super) async fn run_install_freshness_phase(
                             .then(workspace_lockfile::active_workspace_root)
                             .flatten()
                             .and_then(|root| {
-                                lpm_workspace::read_workspace_root_package(&root).ok()
+                                crate::workspace_discovery_cache::read_workspace_root_package(&root)
+                                    .ok()
                             });
                         let workspace_root = workspace
                             .as_deref()

@@ -127,6 +127,29 @@ pub(crate) fn active_workspace(start_dir: &Path) -> Option<Arc<Workspace>> {
         .flatten()
 }
 
+pub(crate) fn find_workspace_root(start_dir: &Path) -> Result<Option<PathBuf>, WorkspaceError> {
+    if let Ok(cached) = ACTIVE_WORKSPACE.try_with(|context| {
+        start_dir
+            .starts_with(&context.scope_root)
+            .then(|| context.workspace.as_ref().map(|ws| ws.root.clone()))
+    }) && let Some(cached) = cached
+    {
+        return Ok(cached);
+    }
+    lpm_workspace::find_workspace_root(start_dir)
+}
+
+pub(crate) fn read_workspace_root_package(
+    root: &Path,
+) -> Result<lpm_workspace::PackageJson, WorkspaceError> {
+    if let Some(workspace) = active_workspace(root)
+        && workspace.root == root
+    {
+        return Ok(workspace.root_package.clone());
+    }
+    lpm_workspace::read_workspace_root_package(root)
+}
+
 pub(crate) fn root_provider_fingerprint_for_member(start_dir: &Path) -> Option<Arc<str>> {
     let workspace = active_workspace(start_dir)?;
     if start_dir == workspace.root {

@@ -120,6 +120,54 @@ pub fn compute_script_hash_with_phase_bodies(
         .flatten()
 }
 
+/// Partial `package.json` view extracting only `scripts` and `gypfile` while
+/// still validating the full JSON syntax and skipping all other fields without
+/// allocating a `serde_json::Value` DOM.
+struct ScriptHashManifest {
+    scripts: Option<serde_json::Value>,
+    gypfile: Option<bool>,
+}
+
+impl<'de> serde::Deserialize<'de> for ScriptHashManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ManifestVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ManifestVisitor {
+            type Value = ScriptHashManifest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut scripts = None;
+                let mut gypfile = None;
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        "scripts" => scripts = Some(map.next_value::<serde_json::Value>()?),
+                        "gypfile" => {
+                            let val = map.next_value::<serde_json::Value>()?;
+                            gypfile = val.as_bool();
+                        }
+                        _ => {
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ScriptHashManifest { scripts, gypfile })
+            }
+        }
+
+        deserializer.deserialize_map(ManifestVisitor)
+    }
+}
+
 /// Read and hash lifecycle scripts, distinguishing invalid bytes from absent scripts.
 pub fn try_compute_script_hash_with_phase_bodies(
     store_pkg_dir: &Path,
@@ -135,19 +183,29 @@ pub fn try_compute_script_hash_with_phase_bodies(
             pkg_json_path.display()
         ))
     };
-    let parsed: serde_json::Value = serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))
-        .map_err(|error| invalid(&format!("is malformed: {error}")))?;
-    let object = parsed
-        .as_object()
-        .ok_or_else(|| invalid("must contain a JSON object"))?;
+    let trimmed = lpm_common::strip_utf8_bom_str(&content);
+    let manifest: ScriptHashManifest = serde_json::from_str(trimmed).map_err(|error| {
+        if trimmed.trim_start().starts_with('{') {
+            invalid(&format!("is malformed: {error}"))
+        } else {
+            invalid("must contain a JSON object")
+        }
+    })?;
     let no_scripts = serde_json::Map::new();
-    let scripts = match object.get("scripts") {
+    let scripts = match manifest.scripts.as_ref() {
         Some(scripts) => scripts
             .as_object()
             .ok_or_else(|| invalid("has a non-object scripts field"))?,
         None => &no_scripts,
     };
-    let implied_install = crate::native_build::implied_install_script(store_pkg_dir, object);
+    let implied_install = (crate::native_build::scripts_leave_install_to_binding_gyp(
+        scripts.get("install").and_then(serde_json::Value::as_str),
+        scripts
+            .get("preinstall")
+            .and_then(serde_json::Value::as_str),
+        manifest.gypfile,
+    ) && crate::native_build::has_binding_gyp(store_pkg_dir))
+    .then_some(crate::native_build::IMPLIED_INSTALL_SCRIPT);
 
     let mut hasher = Sha256::new();
     let mut phase_bodies = Vec::with_capacity(EXECUTED_INSTALL_PHASES.len());
