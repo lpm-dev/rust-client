@@ -101,38 +101,50 @@ pub(super) fn mark_node_required_closure(state: &mut ResolveState, node_id: Node
     }
     let mut pending = Vec::with_capacity(64);
     pending.push(node_id);
-    while let Some(node_id) = pending.pop() {
-        let node = &mut state.nodes[node_id as usize];
+    while let Some(current_id) = pending.pop() {
+        let node = &mut state.nodes[current_id as usize];
         if !node.optional {
             continue;
         }
         node.optional = false;
-        pending.extend(node.children.iter().map(|(_, child_id)| *child_id));
+        let optional_edges = &state.optional_edges;
+        pending.extend(
+            node.children
+                .iter()
+                .filter(|(_, child_id)| !optional_edges.contains(&(current_id, *child_id)))
+                .map(|(_, child_id)| *child_id),
+        );
     }
 }
 
-fn promote_host_materializable_closure(state: &mut ResolveState, node_id: NodeId) {
-    let start = &state.nodes[node_id as usize];
+pub(super) fn promote_host_materializable_closure(state: &mut ResolveState, node_id: NodeId) {
+    let start = &mut state.nodes[node_id as usize];
     if start.host_materializable || !start.self_platform_compatible {
         return;
     }
+    start.host_materializable = true;
     let mut pending = Vec::with_capacity(32);
-    let mut events_to_emit = Vec::new();
     pending.push(node_id);
     while let Some(current_id) = pending.pop() {
-        let node = &mut state.nodes[current_id as usize];
-        if node.host_materializable || !node.self_platform_compatible {
-            continue;
+        let deferred = {
+            let node = &mut state.nodes[current_id as usize];
+            node.deferred_selected_event.take().map(|mut event| {
+                event.optional = node.optional;
+                *event
+            })
+        };
+        if let Some(event) = deferred {
+            state.send_selected_event(event);
         }
-        node.host_materializable = true;
-        if let Some(mut event) = node.deferred_selected_event.take() {
-            event.optional = node.optional;
-            events_to_emit.push(*event);
+        let child_len = state.nodes[current_id as usize].children.len();
+        for idx in 0..child_len {
+            let child_id = state.nodes[current_id as usize].children[idx].1;
+            let child = &mut state.nodes[child_id as usize];
+            if !child.host_materializable && child.self_platform_compatible {
+                child.host_materializable = true;
+                pending.push(child_id);
+            }
         }
-        pending.extend(node.children.iter().map(|(_, child_id)| *child_id));
-    }
-    for event in events_to_emit {
-        state.send_selected_event(event);
     }
 }
 
@@ -260,7 +272,11 @@ fn process_edge_inner(
         })
     });
 
-    let parent_materializable = state.nodes[edge.parent as usize].host_materializable;
+    let parent_materializable = state.nodes[edge.parent as usize].host_materializable
+        && !(is_root_edge
+            && state
+                .non_materializable_ambient_roots
+                .contains(&edge.local_name));
     let child_id = match existing_id {
         Some(id) => {
             if !edge_is_optional_in_context(edge, state) {
@@ -282,8 +298,8 @@ fn process_edge_inner(
         None => {
             let new_id = state.nodes.len() as NodeId;
             let incoming_optional = edge_is_optional_in_context(edge, state);
-            let self_platform_compatible =
-                info.platform_is_compatible(&target_version.to_string()) != Some(false);
+            let self_platform_compatible = !info.has_platform_metadata()
+                || info.platform_is_compatible(&target_version.to_string()) != Some(false);
             let host_materializable = parent_materializable && self_platform_compatible;
             let deferred_selected_event = (!host_materializable
                 && self_platform_compatible
@@ -340,6 +356,15 @@ fn process_edge_inner(
         state.overrides.record_hit(hit);
     }
 
+    let had_existing_edge = state.nodes[edge.parent as usize]
+        .children
+        .iter()
+        .any(|(_, existing)| *existing == child_id);
+    if !edge.behavior.optional {
+        state.optional_edges.remove(&(edge.parent, child_id));
+    } else if !had_existing_edge {
+        state.optional_edges.insert((edge.parent, child_id));
+    }
     state.nodes[edge.parent as usize]
         .children
         .push((edge.local_name.clone(), child_id));
@@ -405,5 +430,84 @@ mod tests {
             status.success(),
             "deep required promotion aborted: {status}"
         );
+    }
+
+    #[test]
+    fn required_promotion_does_not_cross_optional_edges() {
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        // Node 0: shared, Node 1: optional child of shared, Node 2: regular child of shared
+        state.nodes.push(ResolvedNodeBuilder {
+            canonical: CanonicalKey::from_dep_name("shared"),
+            version: NpmVersion::new(1, 0, 0),
+            optional: true,
+            self_platform_compatible: true,
+            host_materializable: false,
+            deferred_selected_event: None,
+            children: vec![("opt-child".into(), 1), ("reg-child".into(), 2)],
+        });
+        state.nodes.push(ResolvedNodeBuilder {
+            canonical: CanonicalKey::from_dep_name("opt-child"),
+            version: NpmVersion::new(1, 0, 0),
+            optional: true,
+            self_platform_compatible: true,
+            host_materializable: false,
+            deferred_selected_event: None,
+            children: Vec::new(),
+        });
+        state.nodes.push(ResolvedNodeBuilder {
+            canonical: CanonicalKey::from_dep_name("reg-child"),
+            version: NpmVersion::new(1, 0, 0),
+            optional: true,
+            self_platform_compatible: true,
+            host_materializable: false,
+            deferred_selected_event: None,
+            children: Vec::new(),
+        });
+        state.optional_edges.insert((0, 1));
+
+        mark_node_required_closure(&mut state, 0);
+
+        assert!(!state.nodes[0].optional, "shared becomes required");
+        assert!(
+            !state.nodes[2].optional,
+            "regular child of shared becomes required"
+        );
+        assert!(
+            state.nodes[1].optional,
+            "optional child of shared must remain optional"
+        );
+    }
+
+    #[test]
+    fn selected_events_preserve_emission_order_when_channel_has_backlog() {
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        state.set_selected_package_tx(Some(tx));
+        let make_event = |name: &str| crate::SelectedPackageEvent {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            is_lpm: false,
+            tarball_url: None,
+            integrity: None,
+            unpacked_size: None,
+            platform: None,
+            node_engine: None,
+            optional: false,
+        };
+
+        state.send_selected_event(make_event("first"));
+        state.send_selected_event(make_event("second"));
+        // Drain "first" so the channel has space while "second" is still queued.
+        assert_eq!(rx.try_recv().unwrap().name, "first");
+        state.send_selected_event(make_event("third"));
+
+        // "third" must queue behind "second", not overtake it.
+        assert!(
+            rx.try_recv().is_err(),
+            "third must not overtake backlogged second"
+        );
+        assert_eq!(state.pending_selected_packages.len(), 2);
+        assert_eq!(state.pending_selected_packages[0].name, "second");
+        assert_eq!(state.pending_selected_packages[1].name, "third");
     }
 }

@@ -1306,6 +1306,9 @@ pub(super) async fn run_offline_install_phase(
             &ambient_peer_installs,
         );
     }
+    if strict_integrity {
+        enforce_registry_integrity_policy(&locked, true, json_output)?;
+    }
     let _platform_skipped =
         filter_platform_packages_for_install(&mut locked, &ambient_peer_installs)?;
     filter_dependency_engine_packages_for_install(
@@ -1371,7 +1374,9 @@ pub(super) async fn run_offline_install_phase(
     if !requested_v2_mode {
         enforce_required_workspace_member_engines(workspace_member_deps, dependency_engine_policy)?;
     }
-    enforce_registry_integrity_policy(&locked, strict_integrity, json_output)?;
+    if !strict_integrity {
+        enforce_registry_integrity_policy(&locked, false, json_output)?;
+    }
     if verify_registry_signatures {
         enforce_registry_signature_policy(
             Arc::clone(arc_client),
@@ -2494,17 +2499,24 @@ fn retain_reachable_edges(
     }
 }
 
-fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
+fn prune_unreachable_packages_with_ambient(
+    packages: &mut Vec<InstallPackage>,
+    ambient_peer_installs: &[String],
+) {
     let traversal = PackageTraversalIndex::new(packages);
+    let ambient_names: HashSet<&str> = ambient_peer_installs.iter().map(String::as_str).collect();
 
     let mut retained = HashSet::with_capacity(packages.len());
     let mut queue = VecDeque::new();
     for (idx, package) in packages.iter().enumerate() {
-        let has_root_link = package
-            .root_link_names
-            .as_ref()
-            .is_some_and(|names| !names.is_empty());
-        if (package.is_direct || (has_root_link && !package.optional)) && retained.insert(idx) {
+        let has_non_ambient_root_link = package.root_link_names.as_ref().is_some_and(|names| {
+            names
+                .iter()
+                .any(|name| !ambient_names.contains(name.as_str()))
+        });
+        if (package.is_direct || (has_non_ambient_root_link && !package.optional))
+            && retained.insert(idx)
+        {
             queue.push_back(idx);
         }
     }
@@ -2662,6 +2674,14 @@ pub(super) fn filter_optional_packages(
     packages: &mut Vec<InstallPackage>,
     optional_roots: &HashSet<String>,
 ) -> usize {
+    filter_optional_packages_for_install(packages, optional_roots, &[])
+}
+
+pub(super) fn filter_optional_packages_for_install(
+    packages: &mut Vec<InstallPackage>,
+    optional_roots: &HashSet<String>,
+    ambient_peer_installs: &[String],
+) -> usize {
     if packages.is_empty() {
         return 0;
     }
@@ -2676,86 +2696,79 @@ pub(super) fn filter_optional_packages(
             }
         }
     }
-    packages.retain(|package| !package.optional);
-    prune_unreachable_packages(packages);
-    original_len - packages.len()
-}
 
-fn with_detached_ambient_peers<T, E>(
-    packages: &mut Vec<InstallPackage>,
-    ambient_peer_installs: &[String],
-    clear_optional_on_detach: bool,
-    run: impl FnOnce(&mut Vec<InstallPackage>) -> Result<T, E>,
-) -> Result<T, E> {
-    if ambient_peer_installs.is_empty() {
-        return run(packages);
-    }
-
-    let ambient_names = ambient_peer_installs
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    let mut detached_root_links = Vec::new();
-    for package in packages.iter_mut().filter(|package| !package.is_direct) {
-        let Some(root_link_names) = &mut package.root_link_names else {
+    let ambient_names: HashSet<&str> = ambient_peer_installs.iter().map(String::as_str).collect();
+    let traversal = PackageTraversalIndex::new(packages);
+    let mut keep_closure = vec![false; packages.len()];
+    let mut promote_children = vec![false; packages.len()];
+    let mut queue = VecDeque::with_capacity(packages.len());
+    for (idx, package) in packages.iter().enumerate() {
+        if package.optional {
             continue;
-        };
-        let mut detached = Vec::new();
-        root_link_names.retain(|name| {
-            if ambient_names.contains(name.as_str()) {
-                detached.push(name.clone());
-                false
-            } else {
-                true
-            }
+        }
+        let has_non_ambient_root_link = package.root_link_names.as_ref().is_some_and(|names| {
+            names
+                .iter()
+                .any(|name| !ambient_names.contains(name.as_str()))
         });
-        if !detached.is_empty() {
-            if clear_optional_on_detach {
-                package.optional = false;
+        if package.is_direct || has_non_ambient_root_link {
+            keep_closure[idx] = true;
+            queue.push_back(idx);
+        }
+    }
+
+    let is_ambient_peer = |package: &InstallPackage| -> bool {
+        !package.is_direct
+            && package.root_link_names.as_ref().is_some_and(|names| {
+                names
+                    .iter()
+                    .any(|name| ambient_names.contains(name.as_str()))
+            })
+    };
+
+    while let Some(idx) = queue.pop_front() {
+        let package = &packages[idx];
+        let force_children = promote_children[idx];
+        for (local_name, version) in &package.dependencies {
+            if let Some(next_idx) = traversal.dependency(package, local_name, version) {
+                let child = &packages[next_idx];
+                let promote = force_children || (child.optional && is_ambient_peer(child));
+                if !child.optional || promote {
+                    if promote && !promote_children[next_idx] {
+                        promote_children[next_idx] = true;
+                        keep_closure[next_idx] = true;
+                        queue.push_back(next_idx);
+                    } else if !keep_closure[next_idx] {
+                        keep_closure[next_idx] = true;
+                        queue.push_back(next_idx);
+                    }
+                }
             }
-            detached_root_links.push((
-                package.instance_id,
-                package.name.clone(),
-                package.version.clone(),
-                package.source.clone(),
-                detached,
-            ));
         }
-        if root_link_names.is_empty() {
-            package.root_link_names = None;
+        for peer in &package.peers {
+            if let Some(next_idx) = traversal.peer(package, peer) {
+                let child = &packages[next_idx];
+                let promote = child.optional || force_children;
+                if promote && !promote_children[next_idx] {
+                    promote_children[next_idx] = true;
+                    keep_closure[next_idx] = true;
+                    queue.push_back(next_idx);
+                } else if !keep_closure[next_idx] {
+                    keep_closure[next_idx] = true;
+                    queue.push_back(next_idx);
+                }
+            }
         }
     }
 
-    let result = run(packages)?;
-    for (instance_id, name, version, source, detached) in detached_root_links {
-        let Some(package) = packages.iter_mut().find(|package| {
-            instance_id.map_or_else(
-                || package.name == name && package.version == version && package.source == source,
-                |instance_id| package.instance_id == Some(instance_id),
-            )
-        }) else {
-            continue;
-        };
-        let root_link_names = package.root_link_names.get_or_insert_with(Vec::new);
-        root_link_names.extend(detached);
-        root_link_names.sort_unstable();
-        root_link_names.dedup();
+    for (idx, package) in packages.iter_mut().enumerate() {
+        if keep_closure[idx] {
+            package.optional = false;
+        }
     }
-    Ok(result)
-}
-
-pub(super) fn filter_optional_packages_for_install(
-    packages: &mut Vec<InstallPackage>,
-    optional_roots: &HashSet<String>,
-    ambient_peer_installs: &[String],
-) -> usize {
-    let Ok(skipped) = with_detached_ambient_peers::<usize, std::convert::Infallible>(
-        packages,
-        ambient_peer_installs,
-        true,
-        |packages| Ok(filter_optional_packages(packages, optional_roots)),
-    );
-    skipped
+    packages.retain(|package| !package.optional);
+    prune_unreachable_packages_with_ambient(packages, ambient_peer_installs);
+    original_len - packages.len()
 }
 
 pub(super) fn filter_platform_packages(
@@ -2768,32 +2781,30 @@ pub(super) fn filter_platform_packages_for_install(
     packages: &mut Vec<InstallPackage>,
     ambient_peer_installs: &[String],
 ) -> Result<usize, LpmError> {
-    with_detached_ambient_peers(packages, ambient_peer_installs, false, |packages| {
-        let mut skipped = 0usize;
-        let mut kept = Vec::with_capacity(packages.len());
+    let mut skipped = 0usize;
+    let mut kept = Vec::with_capacity(packages.len());
 
-        for package in packages.drain(..) {
-            if package_platform_compatible(&package) {
-                kept.push(package);
-                continue;
-            }
-            if package.optional {
-                skipped += 1;
-                continue;
-            }
-            return Err(LpmError::Registry(format!(
-                "{}@{} is incompatible with this platform",
-                package.name, package.version
-            )));
+    for package in packages.drain(..) {
+        if package_platform_compatible(&package) {
+            kept.push(package);
+            continue;
         }
-
-        if skipped > 0 {
-            prune_unreachable_packages(&mut kept);
+        if package.optional {
+            skipped += 1;
+            continue;
         }
+        return Err(LpmError::Registry(format!(
+            "{}@{} is incompatible with this platform",
+            package.name, package.version
+        )));
+    }
 
-        *packages = kept;
-        Ok(skipped)
-    })
+    if skipped > 0 {
+        prune_unreachable_packages_with_ambient(&mut kept, ambient_peer_installs);
+    }
+
+    *packages = kept;
+    Ok(skipped)
 }
 
 /// Return the subset of registry packages reachable from install roots without
@@ -2802,31 +2813,43 @@ pub(super) fn filter_platform_packages_for_install(
 /// non-registry archives while `node --version` is being probed.
 pub(super) fn engine_independent_registry_packages(
     packages: &[InstallPackage],
+    ambient_peer_installs: &[String],
 ) -> Vec<InstallPackage> {
-    let mut by_instance = HashMap::with_capacity(packages.len());
-    let mut by_name_version = HashMap::<(&str, &str), Vec<usize>>::with_capacity(packages.len());
-    for (idx, package) in packages.iter().enumerate() {
-        if let Some(instance_id) = package.instance_id {
-            by_instance.insert(instance_id, idx);
+    if !packages
+        .iter()
+        .any(|package| package.optional && package.node_engine.is_some())
+    {
+        let mut out = Vec::with_capacity(packages.len());
+        for package in packages {
+            if package.node_engine.is_none()
+                && matches!(
+                    package.source_kind(),
+                    Ok(lpm_lockfile::Source::Registry { .. })
+                )
+            {
+                out.push(package.clone());
+            }
         }
-        by_name_version
-            .entry((package.name.as_str(), package.version.as_str()))
-            .or_default()
-            .push(idx);
+        return out;
     }
 
+    let traversal = PackageTraversalIndex::new(packages);
+    let ambient_names: HashSet<&str> = ambient_peer_installs.iter().map(String::as_str).collect();
     let blocked = |package: &InstallPackage| package.optional && package.node_engine.is_some();
-    let mut retained = HashSet::with_capacity(packages.len());
+    let mut retained = vec![false; packages.len()];
     let mut queue = VecDeque::with_capacity(packages.len());
     for (idx, package) in packages.iter().enumerate() {
         if blocked(package) {
             continue;
         }
-        let has_root_link = package
-            .root_link_names
-            .as_ref()
-            .is_some_and(|names| !names.is_empty());
-        if (package.is_direct || (has_root_link && !package.optional)) && retained.insert(idx) {
+        let has_non_ambient_root_link = package.root_link_names.as_ref().is_some_and(|names| {
+            names
+                .iter()
+                .any(|name| !ambient_names.contains(name.as_str()))
+        });
+        if (package.is_direct || (has_non_ambient_root_link && !package.optional)) && !retained[idx]
+        {
+            retained[idx] = true;
             queue.push_back(idx);
         }
     }
@@ -2834,59 +2857,38 @@ pub(super) fn engine_independent_registry_packages(
     while let Some(idx) = queue.pop_front() {
         let package = &packages[idx];
         for (local, version) in &package.dependencies {
-            if let Some(target_id) = package.dependency_targets.get(local) {
-                if let Some(&child_idx) = by_instance.get(target_id)
-                    && !blocked(&packages[child_idx])
-                    && retained.insert(child_idx)
-                {
-                    queue.push_back(child_idx);
-                }
-                continue;
-            }
-            let target_name = package.aliases.get(local).map_or(local, |target| target);
-            if let Some(indices) = by_name_version.get(&(target_name.as_str(), version.as_str())) {
-                for &child_idx in indices {
-                    if !blocked(&packages[child_idx]) && retained.insert(child_idx) {
-                        queue.push_back(child_idx);
-                    }
-                }
+            if let Some(child_idx) = traversal.dependency(package, local, version)
+                && !blocked(&packages[child_idx])
+                && !retained[child_idx]
+            {
+                retained[child_idx] = true;
+                queue.push_back(child_idx);
             }
         }
         for peer in &package.peers {
-            if let Some(target_id) = package.peer_targets.get(&peer.local_name) {
-                if let Some(&child_idx) = by_instance.get(target_id)
-                    && !blocked(&packages[child_idx])
-                    && retained.insert(child_idx)
-                {
-                    queue.push_back(child_idx);
-                }
-                continue;
-            }
-            if let Some(indices) =
-                by_name_version.get(&(peer.target_name.as_str(), peer.target_version.as_str()))
+            if let Some(child_idx) = traversal.peer(package, peer)
+                && !blocked(&packages[child_idx])
+                && !retained[child_idx]
             {
-                for &child_idx in indices {
-                    if !blocked(&packages[child_idx]) && retained.insert(child_idx) {
-                        queue.push_back(child_idx);
-                    }
-                }
+                retained[child_idx] = true;
+                queue.push_back(child_idx);
             }
         }
     }
 
-    packages
-        .iter()
-        .enumerate()
-        .filter(|(idx, package)| {
-            retained.contains(idx)
-                && package.node_engine.is_none()
-                && matches!(
-                    package.source_kind(),
-                    Ok(lpm_lockfile::Source::Registry { .. })
-                )
-        })
-        .map(|(_, package)| package.clone())
-        .collect()
+    let mut out = Vec::with_capacity(packages.len());
+    for (idx, package) in packages.iter().enumerate() {
+        if retained[idx]
+            && package.node_engine.is_none()
+            && matches!(
+                package.source_kind(),
+                Ok(lpm_lockfile::Source::Registry { .. })
+            )
+        {
+            out.push(package.clone());
+        }
+    }
+    out
 }
 
 /// Dependency engine checks running while the install downloads.
@@ -2998,34 +3000,27 @@ pub(super) fn filter_dependency_engine_packages_for_install(
     policy: &crate::engine_check::DependencyEnginePolicy,
     ambient_peer_installs: &[String],
 ) -> Result<usize, LpmError> {
-    with_detached_ambient_peers(packages, ambient_peer_installs, false, |packages| {
-        let mut skipped = 0usize;
-        let mut kept = Vec::with_capacity(packages.len());
+    let mut skipped = 0usize;
+    let mut kept = Vec::with_capacity(packages.len());
 
-        for package in packages.drain(..) {
-            let Some(required) = package.node_engine.as_deref() else {
-                kept.push(package);
-                continue;
-            };
-            if policy.enforce_dependency(
-                &package.name,
-                &package.version,
-                required,
-                package.optional,
-            )? {
-                kept.push(package);
-            } else {
-                skipped += 1;
-            }
+    for package in packages.drain(..) {
+        let Some(required) = package.node_engine.as_deref() else {
+            kept.push(package);
+            continue;
+        };
+        if policy.enforce_dependency(&package.name, &package.version, required, package.optional)? {
+            kept.push(package);
+        } else {
+            skipped += 1;
         }
+    }
 
-        if skipped > 0 {
-            prune_unreachable_packages(&mut kept);
-        }
+    if skipped > 0 {
+        prune_unreachable_packages_with_ambient(&mut kept, ambient_peer_installs);
+    }
 
-        *packages = kept;
-        Ok(skipped)
-    })
+    *packages = kept;
+    Ok(skipped)
 }
 
 pub(super) fn lockfile_satisfies_fast_path_with_packages(

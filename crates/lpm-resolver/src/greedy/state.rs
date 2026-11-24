@@ -422,6 +422,8 @@ pub(super) struct ResolveState {
     /// Sorted alphabetically before drain for deterministic output.
     pub(super) ambient_peer_installs: Vec<String>,
     pub(super) ambient_only_root_names: HashSet<String>,
+    pub(super) non_materializable_ambient_roots: AHashSet<String>,
+    pub(super) optional_edges: AHashSet<(NodeId, NodeId)>,
     /// Peer-group conflicts the drain resolved best-effort. Each entry
     /// corresponds to one canonical whose required consumer ranges were
     /// pairwise-incompatible: lpm picked the version satisfying the most
@@ -440,7 +442,7 @@ pub(super) struct ResolveState {
     pub(super) work_stats: ResolveWorkStats,
     pub(super) peer_work_stats: PeerWorkStats,
     selected_package_tx: Option<tokio::sync::mpsc::Sender<SelectedPackageEvent>>,
-    pending_selected_packages: VecDeque<SelectedPackageEvent>,
+    pub(super) pending_selected_packages: VecDeque<SelectedPackageEvent>,
 }
 
 /// In-flight resolved node — accumulated during the loop, finalized
@@ -523,6 +525,8 @@ impl ResolveState {
             // synthesis). Allocated lazily on first push.
             ambient_peer_installs: Vec::new(),
             ambient_only_root_names: HashSet::new(),
+            non_materializable_ambient_roots: AHashSet::new(),
+            optional_edges: AHashSet::new(),
             // Typically 0 (most installs have a clean peer graph).
             // Allocated lazily on first conflict.
             peer_conflicts: Vec::new(),
@@ -609,6 +613,10 @@ impl ResolveState {
         let Some(tx) = &self.selected_package_tx else {
             return;
         };
+        if !self.pending_selected_packages.is_empty() {
+            self.pending_selected_packages.push_back(event);
+            return;
+        }
         match tx.try_send(event) {
             Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {

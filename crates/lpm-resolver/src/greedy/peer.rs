@@ -525,11 +525,23 @@ where
         state.peer_work_stats.record_group();
         let mut reqs_owned = grouped.remove(&canonical).expect("just collected key");
         apply_peer_overrides(state, &canonical, &mut reqs_owned, &mut fetch_manifest).await?;
+        let any_host_materializable = reqs_owned
+            .iter()
+            .any(|requirement| state.nodes[requirement.consumer as usize].host_materializable);
         let info = if reqs_owned
             .iter()
             .any(|requirement| requirement.range.dist_tag().is_some())
         {
-            Some(fetch_peer_manifest(state, canonical.clone(), &mut fetch_manifest).await?)
+            match fetch_peer_manifest(state, canonical.clone(), &mut fetch_manifest).await {
+                Ok(info) => Some(info),
+                Err(error) if !any_host_materializable => {
+                    tracing::debug!(
+                        "ignoring unavailable peer manifest {canonical} needed only by non-materializable consumer(s): {error}"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             None
         };
@@ -544,6 +556,9 @@ where
                 if !requirement.optional {
                     mark_node_required_closure(state, target);
                 }
+                if state.nodes[requirement.consumer as usize].host_materializable {
+                    super::edge::promote_host_materializable_closure(state, target);
+                }
                 record_peer_bindings(state, &[requirement], &chosen, Some(target));
             } else {
                 reqs.push(requirement);
@@ -554,14 +569,27 @@ where
             continue;
         }
 
-        let outcome = classify_peer_group(
+        let any_pending_host_materializable = reqs
+            .iter()
+            .any(|requirement| state.nodes[requirement.consumer as usize].host_materializable);
+        let outcome = match classify_peer_group(
             state,
             &canonical,
             &reqs,
             auto_install_peers,
             &mut fetch_manifest,
         )
-        .await?;
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) if !any_pending_host_materializable => {
+                tracing::debug!(
+                    "ignoring unresolvable peer {canonical} needed only by non-materializable consumer(s): {error}"
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
 
         match outcome {
             PeerDrainOutcome::SkippedOptOut => {
@@ -575,6 +603,7 @@ where
                     &canonical,
                     &chosen,
                     reqs_owned.len(),
+                    any_pending_host_materializable,
                     &mut synthesized,
                 )?;
                 state.peer_work_stats.record_synthesized_edge();
@@ -591,6 +620,7 @@ where
                     &canonical,
                     &chosen,
                     reqs_owned.len(),
+                    any_pending_host_materializable,
                     &mut synthesized,
                 )?;
                 state.peer_work_stats.record_synthesized_edge();
@@ -626,6 +656,9 @@ where
                 unsatisfied,
             } => {
                 mark_node_required_closure(state, target);
+                if any_pending_host_materializable {
+                    super::edge::promote_host_materializable_closure(state, target);
+                }
                 record_peer_bindings(state, &reqs, &chosen, Some(target));
                 tracing::warn!(
                     "peer dependency mismatch: {} @ {} reused for {} unsatisfied required consumer(s): {}",
@@ -660,6 +693,7 @@ fn synthesize_ambient_edge(
     canonical: &CanonicalKey,
     chosen: &NpmVersion,
     consumer_count: usize,
+    host_materializable: bool,
     out: &mut Vec<Edge>,
 ) -> Result<(), ResolveError> {
     let exact_range = NpmRange::parse(&chosen.to_string()).map_err(|e| {
@@ -678,6 +712,15 @@ fn synthesize_ambient_edge(
             .any(|(local, _)| local == &canonical_name)
     {
         state.ambient_only_root_names.insert(canonical_name.clone());
+    }
+    if !host_materializable {
+        state
+            .non_materializable_ambient_roots
+            .insert(canonical_name.clone());
+    } else {
+        state
+            .non_materializable_ambient_roots
+            .remove(&canonical_name);
     }
     out.push(Edge {
         parent: 0,

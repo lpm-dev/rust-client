@@ -463,4 +463,71 @@ fn gate_for_package_accepts_custom_npmrc_registry_and_rejects_other_origins() {
         evaluate_cached_url_for_package(userinfo_custom, "pkg", &client, &route_table),
         GateDecision::RejectedShape
     );
+
+    let sibling_path = "https://mirror.example.test/other/pkg/-/pkg-1.0.0.tgz";
+    assert_eq!(
+        evaluate_cached_url_for_package(sibling_path, "pkg", &client, &route_table),
+        GateDecision::RejectedOrigin
+    );
+}
+
+#[test]
+fn gate_for_package_accepts_npmjs_cached_url_when_npmrc_has_npmjs_auth_token() {
+    let client = RegistryClient::new();
+    let mut config = crate::NpmrcConfig::parse_layer(
+        "//registry.npmjs.org/:_authToken=secret-token\n",
+        ".npmrc",
+        &|_| None,
+    );
+    config.finalize();
+    let route_table =
+        crate::RouteTable::new(crate::RouteMode::Direct, config).expect("valid npmrc");
+
+    let npm_url = "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz";
+    assert_eq!(
+        evaluate_cached_url_for_package(npm_url, "lodash", &client, &route_table),
+        GateDecision::Accepted,
+        "npmjs auth token in .npmrc must not cause 100% cached-URL rejection"
+    );
+}
+
+#[test]
+fn gate_for_package_uses_scoped_npmrc_route() {
+    let client = RegistryClient::new();
+    let mut config = crate::NpmrcConfig::parse_layer(
+        "@corp:registry=https://npm.corp.example/registry/\n",
+        ".npmrc",
+        &|_| None,
+    );
+    config.finalize();
+    let route_table =
+        crate::RouteTable::new(crate::RouteMode::Direct, config).expect("valid npmrc");
+
+    assert_eq!(
+        evaluate_cached_url_for_package(
+            "https://npm.corp.example/registry/@corp/sdk/-/sdk-1.0.0.tgz",
+            "@corp/sdk",
+            &client,
+            &route_table,
+        ),
+        GateDecision::Accepted
+    );
+    assert_eq!(
+        evaluate_cached_url_for_package(
+            "https://registry.npmjs.org/@corp/sdk/-/sdk-1.0.0.tgz",
+            "@corp/sdk",
+            &client,
+            &route_table,
+        ),
+        GateDecision::RejectedOrigin
+    );
+    assert_eq!(
+        evaluate_cached_url_for_package(
+            "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+            "lodash",
+            &client,
+            &route_table,
+        ),
+        GateDecision::Accepted
+    );
 }

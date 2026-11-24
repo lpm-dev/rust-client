@@ -34,11 +34,11 @@ pub(super) const METADATA_CACHE_JSON_MARKER: u8 = 0xc1;
 /// On format change, bump the trailing version number — old cache
 /// entries fail the magic match and are silently treated as misses.
 ///
-/// V7 records a content ID for each write, which binds stored projections to
-/// the exact document they were derived from.
+/// V8 invalidates entries serialized before `bundleDependencies: true` and
+/// legacy object-form expansion were normalized at parse time.
 /// The magic also salts cache filenames, so schema-old entries cannot make
 /// the resolver's stat-only batch probe disagree with the typed reader.
-pub(super) const METADATA_CACHE_MAGIC: &[u8] = b"LPM-MD-V7\n";
+pub(super) const METADATA_CACHE_MAGIC: &[u8] = b"LPM-MD-V8\n";
 const METADATA_CACHE_CONTENT_ID_LEN: u64 = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -887,7 +887,7 @@ impl RegistryClient {
     /// Returns `(PackageMetadata, Option<etag>)`. The ETag (if present) can be
     /// sent as `If-None-Match` on the next request to enable 304 responses.
     ///
-    /// Cache format (v7): `LPM-MD-V7\n{freshness_seconds}\n{ETag}\n{content_id}\n{payload}`
+    /// Cache format (v8): `LPM-MD-V8\n{freshness_seconds}\n{ETag}\n{content_id}\n{payload}`
     /// - Bytes 0..MAGIC.len(): magic header (ends in `\n`)
     /// - After magic, up to next `\n`: local freshness in seconds
     /// - Next line: ETag string (empty if absent)
@@ -2120,7 +2120,7 @@ mod metadata_cache_schema_tests {
 
     #[test]
     fn persisted_metadata_schema_fields_are_exhaustive() {
-        assert_eq!(METADATA_CACHE_MAGIC, b"LPM-MD-V7\n");
+        assert_eq!(METADATA_CACHE_MAGIC, b"LPM-MD-V8\n");
         let _: fn(PackageMetadata) = package_metadata_fields;
         let _: fn(VersionMetadata) = version_metadata_fields;
         let _: fn(PeerDependencyMeta) = peer_dependency_meta_fields;

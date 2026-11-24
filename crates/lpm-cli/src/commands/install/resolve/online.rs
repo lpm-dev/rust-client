@@ -247,9 +247,28 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     registry_resolver_roots_are_eligible(deps),
                     "non-registry dependency reached the resolver-root boundary"
                 );
+                let constrained_deps = root_versions::constrain(project_dir, deps)?;
+                let speculation_enabled = !(resolve_ahead
+                    || force
+                    || omit_policy.optional
+                    || npm_firewall_mode.disables_tarball_prefetch()
+                    || tarball_prefetch_held);
+                let speculation_deps: HashMap<String, String> = if speculation_enabled {
+                    constrained_deps
+                        .iter()
+                        .filter(|(name, _)| {
+                            (!omit_policy.dev || production_dependency_names.contains(*name))
+                                && (!omit_policy.optional
+                                    || !root_optional_dependency_names.contains(*name))
+                        })
+                        .map(|(name, range)| (name.clone(), range.clone()))
+                        .collect()
+                } else {
+                    HashMap::new()
+                };
                 let resolver_root_dependencies =
                     lpm_resolver::RootDependencies::with_optional_names(
-                        root_versions::constrain(project_dir, deps)?,
+                        constrained_deps,
                         optional_registry_roots,
                     );
                 let resolve_start = Instant::now();
@@ -263,15 +282,6 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                 } else {
                     "greedy-fusion"
                 };
-                let speculation_deps: HashMap<String, String> = deps
-                    .iter()
-                    .filter(|(name, _)| {
-                        (!omit_policy.dev || production_dependency_names.contains(*name))
-                            && (!omit_policy.optional
-                                || !root_optional_dependency_names.contains(*name))
-                    })
-                    .map(|(name, range)| (name.clone(), range.clone()))
-                    .collect();
 
                 let (resolve_res, initial_batch_ms_measured): (
                     Result<lpm_resolver::ResolveResult, LpmError>,
@@ -307,35 +317,34 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
 
                     let shared_cache: lpm_resolver::SharedCache = Arc::new(dashmap::DashMap::new());
                     seed_workspace_resolver_cache(&shared_cache, all_workspace_members)?;
-                    let (spec_tx, spec_rx) =
-                        tokio::sync::mpsc::channel::<(String, SpeculativePackageMetadata)>(512);
-                    let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
-                        spec_rx,
-                        arc_client.clone(),
-                        route_table.clone(),
-                        store.clone(),
-                        fetch_semaphore.clone(),
-                        Some(Arc::new(Semaphore::new(speculation_permits))),
-                        fetch_coord.clone(),
-                        if resolve_ahead
-                            || force
-                            || omit_policy.optional
-                            || npm_firewall_mode.disables_tarball_prefetch()
-                            || tarball_prefetch_held
-                        {
-                            HashMap::new()
-                        } else {
-                            speculation_deps
-                        },
-                        override_set.clone(),
-                        resolver_policy.clone(),
-                        dependency_engine_policy.clone(),
-                        streaming_fetch.then(|| v2_streaming_lane.clone()),
-                        spec_tracker.clone(),
-                        store_v2_handle.clone(),
-                        fetch_extract_limiter.clone(),
-                        install_accounting,
-                    );
+                    let (spec_tx, spawned_speculation) = if speculation_enabled {
+                        let (spec_tx, spec_rx) =
+                            tokio::sync::mpsc::channel::<(String, SpeculativePackageMetadata)>(512);
+                        let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
+                            spec_rx,
+                            arc_client.clone(),
+                            route_table.clone(),
+                            store.clone(),
+                            fetch_semaphore.clone(),
+                            Some(Arc::new(Semaphore::new(speculation_permits))),
+                            fetch_coord.clone(),
+                            speculation_deps,
+                            override_set.clone(),
+                            resolver_policy.clone(),
+                            dependency_engine_policy.clone(),
+                            streaming_fetch.then(|| v2_streaming_lane.clone()),
+                            spec_tracker.clone(),
+                            store_v2_handle.clone(),
+                            fetch_extract_limiter.clone(),
+                            install_accounting,
+                        );
+                        (
+                            Some(spec_tx),
+                            Some((dispatcher_handle, dispatcher_counters)),
+                        )
+                    } else {
+                        (None, None)
+                    };
                     let selected_package_fetch_overlap_allowed =
                         fetch_overlap_allowed_local && !tarball_prefetch_held;
                     let serialize_fetch_after_workspace_firewall =
@@ -456,7 +465,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                             override_set.clone(),
                             route_table.clone(),
                             npm_fanout,
-                            (!resolve_ahead).then_some(spec_tx),
+                            spec_tx,
                             shared_cache,
                             auto_install_peers,
                             true,
@@ -479,20 +488,22 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         }
                     };
 
-                    speculation_join = Some(SpeculationJoin {
-                        producer: None,
-                        dispatcher: dispatcher_handle,
-                        dispatched: dispatcher_counters.dispatched,
-                        completed: dispatcher_counters.completed,
-                        task_ms_sum: dispatcher_counters.task_ms_sum,
-                        transitive_dispatched: dispatcher_counters.transitive_dispatched,
-                        max_depth_reached: dispatcher_counters.max_depth_reached,
-                        no_version_match: dispatcher_counters.no_version_match,
-                        unresolved_parked: dispatcher_counters.unresolved_parked,
-                        failed: dispatcher_counters.failed,
-                        skipped_no_permit: dispatcher_counters.skipped_no_permit,
-                        skipped_auth: dispatcher_counters.skipped_auth,
-                    });
+                    if let Some((dispatcher_handle, dispatcher_counters)) = spawned_speculation {
+                        speculation_join = Some(SpeculationJoin {
+                            producer: None,
+                            dispatcher: dispatcher_handle,
+                            dispatched: dispatcher_counters.dispatched,
+                            completed: dispatcher_counters.completed,
+                            task_ms_sum: dispatcher_counters.task_ms_sum,
+                            transitive_dispatched: dispatcher_counters.transitive_dispatched,
+                            max_depth_reached: dispatcher_counters.max_depth_reached,
+                            no_version_match: dispatcher_counters.no_version_match,
+                            unresolved_parked: dispatcher_counters.unresolved_parked,
+                            failed: dispatcher_counters.failed,
+                            skipped_no_permit: dispatcher_counters.skipped_no_permit,
+                            skipped_auth: dispatcher_counters.skipped_auth,
+                        });
+                    }
                     (res, 0u128)
                 } else {
                     let dep_names: Vec<String> = deps
@@ -545,17 +556,16 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         fetch_semaphore.clone(),
                         None,
                         fetch_coord.clone(),
-                        if resolve_ahead
-                            || force
-                            || omit_policy.optional
-                            || npm_firewall_mode.disables_tarball_prefetch()
-                            || tarball_prefetch_held
-                        {
-                            HashMap::new()
-                        } else {
+                        if speculation_enabled {
                             speculation_deps
+                        } else {
+                            HashMap::new()
                         },
-                        override_set.clone(),
+                        if speculation_enabled {
+                            override_set.clone()
+                        } else {
+                            OverrideSet::empty()
+                        },
                         resolver_policy.clone(),
                         dependency_engine_policy.clone(),
                         streaming_fetch.then(|| v2_streaming_lane.clone()),
@@ -726,6 +736,9 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
             &ambient_peer_installs_for_lockfile,
         );
     }
+    if strict_integrity {
+        enforce_registry_integrity_policy(&packages, true, json_output)?;
+    }
     platform_skipped +=
         filter_platform_packages_for_install(&mut packages, &ambient_peer_installs_for_lockfile)?;
     let engine_check_timing =
@@ -740,7 +753,10 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
     {
         // Only registry packages reachable without passing through an optional
         // engine-constrained ancestor download while Node is probed.
-        let unconstrained = engine_independent_registry_packages(&packages);
+        let unconstrained =
+            engine_independent_registry_packages(&packages, &ambient_peer_installs_for_lockfile);
+        let stream_unconstrained =
+            streaming_fetch && streaming_candidate_is_unconstrained(&packages, &unconstrained);
         fetch_overlap_join = Some(spawn_fetch_overlap_for_packages(
             unconstrained,
             arc_client.clone(),
@@ -755,8 +771,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
             install_accounting,
             streaming_fetch,
             ArtifactSelection::from_used_lockfile(used_lockfile),
-            (streaming_fetch && streaming_candidate_is_unconstrained(&packages))
-                .then(|| v2_streaming_lane.clone()),
+            stream_unconstrained.then(|| v2_streaming_lane.clone()),
         ));
     }
     let deferred_engine_check = filter_or_defer_dependency_engine_packages_for_install(
@@ -779,10 +794,8 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         };
     }
 
-    if strict_integrity {
-        enforce_registry_integrity_policy(&packages_for_lockfile, strict_integrity, json_output)?;
-    } else {
-        enforce_registry_integrity_policy(&packages, strict_integrity, json_output)?;
+    if !strict_integrity {
+        enforce_registry_integrity_policy(&packages, false, json_output)?;
     }
     if !json_output {
         let reported_install_count = requested_add_count.unwrap_or(packages.len());

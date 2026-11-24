@@ -754,6 +754,7 @@ async fn run_with_options_under_store_lock(
         no_skills,
         restore_managed_skills,
         omit_policy,
+        strict_integrity,
         strict_peer_dependencies,
         linker_mode,
         object_integrity_policy,

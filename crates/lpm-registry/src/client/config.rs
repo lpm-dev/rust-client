@@ -535,6 +535,10 @@ impl RegistryClient {
         let Ok(parsed) = reqwest::Url::parse(url) else {
             return false;
         };
+        self.is_configured_origin_parsed(&parsed)
+    }
+
+    pub(crate) fn is_configured_origin_parsed(&self, parsed: &reqwest::Url) -> bool {
         let parsed_origin = parsed.origin().ascii_serialization();
         parsed_origin == self.base_url_origin || parsed_origin == self.npm_registry_url_origin
     }

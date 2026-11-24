@@ -4,9 +4,7 @@
 
 mod support;
 
-use support::mock_registry::{
-    MockRegistry, compute_integrity, make_tarball, make_tarball_from_pkg_json,
-};
+use support::mock_registry::{MockRegistry, make_tarball, make_tarball_from_pkg_json};
 use support::{TempProject, lpm_with_registry};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
@@ -329,7 +327,6 @@ async fn install_skips_tarballs_for_descendants_and_ambient_peers_of_foreign_pla
 #[tokio::test]
 async fn install_strict_integrity_rejects_other_platform_optional_without_integrity() {
     let mock = MockRegistry::start().await;
-    let host_tb = make_tarball("host-pkg", "1.0.0");
     mock.with_manifest_package(
         serde_json::json!({
             "name": "host-pkg",
@@ -362,8 +359,6 @@ async fn install_strict_integrity_rejects_other_platform_optional_without_integr
         .respond_with(ResponseTemplate::new(200).set_body_json(&unsigned_meta))
         .mount(mock.server())
         .await;
-    // Keep host_tb referenced so unused warning never fires.
-    let _ = compute_integrity(&host_tb);
 
     let project = TempProject::empty(
         r#"{
@@ -392,7 +387,150 @@ async fn install_strict_integrity_rejects_other_platform_optional_without_integr
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("unsigned-foreign") || stderr.to_lowercase().contains("integrity"),
-        "expected strict integrity error naming unsigned-foreign; got:\n{stderr}"
+        stderr.contains("--strict-integrity") && stderr.contains("unsigned-foreign@1.0.0"),
+        "expected strict integrity error naming unsigned-foreign@1.0.0; got:\n{stderr}"
+    );
+    assert_eq!(
+        mock.tarball_request_count("unsigned-foreign", "1.0.0")
+            .await,
+        0,
+        "foreign-platform optional package tarball must not be downloaded"
+    );
+    assert!(
+        !project.file_exists("lpm.lock"),
+        "failed --strict-integrity install must not write lpm.lock"
+    );
+
+    // Install without --strict-integrity so lpm.lock is written with the
+    // unsigned foreign optional row, then verify both --offline and freshness
+    // re-installs reject it when --strict-integrity is enabled.
+    let permissive = lpm_with_registry(&project, &mock.url())
+        .args(INSTALL)
+        .output()
+        .expect("run permissive install");
+    assert!(
+        permissive.status.success(),
+        "permissive install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&permissive.stdout),
+        String::from_utf8_lossy(&permissive.stderr)
+    );
+    assert!(project.file_exists("lpm.lock"));
+
+    for extra_args in [
+        vec![
+            "install",
+            "--offline",
+            "--strict-integrity",
+            "--no-skills",
+            "--no-security-summary",
+        ],
+        vec![
+            "install",
+            "--strict-integrity",
+            "--no-skills",
+            "--no-security-summary",
+        ],
+    ] {
+        let strict_replay = lpm_with_registry(&project, &mock.url())
+            .args(&extra_args)
+            .output()
+            .expect("run strict integrity replay");
+        assert!(
+            !strict_replay.status.success(),
+            "replay `{extra_args:?}` must reject unsigned foreign optional lockfile row:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&strict_replay.stdout),
+            String::from_utf8_lossy(&strict_replay.stderr)
+        );
+        let replay_stderr = String::from_utf8_lossy(&strict_replay.stderr);
+        assert!(
+            replay_stderr.contains("--strict-integrity")
+                && replay_stderr.contains("unsigned-foreign@1.0.0"),
+            "expected strict integrity error for `{extra_args:?}`; got:\n{replay_stderr}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn install_local_tgz_skips_vendored_file_bundled_dep_and_foreign_optional_children() {
+    let mock = MockRegistry::start().await;
+    mock.with_package("real-dep", "1.0.0", &make_tarball("real-dep", "1.0.0"))
+        .await;
+
+    let bundled_archive = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "local-vendored-file",
+            "version": "1.0.0",
+            "dependencies": {
+                "vendored-local": "file:../nonexistent-vendored-pkg",
+                "real-dep": "1.0.0"
+            },
+            "bundleDependencies": ["vendored-local"]
+        }),
+        &[(
+            "node_modules/vendored-local/package.json",
+            br#"{"name":"vendored-local","version":"1.0.0"}"#,
+        )],
+    );
+    let foreign_archive = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "local-foreign-with-child",
+            "version": "1.0.0",
+            "os": [foreign_os()],
+            "dependencies": {
+                "foreign-archive-child": "1.0.0"
+            }
+        }),
+        &[],
+    );
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "archive-vendored-consumer",
+            "version": "1.0.0",
+            "dependencies": {
+                "local-vendored-file": "file:./vendor/local-vendored-file.tgz"
+            },
+            "optionalDependencies": {
+                "local-foreign-with-child": "file:./vendor/local-foreign-with-child.tgz"
+            }
+        }"#,
+    );
+    std::fs::create_dir_all(project.path().join("vendor")).unwrap();
+    std::fs::write(
+        project.path().join("vendor/local-vendored-file.tgz"),
+        &bundled_archive,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("vendor/local-foreign-with-child.tgz"),
+        &foreign_archive,
+    )
+    .unwrap();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(INSTALL)
+        .output()
+        .expect("run lpm install");
+    assert!(
+        output.status.success(),
+        "install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let requests = mock.server().received_requests().await.unwrap();
+    assert!(
+        !requests
+            .iter()
+            .any(|req| req.url.path().contains("foreign-archive-child")),
+        "foreign optional archive's unbundled child must never hit the registry; requests: {:?}",
+        requests.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+    );
+    assert!(project.file_exists("node_modules/local-vendored-file/package.json"));
+    assert!(!project.file_exists("node_modules/local-foreign-with-child/package.json"));
+    assert!(!project.file_exists("node_modules/foreign-archive-child/package.json"));
+    assert!(
+        !project.file_exists("node_modules/real-dep/package.json"),
+        "archive's unbundled dependency must not leak as a direct project root link"
     );
 }

@@ -326,7 +326,7 @@ pub(in crate::commands::install) async fn run(
     let mut stats = ExperimentalResolverStats::default();
     let mut stage_timings = ExperimentalResolverStageTimings::default();
     let mut fetch_handles: HashMap<String, FetchHandle> = HashMap::new();
-    let mut install_packages = match graph_source {
+    let (mut install_packages, ambient_peer_installs) = match graph_source {
         ExperimentalResolverGraphSource::ResolveWorklist => {
             let mut pending: FuturesUnordered<ResolveFuture> = FuturesUnordered::new();
             let mut packages: HashMap<PackageIdentity, PackageDraft> =
@@ -516,11 +516,11 @@ pub(in crate::commands::install) async fn run(
                 &mut fetch_handles,
                 &mut stats,
             )?;
-            install_packages
+            (install_packages, Vec::new())
         }
         ExperimentalResolverGraphSource::Lockfile => {
             let package_graph_start = Instant::now();
-            let mut install_packages = load_lockfile_graph_packages(
+            let (mut install_packages, ambient_peer_installs) = load_lockfile_graph_packages(
                 project_dir,
                 deps,
                 catalog_resolutions,
@@ -542,7 +542,7 @@ pub(in crate::commands::install) async fn run(
                 pre_resolved_install_pkgs,
                 pre_resolved_source_deps,
             )?;
-            install_packages
+            (install_packages, ambient_peer_installs)
         }
         ExperimentalResolverGraphSource::Invalid => {
             return Err(LpmError::Registry(
@@ -552,8 +552,13 @@ pub(in crate::commands::install) async fn run(
     };
     let mut omitted_patch_targets =
         registered_patch_targets(current_patches, install_packages.iter())?;
-    filter_dependency_engine_packages(&mut install_packages, dependency_engine_policy)?;
-    let mut platform_skipped = filter_platform_packages(&mut install_packages)?;
+    filter_dependency_engine_packages_for_install(
+        &mut install_packages,
+        dependency_engine_policy,
+        &ambient_peer_installs,
+    )?;
+    let mut platform_skipped =
+        filter_platform_packages_for_install(&mut install_packages, &ambient_peer_installs)?;
     if graph_source == ExperimentalResolverGraphSource::Lockfile {
         let fetch_packages = lockfile_fetch_schedule(&install_packages);
         spawn_fetches_for_packages(

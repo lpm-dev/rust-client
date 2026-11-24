@@ -127,7 +127,7 @@ pub struct VersionMetadata {
     /// and `bundledDependencies` spellings. When both occur, the canonical
     /// `bundleDependencies` field takes precedence. Consumers skip these names —
     /// they're already provided by the parent's tarball.
-    #[serde(default, rename = "bundleDependencies", alias = "bundledDependencies")]
+    #[serde(rename = "bundleDependencies", skip_serializing_if = "Vec::is_empty")]
     pub bundle_dependencies: Vec<String>,
 
     #[serde(default, rename = "optionalDependencies")]
@@ -1671,6 +1671,8 @@ pub fn parse_bundle_dependencies_value<'a>(
                     out.push(name.to_owned());
                 }
             }
+            out.sort_unstable();
+            out.dedup();
             out
         }
         serde_json::Value::Object(map) => {

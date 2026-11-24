@@ -349,6 +349,24 @@ impl RouteTable {
         })
     }
 
+    /// Return the custom `.npmrc` or JSR registry base URL for `name`, or
+    /// `None` when `name` uses the default LPM/npm mode (even if `.npmrc`
+    /// attaches auth to `registry.npmjs.org`).
+    pub(crate) fn custom_registry_base_for_package(&self, name: &str) -> Option<&str> {
+        match self.selected_route_for_package(name) {
+            SelectedRoute::Custom(target) => Some(&target.base_url),
+            SelectedRoute::Jsr => Some(&JSR_TARGET.base_url),
+            SelectedRoute::Mode(_) => None,
+        }
+    }
+
+    pub(crate) fn registry_serves_parsed_url(candidate: &reqwest::Url, registry: &str) -> bool {
+        let Ok(registry) = reqwest::Url::parse(registry) else {
+            return false;
+        };
+        registry_serves_parsed(candidate, &registry)
+    }
+
     /// Whether LPM fetches `name` from the registry the tarball URL
     /// `candidate` lies under, by the route [`Self::route_for_package`]
     /// selects, so `@lpm.dev/*` and package route overrides come first.
@@ -358,10 +376,8 @@ impl RouteTable {
     /// GitLab project's tarball under a route to the same GitLab's instance
     /// or group endpoint, whose metadata points at its projects' tarballs.
     pub fn fetches_package_from(&self, name: &str, candidate: &str) -> bool {
-        let registry = match self.selected_route_for_package(name) {
-            SelectedRoute::Custom(target) => &*target.base_url,
-            SelectedRoute::Jsr => &*JSR_TARGET.base_url,
-            SelectedRoute::Mode(_) => return false,
+        let Some(registry) = self.custom_registry_base_for_package(name) else {
+            return false;
         };
         registry_serves(candidate, registry)
     }
@@ -614,6 +630,10 @@ fn registry_serves(candidate: &str, registry: &str) -> bool {
     ) else {
         return false;
     };
+    registry_serves_parsed(&candidate, &registry)
+}
+
+fn registry_serves_parsed(candidate: &reqwest::Url, registry: &reqwest::Url) -> bool {
     let same_endpoint = if candidate.scheme() == registry.scheme() {
         candidate.port_or_known_default() == registry.port_or_known_default()
     } else {
@@ -621,12 +641,15 @@ fn registry_serves(candidate: &str, registry: &str) -> bool {
             && registry.scheme() == "https"
             && candidate.port() == registry.port()
     };
+    let same_host = match (candidate.host_str(), registry.host_str()) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    };
     same_endpoint
-        && candidate.host_str().map(str::to_ascii_lowercase)
-            == registry.host_str().map(str::to_ascii_lowercase)
+        && same_host
         && (path_lies_under(candidate.path(), registry.path())
             || gitlab_project_tarball_under(candidate.path(), registry.path())
-            || github_packages_download(&candidate))
+            || github_packages_download(candidate))
 }
 
 /// GitHub Packages serves its npm registry at `npm.pkg.github.com`, with or

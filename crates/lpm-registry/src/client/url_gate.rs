@@ -179,11 +179,16 @@ pub enum GateDecision {
 /// like `/api/admin/foo.tgz` lack the `/-/` segment and are rejected
 /// before the bearer is attached.
 pub fn evaluate_cached_url(url: &str, client: &RegistryClient) -> GateDecision {
-    evaluate_cached_url_with_origin_check(url, client, |url| client.is_configured_origin(url))
+    evaluate_cached_url_with_origin_check(url, client, |parsed| {
+        client.is_configured_origin_parsed(parsed)
+    })
 }
 
-/// Gate a lockfile-stored tarball URL for a specific package, accepting either
-/// the package's configured custom `.npmrc` / JSR registry or the client's
+/// Gate a lockfile-stored tarball URL for a specific package.
+///
+/// When `.npmrc` or JSR routes `package_name` to a custom registry, only URLs
+/// served by that custom registry are accepted (so a locked public npmjs URL
+/// cannot bypass a configured mirror). Otherwise, URLs must match the client's
 /// default configured origins.
 pub fn evaluate_cached_url_for_package(
     url: &str,
@@ -191,30 +196,29 @@ pub fn evaluate_cached_url_for_package(
     client: &RegistryClient,
     route_table: &crate::RouteTable,
 ) -> GateDecision {
-    let uses_custom_route = matches!(
-        route_table.route_for_package(package_name),
-        crate::UpstreamRoute::Custom { .. }
-    );
-    evaluate_cached_url_with_origin_check(url, client, |candidate| {
-        if uses_custom_route {
-            route_table.fetches_package_from(package_name, candidate)
-        } else {
-            client.is_configured_origin(candidate)
-        }
+    let custom_registry = route_table.custom_registry_base_for_package(package_name);
+    evaluate_cached_url_with_origin_check(url, client, |parsed| match custom_registry {
+        Some(registry) => crate::RouteTable::registry_serves_parsed_url(parsed, registry),
+        None => client.is_configured_origin_parsed(parsed),
     })
 }
 
 fn evaluate_cached_url_with_origin_check(
     url: &str,
     client: &RegistryClient,
-    origin_allowed: impl FnOnce(&str) -> bool,
+    origin_allowed: impl FnOnce(&reqwest::Url) -> bool,
 ) -> GateDecision {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return GateDecision::RejectedScheme;
+    };
+
     // Scheme — mirrors `RegistryClient::check_tarball_url_scheme` so
     // the lockfile-read gate stays symmetric with the tarball-download
     // guards. `--insecure` specifically widens the carve-out to HTTP,
     // never to `file://`, `ftp://`, `data:`, etc.
-    let scheme_ok =
-        is_https_url(url) || is_localhost_url(url) || (client.allow_insecure() && is_http_url(url));
+    let scheme_ok = parsed.scheme() == "https"
+        || is_loopback_http_url(&parsed)
+        || (client.allow_insecure() && parsed.scheme() == "http");
     if !scheme_ok {
         return GateDecision::RejectedScheme;
     }
@@ -223,9 +227,6 @@ fn evaluate_cached_url_with_origin_check(
     // Suffix-only checks can be bypassed with administrative-looking paths
     // like `/api/admin/foo.tgz`; the `/-/` segment is only ever emitted by
     // the registry tarball route.
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return GateDecision::RejectedShape;
-    };
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return GateDecision::RejectedShape;
     }
@@ -237,7 +238,7 @@ fn evaluate_cached_url_with_origin_check(
         return GateDecision::RejectedShape;
     }
 
-    if !origin_allowed(url) {
+    if !origin_allowed(&parsed) {
         return GateDecision::RejectedOrigin;
     }
 

@@ -2973,7 +2973,7 @@ fn bundled_dependency_names(pkg_json: &serde_json::Value) -> Result<Vec<String>,
     };
 
     let mut names = match raw {
-        serde_json::Value::Bool(false) => Vec::new(),
+        serde_json::Value::Null | serde_json::Value::Bool(false) => Vec::new(),
         serde_json::Value::Bool(true) => {
             let mut names = Vec::new();
             if let Some(dependencies) = pkg_json
@@ -2989,15 +2989,17 @@ fn bundled_dependency_names(pkg_json: &serde_json::Value) -> Result<Vec<String>,
             .map(|entry| {
                 entry.as_str().map(str::to_string).ok_or_else(|| {
                     LpmError::Registry(
-                        "package.json bundledDependencies entries must be package-name strings"
+                        "package.json bundleDependencies/bundledDependencies entries must be package-name strings"
                             .into(),
                     )
                 })
             })
             .collect::<Result<Vec<_>, _>>()?,
+        serde_json::Value::Object(map) => map.keys().cloned().collect(),
         _ => {
             return Err(LpmError::Registry(
-                "package.json bundledDependencies must be an array or boolean".into(),
+                "package.json bundleDependencies/bundledDependencies must be an array, object, or boolean"
+                    .into(),
             ));
         }
     };
@@ -8541,5 +8543,32 @@ mod tests {
 
         let names = bundled_dependency_names(&manifest).expect("parse bundled names");
         assert_eq!(names, vec!["canonical-only".to_string()]);
+    }
+
+    #[test]
+    fn bundled_dependency_names_accepts_null_and_object_forms() {
+        let null_manifest = serde_json::json!({
+            "name": "null-bundle-pkg",
+            "version": "1.0.0",
+            "bundleDependencies": null
+        });
+        assert!(
+            bundled_dependency_names(&null_manifest)
+                .expect("null bundleDependencies should be treated as absent")
+                .is_empty()
+        );
+
+        let object_manifest = serde_json::json!({
+            "name": "object-bundle-pkg",
+            "version": "1.0.0",
+            "bundleDependencies": {
+                "beta": "1.0.0",
+                "alpha": "^2.0.0"
+            }
+        });
+        assert_eq!(
+            bundled_dependency_names(&object_manifest).expect("object bundleDependencies"),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
     }
 }

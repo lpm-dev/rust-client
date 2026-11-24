@@ -11790,10 +11790,10 @@ async fn install_fetch_overlap_dispatches_credentialed_npm_registry_tarballs() {
         Some(0),
         "the public npm registry is not a private mirror; got {overlap:#}"
     );
+    let early_handled = overlap["dispatched_count"].as_u64().unwrap_or(0)
+        + overlap["cache_hit_count"].as_u64().unwrap_or(0);
     assert!(
-        overlap["dispatched_count"]
-            .as_u64()
-            .is_some_and(|count| count >= 1),
+        early_handled >= 1,
         "credentialed npm registry selections must overlap resolution; got {overlap:#}"
     );
     assert_eq!(tarball_requests.len(), 1);

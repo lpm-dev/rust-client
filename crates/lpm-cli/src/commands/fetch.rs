@@ -161,7 +161,7 @@ pub async fn run(
         let plan = if !reachable_for_platform[idx] {
             FetchPlan::Skip("platform".to_string())
         } else {
-            classify_package(package, &target_platform)?
+            classify_compatible_package(package)?
         };
         match plan {
             FetchPlan::Fetch(target) => targets.push(target),
@@ -471,6 +471,227 @@ fn emit_route_warnings(route_table: &RouteTable, json_output: bool) {
     }
 }
 
+enum IndexBucket {
+    One(usize),
+    Many(Vec<usize>),
+}
+
+impl IndexBucket {
+    fn push(&mut self, idx: usize) {
+        match self {
+            Self::One(first) => {
+                let first = *first;
+                *self = Self::Many(vec![first, idx]);
+            }
+            Self::Many(indices) => indices.push(idx),
+        }
+    }
+
+    fn for_each(&self, mut f: impl FnMut(usize)) {
+        match self {
+            Self::One(idx) => f(*idx),
+            Self::Many(indices) => {
+                for &idx in indices {
+                    f(idx);
+                }
+            }
+        }
+    }
+}
+
+fn insert_bucket<K: Eq + Hash>(map: &mut HashMap<K, IndexBucket>, key: K, idx: usize) {
+    match map.entry(key) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(IndexBucket::One(idx));
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            entry.get_mut().push(idx);
+        }
+    }
+}
+
+fn locked_package_wrapper_id(package: &LockedPackage) -> Option<String> {
+    match package.source_kind()? {
+        Ok(
+            source @ (Source::Tarball { .. }
+            | Source::Directory { .. }
+            | Source::Link { .. }
+            | Source::Git { .. }),
+        ) => Some(source.source_id()),
+        _ => None,
+    }
+}
+
+fn alias_target_name<'a>(package: &'a LockedPackage, local: &'a str) -> &'a str {
+    package
+        .alias_dependencies
+        .iter()
+        .find_map(|[alias_local, target]| (alias_local == local).then_some(target.as_str()))
+        .unwrap_or(local)
+}
+
+fn for_each_child_index(
+    package: &LockedPackage,
+    by_instance: &HashMap<lpm_common::PackageInstanceId, usize>,
+    by_name_version: &HashMap<(&str, &str), IndexBucket>,
+    by_source_wrapper: &HashMap<String, IndexBucket>,
+    mut visit: impl FnMut(usize),
+) {
+    for dep_spec in &package.dependencies {
+        let Some((local, version)) = dep_spec.rsplit_once('@') else {
+            continue;
+        };
+        if let Some(target_id) = package.dependency_targets.get(local) {
+            if let Some(&child_idx) = by_instance.get(target_id) {
+                visit(child_idx);
+            }
+            continue;
+        }
+        if let Some(bucket) = by_source_wrapper.get(version) {
+            bucket.for_each(&mut visit);
+            continue;
+        }
+        let target_name = alias_target_name(package, local);
+        if let Some(bucket) = by_name_version.get(&(target_name, version)) {
+            bucket.for_each(&mut visit);
+        }
+    }
+    for peer in &package.peer_edges {
+        if let Some(target_id) = package.peer_targets.get(&peer.local_name) {
+            if let Some(&child_idx) = by_instance.get(target_id) {
+                visit(child_idx);
+            }
+            continue;
+        }
+        if let Some(wrapper_id) = peer.target_wrapper_id.as_deref()
+            && let Some(bucket) = by_source_wrapper.get(wrapper_id)
+        {
+            bucket.for_each(&mut visit);
+            continue;
+        }
+        if let Some(bucket) =
+            by_name_version.get(&(peer.target_name.as_str(), peer.target_version.as_str()))
+        {
+            bucket.for_each(&mut visit);
+        }
+    }
+    if package.peer_edges.is_empty() {
+        for peer_spec in &package.peers {
+            let Some((name, version)) = peer_spec.rsplit_once('@') else {
+                continue;
+            };
+            if let Some(bucket) = by_source_wrapper.get(version) {
+                bucket.for_each(&mut visit);
+                continue;
+            }
+            if let Some(bucket) = by_name_version.get(&(name, version)) {
+                bucket.for_each(&mut visit);
+            }
+        }
+    }
+}
+
+fn mark_reachable_subgraph(
+    packages: &[&LockedPackage],
+    subset_indices: &[usize],
+    compatible: &[bool],
+    root_resolutions: &std::collections::BTreeMap<String, lpm_lockfile::LockedRootResolution>,
+    ambient_peer_installs: &[String],
+    reachable: &mut [bool],
+) {
+    if subset_indices.is_empty() {
+        return;
+    }
+
+    let mut by_instance = HashMap::with_capacity(subset_indices.len());
+    let mut by_name_version: HashMap<(&str, &str), IndexBucket> =
+        HashMap::with_capacity(subset_indices.len());
+    let mut by_source_wrapper: HashMap<String, IndexBucket> = HashMap::new();
+    for &idx in subset_indices {
+        let package = packages[idx];
+        if let Some(instance_id) = package.instance_id {
+            by_instance.insert(instance_id, idx);
+        }
+        insert_bucket(
+            &mut by_name_version,
+            (package.name.as_str(), package.version.as_str()),
+            idx,
+        );
+        if let Some(wrapper_id) = locked_package_wrapper_id(package) {
+            insert_bucket(&mut by_source_wrapper, wrapper_id, idx);
+        }
+    }
+
+    let mut visited = vec![false; packages.len()];
+    let mut queue = std::collections::VecDeque::with_capacity(subset_indices.len());
+    let mut enqueue = |idx: usize| {
+        if compatible[idx] && !visited[idx] {
+            visited[idx] = true;
+            reachable[idx] = true;
+            queue.push_back(idx);
+        }
+    };
+
+    let ambient_names: std::collections::HashSet<&str> =
+        ambient_peer_installs.iter().map(String::as_str).collect();
+    if !root_resolutions.is_empty() {
+        for (local_name, root) in root_resolutions {
+            if ambient_names.contains(local_name.as_str()) {
+                continue;
+            }
+            if let Some(instance_id) = root.instance_id
+                && let Some(&idx) = by_instance.get(&instance_id)
+            {
+                enqueue(idx);
+                continue;
+            }
+            if let Some(bucket) =
+                by_name_version.get(&(root.package.as_str(), root.version.as_str()))
+            {
+                bucket.for_each(|idx| {
+                    if root.source.is_none() || packages[idx].source == root.source {
+                        enqueue(idx);
+                    }
+                });
+            }
+        }
+    } else {
+        let mut has_parent = vec![false; packages.len()];
+        for &idx in subset_indices {
+            for_each_child_index(
+                packages[idx],
+                &by_instance,
+                &by_name_version,
+                &by_source_wrapper,
+                |child_idx| {
+                    has_parent[child_idx] = true;
+                },
+            );
+        }
+        for &idx in subset_indices {
+            if !has_parent[idx] || !packages[idx].optional {
+                enqueue(idx);
+            }
+        }
+    }
+
+    while let Some(idx) = queue.pop_front() {
+        for_each_child_index(
+            packages[idx],
+            &by_instance,
+            &by_name_version,
+            &by_source_wrapper,
+            |child_idx| {
+                if compatible[child_idx] && !visited[child_idx] {
+                    visited[child_idx] = true;
+                    reachable[child_idx] = true;
+                    queue.push_back(child_idx);
+                }
+            },
+        );
+    }
+}
+
 fn platform_reachable_indices(
     lockfile: &lpm_lockfile::Lockfile,
     packages: &[&LockedPackage],
@@ -484,130 +705,78 @@ fn platform_reachable_indices(
         return compatible;
     }
 
-    let mut by_instance = HashMap::with_capacity(packages.len());
-    let mut by_name_version = HashMap::<(&str, &str), Vec<usize>>::with_capacity(packages.len());
-    for (idx, package) in packages.iter().enumerate() {
-        if let Some(instance_id) = package.instance_id {
-            by_instance.insert(instance_id, idx);
-        }
-        by_name_version
-            .entry((package.name.as_str(), package.version.as_str()))
-            .or_default()
-            .push(idx);
-    }
-
-    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); packages.len()];
-    let mut has_parent = vec![false; packages.len()];
-    for (idx, package) in packages.iter().enumerate() {
-        let alias_map: HashMap<&str, &str> = package
-            .alias_dependencies
-            .iter()
-            .map(|[local, target]| (local.as_str(), target.as_str()))
-            .collect();
-        for dep_spec in &package.dependencies {
-            let Some((local, version)) = dep_spec.rsplit_once('@') else {
-                continue;
-            };
-            if let Some(target_id) = package.dependency_targets.get(local) {
-                if let Some(&child_idx) = by_instance.get(target_id) {
-                    edges[idx].push(child_idx);
-                    has_parent[child_idx] = true;
-                }
-                continue;
-            }
-            let target_name = alias_map.get(local).copied().unwrap_or(local);
-            if let Some(indices) = by_name_version.get(&(target_name, version)) {
-                for &child_idx in indices {
-                    edges[idx].push(child_idx);
-                    has_parent[child_idx] = true;
-                }
-            }
-        }
-        for peer in &package.peer_edges {
-            if let Some(target_id) = package.peer_targets.get(&peer.local_name) {
-                if let Some(&child_idx) = by_instance.get(target_id) {
-                    edges[idx].push(child_idx);
-                    has_parent[child_idx] = true;
-                }
-                continue;
-            }
-            if let Some(indices) =
-                by_name_version.get(&(peer.target_name.as_str(), peer.target_version.as_str()))
-            {
-                for &child_idx in indices {
-                    edges[idx].push(child_idx);
-                    has_parent[child_idx] = true;
-                }
-            }
-        }
-        if package.peer_edges.is_empty() {
-            for peer_spec in &package.peers {
-                let Some((name, version)) = peer_spec.rsplit_once('@') else {
-                    continue;
-                };
-                if let Some(indices) = by_name_version.get(&(name, version)) {
-                    for &child_idx in indices {
-                        edges[idx].push(child_idx);
-                        has_parent[child_idx] = true;
-                    }
-                }
-            }
-        }
-    }
-
     let mut reachable = vec![false; packages.len()];
-    let mut queue = std::collections::VecDeque::with_capacity(packages.len());
-    let mut seed_root = |idx: usize| {
-        if compatible[idx] && !reachable[idx] {
-            reachable[idx] = true;
-            queue.push_back(idx);
-        }
-    };
-
-    let mut has_explicit_roots = false;
-    for root in lockfile.root_resolutions.values().chain(
-        lockfile
-            .importers
-            .values()
-            .flat_map(|imp| imp.root_resolutions.values()),
-    ) {
-        has_explicit_roots = true;
-        if let Some(instance_id) = root.instance_id
-            && let Some(&idx) = by_instance.get(&instance_id)
-        {
-            seed_root(idx);
-            continue;
-        }
-        if let Some(indices) = by_name_version.get(&(root.package.as_str(), root.version.as_str()))
-        {
-            for &idx in indices {
-                if root.source.is_none() || packages[idx].source == root.source {
-                    seed_root(idx);
-                }
-            }
-        }
+    let root_count = lockfile.packages.len();
+    if root_count > 0 {
+        let root_indices: Vec<usize> = (0..root_count).collect();
+        mark_reachable_subgraph(
+            packages,
+            &root_indices,
+            &compatible,
+            &lockfile.root_resolutions,
+            &lockfile.ambient_peer_installs,
+            &mut reachable,
+        );
     }
 
-    if !has_explicit_roots {
-        for (idx, package) in packages.iter().enumerate() {
-            if !has_parent[idx] || !package.optional {
-                seed_root(idx);
+    if !lockfile.workspace_packages.is_empty() {
+        let workspace_id_to_idx: HashMap<&str, usize> = lockfile
+            .workspace_packages
+            .keys()
+            .enumerate()
+            .map(|(offset, id)| (id.as_str(), root_count + offset))
+            .collect();
+        let mut any_importer_projected = false;
+        let mut subset_indices = Vec::new();
+        for importer in lockfile.importers.values() {
+            if importer.locked_packages.is_empty() {
+                continue;
             }
+            any_importer_projected = true;
+            subset_indices.clear();
+            subset_indices.extend(
+                importer
+                    .locked_packages
+                    .iter()
+                    .filter_map(|id| workspace_id_to_idx.get(id.as_str()).copied()),
+            );
+            mark_reachable_subgraph(
+                packages,
+                &subset_indices,
+                &compatible,
+                &importer.root_resolutions,
+                &importer.ambient_peer_installs,
+                &mut reachable,
+            );
         }
-    }
-
-    while let Some(idx) = queue.pop_front() {
-        for &child_idx in &edges[idx] {
-            if compatible[child_idx] && !reachable[child_idx] {
-                reachable[child_idx] = true;
-                queue.push_back(child_idx);
+        if !any_importer_projected {
+            let workspace_indices: Vec<usize> = (root_count..packages.len()).collect();
+            let mut combined_roots = std::collections::BTreeMap::new();
+            let mut combined_ambient = Vec::new();
+            for importer in lockfile.importers.values() {
+                combined_roots.extend(
+                    importer
+                        .root_resolutions
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone())),
+                );
+                combined_ambient.extend(importer.ambient_peer_installs.iter().cloned());
             }
+            mark_reachable_subgraph(
+                packages,
+                &workspace_indices,
+                &compatible,
+                &combined_roots,
+                &combined_ambient,
+                &mut reachable,
+            );
         }
     }
 
     reachable
 }
 
+#[cfg(test)]
 fn classify_package(
     package: &LockedPackage,
     platform: &FetchPlatform,
@@ -615,7 +784,10 @@ fn classify_package(
     if !package_matches_platform(package, platform) {
         return Ok(FetchPlan::Skip("platform".to_string()));
     }
+    classify_compatible_package(package)
+}
 
+fn classify_compatible_package(package: &LockedPackage) -> Result<FetchPlan, LpmError> {
     let source = match package.source_kind() {
         Some(Ok(source)) => source,
         Some(Err(err)) => {
@@ -1214,6 +1386,173 @@ mod tests {
         assert_eq!(
             target.source.url(),
             Some("https://registry.npmjs.org/ms/-/ms-2.1.3.tgz")
+        );
+    }
+
+    #[test]
+    fn platform_reachable_indices_isolates_workspace_importers_and_excludes_ambient_peers() {
+        let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver("greedy-fusion");
+        let shared_root_id = lpm_common::PackageInstanceId::derive(
+            "wrapper",
+            "1.0.0",
+            "registry+https://registry.npmjs.org",
+            "root/wrapper",
+        );
+        let child_a_id = lpm_common::PackageInstanceId::derive(
+            "child-a",
+            "1.0.0",
+            "registry+https://registry.npmjs.org",
+            "root/wrapper/child-a",
+        );
+        let child_b_id = lpm_common::PackageInstanceId::derive(
+            "child-b",
+            "1.0.0",
+            "registry+https://registry.npmjs.org",
+            "root/wrapper/child-b",
+        );
+        let foreign_id = lpm_common::PackageInstanceId::derive(
+            "foreign-opt",
+            "1.0.0",
+            "registry+https://registry.npmjs.org",
+            "root/foreign-opt",
+        );
+        let orphan_peer_id = lpm_common::PackageInstanceId::derive(
+            "orphan-peer",
+            "1.0.0",
+            "registry+https://registry.npmjs.org",
+            "root/orphan-peer",
+        );
+
+        let mut wrapper_a = locked_package();
+        wrapper_a.name = "wrapper".to_string();
+        wrapper_a.instance_id = Some(shared_root_id);
+        wrapper_a.dependencies = vec!["child-a@1.0.0".to_string()];
+        wrapper_a
+            .dependency_targets
+            .insert("child-a".to_string(), child_a_id);
+
+        let mut wrapper_b = locked_package();
+        wrapper_b.name = "wrapper".to_string();
+        wrapper_b.instance_id = Some(shared_root_id);
+        wrapper_b.dependencies = vec!["child-b@1.0.0".to_string()];
+        wrapper_b
+            .dependency_targets
+            .insert("child-b".to_string(), child_b_id);
+
+        let mut child_a = locked_package();
+        child_a.name = "child-a".to_string();
+        child_a.instance_id = Some(child_a_id);
+
+        let mut child_b = locked_package();
+        child_b.name = "child-b".to_string();
+        child_b.instance_id = Some(child_b_id);
+
+        let mut foreign = locked_package();
+        foreign.name = "foreign-opt".to_string();
+        foreign.instance_id = Some(foreign_id);
+        foreign.os = vec!["win32".to_string()];
+        foreign.optional = true;
+        foreign.peer_edges.push(lpm_common::PeerEdge::registry(
+            "orphan-peer",
+            "orphan-peer",
+            "1.0.0",
+        ));
+        foreign
+            .peer_targets
+            .insert("orphan-peer".to_string(), orphan_peer_id);
+
+        let mut orphan_peer = locked_package();
+        orphan_peer.name = "orphan-peer".to_string();
+        orphan_peer.instance_id = Some(orphan_peer_id);
+
+        lockfile
+            .workspace_packages
+            .insert("wp-wrapper-a".to_string(), wrapper_a);
+        lockfile
+            .workspace_packages
+            .insert("wp-child-a".to_string(), child_a);
+        lockfile
+            .workspace_packages
+            .insert("wp-wrapper-b".to_string(), wrapper_b);
+        lockfile
+            .workspace_packages
+            .insert("wp-child-b".to_string(), child_b);
+        lockfile
+            .workspace_packages
+            .insert("wp-foreign".to_string(), foreign);
+        lockfile
+            .workspace_packages
+            .insert("wp-orphan-peer".to_string(), orphan_peer);
+
+        let mut imp_a = lpm_lockfile::ImporterSnapshot {
+            locked_packages: vec![
+                "wp-wrapper-a".to_string(),
+                "wp-child-a".to_string(),
+                "wp-foreign".to_string(),
+                "wp-orphan-peer".to_string(),
+            ],
+            ambient_peer_installs: vec!["orphan-peer".to_string()],
+            ..Default::default()
+        };
+        imp_a.root_resolutions.insert(
+            "wrapper".to_string(),
+            lpm_lockfile::LockedRootResolution {
+                package: "wrapper".to_string(),
+                version: "1.0.0".to_string(),
+                source: Some("registry+https://registry.npmjs.org".to_string()),
+                instance_id: Some(shared_root_id),
+            },
+        );
+        imp_a.root_resolutions.insert(
+            "foreign-opt".to_string(),
+            lpm_lockfile::LockedRootResolution {
+                package: "foreign-opt".to_string(),
+                version: "1.0.0".to_string(),
+                source: Some("registry+https://registry.npmjs.org".to_string()),
+                instance_id: Some(foreign_id),
+            },
+        );
+        imp_a.root_resolutions.insert(
+            "orphan-peer".to_string(),
+            lpm_lockfile::LockedRootResolution {
+                package: "orphan-peer".to_string(),
+                version: "1.0.0".to_string(),
+                source: Some("registry+https://registry.npmjs.org".to_string()),
+                instance_id: Some(orphan_peer_id),
+            },
+        );
+
+        let mut imp_b = lpm_lockfile::ImporterSnapshot {
+            locked_packages: vec!["wp-wrapper-b".to_string(), "wp-child-b".to_string()],
+            ..Default::default()
+        };
+        imp_b.root_resolutions.insert(
+            "wrapper".to_string(),
+            lpm_lockfile::LockedRootResolution {
+                package: "wrapper".to_string(),
+                version: "1.0.0".to_string(),
+                source: Some("registry+https://registry.npmjs.org".to_string()),
+                instance_id: Some(shared_root_id),
+            },
+        );
+
+        lockfile.importers.insert("packages/a".to_string(), imp_a);
+        lockfile.importers.insert("packages/b".to_string(), imp_b);
+
+        let all_packages: Vec<&LockedPackage> = lockfile.workspace_packages.values().collect();
+        let reachable = platform_reachable_indices(
+            &lockfile,
+            &all_packages,
+            &FetchPlatform::parse("linux/x64/glibc").unwrap(),
+        );
+        let kept_names: std::collections::BTreeSet<&str> = all_packages
+            .iter()
+            .zip(reachable)
+            .filter_map(|(pkg, keep)| keep.then_some(pkg.name.as_str()))
+            .collect();
+        assert_eq!(
+            kept_names,
+            std::collections::BTreeSet::from(["child-a", "child-b", "wrapper"])
         );
     }
 }
