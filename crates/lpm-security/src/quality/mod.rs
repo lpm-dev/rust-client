@@ -2,10 +2,11 @@
 //! stream past. LPM.dev Registry runs them on every published release with
 //! `lpm internal-package-signals`, and `lpm publish --check` runs them on the
 //! tarball it would upload, so the two agree when they run the same CLI
-//! version. The checks that need registry data (trusted publishing, signed
-//! provenance, a provenance repository that matches `package.json`, the
-//! owner's verified domain, approved Agent Skills) are LPM.dev Registry's;
-//! [`spec`] lists them with the rest.
+//! version on the same inputs, which for Swift include the manifest each side
+//! evaluates with its own toolchain. The checks that need registry data
+//! (trusted publishing, signed provenance, a provenance repository that
+//! matches `package.json`, the owner's verified domain, approved Agent Skills)
+//! are LPM.dev Registry's; [`spec`] lists them with the rest.
 
 mod js;
 mod js_api;
