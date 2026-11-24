@@ -1,10 +1,11 @@
 //! Provenance-drift comparator.
 //!
 //! Pure comparison logic consumed by the install-time drift gate in
-//! `lpm-cli/src/commands/install.rs`. Given an approved
-//! [`ProvenanceSnapshot`] (captured into a
-//! `TrustedDependencyBinding.provenance_at_approval` in `lpm-cli` at approval
-//! time) and a freshly-fetched snapshot for the candidate version,
+//! `lpm-cli/src/commands/install/`. Given an approved
+//! [`ProvenanceSnapshot`] (captured at approval time into
+//! [`lpm_workspace::TrustedDependencyBinding::provenance_at_approval`] for a
+//! project, or the `lpm-global` binding of the same name for a global
+//! install) and a freshly-fetched snapshot for the candidate version,
 //! decide whether the identity has drifted enough to block the install.
 //!
 //! Five-branch comparison table:
