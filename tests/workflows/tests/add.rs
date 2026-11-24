@@ -819,6 +819,51 @@ async fn add_rewrites_imports_relative_to_the_detected_alias_mapping_base() {
     );
 }
 
+#[tokio::test]
+async fn add_with_an_empty_import_alias_leaves_package_imports_unchanged() {
+    let mock = MockRegistry::start().await;
+    let package = "empty-author-alias-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "importAlias": "",
+            "files": [{"src": "Button.ts"}, {"src": "util.ts"}]
+        }),
+        &[
+            (
+                "Button.ts",
+                b"import { useState } from 'react';\nimport { util } from './util';\nexport { useState, util };\n",
+            ),
+            ("util.ts", b"export const util = true;\n"),
+        ],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"paths":{"@/*":["./src/*"]}}}"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--path",
+            "src/components",
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+
+    let button = project.read_file("src/components/Button.ts");
+    assert!(button.contains("from 'react'"), "{button}");
+    assert!(button.contains("from '@/components/util'"), "{button}");
+}
+
 // ─── Test 1: happy path ─────────────────────────────────────────────
 
 #[tokio::test]
