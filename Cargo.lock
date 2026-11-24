@@ -4400,6 +4400,7 @@ version = "0.89.0"
 dependencies = [
  "aes-gcm",
  "base64 0.23.1",
+ "block2",
  "cap-fs-ext",
  "cap-std",
  "core-foundation 0.10.1",

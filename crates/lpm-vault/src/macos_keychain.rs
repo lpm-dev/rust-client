@@ -4,14 +4,15 @@ use core_foundation::data::CFData;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::string::{CFString, CFStringRef};
 use security_framework::access_control::SecAccessControl;
-use security_framework::passwords::{PasswordOptions, delete_generic_password_options};
 use security_framework_sys::access_control::kSecAttrAccessibleWhenUnlockedThisDeviceOnly;
 use security_framework_sys::item::{
     kSecAttrAccessGroup, kSecAttrAccount, kSecAttrService, kSecAttrSynchronizable, kSecClass,
     kSecClassGenericPassword, kSecMatchLimit, kSecMatchLimitAll, kSecReturnAttributes,
     kSecReturnData, kSecUseAuthenticationContext, kSecUseDataProtectionKeychain, kSecValueData,
 };
-use security_framework_sys::keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemUpdate};
+use security_framework_sys::keychain_item::{
+    SecItemAdd, SecItemCopyMatching, SecItemDelete, SecItemUpdate,
+};
 
 #[link(name = "Security", kind = "framework")]
 unsafe extern "C" {
@@ -121,32 +122,70 @@ pub(crate) fn prompting_for_local_history<T>(run: impl FnOnce() -> T) -> T {
     run()
 }
 
-/// The reason the approval prompt gives for reading `account`: the folder
-/// asking and the project's recorded name when a link check noted them, else
-/// its vault ID; a companion record also by what it holds, and either by
-/// what the running command reads for when it says.
-fn operation_prompt(account: &str) -> String {
-    use crate::companion::account::CompanionAccount;
-    let history = lpm_env_companion::append_log::HISTORY;
-    let record = CompanionAccount::parse(account);
-    let vault_id = record.as_ref().map_or(account, CompanionAccount::vault_id);
-    let holds = PURPOSE.get().or_else(|| match record.as_ref()?.kind() {
-        Some(crate::companion::overrides::OVERRIDES_KIND) => Some("personal overrides"),
-        Some(kind) if kind == history.kind || kind == history.head_kind => Some("local history"),
-        _ => Some("newer data"),
-    });
-    let (project, requester) = REQUESTER.with_borrow(|requester| match requester {
-        Some(requester) if requester.vault_id == vault_id => (
-            prompt_project(vault_id, requester.project_name.as_deref()),
-            format!(" in {}", prompt_folder(&requester.folder)),
-        ),
-        _ => (vault_id.to_owned(), String::new()),
-    });
-    match holds {
-        Some(holds) => {
-            format!("Allow LPM CLI{requester} to access env project {project}'s {holds}")
+/// What an approval names for reading `account`: the project's recorded
+/// name and the folder asking when a link check noted them, else its vault
+/// ID; a companion record also by what it holds, and either by what the
+/// running command reads for when it says.
+struct PromptSubject {
+    project: String,
+    holds: Option<&'static str>,
+    folder: Option<String>,
+}
+
+impl PromptSubject {
+    fn of(account: &str) -> Self {
+        use crate::companion::account::CompanionAccount;
+        let history = lpm_env_companion::append_log::HISTORY;
+        let record = CompanionAccount::parse(account);
+        let vault_id = record.as_ref().map_or(account, CompanionAccount::vault_id);
+        let holds = PURPOSE.get().or_else(|| match record.as_ref()?.kind() {
+            Some(crate::companion::overrides::OVERRIDES_KIND) => Some("personal overrides"),
+            Some(kind) if kind == history.kind || kind == history.head_kind => {
+                Some("local history")
+            }
+            _ => Some("newer data"),
+        });
+        let (project, folder) = REQUESTER.with_borrow(|requester| match requester {
+            Some(requester) if requester.vault_id == vault_id => (
+                prompt_project(vault_id, requester.project_name.as_deref()),
+                Some(prompt_folder(&requester.folder)),
+            ),
+            _ => (vault_id.to_owned(), None),
+        });
+        Self {
+            project,
+            holds,
+            folder,
         }
-        None => format!("Allow LPM CLI{requester} to access env project {project}"),
+    }
+
+    fn access(&self) -> String {
+        match self.holds {
+            Some(holds) => format!("access env project {}'s {holds}", self.project),
+            None => format!("access env project {}", self.project),
+        }
+    }
+}
+
+/// The Keychain's own prompt for reading `account`, which macOS shows only
+/// if the run's approved context doesn't cover the item.
+fn operation_prompt(account: &str) -> String {
+    let subject = PromptSubject::of(account);
+    let requester = subject
+        .folder
+        .as_ref()
+        .map(|folder| format!(" in {folder}"))
+        .unwrap_or_default();
+    format!("Allow LPM CLI{requester} to {}", subject.access())
+}
+
+/// What the run's one approval says it's for, reading `account` first.
+/// macOS shows it after "LPM CLI is trying to".
+fn approval_reason(account: &str) -> String {
+    let subject = PromptSubject::of(account);
+    match &subject.folder {
+        Some(folder) => format!("{} in {folder}", subject.access()),
+        None => subject.access(),
     }
 }
 
@@ -173,6 +212,8 @@ thread_local! {
     static AUTHENTICATION_CONTEXT: std::cell::RefCell<
         Option<objc2::rc::Retained<objc2_local_authentication::LAContext>>,
     > = const { std::cell::RefCell::new(None) };
+    /// Whether the person approved the invocation's context.
+    static RUN_APPROVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// What the invocation's one context gives as its reason when the Keychain
@@ -202,6 +243,108 @@ fn authentication_context() -> CFType {
     let pointer = objc2::rc::Retained::as_ptr(&context).cast::<std::ffi::c_void>();
     // SAFETY: get-rule retains the context, so the CFType outlives `context`.
     unsafe { CFType::wrap_under_get_rule(pointer) }
+}
+
+/// How a Keychain call that may meet an item demanding the person's approval
+/// runs: without authentication UI, or with the run's context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ui {
+    Never,
+    Approved,
+}
+
+/// Runs `call`, which may meet an item that demands the person's approval.
+/// Until the run is approved, `call` runs without authentication UI, so an
+/// item that needs none never asks. The first one that does approves the
+/// run's context once, and `call` runs again with it, as every later call
+/// does: macOS asks for each call through a context nobody approved.
+fn approving_once<T>(
+    approved: bool,
+    approve: impl FnOnce() -> Result<(), KeychainStorageError>,
+    mut call: impl FnMut(Ui) -> Result<T, KeychainStorageError>,
+) -> Result<T, KeychainStorageError> {
+    if approved {
+        return call(Ui::Approved);
+    }
+    match call(Ui::Never) {
+        Err(KeychainStorageError::InteractionNotAllowed) => {
+            approve()?;
+            call(Ui::Approved)
+        }
+        result => result,
+    }
+}
+
+/// [`approving_once`] for a Keychain call on `account`, given the context
+/// to pass.
+fn with_run_approval<T>(
+    account: &str,
+    mut call: impl FnMut(CFType) -> Result<T, KeychainStorageError>,
+) -> Result<T, KeychainStorageError> {
+    approving_once(
+        RUN_APPROVED.get(),
+        || {
+            approve_run(&approval_reason(account))?;
+            RUN_APPROVED.set(true);
+            Ok(())
+        },
+        |ui| {
+            call(match ui {
+                Ui::Never => non_interactive_context(),
+                Ui::Approved => authentication_context(),
+            })
+        },
+    )
+}
+
+/// Asks the person to approve the invocation's context, saying `reason`.
+fn approve_run(reason: &str) -> Result<(), KeychainStorageError> {
+    use block2::RcBlock;
+    use objc2::runtime::Bool;
+    use objc2_foundation::{NSError, NSString};
+
+    let context = shared_authentication_context();
+    let reason = NSString::from_str(reason);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reply: RcBlock<dyn Fn(Bool, *mut NSError)> =
+        RcBlock::new(move |approved: Bool, error: *mut NSError| {
+            let refused = (!approved.as_bool()).then(|| {
+                // SAFETY: LocalAuthentication passes a live error, or null,
+                // for the duration of the reply.
+                unsafe { error.as_ref() }.map_or(0, |error| error.code())
+            });
+            let _ = sender.send(refused);
+        });
+    // SAFETY: the reason is non-empty, and the context and the heap-backed
+    // reply stay alive until the reply is received.
+    unsafe {
+        context.evaluatePolicy_localizedReason_reply(
+            objc2_local_authentication::LAPolicy::DeviceOwnerAuthentication,
+            &reason,
+            &reply,
+        );
+    }
+    match receiver.recv() {
+        Ok(None) => Ok(()),
+        Ok(Some(code)) => Err(authentication_error(code)),
+        Err(_) => Err(KeychainStorageError::ApprovalFailed),
+    }
+}
+
+/// What a LocalAuthentication error means for the run's approval.
+fn authentication_error(code: isize) -> KeychainStorageError {
+    use objc2_local_authentication::LAError;
+    match LAError(code) {
+        LAError::UserCancel | LAError::SystemCancel | LAError::AppCancel => {
+            KeychainStorageError::ApprovalCancelled
+        }
+        LAError::AuthenticationFailed => KeychainStorageError::ApprovalFailed,
+        LAError::NotInteractive => KeychainStorageError::InteractionNotAllowed,
+        LAError(code) => KeychainStorageError::Security {
+            operation: "env approval",
+            code: i32::try_from(code).unwrap_or(i32::MIN),
+        },
+    }
 }
 
 /// A context that never shows authentication UI and never reuses an earlier
@@ -280,14 +423,6 @@ pub(crate) fn with_keychain_transaction<T>(
 }
 
 impl SecurityFrameworkBackend {
-    fn options(service: &str, account: &str) -> PasswordOptions {
-        let mut options = PasswordOptions::new_generic_password(service, account);
-        options.set_access_group(SHARED_ACCESS_GROUP);
-        options.set_access_synchronized(Some(false));
-        options.use_protected_keychain();
-        options
-    }
-
     fn map_status(operation: &'static str, code: i32) -> KeychainStorageError {
         Self::map_status_in(
             operation,
@@ -395,12 +530,10 @@ impl SecurityFrameworkBackend {
         ])
     }
 
+    /// The approval `account`'s attributes claim. Attributes need no
+    /// authentication, so like [`Self::claimed_access`] it passes no context.
     fn cli_access(service: &str, account: &str) -> Result<CliAccess, KeychainStorageError> {
         let mut pairs = Self::identity_pairs(service, account);
-        pairs.push((
-            unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationContext) },
-            authentication_context(),
-        ));
         pairs.push((
             unsafe { CFString::wrap_under_get_rule(kSecReturnAttributes) },
             CFBoolean::from(true).into_CFType(),
@@ -469,7 +602,9 @@ impl SecurityFrameworkBackend {
     }
 
     fn read(service: &str, account: &str) -> Result<Option<Vec<u8>>, KeychainStorageError> {
-        Self::read_with_context(service, account, authentication_context())
+        with_run_approval(account, |context| {
+            Self::read_with_context(service, account, context)
+        })
     }
 
     /// Read an item's data and the approval its attributes claim, in one
@@ -478,10 +613,20 @@ impl SecurityFrameworkBackend {
         service: &str,
         account: &str,
     ) -> Result<Option<(Vec<u8>, ClaimedAccess)>, KeychainStorageError> {
+        with_run_approval(account, |context| {
+            Self::read_with_access_through(service, account, context)
+        })
+    }
+
+    fn read_with_access_through(
+        service: &str,
+        account: &str,
+        context: CFType,
+    ) -> Result<Option<(Vec<u8>, ClaimedAccess)>, KeychainStorageError> {
         let mut pairs = Self::identity_pairs(service, account);
         pairs.push((
             unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationContext) },
-            authentication_context(),
+            context,
         ));
         pairs.push((
             unsafe { CFString::wrap_under_get_rule(kSecUseOperationPrompt) },
@@ -630,20 +775,37 @@ impl SecurityFrameworkBackend {
 
     /// Give an existing item CLI approval, keeping its data.
     fn require_approval(service: &str, account: &str) -> Result<(), KeychainStorageError> {
+        let update =
+            CFDictionary::from_CFType_pairs(&Self::access_pairs(CliAccess::RequireApproval)?);
+        with_run_approval(account, |context| {
+            Self::update_through(service, account, &update, context, "require env approval")
+        })
+    }
+
+    /// Change `account`'s attributes to `attributes`, through `context`.
+    fn update_through(
+        service: &str,
+        account: &str,
+        attributes: &CFDictionary<CFString, CFType>,
+        context: CFType,
+        operation: &'static str,
+    ) -> Result<(), KeychainStorageError> {
         let mut pairs = Self::identity_pairs(service, account);
         pairs.push((
             unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationContext) },
-            authentication_context(),
+            context,
         ));
         let query = CFDictionary::from_CFType_pairs(&pairs);
-        let update =
-            CFDictionary::from_CFType_pairs(&Self::access_pairs(CliAccess::RequireApproval)?);
-        let status =
-            unsafe { SecItemUpdate(query.as_concrete_TypeRef(), update.as_concrete_TypeRef()) };
+        let status = unsafe {
+            SecItemUpdate(
+                query.as_concrete_TypeRef(),
+                attributes.as_concrete_TypeRef(),
+            )
+        };
         if status == 0 {
             Ok(())
         } else {
-            Err(Self::map_status("require env approval", status))
+            Err(Self::map_status(operation, status))
         }
     }
 
@@ -698,24 +860,10 @@ impl SecurityFrameworkBackend {
     }
 
     fn update(service: &str, account: &str, value: &[u8]) -> Result<(), KeychainStorageError> {
-        let mut pairs = Self::identity_pairs(service, account);
-        pairs.push((
-            unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationContext) },
-            authentication_context(),
-        ));
-        let query = CFDictionary::from_CFType_pairs(&pairs);
         let attributes = CFDictionary::from_CFType_pairs(&Self::attribute_pairs(Some(value)));
-        let status = unsafe {
-            SecItemUpdate(
-                query.as_concrete_TypeRef(),
-                attributes.as_concrete_TypeRef(),
-            )
-        };
-        if status == 0 {
-            Ok(())
-        } else {
-            Err(Self::map_status("write", status))
-        }
+        with_run_approval(account, |context| {
+            Self::update_through(service, account, &attributes, context, "write")
+        })
     }
 
     fn write(service: &str, account: &str, value: &[u8]) -> Result<(), KeychainStorageError> {
@@ -747,20 +895,10 @@ impl SecurityFrameworkBackend {
         if status != ERR_SEC_DUPLICATE_ITEM {
             return Err(Self::map_status("write approved env", status));
         }
-        pairs = Self::identity_pairs(service, account);
-        pairs.push((
-            unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationContext) },
-            authentication_context(),
-        ));
-        let query = CFDictionary::from_CFType_pairs(&pairs);
         let update = CFDictionary::from_CFType_pairs(&attributes);
-        let status =
-            unsafe { SecItemUpdate(query.as_concrete_TypeRef(), update.as_concrete_TypeRef()) };
-        if status == 0 {
-            Ok(())
-        } else {
-            Err(Self::map_status("write approved env", status))
-        }
+        with_run_approval(account, |context| {
+            Self::update_through(service, account, &update, context, "write approved env")
+        })
     }
 }
 
@@ -933,41 +1071,44 @@ pub(crate) fn plant_approval_claim(
         PlantedClaim::ApprovalNotEnforced => APPROVAL_MARKER,
         PlantedClaim::ApprovalOff => b"",
     };
-    let mut pairs = SecurityFrameworkBackend::identity_pairs(service, account);
-    pairs.push((
-        unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationContext) },
-        authentication_context(),
-    ));
-    let query = CFDictionary::from_CFType_pairs(&pairs);
     let attributes = CFDictionary::from_CFType_pairs(&[(
         unsafe { CFString::wrap_under_get_rule(kSecAttrGeneric) },
         CFData::from_buffer(policy).into_CFType(),
     )]);
-    // SAFETY: Both dictionaries are live CoreFoundation objects for the call.
-    let status = unsafe {
-        SecItemUpdate(
-            query.as_concrete_TypeRef(),
-            attributes.as_concrete_TypeRef(),
+    with_run_approval(account, |context| {
+        SecurityFrameworkBackend::update_through(
+            service,
+            account,
+            &attributes,
+            context,
+            "claim approval",
         )
-    };
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(SecurityFrameworkBackend::map_status("claim approval", status).to_string())
-    }
+    })
+    .map_err(|error| error.to_string())
 }
 
 pub(crate) fn delete(service: &str, account: &str) -> Result<KeychainDeleteOutcome, String> {
-    match delete_generic_password_options(SecurityFrameworkBackend::options(service, account)) {
-        Ok(()) => Ok(KeychainDeleteOutcome::Deleted),
-        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(KeychainDeleteOutcome::NotFound),
-        Err(error) => Err(SecurityFrameworkBackend::map_error("delete", error).to_string()),
-    }
+    with_run_approval(account, |context| {
+        let mut pairs = SecurityFrameworkBackend::identity_pairs(service, account);
+        pairs.push((
+            unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationContext) },
+            context,
+        ));
+        let query = CFDictionary::from_CFType_pairs(&pairs);
+        // SAFETY: the query is a live CoreFoundation dictionary for the call.
+        match unsafe { SecItemDelete(query.as_concrete_TypeRef()) } {
+            0 => Ok(KeychainDeleteOutcome::Deleted),
+            ERR_SEC_ITEM_NOT_FOUND => Ok(KeychainDeleteOutcome::NotFound),
+            status => Err(SecurityFrameworkBackend::map_status("delete", status)),
+        }
+    })
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn a_keychain_failure_inside_lpms_sandbox_says_its_install_script_sandbox_closed_the_keychain()
@@ -1142,6 +1283,215 @@ mod tests {
         assert!(shown.contains('…'), "{shown}");
     }
 
+    /// A Keychain as macOS behaves with the run's context: an item that
+    /// demands approval refuses a call without UI, and asks the person for
+    /// each call until the context itself is approved.
+    #[derive(Default)]
+    struct FakeKeychain {
+        protected: HashSet<&'static str>,
+        /// The Keychain refuses even an approved context, as while the Mac
+        /// is locked.
+        closed: bool,
+        context_approved: std::cell::Cell<bool>,
+        approvals: std::cell::Cell<usize>,
+        prompts: std::cell::RefCell<Vec<&'static str>>,
+        calls: std::cell::RefCell<Vec<(&'static str, Ui)>>,
+    }
+
+    impl FakeKeychain {
+        fn with_protected(items: &[&'static str]) -> Self {
+            Self {
+                protected: items.iter().copied().collect(),
+                ..Self::default()
+            }
+        }
+
+        fn run(&self, item: &'static str) -> Result<(), KeychainStorageError> {
+            self.run_approving(item, || Ok(()))
+        }
+
+        fn run_approving(
+            &self,
+            item: &'static str,
+            approval: impl FnOnce() -> Result<(), KeychainStorageError>,
+        ) -> Result<(), KeychainStorageError> {
+            let protected = self.protected.contains(item);
+            approving_once(
+                self.context_approved.get(),
+                || {
+                    self.approvals.set(self.approvals.get() + 1);
+                    approval()?;
+                    self.context_approved.set(true);
+                    Ok(())
+                },
+                |ui| {
+                    self.calls.borrow_mut().push((item, ui));
+                    match ui {
+                        Ui::Never if protected => Err(KeychainStorageError::InteractionNotAllowed),
+                        Ui::Approved if self.closed => {
+                            Err(KeychainStorageError::InteractionNotAllowed)
+                        }
+                        Ui::Approved if protected && !self.context_approved.get() => {
+                            self.prompts.borrow_mut().push(item);
+                            Ok(())
+                        }
+                        _ => Ok(()),
+                    }
+                },
+            )
+        }
+
+        fn asked(&self) -> usize {
+            self.approvals.get() + self.prompts.borrow().len()
+        }
+    }
+
+    #[test]
+    fn a_run_that_reads_and_changes_several_items_needing_approval_asks_once() {
+        let keychain = FakeKeychain::with_protected(&["values", "stage", "record"]);
+
+        for item in [
+            "marker", "stage", "stage", "record", "marker", "values", "record",
+        ] {
+            keychain.run(item).expect("run");
+        }
+
+        assert_eq!(
+            keychain.asked(),
+            1,
+            "prompts: {:?}",
+            keychain.prompts.borrow()
+        );
+    }
+
+    #[test]
+    fn items_that_need_no_approval_never_ask() {
+        let keychain = FakeKeychain::with_protected(&[]);
+
+        for item in ["values", "marker", "record"] {
+            keychain.run(item).expect("run");
+        }
+
+        assert_eq!(keychain.asked(), 0);
+        assert_eq!(
+            *keychain.calls.borrow(),
+            [
+                ("values", Ui::Never),
+                ("marker", Ui::Never),
+                ("record", Ui::Never)
+            ]
+        );
+    }
+
+    #[test]
+    fn once_approved_every_call_goes_straight_to_the_approved_context() {
+        let keychain = FakeKeychain::with_protected(&["values", "record"]);
+
+        for item in ["values", "marker", "record"] {
+            keychain.run(item).expect("run");
+        }
+
+        assert_eq!(
+            *keychain.calls.borrow(),
+            [
+                ("values", Ui::Never),
+                ("values", Ui::Approved),
+                ("marker", Ui::Approved),
+                ("record", Ui::Approved)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cancelled_approval_releases_nothing() {
+        let keychain = FakeKeychain::with_protected(&["values"]);
+
+        let error = keychain
+            .run_approving("values", || Err(KeychainStorageError::ApprovalCancelled))
+            .expect_err("cancelled");
+
+        assert!(matches!(error, KeychainStorageError::ApprovalCancelled));
+        assert_eq!(*keychain.calls.borrow(), [("values", Ui::Never)]);
+        assert!(!keychain.context_approved.get());
+    }
+
+    #[test]
+    fn a_keychain_closed_after_approval_fails_without_asking_again() {
+        let keychain = FakeKeychain {
+            closed: true,
+            ..FakeKeychain::with_protected(&["values"])
+        };
+
+        for _ in 0..2 {
+            assert!(matches!(
+                keychain.run("values"),
+                Err(KeychainStorageError::InteractionNotAllowed)
+            ));
+        }
+
+        assert_eq!(keychain.asked(), 1);
+    }
+
+    #[test]
+    fn local_authentication_errors_say_whether_the_person_cancelled_failed_or_had_no_ui() {
+        use objc2_local_authentication::LAError;
+        for cancelled in [
+            LAError::UserCancel,
+            LAError::SystemCancel,
+            LAError::AppCancel,
+        ] {
+            assert!(matches!(
+                authentication_error(cancelled.0),
+                KeychainStorageError::ApprovalCancelled
+            ));
+        }
+        assert!(matches!(
+            authentication_error(LAError::AuthenticationFailed.0),
+            KeychainStorageError::ApprovalFailed
+        ));
+        assert!(matches!(
+            authentication_error(LAError::NotInteractive.0),
+            KeychainStorageError::InteractionNotAllowed
+        ));
+        assert!(matches!(
+            authentication_error(LAError::PasscodeNotSet.0),
+            KeychainStorageError::Security {
+                operation: "env approval",
+                code: -5
+            }
+        ));
+    }
+
+    #[test]
+    fn the_runs_approval_says_what_it_reads_first_after_lpm_cli_is_trying_to() {
+        let record = crate::companion::account::record_account(
+            crate::companion::overrides::OVERRIDES_KIND,
+            "approval-reason-vault",
+            None,
+        );
+        assert_eq!(
+            approval_reason("approval-reason-vault"),
+            "access env project approval-reason-vault"
+        );
+        assert_eq!(
+            approval_reason(&record),
+            "access env project approval-reason-vault's personal overrides"
+        );
+        note_requester(
+            "approval-reason-vault",
+            std::path::Path::new("/srv/approval"),
+            || Some("Project".to_owned()),
+        );
+        assert_eq!(
+            approval_reason(&record),
+            "access env project \"Project\"'s personal overrides in \"/srv/approval\""
+        );
+        assert_eq!(
+            operation_prompt(&record),
+            "Allow LPM CLI in \"/srv/approval\" to access env project \"Project\"'s personal overrides"
+        );
+    }
+
     #[test]
     fn a_keychain_read_without_its_own_prompt_still_says_what_it_reads() {
         // SAFETY: reading a property of a live context has no preconditions.
@@ -1236,6 +1586,73 @@ mod tests {
             };
             assert_eq!(claim, case.claim, "{}", case.name);
         }
+    }
+
+    /// Approve the prompts and count them, from lpm-rs's repository root:
+    ///
+    /// ```text
+    /// LPM_RUN_KEYCHAIN_TESTS=1 scripts/build-signed-macos.sh --vault-tests -- \
+    ///     macos_keychain::tests::a_run_that_reads_and_changes_several_items_needing_approval_asks_once_on_this_macs_keychain \
+    ///     --ignored --exact --nocapture
+    /// ```
+    #[test]
+    #[ignore = "requires a signed macOS test bundle with the shared Keychain entitlement and a person to approve and count the prompts"]
+    fn a_run_that_reads_and_changes_several_items_needing_approval_asks_once_on_this_macs_keychain()
+    {
+        assert_eq!(std::env::var("LPM_RUN_KEYCHAIN_TESTS").as_deref(), Ok("1"));
+        const ITEMS: [&str; 3] = ["values", "stage", "record"];
+        let service = format!("dev.lpm.cli-approval.fixture.{}", rand::random::<u128>());
+        struct FixtureCleanup<'a>(&'a str);
+        impl Drop for FixtureCleanup<'_> {
+            fn drop(&mut self) {
+                for account in ITEMS {
+                    let _ = delete(self.0, account);
+                }
+            }
+        }
+        let _cleanup = FixtureCleanup(&service);
+
+        eprintln!(
+            "\nmacOS asks to approve this run now. Approve every prompt and count them: one is expected.\n"
+        );
+        for account in ITEMS {
+            write_bytes_with_access(
+                &service,
+                account,
+                b"synthetic-fixture",
+                CliAccess::RequireApproval,
+            )
+            .expect("write an item that needs approval");
+        }
+        for account in ITEMS {
+            assert_eq!(
+                read_bytes(&service, account).expect("read it back"),
+                Some(b"synthetic-fixture".to_vec())
+            );
+        }
+        write_bytes(&service, "values", b"synthetic-change").expect("change an approved item");
+        assert_eq!(
+            delete(&service, "stage"),
+            Ok(KeychainDeleteOutcome::Deleted)
+        );
+        assert!(
+            matches!(
+                SecurityFrameworkBackend::read_with_context(
+                    &service,
+                    "record",
+                    non_interactive_context()
+                ),
+                Err(KeychainStorageError::InteractionNotAllowed)
+            ),
+            "the items still demand approval from a context nobody approved"
+        );
+
+        eprint!("How many times did macOS ask? ");
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .expect("read the count from the terminal");
+        assert_eq!(answer.trim(), "1", "one run asks once");
     }
 
     #[test]
