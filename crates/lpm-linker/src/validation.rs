@@ -250,3 +250,101 @@ pub(crate) fn validate_bin_target(pkg_dir: &Path, script_path: &str) -> Result<P
 
     Ok(canonical_target)
 }
+
+/// Validate that `script_path` stays inside `pkg_dir` and exists without
+/// requiring a canonicalized return path. On Linux, uses `openat2` with
+/// `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` to verify containment in two
+/// syscalls, falling back to `validate_bin_target` when a symlink or older
+/// kernel / seccomp policy prevents `openat2`.
+pub(crate) fn validate_bin_target_confined(pkg_dir: &Path, script_path: &str) -> Result<(), String> {
+    if Path::new(script_path).is_absolute() {
+        return Err(format!(
+            "bin target \"{script_path}\" must be relative to package directory"
+        ));
+    }
+    let rel_path = Path::new(script_path);
+    for component in rel_path.components() {
+        if component == Component::ParentDir {
+            return Err(format!(
+                "bin target \"{script_path}\" contains path traversal (\"..\")"
+            ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{Mode, OFlags, ResolveFlags};
+        use rustix::io::Errno;
+
+        if let Ok(dir_fd) = rustix::fs::openat(
+            rustix::fs::CWD,
+            pkg_dir,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            match rustix::fs::openat2(
+                &dir_fd,
+                rel_path,
+                OFlags::PATH | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(Errno::NOENT | Errno::NOTDIR) => {
+                    return Err(format!(
+                        "cannot resolve bin target \"{script_path}\": No such file or directory"
+                    ));
+                }
+                Err(
+                    Errno::LOOP
+                    | Errno::XDEV
+                    | Errno::NOSYS
+                    | Errno::INVAL
+                    | Errno::NOTSUP
+                    | Errno::PERM,
+                ) => {}
+                Err(error) => {
+                    return Err(format!(
+                        "cannot resolve bin target \"{script_path}\": {}",
+                        std::io::Error::from(error)
+                    ));
+                }
+            }
+        }
+    }
+
+    validate_bin_target(pkg_dir, script_path).map(|_| ())
+}
+
+#[cfg(test)]
+mod bin_target_confined_tests {
+    use super::validate_bin_target_confined;
+
+    #[test]
+    fn confined_bin_validation_accepts_contained_targets_and_rejects_escapes() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg = root.path().join("pkg");
+        std::fs::create_dir_all(pkg.join("bin")).unwrap();
+        std::fs::write(pkg.join("bin/cli.js"), "#!/usr/bin/env node\n").unwrap();
+        std::fs::write(root.path().join("outside.js"), "console.log('nope')\n").unwrap();
+
+        assert!(validate_bin_target_confined(&pkg, "bin/cli.js").is_ok());
+        assert!(validate_bin_target_confined(&pkg, "./bin/cli.js").is_ok());
+        assert!(validate_bin_target_confined(&pkg, "bin/missing.js").is_err());
+        assert!(validate_bin_target_confined(&pkg, "../outside.js").is_err());
+        assert!(validate_bin_target_confined(&pkg, "/etc/passwd").is_err());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(pkg.join("bin/cli.js"), pkg.join("bin/internal-link.js"))
+                .unwrap();
+            std::os::unix::fs::symlink(
+                root.path().join("outside.js"),
+                pkg.join("bin/escape-link.js"),
+            )
+            .unwrap();
+            assert!(validate_bin_target_confined(&pkg, "bin/internal-link.js").is_ok());
+            assert!(validate_bin_target_confined(&pkg, "bin/escape-link.js").is_err());
+        }
+    }
+}

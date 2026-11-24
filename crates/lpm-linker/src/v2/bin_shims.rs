@@ -14,7 +14,7 @@ use super::keymap::KeyMap;
 use super::reconcile::root_link_names;
 use super::reconcile::{ensure_real_dir, is_direct, remove_node_modules_entry};
 use crate::validate_bin_name;
-use crate::validation::validate_bin_target;
+use crate::validation::{validate_bin_target, validate_bin_target_confined};
 
 struct BinLinkSpec {
     cmd_name: String,
@@ -204,7 +204,7 @@ pub(super) fn create_bin_links_v2(
             //   escapes the package dir (e.g. via an in-package symlink
             //   pointing outside)
             // - rejection of missing files (canonicalize fails)
-            if let Err(reason) = validate_bin_target(&pkg_dir, &bin_rel_path) {
+            if let Err(reason) = validate_bin_target_confined(&pkg_dir, &bin_rel_path) {
                 tracing::warn!(
                     "virtual-store linker: rejecting bin {cmd_name} from {}: {reason}",
                     v2t.target.name

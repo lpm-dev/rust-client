@@ -206,9 +206,12 @@ fn collect(root: &Path, reader: MetadataReader) -> Collected {
         }),
         changed: Condvar::new(),
     };
-    let threads = std::thread::available_parallelism()
-        .map_or(1, std::num::NonZero::get)
-        .min(WALK_THREADS);
+    static WALK_THREAD_BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let threads = *WALK_THREAD_BUDGET.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map_or(1, std::num::NonZero::get)
+            .min(WALK_THREADS)
+    });
     let mut helpers = 0;
     let mut helpers_requested = false;
     std::thread::scope(|scope| {

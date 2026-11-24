@@ -81,6 +81,18 @@ pub(crate) struct ShallowPackageGuard {
 }
 
 impl ShallowPackageGuard {
+    /// Returns true iff `self` was captured safely after both directory and
+    /// manifest mtimes (outside the racily-clean window).
+    pub(crate) fn is_non_racy(&self) -> bool {
+        let Some(captured_at) = self.captured_at_nanos else {
+            return false;
+        };
+        captured_at.saturating_sub(self.package_dir_mtime_nanos)
+            >= SHALLOW_GUARD_RACILY_CLEAN_WINDOW_NANOS
+            && captured_at.saturating_sub(self.package_json_mtime_nanos)
+                >= SHALLOW_GUARD_RACILY_CLEAN_WINDOW_NANOS
+    }
+
     /// Returns true iff `self` (the current filesystem observation) matches
     /// `recorded` AND `recorded` was captured safely after both mtimes (outside
     /// the racily-clean window).
@@ -94,13 +106,7 @@ impl ShallowPackageGuard {
         {
             return false;
         }
-        let Some(captured_at) = recorded.captured_at_nanos else {
-            return false;
-        };
-        captured_at.saturating_sub(recorded.package_dir_mtime_nanos)
-            >= SHALLOW_GUARD_RACILY_CLEAN_WINDOW_NANOS
-            && captured_at.saturating_sub(recorded.package_json_mtime_nanos)
-                >= SHALLOW_GUARD_RACILY_CLEAN_WINDOW_NANOS
+        recorded.is_non_racy()
     }
 }
 
@@ -1081,6 +1087,12 @@ pub(crate) fn refresh_link_snapshot_shallow_guard_best_effort(
     let Some(shallow_guard) = read_shallow_package_guard(package_dir) else {
         return;
     };
+    // Avoid rewriting the snapshot while mtimes are still inside the
+    // racily-clean window: the stamped guard would still miss on the next
+    // check, causing a wasted atomic write+rename.
+    if !shallow_guard.is_non_racy() {
+        return;
+    }
     if let Err(error) = write_tree_snapshot_fields(
         dir,
         snapshot.content_schema(),
@@ -1109,6 +1121,21 @@ pub(crate) fn write_tree_snapshot(
         &integrities.metadata,
         None,
         false,
+    )
+}
+
+pub(crate) fn write_tree_snapshot_unpublished(
+    dir: &Path,
+    integrities: &TreeIntegrities,
+) -> Result<(), LpmError> {
+    write_tree_snapshot_fields(
+        dir,
+        integrities.content_schema,
+        &integrities.content,
+        None,
+        &integrities.metadata,
+        None,
+        true,
     )
 }
 
@@ -1290,6 +1317,34 @@ pub(crate) fn write_object_integrity_for_policy_with_tree(
     }
 }
 
+/// Write object integrity + tree snapshot directly inside an unpublished staging
+/// directory that will be atomically renamed into `objects/` as a whole.
+pub(crate) fn write_object_integrity_for_policy_with_tree_unpublished(
+    dir: &Path,
+    source_sri: &str,
+    policy: ObjectIntegrityPolicy,
+    actual: TreeIntegrities,
+) -> Result<TreeIntegrities, LpmError> {
+    match policy {
+        ObjectIntegrityPolicy::Tree => {
+            write_object_integrity_content_unpublished(dir, &actual.content)?;
+            write_tree_snapshot_unpublished(dir, &actual)?;
+            Ok(actual)
+        }
+        ObjectIntegrityPolicy::Source => {
+            let content = source_object_integrity(source_sri);
+            write_object_integrity_content_unpublished(dir, &content)?;
+            write_tree_snapshot_unpublished(dir, &actual)?;
+            Ok(TreeIntegrities {
+                content,
+                metadata: actual.metadata,
+                stats: actual.stats,
+                content_schema: actual.content_schema,
+            })
+        }
+    }
+}
+
 pub(crate) fn write_source_object_integrity(
     dir: &Path,
     source_sri: &str,
@@ -1317,6 +1372,18 @@ pub(crate) fn write_source_object_integrity_with_tree(
 pub(crate) fn write_object_integrity_content(dir: &Path, content: &str) -> Result<(), LpmError> {
     let path = dir.join(OBJECT_INTEGRITY_FILENAME);
     write_file_atomic(&path, format!("{content}\n")).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to write virtual-store object integrity sidecar: {e}"
+        ))
+    })
+}
+
+fn write_object_integrity_content_unpublished(dir: &Path, content: &str) -> Result<(), LpmError> {
+    let path = dir.join(OBJECT_INTEGRITY_FILENAME);
+    let mut bytes = Vec::with_capacity(content.len() + 1);
+    bytes.extend_from_slice(content.as_bytes());
+    bytes.push(b'\n');
+    std::fs::write(&path, bytes).map_err(|e| {
         LpmError::Store(format!(
             "failed to write virtual-store object integrity sidecar: {e}"
         ))

@@ -6816,3 +6816,61 @@ fn ensure_store_tier_dir_locked_once_detects_symlink_replacement_after_caching()
         "unexpected error: {err}"
     );
 }
+
+#[test]
+fn shallow_guard_refresh_skips_rewriting_snapshot_while_mtimes_are_racily_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_with_object_integrity_policy(dir.path(), ObjectIntegrityPolicy::Source);
+    let sri = synthetic_sri(b"shallow_guard_refresh_skips_rewriting_snapshot_while_racily_clean");
+    let object_dir = write_tree_object(
+        &store,
+        &sri,
+        &[("package.json", br#"{"name":"fresh-pkg","version":"1.0.0"}"#)],
+    );
+    let key = arc_key("fresh-pkg", "1.0.0");
+    let first = store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&key),
+            source_sri: sri,
+            object_dir,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+    let pkg_dir = link_entry_package_dir(&first.link_dir, &key);
+    let snapshot_path = first.link_dir.join(TREE_SNAPSHOT_FILENAME);
+    let initial_snapshot = read_tree_snapshot(&first.link_dir).unwrap();
+    let initial_captured = initial_snapshot.snapshot_captured_at_nanos;
+
+    // Immediately after creation, mtimes are inside the 2s racily-clean window;
+    // refresh must not rewrite the snapshot with another racy timestamp.
+    crate::v2::integrity::refresh_link_snapshot_shallow_guard_best_effort(
+        &first.link_dir,
+        &pkg_dir,
+        &initial_snapshot,
+    );
+    assert_eq!(
+        read_tree_snapshot(&first.link_dir)
+            .unwrap()
+            .snapshot_captured_at_nanos,
+        initial_captured
+    );
+
+    // Once package mtimes age past the 2s window, refresh stamps a non-racy guard.
+    let old = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+    filetime::set_file_mtime(pkg_dir.join("package.json"), old).unwrap();
+    filetime::set_file_mtime(&pkg_dir, old).unwrap();
+    crate::v2::integrity::refresh_link_snapshot_shallow_guard_best_effort(
+        &first.link_dir,
+        &pkg_dir,
+        &initial_snapshot,
+    );
+    let updated = read_tree_snapshot(&first.link_dir).unwrap();
+    assert!(
+        updated
+            .shallow_guard()
+            .is_some_and(|guard| guard.is_non_racy()),
+        "aged package must receive a non-racy shallow guard at {}",
+        snapshot_path.display()
+    );
+}

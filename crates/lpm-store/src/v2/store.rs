@@ -36,6 +36,7 @@ use super::integrity::{
     remove_unusable_object_dir, source_object_integrity, source_policy_uses_source_integrity,
     write_link_tree_snapshot_best_effort, write_link_tree_snapshot_unpublished,
     write_object_integrity_for_policy, write_object_integrity_for_policy_with_tree,
+    write_object_integrity_for_policy_with_tree_unpublished,
     write_tree_snapshot, write_tree_snapshot_best_effort, write_tree_snapshot_with_layout_content,
     write_tree_snapshot_with_layout_content_unpublished,
 };
@@ -562,6 +563,7 @@ pub struct Store {
     migration_paths: Option<StoreV2Paths>,
     object_integrity_policy: ObjectIntegrityPolicy,
     security_analysis_policy: SecurityAnalysisPolicy,
+    stream_staging_swept: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(target_os = "linux")]
     cap_concurrent_link_populates: Arc<std::sync::OnceLock<bool>>,
     #[cfg(test)]
@@ -643,6 +645,7 @@ impl Store {
             migration_paths: Some(StoreV2Paths::from_lpm_root_v3(lpm_root)),
             object_integrity_policy,
             security_analysis_policy,
+            stream_staging_swept: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(target_os = "linux")]
             cap_concurrent_link_populates: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
@@ -682,6 +685,7 @@ impl Store {
             migration_paths: Some(StoreV2Paths::from_lpm_root(lpm_root)),
             object_integrity_policy,
             security_analysis_policy,
+            stream_staging_swept: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(target_os = "linux")]
             cap_concurrent_link_populates: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
@@ -717,6 +721,7 @@ impl Store {
             migration_paths: None,
             object_integrity_policy,
             security_analysis_policy,
+            stream_staging_swept: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(target_os = "linux")]
             cap_concurrent_link_populates: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
@@ -745,6 +750,7 @@ impl Store {
             migration_paths: None,
             object_integrity_policy,
             security_analysis_policy,
+            stream_staging_swept: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(target_os = "linux")]
             cap_concurrent_link_populates: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
@@ -1392,60 +1398,65 @@ impl Store {
                 "failed to create streamed-object staging locks dir: {error}"
             ))
         })?;
-        let _cleanup_lock = lpm_common::acquire_single_file_exclusive_lock(
-            locks_root.join(STREAM_STAGING_CLEANUP_LOCK),
-        )?;
+        if !self
+            .stream_staging_swept
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let _cleanup_lock = lpm_common::acquire_single_file_exclusive_lock(
+                locks_root.join(STREAM_STAGING_CLEANUP_LOCK),
+            )?;
 
-        for entry in std::fs::read_dir(&objects_root).map_err(|error| {
-            LpmError::Store(format!(
-                "failed to scan streamed-object staging dirs: {error}"
-            ))
-        })? {
-            let entry = entry.map_err(|error| {
+            for entry in std::fs::read_dir(&objects_root).map_err(|error| {
                 LpmError::Store(format!(
-                    "failed to inspect streamed-object staging dir: {error}"
+                    "failed to scan streamed-object staging dirs: {error}"
                 ))
-            })?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if !name.starts_with(STREAM_STAGING_PREFIX)
-                || !entry
-                    .file_type()
-                    .map_err(|error| {
-                        LpmError::Store(format!(
-                            "failed to inspect streamed-object staging type: {error}"
-                        ))
-                    })?
-                    .is_dir()
-            {
-                continue;
-            }
-            let lock_path = locks_root.join(format!("{name}.lock"));
-            let lock_file = std::fs::OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .open(&lock_path)
-                .map_err(|error| {
+            })? {
+                let entry = entry.map_err(|error| {
                     LpmError::Store(format!(
-                        "failed to open streamed-object staging lock: {error}"
+                        "failed to inspect streamed-object staging dir: {error}"
                     ))
                 })?;
-            let Some(lock) =
-                lpm_common::try_acquire_single_file_exclusive_lock_from_file(lock_file)?
-            else {
-                continue;
-            };
-            std::fs::remove_dir_all(entry.path()).map_err(|error| {
-                LpmError::Store(format!(
-                    "failed to remove stale streamed-object staging dir: {error}"
-                ))
-            })?;
-            drop(lock);
-            let _ = std::fs::remove_file(lock_path);
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                if !name.starts_with(STREAM_STAGING_PREFIX)
+                    || !entry
+                        .file_type()
+                        .map_err(|error| {
+                            LpmError::Store(format!(
+                                "failed to inspect streamed-object staging type: {error}"
+                            ))
+                        })?
+                        .is_dir()
+                {
+                    continue;
+                }
+                let lock_path = locks_root.join(format!("{name}.lock"));
+                let lock_file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&lock_path)
+                    .map_err(|error| {
+                        LpmError::Store(format!(
+                            "failed to open streamed-object staging lock: {error}"
+                        ))
+                    })?;
+                let Some(lock) =
+                    lpm_common::try_acquire_single_file_exclusive_lock_from_file(lock_file)?
+                else {
+                    continue;
+                };
+                std::fs::remove_dir_all(entry.path()).map_err(|error| {
+                    LpmError::Store(format!(
+                        "failed to remove stale streamed-object staging dir: {error}"
+                    ))
+                })?;
+                drop(lock);
+                let _ = std::fs::remove_file(lock_path);
+            }
         }
 
         let staging_anchor = objects_root.join(".stream");
@@ -1743,7 +1754,7 @@ impl Store {
         let finalize_start = std::time::Instant::now();
         tracing::event!(name: "sidecars_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
         let object_integrity_start = std::time::Instant::now();
-        let integrities = write_object_integrity_for_policy_with_tree(
+        let integrities = write_object_integrity_for_policy_with_tree_unpublished(
             tmp_dir,
             sri,
             policy,

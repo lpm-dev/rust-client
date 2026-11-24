@@ -39,6 +39,8 @@ struct Parent {
     identity: Identity,
 }
 
+const MAX_CACHED_PARENTS: usize = 16;
+
 pub(crate) struct OutputTree {
     root_path: PathBuf,
     visible_root_path: PathBuf,
@@ -46,6 +48,7 @@ pub(crate) struct OutputTree {
     root_identity: Identity,
     directories: HashMap<PathBuf, DirectoryRecord>,
     parent: Option<Parent>,
+    recent_parents: Vec<Parent>,
 }
 
 impl OutputTree {
@@ -59,7 +62,24 @@ impl OutputTree {
             root_identity,
             directories: HashMap::with_capacity(64),
             parent: None,
+            recent_parents: Vec::with_capacity(MAX_CACHED_PARENTS),
         })
+    }
+
+    fn park_current_parent(&mut self) {
+        let Some(previous) = self.parent.take() else {
+            return;
+        };
+        if let Some(pos) = self
+            .recent_parents
+            .iter()
+            .position(|cached| cached.path == previous.path)
+        {
+            self.recent_parents.remove(pos);
+        } else if self.recent_parents.len() >= MAX_CACHED_PARENTS {
+            self.recent_parents.remove(0);
+        }
+        self.recent_parents.push(previous);
     }
 
     pub(crate) fn prepare_parent(
@@ -69,7 +89,7 @@ impl OutputTree {
     ) -> Result<(), LpmError> {
         let parent = path.parent().unwrap_or(Path::new(""));
         if parent.as_os_str().is_empty() {
-            self.parent = None;
+            self.park_current_parent();
             return Ok(());
         }
         if self
@@ -79,7 +99,22 @@ impl OutputTree {
         {
             return Ok(());
         }
-        self.parent = None;
+        self.park_current_parent();
+        if let Some(pos) = self
+            .recent_parents
+            .iter()
+            .position(|cached| cached.path == parent)
+        {
+            let cached = self.recent_parents.remove(pos);
+            if self
+                .directories
+                .get(parent)
+                .is_some_and(|record| record.identity == cached.identity)
+            {
+                self.parent = Some(cached);
+                return Ok(());
+            }
+        }
         if let Some(record) = self.directories.get(parent)
             && let Some((directory, name)) = open_known_parent(&self.root, parent)?
         {
@@ -219,6 +254,7 @@ impl OutputTree {
 
     pub(crate) fn validate(&mut self) -> Result<(), LpmError> {
         self.parent = None;
+        self.recent_parents.clear();
         self.validate_root()?;
         for (path, record) in &self.directories {
             if let Some((directory, _)) = open_known_parent(&self.root, path)? {
