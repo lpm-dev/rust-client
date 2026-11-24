@@ -581,7 +581,11 @@ pub(super) fn spawn_workspace_fetch_overlap_dispatcher(
                         &context.route_table,
                         &context.client,
                     );
-                    if package.optional && (omit_optional || package.integrity.is_none()) {
+                    if package.optional
+                        && (omit_optional
+                            || package.integrity.is_none()
+                            || dependency_engine_policy.skips_optional_mismatches())
+                    {
                         stats.skipped_optional_count =
                             stats.skipped_optional_count.saturating_add(1);
                         continue;
@@ -796,7 +800,11 @@ fn dispatch_selected_event(
     stats: &mut FetchOverlapStats,
 ) {
     let package = install_package_from_selected_event(event, route_table, client.as_ref());
-    if package.optional && (omit_optional || package.integrity.is_none()) {
+    if package.optional
+        && (omit_optional
+            || package.integrity.is_none()
+            || dependency_engine_policy.skips_optional_mismatches())
+    {
         stats.skipped_optional_count = stats.skipped_optional_count.saturating_add(1);
         return;
     }
@@ -1619,6 +1627,11 @@ mod tests {
             .await;
 
         let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("package.json"),
+            r#"{"name":"overlap-optional-test","version":"1.0.0"}"#,
+        )
+        .unwrap();
         let client = Arc::new(
             RegistryClient::new()
                 .with_npm_registry_url(server.uri())
@@ -1628,6 +1641,15 @@ mod tests {
             crate::engine_check::prepare_dependency_policy_reusing(
                 directory.path(),
                 true,
+                false,
+                crate::engine_check::NodeVersionReuse::default(),
+            )
+            .unwrap(),
+        );
+        let strict_policy = Arc::new(
+            crate::engine_check::prepare_dependency_policy_reusing(
+                directory.path(),
+                false,
                 false,
                 crate::engine_check::NodeVersionReuse::default(),
             )
@@ -1718,11 +1740,43 @@ mod tests {
             None,
             1,
         );
-        tx_omitted.send(compatible_event).await.unwrap();
+        tx_omitted.send(compatible_event.clone()).await.unwrap();
         drop(tx_omitted);
 
         let omitted_result = omitted_join.drain().await.unwrap();
         assert_eq!(omitted_result.stats.dispatched_count, 0);
         assert_eq!(omitted_result.stats.skipped_optional_count, 1);
+
+        let (tx_strict, rx_strict) = tokio::sync::mpsc::channel(4);
+        let strict_join = spawn_fetch_overlap_dispatcher(
+            rx_strict,
+            Arc::new(
+                RegistryClient::new()
+                    .with_npm_registry_url(server.uri())
+                    .with_cache_dir(None),
+            ),
+            RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+            PackageStore::at(directory.path().join("store-strict")),
+            Some(Arc::new(lpm_store::v2::Store::at(
+                directory.path().join("store-v2-strict"),
+            ))),
+            Arc::new(Semaphore::new(4)),
+            Arc::new(FetchCoordinator::default()),
+            directory.path().to_path_buf(),
+            Arc::new(GateStats::default()),
+            None,
+            ManagedInstallAccounting,
+            strict_policy,
+            false,
+            true,
+            None,
+            1,
+        );
+        tx_strict.send(compatible_event).await.unwrap();
+        drop(tx_strict);
+
+        let strict_result = strict_join.drain().await.unwrap();
+        assert_eq!(strict_result.stats.dispatched_count, 0);
+        assert_eq!(strict_result.stats.skipped_optional_count, 1);
     }
 }

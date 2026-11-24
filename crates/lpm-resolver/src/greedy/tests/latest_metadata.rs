@@ -158,13 +158,13 @@ async fn authenticated_public_npm_routes_use_the_direct_npm_documents() {
         .expect(..=1)
         .mount(&server)
         .await;
-    // Exact pins fetch their single version document directly.
+    // Exact pins select their manifest from full history.
     Mock::given(method("GET"))
-        .and(path("/pinned/1.2.3"))
+        .and(path("/pinned"))
         .and(header("accept", "application/json"))
         .and(authorized())
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(version_document_json("pinned", "1.2.3", &[])),
+            ResponseTemplate::new(200).set_body_json(metadata_json_version("pinned", "1.2.3", &[])),
         )
         .expect(1)
         .mount(&server)

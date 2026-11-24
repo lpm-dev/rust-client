@@ -5584,7 +5584,7 @@ async fn fusion_fetches_distinct_exact_versions_concurrently() {
     let (requested_tx, mut requested_rx) = tokio::sync::mpsc::channel(4);
     let server = tokio::spawn(async move {
         let mut requests = tokio::task::JoinSet::new();
-        for _ in 0..2 {
+        for _ in 0..4 {
             let (mut socket, _) = listener.accept().await.unwrap();
             let gate = Arc::clone(&gate);
             let tx = requested_tx.clone();
@@ -5599,6 +5599,15 @@ async fn fusion_fetches_distinct_exact_versions_concurrently() {
                 }
                 let request = String::from_utf8(request).unwrap();
                 let path = request.split_whitespace().nth(1).unwrap();
+                if path == "/shared-exact" {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    return;
+                }
                 let version = path.strip_prefix("/shared-exact/").unwrap().to_owned();
                 tx.send(version.clone()).await.unwrap();
                 if version == "1.0.0" {
@@ -5751,21 +5760,15 @@ async fn resolve_direct_and_transitive_overlap_with_seeded_cache(
         .expect(u64::from(!seed_parent))
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/shared-child/1.0.0"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(shared_metadata["versions"]["1.0.0"].clone()),
-        )
-        .expect(u64::from(!seed_shared))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/shared-child"))
-        .and(header("accept", "application/vnd.npm.install-v1+json"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(shared_metadata.clone()))
-        .expect(u64::from(!seed_shared))
-        .mount(&server)
-        .await;
+    for accept in ["application/json", "application/vnd.npm.install-v1+json"] {
+        Mock::given(method("GET"))
+            .and(path("/shared-child"))
+            .and(header("accept", accept))
+            .respond_with(ResponseTemplate::new(200).set_body_json(shared_metadata.clone()))
+            .expect(u64::from(!seed_shared))
+            .mount(&server)
+            .await;
+    }
 
     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
     if seed_parent {
@@ -5895,17 +5898,15 @@ async fn resolve_deep_required_and_shallow_optional_overlap(
         ("middle", middle.clone(), required_chain_seeded),
         ("shared-child", shared_child.clone(), fully_seeded),
     ] {
-        let requests = if name == "shared-child" && !fully_seeded {
-            2
-        } else {
-            u64::from(!seeded)
-        };
-        Mock::given(method("GET"))
+        let mock = Mock::given(method("GET"))
             .and(path(format!("/{name}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
-            .expect(requests)
-            .mount(&server)
-            .await;
+            .respond_with(ResponseTemplate::new(200).set_body_json(metadata));
+        let mock = if name == "shared-child" && !fully_seeded {
+            mock.expect(1..=2)
+        } else {
+            mock.expect(u64::from(!seeded))
+        };
+        mock.mount(&server).await;
     }
 
     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
@@ -7832,8 +7833,16 @@ async fn trace_metadata_keeps_failed_exact_attempts_before_packument_recovery() 
     let _timing_guard = crate::metadata_fetch_detail_test_lock().lock().await;
     lpm_registry::timing::reset_metadata_detail();
     let server = MockServer::start().await;
+    let broken_history = b"{broken history";
     let broken_exact = b"{broken version";
     let complete = serde_json::to_vec(&metadata_json("failed-exact-trace", &[])).unwrap();
+    Mock::given(method("GET"))
+        .and(path("/failed-exact-trace"))
+        .and(header("accept", "application/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(broken_history.to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/failed-exact-trace/1.0.0"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(broken_exact.to_vec()))
@@ -7873,7 +7882,7 @@ async fn trace_metadata_keeps_failed_exact_attempts_before_packument_recovery() 
     );
     assert_eq!(
         snapshot.body_bytes_sum as usize,
-        broken_exact.len() + complete.len()
+        broken_history.len() + broken_exact.len() + complete.len()
     );
     assert_eq!(snapshot.route_npm_direct_count, 1);
     lpm_registry::timing::reset_metadata_detail();

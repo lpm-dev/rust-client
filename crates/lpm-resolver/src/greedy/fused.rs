@@ -1533,7 +1533,7 @@ mod metadata_fetch_scheduler_tests {
             }
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
-                    if server.received_requests().await.unwrap().len() == 8
+                    if server.received_requests().await.unwrap().len() == 16
                         && telemetry.active.load(Ordering::Relaxed) == 0
                     {
                         break;

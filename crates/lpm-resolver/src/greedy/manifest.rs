@@ -880,7 +880,7 @@ pub(super) async fn try_fetch_exact_metadata_for_resolver(
         policy,
         ExactMetadataFetchOptions {
             include_speculation,
-            prefer_history: false,
+            prefer_history: true,
             trace_metadata_fetches,
         },
     )
