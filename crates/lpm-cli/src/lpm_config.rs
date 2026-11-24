@@ -43,18 +43,26 @@ pub(crate) fn parse_and_validate(
     Ok(value)
 }
 
-/// The prefix an `importAlias` value claims. A value that ends in a character
-/// a package name can continue with gets a trailing `/`, so `@` claims
-/// `@/lib/cn` but never the scoped package `@radix-ui/react-slot`. Any other
-/// value, such as `#`, `~` or `/`, stays as written, since no package name
-/// starts with it and `#lib/cn` is a valid subpath import. An empty value is
-/// no alias, as it would claim every specifier.
+/// The prefix an `importAlias` value claims. Trailing slashes count as one.
+/// A value that ends in a character a package name can continue with (an
+/// ASCII letter or digit, `@`, `.`, `_` or `-`) gets a trailing `/`, so `@`
+/// claims `@/lib/cn` but never the scoped package `@radix-ui/react-slot`. Any
+/// other value, such as `#`, `~` or `/`, stays as written, since no package
+/// name starts with it and `#lib/cn` is a valid subpath import. An empty value
+/// is no alias, as it would claim every specifier.
 pub(crate) fn import_alias_prefix(alias: &str) -> Option<String> {
-    let last = alias.chars().next_back()?;
-    if last.is_ascii_alphanumeric() || matches!(last, '@' | '-' | '.' | '_') {
-        Some(format!("{alias}/"))
+    if alias.is_empty() {
+        return None;
+    }
+    let stem = alias.trim_end_matches('/');
+    let Some(last) = stem.chars().next_back() else {
+        return Some("/".to_owned());
+    };
+    let had_slash = stem.len() < alias.len();
+    if had_slash || last.is_ascii_alphanumeric() || matches!(last, '@' | '.' | '_' | '-') {
+        Some(format!("{stem}/"))
     } else {
-        Some(alias.to_owned())
+        Some(stem.to_owned())
     }
 }
 
@@ -70,10 +78,16 @@ mod tests {
             Some("@/components/")
         );
         assert_eq!(import_alias_prefix("lib.v2").as_deref(), Some("lib.v2/"));
+        assert_eq!(import_alias_prefix("ui-").as_deref(), Some("ui-/"));
+        assert_eq!(import_alias_prefix("ui_").as_deref(), Some("ui_/"));
         assert_eq!(import_alias_prefix("@/").as_deref(), Some("@/"));
+        assert_eq!(import_alias_prefix("@//").as_deref(), Some("@/"));
+        assert_eq!(import_alias_prefix("lib//").as_deref(), Some("lib/"));
         assert_eq!(import_alias_prefix("#").as_deref(), Some("#"));
+        assert_eq!(import_alias_prefix("#/").as_deref(), Some("#/"));
         assert_eq!(import_alias_prefix("~").as_deref(), Some("~"));
         assert_eq!(import_alias_prefix("/").as_deref(), Some("/"));
+        assert_eq!(import_alias_prefix("//").as_deref(), Some("/"));
         assert_eq!(import_alias_prefix(""), None);
     }
 

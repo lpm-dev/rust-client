@@ -925,10 +925,69 @@ async fn add_with_a_hash_import_alias_rewrites_imports_with_and_without_a_slash(
         &[
             (
                 "Button.ts",
-                b"import { util } from '#util';\nimport { helper } from '#/helper';\nexport { util, helper };\n",
+                b"import { util } from '#util';\nimport { helper } from '#/helper';\nimport { missing } from '#missing/thing';\nexport { util, helper, missing };\n",
             ),
             ("util.ts", b"export const util = true;\n"),
             ("helper.ts", b"export const helper = true;\n"),
+        ],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let add_args = [
+        "add",
+        package,
+        "--path",
+        "src/components",
+        "--yes",
+        "--no-install-deps",
+        "--no-skills",
+    ];
+
+    let aliased = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    aliased.write_file(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"paths":{"@/*":["./src/*"]}}}"#,
+    );
+    lpm_with_registry(&aliased, &mock.url())
+        .args(add_args)
+        .assert()
+        .success();
+    let button = aliased.read_file("src/components/Button.ts");
+    assert!(button.contains("from '@/components/util'"), "{button}");
+    assert!(button.contains("from '@/components/helper'"), "{button}");
+    assert!(
+        button.contains("from '@/components/missing/thing'"),
+        "{button}"
+    );
+
+    let unaliased = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    lpm_with_registry(&unaliased, &mock.url())
+        .args(add_args)
+        .assert()
+        .success();
+    let button = unaliased.read_file("src/components/Button.ts");
+    assert!(button.contains("from './util'"), "{button}");
+    assert!(button.contains("from './helper'"), "{button}");
+    assert!(button.contains("from '#missing/thing'"), "{button}");
+}
+
+#[tokio::test]
+async fn add_with_a_slash_import_alias_rewrites_root_imports_and_keeps_protocol_relative_urls() {
+    let mock = MockRegistry::start().await;
+    let package = "slash-author-alias-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "importAlias": "/",
+            "files": [{"src": "Button.ts"}, {"src": "util.ts"}]
+        }),
+        &[
+            (
+                "Button.ts",
+                b"import { util } from '/util';\nimport cdn from '//cdn.example.com/lib.js';\nexport { util, cdn };\n",
+            ),
+            ("util.ts", b"export const util = true;\n"),
         ],
     );
     mock.with_package(package, "1.0.0", &tarball).await;
@@ -953,7 +1012,10 @@ async fn add_with_a_hash_import_alias_rewrites_imports_with_and_without_a_slash(
 
     let button = project.read_file("src/components/Button.ts");
     assert!(button.contains("from '@/components/util'"), "{button}");
-    assert!(button.contains("from '@/components/helper'"), "{button}");
+    assert!(
+        button.contains("from '//cdn.example.com/lib.js'"),
+        "{button}"
+    );
 }
 
 // ─── Test 1: happy path ─────────────────────────────────────────────

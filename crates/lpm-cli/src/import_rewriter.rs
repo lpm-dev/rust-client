@@ -21,6 +21,10 @@ fn classify_specifier(specifier: &str, author_alias: Option<&str>) -> SpecifierK
     if specifier.starts_with("./") || specifier.starts_with("../") {
         return SpecifierKind::Relative;
     }
+    // A protocol-relative URL, never a path into the package, even under `/`.
+    if specifier.starts_with("//") {
+        return SpecifierKind::Bare;
+    }
     if let Some(alias) = author_alias
         && specifier.starts_with(alias)
     {
