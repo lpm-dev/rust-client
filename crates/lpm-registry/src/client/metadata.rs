@@ -3315,10 +3315,11 @@ impl RegistryClient {
         &self,
         name: &str,
         route: crate::UpstreamRoute,
+        expected_modified: Option<&str>,
     ) -> Result<ReleaseTimeMetadata, LpmError> {
         match route {
             crate::UpstreamRoute::NpmDirect => Ok(Arc::unwrap_or_clone(
-                self.get_npm_platform_metadata_direct_full_with_timings(name)
+                self.get_npm_platform_metadata_direct_full_with_timings(name, expected_modified)
                     .await?
                     .metadata,
             )),
@@ -3341,15 +3342,16 @@ impl RegistryClient {
         &self,
         name: &str,
         route: crate::UpstreamRoute,
+        expected_modified: Option<&str>,
     ) -> Result<TimedReleaseTimeMetadata, LpmError> {
         match route {
             crate::UpstreamRoute::NpmDirect => {
-                self.get_npm_platform_metadata_direct_full_with_timings(name)
+                self.get_npm_platform_metadata_direct_full_with_timings(name, expected_modified)
                     .await
             }
             route => {
                 let metadata = self
-                    .get_npm_platform_metadata_routed_full(name, route)
+                    .get_npm_platform_metadata_routed_full(name, route, expected_modified)
                     .await?;
                 Ok(TimedReleaseTimeMetadata {
                     metadata: Arc::new(metadata),
@@ -3362,15 +3364,26 @@ impl RegistryClient {
     async fn get_npm_platform_metadata_direct_full_with_timings(
         &self,
         name: &str,
+        expected_modified: Option<&str>,
     ) -> Result<TimedReleaseTimeMetadata, LpmError> {
         let cached = self
-            .get_npm_release_times_direct_full_inner_with_timings(name, true, None, None)
+            .get_npm_release_times_direct_full_inner_with_timings(
+                name,
+                true,
+                expected_modified,
+                None,
+            )
             .await?;
         if cached.metadata.versions.is_some() {
             return Ok(cached);
         }
         let mut fetched = self
-            .get_npm_release_times_direct_full_inner_with_timings(name, false, None, None)
+            .get_npm_release_times_direct_full_inner_with_timings(
+                name,
+                false,
+                expected_modified,
+                None,
+            )
             .await?;
         fetched.timings.cache_read_ms = fetched
             .timings

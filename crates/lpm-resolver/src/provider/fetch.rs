@@ -343,8 +343,11 @@ impl LpmDependencyProvider {
             .rt
             .block_on(lpm_registry::timing::with_metadata_purpose(
                 lpm_registry::timing::MetadataPurpose::PlatformHydration,
-                self.client
-                    .get_npm_platform_metadata_routed_full(name, route.clone()),
+                self.client.get_npm_platform_metadata_routed_full(
+                    name,
+                    route.clone(),
+                    info.modified.as_deref(),
+                ),
             ))
             .map_err(|error| ProviderError::Registry(format!("npm:{name}: {error}")))?;
         merge_release_times_into_cache_info(info, &platform_metadata);
@@ -356,8 +359,11 @@ impl LpmDependencyProvider {
                 .rt
                 .block_on(lpm_registry::timing::with_metadata_purpose(
                     lpm_registry::timing::MetadataPurpose::PlatformHydration,
-                    self.client
-                        .get_npm_platform_metadata_routed_full(name, UpstreamRoute::NpmDirect),
+                    self.client.get_npm_platform_metadata_routed_full(
+                        name,
+                        UpstreamRoute::NpmDirect,
+                        info.modified.as_deref(),
+                    ),
                 ))
                 .map_err(|error| ProviderError::Registry(format!("npm:{name}: {error}")))?;
             merge_release_times_into_cache_info(info, &direct_platform_metadata);

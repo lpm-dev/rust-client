@@ -52,7 +52,7 @@ impl ManifestProjection {
 impl lpm_registry::MetadataProjection for ManifestProjection {
     /// Includes the crate version, so a release that changes how metadata is
     /// parsed never reads projections an older parser derived.
-    const FORMAT: &'static str = concat!("lpm-resolver-manifest/", env!("CARGO_PKG_VERSION"), "/2");
+    const FORMAT: &'static str = concat!("lpm-resolver-manifest/", env!("CARGO_PKG_VERSION"), "/3");
 
     fn decode(bytes: &[u8]) -> Option<Self> {
         let mut reader = Reader(bytes);
@@ -184,6 +184,14 @@ impl CachedPackageInfo {
                 TrustEvidence::TrustedPublisher => TRUSTED_PUBLISHER,
                 TrustEvidence::StagedPublish => STAGED_PUBLISH,
             });
+        }
+
+        let mut platform_hydrated_versions =
+            self.platform_hydrated_versions.iter().collect::<Vec<_>>();
+        platform_hydrated_versions.sort_unstable();
+        writer.len(platform_hydrated_versions.len());
+        for version in platform_hydrated_versions {
+            writer.str(version);
         }
     }
 
@@ -363,8 +371,16 @@ impl CachedPackageInfo {
         if !version_indexes_strictly_ascending(
             trust.iter().map(|record| record.version),
             version_count,
-        ) || !reader.0.is_empty()
-        {
+        ) {
+            return None;
+        }
+
+        let hydrated_count = reader.count(4)?;
+        let mut platform_hydrated_versions = HashSet::with_capacity(hydrated_count);
+        for _ in 0..hydrated_count {
+            platform_hydrated_versions.insert(reader.str()?.to_owned());
+        }
+        if !reader.0.is_empty() {
             return None;
         }
 
@@ -378,7 +394,7 @@ impl CachedPackageInfo {
             covered_ranges,
             workspace_versions,
             platform_metadata_complete: flags & PLATFORM_METADATA_COMPLETE != 0,
-            platform_hydrated_versions: HashSet::new(),
+            platform_hydrated_versions,
             latest_version,
             latest_version_hint,
             preferred_latest,

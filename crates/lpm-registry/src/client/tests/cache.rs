@@ -1291,7 +1291,7 @@ async fn direct_platform_metadata_refetches_incomplete_release_time_cache() {
         .await;
 
     let platform = client
-        .get_npm_platform_metadata_routed_full(npm_name, crate::UpstreamRoute::NpmDirect)
+        .get_npm_platform_metadata_routed_full(npm_name, crate::UpstreamRoute::NpmDirect, None)
         .await
         .expect("platform hydration should bypass a time-only cache entry");
     assert_eq!(
