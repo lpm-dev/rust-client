@@ -59,11 +59,17 @@ pub(crate) fn import_alias_prefix(alias: &str) -> Option<String> {
         return Some("/".to_owned());
     };
     let had_slash = stem.len() < alias.len();
-    if had_slash || last.is_ascii_alphanumeric() || matches!(last, '@' | '.' | '_' | '-') {
+    if had_slash || continues_a_package_name(last) {
         Some(format!("{stem}/"))
     } else {
         Some(stem.to_owned())
     }
+}
+
+/// Whether a package name can continue after `c`, so a prefix ending in it
+/// needs a `/` before a path.
+pub(crate) fn continues_a_package_name(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-')
 }
 
 #[cfg(test)]

@@ -27,7 +27,9 @@
 mod support;
 
 use serde_json::json;
-use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
+use support::mock_registry::{
+    MockRegistry, compute_integrity, make_tarball_from_pkg_json, make_tarball_with_files,
+};
 use support::{
     LOCK_CONTENTION_MARKER_ENV, TempProject, lpm, lpm_spawnable_with_registry, lpm_with_registry,
     wait_for_lock_contention, write_lpm_proxy_npmrc, write_npm_firewall_global_config,
@@ -1028,6 +1030,67 @@ async fn add_with_a_slash_import_alias_rewrites_root_imports_and_keeps_protocol_
         button.contains("from '//cdn.example.com/lib.js'"),
         "{button}"
     );
+}
+
+#[tokio::test]
+async fn add_writes_imports_through_a_consumer_alias_without_a_slash() {
+    let mock = MockRegistry::start().await;
+    let package = "hash-consumer-alias-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "importAlias": "@/",
+            "files": [{"src": "Button.ts"}, {"src": "util.ts"}]
+        }),
+        &[
+            (
+                "Button.ts",
+                b"import { util } from '@/util';\nexport { util };\n",
+            ),
+            ("util.ts", b"export const util = true;\n"),
+        ],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+
+    let mapped = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    mapped.write_file(
+        "tsconfig.json",
+        r##"{"compilerOptions":{"paths":{"#*":["./src/*"]}}}"##,
+    );
+    lpm_with_registry(&mapped, &mock.url())
+        .args([
+            "add",
+            package,
+            "--path",
+            "src/components",
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+    let button = mapped.read_file("src/components/Button.ts");
+    assert!(button.contains("from '#components/util'"), "{button}");
+
+    let explicit = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    lpm_with_registry(&explicit, &mock.url())
+        .args([
+            "add",
+            package,
+            "--path",
+            "src/components",
+            "--alias",
+            "#",
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+    let button = explicit.read_file("src/components/Button.ts");
+    assert!(button.contains("from '#util'"), "{button}");
 }
 
 // ─── Test 1: happy path ─────────────────────────────────────────────
@@ -2058,6 +2121,72 @@ async fn add_simple_yes_with_path_succeeds_and_copies_files_directly() {
         !project.path().join("src/copied").join(pkg).exists(),
         "simple path must NOT auto-nest under package-name subdirectory"
     );
+}
+
+/// The external-imports notice names the packages a copied source needs,
+/// so URLs, absolute paths, subpath imports and Node built-ins stay out of it.
+#[tokio::test]
+async fn add_without_a_source_config_lists_only_package_names_in_the_external_imports_notice() {
+    let pkg = "add-npm-import-notice";
+    let mock = MockRegistry::start().await;
+    let index = br##"import { useState } from "react";
+import { createRoot } from "react-dom/client";
+import { Slot } from "@radix-ui/react-slot/dist/index.js";
+import { readFile } from "node:fs";
+import path from "fs";
+import internal from "#internal";
+import cdn from "//cdn.example.com/lib.js";
+import local from "/abs/thing.js";
+import preact from "https://esm.sh/preact";
+import { cn } from "./utils.js";
+export { useState, createRoot, Slot, readFile, path, internal, cdn, local, preact, cn };
+"##;
+    mock.with_package(
+        pkg,
+        "1.0.0",
+        &make_tarball_with_files(
+            pkg,
+            "1.0.0",
+            &[
+                ("index.js", &index[..]),
+                ("utils.js", b"export const cn = () => '';\n"),
+            ],
+        ),
+    )
+    .await;
+
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{}}"#);
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            pkg,
+            "--yes",
+            "--path",
+            "src/copied",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .output()
+        .expect("spawn lpm add");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("Source uses external imports: @radix-ui/react-slot, react, react-dom"),
+        "stderr:\n{stderr}"
+    );
+    for excluded in [
+        "node:fs",
+        "react-dom, fs",
+        "#internal",
+        "//cdn.example.com",
+        "/abs/thing",
+        "esm.sh",
+    ] {
+        assert!(
+            !stderr.contains(excluded),
+            "{excluded} listed; stderr:\n{stderr}"
+        );
+    }
 }
 
 // ─── NPM simple-path source delivery (full pipeline) ────────────────────

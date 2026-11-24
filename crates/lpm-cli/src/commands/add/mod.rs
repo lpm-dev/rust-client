@@ -971,12 +971,7 @@ async fn run_locked(
         None
     } else if let Some(explicit) = alias_override {
         // --alias flag takes precedence
-        let alias = if explicit.ends_with('/') {
-            explicit.to_string()
-        } else {
-            format!("{explicit}/")
-        };
-        Some(alias)
+        crate::lpm_config::import_alias_prefix(explicit)
     } else {
         let detected = detect_buyer_alias(project_dir, &target_dir);
 
@@ -997,17 +992,7 @@ async fn run_locked(
             .interact()
             .map_err(prompt_err)?;
 
-            let trimmed = input.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                let alias = if trimmed.ends_with('/') {
-                    trimmed.to_string()
-                } else {
-                    format!("{trimmed}/")
-                };
-                Some(alias)
-            }
+            crate::lpm_config::import_alias_prefix(input.trim())
         } else {
             detected
         }
@@ -1523,22 +1508,29 @@ async fn run_locked(
     // Bare-imports notice.
     //
     // Simple path (no `lpm.config.json`) only: walk every JS/TS file we
-    // just copied, collect external/bare specifiers, and surface them
-    // so the user knows which deps they need to install themselves.
+    // just copied, collect external/bare specifiers, and surface the
+    // packages they name so the user knows which deps they need to install
+    // themselves. URLs, absolute paths, subpath imports and Node built-ins
+    // name no package to install.
     // Anti-drift: shares the `SpecifierKind` classifier with
     // `import_rewriter::rewrite_imports` so "bare" means the same thing
     // in both places.
     let external_imports: Vec<String> = if lpm_config.is_none() {
-        let mut sorted: Vec<String> = collected_external_imports.into_iter().collect();
-        sorted.sort();
-        sorted
+        let builtins = crate::intelligence::node_builtin_package_names();
+        collected_external_imports
+            .iter()
+            .filter_map(|specifier| crate::intelligence::extract_package_name(specifier))
+            .filter(|name| !builtins.contains(name.as_str()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     } else {
         Vec::new()
     };
     if !external_imports.is_empty() && !json_output {
         let external_imports = external_imports
             .iter()
-            .map(|specifier| lpm_common::sanitize_terminal_inline(specifier).into_owned())
+            .map(|name| lpm_common::sanitize_terminal_inline(name).into_owned())
             .collect::<Vec<_>>();
         output::info(&format!(
             "Source uses external imports: {}\n  Make sure these are in your project's dependencies.",

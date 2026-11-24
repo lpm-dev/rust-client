@@ -129,7 +129,9 @@ pub(super) fn detect_buyer_alias(project_dir: &Path, target_dir: &Path) -> Optio
             .unwrap_or(".");
         let mut best: Option<(usize, String)> = None;
         for (key, targets) in paths {
-            let Some(alias_prefix) = key.strip_suffix('*') else {
+            // A catch-all `*` key maps bare specifiers, so it names no alias.
+            let Some(alias_prefix) = key.strip_suffix('*').filter(|prefix| !prefix.is_empty())
+            else {
                 continue;
             };
             let Some(targets) = targets.as_array() else {
@@ -145,17 +147,22 @@ pub(super) fn detect_buyer_alias(project_dir: &Path, target_dir: &Path) -> Optio
                 let Ok(alias_suffix) = target_relative.strip_prefix(&mapped_base) else {
                     continue;
                 };
+                // `K*` → `M*` imports the file `M<rest>` as `K<rest>`, so the
+                // folder suffix follows the key as written: `#*` gives
+                // `#components/`, `@/*` gives `@/components/`.
                 let mut alias = alias_prefix.to_string();
+                let mut has_suffix = false;
                 for component in alias_suffix.components() {
                     let std::path::Component::Normal(segment) = component else {
                         continue;
                     };
-                    if !alias.ends_with('/') {
+                    if has_suffix {
                         alias.push('/');
                     }
                     alias.push_str(&segment.to_string_lossy());
+                    has_suffix = true;
                 }
-                if !alias.ends_with('/') {
+                if has_suffix {
                     alias.push('/');
                 }
                 let depth = mapped_base.components().count();
@@ -404,6 +411,48 @@ mod tests {
             );
         }
         assert!(detect_buyer_alias(project.path(), &project.path().join("components")).is_none());
+    }
+
+    #[test]
+    fn buyer_alias_follows_a_paths_key_without_a_slash_as_written() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("tsconfig.json"),
+            r##"{"compilerOptions":{"paths":{"#*":["./src/*"]}}}"##,
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_buyer_alias(project.path(), &project.path().join("src/components")).as_deref(),
+            Some("#components/")
+        );
+        assert_eq!(
+            detect_buyer_alias(project.path(), &project.path().join("src")).as_deref(),
+            Some("#")
+        );
+    }
+
+    #[test]
+    fn buyer_alias_ignores_a_catch_all_paths_key() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{"*":["./src/*"],"@/*":["./src/*"]}}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_buyer_alias(project.path(), &project.path().join("src/components")).as_deref(),
+            Some("@/components/")
+        );
+        std::fs::write(
+            project.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{"*":["./src/*"]}}}"#,
+        )
+        .unwrap();
+        assert!(
+            detect_buyer_alias(project.path(), &project.path().join("src/components")).is_none()
+        );
     }
 
     #[test]

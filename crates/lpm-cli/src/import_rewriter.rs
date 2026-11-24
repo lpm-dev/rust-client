@@ -532,7 +532,10 @@ fn compute_new_specifier(
     };
 
     if let Some(alias) = buyer_alias {
-        let needs_separator = !alias.ends_with('/');
+        let needs_separator = alias
+            .chars()
+            .next_back()
+            .is_some_and(crate::lpm_config::continues_a_package_name);
         let mut specifier =
             String::with_capacity(alias.len() + usize::from(needs_separator) + clean_path.len());
         specifier.push_str(alias);
@@ -1267,7 +1270,7 @@ import { c } from "react";
         .expect("real require must be rewritten");
 
         assert!(rewritten.contains(r#"return /require("alias:util")/"#));
-        assert!(rewritten.contains(r#"require("app:/shared/util")"#));
+        assert!(rewritten.contains(r#"require("app:shared/util")"#));
     }
 
     #[test]
