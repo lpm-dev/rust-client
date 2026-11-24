@@ -958,14 +958,11 @@ async fn run_locked(
     )?;
 
     // Prepare import rewriting.
-    // An empty alias is a prefix of every specifier, so it would claim bare
-    // package imports as author paths.
     let author_alias = lpm_config
         .as_ref()
         .and_then(|c| c.get("importAlias"))
         .and_then(|v| v.as_str())
-        .filter(|alias| !alias.is_empty())
-        .map(|s| s.to_string());
+        .and_then(crate::lpm_config::import_alias_prefix);
 
     // Detect buyer alias from tsconfig/jsconfig, then prompt to confirm.
     // --alias flag overrides all detection and prompting.

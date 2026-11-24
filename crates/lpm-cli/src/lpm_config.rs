@@ -43,9 +43,31 @@ pub(crate) fn parse_and_validate(
     Ok(value)
 }
 
+/// The prefix an `importAlias` value matches, ending in exactly one `/` so
+/// that it matches only at a path boundary: `@` claims `@/lib/cn`, never the
+/// scoped package `@radix-ui/react-slot`. An empty or `/`-only value is no
+/// alias, as it would otherwise claim every specifier.
+pub(crate) fn import_alias_prefix(alias: &str) -> Option<String> {
+    let trimmed = alias.trim_end_matches('/');
+    (!trimmed.is_empty()).then(|| format!("{trimmed}/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_alias_prefix_ends_in_one_slash_and_drops_empty_values() {
+        assert_eq!(import_alias_prefix("@/").as_deref(), Some("@/"));
+        assert_eq!(import_alias_prefix("@").as_deref(), Some("@/"));
+        assert_eq!(
+            import_alias_prefix("@/components").as_deref(),
+            Some("@/components/")
+        );
+        assert_eq!(import_alias_prefix("~//").as_deref(), Some("~/"));
+        assert_eq!(import_alias_prefix(""), None);
+        assert_eq!(import_alias_prefix("/"), None);
+    }
 
     #[test]
     fn schema_patterns_run_on_the_linear_time_regex_engine() {

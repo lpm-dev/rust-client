@@ -884,10 +884,12 @@ fn absorb_lpm_import_alias(content: &str, aliases: &mut ProjectAliases) {
         Ok(v) => v,
         Err(_) => return,
     };
-    if let Some(prefix) = value.get("importAlias").and_then(|v| v.as_str())
-        && !prefix.is_empty()
+    if let Some(prefix) = value
+        .get("importAlias")
+        .and_then(|v| v.as_str())
+        .and_then(crate::lpm_config::import_alias_prefix)
     {
-        absorb_import_alias_prefix(prefix, aliases);
+        aliases.prefixes.push(prefix);
     }
 }
 
@@ -904,14 +906,6 @@ fn absorb_alias_key(key: &str, aliases: &mut ProjectAliases) {
     } else {
         aliases.exact.insert(key.to_string());
     }
-}
-
-fn absorb_import_alias_prefix(alias: &str, aliases: &mut ProjectAliases) {
-    let trimmed = alias.trim_end_matches('/');
-    if trimmed.is_empty() {
-        return;
-    }
-    aliases.prefixes.push(format!("{trimmed}/"));
 }
 
 fn specifier_resolves_under_base_url(base_url_root: &Path, specifier: &str) -> bool {
