@@ -64,7 +64,20 @@ fn per_process_maximum() -> Option<libc::rlim_t> {
     (status == 0 && maximum > 0).then_some(maximum as libc::rlim_t)
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+/// Containers frequently grant a hard `RLIMIT_NOFILE` of `1_073_741_816`
+/// (`NR_OPEN`); raising the soft limit to that value causes legacy child
+/// processes that iterate `close(fd)` up to `RLIMIT_NOFILE` to stall for
+/// seconds. Capping at 65,536 covers LPM's parallel extraction and linker file
+/// descriptor budgets while avoiding close-loop stalls.
+#[cfg(target_os = "linux")]
+const LINUX_OPEN_FILE_SOFT_LIMIT_CAP: libc::rlim_t = 65_536;
+
+#[cfg(target_os = "linux")]
+fn per_process_maximum() -> Option<libc::rlim_t> {
+    Some(LINUX_OPEN_FILE_SOFT_LIMIT_CAP)
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 fn per_process_maximum() -> Option<libc::rlim_t> {
     None
 }
@@ -81,11 +94,19 @@ mod tests {
             Some(184_320)
         );
         assert_eq!(raised_soft_limit(256, 10_240, Some(184_320)), Some(10_240));
+        assert_eq!(
+            raised_soft_limit(1_024, 1_073_741_816, Some(65_536)),
+            Some(65_536)
+        );
     }
 
     #[test]
     fn a_soft_limit_already_at_the_target_or_an_unbounded_target_is_left_alone() {
         assert_eq!(raised_soft_limit(65_536, 65_536, None), None);
+        assert_eq!(
+            raised_soft_limit(131_072, 1_073_741_816, Some(65_536)),
+            None
+        );
         assert_eq!(
             raised_soft_limit(184_320, libc::RLIM_INFINITY, Some(184_320)),
             None
