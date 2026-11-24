@@ -36,8 +36,8 @@ use super::integrity::{
     remove_unusable_object_dir, source_object_integrity, source_policy_uses_source_integrity,
     write_link_tree_snapshot_best_effort, write_link_tree_snapshot_unpublished,
     write_object_integrity_for_policy, write_object_integrity_for_policy_with_tree,
-    write_object_integrity_for_policy_with_tree_unpublished,
-    write_tree_snapshot, write_tree_snapshot_best_effort, write_tree_snapshot_with_layout_content,
+    write_object_integrity_for_policy_with_tree_unpublished, write_tree_snapshot,
+    write_tree_snapshot_best_effort, write_tree_snapshot_with_layout_content,
     write_tree_snapshot_with_layout_content_unpublished,
 };
 use super::local_source::{
@@ -4069,7 +4069,7 @@ impl Store {
     fn needs_linux_populate_cap(&self) -> bool {
         *self
             .cap_concurrent_link_populates
-            .get_or_init(|| linux_path_needs_populate_cap(self.paths.links_root()))
+            .get_or_init(|| linux_path_needs_populate_cap(&self.paths.links_root()))
     }
 }
 
@@ -4124,7 +4124,10 @@ fn linux_overlay_upperdir_from_mountinfo(path: &Path, mountinfo: &[u8]) -> Optio
             continue;
         };
         let depth = mount_point.as_os_str().len();
-        if best.as_ref().is_none_or(|(best_depth, _)| depth >= *best_depth) {
+        if best
+            .as_ref()
+            .is_none_or(|(best_depth, _)| depth >= *best_depth)
+        {
             best = Some((
                 depth,
                 PathBuf::from(std::ffi::OsString::from_vec(upper_raw.to_vec())),

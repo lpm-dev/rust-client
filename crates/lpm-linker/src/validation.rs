@@ -256,7 +256,10 @@ pub(crate) fn validate_bin_target(pkg_dir: &Path, script_path: &str) -> Result<P
 /// `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` to verify containment in two
 /// syscalls, falling back to `validate_bin_target` when a symlink or older
 /// kernel / seccomp policy prevents `openat2`.
-pub(crate) fn validate_bin_target_confined(pkg_dir: &Path, script_path: &str) -> Result<(), String> {
+pub(crate) fn validate_bin_target_confined(
+    pkg_dir: &Path,
+    script_path: &str,
+) -> Result<(), String> {
     if Path::new(script_path).is_absolute() {
         return Err(format!(
             "bin target \"{script_path}\" must be relative to package directory"

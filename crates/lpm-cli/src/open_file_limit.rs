@@ -73,6 +73,7 @@ fn per_process_maximum() -> Option<libc::rlim_t> {
 const LINUX_OPEN_FILE_SOFT_LIMIT_CAP: libc::rlim_t = 65_536;
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::unnecessary_wraps)] // Matches the macOS/other-Unix `Option` signature.
 fn per_process_maximum() -> Option<libc::rlim_t> {
     Some(LINUX_OPEN_FILE_SOFT_LIMIT_CAP)
 }

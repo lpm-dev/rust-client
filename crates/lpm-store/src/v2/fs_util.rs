@@ -734,7 +734,9 @@ pub(crate) mod linux_copy {
     }
 
     pub fn copy_file_plain_io(src: &Path, dst: &Path) -> std::io::Result<()> {
-        copy_file_io(src, dst, false).map(|_| ()).map_err(|(_, error)| error)
+        copy_file_io(src, dst, false)
+            .map(|_| ())
+            .map_err(|(_, error)| error)
     }
 
     fn copy_file_io(
