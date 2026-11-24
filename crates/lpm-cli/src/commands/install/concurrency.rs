@@ -20,12 +20,7 @@ pub(super) fn v2_link_task_concurrency(target_count: usize) -> usize {
 }
 
 pub(super) fn v2_cached_link_task_concurrency(target_count: usize) -> usize {
-    let limit = if cfg!(target_os = "macos") {
-        4
-    } else {
-        V2_LINK_TASK_MAX_CONCURRENCY
-    };
-    v2_link_task_concurrency_with_limit(target_count, limit)
+    v2_link_task_concurrency_with_limit(target_count, V2_LINK_TASK_MAX_CONCURRENCY)
 }
 
 fn v2_link_task_concurrency_with_limit(target_count: usize, limit: usize) -> usize {
@@ -391,7 +386,7 @@ mod cached_link_tests {
     fn fully_cached_link_width_bounds_macos_metadata_contention() {
         let _env = crate::test_env::ScopedEnv::update([("LPM_V2_LINK_TASKS", None)]);
         let expected = if cfg!(target_os = "macos") {
-            v2_link_task_concurrency(100).min(4)
+            v2_link_task_concurrency(100).min(16)
         } else {
             v2_link_task_concurrency(100)
         };

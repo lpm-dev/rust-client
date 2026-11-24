@@ -21,6 +21,7 @@ pub(super) fn write_post_install_hash(
 pub(super) struct PostInstallSyncNoopProofContext<'a> {
     pub(super) routes: &'a lpm_registry::RouteTable,
     pub(super) auto_install_peers: bool,
+    pub(super) parsed_lockfile: Option<(&'a lpm_lockfile::Lockfile, (u64, std::time::SystemTime))>,
 }
 
 pub(super) fn write_post_install_hash_with_proof(
@@ -117,14 +118,26 @@ fn write_post_install_hash_with_context_and_proof(
             lpm_common::STATE_FILE_SIZE_CAP_BYTES.max(64 * 1024 * 1024),
         )
         .ok()?;
-        let lock_raw_str = std::str::from_utf8(&lock_raw).ok()?;
-        let fresh_lockfile = lpm_lockfile::Lockfile::from_toml(lock_raw_str).ok()?;
+        let owned_lockfile;
+        let current_stamp = std::fs::metadata(&lock.path)
+            .ok()
+            .and_then(|meta| Some((meta.len(), meta.modified().ok()?)));
+        let fresh_lockfile = if let Some((parsed, committed_stamp)) = ctx.parsed_lockfile
+            && current_stamp == Some(committed_stamp)
+            && lock_raw == lock.content.as_bytes()
+        {
+            parsed
+        } else {
+            let lock_raw_str = std::str::from_utf8(&lock_raw).ok()?;
+            owned_lockfile = lpm_lockfile::Lockfile::from_toml(lock_raw_str).ok()?;
+            &owned_lockfile
+        };
         Some(super::sync_noop::compute_sync_noop_proof(
             project_dir,
             &lock.path,
             &fresh_package,
             pkg_stripped,
-            &fresh_lockfile,
+            fresh_lockfile,
             &lock_raw,
             ctx.routes,
             ctx.auto_install_peers,

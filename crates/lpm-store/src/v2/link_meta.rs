@@ -269,24 +269,35 @@ impl LinkMeta {
         link_dir: &Path,
     ) -> Result<(Self, Option<std::time::SystemTime>), LpmError> {
         let path = link_dir.join(LINK_META_FILENAME);
-        let (bytes, metadata) = lpm_common::read_text_file_capped_nofollow_with_metadata(
+        let (bytes, metadata) =
+            lpm_common::read_text_file_capped_nofollow_with_metadata(&path, LINK_META_MAX_BYTES)
+                .map_err(|error| map_link_meta_read_error(&path, error))?;
+        Self::parse_and_validate(&path, &bytes, metadata.modified().ok())
+    }
+
+    /// Read a sidecar and mtime if the sidecar file exists, returning `Ok(None)`
+    /// on missing entry without extra stat probes.
+    pub(crate) fn read_from_with_mtime_if_present(
+        link_dir: &Path,
+    ) -> Result<Option<(Self, Option<std::time::SystemTime>)>, LpmError> {
+        let path = link_dir.join(LINK_META_FILENAME);
+        let (bytes, metadata) = match lpm_common::read_text_file_capped_nofollow_with_metadata(
             &path,
             LINK_META_MAX_BYTES,
-        )
-        .map_err(|error| {
-            LpmError::Store(match error {
-                lpm_common::BoundedReadError::TooLarge { .. } => format!(
-                    "virtual-store link sidecar at {}: refusing to read above the {} byte cap",
-                    path.display(),
-                    LINK_META_MAX_BYTES
-                ),
-                _ => format!(
-                    "failed to read virtual-store link sidecar at {}: {error}",
-                    path.display()
-                ),
-            })
-        })?;
-        let parsed: LinkMeta = serde_json::from_str(&bytes).map_err(|e| {
+        ) {
+            Ok(read) => read,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(map_link_meta_read_error(&path, error)),
+        };
+        Self::parse_and_validate(&path, &bytes, metadata.modified().ok()).map(Some)
+    }
+
+    fn parse_and_validate(
+        path: &Path,
+        bytes: &str,
+        mtime: Option<std::time::SystemTime>,
+    ) -> Result<(Self, Option<std::time::SystemTime>), LpmError> {
+        let parsed: LinkMeta = serde_json::from_str(bytes).map_err(|e| {
             LpmError::Store(format!(
                 "malformed virtual-store link sidecar at {}: {e}",
                 path.display()
@@ -323,7 +334,7 @@ impl LinkMeta {
                 path.display()
             )));
         }
-        Ok((parsed, metadata.modified().ok()))
+        Ok((parsed, mtime))
     }
 
     /// Serialize and atomically write to `<link_dir>/.lpm-link-meta.json`.
@@ -395,6 +406,20 @@ impl LinkMeta {
 /// `name` into a path and must trust that single source. Registry-
 /// supplied names ARE strict — this rejects only what a tampered
 /// sidecar could plausibly inject.
+pub fn map_link_meta_read_error(path: &Path, error: lpm_common::BoundedReadError) -> LpmError {
+    LpmError::Store(match error {
+        lpm_common::BoundedReadError::TooLarge { .. } => format!(
+            "virtual-store link sidecar at {}: refusing to read above the {} byte cap",
+            path.display(),
+            LINK_META_MAX_BYTES
+        ),
+        _ => format!(
+            "failed to read virtual-store link sidecar at {}: {error}",
+            path.display()
+        ),
+    })
+}
+
 pub fn validate_name_for_path_join(name: &str) -> Result<(), &'static str> {
     if name.is_empty() {
         return Err("empty name");

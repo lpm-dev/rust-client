@@ -62,6 +62,38 @@ pub async fn resolve_greedy_fused_workspace_with_cache_options_and_policy(
     shared_fact_cache: Option<SharedCache>,
     shared_metadata_concurrency: Option<SharedMetadataConcurrency>,
 ) -> Result<WorkspaceResolveOutcome, ResolveError> {
+    resolve_greedy_fused_workspace_with_cache_options_policy_and_selected_events(
+        client,
+        roots,
+        overrides,
+        route_table,
+        npm_fanout,
+        shared_cache,
+        auto_install_peers,
+        include_optional_dependencies,
+        policies,
+        None,
+        shared_fact_cache,
+        shared_metadata_concurrency,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_greedy_fused_workspace_with_cache_options_policy_and_selected_events(
+    client: Arc<RegistryClient>,
+    roots: Vec<RootDependencies>,
+    overrides: OverrideSet,
+    route_table: RouteTable,
+    npm_fanout: usize,
+    shared_cache: SharedCache,
+    auto_install_peers: bool,
+    include_optional_dependencies: bool,
+    policies: Vec<ResolverPolicy>,
+    selected_package_tx: Option<tokio::sync::mpsc::Sender<crate::resolve::SelectedPackageEvent>>,
+    shared_fact_cache: Option<SharedCache>,
+    shared_metadata_concurrency: Option<SharedMetadataConcurrency>,
+) -> Result<WorkspaceResolveOutcome, ResolveError> {
     if roots.len() != policies.len() {
         return Err(ResolveError::Internal(format!(
             "workspace union received {} roots but {} policies",
@@ -129,7 +161,7 @@ pub async fn resolve_greedy_fused_workspace_with_cache_options_and_policy(
             auto_install_peers,
             include_optional_dependencies,
             union_policy.clone(),
-            None,
+            selected_package_tx.clone(),
             shared_fact_cache.as_ref().map(Arc::clone),
             shared_metadata_concurrency.clone(),
         )
@@ -349,6 +381,7 @@ struct ImporterProjectionContext<'a> {
     union: &'a ResolveResult,
     package_index: &'a HashMap<ResolutionNodeId, usize>,
     artifact_index: &'a HashMap<(String, String), Vec<ResolutionNodeId>>,
+    packages_by_canonical: &'a HashMap<String, Vec<usize>>,
     overrides: &'a OverrideSet,
     auto_install_peers: bool,
     policy: &'a ResolverPolicy,
@@ -365,6 +398,7 @@ fn project_union_result(
     let union_stage_timing = union.stage_timing;
     let package_index = package_indices_by_id(&union.packages);
     let artifact_index = package_ids_by_artifact(&union.packages);
+    let packages_by_canonical = package_indices_by_canonical(&union.packages);
     let mut projected = Vec::with_capacity(slots.len());
     let mut missing_ambient_peers = Vec::new();
     let mut release_age_policy_isolated_count = 0usize;
@@ -379,6 +413,7 @@ fn project_union_result(
             union: &union,
             package_index: &package_index,
             artifact_index: &artifact_index,
+            packages_by_canonical: &packages_by_canonical,
             overrides,
             auto_install_peers,
             policy: &policies[root_index],
@@ -471,6 +506,21 @@ fn package_ids_by_artifact(
     index
 }
 
+fn package_indices_by_canonical(packages: &[ResolvedPackage]) -> HashMap<String, Vec<usize>> {
+    let mut index: HashMap<String, Vec<usize>> = HashMap::with_capacity(packages.len());
+    for (position, package) in packages.iter().enumerate() {
+        index
+            .entry(package.package.canonical_name())
+            .or_default()
+            .push(position);
+    }
+    for positions in index.values_mut() {
+        positions
+            .sort_unstable_by(|left, right| packages[*right].version.cmp(&packages[*left].version));
+    }
+    index
+}
+
 fn project_importer(
     slots: &[RootSlot],
     context: &ImporterProjectionContext<'_>,
@@ -535,13 +585,17 @@ fn project_importer(
             return Ok(ImporterProjection::RequiresIsolatedResolution);
         }
     };
-    let mut ambient_peer_installs = ambient_root_resolutions.keys().cloned().collect::<Vec<_>>();
+    let mut ambient_peer_installs = Vec::with_capacity(ambient_root_resolutions.len());
+    for (name, resolution) in ambient_root_resolutions {
+        if root_resolutions.contains_key(&name) {
+            continue;
+        }
+        ambient_peer_installs.push(name.clone());
+        if !skipped_optional_roots.contains(name.as_str()) {
+            root_resolutions.insert(name, resolution);
+        }
+    }
     ambient_peer_installs.sort_unstable();
-    root_resolutions.extend(
-        ambient_root_resolutions
-            .into_iter()
-            .filter(|(name, _)| !skipped_optional_roots.contains(name.as_str())),
-    );
 
     let mut packages = included
         .iter()
@@ -558,6 +612,14 @@ fn project_importer(
             package
         })
         .collect::<Vec<_>>();
+    if !all_projected_packages_reachable(&packages, &root_resolutions) {
+        tracing::debug!(
+            importer_index,
+            reason = "unreachable-projected-package",
+            "workspace union importer requires isolated resolution"
+        );
+        return Ok(ImporterProjection::RequiresIsolatedResolution);
+    }
     packages.sort_by_cached_key(|package| (package.package.to_string(), package.version.clone()));
     let package_names = packages
         .iter()
@@ -582,7 +644,7 @@ fn project_importer(
 
     Ok(ImporterProjection::Projected(Box::new(ResolveResult {
         packages,
-        cache: union.cache.clone(),
+        cache: Arc::clone(&union.cache),
         applied_overrides,
         platform_skipped: union.platform_skipped,
         root_aliases,
@@ -595,6 +657,40 @@ fn project_importer(
 
 fn usize_to_u64_saturating(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn all_projected_packages_reachable(
+    packages: &[ResolvedPackage],
+    root_resolutions: &HashMap<String, RootResolution>,
+) -> bool {
+    let mut by_id = HashMap::with_capacity(packages.len());
+    for (index, package) in packages.iter().enumerate() {
+        by_id.insert(package.resolution_id, index);
+    }
+    let mut visited = HashSet::with_capacity(packages.len());
+    let mut queue = VecDeque::with_capacity(root_resolutions.len());
+    for root in root_resolutions.values() {
+        if let Some(&index) = by_id.get(&root.target)
+            && visited.insert(index)
+        {
+            queue.push_back(index);
+        }
+    }
+    while let Some(index) = queue.pop_front() {
+        let package = &packages[index];
+        for target in package
+            .dependency_targets
+            .values()
+            .chain(package.peer_targets.values())
+        {
+            if let Some(&child_index) = by_id.get(target)
+                && visited.insert(child_index)
+            {
+                queue.push_back(child_index);
+            }
+        }
+    }
+    visited.len() == packages.len()
 }
 
 fn add_dependency_closure(
@@ -688,6 +784,7 @@ fn project_peer_context(
                 let target_info = union.cache.get(&CanonicalKey::from_dep_name(target));
                 if let Some((version, target_id)) = newest_included_provider(
                     included,
+                    context.packages_by_canonical,
                     &union.packages,
                     target,
                     &range,
@@ -806,14 +903,11 @@ fn project_peer_context(
                 );
                 return Ok(PeerProjectionOutcome::RequiresIsolatedResolution);
             };
-            ambient.insert(
-                identity.0.clone(),
-                RootResolution {
-                    target: *target,
-                    package: identity.0,
-                    version: identity.1,
-                },
-            );
+            ambient.entry(identity.0.clone()).or_insert(RootResolution {
+                target: *target,
+                package: identity.0,
+                version: identity.1,
+            });
             synthesized_targets.push((*target, required_path));
         }
         if !add_dependency_closure(
@@ -901,24 +995,27 @@ fn apply_projected_peer_override(
 
 fn newest_included_provider(
     included: &HashSet<usize>,
+    packages_by_canonical: &HashMap<String, Vec<usize>>,
     packages: &[ResolvedPackage],
     canonical: &str,
     range: &NpmRange,
     info: Option<&CachedPackageInfo>,
 ) -> Option<(String, ResolutionNodeId)> {
-    included
-        .iter()
-        .filter_map(|index| {
-            let package = &packages[*index];
-            (package.package.canonical_name() == canonical
-                && info.map_or_else(
-                    || range.satisfies(&package.version),
-                    |info| info.range_satisfies(range, &package.version),
-                ))
-            .then_some((&package.version, package.resolution_id))
-        })
-        .max_by(|(left, _), (right, _)| left.cmp(right))
-        .map(|(version, target)| (version.to_string(), target))
+    let candidates = packages_by_canonical.get(canonical)?;
+    for &index in candidates {
+        if !included.contains(&index) {
+            continue;
+        }
+        let package = &packages[index];
+        let matches = info.map_or_else(
+            || range.satisfies(&package.version),
+            |info| info.range_satisfies(range, &package.version),
+        );
+        if matches {
+            return Some((package.version.to_string(), package.resolution_id));
+        }
+    }
+    None
 }
 
 enum UnionPeerCandidate<'a> {
@@ -952,7 +1049,7 @@ fn select_union_peer_candidate<'a>(
         unfetched_ranges.dedup();
         return UnionPeerCandidate::NeedsVersions(unfetched_ranges);
     }
-    let mut best = None::<(crate::NpmVersion, usize, Vec<usize>)>;
+    let mut best = None::<(&crate::NpmVersion, usize)>;
     let preferred_latest = info.latest_version.as_ref().filter(|latest| {
         requirements
             .iter()
@@ -963,39 +1060,40 @@ fn select_union_peer_candidate<'a>(
             .iter()
             .filter(|candidate| preferred_latest != Some(*candidate)),
     ) {
-        if info
-            .platform_is_compatible(&candidate.to_string())
-            .is_some_and(|compatible| !compatible)
+        if info.has_platform_metadata()
+            && info
+                .platform_is_compatible(&candidate.to_string())
+                .is_some_and(|compatible| !compatible)
         {
             continue;
         }
         if !version_allowed_by_policy(&canonical_key, info, candidate, policy) {
             continue;
         }
-        let misses = requirements
+        let hits = requirements
             .iter()
-            .enumerate()
-            .filter_map(|(index, requirement)| {
-                (!info.range_satisfies(&requirement.2, candidate)).then_some(index)
-            })
-            .collect::<Vec<_>>();
-        let hits = requirements.len().saturating_sub(misses.len());
+            .filter(|requirement| info.range_satisfies(&requirement.2, candidate))
+            .count();
         if hits == 0 {
             continue;
         }
-        if best
-            .as_ref()
-            .is_none_or(|(_, best_hits, _)| hits > *best_hits)
-        {
-            best = Some((candidate.clone(), hits, misses));
+        if hits == requirements.len() {
+            return UnionPeerCandidate::Selected {
+                version: candidate.to_string(),
+                unsatisfied: Vec::new(),
+            };
+        }
+        if best.as_ref().is_none_or(|(_, best_hits)| hits > *best_hits) {
+            best = Some((candidate, hits));
         }
     }
     match best {
-        Some((version, _, misses)) => UnionPeerCandidate::Selected {
+        Some((version, _)) => UnionPeerCandidate::Selected {
             version: version.to_string(),
-            unsatisfied: misses
-                .into_iter()
-                .map(|index| requirements[index])
+            unsatisfied: requirements
+                .iter()
+                .copied()
+                .filter(|requirement| !info.range_satisfies(&requirement.2, version))
                 .collect(),
         },
         None => UnionPeerCandidate::Unavailable,
@@ -1912,5 +2010,89 @@ mod tests {
         };
         assert!(results[0].is_none());
         assert!(results[1].is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn union_projection_keeps_declared_root_when_ambient_peer_synthesizes_newer_same_name() {
+        let roots = vec![
+            RootDependencies::required(HashMap::from([
+                ("react".to_string(), "19.1.4".to_string()),
+                ("ui".to_string(), "1.0.0".to_string()),
+            ])),
+            RootDependencies::required(HashMap::from([(
+                "react".to_string(),
+                "19.1.4".to_string(),
+            )])),
+        ];
+        let outcome = resolve_roots_with_policies(
+            roots,
+            vec![
+                (
+                    "ui",
+                    cached_package(&[("1.0.0", &[], &[("react-dom", "^19.0.0")])]),
+                ),
+                (
+                    "react-dom",
+                    cached_package(&[("19.3.1", &[], &[("react", "^19.3.1")])]),
+                ),
+                (
+                    "react",
+                    cached_package(&[("19.3.1", &[], &[]), ("19.1.4", &[], &[])]),
+                ),
+            ],
+            vec![ResolverPolicy::default(); 2],
+        )
+        .await;
+
+        let WorkspaceResolveOutcome::Projected { results, .. } = outcome else {
+            panic!("workspace union should project importers")
+        };
+        let ui_result = results[0]
+            .as_ref()
+            .expect("ui importer should be projected");
+        let root_react = ui_result
+            .root_resolutions
+            .get("react")
+            .expect("declared react root must remain present");
+        assert_eq!(
+            root_react.version, "19.1.4",
+            "ambient peer synthesis must not overwrite manifest-declared root_resolutions"
+        );
+        assert!(
+            !ui_result
+                .ambient_peer_installs
+                .iter()
+                .any(|name| name == "react"),
+            "manifest-declared root must not be recorded as an ambient peer install"
+        );
+
+        let mut reachable = HashSet::new();
+        let mut queue: std::collections::VecDeque<_> = ui_result
+            .root_resolutions
+            .values()
+            .map(|res| res.target)
+            .collect();
+        let by_id: HashMap<_, _> = ui_result
+            .packages
+            .iter()
+            .map(|pkg| (pkg.resolution_id, pkg))
+            .collect();
+        while let Some(id) = queue.pop_front() {
+            if !reachable.insert(id) {
+                continue;
+            }
+            if let Some(pkg) = by_id.get(&id) {
+                queue.extend(pkg.dependency_targets.values().copied());
+                queue.extend(pkg.peer_targets.values().copied());
+            }
+        }
+        for pkg in &ui_result.packages {
+            assert!(
+                reachable.contains(&pkg.resolution_id),
+                "projected package {}@{} must be reachable from exact roots",
+                pkg.package,
+                pkg.version
+            );
+        }
     }
 }

@@ -2222,6 +2222,8 @@ impl Store {
             })?;
         }
 
+        #[cfg(target_os = "macos")]
+        let _apfs_populate_permit = acquire_apfs_populate_permit();
         let materialize_dir = self
             .file_cas
             .as_ref()
@@ -3692,10 +3694,13 @@ fn link_entry_is_reusable(
     policy: ObjectIntegrityPolicy,
 ) -> Result<Option<Option<std::time::SystemTime>>, LpmError> {
     harden_tier_of(dir, "links")?;
-    if !is_complete_link_entry(dir, key) {
+    let Some((sidecar, sidecar_mtime)) = LinkMeta::read_from_with_mtime_if_present(dir)? else {
+        return Ok(None);
+    };
+    let package_dir = link_entry_package_dir(dir, key);
+    if !package_dir.join("package.json").is_file() {
         return Ok(None);
     }
-    let (sidecar, sidecar_mtime) = LinkMeta::read_from_with_mtime(dir)?;
     if sidecar.graph_key_digest_hex != key.digest_hex()
         || sidecar.source_sri != source_sri
         || sidecar.tree_digest.as_deref() != tree_digest
@@ -3707,7 +3712,6 @@ fn link_entry_is_reusable(
         Some(digest) => Cow::Borrowed(digest.as_str()),
         None => Cow::Owned(object_integrity_for_link(object_dir, source_sri, policy)?),
     };
-    let package_dir = link_entry_package_dir(dir, key);
     let source_shallow_eligible = source_policy_uses_source_integrity(object_dir, policy)
         && package_dir
             .join(LINK_BUILD_MARKER)
@@ -3991,6 +3995,47 @@ fn record_local_source_fingerprint(
             "virtual-store local-source object: failed to record source fingerprint: {error}"
         );
     }
+}
+
+#[cfg(target_os = "macos")]
+struct ApfsPopulatePermit;
+
+#[cfg(target_os = "macos")]
+fn apfs_populate_gate() -> &'static (std::sync::Mutex<usize>, std::sync::Condvar) {
+    static GATE: std::sync::OnceLock<(std::sync::Mutex<usize>, std::sync::Condvar)> =
+        std::sync::OnceLock::new();
+    GATE.get_or_init(|| (std::sync::Mutex::new(0), std::sync::Condvar::new()))
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ApfsPopulatePermit {
+    fn drop(&mut self) {
+        let (lock, cvar) = apfs_populate_gate();
+        let mut active = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *active = active.saturating_sub(1);
+        cvar.notify_one();
+    }
+}
+
+/// APFS serializes `clonefile` + directory creation on a volume metadata lock;
+/// capping concurrent mutating link populates avoids contention while allowing
+/// read-only reuse checks to scale across all cores.
+#[cfg(target_os = "macos")]
+fn acquire_apfs_populate_permit() -> ApfsPopulatePermit {
+    const MAX_APFS_POPULATE_WRITERS: usize = 2;
+    let (lock, cvar) = apfs_populate_gate();
+    let mut active = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while *active >= MAX_APFS_POPULATE_WRITERS {
+        active = cvar
+            .wait(active)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    *active += 1;
+    ApfsPopulatePermit
 }
 
 mod checked_pins;

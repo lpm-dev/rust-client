@@ -1835,6 +1835,10 @@ pub struct FastLaneMode {
     pub(crate) min_release_age: Option<String>,
     /// Raw `--min-release-age-exclude` arguments forwarded to release-age validation.
     pub(crate) min_release_age_exclude: Vec<String>,
+    /// Explicit `--linker <hoisted|isolated>` override, if passed.
+    pub(crate) linker: Option<lpm_linker::LinkerMode>,
+    /// `--no-engine-strict`: skip fatal `engines` mismatches.
+    pub(crate) no_engine_strict: bool,
 }
 
 pub fn argv_qualifies_for_fast_lane() -> Option<FastLaneMode> {
@@ -1860,6 +1864,8 @@ fn fast_lane_mode_from_args(args: &[&str]) -> Option<FastLaneMode> {
     let mut no_skills = false;
     let mut min_release_age: Option<String> = None;
     let mut min_release_age_exclude: Vec<String> = Vec::new();
+    let mut linker: Option<lpm_linker::LinkerMode> = None;
+    let mut no_engine_strict = false;
     let mut found_install = false;
     let mut is_ci = false;
     // clap refuses a non-repeatable flag given twice on one side of `install`,
@@ -1901,6 +1907,26 @@ fn fast_lane_mode_from_args(args: &[&str]) -> Option<FastLaneMode> {
                     return None;
                 }
                 min_release_age_exclude.push(value.to_string());
+                i += 2;
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("--linker=") {
+                if linker.is_some() {
+                    return None;
+                }
+                linker = Some(lpm_linker::LinkerMode::parse_str(value).ok()?);
+                i += 1;
+                continue;
+            }
+            if arg == "--linker" {
+                if linker.is_some() {
+                    return None;
+                }
+                let value = *args.get(i + 1)?;
+                if value.starts_with('-') {
+                    return None;
+                }
+                linker = Some(lpm_linker::LinkerMode::parse_str(value).ok()?);
                 i += 2;
                 continue;
             }
@@ -1953,14 +1979,15 @@ fn fast_lane_mode_from_args(args: &[&str]) -> Option<FastLaneMode> {
                 }
             }
             "--no-skills" if found_install => no_skills = true,
-            // An up-to-date install has no security summary to leave out.
-            "--no-security-summary" if found_install => {}
+            "--no-engine-strict" if found_install => no_engine_strict = true,
+            // An up-to-date install has no security summary or post-install audit to leave out.
+            "--no-security-summary" | "--no-audit-after-install" if found_install => {}
 
             // Install-specific flags that disqualify the fast lane.
             // ANY of these means semantics differ from a bare `lpm install`.
             "--force" | "--offline" | "--filter" | "-w" | "--workspace-root"
-            | "--fail-if-no-match" | "--allow-new" | "--linker" | "--exact" | "--tilde"
-            | "--save-prefix" | "-D" | "--save-dev" | "--auto-build"
+            | "--fail-if-no-match" | "--allow-new" | "--exact" | "--tilde" | "--save-prefix"
+            | "-D" | "--save-dev" | "--auto-build"
                 if found_install =>
             {
                 return None;
@@ -1994,6 +2021,8 @@ fn fast_lane_mode_from_args(args: &[&str]) -> Option<FastLaneMode> {
         no_skills,
         min_release_age,
         min_release_age_exclude,
+        linker,
+        no_engine_strict,
     })
 }
 
@@ -2123,8 +2152,66 @@ mod tests {
                 no_skills: false,
                 min_release_age: None,
                 min_release_age_exclude: Vec::new(),
+                linker: None,
+                no_engine_strict: false,
             })
         );
+    }
+
+    #[test]
+    fn fast_lane_mode_from_args_accepts_linker_no_audit_and_no_engine_strict() {
+        use crate::commands::install::FrozenLockfileMode;
+
+        assert_eq!(
+            fast_lane_mode_from_args(&[
+                "install",
+                "--no-audit-after-install",
+                "--no-engine-strict",
+                "--linker",
+                "hoisted",
+            ]),
+            Some(FastLaneMode {
+                json: false,
+                timing: false,
+                frozen_lockfile: FrozenLockfileMode::Auto,
+                no_skills: false,
+                min_release_age: None,
+                min_release_age_exclude: Vec::new(),
+                linker: Some(lpm_linker::LinkerMode::Hoisted),
+                no_engine_strict: true,
+            })
+        );
+        assert_eq!(
+            fast_lane_mode_from_args(&["ci", "--linker=isolated", "--no-audit-after-install"]),
+            Some(FastLaneMode {
+                json: false,
+                timing: false,
+                frozen_lockfile: FrozenLockfileMode::Always,
+                no_skills: false,
+                min_release_age: None,
+                min_release_age_exclude: Vec::new(),
+                linker: Some(lpm_linker::LinkerMode::Isolated),
+                no_engine_strict: false,
+            })
+        );
+        for rejected in [
+            &["--linker=hoisted", "install"][..],
+            &["install", "--linker"][..],
+            &["install", "--linker", "--json"][..],
+            &["install", "--linker=bogus"][..],
+            &["install", "--linker", "hoisted", "--linker=isolated"][..],
+            &[
+                "install",
+                "--no-audit-after-install",
+                "--no-audit-after-install",
+            ][..],
+        ] {
+            assert_eq!(
+                fast_lane_mode_from_args(rejected),
+                None,
+                "rejected args should fall back to clap: {rejected:?}"
+            );
+        }
     }
 
     #[test]
@@ -2146,6 +2233,8 @@ mod tests {
                 no_skills: false,
                 min_release_age: Some("7d".to_string()),
                 min_release_age_exclude: vec!["lodash".to_string(), "@types/*".to_string()],
+                linker: None,
+                no_engine_strict: false,
             })
         );
         assert_eq!(
@@ -2157,6 +2246,8 @@ mod tests {
                 no_skills: false,
                 min_release_age: Some("3d".to_string()),
                 min_release_age_exclude: Vec::new(),
+                linker: None,
+                no_engine_strict: false,
             })
         );
         // Duplicate --min-release-age, missing values, or flag before subcommand bail to clap.
@@ -4030,6 +4121,8 @@ mod tests {
                 no_skills: false,
                 min_release_age: None,
                 min_release_age_exclude: Vec::new(),
+                linker: None,
+                no_engine_strict: false,
             })
         );
         assert_eq!(
@@ -4041,6 +4134,8 @@ mod tests {
                 no_skills: true,
                 min_release_age: None,
                 min_release_age_exclude: Vec::new(),
+                linker: None,
+                no_engine_strict: false,
             })
         );
         // `lpm ci --json` must fall through to emit the full JSON envelope.

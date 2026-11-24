@@ -433,11 +433,13 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                             auto_install_peers,
                             include_optional_dependencies: true,
                             policy: resolver_policy.clone(),
+                            selected_package_tx: selected_package_tx.clone(),
                         },
                     )
                     .await?;
                     let res = match union_result {
                         workspace_resolution::WorkspaceUnionResolution::Projected(result) => {
+                            drop(selected_package_tx);
                             Ok(*result)
                         }
                         workspace_resolution::WorkspaceUnionResolution::Isolated(union_timing) => {

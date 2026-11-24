@@ -197,6 +197,8 @@ pub(super) struct WorkspaceUnionRequest {
     pub(super) auto_install_peers: bool,
     pub(super) include_optional_dependencies: bool,
     pub(super) policy: lpm_resolver::ResolverPolicy,
+    pub(super) selected_package_tx:
+        Option<tokio::sync::mpsc::Sender<lpm_resolver::SelectedPackageEvent>>,
 }
 
 enum WorkspaceUnionResult {
@@ -670,25 +672,42 @@ async fn resolve_submitted_workspace_unions(coordinator: &WorkspaceResolutionCoo
             .iter()
             .map(|index| requests[*index].policy.clone())
             .collect::<Vec<_>>();
+        let union_selected_tx = indices
+            .iter()
+            .all(|index| requests[*index].selected_package_tx.is_some())
+            .then(|| requests[indices[0]].selected_package_tx.clone())
+            .flatten();
         let first = &mut requests[indices[0]];
         let metadata_concurrency = metadata_concurrency_with_limit(
             &coordinator.resolver_metadata_concurrency,
             first.npm_fanout,
         );
-        let resolved = lpm_resolver::resolve_greedy_fused_workspace_with_cache_options_and_policy(
-            Arc::clone(&first.client),
-            roots,
-            first.overrides.clone(),
-            first.route_table.clone(),
-            first.npm_fanout,
-            Arc::clone(&first.shared_cache),
-            first.auto_install_peers,
-            first.include_optional_dependencies,
-            policies,
-            Some(Arc::clone(&coordinator.resolver_fact_cache)),
-            metadata_concurrency,
-        )
-        .await;
+        // The union resolver already deduplicates compact ManifestCore facts
+        // through shared_cache + resolver_fact_cache; disable the command-wide
+        // full-packument memory cache during union resolve so 1,400+ full
+        // packuments aren't deep-cloned into resident memory.
+        let union_client = Arc::new(
+            first
+                .client
+                .clone_with_config()
+                .without_metadata_memory_cache(),
+        );
+        let resolved =
+            lpm_resolver::resolve_greedy_fused_workspace_with_cache_options_policy_and_selected_events(
+                union_client,
+                roots,
+                first.overrides.clone(),
+                first.route_table.clone(),
+                first.npm_fanout,
+                Arc::clone(&first.shared_cache),
+                first.auto_install_peers,
+                first.include_optional_dependencies,
+                policies,
+                union_selected_tx,
+                Some(Arc::clone(&coordinator.resolver_fact_cache)),
+                metadata_concurrency,
+            )
+            .await;
         match resolved {
             Ok(lpm_resolver::WorkspaceResolveOutcome::Projected {
                 results: projected,
@@ -734,6 +753,10 @@ async fn resolve_submitted_workspace_unions(coordinator: &WorkspaceResolutionCoo
         }
     }
 
+    for request in &requests {
+        request.client.clear_metadata_memory_cache();
+    }
+    drop(requests);
     *union
         .results
         .lock()
@@ -1736,6 +1759,7 @@ mod tests {
             auto_install_peers: true,
             include_optional_dependencies: true,
             policy: lpm_resolver::ResolverPolicy::default(),
+            selected_package_tx: None,
         }
     }
 

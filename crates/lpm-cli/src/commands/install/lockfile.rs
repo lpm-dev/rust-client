@@ -191,6 +191,13 @@ pub(super) struct OnlineLockfileWritePhaseInput<'a> {
 pub(super) struct OnlineLockfileWritePhaseResult {
     pub(super) write_ms: u128,
     pub(super) write_count: u64,
+    pub(super) committed_lockfile: Option<Arc<lpm_lockfile::Lockfile>>,
+    pub(super) committed_stamp: Option<(u64, std::time::SystemTime)>,
+}
+
+fn lockfile_stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
 }
 
 impl OnlineLockfileWritePhaseResult {
@@ -212,6 +219,10 @@ pub(super) fn run_online_lockfile_write_phase(
             input.lockfile_path,
             "write",
         )?);
+        if !workspace_lockfile::active() {
+            result.committed_stamp = lockfile_stamp(input.lockfile_path);
+            result.committed_lockfile = Some(Arc::new(lockfile));
+        }
         return Ok(result);
     }
 
@@ -220,7 +231,7 @@ pub(super) fn run_online_lockfile_write_phase(
     {
         let refreshed_urls =
             refreshed_tarball_urls(&lockfile, input.lockfile_path, input.fresh_urls)?;
-        if let Some(write_ms) = rewrite_fast_path_lockfile_if_needed(
+        let (lockfile, write_ms) = rewrite_fast_path_lockfile_if_needed(
             lockfile,
             input.lockfile_path,
             input.current_lockfile_patches,
@@ -232,9 +243,19 @@ pub(super) fn run_online_lockfile_write_phase(
             },
             input.obsolete_binary_lockfile,
             input.json_output,
-        )? {
+        )?;
+        if let Some(write_ms) = write_ms {
             result.record_write(write_ms);
         }
+        if !workspace_lockfile::active() {
+            result.committed_stamp = lockfile_stamp(input.lockfile_path);
+            result.committed_lockfile = Some(lockfile);
+        }
+    } else if !workspace_lockfile::active()
+        && let Some(lockfile) = input.fast_path_lockfile
+    {
+        result.committed_stamp = lockfile_stamp(input.lockfile_path);
+        result.committed_lockfile = Some(lockfile);
     }
 
     Ok(result)
@@ -539,7 +560,7 @@ fn rewrite_fast_path_lockfile_if_needed(
     fetched: FetchWritebacks<'_>,
     obsolete_binary_lockfile: bool,
     json_output: bool,
-) -> Result<Option<u128>, LpmError> {
+) -> Result<(Arc<lpm_lockfile::Lockfile>, Option<u128>), LpmError> {
     let reasons = FastPathLockfileRewriteReasons {
         tarball_url_change_count: fetched.tarball_urls.len(),
         unrecordable_hint_count: fetched.unrecordable_tarball_hints,
@@ -555,7 +576,7 @@ fn rewrite_fast_path_lockfile_if_needed(
                 .map_err(|error| LpmError::Registry(error.to_string()))?;
             emit_obsolete_binary_lockfile_notice(json_output);
         }
-        return Ok(None);
+        return Ok((lockfile, None));
     }
 
     if workspace_lockfile::active() {
@@ -600,7 +621,7 @@ fn rewrite_fast_path_lockfile_if_needed(
     if obsolete_binary_lockfile {
         emit_obsolete_binary_lockfile_notice(json_output);
     }
-    Ok(Some(write_ms))
+    Ok((lockfile, Some(write_ms)))
 }
 
 #[derive(Clone, Copy)]

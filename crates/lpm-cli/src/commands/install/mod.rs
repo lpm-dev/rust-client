@@ -1779,19 +1779,7 @@ async fn run_with_options_under_store_lock(
     //
     // Apply is unconditional even on the lockfile fast path: see the
     // module-level comment in `patch_engine.rs` for why.
-    let has_duplicate_materialized_coords = {
-        let mut seen: HashMap<(&str, &str), &Path> =
-            HashMap::with_capacity(link_result.materialized.len());
-        link_result.materialized.iter().any(|entry| {
-            seen.insert(
-                (entry.name.as_str(), entry.version.as_str()),
-                entry.destination.as_path(),
-            )
-            .is_some_and(|prev| prev != entry.destination.as_path())
-        })
-    };
-    let needs_full_baseline_index =
-        !current_patches.is_empty() || has_duplicate_materialized_coords;
+    let needs_full_baseline_index = !current_patches.is_empty();
     let baseline_index = store_version.uses_virtual_store().then(|| {
         if needs_full_baseline_index {
             lpm_store::V2BaselineIndex::for_project(project_dir, lpm_root)
@@ -2348,9 +2336,18 @@ async fn run_with_options_under_store_lock(
             && direct_versions_out.is_none()
             && policy_project_dir == project_dir
         {
+            let parsed_lockfile = if !auto_build_attempted {
+                lockfile_write_result
+                    .committed_lockfile
+                    .as_deref()
+                    .zip(lockfile_write_result.committed_stamp)
+            } else {
+                None
+            };
             Some(PostInstallSyncNoopProofContext {
                 routes: &route_table,
                 auto_install_peers,
+                parsed_lockfile,
             })
         } else {
             None
@@ -2383,6 +2380,14 @@ async fn run_with_options_under_store_lock(
     // collisions on the same name are impossible by construction.
     if let Some(out) = direct_versions_out {
         out.extend(collect_direct_versions(&packages));
+    }
+
+    if !workspace_resolution::active() {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            client.flush_pending_cache_writes(),
+        )
+        .await;
     }
 
     Ok(())

@@ -41,6 +41,7 @@ pub use greedy::{
     resolve_greedy_fused_with_cache_options_policy_and_selected_events,
     resolve_greedy_fused_with_cache_options_policy_and_selected_events_roots,
     resolve_greedy_fused_workspace_with_cache_options_and_policy,
+    resolve_greedy_fused_workspace_with_cache_options_policy_and_selected_events,
 };
 pub use npm_version::NpmVersion;
 pub use overrides::{

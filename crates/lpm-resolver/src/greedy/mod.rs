@@ -90,6 +90,7 @@ pub use fused::{
 pub use types::PeerConflictReport;
 pub use workspace::{
     WorkspaceResolveOutcome, resolve_greedy_fused_workspace_with_cache_options_and_policy,
+    resolve_greedy_fused_workspace_with_cache_options_policy_and_selected_events,
 };
 
 #[doc(hidden)]

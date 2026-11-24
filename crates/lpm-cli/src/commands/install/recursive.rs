@@ -389,6 +389,10 @@ pub(crate) async fn run_recursive_workspace_install(
         // Read once, before any member's install can replace the lockfile.
         let locked_integrities = super::LockedIntegrities::detect(&workspace_root)?;
         let options = Arc::new(options);
+        let target_has_scripts: HashMap<PathBuf, bool> = targets
+            .iter()
+            .map(|target| (target.path.clone(), target.lifecycle.has_scripts()))
+            .collect();
         let workspace_freshness_cache =
             Arc::new(crate::workspace_discovery_cache::WorkspaceFreshnessCache::default());
         let scheduler = async {
@@ -506,11 +510,14 @@ pub(crate) async fn run_recursive_workspace_install(
 
             match first_error {
                 Some(error) => Err(error),
-                None => Ok(outcomes.into_iter().flatten().collect::<Vec<_>>()),
+                None => Ok((
+                    active_workspace,
+                    outcomes.into_iter().flatten().collect::<Vec<_>>(),
+                )),
             }
         };
-        let outcomes = match scheduler.await {
-            Ok(outcomes) => outcomes,
+        let (active_workspace, outcomes) = match scheduler.await {
+            Ok(result) => result,
             Err(error) => {
                 return Err(rollback_workspace_project_state(
                     &workspace_project_state_coordinator,
@@ -536,6 +543,31 @@ pub(crate) async fn run_recursive_workspace_install(
             workspace_lockfile::remove_member_lockfiles(&legacy_importers);
         }
 
+        let sync_noop_targets: Vec<sync_noop::WorkspaceSyncNoopTargetInput<'_>> = outcomes
+            .iter()
+            .map(|outcome| sync_noop::WorkspaceSyncNoopTargetInput {
+                name: outcome.name.as_str(),
+                path: outcome.path.as_path(),
+                kind: outcome.kind,
+                has_scripts: target_has_scripts
+                    .get(outcome.path.as_path())
+                    .copied()
+                    .unwrap_or(true),
+                no_dependencies: outcome
+                    .report
+                    .as_ref()
+                    .and_then(|report| report.get("no_dependencies"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            })
+            .collect();
+        sync_noop::write_workspace_sync_noop_state(
+            &active_workspace,
+            &sync_noop_targets,
+            &options,
+            filters.is_empty() && filter_prod.is_empty(),
+        );
+
         if options.emit_summary {
             emit_workspace_install_report(
                 &workspace_root,
@@ -546,6 +578,11 @@ pub(crate) async fn run_recursive_workspace_install(
                 duration_ms(started.elapsed()),
             );
         }
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            client.flush_pending_cache_writes(),
+        )
+        .await;
         Ok(())
     })
     .await

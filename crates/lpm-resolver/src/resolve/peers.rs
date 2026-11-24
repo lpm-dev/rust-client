@@ -825,6 +825,8 @@ pub fn check_unmet_peers(
                             peer_version_satisfies(&version, parsed_range.as_ref(), tagged_version);
                         (std::borrow::Cow::Owned(version), satisfies)
                     })
+            } else if peer.optional && peer.alias.is_some() {
+                None
             } else {
                 resolve_peer_binding_version(
                     &resolved_pkg.package,

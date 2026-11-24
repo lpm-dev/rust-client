@@ -368,6 +368,9 @@ pub(super) struct ResolveState {
     /// node and append. Per-canonical lists are tiny in practice
     /// (1-2 entries even on big trees), so the linear scan is cheap.
     pub(super) resolved: AHashMap<CanonicalKey, Vec<(NpmVersion, NodeId)>>,
+    /// Declared root-dependency nodes indexed by canonical for O(1) lookup in
+    /// `newest_satisfying_root_node` instead of scanning all root children.
+    pub(super) declared_root_nodes: AHashMap<CanonicalKey, Vec<NodeId>>,
     /// Resolved nodes in declaration order. `nodes[i].id == i`.
     pub(super) nodes: Vec<ResolvedNodeBuilder>,
     /// Set of `(canonical, version)` pairs whose declared deps have
@@ -501,6 +504,7 @@ impl ResolveState {
             optional_root_names,
             task_queue: VecDeque::with_capacity(256),
             resolved: AHashMap::with_capacity(512),
+            declared_root_nodes: AHashMap::with_capacity(64),
             nodes: Vec::with_capacity(512),
             children_enqueued: AHashSet::with_capacity(512),
             platform_skipped: 0,

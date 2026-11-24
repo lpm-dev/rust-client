@@ -87,28 +87,54 @@ impl GraphKeyCache {
         platform: &PlatformTuple,
         linker_tag: LinkerModeTag,
     ) -> Vec<Arc<GraphKey>> {
-        let own_digests: Vec<[u8; 32]> = {
-            let mut entries = self.lock();
+        let fingerprints: Vec<u64> = targets
+            .iter()
+            .map(|target| graph_key_input_fingerprint(target, platform, linker_tag))
+            .collect();
+        let mut own_digests: Vec<Option<[u8; 32]>> = {
+            let entries = self.lock();
             targets
                 .iter()
-                .map(|target| {
-                    let fingerprint = graph_key_input_fingerprint(target, platform, linker_tag);
-                    let bucket = entries.own_digests.entry(fingerprint).or_default();
-                    if let Some(cached) = bucket
-                        .iter()
-                        .find(|cached| cached.input.matches(target, platform, linker_tag))
-                    {
-                        return cached.own;
-                    }
-                    let own = own_digest(target, platform, linker_tag);
-                    bucket.push(CachedOwnDigest {
-                        input: GraphKeyCacheInput::from_target(target, platform, linker_tag),
-                        own,
-                    });
-                    own
+                .zip(fingerprints.iter().copied())
+                .map(|(target, fingerprint)| {
+                    entries.own_digests.get(&fingerprint).and_then(|bucket| {
+                        bucket
+                            .iter()
+                            .find(|cached| cached.input.matches(target, platform, linker_tag))
+                            .map(|cached| cached.own)
+                    })
                 })
                 .collect()
         };
+        let mut misses: Vec<(u64, CachedOwnDigest)> = Vec::new();
+        for ((slot, target), fingerprint) in
+            own_digests.iter_mut().zip(targets.iter()).zip(fingerprints)
+        {
+            if slot.is_none() {
+                let own = own_digest(target, platform, linker_tag);
+                *slot = Some(own);
+                misses.push((
+                    fingerprint,
+                    CachedOwnDigest {
+                        input: GraphKeyCacheInput::from_target(target, platform, linker_tag),
+                        own,
+                    },
+                ));
+            }
+        }
+        if !misses.is_empty() {
+            let mut entries = self.lock();
+            for (fingerprint, item) in misses {
+                let bucket = entries.own_digests.entry(fingerprint).or_default();
+                if !bucket.iter().any(|existing| existing.own == item.own) {
+                    bucket.push(item);
+                }
+            }
+        }
+        let own_digests: Vec<[u8; 32]> = own_digests
+            .into_iter()
+            .map(|slot| slot.expect("every target digest is computed"))
+            .collect();
         // Workspace members derive their keys at once, so the walk over the
         // graph stays outside the lock.
         let digests = linked_digests(targets, &own_digests);

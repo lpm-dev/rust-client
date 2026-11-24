@@ -110,7 +110,31 @@ pub(crate) fn run() -> Result<()> {
                 .is_some_and(install_state::is_workspace_root_content)
                 || install_state::has_pnpm_workspace_yaml(&cwd);
 
-            if !workspace_root_install && let Some(pkg_content) = pkg_content_opt.as_deref() {
+            if workspace_root_install {
+                match commands::install::sync_noop::try_workspace_up_to_date(
+                    &cwd,
+                    pkg_content_opt.as_deref(),
+                    &fast_lane,
+                ) {
+                    Ok(Some(hit)) => {
+                        if !cwd.join(".lpm").join(".gitignore").exists() {
+                            keep_state_ignored_at_exit_from(&cwd);
+                            keep_state_ignored_at_exit();
+                        }
+                        let elapsed_ms =
+                            u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        commands::install::sync_noop::emit_workspace_sync_noop_report(
+                            &cwd, &hit, &fast_lane, elapsed_ms,
+                        );
+                        std::process::exit(0);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        keep_state_ignored_at_exit_from(&cwd);
+                        exit_with_lpm_error(&error, fast_lane.json);
+                    }
+                }
+            } else if let Some(pkg_content) = pkg_content_opt.as_deref() {
                 match commands::install::sync_noop::is_up_to_date(&cwd, pkg_content, &fast_lane) {
                     Ok(true) => {
                         if !cwd.join(".lpm").join(".gitignore").exists() {
