@@ -148,34 +148,35 @@ async fn run_workspace_fetch_overlap_hub(
     let mut tasks = tokio::task::JoinSet::new();
     let mut identities_by_task = HashMap::new();
 
-    let spawn_one = |item: PendingWorkspaceFetch,
-                     pool: &mut Option<WorkspaceFetchPool>,
-                     tasks: &mut tokio::task::JoinSet<FetchOverlapTaskStatus>,
-                     identities_by_task: &mut HashMap<tokio::task::Id, String>| {
-        let shared_pool =
-            pool.get_or_insert_with(|| WorkspaceFetchPool::from_context(&item.context));
-        let context = item.context;
-        let abort_handle = tasks.spawn(
-            fetch_selected_package(
-                item.package,
-                None,
-                context.client.clone(),
-                context.route_table.clone(),
-                shared_pool.store.clone(),
-                shared_pool.store_v2_handle.clone(),
-                shared_pool.fetch_semaphore.clone(),
-                shared_pool.fetch_coord.clone(),
-                context.project_dir.clone(),
-                context.gate_stats.clone(),
-                shared_pool.fetch_extract_limiter.clone(),
-                context.install_accounting,
-                context.streaming_fetch,
-                ArtifactSelection::FreshResolution,
-            )
-            .instrument(item.timeline),
-        );
-        identities_by_task.insert(abort_handle.id(), item.identity);
-    };
+    let spawn_one =
+        |item: PendingWorkspaceFetch,
+         pool: &mut Option<WorkspaceFetchPool>,
+         tasks: &mut tokio::task::JoinSet<FetchOverlapTaskStatus>,
+         identities_by_task: &mut HashMap<tokio::task::Id, String>| {
+            let shared_pool =
+                pool.get_or_insert_with(|| WorkspaceFetchPool::from_context(&item.context));
+            let context = item.context;
+            let abort_handle = tasks.spawn(
+                fetch_selected_package(
+                    item.package,
+                    None,
+                    context.client.clone(),
+                    context.route_table.clone(),
+                    shared_pool.store.clone(),
+                    shared_pool.store_v2_handle.clone(),
+                    shared_pool.fetch_semaphore.clone(),
+                    shared_pool.fetch_coord.clone(),
+                    context.project_dir.clone(),
+                    context.gate_stats.clone(),
+                    shared_pool.fetch_extract_limiter.clone(),
+                    context.install_accounting,
+                    context.streaming_fetch,
+                    ArtifactSelection::FreshResolution,
+                )
+                .instrument(item.timeline),
+            );
+            identities_by_task.insert(abort_handle.id(), item.identity);
+        };
 
     loop {
         while tasks.len() < task_limit

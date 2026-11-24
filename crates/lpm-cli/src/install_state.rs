@@ -1986,8 +1986,8 @@ fn fast_lane_mode_from_args(args: &[&str]) -> Option<FastLaneMode> {
             // Install-specific flags that disqualify the fast lane.
             // ANY of these means semantics differ from a bare `lpm install`.
             "--force" | "--offline" | "--filter" | "-w" | "--workspace-root"
-            | "--fail-if-no-match" | "--allow-new" | "--exact" | "--tilde"
-            | "--save-prefix" | "-D" | "--save-dev" | "--auto-build"
+            | "--fail-if-no-match" | "--allow-new" | "--exact" | "--tilde" | "--save-prefix"
+            | "-D" | "--save-dev" | "--auto-build"
                 if found_install =>
             {
                 return None;
@@ -2200,7 +2200,11 @@ mod tests {
             &["install", "--linker", "--json"][..],
             &["install", "--linker=bogus"][..],
             &["install", "--linker", "hoisted", "--linker=isolated"][..],
-            &["install", "--no-audit-after-install", "--no-audit-after-install"][..],
+            &[
+                "install",
+                "--no-audit-after-install",
+                "--no-audit-after-install",
+            ][..],
         ] {
             assert_eq!(
                 fast_lane_mode_from_args(rejected),

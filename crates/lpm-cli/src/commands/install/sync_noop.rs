@@ -59,7 +59,10 @@ pub(crate) fn is_up_to_date(
         return Ok(false);
     }
     let (linker, _) = crate::linker_config::resolve_effective_linker_with_source_and_workspace(
-        mode.linker, &package, &global, false,
+        mode.linker,
+        &package,
+        &global,
+        false,
     )
     .map_err(LpmError::Registry)?;
     let integrity = crate::commands::config::resolve_object_integrity_policy(&global)?;
@@ -663,8 +666,7 @@ pub(super) fn write_workspace_sync_noop_state(
             return None;
         }
         let lock_text = std::str::from_utf8(&lock_raw).ok()?;
-        let has_node_engines =
-            crate::engine_check::lockfile_has_dependency_node_engines(lock_text);
+        let has_node_engines = crate::engine_check::lockfile_has_dependency_node_engines(lock_text);
 
         let (linker, _) = crate::linker_config::resolve_effective_linker_with_source_and_workspace(
             options.linker_override,
@@ -981,8 +983,7 @@ pub(crate) fn try_workspace_up_to_date(
         &resolved_age.minimum_release_age_exclude,
         false,
     );
-    if current_release_age_key.is_some()
-        && current_release_age_key != state.release_age_policy_key
+    if current_release_age_key.is_some() && current_release_age_key != state.release_age_policy_key
     {
         return Ok(None);
     }

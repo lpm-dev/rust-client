@@ -124,10 +124,7 @@ pub(crate) fn run() -> Result<()> {
                         let elapsed_ms =
                             u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
                         commands::install::sync_noop::emit_workspace_sync_noop_report(
-                            &cwd,
-                            &hit,
-                            &fast_lane,
-                            elapsed_ms,
+                            &cwd, &hit, &fast_lane, elapsed_ms,
                         );
                         std::process::exit(0);
                     }

@@ -110,7 +110,7 @@ impl GraphKeyCache {
         for ((slot, target), fingerprint) in own_digests
             .iter_mut()
             .zip(targets.iter())
-            .zip(fingerprints.into_iter())
+            .zip(fingerprints)
         {
             if slot.is_none() {
                 let own = own_digest(target, platform, linker_tag);

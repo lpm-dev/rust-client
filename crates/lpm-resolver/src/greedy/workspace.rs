@@ -515,7 +515,8 @@ fn package_indices_by_canonical(packages: &[ResolvedPackage]) -> HashMap<String,
             .push(position);
     }
     for positions in index.values_mut() {
-        positions.sort_unstable_by(|left, right| packages[*right].version.cmp(&packages[*left].version));
+        positions
+            .sort_unstable_by(|left, right| packages[*right].version.cmp(&packages[*left].version));
     }
     index
 }
@@ -2016,14 +2017,18 @@ mod tests {
                 ("react".to_string(), "19.1.4".to_string()),
                 ("ui".to_string(), "1.0.0".to_string()),
             ])),
-            RootDependencies::required(HashMap::from([
-                ("react".to_string(), "19.1.4".to_string()),
-            ])),
+            RootDependencies::required(HashMap::from([(
+                "react".to_string(),
+                "19.1.4".to_string(),
+            )])),
         ];
         let outcome = resolve_roots_with_policies(
             roots,
             vec![
-                ("ui", cached_package(&[("1.0.0", &[], &[("react-dom", "^19.0.0")])])),
+                (
+                    "ui",
+                    cached_package(&[("1.0.0", &[], &[("react-dom", "^19.0.0")])]),
+                ),
                 (
                     "react-dom",
                     cached_package(&[("19.3.1", &[], &[("react", "^19.3.1")])]),
@@ -2052,7 +2057,10 @@ mod tests {
             "ambient peer synthesis must not overwrite manifest-declared root_resolutions"
         );
         assert!(
-            !ui_result.ambient_peer_installs.iter().any(|name| name == "react"),
+            !ui_result
+                .ambient_peer_installs
+                .iter()
+                .any(|name| name == "react"),
             "manifest-declared root must not be recorded as an ambient peer install"
         );
 

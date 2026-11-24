@@ -3678,7 +3678,8 @@ async fn peer_drain_hard_errors_when_no_required_consumer_satisfiable() {
 }
 
 #[tokio::test]
-async fn peer_drain_warns_and_reuses_existing_provider_when_required_range_matches_no_published_version() {
+async fn peer_drain_warns_and_reuses_existing_provider_when_required_range_matches_no_published_version()
+ {
     let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
     let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
     let server = push_node(&mut state, CanonicalKey::npm("@trpc/server"), "11.30.3");

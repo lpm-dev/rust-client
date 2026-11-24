@@ -1271,12 +1271,22 @@ mod tests {
         .unwrap();
         let store = Arc::new(lpm_store::v2::Store::at(temp.path().join("store")));
         let sri = lpm_store::compute_sri_hash(b"ms-2.1.3-tarball");
-        store.populate_object_from_local_source(&source, &sri).unwrap();
+        store
+            .populate_object_from_local_source(&source, &sri)
+            .unwrap();
 
-        let first_id =
-            lpm_common::PackageInstanceId::derive("ms", "2.1.3", "registry+npm", "member-a/debug@3");
-        let second_id =
-            lpm_common::PackageInstanceId::derive("ms", "2.1.3", "registry+npm", "member-b/debug@4");
+        let first_id = lpm_common::PackageInstanceId::derive(
+            "ms",
+            "2.1.3",
+            "registry+npm",
+            "member-a/debug@3",
+        );
+        let second_id = lpm_common::PackageInstanceId::derive(
+            "ms",
+            "2.1.3",
+            "registry+npm",
+            "member-b/debug@4",
+        );
         assert_ne!(first_id, second_id);
 
         let mk_target = |instance_id| lpm_linker::v2::V2Target {
