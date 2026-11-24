@@ -1,10 +1,11 @@
 //! The quality checks a package's archive decides, run on its files as they
 //! stream past. LPM.dev Registry runs them on every published release with
 //! `lpm internal-package-signals`, and `lpm publish --check` runs them on the
-//! tarball it would upload, so the two always agree. The checks that need
-//! registry data (trusted publishing, signed provenance, the verified
-//! repository, the owner's verified domain, approved Agent Skills) are
-//! LPM.dev Registry's; [`spec`] lists them with the rest.
+//! tarball it would upload, so the two agree when they run the same CLI
+//! version. The checks that need registry data (trusted publishing, signed
+//! provenance, a provenance repository that matches `package.json`, the
+//! owner's verified domain, approved Agent Skills) are LPM.dev Registry's;
+//! [`spec`] lists them with the rest.
 
 mod js;
 mod js_api;

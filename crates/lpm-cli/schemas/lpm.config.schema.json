@@ -30,7 +30,7 @@
     },
     "importAlias": {
       "type": "string",
-      "description": "Author's import alias prefix used in the source files. It must end with `/` and stand for the package root, so the rest of each import is a path inside the package (e.g., with `@/`, `@/components/button` refers to `components/button`). `lpm add` rewrites matching imports in the copied source to the consumer's alias from `--alias` or the project's tsconfig.json or jsconfig.json paths."
+      "description": "The import prefix that the package source uses. `lpm add` removes it from each import and looks up the rest as a path from the tarball root, with optional extensions and index files. End the prefix with `/`, such as `@/`, and map it to the tarball root in tsconfig.json. With `@/components`, the rest of `@/components/button` is `/button`, which matches no file. `lpm add` rewrites matched imports to the consumer alias from `--alias`, tsconfig.json or jsconfig.json paths, or the prompt. Without a consumer alias, it writes relative imports. An empty prefix counts as no prefix, and Swift sources are not rewritten."
     },
     "configSchema": {
       "type": "object",
