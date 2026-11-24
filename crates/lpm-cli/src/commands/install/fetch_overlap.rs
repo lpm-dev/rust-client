@@ -393,6 +393,7 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
     fetch_extract_limiter: FetchExtractLimiter,
     install_accounting: ManagedInstallAccounting,
     dependency_engine_policy: Arc<crate::engine_check::DependencyEnginePolicy>,
+    omit_optional: bool,
     streaming_fetch: bool,
     streaming_lane: Option<Arc<super::fetch::V2StreamingLane>>,
     min_selected: usize,
@@ -457,6 +458,7 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
                                     &fetch_extract_limiter,
                                     install_accounting,
                                     dependency_engine_policy.as_ref(),
+                                    omit_optional,
                                     streaming_fetch,
                                     &mut seen,
                                     &mut tasks,
@@ -480,6 +482,7 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
                         &fetch_extract_limiter,
                         install_accounting,
                         dependency_engine_policy.as_ref(),
+                        omit_optional,
                         streaming_fetch,
                         &mut seen,
                         &mut tasks,
@@ -523,6 +526,7 @@ pub(super) fn spawn_workspace_fetch_overlap_dispatcher(
     fetch_extract_limiter: FetchExtractLimiter,
     install_accounting: ManagedInstallAccounting,
     dependency_engine_policy: Arc<crate::engine_check::DependencyEnginePolicy>,
+    omit_optional: bool,
     streaming_fetch: bool,
 ) -> FetchOverlapJoin {
     let context = Arc::new(WorkspaceFetchRequestContext {
@@ -577,7 +581,7 @@ pub(super) fn spawn_workspace_fetch_overlap_dispatcher(
                         &context.route_table,
                         &context.client,
                     );
-                    if package.optional {
+                    if package.optional && (omit_optional || package.integrity.is_none()) {
                         stats.skipped_optional_count =
                             stats.skipped_optional_count.saturating_add(1);
                         continue;
@@ -785,13 +789,14 @@ fn dispatch_selected_event(
     fetch_extract_limiter: &FetchExtractLimiter,
     install_accounting: ManagedInstallAccounting,
     dependency_engine_policy: &crate::engine_check::DependencyEnginePolicy,
+    omit_optional: bool,
     streaming_fetch: bool,
     seen: &mut HashSet<String>,
     tasks: &mut tokio::task::JoinSet<FetchOverlapTaskStatus>,
     stats: &mut FetchOverlapStats,
 ) {
     let package = install_package_from_selected_event(event, route_table, client.as_ref());
-    if package.optional {
+    if package.optional && (omit_optional || package.integrity.is_none()) {
         stats.skipped_optional_count = stats.skipped_optional_count.saturating_add(1);
         return;
     }
@@ -809,7 +814,8 @@ fn dispatch_selected_event(
         stats.cache_hit_count = stats.cache_hit_count.saturating_add(1);
         return;
     }
-    let qualifies_for_streaming = super::resolve::is_streaming_candidate(&package)
+    let qualifies_for_streaming = !package.optional
+        && super::resolve::is_streaming_candidate(&package)
         && package
             .unpacked_size
             .is_some_and(|size| size.get() >= super::fetch::LARGE_V2_STREAMING_OBJECT_BYTES)
@@ -1553,6 +1559,7 @@ mod tests {
             None,
             ManagedInstallAccounting,
             policy,
+            false,
             true,
             Some(Arc::clone(&lane)),
             1,
@@ -1580,5 +1587,142 @@ mod tests {
             lane.try_claim(),
             "packages without integrity metadata must not claim the streaming lane"
         );
+    }
+
+    #[tokio::test]
+    async fn selected_event_overlap_fetches_compatible_optional_packages_unless_omitted() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        let manifest = br#"{"name":"optional-native","version":"1.0.0"}"#;
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "package/package.json", &manifest[..])
+            .unwrap();
+        let body = archive.into_inner().unwrap().finish().unwrap();
+        let integrity = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/optional-native.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let directory = tempfile::tempdir().unwrap();
+        let client = Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        );
+        let policy = Arc::new(
+            crate::engine_check::prepare_dependency_policy_reusing(
+                directory.path(),
+                true,
+                false,
+                crate::engine_check::NodeVersionReuse::default(),
+            )
+            .unwrap(),
+        );
+
+        let compatible_event = lpm_resolver::SelectedPackageEvent {
+            name: "optional-native".to_string(),
+            version: "1.0.0".to_string(),
+            tarball_url: Some(format!("{}/optional-native.tgz", server.uri())),
+            integrity: Some(integrity.clone()),
+            is_lpm: false,
+            optional: true,
+            platform: None,
+            node_engine: None,
+            unpacked_size: std::num::NonZeroU64::new(
+                super::super::fetch::LARGE_V2_STREAMING_OBJECT_BYTES * 2,
+            ),
+        };
+        let foreign_event = lpm_resolver::SelectedPackageEvent {
+            name: "optional-foreign".to_string(),
+            version: "1.0.0".to_string(),
+            tarball_url: Some(format!("{}/optional-foreign.tgz", server.uri())),
+            integrity: Some(integrity),
+            is_lpm: false,
+            optional: true,
+            platform: Some(lpm_resolver::PlatformMeta {
+                os: vec!["aix".to_string()],
+                ..Default::default()
+            }),
+            node_engine: None,
+            unpacked_size: None,
+        };
+
+        let lane = Arc::new(super::super::fetch::V2StreamingLane::default());
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let join = spawn_fetch_overlap_dispatcher(
+            rx,
+            Arc::clone(&client),
+            RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+            PackageStore::at(directory.path().join("store")),
+            Some(Arc::new(lpm_store::v2::Store::at(
+                directory.path().join("store-v2"),
+            ))),
+            Arc::new(Semaphore::new(4)),
+            Arc::new(FetchCoordinator::default()),
+            directory.path().to_path_buf(),
+            Arc::new(GateStats::default()),
+            None,
+            ManagedInstallAccounting,
+            Arc::clone(&policy),
+            false,
+            true,
+            Some(Arc::clone(&lane)),
+            1,
+        );
+        tx.send(compatible_event.clone()).await.unwrap();
+        tx.send(foreign_event).await.unwrap();
+        drop(tx);
+
+        let result = join.drain().await.unwrap();
+        assert_eq!(result.stats.completed_count, 1);
+        assert_eq!(result.stats.skipped_platform_count, 1);
+        assert_eq!(result.stats.skipped_optional_count, 0);
+        assert!(
+            lane.try_claim(),
+            "optional packages must not claim the streaming lane"
+        );
+
+        let (tx_omitted, rx_omitted) = tokio::sync::mpsc::channel(4);
+        let omitted_join = spawn_fetch_overlap_dispatcher(
+            rx_omitted,
+            client,
+            RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+            PackageStore::at(directory.path().join("store-omitted")),
+            Some(Arc::new(lpm_store::v2::Store::at(
+                directory.path().join("store-v2-omitted"),
+            ))),
+            Arc::new(Semaphore::new(4)),
+            Arc::new(FetchCoordinator::default()),
+            directory.path().to_path_buf(),
+            Arc::new(GateStats::default()),
+            None,
+            ManagedInstallAccounting,
+            policy,
+            true,
+            true,
+            None,
+            1,
+        );
+        tx_omitted.send(compatible_event).await.unwrap();
+        drop(tx_omitted);
+
+        let omitted_result = omitted_join.drain().await.unwrap();
+        assert_eq!(omitted_result.stats.dispatched_count, 0);
+        assert_eq!(omitted_result.stats.skipped_optional_count, 1);
     }
 }

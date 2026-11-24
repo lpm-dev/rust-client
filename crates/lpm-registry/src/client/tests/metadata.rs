@@ -2908,7 +2908,8 @@ async fn get_npm_version_metadata_direct_reuses_stale_immutable_version_without_
         .expect("initial version document fetch should succeed");
     assert!(!first.timings.cache_hit);
 
-    let key = client.npm_direct_version_metadata_cache_key(pkg, version, PublicNpmAccess::ANONYMOUS);
+    let key =
+        client.npm_direct_version_metadata_cache_key(pkg, version, PublicNpmAccess::ANONYMOUS);
     let path = client.cache_path(&key).unwrap();
     filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
 

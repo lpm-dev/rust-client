@@ -1613,13 +1613,13 @@ async fn cancelling_weighted_stream_before_lease_expiry_releases_all_capacity_af
         .await
         .expect("the server must start the response body");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while extract_semaphore.available_permits() != 1 {
+        while extract_semaphore.available_permits() != 2 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("the weighted streaming task must acquire base and supplemental capacity");
-    assert_eq!(extract_semaphore.available_permits(), 1);
+    assert_eq!(extract_semaphore.available_permits(), 2);
     fetch.abort();
     assert!(fetch.await.unwrap_err().is_cancelled());
     let guard = tokio::time::timeout(

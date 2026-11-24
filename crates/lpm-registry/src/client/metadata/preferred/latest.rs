@@ -243,7 +243,11 @@ impl RegistryClient {
         Ok(fetched)
     }
 
-    fn has_stale_preferred_history_validator(&self, name: &str, access: PublicNpmAccess<'_>) -> bool {
+    fn has_stale_preferred_history_validator(
+        &self,
+        name: &str,
+        access: PublicNpmAccess<'_>,
+    ) -> bool {
         let preferred_key = self.npm_preferred_metadata_cache_key(name, access);
         if self
             .read_cache_validator(&preferred_key)

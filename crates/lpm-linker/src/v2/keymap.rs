@@ -642,7 +642,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::Materialization;
+    use crate::{LinkTarget, Materialization};
 
     fn target() -> V2Target {
         let child_id = PackageInstanceId::derive("child", "2.0.0", "registry+npm", "child");

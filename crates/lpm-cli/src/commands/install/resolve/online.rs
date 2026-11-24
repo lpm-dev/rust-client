@@ -358,6 +358,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                                 fetch_extract_limiter.clone(),
                                 install_accounting,
                                 dependency_engine_policy.clone(),
+                                omit_policy.optional,
                                 streaming_fetch,
                                 streaming_fetch.then(|| v2_streaming_lane.clone()),
                                 1,
@@ -395,6 +396,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                                 fetch_extract_limiter.clone(),
                                 install_accounting,
                                 dependency_engine_policy.clone(),
+                                omit_policy.optional,
                                 streaming_fetch,
                             ));
                             Some(tx)
@@ -415,6 +417,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                                 fetch_extract_limiter.clone(),
                                 install_accounting,
                                 dependency_engine_policy.clone(),
+                                omit_policy.optional,
                                 streaming_fetch,
                                 streaming_fetch.then(|| v2_streaming_lane.clone()),
                                 fetch_overlap_min_selected(),

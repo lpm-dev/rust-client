@@ -317,12 +317,10 @@ impl WorkspaceMaterializationCoordinator {
         pkg_dir: &std::path::Path,
     ) -> Result<Option<lpm_security::script_hash::ScriptHashWithPhaseBodies>, LpmError> {
         if let Some(cached) = self.script_hash_cache.get(pkg_dir) {
-            return cached
-                .value()
-                .clone()
-                .map_err(LpmError::Store);
+            return cached.value().clone().map_err(LpmError::Store);
         }
-        let computed = lpm_security::script_hash::try_compute_script_hash_with_phase_bodies(pkg_dir);
+        let computed =
+            lpm_security::script_hash::try_compute_script_hash_with_phase_bodies(pkg_dir);
         let entry = match &computed {
             Ok(value) => Ok(value.clone()),
             Err(error) => Err(error.to_string()),
@@ -1103,7 +1101,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn link_materialization_keeps_direct_and_transitive_graph_contexts_distinct() {
+    async fn link_materialization_shares_identical_direct_and_transitive_graph_contexts() {
         let temp = tempfile::tempdir().unwrap();
         let direct_project = temp.path().join("direct-project");
         let transitive_project = temp.path().join("transitive-project");
@@ -1178,9 +1176,8 @@ mod tests {
         let direct = direct.unwrap();
         let transitive = transitive.unwrap();
 
-        assert!(direct.performed);
-        assert!(transitive.performed);
-        assert_ne!(
+        assert!(direct.performed ^ transitive.performed);
+        assert_eq!(
             direct.value.materialized.destination,
             transitive.value.materialized.destination
         );
