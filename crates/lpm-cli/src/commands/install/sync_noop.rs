@@ -1702,14 +1702,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let marker = root.join("postinstall-ran.txt");
-        let root_pkg = format!(
-            r#"{{"name":"mono","private":true,"workspaces":["packages/*"],"scripts":{{"postinstall":"node -e \"require('fs').writeFileSync('{}', 'ok')\""}}}}"#,
-            marker.to_string_lossy().replace('\\', "\\\\")
-        );
+        let root_pkg = r#"{"name":"mono","private":true,"workspaces":["packages/*"],"scripts":{"postinstall":"node -e \"require('fs').writeFileSync('postinstall-ran.txt', 'ok')\""}}"#;
         let member_dir = root.join("packages/ui");
         std::fs::create_dir_all(member_dir.join("node_modules")).unwrap();
         std::fs::create_dir_all(root.join("node_modules")).unwrap();
-        std::fs::write(root.join("package.json"), &root_pkg).unwrap();
+        std::fs::write(root.join("package.json"), root_pkg).unwrap();
         std::fs::write(
             member_dir.join("package.json"),
             r#"{"name":"@mono/ui","version":"1.0.0"}"#,
@@ -1779,7 +1776,7 @@ mod tests {
             linker: None,
             no_engine_strict: true,
         };
-        let hit = super::try_workspace_up_to_date(root, Some(&root_pkg), &mode)
+        let hit = super::try_workspace_up_to_date(root, Some(root_pkg), &mode)
             .unwrap()
             .expect("workspace with root postinstall should hit sync_noop");
         assert_eq!(hit.targets.len(), 2);
