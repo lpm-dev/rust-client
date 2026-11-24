@@ -222,7 +222,8 @@ fn resolve_and_rewrite(
                     dest_path,
                     file_dest_dir,
                     buyer_alias,
-                    Some(specifier),
+                    specifier,
+                    true,
                     dest_files,
                 );
             }
@@ -234,7 +235,8 @@ fn resolve_and_rewrite(
                         dest_match,
                         file_dest_dir,
                         buyer_alias,
-                        Some(specifier),
+                        specifier,
+                        true,
                         dest_files,
                     );
                 }
@@ -257,7 +259,8 @@ fn resolve_and_rewrite(
                     dest_path,
                     file_dest_dir,
                     buyer_alias,
-                    None,
+                    path,
+                    false,
                     dest_files,
                 );
             }
@@ -270,7 +273,8 @@ fn resolve_and_rewrite(
                     dest_match,
                     file_dest_dir,
                     buyer_alias,
-                    None,
+                    path,
+                    false,
                     dest_files,
                 );
             }
@@ -541,48 +545,30 @@ fn skip_regex(bytes: &[u8], start: usize) -> usize {
 ///
 /// With a buyer alias, the alias is the exact prefix of every delivered file,
 /// as `lpm add` builds it, and the file's path follows it. Without one, the
-/// specifier is relative, or `None` when the original relative import still
-/// points at the file.
+/// specifier is relative. A relative `requested` import that still reaches the
+/// file stays as written when `keep_if_it_resolves` is set, and the result is
+/// `None`.
 fn compute_new_specifier(
     resolved_dest_path: &str,
     file_dest_dir: &str,
     buyer_alias: Option<&str>,
-    original_relative: Option<&str>,
+    requested: &str,
+    keep_if_it_resolves: bool,
     dest_files: &HashSet<&str>,
 ) -> Option<String> {
-    let runtime_extension = [".js", ".mjs", ".cjs", ".json"]
-        .iter()
-        .any(|extension| resolved_dest_path.ends_with(extension));
-    let clean_path = if runtime_extension {
-        resolved_dest_path.to_string()
-    } else {
-        import_path_without_extension(resolved_dest_path, dest_files)
-    };
-
+    let path = import_path_for(resolved_dest_path, requested, dest_files);
     if let Some(alias) = buyer_alias {
-        return Some(format!("{alias}{clean_path}"));
+        return Some(format!("{alias}{path}"));
     }
-
-    // The original import stays when it still reaches the same file: a folder
-    // import through that folder's index, any other through the same path
-    // with or without its extension.
-    if let Some(original) = original_relative
-        && !leaves_the_root(file_dest_dir, original)
-    {
-        let original_target = normalize_path(&join_path(file_dest_dir, original));
-        let unchanged = if names_a_folder(original) {
-            try_resolve_set(&original_target, true, dest_files) == Some(resolved_dest_path)
-        } else {
-            original_target == clean_path
-                || (!runtime_extension
-                    && import_path_without_extension(&original_target, dest_files) == clean_path)
-        };
-        if unchanged {
+    if keep_if_it_resolves && !leaves_the_root(file_dest_dir, requested) {
+        let target = normalize_path(&join_path(file_dest_dir, requested));
+        if try_resolve_set(&target, names_a_folder(requested), dest_files)
+            == Some(resolved_dest_path)
+        {
             return None;
         }
     }
-
-    Some(relative_import_specifier(file_dest_dir, &clean_path))
+    Some(relative_import_specifier(file_dest_dir, &path))
 }
 
 fn relative_import_specifier(from_dir: &str, target: &str) -> String {
@@ -636,9 +622,10 @@ fn leaves_the_root(dir: &str, specifier: &str) -> bool {
 }
 
 /// LPM CLI's lookup for `candidate`, a path from the package root: the file
-/// itself, then with each supported extension, then the folder's index. A
-/// `folder` candidate only tries the index, and an empty one is the package
-/// root.
+/// itself, then the TypeScript source a runtime extension stands for
+/// (`x.js` for `x.ts`), then with each supported extension, then the folder's
+/// index. A `folder` candidate only tries the index, and an empty one is the
+/// package root.
 fn try_resolve<'a>(
     candidate: &str,
     folder: bool,
@@ -650,6 +637,17 @@ fn try_resolve<'a>(
     if !folder && !candidate.is_empty() {
         if let Some(path) = lookup(candidate) {
             return Some(path);
+        }
+        if let Some(runtime) = file_extension(candidate) {
+            let stem = &candidate[..candidate.len() - runtime.len()];
+            for source in typescript_sources_for(runtime) {
+                scratch.clear();
+                scratch.push_str(stem);
+                scratch.push_str(source);
+                if let Some(path) = lookup(&scratch) {
+                    return Some(path);
+                }
+            }
         }
         for ext in EXTENSIONS {
             scratch.clear();
@@ -697,53 +695,77 @@ fn try_resolve_file(candidate: &str, files: &HashSet<String>) -> Option<String> 
     try_resolve_set(candidate, false, &borrowed).map(str::to_string)
 }
 
-/// The import path for a delivered file: without its extension, and without a
-/// trailing `/index` unless a file of the folder's name ships beside it, since
-/// `a` would then load `a.ts` instead of `a/index.ts`.
-/// Files that bundlers or TypeScript also pick for an extensionless import,
-/// though LPM CLI doesn't rewrite them.
+/// Extensions an import must name, since an extensionless import never reaches
+/// them: runtime files and TypeScript's module-format sources.
+const NAMED_EXTENSIONS: &[&str] = &[".js", ".mjs", ".cjs", ".json", ".mts", ".cts"];
+
+/// Files that bundlers or TypeScript pick for an extensionless import before a
+/// folder's index, though LPM CLI doesn't rewrite them.
 const SIBLING_ONLY_EXTENSIONS: &[&str] = &[".json", ".d.ts", ".d.mts", ".d.cts"];
 
-fn import_path_without_extension(path: &str, dest_files: &HashSet<&str>) -> String {
-    let stripped = strip_import_extension(path);
-    let Some(extension) = EXTENSIONS
-        .iter()
-        .find(|extension| path.ends_with(**extension))
-    else {
-        return stripped;
-    };
-    let Some(folder) = path[..path.len() - extension.len()].strip_suffix("/index") else {
-        return stripped;
-    };
-    let mut sibling = String::with_capacity(folder.len() + 6);
-    let has_sibling = EXTENSIONS
-        .iter()
-        .chain(SIBLING_ONLY_EXTENSIONS)
-        .any(|extension| {
-            sibling.clear();
-            sibling.push_str(folder);
-            sibling.push_str(extension);
-            dest_files.contains(sibling.as_str())
-        });
-    if has_sibling {
-        format!("{folder}/index")
-    } else {
-        stripped
+/// The TypeScript sources a runtime extension stands for: `./x.js` loads
+/// `x.ts` or `x.tsx`.
+fn typescript_sources_for(runtime: &str) -> &'static [&'static str] {
+    match runtime {
+        ".js" => &[".ts", ".tsx"],
+        ".jsx" => &[".tsx"],
+        ".mjs" => &[".mts"],
+        ".cjs" => &[".cts"],
+        _ => &[],
     }
 }
 
-/// Strip file extension for import paths. Also strips /index suffixes.
-fn strip_import_extension(path: &str) -> String {
-    for ext in EXTENSIONS {
-        if let Some(stripped) = path.strip_suffix(ext) {
-            return stripped
-                .strip_suffix("/index")
-                .unwrap_or(stripped)
-                .to_string();
+/// The extension of a path's last segment, with its dot.
+fn file_extension(path: &str) -> Option<&str> {
+    let name = path.rsplit('/').next()?;
+    name.rfind('.')
+        .filter(|&dot| dot > 0)
+        .map(|dot| &name[dot..])
+}
+
+/// The import path for `resolved`, a delivered file, in the style the author
+/// wrote `requested`: with the same extension, or with the runtime extension
+/// TypeScript maps to it (`x.js` for `x.ts`). Otherwise it is the shortest
+/// path that LPM CLI's lookup takes back to the same file, keeping `/index`
+/// or the extension when a shorter path would reach another file.
+fn import_path_for(resolved: &str, requested: &str, dest_files: &HashSet<&str>) -> String {
+    let resolved_extension = file_extension(resolved);
+    if let (Some(requested_extension), Some(resolved_extension)) =
+        (file_extension(requested), resolved_extension)
+    {
+        if requested_extension == resolved_extension {
+            return resolved.to_owned();
+        }
+        if typescript_sources_for(requested_extension).contains(&resolved_extension) {
+            let stem = &resolved[..resolved.len() - resolved_extension.len()];
+            let candidate = format!("{stem}{requested_extension}");
+            if try_resolve_set(&candidate, false, dest_files) == Some(resolved) {
+                return candidate;
+            }
         }
     }
-
-    path.to_string()
+    let Some(extension) =
+        resolved_extension.filter(|extension| !NAMED_EXTENSIONS.contains(extension))
+    else {
+        return resolved.to_owned();
+    };
+    let stem = &resolved[..resolved.len() - extension.len()];
+    if let Some(folder) = stem.strip_suffix("/index") {
+        let mut sibling = String::with_capacity(folder.len() + 6);
+        let has_sibling_only = SIBLING_ONLY_EXTENSIONS.iter().any(|sibling_extension| {
+            sibling.clear();
+            sibling.push_str(folder);
+            sibling.push_str(sibling_extension);
+            dest_files.contains(sibling.as_str())
+        });
+        if !has_sibling_only && try_resolve_set(folder, false, dest_files) == Some(resolved) {
+            return folder.to_owned();
+        }
+    }
+    if try_resolve_set(stem, false, dest_files) == Some(resolved) {
+        return stem.to_owned();
+    }
+    resolved.to_owned()
 }
 
 /// Get the directory portion of a path. `"a/b/c.js"` → `"a/b"`, `"c.js"` → `""`.
@@ -799,11 +821,25 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_import_extension() {
-        assert_eq!(strip_import_extension("foo/bar.js"), "foo/bar");
-        assert_eq!(strip_import_extension("foo/bar.tsx"), "foo/bar");
-        assert_eq!(strip_import_extension("foo/bar/index.js"), "foo/bar");
-        assert_eq!(strip_import_extension("foo/bar"), "foo/bar");
+    fn import_path_drops_an_extension_only_when_the_shorter_path_reaches_the_same_file() {
+        let files = HashSet::from([
+            "foo/bar.js",
+            "foo/baz.tsx",
+            "foo/qux/index.ts",
+            "foo/both.ts",
+            "foo/both.js",
+        ]);
+        assert_eq!(import_path_for("foo/baz.tsx", "./x", &files), "foo/baz");
+        assert_eq!(
+            import_path_for("foo/qux/index.ts", "./x", &files),
+            "foo/qux"
+        );
+        assert_eq!(import_path_for("foo/bar.js", "./x", &files), "foo/bar.js");
+        assert_eq!(import_path_for("foo/both.ts", "./x", &files), "foo/both.ts");
+        assert_eq!(
+            import_path_for("foo/baz.tsx", "./x.js", &files),
+            "foo/baz.js"
+        );
     }
 
     #[test]
@@ -1491,6 +1527,8 @@ import { c } from "react";
         }
     }
 
+    type Mapping<'a> = &'a [(&'a str, &'a str)];
+
     fn rewrite(
         content: &str,
         source: &str,
@@ -1559,6 +1597,103 @@ import { c } from "react";
             )
             .as_deref(),
             Some("import v from \"./a/index\";")
+        );
+    }
+
+    #[test]
+    fn an_import_that_still_reaches_its_file_stays_as_written() {
+        let cases: [(&str, Mapping); 5] = [
+            (
+                "./config",
+                &[
+                    ("config/index.ts", "config/index.ts"),
+                    ("config.json", "config.json"),
+                    ("x.ts", "x.ts"),
+                ],
+            ),
+            ("./a", &[("a.js", "a.js"), ("x.ts", "x.ts")]),
+            (
+                "./a/index",
+                &[("a/index.ts", "a/index.ts"), ("x.ts", "x.ts")],
+            ),
+            ("./util.js", &[("util.ts", "util.ts"), ("x.ts", "x.ts")]),
+            ("./view.mjs", &[("view.mts", "view.mts"), ("x.ts", "x.ts")]),
+        ];
+        for (import, mapping) in cases {
+            assert_eq!(
+                rewrite(
+                    &format!("import v from \"{import}\";"),
+                    "x.ts",
+                    "x.ts",
+                    None,
+                    None,
+                    mapping,
+                    &[]
+                ),
+                None,
+                "{import}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rewritten_import_keeps_the_extension_style_its_author_chose() {
+        let cases: [(&str, Mapping, &str); 4] = [
+            (
+                "./util.js",
+                &[("util.ts", "lib/util.ts"), ("x.ts", "x.ts")],
+                "./lib/util.js",
+            ),
+            (
+                "./a.ts",
+                &[("a.ts", "a/index.ts"), ("x.ts", "x.ts")],
+                "./a/index.ts",
+            ),
+            (
+                "./a/index.ts",
+                &[
+                    ("a/index.ts", "a/index.jsx"),
+                    ("other.ts", "a/index.ts"),
+                    ("a.ts", "a.ts"),
+                    ("x.ts", "x.ts"),
+                ],
+                "./a/index",
+            ),
+            (
+                "./view.mts",
+                &[("view.mts", "lib/view.mts"), ("x.ts", "x.ts")],
+                "./lib/view.mts",
+            ),
+        ];
+        for (import, mapping, expected) in cases {
+            assert_eq!(
+                rewrite(
+                    &format!("import v from \"{import}\";"),
+                    "x.ts",
+                    "x.ts",
+                    None,
+                    None,
+                    mapping,
+                    &[]
+                )
+                .as_deref(),
+                Some(format!("import v from \"{expected}\";").as_str()),
+                "{import}"
+            );
+        }
+
+        assert_eq!(
+            rewrite(
+                "import v from \"@/lib/view.jsx\";",
+                "x.ts",
+                "x.ts",
+                Some("@/"),
+                Some("~/"),
+                &[("x.ts", "x.ts")],
+                &["lib/view.jsx", "lib/view.js"],
+            )
+            .as_deref(),
+            Some("import v from \"~/lib/view.jsx\";")
         );
     }
 
