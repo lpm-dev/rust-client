@@ -148,15 +148,22 @@ pub async fn run(
         ))
     })?;
 
-    let mut targets =
-        Vec::with_capacity(lockfile.packages.len() + lockfile.workspace_packages.len());
-    let mut results = Vec::new();
-    for package in lockfile
+    let all_packages: Vec<&LockedPackage> = lockfile
         .packages
         .iter()
         .chain(lockfile.workspace_packages.values())
-    {
-        match classify_package(package, &target_platform)? {
+        .collect();
+    let reachable_for_platform =
+        platform_reachable_indices(&lockfile, &all_packages, &target_platform);
+    let mut targets = Vec::with_capacity(all_packages.len());
+    let mut results = Vec::new();
+    for (idx, package) in all_packages.iter().enumerate() {
+        let plan = if !reachable_for_platform[idx] {
+            FetchPlan::Skip("platform".to_string())
+        } else {
+            classify_package(package, &target_platform)?
+        };
+        match plan {
             FetchPlan::Fetch(target) => targets.push(target),
             FetchPlan::Skip(reason) => results.push(FetchPackageResult {
                 name: package.name.clone(),
@@ -462,6 +469,143 @@ fn emit_route_warnings(route_table: &RouteTable, json_output: bool) {
             crate::output::warn(&lpm_common::sanitize_terminal_inline(warning));
         }
     }
+}
+
+fn platform_reachable_indices(
+    lockfile: &lpm_lockfile::Lockfile,
+    packages: &[&LockedPackage],
+    platform: &FetchPlatform,
+) -> Vec<bool> {
+    let compatible: Vec<bool> = packages
+        .iter()
+        .map(|package| package_matches_platform(package, platform))
+        .collect();
+    if compatible.iter().all(|ok| *ok) {
+        return compatible;
+    }
+
+    let mut by_instance = HashMap::with_capacity(packages.len());
+    let mut by_name_version = HashMap::<(&str, &str), Vec<usize>>::with_capacity(packages.len());
+    for (idx, package) in packages.iter().enumerate() {
+        if let Some(instance_id) = package.instance_id {
+            by_instance.insert(instance_id, idx);
+        }
+        by_name_version
+            .entry((package.name.as_str(), package.version.as_str()))
+            .or_default()
+            .push(idx);
+    }
+
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); packages.len()];
+    let mut has_parent = vec![false; packages.len()];
+    for (idx, package) in packages.iter().enumerate() {
+        let alias_map: HashMap<&str, &str> = package
+            .alias_dependencies
+            .iter()
+            .map(|[local, target]| (local.as_str(), target.as_str()))
+            .collect();
+        for dep_spec in &package.dependencies {
+            let Some((local, version)) = dep_spec.rsplit_once('@') else {
+                continue;
+            };
+            if let Some(target_id) = package.dependency_targets.get(local) {
+                if let Some(&child_idx) = by_instance.get(target_id) {
+                    edges[idx].push(child_idx);
+                    has_parent[child_idx] = true;
+                }
+                continue;
+            }
+            let target_name = alias_map.get(local).copied().unwrap_or(local);
+            if let Some(indices) = by_name_version.get(&(target_name, version)) {
+                for &child_idx in indices {
+                    edges[idx].push(child_idx);
+                    has_parent[child_idx] = true;
+                }
+            }
+        }
+        for peer in &package.peer_edges {
+            if let Some(target_id) = package.peer_targets.get(&peer.local_name) {
+                if let Some(&child_idx) = by_instance.get(target_id) {
+                    edges[idx].push(child_idx);
+                    has_parent[child_idx] = true;
+                }
+                continue;
+            }
+            if let Some(indices) =
+                by_name_version.get(&(peer.target_name.as_str(), peer.target_version.as_str()))
+            {
+                for &child_idx in indices {
+                    edges[idx].push(child_idx);
+                    has_parent[child_idx] = true;
+                }
+            }
+        }
+        if package.peer_edges.is_empty() {
+            for peer_spec in &package.peers {
+                let Some((name, version)) = peer_spec.rsplit_once('@') else {
+                    continue;
+                };
+                if let Some(indices) = by_name_version.get(&(name, version)) {
+                    for &child_idx in indices {
+                        edges[idx].push(child_idx);
+                        has_parent[child_idx] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut reachable = vec![false; packages.len()];
+    let mut queue = std::collections::VecDeque::with_capacity(packages.len());
+    let mut seed_root = |idx: usize| {
+        if compatible[idx] && !reachable[idx] {
+            reachable[idx] = true;
+            queue.push_back(idx);
+        }
+    };
+
+    let mut has_explicit_roots = false;
+    for root in lockfile.root_resolutions.values().chain(
+        lockfile
+            .importers
+            .values()
+            .flat_map(|imp| imp.root_resolutions.values()),
+    ) {
+        has_explicit_roots = true;
+        if let Some(instance_id) = root.instance_id
+            && let Some(&idx) = by_instance.get(&instance_id)
+        {
+            seed_root(idx);
+            continue;
+        }
+        if let Some(indices) = by_name_version.get(&(root.package.as_str(), root.version.as_str()))
+        {
+            for &idx in indices {
+                if root.source.is_none() || packages[idx].source == root.source {
+                    seed_root(idx);
+                }
+            }
+        }
+    }
+
+    if !has_explicit_roots {
+        for (idx, package) in packages.iter().enumerate() {
+            if !has_parent[idx] || !package.optional {
+                seed_root(idx);
+            }
+        }
+    }
+
+    while let Some(idx) = queue.pop_front() {
+        for &child_idx in &edges[idx] {
+            if compatible[child_idx] && !reachable[child_idx] {
+                reachable[child_idx] = true;
+                queue.push_back(child_idx);
+            }
+        }
+    }
+
+    reachable
 }
 
 fn classify_package(

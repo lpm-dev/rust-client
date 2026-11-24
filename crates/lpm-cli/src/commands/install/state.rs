@@ -416,7 +416,7 @@ pub(super) async fn run_install_freshness_phase(
                             && lockfile_deps.is_empty()
                             && workspace_lockfile::exists(input.lockfile_path)
                         {
-                            return Some(Vec::new());
+                            return Some((Vec::new(), Vec::new()));
                         }
                         let route_table = route_table.as_ref()?;
                         // A plain install outside `--recursive` has no active
@@ -470,21 +470,29 @@ pub(super) async fn run_install_freshness_phase(
                             if expected.as_deref().map(AsRef::as_ref) == locked
                                 && keeps_only_recordable_urls
                             {
-                                Some(fast.packages)
+                                Some((fast.packages, fast.lockfile.ambient_peer_installs.clone()))
                             } else {
                                 None
                             }
                         })
                     });
-            if let Some(mut packages) = fast {
+            if let Some((mut packages, ambient_peer_installs)) = fast {
                 if input.omit_policy.dev {
                     filter_dev_packages(&mut packages, input.production_dependency_names);
                 }
                 if input.omit_policy.optional {
-                    filter_optional_packages(&mut packages, input.root_optional_dependency_names);
+                    filter_optional_packages_for_install(
+                        &mut packages,
+                        input.root_optional_dependency_names,
+                        &ambient_peer_installs,
+                    );
                 }
-                filter_platform_packages(&mut packages)?;
-                filter_dependency_engine_packages(&mut packages, input.dependency_engine_policy)?;
+                filter_platform_packages_for_install(&mut packages, &ambient_peer_installs)?;
+                filter_dependency_engine_packages_for_install(
+                    &mut packages,
+                    input.dependency_engine_policy,
+                    &ambient_peer_installs,
+                )?;
                 let skills_ready = input.no_skills
                     || selected_package_skills(&packages)?
                         .iter()

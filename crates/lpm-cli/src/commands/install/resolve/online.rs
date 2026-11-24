@@ -318,6 +318,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         Some(Arc::new(Semaphore::new(speculation_permits))),
                         fetch_coord.clone(),
                         if resolve_ahead
+                            || force
                             || omit_policy.optional
                             || npm_firewall_mode.disables_tarball_prefetch()
                             || tarball_prefetch_held
@@ -326,6 +327,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         } else {
                             speculation_deps
                         },
+                        override_set.clone(),
                         resolver_policy.clone(),
                         dependency_engine_policy.clone(),
                         streaming_fetch.then(|| v2_streaming_lane.clone()),
@@ -544,6 +546,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         None,
                         fetch_coord.clone(),
                         if resolve_ahead
+                            || force
                             || omit_policy.optional
                             || npm_firewall_mode.disables_tarball_prefetch()
                             || tarball_prefetch_held
@@ -552,6 +555,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         } else {
                             speculation_deps
                         },
+                        override_set.clone(),
                         resolver_policy.clone(),
                         dependency_engine_policy.clone(),
                         streaming_fetch.then(|| v2_streaming_lane.clone()),
@@ -722,7 +726,8 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
             &ambient_peer_installs_for_lockfile,
         );
     }
-    platform_skipped += filter_platform_packages(&mut packages)?;
+    platform_skipped +=
+        filter_platform_packages_for_install(&mut packages, &ambient_peer_installs_for_lockfile)?;
     let engine_check_timing =
         dependency_engine_check_timing(&packages, &dependency_engine_policy, requested_v2_mode);
     if engine_check_timing == EngineCheckTiming::AfterNodeProbe
@@ -733,13 +738,9 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         && !npm_firewall_mode.disables_tarball_prefetch()
         && !tarball_prefetch_held
     {
-        // Packages without an engine requirement download while Node is
-        // probed; platform-incompatible optional trees are already pruned above.
-        let unconstrained = packages
-            .iter()
-            .filter(|package| package.node_engine.is_none())
-            .cloned()
-            .collect();
+        // Only registry packages reachable without passing through an optional
+        // engine-constrained ancestor download while Node is probed.
+        let unconstrained = engine_independent_registry_packages(&packages);
         fetch_overlap_join = Some(spawn_fetch_overlap_for_packages(
             unconstrained,
             arc_client.clone(),
@@ -758,10 +759,11 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                 .then(|| v2_streaming_lane.clone()),
         ));
     }
-    let deferred_engine_check = filter_or_defer_dependency_engine_packages(
+    let deferred_engine_check = filter_or_defer_dependency_engine_packages_for_install(
         &mut packages,
         &dependency_engine_policy,
         engine_check_timing,
+        &ambient_peer_installs_for_lockfile,
     )?;
     retain_peer_issues_for_packages(&mut peer_warnings, &mut peer_conflicts, &packages);
 
@@ -777,7 +779,11 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         };
     }
 
-    enforce_registry_integrity_policy(&packages, strict_integrity, json_output)?;
+    if strict_integrity {
+        enforce_registry_integrity_policy(&packages_for_lockfile, strict_integrity, json_output)?;
+    } else {
+        enforce_registry_integrity_policy(&packages, strict_integrity, json_output)?;
+    }
     if !json_output {
         let reported_install_count = requested_add_count.unwrap_or(packages.len());
         let firewall_active = npm_firewall_mode.is_enabled()

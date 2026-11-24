@@ -2966,8 +2966,8 @@ fn collect_bundled_dependencies(
 
 fn bundled_dependency_names(pkg_json: &serde_json::Value) -> Result<Vec<String>, LpmError> {
     let Some(raw) = pkg_json
-        .get("bundledDependencies")
-        .or_else(|| pkg_json.get("bundleDependencies"))
+        .get("bundleDependencies")
+        .or_else(|| pkg_json.get("bundledDependencies"))
     else {
         return Ok(Vec::new());
     };
@@ -8528,5 +8528,18 @@ mod tests {
             .to_string();
 
         assert!(error.contains("unsupported symlink"), "{error}");
+    }
+
+    #[test]
+    fn bundled_dependency_names_prefers_canonical_bundle_dependencies_over_legacy_spelling() {
+        let manifest = serde_json::json!({
+            "name": "dual-field-pkg",
+            "version": "1.0.0",
+            "bundleDependencies": ["canonical-only"],
+            "bundledDependencies": ["legacy-only"]
+        });
+
+        let names = bundled_dependency_names(&manifest).expect("parse bundled names");
+        assert_eq!(names, vec!["canonical-only".to_string()]);
     }
 }

@@ -708,7 +708,7 @@ pub(super) fn normalize_install_package_optional_reachability(
     let mut required: HashSet<PackageIdentity> = HashSet::new();
     let mut queue = VecDeque::new();
     for package in packages.iter() {
-        if package.root_link_names.is_some() || package.is_direct {
+        if (package.root_link_names.is_some() || package.is_direct) && !package.optional {
             let identity = (package.name.clone(), package.version.clone());
             required.insert(identity.clone());
             queue.push_back(identity);

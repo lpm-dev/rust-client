@@ -3895,6 +3895,7 @@ pub(super) fn spawn_speculation_dispatcher(
     speculation_semaphore: Option<Arc<Semaphore>>,
     coord: Arc<FetchCoordinator>,
     deps: HashMap<String, String>,
+    overrides: lpm_resolver::OverrideSet,
     resolver_policy: lpm_resolver::ResolverPolicy,
     dependency_engine_policy: Arc<crate::engine_check::DependencyEnginePolicy>,
     v2_streaming_lane: Option<Arc<V2StreamingLane>>,
@@ -3953,6 +3954,14 @@ pub(super) fn spawn_speculation_dispatcher(
         // Ranges waiting on a specific package's manifest to arrive.
         // Keyed by package name; values are (range, depth, is_root).
         let mut parked: HashMap<String, Vec<(String, u32, bool)>> = HashMap::new();
+        // Transitive ranges waiting on a declared root dependency of the same
+        // package name to pick its version so speculation mirrors greedy's
+        // root-version reuse instead of downloading a superseded `latest`.
+        let mut parked_for_root: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        let mut declared_root_names: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(deps_for_spec.len());
+        let mut root_selected_versions: HashMap<String, Vec<lpm_resolver::NpmVersion>> =
+            HashMap::with_capacity(deps_for_spec.len());
         // "name@version" that have already been dispatched; dedups
         // re-asks for the same pinned version from multiple parents.
         let mut already_dispatched: std::collections::HashSet<String> =
@@ -3971,6 +3980,13 @@ pub(super) fn spawn_speculation_dispatcher(
                 || (name.clone(), range.clone()),
                 |alias| (alias.target, alias.range),
             );
+            declared_root_names.insert(name.clone());
+            if let Ok(exact) = lpm_resolver::NpmVersion::parse(range.trim()) {
+                root_selected_versions
+                    .entry(name.clone())
+                    .or_default()
+                    .push(exact);
+            }
             work_queue.push((name, range, 1, true));
         }
 
@@ -3983,9 +3999,32 @@ pub(super) fn spawn_speculation_dispatcher(
              is_root: bool,
              metadata: &HashMap<String, SpeculativePackageMetadata>,
              parked: &mut HashMap<String, Vec<(String, u32, bool)>>,
+             parked_for_root: &mut HashMap<String, Vec<(String, u32)>>,
+             root_selected_versions: &mut HashMap<String, Vec<lpm_resolver::NpmVersion>>,
              already_dispatched: &mut std::collections::HashSet<String>,
              work_queue: &mut Vec<(String, String, u32, bool)>,
              spec_tasks: &mut tokio::task::JoinSet<()>| {
+                if !overrides.is_empty() && overrides.may_match_package(&name) {
+                    return;
+                }
+                if !is_root && declared_root_names.contains(&name) {
+                    let Some(root_versions) = root_selected_versions.get(&name) else {
+                        parked_for_root.entry(name).or_default().push((range, depth));
+                        return;
+                    };
+                    if let Ok(parsed_range) = lpm_resolver::NpmRange::parse(&range)
+                        && let Some(reused) = root_versions
+                            .iter()
+                            .filter(|version| parsed_range.satisfies(version))
+                            .max()
+                    {
+                        let reused_str = reused.to_string();
+                        if reused_str != range {
+                            work_queue.push((name, reused_str, depth, false));
+                            return;
+                        }
+                    }
+                }
                 let Some(meta) = metadata.get(&name) else {
                     parked
                         .entry(name)
@@ -4025,6 +4064,20 @@ pub(super) fn spawn_speculation_dispatcher(
                     no_match_c.fetch_add(1, Relaxed);
                     return;
                 };
+
+                if is_root
+                    && let Ok(parsed_version) = lpm_resolver::NpmVersion::parse(&version)
+                {
+                    let versions = root_selected_versions.entry(name.clone()).or_default();
+                    if !versions.contains(&parsed_version) {
+                        versions.push(parsed_version);
+                    }
+                    if let Some(waiting) = parked_for_root.remove(&name) {
+                        for (waiting_range, waiting_depth) in waiting {
+                            work_queue.push((name.clone(), waiting_range, waiting_depth, false));
+                        }
+                    }
+                }
 
                 if meta.info.platform_is_compatible(&version) == Some(false) {
                     return;
@@ -4188,6 +4241,8 @@ pub(super) fn spawn_speculation_dispatcher(
                     is_root,
                     &metadata,
                     &mut parked,
+                    &mut parked_for_root,
+                    &mut root_selected_versions,
                     &mut already_dispatched,
                     &mut work_queue,
                     &mut spec_tasks,
@@ -4234,7 +4289,14 @@ pub(super) fn spawn_speculation_dispatcher(
         // server-side cap if this becomes common.
         let orphan_count: u64 = parked.values().map(|v| v.len() as u64).sum();
         parked_c.fetch_add(orphan_count, Relaxed);
-        drop((metadata, parked, already_dispatched, work_queue));
+        drop((
+            metadata,
+            parked,
+            parked_for_root,
+            root_selected_versions,
+            already_dispatched,
+            work_queue,
+        ));
 
         // Wait for all dispatched speculations to either complete or
         // drop — ensures store visibility for the real fetch loop's

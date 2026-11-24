@@ -8,7 +8,6 @@ use lpm_common::color::Painted;
 use lpm_linker::LinkTarget;
 use lpm_registry::{
     GateDecision, ManagedInstallAccounting, RegistryClient, RouteTable, UpstreamRoute,
-    evaluate_cached_url,
 };
 use lpm_resolver::{
     CachedPackageInfo, CanonicalKey, CompiledPeerRules, OverrideHit, OverrideSet,

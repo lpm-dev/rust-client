@@ -1306,8 +1306,13 @@ pub(super) async fn run_offline_install_phase(
             &ambient_peer_installs,
         );
     }
-    let _platform_skipped = filter_platform_packages(&mut locked)?;
-    filter_dependency_engine_packages(&mut locked, dependency_engine_policy)?;
+    let _platform_skipped =
+        filter_platform_packages_for_install(&mut locked, &ambient_peer_installs)?;
+    filter_dependency_engine_packages_for_install(
+        &mut locked,
+        dependency_engine_policy,
+        &ambient_peer_installs,
+    )?;
     if !json_output {
         output::info_line(crate::install_ui::terminal_line!(
             "Offline: using lockfile ({} packages)",
@@ -2676,13 +2681,14 @@ pub(super) fn filter_optional_packages(
     original_len - packages.len()
 }
 
-pub(super) fn filter_optional_packages_for_install(
+fn with_detached_ambient_peers<T, E>(
     packages: &mut Vec<InstallPackage>,
-    optional_roots: &HashSet<String>,
     ambient_peer_installs: &[String],
-) -> usize {
+    clear_optional_on_detach: bool,
+    run: impl FnOnce(&mut Vec<InstallPackage>) -> Result<T, E>,
+) -> Result<T, E> {
     if ambient_peer_installs.is_empty() {
-        return filter_optional_packages(packages, optional_roots);
+        return run(packages);
     }
 
     let ambient_names = ambient_peer_installs
@@ -2704,7 +2710,9 @@ pub(super) fn filter_optional_packages_for_install(
             }
         });
         if !detached.is_empty() {
-            package.optional = false;
+            if clear_optional_on_detach {
+                package.optional = false;
+            }
             detached_root_links.push((
                 package.instance_id,
                 package.name.clone(),
@@ -2718,7 +2726,7 @@ pub(super) fn filter_optional_packages_for_install(
         }
     }
 
-    let skipped = filter_optional_packages(packages, optional_roots);
+    let result = run(packages)?;
     for (instance_id, name, version, source, detached) in detached_root_links {
         let Some(package) = packages.iter_mut().find(|package| {
             instance_id.map_or_else(
@@ -2733,36 +2741,152 @@ pub(super) fn filter_optional_packages_for_install(
         root_link_names.sort_unstable();
         root_link_names.dedup();
     }
+    Ok(result)
+}
+
+pub(super) fn filter_optional_packages_for_install(
+    packages: &mut Vec<InstallPackage>,
+    optional_roots: &HashSet<String>,
+    ambient_peer_installs: &[String],
+) -> usize {
+    let Ok(skipped) = with_detached_ambient_peers::<usize, std::convert::Infallible>(
+        packages,
+        ambient_peer_installs,
+        true,
+        |packages| Ok(filter_optional_packages(packages, optional_roots)),
+    );
     skipped
 }
 
 pub(super) fn filter_platform_packages(
     packages: &mut Vec<InstallPackage>,
 ) -> Result<usize, LpmError> {
-    let mut skipped = 0usize;
-    let mut kept = Vec::with_capacity(packages.len());
+    filter_platform_packages_for_install(packages, &[])
+}
 
-    for package in packages.drain(..) {
-        if package_platform_compatible(&package) {
-            kept.push(package);
-            continue;
+pub(super) fn filter_platform_packages_for_install(
+    packages: &mut Vec<InstallPackage>,
+    ambient_peer_installs: &[String],
+) -> Result<usize, LpmError> {
+    with_detached_ambient_peers(packages, ambient_peer_installs, false, |packages| {
+        let mut skipped = 0usize;
+        let mut kept = Vec::with_capacity(packages.len());
+
+        for package in packages.drain(..) {
+            if package_platform_compatible(&package) {
+                kept.push(package);
+                continue;
+            }
+            if package.optional {
+                skipped += 1;
+                continue;
+            }
+            return Err(LpmError::Registry(format!(
+                "{}@{} is incompatible with this platform",
+                package.name, package.version
+            )));
         }
-        if package.optional {
-            skipped += 1;
-            continue;
+
+        if skipped > 0 {
+            prune_unreachable_packages(&mut kept);
         }
-        return Err(LpmError::Registry(format!(
-            "{}@{} is incompatible with this platform",
-            package.name, package.version
-        )));
+
+        *packages = kept;
+        Ok(skipped)
+    })
+}
+
+/// Return the subset of registry packages reachable from install roots without
+/// traversing any optional package that carries a `node_engine` constraint, so
+/// lockfile-replay overlap never prefetches potential engine-pruned orphans or
+/// non-registry archives while `node --version` is being probed.
+pub(super) fn engine_independent_registry_packages(
+    packages: &[InstallPackage],
+) -> Vec<InstallPackage> {
+    let mut by_instance = HashMap::with_capacity(packages.len());
+    let mut by_name_version = HashMap::<(&str, &str), Vec<usize>>::with_capacity(packages.len());
+    for (idx, package) in packages.iter().enumerate() {
+        if let Some(instance_id) = package.instance_id {
+            by_instance.insert(instance_id, idx);
+        }
+        by_name_version
+            .entry((package.name.as_str(), package.version.as_str()))
+            .or_default()
+            .push(idx);
     }
 
-    if skipped > 0 {
-        prune_unreachable_packages(&mut kept);
+    let blocked = |package: &InstallPackage| package.optional && package.node_engine.is_some();
+    let mut retained = HashSet::with_capacity(packages.len());
+    let mut queue = VecDeque::with_capacity(packages.len());
+    for (idx, package) in packages.iter().enumerate() {
+        if blocked(package) {
+            continue;
+        }
+        let has_root_link = package
+            .root_link_names
+            .as_ref()
+            .is_some_and(|names| !names.is_empty());
+        if (package.is_direct || (has_root_link && !package.optional)) && retained.insert(idx) {
+            queue.push_back(idx);
+        }
     }
 
-    *packages = kept;
-    Ok(skipped)
+    while let Some(idx) = queue.pop_front() {
+        let package = &packages[idx];
+        for (local, version) in &package.dependencies {
+            if let Some(target_id) = package.dependency_targets.get(local) {
+                if let Some(&child_idx) = by_instance.get(target_id)
+                    && !blocked(&packages[child_idx])
+                    && retained.insert(child_idx)
+                {
+                    queue.push_back(child_idx);
+                }
+                continue;
+            }
+            let target_name = package.aliases.get(local).map_or(local, |target| target);
+            if let Some(indices) = by_name_version.get(&(target_name.as_str(), version.as_str())) {
+                for &child_idx in indices {
+                    if !blocked(&packages[child_idx]) && retained.insert(child_idx) {
+                        queue.push_back(child_idx);
+                    }
+                }
+            }
+        }
+        for peer in &package.peers {
+            if let Some(target_id) = package.peer_targets.get(&peer.local_name) {
+                if let Some(&child_idx) = by_instance.get(target_id)
+                    && !blocked(&packages[child_idx])
+                    && retained.insert(child_idx)
+                {
+                    queue.push_back(child_idx);
+                }
+                continue;
+            }
+            if let Some(indices) =
+                by_name_version.get(&(peer.target_name.as_str(), peer.target_version.as_str()))
+            {
+                for &child_idx in indices {
+                    if !blocked(&packages[child_idx]) && retained.insert(child_idx) {
+                        queue.push_back(child_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    packages
+        .iter()
+        .enumerate()
+        .filter(|(idx, package)| {
+            retained.contains(idx)
+                && package.node_engine.is_none()
+                && matches!(
+                    package.source_kind(),
+                    Ok(lpm_lockfile::Source::Registry { .. })
+                )
+        })
+        .map(|(_, package)| package.clone())
+        .collect()
 }
 
 /// Dependency engine checks running while the install downloads.
@@ -2819,13 +2943,14 @@ pub(super) fn dependency_engine_check_timing(
 }
 
 /// Check dependency engines now, or start the checks alongside the downloads.
-pub(super) fn filter_or_defer_dependency_engine_packages(
+pub(super) fn filter_or_defer_dependency_engine_packages_for_install(
     packages: &mut Vec<InstallPackage>,
     policy: &std::sync::Arc<crate::engine_check::DependencyEnginePolicy>,
     timing: EngineCheckTiming,
+    ambient_peer_installs: &[String],
 ) -> Result<Option<DeferredEngineCheck>, LpmError> {
     if timing != EngineCheckTiming::WhileDownloading {
-        filter_dependency_engine_packages(packages, policy)?;
+        filter_dependency_engine_packages_for_install(packages, policy, ambient_peer_installs)?;
         return Ok(None);
     }
     let constrained = packages
@@ -2865,27 +2990,42 @@ pub(super) fn filter_dependency_engine_packages(
     packages: &mut Vec<InstallPackage>,
     policy: &crate::engine_check::DependencyEnginePolicy,
 ) -> Result<usize, LpmError> {
-    let mut skipped = 0usize;
-    let mut kept = Vec::with_capacity(packages.len());
+    filter_dependency_engine_packages_for_install(packages, policy, &[])
+}
 
-    for package in packages.drain(..) {
-        let Some(required) = package.node_engine.as_deref() else {
-            kept.push(package);
-            continue;
-        };
-        if policy.enforce_dependency(&package.name, &package.version, required, package.optional)? {
-            kept.push(package);
-        } else {
-            skipped += 1;
+pub(super) fn filter_dependency_engine_packages_for_install(
+    packages: &mut Vec<InstallPackage>,
+    policy: &crate::engine_check::DependencyEnginePolicy,
+    ambient_peer_installs: &[String],
+) -> Result<usize, LpmError> {
+    with_detached_ambient_peers(packages, ambient_peer_installs, false, |packages| {
+        let mut skipped = 0usize;
+        let mut kept = Vec::with_capacity(packages.len());
+
+        for package in packages.drain(..) {
+            let Some(required) = package.node_engine.as_deref() else {
+                kept.push(package);
+                continue;
+            };
+            if policy.enforce_dependency(
+                &package.name,
+                &package.version,
+                required,
+                package.optional,
+            )? {
+                kept.push(package);
+            } else {
+                skipped += 1;
+            }
         }
-    }
 
-    if skipped > 0 {
-        prune_unreachable_packages(&mut kept);
-    }
+        if skipped > 0 {
+            prune_unreachable_packages(&mut kept);
+        }
 
-    *packages = kept;
-    Ok(skipped)
+        *packages = kept;
+        Ok(skipped)
+    })
 }
 
 pub(super) fn lockfile_satisfies_fast_path_with_packages(
@@ -3617,7 +3757,12 @@ fn try_lockfile_fast_path_from_rows(
                                 .query_string
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
-                        match evaluate_cached_url(url, input.client) {
+                        match lpm_registry::evaluate_cached_url_for_package(
+                            url,
+                            &lp.name,
+                            input.client,
+                            input.route_table,
+                        ) {
                             GateDecision::Accepted => Some(url.to_string()),
                             GateDecision::RejectedScheme => {
                                 // Writer never emits scheme-unsafe URLs,
@@ -4216,5 +4361,68 @@ mod rewrite_notice_tests {
                 None,
             ]
         );
+    }
+
+    #[test]
+    fn filter_platform_packages_detaches_ambient_peer_only_needed_by_skipped_optional() {
+        let foreign_os = if cfg!(target_os = "macos") {
+            "linux"
+        } else {
+            "darwin"
+        };
+        let mk_pkg = |name: &str| InstallPackage {
+            instance_id: None,
+            name: name.into(),
+            version: "1.0.0".into(),
+            source: DEFAULT_REGISTRY_SOURCE.into(),
+            dependencies: Vec::new(),
+            dependency_targets: HashMap::new(),
+            aliases: HashMap::new(),
+            root_link_names: None,
+            is_direct: false,
+            is_lpm: false,
+            peers: Vec::new(),
+            peer_targets: HashMap::new(),
+            integrity: None,
+            unpacked_size: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            node_engine: None,
+            optional: false,
+            tarball_url: None,
+            metadata_checked_for_tarball: false,
+            manifest_fingerprint: None,
+        };
+        let mut root_app = mk_pkg("root-app");
+        root_app.is_direct = true;
+        root_app.root_link_names = Some(vec!["root-app".into()]);
+        root_app
+            .dependencies
+            .push(("foreign-opt".into(), "1.0.0".into()));
+
+        let mut foreign_opt = mk_pkg("foreign-opt");
+        foreign_opt.optional = true;
+        foreign_opt.platform = Some(lpm_resolver::PlatformMeta {
+            os: vec![foreign_os.into()],
+            cpu: Vec::new(),
+            libc: Vec::new(),
+        });
+        foreign_opt
+            .dependencies
+            .push(("orphan-peer".into(), "1.0.0".into()));
+
+        let mut orphan_peer = mk_pkg("orphan-peer");
+        orphan_peer.is_direct = false;
+        orphan_peer.root_link_names = Some(vec!["orphan-peer".into()]);
+
+        let mut packages = vec![root_app, foreign_opt, orphan_peer];
+
+        let skipped =
+            filter_platform_packages_for_install(&mut packages, &["orphan-peer".to_string()])
+                .expect("platform filter succeeds");
+        assert_eq!(skipped, 1);
+        let kept_names: Vec<&str> = packages.iter().map(|pkg| pkg.name.as_str()).collect();
+        assert_eq!(kept_names, vec!["root-app"]);
     }
 }

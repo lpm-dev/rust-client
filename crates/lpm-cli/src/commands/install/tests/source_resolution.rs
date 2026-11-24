@@ -25,7 +25,8 @@ fn read_pkg_json_name_version_rejects_versionless_tarball_manifest() {
     )
     .unwrap();
 
-    let error = read_pkg_json_name_version(directory.path(), "versionless tarball").unwrap_err();
+    let error =
+        read_archive_manifest_metadata(directory.path(), "versionless tarball").unwrap_err();
 
     assert!(error.to_string().contains("has no `version` field"));
 }
@@ -39,7 +40,7 @@ fn read_pkg_json_name_version_rejects_path_unsafe_package_name() {
     )
     .unwrap();
 
-    let error = read_pkg_json_name_version(directory.path(), "unsafe local package")
+    let error = read_archive_manifest_metadata(directory.path(), "unsafe local package")
         .expect_err("path-unsafe package names must be rejected before store path construction");
 
     assert!(error.to_string().contains("invalid package name"));
@@ -54,7 +55,7 @@ fn read_pkg_json_name_version_rejects_non_version_manifest_value() {
     )
     .unwrap();
 
-    let error = read_pkg_json_name_version(directory.path(), "unsafe local package")
+    let error = read_archive_manifest_metadata(directory.path(), "unsafe local package")
         .expect_err("non-version values must be rejected before store path construction");
 
     assert!(error.to_string().contains("invalid package version"));

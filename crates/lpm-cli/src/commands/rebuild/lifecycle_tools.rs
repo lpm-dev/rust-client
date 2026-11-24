@@ -282,8 +282,13 @@ impl LifecycleTools {
                 }
             }
         }
-        // The package's own dependencies answer before the project's.
+        // The package's own dependencies answer before the project's, and
+        // dependencies bundled inside `<pkg>/node_modules/` answer as a
+        // fallback for approved lifecycle scripts (e.g. bundled `node-pre-gyp`).
         providers.append(&mut project_providers);
+        if matches!(scope, ToolScope::Dependencies) {
+            append_bundled_providers(&package_dir, &mut providers);
+        }
         let provider_refs = providers
             .iter()
             .map(|provider| LifecycleBinProvider {
@@ -411,6 +416,54 @@ fn named_green_tools<'a>(scripts: impl Iterator<Item = &'a str>) -> Vec<&'static
 }
 
 /// Where the dependency `edge` of the package `name` at `directory` is linked.
+fn append_bundled_providers(package_dir: &Path, providers: &mut Vec<Provider>) {
+    let bundled_root = package_dir.join("node_modules");
+    let Ok(entries) = std::fs::read_dir(&bundled_root) else {
+        return;
+    };
+    let mut dirs: Vec<(String, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.file_type().is_dir() {
+            continue;
+        }
+        if name.starts_with('@') {
+            let Ok(scoped_entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for scoped in scoped_entries.flatten() {
+                let scoped_name = scoped.file_name().to_string_lossy().into_owned();
+                if scoped_name.starts_with('.') {
+                    continue;
+                }
+                let scoped_path = scoped.path();
+                if std::fs::symlink_metadata(&scoped_path).is_ok_and(|m| m.file_type().is_dir())
+                    && scoped_path.join("package.json").is_file()
+                {
+                    dirs.push((format!("{name}/{scoped_name}"), scoped_path));
+                }
+            }
+        } else if path.join("package.json").is_file() {
+            dirs.push((name, path));
+        }
+    }
+    dirs.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    for (name, directory) in dirs {
+        providers.push(Provider {
+            name,
+            directory,
+            except: Vec::new(),
+        });
+    }
+}
+
 fn dependency_slot(directory: &Path, name: &str, edge: &LinkMetaDep) -> Result<PathBuf, String> {
     lpm_store::v2::link_meta::validate_name_for_path_join(&edge.local).map_err(str::to_string)?;
     Ok(if edge.local == name {
@@ -531,4 +584,39 @@ fn read_graph(directory: &Path, links_root: &Path) -> Result<LinkMeta, String> {
         return Err("lifecycle dependency path does not match its graph metadata".into());
     }
     Ok(meta)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_bundled_providers_discovers_scoped_and_unscoped_bundled_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_dir = dir.path().join("host");
+        let unscoped = pkg_dir.join("node_modules/bundled-tool");
+        let scoped = pkg_dir.join("node_modules/@scope/bundled-cli");
+        let hidden = pkg_dir.join("node_modules/.bin");
+        let no_manifest = pkg_dir.join("node_modules/incomplete");
+        std::fs::create_dir_all(&unscoped).unwrap();
+        std::fs::create_dir_all(&scoped).unwrap();
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::create_dir_all(&no_manifest).unwrap();
+        std::fs::write(
+            unscoped.join("package.json"),
+            r#"{"name":"bundled-tool","version":"1.0.0","bin":"cli.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            scoped.join("package.json"),
+            r#"{"name":"@scope/bundled-cli","version":"1.0.0","bin":"bin.js"}"#,
+        )
+        .unwrap();
+
+        let mut providers = Vec::new();
+        append_bundled_providers(&pkg_dir, &mut providers);
+
+        let names: Vec<&str> = providers.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["@scope/bundled-cli", "bundled-tool"]);
+    }
 }
