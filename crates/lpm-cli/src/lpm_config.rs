@@ -43,13 +43,19 @@ pub(crate) fn parse_and_validate(
     Ok(value)
 }
 
-/// The prefix an `importAlias` value matches, ending in exactly one `/` so
-/// that it matches only at a path boundary: `@` claims `@/lib/cn`, never the
-/// scoped package `@radix-ui/react-slot`. An empty or `/`-only value is no
-/// alias, as it would otherwise claim every specifier.
+/// The prefix an `importAlias` value claims. A value that ends in a character
+/// a package name can continue with gets a trailing `/`, so `@` claims
+/// `@/lib/cn` but never the scoped package `@radix-ui/react-slot`. Any other
+/// value, such as `#`, `~` or `/`, stays as written, since no package name
+/// starts with it and `#lib/cn` is a valid subpath import. An empty value is
+/// no alias, as it would claim every specifier.
 pub(crate) fn import_alias_prefix(alias: &str) -> Option<String> {
-    let trimmed = alias.trim_end_matches('/');
-    (!trimmed.is_empty()).then(|| format!("{trimmed}/"))
+    let last = alias.chars().next_back()?;
+    if last.is_ascii_alphanumeric() || matches!(last, '@' | '-' | '.' | '_') {
+        Some(format!("{alias}/"))
+    } else {
+        Some(alias.to_owned())
+    }
 }
 
 #[cfg(test)]
@@ -57,16 +63,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn import_alias_prefix_ends_in_one_slash_and_drops_empty_values() {
-        assert_eq!(import_alias_prefix("@/").as_deref(), Some("@/"));
+    fn import_alias_prefix_ends_at_a_package_name_boundary_and_drops_empty_values() {
         assert_eq!(import_alias_prefix("@").as_deref(), Some("@/"));
         assert_eq!(
             import_alias_prefix("@/components").as_deref(),
             Some("@/components/")
         );
-        assert_eq!(import_alias_prefix("~//").as_deref(), Some("~/"));
+        assert_eq!(import_alias_prefix("lib.v2").as_deref(), Some("lib.v2/"));
+        assert_eq!(import_alias_prefix("@/").as_deref(), Some("@/"));
+        assert_eq!(import_alias_prefix("#").as_deref(), Some("#"));
+        assert_eq!(import_alias_prefix("~").as_deref(), Some("~"));
+        assert_eq!(import_alias_prefix("/").as_deref(), Some("/"));
         assert_eq!(import_alias_prefix(""), None);
-        assert_eq!(import_alias_prefix("/"), None);
     }
 
     #[test]

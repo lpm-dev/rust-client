@@ -4,8 +4,6 @@
 //! to be rewritten from the author's alias to the buyer's alias. Relative
 //! imports between installed files are also resolved through the src→dest
 //! mapping to keep internal references correct.
-//!
-//! The path-resolution contract matches the JavaScript CLI.
 
 use std::collections::{HashMap, HashSet};
 
@@ -230,6 +228,8 @@ fn resolve_and_rewrite(
         SpecifierKind::AuthorAlias => {
             let alias = author_alias?;
             let path = specifier.strip_prefix(alias)?;
+            // A prefix kept as written, such as `#`, may be followed by `/`.
+            let path = path.strip_prefix('/').unwrap_or(path);
 
             if let Some(src_match) = try_resolve_map_key(path, src_to_dest)
                 && let Some(dest_path) = src_to_dest.get(src_match)

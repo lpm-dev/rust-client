@@ -910,6 +910,52 @@ async fn add_with_an_import_alias_without_a_trailing_slash_leaves_scoped_package
     assert!(button.contains("from '@/components/util'"), "{button}");
 }
 
+#[tokio::test]
+async fn add_with_a_hash_import_alias_rewrites_imports_with_and_without_a_slash() {
+    let mock = MockRegistry::start().await;
+    let package = "hash-author-alias-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "importAlias": "#",
+            "files": [{"src": "Button.ts"}, {"src": "util.ts"}, {"src": "helper.ts"}]
+        }),
+        &[
+            (
+                "Button.ts",
+                b"import { util } from '#util';\nimport { helper } from '#/helper';\nexport { util, helper };\n",
+            ),
+            ("util.ts", b"export const util = true;\n"),
+            ("helper.ts", b"export const helper = true;\n"),
+        ],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"paths":{"@/*":["./src/*"]}}}"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--path",
+            "src/components",
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+
+    let button = project.read_file("src/components/Button.ts");
+    assert!(button.contains("from '@/components/util'"), "{button}");
+    assert!(button.contains("from '@/components/helper'"), "{button}");
+}
+
 // ─── Test 1: happy path ─────────────────────────────────────────────
 
 #[tokio::test]
