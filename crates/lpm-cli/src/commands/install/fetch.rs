@@ -4561,8 +4561,8 @@ where
     result.map_err(|error| LpmError::Registry(format!("{panic_context}: {error}")))?
 }
 
-pub(super) struct ResolvedRegistryTarballUrl {
-    pub(super) url: String,
+pub(crate) struct ResolvedRegistryTarballUrl {
+    pub(crate) url: String,
 }
 
 fn tarball_file_prefix(name: &str) -> Option<&str> {
@@ -4677,7 +4677,7 @@ pub(crate) async fn metadata_tarball_url_for_package(
 ///
 /// Non-LPM metadata lookups route through `route_table`, so custom registry
 /// hints are validated against the same registry that resolved them.
-pub(super) async fn resolve_tarball_url(
+pub(crate) async fn resolve_tarball_url(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
     name: &str,
@@ -4708,7 +4708,7 @@ pub(super) async fn resolve_tarball_url(
         if url != metadata_url {
             return Err(LpmError::Registry(format!(
                 "registry lockfile tarball for {name}@{version} does not match registry metadata \
-                 dist.tarball; refusing lockfile hint"
+                 dist.tarball; refusing lockfile hint (refresh lpm.lock with `lpm install`)"
             )));
         }
         return Ok(ResolvedRegistryTarballUrl {

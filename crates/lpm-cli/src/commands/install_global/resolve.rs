@@ -43,6 +43,7 @@ pub(super) async fn pre_resolve(
         reads,
     )?;
     let registry = &context.client;
+    let principal = registry.capture_command_cache_principal(&route);
     // Dispatch by name shape: `@lpm.dev/owner.tool` goes through the
     // first-party registry path (PackageName parser); everything else
     // (`eslint`, `@types/node`, `@scope/foo`) is fetched via the npm
@@ -91,7 +92,12 @@ pub(super) async fn pre_resolve(
     // Global installs honor the same save-spec precedence as project installs.
     let decision =
         decide_saved_dependency_spec(&intent, &version, save_flags, SaveConfig::default());
-    if !registry.seed_metadata_for_command(&name, &route, Arc::new(metadata)) {
+    if !registry.seed_metadata_for_command_for_principal(
+        &name,
+        &route,
+        principal.as_deref(),
+        Arc::new(metadata),
+    ) {
         return Err(LpmError::Registry(format!(
             "failed to retain validated global-install metadata for '{name}'"
         )));

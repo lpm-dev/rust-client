@@ -30,7 +30,7 @@ impl RegistryTarget {
     /// Build a target from a raw `.npmrc` URL value. Strips one trailing
     /// slash if present so downstream `format!("{base}/{name}")` produces
     /// `https://npm.example.com/react`, not `…//react`.
-    pub(super) fn from_npmrc_url(raw: &str) -> Result<Self, &'static str> {
+    pub(crate) fn from_npmrc_url(raw: &str) -> Result<Self, &'static str> {
         let url = reqwest::Url::parse(raw)
             .map_err(|_| "invalid registry URL: expected an HTTP(S) URL with a host")?;
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
@@ -288,14 +288,8 @@ impl AuthScope {
     }
 
     pub(super) fn matches(&self, origin: &OriginKey, path: &str) -> bool {
-        if self.origin != *origin {
-            return false;
-        }
-        if self.path_prefix.as_ref() == "/" {
-            return true;
-        }
-        let without_trailing_slash = self.path_prefix.trim_end_matches('/');
-        path == without_trailing_slash || path.starts_with(self.path_prefix.as_ref())
+        self.origin == *origin
+            && lpm_common::path_matches_base_scope(path, self.path_prefix.as_ref())
     }
 }
 

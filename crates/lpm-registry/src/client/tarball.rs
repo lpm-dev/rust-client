@@ -159,7 +159,7 @@ impl RegistryClient {
         url: &str,
         accounting: Option<ManagedInstallAccounting>,
     ) -> Result<reqwest::Response, LpmError> {
-        if !self.is_base_url_origin(url) {
+        if !self.is_base_url_scope(url) {
             let request = self
                 .build_get_with_posture(url, AuthPosture::AnonymousOnly)
                 .await?;
@@ -490,13 +490,45 @@ impl RegistryClient {
         Ok(response)
     }
 
+    fn custom_route_tarball_auth<'a>(
+        target_base_url: &str,
+        route_auth: Option<&'a crate::npmrc::RegistryAuth>,
+        tarball_url: &str,
+    ) -> Option<&'a crate::npmrc::RegistryAuth> {
+        let auth = route_auth?;
+        let candidate = reqwest::Url::parse(tarball_url).ok()?;
+        let registry = reqwest::Url::parse(target_base_url).ok()?;
+        if !crate::route::registry_serves_tarball(&candidate, &registry) {
+            return None;
+        }
+        auth.matches_destination(&candidate).then_some(auth)
+    }
+
+    fn npm_direct_tarball_auth<'a>(
+        &self,
+        route_table: &'a crate::route::RouteTable,
+        name: &str,
+        tarball_url: &str,
+    ) -> Option<&'a crate::npmrc::RegistryAuth> {
+        let candidate = reqwest::Url::parse(tarball_url).ok()?;
+        let registry = reqwest::Url::parse(&self.npm_registry_url).ok()?;
+        if !crate::route::registry_serves_tarball(&candidate, &registry) {
+            return None;
+        }
+        let package_url = format!("{}/{name}", self.npm_registry_url.trim_end_matches('/'));
+        route_table
+            .auth_for_url(&package_url)
+            .filter(|auth| auth.matches_destination(&candidate))
+    }
+
     /// File-spool tarball download with route-appropriate auth.
     ///
-    /// Custom-route destinations attach their `.npmrc` credential when
-    /// one matches the tarball origin. `@lpm.dev/*` packages keep the
-    /// LPM session bearer. Public npm tarballs, including npm packages
-    /// whose metadata came through the Worker proxy, go anonymous so the
-    /// LPM session bearer is not sent cross-origin.
+    /// Custom-route destinations attach only the package route's `.npmrc`
+    /// credential when the tarball URL stays within that route's authorized
+    /// registry scope; approved external CDN URLs go anonymous. `@lpm.dev/*`
+    /// packages keep the LPM session bearer. Public npm tarballs, including npm
+    /// packages whose metadata came through the Worker proxy, go anonymous so
+    /// the LPM session bearer is not sent cross-origin.
     ///
     /// File-spool variant — bounded memory via
     /// [`MAX_COMPRESSED_TARBALL_SIZE`] (500 MB). The streaming sibling
@@ -509,17 +541,22 @@ impl RegistryClient {
         url: &str,
     ) -> Result<DownloadedTarball, LpmError> {
         match route_table.route_for_package(name) {
-            crate::route::UpstreamRoute::Custom { .. } => {
-                let auth = route_table.auth_for_url(url);
+            crate::route::UpstreamRoute::Custom { target, auth } => {
+                let auth = Self::custom_route_tarball_auth(&target.base_url, auth.as_deref(), url);
                 self.download_tarball_to_file_with_auth(url, auth).await
             }
             crate::route::UpstreamRoute::LpmWorker if name.starts_with("@lpm.dev/") => {
                 self.ensure_lpm_tarball_origin(url)?;
                 self.download_tarball_to_file(url).await
             }
-            crate::route::UpstreamRoute::LpmWorker | crate::route::UpstreamRoute::NpmDirect => {
+            crate::route::UpstreamRoute::LpmWorker => {
                 self.ensure_configured_tarball_origin(url)?;
                 self.download_tarball_to_file_with_auth(url, None).await
+            }
+            crate::route::UpstreamRoute::NpmDirect => {
+                self.ensure_configured_tarball_origin(url)?;
+                let auth = self.npm_direct_tarball_auth(route_table, name, url);
+                self.download_tarball_to_file_with_auth(url, auth).await
             }
         }
     }
@@ -559,7 +596,7 @@ impl RegistryClient {
     }
 
     fn ensure_lpm_tarball_origin(&self, url: &str) -> Result<(), LpmError> {
-        if self.is_base_url_origin(url) {
+        if self.is_base_url_scope(url) {
             Ok(())
         } else {
             Err(LpmError::Registry(format!(
@@ -604,17 +641,22 @@ impl RegistryClient {
         url: &str,
     ) -> Result<reqwest::Response, LpmError> {
         match route_table.route_for_package(name) {
-            crate::route::UpstreamRoute::Custom { .. } => {
-                let auth = route_table.auth_for_url(url);
+            crate::route::UpstreamRoute::Custom { target, auth } => {
+                let auth = Self::custom_route_tarball_auth(&target.base_url, auth.as_deref(), url);
                 self.download_tarball_streaming_with_auth(url, auth).await
             }
             crate::route::UpstreamRoute::LpmWorker if name.starts_with("@lpm.dev/") => {
                 self.ensure_lpm_tarball_origin(url)?;
                 self.download_tarball_streaming(url).await
             }
-            crate::route::UpstreamRoute::LpmWorker | crate::route::UpstreamRoute::NpmDirect => {
+            crate::route::UpstreamRoute::LpmWorker => {
                 self.ensure_configured_tarball_origin(url)?;
                 self.download_tarball_streaming_with_auth(url, None).await
+            }
+            crate::route::UpstreamRoute::NpmDirect => {
+                self.ensure_configured_tarball_origin(url)?;
+                let auth = self.npm_direct_tarball_auth(route_table, name, url);
+                self.download_tarball_streaming_with_auth(url, auth).await
             }
         }
     }

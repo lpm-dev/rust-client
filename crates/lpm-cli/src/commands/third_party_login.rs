@@ -191,6 +191,7 @@ pub fn run_custom(
     token: Option<String>,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    lpm_auth::validate_custom_registry_url_for_storage(registry_url).map_err(LpmError::Registry)?;
     let token = match token {
         Some(token) => token,
         None if json_output => {
@@ -418,4 +419,26 @@ fn npm_web_auth_client(builder: reqwest::ClientBuilder) -> Result<reqwest::Clien
         .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
         .build()
         .map_err(|e| LpmError::Registry(format!("failed to create HTTP client: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn custom_registry_storage_validator_rejects_userinfo_query_and_fragment() {
+        for bad in [
+            "https://user:secret@registry.example/npm",
+            "https://registry.example/npm?token=abc",
+            "https://registry.example/npm#frag",
+            "ftp://registry.example/npm",
+        ] {
+            assert!(
+                lpm_auth::validate_custom_registry_url_for_storage(bad).is_err(),
+                "expected rejection for {bad}"
+            );
+        }
+        assert!(
+            lpm_auth::validate_custom_registry_url_for_storage("https://registry.example/npm")
+                .is_ok()
+        );
+    }
 }

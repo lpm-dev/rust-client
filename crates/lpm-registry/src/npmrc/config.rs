@@ -149,11 +149,15 @@ impl NpmrcConfig {
         }
         self.auth_by_origin = HashMap::with_capacity(self.origin_auth.len());
         for auth in self.origin_auth.values() {
+            if lpm_common::path_has_encoded_traversal(auth.scope().path_prefix.as_ref()) {
+                continue;
+            }
+            let normalized = lpm_common::normalize_scope_path(auth.scope().path_prefix.as_ref());
             self.auth_by_origin
                 .entry(auth.origin().clone())
                 .or_default()
                 .insert(
-                    Arc::from(auth.scope().path_prefix.trim_end_matches('/')),
+                    Arc::from(normalized.trim_end_matches('/')),
                     Arc::clone(auth),
                 );
         }
@@ -378,14 +382,20 @@ impl NpmrcConfig {
         origin: &OriginKey,
         path: &str,
     ) -> Option<&Arc<RegistryAuth>> {
+        if lpm_common::path_has_encoded_traversal(path) {
+            return None;
+        }
         let credentials = self.auth_by_origin.get(origin)?;
-        let mut candidate = path.trim_end_matches('/');
+        let normalized = lpm_common::normalize_scope_path(path);
+        let mut candidate = normalized.trim_end_matches('/');
         loop {
             if let Some(auth) = credentials.get(candidate) {
-                return Some(auth);
+                return auth.matches_origin_path(origin, path).then_some(auth);
             }
             let Some(parent_end) = candidate.rfind('/') else {
-                return credentials.get("");
+                return credentials
+                    .get("")
+                    .filter(|auth| auth.matches_origin_path(origin, path));
             };
             candidate = &candidate[..parent_end];
         }

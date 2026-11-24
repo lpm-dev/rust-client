@@ -604,6 +604,20 @@ async fn parse_authenticated_oidc_response(
     response: reqwest::Response,
 ) -> Result<serde_json::Value, LpmError> {
     let status = response.status();
+    if status.is_redirection() {
+        let target = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map_or_else(
+                || "another location".to_string(),
+                lpm_common::safe_url_origin,
+            );
+        return Err(LpmError::Env(format!(
+            "the registry answered with a redirect (HTTP {}) to {target}, which this command does not follow; check the configured registry URL",
+            status.as_u16()
+        )));
+    }
     if !status.is_success() {
         let body: serde_json::Value =
             super::response::parse_capped_platform_json_or_unknown(response).await;
@@ -727,6 +741,7 @@ async fn create_oidc_policy(
     step_up_proof: Option<&str>,
 ) -> Result<PolicyWrite, LpmError> {
     let client = lpm_http::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| LpmError::Network(format!("failed to build HTTP client: {error}")))?;
     let mut request = client
@@ -774,6 +789,7 @@ async fn list_oidc_policies(
     org: Option<&str>,
 ) -> Result<serde_json::Value, LpmError> {
     let client = lpm_http::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| LpmError::Network(format!("failed to build HTTP client: {error}")))?;
     let mut request = client
@@ -956,6 +972,7 @@ pub(super) async fn vars_oidc_pull(
 
     // Exchange OIDC token for short-lived LPM token
     let client = lpm_http::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| LpmError::Network(format!("failed to build HTTP client: {error}")))?;
     let exchange_response = client
@@ -976,6 +993,21 @@ pub(super) async fn vars_oidc_pull(
             ))
         })?;
 
+    if exchange_response.status().is_redirection() {
+        let status = exchange_response.status();
+        let target = exchange_response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map_or_else(
+                || "another location".to_string(),
+                lpm_common::safe_url_origin,
+            );
+        return Err(LpmError::Env(format!(
+            "OIDC exchange refused redirect (HTTP {}) to {target}; check the configured registry URL",
+            status.as_u16()
+        )));
+    }
     if !exchange_response.status().is_success() {
         let body: serde_json::Value =
             super::response::parse_capped_platform_json_or_unknown(exchange_response).await;
@@ -1595,5 +1627,44 @@ mod policy_step_up_tests {
             matches!(&answer, PolicyWrite::Written(body) if body["policyId"] == "id"),
             "{answer:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn oidc_policy_clients_refuse_redirects_without_forwarding_credentials_or_body() {
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        let target = format!("{}/collect", second.uri());
+        Mock::given(method("POST"))
+            .and(path("/api/vault/oidc/policies"))
+            .respond_with(ResponseTemplate::new(307).insert_header("location", target.as_str()))
+            .mount(&first)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/vault/oidc/policies"))
+            .respond_with(ResponseTemplate::new(308).insert_header("location", target.as_str()))
+            .mount(&first)
+            .await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&second)
+            .await;
+
+        let create_err = create_oidc_policy(&first.uri(), "bearer", &policy(), Some("proof"))
+            .await
+            .expect_err("307 on create_oidc_policy must fail");
+        assert!(
+            create_err.to_string().contains("redirect (HTTP 307)"),
+            "{create_err}"
+        );
+
+        let list_err = super::list_oidc_policies(&first.uri(), "bearer", "vault-1", None)
+            .await
+            .expect_err("308 on list_oidc_policies must fail");
+        assert!(
+            list_err.to_string().contains("redirect (HTTP 308)"),
+            "{list_err}"
+        );
+        second.verify().await;
     }
 }

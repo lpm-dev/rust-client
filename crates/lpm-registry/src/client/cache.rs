@@ -297,6 +297,72 @@ pub(super) struct MetadataCacheWrite {
     pub(super) source: Option<ProjectionSource>,
 }
 
+fn sanitize_url_without_secrets(raw: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(raw) else {
+        return lpm_common::safe_url_origin(raw);
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return lpm_common::safe_url_origin(raw);
+    }
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    let rendered = parsed.to_string();
+    if !raw.ends_with('/') && parsed.path() == "/" {
+        rendered.trim_end_matches('/').to_string()
+    } else {
+        rendered
+    }
+}
+
+fn sanitize_cache_key_for_log(key: &str) -> String {
+    // Handle length-prefixed routed memory keys:
+    //   direct:<len>:<url>:<pkg>
+    //   worker:<principal>:<len>:<url>:<pkg>
+    //   custom:<principal>:<len>:<url>:<pkg>
+    for prefix in ["direct:", "worker:", "custom:"] {
+        if let Some(after_prefix) = key.strip_prefix(prefix) {
+            let (lead, len_and_rest) = if prefix == "direct:" {
+                ("", after_prefix)
+            } else if let Some((principal, rest)) = after_prefix.split_once(':') {
+                (principal, rest)
+            } else {
+                break;
+            };
+            if let Some((len_str, rest)) = len_and_rest.split_once(':')
+                && let Ok(url_len) = len_str.parse::<usize>()
+                && url_len <= rest.len()
+                && rest.is_char_boundary(url_len)
+            {
+                let (raw_url, tail) = rest.split_at(url_len);
+                let safe_url = sanitize_url_without_secrets(raw_url);
+                let safe_tail = tail.split(['?', '#']).next().unwrap_or(tail);
+                return if lead.is_empty() {
+                    format!("{prefix}{safe_url}{safe_tail}")
+                } else {
+                    format!("{prefix}{lead}:{safe_url}{safe_tail}")
+                };
+            }
+        }
+    }
+    // Handle storage keys like `npm:<principal>:<url>` or raw URLs.
+    if let Some(scheme_pos) = key.find("://") {
+        let prefix = &key[..scheme_pos];
+        let scheme = prefix
+            .rsplit(':')
+            .next()
+            .filter(|s| s.eq_ignore_ascii_case("http") || s.eq_ignore_ascii_case("https"))
+            .unwrap_or("https");
+        let url_start = scheme_pos.saturating_sub(scheme.len());
+        let before_url = &key[..url_start];
+        let raw_url = &key[url_start..];
+        let safe_url = sanitize_url_without_secrets(raw_url);
+        return format!("{before_url}{safe_url}");
+    }
+    key.split(['?', '#']).next().unwrap_or(key).to_string()
+}
+
 impl RegistryClient {
     // ─── Metadata Cache ──────────────────────────────────────────────
 
@@ -313,36 +379,87 @@ impl RegistryClient {
         key
     }
 
-    fn routed_metadata_memory_cache_key(&self, name: &str, route: &crate::UpstreamRoute) -> String {
+    fn worker_principal_fingerprint(&self) -> Option<String> {
+        use sha2::{Digest as _, Sha256};
+
+        let identity_fp = self.http.identity_fp_for_url(&self.base_url);
+        let bearer = self
+            .current_bearer(super::auth::AuthPosture::PackageRead)
+            .ok()?;
+        if bearer.is_none() && identity_fp.is_none() {
+            return Some("anon".to_string());
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"lpm-worker:");
+        if let Some(bearer) = bearer.as_deref() {
+            hasher.update(bearer.as_bytes());
+        }
+        hasher.update(b"\0id:");
+        if let Some(id) = identity_fp {
+            hasher.update(id.as_bytes());
+        }
+        Some(hex::encode(&hasher.finalize()[..16]))
+    }
+
+    /// Capture the current command-cache principal fingerprint for `route`
+    /// prior to issuing a metadata fetch so seeding can bind to the exact
+    /// principal that authorized the response.
+    pub fn capture_command_cache_principal(&self, route: &crate::UpstreamRoute) -> Option<String> {
+        match route {
+            crate::UpstreamRoute::NpmDirect => Some("anon".to_string()),
+            crate::UpstreamRoute::LpmWorker => self.worker_principal_fingerprint(),
+            crate::UpstreamRoute::Custom { target, auth } => {
+                Some(super::auth::principal_fingerprint(
+                    auth.as_deref(),
+                    self.http.identity_fp_for_url(&target.base_url),
+                ))
+            }
+        }
+    }
+
+    fn routed_metadata_memory_cache_key(
+        &self,
+        name: &str,
+        route: &crate::UpstreamRoute,
+    ) -> Option<String> {
         use std::fmt::Write as _;
 
         match route {
             crate::UpstreamRoute::NpmDirect => {
                 let cache_key =
                     self.npm_direct_metadata_cache_key(name, PublicNpmAccess::ANONYMOUS);
-                self.direct_metadata_memory_cache_key(&cache_key)
+                Some(self.direct_metadata_memory_cache_key(&cache_key))
             }
             crate::UpstreamRoute::LpmWorker => {
-                let mut key = String::with_capacity(self.base_url.len() + name.len() + 24);
-                write!(key, "worker:{}:", self.base_url.len())
+                let principal = self.worker_principal_fingerprint()?;
+                let mut key =
+                    String::with_capacity(self.base_url.len() + name.len() + principal.len() + 28);
+                write!(key, "worker:{principal}:{}:", self.base_url.len())
                     .expect("writing registry length to a String cannot fail");
                 key.push_str(&self.base_url);
                 key.push(':');
                 key.push_str(name);
-                key
+                Some(key)
             }
-            crate::UpstreamRoute::Custom { target, .. } => {
+            crate::UpstreamRoute::Custom { target, auth } => {
                 if let Some(access) = self.public_npm_access(route) {
                     let cache_key = self.npm_direct_metadata_cache_key(name, access);
-                    return self.direct_metadata_memory_cache_key(&cache_key);
+                    return Some(self.direct_metadata_memory_cache_key(&cache_key));
                 }
-                let mut key = String::with_capacity(target.base_url.len() + name.len() + 24);
-                write!(key, "custom:{}:", target.base_url.len())
+                let package_url = format!("{}/{name}", target.base_url.trim_end_matches('/'));
+                let principal = super::auth::principal_fingerprint(
+                    auth.as_deref(),
+                    self.http.identity_fp_for_url(&package_url),
+                );
+                let mut key = String::with_capacity(
+                    target.base_url.len() + name.len() + principal.len() + 28,
+                );
+                write!(key, "custom:{principal}:{}:", target.base_url.len())
                     .expect("writing registry length to a String cannot fail");
                 key.push_str(&target.base_url);
                 key.push(':');
                 key.push_str(name);
-                key
+                Some(key)
             }
         }
     }
@@ -380,7 +497,8 @@ impl RegistryClient {
         name: &str,
         route: &crate::UpstreamRoute,
     ) -> Option<Arc<PackageMetadata>> {
-        let memory_cache_key = self.routed_metadata_memory_cache_key(name, route);
+        self.metadata_memory_cache.as_ref()?;
+        let memory_cache_key = self.routed_metadata_memory_cache_key(name, route)?;
         let cached = self.read_metadata_memory_cache_arc(&memory_cache_key);
         if cached.is_some() {
             crate::timing::record_metadata_request(name);
@@ -459,7 +577,9 @@ impl RegistryClient {
             }
         }
 
-        let key = self.routed_metadata_memory_cache_key(name, route);
+        let Some(key) = self.routed_metadata_memory_cache_key(name, route) else {
+            return false;
+        };
         let expires_at = self.command_cache_expiry_for_seed(name, route);
         let Some(expires_at) = expires_at else {
             self.forget_metadata_for_command(&key);
@@ -476,6 +596,24 @@ impl RegistryClient {
                 },
             );
         true
+    }
+
+    /// Seed command metadata only when the current principal still matches the
+    /// principal captured before fetching the response.
+    pub fn seed_metadata_for_command_for_principal(
+        &self,
+        name: &str,
+        route: &crate::UpstreamRoute,
+        expected_principal: Option<&str>,
+        metadata: Arc<PackageMetadata>,
+    ) -> bool {
+        let Some(expected) = expected_principal else {
+            return false;
+        };
+        if self.capture_command_cache_principal(route).as_deref() != Some(expected) {
+            return false;
+        }
+        self.seed_metadata_for_command(name, route, metadata)
     }
 
     fn command_cache_expiry_for_seed(
@@ -789,6 +927,11 @@ impl RegistryClient {
         package_name: &str,
         version: Option<&str>,
     ) {
+        if self.metadata_memory_cache.is_some()
+            && let Some(memory_key) = self.routed_metadata_memory_cache_key(package_name, route)
+        {
+            self.invalidate_metadata_memory_cache(&memory_key);
+        }
         match route {
             crate::UpstreamRoute::Custom { target, auth } => {
                 self.invalidate_custom_metadata_cache(
@@ -855,7 +998,8 @@ impl RegistryClient {
         self.invalidate_metadata_memory_cache(&format!("custom:{cache_key}"));
         if let Some(path) = self.cache_path(&cache_key) {
             self.invalidate_metadata_cache_path(&path);
-            tracing::debug!("invalidated custom metadata cache for {name} at {base_url}");
+            let safe_base = sanitize_url_without_secrets(base_url);
+            tracing::debug!("invalidated custom metadata cache for {name} at {safe_base}");
         }
     }
 
@@ -1326,8 +1470,9 @@ impl RegistryClient {
                 if let Some(limit) = content.exhausted() {
                     return skip_exhausted(limit);
                 }
+                let safe_key = sanitize_cache_key_for_log(key);
                 tracing::warn!(
-                    "metadata cache serialization failed for {key}: MessagePack: {messagepack_error}; JSON: {json_error}"
+                    "metadata cache serialization failed for {safe_key}: MessagePack: {messagepack_error}; JSON: {json_error}"
                 );
                 return None;
             }
@@ -1338,7 +1483,6 @@ impl RegistryClient {
 
         tracing::event!(name: "serialized", target: "lpm_install_timeline", tracing::Level::TRACE, bytes = content.len() as u64);
         drop(serialization);
-        let key_owned = key.to_string();
         let runtime_handle = tokio::runtime::Handle::try_current();
         if self.synchronous_cache_writes || runtime_handle.is_err() {
             let _operation = mutation
@@ -1348,12 +1492,14 @@ impl RegistryClient {
             if mutation.revision.load(Ordering::Acquire) == revision
                 && let Err(e) = write_metadata_cache_file(&path, &content, expires_at)
             {
-                tracing::warn!("failed to write metadata cache for {key_owned}: {e}");
+                let key_for_log = sanitize_cache_key_for_log(key);
+                tracing::warn!("failed to write metadata cache for {key_for_log}: {e}");
             }
             return Some(written);
         }
 
         let handle = runtime_handle.unwrap();
+        let key_owned = key.to_owned();
         let span = tracing::trace_span!(target: "lpm_install_timeline", "metadata_cache_write");
         tracing::event!(name: "enqueue", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, {});
         let join = handle.spawn_blocking(move || {
@@ -1366,7 +1512,8 @@ impl RegistryClient {
             if mutation.revision.load(Ordering::Acquire) == revision
                 && let Err(e) = write_metadata_cache_file(&path, &content, expires_at)
             {
-                tracing::warn!("failed to write metadata cache for {key_owned}: {e}");
+                let key_for_log = sanitize_cache_key_for_log(&key_owned);
+                tracing::warn!("failed to write metadata cache for {key_for_log}: {e}");
             }
             tracing::event!(name: "work_end", target: "lpm_install_timeline", tracing::Level::TRACE, {});
         });
@@ -2282,6 +2429,112 @@ mod command_metadata_seed_tests {
         assert!(
             client.npm_metadata_direct_memory_cache(package).is_none(),
             "metadata requiring revalidation must not enter the command-scoped cache"
+        );
+    }
+
+    #[test]
+    fn routed_invalidation_removes_seeded_worker_and_custom_metadata() {
+        let client = RegistryClient::new()
+            .with_base_url("https://lpm.example")
+            .with_token("token-a")
+            .with_cache_dir(None)
+            .clone_with_metadata_memory_cache();
+        let pkg = "@lpm.dev/owner.pkg";
+        let worker_route = crate::UpstreamRoute::LpmWorker;
+        assert!(client.seed_metadata_for_command(pkg, &worker_route, package_metadata(pkg)));
+        assert!(
+            client
+                .npm_metadata_memory_cache(pkg, &worker_route)
+                .is_some()
+        );
+        client.invalidate_routed_metadata_cache(&worker_route, pkg, None);
+        assert!(
+            client
+                .npm_metadata_memory_cache(pkg, &worker_route)
+                .is_none(),
+            "routed invalidation must evict seeded Worker command metadata"
+        );
+
+        let custom_pkg = "custom-pkg";
+        let custom_route = crate::UpstreamRoute::Custom {
+            target: crate::npmrc::RegistryTarget::from_npmrc_url("https://corp.example/npm")
+                .unwrap(),
+            auth: None,
+        };
+        assert!(client.seed_metadata_for_command(
+            custom_pkg,
+            &custom_route,
+            package_metadata(custom_pkg)
+        ));
+        assert!(
+            client
+                .npm_metadata_memory_cache(custom_pkg, &custom_route)
+                .is_some()
+        );
+        client.invalidate_routed_metadata_cache(&custom_route, custom_pkg, None);
+        assert!(
+            client
+                .npm_metadata_memory_cache(custom_pkg, &custom_route)
+                .is_none(),
+            "routed invalidation must evict seeded Custom command metadata"
+        );
+    }
+
+    #[test]
+    fn same_principal_clone_retains_command_cache_and_changed_principal_keeps_caching_enabled() {
+        let client_a = RegistryClient::new()
+            .with_base_url("https://lpm.example")
+            .with_token("token-a")
+            .clone_with_metadata_memory_cache();
+        let route = crate::UpstreamRoute::LpmWorker;
+        let pkg = "@lpm.dev/owner.pkg";
+        assert!(client_a.seed_metadata_for_command(pkg, &route, package_metadata(pkg)));
+
+        let same_clone = client_a.clone_with_static_token("token-a");
+        assert!(
+            same_clone.npm_metadata_memory_cache(pkg, &route).is_some(),
+            "reapplying the same static token should retain command metadata cache"
+        );
+
+        let diff_clone = client_a.clone_with_static_token("token-b");
+        assert!(
+            diff_clone.npm_metadata_memory_cache(pkg, &route).is_none(),
+            "changed principal must not see previous principal's metadata"
+        );
+        assert!(
+            diff_clone.seed_metadata_for_command(pkg, &route, package_metadata(pkg)),
+            "changed principal clone should keep command caching enabled with a fresh isolated cache"
+        );
+    }
+
+    #[test]
+    fn sanitize_cache_key_for_log_preserves_registry_and_package_without_secrets() {
+        let rendered = super::sanitize_cache_key_for_log(
+            "npm:anon:https://user:secret@corp.example:8443/npm/pkg?sig=topsecret#frag",
+        );
+        for secret in ["secret", "topsecret", "frag"] {
+            assert!(!rendered.contains(secret), "leaked {secret}: {rendered}");
+        }
+        assert!(
+            rendered.contains("https://corp.example:8443/npm/pkg"),
+            "expected registry and package path to survive: {rendered}"
+        );
+
+        let worker_rendered = super::sanitize_cache_key_for_log(
+            "worker:abc123:31:https://corp.example:8443/lpm:@lpm.dev/owner.pkg",
+        );
+        assert!(
+            worker_rendered.contains("https://corp.example:8443/lpm")
+                && worker_rendered.contains("@lpm.dev/owner.pkg"),
+            "expected worker key to preserve registry and package: {worker_rendered}"
+        );
+
+        let direct_rendered =
+            super::sanitize_cache_key_for_log("direct:26:https://registry.npmjs.org:lodash");
+        assert!(
+            direct_rendered.contains("https://registry.npmjs.org")
+                && direct_rendered.contains("lodash"),
+            "expected authority-only direct key to preserve registry and package: {direct_rendered}"
         );
     }
 }

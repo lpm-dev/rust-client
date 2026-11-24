@@ -2720,4 +2720,29 @@ mod tests {
             merged.errors
         );
     }
+
+    #[test]
+    fn auth_scope_rejects_encoded_separator_traversal() {
+        let cfg = NpmrcConfig::parse("//corp.example/high/:_authToken=HIGH\n", "test", &no_env);
+        let high_auth = cfg
+            .auth_for_url("https://corp.example/high/@scope%2Fpkg")
+            .expect("normal scoped package under /high/ must match");
+        for traversal in [
+            "https://corp.example/high/..%2Flow/pkg.tgz",
+            "https://corp.example/high/%2e%2e%2flow/pkg.tgz",
+            "https://corp.example/high/%252e%252e%252flow/pkg.tgz",
+            "https://corp.example/high/..%5Clow/pkg.tgz",
+            "https://corp.example/high/a%00b/pkg.tgz",
+        ] {
+            assert!(
+                cfg.auth_for_url(traversal).is_none(),
+                "auth_for_url must reject encoded traversal: {traversal}"
+            );
+            let parsed = reqwest::Url::parse(traversal).unwrap();
+            assert!(
+                !high_auth.matches_destination(&parsed),
+                "matches_destination must reject encoded traversal: {traversal}"
+            );
+        }
+    }
 }

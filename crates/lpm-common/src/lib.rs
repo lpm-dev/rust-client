@@ -324,26 +324,159 @@ pub fn redact_exact_secret<'a>(text: &'a str, secret: &str) -> std::borrow::Cow<
     std::borrow::Cow::Owned(text.replace(secret, "<redacted>"))
 }
 
+/// Redacts every non-empty secret in `secrets` from untrusted text without
+/// allocating when none of them appear.
+pub fn redact_exact_secrets<'a>(text: &'a str, secrets: &[&str]) -> std::borrow::Cow<'a, str> {
+    let mut redacted = std::borrow::Cow::Borrowed(text);
+    for &secret in secrets {
+        if !secret.is_empty() && redacted.contains(secret) {
+            redacted = std::borrow::Cow::Owned(redacted.replace(secret, "<redacted>"));
+        }
+    }
+    redacted
+}
+
 pub fn safe_url_origin(raw: &str) -> String {
-    let Some((scheme, rest)) = raw.split_once("://") else {
+    if raw.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return "remote-url".to_string();
+    }
+    let Ok(parsed) = url::Url::parse(raw) else {
         return "remote-url".to_string();
     };
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+    if !matches!(parsed.scheme(), "http" | "https") {
         return "remote-url".to_string();
     }
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("")
-        .rsplit_once('@')
-        .map_or_else(
-            || rest.split(['/', '?', '#']).next().unwrap_or(""),
-            |(_, host)| host,
-        );
-    if authority.is_empty() {
-        return "remote-url".to_string();
+    let origin = parsed.origin().ascii_serialization();
+    if origin == "null" {
+        "remote-url".to_string()
+    } else {
+        origin
     }
-    format!("{}://{authority}", scheme.to_ascii_lowercase())
+}
+
+#[inline]
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Normalize RFC 3986 percent-encoding for path-scope comparison:
+/// - Unreserved characters (`ALPHA / DIGIT / "-" / "_" / "~"`) are decoded,
+///   while `.` (`%2e`/`%2E`) is kept uppercase as `%2E` so encoded dot
+///   segments remain distinguishable for traversal rejection.
+/// - Remaining valid `%XX` escapes are uppercased so `%2f` and `%2F` compare equal.
+pub fn normalize_scope_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut out = String::with_capacity(path.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2]))
+        {
+            let decoded = (hi << 4) | lo;
+            let is_unreserved_non_dot =
+                decoded.is_ascii_alphanumeric() || matches!(decoded, b'-' | b'_' | b'~');
+            if is_unreserved_non_dot {
+                out.push(decoded as char);
+            } else {
+                out.push('%');
+                out.push(bytes[i + 1].to_ascii_uppercase() as char);
+                out.push(bytes[i + 2].to_ascii_uppercase() as char);
+            }
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn bytes_have_path_traversal(bytes: &[u8]) -> bool {
+    if bytes.contains(&b'\\') || bytes.contains(&0) {
+        return true;
+    }
+    bytes
+        .split(|&b| b == b'/')
+        .any(|segment| segment == b"." || segment == b"..")
+}
+
+fn percent_decode_once(input: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut changed = false;
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'%'
+            && i + 2 < input.len()
+            && let (Some(hi), Some(lo)) = (hex_nibble(input[i + 1]), hex_nibble(input[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            changed = true;
+            i += 3;
+            continue;
+        }
+        out.push(input[i]);
+        i += 1;
+    }
+    changed.then_some(out)
+}
+
+/// Reject literal or multi-layer percent-encoded backslashes, NUL bytes, and
+/// dot-segments (`.` / `..`) separated by `/` so reverse proxies that decode
+/// one or more layers before routing cannot traverse out of the base path.
+pub fn path_has_encoded_traversal(path: &str) -> bool {
+    const MAX_DECODE_ROUNDS: usize = 4;
+    if bytes_have_path_traversal(path.as_bytes()) {
+        return true;
+    }
+    let mut current = std::borrow::Cow::Borrowed(path.as_bytes());
+    for _ in 0..MAX_DECODE_ROUNDS {
+        let Some(next) = percent_decode_once(&current) else {
+            return false;
+        };
+        if bytes_have_path_traversal(&next) {
+            return true;
+        }
+        current = std::borrow::Cow::Owned(next);
+    }
+    // Fail closed when additional percent-encoding layers still remain.
+    percent_decode_once(&current).is_some()
+}
+
+/// Returns true when `candidate_path` lies within `base_path` on a segment
+/// boundary after RFC 3986 normalization, rejecting literal or multi-layer
+/// encoded path traversal in either path.
+pub fn path_matches_base_scope(candidate_path: &str, base_path: &str) -> bool {
+    if path_has_encoded_traversal(candidate_path) || path_has_encoded_traversal(base_path) {
+        return false;
+    }
+    let candidate_normalized = normalize_scope_path(candidate_path);
+    let base_normalized = normalize_scope_path(base_path);
+    let base_trimmed = base_normalized.trim_end_matches('/');
+    if base_trimmed.is_empty() {
+        return true;
+    }
+    candidate_normalized
+        .strip_prefix(base_trimmed)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Returns true when `candidate` carries no embedded credentials, shares the
+/// same origin as `base`, and its normalized path lies within `base`'s path
+/// prefix on a segment boundary without traversal.
+pub fn url_matches_base_scope(candidate: &url::Url, base: &url::Url) -> bool {
+    if !candidate.username().is_empty()
+        || candidate.password().is_some()
+        || candidate.origin() != base.origin()
+    {
+        return false;
+    }
+    path_matches_base_scope(candidate.path(), base.path())
 }
 
 /// Loopback host detection covering the shapes that appear in tests
@@ -1156,5 +1289,122 @@ mod tests {
         assert!(!is_loopback_host("8.8.8.8"));
         assert!(!is_loopback_host("registry.npmjs.org"));
         assert!(!is_loopback_host(""));
+    }
+
+    #[test]
+    fn safe_url_origin_handles_backslashes_userinfo_and_control_chars() {
+        assert_eq!(
+            safe_url_origin("https://user:secret@registry.example:8443/private?token=abc#frag"),
+            "https://registry.example:8443"
+        );
+        assert_eq!(
+            safe_url_origin("https://registry.example\\secret/path"),
+            "https://registry.example"
+        );
+        assert_eq!(
+            safe_url_origin("https://registry.example/\x1b[31mred"),
+            "remote-url"
+        );
+        assert_eq!(
+            safe_url_origin("https://registry.example\r\nX-Injected: 1"),
+            "remote-url"
+        );
+    }
+
+    #[test]
+    fn url_matches_base_scope_enforces_origin_and_segment_prefix() {
+        let base = url::Url::parse("https://corp.example/lpm").unwrap();
+        assert!(url_matches_base_scope(
+            &url::Url::parse("https://corp.example/lpm/api/registry/pkg").unwrap(),
+            &base
+        ));
+        assert!(url_matches_base_scope(
+            &url::Url::parse("https://corp.example/lpm").unwrap(),
+            &base
+        ));
+        assert!(!url_matches_base_scope(
+            &url::Url::parse("https://corp.example/lpm-other/api").unwrap(),
+            &base
+        ));
+        assert!(!url_matches_base_scope(
+            &url::Url::parse("https://corp.example/other/api").unwrap(),
+            &base
+        ));
+        assert!(!url_matches_base_scope(
+            &url::Url::parse("https://other.example/lpm/api").unwrap(),
+            &base
+        ));
+    }
+
+    #[test]
+    fn url_matches_base_scope_rejects_encoded_separator_traversal_and_keeps_scoped_npm() {
+        let base = url::Url::parse("https://corp.example/lpm").unwrap();
+        assert!(url_matches_base_scope(
+            &url::Url::parse("https://corp.example/lpm/@scope%2fpkg").unwrap(),
+            &base
+        ));
+        for traversal in [
+            "https://corp.example/lpm/..%2Fother/x",
+            "https://corp.example/lpm/..%2fother/x",
+            "https://corp.example/lpm/%2e%2e%2fother/x",
+            "https://corp.example/lpm/..%5Cother/x",
+            "https://corp.example/lpm/a/%5c/b",
+        ] {
+            assert!(
+                !url_matches_base_scope(&url::Url::parse(traversal).unwrap(), &base),
+                "expected encoded traversal to be rejected: {traversal}"
+            );
+        }
+    }
+
+    #[test]
+    fn base_scope_accepts_equivalent_unreserved_encodings_and_preserves_reserved_delimiters() {
+        let base = url::Url::parse("https://corp.example/my%2Dorg/npm").unwrap();
+        assert!(url_matches_base_scope(
+            &url::Url::parse("https://corp.example/my-org/npm/pkg").unwrap(),
+            &base
+        ));
+        let encoded_delim_base = url::Url::parse("https://corp.example/a%2Fb/npm").unwrap();
+        assert!(url_matches_base_scope(
+            &url::Url::parse("https://corp.example/a%2fb/npm/pkg").unwrap(),
+            &encoded_delim_base
+        ));
+        assert!(!url_matches_base_scope(
+            &url::Url::parse("https://corp.example/a/b/npm/pkg").unwrap(),
+            &encoded_delim_base
+        ));
+    }
+
+    #[test]
+    fn url_matches_base_scope_rejects_double_encoded_traversal() {
+        let base = url::Url::parse("https://corp.example/lpm").unwrap();
+        for traversal in [
+            "https://corp.example/lpm/%252e%252e%252fadmin",
+            "https://corp.example/lpm/%25252e%25252e%25252fadmin",
+            "https://corp.example/lpm/..%252Fadmin",
+            "https://corp.example/lpm/a%255Cb",
+            "https://corp.example/lpm/a%00b",
+            "https://corp.example/lpm/%25252525252e%25252525252e%25252525252fadmin",
+            "https://user:pass@corp.example/lpm/api",
+        ] {
+            assert!(
+                !url_matches_base_scope(&url::Url::parse(traversal).unwrap(), &base),
+                "expected multi-layer traversal or userinfo to be rejected: {traversal}"
+            );
+        }
+        assert!(url_matches_base_scope(
+            &url::Url::parse("https://corp.example/lpm/@scope%2Fpkg/-/pkg-1.0.0.tgz").unwrap(),
+            &base
+        ));
+    }
+
+    #[test]
+    fn redact_exact_secrets_redacts_every_non_empty_secret() {
+        let input = "rejected token=tok-secret otp=987654 proof=web-proof-xyz";
+        let redacted = redact_exact_secrets(input, &["tok-secret", "", "987654", "web-proof-xyz"]);
+        assert_eq!(
+            redacted,
+            "rejected token=<redacted> otp=<redacted> proof=<redacted>"
+        );
     }
 }

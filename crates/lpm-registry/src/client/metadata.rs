@@ -687,7 +687,19 @@ impl RegistryClient {
         let Ok(parsed) = reqwest::Url::parse(url) else {
             return false;
         };
-        parsed.scheme() == "https" && parsed.origin().ascii_serialization() == DEFAULT_REGISTRY_URL
+        if parsed.scheme() != "https"
+            || parsed.origin().ascii_serialization() != DEFAULT_REGISTRY_URL
+        {
+            return false;
+        }
+        // Per-origin TLS overrides on the default Worker origin must use the
+        // origin-aware HTTP/2 client so transport identity matches cache keys.
+        if let Some(origin_key) = OriginKey::from_parsed_url(&parsed)
+            && self.http.tls_overrides.per_origin.contains_key(&origin_key)
+        {
+            return false;
+        }
+        true
     }
 
     async fn worker_metadata_http3_client_for(
@@ -4547,9 +4559,10 @@ impl RegistryClient {
         }
         let etag = Self::response_etag(&response);
         let cache_directive = Self::metadata_cache_directive(response.headers());
+        let safe_base_url = super::config::safe_url_for_diagnostic(base_url);
         let (metadata, body_timings) = match parse_capped_metadata_with_timing::<PackageMetadata>(
             response,
-            &format!("get_npm_metadata_from {name} @ {base_url}"),
+            &format!("get_npm_metadata_from {name} @ {safe_base_url}"),
         )
         .await
         {
