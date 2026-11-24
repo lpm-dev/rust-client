@@ -628,3 +628,151 @@ async fn a_credential_a_registry_echoes_in_its_headers_is_redacted() {
     assert_eq!(answer.message, "token <redacted> can't read this");
     assert!(!format!("{error:?}").contains("lpm_echoed_secret_value"));
 }
+
+#[tokio::test]
+async fn first_party_tarball_downloads_reject_embedded_userinfo_before_network() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let parsed = reqwest::Url::parse(&server.uri()).unwrap();
+    let userinfo_url = format!(
+        "http://user:secret@127.0.0.1:{}/api/registry/@lpm.dev/owner.pkg/-/pkg-1.0.0.tgz",
+        parsed.port().unwrap()
+    );
+
+    for client in [
+        RegistryClient::new().with_base_url(server.uri()),
+        RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("lpm_secret"),
+    ] {
+        assert!(
+            client.download_tarball(&userinfo_url).await.is_err(),
+            "buffered download must reject URL userinfo"
+        );
+        assert!(
+            client
+                .download_tarball_to_file(&userinfo_url)
+                .await
+                .is_err(),
+            "spooled download must reject URL userinfo"
+        );
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn first_party_tarball_does_not_attach_bearer_to_sibling_path_on_same_origin() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/other/pkg/-/pkg-1.0.0.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"sibling-bytes".as_slice()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClient::new()
+        .with_base_url(format!("{}/lpm", server.uri()))
+        .with_token("lpm_path_scoped_secret");
+    let sibling_url = format!("{}/other/pkg/-/pkg-1.0.0.tgz", server.uri());
+
+    let bytes = client.download_tarball(&sibling_url).await.unwrap();
+    assert_eq!(bytes, b"sibling-bytes");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        !requests[0].headers.contains_key("authorization"),
+        "sibling path outside path-prefixed base_url must not receive LPM bearer"
+    );
+}
+
+#[tokio::test]
+async fn authenticated_post_json_rejects_foreign_origin_and_does_not_follow_cross_origin_redirect()
+{
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let primary = MockServer::start().await;
+    let attacker = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/tokens/replace-project"))
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("location", format!("{}/steal", attacker.uri())),
+        )
+        .expect(1)
+        .mount(&primary)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&attacker)
+        .await;
+
+    let client = RegistryClient::new()
+        .with_base_url(primary.uri())
+        .with_token("lpm_bearer_secret");
+    let body = serde_json::json!({ "token": "lpm_project_secret" });
+
+    // Direct call to foreign origin is rejected at the library boundary (L1).
+    let direct_err = client
+        .post_json_raw(&format!("{}/steal", attacker.uri()), &body)
+        .await
+        .unwrap_err();
+    assert!(
+        direct_err
+            .to_string()
+            .contains("outside configured base URL"),
+        "{direct_err}"
+    );
+
+    // Status-preserving POST must NOT follow 307 cross-origin redirect with JSON body (R1).
+    let response = client
+        .post_json_raw_status(
+            &format!("{}/api/tokens/replace-project", primary.uri()),
+            &body,
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+    attacker.verify().await;
+}
+
+#[test]
+fn credential_changing_clone_does_not_reuse_seeded_memory_metadata_cache() {
+    let client_a = RegistryClient::new()
+        .with_base_url("https://lpm.example")
+        .with_token("token-a")
+        .clone_with_metadata_memory_cache();
+    let route = crate::UpstreamRoute::LpmWorker;
+    let meta: crate::PackageMetadata = serde_json::from_value(serde_json::json!({
+        "name": "@lpm.dev/owner.priv",
+        "versions": { "1.0.0": { "name": "@lpm.dev/owner.priv", "version": "1.0.0" } }
+    }))
+    .unwrap();
+    assert!(client_a.seed_metadata_for_command(
+        "@lpm.dev/owner.priv",
+        &route,
+        std::sync::Arc::new(meta)
+    ));
+
+    let client_b = client_a.clone_with_static_token("token-b");
+    assert!(
+        client_b
+            .npm_metadata_memory_cache("@lpm.dev/owner.priv", &route)
+            .is_none(),
+        "credential-changing clone must not inherit seeded metadata from another principal"
+    );
+}

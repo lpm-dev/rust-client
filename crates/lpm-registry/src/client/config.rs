@@ -306,6 +306,10 @@ impl RegistryClient {
         }
         if redirect == HttpRedirectMode::Manual {
             b = b.redirect(reqwest::redirect::Policy::none());
+        } else if identity.is_some() || !tls.extra_roots.is_empty() {
+            // Per-origin client certificates and custom CA trust roots must
+            // never be presented to a different origin across an automatic redirect.
+            b = b.redirect(lpm_http::same_origin_redirect_policy());
         }
         if transport == HttpTransportMode::WorkerMetadataHttp3 {
             b = Self::apply_http3_prior_knowledge(b);
@@ -539,11 +543,14 @@ impl RegistryClient {
         parsed_origin == self.base_url_origin || parsed_origin == self.npm_registry_url_origin
     }
 
-    pub(super) fn is_base_url_origin(&self, url: &str) -> bool {
-        let Ok(parsed) = reqwest::Url::parse(url) else {
+    pub(super) fn is_base_url_scope(&self, url: &str) -> bool {
+        let Ok(candidate) = reqwest::Url::parse(url) else {
             return false;
         };
-        parsed.origin().ascii_serialization() == self.base_url_origin
+        let Ok(base) = reqwest::Url::parse(&self.base_url) else {
+            return false;
+        };
+        lpm_common::url_matches_base_scope(&candidate, &base)
     }
 
     /// Set the registry base URL.
@@ -909,7 +916,23 @@ impl RegistryClient {
                 safe_url_for_diagnostic(url)
             )));
         }
+        let parsed = reqwest::Url::parse(url).map_err(|_| {
+            LpmError::Registry(format!(
+                "invalid tarball URL: {}",
+                safe_url_for_diagnostic(url)
+            ))
+        })?;
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(LpmError::Registry(lpm_http::URL_CREDENTIALS_REFUSAL.into()));
+        }
         Ok(())
+    }
+
+    fn detach_metadata_memory_cache(&mut self) {
+        self.metadata_memory_cache = None;
+        self.release_time_memory_cache = None;
+        self.metadata_route_overrides = None;
+        self.metadata_command_cache_policies = None;
     }
 
     /// Set the bearer token for authenticated requests.
@@ -918,6 +941,7 @@ impl RegistryClient {
     /// in `Debug` output and is zeroized on drop.
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(SecretString::from(token.into()));
+        self.detach_metadata_memory_cache();
         self
     }
 
@@ -929,6 +953,7 @@ impl RegistryClient {
     pub fn with_token_override(mut self, token: impl Into<String>) -> Self {
         self.token = Some(SecretString::from(token.into()));
         self.session = None;
+        self.detach_metadata_memory_cache();
         self
     }
 
@@ -938,6 +963,7 @@ impl RegistryClient {
     pub fn with_session(mut self, session: Arc<SessionManager>) -> Self {
         self.session = Some(session);
         self.package_read_recovery = Arc::new(tokio::sync::Mutex::new(false));
+        self.detach_metadata_memory_cache();
         self.share_tls_settings_with_session();
         self
     }
@@ -1019,6 +1045,7 @@ impl RegistryClient {
         let mut client = self.clone_with_config();
         client.session = None;
         client.token = None;
+        client.detach_metadata_memory_cache();
         client
     }
 
@@ -1032,6 +1059,7 @@ impl RegistryClient {
         let mut client = self.clone_with_config();
         client.session = None;
         client.token = Some(SecretString::from(token.into()));
+        client.detach_metadata_memory_cache();
         client
     }
 
@@ -1046,6 +1074,7 @@ impl RegistryClient {
         client.session = Some(session);
         client.package_read_recovery = Arc::new(tokio::sync::Mutex::new(false));
         client.token = None;
+        client.detach_metadata_memory_cache();
         client.share_tls_settings_with_session();
         client
     }

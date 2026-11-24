@@ -297,6 +297,28 @@ pub(super) struct MetadataCacheWrite {
     pub(super) source: Option<ProjectionSource>,
 }
 
+fn sanitize_cache_key_for_log(key: &str) -> String {
+    let trimmed = key.split(['?', '#']).next().unwrap_or(key);
+    if let Some(scheme_pos) = trimmed.find("://") {
+        let prefix = &trimmed[..scheme_pos];
+        let rest = &trimmed[scheme_pos..];
+        let origin = lpm_common::safe_url_origin(&format!("https{rest}"));
+        let scheme = prefix
+            .rsplit(':')
+            .next()
+            .filter(|s| s.eq_ignore_ascii_case("http") || s.eq_ignore_ascii_case("https"))
+            .unwrap_or("https");
+        let after_scheme = &trimmed[scheme_pos + 3..];
+        let path = after_scheme
+            .find('/')
+            .map_or("", |idx| &after_scheme[idx..]);
+        let before_scheme = &prefix[..prefix.len().saturating_sub(scheme.len())];
+        let host = origin.split_once("://").map_or("remote-url", |(_, h)| h);
+        return format!("{before_scheme}{scheme}://{host}{path}");
+    }
+    trimmed.to_string()
+}
+
 impl RegistryClient {
     // ─── Metadata Cache ──────────────────────────────────────────────
 
@@ -313,6 +335,29 @@ impl RegistryClient {
         key
     }
 
+    fn worker_principal_fingerprint(&self) -> String {
+        use sha2::{Digest as _, Sha256};
+
+        let identity_fp = self.http.identity_fp_for_url(&self.base_url);
+        let bearer = self
+            .current_bearer(super::auth::AuthPosture::PackageRead)
+            .ok()
+            .flatten();
+        if bearer.is_none() && identity_fp.is_none() {
+            return "anon".to_string();
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"lpm-worker:");
+        if let Some(bearer) = bearer.as_deref() {
+            hasher.update(bearer.as_bytes());
+        }
+        hasher.update(b"\0id:");
+        if let Some(id) = identity_fp {
+            hasher.update(id.as_bytes());
+        }
+        hex::encode(&hasher.finalize()[..16])
+    }
+
     fn routed_metadata_memory_cache_key(&self, name: &str, route: &crate::UpstreamRoute) -> String {
         use std::fmt::Write as _;
 
@@ -323,21 +368,30 @@ impl RegistryClient {
                 self.direct_metadata_memory_cache_key(&cache_key)
             }
             crate::UpstreamRoute::LpmWorker => {
-                let mut key = String::with_capacity(self.base_url.len() + name.len() + 24);
-                write!(key, "worker:{}:", self.base_url.len())
+                let principal = self.worker_principal_fingerprint();
+                let mut key =
+                    String::with_capacity(self.base_url.len() + name.len() + principal.len() + 28);
+                write!(key, "worker:{principal}:{}:", self.base_url.len())
                     .expect("writing registry length to a String cannot fail");
                 key.push_str(&self.base_url);
                 key.push(':');
                 key.push_str(name);
                 key
             }
-            crate::UpstreamRoute::Custom { target, .. } => {
+            crate::UpstreamRoute::Custom { target, auth } => {
                 if let Some(access) = self.public_npm_access(route) {
                     let cache_key = self.npm_direct_metadata_cache_key(name, access);
                     return self.direct_metadata_memory_cache_key(&cache_key);
                 }
-                let mut key = String::with_capacity(target.base_url.len() + name.len() + 24);
-                write!(key, "custom:{}:", target.base_url.len())
+                let package_url = format!("{}/{name}", target.base_url.trim_end_matches('/'));
+                let principal = super::auth::principal_fingerprint(
+                    auth.as_deref(),
+                    self.http.identity_fp_for_url(&package_url),
+                );
+                let mut key = String::with_capacity(
+                    target.base_url.len() + name.len() + principal.len() + 28,
+                );
+                write!(key, "custom:{principal}:{}:", target.base_url.len())
                     .expect("writing registry length to a String cannot fail");
                 key.push_str(&target.base_url);
                 key.push(':');
@@ -1338,7 +1392,7 @@ impl RegistryClient {
 
         tracing::event!(name: "serialized", target: "lpm_install_timeline", tracing::Level::TRACE, bytes = content.len() as u64);
         drop(serialization);
-        let key_owned = key.to_string();
+        let key_for_log = sanitize_cache_key_for_log(key);
         let runtime_handle = tokio::runtime::Handle::try_current();
         if self.synchronous_cache_writes || runtime_handle.is_err() {
             let _operation = mutation
@@ -1348,7 +1402,7 @@ impl RegistryClient {
             if mutation.revision.load(Ordering::Acquire) == revision
                 && let Err(e) = write_metadata_cache_file(&path, &content, expires_at)
             {
-                tracing::warn!("failed to write metadata cache for {key_owned}: {e}");
+                tracing::warn!("failed to write metadata cache for {key_for_log}: {e}");
             }
             return Some(written);
         }
@@ -1366,7 +1420,7 @@ impl RegistryClient {
             if mutation.revision.load(Ordering::Acquire) == revision
                 && let Err(e) = write_metadata_cache_file(&path, &content, expires_at)
             {
-                tracing::warn!("failed to write metadata cache for {key_owned}: {e}");
+                tracing::warn!("failed to write metadata cache for {key_for_log}: {e}");
             }
             tracing::event!(name: "work_end", target: "lpm_install_timeline", tracing::Level::TRACE, {});
         });

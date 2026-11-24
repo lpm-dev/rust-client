@@ -46,7 +46,7 @@ pub(super) fn redact_credentials(text: &mut String, headers: &HeaderMap) {
             }
         }
     }
-    for name in ["npm-otp", "x-otp"] {
+    for name in lpm_http::SENSITIVE_PROOF_HEADERS {
         if let Some(secret) = headers.get(name).and_then(|value| value.to_str().ok()) {
             redact_secret(text, secret);
         }
@@ -106,5 +106,15 @@ mod tests {
         let mut text = "permission denied".to_owned();
         redact_credentials(&mut text, &HeaderMap::new());
         assert_eq!(text, "permission denied");
+    }
+
+    #[test]
+    fn redacts_approval_and_step_up_proof_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-lpm-approval", "approval-tok-123".parse().unwrap());
+        headers.insert("x-lpm-step-up-proof", "step-up-tok-456".parse().unwrap());
+        let mut text = "refused approval-tok-123 and step-up-tok-456".to_owned();
+        redact_credentials(&mut text, &headers);
+        assert_eq!(text, "refused <redacted> and <redacted>");
     }
 }

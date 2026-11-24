@@ -159,7 +159,7 @@ impl RegistryClient {
         url: &str,
         accounting: Option<ManagedInstallAccounting>,
     ) -> Result<reqwest::Response, LpmError> {
-        if !self.is_base_url_origin(url) {
+        if !self.is_base_url_scope(url) {
             let request = self
                 .build_get_with_posture(url, AuthPosture::AnonymousOnly)
                 .await?;
@@ -559,7 +559,7 @@ impl RegistryClient {
     }
 
     fn ensure_lpm_tarball_origin(&self, url: &str) -> Result<(), LpmError> {
-        if self.is_base_url_origin(url) {
+        if self.is_base_url_scope(url) {
             Ok(())
         } else {
             Err(LpmError::Registry(format!(

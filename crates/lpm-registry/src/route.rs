@@ -283,26 +283,33 @@ impl RouteTable {
     pub fn route_for_package(&self, name: &str) -> UpstreamRoute {
         match self.selected_route_for_package(name) {
             SelectedRoute::Mode(mode) => self.route_for_mode(name, mode),
-            SelectedRoute::Custom(target) => UpstreamRoute::Custom {
-                target: target.clone(),
-                auth: self.npmrc.shared_auth_for_url(&target.base_url).cloned(),
-            },
-            SelectedRoute::Jsr => UpstreamRoute::Custom {
-                target: JSR_TARGET.clone(),
-                auth: self
-                    .npmrc
-                    .shared_auth_for_origin_path(&JSR_ORIGIN, "/")
-                    .cloned(),
-            },
+            SelectedRoute::Custom(target) => {
+                let package_url = format!("{}/{name}", target.base_url.trim_end_matches('/'));
+                UpstreamRoute::Custom {
+                    target: target.clone(),
+                    auth: self.npmrc.shared_auth_for_url(&package_url).cloned(),
+                }
+            }
+            SelectedRoute::Jsr => {
+                let package_path = format!("/{name}");
+                UpstreamRoute::Custom {
+                    target: JSR_TARGET.clone(),
+                    auth: self
+                        .npmrc
+                        .shared_auth_for_origin_path(&JSR_ORIGIN, &package_path)
+                        .cloned(),
+                }
+            }
         }
     }
 
     fn route_for_mode(&self, name: &str, mode: RouteMode) -> UpstreamRoute {
         match mode.route_for_package(name) {
             UpstreamRoute::NpmDirect => {
+                let package_path = format!("/{name}");
                 let Some(auth) = self
                     .npmrc
-                    .shared_auth_for_origin_path(&NPM_ORIGIN, "/")
+                    .shared_auth_for_origin_path(&NPM_ORIGIN, &package_path)
                     .cloned()
                 else {
                     return UpstreamRoute::NpmDirect;
@@ -327,7 +334,7 @@ impl RouteTable {
             return registry_url_contains(candidate, &target.base_url).then(|| {
                 UpstreamRoute::Custom {
                     target: target.clone(),
-                    auth: self.npmrc.shared_auth_for_url(&target.base_url).cloned(),
+                    auth: self.npmrc.shared_auth_for_url(candidate).cloned(),
                 }
             });
         }
@@ -335,17 +342,14 @@ impl RouteTable {
             return registry_url_contains_parsed(candidate, &JSR_URL).then(|| {
                 UpstreamRoute::Custom {
                     target: JSR_TARGET.clone(),
-                    auth: self
-                        .npmrc
-                        .shared_auth_for_origin_path(&JSR_ORIGIN, "/")
-                        .cloned(),
+                    auth: self.npmrc.shared_auth_for_url(candidate).cloned(),
                 }
             });
         }
         let target = self.npmrc.default_registry.as_ref()?;
         registry_url_contains(candidate, &target.base_url).then(|| UpstreamRoute::Custom {
             target: target.clone(),
-            auth: self.npmrc.shared_auth_for_url(&target.base_url).cloned(),
+            auth: self.npmrc.shared_auth_for_url(candidate).cloned(),
         })
     }
 
@@ -1483,5 +1487,69 @@ mod tests {
             scopes_a.routing_fingerprint(),
             scopes_b.routing_fingerprint()
         );
+    }
+
+    #[test]
+    fn route_for_package_selects_narrower_package_path_credential_over_root() {
+        use secrecy::ExposeSecret as _;
+
+        let table = make_table(
+            concat!(
+                "registry=https://registry.example/npm/\n",
+                "//registry.example/npm/:_authToken=root-token\n",
+                "//registry.example/npm/@scope/secret/:_authToken=pkg-token\n",
+            ),
+            RouteMode::Direct,
+        );
+        match table.route_for_package("@scope/secret") {
+            UpstreamRoute::Custom {
+                auth: Some(auth), ..
+            } => match auth.as_ref() {
+                crate::RegistryAuth::Bearer { token, .. } => {
+                    assert_eq!(token.expose_secret(), "pkg-token")
+                }
+                other => panic!("expected bearer pkg-token, got {other:?}"),
+            },
+            other => panic!("expected package-path credential, got {other:?}"),
+        }
+        match table.route_for_package("@scope/other") {
+            UpstreamRoute::Custom {
+                auth: Some(auth), ..
+            } => match auth.as_ref() {
+                crate::RegistryAuth::Bearer { token, .. } => {
+                    assert_eq!(token.expose_secret(), "root-token")
+                }
+                other => panic!("expected bearer root-token, got {other:?}"),
+            },
+            other => panic!("expected root credential, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_for_package_finds_package_path_credential_without_root_credential() {
+        use secrecy::ExposeSecret as _;
+
+        let table = make_table(
+            concat!(
+                "registry=https://registry.example/npm/\n",
+                "//registry.example/npm/@scope/only-scoped/:_authToken=scoped-only\n",
+            ),
+            RouteMode::Direct,
+        );
+        match table.route_for_package("@scope/only-scoped") {
+            UpstreamRoute::Custom {
+                auth: Some(auth), ..
+            } => match auth.as_ref() {
+                crate::RegistryAuth::Bearer { token, .. } => {
+                    assert_eq!(token.expose_secret(), "scoped-only")
+                }
+                other => panic!("expected bearer scoped-only, got {other:?}"),
+            },
+            other => panic!("expected package-path credential, got {other:?}"),
+        }
+        match table.route_for_package("@scope/anonymous") {
+            UpstreamRoute::Custom { auth: None, .. } => {}
+            other => panic!("expected anonymous custom route, got {other:?}"),
+        }
     }
 }

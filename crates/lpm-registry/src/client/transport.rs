@@ -41,12 +41,26 @@ const RETRY_ERROR_BODY_TIMEOUT: Duration = Duration::from_millis(500);
 impl RegistryClient {
     // ─── Internal: HTTP transport with retry ────────────────────────
 
+    fn ensure_base_url_scope(&self, url: &str) -> Result<(), LpmError> {
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|_| LpmError::Registry("invalid registry endpoint URL".into()))?;
+        self.validate_request_url(&parsed)?;
+        if !self.is_base_url_scope(url) {
+            return Err(LpmError::Registry(format!(
+                "refusing authenticated registry request outside configured base URL (target origin: {})",
+                lpm_common::safe_url_origin(url)
+            )));
+        }
+        Ok(())
+    }
+
     /// POST JSON with auth, returning the raw response (for callers that need status/headers).
     pub async fn post_json_raw(
         &self,
         url: &str,
         body: &serde_json::Value,
     ) -> Result<reqwest::Response, LpmError> {
+        self.ensure_base_url_scope(url)?;
         let mut req = self.http.for_url(url).await?.post(url).json(body);
         if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired)? {
             req = req.bearer_auth(bearer);
@@ -71,6 +85,7 @@ impl RegistryClient {
         command: &'static str,
         operation: &'static str,
     ) -> Result<(serde_json::Value, SecretString), LpmError> {
+        self.ensure_base_url_scope(url)?;
         self.execute_with_recovery(AuthPosture::AuthRequired, || async {
             let mut request = self
                 .http
@@ -125,6 +140,7 @@ impl RegistryClient {
         body: &serde_json::Value,
         operation: &str,
     ) -> Result<serde_json::Value, LpmError> {
+        self.ensure_base_url_scope(url)?;
         self.execute_with_recovery(AuthPosture::SessionRequired, || async {
             let bearer = self
                 .current_bearer(AuthPosture::SessionRequired)?
@@ -176,7 +192,13 @@ impl RegistryClient {
         url: &str,
         body: &serde_json::Value,
     ) -> Result<reqwest::Request, LpmError> {
-        let mut request = self.http.for_url(url).await?.post(url).json(body);
+        self.ensure_base_url_scope(url)?;
+        let mut request = self
+            .http
+            .for_manual_redirect_url(url)
+            .await?
+            .post(url)
+            .json(body);
         if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired)? {
             request = request.bearer_auth(bearer);
         }
@@ -196,9 +218,18 @@ impl RegistryClient {
         mut request: reqwest::Request,
     ) -> Result<reqwest::Response, LpmError> {
         self.validate_base_url()?;
+        if request
+            .headers()
+            .contains_key(reqwest::header::AUTHORIZATION)
+            || lpm_http::SENSITIVE_PROOF_HEADERS
+                .iter()
+                .any(|header| request.headers().contains_key(*header))
+        {
+            self.ensure_base_url_scope(request.url().as_str())?;
+        }
         self.route_to_npm_transport(&mut request);
         self.http
-            .for_url(request.url().as_str())
+            .for_manual_redirect_url(request.url().as_str())
             .await?
             .execute(request)
             .await
@@ -1059,6 +1090,9 @@ impl RegistryClient {
 
     fn npm_transport_url_for(&self, url: &reqwest::Url) -> Option<reqwest::Url> {
         let transport = self.npm_transport_url.as_deref()?;
+        if !super::url_gate::is_localhost_url(transport) {
+            return None;
+        }
         let rest = url
             .as_str()
             .strip_prefix(self.npm_registry_url.trim_end_matches('/'))?;
