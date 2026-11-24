@@ -562,6 +562,8 @@ pub struct Store {
     migration_paths: Option<StoreV2Paths>,
     object_integrity_policy: ObjectIntegrityPolicy,
     security_analysis_policy: SecurityAnalysisPolicy,
+    #[cfg(target_os = "linux")]
+    cap_concurrent_link_populates: Arc<std::sync::OnceLock<bool>>,
     #[cfg(test)]
     object_publish_barriers: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
 }
@@ -641,6 +643,8 @@ impl Store {
             migration_paths: Some(StoreV2Paths::from_lpm_root_v3(lpm_root)),
             object_integrity_policy,
             security_analysis_policy,
+            #[cfg(target_os = "linux")]
+            cap_concurrent_link_populates: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
             object_publish_barriers: None,
         }
@@ -678,6 +682,8 @@ impl Store {
             migration_paths: Some(StoreV2Paths::from_lpm_root(lpm_root)),
             object_integrity_policy,
             security_analysis_policy,
+            #[cfg(target_os = "linux")]
+            cap_concurrent_link_populates: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
             object_publish_barriers: None,
         }
@@ -711,6 +717,8 @@ impl Store {
             migration_paths: None,
             object_integrity_policy,
             security_analysis_policy,
+            #[cfg(target_os = "linux")]
+            cap_concurrent_link_populates: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
             object_publish_barriers: None,
         }
@@ -737,6 +745,8 @@ impl Store {
             migration_paths: None,
             object_integrity_policy,
             security_analysis_policy,
+            #[cfg(target_os = "linux")]
+            cap_concurrent_link_populates: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
             object_publish_barriers: None,
         }
@@ -2223,7 +2233,11 @@ impl Store {
         }
 
         #[cfg(target_os = "macos")]
-        let _apfs_populate_permit = acquire_apfs_populate_permit();
+        let _volume_populate_permit = acquire_volume_populate_permit();
+        #[cfg(target_os = "linux")]
+        let _volume_populate_permit = self
+            .needs_linux_populate_cap()
+            .then(acquire_volume_populate_permit);
         let materialize_dir = self
             .file_cas
             .as_ref()
@@ -3442,6 +3456,7 @@ fn populate_into(
         object.materialize_dir,
         &pkg_dir,
         has_local_source_sentinel(object.dir),
+        object.fresh_object_integrity.is_none(),
     )?;
     timings.materialize_ms = materialize_start.elapsed().as_millis();
 
@@ -3997,20 +4012,20 @@ fn record_local_source_fingerprint(
     }
 }
 
-#[cfg(target_os = "macos")]
-struct ApfsPopulatePermit;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct VolumePopulatePermit;
 
-#[cfg(target_os = "macos")]
-fn apfs_populate_gate() -> &'static (std::sync::Mutex<usize>, std::sync::Condvar) {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn volume_populate_gate() -> &'static (std::sync::Mutex<usize>, std::sync::Condvar) {
     static GATE: std::sync::OnceLock<(std::sync::Mutex<usize>, std::sync::Condvar)> =
         std::sync::OnceLock::new();
     GATE.get_or_init(|| (std::sync::Mutex::new(0), std::sync::Condvar::new()))
 }
 
-#[cfg(target_os = "macos")]
-impl Drop for ApfsPopulatePermit {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Drop for VolumePopulatePermit {
     fn drop(&mut self) {
-        let (lock, cvar) = apfs_populate_gate();
+        let (lock, cvar) = volume_populate_gate();
         let mut active = lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -4019,23 +4034,114 @@ impl Drop for ApfsPopulatePermit {
     }
 }
 
-/// APFS serializes `clonefile` + directory creation on a volume metadata lock;
-/// capping concurrent mutating link populates avoids contention while allowing
-/// read-only reuse checks to scale across all cores.
-#[cfg(target_os = "macos")]
-fn acquire_apfs_populate_permit() -> ApfsPopulatePermit {
-    const MAX_APFS_POPULATE_WRITERS: usize = 2;
-    let (lock, cvar) = apfs_populate_gate();
+/// APFS and Linux btrfs serialize concurrent metadata/reflink commits on a
+/// volume lock; capping concurrent mutating link populates avoids contention
+/// while allowing read-only reuse checks (and ext4/xfs/tmpfs writes) to scale.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn acquire_volume_populate_permit() -> VolumePopulatePermit {
+    const MAX_SERIALIZED_VOLUME_POPULATE_WRITERS: usize = 2;
+    let (lock, cvar) = volume_populate_gate();
     let mut active = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    while *active >= MAX_APFS_POPULATE_WRITERS {
+    while *active >= MAX_SERIALIZED_VOLUME_POPULATE_WRITERS {
         active = cvar
             .wait(active)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
     *active += 1;
-    ApfsPopulatePermit
+    VolumePopulatePermit
+}
+
+#[cfg(target_os = "linux")]
+impl Store {
+    fn needs_linux_populate_cap(&self) -> bool {
+        *self
+            .cap_concurrent_link_populates
+            .get_or_init(|| linux_path_needs_populate_cap(self.paths.links_root()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_statfs_type(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut candidate = path;
+    while !candidate.exists() {
+        candidate = candidate.parent()?;
+    }
+    let c_path = CString::new(candidate.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `c_path` is NUL-terminated and `stats` is writable.
+    if unsafe { libc::statfs(c_path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: `statfs` initialized `stats` on success.
+    Some(unsafe { stats.assume_init().f_type } as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_overlay_upperdir_from_mountinfo(path: &Path, mountinfo: &[u8]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut best: Option<(usize, PathBuf)> = None;
+    for line in mountinfo
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let fields: Vec<&[u8]> = line.split(|byte| *byte == b' ').collect();
+        let Some(mount_point_raw) = fields.get(4).copied() else {
+            continue;
+        };
+        let Some(sep) = (6..fields.len()).find(|index| fields[*index] == b"-") else {
+            continue;
+        };
+        if fields.get(sep + 1).copied() != Some(b"overlay") {
+            continue;
+        }
+        let mount_point = PathBuf::from(std::ffi::OsString::from_vec(mount_point_raw.to_vec()));
+        if !canonical.starts_with(&mount_point) {
+            continue;
+        }
+        let options = fields.get(sep + 3).copied().unwrap_or_default();
+        let Some(upper_raw) = options
+            .split(|byte| *byte == b',')
+            .find_map(|opt| opt.strip_prefix(b"upperdir="))
+        else {
+            continue;
+        };
+        let depth = mount_point.as_os_str().len();
+        if best.as_ref().is_none_or(|(best_depth, _)| depth >= *best_depth) {
+            best = Some((
+                depth,
+                PathBuf::from(std::ffi::OsString::from_vec(upper_raw.to_vec())),
+            ));
+        }
+    }
+    best.map(|(_, upper)| upper)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_path_needs_populate_cap(path: &Path) -> bool {
+    const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
+    const OVERLAYFS_SUPER_MAGIC: u64 = 0x794c_7630;
+
+    match linux_statfs_type(path) {
+        Some(BTRFS_SUPER_MAGIC) => true,
+        Some(OVERLAYFS_SUPER_MAGIC) => {
+            let Ok(mountinfo) =
+                lpm_common::read_file_capped(Path::new("/proc/self/mountinfo"), 16 * 1024 * 1024)
+            else {
+                return false;
+            };
+            linux_overlay_upperdir_from_mountinfo(path, &mountinfo)
+                .and_then(|upper| linux_statfs_type(&upper))
+                == Some(BTRFS_SUPER_MAGIC)
+        }
+        _ => false,
+    }
 }
 
 mod checked_pins;

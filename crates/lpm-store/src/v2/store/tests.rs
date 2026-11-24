@@ -525,6 +525,45 @@ fn linux_materialization_reflinks_only_files_above_the_threshold() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_warm_materialization_uses_lower_4kib_reflink_threshold_and_parses_overlay_upperdir() {
+    use crate::v2::fs_util::linux_copy::{REFLINK_CANDIDATES, WARM_MIN_REFLINK_BYTES};
+    use crate::v2::fs_util::materialize_into_portable_with_integrity_warm;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    let below = usize::try_from(WARM_MIN_REFLINK_BYTES).unwrap() - 1;
+    std::fs::write(source.join("inline.js"), vec![1u8; below]).unwrap();
+    let before = REFLINK_CANDIDATES.with(std::cell::Cell::get);
+    materialize_into_portable_with_integrity_warm(&source, &dir.path().join("warm-below")).unwrap();
+    assert_eq!(REFLINK_CANDIDATES.with(std::cell::Cell::get) - before, 0);
+
+    std::fs::write(source.join("chunk.js"), vec![2u8; below + 1]).unwrap();
+    let before_warm = REFLINK_CANDIDATES.with(std::cell::Cell::get);
+    let integrity =
+        materialize_into_portable_with_integrity_warm(&source, &dir.path().join("warm-4k"))
+            .unwrap();
+    assert_eq!(
+        REFLINK_CANDIDATES.with(std::cell::Cell::get) - before_warm,
+        1
+    );
+    assert_eq!(
+        integrity,
+        compute_tree_metadata_integrity(&dir.path().join("warm-4k")).unwrap()
+    );
+
+    let mountinfo = b"54 29 0:45 / /var/lib/app rw,relatime - overlay overlay rw,lowerdir=/lower,upperdir=/var/lib/btrfs-upper,workdir=/work\n";
+    assert_eq!(
+        super::linux_overlay_upperdir_from_mountinfo(
+            Path::new("/var/lib/app/store/links"),
+            mountinfo
+        ),
+        Some(PathBuf::from("/var/lib/btrfs-upper"))
+    );
+}
+
 #[test]
 fn populate_link_entry_refreshes_missing_tree_snapshot_on_reuse() {
     let dir = tempfile::tempdir().unwrap();

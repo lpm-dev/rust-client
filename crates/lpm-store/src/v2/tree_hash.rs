@@ -136,6 +136,27 @@ impl TreeMetadataBuilder {
         self.refresh(index, path, payload)
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn record_with_metadata(
+        &mut self,
+        root: &Path,
+        path: &Path,
+        kind: TreeMetadataKind,
+        metadata: &std::fs::Metadata,
+        payload: Vec<u8>,
+    ) -> Result<(), LpmError> {
+        let index = self.reserve(root, path, kind)?;
+        let record = self.records.get_mut(index).ok_or_else(|| {
+            LpmError::Store("invalid materialized tree metadata record index".into())
+        })?;
+        record.mode = object_entry_mode(metadata);
+        record.len = metadata.len();
+        record.modified_time_nanos = modified_time_nanos(metadata);
+        record.change_time_nanos = change_time_nanos(metadata);
+        record.payload = payload;
+        Ok(())
+    }
+
     pub(crate) fn finish(self) -> String {
         let mut hasher = Sha256::new();
         for record in self.records {

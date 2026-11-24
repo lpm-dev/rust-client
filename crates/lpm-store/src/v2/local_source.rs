@@ -839,22 +839,21 @@ fn walk_local_source_object(
 }
 
 fn materialize_local_source_file(src: &Path, dst: &Path) -> Result<(), LpmError> {
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
+    #[cfg(target_os = "linux")]
+    {
+        super::fs_util::linux_copy::copy_file(src, dst)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::fs::copy(src, dst).map_err(|copy_err| {
             LpmError::Store(format!(
-                "failed to create virtual-store local-source object parent at {}: {e}",
-                parent.display()
+                "failed to copy virtual-store local-source file {} → {}: {copy_err}",
+                src.display(),
+                dst.display()
             ))
         })?;
+        Ok(())
     }
-    std::fs::copy(src, dst).map_err(|copy_err| {
-        LpmError::Store(format!(
-            "failed to copy virtual-store local-source file {} → {}: {copy_err}",
-            src.display(),
-            dst.display()
-        ))
-    })?;
-    Ok(())
 }
 
 #[cfg(test)]
