@@ -1482,9 +1482,10 @@ fn analyze_source_file(
 
 /// Core scan pass without the filesystem read — takes the file's
 /// package-relative path and raw bytes and returns the same
-/// `FileAnalysisResult` as [`analyze_single_file`]. The fused-scan path in
-/// `lpm-store` invokes this during tar extraction, using bytes the extractor
-/// already had in hand instead of re-reading the file a second time.
+/// `FileAnalysisResult` that [`analyze_package`] computes for that file. The
+/// fused-scan path in `lpm-store` invokes this during tar extraction, using
+/// bytes the extractor already had in hand instead of re-reading the file a
+/// second time.
 ///
 /// The caller is responsible for:
 /// - filtering by extension (`SOURCE_EXTENSIONS`) and `.d.ts`/`.map`

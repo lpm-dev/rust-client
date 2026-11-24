@@ -68,7 +68,7 @@ const BLOCKED_SCRIPTS: &[&str] = &[
 /// [`script_hash::compute_script_hash`] iterates it in fixed order.
 ///
 /// **Invariant** (asserted by `script_hash::tests::executed_install_phases_const_is_subset_of_blocked_scripts`):
-/// every entry here MUST also appear in [`BLOCKED_SCRIPTS`]. You can't run
+/// every entry here MUST also appear in `BLOCKED_SCRIPTS`. You can't run
 /// a script that isn't blocked by default.
 pub const EXECUTED_INSTALL_PHASES: &[&str] = &["preinstall", "install", "postinstall"];
 

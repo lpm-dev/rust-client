@@ -3,7 +3,7 @@
 //! Pure comparison logic consumed by the install-time drift gate in
 //! `lpm-cli/src/commands/install.rs`. Given an approved
 //! [`ProvenanceSnapshot`] (captured into a
-//! [`TrustedDependencyBinding.provenance_at_approval`] at approval
+//! `TrustedDependencyBinding.provenance_at_approval` in `lpm-cli` at approval
 //! time) and a freshly-fetched snapshot for the candidate version,
 //! decide whether the identity has drifted enough to block the install.
 //!
