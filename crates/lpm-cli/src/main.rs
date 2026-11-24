@@ -108,11 +108,11 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 // mimalloc replaces the system allocator in non-profiling builds for Unix
 // targets other than macOS and Linux GNU (comparison builds:
 // `--features no-mimalloc`). macOS, Windows, and Linux GNU keep their system
-// allocators: on both macOS and Linux glibc (with `M_ARENA_MAX=4`), installs
-// peak 40-56% lower in RSS under the system allocator with no wall-clock loss,
-// whereas mimalloc retains freed memory committed in its per-thread arenas.
-// Linux musl keeps mimalloc (with `purge_delay=0`) because musl's mallocng
-// contends heavily across Tokio/rayon worker threads.
+// allocators: on both macOS and Linux glibc (with `M_ARENA_MAX=8`), installs
+// peak 40-56% lower in RSS under the system allocator without regressing
+// throughput, whereas mimalloc retains freed memory committed in its per-thread
+// arenas. Linux musl keeps mimalloc (with `purge_delay=0`) because musl's
+// mallocng contends heavily across Tokio/rayon worker threads.
 #[cfg(all(
     unix,
     not(target_os = "macos"),
@@ -125,16 +125,17 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Bound glibc's per-thread arena proliferation before worker threads start.
 /// glibc defaults to `8 * nproc` arenas, which inflates peak RSS across
-/// short-lived Tokio and rayon threads; capping at 4 arenas keeps Linux GNU
-/// peak RSS ~55% lower without regressing throughput, while still honoring an
-/// explicit `MALLOC_ARENA_MAX` set by the caller.
+/// short-lived Tokio and rayon threads; capping at 8 arenas cuts Linux GNU
+/// peak RSS by ~55% while avoiding warm-lock arena contention across parallel
+/// workspace lanes, and still honors an explicit `MALLOC_ARENA_MAX` set by the
+/// caller.
 #[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "dhat-heap")))]
 fn configure_process_allocator() {
     if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
         // SAFETY: `mallopt` is thread-safe before worker threads spawn and
         // ignores unsupported options safely.
         unsafe {
-            libc::mallopt(libc::M_ARENA_MAX, 4);
+            libc::mallopt(libc::M_ARENA_MAX, 8);
         }
     }
 }
@@ -207,8 +208,8 @@ mod linux_gnu_allocator_tests {
             usable >= 256,
             "linux-gnu allocations must come from glibc malloc"
         );
-        // SAFETY: `mallopt(M_ARENA_MAX, 4)` returns 1 on glibc.
-        let status = unsafe { libc::mallopt(libc::M_ARENA_MAX, 4) };
+        // SAFETY: `mallopt(M_ARENA_MAX, 8)` returns 1 on glibc.
+        let status = unsafe { libc::mallopt(libc::M_ARENA_MAX, 8) };
         assert_eq!(status, 1);
     }
 }
