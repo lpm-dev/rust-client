@@ -614,6 +614,7 @@ async fn assert_online_phase_cancellation(pubgrub_opt_out: bool) {
         json_output: true,
         requested_v2_mode: true,
         v2_workspace_root_pre_resolve: &pre_resolve,
+        promoted_workspace_registry_roots: &no_names,
         workspace_member_deps: &mut workspace_dependencies,
         all_workspace_members: &[],
         store: PackageStore::at(root.path()),

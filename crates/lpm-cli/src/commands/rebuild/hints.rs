@@ -345,21 +345,20 @@ pub fn all_scripted_packages_trusted_in_context(
             Some(p) => p,
             None => continue,
         };
-        let pkg_json_path = pkg_dir.join("package.json");
-
-        let scripts = match read_lifecycle_scripts(&pkg_json_path) {
-            Ok(Some(s)) => s,
+        let script_data = match crate::commands::install::workspace_materialization::cached_script_hash_with_phase_bodies(&pkg_dir) {
+            Ok(Some(data)) => data,
             Ok(None) => continue,
             Err(error) => {
                 tracing::warn!(
-                    path = %pkg_json_path.display(),
+                    path = %pkg_dir.join("package.json").display(),
                     "cannot prove all lifecycle packages are trusted because an installed manifest is invalid: {error}"
                 );
                 return false;
             }
         };
-
-        let script_hash = compute_script_hash(&pkg_dir);
+        let scripts: std::collections::HashMap<String, String> =
+            script_data.phase_bodies.into_iter().collect();
+        let script_hash = Some(script_data.hash);
         if matches!(
             read_build_marker(&pkg_dir.join(BUILD_MARKER)),
             Ok(BuildMarkerState::Present { key })

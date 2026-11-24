@@ -940,7 +940,8 @@ pub(super) fn root_provider_fingerprint_from_projection(
     omit_policy: InstallOmitPolicy,
 ) -> Option<String> {
     let manifest = root_manifest_bytes(root_dir);
-    let package = lpm_workspace::read_workspace_root_package(root_dir).unwrap_or_default();
+    let package =
+        crate::workspace_discovery_cache::read_workspace_root_package(root_dir).unwrap_or_default();
     let local_packages = root_workspace_install_packages(root_dir, &package)?;
     let direct = direct_provider_identities(&package, lockfile, &local_packages);
     let rows = lockfile
@@ -996,7 +997,8 @@ impl RootProviderSnapshot {
                 package,
             ));
         }
-        let package = lpm_workspace::read_workspace_root_package(root_dir).unwrap_or_default();
+        let package = crate::workspace_discovery_cache::read_workspace_root_package(root_dir)
+            .unwrap_or_default();
         let deps = super::manifest_install_deps(&package);
         lockfile.root_aliases = super::root_aliases_for_lockfile(&packages, &deps);
         lockfile.root_resolutions = super::root_resolutions_for_lockfile(&packages);
@@ -1015,20 +1017,88 @@ impl RootProviderSnapshot {
         if omit_policy.optional {
             super::filter_optional_packages(&mut packages, root_optional_dependency_names);
         }
-        let mut direct_by_name = BTreeMap::<String, Vec<usize>>::new();
+        let mut by_instance = HashMap::with_capacity(packages.len());
+        let mut registry_by_name_version = HashMap::<(&str, &str), Vec<usize>>::new();
+        let mut source_by_wrapper = HashMap::<String, Vec<usize>>::new();
         for (index, package) in packages.iter().enumerate() {
-            if package.is_direct {
-                direct_by_name
-                    .entry(package.name.clone())
+            if let Some(instance_id) = package.instance_id {
+                by_instance.insert(instance_id, index);
+            }
+            if matches!(
+                package.source_kind(),
+                Ok(lpm_lockfile::Source::Registry { .. })
+            ) {
+                registry_by_name_version
+                    .entry((package.name.as_str(), package.version.as_str()))
                     .or_default()
                     .push(index);
             }
+            if let Some(wrapper_id) = package.wrapper_id_for_source() {
+                source_by_wrapper.entry(wrapper_id).or_default().push(index);
+            }
+        }
+        let mut exposed_indices = HashSet::new();
+        let mut local_queue = VecDeque::new();
+        let mut visited_locals = HashSet::new();
+        for (index, package) in packages.iter().enumerate() {
+            if package.is_direct {
+                exposed_indices.insert(index);
+                if matches!(
+                    package.source_kind(),
+                    Ok(lpm_lockfile::Source::Directory { .. } | lpm_lockfile::Source::Link { .. })
+                ) && visited_locals.insert(index)
+                {
+                    local_queue.push_back(index);
+                }
+            }
+        }
+        while let Some(local_index) = local_queue.pop_front() {
+            let local_pkg = &packages[local_index];
+            for (local_name, version) in &local_pkg.dependencies {
+                let child_index =
+                    if let Some(target_id) = local_pkg.dependency_targets.get(local_name) {
+                        by_instance.get(target_id).copied()
+                    } else {
+                        let target = local_pkg
+                            .aliases
+                            .get(local_name)
+                            .map_or(local_name, |name| name);
+                        source_by_wrapper
+                            .get(version)
+                            .or_else(|| {
+                                registry_by_name_version.get(&(target.as_str(), version.as_str()))
+                            })
+                            .and_then(|candidates| match candidates.as_slice() {
+                                [child] => Some(*child),
+                                _ => None,
+                            })
+                    };
+                if let Some(child_index) = child_index {
+                    exposed_indices.insert(child_index);
+                    if matches!(
+                        packages[child_index].source_kind(),
+                        Ok(lpm_lockfile::Source::Directory { .. }
+                            | lpm_lockfile::Source::Link { .. })
+                    ) && visited_locals.insert(child_index)
+                    {
+                        local_queue.push_back(child_index);
+                    }
+                }
+            }
+        }
+        let mut direct_by_name = BTreeMap::<String, Vec<usize>>::new();
+        for index in exposed_indices {
+            direct_by_name
+                .entry(packages[index].name.clone())
+                .or_default()
+                .push(index);
         }
         for candidates in direct_by_name.values_mut() {
             candidates.sort_unstable_by(|left, right| {
                 packages[*right]
-                    .version
-                    .cmp(&packages[*left].version)
+                    .is_direct
+                    .cmp(&packages[*left].is_direct)
+                    .then_with(|| packages[*right].version.cmp(&packages[*left].version))
                     .then_with(|| packages[*left].source.cmp(&packages[*right].source))
             });
         }

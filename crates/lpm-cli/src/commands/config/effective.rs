@@ -81,7 +81,7 @@ impl EffectiveConfig {
                 &package_json_value,
             )?;
         let posture = crate::security_approval::load_effective_authorized_posture()?;
-        let workspace_root = lpm_workspace::find_workspace_root(&project_dir)
+        let workspace_root = crate::workspace_discovery_cache::find_workspace_root(&project_dir)
             .map_err(|error| LpmError::Workspace(error.to_string()))?;
         let workspace_detected = workspace_root.is_some();
         let workspace_root = workspace_root.as_deref().unwrap_or(project_dir.as_path());
@@ -89,8 +89,9 @@ impl EffectiveConfig {
         let root_package = if workspace_root == project_dir {
             &package_json
         } else {
-            root_package_storage = lpm_workspace::read_workspace_root_package(workspace_root)
-                .map_err(|error| LpmError::Workspace(error.to_string()))?;
+            root_package_storage =
+                crate::workspace_discovery_cache::read_workspace_root_package(workspace_root)
+                    .map_err(|error| LpmError::Workspace(error.to_string()))?;
             &root_package_storage
         };
         let workspace_toml_path = workspace_root.join("lpm.toml");

@@ -97,7 +97,7 @@ pub(super) fn default_bounded_fetch_extract_permits() -> usize {
         })
     }
 }
-const DEFAULT_LARGE_V2_STREAMING_EXTRACT_WEIGHT: usize = 3;
+const DEFAULT_LARGE_V2_STREAMING_EXTRACT_WEIGHT: usize = 2;
 pub(super) const LARGE_V2_STREAMING_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 pub(super) const MAX_RETAINED_SPECULATIVE_TASKS: usize = 128;
 const SPECULATIVE_FILE_STREAMING_MIN_BYTES: u64 = 8 * 1024 * 1024;
@@ -3108,7 +3108,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_streaming_extract_weight_is_three_only_for_large_objects_by_default() {
+    fn v2_streaming_extract_weight_is_two_only_for_large_objects_by_default() {
         assert_eq!(configured_v2_streaming_extract_weight(None, None), 1);
         assert_eq!(
             configured_v2_streaming_extract_weight(
@@ -3122,11 +3122,11 @@ mod tests {
                 None,
                 std::num::NonZeroU64::new(LARGE_V2_STREAMING_OBJECT_BYTES)
             ),
-            3
+            2
         );
         assert_eq!(
             configured_v2_streaming_extract_weight(None, std::num::NonZeroU64::new(u64::MAX)),
-            3
+            2
         );
     }
 
@@ -3142,10 +3142,10 @@ mod tests {
             configured_v2_streaming_extract_weight(Some(&max_permits_str), large),
             max_permits
         );
-        assert_eq!(configured_v2_streaming_extract_weight(Some("0"), large), 3);
+        assert_eq!(configured_v2_streaming_extract_weight(Some("0"), large), 2);
         assert_eq!(
             configured_v2_streaming_extract_weight(Some(&over_max_str), large),
-            3
+            2
         );
     }
 

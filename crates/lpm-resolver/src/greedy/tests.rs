@@ -5600,7 +5600,12 @@ async fn fusion_fetches_distinct_exact_versions_concurrently() {
                 let request = String::from_utf8(request).unwrap();
                 let path = request.split_whitespace().nth(1).unwrap();
                 if path == "/shared-exact" {
-                    socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
                     return;
                 }
                 let version = path.strip_prefix("/shared-exact/").unwrap().to_owned();
@@ -5893,17 +5898,15 @@ async fn resolve_deep_required_and_shallow_optional_overlap(
         ("middle", middle.clone(), required_chain_seeded),
         ("shared-child", shared_child.clone(), fully_seeded),
     ] {
-        let requests = if name == "shared-child" && !fully_seeded {
-            2
-        } else {
-            u64::from(!seeded)
-        };
-        Mock::given(method("GET"))
+        let mock = Mock::given(method("GET"))
             .and(path(format!("/{name}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
-            .expect(requests)
-            .mount(&server)
-            .await;
+            .respond_with(ResponseTemplate::new(200).set_body_json(metadata));
+        let mock = if name == "shared-child" && !fully_seeded {
+            mock.expect(1..=2)
+        } else {
+            mock.expect(u64::from(!seeded))
+        };
+        mock.mount(&server).await;
     }
 
     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
@@ -7883,6 +7886,62 @@ async fn trace_metadata_keeps_failed_exact_attempts_before_packument_recovery() 
     );
     assert_eq!(snapshot.route_npm_direct_count, 1);
     lpm_registry::timing::reset_metadata_detail();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unrelated_override_keeps_preferred_latest_fast_path_for_other_packages() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let mut latest = version_document_json("unrelated-pkg", "1.5.0", &[]);
+    latest["dist"]["integrity"] = serde_json::json!(format!("sha512-{}==", "A".repeat(86)));
+    Mock::given(method("GET"))
+        .and(path("/unrelated-pkg/latest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(latest))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/unrelated-pkg"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(150))
+                .set_body_json(metadata_json("unrelated-pkg", &[])),
+        )
+        .mount(&server)
+        .await;
+
+    let overrides = OverrideSet::parse(
+        &HashMap::new(),
+        &HashMap::from([("some-other-pkg".to_string(), "9.9.9".to_string())]),
+        &HashMap::new(),
+    )
+    .expect("parse unrelated override");
+
+    let result = resolve_greedy_fused(
+        Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        ),
+        HashMap::from([("unrelated-pkg".to_string(), "^1.0.0".to_string())]),
+        overrides,
+        RouteTable::from_mode_only(RouteMode::Direct),
+        4,
+        None,
+        true,
+    )
+    .await
+    .expect("resolve with unrelated override");
+
+    assert_eq!(result.packages.len(), 1);
+    assert_eq!(result.packages[0].version.to_string(), "1.5.0");
+    assert!(
+        !result.cache[&CanonicalKey::npm("unrelated-pkg")].versions_complete,
+        "unrelated override must not disable preferred latest resolution"
+    );
+    server.verify().await;
 }
 
 #[tokio::test(flavor = "current_thread")]

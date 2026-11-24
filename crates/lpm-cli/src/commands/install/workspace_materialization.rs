@@ -251,7 +251,7 @@ impl WorkspaceLinkHandle {
     }
 }
 
-pub(super) struct WorkspaceMaterializationCoordinator {
+pub(crate) struct WorkspaceMaterializationCoordinator {
     unshared_local_source_roots: Box<[std::path::PathBuf]>,
     fetch_semaphore: Arc<Semaphore>,
     fetch_extract_limiter: super::FetchExtractLimiter,
@@ -270,6 +270,10 @@ pub(super) struct WorkspaceMaterializationCoordinator {
         SingleFlight<LocalSourcePopulationKey, std::path::PathBuf, SharedMaterializationError>,
     link_materializations:
         StdMutex<HashMap<LinkMaterializationKey, Arc<RetainedOperation<LinkMaterialization>>>>,
+    script_hash_cache: dashmap::DashMap<
+        std::path::PathBuf,
+        Result<Option<lpm_security::script_hash::ScriptHashWithPhaseBodies>, String>,
+    >,
 }
 
 impl Default for WorkspaceMaterializationCoordinator {
@@ -304,7 +308,25 @@ impl WorkspaceMaterializationCoordinator {
             union_object_validation: OnceLock::new(),
             local_source_populations: SingleFlight::default(),
             link_materializations: StdMutex::new(HashMap::new()),
+            script_hash_cache: dashmap::DashMap::new(),
         }
+    }
+
+    pub(crate) fn cached_script_hash_with_phase_bodies(
+        &self,
+        pkg_dir: &std::path::Path,
+    ) -> Result<Option<lpm_security::script_hash::ScriptHashWithPhaseBodies>, LpmError> {
+        if let Some(cached) = self.script_hash_cache.get(pkg_dir) {
+            return cached.value().clone().map_err(LpmError::Store);
+        }
+        let computed =
+            lpm_security::script_hash::try_compute_script_hash_with_phase_bodies(pkg_dir);
+        let entry = match &computed {
+            Ok(value) => Ok(value.clone()),
+            Err(error) => Err(error.to_string()),
+        };
+        self.script_hash_cache.insert(pkg_dir.to_path_buf(), entry);
+        computed
     }
 
     pub(super) fn fetch_semaphore(&self) -> Arc<Semaphore> {
@@ -695,8 +717,17 @@ where
     ACTIVE_COORDINATOR.scope(coordinator, future).await
 }
 
-pub(super) fn current() -> Option<Arc<WorkspaceMaterializationCoordinator>> {
+pub(crate) fn current() -> Option<Arc<WorkspaceMaterializationCoordinator>> {
     ACTIVE_COORDINATOR.try_with(Arc::clone).ok()
+}
+
+pub(crate) fn cached_script_hash_with_phase_bodies(
+    pkg_dir: &std::path::Path,
+) -> Result<Option<lpm_security::script_hash::ScriptHashWithPhaseBodies>, LpmError> {
+    if let Some(coordinator) = current() {
+        return coordinator.cached_script_hash_with_phase_bodies(pkg_dir);
+    }
+    lpm_security::script_hash::try_compute_script_hash_with_phase_bodies(pkg_dir)
 }
 
 #[cfg(test)]
@@ -1070,7 +1101,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn link_materialization_keeps_direct_and_transitive_graph_contexts_distinct() {
+    async fn link_materialization_shares_identical_direct_and_transitive_graph_contexts() {
         let temp = tempfile::tempdir().unwrap();
         let direct_project = temp.path().join("direct-project");
         let transitive_project = temp.path().join("transitive-project");
@@ -1145,9 +1176,8 @@ mod tests {
         let direct = direct.unwrap();
         let transitive = transitive.unwrap();
 
-        assert!(direct.performed);
-        assert!(transitive.performed);
-        assert_ne!(
+        assert!(direct.performed ^ transitive.performed);
+        assert_eq!(
             direct.value.materialized.destination,
             transitive.value.materialized.destination
         );

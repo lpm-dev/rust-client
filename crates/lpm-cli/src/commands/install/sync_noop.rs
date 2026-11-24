@@ -550,11 +550,13 @@ pub(crate) struct WorkspaceSyncNoopHit {
     pub(crate) targets: Vec<WorkspaceSyncNoopTarget>,
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct WorkspaceSyncNoopTargetInput<'a> {
     pub(super) name: &'a str,
     pub(super) path: &'a Path,
     pub(super) kind: &'static str,
     pub(super) has_scripts: bool,
+    pub(super) has_dev_preinstall: bool,
     pub(super) no_dependencies: bool,
 }
 
@@ -604,7 +606,12 @@ pub(super) fn write_workspace_sync_noop_state(
         && options.strict_peer_dependencies_override != Some(true)
         && !target_inputs.is_empty()
         && target_inputs.iter().all(|target| {
-            !target.has_scripts
+            let scripts_eligible = if target.kind == "root" {
+                !target.has_dev_preinstall
+            } else {
+                !target.has_scripts
+            };
+            scripts_eligible
                 && !crate::install_recovery::pending(target.path)
                 && !target.path.join("Package.swift").exists()
         })
@@ -882,16 +889,16 @@ pub(crate) fn try_workspace_up_to_date(
     let Ok(package) = serde_json::from_str::<lpm_workspace::PackageJson>(package_json) else {
         return Ok(None);
     };
+    let root_lifecycle = crate::commands::root_lifecycle::RootProjectLifecycle::from_package(
+        workspace_root,
+        &package,
+    );
     if crate::install_recovery::pending(workspace_root)
         || workspace_root.join("Package.swift").exists()
         || workspace_root
             .join(lpm_lockfile::OBSOLETE_BINARY_LOCKFILE_NAME)
             .exists()
-        || crate::commands::root_lifecycle::RootProjectLifecycle::from_package(
-            workspace_root,
-            &package,
-        )
-        .has_scripts()
+        || root_lifecycle.has_dev_preinstall()
     {
         return Ok(None);
     }
@@ -1034,6 +1041,9 @@ pub(crate) fn try_workspace_up_to_date(
     }
 
     suppression_warnings.flush(json_output);
+    if root_lifecycle.has_scripts() {
+        root_lifecycle.run_after_successful_install(workspace_root, json_output)?;
+    }
     Ok(Some(WorkspaceSyncNoopHit {
         targets: state.targets,
     }))
@@ -1528,6 +1538,7 @@ mod tests {
                 path: &member_dir,
                 kind: "member",
                 has_scripts: false,
+                has_dev_preinstall: false,
                 no_dependencies: false,
             },
             super::WorkspaceSyncNoopTargetInput {
@@ -1535,6 +1546,7 @@ mod tests {
                 path: root,
                 kind: "root",
                 has_scripts: false,
+                has_dev_preinstall: false,
                 no_dependencies: false,
             },
         ];
@@ -1668,6 +1680,122 @@ mod tests {
         .unwrap();
         assert!(
             super::try_workspace_up_to_date(root, Some(root_pkg), &mode)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn workspace_sync_noop_hits_and_runs_root_after_install_scripts() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::ScopedEnv::set([
+            ("LPM_HOME", home.path().as_os_str().to_owned()),
+            ("HOME", home.path().as_os_str().to_owned()),
+            (
+                "NPM_CONFIG_USERCONFIG",
+                home.path().join(".npmrc").into_os_string(),
+            ),
+            ("LPM_LINKER", std::ffi::OsString::from("isolated")),
+            ("CI", std::ffi::OsString::from("")),
+            ("GITHUB_ACTIONS", std::ffi::OsString::from("")),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let marker = root.join("postinstall-ran.txt");
+        let root_pkg = r#"{"name":"mono","private":true,"workspaces":["packages/*"],"scripts":{"postinstall":"node -e \"require('fs').writeFileSync('postinstall-ran.txt', 'ok')\""}}"#;
+        let member_dir = root.join("packages/ui");
+        std::fs::create_dir_all(member_dir.join("node_modules")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::fs::write(root.join("package.json"), root_pkg).unwrap();
+        std::fs::write(
+            member_dir.join("package.json"),
+            r#"{"name":"@mono/ui","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let lockfile = lockfile_with_packages(&["react"]);
+        lockfile
+            .write_to_file(&root.join(lpm_lockfile::LOCKFILE_NAME))
+            .unwrap();
+
+        let workspace = lpm_workspace::discover_workspace(root).unwrap().unwrap();
+        let options = crate::commands::install::recursive::RecursiveInstallOptions {
+            json_output: true,
+            emit_summary: true,
+            offline: false,
+            frozen_lockfile: crate::commands::install::FrozenLockfileMode::Never,
+            force: false,
+            allow_new: false,
+            strict_integrity: false,
+            no_engine_strict: true,
+            strict_peer_dependencies_override: None,
+            linker_override: None,
+            lpm_skills_preference: crate::lpm_skills_config::LpmSkillsPreference::Disabled,
+            no_security_summary: true,
+            auto_build: false,
+            script_policy_override: None,
+            advisor_override: None,
+            min_release_age_override: None,
+            min_release_age_exclude: Vec::new(),
+            drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy::EnforceAll,
+            verify_policy: crate::provenance_fetch::VerifyPolicy::default(),
+            omit_policy: crate::commands::install::InstallOmitPolicy::default(),
+            strict_sandbox: false,
+            no_sandbox: false,
+            verbose: false,
+            audit_after_install: false,
+            timing: false,
+            workspace_concurrency: None,
+        };
+        let target_inputs = [
+            super::WorkspaceSyncNoopTargetInput {
+                name: "@mono/ui",
+                path: &member_dir,
+                kind: "member",
+                has_scripts: false,
+                has_dev_preinstall: false,
+                no_dependencies: false,
+            },
+            super::WorkspaceSyncNoopTargetInput {
+                name: "mono",
+                path: root,
+                kind: "root",
+                has_scripts: true,
+                has_dev_preinstall: false,
+                no_dependencies: false,
+            },
+        ];
+        super::write_workspace_sync_noop_state(&workspace, &target_inputs, &options, true);
+
+        let mode = crate::install_state::FastLaneMode {
+            json: true,
+            timing: false,
+            frozen_lockfile: crate::commands::install::FrozenLockfileMode::Never,
+            no_skills: true,
+            min_release_age: None,
+            min_release_age_exclude: Vec::new(),
+            linker: None,
+            no_engine_strict: true,
+        };
+        let hit = super::try_workspace_up_to_date(root, Some(root_pkg), &mode)
+            .unwrap()
+            .expect("workspace with root postinstall should hit sync_noop");
+        assert_eq!(hit.targets.len(), 2);
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ok");
+
+        // devPreinstall on the root still bypasses workspace sync_noop.
+        let dev_preinstall_pkg = r#"{"name":"mono","private":true,"workspaces":["packages/*"],"scripts":{"pnpm:devPreinstall":"node -e 0"}}"#;
+        std::fs::write(root.join("package.json"), dev_preinstall_pkg).unwrap();
+        let workspace_dev = lpm_workspace::discover_workspace(root).unwrap().unwrap();
+        let dev_inputs = [
+            target_inputs[0],
+            super::WorkspaceSyncNoopTargetInput {
+                has_dev_preinstall: true,
+                ..target_inputs[1]
+            },
+        ];
+        super::write_workspace_sync_noop_state(&workspace_dev, &dev_inputs, &options, true);
+        assert!(
+            super::try_workspace_up_to_date(root, Some(dev_preinstall_pkg), &mode)
                 .unwrap()
                 .is_none()
         );

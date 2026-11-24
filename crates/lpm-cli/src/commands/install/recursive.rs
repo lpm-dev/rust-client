@@ -7,7 +7,7 @@ use tokio::task::JoinSet;
 
 const ENV_WORKSPACE_CONCURRENCY: &str = "LPM_WORKSPACE_CONCURRENCY";
 const WORKSPACE_INSTALL_DEFAULT_CONCURRENCY: usize = 1;
-const WORKSPACE_INSTALL_AUTOMATIC_MAX_CONCURRENCY: usize = 3;
+const WORKSPACE_INSTALL_AUTOMATIC_MAX_CONCURRENCY: usize = 6;
 const WORKSPACE_INSTALL_FRESH_MAX_CONCURRENCY: usize = 6;
 const WORKSPACE_INSTALL_FRESH_WORK_UNITS_PER_LANE: usize = 256;
 
@@ -113,6 +113,13 @@ struct TargetTaskResult {
     // Present when the target ran a `pnpm:devPreinstall` script and
     // reloaded its manifest: later-scheduled targets build on this view.
     refreshed_workspace: Option<Arc<lpm_workspace::Workspace>>,
+    // Present when the root joined workspace union resolution ahead of its
+    // `schedule_after` members and deferred its after-install scripts until
+    // every member finished.
+    deferred_after_install: Option<(
+        PathBuf,
+        crate::commands::root_lifecycle::RootProjectLifecycle,
+    )>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -262,8 +269,13 @@ pub(crate) async fn run_recursive_workspace_install(
                 .iter()
                 .enumerate()
                 .filter_map(|(index, target)| {
+                    let scripts_allow_union = if target.kind == "root" {
+                        !target.lifecycle.has_dev_preinstall()
+                    } else {
+                        !target.lifecycle.has_scripts()
+                    };
                     (target.has_registry_resolution_roots
-                        && !target.lifecycle.has_scripts()
+                        && scripts_allow_union
                         && target.resolve_ahead_eligible)
                         .then_some(index)
                 })
@@ -393,6 +405,10 @@ pub(crate) async fn run_recursive_workspace_install(
             .iter()
             .map(|target| (target.path.clone(), target.lifecycle.has_scripts()))
             .collect();
+        let target_has_dev_preinstall: HashMap<PathBuf, bool> = targets
+            .iter()
+            .map(|target| (target.path.clone(), target.lifecycle.has_dev_preinstall()))
+            .collect();
         let workspace_freshness_cache =
             Arc::new(crate::workspace_discovery_cache::WorkspaceFreshnessCache::default());
         let scheduler = async {
@@ -410,6 +426,11 @@ pub(crate) async fn run_recursive_workspace_install(
                 (0..target_count).map(|_| None).collect();
             let mut in_flight: JoinSet<(usize, Result<TargetTaskResult, LpmError>)> =
                 JoinSet::new();
+            let mut deferred_root_after_install: Option<(
+                usize,
+                PathBuf,
+                crate::commands::root_lifecycle::RootProjectLifecycle,
+            )> = None;
             let mut first_error: Option<LpmError> = None;
 
             loop {
@@ -439,6 +460,7 @@ pub(crate) async fn run_recursive_workspace_install(
                                 root_target_index == Some(index)
                             } else {
                                 resolution_task_indices[index].is_some()
+                                    || (lockfile_replay_ready && !plan.lifecycle.has_scripts())
                                     || plan.schedule_after.iter().all(|dep| done[*dep])
                             }
                         });
@@ -446,11 +468,15 @@ pub(crate) async fn run_recursive_workspace_install(
                             continue;
                         }
                         let plan = plans[index].take().expect("ready target plan present");
+                        let defer_after_install = plan.kind == "root"
+                            && plan.lifecycle.has_scripts()
+                            && !plan.schedule_after.iter().all(|dep| done[*dep]);
                         started_at[index] = Some(Instant::now());
                         spawn_workspace_target_install(
                             &mut in_flight,
                             index,
                             plan,
+                            defer_after_install,
                             client,
                             &lpm_root,
                             Arc::clone(&active_workspace),
@@ -481,6 +507,9 @@ pub(crate) async fn run_recursive_workspace_install(
                         if let Some(refreshed) = result.refreshed_workspace {
                             active_workspace = refreshed;
                         }
+                        if let Some((path, lifecycle)) = result.deferred_after_install {
+                            deferred_root_after_install = Some((index, path, lifecycle));
+                        }
                         let outcome = outcomes[index]
                             .as_mut()
                             .expect("outcome slot initialized at spawn");
@@ -504,6 +533,24 @@ pub(crate) async fn run_recursive_workspace_install(
                                 "workspace install worker failed: {join_error}"
                             )));
                         }
+                    }
+                }
+            }
+
+            if first_error.is_none()
+                && let Some((index, path, lifecycle)) = deferred_root_after_install
+            {
+                let hook_start = Instant::now();
+                if let Err(error) =
+                    lifecycle.run_after_successful_install(&path, options.json_output)
+                {
+                    first_error = Some(error);
+                } else {
+                    workspace_freshness_cache.invalidate();
+                    if let Some(outcome) = outcomes[index].as_mut() {
+                        outcome.duration_ms = outcome
+                            .duration_ms
+                            .saturating_add(duration_ms(hook_start.elapsed()));
                     }
                 }
             }
@@ -550,6 +597,10 @@ pub(crate) async fn run_recursive_workspace_install(
                 path: outcome.path.as_path(),
                 kind: outcome.kind,
                 has_scripts: target_has_scripts
+                    .get(outcome.path.as_path())
+                    .copied()
+                    .unwrap_or(true),
+                has_dev_preinstall: target_has_dev_preinstall
                     .get(outcome.path.as_path())
                     .copied()
                     .unwrap_or(true),
@@ -620,6 +671,7 @@ fn spawn_workspace_target_install(
     in_flight: &mut JoinSet<(usize, Result<TargetTaskResult, LpmError>)>,
     index: usize,
     plan: WorkspaceInstallTarget,
+    defer_after_install: bool,
     client: &RegistryClient,
     lpm_root: &lpm_common::LpmRoot,
     base_workspace: Arc<lpm_workspace::Workspace>,
@@ -656,6 +708,7 @@ fn spawn_workspace_target_install(
         let importer = Arc::<str>::from(plan.importer.as_str());
         let install = run_workspace_target_install(
             plan,
+            defer_after_install,
             client,
             lpm_root,
             base_workspace,
@@ -699,6 +752,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn run_workspace_target_install(
     plan: WorkspaceInstallTarget,
+    defer_after_install: bool,
     client: RegistryClient,
     lpm_root: lpm_common::LpmRoot,
     base_workspace: Arc<lpm_workspace::Workspace>,
@@ -804,18 +858,25 @@ async fn run_workspace_target_install(
         }
     }
 
-    plan.lifecycle
-        .run_after_successful_install(&plan.path, options.json_output)?;
-    if plan.lifecycle.has_scripts() {
-        workspace_freshness_cache.invalidate();
-    }
+    let refreshed_workspace = plan
+        .lifecycle
+        .has_dev_preinstall()
+        .then_some(scoped_workspace);
+    let deferred_after_install = if defer_after_install {
+        Some((plan.path, plan.lifecycle))
+    } else {
+        plan.lifecycle
+            .run_after_successful_install(&plan.path, options.json_output)?;
+        if plan.lifecycle.has_scripts() {
+            workspace_freshness_cache.invalidate();
+        }
+        None
+    };
 
     Ok(TargetTaskResult {
         report: capture.as_ref().and_then(report_capture::take),
-        refreshed_workspace: plan
-            .lifecycle
-            .has_dev_preinstall()
-            .then_some(scoped_workspace),
+        refreshed_workspace,
+        deferred_after_install,
     })
 }
 
@@ -1760,7 +1821,7 @@ mod tests {
                 8,
                 WORKSPACE_INSTALL_AUTOMATIC_MAX_CONCURRENCY,
             ),
-            3,
+            6,
         );
     }
 
@@ -1934,7 +1995,7 @@ mod tests {
 
     #[test]
     fn recursive_workspace_install_bounds_fresh_resolution_parallelism() {
-        assert_eq!(automatic_workspace_resolution_concurrency(8, 8), 3);
+        assert_eq!(automatic_workspace_resolution_concurrency(8, 8), 6);
         assert_eq!(automatic_workspace_resolution_concurrency(2, 8), 2);
         assert_eq!(automatic_workspace_resolution_concurrency(8, 1), 1);
     }

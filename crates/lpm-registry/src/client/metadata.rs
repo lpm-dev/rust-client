@@ -483,6 +483,30 @@ fn unix_now_secs() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
+/// RFC 9110 §8.8.3.2 weak ETag comparison.
+///
+/// Cloudflare/npm returns `W/"<tag>"` on compressed 200 responses and `"<tag>"`
+/// on 304 Not Modified responses for the same representation.
+#[inline]
+fn etags_weak_match(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(a), Some(b)) => {
+            a.strip_prefix("W/").unwrap_or(a) == b.strip_prefix("W/").unwrap_or(b)
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn version_doc_has_immutable_dist(name: &str, version: &str, metadata: &PackageMetadata) -> bool {
+    package_metadata_matches_version_doc(name, version, metadata)
+        && metadata
+            .versions
+            .get(version)
+            .and_then(|v| v.dist.as_ref())
+            .is_some_and(|d| d.integrity.is_some() && d.tarball.is_some())
+}
+
 impl RegistryClient {
     fn metadata_cache_key_for_origin(
         &self,
@@ -1019,7 +1043,7 @@ impl RegistryClient {
             directive,
             MetadataCacheDirective::Store { fresh_for }
                 if fresh_for == cached_fresh_for
-                    && effective_etag == cached_etag.as_deref()
+                    && etags_weak_match(effective_etag, cached_etag.as_deref())
         );
         let mut remaining_freshness = Duration::ZERO;
         let mut publish = || {
@@ -1091,7 +1115,7 @@ impl RegistryClient {
             directive,
             MetadataCacheDirective::Store { fresh_for }
                 if fresh_for == cached_fresh_for
-                    && effective_etag == cached_etag.as_deref()
+                    && etags_weak_match(effective_etag, cached_etag.as_deref())
         );
         if can_refresh_in_place {
             let remaining_freshness = self
@@ -1099,7 +1123,7 @@ impl RegistryClient {
                 .unwrap_or_default();
             return Some(MetadataCacheEntry {
                 value: stale.value,
-                etag: response_etag.or(cached_etag),
+                etag: cached_etag.or(response_etag),
                 remaining_freshness,
             });
         }
@@ -2372,6 +2396,49 @@ impl RegistryClient {
                     metadata: cached_packument,
                     timings,
                 });
+            }
+            if !from_history {
+                // Published npm versions are immutable and tarball integrity is verified
+                // on fetch, so a stale cached version document with dist integrity and
+                // tarball URL can satisfy exact pins without a network round trip.
+                if let Some(stale) = self
+                    .read_stale_metadata_cache_entry_as_async::<PackageMetadata>(&cache_key)
+                    .await
+                    && version_doc_has_immutable_dist(name, version, &stale.value)
+                {
+                    timings.cache_read_ms = cache_read_start.elapsed().as_millis();
+                    timings.cache_hit = true;
+                    timings.selected_from_history = false;
+                    crate::timing::record_metadata_cache_hit();
+                    return Ok(TimedPackageMetadata {
+                        metadata: stale.value,
+                        timings,
+                    });
+                }
+                if let Some(mut stale_packument) = self
+                    .read_stale_metadata_cache_entry_as_async::<PackageMetadata>(
+                        &full_packument_key,
+                    )
+                    .await
+                    && batch_metadata_entry_matches_name(name, &stale_packument.value)
+                    && stale_packument
+                        .value
+                        .versions
+                        .get(version)
+                        .and_then(|v| v.dist.as_ref())
+                        .is_some_and(|d| d.integrity.is_some() && d.tarball.is_some())
+                {
+                    stale_packument.value.versions.retain(|v, _| v == version);
+                    stale_packument.value.time.retain(|v, _| v == version);
+                    timings.cache_read_ms = cache_read_start.elapsed().as_millis();
+                    timings.cache_hit = true;
+                    timings.selected_from_history = false;
+                    crate::timing::record_metadata_cache_hit();
+                    return Ok(TimedPackageMetadata {
+                        metadata: stale_packument.value,
+                        timings,
+                    });
+                }
             }
             timings.cache_read_ms = cache_read_start.elapsed().as_millis();
             crate::timing::record_metadata_cache_miss();

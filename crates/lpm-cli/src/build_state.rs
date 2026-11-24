@@ -836,6 +836,10 @@ fn compute_blocked_packages_with_metadata_and_baseline(
 ) -> Result<Vec<BlockedPackage>, LpmError> {
     use rayon::prelude::*;
 
+    // Capture the active workspace materialization coordinator before crossing
+    // into rayon worker threads where Tokio task-locals are unavailable.
+    let workspace_materialization = crate::commands::install::workspace_materialization::current();
+
     let per_pkg = |package: &BlockedCapturePackage| -> Result<Option<BlockedPackage>, LpmError> {
         let BlockedCapturePackage {
             name,
@@ -854,9 +858,10 @@ fn compute_blocked_packages_with_metadata_and_baseline(
         {
             return Ok(None);
         }
-        let Some(script_data) =
-            lpm_security::script_hash::try_compute_script_hash_with_phase_bodies(pkg_dir)?
-        else {
+        let Some(script_data) = (match workspace_materialization.as_deref() {
+            Some(coordinator) => coordinator.cached_script_hash_with_phase_bodies(pkg_dir)?,
+            None => lpm_security::script_hash::try_compute_script_hash_with_phase_bodies(pkg_dir)?,
+        }) else {
             return Ok(None);
         };
         let script_hash = script_data.hash;

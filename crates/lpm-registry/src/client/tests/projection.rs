@@ -305,3 +305,56 @@ async fn revalidation_keeps_a_projection_only_while_the_entry_is_refreshed_in_pl
         server.verify().await;
     }
 }
+
+#[tokio::test]
+async fn weak_etag_from_200_matches_strong_etag_from_304_in_place_and_skips_latest_race() {
+    let server = MockServer::start().await;
+    let (client, _cache) = preferred_client(&server).await;
+    let initial = Mock::given(method("GET"))
+        .and(path("/pkg"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(history())
+                .insert_header("Cache-Control", "max-age=300")
+                .insert_header("ETag", "W/\"weak-hash\""),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+    let fetched = resolve_preferred(&client, |version| version == "1.0.0").await;
+    assert!(fetched.versions_complete);
+    store_document_projection(&client, fetched);
+    drop(initial);
+
+    let key = client.npm_direct_metadata_cache_key("pkg", PublicNpmAccess::ANONYMOUS);
+    let entry = client.cache_path(&key).unwrap();
+    let original_bytes = std::fs::read(&entry).unwrap();
+    filetime::set_file_mtime(&entry, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+
+    Mock::given(method("GET"))
+        .and(path("/pkg"))
+        .and(header("If-None-Match", "W/\"weak-hash\""))
+        .respond_with(
+            ResponseTemplate::new(304)
+                .insert_header("Cache-Control", "max-age=300")
+                .insert_header("ETag", "\"weak-hash\""),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/pkg/latest"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let revalidated = resolve_preferred(&client, |version| version == "1.0.0").await;
+    assert!(revalidated.timings.not_modified);
+    assert!(matches!(
+        revalidated.metadata,
+        ResolutionMetadata::Projected(_)
+    ));
+    assert_eq!(std::fs::read(&entry).unwrap(), original_bytes);
+    server.verify().await;
+}
