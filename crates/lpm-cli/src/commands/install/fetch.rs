@@ -1070,18 +1070,7 @@ pub(super) async fn run_online_fetch_phase(
         let store_v2 = store_v2_handle
             .as_deref()
             .expect("v2_event_driven implies virtual-store store");
-        let fresh_all_registry = !used_lockfile
-            && packages.iter().all(|package| {
-                !package.source.starts_with("file:")
-                    && !package.source.starts_with("link:")
-                    && !package.source.starts_with("git+")
-                    && !package.source.starts_with("github:")
-                    && !package.source.starts_with("http://")
-                    && !package.source.starts_with("https://")
-                    && !package.source.starts_with("workspace:")
-            });
-        let authoritative_peer_context =
-            (used_lockfile && lockfile_peer_context_authoritative) || fresh_all_registry;
+        let authoritative_peer_context = !used_lockfile || lockfile_peer_context_authoritative;
         let plan = match (authoritative_peer_context, workspace_coordinator.as_deref()) {
             (true, Some(coordinator)) => lpm_linker::v2::link_v2_prepare_with_authoritative_peer_context_and_compatibility_bin_names_and_graph_key_cache(
                     project_dir,
