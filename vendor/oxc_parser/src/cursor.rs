@@ -1,27 +1,25 @@
-//! Code related to navigating `Token`s from the lexer
+//! Token cursor: reading, consuming, expecting and re-lexing the current token,
+//! and checkpoints for backtracking.
 
-use oxc_allocator::{ArenaBox, ArenaVec, Dummy, GetAllocator};
-use oxc_ast::ast::{BindingRestElement, RegExpFlags};
-use oxc_span::{GetSpan, Span};
+use oxc_allocator::{Dummy, GetAllocator};
+use oxc_ast::ast::RegExpFlags;
+use oxc_span::Span;
 use oxc_str::JSStr;
 
 use crate::{
-    Context, ParserConfig as Config, ParserImpl,
+    ParserConfig as Config, ParserImpl,
     diagnostics::{self, ParserDiagnostic},
-    error_handler::FatalError,
     lexer::{Kind, LexerCheckpoint, Token, cold_branch},
 };
 
-/// Speculation budget spent on each lexer diagnostic copied into a
-/// checkpoint, in bytes read.
-const DIAGNOSTIC_COPY_COST: u64 = 16;
-
+#[derive(Clone, Copy)]
 pub struct ParserCheckpoint<'a> {
     lexer: LexerCheckpoint<'a>,
     cur_token: Token,
     prev_token_end: u32,
     errors_pos: usize,
-    fatal_error: Option<FatalError<'a>>,
+    cover_parenthesized_len: usize,
+    has_fatal_error: bool,
 }
 
 impl<'a, C: Config> ParserImpl<'a, C> {
@@ -124,7 +122,10 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     /// so every caller unwinds without reading more tokens.
     #[inline]
     fn check_parse_limits(&mut self) {
-        if self.stack_exhausted || self.speculation_budget_exhausted || self.below_stack_floor() {
+        if self.stack_exhausted.get()
+            || self.speculation_budget_exhausted
+            || self.below_stack_floor()
+        {
             self.stop_at_parse_limit();
         }
     }
@@ -148,7 +149,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     #[cold]
     #[inline(never)]
     fn stop_at_parse_limit(&mut self) {
-        if self.speculation_budget_exhausted && !self.stack_exhausted {
+        if self.speculation_budget_exhausted && !self.stack_exhausted.get() {
             self.set_fatal_error(diagnostics::speculation_budget_exhausted(self.token.span()));
         } else {
             self.stop_at_stack_floor();
@@ -158,7 +159,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     #[cold]
     #[inline(never)]
     fn stop_at_stack_floor(&mut self) {
-        self.stack_exhausted = true;
+        self.stack_exhausted.set(true);
         self.set_fatal_error(diagnostics::stack_exhausted(self.token.span()));
     }
 
@@ -169,6 +170,19 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     pub(crate) fn stopped_at_stack_floor<T: Dummy<'a>>(&mut self) -> T {
         self.stop_at_stack_floor();
         Dummy::dummy(self.allocator())
+    }
+
+    /// [`Self::stop_at_stack_floor`] for a check that reads no token and
+    /// can't change the parser: the error the check fails with. The parse
+    /// stops at the next token it reads, and reports
+    /// [`ParserReturn::stack_exhausted`] even if it reads none.
+    ///
+    /// [`ParserReturn::stack_exhausted`]: crate::ParserReturn::stack_exhausted
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn stack_floor_error(&self, span: Span) -> ParserDiagnostic<'a> {
+        self.stack_exhausted.set(true);
+        diagnostics::stack_exhausted(span)
     }
 
     /// Move to the next `JSXChild`
@@ -202,6 +216,39 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     #[inline]
     pub(crate) fn bump_any(&mut self) {
         self.advance(self.cur_kind());
+    }
+
+    /// Advance if `accept` holds for the token after the current one.
+    ///
+    /// Use this instead of [`Lexer::peek_token`] where the answer is nearly always yes, such as
+    /// a modifier keyword, which is nearly always followed by the member it modifies. The token
+    /// after is then lexed once and kept. Peeking lexes it, discards it, and leaves it to be
+    /// lexed again.
+    ///
+    /// [`Lexer::peek_token`]: crate::lexer::Lexer::peek_token
+    #[inline]
+    pub(crate) fn eat_if_next(&mut self, accept: impl FnOnce(Token) -> bool) -> bool {
+        let checkpoint = self.lexer.checkpoint();
+        let next = self.lexer.next_token();
+        if !accept(next) {
+            self.lexer.rewind(checkpoint);
+            return false;
+        }
+        self.advance_to(next);
+        true
+    }
+
+    /// Move to `next`, the token after the current one, which the lexer has already read.
+    #[inline]
+    pub(crate) fn advance_to(&mut self, next: Token) {
+        if self.token.escaped() && self.token.kind().is_any_keyword() {
+            self.report_escaped_keyword(self.token.span());
+        }
+        // The lexer read `next` before this check, so a parse that stops
+        // here still moves to it, and unwinds at the token after.
+        self.check_parse_limits();
+        self.prev_token_end = self.token.end();
+        self.token = next;
     }
 
     /// [Automatic Semicolon Insertion](https://tc39.es/ecma262/#sec-automatic-semicolon-insertion)
@@ -318,6 +365,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     /// Tell lexer to continue reading jsx identifier if the lexer character position is at `-` for `<component-name>`.
     ///
     /// Returns `true` if was continued.
+    #[inline]
     pub(crate) fn continue_lex_jsx_identifier(&mut self) -> bool {
         if let Some(token) = self.lexer.continue_lex_jsx_identifier(self.token.start()) {
             self.token = token;
@@ -346,7 +394,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
             return false;
         }
         let kind = self.cur_kind();
-        if kind == Kind::ShiftLeft || kind == Kind::LtEq {
+        if kind == Kind::ShiftLeft {
             self.token = self.lexer.re_lex_as_typescript_l_angle(2);
             true
         } else if kind == Kind::ShiftLeftEq {
@@ -373,55 +421,59 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         }
     }
 
-    pub(crate) fn checkpoint(&mut self) -> ParserCheckpoint<'a> {
+    pub(crate) fn checkpoint(&self) -> ParserCheckpoint<'a> {
         ParserCheckpoint {
             lexer: self.lexer.checkpoint(),
             cur_token: self.token,
             prev_token_end: self.prev_token_end,
             errors_pos: self.errors.len(),
-            fatal_error: self.fatal_error.take(),
-        }
-    }
-
-    pub(crate) fn checkpoint_with_error_recovery(&mut self) -> ParserCheckpoint<'a> {
-        // The lexer's checkpoint copies every diagnostic it has recorded.
-        self.diagnostics_copied += self.lexer.errors.len() as u64;
-        self.check_speculation_budget();
-        ParserCheckpoint {
-            lexer: self.lexer.checkpoint_with_error_recovery(),
-            cur_token: self.token,
-            prev_token_end: self.prev_token_end,
-            errors_pos: self.errors.len(),
-            fatal_error: self.fatal_error.take(),
+            cover_parenthesized_len: self.state.cover_parenthesized.len(),
+            has_fatal_error: self.fatal_error.is_some(),
         }
     }
 
     pub(crate) fn rewind(&mut self, checkpoint: ParserCheckpoint<'a>) {
-        let ParserCheckpoint { lexer, cur_token, prev_token_end, errors_pos, fatal_error } =
-            checkpoint;
+        let ParserCheckpoint {
+            lexer,
+            cur_token,
+            prev_token_end,
+            errors_pos,
+            cover_parenthesized_len,
+            has_fatal_error,
+        } = checkpoint;
 
+        // A fatal error set after the checkpoint is discarded. If it is a lexer error that
+        // `set_unexpected` took from the lexer, give it back.
+        if !has_fatal_error
+            && let Some(fatal_error) = self.fatal_error.take()
+            && self.lexer.errors.len() < lexer.errors_len()
+        {
+            self.lexer.errors.push(fatal_error.error);
+        }
         self.lexer.rewind(lexer);
         self.check_speculation_budget();
         self.token = cur_token;
         self.prev_token_end = prev_token_end;
         self.errors.truncate(errors_pos);
-        self.fatal_error = fatal_error;
+        self.state.cover_parenthesized.truncate(cover_parenthesized_len);
     }
 
     /// Sets the budget's stop once the work spent on speculation passes it:
     /// the bytes the lexer has read beyond its position, which a rewind made
-    /// it read or will make it read again, and the diagnostics copied into
-    /// checkpoints, each an allocation of about a hundred bytes, at
-    /// [`DIAGNOSTIC_COPY_COST`] each. A parse already stopped at the stack
-    /// floor is unwinding, and reads nothing again.
+    /// it read or will make it read again. A parse already stopped at the
+    /// stack floor is unwinding, and reads nothing again.
     #[inline]
     fn check_speculation_budget(&mut self) {
-        let work = self.lexer.bytes_read_ahead().saturating_add(
-            self.diagnostics_copied.saturating_mul(DIAGNOSTIC_COPY_COST),
-        );
-        if !self.stack_exhausted && work > self.speculation_limit {
+        if !self.stack_exhausted.get() && self.lexer.bytes_read_ahead() > self.speculation_limit {
             self.speculation_budget_exhausted = true;
         }
+    }
+
+    /// Rewind to `checkpoint`, keeping the comments and irregular whitespace lexed after it.
+    /// Only for when the source after `checkpoint` is not all lexed again.
+    pub(crate) fn rewind_keeping_trivia(&mut self, mut checkpoint: ParserCheckpoint<'a>) {
+        self.lexer.keep_trivia(&mut checkpoint.lexer);
+        self.rewind(checkpoint);
     }
 
     pub(crate) fn lookahead<U>(&mut self, predicate: impl Fn(&mut ParserImpl<'a, C>) -> U) -> U {
@@ -429,306 +481,5 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         let answer = predicate(self);
         self.rewind(checkpoint);
         answer
-    }
-
-    #[expect(clippy::inline_always)]
-    #[inline(always)] // inline because this is always on a hot path
-    pub(crate) fn context_add<F, T>(&mut self, add_flags: Context, cb: F) -> T
-    where
-        F: FnOnce(&mut Self) -> T,
-    {
-        let ctx = self.ctx;
-        self.ctx = ctx.union(add_flags);
-        let result = cb(self);
-        self.ctx = ctx;
-        result
-    }
-
-    #[expect(clippy::inline_always)]
-    #[inline(always)] // inline because this is always on a hot path
-    pub(crate) fn context_remove<F, T>(&mut self, remove_flags: Context, cb: F) -> T
-    where
-        F: FnOnce(&mut Self) -> T,
-    {
-        let ctx = self.ctx;
-        self.ctx = ctx.difference(remove_flags);
-        let result = cb(self);
-        self.ctx = ctx;
-        result
-    }
-
-    #[expect(clippy::inline_always)]
-    #[inline(always)] // inline because this is always on a hot path
-    pub(crate) fn context<F, T>(&mut self, add_flags: Context, remove_flags: Context, cb: F) -> T
-    where
-        F: FnOnce(&mut Self) -> T,
-    {
-        let ctx = self.ctx;
-        self.ctx = ctx.difference(remove_flags).union(add_flags);
-        let result = cb(self);
-        self.ctx = ctx;
-        result
-    }
-
-    pub(crate) fn parse_normal_list<F, T>(
-        &mut self,
-        open: Kind,
-        close: Kind,
-        f: F,
-    ) -> ArenaVec<'a, T>
-    where
-        F: FnMut(&mut Self) -> T,
-    {
-        let opening_span = self.cur_token().span();
-        self.expect(open);
-        let mut list = ArenaVec::new_in(self);
-        self.parse_normal_list_into(&mut list, close, f);
-        self.expect_closing(close, opening_span);
-        list
-    }
-
-    #[expect(clippy::inline_always)]
-    #[inline(always)]
-    pub(crate) fn parse_normal_list_into<F, T>(
-        &mut self,
-        list: &mut ArenaVec<'a, T>,
-        close: Kind,
-        mut parse_element: F,
-    ) where
-        F: FnMut(&mut Self) -> T,
-    {
-        loop {
-            if self.at(close) || self.has_fatal_error() {
-                break;
-            }
-            let element = parse_element(self);
-            list.push(element);
-        }
-    }
-
-    pub(crate) fn parse_normal_list_breakable<F, T>(
-        &mut self,
-        open: Kind,
-        close: Kind,
-        f: F,
-    ) -> ArenaVec<'a, T>
-    where
-        F: Fn(&mut Self) -> Option<T>,
-    {
-        let opening_span = self.cur_token().span();
-        self.expect(open);
-        let mut list = ArenaVec::new_in(self);
-        self.parse_normal_list_breakable_into(&mut list, close, f);
-        self.expect_closing(close, opening_span);
-        list
-    }
-
-    #[expect(clippy::inline_always)]
-    #[inline(always)]
-    fn parse_normal_list_breakable_into<F, T>(
-        &mut self,
-        list: &mut ArenaVec<'a, T>,
-        close: Kind,
-        parse_element: F,
-    ) where
-        F: Fn(&mut Self) -> Option<T>,
-    {
-        loop {
-            if self.at(close) || self.has_fatal_error() {
-                break;
-            }
-            if let Some(element) = parse_element(self) {
-                list.push(element);
-            } else {
-                break;
-            }
-        }
-    }
-
-    pub(crate) fn parse_delimited_list<F, T>(
-        &mut self,
-        close: Kind,
-        separator: Kind,
-        opening_span: Span,
-        mut parse_element: F,
-    ) -> (ArenaVec<'a, T>, Option<u32>)
-    where
-        F: FnMut(&mut Self) -> T,
-    {
-        if self.at(close) || self.has_fatal_error() {
-            return (ArenaVec::new_in(self), None);
-        }
-        let first = parse_element(self);
-        if self.at(close) || self.has_fatal_error() {
-            let mut list = ArenaVec::with_capacity_in(1, self);
-            list.push(first);
-            return (list, None);
-        }
-        let mut list = ArenaVec::with_capacity_in(2, self);
-        list.push(first);
-        let trailing_separator = self.parse_delimited_list_rest(
-            &mut list,
-            close,
-            separator,
-            opening_span,
-            parse_element,
-        );
-        (list, trailing_separator)
-    }
-
-    #[expect(clippy::inline_always)]
-    #[inline(always)]
-    pub(crate) fn parse_delimited_list_into<F, T>(
-        &mut self,
-        list: &mut ArenaVec<'a, T>,
-        close: Kind,
-        separator: Kind,
-        opening_span: Span,
-        mut parse_element: F,
-    ) -> Option<u32>
-    where
-        F: FnMut(&mut Self) -> T,
-    {
-        if self.at(close) || self.has_fatal_error() {
-            return None;
-        }
-        let element = parse_element(self);
-        list.push(element);
-        self.parse_delimited_list_rest(list, close, separator, opening_span, parse_element)
-    }
-
-    pub(crate) fn parse_delimited_list_rest<F, T>(
-        &mut self,
-        list: &mut ArenaVec<'a, T>,
-        close: Kind,
-        separator: Kind,
-        opening_span: Span,
-        mut parse_element: F,
-    ) -> Option<u32>
-    where
-        F: FnMut(&mut Self) -> T,
-    {
-        loop {
-            let kind = self.cur_kind();
-            if kind == close || self.has_fatal_error() {
-                return None;
-            }
-            if kind != separator {
-                self.set_fatal_error(diagnostics::expect_closing_or_separator(
-                    close.to_str(),
-                    separator.to_str(),
-                    kind.to_str(),
-                    self.cur_token().span(),
-                    opening_span,
-                ));
-                return None;
-            }
-            self.advance(separator);
-            let kind = self.cur_kind();
-            if kind == close {
-                let trailing_separator = self.prev_token_end - 1;
-                return Some(trailing_separator);
-            }
-            if matches!(kind, Kind::Eof | Kind::Undetermined) {
-                return None;
-            }
-            let element = parse_element(self);
-            list.push(element);
-        }
-    }
-
-    pub(crate) fn parse_delimited_list_with_rest<E, A, R, D>(
-        &mut self,
-        close: Kind,
-        opening_span: Span,
-        parse_element: E,
-        parse_rest: R,
-        rest_last_diagnostic: D,
-    ) -> (ArenaVec<'a, A>, Option<ArenaBox<'a, BindingRestElement<'a>>>)
-    where
-        E: Fn(&mut Self) -> A,
-        R: Fn(&mut Self) -> ArenaBox<'a, BindingRestElement<'a>>,
-        D: Fn(Span) -> ParserDiagnostic<'a>,
-    {
-        let mut list = ArenaVec::new_in(self);
-        let rest = self.parse_delimited_list_with_rest_into(
-            &mut list,
-            close,
-            opening_span,
-            parse_element,
-            parse_rest,
-            rest_last_diagnostic,
-        );
-        (list, rest)
-    }
-
-    #[expect(clippy::inline_always)]
-    #[inline(always)]
-    fn parse_delimited_list_with_rest_into<E, A, R, D>(
-        &mut self,
-        list: &mut ArenaVec<'a, A>,
-        close: Kind,
-        opening_span: Span,
-        parse_element: E,
-        parse_rest: R,
-        rest_last_diagnostic: D,
-    ) -> Option<ArenaBox<'a, BindingRestElement<'a>>>
-    where
-        E: Fn(&mut Self) -> A,
-        R: Fn(&mut Self) -> ArenaBox<'a, BindingRestElement<'a>>,
-        D: Fn(Span) -> ParserDiagnostic<'a>,
-    {
-        let mut rest: Option<ArenaBox<'a, BindingRestElement<'a>>> = None;
-        let mut first = true;
-        loop {
-            let kind = self.cur_kind();
-            if kind == close || self.has_fatal_error() {
-                break;
-            }
-
-            if first {
-                first = false;
-            } else {
-                let comma_span = self.cur_token().span();
-                if kind != Kind::Comma {
-                    let error = diagnostics::expect_closing_or_separator(
-                        close.to_str(),
-                        Kind::Comma.to_str(),
-                        kind.to_str(),
-                        comma_span,
-                        opening_span,
-                    );
-                    self.set_fatal_error(error);
-                    break;
-                }
-                self.bump_any();
-                let kind = self.cur_kind();
-                if kind == close {
-                    if rest.is_some() && !self.ctx.has_ambient() {
-                        self.error(diagnostics::rest_element_trailing_comma(comma_span));
-                    }
-                    break;
-                }
-                if matches!(kind, Kind::Eof | Kind::Undetermined) {
-                    break;
-                }
-            }
-
-            if let Some(r) = &rest {
-                self.set_fatal_error(rest_last_diagnostic(r.span()));
-                break;
-            }
-
-            // Re-capture kind to get the current token (may have changed after else branch)
-            let kind = self.cur_kind();
-            if kind == Kind::Dot3 {
-                rest.replace(parse_rest(self));
-            } else {
-                let element = parse_element(self);
-                list.push(element);
-            }
-        }
-
-        rest
     }
 }

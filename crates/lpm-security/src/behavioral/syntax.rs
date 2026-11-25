@@ -65,13 +65,11 @@ const RESOLUTION_LOOKUPS_PER_BYTE: u64 = 16;
 const RESOLUTION_LOOKUPS_FLOOR: u64 = 1 << 20;
 
 /// Work the parser may spend on speculative parses, per byte of source and
-/// for any source: the bytes it reads again after rewinds, and the lexer
-/// diagnostics it copies into checkpoints. A parenthesized list that may be
-/// arrow parameters, or a `<` that may open type arguments, is parsed one
+/// for any source: the bytes it reads again after rewinds. A TypeScript `<`
+/// that may open a generic arrow function or type arguments is parsed one
 /// way and, when that fails, parsed again the other way with all it holds,
-/// so nested speculation, or speculation after many diagnostics, can make
-/// parsing quadratic. Real code spends under one per byte, and none copies
-/// a diagnostic.
+/// so nested speculation can make parsing quadratic. Real code spends under
+/// one per byte.
 const PARSE_SPECULATION_PER_BYTE: u64 = 2;
 const PARSE_SPECULATION_FLOOR: u64 = 64 * 1024;
 
@@ -567,35 +565,54 @@ impl<'s> SourceContext<'s> {
 mod tests {
     use super::*;
 
-    /// Whether parsing `source` with the floor [`current_stack_floor`] sets
-    /// stopped at it.
-    fn parse_reaches_the_floor(source: &str) -> bool {
+    /// Whether parsing `source`, which is valid, with the floor
+    /// [`current_stack_floor`] stopped at it. A parse that didn't must have
+    /// read the source whole.
+    fn parse_reaches_the_floor(source: &str, source_type: SourceType) -> bool {
         let allocator = Allocator::default();
-        Parser::new(&allocator, source, SourceType::cjs())
+        let parsed = Parser::new(&allocator, source, source_type)
             .with_options(ParseOptions {
                 stack_floor: current_stack_floor().unwrap(),
                 ..ParseOptions::default()
             })
-            .parse()
-            .stack_exhausted
+            .parse();
+        assert!(
+            parsed.stack_exhausted || (!parsed.fatal_error && !parsed.diagnostics.has_errors()),
+            "{}: {:?}",
+            &source[..source.len().min(40)],
+            parsed.diagnostics
+        );
+        parsed.stack_exhausted
     }
 
     #[test]
-    fn patterns_parsed_to_just_above_the_floor_turn_into_expressions_without_overflowing() {
-        // A parenthesized list that parses as arrow parameters, with no `=>`
-        // after it, is turned back into an expression by recursing through its
-        // patterns without reading a token. At the deepest nesting the parse
-        // fits above the floor, that recursion must fit too.
-        let shapes: [(&str, &str, &str, &str, &str); 6] = [
-            ("x=(", "[", "a", "]", ");"),
-            ("x=(", "[", "a", "]", "=0);"),
-            ("x=(", "{a:", "b", "}", ");"),
-            ("x=(", "{a:", "b", "}", "=0);"),
-            ("x=(", "[a=", "0", "]", ");"),
-            ("x=(", "[", "a", "]", ",b);"),
+    fn parenthesized_lists_parsed_just_above_the_floor_become_parameters_or_expressions_without_overflowing()
+     {
+        // The elements of a parenthesized list are parsed once, and turned
+        // into arrow parameters at `=>`, or into an expression, by recursing
+        // through them without reading a token. At the deepest nesting the
+        // parse fits above the floor, that recursion must fit too.
+        let (js, ts) = (SourceType::cjs(), SourceType::ts());
+        let shapes: [(SourceType, &str, &str, &str, &str, &str); 16] = [
+            (js, "x=(", "[", "a", "]", ");"),
+            (js, "x=(", "[", "a", "]", "=0);"),
+            (js, "x=(", "{a:", "b", "}", ");"),
+            (js, "x=(", "{a:", "b", "}", "=0);"),
+            (js, "x=(", "[a=", "0", "]", ");"),
+            (js, "x=(", "[", "a", "]", ",b);"),
+            (js, "x=(", "[", "a", "]", ")=>0;"),
+            (js, "x=(", "[", "a", "]", "=0)=>0;"),
+            (js, "x=(", "{a:", "b", "}", ")=>0;"),
+            (js, "x=(", "[", "a", "]=0", ")=>0;"),
+            (js, "x=(", "{a:", "b", "}=0", ")=>0;"),
+            (js, "x=(", "[...", "a", "]", ")=>0;"),
+            (js, "x=async(", "[", "a", "]", ")=>0;"),
+            (js, "x=async(...", "[", "a", "]", ")=>0;"),
+            (ts, "x=(", "[", "a", "]", "):T=>0;"),
+            (ts, "x=(", "[", "a", "]", ":T)=>0;"),
         ];
         for stack in [2 * 1024 * 1024, DEEP_PARSE_STACK] {
-            for (prefix, open, middle, close, suffix) in shapes {
+            for (source_type, prefix, open, middle, close, suffix) in shapes {
                 let deepest = std::thread::Builder::new()
                     .stack_size(stack)
                     .spawn(move || {
@@ -606,12 +623,14 @@ mod tests {
                                 close.repeat(depth)
                             )
                         };
+                        let reaches_the_floor =
+                            |depth| parse_reaches_the_floor(&source(depth), source_type);
                         let (mut fits, mut too_deep) = (1, 8_000_000);
-                        assert!(!parse_reaches_the_floor(&source(fits)));
-                        assert!(parse_reaches_the_floor(&source(too_deep)));
+                        assert!(!reaches_the_floor(fits));
+                        assert!(reaches_the_floor(too_deep));
                         while too_deep - fits > 1 {
                             let depth = fits + (too_deep - fits) / 2;
-                            if parse_reaches_the_floor(&source(depth)) {
+                            if reaches_the_floor(depth) {
                                 too_deep = depth;
                             } else {
                                 fits = depth;

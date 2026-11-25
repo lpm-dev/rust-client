@@ -79,6 +79,15 @@ updates:
           - "windows-*"
         exclude-patterns:
           - "windows-native-keyring-store"
+      # lpm-cli, lpm-runner and lpm-security pin every oxc crate to one
+      # release, and vendor/oxc_parser patches the parser for all of them, so
+      # a bump of any one alone can't build. Each release also needs that
+      # patch carried over by hand (vendor/oxc_parser/LPM-PATCH.md). This
+      # group must stay above the one below too.
+      oxc:
+        applies-to: version-updates
+        patterns:
+          - "oxc_*"
       rust-minor-and-patch:
         applies-to: version-updates
         update-types:
