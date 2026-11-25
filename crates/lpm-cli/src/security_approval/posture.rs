@@ -233,18 +233,21 @@ fn active_runtime_overrides(
             source: request_firewall.source_label().to_string(),
         });
     }
-    // Measured against what installs run without a table, so a group the
-    // table leaves out is never reported as config's doing.
-    let tableless = crate::npm_firewall_config::runtime_policy_profile(None, effective);
     if let Some(request_policies) =
         crate::npm_firewall_config::runtime_policy_request(&global, effective)?
-        && request_policies != tableless
     {
-        overrides.push(RuntimeOverride {
-            control: crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_PATH.to_string(),
-            value: changed_policy_entries(&request_policies, &tableless),
-            source: "~/.lpm/config.toml [firewall.npm.policies]".to_string(),
-        });
+        let changed = changed_policy_entries(
+            &request_policies,
+            &crate::npm_firewall_config::runtime_policy_profile(None, effective),
+            &effective.posture.firewall_policy_profile(),
+        );
+        if !changed.is_empty() {
+            overrides.push(RuntimeOverride {
+                control: crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_PATH.to_string(),
+                value: changed,
+                source: "~/.lpm/config.toml [firewall.npm.policies]".to_string(),
+            });
+        }
     }
     let requested_source_analysis =
         crate::source_analysis_config::read_install_time_source_analysis(&global)?;
@@ -258,16 +261,22 @@ fn active_runtime_overrides(
     Ok(overrides)
 }
 
+/// The groups the table changes from what installs run without it, a
+/// group it leaves out never counting as config's doing, that also differ
+/// from the approved action.
 fn changed_policy_entries(
     requested: &lpm_registry::client::NpmFirewallPolicyProfile,
-    effective: &lpm_registry::client::NpmFirewallPolicyProfile,
+    tableless: &lpm_registry::client::NpmFirewallPolicyProfile,
+    approved: &lpm_registry::client::NpmFirewallPolicyProfile,
 ) -> String {
+    use crate::npm_firewall_config::policy_action;
     crate::npm_firewall_config::POLICY_KEYS
         .iter()
         .filter_map(|key| {
-            let action = crate::npm_firewall_config::policy_action(requested, key)?;
-            (Some(action) != crate::npm_firewall_config::policy_action(effective, key))
-                .then(|| format!("{key}={}", action.as_str()))
+            let action = policy_action(requested, key)?;
+            (Some(action) != policy_action(tableless, key)
+                && Some(action) != policy_action(approved, key))
+            .then(|| format!("{key}={}", action.as_str()))
         })
         .collect::<Vec<_>>()
         .join(",")

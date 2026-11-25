@@ -1491,14 +1491,22 @@ fn firewall_policy_profile_after_delete_ignores_keys_outside_the_policy_table() 
 
     assert!(
         io::firewall_policy_profile_after_delete(&config, "firewall.mode", || {
-            Ok(lpm_registry::client::NpmFirewallPolicyProfile::default())
+            Ok(crate::npm_firewall_config::PolicyTableBase::of(
+                lpm_registry::client::NpmFirewallPolicyProfile::default(),
+                crate::npm_firewall_config::NpmFirewallMode::Enforce,
+                false,
+            ))
         })
         .unwrap()
         .is_none()
     );
     assert_eq!(
         io::firewall_policy_profile_after_delete(&config, "firewall", || {
-            Ok(lpm_registry::client::NpmFirewallPolicyProfile::default())
+            Ok(crate::npm_firewall_config::PolicyTableBase::of(
+                lpm_registry::client::NpmFirewallPolicyProfile::default(),
+                crate::npm_firewall_config::NpmFirewallMode::Enforce,
+                false,
+            ))
         })
         .unwrap()
         .unwrap(),

@@ -198,3 +198,31 @@ async fn telemetry_following_suspicious_keeps_an_approved_stricter_telemetry_act
     )
     .await;
 }
+
+#[tokio::test]
+async fn telemetry_following_suspicious_keeps_the_approved_default_telemetry_action() {
+    install_sending_policy(
+        "inherited-default-policy",
+        &[("lpm_ai_suspicious", "allow"), ("lpm_ai_telemetry", "warn")],
+        &[("lpm_ai_suspicious", "allow")],
+        &[r#""lpmAiTelemetry":"warn""#, r#""lpmAiSuspicious":"allow""#],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn telemetry_follows_suspicious_down_to_an_approved_looser_telemetry_action() {
+    install_sending_policy(
+        "inherited-looser-policy",
+        &[
+            ("lpm_ai_suspicious", "allow"),
+            ("lpm_ai_telemetry", "allow"),
+        ],
+        &[("lpm_ai_suspicious", "allow")],
+        &[
+            r#""lpmAiTelemetry":"allow""#,
+            r#""lpmAiSuspicious":"allow""#,
+        ],
+    )
+    .await;
+}

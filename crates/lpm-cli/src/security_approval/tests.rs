@@ -2174,6 +2174,65 @@ fn security_status_blames_config_only_for_the_policy_groups_its_table_names() {
 }
 
 #[test]
+fn security_status_lists_no_override_for_a_table_asking_for_the_approved_action() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[(
+            crate::npm_firewall_config::LPM_AI_DEPENDENCY_SCRIPT_POLICY_KEY,
+            "warn",
+        )]);
+        let config_dir = temp.path().join("lpm-home");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_dependency_script_policy = \"warn\"\nlpm_ai_confirmed_malware = \"warn\"\n",
+        )
+        .unwrap();
+
+        let status = load_security_status(None, true).unwrap();
+
+        let policies: Vec<&str> = status
+            .active_runtime_overrides
+            .iter()
+            .filter(|entry| entry.control == "[firewall.npm.policies]")
+            .map(|entry| entry.value.as_str())
+            .collect();
+        assert_eq!(policies, ["lpm_ai_confirmed_malware=warn"]);
+    });
+}
+
+#[test]
+fn forced_floor_measures_a_write_against_what_installs_run_not_an_unapproved_table() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[]);
+        let mut config = firewall_policy_global_config(
+            "enforce",
+            &[(
+                crate::npm_firewall_config::LPM_AI_CONFIRMED_MALWARE_POLICY_KEY,
+                "allow",
+            )],
+        );
+        config.table_mut().insert(
+            "force-security-floor".to_string(),
+            toml::Value::Boolean(true),
+        );
+        let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_confirmed_malware: lpm_registry::client::NpmFirewallPolicyAction::Warn,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        let err = crate::security_floor::reject_looser_firewall_policy_write(&config, &requested)
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("lpm_ai_confirmed_malware"),
+            "{err}"
+        );
+    });
+}
+
+#[test]
 fn runtime_firewall_reports_a_looser_mode_without_listing_unchanged_policies() {
     let temp = tempdir().unwrap();
     let project = temp.path().join("project");

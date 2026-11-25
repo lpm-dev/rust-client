@@ -370,10 +370,7 @@ pub fn reject_looser_firewall_policy_write(
         return Ok(());
     }
     let effective = crate::security_approval::load_effective_authorized_posture()?;
-    let floor = crate::npm_firewall_config::runtime_policy_profile(
-        crate::npm_firewall_config::runtime_policy_request(global, &effective)?,
-        &effective,
-    );
+    let floor = crate::npm_firewall_config::enforced_policy_profile(global, &effective)?;
     reject_policy_below_floor(&floor, requested)
 }
 
