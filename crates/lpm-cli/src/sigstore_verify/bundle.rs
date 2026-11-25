@@ -7,6 +7,7 @@ use x509_parser::prelude::*;
 
 use super::rekor_set::{parse_integrated_time, parse_log_index};
 use super::sct::der_decode_length;
+use super::timestamp::{MAX_SIGNED_TIMESTAMPS, verify_signed_timestamps};
 use super::{
     FulcioRoot, RekorInclusionProofPolicy, TrustRoot, VerifyError, trust_root, verify_cert_chain,
     verify_dsse, verify_embedded_sct, verify_inclusion_proof, verify_rekor_body, verify_rekor_set,
@@ -256,6 +257,26 @@ pub(super) fn verify_sigstore_bundle_with(
         verify_dsse(&components.dsse_envelope, &leaf_parsed)?;
     }
 
+    // Every RFC 3161 timestamp that verifies is a signed time the
+    // signature existed at, so the certificate must have been valid then
+    // too. A timestamp that doesn't verify proves nothing and is skipped.
+    if !components.signed_timestamps.is_empty() {
+        let _span = tracing::debug_span!("provenance.verify.timestamps").entered();
+        let signature = first_dsse_signature(&components.dsse_envelope)?;
+        let timestamps = verify_signed_timestamps(
+            &components.signed_timestamps,
+            &signature,
+            &trust.timestamp_authorities,
+        );
+        for timestamp in &timestamps {
+            verify_cert_chain(
+                &chain_refs,
+                &trust.fulcio_roots_at(timestamp.time),
+                timestamp.time,
+            )?;
+        }
+    }
+
     // SCT verify — need the immediate issuer's SPKI for the precert
     // signed-input. Search the bundle's chain first (chain[1..]),
     // fall back to the active trust anchors. Chain validation has
@@ -339,6 +360,8 @@ pub(super) struct BundleComponents {
     pub(super) leaf_cert_der: Vec<u8>,
     pub(super) chain_der: Vec<Vec<u8>>,
     pub(super) tlog_entry: crate::sigstore::TlogEntry,
+    /// DER `TimeStampResp`s from `timestampVerificationData`.
+    pub(super) signed_timestamps: Vec<Vec<u8>>,
 }
 
 /// Parse a Sigstore bundle body into [`BundleComponents`]. Handles
@@ -465,6 +488,7 @@ fn parse_inner_bundle(bundle: &serde_json::Value) -> Result<BundleComponents, Ve
     })?;
     let tlog_entry: crate::sigstore::TlogEntry = serde_json::from_value(tlog_value.clone())
         .map_err(|e| VerifyError::BundleParse(format!("tlogEntries[0] shape: {e}")))?;
+    let signed_timestamps = parse_signed_timestamps(verification_material)?;
 
     Ok(BundleComponents {
         dsse_envelope,
@@ -472,7 +496,62 @@ fn parse_inner_bundle(bundle: &serde_json::Value) -> Result<BundleComponents, Ve
         leaf_cert_der,
         chain_der,
         tlog_entry,
+        signed_timestamps,
     })
+}
+
+fn parse_signed_timestamps(
+    verification_material: &serde_json::Value,
+) -> Result<Vec<Vec<u8>>, VerifyError> {
+    let Some(timestamps) = verification_material
+        .get("timestampVerificationData")
+        .and_then(|data| data.get("rfc3161Timestamps"))
+    else {
+        return Ok(Vec::new());
+    };
+    let timestamps = timestamps.as_array().ok_or_else(|| {
+        VerifyError::BundleParse(
+            "`timestampVerificationData.rfc3161Timestamps` is not an array".into(),
+        )
+    })?;
+    if timestamps.len() > MAX_SIGNED_TIMESTAMPS {
+        return Err(VerifyError::BundleParse(format!(
+            "the bundle carries {} RFC 3161 timestamps, more than the {MAX_SIGNED_TIMESTAMPS} \
+             accepted",
+            timestamps.len()
+        )));
+    }
+    timestamps
+        .iter()
+        .enumerate()
+        .map(|(i, timestamp)| {
+            let encoded = timestamp
+                .get("signedTimestamp")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    VerifyError::BundleParse(format!(
+                        "rfc3161Timestamps[{i}] has no `signedTimestamp` string"
+                    ))
+                })?;
+            BASE64.decode(encoded.as_bytes()).map_err(|e| {
+                VerifyError::BundleParse(format!(
+                    "rfc3161Timestamps[{i}].signedTimestamp is not base64: {e}"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// The bundle's signature as RFC 3161 timestamps and Rekor v2 entries
+/// name it: the DSSE envelope's first signature, decoded.
+pub(super) fn first_dsse_signature(envelope: &DsseEnvelope) -> Result<Vec<u8>, VerifyError> {
+    let signature = envelope
+        .signatures
+        .first()
+        .ok_or_else(|| VerifyError::DsseSignature("envelope carries no signatures".into()))?;
+    BASE64
+        .decode(signature.sig.as_bytes())
+        .map_err(|e| VerifyError::DsseSignature(format!("signature not valid base64: {e}")))
 }
 
 /// Extract `subject[0].name` and `subject[0].digest.sha256` from the

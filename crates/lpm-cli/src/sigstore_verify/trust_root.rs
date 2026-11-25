@@ -15,13 +15,15 @@ pub(super) const EMBEDDED_TRUST_ROOT_JSON: &[u8] =
 pub(super) const TRUST_ROOT_EXPIRY_WARN_DAYS: i64 = 30;
 
 /// A parsed Sigstore trust root: the Fulcio certificate authorities,
-/// Rekor logs and CT logs bundles are verified against.
+/// Rekor logs, CT logs and timestamp authorities bundles are verified
+/// against.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct TrustRoot {
     pub fulcio_roots: Vec<FulcioRoot>,
     pub rekor_keys: Vec<RekorKey>,
     pub ctlog_keys: Vec<CtLogKey>,
+    pub timestamp_authorities: Vec<TimestampAuthority>,
 }
 
 #[allow(dead_code)]
@@ -44,9 +46,16 @@ pub struct RekorKey {
     /// carries it as base64 — both decode to
     /// the same 32-byte hash, that's the canonical form.
     pub log_id: Vec<u8>,
-    /// DER-encoded SubjectPublicKeyInfo for verifying the SET.
+    /// DER-encoded SubjectPublicKeyInfo for verifying the SET and
+    /// checkpoints.
     pub spki_der: Vec<u8>,
     pub valid_for: ValidityWindow,
+    /// The log's `baseUrl`, whose host names the log on its
+    /// checkpoints. Empty when the trust root doesn't give one.
+    pub base_url: String,
+    /// The log's C2SP signed-note key ID, when the trust root gives one.
+    /// For a Rekor v2 log it equals [`Self::log_id`].
+    pub checkpoint_key_id: Option<Vec<u8>>,
 }
 
 #[allow(dead_code)]
@@ -54,6 +63,18 @@ pub struct RekorKey {
 pub struct CtLogKey {
     pub log_id: Vec<u8>,
     pub spki_der: Vec<u8>,
+    pub valid_for: ValidityWindow,
+}
+
+/// An RFC 3161 timestamp authority bundles may carry signed timestamps
+/// from.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct TimestampAuthority {
+    pub uri: String,
+    /// DER-encoded certs, the signing certificate first when the trust
+    /// root gives it and the trust anchor last.
+    pub cert_chain_der: Vec<Vec<u8>>,
     pub valid_for: ValidityWindow,
 }
 
@@ -67,12 +88,12 @@ pub struct ValidityWindow {
 }
 
 impl ValidityWindow {
-    /// Inclusive lower bound, exclusive upper bound. An open-ended
-    /// window contains every `t >= start`.
+    /// Both bounds are inclusive, as Sigstore's `TimeRange` specifies.
+    /// An open-ended window contains every `t >= start`.
     #[allow(dead_code)]
     pub fn contains(&self, t: SystemTime) -> bool {
         let t: Timestamp = t.into();
-        t >= self.start && self.end.is_none_or(|end| t < end)
+        t >= self.start && self.end.is_none_or(|end| t <= end)
     }
 }
 
@@ -86,6 +107,8 @@ struct TrustedRootJson {
     tlogs: Vec<serde_json::Value>,
     #[serde(default)]
     ctlogs: Vec<serde_json::Value>,
+    #[serde(rename = "timestampAuthorities", default)]
+    timestamp_authorities: Vec<serde_json::Value>,
 }
 
 fn deserialize_entry<T: serde::de::DeserializeOwned>(
@@ -97,6 +120,7 @@ fn deserialize_entry<T: serde::de::DeserializeOwned>(
 const FULCIO_ROLE: &str = "Fulcio CA";
 const REKOR_ROLE: &str = "Rekor signing key";
 const CT_LOG_ROLE: &str = "CT log key";
+const TIMESTAMP_AUTHORITY_ROLE: &str = "timestamp authority";
 
 fn collect_entries<T>(
     values: Vec<serde_json::Value>,
@@ -126,6 +150,8 @@ fn collect_entries<T>(
 
 #[derive(Debug, serde::Deserialize)]
 struct TrustedRootCa {
+    #[serde(default)]
+    uri: String,
     #[serde(rename = "certChain")]
     cert_chain: TrustedRootCertChain,
     #[serde(rename = "validFor")]
@@ -145,8 +171,12 @@ struct TrustedRootCertEntry {
 
 #[derive(Debug, serde::Deserialize)]
 struct TrustedRootLog {
+    #[serde(rename = "baseUrl", default)]
+    base_url: String,
     #[serde(rename = "logId")]
     log_id: TrustedRootLogId,
+    #[serde(rename = "checkpointKeyId", default)]
+    checkpoint_key_id: Option<TrustedRootLogId>,
     #[serde(rename = "publicKey")]
     public_key: TrustedRootKey,
 }
@@ -221,25 +251,34 @@ impl TrustRoot {
                 parse_fulcio_root(deserialize_entry(value)?)
             })?;
         let rekor_keys = collect_entries(raw.tlogs, skipped, REKOR_ROLE, |value| {
-            let (log_id, spki_der, valid_for) = parse_log_key(deserialize_entry(value)?)?;
+            let log = parse_log_key(deserialize_entry(value)?)?;
             Ok(RekorKey {
-                log_id,
-                spki_der,
-                valid_for,
+                log_id: log.log_id,
+                spki_der: log.spki_der,
+                valid_for: log.valid_for,
+                base_url: log.base_url,
+                checkpoint_key_id: log.checkpoint_key_id,
             })
         })?;
         let ctlog_keys = collect_entries(raw.ctlogs, skipped, CT_LOG_ROLE, |value| {
-            let (log_id, spki_der, valid_for) = parse_log_key(deserialize_entry(value)?)?;
+            let log = parse_log_key(deserialize_entry(value)?)?;
             Ok(CtLogKey {
-                log_id,
-                spki_der,
-                valid_for,
+                log_id: log.log_id,
+                spki_der: log.spki_der,
+                valid_for: log.valid_for,
             })
         })?;
+        let timestamp_authorities = collect_entries(
+            raw.timestamp_authorities,
+            skipped,
+            TIMESTAMP_AUTHORITY_ROLE,
+            |value| parse_timestamp_authority(deserialize_entry(value)?),
+        )?;
         Ok(TrustRoot {
             fulcio_roots,
             rekor_keys,
             ctlog_keys,
+            timestamp_authorities,
         })
     }
 
@@ -368,32 +407,66 @@ impl TrustRoot {
 }
 
 fn parse_fulcio_root(raw: TrustedRootCa) -> Result<FulcioRoot, VerifyError> {
-    let mut cert_chain_der = Vec::with_capacity(raw.cert_chain.certificates.len());
-    for cert in raw.cert_chain.certificates {
-        let der = BASE64.decode(cert.raw_bytes.as_bytes()).map_err(|e| {
-            VerifyError::TrustRoot(format!("Fulcio CA cert rawBytes not base64: {e}"))
-        })?;
-        cert_chain_der.push(der);
-    }
-    if cert_chain_der.is_empty() {
-        return Err(VerifyError::TrustRoot(
-            "Fulcio CA entry has an empty certChain".into(),
-        ));
-    }
     Ok(FulcioRoot {
-        cert_chain_der,
+        cert_chain_der: parse_cert_chain(raw.cert_chain, FULCIO_ROLE)?,
         valid_for: raw.valid_for.into(),
     })
 }
 
-fn parse_log_key(raw: TrustedRootLog) -> Result<(Vec<u8>, Vec<u8>, ValidityWindow), VerifyError> {
+fn parse_timestamp_authority(raw: TrustedRootCa) -> Result<TimestampAuthority, VerifyError> {
+    Ok(TimestampAuthority {
+        cert_chain_der: parse_cert_chain(raw.cert_chain, TIMESTAMP_AUTHORITY_ROLE)?,
+        uri: raw.uri,
+        valid_for: raw.valid_for.into(),
+    })
+}
+
+fn parse_cert_chain(
+    chain: TrustedRootCertChain,
+    role: &'static str,
+) -> Result<Vec<Vec<u8>>, VerifyError> {
+    let mut cert_chain_der = Vec::with_capacity(chain.certificates.len());
+    for cert in chain.certificates {
+        let der = BASE64
+            .decode(cert.raw_bytes.as_bytes())
+            .map_err(|e| VerifyError::TrustRoot(format!("{role} cert rawBytes not base64: {e}")))?;
+        cert_chain_der.push(der);
+    }
+    if cert_chain_der.is_empty() {
+        return Err(VerifyError::TrustRoot(format!(
+            "{role} entry has an empty certChain"
+        )));
+    }
+    Ok(cert_chain_der)
+}
+
+struct ParsedLog {
+    log_id: Vec<u8>,
+    spki_der: Vec<u8>,
+    valid_for: ValidityWindow,
+    base_url: String,
+    checkpoint_key_id: Option<Vec<u8>>,
+}
+
+fn parse_log_key(raw: TrustedRootLog) -> Result<ParsedLog, VerifyError> {
     let log_id = BASE64
         .decode(raw.log_id.key_id.as_bytes())
         .map_err(|e| VerifyError::TrustRoot(format!("logId.keyId not base64: {e}")))?;
+    let checkpoint_key_id = raw
+        .checkpoint_key_id
+        .map(|id| BASE64.decode(id.key_id.as_bytes()))
+        .transpose()
+        .map_err(|e| VerifyError::TrustRoot(format!("checkpointKeyId.keyId not base64: {e}")))?;
     let spki_der = BASE64
         .decode(raw.public_key.raw_bytes.as_bytes())
         .map_err(|e| VerifyError::TrustRoot(format!("log publicKey.rawBytes not base64: {e}")))?;
-    Ok((log_id, spki_der, raw.public_key.valid_for.into()))
+    Ok(ParsedLog {
+        log_id,
+        spki_der,
+        valid_for: raw.public_key.valid_for.into(),
+        base_url: raw.base_url,
+        checkpoint_key_id,
+    })
 }
 
 /// The trust root verification uses: the newest one Sigstore's TUF

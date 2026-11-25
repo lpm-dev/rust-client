@@ -1,4 +1,3 @@
-use ecdsa::signature::Verifier;
 use lpm_common::Timestamp;
 use p256::ecdsa::{Signature, VerifyingKey};
 use std::time::SystemTime;
@@ -304,7 +303,7 @@ fn anchor_contains_der(fulcio_roots: &[&FulcioRoot], top_der: &[u8]) -> bool {
         .any(|d| d.as_slice() == top_der)
 }
 
-fn check_cert_validity_at(
+pub(super) fn check_cert_validity_at(
     cert: &X509Certificate<'_>,
     at_time: Timestamp,
     label: &str,
@@ -316,7 +315,7 @@ fn check_cert_validity_at(
         .ok_or_else(|| VerifyError::Chain(format!("{label} notAfter is unrepresentable")))?;
     if at_time < not_before || at_time > not_after {
         return Err(VerifyError::Chain(format!(
-            "{label} validity window [{}, {}] does not contain integratedTime {}",
+            "{label} validity window [{}, {}] does not contain the signing time {}",
             not_before.to_plain_utc(),
             not_after.to_plain_utc(),
             at_time.to_plain_utc()
@@ -325,7 +324,7 @@ fn check_cert_validity_at(
     Ok(())
 }
 
-fn verify_chain_link(
+pub(super) fn verify_chain_link(
     child: &X509Certificate<'_>,
     parent: &X509Certificate<'_>,
     label: &str,
@@ -367,8 +366,10 @@ fn try_anchor_signature(
 /// ECDSA signature OIDs we accept (Sigstore profile).
 /// - 1.2.840.10045.4.3.2 = `ecdsa-with-SHA256` (P-256 leaves)
 /// - 1.2.840.10045.4.3.3 = `ecdsa-with-SHA384` (P-384 roots/intermediates)
+/// - 1.2.840.10045.4.3.4 = `ecdsa-with-SHA512`
 pub(super) const OID_ECDSA_WITH_SHA256: [u64; 7] = [1, 2, 840, 10045, 4, 3, 2];
 pub(super) const OID_ECDSA_WITH_SHA384: [u64; 7] = [1, 2, 840, 10045, 4, 3, 3];
+const OID_ECDSA_WITH_SHA512: [u64; 7] = [1, 2, 840, 10045, 4, 3, 4];
 
 pub(super) fn oid_components_match(
     oid: &x509_parser::der_parser::oid::Oid<'_>,
@@ -388,71 +389,49 @@ fn verify_ecdsa_signature_by_oid(
     parent: &X509Certificate<'_>,
     label: &str,
 ) -> Result<(), VerifyError> {
-    let spki_der = parent.public_key().raw;
-    if oid_components_match(sig_alg_oid, &OID_ECDSA_WITH_SHA256) {
-        verify_ecdsa_p256_sha256(spki_der, tbs_bytes, sig_bytes, label)
+    use sha2::{Digest, Sha256, Sha384, Sha512};
+
+    let digest: Vec<u8> = if oid_components_match(sig_alg_oid, &OID_ECDSA_WITH_SHA256) {
+        Sha256::digest(tbs_bytes).to_vec()
     } else if oid_components_match(sig_alg_oid, &OID_ECDSA_WITH_SHA384) {
-        verify_ecdsa_p384_sha384(spki_der, tbs_bytes, sig_bytes, label)
+        Sha384::digest(tbs_bytes).to_vec()
+    } else if oid_components_match(sig_alg_oid, &OID_ECDSA_WITH_SHA512) {
+        Sha512::digest(tbs_bytes).to_vec()
     } else {
-        Err(VerifyError::Chain(format!(
+        return Err(VerifyError::Chain(format!(
             "{label}: unsupported signature algorithm OID {sig_alg_oid} \
-             (Sigstore profile accepts only ecdsa-with-SHA256 or ecdsa-with-SHA384)"
-        )))
-    }
+             (accepted: ecdsa-with-SHA256, ecdsa-with-SHA384, ecdsa-with-SHA512)"
+        )));
+    };
+    verify_ecdsa_prehash(parent.public_key().raw, &digest, sig_bytes)
+        .map_err(|why| VerifyError::Chain(format!("{label}: {why}")))
 }
 
-pub(super) fn verify_ecdsa_p256_sha256(
+/// Verify a DER ECDSA signature over `digest` under a P-256 or P-384
+/// SubjectPublicKeyInfo. The digest may come from any SHA-2 hash: ECDSA
+/// truncates a digest longer than the curve's order, as X.509 and CMS
+/// signers expect.
+pub(super) fn verify_ecdsa_prehash(
     spki_der: &[u8],
-    tbs_bytes: &[u8],
-    sig_bytes: &[u8],
-    label: &str,
-) -> Result<(), VerifyError> {
+    digest: &[u8],
+    signature_der: &[u8],
+) -> Result<(), String> {
+    use ecdsa::signature::hazmat::PrehashVerifier;
     use p256::pkcs8::DecodePublicKey;
-    let verifying_key = VerifyingKey::from_public_key_der(spki_der).map_err(|e| {
-        VerifyError::Chain(format!(
-            "{label}: parent SPKI did not decode as ECDSA P-256: {e}"
-        ))
-    })?;
-    let signature = Signature::from_der(sig_bytes).map_err(|e| {
-        VerifyError::Chain(format!(
-            "{label}: cert signature is not valid DER ECDSA: {e}"
-        ))
-    })?;
-    // X.509 cert signature: sigma = ECDSA-sign(key, SHA-256(TBS)).
-    // p256::ecdsa::VerifyingKey's `Verifier<Signature>::verify` impl
-    // hashes the message internally with SHA-256 — exactly the curve's
-    // standard hash for ecdsa-with-SHA256 — so passing raw TBS bytes
-    // is the right shape. Pre-hashing first would re-hash the digest
-    // and produce the wrong verification input.
-    verifying_key.verify(tbs_bytes, &signature).map_err(|e| {
-        VerifyError::Chain(format!(
-            "{label}: ECDSA P-256 signature did not verify: {e}"
-        ))
-    })
-}
 
-pub(super) fn verify_ecdsa_p384_sha384(
-    spki_der: &[u8],
-    tbs_bytes: &[u8],
-    sig_bytes: &[u8],
-    label: &str,
-) -> Result<(), VerifyError> {
-    use p384::pkcs8::DecodePublicKey;
-    let verifying_key = p384::ecdsa::VerifyingKey::from_public_key_der(spki_der).map_err(|e| {
-        VerifyError::Chain(format!(
-            "{label}: parent SPKI did not decode as ECDSA P-384: {e}"
-        ))
-    })?;
-    let signature = p384::ecdsa::Signature::from_der(sig_bytes).map_err(|e| {
-        VerifyError::Chain(format!(
-            "{label}: cert signature is not valid DER ECDSA: {e}"
-        ))
-    })?;
-    // Same shape as the P-256 case — p384's Verifier hashes with
-    // SHA-384, which matches ecdsa-with-SHA384.
-    verifying_key.verify(tbs_bytes, &signature).map_err(|e| {
-        VerifyError::Chain(format!(
-            "{label}: ECDSA P-384 signature did not verify: {e}"
-        ))
-    })
+    if let Ok(key) = VerifyingKey::from_public_key_der(spki_der) {
+        let signature = Signature::from_der(signature_der)
+            .map_err(|e| format!("signature is not valid DER ECDSA: {e}"))?;
+        return key
+            .verify_prehash(digest, &signature)
+            .map_err(|e| format!("ECDSA P-256 signature did not verify: {e}"));
+    }
+    if let Ok(key) = p384::ecdsa::VerifyingKey::from_public_key_der(spki_der) {
+        let signature = p384::ecdsa::Signature::from_der(signature_der)
+            .map_err(|e| format!("signature is not valid DER ECDSA: {e}"))?;
+        return key
+            .verify_prehash(digest, &signature)
+            .map_err(|e| format!("ECDSA P-384 signature did not verify: {e}"));
+    }
+    Err("the signing key is not an ECDSA P-256 or P-384 key".into())
 }

@@ -7,7 +7,8 @@
 //! - Sigstore trust root: built into the binary, refreshed from
 //!   Sigstore's TUF repository when a signature needs newer keys.
 //! - DSSE envelope verification against the leaf cert.
-//! - X.509 chain validation at `integratedTime`.
+//! - X.509 chain validation at `integratedTime`, and again at the time of
+//!   every RFC 3161 signed timestamp that verifies.
 //! - embedded SCT verification.
 //! - semantic Rekor body match.
 //! - Rekor SET verification.
@@ -22,6 +23,7 @@
 
 mod bundle;
 mod chain;
+mod der;
 mod dsse;
 mod error;
 mod inclusion;
@@ -30,6 +32,7 @@ mod rekor_set;
 mod sct;
 #[cfg(test)]
 mod tests;
+mod timestamp;
 mod trust_root;
 mod trust_store;
 pub(crate) mod tuf;
@@ -47,7 +50,9 @@ pub use self::inclusion::verify_inclusion_proof;
 pub use self::rekor_body::verify_rekor_body;
 pub use self::rekor_set::verify_rekor_set;
 pub use self::sct::verify_embedded_sct;
-pub use self::trust_root::{CtLogKey, FulcioRoot, RekorKey, TrustRoot, trust_root};
+pub use self::trust_root::{
+    CtLogKey, FulcioRoot, RekorKey, TimestampAuthority, TrustRoot, trust_root,
+};
 pub use self::trust_store::{
     TrustRefresh, verify_sigstore_bundle_refreshing,
     verify_sigstore_bundle_with_built_in_trust_root,
@@ -61,7 +66,6 @@ use self::bundle::{
 #[cfg(test)]
 use self::chain::{
     OID_ECDSA_WITH_SHA256, OID_ECDSA_WITH_SHA384, enforce_issuer_constraints, oid_components_match,
-    verify_ecdsa_p256_sha256, verify_ecdsa_p384_sha384,
 };
 #[cfg(test)]
 use self::inclusion::{rfc6962_hash_children, rfc6962_leaf_hash, rfc6962_verify_inclusion};

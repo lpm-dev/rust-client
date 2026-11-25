@@ -466,6 +466,18 @@ async fn a_fetched_trust_root_this_version_cannot_use_keeps_the_held_one() {
     assert!(refresh.contains("CT log"), "{refresh}");
 }
 
+#[test]
+fn a_fetched_trust_root_with_unreadable_timestamp_authorities_is_still_used() {
+    let mut root: serde_json::Value = serde_json::from_slice(EMBEDDED_TRUST_ROOT_JSON).unwrap();
+    for authority in root["timestampAuthorities"].as_array_mut().unwrap() {
+        authority["certChain"] = serde_json::json!({"futureEncoding": true});
+    }
+    let usable = usable_trust_root(&serde_json::to_vec(&root).unwrap(), SystemTime::now())
+        .expect("bundles with a Rekor v1 entry don't need a timestamp authority");
+    assert!(usable.timestamp_authorities.is_empty());
+    assert!(!usable.rekor_keys.is_empty());
+}
+
 #[tokio::test]
 async fn a_role_sigstore_retired_entirely_stops_counting() {
     let roles = RoleSet::new();
