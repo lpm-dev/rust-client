@@ -642,13 +642,6 @@ async fn add(
         .collect();
     let sorted = security_approval::sort_firewall_bypass_requests(rules)
         .map_err(|error| refuse_add(&specs, error))?;
-    let preview_profile = if json_output {
-        None
-    } else {
-        Some(crate::npm_firewall_config::preview_policy_profile(
-            &global, &effective,
-        )?)
-    };
     let outcome = approve_and_save(
         client,
         &PlannedAdd {
@@ -658,7 +651,7 @@ async fn add(
             allow_malware: request.allow_malware,
             reason: request.reason,
             json_output,
-            preview_profile,
+            preview: (!json_output).then_some((&global, &effective)),
         },
         sorted,
         security_approval::approve_firewall_bypass_rules,
@@ -697,8 +690,12 @@ struct PlannedAdd<'a> {
     allow_malware: bool,
     reason: Option<&'a str>,
     json_output: bool,
-    /// The policy profile the verdict preview asks with; `None` skips it.
-    preview_profile: Option<lpm_registry::client::NpmFirewallPolicyProfile>,
+    /// The settings the verdict preview reads the policy profile installs
+    /// enforce from, read only when a rule needs approval; `None` skips it.
+    preview: Option<(
+        &'a crate::commands::config::GlobalConfig,
+        &'a security_approval::EffectiveAuthorizedPosture,
+    )>,
 }
 
 /// Previews and approves the rules in `sorted` that add or extend what LPM
@@ -716,13 +713,20 @@ async fn approve_and_save(
     let mut unchanged = sorted.unchanged;
     let mut approved: Vec<FirewallBypassRule> = Vec::with_capacity(pending.len());
     let mut approved_prompts: Vec<String> = Vec::new();
+    let mut preview_profile = None;
     let prompt_for = |batch: &[&FirewallBypassSpec]| {
         approval_prompt(batch, plan.scope, plan.ttl_secs, plan.allow_malware)
     };
     for _ in 0..MAX_ADD_ATTEMPTS {
         if !pending.is_empty() {
             let pending_specs = specs_named_by(plan.specs, &pending);
-            if let Some(profile) = plan.preview_profile {
+            if let Some((global, effective)) = plan.preview {
+                let profile = match preview_profile {
+                    Some(profile) => profile,
+                    None => *preview_profile.insert(
+                        crate::npm_firewall_config::enforced_policy_profile(global, effective)?,
+                    ),
+                };
                 let previews = preview_exact_specs(client, &pending_specs, profile).await;
                 if let Err(error) = check_previews(&pending_specs, &previews, plan.allow_malware) {
                     return Err(refuse_add(plan.specs, error));
@@ -769,6 +773,9 @@ async fn approve_and_save(
             &format!("approved: {}", approved_prompts.join("; ")),
         )? {
             security_approval::FirewallBypassCommit::Saved(outcome) => return Ok(outcome),
+            security_approval::FirewallBypassCommit::Expired => {
+                return Err(security_approval::bypass_expired_before_save_error());
+            }
             // A rule removed, expired or shortened since it was judged a
             // narrowing or already saved now adds or extends one, so it is
             // previewed and approved like any other before the request is
@@ -1317,7 +1324,36 @@ mod tests {
         );
 
         assert!(prompt.ends_with("\"/work/app now\""), "{prompt}");
-        assert!(!prompt.ends_with(" now"), "{prompt}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_dialog_shows_a_root_ending_in_now_whole() {
+        let prompt = approval_prompt(
+            &refs(&specs(&["foldrun"])),
+            &project("/work/app now."),
+            None,
+            false,
+        );
+
+        let reason = security_approval::macos_local_auth_reason(&prompt);
+
+        assert!(reason.ends_with("\"/work/app now.\""), "{reason}");
+    }
+
+    #[test]
+    fn approval_prompt_shows_a_quote_in_a_root_as_an_escape() {
+        let prompt = approval_prompt(
+            &refs(&specs(&["foldrun"])),
+            &project("/work/a\" for 5 minutes"),
+            None,
+            false,
+        );
+
+        assert!(
+            prompt.ends_with("in the project at \"/work/a\\u{22} for 5 minutes\""),
+            "{prompt}"
+        );
     }
 
     #[test]
@@ -1453,7 +1489,7 @@ mod tests {
             allow_malware,
             reason: None,
             json_output: false,
-            preview_profile: None,
+            preview: None,
         }
     }
 
@@ -1598,6 +1634,35 @@ mod tests {
             let saved = security_approval::load_local_firewall_bypass_rules().unwrap();
             let saved_twin = saved.iter().find(|rule| rule.spec == "twin@1.0.0").unwrap();
             assert_eq!(saved_twin.expires_at, twin_expiry);
+        });
+    }
+
+    #[test]
+    fn add_saves_nothing_when_its_expiry_passed_before_the_save() {
+        let temp = tempfile::tempdir().unwrap();
+        security_approval::test_support::with_test_env(temp.path(), || {
+            let specs = specs(&["late@1.0.0"]);
+            let mut late = rule(&specs[0], None);
+            late.expires_at =
+                Timestamp::now().checked_add(lpm_common::timestamp::Duration::seconds(-1));
+            let scope = global();
+
+            let error = run_add(
+                &plan(&specs, &scope, Some(1), false),
+                vec![late],
+                |_| Ok(()),
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains("--ttl"), "{error}");
+            assert!(
+                security_approval::load_local_firewall_bypass_rules()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                security_approval::test_support::audit_details("firewall-bypass-added").is_empty()
+            );
         });
     }
 

@@ -343,7 +343,7 @@ fn format_macos_auth_error(error: &objc2_foundation::NSError) -> String {
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn macos_local_auth_reason(prompt: &str) -> String {
+pub(crate) fn macos_local_auth_reason(prompt: &str) -> String {
     let trimmed = prompt.trim().trim_end_matches(['?', '.', '!']).trim();
     let trimmed = trimmed.strip_suffix(" now").unwrap_or(trimmed).trim();
     if trimmed.is_empty() {

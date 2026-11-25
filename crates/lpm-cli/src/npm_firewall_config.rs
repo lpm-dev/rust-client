@@ -558,36 +558,6 @@ fn enforced_rank(mode: NpmFirewallMode, action: NpmFirewallPolicyAction) -> u8 {
     }
 }
 
-/// The profile `lpm firewall bypass add` previews a version with: what
-/// installs run, with each group installs would refuse as looser than the
-/// approved profile held at its approved action, so the preview never hides
-/// a block.
-pub(crate) fn preview_policy_profile(
-    global: &GlobalConfig,
-    effective: &crate::security_approval::EffectiveAuthorizedPosture,
-) -> Result<NpmFirewallPolicyProfile, LpmError> {
-    let mut profile = runtime_policy_profile(runtime_policy_request(global, effective)?, effective);
-    let approved = effective.posture.firewall_policy_profile();
-    let approved_mode = effective.posture.firewall_mode();
-    let requested_mode =
-        runtime_request_mode(global)?.map_or(approved_mode, |request| request.mode());
-    let (requested_mode, approved_mode) = policy_comparison_modes(
-        requested_mode,
-        approved_mode,
-        matches!(
-            effective.sources.firewall_policies,
-            crate::security_approval::PostureSourceKind::ManagedPolicy
-        ),
-    );
-    // Only the groups installs would refuse fall back to the approved action.
-    for loosened in loosened_firewall_policies(requested_mode, &profile, approved_mode, &approved) {
-        if let Some(slot) = policy_action_mut(&mut profile, loosened.key) {
-            *slot = loosened.approved;
-        }
-    }
-    Ok(profile)
-}
-
 /// The modes a requested profile and the approved one are compared at. A
 /// managed profile binds whenever the firewall runs, so both sides use the
 /// requested mode. When the mode itself loosens, that is the mode check's to

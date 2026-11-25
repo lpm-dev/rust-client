@@ -158,6 +158,9 @@ fn split_spec(raw: &str) -> (&str, Option<&str>) {
 /// An exact version is a real published version and may be longer.
 const MAX_RANGE_CHARS: usize = 80;
 
+/// The longest version or range npm accepts.
+const MAX_VERSION_CHARS: usize = 256;
+
 fn parse_versions(text: &str) -> Result<SpecVersions, String> {
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
@@ -169,6 +172,11 @@ fn parse_versions(text: &str) -> Result<SpecVersions, String> {
     if normalized.contains('+') {
         return Err(format!(
             "`{normalized}` has build metadata; name the version without it"
+        ));
+    }
+    if normalized.len() > MAX_VERSION_CHARS {
+        return Err(format!(
+            "the version is longer than the {MAX_VERSION_CHARS} characters npm allows"
         ));
     }
     if let Some(version) = canonical_version(&normalized) {
@@ -473,32 +481,11 @@ fn plain_drive_path(verbatim: &str) -> Option<&str> {
 }
 
 /// A name Win32 reads as a device rather than a file, with or without an
-/// extension: `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, and the
-/// superscript-digit forms.
+/// extension or spaces before it.
 fn reserved_device_name(part: &str) -> bool {
-    let stem = part.split('.').next().unwrap_or(part).trim_end();
-    let upper = stem.to_ascii_uppercase();
-    match upper.as_str() {
-        "CON" | "PRN" | "AUX" | "NUL" => true,
-        _ => ["COM", "LPT"].iter().any(|prefix| {
-            upper.strip_prefix(prefix).is_some_and(|digit| {
-                matches!(
-                    digit,
-                    "1" | "2"
-                        | "3"
-                        | "4"
-                        | "5"
-                        | "6"
-                        | "7"
-                        | "8"
-                        | "9"
-                        | "\u{b9}"
-                        | "\u{b2}"
-                        | "\u{b3}"
-                )
-            })
-        }),
-    }
+    crate::patch_fs::is_windows_reserved_component(
+        part.split('.').next().unwrap_or(part).trim_end(),
+    )
 }
 
 /// [`project_policy_root`] as the text a project rule stores. A root that
@@ -544,16 +531,17 @@ pub(crate) fn shell_safe_in_double_quotes(text: &str) -> bool {
         })
 }
 
-/// A project root as prompts show it: whole, with every control, invisible
-/// or reordering character written as a visible escape, so two roots never
-/// look alike.
+/// A project root as prompts show it in double quotes: whole, with every
+/// control, invisible or reordering character and every `"` written as a
+/// visible escape, so two roots never look alike and the quotes end it.
 pub(crate) fn visible_root(root: &str) -> std::borrow::Cow<'_, str> {
-    if !root.chars().any(lpm_common::is_terminal_control) {
+    let escaped = |character: char| character == '"' || lpm_common::is_terminal_control(character);
+    if !root.chars().any(escaped) {
         return std::borrow::Cow::Borrowed(root);
     }
     let mut visible = String::with_capacity(root.len() + 8);
     for character in root.chars() {
-        if lpm_common::is_terminal_control(character) {
+        if escaped(character) {
             visible.extend(character.escape_unicode());
         } else {
             visible.push(character);
@@ -1049,6 +1037,14 @@ mod tests {
     }
 
     #[test]
+    fn an_exact_version_longer_than_npm_allows_is_refused() {
+        let error =
+            FirewallBypassSpec::parse(&format!("foldrun@1.0.0-{}", "a".repeat(260))).unwrap_err();
+
+        assert!(error.contains("256"), "{error}");
+    }
+
+    #[test]
     fn prerelease_with_an_x_identifier_is_an_exact_version() {
         let parsed = spec("foldrun@1.0.0-alpha.x");
 
@@ -1161,6 +1157,9 @@ mod tests {
             r"\\?\C",
             r"\\?\C:\work\aux\app",
             r"\\?\C:\work\com1.txt",
+            r"\\?\C:\work\CONIN$",
+            r"\\?\C:\work\conout$.log\app",
+            r"\\?\C:\work\con .txt",
             r"C:\work\app",
         ] {
             assert_eq!(plain_drive_path(verbatim), None, "{verbatim}");

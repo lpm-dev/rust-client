@@ -56,10 +56,10 @@ pub use approval::{
 pub(crate) use firewall_bypass::add_firewall_bypass_rules;
 pub(crate) use firewall_bypass::{
     FirewallBypassAdded, FirewallBypassApproval, FirewallBypassCommit, FirewallBypassRequests,
-    approve_firewall_bypass_rules, commit_firewall_bypass_rules, firewall_bypass_file_exists,
-    load_local_firewall_bypass_rules, local_firewall_bypass_inactive_reason,
-    record_firewall_bypass_refusal, remove_firewall_bypass_rules, rules_kept_changing_error,
-    sort_firewall_bypass_requests,
+    approve_firewall_bypass_rules, bypass_expired_before_save_error, commit_firewall_bypass_rules,
+    firewall_bypass_file_exists, load_local_firewall_bypass_rules,
+    local_firewall_bypass_inactive_reason, record_firewall_bypass_refusal,
+    remove_firewall_bypass_rules, rules_kept_changing_error, sort_firewall_bypass_requests,
 };
 pub use helpers::format_unlock_duration;
 pub(crate) use helpers::project_dir_is_global_install;
@@ -71,6 +71,8 @@ pub(crate) use managed_policy::{
 pub(crate) use managed_policy::{
     install_managed_firewall_protection, remove_managed_firewall_protection,
 };
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use native_auth::macos_local_auth_reason;
 #[allow(unused_imports)]
 pub use paths::security_dir;
 pub(crate) use posture::begin_authorized_posture_transaction;

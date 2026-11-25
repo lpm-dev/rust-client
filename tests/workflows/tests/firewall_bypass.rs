@@ -805,3 +805,29 @@ fn bypass_add_json_that_needs_approval_changes_nothing() {
     assert_eq!(rules.len(), 1);
     assert!(rules[0].get("expires_at").is_none());
 }
+
+#[test]
+fn bypass_add_that_only_shortens_a_rule_reads_no_preview_settings() {
+    let project = enforcing_project();
+    write_signed_firewall_bypass(
+        &project,
+        &[stored_rule(
+            "agent-tool",
+            serde_json::json!({ "id": global_rule_id("agent-tool") }),
+        )],
+    );
+
+    let output = lpm(&project)
+        .env("LPM_NPM_FIREWALL", "not-a-mode")
+        .args(["firewall", "bypass", "add", "agent-tool", "--ttl", "30m"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(saved_rules(&project)[0]["expires_at"].is_string());
+}

@@ -757,6 +757,17 @@ impl UpdateFailure {
         self
     }
 
+    /// The lines printed under this failure: the blocked versions unless the
+    /// install listed them, and the block's notes.
+    fn detail_lines(&self) -> Vec<install_ui::TerminalLine> {
+        self.firewall_block
+            .as_deref()
+            .map(|blocked| {
+                crate::cli::npm_firewall_block_detail_lines(blocked, !self.details_shown)
+            })
+            .unwrap_or_default()
+    }
+
     fn with_reason(reason: String, error: &LpmError) -> Self {
         let firewall_block = match error {
             LpmError::NpmFirewallBlocked(blocked) => Some(blocked.clone()),
@@ -1151,10 +1162,8 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
                     "could not plan:".red(),
                     reason_safe
                 );
-                if let Some(blocked) = failure.firewall_block.as_deref() {
-                    for line in crate::cli::npm_firewall_block_detail_lines(blocked, true) {
-                        install_ui::detail_line(line);
-                    }
+                for line in failure.detail_lines() {
+                    install_ui::detail_line(line);
                 }
             }
         }
@@ -1274,12 +1283,8 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
                     install_ui::bold(&package_safe),
                     reason_safe,
                 ));
-                if let Some(blocked) = failure.firewall_block.as_deref() {
-                    for line in
-                        crate::cli::npm_firewall_block_detail_lines(blocked, !failure.details_shown)
-                    {
-                        install_ui::detail_line(line);
-                    }
+                for line in failure.detail_lines() {
+                    install_ui::detail_line(line);
                 }
             }
         }
@@ -1341,6 +1346,58 @@ fn execute_saved_spec_rewrite(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn firewall_block(source: lpm_common::NpmFirewallBlockSource) -> LpmError {
+        LpmError::NpmFirewallBlocked(Box::new(lpm_common::NpmFirewallBlockedErrorContext {
+            source,
+            packages: vec![lpm_common::NpmFirewallBlockedPackage {
+                name: "agent-tool".into(),
+                version: Some("2.0.0".into()),
+                verdict: "suspicious".into(),
+                reason: "client policy maps lpm_ai_agent_control_surface to block".into(),
+                decision_id: None,
+                match_source: Some("package".into()),
+                policy_group: Some("lpm_ai_agent_control_surface".into()),
+                summary: None,
+                report_url: None,
+                block_class: Some("policy".into()),
+                bypassable: true,
+            }],
+            unattributed_count: 0,
+            unchecked_reason: None,
+            bypassed: Vec::new(),
+            bypass_command: None,
+            bypass_unavailable_reason: None,
+        }))
+    }
+
+    fn plain_detail_lines(failure: &UpdateFailure) -> Vec<String> {
+        failure
+            .detail_lines()
+            .iter()
+            .map(|line| console::strip_ansi_codes(line).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_lone_update_lists_a_registry_refusal_its_install_never_printed() {
+        let blocked_rows = |source| {
+            let failure = UpdateFailure::from_error(&firewall_block(source)).shown_by_install(true);
+            plain_detail_lines(&failure)
+                .into_iter()
+                .filter(|line| line.contains("agent-tool@2.0.0"))
+                .count()
+        };
+
+        assert_eq!(
+            blocked_rows(lpm_common::NpmFirewallBlockSource::Registry),
+            1
+        );
+        assert_eq!(
+            blocked_rows(lpm_common::NpmFirewallBlockSource::Preflight),
+            0
+        );
+    }
 
     #[test]
     fn a_registrys_404_reads_as_not_found_with_its_message() {

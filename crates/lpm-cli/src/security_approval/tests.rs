@@ -3245,7 +3245,7 @@ fn the_add_preview_never_uses_a_looser_profile_than_installs_may_run() {
         let effective = load_effective_authorized_posture().unwrap();
 
         let profile =
-            crate::npm_firewall_config::preview_policy_profile(&config, &effective).unwrap();
+            crate::npm_firewall_config::enforced_policy_profile(&config, &effective).unwrap();
 
         assert_eq!(
             profile.lpm_ai_confirmed_malware,
@@ -3355,6 +3355,23 @@ fn forced_floor_holds_an_approved_group_a_partial_table_leaves_out() {
 }
 
 #[test]
+fn a_request_whose_expiry_passed_before_the_save_saves_nothing() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        let saved = bypass_rule("foldrun@32.8.2");
+        with_test_native_auth_result("approve", || add_bypass(vec![saved.clone()], false)).unwrap();
+        let mut expired = bypass_rule("left-pad@1.3.0");
+        expired.expires_at =
+            Timestamp::now().checked_add(lpm_common::timestamp::Duration::seconds(-1));
+
+        let commit = commit_firewall_bypass_rules(std::slice::from_ref(&expired), [], "").unwrap();
+
+        assert!(matches!(commit, FirewallBypassCommit::Expired));
+        assert_eq!(load_local_firewall_bypass_rules().unwrap(), vec![saved]);
+    });
+}
+
+#[test]
 fn a_rule_sharing_an_id_with_a_saved_one_is_judged_a_new_rule() {
     let temp = tempdir().unwrap();
     with_test_env(temp.path(), || {
@@ -3399,7 +3416,7 @@ fn the_add_preview_keeps_what_installs_may_run_where_the_approved_firewall_is_of
         let effective = load_effective_authorized_posture().unwrap();
 
         let profile =
-            crate::npm_firewall_config::preview_policy_profile(&config, &effective).unwrap();
+            crate::npm_firewall_config::enforced_policy_profile(&config, &effective).unwrap();
 
         assert_eq!(
             profile.lpm_ai_telemetry,
