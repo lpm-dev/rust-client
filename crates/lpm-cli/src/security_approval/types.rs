@@ -395,7 +395,9 @@ pub struct FirewallBypassStatus {
     pub local_rules_apply: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inactive_reason: Option<String>,
-    /// Active local rules; expired ones are left out.
+    /// The unexpired local rules that apply to the status target: those for
+    /// every project, and the project's own.
+    #[serde(serialize_with = "crate::firewall_bypass::serialize_rules")]
     pub rules: Vec<crate::firewall_bypass::FirewallBypassRule>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub managed_rules: Vec<ManagedFirewallBypass>,

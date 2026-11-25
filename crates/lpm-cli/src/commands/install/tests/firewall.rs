@@ -2395,7 +2395,8 @@ fn one_version_bypassed_in_two_chunks_is_reported_once() {
         rule: crate::firewall_bypass::AppliedRule {
             spec: "twice".into(),
             id: Some("fwb_1".into()),
-            scope: "every project".into(),
+            scope: crate::firewall_bypass::FirewallBypassScope::Global,
+            project_root: None,
             source: "local",
         },
     };
@@ -2413,6 +2414,54 @@ fn one_version_bypassed_in_two_chunks_is_reported_once() {
     let stats = finish_npm_firewall_preflight(result, true).unwrap();
 
     assert_eq!(stats.bypassed.len(), 1);
+}
+
+#[tokio::test]
+async fn a_review_hold_under_a_managed_policy_names_no_rule_to_add() {
+    let result = enforce_with_rules(
+        verdict_response(
+            1,
+            vec![grouped_block(
+                "held-tool",
+                "suspicious",
+                "lpm_administrative_review",
+            )],
+        ),
+        &["held-tool"],
+        FirewallBypassRules::preloaded(&[], Vec::new(), None, false),
+    )
+    .await;
+
+    let LpmError::NpmFirewallBlocked(blocked) =
+        finish_npm_firewall_preflight(result, true).unwrap_err()
+    else {
+        panic!("expected a firewall block");
+    };
+
+    assert_eq!(blocked.bypass_unavailable_reason, None);
+    assert_eq!(blocked.bypass_command, None);
+}
+
+#[tokio::test]
+async fn a_package_name_a_shell_would_expand_gets_no_bypass_command() {
+    let result = enforce_with_rules(
+        verdict_response(
+            1,
+            vec![grouped_block("bang!tool", "suspicious", "lpm_ai_telemetry")],
+        ),
+        &["bang!tool"],
+        FirewallBypassRules::none(),
+    )
+    .await;
+
+    let LpmError::NpmFirewallBlocked(blocked) =
+        finish_npm_firewall_preflight(result, true).unwrap_err()
+    else {
+        panic!("expected a firewall block");
+    };
+
+    assert!(blocked.packages[0].bypassable);
+    assert_eq!(blocked.bypass_command, None);
 }
 
 #[tokio::test]

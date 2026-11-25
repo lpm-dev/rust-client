@@ -309,7 +309,8 @@ pub fn load_security_status(
         }
     };
 
-    let firewall_bypass = super::firewall_bypass::load_firewall_bypass_status(&effective);
+    let firewall_bypass =
+        super::firewall_bypass::load_firewall_bypass_status(&effective, project_dir, global);
     Ok(SecurityStatus {
         target,
         project_root,

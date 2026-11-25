@@ -154,6 +154,9 @@ fn split_spec(raw: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// The longest range a rule may hold, so the approval prompt names it whole.
+const MAX_RANGE_CHARS: usize = 80;
+
 fn parse_versions(text: &str) -> Result<SpecVersions, String> {
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
@@ -167,24 +170,26 @@ fn parse_versions(text: &str) -> Result<SpecVersions, String> {
             "`{normalized}` has build metadata; name the version without it"
         ));
     }
-    if normalized.starts_with(|c: char| c.is_ascii_digit())
-        && !normalized.contains([' ', '|', '<', '>', '^', '~', '*'])
-        && !normalized.contains(".x")
-        && !normalized.contains(".X")
+    if let Some(version) = canonical_version(&normalized) {
+        return Ok(SpecVersions::Exact(version));
+    }
+    if let Some(bare) = normalized.strip_prefix(['=', 'v', 'V'])
+        && canonical_version(bare).is_some()
     {
-        if let Ok(version) = lpm_semver::Version::parse(&normalized)
-            && normalized.split('.').count() >= 3
-        {
-            return Ok(SpecVersions::Exact(version));
-        }
+        return Err(format!("write the exact version as `{bare}`"));
     }
     if normalized
         .chars()
         .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() && c != 'v' && c != 'x' && c != 'X')
+        .is_some_and(|c| c.is_ascii_alphabetic() && c != 'x' && c != 'X')
     {
         return Err(format!(
             "`{normalized}` looks like a dist-tag, which moves between versions; name an exact version or a range"
+        ));
+    }
+    if normalized.chars().count() > MAX_RANGE_CHARS {
+        return Err(format!(
+            "the range is longer than {MAX_RANGE_CHARS} characters; add a shorter range or exact versions"
         ));
     }
     let req = lpm_semver::StrictVersionReq::parse(&normalized)
@@ -196,6 +201,23 @@ fn parse_versions(text: &str) -> Result<SpecVersions, String> {
         text: normalized,
         req,
     })
+}
+
+/// `text` as an exact version when it is written the canonical way: three
+/// numeric parts and an optional prerelease, as in `1.2.3` or `1.0.0-rc.x`.
+fn canonical_version(text: &str) -> Option<lpm_semver::Version> {
+    let core = text.split_once('-').map_or(text, |(core, _)| core);
+    let mut parts = core.split('.');
+    let numeric = |part: Option<&str>| {
+        part.is_some_and(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+    };
+    if !(numeric(parts.next()) && numeric(parts.next()) && numeric(parts.next()))
+        || parts.next().is_some()
+    {
+        return None;
+    }
+    let version = lpm_semver::Version::parse(text).ok()?;
+    (version.to_string() == text).then_some(version)
 }
 
 /// npm's naming rules, accepting the mixed-case names published before npm
@@ -377,6 +399,10 @@ fn rule_id(
 /// The root a project rule is keyed on: the workspace root for a workspace
 /// member, else the nearest directory with a `package.json`.
 pub(crate) fn project_policy_root(dir: &Path) -> Result<std::path::PathBuf, LpmError> {
+    // Resolved first, so `../typo` can't walk up lexically into the current
+    // project.
+    let dir = std::fs::canonicalize(dir)
+        .map_err(|error| LpmError::NotFound(format!("{}: {error}", dir.display())))?;
     let package_root = dir
         .ancestors()
         .find(|ancestor| ancestor.join("package.json").is_file())
@@ -430,23 +456,44 @@ pub(crate) fn shell_safe_in_double_quotes(text: &str) -> bool {
         })
 }
 
+/// Whether a validated spec reads the same in double quotes in every shell:
+/// interactive bash and zsh expand `!` even there, and the grammar admits it
+/// in old package names.
+#[inline]
+pub(crate) fn spec_shell_safe(spec: &str) -> bool {
+    !spec.contains('!')
+}
+
 /// The rule that let a blocked version through, as install output reports it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AppliedRule {
     pub(crate) spec: String,
     pub(crate) id: Option<String>,
-    pub(crate) scope: String,
+    pub(crate) scope: FirewallBypassScope,
+    pub(crate) project_root: Option<String>,
     pub(crate) source: &'static str,
 }
 
 impl AppliedRule {
+    /// The same fields `lpm firewall bypass list --json` gives a rule.
     pub(crate) fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "spec": self.spec,
             "id": self.id,
-            "scope": self.scope,
+            "scope": self.scope.as_str(),
+            "project_root": self.project_root,
             "source": self.source,
         })
+    }
+
+    /// Where the rule applies, as install output names it.
+    pub(crate) fn scope_text(&self) -> String {
+        let place = self.project_root.as_deref().unwrap_or("every project");
+        if self.source == "managed" {
+            format!("{place} from the managed policy")
+        } else {
+            place.to_string()
+        }
     }
 }
 
@@ -511,10 +558,8 @@ impl FirewallBypassSet {
                     applied: AppliedRule {
                         spec: rule.spec.clone(),
                         id: Some(rule.id.clone()),
-                        scope: rule
-                            .project_root
-                            .clone()
-                            .unwrap_or_else(|| "every project".to_string()),
+                        scope: rule.scope,
+                        project_root: rule.project_root.clone(),
                         source: "local",
                     },
                     project,
@@ -534,7 +579,8 @@ impl FirewallBypassSet {
                     applied: AppliedRule {
                         spec: rule.spec.clone(),
                         id: None,
-                        scope: "every project".to_string(),
+                        scope: FirewallBypassScope::Global,
+                        project_root: None,
                         source: "managed",
                     },
                     project: false,
@@ -792,6 +838,20 @@ pub(crate) fn rule_json(
     })
 }
 
+/// Serializes local rules as [`rule_json`] reports them.
+pub(crate) fn serialize_rules<S: serde::Serializer>(
+    rules: &[FirewallBypassRule],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let now = Timestamp::now();
+    let mut seq = serializer.serialize_seq(Some(rules.len()))?;
+    for rule in rules {
+        seq.serialize_element(&rule_json(rule, "local", now))?;
+    }
+    seq.end()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -839,12 +899,28 @@ mod tests {
             ("foldrun@1.2.3+build.4", "build metadata"),
             ("foldrun@^1.2.3+build.4", "build metadata"),
             ("foldrun@>=1.0.0+a <2", "build metadata"),
+            ("foldrun@=1.2.3", "write the exact version as `1.2.3`"),
+            ("foldrun@v1.2.3", "write the exact version as `1.2.3`"),
+            ("foldrun@vnext", "dist-tag"),
+            (
+                "foldrun@>=0.0.0-this-range-is-long-enough-to-crowd-out-the-rest-of-the-approval-prompt-text",
+                "longer than 80",
+            ),
             ("foldrun@>2 <1", "matches no version"),
             ("foldrun@", "empty"),
         ] {
             let error = FirewallBypassSpec::parse(raw).unwrap_err();
             assert!(error.contains(needle), "{raw}: {error}");
         }
+    }
+
+    #[test]
+    fn prerelease_with_an_x_identifier_is_an_exact_version() {
+        let parsed = spec("foldrun@1.0.0-alpha.x");
+
+        assert_eq!(parsed.kind(), BypassKind::Exact);
+        assert!(parsed.matches("foldrun", "1.0.0-alpha.x"));
+        assert_eq!(spec("foldrun@1.2.x").kind(), BypassKind::Range);
     }
 
     #[test]
@@ -937,6 +1013,18 @@ mod tests {
             )
             .id
         );
+    }
+
+    #[test]
+    fn project_policy_root_refuses_a_missing_directory_beside_a_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("package.json"), r#"{"name":"app"}"#).unwrap();
+
+        let error = project_policy_root(&app.join("../other-ap")).unwrap_err();
+
+        assert_eq!(error.error_code(), "not_found", "{error}");
     }
 
     #[test]

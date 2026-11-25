@@ -4,7 +4,7 @@
 use crate::firewall_bypass::{
     AddedVerdict, BlockClass, BypassKind, FirewallBypassRule, FirewallBypassScope,
     FirewallBypassSpec, MAX_SPECS_PER_APPROVAL, bypass_add_command, forced_floor_refuses_additions,
-    project_policy_root_text, rule_json, shell_safe_in_double_quotes,
+    project_policy_root_text, rule_json, shell_safe_in_double_quotes, spec_shell_safe,
 };
 use crate::install_ui;
 use crate::security_approval;
@@ -342,16 +342,22 @@ fn added_verdict(preview: Option<&Preview>) -> Option<AddedVerdict> {
 }
 
 /// The command a person runs to add `specs` in `scope` with the same
-/// duration and malware coverage, or `None` when the project root can't be
-/// written into a shell command unchanged. The `--reason` note is left out:
+/// duration and malware coverage, or `None` when a spec or the project root
+/// can't be written into a shell command unchanged. The `--reason` note is left out:
 /// it's free text, and the person can add it again.
 fn add_command_hint(
-    specs: &[FirewallBypassSpec],
+    specs: &[&FirewallBypassSpec],
     scope: &RuleScope,
     ttl_secs: Option<u64>,
     allow_malware: bool,
 ) -> Option<String> {
     let coordinates: Vec<String> = specs.iter().map(ToString::to_string).collect();
+    if !coordinates
+        .iter()
+        .all(|coordinate| spec_shell_safe(coordinate))
+    {
+        return None;
+    }
     let mut command = bypass_add_command(coordinates.iter().map(String::as_str));
     if let Some(root) = &scope.project_root {
         if !shell_safe_in_double_quotes(root) {
@@ -374,7 +380,7 @@ fn add_command_hint(
 /// The native prompt: what is allowed, where, and for how long. Built only
 /// from validated specs and fixed text.
 fn approval_prompt(
-    specs: &[FirewallBypassSpec],
+    specs: &[&FirewallBypassSpec],
     scope: &RuleScope,
     ttl_secs: Option<u64>,
     allow_malware: bool,
@@ -397,12 +403,45 @@ fn approval_prompt(
         prompt.push_str(
             &specs
                 .iter()
-                .map(FirewallBypassSpec::describe)
+                .map(|spec| spec.describe())
                 .collect::<Vec<_>>()
                 .join(", "),
         );
     }
     prompt
+}
+
+/// The longest prompt one approval shows; longer requests ask more than once.
+const MAX_APPROVAL_PROMPT_CHARS: usize = 320;
+
+/// `specs` split into approvals of at most [`MAX_SPECS_PER_APPROVAL`] specs
+/// whose prompt stays within [`MAX_APPROVAL_PROMPT_CHARS`], so each prompt
+/// names everything it approves in full. A spec too long to share a prompt
+/// gets one of its own.
+fn approval_batches<'a>(
+    specs: &[&'a FirewallBypassSpec],
+    prompt_for: impl Fn(&[&FirewallBypassSpec]) -> String,
+) -> Vec<Vec<&'a FirewallBypassSpec>> {
+    let mut batches: Vec<Vec<&FirewallBypassSpec>> = Vec::new();
+    let mut current: Vec<&FirewallBypassSpec> = Vec::with_capacity(MAX_SPECS_PER_APPROVAL);
+    for spec in specs {
+        current.push(spec);
+        if current.len() > 1
+            && (current.len() > MAX_SPECS_PER_APPROVAL
+                || prompt_for(&current).chars().count() > MAX_APPROVAL_PROMPT_CHARS)
+        {
+            current.pop();
+            batches.push(std::mem::replace(
+                &mut current,
+                Vec::with_capacity(MAX_SPECS_PER_APPROVAL),
+            ));
+            current.push(spec);
+        }
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
 }
 
 fn print_add_request(
@@ -472,25 +511,6 @@ fn invalid_ttl(raw: &str) -> LpmError {
     ))
 }
 
-/// The firewall policy profile installs use here, for the preview: the
-/// config profile when it is authorized, else the approved one.
-fn runtime_policy_profile(
-    global: &crate::commands::config::GlobalConfig,
-    cwd: &Path,
-    effective: &security_approval::EffectiveAuthorizedPosture,
-) -> lpm_registry::client::NpmFirewallPolicyProfile {
-    crate::npm_firewall_config::resolve_runtime_firewall(
-        global,
-        cwd,
-        true,
-        crate::npm_firewall_config::BypassRuleScope::GlobalOnly,
-    )
-    .map_or_else(
-        |_| effective.posture.firewall_policy_profile(),
-        |firewall| firewall.policy_profile,
-    )
-}
-
 /// Refuses before any prompt, and records the refusal in the audit log.
 fn refuse_add(specs: &[FirewallBypassSpec], error: LpmError) -> LpmError {
     security_approval::record_firewall_bypass_refusal(
@@ -535,7 +555,10 @@ async fn add(
     let previews = if json_output {
         HashMap::new()
     } else {
-        let profile = runtime_policy_profile(&global, cwd, &effective);
+        let profile = crate::npm_firewall_config::runtime_policy_profile(
+            crate::npm_firewall_config::config_policy_request(&global)?,
+            &effective,
+        );
         let previews = preview_exact_specs(client, &specs, profile).await;
         if let Err(error) = check_previews(&specs, &previews, request.allow_malware) {
             return Err(refuse_add(&specs, error));
@@ -544,28 +567,55 @@ async fn add(
         previews
     };
 
-    let mut outcome = security_approval::FirewallBypassAdded::default();
-    for batch in specs.chunks(MAX_SPECS_PER_APPROVAL) {
+    let rules: Vec<FirewallBypassRule> = specs
+        .iter()
+        .map(|spec| {
+            let mut rule = FirewallBypassRule::new(
+                spec,
+                scope.scope,
+                scope.project_root.clone(),
+                request.allow_malware,
+                now,
+            );
+            rule.expires_at = expires_at;
+            rule.reason = request
+                .reason
+                .map(|reason| lpm_common::sanitize_server_text(reason, 200));
+            rule.added_verdict = added_verdict(previews.get(&spec.to_string()));
+            rule
+        })
+        .collect();
+    let sorted = security_approval::sort_firewall_bypass_requests(rules)?;
+    let mut outcome = security_approval::FirewallBypassAdded {
+        unchanged: sorted.unchanged,
+        rules_total: sorted.rules_total,
+        ..security_approval::FirewallBypassAdded::default()
+    };
+    if !sorted.narrowed.is_empty() {
+        outcome.rules_total =
+            security_approval::save_narrowed_firewall_bypass_rules(&sorted.narrowed)?;
+        outcome.narrowed = sorted.narrowed;
+    }
+
+    let mut pending: HashMap<String, FirewallBypassRule> = sorted
+        .needs_approval
+        .into_iter()
+        .map(|rule| (rule.spec.clone(), rule))
+        .collect();
+    let pending_specs: Vec<&FirewallBypassSpec> = specs
+        .iter()
+        .filter(|spec| pending.contains_key(&spec.to_string()))
+        .collect();
+    let command_hint = add_command_hint(&pending_specs, &scope, ttl_secs, request.allow_malware);
+    let prompt_for = |batch: &[&FirewallBypassSpec]| {
+        approval_prompt(batch, &scope, ttl_secs, request.allow_malware)
+    };
+    for batch in approval_batches(&pending_specs, prompt_for) {
         let rules = batch
             .iter()
-            .map(|spec| {
-                let mut rule = FirewallBypassRule::new(
-                    spec,
-                    scope.scope,
-                    scope.project_root.clone(),
-                    request.allow_malware,
-                    now,
-                );
-                rule.expires_at = expires_at;
-                rule.reason = request
-                    .reason
-                    .map(|reason| lpm_common::sanitize_server_text(reason, 200));
-                rule.added_verdict = added_verdict(previews.get(&spec.to_string()));
-                rule
-            })
+            .filter_map(|spec| pending.remove(&spec.to_string()))
             .collect();
-        let prompt = approval_prompt(batch, &scope, ttl_secs, request.allow_malware);
-        let command_hint = add_command_hint(batch, &scope, ttl_secs, request.allow_malware);
+        let prompt = prompt_for(&batch);
         let added = security_approval::add_firewall_bypass_rules(
             security_approval::FirewallBypassApproval {
                 rules,
@@ -577,10 +627,13 @@ async fn add(
         match added {
             Ok(batch_outcome) => {
                 outcome.added.extend(batch_outcome.added);
+                outcome.extended.extend(batch_outcome.extended);
+                outcome.narrowed.extend(batch_outcome.narrowed);
                 outcome.unchanged.extend(batch_outcome.unchanged);
+                outcome.rules_total = batch_outcome.rules_total;
             }
             Err(error) => {
-                if !json_output && !outcome.added.is_empty() {
+                if !json_output {
                     report_added(&outcome, &scope);
                 }
                 return Err(error);
@@ -589,14 +642,21 @@ async fn add(
     }
 
     if json_output {
-        let rules_total = security_approval::load_local_firewall_bypass_rules()?.len();
+        let as_json = |rules: &[FirewallBypassRule]| {
+            rules
+                .iter()
+                .map(|rule| rule_json(rule, "local", now))
+                .collect::<Vec<_>>()
+        };
         print_json(&serde_json::json!({
             "schema_version": BYPASS_SCHEMA_VERSION,
             "success": true,
-            "added": outcome.added.iter().map(|rule| rule_json(rule, "local", now)).collect::<Vec<_>>(),
-            "unchanged": outcome.unchanged.iter().map(|rule| rule_json(rule, "local", now)).collect::<Vec<_>>(),
-            "count": outcome.added.len(),
-            "rules_total": rules_total,
+            "added": as_json(&outcome.added),
+            "extended": as_json(&outcome.extended),
+            "narrowed": as_json(&outcome.narrowed),
+            "unchanged": as_json(&outcome.unchanged),
+            "count": outcome.added.len() + outcome.extended.len() + outcome.narrowed.len(),
+            "rules_total": outcome.rules_total,
         }));
     } else {
         report_added(&outcome, &scope);
@@ -604,32 +664,39 @@ async fn add(
     Ok(())
 }
 
+fn describe_expiry(rule: &FirewallBypassRule) -> String {
+    match rule.expires_at {
+        Some(expires_at) => format!("{} (until {})", rule.spec, expires_at.to_rfc3339_seconds()),
+        None => format!("{} (no expiry)", rule.spec),
+    }
+}
+
 fn report_added(outcome: &security_approval::FirewallBypassAdded, scope: &RuleScope) {
-    if !outcome.added.is_empty() {
-        let specs: Vec<&str> = outcome
-            .added
-            .iter()
-            .map(|rule| rule.spec.as_str())
-            .collect();
+    let allowed: Vec<String> = outcome
+        .added
+        .iter()
+        .chain(&outcome.extended)
+        .map(describe_expiry)
+        .collect();
+    if !allowed.is_empty() {
         install_ui::done_untrusted(&format!(
             "LPM Firewall now allows {} {}.",
-            specs.join(", "),
+            allowed.join(", "),
+            scope.describe()
+        ));
+    }
+    if !outcome.narrowed.is_empty() {
+        let rules: Vec<String> = outcome.narrowed.iter().map(describe_expiry).collect();
+        install_ui::done_untrusted(&format!(
+            "Updated {} {}.",
+            rules.join(", "),
             scope.describe()
         ));
     }
     if !outcome.unchanged.is_empty() {
-        let rules: Vec<String> = outcome
-            .unchanged
-            .iter()
-            .map(|rule| match rule.expires_at {
-                Some(expires_at) => {
-                    format!("{} (until {})", rule.spec, expires_at.to_rfc3339_seconds())
-                }
-                None => format!("{} (no expiry)", rule.spec),
-            })
-            .collect();
+        let rules: Vec<String> = outcome.unchanged.iter().map(describe_expiry).collect();
         install_ui::done_untrusted(&format!(
-            "Already allowed {}, unchanged: {}. Remove a rule first to change its duration.",
+            "Already allowed {}, unchanged: {}.",
             scope.describe(),
             rules.join(", ")
         ));
@@ -662,10 +729,11 @@ fn list(
     }
     let now = Timestamp::now();
     let global = crate::commands::config::GlobalConfig::load_checked()?;
-    let firewall_mode = crate::npm_firewall_config::runtime_request_mode(&global)?.map_or_else(
-        || effective.posture.firewall_mode(),
-        |request| request.mode(),
-    );
+    let approved_mode = effective.posture.firewall_mode();
+    let firewall_mode = crate::npm_firewall_config::runtime_request_mode(&global)?
+        .map_or(approved_mode, |request| {
+            request.mode().stricter(approved_mode)
+        });
 
     if json_output {
         print_json(&serde_json::json!({
@@ -752,36 +820,41 @@ fn remove(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let scope = RuleScope::resolve(cwd, project)?;
-    let mut ids = Vec::with_capacity(targets.len());
-    let mut specs = Vec::with_capacity(targets.len());
+    let mut selectors = Vec::with_capacity(targets.len());
     for target in targets {
-        if target.starts_with("fwb_") {
-            ids.push(target.clone());
-        } else {
-            specs.push(
-                parse_specs(std::slice::from_ref(target))?
-                    .remove(0)
-                    .to_string(),
-            );
-        }
+        let spec = match FirewallBypassSpec::parse(target) {
+            Ok(spec) => Some(spec.to_string()),
+            Err(_) if is_rule_id(target) => None,
+            Err(error) => {
+                return Err(LpmError::InvalidPackageName(format!(
+                    "`{}`: {error}",
+                    lpm_common::sanitize_server_text(target, 120)
+                )));
+            }
+        };
+        selectors.push((target, spec));
     }
-    let removed = security_approval::remove_firewall_bypass_rules(
-        |rule| ids.contains(&rule.id) || (scope.holds(rule) && specs.contains(&rule.spec)),
+    let selects = |rule: &FirewallBypassRule, (target, spec): &(&String, Option<String>)| {
+        rule.id == **target || (scope.holds(rule) && spec.as_deref() == Some(rule.spec.as_str()))
+    };
+    let (removed, rules_total) = security_approval::remove_firewall_bypass_rules(
+        |rule| selectors.iter().any(|selector| selects(rule, selector)),
         "firewall-bypass-removed",
     )?;
-    let not_found: Vec<&String> = targets
+    let not_found: Vec<&String> = selectors
         .iter()
-        .filter(|target| {
-            !removed
-                .iter()
-                .any(|rule| &rule.id == *target || matches_spec(rule, target))
-        })
+        .filter(|selector| !removed.iter().any(|rule| selects(rule, selector)))
+        .map(|(target, _)| *target)
         .collect();
-    report_removed(&removed, &not_found, json_output)
+    report_removed(&removed, &not_found, rules_total, json_output);
+    Ok(())
 }
 
-fn matches_spec(rule: &FirewallBypassRule, target: &str) -> bool {
-    FirewallBypassSpec::parse(target).is_ok_and(|spec| spec.to_string() == rule.spec)
+/// `fwb_` and twelve lowercase hex digits, as [`FirewallBypassRule`] ids are.
+fn is_rule_id(target: &str) -> bool {
+    target.strip_prefix("fwb_").is_some_and(|hex| {
+        hex.len() == 12 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 fn clear(
@@ -795,21 +868,22 @@ fn clear(
         (None, true) => Some(RuleScope::resolve(cwd, None)?),
         (None, false) => None,
     };
-    let removed = security_approval::remove_firewall_bypass_rules(
+    let (removed, rules_total) = security_approval::remove_firewall_bypass_rules(
         |rule| filter.as_ref().is_none_or(|filter| filter.holds(rule)),
         "firewall-bypass-cleared",
     )?;
-    report_removed(&removed, &[], json_output)
+    report_removed(&removed, &[], rules_total, json_output);
+    Ok(())
 }
 
 fn report_removed(
     removed: &[FirewallBypassRule],
     not_found: &[&String],
+    rules_total: usize,
     json_output: bool,
-) -> Result<(), LpmError> {
+) {
     let now = Timestamp::now();
     if json_output {
-        let rules_total = security_approval::load_local_firewall_bypass_rules()?.len();
         print_json(&serde_json::json!({
             "schema_version": BYPASS_SCHEMA_VERSION,
             "success": true,
@@ -818,7 +892,7 @@ fn report_removed(
             "count": removed.len(),
             "rules_total": rules_total,
         }));
-        return Ok(());
+        return;
     }
     for target in not_found {
         install_ui::warn_untrusted(&format!("No LPM Firewall bypass rule matches {target}."));
@@ -827,19 +901,22 @@ fn report_removed(
         if not_found.is_empty() {
             install_ui::done("No LPM Firewall bypass rules to remove.");
         }
-        return Ok(());
+        return;
     }
     let specs: Vec<&str> = removed.iter().map(|rule| rule.spec.as_str()).collect();
     install_ui::done_untrusted(&format!(
         "Removed LPM Firewall bypass for {}. Copies already installed stay until you reinstall.",
         specs.join(", ")
     ));
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn refs(specs: &[FirewallBypassSpec]) -> Vec<&FirewallBypassSpec> {
+        specs.iter().collect()
+    }
 
     fn specs(raw: &[&str]) -> Vec<FirewallBypassSpec> {
         parse_specs(
@@ -860,12 +937,12 @@ mod tests {
     #[test]
     fn approval_prompt_names_the_version_the_scope_and_the_duration() {
         assert_eq!(
-            approval_prompt(&specs(&["foldrun@32.8.2"]), &global(), None, false),
+            approval_prompt(&refs(&specs(&["foldrun@32.8.2"])), &global(), None, false),
             "Allow foldrun@32.8.2 past LPM Firewall in every project"
         );
         assert_eq!(
             approval_prompt(
-                &specs(&["foldrun@32.8.2"]),
+                &refs(&specs(&["foldrun@32.8.2"])),
                 &global(),
                 Some(30 * 86_400),
                 true
@@ -877,7 +954,7 @@ mod tests {
     #[test]
     fn approval_prompt_lists_every_spec_of_a_batch() {
         let prompt = approval_prompt(
-            &specs(&["a@1.0.0", "b", "c@^2.0.0"]),
+            &refs(&specs(&["a@1.0.0", "b", "c@^2.0.0"])),
             &global(),
             None,
             false,
@@ -899,7 +976,12 @@ mod tests {
     #[test]
     fn approval_prompt_names_the_full_project_root_for_a_project_rule() {
         assert_eq!(
-            approval_prompt(&specs(&["foldrun"]), &project("/work/sil"), None, false),
+            approval_prompt(
+                &refs(&specs(&["foldrun"])),
+                &project("/work/sil"),
+                None,
+                false
+            ),
             "Allow every foldrun version past LPM Firewall in the project at /work/sil"
         );
     }
@@ -908,7 +990,7 @@ mod tests {
     fn add_command_hint_quotes_specs_and_names_the_duration() {
         assert_eq!(
             add_command_hint(
-                &specs(&["@scope/pkg@^1.2.0", "foldrun@32.8.2"]),
+                &refs(&specs(&["@scope/pkg@^1.2.0", "foldrun@32.8.2"])),
                 &global(),
                 Some(30 * 86_400),
                 false
@@ -922,7 +1004,7 @@ mod tests {
     fn add_command_hint_uses_the_resolved_project_root() {
         assert_eq!(
             add_command_hint(
-                &specs(&["foldrun@32.8.2"]),
+                &refs(&specs(&["foldrun@32.8.2"])),
                 &project("/work/my app"),
                 None,
                 true
@@ -945,7 +1027,12 @@ mod tests {
             "/work/a!b",
         ] {
             assert_eq!(
-                add_command_hint(&specs(&["foldrun@32.8.2"]), &project(root), None, false),
+                add_command_hint(
+                    &refs(&specs(&["foldrun@32.8.2"])),
+                    &project(root),
+                    None,
+                    false
+                ),
                 None,
                 "{root}"
             );
@@ -1030,6 +1117,53 @@ mod tests {
             let error =
                 check_previews(&specs(&["foldrun@32.8.2"]), &previews, allow_malware).unwrap_err();
             assert!(error.to_string().contains("held for LPM review"), "{error}");
+        }
+    }
+
+    #[test]
+    fn approval_batches_keep_each_prompt_whole() {
+        let short = specs(&[
+            "a@1.0.0", "b@1.0.0", "c@1.0.0", "d@1.0.0", "e@1.0.0", "f@1.0.0",
+        ]);
+        let long_a = format!("{}@1.0.0", "a".repeat(200));
+        let long_b = format!("{}@1.0.0", "b".repeat(200));
+        let long = specs(&[&long_a, &long_b, "c@1.0.0"]);
+        let prompt_for =
+            |batch: &[&FirewallBypassSpec]| approval_prompt(batch, &global(), None, false);
+        let sizes = |raw: &[FirewallBypassSpec]| {
+            approval_batches(&refs(raw), prompt_for)
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(sizes(&short), [5, 1]);
+        assert_eq!(sizes(&long), [1, 2]);
+        for batch in approval_batches(&refs(&long), prompt_for) {
+            if batch.len() > 1 {
+                assert!(prompt_for(&batch).chars().count() <= MAX_APPROVAL_PROMPT_CHARS);
+            }
+        }
+    }
+
+    #[test]
+    fn add_command_hint_is_left_out_for_a_name_a_shell_would_expand() {
+        assert_eq!(
+            add_command_hint(&refs(&specs(&["bang!tool@1.0.0"])), &global(), None, false),
+            None
+        );
+    }
+
+    #[test]
+    fn rule_ids_are_recognised_only_in_their_exact_form() {
+        assert!(is_rule_id("fwb_0123456789ab"));
+        for target in [
+            "fwb_utils",
+            "fwb_0123456789AB",
+            "fwb_0123456789abc",
+            "foldrun",
+        ] {
+            assert!(!is_rule_id(target), "{target}");
         }
     }
 }

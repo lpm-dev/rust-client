@@ -164,6 +164,8 @@ async fn bypassed_version_is_listed_in_the_install_json_security_report() {
     assert_eq!(firewall["bypassed"][0]["name"], "agent-tool");
     assert_eq!(firewall["bypassed"][0]["rule"]["spec"], "agent-tool");
     assert_eq!(firewall["bypassed"][0]["rule"]["source"], "local");
+    assert_eq!(firewall["bypassed"][0]["rule"]["scope"], "global");
+    assert!(firewall["bypassed"][0]["rule"]["project_root"].is_null());
     for timing in [
         &envelope["timing"]["firewall"],
         &envelope["timing"]["detail"]["security"]["firewall"],

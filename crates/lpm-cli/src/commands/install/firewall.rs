@@ -1924,10 +1924,12 @@ pub(super) fn finish_npm_firewall_preflight(
         .map(|decision| blocked_package(decision, additions_usable))
         .collect();
     // The command is offered only when running it lets the command finish:
-    // every block is named and liftable by an exact rule, and every version
-    // was checked.
+    // every block is named and liftable by an exact rule, every version was
+    // checked, and a shell reads every coordinate unchanged.
     let bypass_command = (!packages.is_empty()
-        && packages.iter().all(|package| package.bypassable)
+        && packages.iter().all(|package| {
+            package.bypassable && crate::firewall_bypass::spec_shell_safe(&package.coordinate())
+        })
         && stats.unattributed_block_count == 0
         && stats.unchecked_reason.is_none())
     .then(|| {
@@ -1940,14 +1942,19 @@ pub(super) fn finish_npm_firewall_preflight(
     let has_malware = packages
         .iter()
         .any(|package| package.block_class.as_deref() == Some(BlockClass::Malware.as_str()));
+    // A hold for LPM review lifts for no rule, so no note points at rules.
+    let some_rule_could_lift = packages
+        .iter()
+        .any(|package| package.block_class.as_deref() != Some(BlockClass::ServerReview.as_str()));
     let bypass_unavailable_reason = stats
         .bypass_error
         .as_ref()
+        .filter(|_| some_rule_could_lift)
         .map(|error| {
             format!("your bypass rules couldn't be read: {error}; run `lpm security repair`")
         })
         .or_else(|| {
-            (!stats.local_bypass_available).then(|| {
+            (some_rule_could_lift && !stats.local_bypass_available).then(|| {
                 format!(
                     "{} manages the npm firewall here; ask its administrator to list the version in its `[firewall].{}`",
                     stats
@@ -1959,7 +1966,7 @@ pub(super) fn finish_npm_firewall_preflight(
             })
         })
         .or_else(|| {
-            (!stats.bypass_additions_allowed).then(|| {
+            (some_rule_could_lift && !stats.bypass_additions_allowed).then(|| {
                 "`force-security-floor = true` keeps the npm firewall at enforce, so `lpm firewall bypass add` refuses new rules".to_string()
             })
         });
@@ -2060,16 +2067,11 @@ fn print_bypassed_verdicts(bypassed: &[BypassedVerdict], monitor: bool) {
         for line in firewall_decision_lines(&verdict.decision) {
             install_ui::detail_line(line);
         }
-        let source = if verdict.rule.source == "managed" {
-            " from the managed policy"
-        } else {
-            ""
-        };
         install_ui::detail_line(install_ui::terminal_line!(
             "    {} {} {}",
             install_ui::dim("rule:"),
             install_ui::field(&verdict.rule.spec),
-            install_ui::dim(&format!("({}{source})", verdict.rule.scope)),
+            install_ui::dim(&format!("({})", verdict.rule.scope_text())),
         ));
     }
 }
@@ -2275,10 +2277,12 @@ pub(crate) fn prepare_npm_firewall_materialization_preflight(
         crate::npm_firewall_config::BypassRuleScope::ProjectAndGlobal(project_dir),
     )?;
     let lookup_mode = NpmFirewallLookupMode::from_env();
-    let mut verdict_packages = Vec::with_capacity(packages.len());
-    for package in packages {
-        verdict_packages.push(package.to_batch_package(lookup_mode));
-    }
+    let mut seen = std::collections::HashSet::with_capacity(packages.len());
+    let verdict_packages = packages
+        .iter()
+        .filter(|package| seen.insert((package.name.as_str(), package.version.as_str())))
+        .map(|package| package.to_batch_package(lookup_mode))
+        .collect();
     Ok(NpmFirewallMaterializationPreflight {
         mode,
         lookup_mode,

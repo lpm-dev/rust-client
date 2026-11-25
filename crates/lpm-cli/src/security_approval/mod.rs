@@ -56,7 +56,8 @@ pub(crate) use firewall_bypass::{
     FirewallBypassAdded, FirewallBypassApproval, add_firewall_bypass_rules,
     firewall_bypass_file_exists, load_local_firewall_bypass_rules,
     local_firewall_bypass_inactive_reason, record_firewall_bypass_refusal,
-    remove_firewall_bypass_rules,
+    remove_firewall_bypass_rules, save_narrowed_firewall_bypass_rules,
+    sort_firewall_bypass_requests,
 };
 pub use helpers::format_unlock_duration;
 pub(crate) use helpers::project_dir_is_global_install;

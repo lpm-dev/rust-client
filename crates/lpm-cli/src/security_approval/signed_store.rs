@@ -561,7 +561,8 @@ fn quarantine_security_state_file(
 }
 
 pub fn repair_security_state() -> Result<SecurityRepairReport, LpmError> {
-    let _lock = lpm_common::acquire_exclusive_lock(super::paths::unlocks_lock_path()?)?;
+    let _unlocks = lpm_common::acquire_exclusive_lock(super::paths::unlocks_lock_path()?)?;
+    let _bypass = lpm_common::acquire_exclusive_lock(super::paths::firewall_bypass_lock_path()?)?;
     lpm_common::with_exclusive_lock(audit_lock_path()?, repair_security_state_locked)
 }
 
@@ -577,10 +578,17 @@ fn repair_security_state_locked() -> Result<SecurityRepairReport, LpmError> {
         });
     }
 
+    let bypass_path = firewall_bypass_path()?;
     match stored_signing_secret() {
         Ok(secret) => {
             for path in paths {
-                if let Some(reason) = signed_json_unverified_reason(&path, &secret)? {
+                let reason = match signed_json_unverified_reason(&path, &secret)? {
+                    Some(reason) => Some(reason),
+                    None if path == bypass_path => read_signed_json::<serde_json::Value>(&path)?
+                        .and_then(super::firewall_bypass::firewall_bypass_store_quarantine_reason),
+                    None => None,
+                };
+                if let Some(reason) = reason {
                     quarantined.push(quarantine_security_state_file(&path, reason)?);
                 }
             }
