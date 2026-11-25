@@ -12,6 +12,7 @@ expression: envelope
     "source": "preflight",
     "blocked_count": 2,
     "unattributed_count": 0,
+    "unchecked_reason": null,
     "packages": [
       {
         "name": "blocked-one",

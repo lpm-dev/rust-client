@@ -324,6 +324,8 @@ async fn firewall_block_json_envelope_names_every_blocked_package() {
     }
     Mock::given(method("POST"))
         .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .and(body_string_contains("\"name\":\"blocked-one\""))
+        .and(body_string_contains("\"name\":\"blocked-two\""))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "requestId": "firewall-json",
             "policyMode": "enforce",

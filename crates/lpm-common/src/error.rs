@@ -201,6 +201,8 @@ pub struct NpmFirewallBlockedErrorContext {
     /// Blocks the verdict summary counted without a decision row naming the
     /// package.
     pub unattributed_count: u64,
+    /// Why some packages went unchecked after these blocks were found.
+    pub unchecked_reason: Option<String>,
 }
 
 impl NpmFirewallBlockedErrorContext {
@@ -209,6 +211,7 @@ impl NpmFirewallBlockedErrorContext {
             source: NpmFirewallBlockSource::Registry,
             packages: vec![package],
             unattributed_count: 0,
+            unchecked_reason: None,
         }
     }
 

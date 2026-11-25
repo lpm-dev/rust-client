@@ -1858,3 +1858,116 @@ fn firewall_verdict_request_asks_once_for_peer_instances_of_one_version() {
     assert_eq!(requested.len(), 1);
     assert_eq!(requested[0].name, "shared");
 }
+
+#[tokio::test]
+async fn chunked_enforce_keeps_a_found_block_when_a_later_chunk_request_fails() {
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .and(body_string_contains("\"name\":\"evil-a\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(verdict_response(
+            1,
+            vec![verdict_decision("evil-a", "block")],
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .and(body_string_contains("\"name\":\"broken-b\""))
+        .respond_with(ResponseTemplate::new(500).set_delay(std::time::Duration::from_millis(300)))
+        .mount(&server)
+        .await;
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("firewall-token"),
+    );
+    let (selected_tx, selected_rx) = mpsc::channel(4);
+    let (fetch_tx, mut fetch_rx) = mpsc::channel(4);
+    let join = spawn_chunked_npm_firewall_preflight(
+        selected_rx,
+        fetch_tx,
+        client,
+        chunked_config(NpmFirewallMode::Enforce),
+    );
+
+    selected_tx.send(selected_event("evil-a")).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    selected_tx.send(selected_event("broken-b")).await.unwrap();
+    drop(selected_tx);
+
+    let result = join.drain().await.expect("the found block survives");
+    assert!(fetch_rx.recv().await.is_none());
+    let LpmError::NpmFirewallBlocked(blocked) =
+        finish_npm_firewall_preflight(result, true).unwrap_err()
+    else {
+        panic!("expected the firewall block");
+    };
+    assert_eq!(blocked.packages[0].name, "evil-a");
+    assert!(blocked.unchecked_reason.is_some());
+}
+
+#[tokio::test]
+async fn batch_enforce_keeps_a_found_block_when_a_later_batch_request_fails() {
+    use std::sync::Arc;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .and(body_string_contains("\"name\":\"p-0\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(verdict_response(
+            1,
+            vec![{
+                let mut decision = verdict_decision("p-0", "block");
+                decision["version"] = serde_json::json!("1.0.0");
+                decision
+            }],
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .and(body_string_contains("\"name\":\"p-512\""))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("firewall-token"),
+    );
+    let packages = (0..=512)
+        .map(|index| lpm_registry::client::NpmFirewallBatchPackage {
+            name: format!("p-{index}"),
+            version: "1.0.0".into(),
+            integrity: None,
+            published_at: None,
+        })
+        .collect();
+
+    let result = request_npm_firewall_preflight(
+        NpmFirewallMode::Enforce,
+        NpmFirewallLookupMode::PackageOnly,
+        lpm_registry::client::NpmFirewallPolicyProfile::default(),
+        client,
+        packages,
+        false,
+    )
+    .await
+    .expect("the found block survives");
+
+    let LpmError::NpmFirewallBlocked(blocked) =
+        finish_npm_firewall_preflight(result, true).unwrap_err()
+    else {
+        panic!("expected the firewall block");
+    };
+    assert_eq!(blocked.packages[0].name, "p-0");
+    assert!(blocked.unchecked_reason.is_some());
+}

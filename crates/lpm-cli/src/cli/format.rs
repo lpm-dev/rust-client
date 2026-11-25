@@ -447,6 +447,7 @@ pub(crate) fn json_error_value(error: &lpm_common::LpmError) -> serde_json::Valu
                 "source": blocked.source.as_str(),
                 "blocked_count": blocked.blocked_count(),
                 "unattributed_count": blocked.unattributed_count,
+                "unchecked_reason": blocked.unchecked_reason,
                 "packages": blocked
                     .packages
                     .iter()
@@ -1243,6 +1244,13 @@ fn npm_firewall_blocked_lines(
                     )),
                 );
             }
+            if let Some(reason) = &blocked.unchecked_reason {
+                push_untrusted_detail(
+                    &mut lines,
+                    "unchecked",
+                    &format!("some packages weren't checked: {reason}"),
+                );
+            }
             lines
         }
     }
@@ -1686,6 +1694,7 @@ mod tests {
                     report_url: Some("https://firewall.lpm.dev/npm/foldrun/v/32.8.2".into()),
                 }],
                 unattributed_count,
+                unchecked_reason: None,
             },
         ))
     }

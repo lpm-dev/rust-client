@@ -221,6 +221,10 @@ pub(super) struct NpmFirewallPreflightStats {
     /// Blocks a verdict summary counted beyond the decision rows it returned,
     /// so no package can be named for them.
     pub(super) unattributed_block_count: u64,
+    /// Why some packages went unchecked after a block was already found. The
+    /// command fails on the block either way; this keeps the failure that
+    /// names it from being replaced by the later request error.
+    pub(super) unchecked_reason: Option<String>,
     pub(super) unknown_count: u64,
     pub(super) matched_count: u64,
     pub(super) cache_hit_count: u64,
@@ -635,9 +639,17 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                     }
                 }
                 joined = tasks.join_next(), if !tasks.is_empty() => {
-                    let chunk_result = joined
+                    let chunk_result = match joined
                         .ok_or_else(|| LpmError::Registry("npm firewall chunk task ended unexpectedly".into()))?
-                        .map_err(|error| LpmError::Registry(format!("npm firewall chunk task panicked: {error}")))??;
+                        .map_err(|error| LpmError::Registry(format!("npm firewall chunk task panicked: {error}")))?
+                    {
+                        Ok(chunk_result) => chunk_result,
+                        Err(error) if blocked => {
+                            stats.unchecked_reason.get_or_insert_with(|| error.to_string());
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     blocked |= apply_firewall_chunk_result(
                         chunk_result,
                         &fetch_tx,
@@ -1479,6 +1491,10 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
                     report_error: Some(npm_firewall_preflight_report_error(error)),
                 });
             }
+            Err(error) if stats_have_block(&stats, &all_decisions) => {
+                stats.unchecked_reason = Some(error.to_string());
+                break;
+            }
             Err(error) => {
                 return Err(npm_firewall_preflight_enforce_error(error));
             }
@@ -1650,8 +1666,17 @@ pub(super) fn finish_npm_firewall_preflight(
                 .map(|decision| blocked_package(decision))
                 .collect(),
             unattributed_count: stats.unattributed_block_count,
+            unchecked_reason: stats.unchecked_reason,
         },
     )))
+}
+
+/// Whether the verdicts gathered so far already block the command.
+fn stats_have_block(stats: &NpmFirewallPreflightStats, decisions: &[NpmFirewallDecision]) -> bool {
+    stats.unattributed_block_count > 0
+        || decisions
+            .iter()
+            .any(|decision| decision.action == NpmFirewallAction::Block)
 }
 
 /// The decisions with `action`, once per package version: peer-context
