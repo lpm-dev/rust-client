@@ -2870,6 +2870,50 @@ fn config_list_reports_the_default_where_no_table_asks_for_an_approved_looser_po
 }
 
 #[test]
+fn config_list_reports_the_approved_policy_for_a_group_a_partial_table_leaves_out() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    support::write_signed_firewall_posture(
+        &project,
+        "enforce",
+        &[("lpm_ai_agent_control_surface", "block")],
+    );
+    seed_config(
+        &project,
+        "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_telemetry = \"block\"\n",
+    );
+
+    let entry = config_list_entry(
+        &project,
+        "firewall.npm.policies.lpm_ai_agent_control_surface",
+    );
+
+    assert_eq!(entry["value"], "block", "{entry}");
+    assert_eq!(entry["source"], "approved security posture", "{entry}");
+}
+
+#[test]
+fn config_list_reports_the_managed_policy_over_a_looser_value_under_a_stricter_local_mode() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    std::fs::create_dir_all(project.home().join(".lpm")).unwrap();
+    std::fs::write(
+        project.home().join(".lpm/security-policy.toml"),
+        "[firewall]\nmode = \"monitor\"\n\n[firewall.npm.policies]\nlpm_ai_agent_control_surface = \"block\"\n",
+    )
+    .unwrap();
+    seed_config(
+        &project,
+        "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_agent_control_surface = \"warn\"\n",
+    );
+
+    let entry = config_list_entry(
+        &project,
+        "firewall.npm.policies.lpm_ai_agent_control_surface",
+    );
+
+    assert_eq!(entry["value"], "block", "{entry}");
+}
+
+#[test]
 fn config_list_reports_the_approved_firewall_policy_over_a_looser_config_value() {
     let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
     support::write_signed_firewall_posture(&project, "enforce", &[]);

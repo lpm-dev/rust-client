@@ -1166,16 +1166,12 @@ pub(crate) fn ensure_runtime_npm_firewall_config_authorized_with_effective(
         effective.sources.firewall_policies,
         PostureSourceKind::ManagedPolicy
     );
-    // A managed profile binds whenever the firewall runs, whatever mode the
-    // approved posture holds. A looser mode is the mode check's to report, so
-    // the profile is then compared at the approved mode alone.
-    let (policy_requested_mode, policy_approved_mode) = if policies_managed {
-        (requested_mode, requested_mode)
-    } else if mode_loosens {
-        (approved_mode, approved_mode)
-    } else {
-        (requested_mode, approved_mode)
-    };
+    let (policy_requested_mode, policy_approved_mode) =
+        crate::npm_firewall_config::policy_comparison_modes(
+            requested_mode,
+            approved_mode,
+            policies_managed,
+        );
     let loosened_policies = policy_request.map_or_else(Vec::new, |requested| {
         crate::npm_firewall_config::loosened_firewall_policies(
             policy_requested_mode,

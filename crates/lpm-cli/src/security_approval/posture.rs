@@ -233,7 +233,8 @@ fn active_runtime_overrides(
             source: request_firewall.source_label().to_string(),
         });
     }
-    if let Some(request_policies) = crate::npm_firewall_config::config_policy_request(&global)?
+    if let Some(request_policies) =
+        crate::npm_firewall_config::runtime_policy_request(&global, effective)?
         && request_policies != effective.posture.firewall_policy_profile()
     {
         overrides.push(RuntimeOverride {

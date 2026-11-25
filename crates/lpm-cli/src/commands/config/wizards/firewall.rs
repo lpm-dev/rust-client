@@ -552,11 +552,13 @@ fn read_firewall_policy_profile(
     config_path: &std::path::Path,
 ) -> Result<NpmFirewallPolicyProfile, LpmError> {
     let cfg = read_config(config_path)?;
-    let request =
-        crate::npm_firewall_config::config_policy_request(&GlobalConfig::from_value(cfg)?)?;
+    let effective = crate::security_approval::load_effective_authorized_posture()?;
+    let request = crate::npm_firewall_config::runtime_policy_request(
+        &GlobalConfig::from_value(cfg)?,
+        &effective,
+    )?;
     Ok(crate::npm_firewall_config::runtime_policy_profile(
-        request,
-        &crate::security_approval::load_effective_authorized_posture()?,
+        request, &effective,
     ))
 }
 

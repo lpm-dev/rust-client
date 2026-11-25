@@ -209,14 +209,40 @@ pub(crate) fn config_policy_profile(
     Ok(config_policy_request(global)?.unwrap_or_default())
 }
 
-/// The profile `~/.lpm/config.toml` asks for, or `None` when it has no
-/// `[firewall.npm.policies]` table and the approved profile applies.
+/// The profile `~/.lpm/config.toml` asks for, with the built-in default for
+/// each group its table leaves out, or `None` without a table or with an
+/// empty one.
 pub(crate) fn config_policy_request(
     global: &GlobalConfig,
 ) -> Result<Option<NpmFirewallPolicyProfile>, LpmError> {
+    config_policy_request_over(global, NpmFirewallPolicyProfile::default())
+}
+
+/// The profile `~/.lpm/config.toml` asks for: each group its
+/// `[firewall.npm.policies]` table names, and `base` for the rest, or `None`
+/// without a table or with an empty one.
+pub(crate) fn config_policy_request_over(
+    global: &GlobalConfig,
+    base: NpmFirewallPolicyProfile,
+) -> Result<Option<NpmFirewallPolicyProfile>, LpmError> {
     firewall_policy_table(global.table())
-        .and_then(|policies| policies.map(parse_policy_table).transpose())
+        .and_then(|policies| {
+            policies
+                .filter(|policies| !policies.is_empty())
+                .map(|policies| parse_policy_table_over(policies, base))
+                .transpose()
+        })
         .map_err(LpmError::Registry)
+}
+
+/// What a command asks for: the groups `~/.lpm/config.toml` names, and for
+/// the rest what it runs without a table, so leaving a group out never asks
+/// for less than the approved profile allows.
+pub(crate) fn runtime_policy_request(
+    global: &GlobalConfig,
+    effective: &crate::security_approval::EffectiveAuthorizedPosture,
+) -> Result<Option<NpmFirewallPolicyProfile>, LpmError> {
+    config_policy_request_over(global, runtime_policy_profile(None, effective))
 }
 
 /// The `[firewall.npm.policies]` table under a config-shaped TOML table, as
@@ -246,7 +272,17 @@ pub(crate) fn firewall_policy_table(top: &toml::Table) -> Result<Option<&toml::T
 pub(crate) fn parse_policy_table(
     policies: &toml::Table,
 ) -> Result<NpmFirewallPolicyProfile, String> {
-    let mut profile = NpmFirewallPolicyProfile::default();
+    parse_policy_table_over(policies, NpmFirewallPolicyProfile::default())
+}
+
+/// The table's actions over `base`: a group the table leaves out keeps its
+/// `base` action, except that telemetry follows `lpm_ai_suspicious` when only
+/// that is set.
+fn parse_policy_table_over(
+    policies: &toml::Table,
+    base: NpmFirewallPolicyProfile,
+) -> Result<NpmFirewallPolicyProfile, String> {
+    let mut profile = base;
     let has_canonical_ai_suspicious = policies.contains_key(LPM_AI_SUSPICIOUS_POLICY_KEY);
     for (key, value) in policies {
         if key == LEGACY_STATIC_ONLY_SUSPICIOUS_POLICY_KEY && has_canonical_ai_suspicious {
@@ -437,6 +473,25 @@ fn enforced_rank(mode: NpmFirewallMode, action: NpmFirewallPolicyAction) -> u8 {
     }
 }
 
+/// The modes a requested profile and the approved one are compared at. A
+/// managed profile binds whenever the firewall runs, so both sides use the
+/// requested mode. When the mode itself loosens, that is the mode check's to
+/// report, so both sides use the approved mode. Otherwise each side uses its
+/// own mode.
+pub(crate) fn policy_comparison_modes(
+    requested_mode: NpmFirewallMode,
+    approved_mode: NpmFirewallMode,
+    policies_managed: bool,
+) -> (NpmFirewallMode, NpmFirewallMode) {
+    if policies_managed {
+        (requested_mode, requested_mode)
+    } else if requested_mode.loosens(approved_mode) {
+        (approved_mode, approved_mode)
+    } else {
+        (requested_mode, approved_mode)
+    }
+}
+
 /// The profile a command runs with: the `config.toml` table when there is
 /// one, else the default raised to the approved profile wherever that is
 /// stricter. An approved looser action is a permission the table has to ask
@@ -562,7 +617,7 @@ pub(crate) fn resolve_runtime_firewall(
 ) -> Result<RuntimeFirewall, LpmError> {
     let effective = crate::security_approval::load_effective_authorized_posture()?;
     let mode_request = runtime_request_mode(global)?;
-    let policy_request = config_policy_request(global)?;
+    let policy_request = runtime_policy_request(global, &effective)?;
     crate::security_approval::ensure_runtime_npm_firewall_config_authorized_with_effective(
         &effective,
         project_dir,
@@ -1121,6 +1176,31 @@ mod tests {
             NpmFirewallPolicyAction::Block
         );
         assert_eq!(tableless_policy_profile(approved, true), approved);
+    }
+
+    #[test]
+    fn an_empty_policy_table_requests_nothing() {
+        let global = global_with_policies(&[]);
+
+        assert_eq!(config_policy_request(&global).unwrap(), None);
+    }
+
+    #[test]
+    fn a_partial_table_requests_only_the_groups_it_names() {
+        let base = NpmFirewallPolicyProfile {
+            lpm_ai_agent_control_surface: NpmFirewallPolicyAction::Block,
+            ..NpmFirewallPolicyProfile::default()
+        };
+        let global = global_with_policies(&[(LPM_AI_SUSPICIOUS_POLICY_KEY, "block")]);
+
+        let request = config_policy_request_over(&global, base).unwrap().unwrap();
+
+        assert_eq!(
+            request.lpm_ai_agent_control_surface,
+            NpmFirewallPolicyAction::Block
+        );
+        assert_eq!(request.lpm_ai_suspicious, NpmFirewallPolicyAction::Block);
+        assert_eq!(request.lpm_ai_telemetry, NpmFirewallPolicyAction::Block);
     }
 
     #[test]

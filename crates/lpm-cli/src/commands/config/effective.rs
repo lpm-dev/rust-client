@@ -878,7 +878,14 @@ fn add_firewall_policy_entries(
     let requested = crate::npm_firewall_config::config_policy_request(global)?;
     let approved = posture.posture.firewall_policy_profile();
     let tableless = crate::npm_firewall_config::runtime_policy_profile(None, posture);
-    let approved_mode = posture.posture.firewall_mode();
+    let (requested_mode, floor_mode) = crate::npm_firewall_config::policy_comparison_modes(
+        firewall_mode,
+        posture.posture.firewall_mode(),
+        matches!(
+            posture.sources.firewall_policies,
+            PostureSourceKind::ManagedPolicy
+        ),
+    );
     let policies = global
         .get_table("firewall")
         .and_then(|table| table.get("npm"))
@@ -927,8 +934,12 @@ fn add_firewall_policy_entries(
             }
             _ => Cow::Borrowed(policy_source(key)),
         };
+        // Only a group the table names is a request; the rest run as they
+        // would without a table.
+        let named = config_source.as_ref() != DEFAULT_SOURCE;
         let (value, source) = match requested
             .as_ref()
+            .filter(|_| named)
             .and_then(|requested| crate::npm_firewall_config::policy_action(requested, key))
         {
             Some(action) => select_security_value(
@@ -938,9 +949,9 @@ fn add_firewall_policy_entries(
                 posture.sources.firewall_policies,
                 |candidate, floor| {
                     crate::npm_firewall_config::policy_action_loosens(
-                        firewall_mode,
+                        requested_mode,
                         candidate,
-                        approved_mode,
+                        floor_mode,
                         floor,
                     )
                 },

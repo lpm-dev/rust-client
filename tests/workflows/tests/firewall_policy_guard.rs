@@ -171,3 +171,14 @@ async fn install_needs_no_policy_approval_where_the_approved_firewall_is_off() {
         String::from_utf8_lossy(&output.stdout)
     );
 }
+
+#[tokio::test]
+async fn install_keeps_a_stricter_approved_policy_a_partial_table_leaves_out() {
+    install_sending_policy(
+        "partial-policy",
+        &[("lpm_ai_agent_control_surface", "block")],
+        &[("lpm_ai_telemetry", "block")],
+        r#""lpmAiAgentControlSurface":"block""#,
+    )
+    .await;
+}
