@@ -400,9 +400,9 @@ impl ClassifiedVerdicts {
 /// Splits a response's blocks into those a bypass rule lifts and those that
 /// stand. Each block row is matched to one version this request asked about,
 /// as many times as it was asked; a row beyond that, or for a version it never
-/// asked about, names nothing and is dropped, so the summary's count of that
-/// block stays unattributed and keeps blocking. Only matched rows can be
-/// lifted, and only by a rule whose kind may cover the block.
+/// asked about, names nothing and is dropped but still counts as an unnamed
+/// block, as does a block the summary counts without a row. Only matched rows
+/// can be lifted, and only by a rule whose kind may cover the block.
 async fn classify_verdicts(
     response: NpmFirewallBatchResponse,
     requested: &[NpmFirewallBatchPackage],
@@ -421,11 +421,13 @@ async fn classify_verdicts(
     }
     let mut decisions = Vec::with_capacity(response.decisions.len());
     let mut matched_blocks = Vec::new();
+    let mut block_rows: u64 = 0;
     for decision in response.decisions {
         if decision.action != NpmFirewallAction::Block {
             decisions.push(decision);
             continue;
         }
+        block_rows += 1;
         let remaining = unmatched
             .get_mut(decision.name.as_str())
             .and_then(|versions| {
@@ -445,6 +447,7 @@ async fn classify_verdicts(
         unattributed: response
             .summary
             .block
+            .max(block_rows)
             .saturating_sub(matched_blocks.len() as u64),
         bypass_error: None,
     };
@@ -2000,19 +2003,36 @@ fn stats_have_block(stats: &NpmFirewallPreflightStats, decisions: &[NpmFirewallD
 }
 
 /// The decisions with `action`, once per package version: peer-context
-/// instances of one version can each come back from a separate chunk.
+/// instances of one version can each come back from a separate chunk. A
+/// version blocked more than once, say once per integrity, keeps the block
+/// that is hardest to lift, so the report and its hint answer for every one.
 fn distinct_decisions(
     decisions: &[NpmFirewallDecision],
     action: NpmFirewallAction,
 ) -> Vec<&NpmFirewallDecision> {
-    let mut seen = HashSet::with_capacity(decisions.len());
-    decisions
+    let mut position: HashMap<(&str, &str), usize> = HashMap::with_capacity(decisions.len());
+    let mut distinct: Vec<&NpmFirewallDecision> = Vec::with_capacity(decisions.len());
+    for decision in decisions
         .iter()
-        .filter(|decision| {
-            decision.action == action
-                && seen.insert((decision.name.as_str(), decision.version.as_str()))
-        })
-        .collect()
+        .filter(|decision| decision.action == action)
+    {
+        match position.entry((decision.name.as_str(), decision.version.as_str())) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(distinct.len());
+                distinct.push(decision);
+            }
+            std::collections::hash_map::Entry::Occupied(slot) => {
+                let kept = &mut distinct[*slot.get()];
+                if action == NpmFirewallAction::Block
+                    && decision_block_class(decision).lift_difficulty()
+                        > decision_block_class(kept).lift_difficulty()
+                {
+                    *kept = decision;
+                }
+            }
+        }
+    }
+    distinct
 }
 
 fn blocked_package(
@@ -2260,6 +2280,29 @@ pub(crate) fn registry_materialization_route_is_public_npm(
     }
 }
 
+/// One verdict request per artifact. The integrity is part of the key when
+/// the lookup sends it, so each artifact of one version keeps its own verdict.
+pub(super) fn materialization_verdict_packages(
+    packages: &[NpmFirewallMaterializationPackage],
+    lookup_mode: NpmFirewallLookupMode,
+) -> Vec<NpmFirewallBatchPackage> {
+    let include_integrity = lookup_mode.include_integrity();
+    let mut seen = HashSet::with_capacity(packages.len());
+    packages
+        .iter()
+        .filter(|package| {
+            seen.insert((
+                package.name.as_str(),
+                package.version.as_str(),
+                include_integrity
+                    .then_some(package.integrity.as_deref())
+                    .flatten(),
+            ))
+        })
+        .map(|package| package.to_batch_package(lookup_mode))
+        .collect()
+}
+
 pub(crate) fn prepare_npm_firewall_materialization_preflight(
     project_dir: &Path,
     packages: &[NpmFirewallMaterializationPackage],
@@ -2277,12 +2320,7 @@ pub(crate) fn prepare_npm_firewall_materialization_preflight(
         crate::npm_firewall_config::BypassRuleScope::ProjectAndGlobal(project_dir),
     )?;
     let lookup_mode = NpmFirewallLookupMode::from_env();
-    let mut seen = std::collections::HashSet::with_capacity(packages.len());
-    let verdict_packages = packages
-        .iter()
-        .filter(|package| seen.insert((package.name.as_str(), package.version.as_str())))
-        .map(|package| package.to_batch_package(lookup_mode))
-        .collect();
+    let verdict_packages = materialization_verdict_packages(packages, lookup_mode);
     Ok(NpmFirewallMaterializationPreflight {
         mode,
         lookup_mode,

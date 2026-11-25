@@ -1255,23 +1255,7 @@ fn npm_firewall_blocked_lines(
                 "Blocked by LPM Firewall",
             ))];
             push_untrusted_detail(&mut lines, "reason", &blocked.to_string());
-            if blocked.unattributed_count > 0 {
-                push_detail(
-                    &mut lines,
-                    "unnamed",
-                    install_ui::yellow(&format!(
-                        "{} of them blocked without a package name in the verdict response",
-                        blocked.unattributed_count
-                    )),
-                );
-            }
-            if let Some(reason) = &blocked.unchecked_reason {
-                push_untrusted_detail(
-                    &mut lines,
-                    "unchecked",
-                    &format!("some packages weren't checked: {reason}"),
-                );
-            }
+            push_unreported_block_lines(&mut lines, blocked);
             for bypassed in &blocked.bypassed {
                 push_untrusted_detail(
                     &mut lines,
@@ -1282,27 +1266,7 @@ fn npm_firewall_blocked_lines(
                     ),
                 );
             }
-            for package in &blocked.packages {
-                match package.block_class.as_deref() {
-                    Some("malware") => push_untrusted_detail(
-                        &mut lines,
-                        "malware",
-                        &format!(
-                            "{} is flagged as malware; read its report first (`lpm firewall bypass add --help` explains `--allow-malware`)",
-                            package.coordinate()
-                        ),
-                    ),
-                    Some("server_review") => push_untrusted_detail(
-                        &mut lines,
-                        "held",
-                        &format!(
-                            "{} is held for LPM review, which a local rule can't lift",
-                            package.coordinate()
-                        ),
-                    ),
-                    _ => {}
-                }
-            }
+            push_block_class_lines(&mut lines, blocked);
             if let Some(reason) = &blocked.bypass_unavailable_reason {
                 push_untrusted_detail(&mut lines, "note", reason);
             }
@@ -1312,6 +1276,88 @@ fn npm_firewall_blocked_lines(
             lines
         }
     }
+}
+
+fn push_unreported_block_lines(
+    lines: &mut Vec<SlimErrorLine>,
+    blocked: &lpm_common::NpmFirewallBlockedErrorContext,
+) {
+    if blocked.unattributed_count > 0 {
+        push_detail(
+            lines,
+            "unnamed",
+            install_ui::yellow(&format!(
+                "{} of them blocked without a package name in the verdict response",
+                blocked.unattributed_count
+            )),
+        );
+    }
+    if let Some(reason) = &blocked.unchecked_reason {
+        push_untrusted_detail(
+            lines,
+            "unchecked",
+            &format!("some packages weren't checked: {reason}"),
+        );
+    }
+}
+
+fn push_block_class_lines(
+    lines: &mut Vec<SlimErrorLine>,
+    blocked: &lpm_common::NpmFirewallBlockedErrorContext,
+) {
+    for package in &blocked.packages {
+        match package.block_class.as_deref() {
+            Some("malware") => push_untrusted_detail(
+                lines,
+                "malware",
+                &format!(
+                    "{} is flagged as malware; read its report first (`lpm firewall bypass add --help` explains `--allow-malware`)",
+                    package.coordinate()
+                ),
+            ),
+            Some("server_review") => push_untrusted_detail(
+                lines,
+                "held",
+                &format!(
+                    "{} is held for LPM review, which a local rule can't lift",
+                    package.coordinate()
+                ),
+            ),
+            _ => {}
+        }
+    }
+}
+
+/// The rows a command prints under its own line for a firewall block that
+/// stopped a nested install whose output it hid: each blocked version with
+/// its report, the unnamed and unchecked blocks, and why a malware or review
+/// block takes no plain rule.
+pub(crate) fn npm_firewall_block_detail_lines(
+    blocked: &lpm_common::NpmFirewallBlockedErrorContext,
+) -> Vec<install_ui::TerminalLine> {
+    let mut lines = Vec::with_capacity(blocked.packages.len() * 2 + 2);
+    for package in &blocked.packages {
+        push_untrusted_detail(
+            &mut lines,
+            "blocked",
+            &format!(
+                "{} - {}",
+                package.coordinate(),
+                package.summary.as_deref().unwrap_or(&package.verdict)
+            ),
+        );
+        if let Some(report_url) = &package.report_url {
+            push_detail(&mut lines, "report", install_ui::hyperlink(report_url));
+        }
+    }
+    push_unreported_block_lines(&mut lines, blocked);
+    push_block_class_lines(&mut lines, blocked);
+    lines
+        .into_iter()
+        .map(|line| match line {
+            SlimErrorLine::Failed(line) | SlimErrorLine::Detail(line) => line,
+        })
+        .collect()
 }
 
 fn npm_firewall_registry_refusal_lines(

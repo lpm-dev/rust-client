@@ -1,7 +1,7 @@
 mod args;
 mod dispatch;
 mod format;
-pub(crate) use format::json_error_value;
+pub(crate) use format::{json_error_value, npm_firewall_block_detail_lines};
 mod helpers;
 mod install_timeline;
 

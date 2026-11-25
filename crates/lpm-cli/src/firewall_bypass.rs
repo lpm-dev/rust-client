@@ -284,6 +284,16 @@ impl BlockClass {
         }
     }
 
+    /// How hard a block is to lift: a higher class needs a narrower rule.
+    pub(crate) const fn lift_difficulty(self) -> u8 {
+        match self {
+            Self::Policy => 0,
+            Self::Unscanned => 1,
+            Self::Malware => 2,
+            Self::ServerReview => 3,
+        }
+    }
+
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Policy => "policy",
@@ -445,15 +455,37 @@ pub(crate) fn bypass_add_command<'a>(coordinates: impl IntoIterator<Item = &'a s
 
 /// Whether `text` reads the same in double quotes in POSIX shells,
 /// PowerShell and cmd: no quote, variable, substitution or escape character.
+/// A backslash escapes the next character in POSIX double quotes, so it is
+/// allowed only in Windows paths, and never last, where it would escape the
+/// closing quote.
 pub(crate) fn shell_safe_in_double_quotes(text: &str) -> bool {
     !text.is_empty()
+        && !text.ends_with('\\')
         && text.chars().all(|character| {
             character.is_alphanumeric()
                 || matches!(
                     character,
-                    ' ' | '/' | '\\' | '.' | '_' | '-' | '+' | ',' | '=' | '@' | ':' | '~'
+                    ' ' | '/' | '.' | '_' | '-' | '+' | ',' | '=' | '@' | ':' | '~'
                 )
+                || (character == '\\' && cfg!(windows))
         })
+}
+
+/// A project root as prompts show it: whole, with any control character
+/// written as a visible escape so two roots never look alike.
+pub(crate) fn visible_root(root: &str) -> std::borrow::Cow<'_, str> {
+    if !root.chars().any(char::is_control) {
+        return std::borrow::Cow::Borrowed(root);
+    }
+    let mut visible = String::with_capacity(root.len() + 8);
+    for character in root.chars() {
+        if character.is_control() {
+            visible.extend(character.escape_unicode());
+        } else {
+            visible.push(character);
+        }
+    }
+    std::borrow::Cow::Owned(visible)
 }
 
 /// Whether a validated spec reads the same in double quotes in every shell:
@@ -1217,7 +1249,11 @@ mod tests {
     #[test]
     fn shell_safe_text_excludes_expansion_and_quote_characters() {
         assert!(shell_safe_in_double_quotes("/Users/a b/work-1.2_x"));
-        assert!(shell_safe_in_double_quotes("C:\\Users\\dev\\app"));
+        assert_eq!(
+            shell_safe_in_double_quotes("C:\\Users\\dev\\app"),
+            cfg!(windows)
+        );
+        assert!(!shell_safe_in_double_quotes("/work/dir\\"));
         for unsafe_text in ["$HOME", "`id`", "%PATH%", "a\"b", "a!b", "a^b", "", "a\nb"] {
             assert!(!shell_safe_in_double_quotes(unsafe_text), "{unsafe_text:?}");
         }

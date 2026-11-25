@@ -3043,9 +3043,10 @@ fn a_floor_edit_unlock_does_not_stand_in_for_firewall_bypass_approval() {
         })
         .unwrap();
 
-        let err =
-            without_test_native_auth(|| add_bypass(vec![bypass_rule("foldrun@32.8.2")], true))
-                .unwrap_err();
+        let err = with_test_native_auth_result("deny", || {
+            add_bypass(vec![bypass_rule("foldrun@32.8.2")], false)
+        })
+        .unwrap_err();
 
         assert_eq!(err.error_code(), "security_approval_required");
         assert!(load_local_firewall_bypass_rules().unwrap().is_empty());
@@ -3137,6 +3138,52 @@ fn json_mode_never_prompts_even_where_native_approval_would_pass() {
 
         assert_eq!(err.error_code(), "security_approval_required");
         assert!(load_local_firewall_bypass_rules().unwrap().is_empty());
+    });
+}
+
+#[test]
+fn a_narrowing_judged_before_a_concurrent_remove_is_not_saved_without_approval() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        with_test_native_auth_result("approve", || {
+            add_bypass(vec![bypass_rule("foldrun@32.8.2")], false)
+        })
+        .unwrap();
+        let sorted =
+            sort_firewall_bypass_requests(vec![bypass_rule_expiring_in("foldrun@32.8.2", 30)])
+                .unwrap();
+        assert_eq!(sorted.narrowed.len(), 1);
+        remove_firewall_bypass_rules(|_| true, "firewall-bypass-cleared").unwrap();
+
+        let saved = save_narrowed_firewall_bypass_rules(&sorted.narrowed).unwrap();
+
+        assert!(saved.narrowed.is_empty());
+        assert_eq!(saved.needs_approval.len(), 1);
+        assert!(load_local_firewall_bypass_rules().unwrap().is_empty());
+    });
+}
+
+#[test]
+fn a_narrowing_judged_before_a_shorter_expiry_never_lengthens_the_rule() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        with_test_native_auth_result("approve", || {
+            add_bypass(vec![bypass_rule("foldrun@32.8.2")], false)
+        })
+        .unwrap();
+        let sorted =
+            sort_firewall_bypass_requests(vec![bypass_rule_expiring_in("foldrun@32.8.2", 30)])
+                .unwrap();
+        let shortest = bypass_rule_expiring_in("foldrun@32.8.2", 10);
+        save_narrowed_firewall_bypass_rules(std::slice::from_ref(&shortest)).unwrap();
+
+        let saved = save_narrowed_firewall_bypass_rules(&sorted.narrowed).unwrap();
+
+        assert!(saved.narrowed.is_empty());
+        assert_eq!(
+            load_local_firewall_bypass_rules().unwrap()[0].expires_at,
+            shortest.expires_at
+        );
     });
 }
 

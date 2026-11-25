@@ -8,6 +8,9 @@ use crate::commands::install::firewall::{
     request_npm_firewall_preflight, request_npm_firewall_preflight_with_bypass,
     request_npm_firewall_preflight_with_force, spawn_chunked_npm_firewall_preflight,
 };
+use crate::commands::install::firewall::{
+    NpmFirewallMaterializationPackage, materialization_verdict_packages,
+};
 use crate::firewall_bypass::{FirewallBypassRule, FirewallBypassRules, FirewallBypassScope};
 use crate::npm_firewall_config::NpmFirewallMode;
 
@@ -2462,6 +2465,71 @@ async fn a_package_name_a_shell_would_expand_gets_no_bypass_command() {
 
     assert!(blocked.packages[0].bypassable);
     assert_eq!(blocked.bypass_command, None);
+}
+
+#[tokio::test]
+async fn a_block_row_beyond_an_undercounting_summary_still_blocks() {
+    let result = enforce_with_rules(
+        block_summary(
+            1,
+            vec![
+                grouped_block("lifted", "suspicious", "lpm_ai_telemetry"),
+                grouped_block("extra", "suspicious", "lpm_ai_telemetry"),
+            ],
+        ),
+        &["lifted"],
+        FirewallBypassRules::preloaded(&[global_rule("lifted")], Vec::new(), None, true),
+    )
+    .await;
+
+    assert_eq!(result.stats.bypassed.len(), 1);
+    assert_eq!(result.stats.unattributed_block_count, 1);
+    assert!(finish_npm_firewall_preflight(result, true).is_err());
+}
+
+#[tokio::test]
+async fn one_version_blocked_twice_is_reported_by_its_hardest_block() {
+    let result = enforce_with_rules(
+        block_summary(
+            2,
+            vec![
+                grouped_block("twice", "suspicious", "lpm_ai_telemetry"),
+                grouped_block("twice", "malicious", "lpm_ai_confirmed_malware"),
+            ],
+        ),
+        &["twice", "twice"],
+        FirewallBypassRules::none(),
+    )
+    .await;
+
+    let LpmError::NpmFirewallBlocked(blocked) =
+        finish_npm_firewall_preflight(result, true).unwrap_err()
+    else {
+        panic!("expected a firewall block");
+    };
+
+    assert_eq!(blocked.packages.len(), 1);
+    assert_eq!(blocked.packages[0].block_class.as_deref(), Some("malware"));
+    assert_eq!(blocked.bypass_command, None);
+}
+
+#[test]
+fn materialization_asks_once_per_artifact() {
+    let packages = [
+        NpmFirewallMaterializationPackage::new("pkg", "1.0.0", Some("sha512-a"), None),
+        NpmFirewallMaterializationPackage::new("pkg", "1.0.0", Some("sha512-b"), None),
+        NpmFirewallMaterializationPackage::new("pkg", "1.0.0", Some("sha512-a"), None),
+    ];
+
+    assert_eq!(
+        materialization_verdict_packages(&packages, NpmFirewallLookupMode::PackageAndIntegrity)
+            .len(),
+        2
+    );
+    assert_eq!(
+        materialization_verdict_packages(&packages, NpmFirewallLookupMode::PackageOnly).len(),
+        1
+    );
 }
 
 #[tokio::test]

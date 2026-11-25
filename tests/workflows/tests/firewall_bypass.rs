@@ -165,7 +165,10 @@ async fn bypassed_version_is_listed_in_the_install_json_security_report() {
     assert_eq!(firewall["bypassed"][0]["rule"]["spec"], "agent-tool");
     assert_eq!(firewall["bypassed"][0]["rule"]["source"], "local");
     assert_eq!(firewall["bypassed"][0]["rule"]["scope"], "global");
-    assert!(firewall["bypassed"][0]["rule"]["project_root"].is_null());
+    assert_eq!(
+        firewall["bypassed"][0]["rule"].get("project_root"),
+        Some(&serde_json::Value::Null)
+    );
     for timing in [
         &envelope["timing"]["firewall"],
         &envelope["timing"]["detail"]["security"]["firewall"],
@@ -286,11 +289,12 @@ async fn project_bypass_rule_applies_only_in_its_project() {
         )],
     );
 
-    assert!(
-        install(&project, &mock, "agent-tool", false)
-            .status
-            .success()
-    );
+    let output = install(&project, &mock, "agent-tool", true);
+    assert!(output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rule = &envelope["security"]["firewall"]["bypassed"][0]["rule"];
+    assert_eq!(rule["scope"], "project");
+    assert_eq!(rule["project_root"], root.as_str());
 
     let other = enforcing_project();
     write_signed_firewall_bypass(
@@ -619,13 +623,81 @@ async fn global_update_json_offers_one_bypass_command_for_every_blocked_package(
         let package = result["package"].as_str().unwrap();
         assert_eq!(result["action"], "failed");
         assert_eq!(result["error_code"], "npm_firewall_blocked");
+        assert_eq!(result["error"]["packages"][0]["name"], package);
         assert_eq!(
-            result["bypass_command"],
+            result["error"]["packages"][0]["display"]["report_url"],
+            format!("https://firewall.lpm.dev/npm/{package}/v/1.1.0")
+        );
+        assert_eq!(
+            result["error"]["bypass_command"],
             format!("lpm firewall bypass add \"{package}@1.1.0\"")
         );
     }
     assert_eq!(
         envelope["next_steps"][0]["command"],
         "lpm firewall bypass add \"other-tool@1.1.0\" \"update-tool@1.1.0\""
+    );
+}
+
+#[tokio::test]
+async fn batch_global_update_names_each_blocked_version_under_its_tool() {
+    let mock = MockRegistry::start().await;
+    mount_blocked_global_update(&mock, "update-tool").await;
+    mount_blocked_global_update(&mock, "other-tool").await;
+    let project = enforcing_project();
+    installed_globally(&project, &["update-tool", "other-tool"]);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--color", "never", "global", "update"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    for name in ["update-tool", "other-tool"] {
+        assert!(
+            stderr.contains(&format!(
+                "  blocked {name}@1.1.0 - The package can send a credential to a gateway.\n  report https://firewall.lpm.dev/npm/{name}/v/1.1.0\n"
+            )),
+            "{stderr}"
+        );
+    }
+    assert!(
+        stderr.contains(
+            "  allow lpm firewall bypass add \"other-tool@1.1.0\" \"update-tool@1.1.0\"\n"
+        ),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn managed_bypass_entries_still_apply_when_local_rules_fail_verification() {
+    let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
+    let project = enforcing_project();
+    write_signed_firewall_bypass(
+        &project,
+        &[stored_rule(
+            "other-tool",
+            serde_json::json!({ "reason": "reviewed the report" }),
+        )],
+    );
+    let store = project.home().join(".lpm/security/firewall-bypass.json");
+    let tampered = std::fs::read_to_string(&store)
+        .unwrap()
+        .replace("reviewed the report", "reviewed the reportX");
+    std::fs::write(&store, tampered).unwrap();
+    std::fs::write(
+        project.home().join(".lpm/security-policy.toml"),
+        "[firewall]\nbypass = [\"agent-tool@1.0.0\"]\n",
+    )
+    .unwrap();
+
+    let output = install(&project, &mock, "agent-tool", false);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("rule: agent-tool@1.0.0 (every project from the managed policy)"),
+        "{stderr}"
     );
 }

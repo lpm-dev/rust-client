@@ -5,6 +5,7 @@ use crate::firewall_bypass::{
     AddedVerdict, BlockClass, BypassKind, FirewallBypassRule, FirewallBypassScope,
     FirewallBypassSpec, MAX_SPECS_PER_APPROVAL, bypass_add_command, forced_floor_refuses_additions,
     project_policy_root_text, rule_json, shell_safe_in_double_quotes, spec_shell_safe,
+    visible_root,
 };
 use crate::install_ui;
 use crate::security_approval;
@@ -178,10 +179,7 @@ impl RuleScope {
     fn describe(&self) -> String {
         match &self.project_root {
             None => "in every project".to_string(),
-            Some(root) => format!(
-                "in the project at {}",
-                lpm_common::sanitize_server_text(root, 160)
-            ),
+            Some(root) => format!("in the project at {}", visible_root(root)),
         }
     }
 }
@@ -369,12 +367,23 @@ fn add_command_hint(
     }
     if let Some(ttl_secs) = ttl_secs {
         command.push_str(" --ttl ");
-        command.push_str(&security_approval::format_unlock_duration(ttl_secs));
+        command.push_str(&ttl_argument(ttl_secs));
     }
     if allow_malware {
         command.push_str(" --allow-malware");
     }
     Some(command)
+}
+
+/// `ttl_secs` as `--ttl` reads it back: whole days, hours or minutes, else
+/// bare seconds.
+fn ttl_argument(ttl_secs: u64) -> String {
+    for (unit_secs, suffix) in [(86_400, 'd'), (3_600, 'h'), (60, 'm')] {
+        if ttl_secs.is_multiple_of(unit_secs) {
+            return format!("{}{suffix}", ttl_secs / unit_secs);
+        }
+    }
+    ttl_secs.to_string()
 }
 
 /// The native prompt: what is allowed, where, and for how long. Built only
@@ -585,20 +594,22 @@ async fn add(
             rule
         })
         .collect();
-    let sorted = security_approval::sort_firewall_bypass_requests(rules)?;
+    let sorted = security_approval::sort_firewall_bypass_requests(rules)
+        .map_err(|error| refuse_add(&specs, error))?;
     let mut outcome = security_approval::FirewallBypassAdded {
         unchanged: sorted.unchanged,
         rules_total: sorted.rules_total,
         ..security_approval::FirewallBypassAdded::default()
     };
+    let mut needs_approval = sorted.needs_approval;
     if !sorted.narrowed.is_empty() {
-        outcome.rules_total =
+        let mut narrowed =
             security_approval::save_narrowed_firewall_bypass_rules(&sorted.narrowed)?;
-        outcome.narrowed = sorted.narrowed;
+        needs_approval.append(&mut narrowed.needs_approval);
+        outcome.absorb(narrowed);
     }
 
-    let mut pending: HashMap<String, FirewallBypassRule> = sorted
-        .needs_approval
+    let mut pending: HashMap<String, FirewallBypassRule> = needs_approval
         .into_iter()
         .map(|rule| (rule.spec.clone(), rule))
         .collect();
@@ -625,13 +636,7 @@ async fn add(
             },
         );
         match added {
-            Ok(batch_outcome) => {
-                outcome.added.extend(batch_outcome.added);
-                outcome.extended.extend(batch_outcome.extended);
-                outcome.narrowed.extend(batch_outcome.narrowed);
-                outcome.unchanged.extend(batch_outcome.unchanged);
-                outcome.rules_total = batch_outcome.rules_total;
-            }
+            Ok(batch_outcome) => outcome.absorb(batch_outcome),
             Err(error) => {
                 if !json_output {
                     report_added(&outcome, &scope);
@@ -987,6 +992,32 @@ mod tests {
     }
 
     #[test]
+    fn approval_prompt_shows_a_long_root_whole_and_its_controls_visibly() {
+        let long_root = format!("/work/{}  two  spaces", "d".repeat(200));
+        let prompt = approval_prompt(
+            &refs(&specs(&["foldrun"])),
+            &project(&long_root),
+            None,
+            false,
+        );
+        assert!(
+            prompt.ends_with(&format!("in the project at {long_root}")),
+            "{prompt}"
+        );
+
+        let prompt = approval_prompt(
+            &refs(&specs(&["foldrun"])),
+            &project("/work/a\u{1b}[2Jb"),
+            None,
+            false,
+        );
+        assert!(
+            prompt.ends_with("in the project at /work/a\\u{1b}[2Jb"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
     fn add_command_hint_quotes_specs_and_names_the_duration() {
         assert_eq!(
             add_command_hint(
@@ -1140,9 +1171,8 @@ mod tests {
         assert_eq!(sizes(&short), [5, 1]);
         assert_eq!(sizes(&long), [1, 2]);
         for batch in approval_batches(&refs(&long), prompt_for) {
-            if batch.len() > 1 {
-                assert!(prompt_for(&batch).chars().count() <= MAX_APPROVAL_PROMPT_CHARS);
-            }
+            let within_budget = prompt_for(&batch).chars().count() <= MAX_APPROVAL_PROMPT_CHARS;
+            assert!(within_budget || batch.len() == 1, "{batch:?}");
         }
     }
 
@@ -1164,6 +1194,13 @@ mod tests {
             "foldrun",
         ] {
             assert!(!is_rule_id(target), "{target}");
+        }
+    }
+
+    #[test]
+    fn the_hinted_ttl_reads_back_as_the_same_duration() {
+        for secs in [90, 60, 5_400, 86_400, 2 * 86_400 + 1] {
+            assert_eq!(parse_ttl(Some(&ttl_argument(secs))).unwrap(), Some(secs));
         }
     }
 }

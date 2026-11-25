@@ -298,7 +298,7 @@ pub async fn run(
                 Ok(output) => UpgradeResult::Upgraded(output),
                 Err((package, error)) => UpgradeResult::Failed {
                     package,
-                    failure: UpdateFailure::from_error(&error),
+                    failure: UpdateFailure::from_error(&error).shown_by_install(!json_output),
                 },
             },
         );
@@ -726,6 +726,8 @@ enum UpgradeResult {
 struct UpdateFailure {
     reason: String,
     firewall_block: Option<Box<lpm_common::NpmFirewallBlockedErrorContext>>,
+    /// The nested install already printed the block's details.
+    details_shown: bool,
 }
 
 impl UpdateFailure {
@@ -741,7 +743,14 @@ impl UpdateFailure {
         Self {
             reason: reason.to_string(),
             firewall_block: None,
+            details_shown: false,
         }
+    }
+
+    /// For a failure whose install printed its own output.
+    fn shown_by_install(mut self, shown: bool) -> Self {
+        self.details_shown = shown;
+        self
     }
 
     fn with_reason(reason: String, error: &LpmError) -> Self {
@@ -752,6 +761,7 @@ impl UpdateFailure {
         Self {
             reason,
             firewall_block,
+            details_shown: false,
         }
     }
 
@@ -762,10 +772,10 @@ impl UpdateFailure {
             "reason": self.reason,
         });
         if let Some(blocked) = &self.firewall_block {
-            json["error_code"] = serde_json::json!("npm_firewall_blocked");
-            json["bypass_command"] = serde_json::json!(blocked.bypass_command);
-            json["bypass_unavailable_reason"] =
-                serde_json::json!(blocked.bypass_unavailable_reason);
+            let envelope =
+                crate::cli::json_error_value(&LpmError::NpmFirewallBlocked(blocked.clone()));
+            json["error_code"] = envelope["error_code"].clone();
+            json["error"] = envelope["error"].clone();
         }
         json
     }
@@ -1255,6 +1265,15 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
                     install_ui::bold(&package_safe),
                     reason_safe,
                 ));
+                if let Some(blocked) = failure
+                    .firewall_block
+                    .as_deref()
+                    .filter(|_| !failure.details_shown)
+                {
+                    for line in crate::cli::npm_firewall_block_detail_lines(blocked) {
+                        install_ui::detail_line(line);
+                    }
+                }
             }
         }
     }
