@@ -126,12 +126,14 @@ pub(super) fn extract_conflicts_fallback(report: &str) -> HashSet<String> {
 }
 
 /// A registry refusing a metadata fetch for a reason that isn't the
-/// package's absence: the credential, a rate limit, or the registry's own
-/// refusal. It keeps its kind so the user is told to sign in, wait, or what
-/// the registry said, rather than to change a version range.
+/// package's absence: the credential, a rate limit, LPM Firewall, or the
+/// registry's own refusal. It keeps its kind so the user is told to sign in,
+/// wait, review the firewall report, or what the registry said, rather than
+/// to change a version range.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryFetchFailure {
     Http(Box<lpm_common::RegistryHttpError>),
+    FirewallBlocked(Box<lpm_common::NpmFirewallBlockedErrorContext>),
     AuthRequired,
     SessionExpired,
     EnvTokenRejected,
@@ -147,6 +149,7 @@ impl RegistryFetchFailure {
             LpmError::RegistryHttp(answer) if answer.status != 404 => {
                 Some(Self::Http(answer.clone()))
             }
+            LpmError::NpmFirewallBlocked(blocked) => Some(Self::FirewallBlocked(blocked.clone())),
             LpmError::AuthRequired => Some(Self::AuthRequired),
             LpmError::SessionExpired => Some(Self::SessionExpired),
             LpmError::EnvTokenRejected => Some(Self::EnvTokenRejected),
@@ -164,6 +167,7 @@ impl RegistryFetchFailure {
             Self::Http(answer) => {
                 LpmError::RegistryHttp(Box::new(answer.with_subject(package.to_owned())))
             }
+            Self::FirewallBlocked(blocked) => LpmError::NpmFirewallBlocked(blocked),
             Self::AuthRequired => LpmError::AuthRequired,
             Self::SessionExpired => LpmError::SessionExpired,
             Self::EnvTokenRejected => LpmError::EnvTokenRejected,
@@ -176,6 +180,7 @@ impl std::fmt::Display for RegistryFetchFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Http(answer) => write!(f, "{answer}"),
+            Self::FirewallBlocked(blocked) => write!(f, "{blocked}"),
             Self::AuthRequired => f.write_str("authentication required"),
             Self::SessionExpired => f.write_str("session expired or revoked"),
             Self::EnvTokenRejected => f.write_str("the registry rejected LPM_TOKEN"),

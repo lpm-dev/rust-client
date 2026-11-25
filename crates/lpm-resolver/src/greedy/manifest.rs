@@ -1517,11 +1517,7 @@ async fn fetch_release_times_raw_for_policy(
                 suffix_hint,
             )
             .await
-            .map_err(|e| ResolveError::DependencyFetch {
-                package: canonical.to_string(),
-                version: "*".to_string(),
-                detail: e.to_string(),
-            })?;
+            .map_err(|error| registry_fetch_error(canonical, error))?;
         let detail = ReleaseTimeFetchDetail {
             total_ms: start.elapsed().as_millis(),
             timings: timed.timings,
@@ -1537,11 +1533,7 @@ async fn fetch_release_times_raw_for_policy(
                 suffix_hint,
             )
             .await
-            .map_err(|e| ResolveError::DependencyFetch {
-                package: canonical.to_string(),
-                version: "*".to_string(),
-                detail: e.to_string(),
-            })?;
+            .map_err(|error| registry_fetch_error(canonical, error))?;
         Ok((release_times, None))
     }
 }
@@ -1633,11 +1625,7 @@ async fn fetch_platform_metadata_from_route(
                     info.modified.as_deref(),
                 )
                 .await
-                .map_err(|error| ResolveError::DependencyFetch {
-                    package: canonical.to_string(),
-                    version: "*".to_string(),
-                    detail: error.to_string(),
-                })?;
+                .map_err(|error| registry_fetch_error(canonical, error))?;
             let detail = ReleaseTimeFetchDetail {
                 total_ms: start.elapsed().as_millis(),
                 timings: timed.timings,
@@ -1653,11 +1641,7 @@ async fn fetch_platform_metadata_from_route(
             let metadata = client
                 .get_npm_platform_metadata_routed_full(name, route, info.modified.as_deref())
                 .await
-                .map_err(|error| ResolveError::DependencyFetch {
-                    package: canonical.to_string(),
-                    version: "*".to_string(),
-                    detail: error.to_string(),
-                })?;
+                .map_err(|error| registry_fetch_error(canonical, error))?;
             merge_release_times_into_cache_info(info, &metadata);
             Ok(None)
         }
@@ -1918,6 +1902,12 @@ fn metadata_fetch_error(canonical: &CanonicalKey, error: lpm_common::LpmError) -
             },
         };
     }
+    registry_fetch_error(canonical, error)
+}
+
+/// A fetch for a package whose metadata the resolver already holds: a
+/// registry refusal, such as an LPM Firewall block, keeps its kind.
+fn registry_fetch_error(canonical: &CanonicalKey, error: lpm_common::LpmError) -> ResolveError {
     if let Some(failure) = crate::RegistryFetchFailure::from_lpm_error(&error) {
         return ResolveError::Registry {
             package: canonical.to_string(),
@@ -2064,4 +2054,44 @@ pub(super) fn propagate_fetch_error(
     Err(ResolveError::Resolution(Box::new(
         state.edge_resolution_context(edge, ResolutionFailureKind::FetchFailed, detail, None, None),
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn firewall_block() -> lpm_common::LpmError {
+        lpm_common::LpmError::NpmFirewallBlocked(Box::new(
+            lpm_common::NpmFirewallBlockedErrorContext::registry(
+                lpm_common::NpmFirewallBlockedPackage {
+                    name: "foldrun".to_string(),
+                    version: Some("32.8.2".to_string()),
+                    verdict: "malicious".to_string(),
+                    reason: "the registry policy refused this download".to_string(),
+                    decision_id: None,
+                    match_source: None,
+                    policy_group: None,
+                    summary: None,
+                    report_url: None,
+                },
+            ),
+        ))
+    }
+
+    #[test]
+    fn a_firewall_block_on_a_metadata_fetch_keeps_its_typed_error() {
+        let canonical = CanonicalKey::from_dep_name("foldrun");
+
+        let ResolveError::Registry { package, failure } =
+            metadata_fetch_error(&canonical, firewall_block())
+        else {
+            panic!("a firewall block must stay a registry refusal");
+        };
+
+        assert!(matches!(
+            failure.into_lpm_error(&package),
+            lpm_common::LpmError::NpmFirewallBlocked(blocked)
+                if blocked.packages[0].coordinate() == "foldrun@32.8.2"
+        ));
+    }
 }
