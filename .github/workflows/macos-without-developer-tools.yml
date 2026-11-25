@@ -147,7 +147,7 @@ jobs:
           unset DEVELOPER_DIR
           "$SELF_UPDATE_TESTS" --ignored --test-threads=1 signed_macos_release \
             | tee "$RUNNER_TEMP/signed-release-tests.log"
-          grep -q 'test result: ok. 2 passed' "$RUNNER_TEMP/signed-release-tests.log"
+          grep -q 'test result: ok. 3 passed' "$RUNNER_TEMP/signed-release-tests.log"
 
       - name: Fresh install through the official installer
         timeout-minutes: 5

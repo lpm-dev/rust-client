@@ -18,21 +18,23 @@ fail() {
 # every host has one address in Apple's IPv4 network and one in its IPv6
 # network, and ocsp.apple.com is served only from outside Apple's networks.
 #
-# curl reaches a host by name when any address the hosts file pins it to is
-# reachable, as curl tries each, or at an address of its own when the hosts
-# file doesn't name it; at a --resolve address it uses that one. An address
-# is unreachable when the firewall's active rules drop the <apple_services>
-# table and the table names it or a network holding it. Without IPv6 (no-ipv6) no IPv6 address is reached. A host in
-# never-answers times out whatever happens. A "host status" line in
-# answers-anyway connects whatever is blocked and then exits with that
-# status, such as 35 for a TLS error or 28 for a service that accepts and
-# then stalls. Like curl -w '%{num_connects}', it prints how many
-# connections it opened.
+# curl answers only when its first argument is -q and it gets --noproxy '*',
+# as the probe must ignore ~/.curlrc and proxies. It reaches a host by name
+# when any address the hosts file pins it to is reachable, as curl tries
+# each, or at an address of its own when the hosts file doesn't name it; at
+# a --resolve address it uses that one. An address is unreachable when the
+# firewall's active rules drop the <apple_services> table and the table
+# names it or a network holding it. Without IPv6 (no-ipv6) no IPv6 address
+# is reached. A host in never-answers times out whatever happens. A "host
+# status" line in answers-anyway connects whatever is blocked and then exits
+# with that status, such as 35 for a TLS error or 28 for a service that
+# accepts and then stalls. For -w it prints how many connections it opened,
+# or the connect time, which, as macOS's curl does, stays 0 for a connection
+# that opened and then stalled in the TLS handshake.
 #
 # pfctl applies the rules it is given: none of them when inert-firewall
 # exists, none of the IPv6 entries when inert-ipv6 exists, none of the network
-# entries when inert-networks exists, the rule in rule-override in place of
-# the block rule when that exists, and it refuses them when pfctl-fails
+# entries when inert-networks exists, and it refuses them when pfctl-fails
 # exists.
 make_runner() {
 	rm -rf "$work/runner" "$work/state"
@@ -57,8 +59,6 @@ case "\$1" in
 		awk '{ out = ""; for (i = 1; i <= NF; i++) if (\$i !~ /:/) out = out (out == "" ? "" : " ") \$i; print out }' "\$3" >"$work/runner/active-rules"
 	elif [ -e "$work/runner/inert-networks" ]; then
 		awk '{ out = ""; for (i = 1; i <= NF; i++) if (\$i !~ /\//) out = out (out == "" ? "" : " ") \$i; print out }' "\$3" >"$work/runner/active-rules"
-	elif [ -e "$work/runner/rule-override" ]; then
-		{ grep -v '^block ' "\$3"; cat "$work/runner/rule-override"; } >"$work/runner/active-rules"
 	elif [ ! -e "$work/runner/inert-firewall" ]; then
 		cp "\$3" "$work/runner/active-rules"
 	fi
@@ -79,18 +79,33 @@ if [ -e "\$records.\$2" ]; then cat "\$records.\$2"; else cat "\$records"; fi
 EOF
 	cat >"$work/runner/bin/curl" <<EOF
 #!/bin/bash
+[ "\$1" = -q ] || exit 2
 address=""
+format=""
+noproxy=""
 while [ "\$#" -gt 0 ]; do
 	case "\$1" in
 	--resolve) address="\${2#*:443:}"; shift ;;
+	--noproxy) noproxy="\$2"; shift ;;
+	-w) format="\$2"; shift ;;
 	https://*) url="\$1" ;;
 	esac
 	shift
 done
+[ "\$noproxy" = '*' ] || exit 2
 host="\${url#https://}"
 host="\${host%/}"
-unconnected() { printf '0'; exit "\$1"; }
-connected() { printf '1'; exit "\$1"; }
+report() {
+	case "\$format" in
+	*num_connects*) printf '%s' "\$1" ;;
+	*time_connect*) printf '%s' "\$2" ;;
+	esac
+}
+unconnected() { report 0 0.000000; exit "\$1"; }
+connected() {
+	if [ "\$1" = 28 ]; then report 1 0.000000; else report 1 0.050000; fi
+	exit "\$1"
+}
 grep -Fxq "\$host" "$work/runner/never-answers" && unconnected 28
 status=\$(awk -v host="\$host" '\$1 == host { print \$2 }' "$work/runner/answers-anyway")
 [ -n "\$status" ] && connected "\$status"
@@ -184,6 +199,8 @@ done
 grep -Fxq "2.22.144.17 ocsp.apple.com" "$work/runner/hosts" || fail "ocsp.apple.com is not pinned to its address outside Apple's network"
 grep -Fq '2.22.144.17' "$work/runner/active-rules" \
 	|| fail "the firewall does not block an address outside Apple's networks that an Apple host resolves to"
+grep -Fxq 'block drop out quick from any to <apple_services>' "$work/runner/active-rules" \
+	|| fail "the firewall rules don't drop the table's traffic: $(cat "$work/runner/active-rules")"
 grep -Fq '17.0.0.0/8' "$work/runner/active-rules" \
 	|| fail "the firewall does not block Apple's IPv4 network: $(cat "$work/runner/active-rules")"
 grep -Fq '2a01:b740::/32' "$work/runner/active-rules" \
@@ -209,11 +226,6 @@ make_runner
 printf 'ocsp.apple.com 28\n' >"$work/runner/answers-anyway"
 expect_block_failure after-blocking "ocsp.apple.com is still reachable" "a service that accepts and then stalls was taken for a blocked one"
 echo "PASS: a service that accepts a connection and then stalls still counts as reachable"
-
-make_runner
-printf 'pass out quick from any to <apple_services>\n' >"$work/runner/rule-override"
-expect_block_failure after-blocking "still reachable" "block reported Apple's services unreachable while its rule let the table's traffic through"
-echo "PASS: block fails when the rule doesn't drop the table's traffic"
 
 make_runner
 : >"$work/runner/inert-firewall"
