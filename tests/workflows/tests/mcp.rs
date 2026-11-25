@@ -760,6 +760,31 @@ async fn mcp_serve_lists_the_registry_tools_and_its_own_without_reading_a_login(
 }
 
 #[tokio::test]
+async fn mcp_serve_answers_methods_of_capabilities_it_does_not_offer_with_method_not_found() {
+    // The server offers only tools, so a client that asks for prompts,
+    // resources or completions gets the JSON-RPC error for an unknown
+    // method, not an empty list.
+    let project = TempProject::empty(r#"{"name":"mcp-serve","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    let mut server = McpServer::start(&project, &registry.url());
+
+    for (method, params) in [
+        ("prompts/list", json!({})),
+        ("resources/list", json!({})),
+        ("resources/templates/list", json!({})),
+        (
+            "completion/complete",
+            json!({
+                "ref": { "type": "ref/prompt", "name": "any" },
+                "argument": { "name": "a", "value": "" },
+            }),
+        ),
+    ] {
+        let answer = server.request(method, params);
+        assert_eq!(answer["error"]["code"], -32601, "{method}: {answer}");
+    }
+}
+#[tokio::test]
 async fn mcp_serve_calls_a_registry_tool_with_the_stored_login() {
     let project = TempProject::empty(r#"{"name":"mcp-serve","version":"1.0.0"}"#);
     let registry = MockRegistry::start().await;
