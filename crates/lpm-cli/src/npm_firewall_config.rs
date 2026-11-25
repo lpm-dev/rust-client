@@ -311,7 +311,21 @@ fn parse_policy_table_over(
         *slot = action;
     }
     if telemetry_policy_origin(Some(policies)) == TelemetryPolicyOrigin::InheritedFromAiSuspicious {
-        profile.lpm_ai_telemetry = profile.lpm_ai_suspicious;
+        // Telemetry follows `lpm_ai_suspicious`, but never below a stricter
+        // action `base` holds from the approved profile, so dropping the
+        // telemetry key doesn't ask for less than it was approved at.
+        let enforce = NpmFirewallMode::Enforce;
+        let default_telemetry = NpmFirewallPolicyProfile::default().lpm_ai_telemetry;
+        let approved_stricter = enforced_rank(enforce, base.lpm_ai_telemetry)
+            > enforced_rank(enforce, default_telemetry);
+        profile.lpm_ai_telemetry = if approved_stricter
+            && enforced_rank(enforce, base.lpm_ai_telemetry)
+                > enforced_rank(enforce, profile.lpm_ai_suspicious)
+        {
+            base.lpm_ai_telemetry
+        } else {
+            profile.lpm_ai_suspicious
+        };
     }
     Ok(profile)
 }
@@ -1176,6 +1190,24 @@ mod tests {
             NpmFirewallPolicyAction::Block
         );
         assert_eq!(tableless_policy_profile(approved, true), approved);
+    }
+
+    #[test]
+    fn telemetry_follows_suspicious_but_not_below_an_approved_stricter_action() {
+        let global = global_with_policies(&[(LPM_AI_SUSPICIOUS_POLICY_KEY, "allow")]);
+        let strict_base = NpmFirewallPolicyProfile {
+            lpm_ai_telemetry: NpmFirewallPolicyAction::Block,
+            ..NpmFirewallPolicyProfile::default()
+        };
+
+        let inherited = config_policy_request(&global).unwrap().unwrap();
+        let held = config_policy_request_over(&global, strict_base)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(inherited.lpm_ai_telemetry, NpmFirewallPolicyAction::Allow);
+        assert_eq!(held.lpm_ai_telemetry, NpmFirewallPolicyAction::Block);
+        assert_eq!(held.lpm_ai_suspicious, NpmFirewallPolicyAction::Allow);
     }
 
     #[test]

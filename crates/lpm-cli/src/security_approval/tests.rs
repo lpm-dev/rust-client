@@ -2145,6 +2145,35 @@ fn security_status_reports_config_policy_that_differs_from_the_effective_profile
 }
 
 #[test]
+fn security_status_blames_config_only_for_the_policy_groups_its_table_names() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[(
+            crate::npm_firewall_config::LPM_AI_CONFIRMED_MALWARE_POLICY_KEY,
+            "allow",
+        )]);
+        let config_dir = temp.path().join("lpm-home");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_telemetry = \"warn\"\n",
+        )
+        .unwrap();
+
+        let status = load_security_status(None, true).unwrap();
+
+        assert!(
+            !status
+                .active_runtime_overrides
+                .iter()
+                .any(|entry| entry.control == "[firewall.npm.policies]"),
+            "{:?}",
+            status.active_runtime_overrides
+        );
+    });
+}
+
+#[test]
 fn runtime_firewall_reports_a_looser_mode_without_listing_unchanged_policies() {
     let temp = tempdir().unwrap();
     let project = temp.path().join("project");

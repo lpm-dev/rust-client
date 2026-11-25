@@ -187,3 +187,14 @@ async fn install_keeps_a_stricter_approved_policy_a_partial_table_leaves_out() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn telemetry_following_suspicious_keeps_an_approved_stricter_telemetry_action() {
+    install_sending_policy(
+        "inherited-policy",
+        &[("lpm_ai_telemetry", "block")],
+        &[("lpm_ai_suspicious", "warn")],
+        &[r#""lpmAiTelemetry":"block""#, r#""lpmAiSuspicious":"warn""#],
+    )
+    .await;
+}

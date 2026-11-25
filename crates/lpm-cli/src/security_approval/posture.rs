@@ -233,16 +233,16 @@ fn active_runtime_overrides(
             source: request_firewall.source_label().to_string(),
         });
     }
+    // Measured against what installs run without a table, so a group the
+    // table leaves out is never reported as config's doing.
+    let tableless = crate::npm_firewall_config::runtime_policy_profile(None, effective);
     if let Some(request_policies) =
         crate::npm_firewall_config::runtime_policy_request(&global, effective)?
-        && request_policies != effective.posture.firewall_policy_profile()
+        && request_policies != tableless
     {
         overrides.push(RuntimeOverride {
             control: crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_PATH.to_string(),
-            value: changed_policy_entries(
-                &request_policies,
-                &effective.posture.firewall_policy_profile(),
-            ),
+            value: changed_policy_entries(&request_policies, &tableless),
             source: "~/.lpm/config.toml [firewall.npm.policies]".to_string(),
         });
     }

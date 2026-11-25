@@ -2914,6 +2914,25 @@ fn config_list_reports_the_managed_policy_over_a_looser_value_under_a_stricter_l
 }
 
 #[test]
+fn config_list_reports_the_default_for_an_approved_looser_group_a_partial_table_leaves_out() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    support::write_signed_firewall_posture(
+        &project,
+        "enforce",
+        &[("lpm_ai_confirmed_malware", "allow")],
+    );
+    seed_config(
+        &project,
+        "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_telemetry = \"block\"\n",
+    );
+
+    let entry = config_list_entry(&project, "firewall.npm.policies.lpm_ai_confirmed_malware");
+
+    assert_eq!(entry["value"], "block", "{entry}");
+    assert_eq!(entry["source"], "built-in default", "{entry}");
+}
+
+#[test]
 fn config_list_reports_the_approved_firewall_policy_over_a_looser_config_value() {
     let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
     support::write_signed_firewall_posture(&project, "enforce", &[]);
