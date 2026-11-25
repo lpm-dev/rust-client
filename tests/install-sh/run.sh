@@ -261,10 +261,19 @@ case " $* " in
 esac
 exit 0
 EOF
-    # Decodes a provisioning profile the way `openssl smime -out` does.
+    # Decodes a provisioning profile the way `openssl smime -out` does. Like
+    # macOS's LibreSSL, it writes nothing yet exits 0 when OPENSSL_CONF names
+    # a configuration, and it writes nothing when profile-not-written exists.
     cat > "$CLEAN_PATH_DIR/openssl" <<'EOF'
 #!/bin/sh
 [ "$1 $2 $3 $4 $5 $6" = "smime -verify -noverify -nosigs -inform DER" ] || exit 99
+if [ -n "${OPENSSL_CONF:-}" ]; then
+  echo "failed to load configuration" >&2
+  exit 0
+fi
+if [ -n "${LPM_TEST_TOOL_STATE:-}" ] && [ -e "$LPM_TEST_TOOL_STATE/profile-not-written" ]; then
+  exit 0
+fi
 while [ "$#" -gt 0 ]; do
   [ "$1" = -out ] && out="$2"
   shift
@@ -824,6 +833,23 @@ if [ "$HOST_OS" = "Darwin" ]; then
     stop_server
     trap - EXIT
   }
+
+  harness_openssl_conf="${OPENSSL_CONF-}"
+  export OPENSSL_CONF="$tool_state/openssl3.cnf"
+  run_with_tool_state
+  if [ -n "$harness_openssl_conf" ]; then OPENSSL_CONF="$harness_openssl_conf"; else unset OPENSSL_CONF; fi
+  [ "$RUN_RC" -eq 0 ] || fail "an OPENSSL_CONF in the environment failed the install with exit $RUN_RC: $RUN_OUT"
+  [ -L "$RUN_INSTALL_DIR/lpm" ] || fail "an OPENSSL_CONF in the environment kept lpm from being installed"
+  pass "macOS install decodes the provisioning profile whatever OPENSSL_CONF says"
+
+  : > "$tool_state/profile-not-written"
+  run_with_tool_state
+  rm -f "$tool_state/profile-not-written"
+  [ "$RUN_RC" -ne 0 ] || fail "a provisioning profile openssl didn't decode must fail the install"
+  echo "$RUN_OUT" | grep -q "downloaded LPM CLI.app has an unreadable provisioning profile" \
+    || fail "a provisioning profile openssl didn't decode was reported as something else: $RUN_OUT"
+  [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "a provisioning profile openssl didn't decode must not install anything"
+  pass "macOS install refuses a provisioning profile openssl exits 0 without decoding"
 
   : > "$tool_state/unsatisfied-requirement"
   run_with_tool_state

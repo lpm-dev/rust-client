@@ -547,10 +547,11 @@ fn next_steps_for_error(error: &lpm_common::LpmError) -> Option<serde_json::Valu
             })
         }
         lpm_common::LpmError::StandaloneSelfUpdate {
-            reinstall_command, ..
+            recovery,
+            reinstall_command,
+            ..
         } => Some(crate::json_contract::command_next_steps(
-            "Reinstall LPM CLI with the official installer, which verifies the release itself \
-             and keeps your settings",
+            recovery,
             reinstall_command,
         )),
         _ => None,

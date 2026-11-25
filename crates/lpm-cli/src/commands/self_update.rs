@@ -379,9 +379,14 @@ pub async fn run(
         }
         InstallMethod::Standalone => {
             standalone_update = Some(
-                run_standalone_update(&latest, &current_executable, &account_home, !json_output)
-                    .await
-                    .map_err(|error| with_installer_recovery(error, target_channel))?,
+                run_standalone_update(
+                    &latest,
+                    &current_executable,
+                    &account_home,
+                    target_channel,
+                    !json_output,
+                )
+                .await?,
             );
         }
     }
@@ -2338,25 +2343,63 @@ fn verify_release_asset_digest(
     })
 }
 
-/// A refused standalone update names the official installer, which verifies
-/// the release itself and installs it in `~/.lpm`, so a refusal never leaves
-/// the user without a way to update. Windows has no such installer.
-fn with_installer_recovery(error: LpmError, channel: ReleaseChannel) -> LpmError {
-    match error {
-        LpmError::SelfUpdate(reason) if cfg!(unix) => LpmError::StandaloneSelfUpdate {
-            reason,
-            reinstall_command: installer_command(channel),
-        },
-        other => other,
-    }
+/// What a standalone update refused that the official installer can take over
+/// from. Refusals of the installation's location or permissions, of staged
+/// files that changed, and failed replacements get no installer: reinstalling
+/// wouldn't fix them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StandaloneRefusal {
+    /// The release's provenance or integrity.
+    ReleaseVerification,
+    /// A verified release, or an installation outside the installer's layout,
+    /// that this updater's checks don't accept. The installer applies its
+    /// current checks afresh.
+    Compatibility,
 }
 
-fn installer_command(channel: ReleaseChannel) -> String {
-    let channel = match channel {
-        ReleaseChannel::Stable => "",
-        ReleaseChannel::Nightly => "LPM_INSTALL_CHANNEL=nightly ",
+/// A refusal the official installer can take over from names it, so a
+/// refusal never leaves the user without a way to update. Without cosign the
+/// installer can't tell who published a Linux release's checksums, so a Linux
+/// release the updater couldn't verify is reinstalled only with its signature
+/// required; on macOS the installer checks the app's Developer ID signature,
+/// which only LPM's release workflow can produce. Windows has no such
+/// installer.
+fn with_installer_recovery(
+    error: LpmError,
+    channel: ReleaseChannel,
+    refusal: StandaloneRefusal,
+) -> LpmError {
+    let LpmError::SelfUpdate(reason) = error else {
+        return error;
     };
-    format!("curl -fsSL https://cli.lpm.dev/install | {channel}sh")
+    if !cfg!(unix) {
+        return LpmError::SelfUpdate(reason);
+    }
+    let channel = channel.as_str();
+    let (recovery, reinstall_command) = if refusal == StandaloneRefusal::ReleaseVerification
+        && cfg!(not(target_os = "macos"))
+    {
+        (
+            "If this release keeps failing verification, install cosign and reinstall LPM CLI \
+             with the official installer, which then checks the release's signature itself \
+             and keeps your settings",
+            format!(
+                "curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL={channel} \
+                 LPM_INSTALL_REQUIRE_SIGSTORE=1 sh"
+            ),
+        )
+    } else {
+        (
+            "Reinstall LPM CLI with the official installer, which verifies the release itself \
+             and keeps your settings",
+            format!("curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL={channel} sh"),
+        )
+    };
+    LpmError::StandaloneSelfUpdate {
+        reason,
+        recovery: recovery.to_string(),
+        reinstall_command,
+    }
 }
 
 /// Download and replace the binary in-place for standalone installations.
@@ -2376,19 +2419,26 @@ async fn run_standalone_update(
     version: &str,
     current_executable: &Path,
     account_home: &Path,
+    channel: ReleaseChannel,
     human_output: bool,
 ) -> Result<StandaloneUpdate, LpmError> {
+    let refused = |refusal| move |error| with_installer_recovery(error, channel, refusal);
     validate_standalone_install_location(current_executable)?;
     #[cfg(not(target_os = "macos"))]
     let _ = account_home;
     #[cfg(target_os = "macos")]
-    let macos_layout = prepare_macos_standalone_layout(current_executable, account_home)?;
+    let macos_layout = prepare_macos_standalone_layout(
+        macos_standalone_layout_for(current_executable, account_home)
+            .map_err(refused(StandaloneRefusal::Compatibility))?,
+    )?;
     #[cfg(target_os = "macos")]
     let staging_anchor = macos_layout.app_parent.join(".lpm-release-asset.zip");
     #[cfg(not(target_os = "macos"))]
     let staging_anchor = current_executable.to_path_buf();
 
-    let assets = verify_and_stage_for_standalone(version, &staging_anchor, human_output).await?;
+    let assets = verify_and_stage_for_standalone(version, &staging_anchor, human_output)
+        .await
+        .map_err(refused(StandaloneRefusal::ReleaseVerification))?;
 
     #[cfg(target_os = "macos")]
     {
@@ -2399,8 +2449,10 @@ async fn run_standalone_update(
         let staged_bundle = stage_macos_bundle(
             assets.staged_binary.temporary.path(),
             &macos_layout.app_parent,
-        )?;
-        VersionProbe::verify_staged_path(&staged_bundle.executable, version)?;
+        )
+        .map_err(refused(StandaloneRefusal::Compatibility))?;
+        VersionProbe::verify_staged_path(&staged_bundle.executable, version)
+            .map_err(refused(StandaloneRefusal::Compatibility))?;
         install_staged_macos_bundle(&macos_layout, staged_bundle, version)?;
     }
 
@@ -2412,7 +2464,8 @@ async fn run_standalone_update(
             &assets.staged_binary.temporary,
             &assets.staged_binary.sha256,
             version,
-        )?;
+        )
+        .map_err(refused(StandaloneRefusal::Compatibility))?;
         ensure_staged_file_unchanged(
             &assets.staged_binary.temporary,
             &assets.staged_binary.sha256,
@@ -2623,12 +2676,10 @@ fn macos_standalone_layout_for(
 
 #[cfg(target_os = "macos")]
 fn prepare_macos_standalone_layout(
-    current_executable: &Path,
-    account_home: &Path,
+    layout: MacOSStandaloneLayout,
 ) -> Result<MacOSStandaloneLayout, LpmError> {
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 
-    let layout = macos_standalone_layout_for(current_executable, account_home)?;
     if let Ok(metadata) = std::fs::symlink_metadata(&layout.app_parent) {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(LpmError::SelfUpdate(format!(
@@ -2982,7 +3033,7 @@ enum MacOSTool {
 impl MacOSTool {
     #[cfg(test)]
     const ALL: [Self; 3] = {
-        // A new tool must be listed here, or this match stops compiling.
+        // A new variant breaks this match, a reminder to list it here too.
         match Self::Codesign {
             Self::Codesign | Self::Ditto | Self::PlistBuddy => {}
         }
@@ -6960,6 +7011,104 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
                 tool.path()
             );
         }
+    }
+
+    #[cfg(unix)]
+    fn installer_recovery(channel: ReleaseChannel, refusal: StandaloneRefusal) -> (String, String) {
+        match with_installer_recovery(
+            LpmError::SelfUpdate("refused".to_string()),
+            channel,
+            refusal,
+        ) {
+            LpmError::StandaloneSelfUpdate {
+                reason,
+                recovery,
+                reinstall_command,
+            } => {
+                assert_eq!(reason, "refused");
+                (recovery, reinstall_command)
+            }
+            other => panic!("expected a refusal naming the installer, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refusal_the_installer_can_take_over_names_it_for_its_channel() {
+        for (channel, command) in [
+            (
+                ReleaseChannel::Stable,
+                "curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL=stable sh",
+            ),
+            (
+                ReleaseChannel::Nightly,
+                "curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL=nightly sh",
+            ),
+        ] {
+            let (_, reinstall_command) =
+                installer_recovery(channel, StandaloneRefusal::Compatibility);
+            assert_eq!(reinstall_command, command);
+        }
+    }
+
+    /// Without cosign, the installer can't tell who published a Linux
+    /// release's checksums, so it could install what the updater refused.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn release_refused_by_verification_on_linux_is_reinstalled_only_with_its_signature_checked() {
+        let (recovery, reinstall_command) = installer_recovery(
+            ReleaseChannel::Stable,
+            StandaloneRefusal::ReleaseVerification,
+        );
+
+        assert_eq!(
+            reinstall_command,
+            "curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL=stable LPM_INSTALL_REQUIRE_SIGSTORE=1 sh"
+        );
+        assert!(recovery.contains("cosign"), "{recovery}");
+    }
+
+    /// The installer checks the app's Developer ID signature, which only
+    /// LPM's release workflow can produce.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn release_refused_by_verification_on_macos_is_reinstalled_through_the_developer_id_check() {
+        assert_eq!(
+            installer_recovery(
+                ReleaseChannel::Stable,
+                StandaloneRefusal::ReleaseVerification
+            ),
+            installer_recovery(ReleaseChannel::Stable, StandaloneRefusal::Compatibility)
+        );
+    }
+
+    #[test]
+    fn failures_other_than_a_refusal_keep_their_own_error() {
+        let error = with_installer_recovery(
+            LpmError::Network("connection reset".to_string()),
+            ReleaseChannel::Stable,
+            StandaloneRefusal::ReleaseVerification,
+        );
+
+        assert!(
+            matches!(&error, LpmError::Network(message) if message == "connection reset"),
+            "{error:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_refusals_name_no_installer() {
+        let error = with_installer_recovery(
+            LpmError::SelfUpdate("refused".to_string()),
+            ReleaseChannel::Stable,
+            StandaloneRefusal::Compatibility,
+        );
+
+        assert!(
+            matches!(&error, LpmError::SelfUpdate(reason) if reason == "refused"),
+            "{error:?}"
+        );
     }
 
     #[cfg(target_os = "macos")]

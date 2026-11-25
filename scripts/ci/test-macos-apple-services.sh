@@ -11,18 +11,35 @@ fail() {
 	exit 1
 }
 
-# A fake runner. curl reaches a host unless the hosts file maps it to 0.0.0.0,
-# or, at a --resolve address, unless the firewall holds rules that block
-# 17.0.0.0/8; a host listed in reachable-anyway is reached either way. dig
-# answers 17.253.0.1 for every name, as Apple's DNS does for its own hosts.
-# pfctl accepts rules without applying them when inert-firewall exists.
+# A fake runner.
+#
+# dig answers a host's A records from dns-a.<host> when that exists and from
+# dns-a otherwise, and its AAAA records likewise from dns-aaaa. By default
+# every host has one address in Apple's IPv4 network and one in its IPv6
+# network, and ocsp.apple.com is served only from outside Apple's networks.
+#
+# curl reaches a host by name at the first address the hosts file pins it to,
+# or at an address of its own when the hosts file doesn't name it; at a
+# --resolve address it uses that one. An address is unreachable when the
+# firewall's active rules name it or a network holding it. Without IPv6
+# (no-ipv6) no IPv6 address is reached. A host in never-answers times out
+# whatever happens. A "host status" line in answers-anyway connects whatever
+# is blocked and then exits with that status, such as 35 for a TLS error.
+#
+# pfctl applies the rules it is given, none of them when inert-firewall
+# exists, the IPv4 ones only when inert-ipv6 exists, and refuses them when
+# pfctl-fails exists.
 make_runner() {
 	rm -rf "$work/runner" "$work/state"
 	mkdir -p "$work/runner/bin"
 	printf '127.0.0.1 localhost\n' >"$work/runner/hosts"
 	printf 'default rules\n' >"$work/runner/pf.conf"
+	printf '17.253.0.1\n' >"$work/runner/dns-a"
+	printf '2a01:b740::1\n' >"$work/runner/dns-aaaa"
+	printf '2.22.144.17\n' >"$work/runner/dns-a.ocsp.apple.com"
 	: >"$work/runner/active-rules"
-	: >"$work/runner/reachable-anyway"
+	: >"$work/runner/never-answers"
+	: >"$work/runner/answers-anyway"
 	: >"$work/runner/calls"
 	cat >"$work/runner/bin/pfctl" <<EOF
 #!/bin/bash
@@ -30,7 +47,11 @@ echo "pfctl \$*" >>"$work/runner/calls"
 case "\$1" in
 -E)
 	[ -e "$work/runner/pfctl-fails" ] && { echo "pfctl: syntax error" >&2; exit 1; }
-	[ -e "$work/runner/inert-firewall" ] || cp "\$3" "$work/runner/active-rules"
+	if [ -e "$work/runner/inert-ipv6" ]; then
+		grep -v inet6 "\$3" >"$work/runner/active-rules"
+	elif [ ! -e "$work/runner/inert-firewall" ]; then
+		cp "\$3" "$work/runner/active-rules"
+	fi
 	echo "pf enabled" >&2
 	echo "Token : 4242" >&2
 	;;
@@ -38,30 +59,44 @@ case "\$1" in
 -X) [ "\$2" = 4242 ] || exit 1 ;;
 esac
 EOF
-	cat >"$work/runner/bin/dig" <<'EOF'
+	cat >"$work/runner/bin/dig" <<EOF
 #!/bin/bash
-echo 17.253.0.1
+case "\$3" in
+A) records="$work/runner/dns-a" ;;
+AAAA) records="$work/runner/dns-aaaa" ;;
+esac
+if [ -e "\$records.\$2" ]; then cat "\$records.\$2"; else cat "\$records"; fi
 EOF
 	cat >"$work/runner/bin/curl" <<EOF
 #!/bin/bash
 address=""
 while [ "\$#" -gt 0 ]; do
 	case "\$1" in
-	--resolve) address="\${2##*:}"; shift ;;
+	--resolve) address="\${2#*:443:}"; shift ;;
 	https://*) url="\$1" ;;
 	esac
 	shift
 done
 host="\${url#https://}"
 host="\${host%/}"
-grep -Fxq "\$host" "$work/runner/reachable-anyway" && exit 0
-if [ -n "\$address" ]; then
-	case "\$address" in
-	17.*) grep -Fq '17.0.0.0/8' "$work/runner/active-rules" && exit 28 ;;
-	esac
-	exit 0
+grep -Fxq "\$host" "$work/runner/never-answers" && exit 28
+status=\$(awk -v host="\$host" '\$1 == host { print \$2 }' "$work/runner/answers-anyway")
+[ -n "\$status" ] && exit "\$status"
+if [ -z "\$address" ]; then
+	address=\$(awk -v host="\$host" '\$2 == host { print \$1; exit }' "$work/runner/hosts")
+	[ -n "\$address" ] || exit 0
 fi
-grep -Eq "^0\\.0\\.0\\.0 \$host\$" "$work/runner/hosts" && exit 7
+address="\${address#[}"
+address="\${address%]}"
+case "\$address" in
+*:*) [ -e "$work/runner/no-ipv6" ] && exit 7 ;;
+esac
+rules="$work/runner/active-rules"
+grep -Eq "[ {]\$address[ }]" "\$rules" && exit 28
+case "\$address" in
+17.*) grep -Fq '17.0.0.0/8' "\$rules" && exit 28 ;;
+2a01:b740:*) grep -Fq '2a01:b740::/32' "\$rules" && exit 28 ;;
+esac
 exit 0
 EOF
 	printf '#!/bin/bash\necho "dscacheutil $*" >>"%s"\n' "$work/runner/calls" >"$work/runner/bin/dscacheutil"
@@ -81,13 +116,38 @@ run_helper() {
 		bash "$helper" "$@"
 }
 
+# Runs block, which must fail with an error containing $2, or else fail the
+# test with $3. When $1 is "before-blocking", block must also have left the
+# hosts file alone.
+expect_block_failure() {
+	local output
+	if output=$(run_helper block "$work/state" 2>&1); then
+		fail "$3"
+	fi
+	case "$output" in
+	*"$2"*) ;;
+	*) fail "$3: $output" ;;
+	esac
+	if [ "$1" = before-blocking ] && [ "$(cat "$work/runner/hosts")" != "127.0.0.1 localhost" ]; then
+		fail "block changed the hosts file before it knew it could show the block works"
+	fi
+}
+
 make_runner
 run_helper block "$work/state" >/dev/null || fail "block did not confirm Apple's services unreachable"
-for host in api.apple-cloudkit.com ocsp.apple.com ocsp2.apple.com crl.apple.com valid.apple.com; do
-	grep -Fxq "0.0.0.0 $host" "$work/runner/hosts" || fail "$host is not blocked by name"
-	grep -Fxq ":: $host" "$work/runner/hosts" || fail "$host is not blocked by name over IPv6"
+for host in api.apple-cloudkit.com ocsp2.apple.com crl.apple.com valid.apple.com; do
+	grep -Fxq "17.253.0.1 $host" "$work/runner/hosts" || fail "$host is not pinned to its address"
+	grep -Fxq "$host 17.253.0.1" "$work/state/targets" || fail "$host's address in Apple's network was not checked"
 done
-grep -Fq 'block drop out quick inet from any to { 17.0.0.0/8 }' "$work/runner/active-rules" \
+for host in api.apple-cloudkit.com ocsp.apple.com ocsp2.apple.com crl.apple.com valid.apple.com; do
+	grep -Fxq "2a01:b740::1 $host" "$work/runner/hosts" || fail "$host is not pinned to its IPv6 address"
+	grep -Fxq "$host [2a01:b740::1]" "$work/state/targets" || fail "$host's IPv6 address was not checked"
+	grep -Fxq "$host" "$work/state/targets" || fail "$host was not checked by name"
+done
+grep -Fxq "2.22.144.17 ocsp.apple.com" "$work/runner/hosts" || fail "ocsp.apple.com is not pinned to its address outside Apple's network"
+grep -Fq '2.22.144.17' "$work/runner/active-rules" \
+	|| fail "the firewall does not block an address outside Apple's networks that an Apple host resolves to"
+grep -Fq '17.0.0.0/8' "$work/runner/active-rules" \
 	|| fail "the firewall does not block Apple's IPv4 network: $(cat "$work/runner/active-rules")"
 grep -Fq '2a01:b740::/32' "$work/runner/active-rules" \
 	|| fail "the firewall does not block Apple's IPv6 networks: $(cat "$work/runner/active-rules")"
@@ -96,27 +156,56 @@ run_helper restore "$work/state"
 [ "$(cat "$work/runner/hosts")" = "127.0.0.1 localhost" ] || fail "restore left this hosts file: $(cat "$work/runner/hosts")"
 [ "$(cat "$work/runner/active-rules")" = "default rules" ] || fail "restore did not reload the default firewall rules"
 grep -Fxq 'pfctl -X 4242' "$work/runner/calls" || fail "restore did not release the firewall token"
-echo "PASS: Apple's services are blocked by name and network, then restored"
+echo "PASS: Apple's hosts are pinned to their addresses, which the firewall drops, and restore undoes it"
 
 make_runner
-printf 'ocsp.apple.com\n' >"$work/runner/reachable-anyway"
-if run_helper block "$work/state" >/dev/null 2>&1; then
-	fail "block reported Apple's services unreachable while one still answered"
-fi
+printf 'ocsp.apple.com 0\n' >"$work/runner/answers-anyway"
+expect_block_failure after-blocking "ocsp.apple.com is still reachable" "block reported Apple's services unreachable while one still answered"
 echo "PASS: block fails when an Apple service still answers"
 
 make_runner
+printf 'ocsp.apple.com 35\n' >"$work/runner/answers-anyway"
+expect_block_failure after-blocking "ocsp.apple.com is still reachable" "a TLS error after connecting was taken for a blocked service"
+echo "PASS: a service that connects and then fails TLS still counts as reachable"
+
+make_runner
 : >"$work/runner/inert-firewall"
-if run_helper block "$work/state" >/dev/null 2>&1; then
-	fail "block reported Apple's network unreachable while the firewall let it through"
+expect_block_failure after-blocking "still reachable" "block reported Apple's services unreachable while the firewall let them through"
+echo "PASS: block fails when the firewall doesn't stop the traffic"
+
+make_runner
+: >"$work/runner/inert-ipv6"
+expect_block_failure after-blocking "still reachable at [2a01:b740::1]" "block reported Apple's IPv6 network unreachable while the firewall let it through"
+echo "PASS: block fails when the firewall doesn't stop traffic to Apple's IPv6 network"
+
+make_runner
+: >"$work/runner/no-ipv6"
+: >"$work/runner/inert-ipv6"
+run_helper block "$work/state" >/dev/null || fail "a runner without IPv6 can't show the IPv6 rules work, and needn't"
+if grep -q '\[' "$work/state/targets"; then
+	fail "an IPv6 address the runner never reached was taken as checked"
 fi
-echo "PASS: block fails when the firewall doesn't stop traffic to Apple's network"
+echo "PASS: IPv6 is checked only where the runner reaches it"
+
+make_runner
+printf 'crl.apple.com\n' >"$work/runner/never-answers"
+expect_block_failure before-blocking "crl.apple.com is unreachable before blocking" "a service that never answered was taken for a blocked one"
+echo "PASS: block fails before blocking when a service doesn't answer to begin with"
+
+make_runner
+printf '2.22.144.17\n' >"$work/runner/dns-a"
+expect_block_failure before-blocking "no address in Apple's IPv4 network answered" "block proceeded with no address in Apple's network to check the firewall against"
+echo "PASS: block fails before blocking when no address in Apple's network answers"
+
+make_runner
+: >"$work/runner/dns-a.crl.apple.com"
+: >"$work/runner/dns-aaaa.crl.apple.com"
+expect_block_failure before-blocking "DNS gave no address for crl.apple.com" "block proceeded with a host it had no address to block for"
+echo "PASS: block fails before blocking when DNS gives a host no address"
 
 make_runner
 : >"$work/runner/pfctl-fails"
-if run_helper block "$work/state" >/dev/null 2>&1; then
-	fail "block succeeded although the firewall refused its rules"
-fi
+expect_block_failure after-blocking "pfctl refused the rules" "block succeeded although the firewall refused its rules"
 run_helper restore "$work/state"
 [ "$(cat "$work/runner/hosts")" = "127.0.0.1 localhost" ] || fail "restore after a refused block left this hosts file: $(cat "$work/runner/hosts")"
 echo "PASS: a refused firewall rule set fails block, and restore still undoes it"

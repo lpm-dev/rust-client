@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 const OUTPUT_LIMIT: usize = 1024 * 1024;
 
-/// The only environment a validation program gets. Variables of the caller's,
-/// such as `DEVELOPER_DIR`, would otherwise change what the system tools do.
+/// The only environment a validation program gets, so none of the caller's
+/// variables can change what a system tool does or prints.
 const VALIDATION_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 pub(super) fn run(

@@ -852,19 +852,14 @@ pub enum LpmError {
     )]
     SelfUpdate(String),
 
-    /// A standalone install's self-update refused the update. The official
-    /// installer verifies the release itself and installs it in `~/.lpm`,
-    /// keeping the user's settings, so it is the way forward.
+    /// A standalone install's self-update refused the update, with how the
+    /// official installer can take over: it verifies the release itself and
+    /// installs it in `~/.lpm`, keeping the user's settings.
     #[error("self-update refused: {reason}")]
-    #[diagnostic(
-        code(lpm::self_update),
-        help(
-            "Reinstall LPM CLI with the official installer, which verifies the release \
-             itself and keeps your settings:\n{reinstall_command}"
-        )
-    )]
+    #[diagnostic(code(lpm::self_update), help("{recovery}:\n{reinstall_command}"))]
     StandaloneSelfUpdate {
         reason: String,
+        recovery: String,
         reinstall_command: String,
     },
 
@@ -1476,6 +1471,7 @@ mod tests {
             LpmError::SelfUpdateRateLimited("x".into()),
             LpmError::StandaloneSelfUpdate {
                 reason: "x".into(),
+                recovery: "x".into(),
                 reinstall_command: "x".into(),
             },
             LpmError::SecurityFloor("x".into()),
@@ -1545,6 +1541,7 @@ mod tests {
     fn refused_standalone_self_update_is_a_self_update_error_naming_the_reinstall_command() {
         let error = LpmError::StandaloneSelfUpdate {
             reason: "the release is not signed".into(),
+            recovery: "Reinstall LPM CLI with the official installer".into(),
             reinstall_command: "curl -fsSL https://cli.lpm.dev/install | sh".into(),
         };
 
@@ -1554,9 +1551,9 @@ mod tests {
             "self-update refused: the release is not signed"
         );
         let help = error.help().unwrap().to_string();
-        assert!(
-            help.ends_with("\ncurl -fsSL https://cli.lpm.dev/install | sh"),
-            "help: {help}"
+        assert_eq!(
+            help,
+            "Reinstall LPM CLI with the official installer:\ncurl -fsSL https://cli.lpm.dev/install | sh"
         );
     }
 

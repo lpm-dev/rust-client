@@ -755,8 +755,12 @@ validate_macos_bundle() {
   # security cms -D would import the profile's certificates into the default
   # keychain, and fails for an account without one. The profile is a sealed
   # resource of the code signature verified above, so it only needs decoding.
+  # macOS's openssl reads OPENSSL_CONF, and with an OpenSSL 3 configuration
+  # there it writes nothing yet exits 0.
   profile_plist="$STAGE_DIR/profile.plist"
-  if ! "$MACOS_OPENSSL_TOOL" smime -verify -noverify -nosigs -inform DER -in "$app_profile" -out "$profile_plist" 2>/dev/null; then
+  rm -f "$profile_plist"
+  if ! (unset OPENSSL_CONF; "$MACOS_OPENSSL_TOOL" smime -verify -noverify -nosigs -inform DER -in "$app_profile" -out "$profile_plist" 2>/dev/null) || \
+     [ ! -s "$profile_plist" ]; then
     echo "ERROR: $app_label has an unreadable provisioning profile."
     return 1
   fi
