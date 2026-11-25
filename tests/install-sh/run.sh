@@ -311,6 +311,7 @@ run_install_sh() {
     LPM_TEST_COSIGN_REFUSED_TRIGGER="${LPM_TEST_COSIGN_REFUSED_TRIGGER:-}" \
     RELEASE_COMMIT="${RELEASE_COMMIT:-}" \
     HOME="$install_root" \
+    CURL_HOME="$install_root" \
     LPM_INSTALL_INSECURE="${LPM_INSTALL_INSECURE:-}" \
     LPM_INSTALL_MIN_VERSION_OVERRIDE="${LPM_INSTALL_MIN_VERSION_OVERRIDE:-}" \
     LPM_INSTALL_REQUIRE_SIGSTORE="${LPM_INSTALL_REQUIRE_SIGSTORE:-}" \
@@ -915,7 +916,8 @@ EOF_SLEEP
     "denied:refused to look up the ticket of downloaded LPM CLI.app (ACCESS_DENIED)" \
     "400:refused to look up the ticket of downloaded LPM CLI.app (HTTP 400)" \
     "emptyerror:refused to look up the ticket of downloaded LPM CLI.app (an unrecognized error)" \
-    "longerror:refused to look up the ticket of downloaded LPM CLI.app (an unrecognized error)"
+    "longerror:refused to look up the ticket of downloaded LPM CLI.app (an unrecognized error)" \
+    "multilineerror:refused to look up the ticket of downloaded LPM CLI.app (an unrecognized error)"
   do
     outcome="${refusal%%:*}"
     expected_error="${refusal#*:}"
@@ -944,17 +946,32 @@ EOF_SLEEP
   done
   pass "macOS install retries answers that name no single ticket, and a request timeout"
 
-  run_with_ticket_outcomes nullrecord dictrecords arraydeleted arrayticket badbase64 issued
+  run_with_ticket_outcomes norecords arraydeleted arrayticket badbase64 issued
   [ "$RUN_RC" -eq 0 ] || fail "malformed answers then a ticket failed the install with exit $RUN_RC: $RUN_OUT"
-  [ "$TICKET_LOOKUPS" -eq 6 ] || fail "a malformed answer carrying the ticket was taken as an answer ($TICKET_LOOKUPS lookups, expected 6)"
-  for detail in "an answer about another record" "an unreadable answer" "an unreadable ticket"; do
-    echo "$RUN_OUT" | grep -qF "did not answer ($detail)" || fail "'$detail' was not retried as such: $RUN_OUT"
+  [ "$TICKET_LOOKUPS" -eq 5 ] || fail "a malformed answer carrying the ticket was taken as an answer ($TICKET_LOOKUPS lookups, expected 5)"
+  for counted in "1:an answer about another record" "2:an unreadable answer" "1:an unreadable ticket"; do
+    [ "$(echo "$RUN_OUT" | grep -cF "did not answer (${counted#*:})")" -eq "${counted%%:*}" ] \
+      || fail "malformed answers were not retried as ${counted%%:*} x '${counted#*:}': $RUN_OUT"
+  done
+  run_with_ticket_outcomes dashticket unpaddedticket notfoundnumericticket issued
+  [ "$RUN_RC" -eq 0 ] || fail "nonstandard base64 or a malformed field beside NOT_FOUND failed the install with exit $RUN_RC: $RUN_OUT"
+  [ "$TICKET_LOOKUPS" -eq 4 ] || fail "nonstandard base64 or a malformed field beside NOT_FOUND decided the lookup ($TICKET_LOOKUPS lookups, expected 4)"
+  for counted in "2:an unreadable ticket" "1:an unreadable answer"; do
+    [ "$(echo "$RUN_OUT" | grep -cF "did not answer (${counted#*:})")" -eq "${counted%%:*}" ] \
+      || fail "nonstandard base64 and a malformed field beside NOT_FOUND were not retried as ${counted%%:*} x '${counted#*:}': $RUN_OUT"
   done
   run_with_ticket_outcomes numericticket numericerror garbage issued
   [ "$RUN_RC" -eq 0 ] || fail "malformed answers then a ticket failed the install with exit $RUN_RC: $RUN_OUT"
   [ "$TICKET_LOOKUPS" -eq 4 ] || fail "a numeric field or a non-JSON page was taken as an answer ($TICKET_LOOKUPS lookups, expected 4)"
   [ "$(echo "$RUN_OUT" | grep -cF "did not answer (an unreadable answer)")" -eq 3 ] \
     || fail "numeric fields and a non-JSON page were not all retried as unreadable: $RUN_OUT"
+  run_with_ticket_outcomes numericfields emptysignedticket nullticketvalue issued
+  [ "$RUN_RC" -eq 0 ] || fail "malformed ticket containers then a ticket failed the install with exit $RUN_RC: $RUN_OUT"
+  [ "$TICKET_LOOKUPS" -eq 4 ] || fail "a malformed ticket container decided the lookup ($TICKET_LOOKUPS lookups, expected 4)"
+  for counted in "2:an unreadable answer" "1:an answer without a ticket"; do
+    [ "$(echo "$RUN_OUT" | grep -cF "did not answer (${counted#*:})")" -eq "${counted%%:*}" ] \
+      || fail "malformed ticket containers were not retried as ${counted%%:*} x '${counted#*:}': $RUN_OUT"
+  done
   pass "macOS install takes only a well-formed answer about exactly one record"
 
   run_with_ticket_outcomes truncated issued
@@ -968,6 +985,23 @@ EOF_SLEEP
   [ "$RUN_RC" -eq 0 ] || fail "JSON nulls beside the ticket failed the install with exit $RUN_RC: $RUN_OUT"
   [ "$TICKET_LOOKUPS" -eq 1 ] || fail "JSON nulls beside the ticket made the install look it up $TICKET_LOOKUPS times"
   pass "macOS install reads the ticket past JSON nulls in the answer"
+
+  run_with_ticket_outcomes exactcap
+  [ "$RUN_RC" -eq 0 ] || fail "a 65,536-byte answer failed the install with exit $RUN_RC: $RUN_OUT"
+  [ "$TICKET_LOOKUPS" -eq 1 ] || fail "a 65,536-byte answer was looked up $TICKET_LOOKUPS times, expected once"
+  run_with_ticket_outcomes overcap issued
+  [ "$RUN_RC" -eq 0 ] || fail "a 65,537-byte answer then a ticket failed the install with exit $RUN_RC: $RUN_OUT"
+  [ "$TICKET_LOOKUPS" -eq 2 ] || fail "a 65,537-byte answer was taken as an answer ($TICKET_LOOKUPS lookups, expected 2)"
+  echo "$RUN_OUT" | grep -qF "did not answer (an oversized answer)" \
+    || fail "a 65,537-byte answer was not reported as oversized: $RUN_OUT"
+  pass "macOS install reads an answer of up to 65,536 bytes and no more"
+
+  run_with_ticket_outcomes interimonly noreason
+  [ "$RUN_RC" -eq 0 ] || fail "an interim-only answer then a reasonless 200 failed the install with exit $RUN_RC: $RUN_OUT"
+  [ "$TICKET_LOOKUPS" -eq 2 ] || fail "an interim-only answer was looked up $TICKET_LOOKUPS times, expected 2 lookups"
+  echo "$RUN_OUT" | grep -qF "did not answer (HTTP 100)" \
+    || fail "an interim-only answer was not retried as HTTP 100: $RUN_OUT"
+  pass "macOS install retries an interim-only answer and reads a status line without a reason phrase"
 
   run_with_ticket_outcomes huge issued
   [ "$RUN_RC" -eq 0 ] || fail "an oversized answer then a ticket failed the install with exit $RUN_RC: $RUN_OUT"
@@ -984,16 +1018,19 @@ EOF_SLEEP
     "$(printf 'fixture-notarization-ticket' | base64)" > "$fdir/redirected-ticket"
   curlrc_home="$(mktemp -d)"
   printf 'location\nfail\n' > "$curlrc_home/.curlrc"
+  RUN_INSTALL_ROOT_OVERRIDE="$curlrc_home"
+  run_with_ticket_outcomes issued
+  [ "$RUN_RC" -eq 0 ] || fail "with a ~/.curlrc, a confirmed ticket failed the install with exit $RUN_RC: $RUN_OUT"
+  [ "$TICKET_LOOKUPS" -eq 1 ] || fail "with a ~/.curlrc, a confirmed ticket was looked up $TICKET_LOOKUPS times"
   for refusal in "302:(HTTP 302)" "403:(HTTP 403)"; do
     outcome="${refusal%%:*}"
-    RUN_INSTALL_ROOT_OVERRIDE="$curlrc_home"
     run_with_ticket_outcomes "$outcome" issued
-    unset RUN_INSTALL_ROOT_OVERRIDE
     [ "$RUN_RC" -ne 0 ] || fail "with a ~/.curlrc, ticket outcome '$outcome' must fail the install"
     [ "$TICKET_LOOKUPS" -eq 1 ] || fail "with a ~/.curlrc, ticket outcome '$outcome' was retried ($TICKET_LOOKUPS lookups)"
     echo "$RUN_OUT" | grep -qF "refused to look up the ticket of downloaded LPM CLI.app ${refusal#*:}" \
       || fail "with a ~/.curlrc, ticket outcome '$outcome' was reported as something else: $RUN_OUT"
   done
+  unset RUN_INSTALL_ROOT_OVERRIDE
   rm -rf "$curlrc_home" "$fdir/redirected-ticket"
   pass "macOS install decides on Apple's answer whatever ~/.curlrc says"
 

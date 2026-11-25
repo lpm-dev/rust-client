@@ -682,17 +682,19 @@ NOTARIZATION_TICKET_TRANSIENT_ERRORS=" THROTTLED TRY_AGAIN_LATER SERVICE_UNAVAIL
 # A ticket record is under 4 KiB; anything far larger isn't one.
 NOTARIZATION_TICKET_RESPONSE_MAX_BYTES=65536
 
-# Prints the lookup answer's value at key path $1, in plutil's format $2.
-# Each value is extracted on its own, so a JSON null elsewhere in the answer,
-# which a plist can't hold, doesn't hide the ones the check reads.
+# Prints the lookup answer's value at key path $1 as a one-value XML plist.
+# Values are extracted one by one: a plist can't hold a JSON null, so a null
+# fails only the extraction of a value that holds it, and plutil writes JSON
+# holding a null only on some macOS versions.
 notarization_ticket_extract() {
-  "$MACOS_PLUTIL_TOOL" -extract "$1" "$2" -o - "$ticket_response" 2>/dev/null
+  "$MACOS_PLUTIL_TOOL" -extract "$1" xml1 -o - "$ticket_response" 2>/dev/null
 }
 
 # Prints the root element of the value at key path $1: the line after
-# `<plist version="1.0">` in its one-value XML plist.
+# `<plist version="1.0">`. Prints nothing for a missing or null value, or one
+# that holds a null.
 notarization_ticket_root() {
-  notarization_ticket_extract "$1" xml1 | sed -n '/^<plist version="1.0">$/{n;p;q;}'
+  notarization_ticket_extract "$1" | sed -n '/^<plist version="1.0">$/{n;p;q;}'
 }
 
 # Prints the string at key path $1. Returns 1 when the answer has no such
@@ -703,6 +705,9 @@ notarization_ticket_string() {
     '') return 1 ;;
     '<string/>'|'<string></string>') return 0 ;;
     '<string>'*'</string>') ;;
+    # A string across lines: no identifier, record name or base64 ticket has
+    # one, so it is judged as an empty string.
+    '<string>'*) return 0 ;;
     *) return 2 ;;
   esac
   printf '%s\n' "$ticket_field_root" | sed -n 's:^<string>\(.*\)</string>$:\1:p'
@@ -747,26 +752,21 @@ lookup_notarization_ticket() {
     fi
     return 0
   fi
-  # `records` must be an array of objects, and hold only one: plutil writes
-  # it as `[`, that record and `]`, whatever the record's key order.
-  ticket_records_json=$(notarization_ticket_extract records json || true)
-  if [ "$ticket_records_json" = "[]" ]; then
+  # The answer must be about this record alone: a second record, or none,
+  # means it is about something else.
+  if notarization_ticket_extract records.1 >/dev/null || \
+     notarization_ticket_extract records.1.recordName >/dev/null || \
+     [ "$(notarization_ticket_root records)" = '<array/>' ]; then
     ticket_lookup_detail="an answer about another record"
     return 0
   fi
-  ticket_record_json=$(notarization_ticket_extract records.0 json || true)
-  case "$ticket_records_json:$ticket_record_json" in
-    '['*']:{'*'}') ;;
-    *) ticket_lookup_detail="an unreadable answer"; return 0 ;;
-  esac
   ticket_field_status=0
   ticket_answered_record=$(notarization_ticket_string records.0.recordName) || ticket_field_status=$?
   if [ "$ticket_field_status" -ne 0 ]; then
     ticket_lookup_detail="an unreadable answer"
     return 0
   fi
-  if [ "${#ticket_records_json}" -ne "$((${#ticket_record_json} + 2))" ] || \
-     [ "$ticket_answered_record" != "$ticket_record" ]; then
+  if [ "$ticket_answered_record" != "$ticket_record" ]; then
     ticket_lookup_detail="an answer about another record"
     return 0
   fi
@@ -777,8 +777,19 @@ lookup_notarization_ticket() {
   ticket_value_status=0
   ticket_value=$(notarization_ticket_string records.0.fields.signedTicket.value) || ticket_value_status=$?
   ticket_deleted=$(notarization_ticket_root records.0.deleted)
-  case "$ticket_error_status:$ticket_value_status:$ticket_deleted" in
-    2:*|*:2:*|*:*:'<false/>'|*:*:'<true/>'|*:*:) ;;
+  case "$ticket_deleted" in
+    ''|'<false/>'|'<true/>') ;;
+    *) ticket_error_status=2 ;;
+  esac
+  # `fields` and `signedTicket` are objects when present, and a signedTicket
+  # holds its value.
+  case "$(notarization_ticket_root records.0.fields)" in
+    ''|'<dict>'|'<dict/>') ;;
+    *) ticket_error_status=2 ;;
+  esac
+  case "$(notarization_ticket_root records.0.fields.signedTicket)" in
+    '') ;;
+    '<dict>'|'<dict/>') [ "$ticket_value_status" -eq 0 ] || ticket_error_status=2 ;;
     *) ticket_error_status=2 ;;
   esac
   case "$ticket_error_status:$ticket_value_status:$ticket_deleted" in

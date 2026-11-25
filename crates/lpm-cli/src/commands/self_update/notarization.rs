@@ -162,7 +162,10 @@ async fn lookup(client: &reqwest::Client, lookup_url: &str, record_name: &str) -
         Err(lpm_http::ResponseBodyError::Read(error)) => {
             Lookup::Unavailable(lpm_http::display_error(&error.without_url()).to_string())
         }
-        Err(_) => Lookup::Unavailable("an oversized answer".to_string()),
+        Err(
+            lpm_http::ResponseBodyError::DeclaredTooLarge { .. }
+            | lpm_http::ResponseBodyError::StreamedTooLarge { .. },
+        ) => Lookup::Unavailable("an oversized answer".to_string()),
     }
 }
 
@@ -298,7 +301,9 @@ mod tests {
         server
     }
 
-    async fn confirm(server: &MockServer, retries: usize) -> (Result<(), LpmError>, Vec<Duration>) {
+    /// Confirms `TICKET` against `server`, returning the outcome and what the
+    /// service said before each retry.
+    async fn confirm(server: &MockServer, retries: usize) -> (Result<(), LpmError>, Vec<String>) {
         let mut waits = Vec::new();
         let result = confirm_stapled_ticket(
             &lookup_client().unwrap(),
@@ -306,7 +311,7 @@ mod tests {
             CDHASH,
             TICKET,
             &vec![Duration::from_millis(1); retries],
-            |delay, _| waits.push(delay),
+            |_, detail| waits.push(detail.to_string()),
         )
         .await;
         (result, waits)
@@ -338,7 +343,7 @@ mod tests {
             ResponseTemplate::new(429),
             ResponseTemplate::new(408),
             ResponseTemplate::new(200).set_body_string("<html>captive portal</html>"),
-            ResponseTemplate::new(200).set_body_bytes(vec![b' '; RESPONSE_MAX_BYTES + 1]),
+            ResponseTemplate::new(200).set_body_bytes(padded_issued(RESPONSE_MAX_BYTES + 1)),
             ResponseTemplate::new(200).set_body_json(issued(TICKET)),
         ])
         .await;
@@ -346,8 +351,42 @@ mod tests {
         let (result, waits) = confirm(&server, 6).await;
 
         result.unwrap();
-        assert_eq!(waits.len(), 6);
+        assert_eq!(
+            waits,
+            [
+                "HTTP 503",
+                "THROTTLED",
+                "HTTP 429",
+                "HTTP 408",
+                "an unreadable answer",
+                "an oversized answer",
+            ]
+        );
         assert_eq!(lookups(&server).await, 7);
+    }
+
+    /// An answer that issues `TICKET`, padded to exactly `size` bytes.
+    fn padded_issued(size: usize) -> Vec<u8> {
+        let mut answer = issued(TICKET);
+        answer["records"][0]["padding"] = serde_json::Value::from("");
+        let unpadded = serde_json::to_vec(&answer).unwrap().len();
+        answer["records"][0]["padding"] = serde_json::Value::from("x".repeat(size - unpadded));
+        let body = serde_json::to_vec(&answer).unwrap();
+        assert_eq!(body.len(), size);
+        body
+    }
+
+    #[tokio::test]
+    async fn answer_of_exactly_the_size_limit_is_read() {
+        let server = ticket_service(vec![
+            ResponseTemplate::new(200).set_body_bytes(padded_issued(RESPONSE_MAX_BYTES)),
+        ])
+        .await;
+
+        let (result, waits) = confirm(&server, 5).await;
+
+        result.unwrap();
+        assert!(waits.is_empty(), "{waits:?}");
     }
 
     #[tokio::test]
@@ -466,7 +505,8 @@ mod tests {
         ));
     }
 
-    /// install.sh's harness feeds the same malformed records to its parser.
+    /// install.sh's harness feeds the same malformed records to its parser,
+    /// apart from the null-holding ones noted below.
     #[test]
     fn malformed_record_fields_are_classified_as_install_sh_classifies_them() {
         let mut deleted_string = issued(TICKET);
@@ -483,8 +523,17 @@ mod tests {
         let value = array_ticket["records"][0]["fields"]["signedTicket"]["value"].clone();
         array_ticket["records"][0]["fields"]["signedTicket"]["value"] = serde_json::json!([value]);
         let record = issued(TICKET)["records"][0].clone();
-        let null_record = serde_json::json!({ "records": [record, null] });
         let dict_records = serde_json::json!({ "records": { "0": record } });
+        let mut numeric_fields = issued(TICKET);
+        numeric_fields["records"][0]["fields"] = serde_json::Value::from(5);
+        numeric_fields["records"][0]["serverErrorCode"] = serde_json::Value::from("ACCESS_DENIED");
+        let mut empty_signed_ticket = issued(TICKET);
+        empty_signed_ticket["records"][0]["fields"]["signedTicket"] = serde_json::json!({});
+        empty_signed_ticket["records"][0]["serverErrorCode"] =
+            serde_json::Value::from("ACCESS_DENIED");
+        let mut null_ticket_value = issued(TICKET);
+        null_ticket_value["records"][0]["fields"]["signedTicket"]["value"] =
+            serde_json::Value::Null;
 
         for answer in [
             deleted_string,
@@ -492,8 +541,10 @@ mod tests {
             numeric_ticket,
             array_deleted,
             array_ticket,
-            null_record,
             dict_records,
+            numeric_fields,
+            empty_signed_ticket,
+            null_ticket_value,
         ] {
             assert_eq!(
                 parse_lookup(&serde_json::to_vec(&answer).unwrap(), RECORD),
@@ -501,10 +552,22 @@ mod tests {
                 "{answer}"
             );
         }
-        assert_eq!(
-            parse_lookup(&serde_json::to_vec(&record_error("")).unwrap(), RECORD),
-            Lookup::Refused("an unrecognized error".to_string())
-        );
+        for code in ["", "BAD\nCODE"] {
+            assert_eq!(
+                parse_lookup(&serde_json::to_vec(&record_error(code)).unwrap(), RECORD),
+                Lookup::Refused("an unrecognized error".to_string()),
+                "{code:?}"
+            );
+        }
+        // plutil can't extract a value that holds a JSON null, so install.sh
+        // reads `[record, null]`, `{"0": record}` and null-holding containers
+        // by their record alone, where this parser retries. Either way only
+        // the exact ticket confirms.
+        let null_record = serde_json::json!({ "records": [issued(TICKET)["records"][0], null] });
+        assert!(matches!(
+            parse_lookup(&serde_json::to_vec(&null_record).unwrap(), RECORD),
+            Lookup::Unavailable(_)
+        ));
     }
 
     #[test]

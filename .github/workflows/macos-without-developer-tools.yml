@@ -116,24 +116,15 @@ jobs:
           grep -q 'test result: ok. 4 passed' "$RUNNER_TEMP/signed-release-tests.log"
 
       - name: Fresh install through the official installer
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           unset DEVELOPER_DIR
           rm -rf "$HOME/.lpm"
-          # The installer asks GitHub's API for the latest release without a
-          # token; hosted runners share that limit, so a refusal is retried.
-          for attempt in 1 2 3; do
-            status=0
-            env PATH=/usr/bin:/bin:/usr/sbin:/sbin SHELL=/bin/zsh sh install.sh > "$RUNNER_TEMP/fresh-install.log" 2>&1 || status=$?
-            cat "$RUNNER_TEMP/fresh-install.log"
-            [ "$status" -ne 0 ] && grep -q 'Failed to detect latest stable version' "$RUNNER_TEMP/fresh-install.log" || break
-            sleep 60
-          done
-          test "$status" -eq 0
-          installer_stable=$(gh release view --repo lpm-dev/rust-client --json tagName --jq .tagName)
-          test "$(LPM_NO_UPDATE_CHECK=1 "$HOME/.lpm/bin/lpm" --version | sed -n 1p)" = "lpm ${installer_stable#v}"
+          # The version is named: the installer's own latest-release lookup
+          # is unauthenticated, and hosted runners share GitHub's hourly
+          # limit for it. tests/install-sh covers that lookup.
+          env PATH=/usr/bin:/bin:/usr/sbin:/sbin SHELL=/bin/zsh LPM_INSTALL_VERSION="v$INSTALLER_STABLE" sh install.sh
+          test "$(LPM_NO_UPDATE_CHECK=1 "$HOME/.lpm/bin/lpm" --version | sed -n 1p)" = "lpm $INSTALLER_STABLE"
 
       - name: In-place upgrade of an affected install through the official installer
         env:
@@ -159,12 +150,10 @@ jobs:
             || { cat "$RUNNER_TEMP/affected-self-update.log"; exit 1; }
           (cd "$HOME/.lpm" && find . -type f ! -path './bin/*' ! -path './libexec/*' -print0 \
             | xargs -0 shasum -a 256) > "$RUNNER_TEMP/settings"
-          # The version is named so the job asks GitHub's API for the latest
-          # release once, in the fresh install, within its unauthenticated limit.
           env PATH=/usr/bin:/bin:/usr/sbin:/sbin SHELL=/bin/zsh LPM_INSTALL_VERSION="v$INSTALLER_STABLE" sh install.sh
           (cd "$HOME/.lpm" && shasum -a 256 --check --quiet "$RUNNER_TEMP/settings")
           test "$(LPM_NO_UPDATE_CHECK=1 "$lpm" --version | sed -n 1p)" = "lpm $INSTALLER_STABLE"
-          grep -qx 'minimum-release-age-secs = 259200' "$HOME/.lpm/config.toml"
+          grep -Eqx 'minimum-release-age-secs = "?259200"?' "$HOME/.lpm/config.toml"
           test "$(grep -c '\.lpm/bin' "$HOME/.zshrc")" -eq 1
 
       - name: The latest stable release's own updater takes the newest nightly
@@ -174,8 +163,10 @@ jobs:
           set -euo pipefail
           unset DEVELOPER_DIR
           lpm="$HOME/.lpm/bin/lpm"
+          nightly() { curl -fsSL https://registry.npmjs.org/@lpm-registry/cli/nightly | jq -er .version; }
+          before=$(nightly)
           status=0
-          "$lpm" self-update --channel nightly --refresh > "$RUNNER_TEMP/latest-self-update.log" 2>&1 || status=$?
+          NO_COLOR=1 "$lpm" self-update --channel nightly --refresh > "$RUNNER_TEMP/latest-self-update.log" 2>&1 || status=$?
           cat "$RUNNER_TEMP/latest-self-update.log"
           if [ "$(printf '%s\n%s\n' "$INSTALLER_STABLE" "$LAST_UPDATER_NEEDING_XCODE" | sort -V | tail -n 1)" = "$LAST_UPDATER_NEEDING_XCODE" ]; then
             test "$status" -ne 0
@@ -183,9 +174,9 @@ jobs:
             echo "::notice::$INSTALLER_STABLE still needs Xcode to update; its users recover through the installer"
           else
             test "$status" -eq 0
-            # Read after the update, so a nightly published meanwhile counts.
-            nightly=$(curl -fsSL https://registry.npmjs.org/@lpm-registry/cli/nightly | jq -er .version)
-            test "$(LPM_NO_UPDATE_CHECK=1 "$lpm" --version | sed -n 1p)" = "lpm $nightly"
+            chosen=$(sed -n 's/.*LPM updated to \([^ ]*\).*/\1/p' "$RUNNER_TEMP/latest-self-update.log")
+            [ "$chosen" = "$before" ] || [ "$chosen" = "$(nightly)" ]
+            test "$(LPM_NO_UPDATE_CHECK=1 "$lpm" --version | sed -n 1p)" = "lpm $chosen"
           fi
 
       - name: Self-update from this build to the latest signed releases
@@ -203,11 +194,16 @@ jobs:
             mkdir -p "$app/Contents/MacOS"
             cp "$RUNNER_TEMP/fixed/lpm-rs" "$app/Contents/MacOS/lpm-rs"
             test "$(LPM_NO_UPDATE_CHECK=1 "$lpm" --version | sed -n 1p)" = "lpm $FIXED_BUILD_VERSION"
-            "$lpm" self-update --channel "$channel" --refresh
             if [ "$channel" = stable ]; then tag=latest; else tag=nightly; fi
-            # Read after the update, so a release published meanwhile counts.
-            expected=$(curl -fsSL "https://registry.npmjs.org/@lpm-registry/cli/$tag" | jq -er .version)
-            test "$(LPM_NO_UPDATE_CHECK=1 "$lpm" --version | sed -n 1p)" = "lpm $expected"
+            before=$(curl -fsSL "https://registry.npmjs.org/@lpm-registry/cli/$tag" | jq -er .version)
+            "$lpm" self-update --channel "$channel" --refresh --json | tee "$RUNNER_TEMP/self-update-$channel.json"
+            jq -e '.applied and .verified' "$RUNNER_TEMP/self-update-$channel.json"
+            chosen=$(jq -er .latest "$RUNNER_TEMP/self-update-$channel.json")
+            # What the updater chose must be the release the dist-tag named,
+            # before or after the update, and must be what got installed.
+            [ "$chosen" = "$before" ] || \
+              [ "$chosen" = "$(curl -fsSL "https://registry.npmjs.org/@lpm-registry/cli/$tag" | jq -er .version)" ]
+            test "$(LPM_NO_UPDATE_CHECK=1 "$lpm" --version | sed -n 1p)" = "lpm $chosen"
             /usr/bin/codesign --verify --strict \
               -R '=anchor apple generic and certificate leaf[subject.OU] = "823S8YKMRW" and notarized' "$app"
           done

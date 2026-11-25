@@ -58,6 +58,14 @@ case "\$(cat "$work/runner/selected")" in
 *) echo "xcode-select: error: tool 'stapler' requires Xcode, but active developer directory '\$(cat "$work/runner/selected")' is a command line tools instance" >&2; exit 1 ;;
 esac
 EOF
+	# Like getconf: prints the per-user temporary directory, or nothing when
+	# getconf-fails exists.
+	cat >"$work/runner/bin/getconf" <<EOF
+#!/bin/bash
+[ -e "$work/runner/getconf-fails" ] && exit 1
+echo "$work/user temp"
+EOF
+	mkdir -p "$work/cache dir" "$work/user temp"
 	chmod +x "$work/runner/bin/"*
 }
 
@@ -67,9 +75,9 @@ run_helper() {
 		XCODE_SELECT_BIN="$work/runner/bin/xcode-select" \
 		XCRUN_BIN="$work/runner/bin/xcrun" \
 		STAPLER_BIN="$work/runner/bin/stapler" \
-		XCRUN_CACHE_DIR="$work/cache dir" \
+		GETCONF_BIN="$work/runner/bin/getconf" \
 		SUDO="" \
-		TMPDIR="$work" \
+		TMPDIR="$work/cache dir" \
 		bash "$helper" "$@"
 }
 
@@ -127,11 +135,19 @@ echo "PASS: restore without hidden tools changes nothing"
 
 make_runner
 printf '%s\n' "$work/runner/Applications/Xcode_26.0.app/Contents/Developer" >"$work/runner/selected"
-mkdir -p "$work/cache dir"
 : >"$work/cache dir/xcrun_db"
+: >"$work/user temp/xcrun_db"
 run_helper hide none "$work/state" >/dev/null
-[ ! -e "$work/cache dir/xcrun_db" ] || fail "hiding developer tools left xcrun's cache of their paths"
+[ ! -e "$work/cache dir/xcrun_db" ] && [ ! -e "$work/user temp/xcrun_db" ] \
+	|| fail "hiding developer tools left xcrun's cache of their paths"
 run_helper restore "$work/state"
 [ "$(cat "$work/runner/selected")" = "$work/runner/Applications/Xcode_26.0.app/Contents/Developer" ] \
 	|| fail "restore selected $(cat "$work/runner/selected") instead of the Xcode selected before"
 echo "PASS: restore selects the developer directory selected before"
+
+make_runner
+: >"$work/runner/getconf-fails"
+run_helper hide none "$work/state" >/dev/null || fail "hide stopped when getconf named no per-user temporary directory"
+run_helper restore "$work/state" || fail "restore stopped when getconf named no per-user temporary directory"
+[ "$(apps)" = "Safari.app Xcode.app Xcode_16.4.app Xcode_26.0.app " ] || fail "restore left these apps: $(apps)"
+echo "PASS: a missing per-user temporary directory doesn't stop hide or restore"

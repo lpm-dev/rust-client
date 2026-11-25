@@ -25,8 +25,14 @@ request is answered with line n of `ticket-outcomes` (default `issued`):
 and `serverErrorCode` fields, `withnull` adds JSON nulls to an issued
 ticket, `extrarecord` answers with two records, `emptyticket` with an empty
 ticket, `truncated` closes the connection before its declared length, and
-`nullrecord`/`dictrecords`/`arraydeleted`/`arrayticket`/`badbase64`/
-`numericticket`/`numericerror` carry the issued ticket in a malformed answer,
+`norecords` names no record, `arraydeleted`/`arrayticket`/`badbase64`/
+`numericticket`/`numericerror`/`numericfields`/`emptysignedticket`/
+`nullticketvalue` carry the issued ticket in a malformed answer, `multilineerror` returns an error code with a
+newline, `dashticket`/`unpaddedticket` carry base64 outside the standard
+padded alphabet, `notfoundnumericticket` pairs NOT_FOUND with a numeric
+ticket, `exactcap`/`overcap` pad an issued
+ticket's answer to 65,536 and 65,537 bytes, `interimonly` sends only
+`100 Continue`, `noreason` answers `HTTP/1.1 200` without a reason phrase,
 `wrongrecord` answers about another record, `garbage` returns a non-JSON
 page, `huge` streams 16 MiB without a length (and notes in `ticket-hangups` a
 client that hangs up first), `drop` closes the
@@ -133,12 +139,33 @@ def main() -> int:
                         self.wfile.write(f"{len(chunk):x}\r\n".encode("ascii") + chunk + b"\r\n")
                         self.wfile.flush()
                     self.wfile.write(b"0\r\n\r\n")
-                except (BrokenPipeError, ConnectionResetError):
+                except OSError:
                     with open(os.path.join(fixture_dir, "ticket-hangups"), "a", encoding="utf-8") as f:
                         f.write(record_name + "\n")
                 return
             if outcome == "garbage":
                 self.answer(200, b"<html>captive portal</html>")
+                return
+            ticket_value = base64.b64encode(DEFAULT_TICKET).decode("ascii")
+            issued_record = {"recordName": record_name, "deleted": False, "fields": {"signedTicket": {"value": ticket_value}}}
+            if outcome in ("exactcap", "overcap"):
+                size = 65536 if outcome == "exactcap" else 65537
+                body = json.dumps({"records": [dict(issued_record, padding="")]}).encode("utf-8")
+                body = json.dumps({"records": [dict(issued_record, padding="x" * (size - len(body)))]}).encode("utf-8")
+                assert len(body) == size
+                self.answer(200, body)
+                return
+            if outcome == "interimonly":
+                self.wfile.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+                self.wfile.flush()
+                self.close_connection = True
+                self.connection.shutdown(2)
+                return
+            if outcome == "noreason":
+                body = json.dumps({"records": [issued_record]}).encode("utf-8")
+                self.wfile.write(b"HTTP/1.1 200\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body)
+                self.wfile.flush()
+                self.close_connection = True
                 return
             if outcome == "truncated":
                 body = json.dumps({"records": [{"recordName": record_name, "fields": {"signedTicket": {"value": base64.b64encode(DEFAULT_TICKET).decode("ascii")}}}]}).encode("utf-8")
@@ -152,12 +179,18 @@ def main() -> int:
                 self.connection.shutdown(2)
                 return
             shapes = {
-                "nullrecord": lambda r: {"records": [r, None]},
-                "dictrecords": lambda r: {"records": {"0": r}},
+                "norecords": lambda r: {"records": []},
                 "arraydeleted": lambda r: {"records": [dict(r, deleted=[False])]},
                 "arrayticket": lambda r: {"records": [dict(r, fields={"signedTicket": {"value": [r["fields"]["signedTicket"]["value"]]}})]},
                 "badbase64": lambda r: {"records": [dict(r, fields={"signedTicket": {"value": "not base64!"}})]},
                 "numericticket": lambda r: {"records": [dict(r, fields={"signedTicket": {"value": 5}})]},
+                "numericfields": lambda r: {"records": [dict(r, fields=5, serverErrorCode="ACCESS_DENIED")]},
+                "emptysignedticket": lambda r: {"records": [dict(r, fields={"signedTicket": {}}, serverErrorCode="ACCESS_DENIED")]},
+                "nullticketvalue": lambda r: {"records": [dict(r, fields={"signedTicket": {"value": None}})]},
+                "multilineerror": lambda r: {"records": [dict(r, serverErrorCode="BAD\nCODE")]},
+                "dashticket": lambda r: {"records": [dict(r, fields={"signedTicket": {"value": "Zm9v-m9v"}})]},
+                "unpaddedticket": lambda r: {"records": [dict(r, fields={"signedTicket": {"value": "YWJjZA"}})]},
+                "notfoundnumericticket": lambda r: {"records": [dict(r, serverErrorCode="NOT_FOUND", fields={"signedTicket": {"value": 5}})]},
             }
             if outcome in shapes:
                 ticket = base64.b64encode(DEFAULT_TICKET).decode("ascii")
