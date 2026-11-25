@@ -28,7 +28,6 @@ tempfile = "3"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
-filetime = { workspace = true }
 wiremock = "0.6"
 tokio = { workspace = true }
 

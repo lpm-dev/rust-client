@@ -793,8 +793,7 @@ mod tests {
         assert_eq!(original.len(), tampered.len());
 
         let hash = write_binary(&bin, original);
-        let original_mtime =
-            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&bin).unwrap());
+        let original_mtime = std::fs::metadata(&bin).unwrap().modified().unwrap();
         let sidecar = make_sidecar_with_snapshot(
             "oxlint",
             "1.58.0",
@@ -808,7 +807,7 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(10));
         std::fs::write(&bin, tampered).unwrap();
-        filetime::set_file_mtime(&bin, original_mtime).unwrap();
+        std::fs::set_times(&bin, std::fs::FileTimes::new().set_modified(original_mtime)).unwrap();
 
         let result = validate_for_reuse(
             &sidecar_path,

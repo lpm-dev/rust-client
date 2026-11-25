@@ -1167,9 +1167,10 @@ mod tests {
         ]);
         let forward = forward.finish(dir.path()).unwrap();
 
-        filetime::set_file_mtime(
+        std::fs::set_times(
             dir.path().join("lib"),
-            filetime::FileTime::from_unix_time(1, 0),
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
         )
         .unwrap();
 

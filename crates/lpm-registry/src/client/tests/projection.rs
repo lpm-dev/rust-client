@@ -66,7 +66,7 @@ fn replace_payload(client: &RegistryClient, key: &str, payload: &[u8]) {
     bytes.truncate(payload_start);
     bytes.extend_from_slice(payload);
     std::fs::write(&path, bytes).unwrap();
-    filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(expiry)).unwrap();
+    std::fs::set_times(&path, std::fs::FileTimes::new().set_modified(expiry)).unwrap();
 }
 
 #[tokio::test]
@@ -263,7 +263,12 @@ async fn revalidation_keeps_a_projection_only_while_the_entry_is_refreshed_in_pl
 
         let key = client.npm_direct_metadata_cache_key("pkg", PublicNpmAccess::ANONYMOUS);
         let entry = client.cache_path(&key).unwrap();
-        filetime::set_file_mtime(&entry, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+        std::fs::set_times(
+            &entry,
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+        )
+        .unwrap();
         Mock::given(method("GET"))
             .and(path("/pkg"))
             .and(header("If-None-Match", "\"initial\""))
@@ -329,7 +334,12 @@ async fn weak_etag_from_200_matches_strong_etag_from_304_in_place_and_skips_late
     let key = client.npm_direct_metadata_cache_key("pkg", PublicNpmAccess::ANONYMOUS);
     let entry = client.cache_path(&key).unwrap();
     let original_bytes = std::fs::read(&entry).unwrap();
-    filetime::set_file_mtime(&entry, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+    std::fs::set_times(
+        &entry,
+        std::fs::FileTimes::new()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+    )
+    .unwrap();
 
     Mock::given(method("GET"))
         .and(path("/pkg"))

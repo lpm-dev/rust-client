@@ -381,11 +381,10 @@ async fn conditional_no_store_response_invalidates_reusable_canonical_history() 
                 PublicNpmAccess::ANONYMOUS,
             ))
             .unwrap();
-        filetime::set_file_mtime(
+        std::fs::set_times(
             path,
-            filetime::FileTime::from_system_time(
-                std::time::SystemTime::now() - Duration::from_secs(1),
-            ),
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(1)),
         )
         .unwrap();
         fetch(&client, "1.0.0").await;

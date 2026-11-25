@@ -30,7 +30,6 @@ hmac = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 rmp-serde = { workspace = true }
-filetime = { workspace = true }
 httpdate = { workspace = true }
 secrecy = { workspace = true }
 zeroize = "1"
