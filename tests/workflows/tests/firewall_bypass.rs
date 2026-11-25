@@ -461,3 +461,169 @@ fn bypass_remove_and_clear_need_no_approval() {
             .exists()
     );
 }
+
+#[tokio::test]
+async fn global_install_block_names_a_rule_for_every_project() {
+    let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
+    let project = enforcing_project();
+    let root = std::fs::canonicalize(project.path())
+        .unwrap()
+        .display()
+        .to_string();
+    write_signed_firewall_bypass(
+        &project,
+        &[stored_rule(
+            "agent-tool",
+            serde_json::json!({ "scope": "project", "project_root": root }),
+        )],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--color", "never", "install", "-g", "agent-tool@1.0.0"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains(AGENT_TOOL_HINT), "{stderr}");
+    assert!(!stderr.contains("--project"), "{stderr}");
+}
+
+async fn mount_blocked_global_update(mock: &MockRegistry, name: &str) {
+    let bin_path = format!("bin/{name}.js");
+    let tarball = support::mock_registry::make_tarball_from_pkg_json(
+        serde_json::json!({ "name": name, "version": "1.1.0", "bin": { name: bin_path } }),
+        &[(bin_path.as_str(), b"#!/usr/bin/env node\n" as &[u8])],
+    );
+    let tarball_path = format!("/tarballs/{name}/-/{name}-1.1.0.tgz");
+    Mock::given(method("GET"))
+        .and(path(format!("/{name}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": name,
+            "dist-tags": { "latest": "1.1.0" },
+            "versions": {
+                "1.0.0": { "name": name, "version": "1.0.0" },
+                "1.1.0": {
+                    "name": name,
+                    "version": "1.1.0",
+                    "bin": { name: bin_path },
+                    "dist": {
+                        "tarball": format!("{}{tarball_path}", mock.url()),
+                        "integrity": support::mock_registry::compute_integrity(&tarball)
+                    }
+                }
+            },
+            "time": {
+                "1.0.0": "2025-01-01T00:00:00.000Z",
+                "1.1.0": "2025-01-01T00:00:00.000Z"
+            }
+        })))
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path(tarball_path))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball))
+        .mount(mock.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path(VERDICTS_PATH))
+        .and(body_string_contains(format!("\"name\":\"{name}\"")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "requestId": "global-update",
+            "policyMode": "enforce",
+            "summary": { "total": 1, "allow": 0, "warn": 0, "block": 1, "unknown": 0, "matched": 1 },
+            "decisions": [{
+                "decisionId": format!("global-update:{name}"),
+                "name": name,
+                "version": "1.1.0",
+                "action": "block",
+                "verdict": "suspicious",
+                "reason": "client policy maps lpm_ai_agent_control_surface to block",
+                "matchSource": "package",
+                "policyMode": "enforce",
+                "enqueueScan": false,
+                "policy": { "group": "lpm_ai_agent_control_surface" },
+                "display": {
+                    "summary": "The package can send a credential to a gateway.",
+                    "reportUrl": format!("https://firewall.lpm.dev/npm/{name}/v/1.1.0")
+                }
+            }]
+        })))
+        .mount(mock.server())
+        .await;
+}
+
+fn installed_globally(project: &TempProject, names: &[&str]) {
+    let mut manifest = lpm_global::GlobalManifest::default();
+    for name in names {
+        manifest.packages.insert(
+            (*name).to_string(),
+            lpm_global::PackageEntry {
+                saved_spec: "^1".to_string(),
+                resolved: "1.0.0".to_string(),
+                integrity: "sha512-old".to_string(),
+                source: lpm_global::PackageSource::UpstreamNpm,
+                installed_at: lpm_common::Timestamp::now(),
+                root: format!("installs/{name}@1.0.0"),
+                commands: vec![(*name).to_string()],
+            },
+        );
+    }
+    lpm_global::write_for(
+        &lpm_common::LpmRoot::from_dir(project.home().join(".lpm")),
+        &manifest,
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn global_update_block_names_the_bypass_command() {
+    let mock = MockRegistry::start().await;
+    mount_blocked_global_update(&mock, "update-tool").await;
+    let project = enforcing_project();
+    installed_globally(&project, &["update-tool"]);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--color", "never", "global", "update"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("  allow lpm firewall bypass add \"update-tool@1.1.0\"\n"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn global_update_json_offers_one_bypass_command_for_every_blocked_package() {
+    let mock = MockRegistry::start().await;
+    mount_blocked_global_update(&mock, "update-tool").await;
+    mount_blocked_global_update(&mock, "other-tool").await;
+    let project = enforcing_project();
+    installed_globally(&project, &["update-tool", "other-tool"]);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "global", "update"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let results = envelope["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2, "{envelope:#}");
+    for result in results {
+        let package = result["package"].as_str().unwrap();
+        assert_eq!(result["action"], "failed");
+        assert_eq!(result["error_code"], "npm_firewall_blocked");
+        assert_eq!(
+            result["bypass_command"],
+            format!("lpm firewall bypass add \"{package}@1.1.0\"")
+        );
+    }
+    assert_eq!(
+        envelope["next_steps"][0]["command"],
+        "lpm firewall bypass add \"other-tool@1.1.0\" \"update-tool@1.1.0\""
+    );
+}

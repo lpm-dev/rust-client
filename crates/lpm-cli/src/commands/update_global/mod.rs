@@ -194,10 +194,10 @@ pub async fn run(
         match result {
             Ok(plan) => plans.push(plan),
             Err(error) => {
-                let reason = update_failure_reason(&error);
+                let failure = UpdateFailure::planning(&error);
                 if !json_output {
                     let name_safe = sanitize_for_terminal(&target.name);
-                    let reason_safe = sanitize_for_terminal(&reason);
+                    let reason_safe = sanitize_for_terminal(&failure.reason);
                     output::warn_line(install_ui::terminal_line!(
                         "planning {}: {}",
                         install_ui::bold(&name_safe),
@@ -208,7 +208,7 @@ pub async fn run(
                 // block the bulk update.
                 plans.push(UpgradePlan::PlanError {
                     package: target.name,
-                    reason,
+                    failure,
                 });
             }
         }
@@ -240,7 +240,9 @@ pub async fn run(
                 if !install_registry.seed_metadata_for_command(&prep.name, &route, metadata) {
                     ordered_results[index] = Some(UpgradeResult::Failed {
                         package: prep.name.clone(),
-                        reason: "failed to retain validated global-update metadata".to_string(),
+                        failure: UpdateFailure::message(
+                            "failed to retain validated global-update metadata",
+                        ),
                     });
                     continue;
                 }
@@ -271,7 +273,7 @@ pub async fn run(
                     Err(e) => {
                         ordered_results[index] = Some(UpgradeResult::Failed {
                             package,
-                            reason: e.to_string(),
+                            failure: UpdateFailure::from_error(&e),
                         })
                     }
                 }
@@ -279,8 +281,8 @@ pub async fn run(
             UpgradePlan::AlreadyCurrent { package, version } => {
                 ordered_results[index] = Some(UpgradeResult::AlreadyCurrent { package, version });
             }
-            UpgradePlan::PlanError { package, reason } => {
-                ordered_results[index] = Some(UpgradeResult::Failed { package, reason });
+            UpgradePlan::PlanError { package, failure } => {
+                ordered_results[index] = Some(UpgradeResult::Failed { package, failure });
             }
         }
     }
@@ -296,7 +298,7 @@ pub async fn run(
                 Ok(output) => UpgradeResult::Upgraded(output),
                 Err((package, error)) => UpgradeResult::Failed {
                     package,
-                    reason: error.to_string(),
+                    failure: UpdateFailure::from_error(&error),
                 },
             },
         );
@@ -439,13 +441,10 @@ enum UpgradePlan {
         prior_snapshot: Box<serde_json::Value>,
     },
     /// No version change AND no saved_spec change.
-    AlreadyCurrent {
-        package: String,
-        version: String,
-    },
+    AlreadyCurrent { package: String, version: String },
     PlanError {
         package: String,
-        reason: String,
+        failure: UpdateFailure,
     },
 }
 
@@ -717,8 +716,121 @@ enum UpgradeResult {
     },
     Failed {
         package: String,
-        reason: String,
+        failure: UpdateFailure,
     },
+}
+
+/// Why a package didn't update. A firewall block keeps its details so the
+/// output can name the bypass command that lets the update through.
+#[derive(Debug, Clone)]
+struct UpdateFailure {
+    reason: String,
+    firewall_block: Option<Box<lpm_common::NpmFirewallBlockedErrorContext>>,
+}
+
+impl UpdateFailure {
+    fn from_error(error: &LpmError) -> Self {
+        Self::with_reason(error.to_string(), error)
+    }
+
+    fn planning(error: &LpmError) -> Self {
+        Self::with_reason(update_failure_reason(error), error)
+    }
+
+    fn message(reason: &str) -> Self {
+        Self {
+            reason: reason.to_string(),
+            firewall_block: None,
+        }
+    }
+
+    fn with_reason(reason: String, error: &LpmError) -> Self {
+        let firewall_block = match error {
+            LpmError::NpmFirewallBlocked(blocked) => Some(blocked.clone()),
+            _ => None,
+        };
+        Self {
+            reason,
+            firewall_block,
+        }
+    }
+
+    fn to_json(&self, package: &str, action: &str) -> serde_json::Value {
+        let mut json = serde_json::json!({
+            "package": package,
+            "action": action,
+            "reason": self.reason,
+        });
+        if let Some(blocked) = &self.firewall_block {
+            json["error_code"] = serde_json::json!("npm_firewall_blocked");
+            json["bypass_command"] = serde_json::json!(blocked.bypass_command);
+            json["bypass_unavailable_reason"] =
+                serde_json::json!(blocked.bypass_unavailable_reason);
+        }
+        json
+    }
+}
+
+/// One `lpm firewall bypass add` command for every blocked version a rule can
+/// let through, so a person approves them with one prompt. A failure joins
+/// only when its own block offered a command, which means a rule lifts all
+/// of its blocks.
+fn combined_bypass_command<'a>(
+    failures: impl IntoIterator<Item = &'a UpdateFailure>,
+) -> Option<String> {
+    let mut coordinates: Vec<String> = failures
+        .into_iter()
+        .filter_map(|failure| failure.firewall_block.as_deref())
+        .filter(|blocked| blocked.bypass_command.is_some())
+        .flat_map(|blocked| {
+            blocked
+                .packages
+                .iter()
+                .map(lpm_common::NpmFirewallBlockedPackage::coordinate)
+        })
+        .collect();
+    coordinates.sort_unstable();
+    coordinates.dedup();
+    (!coordinates.is_empty())
+        .then(|| crate::firewall_bypass::bypass_add_command(coordinates.iter().map(String::as_str)))
+}
+
+const BYPASS_NEXT_STEP: &str = "Review each report, then allow the blocked versions past LPM Firewall; a person approves it with Touch ID, Windows Hello or a password";
+
+fn print_firewall_bypass_hint<'a>(failures: impl IntoIterator<Item = &'a UpdateFailure>) {
+    let failures: Vec<&UpdateFailure> = failures.into_iter().collect();
+    let mut notes: Vec<&str> = failures
+        .iter()
+        .filter_map(|failure| failure.firewall_block.as_deref())
+        .filter_map(|blocked| blocked.bypass_unavailable_reason.as_deref())
+        .collect();
+    notes.sort_unstable();
+    notes.dedup();
+    for note in notes {
+        install_ui::detail_line(install_ui::terminal_line!(
+            "  {} {}",
+            install_ui::dim("note"),
+            install_ui::field(note),
+        ));
+    }
+    if let Some(command) = combined_bypass_command(failures) {
+        install_ui::detail_line(install_ui::terminal_line!(
+            "  {} {}",
+            install_ui::dim("allow"),
+            install_ui::yellow(&command),
+        ));
+    }
+}
+
+fn with_bypass_next_step<'a>(
+    mut envelope: serde_json::Value,
+    failures: impl IntoIterator<Item = &'a UpdateFailure>,
+) -> serde_json::Value {
+    if let Some(command) = combined_bypass_command(failures) {
+        envelope["next_steps"] =
+            crate::json_contract::command_next_steps(BYPASS_NEXT_STEP, &command);
+    }
+    envelope
 }
 
 struct BatchUpgrade {
@@ -757,7 +869,7 @@ async fn execute_upgrade_batch(
                 index,
                 UpgradeResult::Failed {
                     package: prep.name.clone(),
-                    reason: error.to_string(),
+                    failure: UpdateFailure::from_error(&error),
                 },
             )),
         }
@@ -775,13 +887,13 @@ async fn execute_upgrade_batch(
     }) {
         Ok(prepared) => prepared,
         Err(error) => {
-            let reason = error.to_string();
+            let failure = UpdateFailure::from_error(&error);
             results.extend(locked.into_iter().map(|upgrade| {
                 (
                     upgrade.index,
                     UpgradeResult::Failed {
                         package: upgrade.prep.name.clone(),
-                        reason: reason.clone(),
+                        failure: failure.clone(),
                     },
                 )
             }));
@@ -802,7 +914,7 @@ async fn execute_upgrade_batch(
                 upgrade.index,
                 UpgradeResult::Failed {
                     package: upgrade.prep.name.clone(),
-                    reason: error.to_string(),
+                    failure: UpdateFailure::from_error(&error),
                 },
             )),
         }
@@ -843,7 +955,7 @@ async fn execute_upgrade_batch(
                 upgrade.index,
                 UpgradeResult::Failed {
                     package: upgrade.prep.name.clone(),
-                    reason: error.to_string(),
+                    failure: UpdateFailure::from_error(&error),
                 },
             )),
         }
@@ -864,20 +976,20 @@ async fn execute_upgrade_batch(
                         Ok(output) => UpgradeResult::Upgraded(output),
                         Err(error) => UpgradeResult::Failed {
                             package: upgrade.prep.name.clone(),
-                            reason: error.to_string(),
+                            failure: UpdateFailure::from_error(&error),
                         },
                     };
                     results.push((upgrade.index, result));
                 }
             }
             Err(error) => {
-                let reason = error.to_string();
+                let failure = UpdateFailure::from_error(&error);
                 results.extend(commit_ready.into_iter().map(|upgrade| {
                     (
                         upgrade.index,
                         UpgradeResult::Failed {
                             package: upgrade.prep.name.clone(),
-                            reason: reason.clone(),
+                            failure: failure.clone(),
                         },
                     )
                 }));
@@ -956,22 +1068,20 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
                     "action": "skip",
                     "current": version,
                 }),
-                UpgradePlan::PlanError { package, reason } => serde_json::json!({
-                    "package": package,
-                    "action": "plan_error",
-                    "reason": reason,
-                }),
+                UpgradePlan::PlanError { package, failure } => {
+                    failure.to_json(package, "plan_error")
+                }
             })
             .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+        let envelope = with_bypass_next_step(
+            serde_json::json!({
                 "success": !any_plan_error,
                 "dry_run": true,
                 "plans": entries,
-            }))
-            .unwrap()
+            }),
+            plan_failures(plans),
         );
+        println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
         return;
     }
     let mut any_action = false;
@@ -1018,9 +1128,9 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
                     format!("@{version_safe}").dimmed()
                 );
             }
-            UpgradePlan::PlanError { package, reason } => {
+            UpgradePlan::PlanError { package, failure } => {
                 let package_safe = sanitize_for_terminal(package);
-                let reason_safe = sanitize_for_terminal(reason);
+                let reason_safe = sanitize_for_terminal(&failure.reason);
                 eprintln!(
                     "  {} {} {}",
                     package_safe.bold(),
@@ -1030,9 +1140,24 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
             }
         }
     }
+    print_firewall_bypass_hint(plan_failures(plans));
     if !any_action {
         output::info("Nothing to update.");
     }
+}
+
+fn plan_failures(plans: &[UpgradePlan]) -> impl Iterator<Item = &UpdateFailure> {
+    plans.iter().filter_map(|plan| match plan {
+        UpgradePlan::PlanError { failure, .. } => Some(failure),
+        _ => None,
+    })
+}
+
+fn result_failures(results: &[UpgradeResult]) -> impl Iterator<Item = &UpdateFailure> {
+    results.iter().filter_map(|result| match result {
+        UpgradeResult::Failed { failure, .. } => Some(failure),
+        _ => None,
+    })
 }
 
 fn emit_results(results: &[UpgradeResult], json_output: bool) {
@@ -1065,25 +1190,21 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
                     "action": "skip",
                     "current": version,
                 }),
-                UpgradeResult::Failed { package, reason } => serde_json::json!({
-                    "package": package,
-                    "action": "failed",
-                    "reason": reason,
-                }),
+                UpgradeResult::Failed { package, failure } => failure.to_json(package, "failed"),
             })
             .collect();
         let any_failure = results
             .iter()
             .any(|r| matches!(r, UpgradeResult::Failed { .. }));
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+        let envelope = with_bypass_next_step(
+            serde_json::json!({
                 "success": !any_failure,
                 "dry_run": false,
                 "results": entries,
-            }))
-            .unwrap()
+            }),
+            result_failures(results),
         );
+        println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
         return;
     }
     for r in results {
@@ -1126,9 +1247,9 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
                     install_ui::dim(&format!("@{version_safe}")),
                 ));
             }
-            UpgradeResult::Failed { package, reason } => {
+            UpgradeResult::Failed { package, failure } => {
                 let package_safe = sanitize_for_terminal(package);
-                let reason_safe = sanitize_for_terminal(reason);
+                let reason_safe = sanitize_for_terminal(&failure.reason);
                 output::warn_line(install_ui::terminal_line!(
                     "{}: {}",
                     install_ui::bold(&package_safe),
@@ -1137,6 +1258,7 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
             }
         }
     }
+    print_firewall_bypass_hint(result_failures(results));
 }
 
 /// Manifest-only mutation: change `[packages.<pkg>].saved_spec` to
