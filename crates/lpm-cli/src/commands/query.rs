@@ -60,6 +60,7 @@ struct QueryDataRequirements {
     built: bool,
     vulnerabilities: bool,
     deprecations: bool,
+    skills: bool,
 }
 
 impl QueryDataRequirements {
@@ -103,11 +104,12 @@ impl QueryDataRequirements {
             deprecations: selector.is_some_and(|selector| {
                 selector_uses_pseudo_class(selector, |class| class == PseudoClass::Deprecated)
             }),
+            skills: selector.is_some_and(Selector::uses_skills),
         }
     }
 
     fn needs_disk_state(self) -> bool {
-        self.scripts || self.built
+        self.scripts || self.built || self.skills
     }
 }
 
@@ -137,7 +139,7 @@ fn selector_uses_pseudo_class(
             selector_uses_pseudo_class(parent, predicate)
                 || selector_uses_pseudo_class(child, predicate)
         }
-        Selector::Id(_) => false,
+        Selector::Id(_) | Selector::Skill(_) => false,
     }
 }
 
@@ -161,10 +163,14 @@ pub async fn run(
                 "No selector provided. Usage: lpm query \":eval\" or lpm query --count".into(),
             )
         })?;
-        Some(
-            parse_selector(selector_str)
-                .map_err(|e| LpmError::Registry(format!("Invalid selector: {e}")))?,
-        )
+        let selector = parse_selector(selector_str)
+            .map_err(|e| LpmError::Registry(format!("Invalid selector: {e}")))?;
+        if selector_uses_pseudo_class(&selector, |class| class == PseudoClass::Malware) {
+            return Err(LpmError::Registry(
+                "`:malware` needs a security verdict, which `lpm query` doesn't fetch; use it in a skills allow-list (`package.json > lpm > skills`), where LPM has verdicts".into(),
+            ));
+        }
+        Some(selector)
     };
     let requirements = QueryDataRequirements::for_request(
         selector.as_ref(),
@@ -205,8 +211,7 @@ pub async fn run(
     // Maps use owned `String` keys (not `&str`) because the inventory
     // is built inside the closure and moves out, which would invalidate
     // borrows into `inv.discovery.packages`.
-    let mut has_scripts = Vec::new();
-    let mut is_built = Vec::new();
+    let mut disk_state = PackageDiskState::default();
 
     let inv: PackageInventory = if is_lpm_project {
         let lpm_root_outer = lpm_common::LpmRoot::from_env()?;
@@ -221,14 +226,11 @@ pub async fn run(
             );
             inv.retain_installed();
             if requirements.needs_disk_state() {
-                populate_package_disk_state(
+                disk_state = load_package_disk_state(
                     &inv,
                     Some(&lpm_root_inner),
                     inv.baseline_index.as_ref(),
-                    requirements.scripts,
-                    requirements.built,
-                    &mut has_scripts,
-                    &mut is_built,
+                    requirements,
                 )?;
             }
             Ok(inv)
@@ -242,15 +244,7 @@ pub async fn run(
         );
         inv.retain_installed();
         if requirements.needs_disk_state() {
-            populate_package_disk_state(
-                &inv,
-                None,
-                None,
-                requirements.scripts,
-                requirements.built,
-                &mut has_scripts,
-                &mut is_built,
-            )?;
+            disk_state = load_package_disk_state(&inv, None, None, requirements)?;
         }
         inv
     };
@@ -335,14 +329,17 @@ pub async fn run(
                 version: &package.version,
                 path: &package.path,
                 analysis: inv.analyses[index].as_deref(),
-                has_scripts: has_scripts.get(index).copied().unwrap_or(false),
-                is_built: is_built.get(index).copied().unwrap_or(false),
+                has_scripts: disk_state.has_scripts(index),
+                is_built: disk_state.is_built(index),
                 is_vulnerable: external_state.is_vulnerable(index, &package.name, &package.version),
                 is_deprecated: deprecated_versions
                     .get(&package.name)
                     .is_some_and(|versions| versions.contains(&package.version)),
                 is_root: false,
                 is_workspace_root_dep: false,
+                skills: Some(disk_state.skills(index)),
+                skill: None,
+                malware: None,
             })
             .collect::<Vec<_>>();
         run_count_mode(&contexts, json_output);
@@ -396,14 +393,17 @@ pub async fn run(
             version: &pkg.version,
             path: display_paths[index].as_ref(),
             analysis: inv.analyses[index].as_deref(),
-            has_scripts: has_scripts.get(index).copied().unwrap_or(false),
-            is_built: is_built.get(index).copied().unwrap_or(false),
+            has_scripts: disk_state.has_scripts(index),
+            is_built: disk_state.is_built(index),
             is_vulnerable: external_state.is_vulnerable(index, &pkg.name, &pkg.version),
             is_deprecated: deprecated_versions
                 .get(&pkg.name)
                 .is_some_and(|versions| versions.contains(&pkg.version)),
             is_root: false,
             is_workspace_root_dep: false,
+            skills: Some(disk_state.skills(index)),
+            skill: None,
+            malware: None,
         })
         .collect();
 
@@ -501,6 +501,9 @@ pub async fn run(
                         is_deprecated: p.is_deprecated,
                         is_root: p.is_root,
                         is_workspace_root_dep: p.is_workspace_root_dep,
+                        skills: p.skills,
+                        skill: p.skill,
+                        malware: p.malware,
                     },
                 )
             })
@@ -548,6 +551,9 @@ pub async fn run(
                 }
                 if !pkg.path.is_empty() {
                     obj["path"] = serde_json::json!(pkg.path);
+                }
+                if requirements.skills {
+                    obj["skills"] = serde_json::json!(pkg.skills);
                 }
                 if verbose {
                     if let Some(analysis) = pkg.analysis {
@@ -602,6 +608,13 @@ pub async fn run(
                 )
             );
 
+            if let Some(skills) = pkg.skills.filter(|skills| !skills.is_empty()) {
+                println!(
+                    "      {} {}",
+                    install_ui::dim("skills:"),
+                    install_ui::dim(&skills.join(", "))
+                );
+            }
             let tags = pkg.analysis.map(collect_active_tags).unwrap_or_default();
             if !tags.is_empty() {
                 println!(
@@ -1049,30 +1062,59 @@ fn read_root_dependencies(project_dir: &Path) -> Result<HashSet<String>, LpmErro
     Ok(dependencies)
 }
 
-fn populate_package_disk_state(
+/// What a query read from each package's files, indexed like the
+/// inventory's packages; empty when the query didn't ask for that fact.
+#[derive(Default)]
+struct PackageDiskState {
+    has_scripts: Vec<bool>,
+    is_built: Vec<bool>,
+    skill_names: Vec<Vec<String>>,
+}
+
+impl PackageDiskState {
+    fn has_scripts(&self, index: usize) -> bool {
+        self.has_scripts.get(index).copied().unwrap_or(false)
+    }
+
+    fn is_built(&self, index: usize) -> bool {
+        self.is_built.get(index).copied().unwrap_or(false)
+    }
+
+    fn skills(&self, index: usize) -> &[String] {
+        self.skill_names.get(index).map_or(&[], Vec::as_slice)
+    }
+}
+
+/// The facts one package's files gave.
+struct PackageDiskFacts {
+    has_scripts: bool,
+    is_built: bool,
+    skill_names: Vec<String>,
+}
+
+fn load_package_disk_state(
     inventory: &PackageInventory,
     lpm_root: Option<&lpm_common::LpmRoot>,
     baseline_index: Option<&crate::commands::audit::inventory::ProjectV2BaselineIndex>,
-    load_scripts: bool,
-    load_built: bool,
-    has_scripts: &mut Vec<bool>,
-    is_built: &mut Vec<bool>,
-) -> Result<(), LpmError> {
+    requirements: QueryDataRequirements,
+) -> Result<PackageDiskState, LpmError> {
     use rayon::prelude::*;
 
-    has_scripts.clear();
-    is_built.clear();
     let count = inventory.discovery.packages.len();
-    if load_scripts {
-        has_scripts.resize(count, false);
+    let mut state = PackageDiskState::default();
+    if requirements.scripts {
+        state.has_scripts.resize(count, false);
     }
-    if load_built {
-        is_built.resize(count, false);
+    if requirements.built {
+        state.is_built.resize(count, false);
+    }
+    if requirements.skills {
+        state.skill_names.resize(count, Vec::new());
     }
     let project_root =
         crate::commands::audit::inventory::open_project_root(&inventory.discovery.project_root)
             .ok();
-    let inspect_one = |package: &crate::commands::audit::discovery::DiscoveredPackage| -> Result<(bool, bool), LpmError> {
+    let inspect_one = |package: &crate::commands::audit::discovery::DiscoveredPackage| -> Result<PackageDiskFacts, LpmError> {
         let directory = crate::commands::audit::inventory::open_package_source_directory(
             project_root.as_ref(),
             package,
@@ -1085,7 +1127,7 @@ fn populate_package_disk_state(
                 package.name, package.version
             ))
         })?;
-        let pkg_has_scripts = if load_scripts {
+        let has_scripts = if requirements.scripts {
             check_has_lifecycle_scripts(&directory).map_err(|error| {
                 LpmError::Script(format!(
                     "cannot read scripts for {}@{}: {error}",
@@ -1095,17 +1137,42 @@ fn populate_package_disk_state(
         } else {
             false
         };
-        let pkg_is_built = if load_built {
+        let is_built = if requirements.built {
             has_regular_build_marker(&directory)?
         } else {
             false
         };
-        Ok((pkg_has_scripts, pkg_is_built))
+        let skill_names = if requirements.skills {
+            crate::dependency_skills::skill_directory_names(&directory).map_err(|error| {
+                LpmError::Script(format!(
+                    "cannot read skills for {}@{}: {error}",
+                    package.name, package.version
+                ))
+            })?
+        } else {
+            Vec::new()
+        };
+        Ok(PackageDiskFacts {
+            has_scripts,
+            is_built,
+            skill_names,
+        })
+    };
+    let mut record = |index: usize, facts: PackageDiskFacts| {
+        if requirements.scripts {
+            state.has_scripts[index] = facts.has_scripts;
+        }
+        if requirements.built {
+            state.is_built[index] = facts.is_built;
+        }
+        if requirements.skills {
+            state.skill_names[index] = facts.skill_names;
+        }
     };
 
     if count >= 4 {
         let failed = std::sync::atomic::AtomicBool::new(false);
-        let results: Vec<Option<Result<(bool, bool), LpmError>>> = inventory
+        let results: Vec<Option<Result<PackageDiskFacts, LpmError>>> = inventory
             .discovery
             .packages
             .par_iter()
@@ -1121,29 +1188,18 @@ fn populate_package_disk_state(
             })
             .collect();
         for (index, result) in results.into_iter().enumerate() {
-            let (pkg_has_scripts, pkg_is_built) = match result {
+            let facts = match result {
                 Some(outcome) => outcome?,
                 None => inspect_one(&inventory.discovery.packages[index])?,
             };
-            if load_scripts {
-                has_scripts[index] = pkg_has_scripts;
-            }
-            if load_built {
-                is_built[index] = pkg_is_built;
-            }
+            record(index, facts);
         }
     } else {
         for (index, package) in inventory.discovery.packages.iter().enumerate() {
-            let (pkg_has_scripts, pkg_is_built) = inspect_one(package)?;
-            if load_scripts {
-                has_scripts[index] = pkg_has_scripts;
-            }
-            if load_built {
-                is_built[index] = pkg_is_built;
-            }
+            record(index, inspect_one(package)?);
         }
     }
-    Ok(())
+    Ok(state)
 }
 
 struct LifecycleScriptManifest {

@@ -498,3 +498,74 @@ fn query_package_relationships_do_not_require_a_project_manifest() {
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report.as_array().unwrap().len(), 1, "{report}");
 }
+
+fn seed_skill(project: &TempProject, package: &str, skill: &str) {
+    project.write_file(
+        &format!("node_modules/{package}/skills/{skill}/SKILL.md"),
+        &format!("---\nname: {skill}\ndescription: Guidance for {package}.\n---\nUse it.\n"),
+    );
+}
+
+#[test]
+fn query_selects_packages_by_the_skills_they_ship() {
+    let project = TempProject::empty(
+        r#"{"name":"q","version":"1.0.0","dependencies":{"browser":"1.0.0","plain":"1.0.0"}}"#,
+    );
+    seed_pkg_with_source(&project, "browser", "1.0.0", SRC_CLEAN);
+    seed_pkg_with_source(&project, "plain", "1.0.0", SRC_CLEAN);
+    seed_skill(&project, "browser", "browser-core");
+    seed_skill(&project, "browser", "browser-qa");
+    project.write_file("node_modules/browser/skills/notes.md", "not a skill");
+    project.write_file(
+        "node_modules/plain/skills/README.md",
+        "no skill directories",
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "query", ":skills"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report,
+        serde_json::json!([{
+            "name": "browser",
+            "version": "1.0.0",
+            "path": "node_modules/browser",
+            "skills": ["browser-core", "browser-qa"],
+        }])
+    );
+
+    lpm(&project)
+        .args(["query", "#browser:skill(browser-qa)", "--assert-none"])
+        .assert()
+        .failure();
+    lpm(&project)
+        .args(["query", ":skill(missing), #plain:skills", "--assert-none"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn query_refuses_malware_selectors_because_it_fetches_no_verdicts() {
+    let project =
+        TempProject::empty(r#"{"name":"q","version":"1.0.0","dependencies":{"sample":"1.0.0"}}"#);
+    seed_pkg_with_source(&project, "sample", "1.0.0", SRC_CLEAN);
+
+    let output = lpm(&project)
+        .args(["query", ":skills:not(:malware)"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("`:malware` needs a security verdict"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
