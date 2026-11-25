@@ -15,6 +15,12 @@
 # --published-at gives a published release's real publication time; an
 # unpublished candidate is served as published when Rekor recorded its
 # signature.
+#
+# The updater finds the account's home directory from the system, not from
+# $HOME, and on macOS updates only an app in that home. So this runs only on
+# a disposable CI runner, where it sets the account's ~/.lpm aside and puts
+# it back afterwards. Sigstore's trust root is fetched as installed copies
+# fetch it.
 
 set -euo pipefail
 
@@ -43,6 +49,11 @@ while [ "$#" -gt 0 ]; do
 done
 [ "$#" -eq 4 ] || usage
 
+if [ "${GITHUB_ACTIONS:-}" != true ]; then
+  echo "$0 replaces this account's ~/.lpm while it runs, so it runs only in GitHub Actions" >&2
+  exit 2
+fi
+
 release_dir=$(cd "$1" && pwd)
 version=$2
 source_commit=$3
@@ -69,34 +80,29 @@ for asset in SHA256SUMS.txt SHA256SUMS.txt.sigstore; do
   fi
 done
 
-# Prints yes when the first semantic version is newer than the second.
 newer_than() {
-  python3 - "$1" "$2" <<'PY'
-import re, sys
-
-def key(version):
-    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-(.+))?", version)
-    if not match:
-        sys.exit(f"not a release version: {version}")
-    major, minor, patch, pre = match.groups()
-    return (int(major), int(minor), int(patch), pre is None, pre or "")
-
-print("yes" if key(sys.argv[1]) > key(sys.argv[2]) else "no")
-PY
+  python3 -I "$repo_root/scripts/ci/semver-newer.py" "$1" "$2"
 }
 
 if [ -z "$previous" ]; then
   previous=$(curl -fsSL --retry 3 https://registry.npmjs.org/@lpm-registry/cli/latest |
-    python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])')
+    python3 -I -c 'import json, sys; print(json.load(sys.stdin)["version"])')
 fi
 if [ "$(newer_than "$version" "$previous")" != yes ]; then
   echo "::error::$version is not newer than $previous, so LPM $previous has nothing to update to" >&2
   exit 1
 fi
 
+account_home=$(python3 -I -c 'import os, pwd; print(pwd.getpwuid(os.geteuid()).pw_dir)')
+account_lpm="$account_home/.lpm"
 work=$(mktemp -d)
-developer_tools="$work/developer-tools"
+# Beside ~/.lpm, so setting it aside is a rename on the same volume.
+set_aside="$account_home/.lpm-set-aside-by-update-gate"
+# Under RUNNER_TEMP, so a workflow step can restore the developer tools even
+# if this script is killed.
+developer_tools="${RUNNER_TEMP:-$work}/previous-stable-gate-developer-tools"
 server_pid=
+account_lpm_claimed=
 developer_tools_hidden=
 cleanup() {
   local status=$?
@@ -105,9 +111,15 @@ cleanup() {
   fi
   if [ -n "$developer_tools_hidden" ] &&
     ! bash "$repo_root/scripts/ci/macos-developer-tools.sh" restore "$developer_tools"; then
-    # The hidden tools are still under the work directory, so keep it.
     echo "::error::developer tools could not be restored; they remain under $developer_tools" >&2
-    exit 1
+    status=1
+  fi
+  if [ -n "$account_lpm_claimed" ]; then
+    rm -rf "$account_lpm"
+    if [ -e "$set_aside" ] && ! mv "$set_aside" "$account_lpm"; then
+      echo "::error::could not put the account's ~/.lpm back; it is at $set_aside" >&2
+      status=1
+    fi
   fi
   rm -rf "$work"
   exit "$status"
@@ -115,15 +127,23 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-home="$work/home"
+if [ -e "$set_aside" ]; then
+  echo "$set_aside already exists: an earlier run didn't put the account's ~/.lpm back" >&2
+  exit 1
+fi
+if [ -e "$account_lpm" ]; then
+  mv "$account_lpm" "$set_aside"
+fi
+account_lpm_claimed=1
+
 serve="$work/serve"
-mkdir -p "$home" "$serve/download/$version" "$serve/release"
+mkdir -p "$serve/download/$version" "$serve/release"
 cp -p "$release_dir"/* "$serve/download/$version/"
 
 # The updater checks that the release was published close to when Rekor
 # recorded its signature, and from the commit the signature names.
 if [ -z "$published_at" ]; then
-  published_at=$(python3 - "$release_dir/SHA256SUMS.txt.sigstore" <<'PY'
+  published_at=$(python3 -I - "$release_dir/SHA256SUMS.txt.sigstore" <<'PY'
 import datetime, json, sys
 
 def find(value):
@@ -150,13 +170,23 @@ printf '{"name":"@lpm-registry/cli","version":"%s"}\n' "$version" > "$serve/npm.
 printf '{"tag_name":"v%s","published_at":"%s","target_commitish":"%s"}\n' \
   "$version" "$published_at" "$source_commit" > "$serve/release/$version.json"
 
-port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-python3 -m http.server "$port" --bind 127.0.0.1 --directory "$serve" \
+if [ "$(uname -s)" = Darwin ]; then
+  # The server keeps running while the developer tools are hidden.
+  python_prefix=$(python3 -I -c 'import sys; print(sys.base_prefix)')
+  case "$python_prefix" in
+    /Library/Developer/*|/Applications/Xcode*)
+      echo "::error::python3 comes from developer tools ($python_prefix), which this gate hides" >&2
+      exit 1
+      ;;
+  esac
+fi
+python3 -I -u -m http.server 0 --bind 127.0.0.1 --directory "$serve" \
   >"$work/server.log" 2>&1 &
 server_pid=$!
-base="http://127.0.0.1:$port"
+port=
 for attempt in $(seq 1 50); do
-  if curl -fsS -o /dev/null "$base/npm.json" 2>/dev/null; then
+  port=$(sed -n 's/.* port \([0-9][0-9]*\) .*/\1/p' "$work/server.log" | head -n 1)
+  if [ -n "$port" ] && curl -fsS -o /dev/null "http://127.0.0.1:$port/npm.json" 2>/dev/null; then
     break
   fi
   if [ "$attempt" -eq 50 ]; then
@@ -165,15 +195,16 @@ for attempt in $(seq 1 50); do
   fi
   sleep 0.1
 done
+base="http://127.0.0.1:$port"
 
 run_isolated() {
-  env -u LPM_HOME -u LPM_INSTALL_DOWNLOAD_BASE -u LPM_INSTALL_TEST_DOWNLOAD_BASE \
-    HOME="$home" LPM_NO_UPDATE_CHECK=1 "$@"
+  env -u LPM_HOME -u LPM_INSTALL_DOWNLOAD_BASE -u LPM_INSTALL_TEST_DOWNLOAD_BASE -u DEVELOPER_DIR \
+    HOME="$account_home" LPM_NO_UPDATE_CHECK=1 "$@"
 }
 
 echo "Installing LPM $previous through the official installer"
 run_isolated LPM_INSTALL_VERSION="v$previous" LPM_INSTALL_CHANNEL=stable sh "$repo_root/install.sh"
-lpm="$home/.lpm/bin/lpm"
+lpm="$account_lpm/bin/lpm"
 actual=$(run_isolated "$lpm" --version)
 if [ "$actual" != "lpm $previous" ]; then
   echo "the installer installed '$actual', not lpm $previous" >&2

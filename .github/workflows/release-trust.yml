@@ -20,6 +20,7 @@ on:
       - 'crates/lpm-cli/assets/sigstore_*'
       - 'crates/lpm-cli/src/sigstore_verify/**'
       - 'scripts/ci/previous-stable-update-gate.sh'
+      - 'scripts/ci/semver-newer.py'
       - 'scripts/ci/with-apple-service-retry.sh'
       - '.github/workflows/release-trust.yml'
   schedule:
@@ -149,16 +150,7 @@ jobs:
           tags=$(curl -fsSL --retry 3 https://registry.npmjs.org/-/package/@lpm-registry/cli/dist-tags)
           stable=$(jq -er .latest <<<"$tags")
           nightly=$(jq -er .nightly <<<"$tags")
-          nightly_is_newer=$(python3 - "$nightly" "$stable" <<'PY'
-          import re, sys
-
-          def key(version):
-              major, minor, patch, pre = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-(.+))?", version).groups()
-              return (int(major), int(minor), int(patch), pre is None, pre or "")
-
-          print("yes" if key(sys.argv[1]) > key(sys.argv[2]) else "no")
-          PY
-          )
+          nightly_is_newer=$(python3 -I scripts/ci/semver-newer.py "$nightly" "$stable")
           if [ "$nightly_is_newer" = yes ]; then
             target=$nightly
             channel=nightly
@@ -192,3 +184,7 @@ jobs:
           --previous "$PREVIOUS_VERSION"
           --published-at "$TARGET_PUBLISHED_AT"
           "$TARGET_RELEASE" "$TARGET_VERSION" "$TARGET_COMMIT" "$TARGET_CHANNEL"
+
+      - name: Restore developer tools after the update gate
+        if: always() && runner.os == 'macOS'
+        run: bash scripts/ci/macos-developer-tools.sh restore "$RUNNER_TEMP/previous-stable-gate-developer-tools"

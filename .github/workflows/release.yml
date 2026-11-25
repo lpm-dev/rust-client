@@ -1978,6 +1978,10 @@ jobs:
           scripts/ci/previous-stable-update-gate.sh
           staged-release "$RELEASE_VERSION" "$GITHUB_SHA" "$RELEASE_CHANNEL"
 
+      - name: Restore developer tools after the update gate
+        if: always() && matrix.platform == 'macos'
+        run: bash scripts/ci/macos-developer-tools.sh restore "$RUNNER_TEMP/previous-stable-gate-developer-tools"
+
   seal-candidate:
     name: Seal stable release candidate
     needs:
