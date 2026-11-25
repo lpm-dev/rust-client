@@ -183,7 +183,7 @@ if [ "$(uname -s)" = Darwin ]; then
 fi
 # The server binds its own port and writes it to a file, so nothing else can
 # take the port between choosing and binding it.
-python3 -I - "$serve" "$work/port" >"$work/server.log" 2>&1 <<'PY' &
+cat >"$work/serve.py" <<'PY'
 import functools, http.server, os, sys
 
 handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=sys.argv[1])
@@ -193,18 +193,24 @@ with open(sys.argv[2] + ".partial", "w") as port_file:
 os.replace(sys.argv[2] + ".partial", sys.argv[2])
 server.serve_forever()
 PY
+python3 -I "$work/serve.py" "$serve" "$work/port" </dev/null >"$work/server.log" 2>&1 &
 server_pid=$!
 port=
-for attempt in $(seq 1 100); do
+for attempt in $(seq 1 300); do
   if [ -s "$work/port" ]; then
     port=$(cat "$work/port")
     if curl -fsS -o /dev/null "http://127.0.0.1:$port/npm.json" 2>/dev/null; then
       break
     fi
   fi
-  if [ "$attempt" -eq 100 ] || ! kill -0 "$server_pid" 2>/dev/null; then
+  if [ "$attempt" -eq 300 ] || ! kill -0 "$server_pid" 2>/dev/null; then
     echo "::error::the release server didn't start (port: ${port:-none})" >&2
-    cat "$work/server.log" >&2
+    {
+      echo "python3: $(command -v python3) ($(python3 --version 2>&1))"
+      ps -o pid,stat,etime,command -p "$server_pid" || echo "the server process has exited"
+      echo "server log:"
+      cat "$work/server.log"
+    } >&2
     exit 1
   fi
   sleep 0.1
