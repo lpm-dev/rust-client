@@ -2181,7 +2181,7 @@ jobs:
     if: needs.prepare-promotion.result == 'success' && needs.release-metadata.outputs.mode == 'promote'
     runs-on: ubuntu-latest
     environment: release
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       actions: read
       attestations: write
@@ -2238,6 +2238,16 @@ jobs:
           release-candidate/github-release/SHA256SUMS.txt
           release-candidate/github-release/SHA256SUMS.txt.sigstore
           "$SOURCE_SHA"
+
+      # Promotion signs the release again, and users get this signature, not
+      # the candidate's. The candidate's macOS bundles already passed the
+      # gate and are unchanged.
+      - name: Update the latest stable to the promoted release through its own updater
+        env:
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+        run: >-
+          scripts/ci/previous-stable-update-gate.sh
+          release-candidate/github-release "$RELEASE_VERSION" "$SOURCE_SHA" stable
 
       - name: Upload promotion-time GitHub assets
         id: github-assets
