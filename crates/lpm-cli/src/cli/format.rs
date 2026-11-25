@@ -546,6 +546,13 @@ fn next_steps_for_error(error: &lpm_common::LpmError) -> Option<serde_json::Valu
                 )
             })
         }
+        lpm_common::LpmError::StandaloneSelfUpdate {
+            reinstall_command, ..
+        } => Some(crate::json_contract::command_next_steps(
+            "Reinstall LPM CLI with the official installer, which verifies the release itself \
+             and keeps your settings",
+            reinstall_command,
+        )),
         _ => None,
     }
 }
@@ -1089,7 +1096,8 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         lpm_common::LpmError::ProvenanceUnavailable(reason) => {
             diagnostic_lines("Provenance unavailable", Some(reason), error)
         }
-        lpm_common::LpmError::SelfUpdate(reason) => {
+        lpm_common::LpmError::SelfUpdate(reason)
+        | lpm_common::LpmError::StandaloneSelfUpdate { reason, .. } => {
             diagnostic_lines("Self-update refused", Some(reason), error)
         }
         lpm_common::LpmError::SecurityFloor(reason) => {

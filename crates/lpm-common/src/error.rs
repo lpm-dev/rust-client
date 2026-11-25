@@ -852,6 +852,22 @@ pub enum LpmError {
     )]
     SelfUpdate(String),
 
+    /// A standalone install's self-update refused the update. The official
+    /// installer verifies the release itself and installs it in `~/.lpm`,
+    /// keeping the user's settings, so it is the way forward.
+    #[error("self-update refused: {reason}")]
+    #[diagnostic(
+        code(lpm::self_update),
+        help(
+            "Reinstall LPM CLI with the official installer, which verifies the release \
+             itself and keeps your settings:\n{reinstall_command}"
+        )
+    )]
+    StandaloneSelfUpdate {
+        reason: String,
+        reinstall_command: String,
+    },
+
     #[error("security floor refused: {0}")]
     #[diagnostic(
         code(lpm::security_floor),
@@ -1077,7 +1093,7 @@ impl LpmError {
             LpmError::SelfUpdateRateLimited(_) => "self_update_rate_limited",
             LpmError::ProvenanceVerification(_) => "provenance_verification",
             LpmError::ProvenanceUnavailable(_) => "provenance_unavailable",
-            LpmError::SelfUpdate(_) => "self_update",
+            LpmError::SelfUpdate(_) | LpmError::StandaloneSelfUpdate { .. } => "self_update",
             LpmError::SecurityFloor(_) => "security_floor",
             LpmError::SecurityApprovalStore(_) => "security_approval_store",
             LpmError::SecurityApprovalRequired(_) => "security_approval_required",
@@ -1458,6 +1474,10 @@ mod tests {
             })),
             LpmError::SelfUpdatePaused("x".into()),
             LpmError::SelfUpdateRateLimited("x".into()),
+            LpmError::StandaloneSelfUpdate {
+                reason: "x".into(),
+                reinstall_command: "x".into(),
+            },
             LpmError::SecurityFloor("x".into()),
             LpmError::SecurityApprovalStore("x".into()),
             LpmError::SudoNotSupported,
@@ -1519,6 +1539,25 @@ mod tests {
         let help = err.help().unwrap().to_string();
         assert!(help.contains("GITHUB_TOKEN"), "help: {help}");
         assert!(help.contains("GH_TOKEN"), "help: {help}");
+    }
+
+    #[test]
+    fn refused_standalone_self_update_is_a_self_update_error_naming_the_reinstall_command() {
+        let error = LpmError::StandaloneSelfUpdate {
+            reason: "the release is not signed".into(),
+            reinstall_command: "curl -fsSL https://cli.lpm.dev/install | sh".into(),
+        };
+
+        assert_eq!(error.error_code(), "self_update");
+        assert_eq!(
+            error.to_string(),
+            "self-update refused: the release is not signed"
+        );
+        let help = error.help().unwrap().to_string();
+        assert!(
+            help.ends_with("\ncurl -fsSL https://cli.lpm.dev/install | sh"),
+            "help: {help}"
+        );
     }
 
     #[test]

@@ -30,6 +30,10 @@ EXPECTED_BUNDLE_ID="dev.lpm.cli"
 EXPECTED_TEAM_ID="823S8YKMRW"
 EXPECTED_ACCESS_GROUP="$EXPECTED_TEAM_ID.dev.lpm.vault.shared"
 EXPECTED_PROFILE_ACCESS_GROUP="$EXPECTED_TEAM_ID.*"
+# A Developer ID Application signature of LPM's team, on code Apple
+# notarized. codesign judges `notarized` itself, from the stapled ticket when
+# Apple can't be reached.
+MACOS_CODE_REQUIREMENT="anchor apple generic and identifier \"$EXPECTED_BUNDLE_ID\" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$EXPECTED_TEAM_ID\" and notarized"
 # v0.76.5 is the last signed app bundle that does not declare an icon.
 MACOS_ICON_FIRST_VERSION="v0.76.6"
 MACOS_BUNDLE=0
@@ -197,16 +201,21 @@ is_loopback_http() {
     *) return 1 ;;
   esac
   loopback_authority=${loopback_authority%%/*}
+  # Only the exact host, then an optional all-digit port: anything else, a
+  # user-info `@` among it, would let curl reach another host.
   case "$loopback_authority" in
-    127.0.0.1|localhost|'[::1]') return 0 ;;
-    127.0.0.1:*|localhost:*|'[::1]':*)
-      loopback_port=${loopback_authority##*:}
-      case "$loopback_port" in
-        ''|*[!0-9]*) return 1 ;;
-        *) return 0 ;;
-      esac
-      ;;
+    127.0.0.1*) loopback_port=${loopback_authority#127.0.0.1} ;;
+    localhost*) loopback_port=${loopback_authority#localhost} ;;
+    '[::1]'*) loopback_port=${loopback_authority#'[::1]'} ;;
     *) return 1 ;;
+  esac
+  case "$loopback_port" in
+    '') return 0 ;;
+    :*) loopback_port=${loopback_port#:} ;;
+    *) return 1 ;;
+  esac
+  case "$loopback_port" in
+    ''|*[!0123456789]*) return 1 ;;
   esac
 }
 
@@ -226,14 +235,17 @@ if [ -n "${LPM_INSTALL_TEST_INTERRUPT_AFTER:-}" ] && { \
   exit 1
 fi
 
+# Every macOS tool below ships with macOS. None may be an xcrun shim such as
+# /usr/bin/stapler, which fails on a Mac without Xcode or the Command Line
+# Tools, or one of Gatekeeper's assessors (spctl, syspolicy_check), which
+# answer from the Mac's security policy and Apple's services.
 MACOS_CODESIGN_TOOL="/usr/bin/codesign"
-MACOS_SECURITY_TOOL="/usr/bin/security"
-MACOS_SPCTL_TOOL="/usr/sbin/spctl"
-MACOS_XCRUN_TOOL="/usr/bin/xcrun"
 MACOS_DITTO_TOOL="/usr/bin/ditto"
+MACOS_OPENSSL_TOOL="/usr/bin/openssl"
+MACOS_PLISTBUDDY_TOOL="/usr/libexec/PlistBuddy"
 MACOS_UNZIP_TOOL="/usr/bin/unzip"
 
-if [ -n "${LPM_INSTALL_TEST_CODESIGN:-}${LPM_INSTALL_TEST_SECURITY:-}${LPM_INSTALL_TEST_SPCTL:-}${LPM_INSTALL_TEST_XCRUN:-}" ]; then
+if [ -n "${LPM_INSTALL_TEST_CODESIGN:-}${LPM_INSTALL_TEST_OPENSSL:-}" ]; then
   if [ "$OS" != "Darwin" ] || \
      [ -z "${LPM_INSTALL_TEST_API_URL:-}" ] || \
      [ -z "${LPM_INSTALL_TEST_DOWNLOAD_BASE:-}" ]; then
@@ -241,9 +253,7 @@ if [ -n "${LPM_INSTALL_TEST_CODESIGN:-}${LPM_INSTALL_TEST_SECURITY:-}${LPM_INSTA
     exit 1
   fi
   MACOS_CODESIGN_TOOL="${LPM_INSTALL_TEST_CODESIGN:-$MACOS_CODESIGN_TOOL}"
-  MACOS_SECURITY_TOOL="${LPM_INSTALL_TEST_SECURITY:-$MACOS_SECURITY_TOOL}"
-  MACOS_SPCTL_TOOL="${LPM_INSTALL_TEST_SPCTL:-$MACOS_SPCTL_TOOL}"
-  MACOS_XCRUN_TOOL="${LPM_INSTALL_TEST_XCRUN:-$MACOS_XCRUN_TOOL}"
+  MACOS_OPENSSL_TOOL="${LPM_INSTALL_TEST_OPENSSL:-$MACOS_OPENSSL_TOOL}"
 fi
 
 REQUESTED_VERSION="${LPM_INSTALL_VERSION:-}"
@@ -652,43 +662,14 @@ require_reported_version() {
   fi
 }
 
-# stapler validate checks the stapled ticket against Apple's CloudKit record
-# and exits with EX_NOHOST when CloudKit doesn't answer. CloudKit lookups have
-# kept failing for over 20 s at a time, so the checks spread over about two
-# minutes before giving up.
-STAPLER_CLOUDKIT_UNREACHABLE=68
-
-validate_notarization_ticket() {
-  ticket_bundle="$1"
-  ticket_label="$2"
-  for ticket_retry_delay in 2 5 15 30 60 ""; do
-    ticket_status=0
-    "$MACOS_XCRUN_TOOL" stapler validate "$ticket_bundle" || ticket_status=$?
-    if [ "$ticket_status" -eq 0 ]; then
-      return 0
-    fi
-    if [ "$ticket_status" -ne "$STAPLER_CLOUDKIT_UNREACHABLE" ]; then
-      echo "ERROR: $ticket_label does not contain a valid notarization ticket."
-      return 1
-    fi
-    if [ -z "$ticket_retry_delay" ]; then
-      echo "ERROR: Apple's notarization service did not answer while checking $ticket_label. Try again in a few minutes."
-      return 1
-    fi
-    echo "Apple's notarization service did not answer; checking the notarization ticket again in ${ticket_retry_delay}s..."
-    sleep "$ticket_retry_delay"
-  done
-}
-
 # Validates an app bundle and sets app_cdhash to its code-directory hash. Given
-# a bundle Apple already confirmed and that bundle's hash, the bundle is a copy
-# of it: instead of asking Apple again, it must carry the same code and the
-# same stapled ticket.
+# a bundle validated before and that bundle's hash, the bundle is a copy of it
+# and must carry the same code and the same stapled ticket.
 validate_macos_bundle() {
   app_bundle="$1"
   app_label="$2"
-  confirmed_bundle="${3:-}"
-  confirmed_cdhash="${4:-}"
+  validated_bundle="${3:-}"
+  validated_cdhash="${4:-}"
   app_contents="$app_bundle/Contents"
   app_executable="$app_contents/MacOS/lpm-rs"
   app_icon="$app_contents/Resources/LPMCLI.icns"
@@ -709,7 +690,7 @@ validate_macos_bundle() {
     fi
   done
 
-  declared_icon=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$app_contents/Info.plist" 2>/dev/null || true)
+  declared_icon=$("$MACOS_PLISTBUDDY_TOOL" -c 'Print :CFBundleIconFile' "$app_contents/Info.plist" 2>/dev/null || true)
   icon_required=0
   if ! version_lt "$VERSION" "$MACOS_ICON_FIRST_VERSION"; then
     icon_required=1
@@ -743,18 +724,18 @@ validate_macos_bundle() {
     return 1
   fi
 
-  if ! "$MACOS_CODESIGN_TOOL" --verify --strict --verbose=4 "$app_bundle"; then
-    echo "ERROR: $app_label failed code-signature validation."
+  if ! "$MACOS_CODESIGN_TOOL" --verify --strict --verbose=4 -R "=$MACOS_CODE_REQUIREMENT" "$app_bundle"; then
+    echo "ERROR: $app_label failed code-signature and notarization validation."
     return 1
   fi
   signature_details=$("$MACOS_CODESIGN_TOOL" -dvvv "$app_bundle" 2>&1) || return 1
-  signed_team=$(printf '%s\n' "$signature_details" | awk -F= '/^TeamIdentifier=/{print $2}')
-  signed_identifier=$(printf '%s\n' "$signature_details" | awk -F= '/^Identifier=/{print $2}')
+  signed_team=$(printf '%s\n' "$signature_details" | sed -n 's/^TeamIdentifier=//p')
+  signed_identifier=$(printf '%s\n' "$signature_details" | sed -n 's/^Identifier=//p')
   if [ "$signed_team" != "$EXPECTED_TEAM_ID" ] || [ "$signed_identifier" != "$EXPECTED_BUNDLE_ID" ]; then
     echo "ERROR: $app_label has an unexpected signing identity."
     return 1
   fi
-  app_cdhash=$(printf '%s\n' "$signature_details" | awk -F= '/^CDHash=/{print $2}')
+  app_cdhash=$(printf '%s\n' "$signature_details" | sed -n 's/^CDHash=//p')
   if [ -z "$app_cdhash" ]; then
     echo "ERROR: $app_label has no code-directory hash."
     return 1
@@ -765,23 +746,26 @@ validate_macos_bundle() {
     echo "ERROR: $app_label has no readable signed entitlements."
     return 1
   fi
-  signed_access_groups=$(/usr/libexec/PlistBuddy -c 'Print :keychain-access-groups' "$signed_entitlements" 2>/dev/null) || return 1
+  signed_access_groups=$("$MACOS_PLISTBUDDY_TOOL" -c 'Print :keychain-access-groups' "$signed_entitlements" 2>/dev/null) || return 1
   if ! plist_array_contains_exact "$signed_access_groups" "$EXPECTED_ACCESS_GROUP"; then
     echo "ERROR: $app_label does not have the LPM Vault shared Keychain access group."
     return 1
   fi
 
+  # security cms -D would import the profile's certificates into the default
+  # keychain, and fails for an account without one. The profile is a sealed
+  # resource of the code signature verified above, so it only needs decoding.
   profile_plist="$STAGE_DIR/profile.plist"
-  if ! "$MACOS_SECURITY_TOOL" cms -D -i "$app_profile" > "$profile_plist"; then
+  if ! "$MACOS_OPENSSL_TOOL" smime -verify -noverify -nosigs -inform DER -in "$app_profile" -out "$profile_plist" 2>/dev/null; then
     echo "ERROR: $app_label has an unreadable provisioning profile."
     return 1
   fi
-  profile_team=$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$profile_plist" 2>/dev/null) || return 1
+  profile_team=$("$MACOS_PLISTBUDDY_TOOL" -c 'Print :TeamIdentifier:0' "$profile_plist" 2>/dev/null) || return 1
   profile_application=$(
-    /usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.application-identifier' "$profile_plist" 2>/dev/null ||
-      /usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$profile_plist" 2>/dev/null
+    "$MACOS_PLISTBUDDY_TOOL" -c 'Print :Entitlements:com.apple.application-identifier' "$profile_plist" 2>/dev/null ||
+      "$MACOS_PLISTBUDDY_TOOL" -c 'Print :Entitlements:application-identifier' "$profile_plist" 2>/dev/null
   ) || return 1
-  profile_access_groups=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:keychain-access-groups' "$profile_plist" 2>/dev/null) || return 1
+  profile_access_groups=$("$MACOS_PLISTBUDDY_TOOL" -c 'Print :Entitlements:keychain-access-groups' "$profile_plist" 2>/dev/null) || return 1
   if [ "$profile_team" != "$EXPECTED_TEAM_ID" ] || \
      [ "$profile_application" != "$EXPECTED_TEAM_ID.$EXPECTED_BUNDLE_ID" ] || \
      { ! plist_array_contains_exact "$profile_access_groups" "$EXPECTED_ACCESS_GROUP" && \
@@ -790,15 +774,10 @@ validate_macos_bundle() {
     return 1
   fi
 
-  if [ -z "$confirmed_bundle" ]; then
-    validate_notarization_ticket "$app_bundle" "$app_label" || return 1
-  elif [ "$app_cdhash" != "$confirmed_cdhash" ] || \
-       ! cmp -s "$confirmed_bundle/Contents/CodeResources" "$app_ticket"; then
-    echo "ERROR: $app_label differs from the downloaded bundle whose notarization ticket Apple confirmed."
-    return 1
-  fi
-  if ! "$MACOS_SPCTL_TOOL" --assess --type execute --verbose=4 "$app_bundle"; then
-    echo "ERROR: Gatekeeper rejected $app_label."
+  if [ -n "$validated_bundle" ] && \
+     { [ "$app_cdhash" != "$validated_cdhash" ] || \
+       ! cmp -s "$validated_bundle/Contents/CodeResources" "$app_ticket"; }; then
+    echo "ERROR: $app_label differs from the downloaded bundle that was validated."
     return 1
   fi
 }

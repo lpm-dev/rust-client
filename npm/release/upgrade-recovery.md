@@ -17,6 +17,18 @@ cargo install --git https://github.com/lpm-dev/rust-client --tag v<version> lpm-
 
 Later versions accept both signing identities, so `lpm self-update` works again after this one reinstall. npm, Homebrew, and nightly installations are not affected.
 
+### macOS standalone upgrades without Xcode from 0.76.0 to 0.88.0
+
+`lpm self-update` in 0.76.0 to 0.88.0, and in nightly releases built before this fix, checks the release's notarization ticket with `stapler`, which macOS runs only when Xcode is installed. On a Mac without Xcode, including one with only the Command Line Tools, it stops with `tool 'stapler' requires Xcode` or another `xcrun` or `xcode-select` error. The release is not tampered. Rerun the installer once:
+
+```sh
+curl -fsSL https://cli.lpm.dev/install | sh
+```
+
+On the nightly channel, run `curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL=nightly sh` instead.
+
+The installer checks the release with tools every Mac ships with and needs neither Xcode nor a connection to Apple, and so does `lpm self-update` from this release on. The reinstall keeps your settings and installs this release or a later one, so later updates work through `lpm self-update` again.
+
 ### macOS standalone upgrades from 0.76.5
 
 The standalone updater in 0.76.5 rejects newer signed app bundles with an icon. If it reports an unexpected `Contents/Resources/` entry, rerun the installer once:

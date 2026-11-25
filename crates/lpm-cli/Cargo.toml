@@ -177,6 +177,7 @@ block2 = { version = "0.6", default-features = false, features = ["std"] }
 objc2 = { version = "0.6", default-features = false, features = ["std"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSError", "NSString"] }
 objc2-local-authentication = { version = "0.3", default-features = false, features = ["std", "LAContext", "block2"] }
+security-framework = { version = "3", features = ["OSX_10_15"] }
 
 [target.'cfg(windows)'.dependencies]
 # The generated Windows Hello bindings need none of windows-core's proc macros.

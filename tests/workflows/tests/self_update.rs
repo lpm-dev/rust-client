@@ -1564,6 +1564,99 @@ fn self_update_recent_failure_short_circuits_with_backoff_error() {
     );
 }
 
+/// A standalone install whose update is refused names the official installer,
+/// which replaces it in place, so a refusal never leaves anyone without a way
+/// to update. On macOS the copy below isn't in the installer's app-bundle
+/// layout; elsewhere the release lookup finds no release.
+#[cfg(unix)]
+#[tokio::test]
+async fn refused_standalone_self_update_names_the_official_installer() {
+    let releases = support::mock_registry::MockRegistry::start().await;
+    for (channel, installer) in [
+        (None, "curl -fsSL https://cli.lpm.dev/install | sh"),
+        (
+            Some("nightly"),
+            "curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL=nightly sh",
+        ),
+    ] {
+        let project = TempProject::empty(r#"{"name":"su","version":"1.0.0"}"#);
+        seed_newer_stable_release(&project);
+        let bin = project.home().join(".lpm").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let standalone = bin.join("lpm");
+        std::fs::copy(support::lpm_binary(), &standalone).unwrap();
+        let mut arguments = vec!["self-update"];
+        if let Some(channel) = channel {
+            arguments.extend(["--channel", channel]);
+        }
+        let refused = |json: bool| {
+            let mut command = lpm_from_path(&project, &standalone);
+            command
+                .env(
+                    "LPM_GITHUB_RELEASE_BY_TAG_URL_OVERRIDE",
+                    format!("{}/releases/tags/v{{tag}}", releases.url()),
+                )
+                .env(
+                    "LPM_GITHUB_RELEASE_DOWNLOAD_URL_OVERRIDE",
+                    format!("{}/download/v{{tag}}/{{file}}", releases.url()),
+                );
+            if json {
+                command.arg("--json");
+            }
+            let output = command.args(&arguments).output().unwrap();
+            assert!(
+                !output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            output
+        };
+
+        let human = String::from_utf8(refused(false).stderr).unwrap();
+        assert!(human.contains("Self-update refused"), "{human}");
+        assert!(human.contains(installer), "{human}");
+
+        let json = refused(true);
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&json.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "{error}\nstdout: {}\nstderr: {}",
+                    String::from_utf8_lossy(&json.stdout),
+                    String::from_utf8_lossy(&json.stderr),
+                )
+            });
+        assert!(
+            envelope["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("self-update refused: ")),
+            "{envelope}"
+        );
+        assert_eq!(
+            envelope["next_steps"][0]["command"], installer,
+            "{envelope}"
+        );
+        if channel.is_none() {
+            let mut snapshot = envelope;
+            snapshot["error"] = serde_json::json!("<reason>");
+            insta::assert_json_snapshot!(snapshot, @r#"
+            {
+              "schema_version": 1,
+              "success": false,
+              "error": "<reason>",
+              "error_code": "self_update",
+              "next_steps": [
+                {
+                  "description": "Reinstall LPM CLI with the official installer, which verifies the release itself and keeps your settings",
+                  "command": "curl -fsSL https://cli.lpm.dev/install | sh"
+                }
+              ]
+            }
+            "#);
+        }
+    }
+}
+
 // ─── release-workflow signing gate ────────────────────────────────────
 
 const V0_84_0_SOURCE_COMMIT: &str = "35edeab28d25a6851519629e99e478c3cd810c3a";

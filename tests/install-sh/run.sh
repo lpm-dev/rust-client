@@ -214,8 +214,11 @@ build_clean_path() {
   if [ "$(PATH="$CLEAN_PATH_DIR" uname -s)" = "Darwin" ]; then
     ln -s "$(command -v ditto)" "$CLEAN_PATH_DIR/ditto"
     ln -s "$(command -v unzip)" "$CLEAN_PATH_DIR/unzip"
-    # A staged copy reports the CDHash in $LPM_TEST_TOOL_STATE/staged-cdhash
-    # and has its stapled ticket replaced when tamper-staged-ticket exists.
+    # Verifying fails as for code that isn't LPM's notarized Developer ID
+    # code unless install.sh passes LPM's exact requirement, or when
+    # $LPM_TEST_TOOL_STATE/unsatisfied-requirement exists. A staged copy
+    # reports the CDHash in staged-cdhash and has its stapled ticket replaced
+    # when tamper-staged-ticket exists.
     cat > "$CLEAN_PATH_DIR/codesign" <<'EOF'
 #!/bin/sh
 for bundle in "$@"; do :; done
@@ -227,6 +230,18 @@ staged_override() {
 }
 case " $* " in
   *" --verify "*)
+    expected_requirement='=anchor apple generic and identifier "dev.lpm.cli" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "823S8YKMRW" and notarized'
+    requirement=""
+    previous=""
+    for argument in "$@"; do
+      [ "$previous" = -R ] && requirement="$argument"
+      previous="$argument"
+    done
+    if [ "$requirement" != "$expected_requirement" ] || \
+       { [ -n "${LPM_TEST_TOOL_STATE:-}" ] && [ -e "$LPM_TEST_TOOL_STATE/unsatisfied-requirement" ]; }; then
+      echo "$bundle: code failed to satisfy specified code requirement(s)" >&2
+      exit 3
+    fi
     if staged_override tamper-staged-ticket; then
       printf 'replaced-notarization-ticket' > "$bundle/Contents/CodeResources"
     fi
@@ -246,16 +261,19 @@ case " $* " in
 esac
 exit 0
 EOF
-    cat > "$CLEAN_PATH_DIR/security" <<'EOF'
+    # Decodes a provisioning profile the way `openssl smime -out` does.
+    cat > "$CLEAN_PATH_DIR/openssl" <<'EOF'
 #!/bin/sh
-cat <<'PLIST'
+[ "$1 $2 $3 $4 $5 $6" = "smime -verify -noverify -nosigs -inform DER" ] || exit 99
+while [ "$#" -gt 0 ]; do
+  [ "$1" = -out ] && out="$2"
+  shift
+done
+cat > "$out" <<'PLIST'
 <?xml version="1.0"?><plist><dict><key>TeamIdentifier</key><array><string>823S8YKMRW</string></array><key>Entitlements</key><dict><key>com.apple.application-identifier</key><string>823S8YKMRW.dev.lpm.cli</string><key>keychain-access-groups</key><array><string>823S8YKMRW.*</string></array></dict></dict></plist>
 PLIST
 EOF
-    printf '#!/bin/sh\nexit 0\n' > "$CLEAN_PATH_DIR/spctl"
-    printf '#!/bin/sh\nexit 0\n' > "$CLEAN_PATH_DIR/xcrun"
-    chmod +x "$CLEAN_PATH_DIR/codesign" "$CLEAN_PATH_DIR/security" \
-      "$CLEAN_PATH_DIR/spctl" "$CLEAN_PATH_DIR/xcrun"
+    chmod +x "$CLEAN_PATH_DIR/codesign" "$CLEAN_PATH_DIR/openssl"
   fi
 }
 
@@ -267,14 +285,10 @@ run_install_sh() {
     install_root="$(mktemp -d)"
   fi
   test_codesign=""
-  test_security=""
-  test_spctl=""
-  test_xcrun=""
+  test_openssl=""
   if [ "$(PATH="$CLEAN_PATH_DIR" uname -s)" = "Darwin" ]; then
     test_codesign="$CLEAN_PATH_DIR/codesign"
-    test_security="$CLEAN_PATH_DIR/security"
-    test_spctl="$CLEAN_PATH_DIR/spctl"
-    test_xcrun="$CLEAN_PATH_DIR/xcrun"
+    test_openssl="$CLEAN_PATH_DIR/openssl"
   fi
   set +e
   RUN_OUT="$(
@@ -282,9 +296,7 @@ run_install_sh() {
     LPM_INSTALL_TEST_API_URL="http://127.0.0.1:$SERVER_PORT/api.json" \
     LPM_INSTALL_TEST_DOWNLOAD_BASE="http://127.0.0.1:$SERVER_PORT" \
     LPM_INSTALL_TEST_CODESIGN="$test_codesign" \
-    LPM_INSTALL_TEST_SECURITY="$test_security" \
-    LPM_INSTALL_TEST_SPCTL="$test_spctl" \
-    LPM_INSTALL_TEST_XCRUN="$test_xcrun" \
+    LPM_INSTALL_TEST_OPENSSL="$test_openssl" \
     LPM_INSTALL_TEST_INTERRUPT_AFTER="${LPM_INSTALL_TEST_INTERRUPT_AFTER:-}" \
     LPM_MV_FAILURE_COUNT_FILE="${LPM_MV_FAILURE_COUNT_FILE:-}" \
     LPM_TEST_TOOL_STATE="${LPM_TEST_TOOL_STATE:-}" \
@@ -292,6 +304,7 @@ run_install_sh() {
     LPM_TEST_COSIGN_REFUSED_TRIGGER="${LPM_TEST_COSIGN_REFUSED_TRIGGER:-}" \
     RELEASE_COMMIT="${RELEASE_COMMIT:-}" \
     HOME="$install_root" \
+    CURL_HOME="$install_root" \
     LPM_INSTALL_INSECURE="${LPM_INSTALL_INSECURE:-}" \
     LPM_INSTALL_MIN_VERSION_OVERRIDE="${LPM_INSTALL_MIN_VERSION_OVERRIDE:-}" \
     LPM_INSTALL_REQUIRE_SIGSTORE="${LPM_INSTALL_REQUIRE_SIGSTORE:-}" \
@@ -391,6 +404,34 @@ build_clean_path
 sh -n "$INSTALL_SH" || fail "install.sh has shell syntax errors"
 pass "install.sh shell syntax"
 
+# ── Case 1b: the installer depends only on the release and macOS ─
+# Each xcrun shim in /usr/bin is a hard link of git (the Command Line Tools
+# shims) or xcodebuild (the Xcode-only shims, stapler among them), and fails
+# on a Mac without developer tools. Gatekeeper's assessors and Apple's
+# services answer from the Mac's security policy and the network, so a
+# genuine release could be refused on some Macs.
+if grep -v '^[[:space:]]*#' "$INSTALL_SH" | grep -Eq '(^|[^[:alnum:]_])(xcrun|stapler|xcode-select|spctl|syspolicy_check)([^[:alnum:]_]|$)|apple(-cloudkit)?\.com'; then
+  fail "install.sh depends on a developer tool, a Gatekeeper assessor or an Apple service: $(grep -n -E '(xcrun|stapler|xcode-select|spctl|syspolicy_check)|apple(-cloudkit)?\.com' "$INSTALL_SH" | grep -v ':[[:space:]]*#')"
+fi
+if [ "$HOST_OS" = "Darwin" ]; then
+  shim_identities="$(stat -f '%d:%i' /usr/bin/git /usr/bin/xcodebuild)"
+  harness_clean_path_dir="${CLEAN_PATH_DIR:-}"
+  build_clean_path
+  absolute_tools="$(sed -n 's/^MACOS_[A-Z0-9_]*_TOOL="\(\/[^"]*\)"$/\1/p' "$INSTALL_SH")"
+  [ -n "$absolute_tools" ] || fail "found no macOS tool paths in install.sh"
+  for tool in $absolute_tools $(find "$CLEAN_PATH_DIR" -type l); do
+    resolved="$tool"
+    [ -L "$tool" ] && resolved="$(readlink "$tool")"
+    [ -x "$resolved" ] || fail "$resolved does not ship with this macOS"
+    if printf '%s\n' "$shim_identities" | grep -Fxq "$(stat -L -f '%d:%i' "$resolved")"; then
+      fail "install.sh runs $resolved, an xcrun shim that needs Xcode or the Command Line Tools"
+    fi
+  done
+  rm -rf "$CLEAN_PATH_DIR"
+  CLEAN_PATH_DIR="$harness_clean_path_dir"
+fi
+pass "install.sh needs no developer tool, Gatekeeper assessor or Apple service"
+
 # ── Case 2: sudo transition fails before installer activity ───
 sudo_path_dir="$(mktemp -d)"
 sudo_home_dir="$(mktemp -d)"
@@ -477,17 +518,26 @@ echo "$out" | grep -q "127.0.0.1" || fail "expected loopback-only error: $out"
 for spoofed_url in \
   "http://localhost.attacker.example/x" \
   "http://127.0.0.1.attacker.example/x" \
-  "http://localhost:80.attacker.example/x"
+  "http://localhost:80.attacker.example/x" \
+  "http://127.0.0.1:1@attacker.example:80/x" \
+  "http://localhost:x@attacker.example:80/x" \
+  "http://[::1]:1@attacker.example:80/x" \
+  "http://127.0.0.1@attacker.example/x"
 do
-  actual_exit=0
-  out="$(LPM_INSTALL_TEST_API_URL="$spoofed_url" sh "$INSTALL_SH" 2>&1)" || actual_exit=$?
-  [ "$actual_exit" -ne 0 ] || fail "loopback-prefix hostname should fail-closed: $spoofed_url"
+  for override in LPM_INSTALL_TEST_API_URL LPM_INSTALL_TEST_DOWNLOAD_BASE; do
+    actual_exit=0
+    out="$(env "$override=$spoofed_url" sh "$INSTALL_SH" 2>&1)" || actual_exit=$?
+    [ "$actual_exit" -ne 0 ] || fail "$override must fail closed for $spoofed_url"
+    echo "$out" | grep -q "must point at 127.0.0.1" || fail "$override accepted $spoofed_url: $out"
+  done
 done
-actual_exit=0
-out="$(LPM_INSTALL_TEST_CODESIGN="/tmp/fake-codesign" sh "$INSTALL_SH" 2>&1)" || actual_exit=$?
-[ "$actual_exit" -ne 0 ] || fail "macOS tool override should require loopback endpoints"
-echo "$out" | grep -q "loopback test endpoints" \
-  || fail "tool-override failure did not explain the loopback requirement: $out"
+for override in LPM_INSTALL_TEST_CODESIGN LPM_INSTALL_TEST_OPENSSL; do
+  actual_exit=0
+  out="$(env "$override=/tmp/fake-tool" sh "$INSTALL_SH" 2>&1)" || actual_exit=$?
+  [ "$actual_exit" -ne 0 ] || fail "$override should require loopback endpoints"
+  echo "$out" | grep -q "loopback test endpoints" \
+    || fail "$override failure did not explain the loopback requirement: $out"
+done
 pass "test-override env vars are loopback-gated"
 
 # ── Case 5: happy path ─────────────────────────────────────────
@@ -758,114 +808,51 @@ if [ "$HOST_OS" = "Darwin" ]; then
   rm -rf "$fdir"
   pass "icon-bearing macOS release requires its declared icon"
 
-  # stapler validate exits 68 (EX_NOHOST) while Apple's CloudKit ticket
-  # lookup doesn't answer. Apple is asked about the downloaded bundle only;
-  # the staged copy must carry the same code and the same stapled ticket.
+  # The downloaded bundle must be LPM's notarized Developer ID code, and the
+  # staged copy must carry its code and its stapled ticket.
   tool_state="$(mktemp -d)"
-  rm -f "$CLEAN_PATH_DIR/xcrun" "$CLEAN_PATH_DIR/sleep"
-  cat > "$CLEAN_PATH_DIR/xcrun" <<'EOF'
-#!/bin/sh
-[ "$1" = stapler ] && [ "$2" = validate ] && [ "$#" -eq 3 ] || exit 99
-printf '%s\n' "$3" >> "$LPM_TEST_TOOL_STATE/stapler-runs"
-run=$(grep -c '' "$LPM_TEST_TOOL_STATE/stapler-runs")
-status=$(sed -n "${run}p" "$LPM_TEST_TOOL_STATE/stapler-outcomes")
-[ "$status" -eq 0 ] || echo "The validate action failed! Error $status."
-exit "$status"
-EOF
-  cat > "$CLEAN_PATH_DIR/sleep" <<'EOF'
-#!/bin/sh
-printf '%s\n' "$*" >> "$LPM_TEST_TOOL_STATE/sleep-requests"
-EOF
-  chmod +x "$CLEAN_PATH_DIR/xcrun" "$CLEAN_PATH_DIR/sleep"
   fdir="$(mktemp -d)"
   printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
-  write_release_asset "$fdir" 'notarization-retry-binary-bytes'
+  write_release_asset "$fdir" 'bundle-validation-binary-bytes'
   sha="$($SHA_TOOL "$fdir/$RELEASE_ASSET" | awk '{print $1}')"
   printf '%s  %s\n' "$sha" "$RELEASE_ASSET" > "$fdir/SHA256SUMS.txt"
   printf 'dummy-sigstore-bundle' > "$fdir/SHA256SUMS.txt.sigstore"
-  run_with_stapler_outcomes() {
-    printf '%s\n' "$@" > "$tool_state/stapler-outcomes"
-    : > "$tool_state/stapler-runs"
-    : > "$tool_state/sleep-requests"
+  run_with_tool_state() {
     trap 'stop_server' EXIT
     start_server "$fdir"
     LPM_TEST_TOOL_STATE="$tool_state" run_install_sh
     stop_server
     trap - EXIT
-    STAPLER_RUNS="$(grep -c '' "$tool_state/stapler-runs" || true)"
-    SLEEP_REQUESTS="$(tr '\n' ' ' < "$tool_state/sleep-requests")"
   }
 
-  run_with_stapler_outcomes 68 68 0
-  [ "$RUN_RC" -eq 0 ] \
-    || fail "a brief CloudKit outage failed the install with exit $RUN_RC: $RUN_OUT"
-  [ "$STAPLER_RUNS" -eq 3 ] || fail "brief CloudKit outage ran stapler $STAPLER_RUNS times, expected 3"
-  [ "$SLEEP_REQUESTS" = "2 5 " ] || fail "notarization ticket retries waited '$SLEEP_REQUESTS', expected '2 5 '"
-  echo "$RUN_OUT" | grep -q "checking the notarization ticket again in 2s" \
-    || fail "notarization ticket retry was not announced: $RUN_OUT"
-  [ -L "$RUN_INSTALL_DIR/lpm" ] || fail "install after a brief CloudKit outage did not link lpm"
-  pass "macOS install outlasts a brief CloudKit outage while checking the notarization ticket"
-
-  run_with_stapler_outcomes 68 68 68 68 68 0
-  [ "$RUN_RC" -eq 0 ] \
-    || fail "a two-minute CloudKit outage failed the install with exit $RUN_RC: $RUN_OUT"
-  [ "$STAPLER_RUNS" -eq 6 ] || fail "two-minute CloudKit outage ran stapler $STAPLER_RUNS times, expected 6"
-  [ "$SLEEP_REQUESTS" = "2 5 15 30 60 " ] \
-    || fail "notarization ticket retries waited '$SLEEP_REQUESTS', expected '2 5 15 30 60 '"
-  [ -L "$RUN_INSTALL_DIR/lpm" ] || fail "install after a two-minute CloudKit outage did not link lpm"
-  pass "macOS install outlasts a CloudKit outage of about two minutes"
-
-  run_with_stapler_outcomes 68 68 68 68 68 68 0
-  [ "$RUN_RC" -ne 0 ] || fail "a lasting CloudKit outage must fail the install"
-  [ "$STAPLER_RUNS" -eq 6 ] || fail "lasting CloudKit outage ran stapler $STAPLER_RUNS times, expected 6"
-  [ "$SLEEP_REQUESTS" = "2 5 15 30 60 " ] \
-    || fail "lasting CloudKit outage waited '$SLEEP_REQUESTS', expected '2 5 15 30 60 '"
-  echo "$RUN_OUT" | grep -q "Apple's notarization service did not answer while checking downloaded" \
-    || fail "lasting CloudKit outage was reported as something else: $RUN_OUT"
-  [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "lasting CloudKit outage must not install anything"
-  pass "macOS install fails closed on a lasting CloudKit outage"
-
-  run_with_stapler_outcomes 0 68 68 68 68 68 68
-  [ "$RUN_RC" -eq 0 ] \
-    || fail "CloudKit going quiet after the downloaded bundle passed failed the install with exit $RUN_RC: $RUN_OUT"
-  [ "$STAPLER_RUNS" -eq 1 ] || fail "one install asked Apple about its notarization ticket $STAPLER_RUNS times, expected once"
-  [ -z "$SLEEP_REQUESTS" ] || fail "a confirmed notarization ticket still waited '$SLEEP_REQUESTS'"
-  [ -L "$RUN_INSTALL_DIR/lpm" ] || fail "install with a confirmed notarization ticket did not link lpm"
-  pass "macOS install asks Apple about the notarization ticket once"
+  : > "$tool_state/unsatisfied-requirement"
+  run_with_tool_state
+  rm -f "$tool_state/unsatisfied-requirement"
+  [ "$RUN_RC" -ne 0 ] || fail "a bundle that isn't LPM's notarized Developer ID code must fail the install"
+  echo "$RUN_OUT" | grep -q "downloaded LPM CLI.app failed code-signature and notarization validation" \
+    || fail "a bundle that isn't LPM's notarized Developer ID code was reported as something else: $RUN_OUT"
+  [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "a bundle that isn't LPM's notarized Developer ID code must not install anything"
+  pass "macOS install refuses a bundle that isn't LPM's notarized Developer ID code"
 
   printf '%s' 'a1b2c3d4e5f60718293a4b5c6d7e8f9001122334' > "$tool_state/staged-cdhash"
-  run_with_stapler_outcomes 0 0
+  run_with_tool_state
   rm -f "$tool_state/staged-cdhash"
   [ "$RUN_RC" -ne 0 ] || fail "a staged copy with different code must fail the install"
-  [ "$STAPLER_RUNS" -eq 1 ] || fail "a staged copy with different code was checked with Apple instead of against the download"
-  echo "$RUN_OUT" | grep -q "staged LPM CLI.app differs from the downloaded bundle" \
+  echo "$RUN_OUT" | grep -q "staged LPM CLI.app differs from the downloaded bundle that was validated" \
     || fail "a staged copy with different code was reported as something else: $RUN_OUT"
   [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "a staged copy with different code must not install anything"
-  pass "macOS install rejects a staged copy whose code differs from the confirmed download"
+  pass "macOS install rejects a staged copy whose code differs from the validated download"
 
   : > "$tool_state/tamper-staged-ticket"
-  run_with_stapler_outcomes 0 0
+  run_with_tool_state
   rm -f "$tool_state/tamper-staged-ticket"
   [ "$RUN_RC" -ne 0 ] || fail "a staged copy with a different ticket must fail the install"
-  [ "$STAPLER_RUNS" -eq 1 ] || fail "a staged copy with a different ticket was checked with Apple instead of against the download"
-  echo "$RUN_OUT" | grep -q "staged LPM CLI.app differs from the downloaded bundle" \
+  echo "$RUN_OUT" | grep -q "staged LPM CLI.app differs from the downloaded bundle that was validated" \
     || fail "a staged copy with a different ticket was reported as something else: $RUN_OUT"
   [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "a staged copy with a different ticket must not install anything"
-  pass "macOS install rejects a staged copy whose stapled ticket differs from the confirmed download"
-
-  run_with_stapler_outcomes 65 0
-  [ "$RUN_RC" -ne 0 ] || fail "an invalid notarization ticket must fail the install"
-  [ "$STAPLER_RUNS" -eq 1 ] || fail "invalid notarization ticket was retried ($STAPLER_RUNS stapler runs)"
-  [ -z "$SLEEP_REQUESTS" ] || fail "invalid notarization ticket waited '$SLEEP_REQUESTS'"
-  echo "$RUN_OUT" | grep -q "does not contain a valid notarization ticket" \
-    || fail "invalid notarization ticket failure was unclear: $RUN_OUT"
-  [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "invalid notarization ticket must not install anything"
-  pass "macOS install rejects an invalid notarization ticket without retrying"
+  pass "macOS install rejects a staged copy whose stapled ticket differs from the validated download"
 
   rm -rf "$fdir" "$tool_state"
-  printf '#!/bin/sh\nexit 0\n' > "$CLEAN_PATH_DIR/xcrun"
-  rm -f "$CLEAN_PATH_DIR/sleep"
-  ln -s "$(command -v sleep)" "$CLEAN_PATH_DIR/sleep"
 fi
 
 # ── Case 10: manifest 404 fails closed ────────────────────────
