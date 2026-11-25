@@ -1791,7 +1791,7 @@ jobs:
       needs.release-metadata.outputs.should_release == 'true' &&
       (needs.release-metadata.outputs.mode == 'candidate' || needs.release-metadata.outputs.mode == 'full')
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       actions: read
       contents: read
@@ -1966,6 +1966,21 @@ jobs:
       - name: Restore developer tools
         if: always() && matrix.platform == 'macos'
         run: bash scripts/ci/macos-developer-tools.sh restore "$RUNNER_TEMP/developer-tools"
+
+      # Installed copies update with the updater they shipped. If the latest
+      # stable's updater refuses this release, users on it are stranded, so
+      # the release must not be published.
+      - name: Update the latest stable to this release through its own updater
+        env:
+          RELEASE_CHANNEL: ${{ needs.release-metadata.outputs.channel }}
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+        run: >-
+          scripts/ci/previous-stable-update-gate.sh
+          staged-release "$RELEASE_VERSION" "$GITHUB_SHA" "$RELEASE_CHANNEL"
+
+      - name: Restore developer tools after the update gate
+        if: always() && matrix.platform == 'macos'
+        run: bash scripts/ci/macos-developer-tools.sh restore "$RUNNER_TEMP/previous-stable-gate-developer-tools"
 
   seal-candidate:
     name: Seal stable release candidate
@@ -2166,7 +2181,7 @@ jobs:
     if: needs.prepare-promotion.result == 'success' && needs.release-metadata.outputs.mode == 'promote'
     runs-on: ubuntu-latest
     environment: release
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       actions: read
       attestations: write
@@ -2223,6 +2238,16 @@ jobs:
           release-candidate/github-release/SHA256SUMS.txt
           release-candidate/github-release/SHA256SUMS.txt.sigstore
           "$SOURCE_SHA"
+
+      # Promotion signs the release again, and users get this signature, not
+      # the candidate's. The candidate's macOS bundles already passed the
+      # gate and are unchanged.
+      - name: Update the latest stable to the promoted release through its own updater
+        env:
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+        run: >-
+          scripts/ci/previous-stable-update-gate.sh
+          release-candidate/github-release "$RELEASE_VERSION" "$SOURCE_SHA" stable
 
       - name: Upload promotion-time GitHub assets
         id: github-assets
