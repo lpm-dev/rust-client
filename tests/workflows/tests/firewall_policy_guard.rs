@@ -89,12 +89,14 @@ async fn install_sending_policy(
     name: &str,
     approved: &[(&str, &str)],
     config: &[(&str, &str)],
-    expected_body: &str,
+    expected_body: &[&str],
 ) {
     let mock = registry_with_package(name).await;
-    Mock::given(method("POST"))
-        .and(path(VERDICTS_PATH))
-        .and(body_string_contains(expected_body))
+    let mut verdicts = Mock::given(method("POST")).and(path(VERDICTS_PATH));
+    for fragment in expected_body {
+        verdicts = verdicts.and(body_string_contains(*fragment));
+    }
+    verdicts
         .respond_with(allow_response(name))
         .expect(1)
         .mount(mock.server())
@@ -119,7 +121,7 @@ async fn install_runs_the_default_policy_when_config_has_no_table_and_the_approv
         "approved-policy",
         &[("lpm_ai_confirmed_malware", "allow")],
         &[],
-        r#""lpmAiConfirmedMalware":"block""#,
+        &[r#""lpmAiConfirmedMalware":"block""#],
     )
     .await;
 }
@@ -130,7 +132,7 @@ async fn install_keeps_a_stricter_approved_policy_when_config_has_no_table() {
         "strict-policy",
         &[("lpm_ai_agent_control_surface", "block")],
         &[],
-        r#""lpmAiAgentControlSurface":"block""#,
+        &[r#""lpmAiAgentControlSurface":"block""#],
     )
     .await;
 }
@@ -141,7 +143,7 @@ async fn install_sends_an_approved_looser_policy_the_config_asks_for() {
         "requested-policy",
         &[("lpm_ai_confirmed_malware", "allow")],
         &[("lpm_ai_confirmed_malware", "allow")],
-        r#""lpmAiConfirmedMalware":"allow""#,
+        &[r#""lpmAiConfirmedMalware":"allow""#],
     )
     .await;
 }
@@ -178,7 +180,10 @@ async fn install_keeps_a_stricter_approved_policy_a_partial_table_leaves_out() {
         "partial-policy",
         &[("lpm_ai_agent_control_surface", "block")],
         &[("lpm_ai_telemetry", "block")],
-        r#""lpmAiAgentControlSurface":"block""#,
+        &[
+            r#""lpmAiAgentControlSurface":"block""#,
+            r#""lpmAiTelemetry":"block""#,
+        ],
     )
     .await;
 }

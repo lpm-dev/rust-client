@@ -360,8 +360,8 @@ pub fn reject_looser_firewall_mode_write(
 }
 
 /// Refuses a `[firewall.npm.policies]` write that handles any policy group
-/// more leniently than `~/.lpm/config.toml` does now, while
-/// `force-security-floor = true` is active.
+/// more leniently than installs do now, a group the table leaves out
+/// included, while `force-security-floor = true` is active.
 pub fn reject_looser_firewall_policy_write(
     global: &GlobalConfig,
     requested: &lpm_registry::client::NpmFirewallPolicyProfile,
@@ -369,10 +369,21 @@ pub fn reject_looser_firewall_policy_write(
     if !force_security_floor_enabled(global) {
         return Ok(());
     }
+    let effective = crate::security_approval::load_effective_authorized_posture()?;
+    let floor = crate::npm_firewall_config::runtime_policy_profile(
+        crate::npm_firewall_config::runtime_policy_request(global, &effective)?,
+        &effective,
+    );
+    reject_policy_below_floor(&floor, requested)
+}
+
+fn reject_policy_below_floor(
+    floor: &lpm_registry::client::NpmFirewallPolicyProfile,
+    requested: &lpm_registry::client::NpmFirewallPolicyProfile,
+) -> Result<(), LpmError> {
     let enforce = crate::npm_firewall_config::NpmFirewallMode::Enforce;
-    let floor = crate::npm_firewall_config::config_policy_profile(global)?;
     let loosened =
-        crate::npm_firewall_config::loosened_firewall_policies(enforce, requested, enforce, &floor);
+        crate::npm_firewall_config::loosened_firewall_policies(enforce, requested, enforce, floor);
     if let Some(first) = loosened.first() {
         return Err(security_floor_write_error(
             &format!(
@@ -539,23 +550,21 @@ mod tests {
         clear_recorded_suppressions_for_tests();
     }
 
-    fn firewall_policy_floor_config(force: bool, malware_action: &str) -> GlobalConfig {
-        let config: toml::Table = toml::from_str(&format!(
-            "force-security-floor = {force}\n\n[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_confirmed_malware = \"{malware_action}\"\n"
-        ))
-        .unwrap();
-        GlobalConfig::from_table(config)
+    fn malware_floor(
+        action: lpm_registry::client::NpmFirewallPolicyAction,
+    ) -> lpm_registry::client::NpmFirewallPolicyProfile {
+        lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_confirmed_malware: action,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        }
     }
 
     #[test]
     fn forced_floor_refuses_a_looser_firewall_policy_write() {
-        let requested = lpm_registry::client::NpmFirewallPolicyProfile {
-            lpm_ai_confirmed_malware: lpm_registry::client::NpmFirewallPolicyAction::Allow,
-            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
-        };
+        let requested = malware_floor(lpm_registry::client::NpmFirewallPolicyAction::Allow);
 
-        let err = reject_looser_firewall_policy_write(
-            &firewall_policy_floor_config(true, "block"),
+        let err = reject_policy_below_floor(
+            &malware_floor(lpm_registry::client::NpmFirewallPolicyAction::Block),
             &requested,
         )
         .unwrap_err();
@@ -565,12 +574,10 @@ mod tests {
                 .contains("[firewall.npm.policies].lpm_ai_confirmed_malware"),
             "{err}"
         );
+        let unforced: toml::Table = toml::from_str("force-security-floor = false\n").unwrap();
         assert!(
-            reject_looser_firewall_policy_write(
-                &firewall_policy_floor_config(false, "block"),
-                &requested
-            )
-            .is_ok()
+            reject_looser_firewall_policy_write(&GlobalConfig::from_table(unforced), &requested)
+                .is_ok()
         );
     }
 
@@ -579,8 +586,8 @@ mod tests {
         let requested = lpm_registry::client::NpmFirewallPolicyProfile::default();
 
         assert!(
-            reject_looser_firewall_policy_write(
-                &firewall_policy_floor_config(true, "warn"),
+            reject_policy_below_floor(
+                &malware_floor(lpm_registry::client::NpmFirewallPolicyAction::Warn),
                 &requested
             )
             .is_ok()

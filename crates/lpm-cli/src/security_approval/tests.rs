@@ -2211,3 +2211,37 @@ fn tightening_the_approved_profile_restores_defaults_without_approval() {
         );
     });
 }
+
+#[test]
+fn forced_floor_holds_an_approved_group_a_partial_table_leaves_out() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[(
+            crate::npm_firewall_config::LPM_AI_AGENT_CONTROL_SURFACE_POLICY_KEY,
+            "block",
+        )]);
+        let mut config = firewall_policy_global_config(
+            "enforce",
+            &[(
+                crate::npm_firewall_config::LPM_AI_TELEMETRY_POLICY_KEY,
+                "block",
+            )],
+        );
+        config.table_mut().insert(
+            "force-security-floor".to_string(),
+            toml::Value::Boolean(true),
+        );
+        let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_telemetry: lpm_registry::client::NpmFirewallPolicyAction::Block,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        let err = crate::security_floor::reject_looser_firewall_policy_write(&config, &requested)
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("lpm_ai_agent_control_surface"),
+            "{err}"
+        );
+    });
+}

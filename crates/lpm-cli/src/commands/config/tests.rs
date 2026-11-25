@@ -1461,6 +1461,7 @@ async fn firewall_mode_wizard_returns_an_approved_looser_profile_to_the_config_p
 
 #[test]
 fn deleting_a_stricter_firewall_policy_is_refused_under_a_forced_floor() {
+    let (_dir, _path, _env) = tmp_config();
     let config = global_config(
         "force-security-floor = true\n\n[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_agent_control_surface = \"block\"\n",
     );
@@ -1489,14 +1490,18 @@ fn firewall_policy_profile_after_delete_ignores_keys_outside_the_policy_table() 
     let config = global_config("[firewall]\nmode = \"enforce\"\n");
 
     assert!(
-        io::firewall_policy_profile_after_delete(&config, "firewall.mode")
-            .unwrap()
-            .is_none()
+        io::firewall_policy_profile_after_delete(&config, "firewall.mode", || {
+            Ok(lpm_registry::client::NpmFirewallPolicyProfile::default())
+        })
+        .unwrap()
+        .is_none()
     );
     assert_eq!(
-        io::firewall_policy_profile_after_delete(&config, "firewall")
-            .unwrap()
-            .unwrap(),
+        io::firewall_policy_profile_after_delete(&config, "firewall", || {
+            Ok(lpm_registry::client::NpmFirewallPolicyProfile::default())
+        })
+        .unwrap()
+        .unwrap(),
         lpm_registry::client::NpmFirewallPolicyProfile::default()
     );
 }

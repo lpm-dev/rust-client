@@ -636,7 +636,9 @@ pub(super) fn guard_generic_delete_against_force_floor(
             authorize_force_floor_removal()?;
         }
         _ => {
-            if let Some(after) = firewall_policy_profile_after_delete(global, key)? {
+            if let Some(after) =
+                firewall_policy_profile_after_delete(global, key, tableless_policy_profile)?
+            {
                 crate::security_floor::reject_looser_firewall_policy_write(global, &after)?;
             }
         }
@@ -644,11 +646,14 @@ pub(super) fn guard_generic_delete_against_force_floor(
     Ok(())
 }
 
-/// The `[firewall.npm.policies]` profile `config.toml` asks for once `key` is
-/// deleted, or `None` when deleting `key` leaves that table alone.
+/// The profile installs run once `key` is deleted from `config.toml`, or
+/// `None` when deleting `key` leaves `[firewall.npm.policies]` alone.
+/// `tableless` gives the profile installs run without a table, and is asked
+/// only for a key that touches the policies.
 pub(super) fn firewall_policy_profile_after_delete(
     config: &GlobalConfig,
     key: &str,
+    tableless: impl FnOnce() -> Result<lpm_registry::client::NpmFirewallPolicyProfile, LpmError>,
 ) -> Result<Option<lpm_registry::client::NpmFirewallPolicyProfile>, LpmError> {
     let firewall = crate::npm_firewall_config::FIREWALL_CONFIG_SECTION;
     let affects_policies = key == firewall
@@ -660,15 +665,20 @@ pub(super) fn firewall_policy_profile_after_delete(
     }
     let mut after = config.table().clone();
     remove_config_value_at_path(&mut after, key);
-    crate::npm_firewall_config::firewall_policy_table(&after)
-        .and_then(|policies| {
-            policies
-                .map(crate::npm_firewall_config::parse_policy_table)
-                .transpose()
-        })
-        .map(Option::unwrap_or_default)
-        .map(Some)
-        .map_err(LpmError::Registry)
+    let after = GlobalConfig::from_value(toml::Value::Table(after))?;
+    let base = tableless()?;
+    Ok(Some(
+        crate::npm_firewall_config::config_policy_request_over(&after, base)?.unwrap_or(base),
+    ))
+}
+
+/// The profile installs run without a `[firewall.npm.policies]` table.
+pub(super) fn tableless_policy_profile()
+-> Result<lpm_registry::client::NpmFirewallPolicyProfile, LpmError> {
+    let effective = crate::security_approval::load_effective_authorized_posture()?;
+    Ok(crate::npm_firewall_config::runtime_policy_profile(
+        None, &effective,
+    ))
 }
 
 fn authorize_force_floor_removal() -> Result<(), LpmError> {
