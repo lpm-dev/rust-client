@@ -2233,6 +2233,54 @@ fn forced_floor_measures_a_write_against_what_installs_run_not_an_unapproved_tab
 }
 
 #[test]
+fn forced_floor_judges_a_change_only_by_the_groups_it_changes() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[]);
+        let mut config = firewall_policy_global_config(
+            "enforce",
+            &[
+                (
+                    crate::npm_firewall_config::LPM_AI_CONFIRMED_MALWARE_POLICY_KEY,
+                    "warn",
+                ),
+                (
+                    crate::npm_firewall_config::LPM_AI_DEPENDENCY_SCRIPT_POLICY_KEY,
+                    "warn",
+                ),
+            ],
+        );
+        config.table_mut().insert(
+            "force-security-floor".to_string(),
+            toml::Value::Boolean(true),
+        );
+        let restores_malware = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_dependency_script_policy: lpm_registry::client::NpmFirewallPolicyAction::Warn,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+        let loosens_scripts = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_confirmed_malware: lpm_registry::client::NpmFirewallPolicyAction::Warn,
+            lpm_ai_dependency_script_policy: lpm_registry::client::NpmFirewallPolicyAction::Allow,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        let restored =
+            crate::security_floor::reject_looser_firewall_policy_write(&config, &restores_malware);
+        let loosened =
+            crate::security_floor::reject_looser_firewall_policy_write(&config, &loosens_scripts)
+                .unwrap_err();
+
+        assert!(restored.is_ok(), "{restored:?}");
+        assert!(
+            loosened
+                .to_string()
+                .contains("lpm_ai_dependency_script_policy"),
+            "{loosened}"
+        );
+    });
+}
+
+#[test]
 fn runtime_firewall_reports_a_looser_mode_without_listing_unchanged_policies() {
     let temp = tempdir().unwrap();
     let project = temp.path().join("project");

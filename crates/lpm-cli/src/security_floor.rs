@@ -359,9 +359,11 @@ pub fn reject_looser_firewall_mode_write(
     Ok(())
 }
 
-/// Refuses a `[firewall.npm.policies]` write that handles any policy group
-/// more leniently than installs do now, a group the table leaves out
-/// included, while `force-security-floor = true` is active.
+/// Refuses a `[firewall.npm.policies]` write or delete that handles a policy
+/// group it changes, a group the table leaves out included, more leniently
+/// than installs enforce now, while `force-security-floor = true` is active.
+/// A group the change leaves as it was is not its doing, so restoring one
+/// group never waits on another that is still loose.
 pub fn reject_looser_firewall_policy_write(
     global: &GlobalConfig,
     requested: &lpm_registry::client::NpmFirewallPolicyProfile,
@@ -370,8 +372,24 @@ pub fn reject_looser_firewall_policy_write(
         return Ok(());
     }
     let effective = crate::security_approval::load_effective_authorized_posture()?;
+    let current = crate::npm_firewall_config::runtime_policy_profile(
+        crate::npm_firewall_config::runtime_policy_request(global, &effective)?,
+        &effective,
+    );
     let floor = crate::npm_firewall_config::enforced_policy_profile(global, &effective)?;
-    reject_policy_below_floor(&floor, requested)
+    let mut changed = floor;
+    for key in crate::npm_firewall_config::POLICY_KEYS {
+        let requested_action = crate::npm_firewall_config::policy_action(requested, key);
+        if requested_action != crate::npm_firewall_config::policy_action(&current, key)
+            && let (Some(slot), Some(action)) = (
+                crate::npm_firewall_config::policy_action_mut(&mut changed, key),
+                requested_action,
+            )
+        {
+            *slot = action;
+        }
+    }
+    reject_policy_below_floor(&floor, &changed)
 }
 
 fn reject_policy_below_floor(

@@ -406,7 +406,7 @@ pub(crate) fn policy_action(
     })
 }
 
-fn policy_action_mut<'a>(
+pub(crate) fn policy_action_mut<'a>(
     profile: &'a mut NpmFirewallPolicyProfile,
     key: &str,
 ) -> Option<&'a mut NpmFirewallPolicyAction> {
