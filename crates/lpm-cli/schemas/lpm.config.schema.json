@@ -30,7 +30,7 @@
     },
     "importAlias": {
       "type": "string",
-      "description": "Author's import alias prefix used in the source files (e.g., `@/components`). `lpm add` rewrites occurrences in the copied source to match the consumer project's tsconfig.json paths or the explicit `--alias` flag."
+      "description": "The import prefix that the package source uses. `lpm add` treats every import that starts with it as a path into the package, except relative imports and protocol-relative URLs (`//`). Extra trailing slashes in the value count as one. If the prefix ends in an ASCII letter or digit, `@`, `.`, `_` or `-`, `lpm add` adds a `/`, so `@` never claims `@radix-ui/react-slot`. Other prefixes, such as `#`, `~` or `/`, stay as written. `lpm add` removes one `/` after the prefix, so with `#`, `#util` and `#/util` both work. An empty value is no prefix. `lpm add` looks up the rest among the delivered source files, as a path from the tarball root, with optional extensions and index files, so map the prefix to the tarball root in tsconfig.json. For a found file, `lpm add` writes an import through the consumer alias (from `--alias`, tsconfig.json or jsconfig.json paths, or the prompt), or a relative import when the consumer has no alias. For other imports, `lpm add` replaces the prefix with the consumer alias, or leaves them unchanged. `lpm add` rewrites only JavaScript and TypeScript files, not declaration files."
     },
     "configSchema": {
       "type": "object",

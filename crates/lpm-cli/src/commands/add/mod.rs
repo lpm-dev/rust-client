@@ -962,7 +962,7 @@ async fn run_locked(
         .as_ref()
         .and_then(|c| c.get("importAlias"))
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        .and_then(crate::lpm_config::import_alias_prefix);
 
     // Detect buyer alias from tsconfig/jsconfig, then prompt to confirm.
     // --alias flag overrides all detection and prompting.
