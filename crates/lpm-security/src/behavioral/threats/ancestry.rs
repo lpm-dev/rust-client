@@ -68,11 +68,7 @@ impl Ancestry {
                 None => ancestry.block[up],
             };
             ancestry.numeric_property[child] = match parent_kind {
-                AstKind::ObjectProperty(property)
-                    if matches!(property.key, PropertyKey::NumericLiteral(_)) =>
-                {
-                    Some(parent)
-                }
+                AstKind::ObjectProperty(property) if has_numeric_key(property) => Some(parent),
                 _ => ancestry.numeric_property[up],
             };
             ancestry.declarator[child] = match parent_kind {
@@ -155,6 +151,15 @@ impl Ancestry {
             _ => None,
         }
     }
+}
+
+/// Whether a property is keyed by a number, plain (`17:`) or computed
+/// (`[17]:`), as a bundle's module table keys its factories.
+fn has_numeric_key(property: &ObjectProperty<'_>) -> bool {
+    matches!(
+        property.key,
+        PropertyKey::StaticNumericLiteral(_) | PropertyKey::NumericLiteral(_)
+    )
 }
 
 /// Whether a node starting at `start`, under `statement`, is in the branch
@@ -311,7 +316,7 @@ mod tests {
                 walked(
                     semantic,
                     id,
-                    |kind| matches!(kind, AstKind::ObjectProperty(property) if matches!(property.key, PropertyKey::NumericLiteral(_)))
+                    |kind| matches!(kind, AstKind::ObjectProperty(property) if has_numeric_key(property))
                 ),
             );
             assert_eq!(

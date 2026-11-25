@@ -1,25 +1,22 @@
 --- a/src/cursor.rs
 +++ b/src/cursor.rs
-@@ -1,6 +1,6 @@
- //! Code related to navigating `Token`s from the lexer
+@@ -1,12 +1,14 @@
+ //! Token cursor: reading, consuming, expecting and re-lexing the current token,
+ //! and checkpoints for backtracking.
  
--use oxc_allocator::{ArenaBox, ArenaVec};
-+use oxc_allocator::{ArenaBox, ArenaVec, Dummy, GetAllocator};
- use oxc_ast::ast::{BindingRestElement, RegExpFlags};
- use oxc_span::{GetSpan, Span};
++use oxc_allocator::{Dummy, GetAllocator};
+ use oxc_ast::ast::RegExpFlags;
+ use oxc_span::Span;
  use oxc_str::JSStr;
-@@ -12,6 +12,10 @@
+ 
+ use crate::{
+-    ParserConfig as Config, ParserImpl, diagnostics,
++    ParserConfig as Config, ParserImpl,
++    diagnostics::{self, ParserDiagnostic},
      lexer::{Kind, LexerCheckpoint, Token, cold_branch},
  };
  
-+/// Speculation budget spent on each lexer diagnostic copied into a
-+/// checkpoint, in bytes read.
-+const DIAGNOSTIC_COPY_COST: u64 = 16;
-+
- pub struct ParserCheckpoint<'a> {
-     lexer: LexerCheckpoint<'a>,
-     cur_token: Token,
-@@ -108,13 +112,69 @@
+@@ -108,13 +110,85 @@
          if self.token.escaped() && kind.is_any_keyword() {
              self.report_escaped_keyword(self.token.span());
          }
@@ -35,7 +32,10 @@
 +    /// so every caller unwinds without reading more tokens.
 +    #[inline]
 +    fn check_parse_limits(&mut self) {
-+        if self.stack_exhausted || self.speculation_budget_exhausted || self.below_stack_floor() {
++        if self.stack_exhausted.get()
++            || self.lexer.speculation_budget_exhausted()
++            || self.below_stack_floor()
++        {
 +            self.stop_at_parse_limit();
 +        }
 +    }
@@ -59,7 +59,7 @@
 +    #[cold]
 +    #[inline(never)]
 +    fn stop_at_parse_limit(&mut self) {
-+        if self.speculation_budget_exhausted && !self.stack_exhausted {
++        if self.lexer.speculation_budget_exhausted() && !self.stack_exhausted.get() {
 +            self.set_fatal_error(diagnostics::speculation_budget_exhausted(self.token.span()));
 +        } else {
 +            self.stop_at_stack_floor();
@@ -69,7 +69,7 @@
 +    #[cold]
 +    #[inline(never)]
 +    fn stop_at_stack_floor(&mut self) {
-+        self.stack_exhausted = true;
++        self.stack_exhausted.set(true);
 +        self.set_fatal_error(diagnostics::stack_exhausted(self.token.span()));
 +    }
 +
@@ -82,6 +82,19 @@
 +        Dummy::dummy(self.allocator())
 +    }
 +
++    /// [`Self::stop_at_stack_floor`] for a check that reads no token and
++    /// can't change the parser: the error the check fails with. The parse
++    /// stops at the next token it reads, and reports
++    /// [`ParserReturn::stack_exhausted`] even if it reads none.
++    ///
++    /// [`ParserReturn::stack_exhausted`]: crate::ParserReturn::stack_exhausted
++    #[cold]
++    #[inline(never)]
++    pub(crate) fn stack_floor_error(&self, span: Span) -> ParserDiagnostic<'a> {
++        self.stack_exhausted.set(true);
++        diagnostics::stack_exhausted(span)
++    }
++
      /// Move to the next `JSXChild`
      /// Checks if the current token is escaped if it is a keyword
      pub(crate) fn advance_for_jsx_child(&mut self) {
@@ -89,7 +102,17 @@
          self.prev_token_end = self.token.end();
          self.token = self.lexer.next_jsx_child();
      }
-@@ -233,6 +293,7 @@
+@@ -170,6 +244,9 @@
+         if self.token.escaped() && self.token.kind().is_any_keyword() {
+             self.report_escaped_keyword(self.token.span());
+         }
++        // The lexer read `next` before this check, so a parse that stops
++        // here still moves to it, and unwinds at the token after.
++        self.check_parse_limits();
+         self.prev_token_end = self.token.end();
+         self.token = next;
+     }
+@@ -263,6 +340,7 @@
  
      /// Move to the next token, lexing it as a JSX attribute value.
      pub(crate) fn advance_for_jsx_attribute_value(&mut self) {
@@ -97,48 +120,10 @@
          self.prev_token_end = self.token.end();
          self.token = self.lexer.next_jsx_attribute_value();
      }
-@@ -323,6 +384,9 @@
-     }
- 
-     pub(crate) fn checkpoint_with_error_recovery(&mut self) -> ParserCheckpoint<'a> {
-+        // The lexer's checkpoint copies every diagnostic it has recorded.
-+        self.diagnostics_copied += self.lexer.errors.len() as u64;
-+        self.check_speculation_budget();
-         ParserCheckpoint {
-             lexer: self.lexer.checkpoint_with_error_recovery(),
-             cur_token: self.token,
-@@ -337,10 +401,27 @@
-             checkpoint;
- 
-         self.lexer.rewind(lexer);
-+        self.check_speculation_budget();
-         self.token = cur_token;
-         self.prev_token_end = prev_token_end;
-         self.errors.truncate(errors_pos);
-         self.fatal_error = fatal_error;
-+    }
-+
-+    /// Sets the budget's stop once the work spent on speculation passes it:
-+    /// the bytes the lexer has read beyond its position, which a rewind made
-+    /// it read or will make it read again, and the diagnostics copied into
-+    /// checkpoints, each an allocation of about a hundred bytes, at
-+    /// [`DIAGNOSTIC_COPY_COST`] each. A parse already stopped at the stack
-+    /// floor is unwinding, and reads nothing again.
-+    #[inline]
-+    fn check_speculation_budget(&mut self) {
-+        let work = self.lexer.bytes_read_ahead().saturating_add(
-+            self.diagnostics_copied.saturating_mul(DIAGNOSTIC_COPY_COST),
-+        );
-+        if !self.stack_exhausted && work > self.speculation_limit {
-+            self.speculation_budget_exhausted = true;
-+        }
-     }
- 
-     pub(crate) fn lookahead<U>(&mut self, predicate: impl Fn(&mut ParserImpl<'a, C>) -> U) -> U {
 --- a/src/diagnostics.rs
 +++ b/src/diagnostics.rs
-@@ -91,6 +91,16 @@
-         OxcDiagnostic::error("Source length exceeds 4 GiB limit")
+@@ -94,6 +94,16 @@
+         OxcDiagnostic::error(MAX_LEN_ERROR)
      };
  
 +    stack_exhausted(span: Span) => {
@@ -156,22 +141,134 @@
      };
 --- a/src/js/arrow.rs
 +++ b/src/js/arrow.rs
-@@ -537,6 +537,12 @@
-         &mut self,
-         pattern: BindingPattern<'a>,
-     ) -> Option<Expression<'a>> {
-+        // This reads no token, so it checks the stack floor itself. Below it,
-+        // the caller parses the source again as an expression, which checks
-+        // the floor per token.
-+        if self.below_stack_floor() {
-+            return None;
+@@ -185,6 +185,7 @@
+                 }
+                 let expression = Expression::new_identifier(span, name, self);
+                 let expression = if self.options.preserve_parens {
++                    self.state.last_parenthesized = (start, span.start);
+                     Expression::new_parenthesized_expression(self.end_span(start), expression, self)
+                 } else {
+                     expression
+@@ -373,8 +374,8 @@
+         {
+             // Discard what `rewind` does not restore, and parse the list as parameters.
+             self.state.cover_elements.truncate(base);
+-            self.state.cover_initialized_name.retain(|&start, _| start < lparen);
+-            self.state.trailing_commas.retain(|&start, _| start < lparen);
++            self.state.cover_initialized_name.split_off(&lparen);
++            self.state.trailing_commas.split_off(&lparen);
+             self.deferred_script_errors.truncate(deferred_script_errors_len);
+             if !had_module_syntax {
+                 self.module_record_builder.unset_module_syntax();
+--- a/src/js/cover.rs
++++ b/src/js/cover.rs
+@@ -797,15 +797,31 @@
+         // Record where the innermost expression starts, which is what an enclosing check
+         // finds: inner parentheses leave no node without `preserve_parens`, and an assignment
+         // target drops them in `((a)) = b`.
++        let innermost = self.innermost_parenthesized_start(&expression);
+         self.state.cover_parenthesized.truncate(parenthesized_base);
+         if self.state.cover_depth > 0 {
+-            self.state.cover_parenthesized.push(expression.without_parentheses().span().start);
++            self.state.cover_parenthesized.push(innermost);
+         }
+ 
+         if self.options.preserve_parens {
++            self.state.last_parenthesized = (start, innermost);
+             Expression::new_parenthesized_expression(self.end_span(start), expression, self)
+         } else {
+             expression
 +        }
-         Some(match pattern {
-             BindingPattern::BindingIdentifier(ident) => {
-                 if ident.name == "await" && !self.ctx.has_await() {
++    }
++
++    /// Where the expression innermost in the parentheses around `expression` starts: the
++    /// start of `expression` without the `ParenthesizedExpression`s that wrap it.
++    #[inline]
++    pub(super) fn innermost_parenthesized_start(&self, expression: &Expression<'a>) -> u32 {
++        match expression {
++            Expression::ParenthesizedExpression(inner)
++                if inner.span.start == self.state.last_parenthesized.0 =>
++            {
++                self.state.last_parenthesized.1
++            }
++            expression => expression.without_parentheses().span().start,
+         }
+     }
+ 
+--- a/src/js/expression.rs
++++ b/src/js/expression.rs
+@@ -408,6 +408,7 @@
+         }
+ 
+         if self.options.preserve_parens {
++            self.state.last_parenthesized = (start, self.innermost_parenthesized_start(&expression));
+             Expression::new_parenthesized_expression(self.end_span(start), expression, self)
+         } else {
+             expression
+@@ -1939,34 +1940,36 @@
+         }
+     }
+ 
+-    fn set_pure_on_call_or_new_expr(expr: &mut Expression<'a>) -> bool {
+-        match expr.get_inner_expression_mut() {
+-            Expression::CallExpression(call_expr) => {
+-                call_expr.pure = true;
+-                true
+-            }
+-            Expression::NewExpression(new_expr) => {
+-                new_expr.pure = true;
+-                true
+-            }
+-            expr @ match_member_expression!(Expression) => {
+-                Self::set_pure_on_call_or_new_expr(expr.to_member_expression_mut().object_mut())
+-            }
+-            Expression::ChainExpression(chain_expr) => match &mut chain_expr.expression {
+-                ChainElement::CallExpression(call_expr) => {
++    /// Walks down a member chain in a loop: the parser reads a chain without recursing, so
++    /// recursing once per member here could overflow the stack.
++    fn set_pure_on_call_or_new_expr(mut expr: &mut Expression<'a>) -> bool {
++        loop {
++            expr = match expr.get_inner_expression_mut() {
++                Expression::CallExpression(call_expr) => {
+                     call_expr.pure = true;
+-                    true
++                    return true;
+                 }
+-                element @ match_member_expression!(ChainElement) => {
+-                    Self::set_pure_on_call_or_new_expr(
+-                        element.to_member_expression_mut().object_mut(),
+-                    )
++                Expression::NewExpression(new_expr) => {
++                    new_expr.pure = true;
++                    return true;
+                 }
+-                ChainElement::TSNonNullExpression(non_null_expr) => {
+-                    Self::set_pure_on_call_or_new_expr(&mut non_null_expr.expression)
++                expr @ match_member_expression!(Expression) => {
++                    expr.to_member_expression_mut().object_mut()
+                 }
+-            },
+-            _ => false,
++                Expression::ChainExpression(chain_expr) => match &mut chain_expr.expression {
++                    ChainElement::CallExpression(call_expr) => {
++                        call_expr.pure = true;
++                        return true;
++                    }
++                    element @ match_member_expression!(ChainElement) => {
++                        element.to_member_expression_mut().object_mut()
++                    }
++                    ChainElement::TSNonNullExpression(non_null_expr) => {
++                        &mut non_null_expr.expression
++                    }
++                },
++                _ => return false,
++            };
+         }
+     }
+ 
 --- a/src/js/grammar.rs
 +++ b/src/js/grammar.rs
-@@ -12,6 +12,11 @@
+@@ -14,6 +14,11 @@
  
  impl<'a, C: Config> CoverGrammar<'a, Expression<'a>, C> for AssignmentTarget<'a> {
      fn cover(expr: Expression<'a>, p: &mut ParserImpl<'a, C>) -> Self {
@@ -183,9 +280,116 @@
          match expr {
              Expression::ArrayExpression(array_expr) => {
                  let pat = ArrayAssignmentTarget::cover(array_expr.unbox(), p);
+@@ -30,6 +35,10 @@
+ 
+ impl<'a, C: Config> CoverGrammar<'a, Expression<'a>, C> for SimpleAssignmentTarget<'a> {
+     fn cover(expr: Expression<'a>, p: &mut ParserImpl<'a, C>) -> Self {
++        // Nested parentheses recurse here without passing through `AssignmentTarget::cover`.
++        if p.below_stack_floor() {
++            return p.stopped_at_stack_floor();
++        }
+         match expr {
+             Expression::Identifier(ident) => {
+                 SimpleAssignmentTarget::AssignmentTargetIdentifier(ident)
+@@ -303,6 +312,12 @@
+ 
+     /// Check that `expression` covers a `BindingIdentifier` or a `BindingPattern`.
+     pub(super) fn check_cover_binding(&self, expression: &Expression<'a>) -> CoverCheck<'a> {
++        // The checks and conversions of binding patterns read no token, so they
++        // check the stack floor themselves. Nested elements pass through here,
++        // or through `check_cover_binding_target`, once per level.
++        if self.below_stack_floor() {
++            return Err(self.stack_floor_error(expression.span()));
++        }
+         match expression {
+             Expression::Identifier(ident) if !self.is_cover_parenthesized(ident.span.start) => {
+                 Ok(())
+@@ -376,6 +391,9 @@
+     /// Check that an assignment target, which an expression was already refined to, covers
+     /// a `BindingIdentifier` or a `BindingPattern`.
+     fn check_cover_binding_target(&self, target: &AssignmentTarget<'a>) -> CoverCheck<'a> {
++        if self.below_stack_floor() {
++            return Err(self.stack_floor_error(target.span()));
++        }
+         match target {
+             AssignmentTarget::AssignmentTargetIdentifier(ident)
+                 if !self.is_cover_parenthesized(ident.span.start) =>
+@@ -452,6 +470,9 @@
+         &mut self,
+         expression: Expression<'a>,
+     ) -> BindingPattern<'a> {
++        if self.below_stack_floor() {
++            return self.stopped_at_stack_floor();
++        }
+         match expression {
+             Expression::Identifier(ident) => {
+                 BindingPattern::new_binding_identifier(ident.span, ident.name, self)
+@@ -555,6 +576,9 @@
+         &mut self,
+         target: AssignmentTarget<'a>,
+     ) -> BindingPattern<'a> {
++        if self.below_stack_floor() {
++            return self.stopped_at_stack_floor();
++        }
+         match target {
+             AssignmentTarget::AssignmentTargetIdentifier(ident) => {
+                 BindingPattern::new_binding_identifier(ident.span, ident.name, self)
+--- a/src/jsx/mod.rs
++++ b/src/jsx/mod.rs
+@@ -661,27 +661,31 @@
+         }
+     }
+ 
++    /// Compares the names in a loop: the parser reads `<a.b.c>` without recursing, so
++    /// recursing once per member here could overflow the stack.
+     fn jsx_member_expression_eq(
+-        lhs: &JSXMemberExpression<'a>,
+-        rhs: &JSXMemberExpression<'a>,
++        mut lhs: &JSXMemberExpression<'a>,
++        mut rhs: &JSXMemberExpression<'a>,
+     ) -> bool {
+-        if lhs.property.name != rhs.property.name {
+-            return false;
+-        }
+-        match (&lhs.object, &rhs.object) {
+-            (
+-                JSXMemberExpressionObject::IdentifierReference(lhs),
+-                JSXMemberExpressionObject::IdentifierReference(rhs),
+-            ) => lhs.name == rhs.name,
+-            (
+-                JSXMemberExpressionObject::MemberExpression(lhs),
+-                JSXMemberExpressionObject::MemberExpression(rhs),
+-            ) => Self::jsx_member_expression_eq(lhs, rhs),
+-            (
+-                JSXMemberExpressionObject::ThisExpression(_),
+-                JSXMemberExpressionObject::ThisExpression(_),
+-            ) => true,
+-            _ => false,
++        loop {
++            if lhs.property.name != rhs.property.name {
++                return false;
++            }
++            (lhs, rhs) = match (&lhs.object, &rhs.object) {
++                (
++                    JSXMemberExpressionObject::IdentifierReference(lhs),
++                    JSXMemberExpressionObject::IdentifierReference(rhs),
++                ) => return lhs.name == rhs.name,
++                (
++                    JSXMemberExpressionObject::MemberExpression(lhs),
++                    JSXMemberExpressionObject::MemberExpression(rhs),
++                ) => (lhs, rhs),
++                (
++                    JSXMemberExpressionObject::ThisExpression(_),
++                    JSXMemberExpressionObject::ThisExpression(_),
++                ) => return true,
++                _ => return false,
++            };
+         }
+     }
+ }
 --- a/src/lexer/mod.rs
 +++ b/src/lexer/mod.rs
-@@ -120,6 +120,13 @@
+@@ -130,6 +130,20 @@
  
      /// Config
      pub(crate) config: C,
@@ -196,39 +400,68 @@
 +    /// Bytes the lexer has skipped without reading, by moving to the end of
 +    /// the source after a fatal error.
 +    bytes_skipped: u64,
++
++    /// `ParseOptions::speculation_budget`, with `u64::MAX` for no limit.
++    speculation_limit: u64,
++
++    /// A rewind left the lexer having read more beyond its position than
++    /// `speculation_limit` allows.
++    speculation_budget_exhausted: bool,
  }
  
  impl<'a, C: Config> Lexer<'a, C> {
-@@ -168,6 +175,8 @@
-             multi_line_comment_end_finder: None,
+@@ -176,9 +190,27 @@
+             escaped_templates: FxHashMap::default(),
              tokens,
              config,
 +            bytes_rewound: 0,
 +            bytes_skipped: 0,
++            speculation_limit: u64::MAX,
++            speculation_budget_exhausted: false,
          }
      }
  
-@@ -248,10 +257,19 @@
-         }
++    /// Limit the bytes the lexer may read beyond its position, by rewinding, to `budget`.
++    /// `0` is no limit.
++    pub(crate) fn with_speculation_budget(mut self, budget: u64) -> Self {
++        self.speculation_limit = if budget == 0 { u64::MAX } else { budget };
++        self
++    }
++
++    /// Whether a rewind went past the speculation budget. Every rewind, the parser's and the
++    /// lexer's own lookaheads', checks it, and it stays set.
++    #[inline]
++    pub(crate) fn speculation_budget_exhausted(&self) -> bool {
++        self.speculation_budget_exhausted
++    }
++
+     /// Create a [`Lexer`], and call `f` with it. Returns what `f` returns.
+     ///
+     /// The `Lexer` is passed to `f`, not returned, because that's what makes `'brand`
+@@ -239,10 +271,22 @@
+         self.errors.truncate(checkpoint.errors_len);
  
          self.tokens.truncate(checkpoint.tokens_len);
 +        let from = self.offset();
          self.source.set_position(checkpoint.source_position);
 +        self.bytes_rewound += u64::from(from.saturating_sub(self.offset()));
-         self.trivia_builder.annotation_comments = checkpoint.annotation_comments;
++        if self.bytes_read_ahead() > self.speculation_limit {
++            self.speculation_budget_exhausted = true;
++        }
+         self.trivia_builder.rewind(checkpoint.trivia);
      }
  
 +    /// Bytes the lexer has read beyond its current position: those it read
 +    /// and then rewound over, less those it skipped without reading. In all
 +    /// it has read at most its position plus this many bytes.
-+    pub(crate) fn bytes_read_ahead(&self) -> u64 {
++    fn bytes_read_ahead(&self) -> u64 {
 +        self.bytes_rewound.saturating_sub(self.bytes_skipped)
 +    }
 +
-     pub fn peek_token(&mut self) -> Token {
-         let checkpoint = self.checkpoint();
-         let token = self.next_token();
-@@ -405,7 +423,9 @@
+     /// Make rewinding to `checkpoint` keep the comments and irregular whitespace lexed after it.
+     pub(crate) fn keep_trivia(&self, checkpoint: &mut LexerCheckpoint<'a>) {
+         self.trivia_builder.keep_trivia(&mut checkpoint.trivia);
+@@ -570,7 +614,9 @@
      /// Advance source cursor to end of file.
      #[inline]
      pub fn advance_to_end(&mut self) {
@@ -240,7 +473,16 @@
      // ---------- Private Methods ---------- //
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -213,6 +213,15 @@
+@@ -64,7 +64,7 @@
+ //!
+ //! See [full linter example](https://github.com/Boshen/oxc/blob/ab2ef4f89ba3ca50c68abb2ca43e36b7793f3673/crates/oxc_linter/examples/linter.rs#L38-L39)
+ 
+-use std::any::Any;
++use std::{any::Any, cell::Cell};
+ 
+ mod ast_builder;
+ pub mod config;
+@@ -221,6 +221,17 @@
  
      /// Whether the file is [flow](https://flow.org).
      pub is_flow_language: bool,
@@ -251,12 +493,14 @@
 +    pub stack_exhausted: bool,
 +
 +    /// Whether parsing stopped at [`ParseOptions::speculation_budget`].
-+    /// [`fatal_error`](ParserReturn::fatal_error) is set too.
++    /// [`fatal_error`](ParserReturn::fatal_error) is set too. A parse that
++    /// reached [`ParseOptions::stack_floor`] reports only that: on a larger
++    /// stack it is checked against the budget again.
 +    pub speculation_budget_exhausted: bool,
  }
  
- /// Parse options
-@@ -267,6 +276,34 @@
+ // `ParserReturn` is the output of `ParserImpl::parse`.
+@@ -291,6 +302,33 @@
      ///
      /// Default: `true`
      pub enable_ident_hashes: bool,
@@ -276,14 +520,13 @@
 +
 +    /// How much work the parser may spend on speculative parses.
 +    ///
-+    /// A speculative parse, such as of a parenthesized list that may be
-+    /// arrow parameters, takes a checkpoint and rewinds to it when it fails,
-+    /// and a lookahead reads a few tokens and rewinds the lexer. Each byte the
-+    /// lexer has read beyond its position after such rewinds costs one, and
-+    /// each lexer diagnostic copied into a checkpoint that can restore them
-+    /// costs 16. When the total passes this budget, the parser stops with a
-+    /// fatal error and [`ParserReturn::speculation_budget_exhausted`] set. A
-+    /// budget proportional to the source's length keeps the work spent on
++    /// A speculative parse, such as of type arguments that may turn out to be
++    /// comparisons, takes a checkpoint and rewinds to it when it fails, and a
++    /// lookahead reads a few tokens and rewinds the lexer. Each byte the lexer
++    /// has read beyond its position after such rewinds costs one. When the
++    /// total passes this budget, the parser stops with a fatal error and
++    /// [`ParserReturn::speculation_budget_exhausted`] set. A budget
++    /// proportional to the source's length keeps the work spent on
 +    /// speculation proportional to it too.
 +    ///
 +    /// Default: `0`, no limit
@@ -291,7 +534,7 @@
  }
  
  impl Default for ParseOptions {
-@@ -278,6 +315,8 @@
+@@ -302,6 +340,8 @@
              preserve_parens: true,
              allow_v8_intrinsics: false,
              enable_ident_hashes: true,
@@ -300,46 +543,101 @@
          }
      }
  }
-@@ -670,6 +709,18 @@
+@@ -563,6 +603,10 @@
  
      /// Precomputed typescript detection
      is_ts: bool,
 +
-+    /// Parsing reached [`ParseOptions::stack_floor`].
-+    stack_exhausted: bool,
-+
-+    /// [`ParseOptions::speculation_budget`], with `u64::MAX` for no limit.
-+    speculation_limit: u64,
-+
-+    /// Lexer diagnostics copied into checkpoints so far.
-+    diagnostics_copied: u64,
-+
-+    /// Parsing reached [`ParseOptions::speculation_budget`].
-+    speculation_budget_exhausted: bool,
++    /// Parsing reached [`ParseOptions::stack_floor`]. A `Cell`, so that a
++    /// check that reads no token and borrows the parser can record it.
++    stack_exhausted: Cell<bool>,
  }
  
  impl<'a, C: ParserConfig> ParserImpl<'a, C> {
-@@ -702,6 +753,14 @@
+@@ -589,7 +633,8 @@
+                 source_type,
+                 config.lexer_config(),
+                 brand_origin,
+-            ),
++            )
++            .with_speculation_budget(options.speculation_budget),
+             source_type,
+             source_text,
+             errors: vec![],
+@@ -602,6 +647,7 @@
              ast: ParserAstBuilder::new(allocator),
              module_record_builder: ModuleRecordBuilder::new(allocator, source_type),
              is_ts: source_type.is_typescript(),
-+            stack_exhausted: false,
-+            speculation_limit: if options.speculation_budget == 0 {
-+                u64::MAX
-+            } else {
-+                options.speculation_budget
-+            },
-+            diagnostics_copied: 0,
-+            speculation_budget_exhausted: false,
++            stack_exhausted: Cell::new(false),
          }
      }
  
-@@ -795,6 +854,8 @@
+@@ -719,6 +765,9 @@
              tokens,
              fatal_error: has_fatal_error,
              is_flow_language,
-+            stack_exhausted: self.stack_exhausted,
-+            speculation_budget_exhausted: self.speculation_budget_exhausted,
++            stack_exhausted: self.stack_exhausted.get(),
++            speculation_budget_exhausted: self.lexer.speculation_budget_exhausted()
++                && !self.stack_exhausted.get(),
          }
      }
  
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -1,5 +1,7 @@
+-use rustc_hash::{FxHashMap, FxHashSet};
++use std::collections::BTreeMap;
+ 
++use rustc_hash::FxHashSet;
++
+ use oxc_allocator::{Allocator, ArenaVec};
+ use oxc_ast::ast::Expression;
+ use oxc_span::Span;
+@@ -43,6 +45,13 @@
+     /// Like `cover_elements`, each cover list owns the entries above its recorded length.
+     pub cover_parenthesized: ArenaVec<'a, u32>,
+ 
++    /// The start of the `ParenthesizedExpression` built last, and the start of the expression
++    /// innermost in its parentheses. A chain of parentheses, `((a))`, reads its innermost
++    /// expression's start from here instead of walking the chain at each level, which is
++    /// quadratic in its length. A rewind leaves no stale entry: only a parse of the same offset
++    /// can build another `ParenthesizedExpression` that starts there, and it records its own.
++    pub last_parenthesized: (u32, u32),
++
+     /// Zero outside speculative expression type arguments; otherwise their nesting depth.
+     pub type_argument_depth: u32,
+ 
+@@ -51,12 +60,17 @@
+ 
+     /// Temporary storage for `CoverInitializedName` `({ foo = bar })`.
+     /// Keyed by `ObjectProperty`'s span.start.
+-    pub cover_initialized_name: FxHashMap<u32, CoverInitializedName<'a>>,
++    ///
++    /// Ordered, as `trailing_commas` is, so that parsing the arguments of `async(…)` again as
++    /// parameters drops the entries inside them without visiting every entry before them.
++    /// Neither map forgets an entry no conversion consumes, so visiting them all made each
++    /// parse again cost the number of literals before it.
++    pub cover_initialized_name: BTreeMap<u32, CoverInitializedName<'a>>,
+ 
+     /// Trailing comma spans for `ArrayExpression` and `ObjectExpression` ending in a spread.
+     /// Used for error reporting when covering a rest assignment target.
+     /// Keyed by the expression start and consumed when checked.
+-    pub trailing_commas: FxHashMap<u32, Span>,
++    pub trailing_commas: BTreeMap<u32, Span>,
+ 
+     /// Statements that may need reparsing when `sourceType` is `unambiguous`.
+     ///
+@@ -81,10 +95,11 @@
+             mentions_await: false,
+             cover_depth: 0,
+             cover_parenthesized: ArenaVec::new_in(&allocator),
++            last_parenthesized: (u32::MAX, u32::MAX),
+             type_argument_depth: 0,
+             type_argument_lookahead: None,
+-            cover_initialized_name: FxHashMap::default(),
+-            trailing_commas: FxHashMap::default(),
++            cover_initialized_name: BTreeMap::new(),
++            trailing_commas: BTreeMap::new(),
+             potential_await_reparse: Vec::new(),
+             encountered_await_identifier: false,
+         }

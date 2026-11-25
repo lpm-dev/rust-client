@@ -92,7 +92,8 @@ impl Bundles {
                         continue;
                     };
                     let AstKind::ObjectProperty(ObjectProperty {
-                        key: PropertyKey::NumericLiteral(key),
+                        key:
+                            PropertyKey::StaticNumericLiteral(key) | PropertyKey::NumericLiteral(key),
                         ..
                     }) = semantic.nodes().kind(factory)
                     else {

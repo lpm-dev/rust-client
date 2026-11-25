@@ -3462,10 +3462,10 @@ mod tests {
     }
 
     #[test]
-    fn parenthesized_lists_nested_in_defaults_are_read_without_parsing_in_linear_time() {
-        // A parenthesized list that may be arrow parameters is parsed as
-        // parameters and, when it turns out not to be, parsed again as an
-        // expression, with every list nested in it.
+    fn parenthesized_lists_nested_in_defaults_are_parsed_in_linear_time() {
+        // A parenthesized list that may be arrow parameters must be parsed
+        // once, not as parameters and then again as an expression with every
+        // list nested in it.
         for (filename, open) in [
             ("index.js", "([,],a=y,b="),
             ("index.js", "({a=1}=y,b="),
@@ -3481,7 +3481,7 @@ mod tests {
             let nested_time = started.elapsed();
             assert_eq!(flat_result.unparsed_files, 0);
             assert!(result.source.eval);
-            assert_eq!(result.unparsed_files, 1, "{filename} {open}");
+            assert_eq!(result.unparsed_files, 0, "{filename} {open}");
             assert!(
                 nested_time < flat_time * 5 + std::time::Duration::from_millis(200),
                 "{filename} {open}: nested {nested_time:?}, flat {flat_time:?}"
@@ -3490,9 +3490,59 @@ mod tests {
     }
 
     #[test]
+    fn generic_arrow_heads_nested_in_defaults_are_read_without_parsing_in_linear_time() {
+        // A TypeScript `<` that may open a generic arrow function is parsed
+        // as one and, when no `=>` follows its parameters, parsed again as a
+        // type assertion, with every head nested in its defaults.
+        let source = format!("x={};eval(y);", nested("<T>(a=y,b=", "0", ")", 3_000));
+        assert!(syntax::exhausts_the_speculation_budget("index.ts", &source));
+        let flat = format!("{}eval(y);", "x;".repeat(source.len() / 2));
+        let started = std::time::Instant::now();
+        let flat_result = analyze_on_a_worker_stack("index.ts", flat);
+        let flat_time = started.elapsed();
+        let started = std::time::Instant::now();
+        let result = analyze_on_a_worker_stack("index.ts", source);
+        let nested_time = started.elapsed();
+        assert_eq!(flat_result.unparsed_files, 0);
+        assert!(result.source.eval);
+        assert_eq!(result.unparsed_files, 1);
+        assert!(
+            nested_time < flat_time * 5 + std::time::Duration::from_millis(200),
+            "nested {nested_time:?}, flat {flat_time:?}"
+        );
+    }
+
+    #[test]
+    fn async_arrow_heads_that_mention_await_nested_in_defaults_are_read_without_parsing_in_linear_time()
+     {
+        // The arguments of an `async(…)` that mention `await` are parsed
+        // again as parameters when `=>` follows, with every head nested in
+        // their defaults.
+        let source = format!(
+            "x={};eval(y);",
+            nested("async(a=", "await 0", ")=>0", 3_000)
+        );
+        assert!(syntax::exhausts_the_speculation_budget("index.js", &source));
+        let flat = format!("{}eval(y);", "x;".repeat(source.len() / 2));
+        let started = std::time::Instant::now();
+        let flat_result = analyze_on_a_worker_stack("index.js", flat);
+        let flat_time = started.elapsed();
+        let started = std::time::Instant::now();
+        let result = analyze_on_a_worker_stack("index.js", source);
+        let nested_time = started.elapsed();
+        assert_eq!(flat_result.unparsed_files, 0);
+        assert!(result.source.eval);
+        assert_eq!(result.unparsed_files, 1);
+        assert!(
+            nested_time < flat_time * 5 + std::time::Duration::from_millis(200),
+            "nested {nested_time:?}, flat {flat_time:?}"
+        );
+    }
+
+    #[test]
     fn arrow_heads_after_many_lexer_errors_are_analyzed_in_linear_time() {
-        // Each parenthesized list that may be arrow parameters takes a
-        // checkpoint that copies every diagnostic the lexer has recorded.
+        // A checkpoint taken at each parenthesized list that may be arrow
+        // parameters must not copy every diagnostic the lexer has recorded.
         for (filename, head) in [
             ("index.js", "(a,b)=>0;"),
             ("index.js", "(a,b);"),
@@ -3520,30 +3570,32 @@ mod tests {
     }
 
     #[test]
-    fn tokens_read_ahead_inside_nested_lists_count_toward_the_parse_budget() {
-        // Deciding whether a parenthesized list is arrow parameters reads a
-        // few tokens ahead and rewinds the lexer, and each enclosing list
-        // parsed again reads them again.
-        for filename in ["index.js", "index.ts"] {
-            let source = format!(
-                "x={}(] \"{}\" 0",
-                "(a=".repeat(2_000),
-                "a".repeat(256 * 1024)
-            );
-            let flat = format!("{}eval(y);", "x;".repeat(source.len() / 2));
-            let started = std::time::Instant::now();
-            let flat_result = analyze_on_a_worker_stack(filename, flat);
-            let flat_time = started.elapsed();
-            let started = std::time::Instant::now();
-            let result = analyze_on_a_worker_stack(filename, source);
-            let nested_time = started.elapsed();
-            assert_eq!(flat_result.unparsed_files, 0);
-            assert_eq!(result.unparsed_files, 1, "{filename}");
-            assert!(
-                nested_time < flat_time * 5 + std::time::Duration::from_millis(200),
-                "{filename}: nested {nested_time:?}, flat {flat_time:?}"
-            );
-        }
+    fn long_tokens_read_again_by_nested_speculation_count_toward_the_parse_budget() {
+        // Each enclosing generic arrow head parsed again reads the string
+        // again: the budget counts bytes, not tokens.
+        let source = format!(
+            "x={};",
+            nested(
+                "<T>(a=",
+                &format!("\"{}\"", "a".repeat(256 * 1024)),
+                ")",
+                2_000
+            )
+        );
+        assert!(syntax::exhausts_the_speculation_budget("index.ts", &source));
+        let flat = format!("{}eval(y);", "x;".repeat(source.len() / 2));
+        let started = std::time::Instant::now();
+        let flat_result = analyze_on_a_worker_stack("index.ts", flat);
+        let flat_time = started.elapsed();
+        let started = std::time::Instant::now();
+        let result = analyze_on_a_worker_stack("index.ts", source);
+        let nested_time = started.elapsed();
+        assert_eq!(flat_result.unparsed_files, 0);
+        assert_eq!(result.unparsed_files, 1);
+        assert!(
+            nested_time < flat_time * 5 + std::time::Duration::from_millis(200),
+            "nested {nested_time:?}, flat {flat_time:?}"
+        );
     }
 
     #[test]

@@ -659,7 +659,10 @@ fn destructured_methods<'a>(semantic: &Semantic<'a>) -> HashMap<SymbolId, &'a st
             };
             let name = match &property.key {
                 PropertyKey::StaticIdentifier(key) => Some(key.name.as_str()),
-                PropertyKey::StringLiteral(key) => key.value.as_str(),
+                PropertyKey::StaticStringLiteral(key) | PropertyKey::StringLiteral(key) => {
+                    key.value.as_str()
+                }
+                PropertyKey::TemplateLiteral(key) => key.single_quasi().and_then(JSStr::as_str),
                 _ => None,
             };
             if let Some(name) = name
@@ -932,9 +935,14 @@ mod tests {
 
     #[test]
     fn bundled_class_helper_preserves_the_environment_upload_flow() {
-        assert!(leaks(
-            r#"var modules = {17: (m,e,r) => { r.d(e, {Publisher: () => Publisher}); class Publisher { publish(data) { this.client.rest.repos.createOrUpdateFileContents({content: Buffer.from(data).toString('base64')}); } } }}; function load(id) { const m = {exports:{}}; modules[id].call(m.exports,m,m.exports,load); return m.exports; } const api = load(17); const publisher = new api.Publisher(); publisher.publish(JSON.stringify({environment:process.env}));"#
-        ));
+        for factory_key in ["17", "[17]"] {
+            assert!(
+                leaks(&format!(
+                    r#"var modules = {{{factory_key}: (m,e,r) => {{ r.d(e, {{Publisher: () => Publisher}}); class Publisher {{ publish(data) {{ this.client.rest.repos.createOrUpdateFileContents({{content: Buffer.from(data).toString('base64')}}); }} }} }}}}; function load(id) {{ const m = {{exports:{{}}}}; modules[id].call(m.exports,m,m.exports,load); return m.exports; }} const api = load(17); const publisher = new api.Publisher(); publisher.publish(JSON.stringify({{environment:process.env}}));"#
+                )),
+                "{factory_key}"
+            );
+        }
     }
 
     #[test]
@@ -1071,12 +1079,24 @@ mod tests {
     }
 
     fn time_to_analyze(sources: &[String]) -> std::time::Duration {
-        let started = std::time::Instant::now();
-        for source in sources {
-            let result = super::super::analyze_bytes("index.js", source.as_bytes());
-            assert_eq!(result.unparsed_files, 0, "{}", &source[..80]);
-        }
-        started.elapsed()
+        // Parsing recurses once per level, and a debug build parses the
+        // deepest of these sources in more than the 64 MiB stack a deep
+        // parse falls back to.
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(256 * 1024 * 1024)
+                .spawn_scoped(scope, || {
+                    let started = std::time::Instant::now();
+                    for source in sources {
+                        let result = super::super::analyze_bytes("index.js", source.as_bytes());
+                        assert_eq!(result.unparsed_files, 0, "{}", &source[..80]);
+                    }
+                    started.elapsed()
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        })
     }
 
     #[test]
