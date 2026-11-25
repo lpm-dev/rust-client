@@ -2945,3 +2945,59 @@ fn config_list_reports_the_approved_firewall_policy_over_a_looser_config_value()
 
     assert_eq!(entry["value"], "block");
 }
+
+#[test]
+fn deleting_a_policy_key_never_copies_a_managed_action_into_the_local_posture() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    std::fs::create_dir_all(project.home().join(".lpm")).unwrap();
+    std::fs::write(
+        project.home().join(".lpm/security-policy.toml"),
+        "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_telemetry = \"block\"\n",
+    )
+    .unwrap();
+    seed_config(
+        &project,
+        "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_suspicious = \"warn\"\ncritical_vulnerability = \"block\"\n",
+    );
+
+    let output = lpm(&project)
+        .args([
+            "config",
+            "delete",
+            "firewall.npm.policies.lpm_ai_suspicious",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let posture_path = project.home().join(".lpm/security/approved-posture.json");
+    if posture_path.exists() {
+        let posture: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(posture_path).unwrap()).unwrap();
+        assert!(
+            posture["payload"]["firewall_policies"]
+                .get("lpm_ai_telemetry")
+                .is_none(),
+            "{posture}"
+        );
+    }
+}
+
+#[test]
+fn config_list_reports_telemetry_held_at_an_approved_action_as_installs_send_it() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    support::write_signed_firewall_posture(&project, "monitor", &[("lpm_ai_telemetry", "block")]);
+    seed_config(
+        &project,
+        "[firewall]\nmode = \"monitor\"\n\n[firewall.npm.policies]\nlpm_ai_suspicious = \"warn\"\n",
+    );
+
+    let entry = config_list_entry(&project, "firewall.npm.policies.lpm_ai_telemetry");
+
+    assert_eq!(entry["value"], "block", "{entry}");
+    assert_eq!(entry["source"], "approved security posture", "{entry}");
+}

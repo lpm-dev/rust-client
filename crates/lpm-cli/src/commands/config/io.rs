@@ -681,6 +681,18 @@ pub(super) fn tableless_policy_profile()
     ))
 }
 
+/// The table-less profile as the local signed posture alone sets it, without
+/// a managed policy's actions, for updating that posture: a managed action
+/// copied there would outlive its removal from the policy.
+pub(super) fn local_tableless_policy_profile()
+-> Result<lpm_registry::client::NpmFirewallPolicyProfile, LpmError> {
+    let local = crate::security_approval::load_authorized_posture()?.firewall_policy_profile();
+    Ok(crate::npm_firewall_config::stricter_policy_profile(
+        &lpm_registry::client::NpmFirewallPolicyProfile::default(),
+        &local,
+    ))
+}
+
 fn authorize_force_floor_removal() -> Result<(), LpmError> {
     crate::security_approval::ensure_global_unlock(
         crate::security_approval::ApprovalScope::FloorEdit,

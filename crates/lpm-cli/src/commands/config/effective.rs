@@ -876,6 +876,7 @@ fn add_firewall_policy_entries(
     firewall_mode: crate::npm_firewall_config::NpmFirewallMode,
 ) -> Result<(), LpmError> {
     let requested = crate::npm_firewall_config::config_policy_request(global)?;
+    let runtime_requested = crate::npm_firewall_config::runtime_policy_request(global, posture)?;
     let approved = posture.posture.firewall_policy_profile();
     let tableless = crate::npm_firewall_config::runtime_policy_profile(None, posture);
     let (requested_mode, floor_mode) = crate::npm_firewall_config::policy_comparison_modes(
@@ -937,11 +938,20 @@ fn add_firewall_policy_entries(
         // Only a group the table names is a request; the rest run as they
         // would without a table.
         let named = config_source.as_ref() != DEFAULT_SOURCE;
-        let (value, source) = match requested
+        let literal = requested
             .as_ref()
             .filter(|_| named)
-            .and_then(|requested| crate::npm_firewall_config::policy_action(requested, key))
-        {
+            .and_then(|requested| crate::npm_firewall_config::policy_action(requested, key));
+        let sent = runtime_requested
+            .as_ref()
+            .and_then(|requested| crate::npm_firewall_config::policy_action(requested, key));
+        let (value, source) = match literal {
+            // Telemetry following `lpm_ai_suspicious` holds at a stricter
+            // approved action; installs send that, and the posture set it.
+            Some(action) if sent.is_some_and(|sent| sent != action) => (
+                sent.unwrap_or(action),
+                posture_source(posture.sources.firewall_policies).to_string(),
+            ),
             Some(action) => select_security_value(
                 action,
                 &config_source,
