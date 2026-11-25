@@ -8339,6 +8339,31 @@ async fn fusion_reports_an_exact_document_firewall_refusal_without_the_packument
         })
     ));
     server.verify().await;
+    let requests: Vec<(String, String)> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| {
+            (
+                request.url.path().to_string(),
+                request
+                    .headers
+                    .get("accept")
+                    .and_then(|accept| accept.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect();
+    let json = "application/json".to_string();
+    assert_eq!(
+        requests,
+        [
+            ("/blocked-exact".to_string(), json.clone()),
+            ("/blocked-exact/1.0.0".to_string(), json),
+        ]
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
