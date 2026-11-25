@@ -11,7 +11,7 @@ use crate::install_ui;
 use crate::lpm_insights_config::FETCH_LPM_SECURITY_INSIGHTS_KEY;
 use crate::lpm_skills_config::{
     AUTO_INSTALL_LPM_SKILLS_KEY, LEGACY_NO_SKILLS_KEY, LPM_DEV_PACKAGES_SETTING,
-    OTHER_PACKAGES_SETTING,
+    OTHER_PACKAGES_SETTING, SECURITY_PROVIDER_SETTING,
 };
 use crate::npm_firewall_config::{FIREWALL_CONFIG_SECTION, NpmFirewallMode};
 use crate::prompt::prompt_err;
@@ -64,8 +64,10 @@ enum GenericSetTarget {
     /// `skills.lpm-dev-packages`, `skills.other-packages`, or the legacy
     /// `auto-install-lpm-skills`, which writes `skills.lpm-dev-packages`.
     SkillSetting,
-    /// The `[skills]` table itself, which holds both skill settings.
+    /// The `[skills]` table itself, which holds the skill settings.
     SkillsSection,
+    /// `skills.security-provider`.
+    SkillSecurityProvider,
     UnsupportedNested,
 }
 
@@ -101,10 +103,22 @@ fn generic_set_target(key: &str) -> GenericSetTarget {
         AUTO_INSTALL_LPM_SKILLS_KEY => GenericSetTarget::SkillSetting,
         _ if SKILL_SETTINGS.contains(&key) => GenericSetTarget::SkillSetting,
         crate::lpm_skills_config::SKILLS_TABLE => GenericSetTarget::SkillsSection,
+        SECURITY_PROVIDER_SETTING => GenericSetTarget::SkillSecurityProvider,
         "policy" | "tunnel" => GenericSetTarget::UnsupportedNested,
         _ if key.contains('.') => GenericSetTarget::UnsupportedNested,
         _ => GenericSetTarget::Scalar,
     }
+}
+
+/// Writes `[skills] security-provider` in the user config, as `lpm login
+/// --socket` and `lpm logout --socket` do.
+pub(crate) async fn set_skill_security_provider(
+    provider: crate::lpm_skills_config::SecurityProvider,
+) -> Result<(), LpmError> {
+    let config_path = LpmRoot::from_env()?.root().join("config.toml");
+    wizards::persist_security_provider(&config_path, provider.as_str())
+        .await
+        .map(|_| ())
 }
 
 /// CLI configuration management.
@@ -301,6 +315,16 @@ pub async fn run(
                     announce_generic_set(key, value, serde_json::json!(enabled), json_output);
                     return Ok(());
                 }
+                GenericSetTarget::SkillSecurityProvider => {
+                    let provider = wizards::persist_security_provider(&config_path, value).await?;
+                    announce_generic_set(
+                        key,
+                        value,
+                        serde_json::json!(provider.as_str()),
+                        json_output,
+                    );
+                    return Ok(());
+                }
                 GenericSetTarget::Sandbox => {
                     apply_sandbox_mode(
                         &config_path,
@@ -355,7 +379,7 @@ pub async fn run(
                 }
                 GenericSetTarget::SkillsSection => {
                     return Err(LpmError::Registry(format!(
-                        "`{key}` holds two settings; use `lpm config set {LPM_DEV_PACKAGES_SETTING} <true|false>`, `lpm config set {OTHER_PACKAGES_SETTING} <true|false>`, or `lpm config skills`"
+                        "`{key}` holds several settings; use `lpm config set {LPM_DEV_PACKAGES_SETTING} <true|false>`, `lpm config set {OTHER_PACKAGES_SETTING} <true|false>`, `lpm config set {SECURITY_PROVIDER_SETTING} <none|socket>`, or `lpm config skills`"
                     )));
                 }
                 GenericSetTarget::UnsupportedNested => {

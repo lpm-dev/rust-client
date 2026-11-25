@@ -67,6 +67,8 @@ fn settings() -> Result<Settings, LpmError> {
         Settings::resolve(LpmSkillsPreference::Config)?.unwrap_or(Settings {
             lpm_dev_packages: true,
             other_packages: true,
+            security_provider: Default::default(),
+            offline: false,
             omitted: Default::default(),
         }),
     )
@@ -268,7 +270,8 @@ pub(super) async fn link(
     let mut edit = ManifestEdit::read(&root)?;
     let before = edit.value.clone();
     let added = edit.add(PolicyList::Allow, &selectors)?;
-    let preview = crate::dependency_skills::inspect_project(&root, &edit.value, settings)?;
+    let inspector = crate::dependency_skills::Inspector::new(&root, settings);
+    let preview = inspector.project(&edit.value, settings)?;
     let changes = previewed_changes(&preview);
     if args.dry_run {
         print_policy_preview(json_output, "link", &added, &[], &changes);
@@ -281,10 +284,7 @@ pub(super) async fn link(
         let grants = if args.yes || !super::is_interactive(json_output) {
             0
         } else {
-            new_grants(
-                &crate::dependency_skills::inspect_project(&root, &before, settings)?,
-                &preview,
-            )
+            new_grants(&inspector.project(&before, settings)?, &preview)
         };
         let prompt = if grants == 0 {
             "Allow these skills for agents in package.json?".to_string()
@@ -378,9 +378,10 @@ pub(super) async fn unlink(
         other_packages: true,
         ..settings
     };
+    let inspector = crate::dependency_skills::Inspector::new(&root, settings);
     let (removed, denied) = if args.all {
         let removed = edit.clear(PolicyList::Allow);
-        let remaining = crate::dependency_skills::inspect_project(&root, &edit.value, shared)?;
+        let remaining = inspector.project(&edit.value, shared)?;
         let still_linked: Vec<String> = linked_after(&remaining)
             .into_iter()
             .map(|outcome| format!("#{}", outcome.package))
@@ -399,7 +400,7 @@ pub(super) async fn unlink(
             .iter()
             .filter_map(|text| crate::dependency_skills::validate_selector(text).ok())
             .collect();
-        let remaining = crate::dependency_skills::inspect_project(&root, &edit.value, shared)?;
+        let remaining = inspector.project(&edit.value, shared)?;
         let linked = linked_after(&remaining);
         let mut deny = Vec::with_capacity(selectors.len());
         for selector in selectors {
@@ -408,11 +409,7 @@ pub(super) async fn unlink(
                 || {
                     let mut trial = edit.clone();
                     trial.add(PolicyList::Deny, std::slice::from_ref(&selector))?;
-                    linked_after(&crate::dependency_skills::inspect_project(
-                        &root,
-                        &trial.value,
-                        shared,
-                    )?) != linked
+                    linked_after(&inspector.project(&trial.value, shared)?) != linked
                 }
             {
                 deny.push(selector);
@@ -421,7 +418,7 @@ pub(super) async fn unlink(
         let denied = edit.add(PolicyList::Deny, &deny)?;
         (removed, denied)
     };
-    let preview = crate::dependency_skills::inspect_project(&root, &edit.value, settings)?;
+    let preview = inspector.project(&edit.value, settings)?;
     let changes = previewed_changes(&preview);
     if args.dry_run {
         print_policy_preview(json_output, "unlink", &removed, &denied, &changes);

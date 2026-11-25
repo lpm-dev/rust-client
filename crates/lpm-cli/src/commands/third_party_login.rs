@@ -10,6 +10,59 @@ const NPM_DISPLAY: &str = "npmjs.org";
 const GITHUB_DISPLAY: &str = "github.com";
 const GITLAB_DISPLAY: &str = "gitlab.com";
 
+/// `lpm login --socket`: checks the token with Socket, stores it, and turns
+/// the Socket check of dependency skills on.
+pub async fn run_socket(token: Option<String>, json_output: bool) -> Result<(), LpmError> {
+    let token = match token {
+        Some(token) => token,
+        None if !json_output && std::io::stdin().is_terminal() => {
+            cliclack::password("Socket API token (an organization token with packages:list)")
+                .interact()
+                .map_prompt_err(|e| LpmError::Script(format!("token prompt failed: {e}")))?
+        }
+        None => {
+            return Err(LpmError::Registry(format!(
+                "pass the Socket API token with `--token`; or set SOCKET_CLI_API_TOKEN instead of storing one, and turn the check on with `lpm config set {} socket`",
+                crate::lpm_skills_config::SECURITY_PROVIDER_SETTING
+            )));
+        }
+    };
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(LpmError::Registry("token cannot be empty".into()));
+    }
+    let organization = crate::dependency_skills::socket_organization(token)
+        .await
+        .map_err(|reason| LpmError::Registry(format!("Socket refused the token: {reason}")))?;
+    let backend = auth::set_socket_token_with_backend(token)
+        .map_err(|e| LpmError::Registry(format!("failed to store token: {e}")))?;
+    crate::dependency_skills::socket_credentials_changed();
+    crate::commands::config::set_skill_security_provider(
+        crate::lpm_skills_config::SecurityProvider::Socket,
+    )
+    .await?;
+    let storage = auth::AuthStorageStatus::from_backend(backend);
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "provider": "socket",
+                "organization": organization,
+                "storage_backend": storage.backend_json_value(),
+                "storage_degraded": storage.degraded,
+            }))
+            .map_err(|e| LpmError::Registry(format!("failed to serialize login result: {e}")))?
+        );
+    } else {
+        install_ui::done_untrusted(&format!(
+            "Socket token stored for {organization}; installs check the packages behind npm and other dependency skills with Socket before linking them"
+        ));
+        render_storage_backend(storage);
+    }
+    Ok(())
+}
+
 /// `client` is the registry client the web login's requests take their
 /// `.npmrc` TLS settings from; a token given outright needs no request.
 pub async fn run_npm(

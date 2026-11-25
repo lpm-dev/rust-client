@@ -95,8 +95,8 @@ pub(in crate::commands::config) use sigstore::{
     read_sigstore_availability, read_sigstore_scope, read_sigstore_verify,
 };
 pub(in crate::commands::config) use skills::{
-    SKILL_SETTINGS, format_current_skill_settings, persist_skill_settings, read_skill_settings,
-    run_npm_skills_wizard, run_skills_wizard,
+    SKILL_SETTINGS, format_current_skill_settings, persist_security_provider,
+    persist_skill_settings, read_skill_settings, run_npm_skills_wizard, run_skills_wizard,
 };
 pub(in crate::commands::config) use source_analysis::run_source_analysis_wizard;
 pub(in crate::commands::config) use triage::run_triage_wizard;

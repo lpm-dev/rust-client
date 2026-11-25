@@ -193,20 +193,8 @@ fn read_entries(
         }
         match parse_selector(text) {
             Ok(selector) => {
-                if let Some(class) = standalone_root(&selector) {
-                    problems.push(format!(
-                        "{location} uses `{}` on its own, which no installed package is; it works before `>`, as in `{} > #pkg`",
-                        class.display_name(),
-                        class.display_name()
-                    ));
-                    complete = false;
-                    continue;
-                }
-                if let Some(class) = unsupported_class(&selector) {
-                    problems.push(format!(
-                        "{location} uses `{}`, which skill selectors can't decide; use package names, `:skills`, `:skill()`, `:malware`, `:lpm`, `:npm`, `:root`, `>` and behavioral tags",
-                        class.display_name()
-                    ));
+                if let Some(problem) = selector_problem(&selector) {
+                    problems.push(format!("{location} {problem}"));
                     complete = false;
                     continue;
                 }
@@ -268,6 +256,21 @@ fn read_targets(value: Option<&serde_json::Value>, problems: &mut Vec<String>) -
     Targets::Explicit(targets)
 }
 
+/// Whether `selector` reads `:malware` of a parent, before `>`: LPM asks
+/// the security provider only about the packages whose skills it decides.
+fn malware_before_child(selector: &Selector) -> bool {
+    match selector {
+        Selector::DirectChild { parent, child } => {
+            crate::commands::query::selector_uses_pseudo_class(parent, |class| {
+                class == PseudoClass::Malware
+            }) || malware_before_child(child)
+        }
+        Selector::And(parts) | Selector::Or(parts) => parts.iter().any(malware_before_child),
+        Selector::Not(inner) => malware_before_child(inner),
+        Selector::PseudoClass(_) | Selector::Id(_) | Selector::Skill(_) => false,
+    }
+}
+
 /// A `:root` or `:workspace-root` in `selector` other than as the parent of
 /// `>`: on its own it names the project, never a package, so it decides
 /// nothing.
@@ -288,6 +291,29 @@ fn standalone_root(selector: &Selector) -> Option<PseudoClass> {
     }
 }
 
+/// Why skill selection can't use `selector`, which parsed: the rules
+/// [`read_policy`] drops an entry by.
+fn selector_problem(selector: &Selector) -> Option<String> {
+    if let Some(class) = standalone_root(selector) {
+        return Some(format!(
+            "uses `{0}` on its own, which no installed package is; it works before `>`, as in `{0} > #pkg`",
+            class.display_name()
+        ));
+    }
+    if malware_before_child(selector) {
+        return Some(
+            "uses `:malware` before `>`, which skill selectors can't decide; use it on the package itself, as in `#pkg:not(:malware)`"
+                .to_string(),
+        );
+    }
+    unsupported_class(selector).map(|class| {
+        format!(
+            "uses `{}`, which skill selectors can't decide; use package names, `:skills`, `:skill()`, `:malware`, `:lpm`, `:npm`, `:root`, `>` and behavioral tags",
+            class.display_name()
+        )
+    })
+}
+
 /// Parses `text` as a skill-policy selector, refusing what [`read_policy`]
 /// would drop, and returns it in canonical form.
 pub(crate) fn validate_selector(text: &str) -> Result<String, String> {
@@ -298,17 +324,8 @@ pub(crate) fn validate_selector(text: &str) -> Result<String, String> {
     }
     let selector = parse_selector(text)
         .map_err(|error| format!("`{text}` is not a valid selector: {}", error.message))?;
-    if let Some(class) = standalone_root(&selector) {
-        return Err(format!(
-            "`{text}` uses `{}` on its own, which no installed package is; it works before `>`",
-            class.display_name()
-        ));
-    }
-    if let Some(class) = unsupported_class(&selector) {
-        return Err(format!(
-            "`{text}` uses `{}`, which skill selectors can't decide",
-            class.display_name()
-        ));
+    if let Some(problem) = selector_problem(&selector) {
+        return Err(format!("`{text}` {problem}"));
     }
     let canonical = selector.to_string();
     if canonical.len() > MAX_SELECTOR_LENGTH {
@@ -461,6 +478,30 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         assert!(validate_selector(&shorter).is_ok());
+    }
+
+    #[test]
+    fn malware_counts_only_on_the_package_a_selector_decides() {
+        let parsed =
+            parse(r##"{"lpm":{"skills":{"allow":[":malware > #a", "#a:not(:malware)"]}}}"##);
+        let policy = parsed.policy.unwrap();
+        assert_eq!(policy.allow.len(), 1);
+        assert_eq!(policy.allow[0].text, "#a:not(:malware)");
+        assert!(parsed.problems[0].contains("`:malware` before `>`"));
+    }
+
+    #[test]
+    fn link_and_unlink_refuse_every_selector_the_policy_reader_drops() {
+        for text in [":malware > #a", ":root", "#a:not(:scripts)", "#a:unknown"] {
+            assert!(validate_selector(text).is_err(), "{text}");
+            let parsed =
+                parse(&serde_json::json!({ "lpm": { "skills": { "allow": [text] } } }).to_string());
+            assert!(parsed.policy.unwrap().allow.is_empty(), "{text}");
+        }
+        assert_eq!(
+            validate_selector(" #a:not(:malware) ").as_deref(),
+            Ok("#a:not(:malware)")
+        );
     }
 
     #[test]

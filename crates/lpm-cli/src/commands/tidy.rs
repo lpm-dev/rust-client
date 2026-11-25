@@ -201,6 +201,7 @@ pub async fn run(
             project_dir,
             crate::lpm_skills_config::LpmSkillsPreference::Config,
             InstallOmitPolicy::default(),
+            false,
         )
     });
 

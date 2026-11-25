@@ -25,7 +25,7 @@ const GROUP_NETWORK: &str = "Network";
 const GROUP_EXTENSIONS: &str = "Local policy extensions";
 const GROUP_ADDITIONAL: &str = "Additional saved values";
 
-const STATIC_CONFIG_ENTRY_COUNT: usize = 37;
+const STATIC_CONFIG_ENTRY_COUNT: usize = 38;
 const LEGACY_CONFIG_PATHS: &[&str] = &[
     "firewall.npm.policies.static_only_suspicious",
     "noSkills",
@@ -1077,6 +1077,16 @@ fn add_install_entries(
         crate::lpm_skills_config::OTHER_PACKAGES_SETTING,
         other_packages,
         if other_packages_configured {
+            user_source
+        } else {
+            DEFAULT_SOURCE
+        },
+        GROUP_INSTALL,
+    ));
+    entries.push(EffectiveConfigEntry::new(
+        crate::lpm_skills_config::SECURITY_PROVIDER_SETTING,
+        crate::lpm_skills_config::security_provider(global)?.as_str(),
+        if crate::lpm_skills_config::security_provider_configured(global) {
             user_source
         } else {
             DEFAULT_SOURCE

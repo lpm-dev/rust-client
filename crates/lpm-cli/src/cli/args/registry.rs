@@ -167,7 +167,7 @@ pub(crate) struct StageArgs {
 #[command(
     group(
         clap::ArgGroup::new("login_target")
-            .args(["npm", "github", "gitlab", "login_registry"])
+            .args(["npm", "github", "gitlab", "login_registry", "socket"])
             .multiple(false)
     ),
     group(
@@ -193,7 +193,12 @@ pub(crate) struct LoginArgs {
     #[arg(long = "login-registry", value_name = "URL")]
     pub(crate) login_registry: Option<String>,
 
-    /// Explicit token fallback for npm, GitHub Packages, GitLab Packages, or a custom registry.
+    /// Store a Socket API token and check the packages behind dependency
+    /// skills with Socket before they link.
+    #[arg(long)]
+    pub(crate) socket: bool,
+
+    /// Explicit token for npm, GitHub Packages, GitLab Packages, a custom registry, or Socket.
     #[arg(long)]
     pub(crate) token: Option<String>,
 
@@ -220,7 +225,11 @@ pub(crate) struct LogoutArgs {
     #[arg(long)]
     pub(crate) gitlab: bool,
 
-    /// Log out from all registries (LPM + npm + GitHub + GitLab + custom).
+    /// Remove the stored Socket API token and stop checking dependency skills with Socket.
+    #[arg(long)]
+    pub(crate) socket: bool,
+
+    /// Log out from all registries (LPM + npm + GitHub + GitLab + custom) and Socket.
     #[arg(long)]
     pub(crate) all: bool,
 

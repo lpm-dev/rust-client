@@ -125,7 +125,7 @@ fn selector_needs_vulnerabilities(selector: &Selector) -> bool {
     })
 }
 
-fn selector_uses_pseudo_class(
+pub(crate) fn selector_uses_pseudo_class(
     selector: &Selector,
     predicate: impl Copy + Fn(PseudoClass) -> bool,
 ) -> bool {
@@ -167,7 +167,7 @@ pub async fn run(
             .map_err(|e| LpmError::Registry(format!("Invalid selector: {e}")))?;
         if selector_uses_pseudo_class(&selector, |class| class == PseudoClass::Malware) {
             return Err(LpmError::Registry(
-                "`:malware` needs a security verdict, which `lpm query` doesn't fetch; use it in a skills allow-list (`package.json > lpm > skills`), where LPM has verdicts".into(),
+                "`:malware` needs a security verdict, which `lpm query` doesn't fetch; skills policies (`package.json > lpm > skills`) get verdicts once `skills.security-provider` is socket".into(),
             ));
         }
         Some(selector)

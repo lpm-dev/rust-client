@@ -3488,6 +3488,2013 @@ async fn adding_an_lpm_dev_package_names_the_skills_review_warned_about_and_leav
     );
 }
 
+const SOCKET_TOKEN: &str = "socket-token";
+
+/// One line of Socket's answer for `name` at `version` with these alert
+/// types, without the `inputPurl` compact answers may leave out.
+fn socket_row(name: &str, version: &str, alerts: &[&str]) -> serde_json::Value {
+    let alerts: Vec<serde_json::Value> = alerts
+        .iter()
+        .map(|kind| serde_json::json!({ "type": kind, "key": format!("{name}-{kind}") }))
+        .collect();
+    let mut row = serde_json::json!({
+        "type": "npm",
+        "name": name,
+        "version": version,
+        "alerts": alerts,
+    });
+    if let Some((scope, bare)) = name.split_once('/') {
+        row["namespace"] = serde_json::json!(scope);
+        row["name"] = serde_json::json!(bare);
+    }
+    row
+}
+
+/// A Socket API for the organization `acme` that answers each package
+/// lookup made with [`SOCKET_TOKEN`] and every parameter LPM relies on
+/// with `response`. Anything else gets a 404.
+async fn socket_api_answering(response: wiremock::ResponseTemplate) -> wiremock::MockServer {
+    let server = wiremock::MockServer::start().await;
+    mount_socket(&server, response).await;
+    server
+}
+
+/// Mounts Socket's organization list and package lookup on `server`, the
+/// lookup answering with `response`.
+async fn mount_socket(server: &wiremock::MockServer, response: wiremock::ResponseTemplate) {
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let bearer = format!("Bearer {SOCKET_TOKEN}");
+    Mock::given(method("GET"))
+        .and(path("/v0/organizations"))
+        .and(header("authorization", bearer.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organizations": {
+                "org-1": { "id": "org-1", "name": "Acme", "image": null, "plan": "team", "slug": "acme" }
+            }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v0/orgs/acme/purl"))
+        .and(query_param("alerts", "true"))
+        .and(query_param("compact", "true"))
+        .and(query_param("purlErrors", "true"))
+        .and(query_param("notFoundAlerts", "true"))
+        .and(query_param("poll", "false"))
+        .and(header("authorization", bearer.as_str()))
+        .respond_with(response)
+        .mount(server)
+        .await;
+}
+
+/// Socket's answer reporting each package version's alert types in
+/// `verdicts`.
+fn verdict_answer(verdicts: &[(&str, &str, &[&str])]) -> wiremock::ResponseTemplate {
+    let body: String = verdicts
+        .iter()
+        .map(|(name, version, alerts)| format!("{}\n", socket_row(name, version, alerts)))
+        .collect();
+    wiremock::ResponseTemplate::new(200).set_body_raw(body, "application/x-ndjson")
+}
+
+/// A Socket API that reports each package version's alert types in
+/// `verdicts`.
+async fn socket_api(verdicts: &[(&str, &str, &[&str])]) -> wiremock::MockServer {
+    socket_api_answering(verdict_answer(verdicts)).await
+}
+
+/// Makes `socket` answer later lookups with `verdicts` instead, as one
+/// Socket API whose verdicts change over time.
+async fn answer_with(socket: &wiremock::MockServer, verdicts: &[(&str, &str, &[&str])]) {
+    socket.reset().await;
+    mount_socket(socket, verdict_answer(verdicts)).await;
+}
+
+/// The PURLs each package lookup `socket` received asked about, in order.
+async fn socket_lookups(socket: &wiremock::MockServer) -> Vec<Vec<String>> {
+    socket
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.method.as_str() == "POST")
+        .map(|request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            body["components"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|component| component["purl"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .collect()
+}
+
+fn turn_socket_check_on(project: &TempProject) {
+    let config = project.home().join(".lpm/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[skills]\nsecurity-provider = \"socket\"\n").unwrap();
+}
+
+/// `lpm --json <args>` against `registry` with `socket` as Socket's API
+/// and `token`, when given, as the Socket token in the environment.
+fn run_with_socket(
+    project: &TempProject,
+    registry: &MockRegistry,
+    socket: &wiremock::MockServer,
+    token: Option<&str>,
+    args: &[&str],
+) -> serde_json::Value {
+    let mut command = lpm_with_registry(project, &registry.url());
+    command
+        .arg("--json")
+        .args(args)
+        .env("LPM_SOCKET_API_URL", format!("{}/v0", socket.uri()))
+        .env(
+            "LPM_SOCKET_NPM_MIRROR",
+            format!("{}/tarballs", registry.url()),
+        );
+    if let Some(token) = token {
+        command.env("SOCKET_CLI_API_TOKEN", token);
+    }
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{args:?}: {}", combined(&output));
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn install_checked(
+    project: &TempProject,
+    registry: &MockRegistry,
+    socket: &wiremock::MockServer,
+    token: Option<&str>,
+) -> serde_json::Value {
+    run_with_socket(project, registry, socket, token, &["install"])
+}
+
+/// Whether `report` carries a warning containing `text`.
+fn warned(report: &serde_json::Value, text: &str) -> bool {
+    report["warnings"].as_array().is_some_and(|warnings| {
+        warnings.iter().any(|warning| {
+            warning
+                .as_str()
+                .is_some_and(|warning| warning.contains(text))
+        })
+    })
+}
+
+/// `lpm --json install` with nothing on the command line that keeps it off
+/// the fast lane, against `registry` and with `socket` as Socket's API.
+fn bare_install_with_socket(
+    project: &TempProject,
+    registry: &MockRegistry,
+    socket: &wiremock::MockServer,
+) -> serde_json::Value {
+    let output = lpm(project)
+        .args(["--json", "install"])
+        .env("LPM_REGISTRY_URL", registry.url())
+        .env("LPM_SOCKET_API_URL", format!("{}/v0", socket.uri()))
+        .env(
+            "LPM_SOCKET_NPM_MIRROR",
+            format!("{}/tarballs", registry.url()),
+        )
+        .env("SOCKET_CLI_API_TOKEN", SOCKET_TOKEN)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", combined(&output));
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// A project that allows `browser-tool` 1.0.0's skill, with the Socket
+/// check on.
+async fn socket_checked_browser_tool() -> (MockRegistry, TempProject) {
+    let registry = MockRegistry::start().await;
+    serve(
+        &registry,
+        "browser-tool",
+        "1.0.0",
+        &skill_package(
+            "browser-tool",
+            "1.0.0",
+            false,
+            &[("browser-tool", plain_skill("browser-tool"))],
+        ),
+    )
+    .await;
+    let project = TempProject::empty(&manifest(
+        &[("browser-tool", "1.0.0")],
+        Some(serde_json::json!({ "allow": ["#browser-tool"] })),
+    ));
+    turn_socket_check_on(&project);
+    (registry, project)
+}
+
+#[tokio::test]
+async fn socket_verdicts_keep_malware_out_and_let_clean_skills_link() {
+    let registry = MockRegistry::start().await;
+    for name in ["browser-tool", "bad-tool"] {
+        serve(
+            &registry,
+            name,
+            "1.0.0",
+            &skill_package(name, "1.0.0", false, &[(name, plain_skill(name))]),
+        )
+        .await;
+    }
+    let socket = socket_api(&[
+        ("browser-tool", "1.0.0", &["envVars"]),
+        ("bad-tool", "1.0.0", &["malware"]),
+    ])
+    .await;
+    let project = TempProject::empty(&manifest(
+        &[("browser-tool", "1.0.0"), ("bad-tool", "1.0.0")],
+        Some(serde_json::json!({ "allow": ["#browser-tool", "#bad-tool"] })),
+    ));
+    turn_socket_check_on(&project);
+
+    let report = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+    assert!(
+        linked_document(&project, ".agents/skills", "browser-tool").is_some(),
+        "{report:#}"
+    );
+    assert!(linked_document(&project, ".agents/skills", "bad-tool").is_none());
+    let held = &report["dependency_skills"]["held"];
+    assert_eq!(held[0]["skill"], "bad-tool", "{report:#}");
+    assert_eq!(held[0]["reason"], "malware");
+    assert_eq!(
+        socket_lookups(&socket).await,
+        [["pkg:npm/bad-tool@1.0.0", "pkg:npm/browser-tool@1.0.0"]]
+    );
+}
+
+/// Serves `browser-tool` 1.0.0 and 1.1.0, each shipping a `browser-tool`
+/// skill with its own document, and returns the two documents.
+async fn browser_tool_versions(registry: &MockRegistry) -> (String, String) {
+    let first = plain_skill("browser-tool");
+    let second = skill_document("browser-tool", "", "Run the newer tool.");
+    serve_versions(
+        registry,
+        "browser-tool",
+        &[
+            (
+                "1.0.0",
+                skill_package(
+                    "browser-tool",
+                    "1.0.0",
+                    false,
+                    &[("browser-tool", first.clone())],
+                ),
+            ),
+            (
+                "1.1.0",
+                skill_package(
+                    "browser-tool",
+                    "1.1.0",
+                    false,
+                    &[("browser-tool", second.clone())],
+                ),
+            ),
+        ],
+    )
+    .await;
+    (first, second)
+}
+
+/// A project that linked `browser-tool` 1.0.0's skill on a clean verdict
+/// from `socket`, and now installs 1.1.0, which Socket is still analyzing.
+async fn kept_while_socket_analyzes(
+    registry: &MockRegistry,
+    socket: &wiremock::MockServer,
+    first: &str,
+) -> (TempProject, serde_json::Value) {
+    let policy = Some(serde_json::json!({ "allow": ["#browser-tool"] }));
+    let project = TempProject::empty(&manifest(&[("browser-tool", "1.0.0")], policy.clone()));
+    turn_socket_check_on(&project);
+    answer_with(socket, &[("browser-tool", "1.0.0", &[])]).await;
+    install_checked(&project, registry, socket, Some(SOCKET_TOKEN));
+    assert_eq!(
+        linked_document(&project, ".agents/skills", "browser-tool").as_deref(),
+        Some(first)
+    );
+    set_policy(&project, &[("browser-tool", "1.1.0")], policy);
+    answer_with(
+        socket,
+        &[
+            ("browser-tool", "1.0.0", &[]),
+            ("browser-tool", "1.1.0", &["pendingScan"]),
+        ],
+    )
+    .await;
+    let report = install_checked(&project, registry, socket, Some(SOCKET_TOKEN));
+    (project, report)
+}
+
+#[tokio::test]
+async fn a_copy_linked_before_the_socket_check_was_on_is_not_kept_on_a_verdict() {
+    let registry = MockRegistry::start().await;
+    let (first, _) = browser_tool_versions(&registry).await;
+    let policy = Some(serde_json::json!({ "allow": ["#browser-tool"] }));
+    let project = TempProject::empty(&manifest(&[("browser-tool", "1.0.0")], policy.clone()));
+    install(&project, &registry, &[]);
+    assert_eq!(
+        linked_document(&project, ".agents/skills", "browser-tool").as_deref(),
+        Some(first.as_str())
+    );
+    turn_socket_check_on(&project);
+    set_policy(&project, &[("browser-tool", "1.1.0")], policy);
+    let socket = socket_api(&[
+        ("browser-tool", "1.0.0", &[]),
+        ("browser-tool", "1.1.0", &["pendingScan"]),
+    ])
+    .await;
+
+    let report = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+    let held = &report["dependency_skills"]["held"][0];
+    assert_eq!(held["reason"], "awaiting_check", "{report:#}");
+    assert_eq!(held["kept_version"], serde_json::Value::Null, "{report:#}");
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_none());
+    assert_eq!(
+        socket_lookups(&socket).await,
+        [["pkg:npm/browser-tool@1.1.0"]],
+        "a copy that can't be kept on a verdict is never asked about"
+    );
+}
+
+#[tokio::test]
+async fn a_kept_copy_is_dropped_once_its_own_release_is_flagged() {
+    let registry = MockRegistry::start().await;
+    let (first, _) = browser_tool_versions(&registry).await;
+    let socket = socket_api(&[]).await;
+    let (project, report) = kept_while_socket_analyzes(&registry, &socket, &first).await;
+    assert_eq!(
+        report["dependency_skills"]["held"][0]["kept_version"], "1.0.0",
+        "{report:#}"
+    );
+    age_socket_checks(&project);
+    answer_with(
+        &socket,
+        &[
+            ("browser-tool", "1.0.0", &["malware"]),
+            ("browser-tool", "1.1.0", &["pendingScan"]),
+        ],
+    )
+    .await;
+
+    let report = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+    assert_eq!(
+        report["dependency_skills"]["held"][0]["kept_version"],
+        serde_json::Value::Null,
+        "{report:#}"
+    );
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_none());
+    assert!(
+        socket_lookups(&socket)
+            .await
+            .concat()
+            .contains(&"pkg:npm/browser-tool@1.0.0".to_string())
+    );
+}
+
+#[tokio::test]
+async fn a_copy_whose_link_is_gone_is_neither_kept_nor_asked_about() {
+    let registry = MockRegistry::start().await;
+    let (_, _) = browser_tool_versions(&registry).await;
+    let socket = socket_api(&[]).await;
+    let policy = Some(serde_json::json!({ "allow": ["#browser-tool"] }));
+    let project = TempProject::empty(&manifest(&[("browser-tool", "1.0.0")], policy.clone()));
+    turn_socket_check_on(&project);
+    answer_with(&socket, &[("browser-tool", "1.0.0", &[])]).await;
+    install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+    age_socket_checks(&project);
+    lpm_common::remove_path_entry(&project.path().join(".agents/skills/browser-tool")).unwrap();
+    set_policy(&project, &[("browser-tool", "1.1.0")], policy);
+    answer_with(
+        &socket,
+        &[
+            ("browser-tool", "1.0.0", &[]),
+            ("browser-tool", "1.1.0", &["pendingScan"]),
+        ],
+    )
+    .await;
+
+    let report = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+    assert_eq!(
+        report["dependency_skills"]["held"][0]["kept_version"],
+        serde_json::Value::Null,
+        "{report:#}"
+    );
+    assert_eq!(
+        socket_lookups(&socket).await,
+        [["pkg:npm/browser-tool@1.1.0"]]
+    );
+}
+
+#[tokio::test]
+async fn a_copy_that_pre_approves_its_command_is_not_kept_while_the_new_release_awaits_socket() {
+    let registry = MockRegistry::start().await;
+    let document = |body: &str| {
+        skill_document(
+            "browser-tool",
+            "allowed-tools: Bash(browser-tool:*)\n",
+            body,
+        )
+    };
+    serve_versions(
+        &registry,
+        "browser-tool",
+        &[
+            (
+                "1.0.0",
+                skill_package(
+                    "browser-tool",
+                    "1.0.0",
+                    true,
+                    &[("browser-tool", document("Run it."))],
+                ),
+            ),
+            (
+                "1.1.0",
+                skill_package(
+                    "browser-tool",
+                    "1.1.0",
+                    true,
+                    &[("browser-tool", document("Run the newer tool."))],
+                ),
+            ),
+        ],
+    )
+    .await;
+    let socket = socket_api(&[]).await;
+    let policy = Some(serde_json::json!({ "allow": [BROWSER_TOOL_SKILL] }));
+    let project = TempProject::empty(&manifest(&[("browser-tool", "1.0.0")], policy.clone()));
+    turn_socket_check_on(&project);
+    answer_with(&socket, &[("browser-tool", "1.0.0", &[])]).await;
+    install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_some());
+    set_policy(&project, &[("browser-tool", "1.1.0")], policy);
+    answer_with(
+        &socket,
+        &[
+            ("browser-tool", "1.0.0", &[]),
+            ("browser-tool", "1.1.0", &["pendingScan"]),
+        ],
+    )
+    .await;
+
+    let report = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+    let held = &report["dependency_skills"]["held"][0];
+    assert_eq!(held["reason"], "awaiting_check", "{report:#}");
+    assert_eq!(
+        held["kept_version"],
+        serde_json::Value::Null,
+        "the kept skill would pre-approve the unchecked release's command: {report:#}"
+    );
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_none());
+}
+
+/// Makes every skills folder under `root` holding `document` unreadable,
+/// returning them so the test can restore them.
+#[cfg(unix)]
+fn seal_skill_folders(root: &std::path::Path, document: &str) -> Vec<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut sealed = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                pending.push(path);
+            } else if kind.is_file()
+                && path.file_name().is_some_and(|name| name == "SKILL.md")
+                && std::fs::read_to_string(&path).is_ok_and(|content| content == document)
+            {
+                let skills = path.parent().unwrap().parent().unwrap().to_path_buf();
+                sealed.push(skills);
+            }
+        }
+    }
+    for skills in &sealed {
+        std::fs::set_permissions(skills, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    sealed
+}
+
+/// What a sync made of `browser-tool@1.0.0`'s linked skill: the document
+/// linked afterwards, the sync's report, and every release Socket was asked
+/// about.
+#[cfg(unix)]
+struct UnlistableSync {
+    linked: Option<String>,
+    synced: serde_json::Value,
+    asked: Vec<String>,
+}
+
+#[cfg(unix)]
+impl UnlistableSync {
+    fn kept(&self) -> bool {
+        self.linked
+            .as_deref()
+            .is_some_and(|linked| linked.contains("Run it."))
+    }
+
+    fn held_unreadable(&self) -> bool {
+        self.synced["dependency_skills"]["held"]
+            .as_array()
+            .is_some_and(|held| held.iter().any(|entry| entry["reason"] == "unreadable"))
+    }
+}
+
+/// Links `browser-tool@1.0.0`'s skill, whose frontmatter adds
+/// `extra_frontmatter`, under Socket, then syncs once the skills of an
+/// installed release can't be listed: 1.0.0's own, or, with
+/// `update_alerts`, those of 1.1.0, installed in its place and answered
+/// with those alerts. `None` when running as root, which reads the sealed
+/// folder anyway.
+#[cfg(unix)]
+async fn sync_with_unlistable_skills(
+    extra_frontmatter: &str,
+    update_alerts: Option<&[&str]>,
+) -> Option<UnlistableSync> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return None;
+    }
+    let registry = MockRegistry::start().await;
+    let document = |body: &str| skill_document("browser-tool", extra_frontmatter, body);
+    let original = document("Run it.");
+    let newer = document("Run the newer tool.");
+    serve_versions(
+        &registry,
+        "browser-tool",
+        &[
+            (
+                "1.0.0",
+                skill_package(
+                    "browser-tool",
+                    "1.0.0",
+                    true,
+                    &[("browser-tool", original.clone())],
+                ),
+            ),
+            (
+                "1.1.0",
+                skill_package(
+                    "browser-tool",
+                    "1.1.0",
+                    true,
+                    &[("browser-tool", newer.clone())],
+                ),
+            ),
+        ],
+    )
+    .await;
+    let socket = socket_api(&[]).await;
+    let policy = Some(serde_json::json!({ "allow": [BROWSER_TOOL_SKILL] }));
+    let project = TempProject::empty(&manifest(&[("browser-tool", "1.0.0")], policy.clone()));
+    turn_socket_check_on(&project);
+    answer_with(&socket, &[("browser-tool", "1.0.0", &[])]).await;
+    install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_some());
+    let sealed_document = match update_alerts {
+        Some(alerts) => {
+            set_policy(&project, &[("browser-tool", "1.1.0")], policy);
+            run_with_socket(
+                &project,
+                &registry,
+                &socket,
+                Some(SOCKET_TOKEN),
+                &["install", "--no-skills"],
+            );
+            answer_with(
+                &socket,
+                &[
+                    ("browser-tool", "1.0.0", &[]),
+                    ("browser-tool", "1.1.0", alerts),
+                ],
+            )
+            .await;
+            newer
+        }
+        None => {
+            answer_with(&socket, &[("browser-tool", "1.0.0", &[])]).await;
+            original
+        }
+    };
+    let sealed = seal_skill_folders(project.home(), &sealed_document);
+    assert!(!sealed.is_empty());
+
+    let synced = run_with_socket(
+        &project,
+        &registry,
+        &socket,
+        Some(SOCKET_TOKEN),
+        &["skills", "sync"],
+    );
+
+    for skills in &sealed {
+        std::fs::set_permissions(skills, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    Some(UnlistableSync {
+        linked: linked_document(&project, ".agents/skills", "browser-tool"),
+        synced,
+        asked: socket_lookups(&socket).await.concat(),
+    })
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_command_granting_copy_is_not_kept_for_a_release_whose_skills_cant_be_listed() {
+    let Some(sync) =
+        sync_with_unlistable_skills("allowed-tools: Bash(browser-tool:*)\n", Some(&[])).await
+    else {
+        return;
+    };
+
+    assert!(sync.held_unreadable(), "{:#}", sync.synced);
+    assert!(
+        sync.linked.is_none(),
+        "the kept skill would pre-approve the unread release's command: {:#}",
+        sync.synced
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_command_granting_copy_is_kept_while_the_release_whose_skills_cant_be_listed_is_its_own()
+{
+    let Some(sync) =
+        sync_with_unlistable_skills("allowed-tools: Bash(browser-tool:*)\n", None).await
+    else {
+        return;
+    };
+
+    assert!(sync.held_unreadable(), "{:#}", sync.synced);
+    assert!(sync.kept(), "{:#}", sync.synced);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_copy_is_not_kept_once_the_release_installed_in_its_place_is_flagged() {
+    let Some(sync) = sync_with_unlistable_skills("", Some(&["malware"])).await else {
+        return;
+    };
+
+    assert!(sync.held_unreadable(), "{:#}", sync.synced);
+    assert!(
+        sync.linked.is_none(),
+        "the installed release is malware: {:#}",
+        sync.synced
+    );
+    assert!(
+        sync.asked
+            .contains(&"pkg:npm/browser-tool@1.1.0".to_string())
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_copy_that_pre_approves_nothing_is_kept_while_a_clean_release_s_skills_cant_be_listed() {
+    let Some(sync) = sync_with_unlistable_skills("", Some(&[])).await else {
+        return;
+    };
+
+    assert!(sync.held_unreadable(), "{:#}", sync.synced);
+    assert!(sync.kept(), "{:#}", sync.synced);
+    assert!(
+        sync.asked
+            .contains(&"pkg:npm/browser-tool@1.1.0".to_string())
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_nested_release_whose_skills_cant_be_listed_keeps_no_copy_the_root_release_refuses() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // SAFETY: geteuid has no preconditions. Root ignores the modes below.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let registry = MockRegistry::start().await;
+    let document = |body: &str| {
+        skill_document(
+            "browser-tool",
+            "allowed-tools: Bash(browser-tool:*)\n",
+            body,
+        )
+    };
+    let original = document("Run it.");
+    serve_versions(
+        &registry,
+        "browser-tool",
+        &[
+            (
+                "1.0.0",
+                skill_package(
+                    "browser-tool",
+                    "1.0.0",
+                    true,
+                    &[("browser-tool", original.clone())],
+                ),
+            ),
+            (
+                "1.1.0",
+                skill_package(
+                    "browser-tool",
+                    "1.1.0",
+                    true,
+                    &[("browser-tool", document("Run the newer tool."))],
+                ),
+            ),
+        ],
+    )
+    .await;
+    registry
+        .with_manifest_package(
+            serde_json::json!({
+                "name": "host",
+                "version": "1.0.0",
+                "dependencies": { "browser-tool": "1.0.0" }
+            }),
+            &[("index.js", b"module.exports = 1;\n".as_slice())],
+        )
+        .await;
+    let socket = socket_api(&[]).await;
+    let policy = Some(serde_json::json!({ "allow": [BROWSER_TOOL_SKILL] }));
+    let project = TempProject::empty(&manifest(&[("browser-tool", "1.0.0")], policy.clone()));
+    turn_socket_check_on(&project);
+    answer_with(&socket, &[("browser-tool", "1.0.0", &[])]).await;
+    install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_some());
+    set_policy(
+        &project,
+        &[("browser-tool", "1.1.0"), ("host", "1.0.0")],
+        policy,
+    );
+    run_with_socket(
+        &project,
+        &registry,
+        &socket,
+        Some(SOCKET_TOKEN),
+        &["install", "--no-skills"],
+    );
+    answer_with(&socket, &[("browser-tool", "1.0.0", &[])]).await;
+    let sealed = seal_skill_folders(project.home(), &original);
+    assert!(!sealed.is_empty());
+
+    let synced = run_with_socket(
+        &project,
+        &registry,
+        &socket,
+        Some(SOCKET_TOKEN),
+        &["skills", "sync"],
+    );
+
+    for skills in &sealed {
+        std::fs::set_permissions(skills, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert!(
+        linked_document(&project, ".agents/skills", "browser-tool").is_none(),
+        "the root's 1.1.0 runs the command the 1.0.0 copy pre-approves: {synced:#}"
+    );
+    let held = synced["dependency_skills"]["held"].as_array().unwrap();
+    assert_eq!(held.len(), 1, "one decision per skill: {synced:#}");
+    assert_eq!(held[0]["reason"], "awaiting_check", "{synced:#}");
+    assert_eq!(held[0]["version"], "1.1.0", "{synced:#}");
+}
+
+#[tokio::test]
+async fn a_skill_that_pre_approves_its_command_waits_for_every_installed_version_to_be_clean() {
+    let registry = MockRegistry::start().await;
+    serve_versions(
+        &registry,
+        "browser-tool",
+        &[
+            (
+                "1.0.0",
+                skill_package(
+                    "browser-tool",
+                    "1.0.0",
+                    true,
+                    &[(
+                        "browser-tool",
+                        skill_document(
+                            "browser-tool",
+                            "allowed-tools: Bash(browser-tool:*)\n",
+                            "Run it.",
+                        ),
+                    )],
+                ),
+            ),
+            ("2.0.0", skill_package("browser-tool", "2.0.0", true, &[])),
+        ],
+    )
+    .await;
+    registry
+        .with_manifest_package(
+            serde_json::json!({
+                "name": "host",
+                "version": "1.0.0",
+                "dependencies": { "browser-tool": "1.0.0" }
+            }),
+            &[("index.js", b"module.exports = 1;\n".as_slice())],
+        )
+        .await;
+    let socket = socket_api(&[
+        ("browser-tool", "1.0.0", &[]),
+        ("browser-tool", "2.0.0", &["malware"]),
+    ])
+    .await;
+    let project = TempProject::empty(&manifest(
+        &[("browser-tool", "2.0.0"), ("host", "1.0.0")],
+        Some(serde_json::json!({ "allow": [BROWSER_TOOL_SKILL] })),
+    ));
+    turn_socket_check_on(&project);
+
+    let report = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+    assert!(
+        linked_document(&project, ".agents/skills", "browser-tool").is_none(),
+        "the command it pre-approves runs the root's flagged 2.0.0: {report:#}"
+    );
+    let held = &report["dependency_skills"]["held"][0];
+    assert_eq!(held["reason"], "malware", "{report:#}");
+    assert!(
+        held["detail"]
+            .as_str()
+            .unwrap()
+            .contains("browser-tool@2.0.0"),
+        "{report:#}"
+    );
+    assert!(
+        socket_lookups(&socket)
+            .await
+            .concat()
+            .contains(&"pkg:npm/browser-tool@2.0.0".to_string())
+    );
+
+    answer_with(
+        &socket,
+        &[
+            ("browser-tool", "1.0.0", &[]),
+            ("browser-tool", "2.0.0", &[]),
+        ],
+    )
+    .await;
+    age_socket_checks(&project);
+    run_with_socket(
+        &project,
+        &registry,
+        &socket,
+        Some(SOCKET_TOKEN),
+        &["skills", "sync"],
+    );
+    assert!(
+        linked_document(&project, ".agents/skills", "browser-tool").is_some(),
+        "every installed version is clean now"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_copy_stays_while_its_skills_cant_be_read_beside_a_version_the_policy_leaves_out() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // SAFETY: geteuid has no preconditions. Root ignores the modes below.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let registry = MockRegistry::start().await;
+    let original = plain_skill("tool");
+    serve_versions(
+        &registry,
+        "tool",
+        &[
+            (
+                "1.0.0",
+                skill_package("tool", "1.0.0", false, &[("tool", original.clone())]),
+            ),
+            (
+                "2.0.0",
+                skill_package(
+                    "tool",
+                    "2.0.0",
+                    false,
+                    &[("tool", skill_document("tool", "", "Run the newer tool."))],
+                ),
+            ),
+        ],
+    )
+    .await;
+    registry
+        .with_manifest_package(
+            serde_json::json!({
+                "name": "host",
+                "version": "1.0.0",
+                "dependencies": { "tool": "1.0.0" }
+            }),
+            &[("index.js", b"module.exports = 1;\n".as_slice())],
+        )
+        .await;
+    let project = TempProject::empty(&manifest(
+        &[("tool", "2.0.0"), ("host", "1.0.0")],
+        Some(serde_json::json!({ "allow": ["#tool@1.0.0"] })),
+    ));
+    install(&project, &registry, &[]);
+    assert!(linked_document(&project, ".agents/skills", "tool").is_some());
+    let sealed = seal_skill_folders(project.home(), &original);
+    assert!(!sealed.is_empty());
+
+    let synced = run_json(&project, &registry, &["skills", "sync"]);
+
+    for skills in &sealed {
+        std::fs::set_permissions(skills, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert!(
+        linked_document(&project, ".agents/skills", "tool").is_some(),
+        "2.0.0 isn't allowed, so it doesn't decide 1.0.0's copy: {synced:#}"
+    );
+    assert!(
+        synced["dependency_skills"]["held"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|held| held["reason"] == "unreadable" && held["kept_version"] == "1.0.0"),
+        "{synced:#}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_held_root_release_keeps_no_copy_while_another_instance_cant_be_listed() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // SAFETY: geteuid has no preconditions. Root ignores the modes below.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let registry = MockRegistry::start().await;
+    let document = |body: &str| {
+        skill_document(
+            "browser-tool",
+            "allowed-tools: Bash(browser-tool:*)\n",
+            body,
+        )
+    };
+    let original = document("Run it.");
+    let newer = document("Run the newer tool.");
+    serve_versions(
+        &registry,
+        "browser-tool",
+        &[
+            (
+                "1.0.0",
+                skill_package(
+                    "browser-tool",
+                    "1.0.0",
+                    true,
+                    &[("browser-tool", original.clone())],
+                ),
+            ),
+            (
+                "1.1.0",
+                skill_package(
+                    "browser-tool",
+                    "1.1.0",
+                    true,
+                    &[("browser-tool", newer.clone())],
+                ),
+            ),
+        ],
+    )
+    .await;
+    registry
+        .with_manifest_package(
+            serde_json::json!({
+                "name": "host",
+                "version": "1.0.0",
+                "dependencies": { "browser-tool": "1.0.0" }
+            }),
+            &[("index.js", b"module.exports = 1;\n".as_slice())],
+        )
+        .await;
+    let socket = socket_api(&[
+        ("browser-tool", "1.0.0", &[]),
+        ("browser-tool", "1.1.0", &[]),
+    ])
+    .await;
+    let policy = Some(serde_json::json!({ "allow": [BROWSER_TOOL_SKILL] }));
+    let project = TempProject::empty(&manifest(&[("browser-tool", "1.0.0")], policy.clone()));
+    turn_socket_check_on(&project);
+    install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_some());
+    set_policy(
+        &project,
+        &[("browser-tool", "1.1.0"), ("host", "1.0.0")],
+        policy,
+    );
+    run_with_socket(
+        &project,
+        &registry,
+        &socket,
+        Some(SOCKET_TOKEN),
+        &["install", "--no-skills"],
+    );
+    let mut sealed = seal_skill_folders(project.home(), &original);
+    assert!(!sealed.is_empty());
+    let unreadable = seal_skill_folders(project.home(), &newer)
+        .into_iter()
+        .map(|skills| {
+            std::fs::set_permissions(&skills, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let skill = skills.join("browser-tool");
+            std::fs::set_permissions(&skill, std::fs::Permissions::from_mode(0o000)).unwrap();
+            skill
+        })
+        .collect::<Vec<_>>();
+    assert!(!unreadable.is_empty());
+    sealed.extend(unreadable);
+
+    let synced = run_with_socket(
+        &project,
+        &registry,
+        &socket,
+        Some(SOCKET_TOKEN),
+        &["skills", "sync"],
+    );
+
+    for path in &sealed {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let held = synced["dependency_skills"]["held"].as_array().unwrap();
+    assert!(
+        held.iter()
+            .any(|entry| entry["version"] == "1.1.0" && entry["reason"] == "unreadable"),
+        "{synced:#}"
+    );
+    assert!(
+        linked_document(&project, ".agents/skills", "browser-tool").is_none(),
+        "the 1.0.0 copy pre-approves the command the root's 1.1.0 runs: {synced:#}"
+    );
+}
+
+#[tokio::test]
+async fn a_kept_copy_is_never_linked_into_a_target_it_was_not_linked_in() {
+    let registry = MockRegistry::start().await;
+    let (first, _) = browser_tool_versions(&registry).await;
+    let socket = socket_api(&[]).await;
+    let policy = Some(serde_json::json!({ "allow": ["#browser-tool"] }));
+    let project = TempProject::empty(&manifest(&[("browser-tool", "1.0.0")], policy.clone()));
+    turn_socket_check_on(&project);
+    answer_with(&socket, &[("browser-tool", "1.0.0", &[])]).await;
+    install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+    std::fs::create_dir_all(project.path().join(".claude")).unwrap();
+    set_policy(&project, &[("browser-tool", "1.1.0")], policy);
+    answer_with(
+        &socket,
+        &[
+            ("browser-tool", "1.0.0", &[]),
+            ("browser-tool", "1.1.0", &["pendingScan"]),
+        ],
+    )
+    .await;
+
+    let report = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+    assert_eq!(
+        report["dependency_skills"]["held"][0]["kept_version"], "1.0.0",
+        "{report:#}"
+    );
+    assert_eq!(
+        linked_document(&project, ".agents/skills", "browser-tool").as_deref(),
+        Some(first.as_str())
+    );
+    assert!(
+        std::fs::symlink_metadata(project.path().join(".claude/skills/browser-tool")).is_err(),
+        "{report:#}"
+    );
+}
+
+#[tokio::test]
+async fn an_aged_clean_verdict_keeps_its_copy_through_a_policy_edit_that_still_allows_it() {
+    let (registry, project) = socket_checked_browser_tool().await;
+    let socket = socket_api(&[("browser-tool", "1.0.0", &[])]).await;
+    install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+    age_socket_checks(&project);
+    socket.reset().await;
+    mount_socket(&socket, wiremock::ResponseTemplate::new(503)).await;
+    set_policy(
+        &project,
+        &[("browser-tool", "1.0.0")],
+        Some(serde_json::json!({ "allow": ["#browser-tool", "#other-tool"] })),
+    );
+
+    let report = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+    assert_eq!(
+        report["dependency_skills"]["held"][0]["kept_version"], "1.0.0",
+        "{report:#}"
+    );
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_some());
+    assert!(warned(&report, "Socket answered 503"), "{report:#}");
+}
+
+/// Records a clean verdict from Socket for `name` at `version`, given now,
+/// in every Socket cache.
+fn seed_clean_verdict(project: &TempProject, name: &str, version: &str) {
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let caches = std::fs::read_dir(project.home().join(".lpm/cache/skill-checks")).unwrap();
+    for cache in caches.flatten().map(|entry| entry.path()) {
+        if cache
+            .extension()
+            .is_none_or(|extension| extension != "json")
+        {
+            continue;
+        }
+        let mut checks: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+        checks["verdicts"][format!("pkg:npm/{name}@{version}")] =
+            serde_json::json!({ "kind": "clean", "checked_at_ms": now_ms });
+        std::fs::write(&cache, serde_json::to_vec(&checks).unwrap()).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_package_whose_clean_verdict_aged_still_contests_its_skills_name() {
+    let (registry, project) = socket_checked_browser_tool().await;
+    serve(
+        &registry,
+        "other-tool",
+        "1.0.0",
+        &skill_package(
+            "other-tool",
+            "1.0.0",
+            false,
+            &[("browser-tool", plain_skill("browser-tool"))],
+        ),
+    )
+    .await;
+    let policy = Some(serde_json::json!({ "allow": ["#browser-tool", "#other-tool"] }));
+    set_policy(&project, &[("browser-tool", "1.0.0")], policy.clone());
+    let socket = socket_api(&[("browser-tool", "1.0.0", &[])]).await;
+    install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_some());
+    age_socket_checks(&project);
+    seed_clean_verdict(&project, "other-tool", "1.0.0");
+    socket.reset().await;
+    mount_socket(&socket, wiremock::ResponseTemplate::new(503)).await;
+    set_policy(
+        &project,
+        &[("browser-tool", "1.0.0"), ("other-tool", "1.0.0")],
+        policy,
+    );
+
+    let report = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+    let held = report["dependency_skills"]["held"].as_array().unwrap();
+    assert!(
+        held.iter().any(|entry| entry["reason"] == "name_conflict"),
+        "{report:#}"
+    );
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_none());
+}
+
+#[tokio::test]
+async fn an_unchecked_version_keeps_the_earlier_copy_until_socket_decides() {
+    let registry = MockRegistry::start().await;
+    let first = plain_skill("browser-tool");
+    let second = skill_document("browser-tool", "", "Run the newer tool.");
+    serve_versions(
+        &registry,
+        "browser-tool",
+        &[
+            (
+                "1.0.0",
+                skill_package(
+                    "browser-tool",
+                    "1.0.0",
+                    false,
+                    &[("browser-tool", first.clone())],
+                ),
+            ),
+            (
+                "1.1.0",
+                skill_package(
+                    "browser-tool",
+                    "1.1.0",
+                    false,
+                    &[("browser-tool", second.clone())],
+                ),
+            ),
+        ],
+    )
+    .await;
+    let policy = Some(serde_json::json!({ "allow": ["#browser-tool"] }));
+    let project = TempProject::empty(&manifest(&[("browser-tool", "1.0.0")], policy.clone()));
+    turn_socket_check_on(&project);
+    let socket = socket_api(&[("browser-tool", "1.0.0", &[])]).await;
+    install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+    assert_eq!(
+        linked_document(&project, ".agents/skills", "browser-tool").as_deref(),
+        Some(first.as_str())
+    );
+
+    set_policy(&project, &[("browser-tool", "1.1.0")], policy);
+    answer_with(&socket, &[("browser-tool", "1.1.0", &["pendingScan"])]).await;
+    let report = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+    let held = &report["dependency_skills"]["held"][0];
+    assert_eq!(held["reason"], "awaiting_check", "{report:#}");
+    assert_eq!(held["kept_version"], "1.0.0");
+    assert_eq!(
+        linked_document(&project, ".agents/skills", "browser-tool").as_deref(),
+        Some(first.as_str())
+    );
+
+    answer_with(&socket, &[("browser-tool", "1.1.0", &[])]).await;
+    run_with_socket(
+        &project,
+        &registry,
+        &socket,
+        Some(SOCKET_TOKEN),
+        &["skills", "sync"],
+    );
+    assert_eq!(
+        linked_document(&project, ".agents/skills", "browser-tool").as_deref(),
+        Some(second.as_str())
+    );
+}
+
+#[tokio::test]
+async fn with_the_socket_check_on_and_no_token_npm_skills_wait() {
+    let registry = MockRegistry::start().await;
+    serve(
+        &registry,
+        "browser-tool",
+        "1.0.0",
+        &skill_package(
+            "browser-tool",
+            "1.0.0",
+            false,
+            &[("browser-tool", plain_skill("browser-tool"))],
+        ),
+    )
+    .await;
+    let socket = socket_api(&[]).await;
+    let project = TempProject::empty(&manifest(
+        &[("browser-tool", "1.0.0")],
+        Some(serde_json::json!({ "allow": ["#browser-tool"] })),
+    ));
+    turn_socket_check_on(&project);
+
+    let report = install_checked(&project, &registry, &socket, None);
+
+    let held = &report["dependency_skills"]["held"][0];
+    assert_eq!(held["reason"], "awaiting_check", "{report:#}");
+    assert!(
+        held["detail"]
+            .as_str()
+            .unwrap()
+            .contains("lpm login --socket"),
+        "{report:#}"
+    );
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_none());
+}
+
+#[tokio::test]
+async fn socket_login_turns_the_check_on_and_logout_turns_it_off() {
+    let socket = socket_api(&[]).await;
+    let project = TempProject::empty(&manifest(&[], None));
+    let config = project.home().join(".lpm/config.toml");
+
+    let login = support::lpm(&project)
+        .args(["--json", "login", "--socket", "--token", SOCKET_TOKEN])
+        .env("LPM_SOCKET_API_URL", format!("{}/v0", socket.uri()))
+        .output()
+        .unwrap();
+    assert!(login.status.success(), "{}", combined(&login));
+    let report: serde_json::Value = serde_json::from_slice(&login.stdout).unwrap();
+    insta::assert_json_snapshot!("socket_login", report, {
+        ".storage_backend" => "[backend]",
+        ".storage_degraded" => "[degraded]",
+    });
+    assert!(
+        std::fs::read_to_string(&config)
+            .unwrap()
+            .contains("security-provider = \"socket\"")
+    );
+
+    let logout = support::lpm(&project)
+        .args(["logout", "--socket"])
+        .output()
+        .unwrap();
+    assert!(logout.status.success(), "{}", combined(&logout));
+    assert!(
+        std::fs::read_to_string(&config)
+            .unwrap()
+            .contains("security-provider = \"none\"")
+    );
+}
+
+#[tokio::test]
+async fn a_socket_answer_without_alerts_leaves_the_skill_waiting() {
+    let (registry, project) = socket_checked_browser_tool().await;
+    let row = serde_json::json!({ "type": "npm", "name": "browser-tool", "version": "1.0.0" });
+    let socket = socket_api_answering(
+        wiremock::ResponseTemplate::new(200)
+            .set_body_raw(format!("{row}\n"), "application/x-ndjson"),
+    )
+    .await;
+
+    let report = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+    assert_eq!(
+        report["dependency_skills"]["held"][0]["reason"], "awaiting_check",
+        "{report:#}"
+    );
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_none());
+}
+
+#[tokio::test]
+async fn a_package_from_a_local_directory_is_never_vouched_for_by_socket() {
+    let registry = MockRegistry::start().await;
+    let project = TempProject::empty(
+        &serde_json::json!({
+            "name": "app",
+            "version": "1.0.0",
+            "dependencies": { "browser-tool": "file:./vendor/browser-tool" },
+            "lpm": { "skills": { "allow": ["#browser-tool"] } }
+        })
+        .to_string(),
+    );
+    project.write_file(
+        "vendor/browser-tool/package.json",
+        r#"{"name":"browser-tool","version":"1.0.0"}"#,
+    );
+    project.write_file(
+        "vendor/browser-tool/skills/browser-tool/SKILL.md",
+        &plain_skill("browser-tool"),
+    );
+    turn_socket_check_on(&project);
+    let socket = socket_api(&[("browser-tool", "1.0.0", &[])]).await;
+
+    let report = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+    insta::assert_json_snapshot!(report["dependency_skills"]["held"], @r#"
+    [
+      {
+        "skill": "browser-tool",
+        "package": "browser-tool",
+        "version": "1.0.0",
+        "reason": "not_checkable",
+        "detail": "Socket's verdicts can't vouch for this copy: it was installed from a local directory",
+        "kept_version": null
+      }
+    ]
+    "#);
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_none());
+    assert!(
+        socket
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_bare_install_answers_from_the_fast_lane_until_a_verdict_comes_due() {
+    let (registry, project) = socket_checked_browser_tool().await;
+    let socket = socket_api(&[("browser-tool", "1.0.0", &[])]).await;
+    install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+    let asked = socket.received_requests().await.unwrap().len();
+
+    let unchanged = bare_install_with_socket(&project, &registry, &socket);
+
+    assert!(
+        unchanged["up_to_date"] == true && unchanged.get("counts").is_none(),
+        "{unchanged:#}"
+    );
+    assert_eq!(socket.received_requests().await.unwrap().len(), asked);
+
+    age_socket_checks(&project);
+    let due = bare_install_with_socket(&project, &registry, &socket);
+
+    assert!(due.get("counts").is_some(), "{due:#}");
+    assert!(socket.received_requests().await.unwrap().len() > asked);
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_some());
+}
+
+#[tokio::test]
+async fn a_malware_selector_without_a_security_provider_warns_and_waits() {
+    let registry = MockRegistry::start().await;
+    serve(
+        &registry,
+        "browser-tool",
+        "1.0.0",
+        &skill_package(
+            "browser-tool",
+            "1.0.0",
+            false,
+            &[("browser-tool", plain_skill("browser-tool"))],
+        ),
+    )
+    .await;
+    let project = TempProject::empty(&manifest(
+        &[("browser-tool", "1.0.0")],
+        Some(serde_json::json!({ "allow": ["#browser-tool:not(:malware)"] })),
+    ));
+
+    let report = install_json(&project, &registry);
+
+    assert!(warned(&report, "no security provider is on"), "{report:#}");
+    assert_eq!(
+        report["dependency_skills"]["held"][0]["reason"], "needs_data",
+        "{report:#}"
+    );
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_none());
+}
+
+#[tokio::test]
+async fn answers_lpm_cannot_save_still_decide_the_install_and_it_warns() {
+    let (registry, project) = socket_checked_browser_tool().await;
+    let cache = project.home().join(".lpm/cache/skill-checks");
+    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    std::fs::write(&cache, "not a directory").unwrap();
+    let socket = socket_api(&[("browser-tool", "1.0.0", &[])]).await;
+
+    let report = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+    assert!(
+        linked_document(&project, ".agents/skills", "browser-tool").is_some(),
+        "{report:#}"
+    );
+    assert!(
+        warned(&report, "Socket's answers couldn't be saved"),
+        "{report:#}"
+    );
+}
+
+#[tokio::test]
+async fn an_offline_install_never_asks_socket() {
+    let (registry, project) = socket_checked_browser_tool().await;
+    std::fs::remove_file(project.home().join(".lpm/config.toml")).unwrap();
+    install(&project, &registry, &[]);
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_some());
+    turn_socket_check_on(&project);
+    let socket = socket_api(&[("browser-tool", "1.0.0", &[])]).await;
+
+    let report = run_with_socket(
+        &project,
+        &registry,
+        &socket,
+        Some(SOCKET_TOKEN),
+        &["install", "--offline"],
+    );
+
+    let held = &report["dependency_skills"]["held"][0];
+    assert_eq!(held["reason"], "awaiting_check", "{report:#}");
+    assert!(
+        held["detail"].as_str().unwrap().contains("offline"),
+        "{report:#}"
+    );
+    assert_eq!(held["kept_version"], serde_json::Value::Null, "{report:#}");
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_none());
+    assert!(
+        socket
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn an_offline_install_drops_a_copy_once_its_verdict_expires() {
+    let (registry, project) = socket_checked_browser_tool().await;
+    let socket = socket_api(&[("browser-tool", "1.0.0", &[])]).await;
+    install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_some());
+    let a_month_and_a_day_ago_ms = now_ms() - 31 * 24 * 60 * 60 * 1000;
+    edit_socket_verdicts(&project, |entry| {
+        entry["checked_at_ms"] = serde_json::json!(a_month_and_a_day_ago_ms);
+    });
+    edit_link_state(&project, |state| state["expires_at"] = serde_json::json!(1));
+    socket.reset().await;
+
+    let report = run_with_socket(
+        &project,
+        &registry,
+        &socket,
+        Some(SOCKET_TOKEN),
+        &["install", "--offline"],
+    );
+
+    assert!(
+        linked_document(&project, ".agents/skills", "browser-tool").is_none(),
+        "{report:#}"
+    );
+    assert!(socket_lookups(&socket).await.is_empty());
+}
+
+#[tokio::test]
+async fn an_offline_install_applies_a_verdict_another_project_recorded_even_while_waiting_to_retry()
+{
+    let (registry, project) = socket_checked_browser_tool().await;
+    let socket = socket_api(&[("browser-tool", "1.0.0", &[])]).await;
+    install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_some());
+    let recorded_now = now_ms();
+    edit_socket_verdicts(&project, |entry| {
+        *entry = serde_json::json!({
+            "kind": "malware",
+            "alert": "malware",
+            "checked_at_ms": recorded_now,
+        });
+    });
+    let a_day_on_secs = recorded_now / 1000 + 24 * 60 * 60;
+    edit_link_state(&project, |state| {
+        state["recheck_at"] = serde_json::json!(a_day_on_secs);
+    });
+    socket.reset().await;
+
+    let report = run_with_socket(
+        &project,
+        &registry,
+        &socket,
+        Some(SOCKET_TOKEN),
+        &["install", "--offline"],
+    );
+
+    assert!(
+        linked_document(&project, ".agents/skills", "browser-tool").is_none(),
+        "{report:#}"
+    );
+    assert!(socket_lookups(&socket).await.is_empty());
+}
+
+#[tokio::test]
+async fn an_offline_install_leaves_the_links_alone_while_the_verdicts_are_unchanged() {
+    let (registry, project) = socket_checked_browser_tool().await;
+    let socket = socket_api(&[("browser-tool", "1.0.0", &[])]).await;
+    install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+    edit_link_state(&project, |state| state["recheck_at"] = serde_json::json!(1));
+    socket.reset().await;
+
+    let report = run_with_socket(
+        &project,
+        &registry,
+        &socket,
+        Some(SOCKET_TOKEN),
+        &["install", "--offline"],
+    );
+
+    assert!(
+        report.get("dependency_skills").is_none(),
+        "nothing changed since the links read the verdicts: {report:#}"
+    );
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_some());
+}
+
+#[tokio::test]
+async fn listing_dependency_skills_never_asks_socket() {
+    let (registry, project) = socket_checked_browser_tool().await;
+    std::fs::remove_file(project.home().join(".lpm/config.toml")).unwrap();
+    install(&project, &registry, &[]);
+    turn_socket_check_on(&project);
+    let socket = socket_api(&[("browser-tool", "1.0.0", &[])]).await;
+
+    let deps = run_with_socket(
+        &project,
+        &registry,
+        &socket,
+        Some(SOCKET_TOKEN),
+        &["skills", "deps"],
+    );
+
+    assert_eq!(deps["skills"][0]["reason"], "awaiting_check", "{deps:#}");
+    assert!(
+        socket
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn while_socket_is_down_installs_wait_before_asking_again_and_sync_asks_now() {
+    let (registry, project) = socket_checked_browser_tool().await;
+    let socket = socket_api_answering(wiremock::ResponseTemplate::new(503)).await;
+
+    let first = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+    let held = &first["dependency_skills"]["held"][0];
+    assert_eq!(held["reason"], "awaiting_check", "{first:#}");
+    assert!(
+        held["detail"].as_str().unwrap().contains("503"),
+        "{first:#}"
+    );
+
+    set_policy(
+        &project,
+        &[("browser-tool", "1.0.0")],
+        Some(serde_json::json!({ "allow": ["#browser-tool"], "deny": ["#other-tool"] })),
+    );
+    install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+    assert_eq!(socket_lookups(&socket).await.len(), 1);
+
+    run_with_socket(
+        &project,
+        &registry,
+        &socket,
+        Some(SOCKET_TOKEN),
+        &["skills", "sync"],
+    );
+    assert_eq!(socket_lookups(&socket).await.len(), 2);
+}
+
+#[tokio::test]
+async fn socket_refusals_say_whether_the_quota_or_the_permission_is_missing() {
+    for (status, says) in [(429, "rate limit"), (403, "packages:list")] {
+        let (registry, project) = socket_checked_browser_tool().await;
+        let socket = socket_api_answering(
+            wiremock::ResponseTemplate::new(status).insert_header("retry-after", "120"),
+        )
+        .await;
+
+        let report = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+        let detail = report["dependency_skills"]["held"][0]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(detail.contains(says), "{status}: {report:#}");
+    }
+}
+
+fn now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+
+/// Rewrites every verdict LPM keeps for Socket with `edit`.
+fn edit_socket_verdicts(project: &TempProject, edit: impl Fn(&mut serde_json::Value)) {
+    let caches = std::fs::read_dir(project.home().join(".lpm/cache/skill-checks")).unwrap();
+    for cache in caches.flatten().map(|entry| entry.path()) {
+        if cache
+            .extension()
+            .is_none_or(|extension| extension != "json")
+        {
+            continue;
+        }
+        let mut checks: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+        for entry in checks["verdicts"].as_object_mut().unwrap().values_mut() {
+            edit(entry);
+        }
+        std::fs::write(&cache, serde_json::to_vec(&checks).unwrap()).unwrap();
+    }
+}
+
+/// Rewrites the project's record of its links with `edit`.
+fn edit_link_state(project: &TempProject, edit: impl FnOnce(&mut serde_json::Value)) {
+    let state_path = project.path().join(".lpm/linked-skills/state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    edit(&mut state);
+    std::fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+}
+
+/// Makes every verdict LPM keeps for Socket, and the links' next recheck,
+/// due now.
+fn age_socket_checks(project: &TempProject) {
+    let two_days_ago_ms = now_ms() - 2 * 24 * 60 * 60 * 1000;
+    edit_socket_verdicts(project, |entry| {
+        entry["checked_at_ms"] = serde_json::json!(two_days_ago_ms);
+    });
+    edit_link_state(project, |state| state["recheck_at"] = serde_json::json!(1));
+}
+
+#[tokio::test]
+async fn a_socket_verdict_stands_until_it_ages_out() {
+    let (registry, project) = socket_checked_browser_tool().await;
+    let socket = socket_api(&[("browser-tool", "1.0.0", &[])]).await;
+    install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_some());
+    let state: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(project.path().join(".lpm/linked-skills/state.json")).unwrap(),
+    )
+    .unwrap();
+    let in_a_day = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 24 * 60 * 60;
+    let recheck_at = state["recheck_at"].as_u64().unwrap();
+    assert!(recheck_at.abs_diff(in_a_day) < 300, "{state:#}");
+
+    set_policy(
+        &project,
+        &[("browser-tool", "1.0.0")],
+        Some(serde_json::json!({ "allow": ["#browser-tool"], "deny": ["#other-tool"] })),
+    );
+    install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+    assert_eq!(socket_lookups(&socket).await.len(), 1);
+
+    age_socket_checks(&project);
+    install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+    assert_eq!(socket_lookups(&socket).await.len(), 2);
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_some());
+}
+
+#[tokio::test]
+async fn a_malware_package_never_keeps_a_clean_one_with_the_same_skill_name_out() {
+    let registry = MockRegistry::start().await;
+    let good = skill_document("shared", "", "Run the good tool.");
+    let bad = skill_document("shared", "", "Run the bad tool.");
+    for (name, document) in [("good-tool", &good), ("bad-tool", &bad)] {
+        serve(
+            &registry,
+            name,
+            "1.0.0",
+            &skill_package(name, "1.0.0", false, &[("shared", document.clone())]),
+        )
+        .await;
+    }
+    let project = TempProject::empty(&manifest(
+        &[("good-tool", "1.0.0"), ("bad-tool", "1.0.0")],
+        Some(serde_json::json!({ "allow": ["#good-tool", "#bad-tool"] })),
+    ));
+    turn_socket_check_on(&project);
+    let socket = socket_api(&[
+        ("good-tool", "1.0.0", &[]),
+        ("bad-tool", "1.0.0", &["malware"]),
+    ])
+    .await;
+
+    let report = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+    insta::assert_json_snapshot!(report["dependency_skills"]["held"], @r#"
+    [
+      {
+        "skill": "shared",
+        "package": "bad-tool",
+        "version": "1.0.0",
+        "reason": "malware",
+        "detail": "Socket flags bad-tool@1.0.0 as known malware",
+        "kept_version": null
+      }
+    ]
+    "#);
+    assert_eq!(
+        linked_document(&project, ".agents/skills", "shared").as_deref(),
+        Some(good.as_str())
+    );
+}
+
+#[tokio::test]
+async fn a_scoped_package_is_matched_to_its_socket_verdict_without_an_input_purl() {
+    let registry = MockRegistry::start().await;
+    serve(
+        &registry,
+        "@acme/browser-tool",
+        "1.0.0",
+        &skill_package(
+            "@acme/browser-tool",
+            "1.0.0",
+            false,
+            &[("browser-tool", plain_skill("browser-tool"))],
+        ),
+    )
+    .await;
+    let project = TempProject::empty(&manifest(
+        &[("@acme/browser-tool", "1.0.0")],
+        Some(serde_json::json!({ "allow": ["#@acme/browser-tool"] })),
+    ));
+    turn_socket_check_on(&project);
+    let socket = socket_api(&[("@acme/browser-tool", "1.0.0", &[])]).await;
+
+    install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_some());
+    assert_eq!(
+        socket_lookups(&socket).await,
+        [["pkg:npm/%40acme/browser-tool@1.0.0"]]
+    );
+}
+
+#[tokio::test]
+async fn the_stored_socket_token_goes_only_to_sockets_own_api() {
+    let (registry, project) = socket_checked_browser_tool().await;
+    let socket = socket_api(&[("browser-tool", "1.0.0", &[])]).await;
+    let login = support::lpm(&project)
+        .args(["--json", "login", "--socket", "--token", SOCKET_TOKEN])
+        .env("LPM_SOCKET_API_URL", format!("{}/v0", socket.uri()))
+        .output()
+        .unwrap();
+    assert!(login.status.success(), "{}", combined(&login));
+    let after_login = socket.received_requests().await.unwrap_or_default().len();
+
+    let report = install_checked(&project, &registry, &socket, None);
+
+    let held = &report["dependency_skills"]["held"][0];
+    assert_eq!(held["reason"], "awaiting_check", "{report:#}");
+    assert!(
+        held["detail"]
+            .as_str()
+            .unwrap()
+            .contains("SOCKET_CLI_API_TOKEN"),
+        "{report:#}"
+    );
+    assert_eq!(
+        socket.received_requests().await.unwrap_or_default().len(),
+        after_login
+    );
+}
+
+#[tokio::test]
+async fn a_missing_token_never_blocks_the_next_install_once_it_is_set() {
+    let (registry, project) = socket_checked_browser_tool().await;
+    let socket = socket_api(&[("browser-tool", "1.0.0", &[])]).await;
+    let first = install_checked(&project, &registry, &socket, None);
+    assert_eq!(
+        first["dependency_skills"]["held"][0]["reason"], "awaiting_check",
+        "{first:#}"
+    );
+
+    install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_some());
+}
+
+#[tokio::test]
+async fn without_a_named_mirror_a_copy_fetched_elsewhere_is_never_vouched_for() {
+    let (registry, project) = socket_checked_browser_tool().await;
+    let socket = socket_api(&[("browser-tool", "1.0.0", &[])]).await;
+    let mut command = lpm_with_registry(&project, &registry.url());
+    command
+        .args(["--json", "install"])
+        .env("LPM_SOCKET_API_URL", format!("{}/v0", socket.uri()))
+        .env("SOCKET_CLI_API_TOKEN", SOCKET_TOKEN);
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{}", combined(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    let held = &report["dependency_skills"]["held"][0];
+    assert_eq!(held["reason"], "not_checkable", "{report:#}");
+    assert!(
+        socket
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_clean_verdict_more_than_a_day_old_never_links_a_skill_anew() {
+    let (registry, project) = socket_checked_browser_tool().await;
+    let socket = socket_api(&[("browser-tool", "1.0.0", &[])]).await;
+    install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_some());
+    age_socket_checks(&project);
+    std::fs::remove_dir_all(project.path().join(".lpm/linked-skills")).unwrap();
+    std::fs::remove_dir_all(project.path().join(".agents")).unwrap();
+    socket.reset().await;
+    mount_socket(&socket, wiremock::ResponseTemplate::new(503)).await;
+
+    let report = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+    let held = &report["dependency_skills"]["held"][0];
+    assert_eq!(held["reason"], "awaiting_check", "{report:#}");
+    assert!(
+        held["detail"]
+            .as_str()
+            .unwrap()
+            .contains("more than a day old"),
+        "{report:#}"
+    );
+    assert!(
+        warned(&report, "more than a day old and LPM couldn't ask again"),
+        "{report:#}"
+    );
+    assert!(linked_document(&project, ".agents/skills", "browser-tool").is_none());
+}
+
+#[tokio::test]
+async fn a_clean_package_linking_a_name_fresh_wins_over_another_packages_kept_copy() {
+    let registry = MockRegistry::start().await;
+    let kept = skill_document("shared", "", "Run the waiting tool.");
+    let fresh = skill_document("shared", "", "Run the clean tool.");
+    serve_versions(
+        &registry,
+        "waiting-tool",
+        &[
+            (
+                "1.0.0",
+                skill_package("waiting-tool", "1.0.0", false, &[("shared", kept.clone())]),
+            ),
+            (
+                "2.0.0",
+                skill_package("waiting-tool", "2.0.0", false, &[("shared", kept.clone())]),
+            ),
+        ],
+    )
+    .await;
+    serve(
+        &registry,
+        "clean-tool",
+        "1.0.0",
+        &skill_package("clean-tool", "1.0.0", false, &[("shared", fresh.clone())]),
+    )
+    .await;
+    let policy = Some(serde_json::json!({ "allow": ["#waiting-tool", "#clean-tool"] }));
+    let project = TempProject::empty(&manifest(&[("waiting-tool", "1.0.0")], policy.clone()));
+    turn_socket_check_on(&project);
+    let socket = socket_api(&[("waiting-tool", "1.0.0", &[])]).await;
+    install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+    assert_eq!(
+        linked_document(&project, ".agents/skills", "shared").as_deref(),
+        Some(kept.as_str())
+    );
+
+    set_policy(
+        &project,
+        &[("waiting-tool", "2.0.0"), ("clean-tool", "1.0.0")],
+        policy,
+    );
+    answer_with(
+        &socket,
+        &[
+            ("waiting-tool", "2.0.0", &["pendingScan"]),
+            ("clean-tool", "1.0.0", &[]),
+        ],
+    )
+    .await;
+    let report = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+    assert_eq!(
+        linked_document(&project, ".agents/skills", "shared").as_deref(),
+        Some(fresh.as_str()),
+        "{report:#}"
+    );
+}
+
+#[test]
+fn logout_all_turns_the_socket_check_off_only_when_it_was_on() {
+    let project = TempProject::empty(&manifest(&[], None));
+    let config = project.home().join(".lpm/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[skills]\nother-packages = true\n").unwrap();
+
+    let logout = support::lpm(&project)
+        .args(["logout", "--all"])
+        .output()
+        .unwrap();
+    assert!(logout.status.success(), "{}", combined(&logout));
+    assert!(
+        !std::fs::read_to_string(&config)
+            .unwrap()
+            .contains("security-provider")
+    );
+
+    turn_socket_check_on(&project);
+    let logout = support::lpm(&project)
+        .args(["logout", "--all"])
+        .output()
+        .unwrap();
+    assert!(logout.status.success(), "{}", combined(&logout));
+    assert!(
+        std::fs::read_to_string(&config)
+            .unwrap()
+            .contains("security-provider = \"none\"")
+    );
+}
+
 #[test]
 fn skill_settings_have_focused_setters_and_the_legacy_key_migrates() {
     let project = TempProject::empty(r#"{"name":"app","version":"1.0.0"}"#);
@@ -3851,5 +5858,279 @@ async fn an_lpm_dev_parent_whose_reviewed_skills_lpm_never_fetched_decides_no_sk
             .to_string()
             .contains("no record of the reviewed skills of @lpm.dev/acme.ui@1.0.0"),
         "{installed:#}"
+    );
+}
+
+#[tokio::test]
+async fn a_reviewed_lpm_dev_skill_that_pre_approves_commands_links_while_socket_checks_npm_packages()
+ {
+    let registry = MockRegistry::start().await;
+    let content = "---\nname: usage\ndescription: How to use it.\nallowed-tools: Bash(git:*)\n---\nRun git.\n";
+    serve_lpm_dev_package(
+        &registry,
+        &[],
+        reviewed(
+            serde_json::json!([{
+                "name": "usage",
+                "description": "How to use it.",
+                "sizeBytes": content.len(),
+                "rawContent": content,
+            }]),
+            serde_json::json!([]),
+        ),
+    )
+    .await;
+    let project = TempProject::empty(&manifest(
+        &[("@lpm.dev/acme.ui", "1.0.0")],
+        Some(serde_json::json!({ "allow": ["#@lpm.dev/acme.ui:skill(acme-ui-usage)"] })),
+    ));
+    turn_socket_check_on(&project);
+    let socket = socket_api(&[]).await;
+
+    let report = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+    assert!(
+        linked_document(&project, ".agents/skills", "acme-ui-usage").is_some(),
+        "LPM.dev review vouches for LPM.dev packages, not Socket: {report:#}"
+    );
+    assert!(
+        socket_lookups(&socket)
+            .await
+            .iter()
+            .flatten()
+            .all(|purl| !purl.contains("acme")),
+        "{report:#}"
+    );
+}
+
+#[tokio::test]
+async fn a_skill_held_for_a_flagged_version_its_command_may_run_leaves_its_name_to_a_clean_skill() {
+    let registry = MockRegistry::start().await;
+    serve_versions(
+        &registry,
+        "browser-tool",
+        &[
+            (
+                "1.0.0",
+                skill_package(
+                    "browser-tool",
+                    "1.0.0",
+                    true,
+                    &[(
+                        "browser-tool",
+                        skill_document(
+                            "browser-tool",
+                            "allowed-tools: Bash(browser-tool:*)\n",
+                            "Run it.",
+                        ),
+                    )],
+                ),
+            ),
+            ("2.0.0", skill_package("browser-tool", "2.0.0", true, &[])),
+        ],
+    )
+    .await;
+    serve(
+        &registry,
+        "other-tool",
+        "1.0.0",
+        &skill_package(
+            "other-tool",
+            "1.0.0",
+            false,
+            &[(
+                "browser-tool",
+                skill_document("browser-tool", "", "Run the other tool."),
+            )],
+        ),
+    )
+    .await;
+    registry
+        .with_manifest_package(
+            serde_json::json!({
+                "name": "host",
+                "version": "1.0.0",
+                "dependencies": { "browser-tool": "1.0.0" }
+            }),
+            &[("index.js", b"module.exports = 1;\n".as_slice())],
+        )
+        .await;
+    let socket = socket_api(&[
+        ("browser-tool", "1.0.0", &[]),
+        ("browser-tool", "2.0.0", &["malware"]),
+        ("other-tool", "1.0.0", &[]),
+    ])
+    .await;
+    let project = TempProject::empty(&manifest(
+        &[
+            ("browser-tool", "2.0.0"),
+            ("host", "1.0.0"),
+            ("other-tool", "1.0.0"),
+        ],
+        Some(serde_json::json!({ "allow": [BROWSER_TOOL_SKILL, "#other-tool"] })),
+    ));
+    turn_socket_check_on(&project);
+
+    let report = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+    let linked = linked_document(&project, ".agents/skills", "browser-tool")
+        .unwrap_or_else(|| panic!("not linked: {report:#}"));
+    assert!(linked.contains("Run the other tool."), "{linked}");
+    let held = report["dependency_skills"]["held"].as_array().unwrap();
+    assert!(
+        held.iter()
+            .any(|entry| entry["package"] == "browser-tool" && entry["reason"] == "malware"),
+        "{report:#}"
+    );
+    let lookups = socket_lookups(&socket).await;
+    assert_eq!(
+        lookups.len(),
+        1,
+        "one ask covers every release: {lookups:?}"
+    );
+    assert!(
+        lookups[0].contains(&"pkg:npm/browser-tool@2.0.0".to_string()),
+        "{lookups:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_skill_that_cant_link_until_the_policy_names_it_sends_nothing_to_socket() {
+    let registry = MockRegistry::start().await;
+    serve(
+        &registry,
+        "browser-tool",
+        "1.0.0",
+        &skill_package(
+            "browser-tool",
+            "1.0.0",
+            false,
+            &[(
+                "browser-tool",
+                skill_document("browser-tool", "allowed-tools: Bash(git:*)\n", "Run git."),
+            )],
+        ),
+    )
+    .await;
+    let socket = socket_api(&[("browser-tool", "1.0.0", &[])]).await;
+    let project = TempProject::empty(&manifest(
+        &[("browser-tool", "1.0.0")],
+        Some(serde_json::json!({ "allow": ["#browser-tool"] })),
+    ));
+    turn_socket_check_on(&project);
+
+    let report = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+    assert_eq!(
+        report["dependency_skills"]["held"][0]["reason"], "needs_skill_name",
+        "{report:#}"
+    );
+    assert!(
+        socket_lookups(&socket).await.is_empty(),
+        "only a skill that may link is worth a verdict: {report:#}"
+    );
+}
+
+#[tokio::test]
+async fn a_skill_that_cant_link_as_the_policy_names_it_leaves_its_name_to_one_that_can() {
+    let registry = MockRegistry::start().await;
+    serve(
+        &registry,
+        "tool-a",
+        "1.0.0",
+        &skill_package(
+            "tool-a",
+            "1.0.0",
+            false,
+            &[(
+                "guide",
+                skill_document("guide", "allowed-tools: Bash(git:*)\n", "Run git."),
+            )],
+        ),
+    )
+    .await;
+    serve(
+        &registry,
+        "tool-b",
+        "1.0.0",
+        &skill_package(
+            "tool-b",
+            "1.0.0",
+            false,
+            &[("guide", skill_document("guide", "", "Read the guide."))],
+        ),
+    )
+    .await;
+    let project = TempProject::empty(&manifest(
+        &[("tool-a", "1.0.0"), ("tool-b", "1.0.0")],
+        Some(serde_json::json!({ "allow": ["#tool-a", "#tool-b"] })),
+    ));
+
+    let report = install_json(&project, &registry);
+
+    let linked = linked_document(&project, ".agents/skills", "guide")
+        .unwrap_or_else(|| panic!("not linked: {report:#}"));
+    assert!(linked.contains("Read the guide."), "{linked}");
+    let held = report["dependency_skills"]["held"].as_array().unwrap();
+    assert!(
+        held.iter()
+            .any(|entry| entry["package"] == "tool-a" && entry["reason"] == "needs_skill_name"),
+        "tool-a's guide needs its skill named before it can contend for the name: {report:#}"
+    );
+}
+
+#[tokio::test]
+async fn a_flagged_version_its_command_may_run_outranks_a_wait_for_its_own_verdict() {
+    let registry = MockRegistry::start().await;
+    serve_versions(
+        &registry,
+        "browser-tool",
+        &[
+            (
+                "1.0.0",
+                skill_package(
+                    "browser-tool",
+                    "1.0.0",
+                    true,
+                    &[(
+                        "browser-tool",
+                        skill_document(
+                            "browser-tool",
+                            "allowed-tools: Bash(browser-tool:*)\n",
+                            "Run it.",
+                        ),
+                    )],
+                ),
+            ),
+            ("2.0.0", skill_package("browser-tool", "2.0.0", true, &[])),
+        ],
+    )
+    .await;
+    registry
+        .with_manifest_package(
+            serde_json::json!({
+                "name": "host",
+                "version": "1.0.0",
+                "dependencies": { "browser-tool": "1.0.0" }
+            }),
+            &[("index.js", b"module.exports = 1;\n".as_slice())],
+        )
+        .await;
+    let socket = socket_api(&[
+        ("browser-tool", "1.0.0", &["pendingScan"]),
+        ("browser-tool", "2.0.0", &["malware"]),
+    ])
+    .await;
+    let project = TempProject::empty(&manifest(
+        &[("browser-tool", "2.0.0"), ("host", "1.0.0")],
+        Some(serde_json::json!({ "allow": [BROWSER_TOOL_SKILL] })),
+    ));
+    turn_socket_check_on(&project);
+
+    let report = install_checked(&project, &registry, &socket, Some(SOCKET_TOKEN));
+
+    assert_eq!(
+        report["dependency_skills"]["held"][0]["reason"], "malware",
+        "{report:#}"
     );
 }

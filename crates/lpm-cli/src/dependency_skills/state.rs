@@ -55,6 +55,11 @@ pub(crate) struct LinkedSkillRecord {
     /// copy stays only while LPM uses that registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reviewed_by: Option<String>,
+    /// The release check this copy's npm package passed when it linked:
+    /// the security provider's API and the npm registries LPM accepted.
+    /// The copy stays on a later verdict only under the same check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) checked_as: Option<String>,
     pub(crate) links: Vec<LinkRecord>,
     /// Target entries, project-relative, that something else held or that
     /// couldn't be made; reconciling tries them again once they're free.
@@ -99,6 +104,21 @@ pub(crate) struct LinkState {
     /// skills the links follow besides the project's own.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) members: Vec<String>,
+    /// When a security verdict the links rest on comes due, in seconds
+    /// since the Unix epoch: an install then reconciles again although
+    /// nothing else changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) recheck_at: Option<u64>,
+    /// When the earliest security verdict the links rest on expires, in
+    /// seconds since the Unix epoch: an install then reconciles, offline
+    /// too, so copies it kept stop being kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expires_at: Option<u64>,
+    /// The verdict cache's stamp when the links read it, so an install,
+    /// online or offline, reconciles once another project recorded verdicts
+    /// since, a newly flagged release among them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) verdicts_stamp: Option<super::checks::CacheStamp>,
 }
 
 impl LinkState {
@@ -119,7 +139,7 @@ impl LinkState {
 /// The state file as read.
 pub(crate) enum StoredState {
     Missing,
-    Present(LinkState),
+    Present(Box<LinkState>),
     /// Unreadable or malformed: nothing it lists is trusted, so no
     /// existing entry is removed on its word.
     Unusable(String),
@@ -244,7 +264,7 @@ pub(crate) fn read_state(project_dir: &Path) -> StoredState {
     match serde_json::from_str::<LinkState>(&content) {
         Ok(mut state) if state_is_sound(&state) => {
             lift_retired_permissions(&mut state);
-            StoredState::Present(state)
+            StoredState::Present(Box::new(state))
         }
         Ok(_) => StoredState::Unusable(format!("{} lists unsafe paths", path.display())),
         Err(error) => StoredState::Unusable(format!("{} is malformed: {error}", path.display())),
@@ -352,6 +372,7 @@ mod tests {
             permission: "broad".into(),
             requires: Naming::Package,
             reviewed_by: None,
+            checked_as: None,
             links: vec![LinkRecord {
                 path: path.into(),
                 kind: LinkKind::Link,

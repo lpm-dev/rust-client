@@ -157,7 +157,7 @@ fn guided_config_summary_uses_product_defaults_when_unset() {
             release_age: "default (off)".to_string(),
             release_age_policy: "direct".to_string(),
             source_analysis: "disabled",
-            skill_settings: "lpm.dev=enabled, npm=enabled".to_string(),
+            skill_settings: "lpm.dev=enabled, npm=enabled, check=none".to_string(),
             lpm_insights: "enabled",
         }
     );
@@ -214,7 +214,7 @@ mode = "enforce"
             release_age: "3d".to_string(),
             release_age_policy: "strict".to_string(),
             source_analysis: "disabled",
-            skill_settings: "lpm.dev=disabled, npm=enabled".to_string(),
+            skill_settings: "lpm.dev=disabled, npm=enabled, check=none".to_string(),
             lpm_insights: "disabled",
         }
     );

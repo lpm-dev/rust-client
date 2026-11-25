@@ -2929,6 +2929,7 @@ pub async fn run(project_dir: &Path, package: &str, json_output: bool) -> Result
             project_dir,
             crate::lpm_skills_config::LpmSkillsPreference::Config,
             crate::commands::install::InstallOmitPolicy::default(),
+            false,
         )
     });
     render_result(

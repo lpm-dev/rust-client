@@ -1311,6 +1311,7 @@ fn config_list_json_reports_every_known_effective_key() {
             "auto-install-peers",
             "skills.lpm-dev-packages",
             "skills.other-packages",
+            "skills.security-provider",
             "audit-after-install",
             "linker",
             "workspace-concurrency",

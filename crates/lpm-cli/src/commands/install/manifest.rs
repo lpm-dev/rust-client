@@ -1644,7 +1644,12 @@ pub async fn run_add_packages(
             };
         let requested = javascript_result?;
         let dependency_skills = reconciles_skills.then(|| {
-            super::reconcile_dependency_skills(project_dir, lpm_skills_preference, omit_policy)
+            super::reconcile_dependency_skills(
+                project_dir,
+                lpm_skills_preference,
+                omit_policy,
+                false,
+            )
         });
         if !json_output {
             if let Some(reconciled) = &dependency_skills {
@@ -2275,6 +2280,7 @@ pub async fn run_install_filtered_add(
                 &workspace_root_for_config,
                 lpm_skills_preference,
                 omit_policy,
+                false,
             )
         });
         if js_result.is_ok() && json_output {

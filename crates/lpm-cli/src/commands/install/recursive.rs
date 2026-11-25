@@ -630,6 +630,7 @@ pub(crate) async fn run_recursive_workspace_install(
                 &workspace_root,
                 options.lpm_skills_preference,
                 options.omit_policy,
+                options.offline,
             )
         };
         if options.emit_summary {

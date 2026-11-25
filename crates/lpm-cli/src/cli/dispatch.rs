@@ -1740,10 +1740,13 @@ async fn async_main(cli: Cli) -> Result<()> {
                 github,
                 gitlab,
                 login_registry,
+                socket,
                 token,
                 save_env_token,
             } = args;
-            if npm {
+            if socket {
+                commands::third_party_login::run_socket(token, cli.json).await
+            } else if npm {
                 commands::third_party_login::run_npm(&client, token, cli.json).await
             } else if github {
                 commands::third_party_login::run_github(token, save_env_token, cli.json)
@@ -1767,10 +1770,11 @@ async fn async_main(cli: Cli) -> Result<()> {
                 npm,
                 github,
                 gitlab,
+                socket,
                 all,
                 logout_registry,
             } = args;
-            let has_specific = npm || github || gitlab || logout_registry.is_some();
+            let has_specific = npm || github || gitlab || socket || logout_registry.is_some();
             if revoke && has_specific && !all {
                 return Err(lpm_common::LpmError::Script(
                     "--revoke can only be used for the LPM.dev session; use `lpm logout --revoke` or `lpm logout --all --revoke`"
@@ -1793,6 +1797,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                     npm: all || npm,
                     github: all || github,
                     gitlab: all || gitlab,
+                    socket: all || socket,
                     custom_registry: (!all).then_some(logout_registry.as_deref()).flatten(),
                     all_custom_registries: all,
                 },

@@ -963,7 +963,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
     let report = report_capture::take(&capture);
     if result.is_ok() {
         let reconciled =
-            reconcile_dependency_skills(project_dir, lpm_skills_preference, omit_policy);
+            reconcile_dependency_skills(project_dir, lpm_skills_preference, omit_policy, offline);
         match report {
             Some(mut report) => {
                 attach_dependency_skills(&mut report, &reconciled);
@@ -998,20 +998,23 @@ pub(crate) fn dependency_skills_deferred() -> bool {
 
 /// Reconciles the dependency skills of the project at `project_dir`, at
 /// its workspace root in a workspace, after an install that left out
-/// `omitted`. Never fails: what goes wrong is a warning in the report.
+/// `omitted` and ran `offline` or not. Never fails: what goes wrong is a
+/// warning in the report.
 pub(crate) fn reconcile_dependency_skills(
     project_dir: &Path,
     preference: crate::lpm_skills_config::LpmSkillsPreference,
     omitted: InstallOmitPolicy,
+    offline: bool,
 ) -> crate::dependency_skills::ReconcileReport {
     let root = crate::dependency_skills::skills_root(project_dir);
     if !crate::dependency_skills::may_have_skill_work(&root) {
         return crate::dependency_skills::ReconcileReport::default();
     }
     match crate::dependency_skills::Settings::resolve(preference) {
-        Ok(Some(settings)) => {
-            crate::dependency_skills::reconcile_project(&root, settings.omitting(omitted))
-        }
+        Ok(Some(settings)) => crate::dependency_skills::reconcile_project(
+            &root,
+            settings.omitting(omitted).offline(offline),
+        ),
         Ok(None) => crate::dependency_skills::ReconcileReport::default(),
         Err(error) => crate::dependency_skills::ReconcileReport {
             warnings: vec![format!("dependency skills were not linked: {error}")],

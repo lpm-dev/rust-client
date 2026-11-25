@@ -258,6 +258,8 @@ pub enum ThirdPartyCredentialSource {
     GitlabCiJob,
     GithubCli,
     GitlabCli,
+    SocketEnvironment,
+    SocketLegacyEnvironment,
     Stored(AuthStorageBackend),
 }
 
@@ -269,6 +271,8 @@ impl ThirdPartyCredentialSource {
             Self::GitlabCiJob => "env:CI_JOB_TOKEN",
             Self::GithubCli => "gh",
             Self::GitlabCli => "glab",
+            Self::SocketEnvironment => "env:SOCKET_CLI_API_TOKEN",
+            Self::SocketLegacyEnvironment => "env:SOCKET_SECURITY_API_TOKEN",
             Self::Stored(_) => "stored",
         }
     }
@@ -291,6 +295,8 @@ impl ThirdPartyCredentialSource {
             Self::GitlabCiJob => "configured (env: CI_JOB_TOKEN)",
             Self::GithubCli => "available (gh auth)",
             Self::GitlabCli => "available (glab auth)",
+            Self::SocketEnvironment => "configured (env: SOCKET_CLI_API_TOKEN)",
+            Self::SocketLegacyEnvironment => "configured (env: SOCKET_SECURITY_API_TOKEN)",
             Self::Stored(backend) => backend.registry_status_label(),
         }
     }
@@ -829,6 +835,48 @@ pub fn set_npm_token_with_backend(token: &str) -> Result<AuthStorageBackend, Str
 /// Clear stored npm token (`lpm logout --npm`).
 pub fn clear_npm_token() -> Result<(), String> {
     clear_stored_token(NPM_REGISTRY_URL).map_err(|e| format!("failed to clear npm token: {e}"))
+}
+
+// ─── Socket Token ──────────────────────────────────────────────────
+
+/// The key a Socket API token is stored under: not a URL, so no registry
+/// lookup or custom-registry listing ever takes it for a registry's token.
+const SOCKET_CREDENTIAL_KEY: &str = "socket:api-token";
+
+/// Resolves the Socket API token that dependency-skill checks use.
+///
+/// Priority: `SOCKET_CLI_API_TOKEN` env → `SOCKET_SECURITY_API_TOKEN` env,
+/// the name older Socket tools read → the token `lpm login --socket` stored.
+pub fn resolve_socket_credential() -> Option<ResolvedThirdPartyCredential> {
+    non_empty_environment_credential(
+        "SOCKET_CLI_API_TOKEN",
+        ThirdPartyCredentialSource::SocketEnvironment,
+    )
+    .or_else(|| {
+        non_empty_environment_credential(
+            "SOCKET_SECURITY_API_TOKEN",
+            ThirdPartyCredentialSource::SocketLegacyEnvironment,
+        )
+    })
+    .or_else(|| {
+        get_stored_builtin_token_with_backend(SOCKET_CREDENTIAL_KEY).map(|stored| {
+            ResolvedThirdPartyCredential::new(
+                stored.token,
+                ThirdPartyCredentialSource::Stored(stored.backend),
+            )
+        })
+    })
+}
+
+/// Stores a Socket API token (`lpm login --socket`).
+pub fn set_socket_token_with_backend(token: &str) -> Result<AuthStorageBackend, String> {
+    set_token_with_backend(SOCKET_CREDENTIAL_KEY, token)
+}
+
+/// Clears the stored Socket API token (`lpm logout --socket`).
+pub fn clear_socket_token() -> Result<(), String> {
+    clear_stored_token(SOCKET_CREDENTIAL_KEY)
+        .map_err(|e| format!("failed to clear Socket token: {e}"))
 }
 
 // ─── GitHub Token ──────────────────────────────────────────────────
@@ -1505,7 +1553,7 @@ fn write_custom_registries_checked(
 fn is_builtin_registry_url(registry_url: &str) -> bool {
     matches!(
         registry_url,
-        NPM_REGISTRY_URL | GITHUB_REGISTRY_URL | GITLAB_REGISTRY_URL
+        NPM_REGISTRY_URL | GITHUB_REGISTRY_URL | GITLAB_REGISTRY_URL | SOCKET_CREDENTIAL_KEY
     )
 }
 
@@ -6219,6 +6267,31 @@ mod tests {
             assert!(
                 registries.iter().all(|(name, _)| name != "github.com"),
                 "malformed GitHub builtin entry should not be reported as configured: {registries:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_stored_socket_token_is_never_listed_or_used_as_a_registry_token() {
+        with_temp_home(|_home| {
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                ("SOCKET_CLI_API_TOKEN", None),
+                ("SOCKET_SECURITY_API_TOKEN", None),
+            ]);
+
+            set_socket_token_with_backend("socket-file-token").expect("store the Socket token");
+
+            assert!(
+                list_custom_registries().is_empty(),
+                "{:?}",
+                list_custom_registries()
+            );
+            assert_eq!(get_custom_registry_token("https://api.socket.dev"), None);
+            assert_eq!(
+                resolve_socket_credential()
+                    .map(|credential| credential.with_exposed_token(str::to_owned)),
+                Some("socket-file-token".to_string())
             );
         });
     }
