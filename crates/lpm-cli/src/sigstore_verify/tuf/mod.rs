@@ -95,6 +95,16 @@ pub(crate) struct TrustedMetadata {
     pub(crate) trusted_root: String,
 }
 
+/// How recent verified metadata is: a later root first, then a later
+/// targets, snapshot and timestamp version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Freshness {
+    root: u64,
+    targets: u64,
+    snapshot: u64,
+    timestamp: u64,
+}
+
 /// A trust root that Sigstore's targets role signed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VerifiedTrustedRoot {
@@ -109,6 +119,23 @@ impl TrustedMetadata {
     /// Expiry is not enforced here. Stored metadata stands in for the trust
     /// root built into the binary when Sigstore's repository can't be
     /// reached, and it is never older than what that binary was built with.
+    /// Check stored metadata again and say how recent it is.
+    pub(crate) fn freshness(&self, embedded_root: &[u8]) -> Result<Freshness, TufError> {
+        let root = follow_roots(Signed::<Root>::parse(embedded_root)?, &self.roots)?;
+        let targets = Signed::<Targets>::parse(self.targets.as_bytes())?;
+        targets.verify_with(&root.signed)?;
+        let snapshot = Signed::<Snapshot>::parse(self.snapshot.as_bytes())?;
+        snapshot.verify_with(&root.signed)?;
+        let timestamp = Signed::<Timestamp>::parse(self.timestamp.as_bytes())?;
+        timestamp.verify_with(&root.signed)?;
+        Ok(Freshness {
+            root: root.version(),
+            targets: targets.version(),
+            snapshot: snapshot.version(),
+            timestamp: timestamp.version(),
+        })
+    }
+
     pub(crate) fn verified_trusted_root(
         &self,
         embedded_root: &[u8],

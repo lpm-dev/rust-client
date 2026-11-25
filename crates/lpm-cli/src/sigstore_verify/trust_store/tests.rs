@@ -20,14 +20,18 @@ fn trust_root_without_the_axios_log() -> Vec<u8> {
 
 async fn serve(files: BTreeMap<String, Vec<u8>>) -> MockServer {
     let server = MockServer::start().await;
+    mount(&server, files).await;
+    server
+}
+
+async fn mount(server: &MockServer, files: BTreeMap<String, Vec<u8>>) {
     for (file, bytes) in files {
         Mock::given(method("GET"))
             .and(path(format!("/{file}")))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
-            .mount(&server)
+            .mount(server)
             .await;
     }
-    server
 }
 
 /// A repository that serves `trusted_root` under targets version
@@ -71,6 +75,7 @@ fn store_holding(
         repository,
         current: RwLock::new(None),
         last_fetch: tokio::sync::Mutex::new(None),
+        last_metadata: Mutex::new(None),
     }
 }
 
@@ -420,6 +425,139 @@ async fn a_release_verifies_with_the_held_root_when_sigstores_repository_fails()
     verify_lpm_release(&store, TrustRefresh::BeforeVerifying)
         .await
         .expect("the held trust root verifies the release");
+}
+
+/// The built-in trust root with every CT log entry in a shape this version
+/// can't read, as a future schema change might publish them.
+fn trust_root_with_unreadable_ct_logs() -> Vec<u8> {
+    let mut root: serde_json::Value = serde_json::from_slice(EMBEDDED_TRUST_ROOT_JSON).unwrap();
+    for log in root["ctlogs"].as_array_mut().unwrap() {
+        log["publicKey"] = serde_json::json!({"keyDetails": "PKIX_FUTURE", "validFor": {"start": "2022-10-20T00:00:00Z"}});
+    }
+    serde_json::to_vec(&root).unwrap()
+}
+
+/// The built-in trust root with every CT log retired.
+fn trust_root_retiring_every_ct_log() -> Vec<u8> {
+    let mut root: serde_json::Value = serde_json::from_slice(EMBEDDED_TRUST_ROOT_JSON).unwrap();
+    for log in root["ctlogs"].as_array_mut().unwrap() {
+        log["publicKey"]["validFor"]["end"] = serde_json::json!("2023-01-01T00:00:00Z");
+    }
+    serde_json::to_vec(&root).unwrap()
+}
+
+#[tokio::test]
+async fn a_fetched_trust_root_this_version_cannot_use_keeps_the_held_one() {
+    let roles = RoleSet::new();
+    let server = sigstore_serving(&roles, &trust_root_with_unreadable_ct_logs(), 1).await;
+    let store = store_holding(
+        &roles,
+        EMBEDDED_TRUST_ROOT_JSON.to_vec(),
+        1,
+        None,
+        Repository::Url(server.uri()),
+    );
+
+    verify_lpm_release(&store, TrustRefresh::BeforeVerifying)
+        .await
+        .expect("the held trust root still verifies the release");
+
+    let refresh = store.refresh().await.unwrap_err();
+    assert!(refresh.contains("CT log"), "{refresh}");
+}
+
+#[tokio::test]
+async fn a_role_sigstore_retired_entirely_stops_counting() {
+    let roles = RoleSet::new();
+    let server = sigstore_serving(&roles, &trust_root_retiring_every_ct_log(), 1).await;
+    let store = store_holding(
+        &roles,
+        EMBEDDED_TRUST_ROOT_JSON.to_vec(),
+        1,
+        None,
+        Repository::Url(server.uri()),
+    );
+
+    let error = verify_lpm_release(&store, TrustRefresh::BeforeVerifying)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, VerifyError::TrustRootExpired { .. }),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_older_fetch_never_replaces_a_newer_cached_trust_root() {
+    let roles = RoleSet::new();
+    let newer = sigstore_serving(&roles, EMBEDDED_TRUST_ROOT_JSON, 2).await;
+    let older = sigstore_serving(&roles, &trust_root_without_the_axios_log(), 1).await;
+    let cache = tempfile::tempdir().unwrap();
+    let cache_file = cache.path().join(CACHE_FILE_NAME);
+    let slower = store_holding(
+        &roles,
+        trust_root_without_the_axios_log(),
+        1,
+        Some(cache_file.clone()),
+        Repository::Url(older.uri()),
+    );
+    let fetched_before_the_update = tuf::refresh(
+        &roles.signed_root(1),
+        None,
+        &HttpFetcher::new(&older.uri()).unwrap(),
+        SystemTime::now(),
+    )
+    .await
+    .unwrap();
+    let faster = store_holding(
+        &roles,
+        trust_root_without_the_axios_log(),
+        1,
+        Some(cache_file.clone()),
+        Repository::Url(newer.uri()),
+    );
+    verify_axios(&faster, TrustRefresh::WhenMissing)
+        .await
+        .unwrap();
+
+    slower.write_cache(fetched_before_the_update).await;
+
+    let offline = store_holding(
+        &roles,
+        trust_root_without_the_axios_log(),
+        1,
+        Some(cache_file),
+        Repository::Disabled,
+    );
+    verify_axios(&offline, TrustRefresh::WhenMissing)
+        .await
+        .expect("the cache still holds the newer trust root");
+}
+
+#[tokio::test]
+async fn a_process_that_cannot_cache_still_refuses_a_rollback() {
+    let roles = RoleSet::new();
+    let server = sigstore_serving(&roles, EMBEDDED_TRUST_ROOT_JSON, 5).await;
+    let store = store_holding(
+        &roles,
+        EMBEDDED_TRUST_ROOT_JSON.to_vec(),
+        1,
+        None,
+        Repository::Url(server.uri()),
+    );
+    store.refresh().await.unwrap();
+
+    server.reset().await;
+    mount(
+        &server,
+        repository_files(&roles, 4, 4, 4, EMBEDDED_TRUST_ROOT_JSON),
+    )
+    .await;
+    *store.last_fetch.lock().await = None;
+    let refresh = store.refresh().await.unwrap_err();
+
+    assert!(refresh.contains("went back"), "{refresh}");
 }
 
 #[test]

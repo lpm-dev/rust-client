@@ -165,7 +165,7 @@ impl<T: Role> Signed<T> {
     /// least as many times as the role's threshold requires.
     ///
     /// Each key counts once, however many signatures name it and under
-    /// however many key IDs it is listed.
+    /// however many key IDs or encodings it is listed.
     pub(super) fn verify_with(&self, delegator: &Root) -> Result<(), TufError> {
         let role = delegator
             .roles
@@ -180,12 +180,15 @@ impl<T: Role> Signed<T> {
                 detail: format!("the {} role has a threshold of 0", T::NAME),
             });
         }
-        let mut counted: Vec<&str> = Vec::with_capacity(role.keyids.len());
+        let mut counted: Vec<Vec<u8>> = Vec::with_capacity(role.keyids.len());
         for keyid in &role.keyids {
             let Some(key) = delegator.keys.get(keyid) else {
                 continue;
             };
-            if counted.contains(&key.keyval.public.as_str()) {
+            let Some(identity) = key.identity() else {
+                continue;
+            };
+            if counted.contains(&identity) {
                 continue;
             }
             let signed_by_key = self
@@ -194,7 +197,7 @@ impl<T: Role> Signed<T> {
                 .filter(|signature| &signature.keyid == keyid)
                 .any(|signature| key.verifies(&self.canonical, &signature.sig));
             if signed_by_key {
-                counted.push(&key.keyval.public);
+                counted.push(identity);
             }
         }
         let threshold = role.threshold as usize;
@@ -234,21 +237,53 @@ impl Root {
         self.role_keys(role) != other.role_keys(role)
     }
 
-    fn role_keys(&self, role: &str) -> Option<(Vec<&str>, u32)> {
+    fn role_keys(&self, role: &str) -> Option<(Vec<Vec<u8>>, u32)> {
         self.roles.get(role).map(|keys| {
-            let mut public: Vec<&str> = keys
+            let mut identities: Vec<Vec<u8>> = keys
                 .keyids
                 .iter()
                 .filter_map(|keyid| self.keys.get(keyid))
-                .map(|key| key.keyval.public.as_str())
+                .filter_map(Key::identity)
                 .collect();
-            public.sort_unstable();
-            (public, keys.threshold)
+            identities.sort_unstable();
+            identities.dedup();
+            (identities, keys.threshold)
         })
     }
 }
 
 impl Key {
+    /// The key itself, independent of how the metadata encodes it: the
+    /// scheme and the DER public key or raw Ed25519 bytes. `None` for a key
+    /// this client can't use.
+    fn identity(&self) -> Option<Vec<u8>> {
+        use p256::pkcs8::{DecodePublicKey, EncodePublicKey};
+        let (tag, bytes) = match (self.keytype.as_str(), self.scheme.as_str()) {
+            ("ecdsa" | "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp256") => (
+                b'1',
+                p256::ecdsa::VerifyingKey::from_public_key_pem(&self.keyval.public)
+                    .ok()?
+                    .to_public_key_der()
+                    .ok()?
+                    .into_vec(),
+            ),
+            ("ecdsa" | "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp384") => (
+                b'3',
+                p384::ecdsa::VerifyingKey::from_public_key_pem(&self.keyval.public)
+                    .ok()?
+                    .to_public_key_der()
+                    .ok()?
+                    .into_vec(),
+            ),
+            ("ed25519", "ed25519") => (b'e', hex::decode(&self.keyval.public).ok()?),
+            _ => return None,
+        };
+        let mut identity = Vec::with_capacity(bytes.len() + 1);
+        identity.push(tag);
+        identity.extend_from_slice(&bytes);
+        Some(identity)
+    }
+
     /// Whether `signature_hex` is this key's signature over `message`.
     ///
     /// Supports the key types securesystemslib signs TUF metadata with;

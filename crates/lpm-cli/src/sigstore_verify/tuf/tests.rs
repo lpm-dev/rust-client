@@ -553,3 +553,51 @@ fn a_missing_trust_root_target_is_reported() {
 
     assert!(matches!(error, TufError::Missing(_)), "{error}");
 }
+
+#[test]
+fn one_key_under_two_ids_and_encodings_counts_once_toward_the_threshold() {
+    let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let public = hex::encode(key.verifying_key().as_bytes());
+    let root_with = |version: u64| {
+        json!({
+            "_type": "root",
+            "spec_version": "1.0",
+            "version": version,
+            "expires": "2099-01-01T00:00:00Z",
+            "consistent_snapshot": true,
+            "keys": {
+                "lower": {"keytype": "ed25519", "scheme": "ed25519", "keyval": {"public": public}},
+                "upper": {"keytype": "ed25519", "scheme": "ed25519", "keyval": {"public": public.to_uppercase()}},
+            },
+            "roles": {
+                "root": {"keyids": ["lower", "upper"], "threshold": 2},
+                "timestamp": {"keyids": ["lower"], "threshold": 1},
+                "snapshot": {"keyids": ["lower"], "threshold": 1},
+                "targets": {"keyids": ["lower"], "threshold": 1},
+            },
+        })
+    };
+    let signed_by_both_ids = |signed: Value| {
+        use ed25519_dalek::Signer;
+        let mut message = Vec::new();
+        canonical::encode(&signed, &mut message).unwrap();
+        let sig = hex::encode(key.sign(&message).to_bytes());
+        serde_json::to_vec(&json!({
+            "signed": signed,
+            "signatures": [{"keyid": "lower", "sig": sig}, {"keyid": "upper", "sig": sig}],
+        }))
+        .unwrap()
+    };
+    let repository = Repository::default().with("2.root.json", signed_by_both_ids(root_with(2)));
+
+    let error = refreshed(&signed_by_both_ids(root_with(1)), None, &repository, now()).unwrap_err();
+
+    assert_eq!(
+        error,
+        TufError::Threshold {
+            role: "root",
+            valid: 1,
+            threshold: 2
+        }
+    );
+}

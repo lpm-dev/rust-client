@@ -13,13 +13,13 @@
 
 use super::bundle::verify_sigstore_bundle_with;
 use super::trust_root::EMBEDDED_TRUST_ROOT_JSON;
-use super::tuf::{self, Fetcher, TrustedMetadata, VerifiedTrustedRoot};
+use super::tuf::{self, Fetcher, Freshness, TrustedMetadata, VerifiedTrustedRoot};
 use super::{IdentityExpectations, TrustRoot, VerifiedProvenance, VerifyError, VerifyOptions};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Version of Sigstore's targets metadata that signed the trust root built
@@ -81,6 +81,9 @@ pub(crate) struct TrustStore {
     repository: Repository,
     current: RwLock<Option<Arc<TrustRoot>>>,
     last_fetch: tokio::sync::Mutex<Option<(Instant, Result<(), String>)>>,
+    /// The last metadata this process verified, the rollback baseline when
+    /// the cache can't be written or another process wrote an older one.
+    last_metadata: Mutex<Option<TrustedMetadata>>,
 }
 
 /// The store every verification in this process shares.
@@ -113,6 +116,7 @@ impl TrustStore {
             repository: repository_from_environment(),
             current: RwLock::new(None),
             last_fetch: tokio::sync::Mutex::new(None),
+            last_metadata: Mutex::new(None),
         }
     }
 
@@ -188,7 +192,7 @@ impl TrustStore {
             ));
         };
         let fetcher = HttpFetcher::new(url)?;
-        let stored = self.read_cached_metadata();
+        let stored = self.newest_stored_metadata();
         let metadata = tokio::time::timeout(
             REFRESH_TIMEOUT,
             tuf::refresh(
@@ -216,9 +220,12 @@ impl TrustStore {
                 verified.targets_version, self.embedded_targets_version
             ));
         }
-        let root = TrustRoot::parse_skipping_unreadable(&verified.bytes)
-            .map_err(|error| error.to_string())?;
-        self.write_cache(metadata);
+        let root = usable_trust_root(&verified.bytes, SystemTime::now())?;
+        *self
+            .last_metadata
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(metadata.clone());
+        self.write_cache(metadata).await;
         *self.current.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(root));
         tracing::debug!(
             target: "lpm_cli::sigstore_verify",
@@ -233,7 +240,7 @@ impl TrustStore {
             .read_cached_trusted_root()
             .filter(|cached| cached.targets_version >= self.embedded_targets_version)
             .and_then(|cached| {
-                TrustRoot::parse_skipping_unreadable(&cached.bytes)
+                usable_trust_root(&cached.bytes, SystemTime::now())
                     .inspect_err(|error| {
                         tracing::debug!(
                             target: "lpm_cli::sigstore_verify",
@@ -299,26 +306,63 @@ impl TrustStore {
             .ok()
     }
 
-    fn write_cache(&self, metadata: TrustedMetadata) {
+    /// The newer of the cached metadata and what this process last verified,
+    /// whichever still verifies.
+    fn newest_stored_metadata(&self) -> Option<TrustedMetadata> {
+        let in_memory = self
+            .last_metadata
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        [self.read_cached_metadata(), in_memory]
+            .into_iter()
+            .flatten()
+            .filter_map(|metadata| Some((self.freshness(&metadata)?, metadata)))
+            .max_by_key(|(freshness, _)| *freshness)
+            .map(|(_, metadata)| metadata)
+    }
+
+    fn freshness(&self, metadata: &TrustedMetadata) -> Option<Freshness> {
+        metadata.freshness(&self.embedded_tuf_root).ok()
+    }
+
+    /// Cache `metadata` unless another process already cached newer
+    /// metadata, so concurrent fetches that finish out of order never roll
+    /// the cache back.
+    async fn write_cache(&self, metadata: TrustedMetadata) {
         let Some(path) = &self.cache_file else {
             return;
         };
-        let cache = CacheFile {
-            schema_version: CACHE_SCHEMA_VERSION,
-            metadata,
+        let Some(ours) = self.freshness(&metadata) else {
+            return;
         };
-        let written = serde_json::to_vec(&cache)
-            .map_err(std::io::Error::other)
-            .and_then(|bytes| {
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
+        let written = async {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(lpm_common::LpmError::Io)?;
+            }
+            lpm_common::with_exclusive_lock_async(path.with_extension("lock"), async {
+                let cached = self
+                    .read_cached_metadata()
+                    .and_then(|cached| self.freshness(&cached));
+                if cached.is_some_and(|cached| cached > ours) {
+                    return Ok(());
                 }
+                let cache = CacheFile {
+                    schema_version: CACHE_SCHEMA_VERSION,
+                    metadata,
+                };
+                let bytes = serde_json::to_vec(&cache)
+                    .map_err(|error| lpm_common::LpmError::Io(std::io::Error::other(error)))?;
                 lpm_common::write_file_atomic_with_options(
                     path,
                     bytes,
                     lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
                 )
-            });
+                .map_err(lpm_common::LpmError::Io)
+            })
+            .await
+        }
+        .await;
         if let Err(error) = written {
             tracing::debug!(
                 target: "lpm_cli::sigstore_verify",
@@ -327,6 +371,28 @@ impl TrustStore {
                 "can't cache Sigstore's current trust root; the next run fetches it again",
             );
         }
+    }
+}
+
+/// Parse a trust root Sigstore's repository delivered, refusing one in which
+/// a role has no usable key because of entries this version can't read.
+/// Using it would fail every verification the held trust root still passes.
+/// A role whose readable keys Sigstore retired is a decision, and stands.
+fn usable_trust_root(bytes: &[u8], now: SystemTime) -> Result<TrustRoot, String> {
+    let (root, skipped) =
+        TrustRoot::parse_skipping_unreadable(bytes).map_err(|error| error.to_string())?;
+    let unusable: Vec<&str> = root
+        .roles_without_active_key(now)
+        .into_iter()
+        .filter(|role| skipped.contains(role))
+        .collect();
+    if unusable.is_empty() {
+        Ok(root)
+    } else {
+        Err(format!(
+            "its {} entries are in a form this version of LPM can't read",
+            unusable.join(", ")
+        ))
     }
 }
 

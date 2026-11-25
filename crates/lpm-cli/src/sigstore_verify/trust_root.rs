@@ -94,23 +94,31 @@ fn deserialize_entry<T: serde::de::DeserializeOwned>(
     serde_json::from_value(value).map_err(|e| VerifyError::TrustRoot(format!("JSON parse: {e}")))
 }
 
+const FULCIO_ROLE: &str = "Fulcio CA";
+const REKOR_ROLE: &str = "Rekor signing key";
+const CT_LOG_ROLE: &str = "CT log key";
+
 fn collect_entries<T>(
     values: Vec<serde_json::Value>,
-    skip_unreadable: bool,
+    skipped: &mut Option<Vec<&'static str>>,
+    role: &'static str,
     parse: impl Fn(serde_json::Value) -> Result<T, VerifyError>,
 ) -> Result<Vec<T>, VerifyError> {
     let mut entries = Vec::with_capacity(values.len());
     for value in values {
-        match parse(value) {
-            Ok(entry) => entries.push(entry),
-            Err(error) if skip_unreadable => {
+        match (parse(value), skipped.as_mut()) {
+            (Ok(entry), _) => entries.push(entry),
+            (Err(error), Some(skipped)) => {
                 tracing::debug!(
                     target: "lpm_cli::sigstore_verify",
                     %error,
                     "skipping a Sigstore trust root entry this version can't read",
                 );
+                if !skipped.contains(&role) {
+                    skipped.push(role);
+                }
             }
-            Err(error) => return Err(error),
+            (Err(error), None) => return Err(error),
         }
     }
     Ok(entries)
@@ -182,25 +190,37 @@ impl TrustRoot {
     /// uses; bytes passed here must come from the binary or from
     /// Sigstore's TUF repository through [`super::tuf`].
     pub fn parse(bytes: &[u8]) -> Result<TrustRoot, VerifyError> {
-        Self::parse_entries(bytes, false)
+        Self::parse_entries(bytes, &mut None)
     }
 
     /// Parse a trust root from Sigstore's TUF repository, skipping any
     /// entry this version can't read rather than refusing the whole
     /// root. Sigstore can add entries in shapes newer than this
     /// version, and the entries it can read must stay usable.
-    pub fn parse_skipping_unreadable(bytes: &[u8]) -> Result<TrustRoot, VerifyError> {
-        Self::parse_entries(bytes, true)
+    ///
+    /// Also returns the roles, named as [`Self::check_expiry`] names
+    /// them, that had an entry skipped.
+    pub fn parse_skipping_unreadable(
+        bytes: &[u8],
+    ) -> Result<(TrustRoot, Vec<&'static str>), VerifyError> {
+        let mut skipped = Some(Vec::new());
+        let root = Self::parse_entries(bytes, &mut skipped)?;
+        Ok((root, skipped.unwrap_or_default()))
     }
 
-    fn parse_entries(bytes: &[u8], skip_unreadable: bool) -> Result<TrustRoot, VerifyError> {
+    /// `skipped` is `None` to refuse an unreadable entry, or collects the
+    /// roles whose unreadable entries were skipped.
+    fn parse_entries(
+        bytes: &[u8],
+        skipped: &mut Option<Vec<&'static str>>,
+    ) -> Result<TrustRoot, VerifyError> {
         let raw: TrustedRootJson = serde_json::from_slice(bytes)
             .map_err(|e| VerifyError::TrustRoot(format!("JSON parse: {e}")))?;
         let fulcio_roots =
-            collect_entries(raw.certificate_authorities, skip_unreadable, |value| {
+            collect_entries(raw.certificate_authorities, skipped, FULCIO_ROLE, |value| {
                 parse_fulcio_root(deserialize_entry(value)?)
             })?;
-        let rekor_keys = collect_entries(raw.tlogs, skip_unreadable, |value| {
+        let rekor_keys = collect_entries(raw.tlogs, skipped, REKOR_ROLE, |value| {
             let (log_id, spki_der, valid_for) = parse_log_key(deserialize_entry(value)?)?;
             Ok(RekorKey {
                 log_id,
@@ -208,7 +228,7 @@ impl TrustRoot {
                 valid_for,
             })
         })?;
-        let ctlog_keys = collect_entries(raw.ctlogs, skip_unreadable, |value| {
+        let ctlog_keys = collect_entries(raw.ctlogs, skipped, CT_LOG_ROLE, |value| {
             let (log_id, spki_der, valid_for) = parse_log_key(deserialize_entry(value)?)?;
             Ok(CtLogKey {
                 log_id,
@@ -259,22 +279,28 @@ impl TrustRoot {
     /// `start <= now` and (`end is None` OR `end > now`). Retired
     /// entries (end <= now) don't count.
     pub fn check_expiry(&self, now: SystemTime) -> Result<(), VerifyError> {
-        let mut missing: Vec<&str> = Vec::new();
-        if !self.fulcio_roots.iter().any(|r| r.valid_for.contains(now)) {
-            missing.push("Fulcio CA");
-        }
-        if !self.rekor_keys.iter().any(|k| k.valid_for.contains(now)) {
-            missing.push("Rekor signing key");
-        }
-        if !self.ctlog_keys.iter().any(|k| k.valid_for.contains(now)) {
-            missing.push("CT log key");
-        }
+        let missing = self.roles_without_active_key(now);
         if missing.is_empty() {
             return Ok(());
         }
         Err(VerifyError::TrustRootExpired {
             missing_roles: missing.join(", "),
         })
+    }
+
+    /// The roles with no key active at `now`.
+    pub fn roles_without_active_key(&self, now: SystemTime) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if !self.fulcio_roots.iter().any(|r| r.valid_for.contains(now)) {
+            missing.push(FULCIO_ROLE);
+        }
+        if !self.rekor_keys.iter().any(|k| k.valid_for.contains(now)) {
+            missing.push(REKOR_ROLE);
+        }
+        if !self.ctlog_keys.iter().any(|k| k.valid_for.contains(now)) {
+            missing.push(CT_LOG_ROLE);
+        }
+        missing
     }
 
     /// Soonest "next currently-active key retirement" date. Per
