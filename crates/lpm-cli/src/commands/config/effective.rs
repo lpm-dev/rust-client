@@ -814,7 +814,7 @@ fn add_security_entries(
         firewall_source,
         GROUP_SECURITY,
     ));
-    add_firewall_policy_entries(entries, global, user_source)?;
+    add_firewall_policy_entries(entries, global, user_source, posture, firewall)?;
 
     let integrity = crate::commands::config::resolve_object_integrity_policy(global)?;
     entries.push(EffectiveConfigEntry::new(
@@ -872,8 +872,12 @@ fn add_firewall_policy_entries(
     entries: &mut Vec<EffectiveConfigEntry>,
     global: &GlobalConfig,
     user_source: &str,
+    posture: &EffectiveAuthorizedPosture,
+    firewall_mode: crate::npm_firewall_config::NpmFirewallMode,
 ) -> Result<(), LpmError> {
-    let profile = crate::npm_firewall_config::config_policy_profile(global)?;
+    let requested = crate::npm_firewall_config::config_policy_request(global)?;
+    let approved = posture.posture.firewall_policy_profile();
+    let approved_mode = posture.posture.firewall_mode();
     let policies = global
         .get_table("firewall")
         .and_then(|table| table.get("npm"))
@@ -887,38 +891,20 @@ fn add_firewall_policy_entries(
             DEFAULT_SOURCE
         }
     };
-    let values = [
-        (
-            crate::npm_firewall_config::TRUSTED_PUBLIC_MALICIOUS_ADVISORIES_POLICY_KEY,
-            profile.trusted_public_malicious_advisories,
-        ),
-        (
-            crate::npm_firewall_config::LPM_AI_CONFIRMED_MALWARE_POLICY_KEY,
-            profile.lpm_ai_confirmed_malware,
-        ),
-        (
-            crate::npm_firewall_config::LPM_AI_DEPENDENCY_SCRIPT_POLICY_KEY,
-            profile.lpm_ai_dependency_script_policy,
-        ),
-        (
-            crate::npm_firewall_config::LPM_AI_AGENT_CONTROL_SURFACE_POLICY_KEY,
-            profile.lpm_ai_agent_control_surface,
-        ),
-        (
-            crate::npm_firewall_config::LPM_AI_TELEMETRY_POLICY_KEY,
-            profile.lpm_ai_telemetry,
-        ),
-        (
-            crate::npm_firewall_config::CRITICAL_VULNERABILITY_POLICY_KEY,
-            profile.critical_vulnerability,
-        ),
-        (
-            crate::npm_firewall_config::LPM_AI_SUSPICIOUS_POLICY_KEY,
-            profile.lpm_ai_suspicious,
-        ),
-    ];
-    for (key, value) in values {
-        let source: Cow<'_, str> = match key {
+    for key in [
+        crate::npm_firewall_config::TRUSTED_PUBLIC_MALICIOUS_ADVISORIES_POLICY_KEY,
+        crate::npm_firewall_config::LPM_AI_CONFIRMED_MALWARE_POLICY_KEY,
+        crate::npm_firewall_config::LPM_AI_DEPENDENCY_SCRIPT_POLICY_KEY,
+        crate::npm_firewall_config::LPM_AI_AGENT_CONTROL_SURFACE_POLICY_KEY,
+        crate::npm_firewall_config::LPM_AI_TELEMETRY_POLICY_KEY,
+        crate::npm_firewall_config::CRITICAL_VULNERABILITY_POLICY_KEY,
+        crate::npm_firewall_config::LPM_AI_SUSPICIOUS_POLICY_KEY,
+    ] {
+        let Some(approved_action) = crate::npm_firewall_config::policy_action(&approved, key)
+        else {
+            continue;
+        };
+        let config_source: Cow<'_, str> = match key {
             crate::npm_firewall_config::LPM_AI_SUSPICIOUS_POLICY_KEY
                 if policies.is_some_and(|policies| {
                     policies.contains_key(
@@ -940,6 +926,30 @@ fn add_firewall_policy_entries(
             }
             _ => Cow::Borrowed(policy_source(key)),
         };
+        let (candidate, candidate_source) = match requested
+            .as_ref()
+            .and_then(|requested| crate::npm_firewall_config::policy_action(requested, key))
+        {
+            Some(action) => (action, config_source),
+            None => (
+                approved_action,
+                Cow::Borrowed(posture_source(posture.sources.firewall_policies)),
+            ),
+        };
+        let (value, source) = select_security_value(
+            candidate,
+            &candidate_source,
+            approved_action,
+            posture.sources.firewall_policies,
+            |candidate, floor| {
+                crate::npm_firewall_config::policy_action_loosens(
+                    firewall_mode,
+                    candidate,
+                    approved_mode,
+                    floor,
+                )
+            },
+        );
         entries.push(EffectiveConfigEntry::new(
             format!("firewall.npm.policies.{key}"),
             value.as_str(),

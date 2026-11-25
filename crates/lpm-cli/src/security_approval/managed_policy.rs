@@ -531,6 +531,14 @@ fn policy_value_has_enforced_controls(value: &toml::Value) -> bool {
             .and_then(toml::Value::as_table)
             .is_some_and(|firewall| {
                 firewall.contains_key(crate::npm_firewall_config::FIREWALL_CONFIG_MODE_KEY)
+                    || firewall
+                        .get(crate::npm_firewall_config::FIREWALL_NPM_CONFIG_SECTION)
+                        .and_then(toml::Value::as_table)
+                        .is_some_and(|npm| {
+                            npm.contains_key(
+                                crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_SECTION,
+                            )
+                        })
             })
 }
 
@@ -1247,6 +1255,13 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
         .transpose()?
         .map(|raw| parse_policy_firewall(&path, raw))
         .transpose()?;
+    let firewall_policies = crate::npm_firewall_config::firewall_policy_table(table)
+        .and_then(|policies| {
+            policies
+                .map(crate::npm_firewall_config::parse_policy_table)
+                .transpose()
+        })
+        .map_err(|message| managed_policy_error(&path, format!("is invalid: {message}")))?;
     let install_time_source_analysis = table
         .get(crate::source_analysis_config::INSTALL_TIME_SOURCE_ANALYSIS_KEY)
         .map(|value| {
@@ -1287,6 +1302,9 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
     if firewall_mode.is_some() {
         enforced_controls.push("firewall.mode".to_string());
     }
+    if firewall_policies.is_some() {
+        enforced_controls.push("firewall.npm.policies".to_string());
+    }
     if install_time_source_analysis.is_some() {
         enforced_controls
             .push(crate::source_analysis_config::INSTALL_TIME_SOURCE_ANALYSIS_KEY.to_string());
@@ -1307,6 +1325,7 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
         sigstore_verify,
         typosquat_guard,
         firewall_mode,
+        firewall_policies,
         install_time_source_analysis,
     }))
 }

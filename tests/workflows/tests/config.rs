@@ -2817,3 +2817,52 @@ fn zero_or_invalid_blocking_thread_cap_does_not_panic() {
             .success();
     }
 }
+
+fn config_list_entry(project: &TempProject, key: &str) -> serde_json::Value {
+    let output = lpm(project)
+        .args(["config", "list", "--json"])
+        .output()
+        .expect("failed to run lpm config list --json");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    envelope["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["key"] == key)
+        .cloned()
+        .unwrap_or_else(|| panic!("{key} is listed"))
+}
+
+#[test]
+fn config_list_reports_the_approved_firewall_policy_when_config_has_none() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    support::write_signed_firewall_posture(
+        &project,
+        "enforce",
+        &[("critical_vulnerability", "block")],
+    );
+    seed_config(&project, "[firewall]\nmode = \"enforce\"\n");
+
+    let entry = config_list_entry(&project, "firewall.npm.policies.critical_vulnerability");
+
+    assert_eq!(entry["value"], "block");
+}
+
+#[test]
+fn config_list_reports_the_approved_firewall_policy_over_a_looser_config_value() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    support::write_signed_firewall_posture(&project, "enforce", &[]);
+    seed_config(
+        &project,
+        "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_confirmed_malware = \"allow\"\n",
+    );
+
+    let entry = config_list_entry(&project, "firewall.npm.policies.lpm_ai_confirmed_malware");
+
+    assert_eq!(entry["value"], "block");
+}

@@ -359,6 +359,34 @@ pub fn reject_looser_firewall_mode_write(
     Ok(())
 }
 
+/// Refuses a `[firewall.npm.policies]` write that handles any policy group
+/// more leniently than `~/.lpm/config.toml` does now, while
+/// `force-security-floor = true` is active.
+pub fn reject_looser_firewall_policy_write(
+    global: &GlobalConfig,
+    requested: &lpm_registry::client::NpmFirewallPolicyProfile,
+) -> Result<(), LpmError> {
+    if !force_security_floor_enabled(global) {
+        return Ok(());
+    }
+    let enforce = crate::npm_firewall_config::NpmFirewallMode::Enforce;
+    let floor = crate::npm_firewall_config::config_policy_profile(global)?;
+    let loosened =
+        crate::npm_firewall_config::loosened_firewall_policies(enforce, requested, enforce, &floor);
+    if let Some(first) = loosened.first() {
+        return Err(security_floor_write_error(
+            &format!(
+                "{}.{}",
+                crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_PATH,
+                first.key
+            ),
+            first.requested.as_str(),
+            first.approved.as_str(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn current_sandbox_floor_mode(global: &GlobalConfig) -> ResolvedSandboxMode {
     global
         .get_table("sandbox")
@@ -509,5 +537,53 @@ mod tests {
         guard.flush(true);
         assert_eq!(recorded_suppressions().len(), 1);
         clear_recorded_suppressions_for_tests();
+    }
+
+    fn firewall_policy_floor_config(force: bool, malware_action: &str) -> GlobalConfig {
+        let config: toml::Table = toml::from_str(&format!(
+            "force-security-floor = {force}\n\n[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_confirmed_malware = \"{malware_action}\"\n"
+        ))
+        .unwrap();
+        GlobalConfig::from_table(config)
+    }
+
+    #[test]
+    fn forced_floor_refuses_a_looser_firewall_policy_write() {
+        let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_confirmed_malware: lpm_registry::client::NpmFirewallPolicyAction::Allow,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        let err = reject_looser_firewall_policy_write(
+            &firewall_policy_floor_config(true, "block"),
+            &requested,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("[firewall.npm.policies].lpm_ai_confirmed_malware"),
+            "{err}"
+        );
+        assert!(
+            reject_looser_firewall_policy_write(
+                &firewall_policy_floor_config(false, "block"),
+                &requested
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn forced_floor_accepts_a_stricter_firewall_policy_write() {
+        let requested = lpm_registry::client::NpmFirewallPolicyProfile::default();
+
+        assert!(
+            reject_looser_firewall_policy_write(
+                &firewall_policy_floor_config(true, "warn"),
+                &requested
+            )
+            .is_ok()
+        );
     }
 }

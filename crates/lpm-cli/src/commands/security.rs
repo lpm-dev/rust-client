@@ -554,6 +554,24 @@ fn push_managed_policy_details(
     }
 }
 
+/// The policy groups whose action differs from the default profile, or
+/// `default` when none does.
+fn describe_firewall_policies(policies: &std::collections::BTreeMap<String, String>) -> String {
+    let default = crate::npm_firewall_config::policy_profile_entries(
+        &lpm_registry::client::NpmFirewallPolicyProfile::default(),
+    );
+    let changed: Vec<String> = policies
+        .iter()
+        .filter(|(key, action)| default.get(*key) != Some(*action))
+        .map(|(key, action)| format!("{key}={action}"))
+        .collect();
+    if changed.is_empty() {
+        "default".to_string()
+    } else {
+        changed.join(", ")
+    }
+}
+
 /// Prints `lpm security status`: every section's rows line up, and a floor
 /// value that comes from a built-in default is dimmed so the values an
 /// approved posture or a managed policy sets stand out.
@@ -617,6 +635,11 @@ fn print_security_status(status: &security_approval::SecurityStatus) {
             "npm firewall",
             floor.firewall_mode.clone(),
             sources.firewall_mode,
+        ),
+        (
+            "npm firewall policies",
+            describe_firewall_policies(&floor.firewall_policies),
+            sources.firewall_policies,
         ),
         (
             "install-time source analysis",

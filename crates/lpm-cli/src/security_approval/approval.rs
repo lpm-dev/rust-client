@@ -924,6 +924,70 @@ pub fn authorize_persistent_npm_firewall_mode(
     persist_authorized_posture(&posture)
 }
 
+/// Approves `requested` as the machine's npm firewall policy profile, with the
+/// firewall in enforce mode, as `lpm config firewall` saves a custom profile.
+pub fn authorize_persistent_npm_firewall_policies(
+    requested: &lpm_registry::client::NpmFirewallPolicyProfile,
+    json_output: bool,
+    command_hint: &str,
+) -> Result<(), LpmError> {
+    let enforce = crate::npm_firewall_config::NpmFirewallMode::Enforce;
+    let effective = load_effective_authorized_posture()?;
+    let weakened = crate::npm_firewall_config::loosened_firewall_policies(
+        enforce,
+        requested,
+        effective.posture.firewall_mode(),
+        &effective.posture.firewall_policy_profile(),
+    );
+    if let Some(first) = weakened.first()
+        && (matches!(
+            effective.sources.firewall_policies,
+            PostureSourceKind::ManagedPolicy
+        ) || matches!(
+            effective.sources.firewall_mode,
+            PostureSourceKind::ManagedPolicy
+        ))
+    {
+        let managed_policy = effective
+            .managed_policy
+            .as_ref()
+            .expect("managed policy source must include status metadata");
+        let err = managed_policy_write_error(
+            managed_policy,
+            &format!(
+                "{}.{}",
+                crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_PATH,
+                first.key
+            ),
+            first.requested.as_str(),
+            first.approved.as_str(),
+        );
+        record_persistent_guarded_attempt(ApprovalScope::FirewallDisable, false, &err.to_string());
+        return Err(err);
+    }
+    if !weakened.is_empty() {
+        confirm_persistent_weakening(
+            ApprovalScope::FirewallDisable,
+            json_output,
+            command_hint,
+            &format!(
+                "Persisting `{}` with {} weakens the approved machine posture.",
+                crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_PATH,
+                crate::npm_firewall_config::describe_loosened_policies(&weakened),
+            ),
+        )?;
+    }
+
+    let mut posture = load_authorized_posture()?;
+    let policies = crate::npm_firewall_config::policy_profile_overrides(requested);
+    if posture.firewall_mode() == enforce && posture.firewall_policies == policies {
+        return Ok(());
+    }
+    posture.firewall_mode = enforce.as_str().to_string();
+    posture.firewall_policies = policies;
+    persist_authorized_posture(&posture)
+}
+
 pub fn authorize_persistent_install_time_source_analysis(
     requested: bool,
     json_output: bool,
@@ -1057,23 +1121,85 @@ pub(crate) fn ensure_runtime_npm_firewall_config_authorized(
         &effective,
         project_dir,
         json_output,
-        crate::npm_firewall_config::NpmFirewallModeRequest::from_config(requested),
+        Some(crate::npm_firewall_config::NpmFirewallModeRequest::from_config(requested)),
+        None,
     )
 }
+
+const FIREWALL_POLICIES_APPROVAL_COMMAND: &str = "lpm config firewall";
 
 pub(crate) fn ensure_runtime_npm_firewall_config_authorized_with_effective(
     effective: &EffectiveAuthorizedPosture,
     project_dir: &Path,
     json_output: bool,
-    request: crate::npm_firewall_config::NpmFirewallModeRequest,
+    mode_request: Option<crate::npm_firewall_config::NpmFirewallModeRequest>,
+    policy_request: Option<&lpm_registry::client::NpmFirewallPolicyProfile>,
 ) -> Result<(), LpmError> {
-    let requested = request.mode();
-    let approved = effective.posture.firewall_mode();
-    if !requested.loosens(approved) {
+    let approved_mode = effective.posture.firewall_mode();
+    let requested_mode = mode_request.map_or(approved_mode, |request| request.mode());
+    let mode_loosens = requested_mode.loosens(approved_mode);
+    let loosened_policies = policy_request.map_or_else(Vec::new, |requested| {
+        crate::npm_firewall_config::loosened_firewall_policies(
+            requested_mode,
+            requested,
+            approved_mode,
+            &effective.posture.firewall_policy_profile(),
+        )
+    });
+    if !mode_loosens && loosened_policies.is_empty() {
         return Ok(());
     }
-    let source = request.approval_source();
-    if let Some(err) = managed_policy_blocks_scope(effective, ApprovalScope::FirewallDisable) {
+
+    let source = match mode_request {
+        Some(request) if mode_loosens => request.approval_source(),
+        _ => ApprovalSource::GlobalConfig,
+    };
+    let policies_message = (!loosened_policies.is_empty()).then(|| {
+        format!(
+            "The `{}` settings in ~/.lpm/config.toml handle npm firewall verdicts more leniently than the approved policy: {}.",
+            crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_PATH,
+            crate::npm_firewall_config::describe_loosened_policies(&loosened_policies),
+        )
+    });
+    let mut message = String::new();
+    if mode_loosens && let Some(request) = mode_request {
+        message.push_str(request.downgrade_message());
+    }
+    if let Some(policies) = policies_message.as_deref() {
+        if !message.is_empty() {
+            message.push(' ');
+        }
+        message.push_str(policies);
+    }
+
+    let managed_error = if mode_loosens {
+        managed_policy_blocks_scope(effective, ApprovalScope::FirewallDisable)
+    } else {
+        None
+    }
+    .or_else(|| {
+        if loosened_policies.is_empty() {
+            return None;
+        }
+        let policies_managed = matches!(
+            effective.sources.firewall_policies,
+            PostureSourceKind::ManagedPolicy
+        ) || matches!(
+            effective.sources.firewall_mode,
+            PostureSourceKind::ManagedPolicy
+        );
+        policies_managed
+            .then_some(effective.managed_policy.as_ref())
+            .flatten()
+            .map(|managed_policy| {
+                managed_policy_scope_error(
+                    managed_policy,
+                    ApprovalScope::FirewallDisable,
+                    crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_PATH,
+                )
+            })
+    });
+    if let Some(err) = managed_error {
         record_audit_event(
             AuditRecord::new(
                 "guarded-attempt",
@@ -1082,19 +1208,32 @@ pub(crate) fn ensure_runtime_npm_firewall_config_authorized_with_effective(
             )
             .project_root(canonical_project_root(project_dir))
             .source(source)
-            .detail("runtime npm firewall posture is weaker than managed policy".to_string()),
+            .detail(format!(
+                "runtime npm firewall posture is weaker than managed policy: {message}"
+            )),
         );
         return Err(err);
     }
+
     ensure_project_unlock(
         ApprovalScope::FirewallDisable,
         project_dir,
         json_output,
         source,
-        request.downgrade_message(),
+        &message,
         None,
         &[],
     )
+    .map_err(|err| match err {
+        LpmError::SecurityApprovalRequired(mut context) if policies_message.is_some() => {
+            context.message = format!(
+                "{message} Approve these settings with `{FIREWALL_POLICIES_APPROVAL_COMMAND}`, or remove them from ~/.lpm/config.toml."
+            );
+            context.suggested_command = Some(FIREWALL_POLICIES_APPROVAL_COMMAND.to_string());
+            LpmError::SecurityApprovalRequired(context)
+        }
+        other => other,
+    })
 }
 
 /// Inspect a proposed project Sigstore posture without prompting or changing signed state.

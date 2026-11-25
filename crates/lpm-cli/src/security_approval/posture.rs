@@ -129,6 +129,11 @@ pub fn load_effective_authorized_posture() -> Result<EffectiveAuthorizedPosture,
             posture.firewall_mode = firewall_mode.as_str().to_string();
             sources.firewall_mode = PostureSourceKind::ManagedPolicy;
         }
+        if let Some(firewall_policies) = policy.firewall_policies.as_ref() {
+            posture.firewall_policies =
+                crate::npm_firewall_config::policy_profile_overrides(firewall_policies);
+            sources.firewall_policies = PostureSourceKind::ManagedPolicy;
+        }
         if let Some(install_time_source_analysis) = policy.install_time_source_analysis {
             posture.install_time_source_analysis = install_time_source_analysis;
             sources.install_time_source_analysis = PostureSourceKind::ManagedPolicy;
@@ -228,6 +233,18 @@ fn active_runtime_overrides(
             source: request_firewall.source_label().to_string(),
         });
     }
+    if let Some(request_policies) = crate::npm_firewall_config::config_policy_request(&global)?
+        && request_policies != effective.posture.firewall_policy_profile()
+    {
+        overrides.push(RuntimeOverride {
+            control: crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_PATH.to_string(),
+            value: changed_policy_entries(
+                &request_policies,
+                &effective.posture.firewall_policy_profile(),
+            ),
+            source: "~/.lpm/config.toml [firewall.npm.policies]".to_string(),
+        });
+    }
     let requested_source_analysis =
         crate::source_analysis_config::read_install_time_source_analysis(&global)?;
     if requested_source_analysis != effective.posture.install_time_source_analysis() {
@@ -238,6 +255,21 @@ fn active_runtime_overrides(
         });
     }
     Ok(overrides)
+}
+
+fn changed_policy_entries(
+    requested: &lpm_registry::client::NpmFirewallPolicyProfile,
+    effective: &lpm_registry::client::NpmFirewallPolicyProfile,
+) -> String {
+    crate::npm_firewall_config::POLICY_KEYS
+        .iter()
+        .filter_map(|key| {
+            let action = crate::npm_firewall_config::policy_action(requested, key)?;
+            (Some(action) != crate::npm_firewall_config::policy_action(effective, key))
+                .then(|| format!("{key}={}", action.as_str()))
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub fn load_security_status(

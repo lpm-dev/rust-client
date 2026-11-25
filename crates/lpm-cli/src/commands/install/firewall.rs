@@ -1790,9 +1790,14 @@ pub(crate) fn prepare_npm_firewall_materialization_preflight(
     json_output: bool,
 ) -> Result<NpmFirewallMaterializationPreflight, LpmError> {
     let global_config = crate::commands::config::GlobalConfig::load_checked()?;
-    let mode =
-        crate::npm_firewall_config::resolve_runtime_mode(&global_config, project_dir, json_output)?;
-    let policy_profile = crate::npm_firewall_config::config_policy_profile(&global_config)?;
+    let crate::npm_firewall_config::RuntimeFirewall {
+        mode,
+        policy_profile,
+    } = crate::npm_firewall_config::resolve_runtime_firewall(
+        &global_config,
+        project_dir,
+        json_output,
+    )?;
     let lookup_mode = NpmFirewallLookupMode::from_env();
     let mut verdict_packages = Vec::with_capacity(packages.len());
     for package in packages {

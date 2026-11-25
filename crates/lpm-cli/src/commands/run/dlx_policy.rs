@@ -144,7 +144,11 @@ pub(super) fn authorize(
         &scripts,
         options.reserve_stdout,
     )?;
-    crate::npm_firewall_config::resolve_runtime_mode(&global, project_dir, options.reserve_stdout)?;
+    crate::npm_firewall_config::resolve_runtime_firewall(
+        &global,
+        project_dir,
+        options.reserve_stdout,
+    )?;
     crate::source_analysis_config::resolve_install_time_source_analysis(
         &global,
         project_dir,

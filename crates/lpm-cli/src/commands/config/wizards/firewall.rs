@@ -146,11 +146,21 @@ async fn apply_firewall_selection(
     update_config(config_path, |config| {
         validate_firewall_selection_target(config, selection)?;
         crate::security_floor::reject_looser_firewall_mode_write(config, mode)?;
-        crate::security_approval::authorize_persistent_npm_firewall_mode(
-            mode,
-            json_output,
-            proposed_command,
-        )?;
+        match selection.policy_profile() {
+            Some(profile) => {
+                crate::security_floor::reject_looser_firewall_policy_write(config, &profile)?;
+                crate::security_approval::authorize_persistent_npm_firewall_policies(
+                    &profile,
+                    json_output,
+                    proposed_command,
+                )?;
+            }
+            None => crate::security_approval::authorize_persistent_npm_firewall_mode(
+                mode,
+                json_output,
+                proposed_command,
+            )?,
+        }
         persist_firewall_mode_in_config_value(config, mode)?;
         if let Some(profile) = selection.policy_profile() {
             persist_firewall_policy_profile_in_config_value(config, profile)?;

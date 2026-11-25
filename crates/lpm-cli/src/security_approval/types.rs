@@ -131,6 +131,10 @@ pub struct AuthorizedPosture {
     pub typosquat_guard: String,
     #[serde(default = "default_firewall_mode_string")]
     pub firewall_mode: String,
+    /// Approved `[firewall.npm.policies]` actions that differ from the default
+    /// profile, keyed by policy group.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub firewall_policies: BTreeMap<String, String>,
     #[serde(default = "default_install_time_source_analysis")]
     pub install_time_source_analysis: bool,
 }
@@ -145,6 +149,7 @@ pub struct AuthorizedPostureView {
     pub sigstore_verify: String,
     pub typosquat_guard: String,
     pub firewall_mode: String,
+    pub firewall_policies: BTreeMap<String, String>,
     pub install_time_source_analysis: bool,
 }
 
@@ -182,6 +187,7 @@ impl Default for AuthorizedPosture {
             sigstore_verify: "deny".to_string(),
             typosquat_guard: default_typosquat_guard_string(),
             firewall_mode: default_firewall_mode_string(),
+            firewall_policies: BTreeMap::new(),
             install_time_source_analysis: default_install_time_source_analysis(),
         }
     }
@@ -227,6 +233,10 @@ impl AuthorizedPosture {
         crate::npm_firewall_config::NpmFirewallMode::parse(&self.firewall_mode).unwrap_or_default()
     }
 
+    pub fn firewall_policy_profile(&self) -> lpm_registry::client::NpmFirewallPolicyProfile {
+        crate::npm_firewall_config::policy_profile_from_overrides(&self.firewall_policies)
+    }
+
     pub fn install_time_source_analysis(&self) -> bool {
         self.install_time_source_analysis
     }
@@ -241,6 +251,9 @@ impl AuthorizedPosture {
             sigstore_verify: self.sigstore_verify.clone(),
             typosquat_guard: self.typosquat_guard().as_str().to_string(),
             firewall_mode: self.firewall_mode().as_str().to_string(),
+            firewall_policies: crate::npm_firewall_config::policy_profile_entries(
+                &self.firewall_policy_profile(),
+            ),
             install_time_source_analysis: self.install_time_source_analysis,
         }
     }
@@ -264,6 +277,7 @@ pub struct EffectivePostureSources {
     pub sigstore_verify: PostureSourceKind,
     pub typosquat_guard: PostureSourceKind,
     pub firewall_mode: PostureSourceKind,
+    pub firewall_policies: PostureSourceKind,
     pub install_time_source_analysis: PostureSourceKind,
 }
 
@@ -278,6 +292,7 @@ impl EffectivePostureSources {
             sigstore_verify: base,
             typosquat_guard: base,
             firewall_mode: base,
+            firewall_policies: base,
             install_time_source_analysis: base,
         }
     }
@@ -402,6 +417,7 @@ pub(super) struct ManagedPolicy {
     pub(super) sigstore_verify: Option<EnforceMode>,
     pub(super) typosquat_guard: Option<crate::commands::config::TyposquatGuardSelection>,
     pub(super) firewall_mode: Option<crate::npm_firewall_config::NpmFirewallMode>,
+    pub(super) firewall_policies: Option<lpm_registry::client::NpmFirewallPolicyProfile>,
     pub(super) install_time_source_analysis: Option<bool>,
 }
 
