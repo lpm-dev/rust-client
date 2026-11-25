@@ -4183,7 +4183,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     #[ignore = "requires two signed release archives in LPM_TEST_MACOS_RELEASE_ARCHIVES"]
-    async fn apple_s_ticket_database_confirms_only_the_ticket_it_issued_for_the_code() {
+    async fn apple_s_ticket_database_confirms_only_a_ticket_for_the_release_s_code() {
         let archives = std::env::var_os("LPM_TEST_MACOS_RELEASE_ARCHIVES")
             .expect("set LPM_TEST_MACOS_RELEASE_ARCHIVES to signed release ZIP paths");
         let archives = std::env::split_paths(&archives).collect::<Vec<_>>();
@@ -4216,7 +4216,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("not the one Apple issued"), "{error}");
+            assert!(error.contains("not a ticket for its code"), "{error}");
         }
     }
 
@@ -4280,7 +4280,7 @@ mod tests {
                 .to_string();
 
             assert!(
-                error.contains("not the one Apple issued")
+                error.contains("not a ticket for its code")
                     || error.contains("code-signature and notarization validation"),
                 "{error}"
             );

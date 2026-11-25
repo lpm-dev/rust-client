@@ -19,7 +19,7 @@ POST /ticket-lookup stands in for Apple's notarization ticket database.
 Each request's record name is appended to `ticket-requests`; the nth
 request is answered with line n of `ticket-outcomes` (default `issued`):
 `issued` returns the ticket in `ticket-issued` (default
-`fixture-notarization-ticket`), `other` returns a different ticket,
+the fixture bundle's stapled ticket), `other` returns another ticket,
 `notfound`/`deleted`/`throttled`/`denied` return those record states,
 `deletedstring`, `emptyerror` and `longerror` return malformed `deleted`
 and `serverErrorCode` fields, `withnull` adds JSON nulls to an issued
@@ -47,7 +47,13 @@ import os
 import socketserver
 import sys
 
-DEFAULT_TICKET = b"fixture-notarization-ticket"
+# The fixture bundle's stapled ticket: Apple's `s8ch` magic and the code
+# directory hash the harness's fake codesign reports, as raw bytes.
+DEFAULT_TICKET = (
+    b"s8ch"
+    + bytes.fromhex("0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c")
+    + b"fixture-notarization-ticket"
+)
 
 
 def main() -> int:

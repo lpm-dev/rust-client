@@ -250,8 +250,10 @@ MACOS_UNZIP_TOOL="/usr/bin/unzip"
 
 # Apple publishes the ticket it issues for each notarized code directory as a
 # record in a public CloudKit database, named after the code-directory hash.
-# `stapler validate` compares that record with the ticket stapled to the app;
-# the installer does the same with curl.
+# `stapler validate` accepts the stapled ticket while that record stands, as
+# long as the stapled ticket is the record's or another ticket for the same
+# code, which Apple issues when the code is notarized again. The installer
+# does the same with curl.
 NOTARIZATION_TICKET_LOOKUP_URL="https://api.apple-cloudkit.com/database/1/com.apple.gk.ticket-delivery/production/public/records/lookup"
 
 if [ -n "${LPM_INSTALL_TEST_CODESIGN:-}${LPM_INSTALL_TEST_OPENSSL:-}${LPM_INSTALL_TEST_SPCTL:-}${LPM_INSTALL_TEST_TICKET_LOOKUP_URL:-}" ]; then
@@ -834,10 +836,25 @@ lookup_notarization_ticket() {
   ticket_lookup="issued"
 }
 
-# Confirms that Apple's ticket database holds exactly the ticket stapled to an
-# app bundle, for the code directory whose SHA-256 hash is $3. The service has
-# kept failing for over 20 s at a time, so the lookups spread over about two
-# minutes before giving up.
+# Whether the file $1 is a ticket for the code directory whose hash is $2: it
+# carries the `s8ch` magic and, among its listed code directories, that hash.
+# Its bytes come from the verified release archive, and Apple's record shows
+# the code is notarized, so the stapled ticket only has to be for this code.
+is_ticket_for() {
+  [ "$(head -c 4 "$1")" = s8ch ] || return 1
+  ticket_bytes=" $(od -An -v -tx1 "$1" | tr -s ' \n' '  ') "
+  ticket_hash=" $(printf '%s\n' "$2" | sed 's/../& /g')"
+  case "$ticket_bytes" in
+    *"$ticket_hash"*) return 0 ;;
+  esac
+  return 1
+}
+
+# Confirms that Apple's ticket database holds a ticket for the code directory
+# whose SHA-256 hash is $3, and that the ticket stapled to the app bundle is
+# that ticket or another one for the same code. The service has kept failing
+# for over 20 s at a time, so the lookups spread over about two minutes before
+# giving up.
 confirm_notarization_ticket() {
   ticket_bundle="$1"
   ticket_label="$2"
@@ -850,10 +867,11 @@ confirm_notarization_ticket() {
     lookup_notarization_ticket
     case "$ticket_lookup" in
       issued)
-        if cmp -s "$ticket_issued" "$ticket_bundle/Contents/CodeResources"; then
+        if cmp -s "$ticket_issued" "$ticket_bundle/Contents/CodeResources" || \
+           is_ticket_for "$ticket_bundle/Contents/CodeResources" "$3"; then
           return 0
         fi
-        echo "ERROR: the notarization ticket stapled to $ticket_label is not the one Apple issued for its code."
+        echo "ERROR: the notarization ticket stapled to $ticket_label is not a ticket for its code."
         return 1
         ;;
       not-issued)

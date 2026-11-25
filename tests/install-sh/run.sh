@@ -173,7 +173,9 @@ write_release_asset() {
       > "$fixture_app/Contents/Info.plist"
   fi
   printf 'fixture-profile' > "$fixture_app/Contents/embedded.provisionprofile"
-  printf 'fixture-notarization-ticket' > "$fixture_app/Contents/CodeResources"
+  # A ticket for the fixture's code: Apple's `s8ch` magic and the code
+  # directory hash the fake codesign reports, as raw bytes.
+  printf 's8ch\017\036\055\074\113\132\151\170\207\226\245\264\303\322\341\360\017\036\055\074fixture-notarization-ticket' > "$fixture_app/Contents/CodeResources"
   if [ "$include_macos_icon" = "1" ]; then
     printf 'fixture-icon' > "$fixture_app/Contents/Resources/LPMCLI.icns"
   fi
@@ -199,7 +201,7 @@ write_signed_release() {
 build_clean_path() {
   CLEAN_PATH_DIR="$(mktemp -d)"
   # Tools install.sh shells out to during the integrity flow.
-  for tool in sh id uname mktemp rm basename dirname grep awk curl sed cat tr cut chmod mv mkdir ln find readlink cp cmp sleep head wc; do
+  for tool in sh id uname mktemp rm basename dirname grep awk curl sed cat tr cut chmod mv mkdir ln find readlink cp cmp sleep head wc od; do
     src="$(command -v "$tool" 2>/dev/null || true)"
     if [ -n "$src" ]; then
       ln -s "$src" "$CLEAN_PATH_DIR/$tool"
@@ -238,6 +240,14 @@ case " $* " in
     if staged_override tamper-staged-ticket; then
       printf 'replaced-notarization-ticket' > "$bundle/Contents/CodeResources"
     fi
+    # The downloaded bundle's ticket names its code but lacks Apple's magic.
+    case "$bundle" in
+      */extracted/*)
+        if [ -n "${LPM_TEST_TOOL_STATE:-}" ] && [ -e "$LPM_TEST_TOOL_STATE/unmarked-ticket" ]; then
+          printf 'xxxx\017\036\055\074\113\132\151\170\207\226\245\264\303\322\341\360\017\036\055\074fixture-notarization-ticket' > "$bundle/Contents/CodeResources"
+        fi
+        ;;
+    esac
     ;;
   *" --entitlements "*)
     printf '%s\n' '<?xml version="1.0"?><plist><dict><key>keychain-access-groups</key><array><string>823S8YKMRW.dev.lpm.vault.shared</string></array></dict></plist>'
@@ -909,8 +919,28 @@ EOF_SLEEP
   [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "a staged copy with a different ticket must not install anything"
   pass "macOS install rejects a staged copy whose stapled ticket differs from the confirmed download"
 
+  # Apple issues a new ticket when the same code is notarized again; the
+  # stapled one stands while it is a ticket for this code.
+  run_with_ticket_outcomes other
+  [ "$RUN_RC" -eq 0 ] || fail "a ticket Apple issued again for the same code failed the install with exit $RUN_RC: $RUN_OUT"
+  [ "$TICKET_LOOKUPS" -eq 1 ] || fail "a ticket Apple issued again for the same code was looked up $TICKET_LOOKUPS times"
+  printf '%s' 'a1b2c3d4e5f60718293a4b5c6d7e8f9001122334' > "$tool_state/cdhash"
+  run_with_ticket_outcomes other issued
+  rm -f "$tool_state/cdhash"
+  [ "$RUN_RC" -ne 0 ] || fail "a stapled ticket for other code must fail the install"
+  [ "$TICKET_LOOKUPS" -eq 1 ] || fail "a stapled ticket for other code was retried ($TICKET_LOOKUPS lookups)"
+  echo "$RUN_OUT" | grep -qF "is not a ticket for its code" \
+    || fail "a stapled ticket for other code was reported as something else: $RUN_OUT"
+  [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "a stapled ticket for other code must not install anything"
+  : > "$tool_state/unmarked-ticket"
+  run_with_ticket_outcomes other issued
+  rm -f "$tool_state/unmarked-ticket"
+  [ "$RUN_RC" -ne 0 ] || fail "a stapled file without Apple's ticket magic must fail the install"
+  echo "$RUN_OUT" | grep -qF "is not a ticket for its code" \
+    || fail "a stapled file without Apple's ticket magic was reported as something else: $RUN_OUT"
+  pass "macOS install takes a ticket Apple issued again for the same code, and no ticket for other code"
+
   for refusal in \
-    "other:is not the one Apple issued for its code" \
     "notfound:Apple has not issued a notarization ticket" \
     "deleted:Apple has not issued a notarization ticket" \
     "denied:refused to look up the ticket of downloaded LPM CLI.app (ACCESS_DENIED)" \
@@ -1015,7 +1045,7 @@ EOF_SLEEP
   # A user's ~/.curlrc may follow redirects and fail on HTTP errors; neither
   # may change what the lookup decides.
   printf '{"records":[{"recordName":"2/2/0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c","fields":{"signedTicket":{"value":"%s","type":"BYTES"}}}]}' \
-    "$(printf 'fixture-notarization-ticket' | base64)" > "$fdir/redirected-ticket"
+    "$(base64 < "$fdir/.bundle-fixture/LPM CLI.app/Contents/CodeResources")" > "$fdir/redirected-ticket"
   curlrc_home="$(mktemp -d)"
   printf 'location\nfail\n' > "$curlrc_home/.curlrc"
   RUN_INSTALL_ROOT_OVERRIDE="$curlrc_home"

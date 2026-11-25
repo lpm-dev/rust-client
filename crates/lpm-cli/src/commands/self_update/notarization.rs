@@ -3,9 +3,11 @@
 //! Apple's notarization service publishes the ticket it issues for each
 //! notarized code directory as a record in a public CloudKit database, named
 //! after the code-directory hash. `stapler validate` fetches that record and
-//! compares its ticket with the one stapled to the app. This module does the
-//! same over HTTPS, because `/usr/bin/stapler` and `xcrun` only run on a Mac
-//! with Xcode or the Command Line Tools installed.
+//! accepts the stapled ticket while the record stands, as long as the stapled
+//! ticket is the record's or another ticket for the same code, which Apple
+//! issues when the code is notarized again. This module does the same over
+//! HTTPS, because `/usr/bin/stapler` and `xcrun` only run on a Mac with Xcode
+//! or the Command Line Tools installed.
 
 use base64::Engine as _;
 use lpm_common::LpmError;
@@ -62,13 +64,14 @@ pub(super) fn lookup_client() -> Result<reqwest::Client, LpmError> {
         .map_err(|error| LpmError::Network(format!("failed to create HTTP client: {error}")))
 }
 
-/// Confirms that Apple's ticket database holds exactly `stapled_ticket` for
-/// the code directory whose SHA-256 hash is `cdhash`.
+/// Confirms that Apple's ticket database holds a ticket for the code
+/// directory whose SHA-256 hash is `cdhash`, and that `stapled_ticket` is
+/// that ticket or another one for the same code.
 ///
 /// While the service gives no usable answer, it is asked again after each of
 /// `retry_delays`, and `on_retry` hears of each wait and what the service
-/// said first. A ticket that differs from the stapled one, a missing or
-/// revoked ticket, and any other refusal fail at once.
+/// said first. A stapled ticket for other code, a missing or revoked ticket,
+/// and any other refusal fail at once.
 pub(super) async fn confirm_stapled_ticket(
     client: &reqwest::Client,
     lookup_url: &str,
@@ -81,11 +84,14 @@ pub(super) async fn confirm_stapled_ticket(
     let mut retry_delays = retry_delays.iter();
     loop {
         match lookup(client, lookup_url, &record_name).await {
-            Lookup::Issued(ticket) if ticket == stapled_ticket => return Ok(()),
+            Lookup::Issued(ticket)
+                if ticket == stapled_ticket || is_ticket_for(stapled_ticket, cdhash) =>
+            {
+                return Ok(());
+            }
             Lookup::Issued(_) => {
                 return Err(LpmError::SelfUpdate(
-                    "the notarization ticket stapled to the macOS app is not the one Apple issued \
-                     for its code"
+                    "the notarization ticket stapled to the macOS app is not a ticket for its code"
                         .to_string(),
                 ));
             }
@@ -116,6 +122,22 @@ pub(super) async fn confirm_stapled_ticket(
             },
         }
     }
+}
+
+/// Whether `ticket` is a ticket Apple issued for the code directory whose
+/// hash is `cdhash`: it carries the `s8ch` magic and, among its listed code
+/// directories, that hash. Its bytes come from the Sigstore-verified release
+/// archive, and Apple's record shows the code is notarized, so the stapled
+/// ticket only has to be for this code.
+fn is_ticket_for(ticket: &[u8], cdhash: &str) -> bool {
+    let Some(hash) = (0..cdhash.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(cdhash.get(at..at + 2)?, 16).ok())
+        .collect::<Option<Vec<u8>>>()
+    else {
+        return false;
+    };
+    ticket.starts_with(b"s8ch") && ticket.windows(hash.len()).any(|window| window == hash)
 }
 
 /// The record holding the ticket for a SHA-256 code directory: `2/`, the
@@ -426,19 +448,67 @@ mod tests {
         assert_eq!(waits.len(), 2);
     }
 
+    /// A ticket as Apple writes them: the `s8ch` magic, then, among the rest,
+    /// the 20-byte code-directory hash of the code it was issued for.
+    fn ticket_for(cdhash: &str, rest: &[u8]) -> Vec<u8> {
+        let mut ticket = b"s8ch".to_vec();
+        ticket.extend(
+            (0..cdhash.len())
+                .step_by(2)
+                .map(|at| u8::from_str_radix(&cdhash[at..at + 2], 16).unwrap()),
+        );
+        ticket.extend_from_slice(rest);
+        ticket
+    }
+
+    async fn confirm_stapled(server: &MockServer, stapled: &[u8]) -> Result<(), LpmError> {
+        confirm_stapled_ticket(
+            &lookup_client().unwrap(),
+            &format!("{}/lookup", server.uri()),
+            CDHASH,
+            stapled,
+            &[],
+            |_, _| {},
+        )
+        .await
+    }
+
     #[tokio::test]
-    async fn stapled_ticket_other_than_apple_s_record_is_rejected_without_retrying() {
+    async fn stapled_ticket_apple_reissued_for_the_same_code_is_accepted() {
         let server = ticket_service(vec![
-            ResponseTemplate::new(200).set_body_json(issued(b"another release's ticket")),
+            ResponseTemplate::new(200)
+                .set_body_json(issued(&ticket_for(CDHASH, b"second notarization"))),
         ])
         .await;
 
-        let (result, waits) = confirm(&server, 5).await;
+        confirm_stapled(&server, &ticket_for(CDHASH, b"first notarization"))
+            .await
+            .unwrap();
+    }
 
-        let error = result.unwrap_err().to_string();
-        assert!(error.contains("not the one Apple issued"), "{error}");
-        assert!(waits.is_empty());
-        assert_eq!(lookups(&server).await, 1);
+    #[tokio::test]
+    async fn stapled_ticket_for_other_code_or_none_is_rejected_without_retrying() {
+        let other_code = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c";
+        let mut unmarked = ticket_for(CDHASH, b"first notarization");
+        unmarked[..4].copy_from_slice(b"xxxx");
+        for stapled in [
+            ticket_for(other_code, b"another release's ticket"),
+            unmarked,
+            TICKET.to_vec(),
+        ] {
+            let server = ticket_service(vec![
+                ResponseTemplate::new(200).set_body_json(issued(&ticket_for(CDHASH, b"issued"))),
+            ])
+            .await;
+
+            let error = confirm_stapled(&server, &stapled)
+                .await
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains("not a ticket for its code"), "{error}");
+            assert_eq!(lookups(&server).await, 1);
+        }
     }
 
     #[tokio::test]
