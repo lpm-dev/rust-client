@@ -1225,9 +1225,10 @@ async fn a_stale_complete_history_is_revalidated_with_its_etag() {
     assert!(complete);
     drop(initial);
     let key = client.npm_direct_metadata_cache_key("pkg", PublicNpmAccess::ANONYMOUS);
-    filetime::set_file_mtime(
+    std::fs::set_times(
         client.cache_path(&key).unwrap(),
-        filetime::FileTime::from_unix_time(1, 0),
+        std::fs::FileTimes::new()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
     )
     .unwrap();
     Mock::given(method("GET"))

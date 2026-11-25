@@ -180,15 +180,8 @@ fn expire_cache_entry(client: &RegistryClient, cache_key: &str) {
     let cache_path = client
         .cache_path(cache_key)
         .expect("cache path should be available");
-    let past = filetime::FileTime::from_unix_time(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64
-            - 600,
-        0,
-    );
-    filetime::set_file_mtime(&cache_path, past).unwrap();
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+    std::fs::set_times(&cache_path, std::fs::FileTimes::new().set_modified(past)).unwrap();
 }
 
 fn expire_all_cache_entries(client: &RegistryClient) {
@@ -196,17 +189,10 @@ fn expire_all_cache_entries(client: &RegistryClient) {
         .cache_dir
         .as_ref()
         .expect("test client should have a cache dir");
-    let past = filetime::FileTime::from_unix_time(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64
-            - 600,
-        0,
-    );
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
     for entry in std::fs::read_dir(cache_dir).unwrap() {
         let path = entry.unwrap().path();
-        filetime::set_file_mtime(&path, past).unwrap();
+        std::fs::set_times(&path, std::fs::FileTimes::new().set_modified(past)).unwrap();
     }
 }
 
@@ -271,15 +257,8 @@ async fn etag_304_revalidation_lpm_metadata() {
 
     // Expire the cache by setting mtime to 10 minutes ago
     if let Some(cache_path) = client.cache_path(&client.lpm_metadata_cache_key(pkg_name).unwrap()) {
-        let past = filetime::FileTime::from_unix_time(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64
-                - 600,
-            0,
-        );
-        filetime::set_file_mtime(&cache_path, past).unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        std::fs::set_times(&cache_path, std::fs::FileTimes::new().set_modified(past)).unwrap();
     }
 
     // Reset mocks for second request
@@ -410,15 +389,8 @@ async fn etag_updated_on_new_response() {
 
     // Expire cache
     if let Some(cache_path) = client.cache_path(&client.lpm_metadata_cache_key(pkg_name).unwrap()) {
-        let past = filetime::FileTime::from_unix_time(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64
-                - 600,
-            0,
-        );
-        filetime::set_file_mtime(&cache_path, past).unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        std::fs::set_times(&cache_path, std::fs::FileTimes::new().set_modified(past)).unwrap();
     }
 
     server.reset().await;
@@ -534,15 +506,8 @@ async fn npm_metadata_etag_304_revalidation() {
     if let Some(cache_path) =
         client.cache_path(&client.npm_worker_metadata_cache_key(npm_name).unwrap())
     {
-        let past = filetime::FileTime::from_unix_time(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64
-                - 600,
-            0,
-        );
-        filetime::set_file_mtime(&cache_path, past).unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        std::fs::set_times(&cache_path, std::fs::FileTimes::new().set_modified(past)).unwrap();
     }
 
     server.reset().await;
@@ -652,15 +617,12 @@ async fn legacy_schema_cache_never_supplies_a_validator_to_current_metadata_fetc
     let mut legacy_entry = b"LPM-MD-V3\n\"legacy-etag\"\n".to_vec();
     legacy_entry.extend_from_slice(&legacy_payload);
     std::fs::write(&legacy_cache_path, legacy_entry).expect("seed legacy cache entry");
-    let stale = filetime::FileTime::from_unix_time(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64
-            - 600,
-        0,
-    );
-    filetime::set_file_mtime(&legacy_cache_path, stale).expect("expire legacy cache entry");
+    let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+    std::fs::set_times(
+        &legacy_cache_path,
+        std::fs::FileTimes::new().set_modified(stale),
+    )
+    .expect("expire legacy cache entry");
 
     let conditional_requests = Arc::new(AtomicUsize::new(0));
     let conditional_requests_for_responder = Arc::clone(&conditional_requests);
@@ -722,11 +684,10 @@ fn legacy_schema_file_never_suppresses_current_batch_prefetch() {
     hasher.update(cache_key.as_bytes());
     let legacy_cache_path = tmp.path().join(&hex::encode(hasher.finalize())[..16]);
     std::fs::write(&legacy_cache_path, b"LPM-MD-V3\n\nlegacy").unwrap();
-    filetime::set_file_mtime(
+    std::fs::set_times(
         &legacy_cache_path,
-        filetime::FileTime::from_system_time(
-            std::time::SystemTime::now() + std::time::Duration::from_secs(300),
-        ),
+        std::fs::FileTimes::new()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(300)),
     )
     .unwrap();
 
@@ -2394,15 +2355,8 @@ async fn etag_304_with_undecodable_cached_payload_refetches_lpm_metadata() {
     corrupted_content.extend_from_slice(corrupted_data);
     std::fs::write(&cache_path, corrupted_content).unwrap();
 
-    let past = filetime::FileTime::from_unix_time(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64
-            - 600,
-        0,
-    );
-    filetime::set_file_mtime(&cache_path, past).unwrap();
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+    std::fs::set_times(&cache_path, std::fs::FileTimes::new().set_modified(past)).unwrap();
 
     server.reset().await;
 
@@ -2506,15 +2460,8 @@ async fn npm_etag_304_with_undecodable_cached_payload_refetches_proxy_metadata()
     corrupted_content.extend_from_slice(corrupted_data);
     std::fs::write(&cache_path, corrupted_content).unwrap();
 
-    let past = filetime::FileTime::from_unix_time(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64
-            - 600,
-        0,
-    );
-    filetime::set_file_mtime(&cache_path, past).unwrap();
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+    std::fs::set_times(&cache_path, std::fs::FileTimes::new().set_modified(past)).unwrap();
 
     server.reset().await;
 
@@ -2604,15 +2551,8 @@ async fn etag_revalidation_retries_429_and_keeps_conditional_header() {
     client.get_package_metadata(&name).await.unwrap();
 
     if let Some(cache_path) = client.cache_path(&client.lpm_metadata_cache_key(pkg_name).unwrap()) {
-        let past = filetime::FileTime::from_unix_time(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64
-                - 600,
-            0,
-        );
-        filetime::set_file_mtime(&cache_path, past).unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        std::fs::set_times(&cache_path, std::fs::FileTimes::new().set_modified(past)).unwrap();
     }
 
     server.reset().await;
@@ -2697,15 +2637,8 @@ async fn npm_etag_revalidation_retries_503_and_keeps_conditional_header() {
     if let Some(cache_path) =
         client.cache_path(&client.npm_worker_metadata_cache_key(npm_name).unwrap())
     {
-        let past = filetime::FileTime::from_unix_time(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64
-                - 600,
-            0,
-        );
-        filetime::set_file_mtime(&cache_path, past).unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        std::fs::set_times(&cache_path, std::fs::FileTimes::new().set_modified(past)).unwrap();
     }
 
     server.reset().await;
@@ -2789,15 +2722,8 @@ async fn npm_etag_revalidation_exhausts_429_and_returns_rate_limited() {
     if let Some(cache_path) =
         client.cache_path(&client.npm_worker_metadata_cache_key(npm_name).unwrap())
     {
-        let past = filetime::FileTime::from_unix_time(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64
-                - 600,
-            0,
-        );
-        filetime::set_file_mtime(&cache_path, past).unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        std::fs::set_times(&cache_path, std::fs::FileTimes::new().set_modified(past)).unwrap();
     }
 
     server.reset().await;
@@ -2866,15 +2792,8 @@ async fn npm_etag_revalidation_exhausts_503_and_returns_http_error() {
     if let Some(cache_path) =
         client.cache_path(&client.npm_worker_metadata_cache_key(npm_name).unwrap())
     {
-        let past = filetime::FileTime::from_unix_time(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64
-                - 600,
-            0,
-        );
-        filetime::set_file_mtime(&cache_path, past).unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        std::fs::set_times(&cache_path, std::fs::FileTimes::new().set_modified(past)).unwrap();
     }
 
     server.reset().await;
@@ -2943,15 +2862,8 @@ async fn etag_revalidation_exhausts_429_and_returns_rate_limited() {
     client.get_package_metadata(&name).await.unwrap();
 
     if let Some(cache_path) = client.cache_path(&client.lpm_metadata_cache_key(pkg_name).unwrap()) {
-        let past = filetime::FileTime::from_unix_time(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64
-                - 600,
-            0,
-        );
-        filetime::set_file_mtime(&cache_path, past).unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        std::fs::set_times(&cache_path, std::fs::FileTimes::new().set_modified(past)).unwrap();
     }
 
     server.reset().await;
@@ -3019,15 +2931,8 @@ async fn etag_revalidation_exhausts_503_and_returns_http_error() {
     client.get_package_metadata(&name).await.unwrap();
 
     if let Some(cache_path) = client.cache_path(&client.lpm_metadata_cache_key(pkg_name).unwrap()) {
-        let past = filetime::FileTime::from_unix_time(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64
-                - 600,
-            0,
-        );
-        filetime::set_file_mtime(&cache_path, past).unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        std::fs::set_times(&cache_path, std::fs::FileTimes::new().set_modified(past)).unwrap();
     }
 
     server.reset().await;

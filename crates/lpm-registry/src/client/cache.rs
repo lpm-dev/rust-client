@@ -105,11 +105,7 @@ fn set_metadata_cache_file_expiry(
     file: &std::fs::File,
     expires_at: std::time::SystemTime,
 ) -> std::io::Result<()> {
-    filetime::set_file_handle_times(
-        file,
-        None,
-        Some(filetime::FileTime::from_system_time(expires_at)),
-    )
+    file.set_times(std::fs::FileTimes::new().set_modified(expires_at))
 }
 
 pub(super) fn reserve_pending_metadata_cache_bytes(
@@ -1549,7 +1545,7 @@ impl RegistryClient {
         let now = std::time::SystemTime::now();
         let expires_at = now.checked_add(fresh_for).unwrap_or(now);
         if let Err(error) =
-            filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(expires_at))
+            std::fs::set_times(&path, std::fs::FileTimes::new().set_modified(expires_at))
         {
             tracing::warn!(%error, "failed to refresh metadata cache freshness");
         }
@@ -1592,7 +1588,7 @@ impl RegistryClient {
             let now = std::time::SystemTime::now();
             let expires_at = now.checked_add(fresh_for).unwrap_or(now);
             if let Err(error) =
-                filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(expires_at))
+                std::fs::set_times(&path, std::fs::FileTimes::new().set_modified(expires_at))
             {
                 tracing::warn!(%error, "failed to refresh metadata cache freshness");
             }
@@ -1872,11 +1868,10 @@ mod pending_write_budget_tests {
             contents.push(METADATA_CACHE_JSON_MARKER);
             contents.extend_from_slice(payload);
             std::fs::write(&path, contents).unwrap();
-            filetime::set_file_mtime(
+            std::fs::set_times(
                 &path,
-                filetime::FileTime::from_system_time(
-                    std::time::SystemTime::now() + METADATA_CACHE_TTL,
-                ),
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() + METADATA_CACHE_TTL),
             )
             .unwrap();
             assert!(

@@ -2952,12 +2952,15 @@ mod tests {
         let manifest_path = cas
             .tree_manifest_path(&prepared.record.tree_digest)
             .unwrap();
-        let original_mtime =
-            filetime::FileTime::from_last_modification_time(&fs::metadata(&manifest_path).unwrap());
+        let original_mtime = fs::metadata(&manifest_path).unwrap().modified().unwrap();
         let mut bytes = fs::read(&manifest_path).unwrap();
         bytes[0] ^= 0x01;
         fs::write(&manifest_path, bytes).unwrap();
-        filetime::set_file_mtime(&manifest_path, original_mtime).unwrap();
+        fs::set_times(
+            &manifest_path,
+            fs::FileTimes::new().set_modified(original_mtime),
+        )
+        .unwrap();
 
         assert_eq!(
             cas.source_reuse_status(&object, "sha512-source").unwrap(),

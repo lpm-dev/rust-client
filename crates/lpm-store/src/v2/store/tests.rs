@@ -1313,9 +1313,9 @@ fn populate_is_idempotent_and_touches_last_referenced_at() {
     // Backdate the sidecar past the touch cooldown and advance wall time so
     // the reuse hit must refresh file mtime on every supported FS granularity.
     let stale_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
-    filetime::set_file_mtime(
+    std::fs::set_times(
         &sidecar_path,
-        filetime::FileTime::from_system_time(stale_mtime),
+        std::fs::FileTimes::new().set_modified(stale_mtime),
     )
     .unwrap();
     let mtime_before = std::fs::metadata(&sidecar_path)
@@ -3473,10 +3473,13 @@ fn v3_normal_reuse_rejects_same_size_blob_tampering() {
         .into_iter()
         .find(|path| path.metadata().is_ok_and(|metadata| metadata.len() == 6))
         .unwrap();
-    let original_mtime =
-        filetime::FileTime::from_last_modification_time(&std::fs::metadata(&blob).unwrap());
+    let original_mtime = std::fs::metadata(&blob).unwrap().modified().unwrap();
     std::fs::write(&blob, b"after!").unwrap();
-    filetime::set_file_mtime(&blob, original_mtime).unwrap();
+    std::fs::set_times(
+        &blob,
+        std::fs::FileTimes::new().set_modified(original_mtime),
+    )
+    .unwrap();
 
     let reusable = store.reusable_object(&sri).unwrap();
 
@@ -6669,9 +6672,9 @@ fn source_policy_keeps_full_tree_verification_for_built_link_entries() {
     // so only the `.lpm-built` bypass forces full tree verification.
     std::fs::write(pkg_dir.join(".lpm-built"), b"built").unwrap();
     std::fs::write(pkg_dir.join("nested/sub/file.js"), b"tampered").unwrap();
-    filetime::set_file_mtime(
+    std::fs::set_times(
         &pkg_dir,
-        filetime::FileTime::from_system_time(original_dir_mtime),
+        std::fs::FileTimes::new().set_modified(original_dir_mtime),
     )
     .unwrap();
 
@@ -6715,9 +6718,9 @@ fn reused_link_entry_touches_sidecar_after_cooldown_expires() {
     let first = store.populate_link_entry(request()).unwrap();
     let sidecar_path = first.link_dir.join(LINK_META_FILENAME);
     let stale_time = std::time::SystemTime::now() - std::time::Duration::from_secs(900);
-    filetime::set_file_mtime(
+    std::fs::set_times(
         &sidecar_path,
-        filetime::FileTime::from_system_time(stale_time),
+        std::fs::FileTimes::new().set_modified(stale_time),
     )
     .unwrap();
     let before = std::fs::metadata(&sidecar_path)
@@ -6738,9 +6741,9 @@ fn reused_link_entry_touches_sidecar_after_cooldown_expires() {
 
     // Future-dated sidecar (clock skew) must also be repaired back to now.
     let future_time = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
-    filetime::set_file_mtime(
+    std::fs::set_times(
         &sidecar_path,
-        filetime::FileTime::from_system_time(future_time),
+        std::fs::FileTimes::new().set_modified(future_time),
     )
     .unwrap();
     let reused_after_skew = store.populate_link_entry(request()).unwrap();
@@ -6857,9 +6860,13 @@ fn shallow_guard_refresh_skips_rewriting_snapshot_while_mtimes_are_racily_clean(
     );
 
     // Once package mtimes age past the 2s window, refresh stamps a non-racy guard.
-    let old = filetime::FileTime::from_unix_time(1_700_000_000, 0);
-    filetime::set_file_mtime(pkg_dir.join("package.json"), old).unwrap();
-    filetime::set_file_mtime(&pkg_dir, old).unwrap();
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    std::fs::set_times(
+        pkg_dir.join("package.json"),
+        std::fs::FileTimes::new().set_modified(old),
+    )
+    .unwrap();
+    std::fs::set_times(&pkg_dir, std::fs::FileTimes::new().set_modified(old)).unwrap();
     crate::v2::integrity::refresh_link_snapshot_shallow_guard_best_effort(
         &first.link_dir,
         &pkg_dir,

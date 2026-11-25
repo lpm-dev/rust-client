@@ -2911,7 +2911,12 @@ async fn get_npm_version_metadata_direct_reuses_stale_immutable_version_without_
     let key =
         client.npm_direct_version_metadata_cache_key(pkg, version, PublicNpmAccess::ANONYMOUS);
     let path = client.cache_path(&key).unwrap();
-    filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+    std::fs::set_times(
+        &path,
+        std::fs::FileTimes::new()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+    )
+    .unwrap();
 
     let second = client
         .get_npm_version_metadata_direct_with_timings(pkg, version)

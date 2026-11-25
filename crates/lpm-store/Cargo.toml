@@ -26,7 +26,6 @@ hex = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
-filetime = { workspace = true }
 subtle = "2"
 
 [target.'cfg(unix)'.dependencies]

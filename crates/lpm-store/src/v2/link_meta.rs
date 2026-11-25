@@ -214,7 +214,11 @@ impl LinkMeta {
         }
         #[cfg(not(unix))]
         {
-            filetime::set_file_mtime(sidecar_path, filetime::FileTime::now()).map_err(|e| {
+            std::fs::set_times_nofollow(
+                sidecar_path,
+                std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()),
+            )
+            .map_err(|e| {
                 LpmError::Store(format!(
                     "failed to update virtual-store link sidecar mtime at {}: {e}",
                     sidecar_path.display()

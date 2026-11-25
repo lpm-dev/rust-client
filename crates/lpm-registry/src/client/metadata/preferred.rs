@@ -928,7 +928,12 @@ mod tests {
         drop(initial);
         let key = client.npm_preferred_metadata_cache_key("pkg", PublicNpmAccess::ANONYMOUS);
         let cache_path = client.cache_path(&key).unwrap();
-        filetime::set_file_mtime(&cache_path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+        std::fs::set_times(
+            &cache_path,
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+        )
+        .unwrap();
         Mock::given(method("GET"))
             .and(path("/pkg"))
             .and(header("If-None-Match", "\"initial\""))
@@ -1023,7 +1028,7 @@ mod tests {
                     bytes.extend(payload);
                 }
                 std::fs::write(&cache_path, bytes).unwrap();
-                filetime::set_file_mtime(&cache_path, filetime::FileTime::from_system_time(expiry))
+                std::fs::set_times(&cache_path, std::fs::FileTimes::new().set_modified(expiry))
                     .unwrap();
                 let (refetched, actual_complete) = client
                     .get_npm_preferred_metadata_for_resolution_with_timings("pkg", move |_| {

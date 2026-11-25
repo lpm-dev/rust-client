@@ -758,8 +758,7 @@ mod tests {
     // ─── Proactive sweep tests ────────────────────────────────────
 
     /// Build a dlx entry whose `package.json` mtime is set `age_secs`
-    /// seconds in the past. Uses `filetime` semantics via a direct
-    /// SystemTime write — the stdlib `set_modified` is enough.
+    /// seconds in the past.
     fn make_dlx_entry_with_age(entry: &Path, age_secs: u64) {
         std::fs::create_dir_all(entry).unwrap();
         let pkg = entry.join("package.json");

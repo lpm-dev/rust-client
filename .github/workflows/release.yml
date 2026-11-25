@@ -2564,7 +2564,7 @@ jobs:
       - name: Create a token for release tags
         id: tag-token
         if: steps.release-state.outputs.publish == 'true'
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           client-id: ${{ vars.RELEASE_TAGS_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_TAGS_APP_PRIVATE_KEY }}
@@ -2696,7 +2696,7 @@ jobs:
     steps:
       - name: Create a token for release tags
         id: tag-token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           client-id: ${{ vars.RELEASE_TAGS_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_TAGS_APP_PRIVATE_KEY }}
@@ -3154,7 +3154,7 @@ jobs:
       # the wait below need, and expires within the hour.
       - name: Create a token for the Homebrew tap
         id: tap-token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           client-id: ${{ vars.HOMEBREW_APP_CLIENT_ID }}
           private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
