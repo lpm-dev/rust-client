@@ -23,7 +23,7 @@ pub use model::{
     LOCKFILE_VERSION_WITH_WORKSPACE_PROJECTIONS, LockedPackage, LockedProvenance,
     LockedRegistrySignature, LockedRootResolution, Lockfile, LockfileMetadata, LockfilePatch,
     LockfilePatches, PackageKey, RootResolutions, ValidatedLockfile, is_recordable_tarball_hint,
-    is_safe_source,
+    is_safe_source, is_valid_package_name,
 };
 pub use parse_cache::{ParseCacheStats, parse_cache_stats};
 pub use source::{Source, SourceParseError, safe_source_identity};

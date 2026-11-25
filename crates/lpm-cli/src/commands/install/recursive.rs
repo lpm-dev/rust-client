@@ -184,6 +184,7 @@ pub(crate) async fn run_recursive_workspace_install(
                 emit_workspace_install_report(
                     &workspace.root,
                     &[],
+                    &crate::dependency_skills::ReconcileReport::default(),
                     options.json_output,
                     options.timing,
                     timing_detail_mode,
@@ -622,15 +623,27 @@ pub(crate) async fn run_recursive_workspace_install(
             filters.is_empty() && filter_prod.is_empty(),
         );
 
+        let dependency_skills = if super::dependency_skills_deferred() {
+            crate::dependency_skills::ReconcileReport::default()
+        } else {
+            super::reconcile_dependency_skills(
+                &workspace_root,
+                options.lpm_skills_preference,
+                options.omit_policy,
+            )
+        };
         if options.emit_summary {
             emit_workspace_install_report(
                 &workspace_root,
                 &outcomes,
+                &dependency_skills,
                 options.json_output,
                 options.timing,
                 timing_detail_mode,
                 duration_ms(started.elapsed()),
             );
+        } else if !options.json_output {
+            crate::dependency_skills::print_report(&dependency_skills);
         }
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(250),
@@ -807,41 +820,43 @@ async fn run_workspace_target_install(
     } else {
         None
     };
-    let install = assert_send(run_with_options_with_lpm_root(
-        &client,
-        &plan.path,
-        options.json_output,
-        options.offline,
-        options.frozen_lockfile,
-        options.force,
-        options.allow_new,
-        options.strict_integrity,
-        options.no_engine_strict,
-        options.strict_peer_dependencies_override,
-        options.linker_override,
-        options.lpm_skills_preference,
-        options.no_security_summary,
-        options.auto_build,
-        None,
-        None,
-        None,
-        options.script_policy_override,
-        options.advisor_override.clone(),
-        options.min_release_age_override,
-        &options.min_release_age_exclude,
-        options.drift_ignore_policy.clone(),
-        options.verify_policy.clone(),
-        options.omit_policy,
-        options.strict_sandbox,
-        options.no_sandbox,
-        options.verbose,
-        options.audit_after_install,
-        options.timing,
-        &[],
-        options.json_output,
-        false,
-        caller_context,
-        lpm_root,
+    let install = assert_send(super::defer_dependency_skills(
+        run_with_options_with_lpm_root(
+            &client,
+            &plan.path,
+            options.json_output,
+            options.offline,
+            options.frozen_lockfile,
+            options.force,
+            options.allow_new,
+            options.strict_integrity,
+            options.no_engine_strict,
+            options.strict_peer_dependencies_override,
+            options.linker_override,
+            options.lpm_skills_preference,
+            options.no_security_summary,
+            options.auto_build,
+            None,
+            None,
+            None,
+            options.script_policy_override,
+            options.advisor_override.clone(),
+            options.min_release_age_override,
+            &options.min_release_age_exclude,
+            options.drift_ignore_policy.clone(),
+            options.verify_policy.clone(),
+            options.omit_policy,
+            options.strict_sandbox,
+            options.no_sandbox,
+            options.verbose,
+            options.audit_after_install,
+            options.timing,
+            &[],
+            options.json_output,
+            false,
+            caller_context,
+            lpm_root,
+        ),
     ));
     match &capture {
         Some(capture) => {
@@ -1410,6 +1425,7 @@ const TARGET_REPORT_FIELDS: &[&str] = &[
 fn emit_workspace_install_report(
     workspace_root: &Path,
     outcomes: &[WorkspaceInstallOutcome],
+    dependency_skills: &crate::dependency_skills::ReconcileReport,
     json_output: bool,
     emit_timing: bool,
     timing_detail_mode: TimingDetailMode,
@@ -1453,6 +1469,12 @@ fn emit_workspace_install_report(
                 "failed": 0,
             },
         });
+        if !dependency_skills.is_quiet() || dependency_skills.unchanged > 0 {
+            report["dependency_skills"] = crate::dependency_skills::report_json(dependency_skills);
+        }
+        if !dependency_skills.warnings.is_empty() {
+            report["warnings"] = serde_json::json!(dependency_skills.warnings);
+        }
         attach_aggregate_telemetry(&mut report, duration_ms, emit_timing, timing_detail_mode);
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
     } else {
@@ -1461,6 +1483,7 @@ fn emit_workspace_install_report(
             outcomes.len(),
             if outcomes.len() == 1 { "" } else { "s" },
         ));
+        crate::dependency_skills::print_report(dependency_skills);
     }
 }
 

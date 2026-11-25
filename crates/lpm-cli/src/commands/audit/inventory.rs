@@ -365,6 +365,14 @@ impl PackageInventory {
         discovery::discover_packages_retaining_parsed_lpm_lockfile(project_dir)
     }
 
+    /// [`Self::discover`] with the lockfile search stopped at `boundary`.
+    pub(crate) fn discover_within(
+        project_dir: &Path,
+        boundary: &Path,
+    ) -> Result<discovery::DiscoveryResult, lpm_common::LpmError> {
+        discovery::discover_packages_within(project_dir, boundary)
+    }
+
     pub(crate) fn from_discovery_with_options(
         discovery: discovery::DiscoveryResult,
         store_version: lpm_store::StoreVersion,
@@ -405,15 +413,37 @@ impl PackageInventory {
             return;
         }
         let not_installed = std::mem::take(&mut self.not_installed);
-        self.discovery.remove_packages(&not_installed);
-        let mut removed = not_installed.iter();
-        self.analyses
-            .retain(|_| !removed.next().is_some_and(|&flag| flag));
-        let mut removed = not_installed.iter();
-        self.source_paths
-            .retain(|_| !removed.next().is_some_and(|&flag| flag));
-        self.not_installed = vec![false; self.discovery.packages.len()];
+        self.not_installed = vec![false; not_installed.len()];
+        self.remove_marked(&not_installed);
     }
+
+    /// Drop the packages `keep` rejects.
+    pub(crate) fn retain_packages(&mut self, keep: impl Fn(&DiscoveredPackage) -> bool) {
+        let remove: Vec<bool> = self
+            .discovery
+            .packages
+            .iter()
+            .map(|package| !keep(package))
+            .collect();
+        self.remove_marked(&remove);
+    }
+
+    /// Drop the packages `remove` marks, aligned with the discovered
+    /// packages, with their per-package data.
+    fn remove_marked(&mut self, remove: &[bool]) {
+        if !remove.contains(&true) {
+            return;
+        }
+        self.discovery.remove_packages(remove);
+        retain_unmarked(&mut self.analyses, remove);
+        retain_unmarked(&mut self.source_paths, remove);
+        retain_unmarked(&mut self.not_installed, remove);
+    }
+}
+
+fn retain_unmarked<T>(values: &mut Vec<T>, remove: &[bool]) {
+    let mut marks = remove.iter();
+    values.retain(|_| !marks.next().is_some_and(|&flag| flag));
 }
 
 pub(crate) fn load_behavioral_analyses(
@@ -789,6 +819,35 @@ pub(crate) fn open_package_source_directory(
         .map(|source| source.directory)
 }
 
+/// Opens the bytes a package was published with, for consumers that must
+/// never read what an install script or patch changed: a `file:` or `link:`
+/// dependency's own directory, else the store's pristine copy of the
+/// release. Only a project without an LPM store falls back to its
+/// `node_modules` copy.
+pub(crate) fn open_package_pristine_directory(
+    project_root: Option<&cap_std::fs::Dir>,
+    package: &DiscoveredPackage,
+    lpm_root: Option<&lpm_common::LpmRoot>,
+    baseline_index: Option<&ProjectV2BaselineIndex>,
+) -> io::Result<cap_std::fs::Dir> {
+    if let Some(source_dir) = package.local_source_dir.as_ref() {
+        return open_absolute_directory_nofollow(source_dir);
+    }
+    match lpm_root.zip(baseline_index) {
+        Some((root, index)) => {
+            let baseline =
+                find_project_baseline_by_identity(index, root, package).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "the package's published bytes are not in the store",
+                    )
+                })?;
+            open_absolute_directory_nofollow(&baseline.pristine_dir)
+        }
+        None => open_project_package_directory(project_root, &package.path),
+    }
+}
+
 struct OpenedPackageSource {
     directory: cap_std::fs::Dir,
     path: PathBuf,
@@ -917,6 +976,7 @@ mod tests {
             is_dev: false,
             is_optional: false,
             platform_skipped: false,
+            installed: None,
             dependencies: Vec::new(),
         }
     }

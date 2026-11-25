@@ -220,13 +220,7 @@ pub(crate) fn is_up_to_date(
         return Ok(false);
     }
     let extensions = super::policy_extensions::load_policy_extension_configs(&global)?;
-    let skills_ready = mode.no_skills
-        || ((!crate::lpm_skills_config::LpmSkillsPreference::Config.resolve(&global)?
-            || crate::commands::skills::package::materialization_complete(
-                project_dir,
-                package_json,
-            ))
-            && crate::commands::skills::project_skills_ready(project_dir));
+    let skills_ready = mode.no_skills || skills_ready(project_dir, package_json, &global);
     if !extensions.is_empty() || !skills_ready {
         return Ok(false);
     }
@@ -1018,13 +1012,7 @@ pub(crate) fn try_workspace_up_to_date(
     }
 
     let extensions = super::policy_extensions::load_policy_extension_configs(&global)?;
-    let skills_ready = mode.no_skills
-        || ((!crate::lpm_skills_config::LpmSkillsPreference::Config.resolve(&global)?
-            || crate::commands::skills::package::materialization_complete(
-                workspace_root,
-                package_json,
-            ))
-            && crate::commands::skills::project_skills_ready(workspace_root));
+    let skills_ready = mode.no_skills || skills_ready(workspace_root, package_json, &global);
     if !extensions.is_empty() || !skills_ready {
         return Ok(None);
     }
@@ -1165,6 +1153,35 @@ pub(crate) fn emit_workspace_sync_noop_report(
 fn lockfile_contains_lpm_package(project_dir: &Path) -> bool {
     lpm_lockfile::Lockfile::read_for_project(project_dir)
         .map_or(true, |project| requires_install_access(&project.lockfile))
+}
+
+/// Whether the project's skills need no work, as the full install would
+/// find. A skill setting this can't read counts as work: the full install
+/// then reports it, so the fast lane never decides differently.
+fn skills_ready(
+    project_dir: &Path,
+    package_json: &str,
+    global: &crate::commands::config::GlobalConfig,
+) -> bool {
+    let Ok(lpm_dev_packages) =
+        crate::lpm_skills_config::LpmSkillsPreference::Config.resolve(global)
+    else {
+        return false;
+    };
+    let Ok(other_packages) = crate::lpm_skills_config::other_package_skills_enabled(global) else {
+        return false;
+    };
+    (!lpm_dev_packages
+        || crate::commands::skills::package::materialization_complete(project_dir, package_json))
+        && crate::commands::skills::project_skills_ready(project_dir)
+        && crate::dependency_skills::links_ready_for_manifest_text(
+            project_dir,
+            package_json,
+            crate::dependency_skills::Settings {
+                other_packages,
+                omitted: Default::default(),
+            },
+        )
 }
 
 #[cfg(test)]

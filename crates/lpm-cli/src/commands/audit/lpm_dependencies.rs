@@ -163,6 +163,7 @@ mod tests {
             is_dev: false,
             is_optional: false,
             platform_skipped: false,
+            installed: None,
             dependencies: dependencies
                 .iter()
                 .map(|(name, version)| (name.to_string(), version.to_string()))

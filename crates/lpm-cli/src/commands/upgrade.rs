@@ -475,6 +475,7 @@ pub async fn run(
                 &skipped_private,
                 &skipped_non_registry,
                 &crate::commands::install::FirewallBypassRecord::default(),
+                None,
             )?;
         } else {
             if !dry_run {
@@ -525,6 +526,7 @@ pub async fn run(
                 &skipped_private,
                 &skipped_non_registry,
                 &crate::commands::install::FirewallBypassRecord::default(),
+                None,
             )?;
             return Ok(());
         }
@@ -637,6 +639,7 @@ pub async fn run(
     let project_dirs = [project_dir.to_path_buf()];
     let firewall_bypass_report =
         std::sync::Arc::new(crate::commands::install::FirewallBypassReport::default());
+    let reconciles_skills = !crate::commands::install::dependency_skills_deferred();
     let install_result =
         crate::commands::install::workspace_lockfile::scope_workspace_mutation_if_present(
             project_dir,
@@ -691,7 +694,8 @@ pub async fn run(
                 }
 
                 let lpm_root = lpm_common::LpmRoot::from_env()?;
-                let install = crate::commands::install::run_with_options_with_lpm_root(
+                let install = crate::commands::install::defer_dependency_skills(
+                    crate::commands::install::run_with_options_with_lpm_root(
                     &install_client,
                     project_dir,
                     json_output,
@@ -730,6 +734,7 @@ pub async fn run(
                         ),
                     ),
                     lpm_root,
+                    ),
                 );
                 let install_result = crate::commands::install::root_versions::scope(
                     project_dir, root_versions, install,
@@ -753,6 +758,13 @@ pub async fn run(
         .await;
 
     install_result?;
+    let dependency_skills = reconciles_skills.then(|| {
+        crate::commands::install::reconcile_dependency_skills(
+            project_dir,
+            crate::lpm_skills_config::LpmSkillsPreference::Config,
+            crate::commands::install::InstallOmitPolicy::default(),
+        )
+    });
 
     if json_output {
         emit_upgrade_json(
@@ -762,8 +774,12 @@ pub async fn run(
             &skipped_private,
             &skipped_non_registry,
             &firewall_bypass_report.take(),
+            dependency_skills.as_ref(),
         )?;
     } else {
+        if let Some(reconciled) = &dependency_skills {
+            crate::dependency_skills::print_report(reconciled);
+        }
         install_ui::done("Updated package.json, lpm.lock, node_modules");
         install_ui::done_untrusted(&format!(
             "Done · upgraded {} {} in {}",
@@ -1067,6 +1083,7 @@ fn emit_upgrade_json(
     skipped_private: &[String],
     skipped_non_registry: &[String],
     firewall_bypassed: &crate::commands::install::FirewallBypassRecord,
+    dependency_skills: Option<&crate::dependency_skills::ReconcileReport>,
 ) -> Result<(), LpmError> {
     let packages: Vec<_> = candidates.iter().map(candidate_to_json).collect();
     let mut json = serde_json::json!({
@@ -1087,6 +1104,9 @@ fn emit_upgrade_json(
     }
     if let Some(security) = firewall_bypassed.security_json() {
         json["security"] = security;
+    }
+    if let Some(reconciled) = dependency_skills {
+        crate::commands::install::attach_dependency_skills(&mut json, reconciled);
     }
     let encoded = serde_json::to_string_pretty(&json).map_err(|error| {
         LpmError::Script(format!("failed to serialize upgrade result: {error}"))

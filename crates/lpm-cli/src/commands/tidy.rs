@@ -99,6 +99,10 @@ struct TidyReport {
     phantoms: Vec<PhantomDependency>,
     removed: Vec<RemovedDependency>,
     ignored: Vec<IgnoredFinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dependency_skills: Option<Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
     elapsed_ms: u128,
     /// What LPM Firewall bypass rules let through in the reinstall `--fix`
     /// runs, in the `security.firewall` shape other commands report.
@@ -190,6 +194,15 @@ pub async fn run(
             analysis.remove_findings_resolved_by(&removed);
         }
     }
+    // The install tidy runs does no skill work, so the skills of the
+    // packages it removed are unlinked here.
+    let dependency_skills = (!removed.is_empty()).then(|| {
+        crate::commands::install::reconcile_dependency_skills(
+            project_dir,
+            crate::lpm_skills_config::LpmSkillsPreference::Config,
+            InstallOmitPolicy::default(),
+        )
+    });
 
     let elapsed_ms = start.elapsed().as_millis();
     let remaining = analysis.unused.len() + analysis.phantoms.len();
@@ -210,6 +223,14 @@ pub async fn run(
         phantoms: analysis.phantoms,
         removed,
         ignored: analysis.ignored,
+        dependency_skills: dependency_skills
+            .as_ref()
+            .filter(|reconciled| !reconciled.is_quiet() || reconciled.unchanged > 0)
+            .map(crate::dependency_skills::report_json),
+        warnings: dependency_skills
+            .as_ref()
+            .map(|reconciled| reconciled.warnings.clone())
+            .unwrap_or_default(),
         elapsed_ms,
         security: firewall_bypassed.security_json(),
     };
@@ -221,6 +242,9 @@ pub async fn run(
                 .map_err(|error| LpmError::Registry(error.to_string()))?
         );
     } else {
+        if let Some(reconciled) = &dependency_skills {
+            crate::dependency_skills::print_report(reconciled);
+        }
         print_human_report(&report);
     }
 

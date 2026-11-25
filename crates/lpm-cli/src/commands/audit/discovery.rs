@@ -66,6 +66,12 @@ pub struct DiscoveredPackage {
     /// install path from its parent; when its source is absent, it isn't
     /// installed rather than missing.
     pub platform_skipped: bool,
+    /// Whether the importer's install tree holds this `lpm.lock` instance,
+    /// when discovery works it out. `None` where it isn't asked or has
+    /// nothing to go on: rows without an instance id, a lockfile without
+    /// root instances, and other lockfiles, whose scan mode says what is on
+    /// disk.
+    pub installed: Option<Installation>,
     /// Direct dependencies: (name, exact_version).
     /// Extracted from lockfile dependency edges. Used by the query engine
     /// for `>` combinator traversal (e.g., `lpm query :eval > :network`).
@@ -148,7 +154,37 @@ pub(crate) struct WorkspaceRootDiscovery {
     pub(crate) lockfile: Arc<lpm_lockfile::Lockfile>,
 }
 
+/// Whether an importer's install tree holds an `lpm.lock` instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Installation {
+    /// A root dependency whose entry holds the release, or what Node loads
+    /// from such a package.
+    Installed,
+    /// Left out of the install, as `--prod` leaves dev dependencies and
+    /// `--no-optional` or the platform optional ones.
+    Absent,
+    /// Behind an entry that couldn't be inspected: it may or may not be
+    /// there.
+    Unknown,
+}
+
 impl DiscoveryResult {
+    /// A project with nothing installed yet: no lockfile and no
+    /// `node_modules`.
+    pub(crate) fn nothing_installed(project_root: PathBuf) -> Self {
+        Self {
+            manager: ManagerKind::FallbackNodeModules,
+            lockfile_path: None,
+            project_root,
+            is_degraded: true,
+            is_yarn_pnp: false,
+            packages: Vec::new(),
+            lpm_lockfile: None,
+            lpm_lockfile_content: None,
+            workspace_root: None,
+        }
+    }
+
     pub(crate) fn retained_lpm_lockfile(&self) -> Option<&lpm_lockfile::Lockfile> {
         self.lpm_lockfile.as_deref()
     }
@@ -198,7 +234,11 @@ impl DiscoveryResult {
             .flat_map(|lockfile| lockfile.packages.iter().map(row_key))
             .collect();
         let mut added_rows = Vec::new();
-        let discovered = lpm_discovered_packages(&workspace.project_root, &workspace.lockfile);
+        let discovered = lpm_discovered_packages(
+            &workspace.project_root,
+            &workspace.lockfile,
+            Reachability::Skip,
+        );
         for (package, row) in discovered.into_iter().zip(&workspace.lockfile.packages) {
             let package_key = package.analysis_key();
             let key = row_key(row);
@@ -232,37 +272,88 @@ thread_local! {
 ///    (most recently modified lockfile wins when multiple exist)
 /// 3. Falls back to walking `node_modules/` (degraded mode)
 pub fn discover_packages(start_dir: &Path) -> Result<DiscoveryResult, LpmError> {
-    discover_packages_with_options(start_dir, false, false)
+    discover_packages_with_options(start_dir, DiscoveryOptions::default())
 }
 
 pub(super) fn discover_packages_retaining_lpm_lockfile(
     start_dir: &Path,
 ) -> Result<DiscoveryResult, LpmError> {
-    discover_packages_with_options(start_dir, true, true)
+    discover_packages_with_options(
+        start_dir,
+        DiscoveryOptions {
+            retain_lockfile: true,
+            retain_lockfile_content: true,
+            ..DiscoveryOptions::default()
+        },
+    )
 }
 
 pub(super) fn discover_packages_retaining_parsed_lpm_lockfile(
     start_dir: &Path,
 ) -> Result<DiscoveryResult, LpmError> {
-    discover_packages_with_options(start_dir, true, false)
+    discover_packages_with_options(
+        start_dir,
+        DiscoveryOptions {
+            retain_lockfile: true,
+            ..DiscoveryOptions::default()
+        },
+    )
+}
+
+/// [`discover_packages_retaining_parsed_lpm_lockfile`] that looks for a
+/// lockfile from `start_dir` up to `boundary` and never above it, so a
+/// lockfile some unrelated project higher up holds is never read as this
+/// one's, and works out which `lpm.lock` instances the install tree holds.
+/// A `boundary` that doesn't contain `start_dir` stops the search at
+/// `start_dir`.
+pub(super) fn discover_packages_within(
+    start_dir: &Path,
+    boundary: &Path,
+) -> Result<DiscoveryResult, LpmError> {
+    let boundary = if start_dir.starts_with(boundary) {
+        boundary
+    } else {
+        start_dir
+    };
+    discover_packages_with_options(
+        start_dir,
+        DiscoveryOptions {
+            boundary: Some(boundary),
+            retain_lockfile: true,
+            reachability: Reachability::Track,
+            ..DiscoveryOptions::default()
+        },
+    )
+}
+
+#[derive(Clone, Copy, Default)]
+struct DiscoveryOptions<'a> {
+    /// The directory the lockfile search stops at.
+    boundary: Option<&'a Path>,
+    retain_lockfile: bool,
+    retain_lockfile_content: bool,
+    reachability: Reachability,
+}
+
+/// Whether discovery works out which `lpm.lock` instances the install tree
+/// holds, as [`DiscoveredPackage::installed`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Reachability {
+    #[default]
+    Skip,
+    Track,
 }
 
 fn discover_packages_with_options(
     start_dir: &Path,
-    retain_lpm_lockfile: bool,
-    retain_lpm_lockfile_content: bool,
+    options: DiscoveryOptions<'_>,
 ) -> Result<DiscoveryResult, LpmError> {
     // Walk up to find a lockfile
     let mut current = start_dir.to_path_buf();
     loop {
         // 1. lpm.lock — always highest priority (LPM-managed project)
         if current.join("lpm.lock").exists() {
-            return discover_from_lpm_lock(
-                start_dir,
-                &current,
-                retain_lpm_lockfile,
-                retain_lpm_lockfile_content,
-            );
+            return discover_from_lpm_lock(start_dir, &current, options);
         }
 
         // 2. Foreign lockfiles — use lpm-migrate's mtime-based detection.
@@ -281,8 +372,7 @@ fn discover_packages_with_options(
             };
         }
 
-        // Walk up
-        if !current.pop() {
+        if options.boundary.is_some_and(|boundary| current == boundary) || !current.pop() {
             break;
         }
     }
@@ -303,9 +393,14 @@ fn discover_packages_with_options(
 fn discover_from_lpm_lock(
     start_dir: &Path,
     project_root: &Path,
-    retain_lockfile: bool,
-    retain_lockfile_content: bool,
+    options: DiscoveryOptions<'_>,
 ) -> Result<DiscoveryResult, LpmError> {
+    let DiscoveryOptions {
+        retain_lockfile,
+        retain_lockfile_content,
+        reachability,
+        ..
+    } = options;
     let target_root =
         lpm_workspace::find_project_root(start_dir).unwrap_or_else(|| start_dir.to_path_buf());
     let (lockfile_path, lockfile, lpm_lockfile_content, workspace_root) = if retain_lockfile {
@@ -343,7 +438,7 @@ fn discover_from_lpm_lock(
         )
     };
 
-    let packages = lpm_discovered_packages(&target_root, &lockfile);
+    let packages = lpm_discovered_packages(&target_root, &lockfile, reachability);
 
     let lpm_lockfile = retain_lockfile.then(|| Arc::new(lockfile));
     Ok(DiscoveryResult {
@@ -362,6 +457,7 @@ fn discover_from_lpm_lock(
 fn lpm_discovered_packages(
     project_root: &Path,
     lockfile: &lpm_lockfile::Lockfile,
+    reachability: Reachability,
 ) -> Vec<DiscoveredPackage> {
     let ProjectPackagePaths {
         paths: project_paths,
@@ -373,6 +469,10 @@ fn lpm_discovered_packages(
         .filter_map(|package| package.instance_id.map(|id| (id, package)))
         .collect();
     let platform_skipped = lpm_platform_skipped_packages(project_root, lockfile);
+    let reach = match reachability {
+        Reachability::Track => installed_lpm_instances(project_root, lockfile, &by_instance),
+        Reachability::Skip => None,
+    };
     lockfile
         .packages
         .iter()
@@ -417,10 +517,594 @@ fn lpm_discovered_packages(
                 is_optional: p.optional,
                 platform_skipped: platform_skipped
                     && p.instance_id.is_some_and(|id| !unverified.contains(&id)),
+                installed: p.instance_id.and_then(|id| Some(reach.as_ref()?.of(id))),
                 dependencies,
             }
         })
         .collect()
+}
+
+/// What an importer's install tree holds of its `lpm.lock` instances.
+struct Reach {
+    installed: HashSet<lpm_common::PackageInstanceId>,
+    /// Behind an entry that couldn't be inspected, and never found
+    /// installed another way.
+    unknown: HashSet<lpm_common::PackageInstanceId>,
+}
+
+impl Reach {
+    fn of(&self, instance: lpm_common::PackageInstanceId) -> Installation {
+        if self.installed.contains(&instance) {
+            Installation::Installed
+        } else if self.unknown.contains(&instance) {
+            Installation::Unknown
+        } else {
+            Installation::Absent
+        }
+    }
+}
+
+/// The `lpm.lock` instances the importer at `project_root` installed: each
+/// root dependency whose entry in its `node_modules` holds that very
+/// release, and each dependency Node would load from an installed package,
+/// following the lockfile's edges. Entries are followed wherever they lead,
+/// since the store's linked layout puts packages outside the project, and
+/// a dependency an install left out, as `--prod` does for dev dependencies
+/// and `--no-optional` or the platform for optional ones, has no entry
+/// there. An entry that can't be inspected leaves its release, and what
+/// only it reaches, unknown. `None` when the lockfile records no root
+/// instances.
+fn installed_lpm_instances(
+    project_root: &Path,
+    lockfile: &lpm_lockfile::Lockfile,
+    by_instance: &HashMap<lpm_common::PackageInstanceId, &lpm_lockfile::LockedPackage>,
+) -> Option<Reach> {
+    let mut installed = HashSet::with_capacity(by_instance.len());
+    let mut unknown = Vec::new();
+    let mut to_visit = Vec::with_capacity(lockfile.root_resolutions.len());
+    let mut entry = PathBuf::with_capacity(project_root.as_os_str().len() + 64);
+    let mut records_roots = false;
+    for (local_name, resolution) in &lockfile.root_resolutions {
+        let Some(instance_id) = resolution.instance_id else {
+            continue;
+        };
+        let Some(package) = by_instance.get(&instance_id) else {
+            continue;
+        };
+        records_roots = true;
+        let Some(segments) = PackageSegments::of(local_name) else {
+            continue;
+        };
+        segments.entry_in(project_root, &mut entry);
+        match installed_copy(&entry, package) {
+            InstalledCopy::Found(path) => {
+                if installed.insert(instance_id) {
+                    to_visit.push((instance_id, path));
+                }
+            }
+            InstalledCopy::Other | InstalledCopy::Unloadable => {}
+            InstalledCopy::Unknown => unknown.push(instance_id),
+        }
+    }
+    if !records_roots {
+        return None;
+    }
+    let mut lookup = NodeLookup::default();
+    while let Some((instance_id, path)) = to_visit.pop() {
+        let Some(package) = by_instance.get(&instance_id) else {
+            continue;
+        };
+        lookup.start(&path);
+        for (local_name, target_id) in package
+            .dependency_targets
+            .iter()
+            .chain(&package.peer_targets)
+        {
+            if installed.contains(target_id) {
+                continue;
+            }
+            let Some(target) = by_instance.get(target_id) else {
+                continue;
+            };
+            let Some(segments) = PackageSegments::of(local_name) else {
+                continue;
+            };
+            match lookup.resolve(segments, target) {
+                InstalledCopy::Found(found) => {
+                    installed.insert(*target_id);
+                    to_visit.push((*target_id, found));
+                }
+                InstalledCopy::Other | InstalledCopy::Unloadable => {}
+                InstalledCopy::Unknown => unknown.push(*target_id),
+            }
+        }
+    }
+    let mut behind_unknown = HashSet::new();
+    while let Some(instance_id) = unknown.pop() {
+        if installed.contains(&instance_id) || !behind_unknown.insert(instance_id) {
+            continue;
+        }
+        if let Some(package) = by_instance.get(&instance_id) {
+            unknown.extend(
+                package
+                    .dependency_targets
+                    .values()
+                    .chain(package.peer_targets.values())
+                    .copied(),
+            );
+        }
+    }
+    Some(Reach {
+        installed,
+        unknown: behind_unknown,
+    })
+}
+
+/// What an install tree holds where a package is looked up.
+enum InstalledCopy {
+    /// The release itself, at this real path.
+    Found(PathBuf),
+    /// Something Node loads there in place of the release.
+    Other,
+    /// Nothing Node loads: no entry, a dangling link, or a folder without a
+    /// `package.json` or an `index` file.
+    Unloadable,
+    /// Something that couldn't be inspected.
+    Unknown,
+}
+
+/// A package name's path segments: one, or a scope and a name.
+#[derive(Clone, Copy)]
+struct PackageSegments<'a> {
+    first: &'a str,
+    second: Option<&'a str>,
+}
+
+impl<'a> PackageSegments<'a> {
+    /// `None` unless lpm-lockfile accepts `local_name` as a package name,
+    /// which keeps each segment a plain path component on every platform.
+    fn of(local_name: &'a str) -> Option<Self> {
+        if !lpm_lockfile::is_valid_package_name(local_name) {
+            return None;
+        }
+        let (first, second) = match local_name.split_once('/') {
+            Some((scope, name)) => (scope, Some(name)),
+            None => (local_name, None),
+        };
+        Some(Self { first, second })
+    }
+
+    /// Sets `path` to the package's entry in `directory`'s `node_modules`,
+    /// pushing segment by segment so a verbatim Windows path never holds a
+    /// `/`.
+    fn entry_in(self, directory: &Path, path: &mut PathBuf) {
+        path.clear();
+        path.push(directory);
+        path.push("node_modules");
+        path.push(self.first);
+        if let Some(second) = self.second {
+            path.push(second);
+        }
+    }
+}
+
+/// The fields of a `package.json` that name its release, and those that give
+/// CommonJS an entry point, borrowed from the text unless they hold escapes.
+/// A repeated field takes its last value and a `null` counts as absent, as
+/// the installer reads them.
+#[derive(Default)]
+struct ManifestIdentity<'a> {
+    name: Field<'a>,
+    version: Field<'a>,
+    main: Field<'a>,
+    exports: Field<'a>,
+}
+
+#[derive(Default)]
+enum Field<'a> {
+    #[default]
+    Absent,
+    Text(std::borrow::Cow<'a, str>),
+    /// Present, but not a string.
+    Other,
+}
+
+impl ManifestIdentity<'_> {
+    /// Whether it names `package`'s release. A manifest without a version
+    /// names `0.0.0`, as a local package's does when the installer locks it.
+    fn names(&self, package: &lpm_lockfile::LockedPackage) -> bool {
+        matches!(&self.name, Field::Text(name) if *name == package.name)
+            && match &self.version {
+                Field::Absent => package.version == "0.0.0",
+                Field::Text(version) => *version == package.version,
+                Field::Other => false,
+            }
+    }
+
+    /// Whether CommonJS has an entry point here: `exports`, or a `main` that
+    /// isn't empty.
+    fn has_entry_point(&self) -> bool {
+        !matches!(self.exports, Field::Absent)
+            || match &self.main {
+                Field::Absent => false,
+                Field::Text(main) => !main.is_empty(),
+                Field::Other => true,
+            }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ManifestIdentity<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Fields;
+
+        impl<'de> serde::de::Visitor<'de> for Fields {
+            type Value = ManifestIdentity<'de>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a package.json object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut identity = ManifestIdentity::default();
+                while let Some(key) = map.next_key::<IdentityKey>()? {
+                    match key {
+                        IdentityKey::Name => identity.name = map.next_value()?,
+                        IdentityKey::Version => identity.version = map.next_value()?,
+                        IdentityKey::Main => identity.main = map.next_value()?,
+                        IdentityKey::Exports => identity.exports = map.next_value()?,
+                        IdentityKey::Other => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(identity)
+            }
+        }
+
+        deserializer.deserialize_map(Fields)
+    }
+}
+
+enum IdentityKey {
+    Name,
+    Version,
+    Main,
+    Exports,
+    Other,
+}
+
+impl<'de> serde::Deserialize<'de> for IdentityKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Key;
+
+        impl serde::de::Visitor<'_> for Key {
+            type Value = IdentityKey;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a field name")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, key: &str) -> Result<IdentityKey, E> {
+                Ok(match key {
+                    "name" => IdentityKey::Name,
+                    "version" => IdentityKey::Version,
+                    "main" => IdentityKey::Main,
+                    "exports" => IdentityKey::Exports,
+                    _ => IdentityKey::Other,
+                })
+            }
+        }
+
+        deserializer.deserialize_identifier(Key)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Field<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Value;
+
+        impl<'de> serde::de::Visitor<'de> for Value {
+            type Value = Field<'de>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON value")
+            }
+
+            fn visit_borrowed_str<E: serde::de::Error>(
+                self,
+                text: &'de str,
+            ) -> Result<Field<'de>, E> {
+                Ok(Field::Text(std::borrow::Cow::Borrowed(text)))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Field<'de>, E> {
+                Ok(Field::Text(std::borrow::Cow::Owned(text.to_owned())))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, text: String) -> Result<Field<'de>, E> {
+                Ok(Field::Text(std::borrow::Cow::Owned(text)))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Field<'de>, E> {
+                Ok(Field::Absent)
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Field<'de>, E> {
+                Ok(Field::Other)
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Field<'de>, E> {
+                Ok(Field::Other)
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Field<'de>, E> {
+                Ok(Field::Other)
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Field<'de>, E> {
+                Ok(Field::Other)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Field<'de>, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(Field::Other)
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Field<'de>, A::Error> {
+                while map
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(Field::Other)
+            }
+        }
+
+        deserializer.deserialize_any(Value)
+    }
+}
+
+/// What `entry` holds of `package` for a root dependency: found only when
+/// it leads to a folder whose `package.json` names `package`'s release.
+fn installed_copy(entry: &Path, package: &lpm_lockfile::LockedPackage) -> InstalledCopy {
+    match inspect_entry(entry, package) {
+        Entry::Release(real) => InstalledCopy::Found(real),
+        Entry::File | Entry::OtherPackage => InstalledCopy::Other,
+        Entry::Missing | Entry::Bare => InstalledCopy::Unloadable,
+        Entry::Unknown => InstalledCopy::Unknown,
+    }
+}
+
+/// What a package's entry in one `node_modules` folder holds.
+enum Entry {
+    /// No entry, or a link that leads nowhere.
+    Missing,
+    /// Something other than a folder, which CommonJS loads as a file and ES
+    /// modules look past.
+    File,
+    /// A folder whose `package.json` names the release, at this real path.
+    Release(PathBuf),
+    /// A folder Node loads something else from: another release with an
+    /// entry point, or an `index` file.
+    OtherPackage,
+    /// A folder that isn't the release and that CommonJS can't load, having
+    /// no entry point and no `index` file, so it looks past it; ES modules
+    /// stop at it.
+    Bare,
+    /// Something that couldn't be inspected.
+    Unknown,
+}
+
+/// Classifies `entry` against `package`. A `package.json` that isn't valid
+/// UTF-8 is read as Node reads it, with replacement characters; one that is
+/// a FIFO, a device or a socket can't be read without risking a hang, so
+/// what it holds is unknown.
+fn inspect_entry(entry: &Path, package: &lpm_lockfile::LockedPackage) -> Entry {
+    let real = match entry.canonicalize() {
+        Ok(real) => real,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Entry::Missing;
+        }
+        Err(_) => return Entry::Unknown,
+    };
+    match std::fs::metadata(&real) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Entry::File,
+        Err(_) => return Entry::Unknown,
+    }
+    let manifest_path = real.join("package.json");
+    match std::fs::metadata(&manifest_path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(metadata) if metadata.is_dir() => return without_manifest(&real),
+        Ok(_) => return Entry::Unknown,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return without_manifest(&real);
+        }
+        Err(_) => return Entry::Unknown,
+    }
+    let Ok((manifest, _)) = lpm_common::read_regular_file_capped_with_metadata(
+        &manifest_path,
+        lpm_common::STATE_FILE_SIZE_CAP_BYTES,
+    ) else {
+        return Entry::Unknown;
+    };
+    let text = String::from_utf8_lossy(&manifest);
+    match serde_json::from_str::<ManifestIdentity<'_>>(lpm_common::strip_utf8_bom_str(&text)) {
+        Ok(identity) if identity.names(package) => Entry::Release(real),
+        Ok(identity) if !identity.has_entry_point() => without_manifest(&real),
+        _ => Entry::OtherPackage,
+    }
+}
+
+/// Whether `manifest`, a `package.json`'s bytes, names `package`'s release,
+/// read as Node reads it: invalid UTF-8 as replacement characters, a
+/// byte-order mark skipped.
+fn manifest_names(manifest: &[u8], package: &lpm_lockfile::LockedPackage) -> bool {
+    let text = String::from_utf8_lossy(manifest);
+    serde_json::from_str::<ManifestIdentity<'_>>(lpm_common::strip_utf8_bom_str(&text))
+        .is_ok_and(|identity| identity.names(package))
+}
+
+/// What a package folder without an entry point holds for Node: the `index`
+/// file CommonJS loads in its place, which isn't the release, or nothing.
+fn without_manifest(folder: &Path) -> Entry {
+    if ["index.js", "index.json", "index.node"]
+        .iter()
+        .any(|name| folder.join(name).is_file())
+    {
+        Entry::OtherPackage
+    } else {
+        Entry::Bare
+    }
+}
+
+/// Looks up what Node loads for each dependency of one installed package,
+/// reusing its buffers and remembering which `node_modules` folders exist
+/// on the way up from the package.
+#[derive(Default)]
+struct NodeLookup {
+    package_path: PathBuf,
+    entry: PathBuf,
+    scratch: PathBuf,
+    /// Whether each folder on the way up has a `node_modules` folder, by
+    /// position; `None` until it is needed.
+    modules: Vec<Option<bool>>,
+}
+
+impl NodeLookup {
+    /// Starts the lookups from the package installed at `package_path`.
+    fn start(&mut self, package_path: &Path) {
+        self.package_path.clear();
+        self.package_path.push(package_path);
+        self.modules.clear();
+    }
+
+    /// What Node loads as the package named `segments` from the package
+    /// being looked up from, against `target`'s release. CommonJS takes a
+    /// file named for the package, or with a `.js`, `.json` or `.node`
+    /// extension, before a folder, and looks past a folder it can't load;
+    /// ES modules take the first folder of that name and look past files.
+    /// The release counts as found when either loads it, so a copy one of
+    /// them runs is never taken for absent, and where it sits even without an
+    /// entry point, as a package that only ships skills has none.
+    fn resolve(
+        &mut self,
+        segments: PackageSegments<'_>,
+        target: &lpm_lockfile::LockedPackage,
+    ) -> InstalledCopy {
+        let mut commonjs_open = true;
+        let mut es_modules_open = true;
+        let mut stopped = false;
+        let Self {
+            package_path,
+            entry,
+            scratch,
+            modules,
+        } = self;
+        let mut position = 0;
+        for directory in package_path.ancestors() {
+            if directory
+                .file_name()
+                .is_some_and(|name| name == "node_modules")
+            {
+                continue;
+            }
+            let level = position;
+            position += 1;
+            if modules.len() <= level {
+                modules.resize(level + 1, None);
+            }
+            if modules[level].is_none() {
+                scratch.clear();
+                scratch.push(directory);
+                scratch.push("node_modules");
+                modules[level] = match std::fs::metadata(&*scratch) {
+                    Ok(metadata) => Some(metadata.is_dir()),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        Some(false)
+                    }
+                    Err(_) => None,
+                };
+            }
+            if modules[level] == Some(false) {
+                continue;
+            }
+            segments.entry_in(directory, entry);
+            let found = inspect_entry(entry, target);
+            let mut file_beside = || loads_as_file(entry, scratch);
+            match found {
+                Entry::Unknown => return InstalledCopy::Unknown,
+                Entry::Release(real) => {
+                    if es_modules_open || !file_beside() {
+                        return InstalledCopy::Found(real);
+                    }
+                    // CommonJS loads the file beside it unless the folder's
+                    // `exports` take over, which this walk doesn't read.
+                    return InstalledCopy::Unknown;
+                }
+                Entry::OtherPackage => return InstalledCopy::Other,
+                Entry::File => {
+                    commonjs_open = false;
+                    stopped = true;
+                }
+                Entry::Bare => {
+                    es_modules_open = false;
+                    stopped = true;
+                    if commonjs_open && file_beside() {
+                        commonjs_open = false;
+                    }
+                }
+                Entry::Missing => {
+                    if commonjs_open && file_beside() {
+                        commonjs_open = false;
+                        stopped = true;
+                    }
+                }
+            }
+            if !commonjs_open && !es_modules_open {
+                return InstalledCopy::Other;
+            }
+        }
+        if stopped {
+            InstalledCopy::Other
+        } else {
+            InstalledCopy::Unloadable
+        }
+    }
+}
+
+/// Whether CommonJS loads a file in place of `entry`: `entry` with a `.js`,
+/// `.json` or `.node` extension. `scratch` is reused.
+fn loads_as_file(entry: &Path, scratch: &mut PathBuf) -> bool {
+    [".js", ".json", ".node"].iter().any(|extension| {
+        scratch.clear();
+        scratch.push(entry);
+        scratch.as_mut_os_string().push(extension);
+        scratch.is_file()
+    })
 }
 
 /// [`crate::commands::manifest_metadata::platform_skipped_package_flags`]
@@ -506,6 +1190,7 @@ fn resolve_lpm_project_paths(
         .collect();
     let mut absolute_paths = HashMap::with_capacity(packages_by_instance.len());
     let mut to_visit = VecDeque::new();
+    let mut candidate = PathBuf::with_capacity(canonical_root.as_os_str().len() + 64);
 
     for (local_name, resolution) in &lockfile.root_resolutions {
         let Some(instance_id) = resolution.instance_id else {
@@ -514,7 +1199,10 @@ fn resolve_lpm_project_paths(
         let Some(package) = packages_by_instance.get(&instance_id) else {
             continue;
         };
-        let candidate = canonical_root.join("node_modules").join(local_name);
+        let Some(segments) = PackageSegments::of(local_name) else {
+            continue;
+        };
+        segments.entry_in(&canonical_root, &mut candidate);
         let path = match project_package_candidate(&candidate, &canonical_root, package) {
             CandidatePath::Matched(path) => path,
             CandidatePath::Absent => continue,
@@ -543,19 +1231,19 @@ fn resolve_lpm_project_paths(
             let Some(target) = packages_by_instance.get(target_id) else {
                 continue;
             };
-            let path = match resolve_node_modules_target(
-                &package_path,
-                &canonical_root,
-                local_name,
-                target,
-            ) {
-                CandidatePath::Matched(path) => path,
-                CandidatePath::Absent => continue,
-                CandidatePath::Unverified => {
-                    unverified.insert(*target_id);
-                    continue;
-                }
+            let Some(segments) = PackageSegments::of(local_name) else {
+                continue;
             };
+            let path =
+                match resolve_node_modules_target(&package_path, &canonical_root, segments, target)
+                {
+                    CandidatePath::Matched(path) => path,
+                    CandidatePath::Absent => continue,
+                    CandidatePath::Unverified => {
+                        unverified.insert(*target_id);
+                        continue;
+                    }
+                };
             absolute_paths.insert(*target_id, path.clone());
             to_visit.push_back((*target_id, path));
         }
@@ -598,16 +1286,17 @@ enum CandidatePath {
 fn resolve_node_modules_target(
     package_path: &Path,
     project_root: &Path,
-    local_name: &str,
+    segments: PackageSegments<'_>,
     target: &lpm_lockfile::LockedPackage,
 ) -> CandidatePath {
     let mut saw_unverified = false;
+    let mut candidate = PathBuf::with_capacity(package_path.as_os_str().len() + 64);
     let mut current = Some(package_path);
     while let Some(directory) = current {
         if !directory.starts_with(project_root) {
             break;
         }
-        let candidate = directory.join("node_modules").join(local_name);
+        segments.entry_in(directory, &mut candidate);
         match project_package_candidate(&candidate, project_root, target) {
             CandidatePath::Matched(path) => return CandidatePath::Matched(path),
             CandidatePath::Unverified => saw_unverified = true,
@@ -639,17 +1328,11 @@ fn project_package_candidate(
     };
     let matches = canonical.starts_with(project_root)
         && canonical.is_dir()
-        && lpm_common::read_text_file_capped(
+        && lpm_common::read_regular_file_capped_with_metadata(
             &canonical.join("package.json"),
             lpm_common::STATE_FILE_SIZE_CAP_BYTES,
         )
-        .ok()
-        .and_then(|manifest| serde_json::from_str::<serde_json::Value>(&manifest).ok())
-        .is_some_and(|manifest| {
-            manifest.get("name").and_then(serde_json::Value::as_str) == Some(target.name.as_str())
-                && manifest.get("version").and_then(serde_json::Value::as_str)
-                    == Some(target.version.as_str())
-        });
+        .is_ok_and(|(manifest, _)| manifest_names(&manifest, target));
     if matches {
         CandidatePath::Matched(canonical)
     } else {
@@ -742,6 +1425,7 @@ fn discover_from_yarn_lockfile(
                     is_dev: package.is_dev,
                     is_optional: package.is_optional,
                     platform_skipped: false,
+                    installed: None,
                     dependencies: package.dependencies,
                 }
             })
@@ -1085,6 +1769,7 @@ fn read_package_from_node_modules(
             is_dev: false,      // Can't determine without lockfile
             is_optional: false, // Can't determine without lockfile
             platform_skipped: false,
+            installed: None,
             dependencies: Vec::new(), // Resolved in second pass
         },
         dep_names,
@@ -1214,6 +1899,7 @@ where
             is_dev,
             is_optional,
             platform_skipped: false,
+            installed: None,
             dependencies,
         });
     }
@@ -1510,7 +2196,7 @@ mod tests {
             ..lpm_lockfile::Lockfile::new()
         };
 
-        let packages = lpm_discovered_packages(project.path(), &lockfile);
+        let packages = lpm_discovered_packages(project.path(), &lockfile, Reachability::Skip);
 
         assert_eq!(
             packages
@@ -1519,6 +2205,747 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(false, false), (true, true), (false, true)],
             "a row without an instance id has no resolved install path to confirm its absence"
+        );
+    }
+
+    fn write_package(directory: &Path, name: &str, version: &str) {
+        fs::create_dir_all(directory).unwrap();
+        fs::write(
+            directory.join("package.json"),
+            serde_json::json!({ "name": name, "version": version }).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn only_what_node_would_load_from_an_installed_root_dependency_is_installed() {
+        let project = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let siblings = store.path().join("links/host@1.0.0/node_modules");
+        write_package(&siblings.join("host"), "host", "1.0.0");
+        write_package(&siblings.join("tool"), "tool", "1.0.0");
+        let node_modules = project.path().join("node_modules");
+        fs::create_dir_all(&node_modules).unwrap();
+        lpm_common::create_dir_symlink_or_junction(
+            &siblings.join("host"),
+            &node_modules.join("host"),
+        )
+        .unwrap();
+        write_package(&node_modules.join("wrong"), "wrong", "2.0.0");
+        fs::write(node_modules.join("stray"), "not a package").unwrap();
+        fs::create_dir_all(node_modules.join("marked")).unwrap();
+        fs::write(
+            node_modules.join("marked/package.json"),
+            "\u{feff}{\"name\":\"marked\",\"version\":\"1.0.0\"}",
+        )
+        .unwrap();
+        fs::create_dir_all(node_modules.join("local")).unwrap();
+        fs::write(
+            node_modules.join("local/package.json"),
+            r#"{"name":"local"}"#,
+        )
+        .unwrap();
+        let mut host = locked_at(1, "host", "1.0.0");
+        host.dependency_targets = BTreeMap::from([
+            ("tool".to_string(), instance(2)),
+            ("optional-only".to_string(), instance(3)),
+        ]);
+        let mut wrong = locked_at(4, "wrong", "1.0.0");
+        wrong.dependency_targets = BTreeMap::from([("tool".to_string(), instance(2))]);
+        let mut dev_only = locked_at(6, "dev-only", "1.0.0");
+        dev_only.dependency_targets = BTreeMap::from([("dev-helper".to_string(), instance(7))]);
+        let root = |id| lpm_lockfile::LockedRootResolution {
+            instance_id: Some(instance(id)),
+            ..Default::default()
+        };
+        let lockfile = lpm_lockfile::Lockfile {
+            packages: vec![
+                host,
+                locked_at(2, "tool", "1.0.0"),
+                locked_at(3, "optional-only", "1.0.0"),
+                wrong,
+                locked_at(5, "stray", "1.0.0"),
+                dev_only,
+                locked_at(7, "dev-helper", "1.0.0"),
+                locked_at(8, "marked", "1.0.0"),
+                locked_at(9, "local", "0.0.0"),
+            ],
+            root_resolutions: BTreeMap::from([
+                ("host".to_string(), root(1)),
+                ("wrong".to_string(), root(4)),
+                ("stray".to_string(), root(5)),
+                ("dev-only".to_string(), root(6)),
+                ("marked".to_string(), root(8)),
+                ("local".to_string(), root(9)),
+            ]),
+            ..lpm_lockfile::Lockfile::new()
+        };
+
+        let packages = lpm_discovered_packages(project.path(), &lockfile, Reachability::Track);
+
+        assert_eq!(
+            packages
+                .iter()
+                .map(|package| (package.name.as_str(), package.installed))
+                .collect::<Vec<_>>(),
+            [
+                ("host", Some(Installation::Installed)),
+                ("tool", Some(Installation::Installed)),
+                ("optional-only", Some(Installation::Absent)),
+                ("wrong", Some(Installation::Absent)),
+                ("stray", Some(Installation::Absent)),
+                ("dev-only", Some(Installation::Absent)),
+                ("dev-helper", Some(Installation::Absent)),
+                ("marked", Some(Installation::Installed)),
+                ("local", Some(Installation::Installed)),
+            ]
+        );
+    }
+
+    /// A project whose `node_modules/host` links into a store folder of
+    /// siblings, as LPM's linked layout installs `host@1.0.0`.
+    struct LinkedLayout {
+        project: tempfile::TempDir,
+        store: tempfile::TempDir,
+    }
+
+    impl LinkedLayout {
+        fn new() -> Self {
+            let layout = Self {
+                project: tempfile::tempdir().unwrap(),
+                store: tempfile::tempdir().unwrap(),
+            };
+            write_package(&layout.siblings().join("host"), "host", "1.0.0");
+            let node_modules = layout.project.path().join("node_modules");
+            fs::create_dir_all(&node_modules).unwrap();
+            lpm_common::create_dir_symlink_or_junction(
+                &layout.siblings().join("host"),
+                &node_modules.join("host"),
+            )
+            .unwrap();
+            layout
+        }
+
+        fn siblings(&self) -> PathBuf {
+            self.store.path().join("links/host@1.0.0/node_modules")
+        }
+
+        /// Whether each package of a lockfile whose only root is `host`
+        /// (instance 1), depending on `dependencies` and peering `peers` by
+        /// local name and instance, is installed; `others` are the other
+        /// packages, in order after `host`.
+        fn installed(
+            &self,
+            dependencies: &[(&str, u8)],
+            peers: &[(&str, u8)],
+            others: Vec<lpm_lockfile::LockedPackage>,
+        ) -> Vec<(String, Option<Installation>)> {
+            let edges = |edges: &[(&str, u8)]| {
+                edges
+                    .iter()
+                    .map(|(name, id)| ((*name).to_string(), instance(*id)))
+                    .collect()
+            };
+            let mut host = locked_at(1, "host", "1.0.0");
+            host.dependency_targets = edges(dependencies);
+            host.peer_targets = edges(peers);
+            let mut packages = vec![host];
+            packages.extend(others);
+            let lockfile = lpm_lockfile::Lockfile {
+                packages,
+                root_resolutions: BTreeMap::from([(
+                    "host".to_string(),
+                    lpm_lockfile::LockedRootResolution {
+                        instance_id: Some(instance(1)),
+                        ..Default::default()
+                    },
+                )]),
+                ..lpm_lockfile::Lockfile::new()
+            };
+            lpm_discovered_packages(self.project.path(), &lockfile, Reachability::Track)
+                .into_iter()
+                .map(|package| (package.name, package.installed))
+                .collect()
+        }
+    }
+
+    fn installed_as(entries: &[(&str, Installation)]) -> Vec<(String, Option<Installation>)> {
+        entries
+            .iter()
+            .map(|(name, installation)| ((*name).to_string(), Some(*installation)))
+            .collect()
+    }
+
+    #[test]
+    fn the_walk_follows_scoped_names_and_peer_edges() {
+        let layout = LinkedLayout::new();
+        write_package(&layout.siblings().join("@acme/util"), "@acme/util", "1.0.0");
+        write_package(&layout.siblings().join("react"), "react", "18.0.0");
+
+        let installed = layout.installed(
+            &[("@acme/util", 2)],
+            &[("react", 3)],
+            vec![
+                locked_at(2, "@acme/util", "1.0.0"),
+                locked_at(3, "react", "18.0.0"),
+            ],
+        );
+
+        assert_eq!(
+            installed,
+            installed_as(&[
+                ("host", Installation::Installed),
+                ("@acme/util", Installation::Installed),
+                ("react", Installation::Installed),
+            ])
+        );
+    }
+
+    #[test]
+    fn the_walk_ends_on_a_dependency_cycle() {
+        let layout = LinkedLayout::new();
+        write_package(&layout.siblings().join("util"), "util", "1.0.0");
+        let mut util = locked_at(2, "util", "1.0.0");
+        util.dependency_targets = BTreeMap::from([("host".to_string(), instance(1))]);
+
+        let installed = layout.installed(&[("util", 2)], &[], vec![util]);
+
+        assert_eq!(
+            installed,
+            installed_as(&[
+                ("host", Installation::Installed),
+                ("util", Installation::Installed),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_nearer_copy_of_another_version_hides_the_locked_one() {
+        let layout = LinkedLayout::new();
+        write_package(&layout.siblings().join("shadowed"), "shadowed", "1.0.0");
+        write_package(
+            &layout.siblings().join("host/node_modules/shadowed"),
+            "shadowed",
+            "2.0.0",
+        );
+        fs::write(
+            layout
+                .siblings()
+                .join("host/node_modules/shadowed/index.js"),
+            "",
+        )
+        .unwrap();
+
+        let installed = layout.installed(
+            &[("shadowed", 2)],
+            &[],
+            vec![locked_at(2, "shadowed", "1.0.0")],
+        );
+
+        assert_eq!(
+            installed,
+            installed_as(&[
+                ("host", Installation::Installed),
+                ("shadowed", Installation::Absent),
+            ])
+        );
+    }
+
+    #[test]
+    fn the_walk_looks_past_entries_node_cannot_load() {
+        let layout = LinkedLayout::new();
+        let nearer = layout.siblings().join("host/node_modules");
+        fs::create_dir_all(&nearer).unwrap();
+        for name in ["dangling", "bare", "manifest-folder"] {
+            write_package(&layout.siblings().join(name), name, "1.0.0");
+        }
+        lpm_common::create_dir_symlink_or_junction(
+            &layout.store.path().join("gone"),
+            &nearer.join("dangling"),
+        )
+        .unwrap();
+        fs::create_dir_all(nearer.join("bare/lib")).unwrap();
+        fs::create_dir_all(nearer.join("manifest-folder/package.json")).unwrap();
+
+        let installed = layout.installed(
+            &[("dangling", 2), ("bare", 3), ("manifest-folder", 4)],
+            &[],
+            vec![
+                locked_at(2, "dangling", "1.0.0"),
+                locked_at(3, "bare", "1.0.0"),
+                locked_at(4, "manifest-folder", "1.0.0"),
+            ],
+        );
+
+        assert_eq!(
+            installed,
+            installed_as(&[
+                ("host", Installation::Installed),
+                ("dangling", Installation::Installed),
+                ("bare", Installation::Installed),
+                ("manifest-folder", Installation::Installed),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_nearer_folder_node_loads_through_its_index_file_stops_the_walk() {
+        let layout = LinkedLayout::new();
+        let nearer = layout.siblings().join("host/node_modules");
+        for (name, index) in [
+            ("js", "index.js"),
+            ("json", "index.json"),
+            ("addon", "index.node"),
+        ] {
+            write_package(&layout.siblings().join(name), name, "1.0.0");
+            fs::create_dir_all(nearer.join(name)).unwrap();
+            fs::write(nearer.join(name).join(index), "").unwrap();
+        }
+
+        let installed = layout.installed(
+            &[("js", 2), ("json", 3), ("addon", 4)],
+            &[],
+            vec![
+                locked_at(2, "js", "1.0.0"),
+                locked_at(3, "json", "1.0.0"),
+                locked_at(4, "addon", "1.0.0"),
+            ],
+        );
+
+        assert_eq!(
+            installed,
+            installed_as(&[
+                ("host", Installation::Installed),
+                ("js", Installation::Absent),
+                ("json", Installation::Absent),
+                ("addon", Installation::Absent),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_manifest_that_isnt_utf8_still_names_its_release() {
+        let layout = LinkedLayout::new();
+        let manifest = layout.siblings().join("latin1/package.json");
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::write(
+            &manifest,
+            b"{\"name\":\"latin1\",\"version\":\"1.0.0\",\"author\":\"Ren\xe9\"}",
+        )
+        .unwrap();
+
+        let installed =
+            layout.installed(&[("latin1", 2)], &[], vec![locked_at(2, "latin1", "1.0.0")]);
+
+        assert_eq!(
+            installed,
+            installed_as(&[
+                ("host", Installation::Installed),
+                ("latin1", Installation::Installed),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_local_name_that_isnt_a_package_name_is_never_joined() {
+        let project = tempfile::tempdir().unwrap();
+        write_package(&project.path().join("escaper"), "escaper", "1.0.0");
+        write_package(&project.path().join("node_modules/host"), "host", "1.0.0");
+        let mut host = locked_at(1, "host", "1.0.0");
+        host.dependency_targets = BTreeMap::from([("../../escaper".to_string(), instance(2))]);
+        let root = |id| lpm_lockfile::LockedRootResolution {
+            instance_id: Some(instance(id)),
+            ..Default::default()
+        };
+        let lockfile = lpm_lockfile::Lockfile {
+            packages: vec![
+                host,
+                locked_at(2, "escaper", "1.0.0"),
+                locked_at(3, "rooted", "1.0.0"),
+            ],
+            root_resolutions: BTreeMap::from([
+                ("host".to_string(), root(1)),
+                ("../rooted".to_string(), root(3)),
+            ]),
+            ..lpm_lockfile::Lockfile::new()
+        };
+        write_package(&project.path().join("rooted"), "rooted", "1.0.0");
+
+        let packages = lpm_discovered_packages(project.path(), &lockfile, Reachability::Track);
+
+        assert_eq!(
+            packages
+                .iter()
+                .map(|package| (package.name.as_str(), package.installed))
+                .collect::<Vec<_>>(),
+            [
+                ("host", Some(Installation::Installed)),
+                ("escaper", Some(Installation::Absent)),
+                ("rooted", Some(Installation::Absent)),
+            ]
+        );
+        assert_eq!(
+            packages
+                .iter()
+                .map(|package| package.path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "node_modules/host",
+                "node_modules/escaper",
+                "node_modules/rooted"
+            ],
+            "a name that isn't a package name never resolves to a folder"
+        );
+    }
+
+    #[test]
+    fn a_release_is_installed_when_commonjs_or_es_modules_load_it_and_absent_when_neither_does() {
+        let layout = LinkedLayout::new();
+        let nearer = layout.siblings().join("host/node_modules");
+        fs::create_dir_all(&nearer).unwrap();
+        let names = [
+            "file-js",
+            "file-json",
+            "file-addon",
+            "plain-file",
+            "dangling-beside",
+            "bare-beside",
+        ];
+        for name in names {
+            write_package(&layout.siblings().join(name), name, "1.0.0");
+        }
+        fs::write(nearer.join("file-js.js"), "").unwrap();
+        fs::write(nearer.join("file-json.json"), "").unwrap();
+        fs::write(nearer.join("file-addon.node"), "").unwrap();
+        fs::write(nearer.join("plain-file"), "").unwrap();
+        lpm_common::create_dir_symlink_or_junction(
+            &layout.store.path().join("gone"),
+            &nearer.join("dangling-beside"),
+        )
+        .unwrap();
+        fs::write(nearer.join("dangling-beside.js"), "").unwrap();
+        fs::create_dir_all(nearer.join("bare-beside")).unwrap();
+        fs::write(nearer.join("bare-beside.js"), "").unwrap();
+
+        let installed = layout.installed(
+            &names
+                .iter()
+                .zip(2..)
+                .map(|(name, id)| (*name, id))
+                .collect::<Vec<_>>(),
+            &[],
+            names
+                .iter()
+                .zip(2..)
+                .map(|(name, id)| locked_at(id, name, "1.0.0"))
+                .collect(),
+        );
+
+        assert_eq!(
+            installed,
+            installed_as(&[
+                ("host", Installation::Installed),
+                ("file-js", Installation::Installed),
+                ("file-json", Installation::Installed),
+                ("file-addon", Installation::Installed),
+                ("plain-file", Installation::Installed),
+                ("dangling-beside", Installation::Installed),
+                ("bare-beside", Installation::Absent),
+            ]),
+            "ES modules look past files and dangling links to the release; \
+             CommonJS loads the file beside a folder ES modules stop at"
+        );
+    }
+
+    #[test]
+    fn a_nearer_package_commonjs_cant_load_hides_the_release_only_from_es_modules() {
+        let layout = LinkedLayout::new();
+        let nearer = layout.siblings().join("host/node_modules");
+        let names = ["stub", "with-main", "with-exports", "with-index"];
+        for name in names {
+            write_package(&layout.siblings().join(name), name, "1.0.0");
+            fs::create_dir_all(nearer.join(name)).unwrap();
+        }
+        let manifest = |name: &str, extra: serde_json::Value| {
+            let mut manifest = serde_json::json!({ "name": name, "version": "9.9.9" });
+            manifest
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            fs::write(nearer.join(name).join("package.json"), manifest.to_string()).unwrap();
+        };
+        manifest("stub", serde_json::json!({ "types": "index.d.ts" }));
+        manifest("with-main", serde_json::json!({ "main": "lib.js" }));
+        manifest("with-exports", serde_json::json!({ "exports": "./lib.js" }));
+        manifest("with-index", serde_json::json!({}));
+        fs::write(nearer.join("with-index/index.js"), "").unwrap();
+
+        let installed = layout.installed(
+            &names
+                .iter()
+                .zip(2..)
+                .map(|(name, id)| (*name, id))
+                .collect::<Vec<_>>(),
+            &[],
+            names
+                .iter()
+                .zip(2..)
+                .map(|(name, id)| locked_at(id, name, "1.0.0"))
+                .collect(),
+        );
+
+        assert_eq!(
+            installed,
+            installed_as(&[
+                ("host", Installation::Installed),
+                ("stub", Installation::Installed),
+                ("with-main", Installation::Absent),
+                ("with-exports", Installation::Absent),
+                ("with-index", Installation::Absent),
+            ]),
+            "CommonJS looks past a package folder with no `main`, `exports` or index file"
+        );
+    }
+
+    #[test]
+    fn a_release_only_commonjs_reaches_beside_a_file_it_may_load_instead_is_unknown() {
+        let layout = LinkedLayout::new();
+        fs::create_dir_all(layout.siblings().join("host/node_modules/shadowed")).unwrap();
+        write_package(&layout.siblings().join("shadowed"), "shadowed", "1.0.0");
+        fs::write(layout.siblings().join("shadowed.js"), "").unwrap();
+
+        let installed = layout.installed(
+            &[("shadowed", 2)],
+            &[],
+            vec![locked_at(2, "shadowed", "1.0.0")],
+        );
+
+        assert_eq!(
+            installed,
+            installed_as(&[
+                ("host", Installation::Installed),
+                ("shadowed", Installation::Unknown),
+            ]),
+            "ES modules stop at the bare folder and CommonJS loads shadowed.js \
+             unless the release's exports take over"
+        );
+    }
+
+    #[test]
+    fn the_project_path_walk_reads_manifests_as_node_does() {
+        let project = tempfile::tempdir().unwrap();
+        write_package(&project.path().join("node_modules/host"), "host", "1.0.0");
+        let nested = project.path().join("node_modules/host/node_modules/marked");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("package.json"),
+            "\u{feff}{\"name\":\"marked\",\"version\":\"1.0.0\"}",
+        )
+        .unwrap();
+        let mut host = locked_at(1, "host", "1.0.0");
+        host.dependency_targets = BTreeMap::from([("marked".to_string(), instance(2))]);
+        let lockfile = lpm_lockfile::Lockfile {
+            packages: vec![host, locked_at(2, "marked", "1.0.0")],
+            root_resolutions: BTreeMap::from([(
+                "host".to_string(),
+                lpm_lockfile::LockedRootResolution {
+                    instance_id: Some(instance(1)),
+                    ..Default::default()
+                },
+            )]),
+            ..lpm_lockfile::Lockfile::new()
+        };
+
+        let packages = lpm_discovered_packages(project.path(), &lockfile, Reachability::Skip);
+
+        assert_eq!(packages[1].path, "node_modules/host/node_modules/marked");
+    }
+
+    #[test]
+    fn package_segments_accept_only_package_names() {
+        for (name, expected) in [
+            ("tool", Some(("tool", None))),
+            ("@acme/util", Some(("@acme", Some("util")))),
+            ("tool.js", Some(("tool.js", None))),
+            ("", None),
+            ("..", None),
+            ("../tool", None),
+            ("tool/extra", None),
+            ("@acme", None),
+            ("@/util", None),
+            ("@acme/util/extra", None),
+            ("tool\\extra", None),
+            ("c:tool", None),
+            ("tool.", None),
+            ("tool ", None),
+            ("CON", None),
+            ("@acme/nul.txt", None),
+            ("tool\0", None),
+        ] {
+            assert_eq!(
+                PackageSegments::of(name).map(|segments| (segments.first, segments.second)),
+                expected,
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_manifest_identity_borrows_and_takes_the_last_repeated_field() {
+        let package = locked_at(1, "tool", "1.0.0");
+        let parse = |text| serde_json::from_str::<ManifestIdentity<'_>>(text).unwrap();
+
+        let plain = parse(r#"{"name":"tool","version":"1.0.0"}"#);
+        assert!(matches!(
+            &plain.name,
+            Field::Text(std::borrow::Cow::Borrowed("tool"))
+        ));
+        assert!(plain.names(&package));
+        assert!(parse(r#"{"name":"other","version":"1.0.0","name":"tool"}"#).names(&package));
+        assert!(!parse(r#"{"name":"tool","version":"1.0.0","version":"2.0.0"}"#).names(&package));
+        assert!(parse(r#"{"name":"tool","version":"1.0.0"}"#).names(&package));
+        assert!(!parse(r#"{"name":"tool","version":1}"#).names(&package));
+
+        let local = locked_at(2, "tool", "0.0.0");
+        assert!(parse(r#"{"name":"tool"}"#).names(&local));
+        assert!(parse(r#"{"name":"tool","version":null}"#).names(&local));
+        assert!(!parse(r#"{"name":null}"#).names(&local));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_package_json_that_is_a_fifo_leaves_the_release_unknown_without_blocking() {
+        let project = tempfile::tempdir().unwrap();
+        let fifo_package = project.path().join("node_modules/piped");
+        fs::create_dir_all(&fifo_package).unwrap();
+        let fifo = std::ffi::CString::new(
+            fifo_package
+                .join("package.json")
+                .into_os_string()
+                .into_encoded_bytes(),
+        )
+        .unwrap();
+        // SAFETY: `fifo` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        let mut piped = locked_at(1, "piped", "1.0.0");
+        piped.dependency_targets = BTreeMap::from([("inner".to_string(), instance(2))]);
+        let lockfile = lpm_lockfile::Lockfile {
+            packages: vec![piped, locked_at(2, "inner", "1.0.0")],
+            root_resolutions: BTreeMap::from([(
+                "piped".to_string(),
+                lpm_lockfile::LockedRootResolution {
+                    instance_id: Some(instance(1)),
+                    ..Default::default()
+                },
+            )]),
+            ..lpm_lockfile::Lockfile::new()
+        };
+        let root = project.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let packages = lpm_discovered_packages(&root, &lockfile, Reachability::Track);
+            let _ = sender.send(
+                packages
+                    .into_iter()
+                    .map(|package| (package.name, package.installed))
+                    .collect::<Vec<_>>(),
+            );
+        });
+
+        let installed = receiver
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("discovery blocked on a FIFO");
+
+        assert_eq!(
+            installed,
+            installed_as(&[
+                ("piped", Installation::Unknown),
+                ("inner", Installation::Unknown),
+            ])
+        );
+    }
+
+    #[test]
+    fn whether_a_package_is_installed_is_left_open_without_root_instances_or_when_not_asked() {
+        let project = tempfile::tempdir().unwrap();
+        write_package(&project.path().join("node_modules/host"), "host", "1.0.0");
+        let without_roots = lpm_lockfile::Lockfile {
+            packages: vec![locked_at(1, "host", "1.0.0")],
+            ..lpm_lockfile::Lockfile::new()
+        };
+        let with_roots = lpm_lockfile::Lockfile {
+            root_resolutions: BTreeMap::from([(
+                "host".to_string(),
+                lpm_lockfile::LockedRootResolution {
+                    instance_id: Some(instance(1)),
+                    ..Default::default()
+                },
+            )]),
+            ..without_roots.clone()
+        };
+
+        let installed = |lockfile, reachability| {
+            lpm_discovered_packages(project.path(), lockfile, reachability)[0].installed
+        };
+
+        assert_eq!(installed(&without_roots, Reachability::Track), None);
+        assert_eq!(installed(&with_roots, Reachability::Skip), None);
+        assert_eq!(
+            installed(&with_roots, Reachability::Track),
+            Some(Installation::Installed)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_that_cant_be_inspected_leaves_only_what_it_reaches_unknown() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // SAFETY: geteuid has no preconditions. Root ignores the mode below.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let project = tempfile::tempdir().unwrap();
+        let node_modules = project.path().join("node_modules");
+        write_package(&node_modules.join("sealed"), "sealed", "1.0.0");
+        write_package(&node_modules.join("open"), "open", "1.0.0");
+        let mut sealed = locked_at(1, "sealed", "1.0.0");
+        sealed.dependency_targets = BTreeMap::from([("inner".to_string(), instance(2))]);
+        let root = |id| lpm_lockfile::LockedRootResolution {
+            instance_id: Some(instance(id)),
+            ..Default::default()
+        };
+        let lockfile = lpm_lockfile::Lockfile {
+            packages: vec![
+                sealed,
+                locked_at(2, "inner", "1.0.0"),
+                locked_at(3, "open", "1.0.0"),
+                locked_at(4, "dev-only", "1.0.0"),
+            ],
+            root_resolutions: BTreeMap::from([
+                ("sealed".to_string(), root(1)),
+                ("open".to_string(), root(3)),
+                ("dev-only".to_string(), root(4)),
+            ]),
+            ..lpm_lockfile::Lockfile::new()
+        };
+        let sealed_dir = node_modules.join("sealed");
+        fs::set_permissions(&sealed_dir, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let packages = lpm_discovered_packages(project.path(), &lockfile, Reachability::Track);
+
+        fs::set_permissions(&sealed_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            packages
+                .iter()
+                .map(|package| (package.name.as_str(), package.installed))
+                .collect::<Vec<_>>(),
+            [
+                ("sealed", Some(Installation::Unknown)),
+                ("inner", Some(Installation::Unknown)),
+                ("open", Some(Installation::Installed)),
+                ("dev-only", Some(Installation::Absent)),
+            ]
         );
     }
 
@@ -1558,7 +2985,7 @@ mod tests {
             ..lpm_lockfile::Lockfile::new()
         };
 
-        let packages = lpm_discovered_packages(project.path(), &lockfile);
+        let packages = lpm_discovered_packages(project.path(), &lockfile, Reachability::Skip);
 
         assert!(
             !packages[1].platform_skipped,
@@ -1614,7 +3041,7 @@ mod tests {
             project_root: project.path().to_path_buf(),
             is_degraded: false,
             is_yarn_pnp: false,
-            packages: lpm_discovered_packages(project.path(), &lockfile),
+            packages: lpm_discovered_packages(project.path(), &lockfile, Reachability::Skip),
             lpm_lockfile: Some(Arc::new(lockfile)),
             lpm_lockfile_content: None,
             workspace_root: None,
@@ -2595,7 +4022,7 @@ packages:
             project_root: member.path().to_path_buf(),
             is_degraded: false,
             is_yarn_pnp: false,
-            packages: lpm_discovered_packages(member.path(), &member_lockfile),
+            packages: lpm_discovered_packages(member.path(), &member_lockfile, Reachability::Skip),
             lpm_lockfile: Some(Arc::new(member_lockfile)),
             lpm_lockfile_content: None,
             workspace_root: Some(WorkspaceRootDiscovery {
