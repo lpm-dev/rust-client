@@ -388,6 +388,17 @@ impl FirewallBypassRule {
     pub(crate) fn is_expired(&self, now: Timestamp) -> bool {
         self.expires_at.is_some_and(|expires_at| expires_at <= now)
     }
+
+    /// Whether `other` names this rule. The id is a short digest, so two
+    /// different rules can share one; matching every field it digests keeps
+    /// one rule from ever standing in for another.
+    pub(crate) fn is_same_rule_as(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.spec == other.spec
+            && self.scope == other.scope
+            && self.project_root == other.project_root
+            && self.covers_malware == other.covers_malware
+    }
 }
 
 /// Rules with the same scope, project, spec and malware coverage share an id,

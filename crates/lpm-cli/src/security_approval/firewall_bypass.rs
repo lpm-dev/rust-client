@@ -185,17 +185,6 @@ pub(crate) fn load_firewall_bypass_status(
     }
 }
 
-/// Whether `saved` is the rule `requested` names. The id is a short digest,
-/// so two different rules can share one; matching every field it digests
-/// keeps a request from ever standing in for another rule.
-fn same_rule(saved: &FirewallBypassRule, requested: &FirewallBypassRule) -> bool {
-    saved.id == requested.id
-        && saved.spec == requested.spec
-        && saved.scope == requested.scope
-        && saved.project_root == requested.project_root
-        && saved.covers_malware == requested.covers_malware
-}
-
 /// How a requested rule compares with the saved rule it names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FirewallBypassChange {
@@ -257,17 +246,17 @@ fn merged_rule(
 }
 
 /// Requested rules sorted, against the store as it is now, by what saving
-/// them takes. The save itself judges each rule again under the store's lock.
+/// them takes. The save judges every requested rule again under the store's
+/// lock, the unchanged ones included, so one removed or expired meanwhile
+/// comes back for approval.
 #[derive(Debug, Default)]
 pub(crate) struct FirewallBypassRequests {
     /// New or extended rules, which a person approves.
     pub(crate) needs_approval: Vec<FirewallBypassRule>,
     /// Requested rules that only narrow a saved one.
     pub(crate) narrowed: Vec<FirewallBypassRule>,
-    /// The saved rules that already match the request.
+    /// Requested rules the store already holds as asked.
     pub(crate) unchanged: Vec<FirewallBypassRule>,
-    /// How many unexpired rules the store holds.
-    pub(crate) rules_total: usize,
 }
 
 pub(crate) fn sort_firewall_bypass_requests(
@@ -275,18 +264,17 @@ pub(crate) fn sort_firewall_bypass_requests(
 ) -> Result<FirewallBypassRequests, LpmError> {
     let now = Timestamp::now();
     let existing = load_local_firewall_bypass_rules()?;
-    let mut sorted = FirewallBypassRequests {
-        rules_total: existing.iter().filter(|rule| !rule.is_expired(now)).count(),
-        ..FirewallBypassRequests::default()
-    };
+    let mut sorted = FirewallBypassRequests::default();
     for rule in rules {
         let saved = existing
             .iter()
-            .find(|saved| same_rule(saved, &rule) && !saved.is_expired(now));
-        match (firewall_bypass_change(saved, &rule), saved) {
-            (FirewallBypassChange::Unchanged, Some(saved)) => sorted.unchanged.push(saved.clone()),
-            (FirewallBypassChange::Narrowed, _) => sorted.narrowed.push(rule),
-            _ => sorted.needs_approval.push(rule),
+            .find(|saved| saved.is_same_rule_as(&rule) && !saved.is_expired(now));
+        match firewall_bypass_change(saved, &rule) {
+            FirewallBypassChange::Unchanged => sorted.unchanged.push(rule),
+            FirewallBypassChange::Narrowed => sorted.narrowed.push(rule),
+            FirewallBypassChange::New | FirewallBypassChange::Extended => {
+                sorted.needs_approval.push(rule);
+            }
         }
     }
     Ok(sorted)
@@ -317,16 +305,6 @@ pub(crate) struct FirewallBypassAdded {
     pub(crate) rules_total: usize,
 }
 
-impl FirewallBypassAdded {
-    pub(crate) fn absorb(&mut self, other: Self) {
-        self.added.extend(other.added);
-        self.extended.extend(other.extended);
-        self.narrowed.extend(other.narrowed);
-        self.unchanged.extend(other.unchanged);
-        self.rules_total = other.rules_total;
-    }
-}
-
 /// What committing a request did.
 pub(crate) enum FirewallBypassCommit {
     Saved(FirewallBypassAdded),
@@ -341,9 +319,9 @@ pub(crate) enum FirewallBypassCommit {
 /// narrows the saved rule. When any unapproved rule would by now add or extend
 /// one, the store is left as it was and those rules come back for approval,
 /// so a concurrent `remove` or a newer expiry is never undone without it.
-pub(crate) fn commit_firewall_bypass_rules(
+pub(crate) fn commit_firewall_bypass_rules<'a>(
     approved: &[FirewallBypassRule],
-    unapproved: &[FirewallBypassRule],
+    unapproved: impl IntoIterator<Item = &'a FirewallBypassRule>,
     approval_note: &str,
 ) -> Result<FirewallBypassCommit, LpmError> {
     let (commit, rules_total) = update_local_firewall_bypass_rules(|saved| {
@@ -354,11 +332,11 @@ pub(crate) fn commit_firewall_bypass_rules(
         let requested = approved
             .iter()
             .map(|rule| (rule, true))
-            .chain(unapproved.iter().map(|rule| (rule, false)));
+            .chain(unapproved.into_iter().map(|rule| (rule, false)));
         for (rule, is_approved) in requested {
             let live = saved
                 .iter()
-                .position(|saved| same_rule(saved, rule) && !saved.is_expired(now));
+                .position(|saved| saved.is_same_rule_as(rule) && !saved.is_expired(now));
             let change = firewall_bypass_change(live.map(|index| &saved[index]), rule);
             let bucket = match change {
                 FirewallBypassChange::Unchanged => {
@@ -379,7 +357,7 @@ pub(crate) fn commit_firewall_bypass_rules(
             match live {
                 Some(index) => saved[index] = merged.clone(),
                 None => {
-                    saved.retain(|existing| !same_rule(existing, rule));
+                    saved.retain(|existing| !existing.is_same_rule_as(rule));
                     saved.push(merged.clone());
                 }
             }
@@ -506,7 +484,8 @@ pub(crate) fn add_firewall_bypass_rules(
                     rules: pending.clone(),
                     ..approval
                 })?;
-                unapproved.retain(|rule| !pending.iter().any(|waiting| waiting.id == rule.id));
+                unapproved
+                    .retain(|rule| !pending.iter().any(|waiting| waiting.is_same_rule_as(rule)));
                 approved.extend(pending);
             }
         }

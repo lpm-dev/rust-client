@@ -60,12 +60,21 @@ fn stored_rule(spec: &str, extra: serde_json::Value) -> serde_json::Value {
     rule
 }
 
-/// A project root as the CLI keys rules on it: canonical, and on Windows
-/// without the `\\?\` prefix canonical paths carry there.
+/// A project root as the CLI keys rules on it: canonical, and on Windows a
+/// drive path without the `\\?\` prefix canonical paths carry there. Other
+/// verbatim paths, such as `\\?\UNC\...`, keep it, as the CLI does.
 fn cli_project_root(dir: &std::path::Path) -> String {
     let root = std::fs::canonicalize(dir).unwrap().display().to_string();
     match root.strip_prefix(r"\\?\") {
-        Some(plain) if cfg!(windows) => plain.to_string(),
+        Some(plain)
+            if cfg!(windows)
+                && matches!(
+                    plain.as_bytes(),
+                    [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic()
+                ) =>
+        {
+            plain.to_string()
+        }
         _ => root,
     }
 }

@@ -55,7 +55,7 @@ pub use approval::{
 #[cfg(test)]
 pub(crate) use firewall_bypass::add_firewall_bypass_rules;
 pub(crate) use firewall_bypass::{
-    FirewallBypassAdded, FirewallBypassApproval, FirewallBypassCommit,
+    FirewallBypassAdded, FirewallBypassApproval, FirewallBypassCommit, FirewallBypassRequests,
     approve_firewall_bypass_rules, commit_firewall_bypass_rules, firewall_bypass_file_exists,
     load_local_firewall_bypass_rules, local_firewall_bypass_inactive_reason,
     record_firewall_bypass_refusal, remove_firewall_bypass_rules, rules_kept_changing_error,
