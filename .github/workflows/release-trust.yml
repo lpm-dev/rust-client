@@ -11,7 +11,8 @@ name: Release trust
 #   Sigstore's current keys.
 # - The latest stable updates itself to the newest nightly, so a signing or
 #   packaging change on main that installed updaters would refuse fails
-#   here before a stable release carries it.
+#   here before a stable release carries it. Until the first nightly after a
+#   stable release, the stable before it updates to it instead.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -61,8 +62,13 @@ jobs:
             mkdir -p "$release"
             gh release download "v$version" --repo lpm-dev/rust-client --dir "$release" \
               --pattern SHA256SUMS.txt --pattern 'lpm-darwin-*.zip'
-            for archive in "$release"/lpm-darwin-*.zip; do
-              asset=$(basename "$archive")
+            for asset in lpm-darwin-arm64.zip lpm-darwin-x64.zip; do
+              archive="$release/$asset"
+              if [ ! -f "$archive" ]; then
+                echo "::error::v$version has no $asset"
+                failed=1
+                continue
+              fi
               (cd "$release" && awk -v asset="$asset" '$2 == asset' SHA256SUMS.txt | shasum -a 256 --check --strict)
               unpacked="$RUNNER_TEMP/unpacked/v$version/${asset%.zip}"
               mkdir -p "$unpacked"
@@ -104,13 +110,16 @@ jobs:
           restore-keys: release-trust-sigstore-1.99.1-
 
       - name: Refresh from Sigstore's live repository
-        run: >-
-          cargo test --locked -p lpm-cli --bin lpm-rs --
-          --ignored --exact
-          sigstore_verify::trust_store::tests::sigstores_live_repository_serves_the_built_in_trust_root
+        run: |
+          set -euo pipefail
+          cargo test --locked -p lpm-cli --bin lpm-rs -- --ignored --exact \
+            sigstore_verify::trust_store::tests::sigstores_live_repository_serves_the_built_in_trust_root \
+            | tee "$RUNNER_TEMP/sigstore-live.log"
+          # A renamed test would match nothing, and cargo passes an empty run.
+          grep -q '^test result: ok. 1 passed' "$RUNNER_TEMP/sigstore-live.log"
 
-  previous-stable-updates-to-nightly:
-    name: Latest stable updates itself to the newest nightly (${{ matrix.runner }})
+  previous-stable-updates-to-newest:
+    name: Latest stable updates itself to the newest release (${{ matrix.runner }})
     if: ${{ !github.event.pull_request.draft }}
     strategy:
       fail-fast: false
@@ -131,24 +140,55 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Download the newest nightly
+      - name: Download the release to update to
         env:
           ASSET: ${{ matrix.asset }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          version=$(curl -fsSL --retry 3 https://registry.npmjs.org/@lpm-registry/cli/nightly | jq -er .version)
-          release="$RUNNER_TEMP/nightly"
-          gh release download "v$version" --repo lpm-dev/rust-client --dir "$release" \
+          tags=$(curl -fsSL --retry 3 https://registry.npmjs.org/-/package/@lpm-registry/cli/dist-tags)
+          stable=$(jq -er .latest <<<"$tags")
+          nightly=$(jq -er .nightly <<<"$tags")
+          nightly_is_newer=$(python3 - "$nightly" "$stable" <<'PY'
+          import re, sys
+
+          def key(version):
+              major, minor, patch, pre = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-(.+))?", version).groups()
+              return (int(major), int(minor), int(patch), pre is None, pre or "")
+
+          print("yes" if key(sys.argv[1]) > key(sys.argv[2]) else "no")
+          PY
+          )
+          if [ "$nightly_is_newer" = yes ]; then
+            target=$nightly
+            channel=nightly
+            previous=$stable
+          else
+            # Until the next nightly, the newest one predates the latest
+            # stable, so check the update to that stable from the one before.
+            target=$stable
+            channel=stable
+            previous=$(gh release list --repo lpm-dev/rust-client --exclude-drafts --exclude-pre-releases \
+              --limit 2 --json tagName --jq '.[1].tagName')
+            previous=${previous#v}
+          fi
+          release="$RUNNER_TEMP/release"
+          gh release download "v$target" --repo lpm-dev/rust-client --dir "$release" \
             --pattern SHA256SUMS.txt --pattern SHA256SUMS.txt.sigstore --pattern "$ASSET"
-          commit=$(gh release view "v$version" --repo lpm-dev/rust-client --json targetCommitish --jq .targetCommitish)
+          gh release view "v$target" --repo lpm-dev/rust-client --json targetCommitish,publishedAt \
+            > "$RUNNER_TEMP/release.json"
           {
-            echo "NIGHTLY_VERSION=$version"
-            echo "NIGHTLY_COMMIT=$commit"
-            echo "NIGHTLY_RELEASE=$release"
+            echo "TARGET_VERSION=$target"
+            echo "TARGET_CHANNEL=$channel"
+            echo "TARGET_COMMIT=$(jq -er .targetCommitish "$RUNNER_TEMP/release.json")"
+            echo "TARGET_PUBLISHED_AT=$(jq -er .publishedAt "$RUNNER_TEMP/release.json")"
+            echo "TARGET_RELEASE=$release"
+            echo "PREVIOUS_VERSION=$previous"
           } >> "$GITHUB_ENV"
 
-      - name: Update the latest stable to it through its own updater
+      - name: Update the previous stable to it through its own updater
         run: >-
           scripts/ci/previous-stable-update-gate.sh
-          "$NIGHTLY_RELEASE" "$NIGHTLY_VERSION" "$NIGHTLY_COMMIT" nightly
+          --previous "$PREVIOUS_VERSION"
+          --published-at "$TARGET_PUBLISHED_AT"
+          "$TARGET_RELEASE" "$TARGET_VERSION" "$TARGET_COMMIT" "$TARGET_CHANNEL"

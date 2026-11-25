@@ -1,30 +1,52 @@
 #!/bin/bash
-# Updates the latest published stable LPM to a release served from this
-# machine, through that stable's own `lpm self-update`.
+# Updates a published stable LPM to a release served from this machine,
+# through that stable's own `lpm self-update`.
 #
 # Every installed copy updates with the code it shipped, and that code can't
 # change afterwards. A release whose signature, manifest or macOS bundle an
 # installed updater would refuse strands those users, so the release workflow
 # runs this on each candidate before promoting it, and the release trust
-# monitor runs it daily on the newest nightly.
+# monitor runs it daily on the newest release.
 #
 # The release directory holds the release's GitHub assets: SHA256SUMS.txt,
 # SHA256SUMS.txt.sigstore and the platform assets.
+#
+# --previous names the stable to update from; the default is npm's latest.
+# --published-at gives a published release's real publication time; an
+# unpublished candidate is served as published when Rekor recorded its
+# signature.
 
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 <release-dir> <version> <source-commit> <stable|nightly> [previous-stable-version]" >&2
+  echo "usage: $0 [--previous VERSION] [--published-at RFC3339] <release-dir> <version> <source-commit> <stable|nightly>" >&2
   exit 2
 }
 
-[ "$#" -ge 4 ] && [ "$#" -le 5 ] || usage
+previous=
+published_at=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --previous)
+      [ "$#" -ge 2 ] || usage
+      previous=$2
+      shift 2
+      ;;
+    --published-at)
+      [ "$#" -ge 2 ] || usage
+      published_at=$2
+      shift 2
+      ;;
+    --*) usage ;;
+    *) break ;;
+  esac
+done
+[ "$#" -eq 4 ] || usage
 
 release_dir=$(cd "$1" && pwd)
 version=$2
 source_commit=$3
 channel=$4
-previous=${5:-}
 repo_root=$(cd "$(dirname "$0")/../.." && pwd)
 
 # The first stable whose updater needs neither Xcode nor the Command Line
@@ -47,11 +69,9 @@ for asset in SHA256SUMS.txt SHA256SUMS.txt.sigstore; do
   fi
 done
 
-if [ -z "$previous" ]; then
-  previous=$(curl -fsSL --retry 3 https://registry.npmjs.org/@lpm-registry/cli/latest |
-    python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])')
-fi
-newer=$(python3 - "$version" "$previous" <<'PY'
+# Prints yes when the first semantic version is newer than the second.
+newer_than() {
+  python3 - "$1" "$2" <<'PY'
 import re, sys
 
 def key(version):
@@ -63,25 +83,37 @@ def key(version):
 
 print("yes" if key(sys.argv[1]) > key(sys.argv[2]) else "no")
 PY
-)
-if [ "$newer" != yes ]; then
-  echo "$version is not newer than the latest stable, $previous; nothing to update from" >&2
-  exit 0
+}
+
+if [ -z "$previous" ]; then
+  previous=$(curl -fsSL --retry 3 https://registry.npmjs.org/@lpm-registry/cli/latest |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])')
+fi
+if [ "$(newer_than "$version" "$previous")" != yes ]; then
+  echo "::error::$version is not newer than $previous, so LPM $previous has nothing to update to" >&2
+  exit 1
 fi
 
 work=$(mktemp -d)
+developer_tools="$work/developer-tools"
 server_pid=
 developer_tools_hidden=
 cleanup() {
+  local status=$?
   if [ -n "$server_pid" ]; then
     kill "$server_pid" 2>/dev/null || true
   fi
-  if [ -n "$developer_tools_hidden" ]; then
-    bash "$repo_root/scripts/ci/macos-developer-tools.sh" restore "$work/developer-tools" || true
+  if [ -n "$developer_tools_hidden" ] &&
+    ! bash "$repo_root/scripts/ci/macos-developer-tools.sh" restore "$developer_tools"; then
+    # The hidden tools are still under the work directory, so keep it.
+    echo "::error::developer tools could not be restored; they remain under $developer_tools" >&2
+    exit 1
   fi
   rm -rf "$work"
+  exit "$status"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 
 home="$work/home"
 serve="$work/serve"
@@ -90,8 +122,9 @@ cp -p "$release_dir"/* "$serve/download/$version/"
 
 # The updater checks that the release was published close to when Rekor
 # recorded its signature, and from the commit the signature names.
-integrated_time=$(python3 - "$release_dir/SHA256SUMS.txt.sigstore" <<'PY'
-import json, sys
+if [ -z "$published_at" ]; then
+  published_at=$(python3 - "$release_dir/SHA256SUMS.txt.sigstore" <<'PY'
+import datetime, json, sys
 
 def find(value):
     if isinstance(value, dict):
@@ -108,10 +141,11 @@ def find(value):
             return found
     return None
 
-print(int(find(json.load(open(sys.argv[1])))))
+integrated = int(find(json.load(open(sys.argv[1]))))
+print(datetime.datetime.fromtimestamp(integrated, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
 PY
 )
-published_at=$(python3 -c 'import datetime, sys; print(datetime.datetime.fromtimestamp(int(sys.argv[1]), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$integrated_time")
+fi
 printf '{"name":"@lpm-registry/cli","version":"%s"}\n' "$version" > "$serve/npm.json"
 printf '{"tag_name":"v%s","published_at":"%s","target_commitish":"%s"}\n' \
   "$version" "$published_at" "$source_commit" > "$serve/release/$version.json"
@@ -147,10 +181,11 @@ if [ "$actual" != "lpm $previous" ]; then
 fi
 
 if [ "$(uname -s)" = Darwin ] &&
-  [ "$(printf '%s\n%s\n' "$first_version_without_developer_tools" "$previous" | sort -V | head -n 1)" = "$first_version_without_developer_tools" ]; then
-  # Most users' Macs have neither Xcode nor the Command Line Tools.
-  bash "$repo_root/scripts/ci/macos-developer-tools.sh" hide none "$work/developer-tools"
+  [ "$(newer_than "$first_version_without_developer_tools" "$previous")" = no ]; then
+  # Most users' Macs have neither Xcode nor the Command Line Tools. Set
+  # before hiding, so a hide that fails partway is still undone.
   developer_tools_hidden=1
+  bash "$repo_root/scripts/ci/macos-developer-tools.sh" hide none "$developer_tools"
 fi
 
 echo "Updating LPM $previous to $version through its own updater"
@@ -165,7 +200,7 @@ run_isolated \
   "$lpm" self-update --channel "$channel" --refresh || update_status=$?
 
 if [ -n "$developer_tools_hidden" ]; then
-  bash "$repo_root/scripts/ci/macos-developer-tools.sh" restore "$work/developer-tools"
+  bash "$repo_root/scripts/ci/macos-developer-tools.sh" restore "$developer_tools"
   developer_tools_hidden=
 fi
 if [ "$update_status" -ne 0 ]; then
