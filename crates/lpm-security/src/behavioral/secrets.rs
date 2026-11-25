@@ -630,7 +630,7 @@ pub fn scan_content(content: &str, file_path: &str) -> Vec<SecretMatch> {
 /// Whether a file, by its name and whatever its directory, holds credentials
 /// that never belong in a published package: `.env` and `.env.<name>`
 /// files other than templates such as `.env.example` or
-/// `.env.production.example`, and the files in [`BLOCKED_FILES`]. Case is
+/// `.env.production.example`, and the files in `BLOCKED_FILES`. Case is
 /// ignored, as on a case-insensitive disk.
 pub fn is_blocked_file(filename: &str) -> bool {
     let filename = &*folded(filename);
@@ -739,7 +739,7 @@ fn blocked_file_result(file_path: &str, budget: &mut SecretScanBudget) -> Secret
 /// Scans the file `reader` reads, `size` bytes of it, as
 /// [`scan_file_content_with_budget`] scans that content, reading it a piece
 /// at a time: memory holds a piece and a line of at most
-/// [`HELD_LINE_BYTES`], whatever the file's size, a file the byte budget
+/// `HELD_LINE_BYTES`, whatever the file's size, a file the byte budget
 /// can't cover is not read, and a file whose name doesn't call for its
 /// content is read only as far as [`PRIVATE_KEY_SNIFF_BYTES`].
 pub fn scan_file_reader_with_budget(

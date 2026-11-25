@@ -2021,13 +2021,13 @@ fn is_safe_relative_path(p: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelegateShape {
     /// `node <path>` — two POSIX-shell tokens. Recognised by
-    /// [`matches_node_relative`] (non-reserved basename → Green
-    /// unconditionally) and by [`matches_delegating_identity_green`]
+    /// `matches_node_relative` (non-reserved basename → Green
+    /// unconditionally) and by `matches_delegating_identity_green`
     /// (reserved basename + identity match → Green).
     Bare,
     /// `node -e <body>` / `node --eval <body>` — three tokens where
-    /// `<body>` matches one of the [`parse_softfail_wrapper`] shapes.
-    /// Recognised by [`matches_node_eval_softfail_green`]
+    /// `<body>` matches one of the `parse_softfail_wrapper` shapes.
+    /// Recognised by `matches_node_eval_softfail_green`
     /// (non-reserved basename → Green; reserved basename → Amber).
     SoftfailWrapper,
 }
@@ -2046,8 +2046,8 @@ pub struct DelegateMatch {
 ///
 /// This is the **single source of truth** for delegate recognition.
 /// Every classifier branch that grants Green via a delegate shape
-/// ([`matches_node_relative`], [`matches_delegating_identity_green`],
-/// [`matches_node_eval_softfail_green`]) dispatches through this
+/// (`matches_node_relative`, `matches_delegating_identity_green`,
+/// `matches_node_eval_softfail_green`) dispatches through this
 /// function, then applies its specific tier rules to the returned
 /// shape and path. The script-hash binding
 /// (`lpm_security::script_hash::compute_script_hash`) and the
