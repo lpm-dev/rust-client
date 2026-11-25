@@ -22,7 +22,8 @@
 # it back afterwards. Sigstore's trust root is fetched as installed copies
 # fetch it.
 
-set -euo pipefail
+set -Eeuo pipefail
+trap 'echo "::error::$(basename "$0") failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 usage() {
   echo "usage: $0 [--previous VERSION] [--published-at RFC3339] <release-dir> <version> <source-commit> <stable|nightly>" >&2
@@ -180,21 +181,35 @@ if [ "$(uname -s)" = Darwin ]; then
       ;;
   esac
 fi
-python3 -I -u -m http.server 0 --bind 127.0.0.1 --directory "$serve" \
-  >"$work/server.log" 2>&1 &
+# The server binds its own port and writes it to a file, so nothing else can
+# take the port between choosing and binding it.
+python3 -I - "$serve" "$work/port" >"$work/server.log" 2>&1 <<'PY' &
+import functools, http.server, os, sys
+
+handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=sys.argv[1])
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+with open(sys.argv[2] + ".partial", "w") as port_file:
+    port_file.write(str(server.server_address[1]))
+os.replace(sys.argv[2] + ".partial", sys.argv[2])
+server.serve_forever()
+PY
 server_pid=$!
 port=
-for attempt in $(seq 1 50); do
-  port=$(sed -n 's/.* port \([0-9][0-9]*\) .*/\1/p' "$work/server.log" | head -n 1)
-  if [ -n "$port" ] && curl -fsS -o /dev/null "http://127.0.0.1:$port/npm.json" 2>/dev/null; then
-    break
+for attempt in $(seq 1 100); do
+  if [ -s "$work/port" ]; then
+    port=$(cat "$work/port")
+    if curl -fsS -o /dev/null "http://127.0.0.1:$port/npm.json" 2>/dev/null; then
+      break
+    fi
   fi
-  if [ "$attempt" -eq 50 ]; then
+  if [ "$attempt" -eq 100 ] || ! kill -0 "$server_pid" 2>/dev/null; then
+    echo "::error::the release server didn't start (port: ${port:-none})" >&2
     cat "$work/server.log" >&2
     exit 1
   fi
   sleep 0.1
 done
+echo "Serving v$version on 127.0.0.1:$port"
 base="http://127.0.0.1:$port"
 
 run_isolated() {

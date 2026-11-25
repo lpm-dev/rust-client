@@ -110,6 +110,9 @@ jobs:
           key: release-trust-sigstore-1.99.1-${{ hashFiles('Cargo.lock') }}
           restore-keys: release-trust-sigstore-1.99.1-
 
+      - name: Install Linux build dependencies
+        run: bash scripts/ci/install-apt-packages.sh pkg-config libdbus-1-dev
+
       - name: Refresh from Sigstore's live repository
         run: |
           set -euo pipefail
