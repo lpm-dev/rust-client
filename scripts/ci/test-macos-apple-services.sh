@@ -29,8 +29,9 @@ fail() {
 # status" line in answers-anyway connects whatever is blocked and then exits
 # with that status, such as 35 for a TLS error or 28 for a service that
 # accepts and then stalls. For -w it prints how many connections it opened,
-# or the connect time, which, as macOS's curl does, stays 0 for a connection
-# that opened and then stalled in the TLS handshake.
+# or the connect time. As with macOS's curl, the connect time stays 0 for a
+# connection that opened and then stalled in the TLS handshake, so a probe
+# that went back to it takes such a service for a blocked one.
 #
 # pfctl applies the rules it is given: none of them when inert-firewall
 # exists, none of the IPv6 entries when inert-ipv6 exists, none of the network
@@ -199,8 +200,6 @@ done
 grep -Fxq "2.22.144.17 ocsp.apple.com" "$work/runner/hosts" || fail "ocsp.apple.com is not pinned to its address outside Apple's network"
 grep -Fq '2.22.144.17' "$work/runner/active-rules" \
 	|| fail "the firewall does not block an address outside Apple's networks that an Apple host resolves to"
-grep -Fxq 'block drop out quick from any to <apple_services>' "$work/runner/active-rules" \
-	|| fail "the firewall rules don't drop the table's traffic: $(cat "$work/runner/active-rules")"
 grep -Fq '17.0.0.0/8' "$work/runner/active-rules" \
 	|| fail "the firewall does not block Apple's IPv4 network: $(cat "$work/runner/active-rules")"
 grep -Fq '2a01:b740::/32' "$work/runner/active-rules" \

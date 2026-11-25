@@ -2419,7 +2419,7 @@ fn check_staged_asset<T>(
 
 /// Runs the staged app's executable to check its version. A failed probe names
 /// the installer only when the bundle is still the one that was validated; a
-/// bundle that changed afterwards is refused without it.
+/// bundle that changed afterwards is refused as that, without it.
 #[cfg(target_os = "macos")]
 fn probe_staged_macos_bundle(
     staged: &StagedMacOSBundle,
@@ -2431,11 +2431,20 @@ fn probe_staged_macos_bundle(
     };
     let still_validated = validate_macos_app_bundle(&staged.app_bundle)
         .is_ok_and(|fingerprint| fingerprint == staged.fingerprint);
-    Err(if still_validated {
-        with_installer_recovery(error, channel, StandaloneRefusal::Compatibility)
-    } else {
-        error
-    })
+    if still_validated {
+        return Err(with_installer_recovery(
+            error,
+            channel,
+            StandaloneRefusal::Compatibility,
+        ));
+    }
+    let probe_failure = match error {
+        LpmError::SelfUpdate(reason) => reason,
+        other => other.to_string(),
+    };
+    Err(LpmError::SelfUpdate(format!(
+        "staged macOS app bundle changed after it was validated ({probe_failure})"
+    )))
 }
 
 /// Download and replace the binary in-place for standalone installations.
@@ -4265,29 +4274,43 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    #[ignore = "requires signed release archives in LPM_TEST_MACOS_RELEASE_ARCHIVES"]
+    #[ignore = "requires two signed release archives in LPM_TEST_MACOS_RELEASE_ARCHIVES"]
     fn signed_macos_release_probe_names_the_installer_only_for_the_validated_bundle() {
         let archives = std::env::var_os("LPM_TEST_MACOS_RELEASE_ARCHIVES")
             .expect("set LPM_TEST_MACOS_RELEASE_ARCHIVES to signed release ZIP paths");
-        let archive = std::env::split_paths(&archives)
-            .next()
-            .expect("at least one signed release archive");
+        let archives = std::env::split_paths(&archives).collect::<Vec<_>>();
+        let [first, second, ..] = archives.as_slice() else {
+            panic!("LPM_TEST_MACOS_RELEASE_ARCHIVES must name two signed release archives");
+        };
         let parent = tempfile::tempdir().unwrap();
-        let staged = stage_macos_bundle(&archive, parent.path()).unwrap();
+        let staged = stage_macos_bundle(first, parent.path()).unwrap();
 
         let error = probe_staged_macos_bundle(&staged, "0.0.0", ReleaseChannel::Stable)
             .expect_err("a release reports its own version, not 0.0.0");
         assert!(
-            matches!(error, LpmError::StandaloneSelfUpdate { .. }),
+            matches!(&error, LpmError::StandaloneSelfUpdate { reason, .. } if reason.contains("exact version 0.0.0")),
             "a failed probe of the validated bundle must name the installer: {error:?}"
+        );
+
+        // Another genuine release validates too, but isn't the bundle that was.
+        let other_parent = tempfile::tempdir().unwrap();
+        let other = stage_macos_bundle(second, other_parent.path()).unwrap();
+        assert_ne!(other.fingerprint, staged.fingerprint);
+        std::fs::remove_dir_all(&staged.app_bundle).unwrap();
+        std::fs::rename(&other.app_bundle, &staged.app_bundle).unwrap();
+        let error = probe_staged_macos_bundle(&staged, "0.0.0", ReleaseChannel::Stable)
+            .expect_err("a release reports its own version, not 0.0.0");
+        assert!(
+            matches!(&error, LpmError::SelfUpdate(reason) if reason.contains("changed after it was validated")),
+            "another validly signed bundle must be refused as a changed bundle, without the installer: {error:?}"
         );
 
         std::fs::write(&staged.executable, b"#!/bin/sh\nexit 1\n").unwrap();
         let error = probe_staged_macos_bundle(&staged, "0.0.0", ReleaseChannel::Stable)
             .expect_err("a replaced executable must not pass the probe");
         assert!(
-            !matches!(error, LpmError::StandaloneSelfUpdate { .. }),
-            "a bundle changed after validation must be refused without the installer: {error:?}"
+            matches!(&error, LpmError::SelfUpdate(reason) if reason.contains("changed after it was validated")),
+            "a bundle changed after validation must be refused as that, without the installer: {error:?}"
         );
     }
 
@@ -5418,11 +5441,16 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
 
     /// Serves the published v0.84.0 release, whose manifest and Sigstore
     /// bundle verify, with `asset` as every platform's release asset. The
-    /// release ships no asset for Windows on ARM64 or musl ARM64.
-    #[cfg(not(any(
-        all(windows, target_arch = "aarch64"),
-        all(target_os = "linux", target_env = "musl", target_arch = "aarch64")
-    )))]
+    /// release ships assets only for the targets these tests run on.
+    #[cfg(any(
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64", not(target_env = "musl")),
+        all(windows, target_arch = "x86_64")
+    ))]
     async fn mount_real_v0_84_0_release(server: &wiremock::MockServer, asset: &'static [u8]) {
         let (manifest, bundle) = real_v0_84_0_release_assets();
         let routes = [
@@ -5457,10 +5485,15 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
             .await;
     }
 
-    #[cfg(not(any(
-        all(windows, target_arch = "aarch64"),
-        all(target_os = "linux", target_env = "musl", target_arch = "aarch64")
-    )))]
+    #[cfg(any(
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64", not(target_env = "musl")),
+        all(windows, target_arch = "x86_64")
+    ))]
     #[tokio::test]
     async fn release_asset_that_differs_from_its_signed_digest_is_a_release_verification_failure() {
         let server = wiremock::MockServer::start().await;
@@ -5512,10 +5545,15 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
 
     /// Staging that fails on this machine, after the release verified, isn't
     /// the release's doing.
-    #[cfg(not(any(
-        all(windows, target_arch = "aarch64"),
-        all(target_os = "linux", target_env = "musl", target_arch = "aarch64")
-    )))]
+    #[cfg(any(
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64", not(target_env = "musl")),
+        all(windows, target_arch = "x86_64")
+    ))]
     #[tokio::test]
     async fn staging_that_fails_on_this_machine_is_a_local_failure() {
         let server = wiremock::MockServer::start().await;
