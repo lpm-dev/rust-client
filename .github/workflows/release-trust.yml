@@ -1,0 +1,154 @@
+name: Release trust
+
+# Installed copies of LPM check every update with code they can never
+# change, against keys and records that Apple and Sigstore keep changing.
+# These checks watch the published releases from the outside every day:
+#
+# - Apple still vouches for the current stable and nightly macOS apps: the
+#   notarization ticket stands and the Developer ID certificate isn't
+#   revoked. Clients check the stapled ticket offline and can't see either.
+# - Sigstore still serves the trust root built into LPM, so releases ship
+#   Sigstore's current keys.
+# - The latest stable updates itself to the newest nightly, so a signing or
+#   packaging change on main that installed updaters would refuse fails
+#   here before a stable release carries it.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'crates/lpm-cli/assets/sigstore_*'
+      - 'crates/lpm-cli/src/sigstore_verify/**'
+      - 'scripts/ci/previous-stable-update-gate.sh'
+      - 'scripts/ci/with-apple-service-retry.sh'
+      - '.github/workflows/release-trust.yml'
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-trust-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+
+jobs:
+  apple:
+    name: Apple vouches for the current macOS apps
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check each current release with Apple
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tags=$(curl -fsSL --retry 3 https://registry.npmjs.org/-/package/@lpm-registry/cli/dist-tags)
+          failed=0
+          for channel in latest nightly; do
+            version=$(jq -er --arg channel "$channel" '.[$channel]' <<<"$tags")
+            release="$RUNNER_TEMP/v$version"
+            mkdir -p "$release"
+            gh release download "v$version" --repo lpm-dev/rust-client --dir "$release" \
+              --pattern SHA256SUMS.txt --pattern 'lpm-darwin-*.zip'
+            for archive in "$release"/lpm-darwin-*.zip; do
+              asset=$(basename "$archive")
+              (cd "$release" && awk -v asset="$asset" '$2 == asset' SHA256SUMS.txt | shasum -a 256 --check --strict)
+              unpacked="$RUNNER_TEMP/unpacked/v$version/${asset%.zip}"
+              mkdir -p "$unpacked"
+              ditto -x -k "$archive" "$unpacked"
+              app="$unpacked/LPM CLI.app"
+              echo "::group::v$version $asset"
+              if /usr/bin/codesign --verify --strict --verbose=2 "$app" &&
+                scripts/ci/with-apple-service-retry.sh stapler validate "$app" &&
+                /usr/sbin/spctl --assess --type execute --verbose=4 "$app"; then
+                echo "Apple vouches for v$version $asset"
+              else
+                echo "::error::Apple no longer vouches for v$version $asset. Installed copies that update to it, and the installer, will refuse it."
+                failed=1
+              fi
+              echo "::endgroup::"
+            done
+          done
+          exit "$failed"
+
+  sigstore:
+    name: Sigstore serves the trust root built into LPM
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: '1.99.1'
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-trust-sigstore-1.99.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: release-trust-sigstore-1.99.1-
+
+      - name: Refresh from Sigstore's live repository
+        run: >-
+          cargo test --locked -p lpm-cli --bin lpm-rs --
+          --ignored --exact
+          sigstore_verify::trust_store::tests::sigstores_live_repository_serves_the_built_in_trust_root
+
+  previous-stable-updates-to-nightly:
+    name: Latest stable updates itself to the newest nightly (${{ matrix.runner }})
+    if: ${{ !github.event.pull_request.draft }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            asset: lpm-linux-x64
+          - runner: ubuntu-24.04-arm
+            asset: lpm-linux-arm64
+          - runner: macos-15
+            asset: lpm-darwin-arm64.zip
+          - runner: macos-15-intel
+            asset: lpm-darwin-x64.zip
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the newest nightly
+        env:
+          ASSET: ${{ matrix.asset }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(curl -fsSL --retry 3 https://registry.npmjs.org/@lpm-registry/cli/nightly | jq -er .version)
+          release="$RUNNER_TEMP/nightly"
+          gh release download "v$version" --repo lpm-dev/rust-client --dir "$release" \
+            --pattern SHA256SUMS.txt --pattern SHA256SUMS.txt.sigstore --pattern "$ASSET"
+          commit=$(gh release view "v$version" --repo lpm-dev/rust-client --json targetCommitish --jq .targetCommitish)
+          {
+            echo "NIGHTLY_VERSION=$version"
+            echo "NIGHTLY_COMMIT=$commit"
+            echo "NIGHTLY_RELEASE=$release"
+          } >> "$GITHUB_ENV"
+
+      - name: Update the latest stable to it through its own updater
+        run: >-
+          scripts/ci/previous-stable-update-gate.sh
+          "$NIGHTLY_RELEASE" "$NIGHTLY_VERSION" "$NIGHTLY_COMMIT" nightly

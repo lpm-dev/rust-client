@@ -1791,7 +1791,7 @@ jobs:
       needs.release-metadata.outputs.should_release == 'true' &&
       (needs.release-metadata.outputs.mode == 'candidate' || needs.release-metadata.outputs.mode == 'full')
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       actions: read
       contents: read
@@ -1966,6 +1966,17 @@ jobs:
       - name: Restore developer tools
         if: always() && matrix.platform == 'macos'
         run: bash scripts/ci/macos-developer-tools.sh restore "$RUNNER_TEMP/developer-tools"
+
+      # Installed copies update with the updater they shipped. If the latest
+      # stable's updater refuses this release, users on it are stranded, so
+      # the release must not be published.
+      - name: Update the latest stable to this release through its own updater
+        env:
+          RELEASE_CHANNEL: ${{ needs.release-metadata.outputs.channel }}
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+        run: >-
+          scripts/ci/previous-stable-update-gate.sh
+          staged-release "$RELEASE_VERSION" "$GITHUB_SHA" "$RELEASE_CHANNEL"
 
   seal-candidate:
     name: Seal stable release candidate
