@@ -51,6 +51,10 @@ pub(crate) struct LinkedSkillRecord {
     pub(crate) permission: String,
     /// How specifically an allowing entry had to name the skill to link it.
     pub(crate) requires: Naming,
+    /// The registry whose review approved an LPM.dev package's copy. The
+    /// copy stays only while LPM uses that registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reviewed_by: Option<String>,
     pub(crate) links: Vec<LinkRecord>,
     /// Target entries, project-relative, that something else held or that
     /// couldn't be made; reconciling tries them again once they're free.
@@ -91,6 +95,10 @@ pub(crate) struct LinkState {
     /// Target directories LPM created, which it removes once empty.
     #[serde(default)]
     pub(crate) created_directories: Vec<String>,
+    /// The workspace members, project-relative, whose materialized LPM.dev
+    /// skills the links follow besides the project's own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) members: Vec<String>,
 }
 
 impl LinkState {
@@ -278,6 +286,7 @@ fn state_is_sound(state: &LinkState) -> bool {
     }) && state
         .created_directories
         .iter()
+        .chain(&state.members)
         .all(|directory| super::policy::normalize_relative_dir(directory).is_ok())
 }
 
@@ -342,6 +351,7 @@ mod tests {
             digest: "sha256:00".into(),
             permission: "broad".into(),
             requires: Naming::Package,
+            reviewed_by: None,
             links: vec![LinkRecord {
                 path: path.into(),
                 kind: LinkKind::Link,

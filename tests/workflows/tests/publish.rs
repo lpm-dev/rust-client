@@ -4491,6 +4491,80 @@ async fn publish_ships_a_skill_with_a_warning_ordinary_code_matches_and_reports_
 }
 
 #[tokio::test]
+async fn publish_to_lpm_dev_names_the_skill_directories_review_will_not_approve_once() {
+    let document = |name: &str| {
+        format!(
+            "---\nname: {name}\ndescription: Guidance for the {name} workflow.\n---\n\nFollow the steps.\n"
+        )
+    };
+    let notes = "Keep each step short and check its output.\n".repeat(3_200);
+    let size = document("guide").len() + notes.len();
+    let unreviewed = format!(
+        "skills/guide/: holds {size} bytes, more than the 128 KiB LPM.dev reviews in a skill directory, so installs from LPM.dev won't link it"
+    );
+    let stale = "Agent Skills haven't changed since v0.9.0 - consider reviewing them for accuracy";
+    let mock = MockRegistry::start().await;
+    let broken = "skills/broken/SKILL.md: name `other` must match its directory `broken`; LPM.dev review won't approve this skill directory as it is";
+    mock.with_publish_endpoint_warnings(&[
+        unreviewed.clone(),
+        broken.to_string(),
+        stale.to_string(),
+    ])
+    .await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    let project = authored_skills_project("@lpm.dev/testuser.directory-skills");
+    project.write_file("skills/guide/SKILL.md", &document("guide"));
+    project.write_file("skills/guide/references/notes.md", &notes);
+    project.write_file("skills/broken/SKILL.md", &document("other"));
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "--json",
+            "publish",
+            "--yes",
+            "--token",
+            "test-token-123",
+            "--lpm",
+        ])
+        .output()
+        .expect("run publish with skill directories");
+
+    assert!(
+        output.status.success(),
+        "publish must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope = parse_json_output(&output.stdout);
+    let warnings: Vec<&str> = envelope["results"][0]["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{envelope}"))
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    for expected in [unreviewed.as_str(), broken] {
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|warning| **warning == expected)
+                .count(),
+            1,
+            "{warnings:?}"
+        );
+    }
+    assert!(warnings.contains(&stale), "{warnings:?}");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["publish", "--yes", "--token", "test-token-123", "--lpm"])
+        .output()
+        .expect("run publish with skill directories");
+    let shown = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{shown}");
+    assert_eq!(shown.matches("skills/guide/: holds").count(), 1, "{shown}");
+    assert!(shown.contains(stale), "{shown}");
+}
+
+#[tokio::test]
 async fn publish_rewrites_catalog_dependency_in_uploaded_tarball() {
     let mock = MockRegistry::start().await;
     mock.with_publish_endpoint().await;

@@ -4501,6 +4501,7 @@ dependencies = [
  "lpm-runtime",
  "lpm-sandbox",
  "lpm-security",
+ "lpm-skill",
  "lpm-store",
  "lpm-tunnel",
  "lpm-vault",

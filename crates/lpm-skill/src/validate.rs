@@ -61,6 +61,24 @@ pub struct LocatedSecurityIssue {
 }
 
 impl LocatedSecurityIssue {
+    /// The issue as one line about the skill directory `name`, whose files
+    /// its path is relative to, saying it's blocked when its severity keeps
+    /// the skill from linking. The CLI and the registry word it alike.
+    pub fn directory_message(&self, name: &str) -> String {
+        format!(
+            "skills/{name}/{}:{}: {}{} pattern `{}`",
+            self.path,
+            self.issue.line_number,
+            if self.issue.severity == crate::SkillSecuritySeverity::Block {
+                "blocked "
+            } else {
+                ""
+            },
+            self.issue.category,
+            self.issue.rule_id
+        )
+    }
+
     /// The issue as one line, saying it's blocked when it keeps
     /// `lpm-skills/` files from publishing.
     pub fn message(&self) -> String {

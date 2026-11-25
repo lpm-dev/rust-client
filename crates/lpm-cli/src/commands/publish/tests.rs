@@ -364,6 +364,7 @@ fn local_and_published_skill_digests_use_frontmatter_names() {
         content: None,
         raw_content: Some(raw_content.clone()),
         size_bytes: Some(raw_content.len() as u64),
+        warning: None,
     }];
 
     assert_eq!(

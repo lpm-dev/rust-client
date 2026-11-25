@@ -75,6 +75,7 @@ pub(crate) fn run() -> Result<()> {
     // first, which skips both the lpm.lock read and the SHA-256 pass
     // when the manifest/lockfile mtimes are unchanged.
     if let Some(fast_lane) = install_state::argv_qualifies_for_fast_lane() {
+        commands::skills::reviews::use_registry_from_environment();
         let timeline_enabled =
             std::env::var_os("LPM_INSTALL_TIMELINE_DIR").is_some_and(|value| !value.is_empty());
         let provenance_env_set =
@@ -439,6 +440,7 @@ async fn async_main(cli: Cli) -> Result<()> {
     let session_manager = auth_storage_notice::attach(session_manager, cli.json);
     let session = std::sync::Arc::new(session_manager);
 
+    commands::skills::reviews::use_registry(&session_registry_url);
     let mut client = lpm_registry::RegistryClient::new()
         .with_base_url(session_registry_url.to_string())
         .with_insecure(cli.insecure);
@@ -1424,9 +1426,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             let cwd = package_root_for(&invocation_dir, cli.json);
             let path = path
                 .map(|path| project_relative_path(&invocation_dir, &cwd, std::path::Path::new(&path)));
-            let config = commands::config::GlobalConfig::load_checked()?;
-            let no_skills = !lpm_skills_config::LpmSkillsPreference::from_cli(skills, no_skills)
-                .resolve(&config)?;
+            let skills = lpm_skills_config::LpmSkillsPreference::from_cli(skills, no_skills);
             commands::add::run(
                 &client,
                 &cwd,
@@ -1437,7 +1437,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 force,
                 dry_run,
                 no_install_deps,
-                no_skills,
+                skills,
                 no_engine_strict,
                 &pm,
                 alias.as_deref(),

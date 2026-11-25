@@ -544,6 +544,26 @@ pub fn lpm_published_tarball(requests: &[Request]) -> Vec<u8> {
         .clone()
 }
 
+/// The skills answer for a package with none published, naming the package
+/// and version it was asked about as the registry does; a request without
+/// a version gets `1.0.0` as its latest.
+struct NoPublishedSkillsResponder;
+
+impl Respond for NoPublishedSkillsResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let query = request
+            .url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": query.get("name").map_or("", |value| value.as_ref()),
+            "version": query.get("version").map_or("1.0.0", |value| value.as_ref()),
+            "available": false,
+            "skills": [],
+        }))
+    }
+}
+
 struct PublishPreflightResponder;
 
 impl Respond for PublishPreflightResponder {
@@ -755,11 +775,7 @@ impl MockRegistry {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/registry/skills"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "name": "fixture.package",
-                "available": false,
-                "skills": [],
-            })))
+            .respond_with(NoPublishedSkillsResponder)
             .with_priority(u8::MAX)
             .mount(&server)
             .await;
@@ -818,11 +834,22 @@ impl MockRegistry {
         name: &str,
         response: serde_json::Value,
     ) -> &Self {
+        self.with_package_skills_response_fetched(name, response, 1)
+            .await
+    }
+
+    /// [`Self::with_package_skills_response`], fetched exactly `times` times.
+    pub async fn with_package_skills_response_fetched(
+        &self,
+        name: &str,
+        response: serde_json::Value,
+        times: u64,
+    ) -> &Self {
         Mock::given(method("GET"))
             .and(path("/api/registry/skills"))
             .and(query_param("name", name))
             .respond_with(ResponseTemplate::new(200).set_body_json(response))
-            .expect(1)
+            .expect(times)
             .mount(self.server())
             .await;
         self
@@ -835,6 +862,7 @@ impl MockRegistry {
             .and(query_param("name", name))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "name": name,
+                "version": "1.0.0",
                 "available": true,
                 "skills": skills,
             })))
@@ -3847,6 +3875,20 @@ impl MockRegistry {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
                 "message": "Package published"
+            })))
+            .mount(self.server())
+            .await;
+        self
+    }
+
+    /// Mount a publish endpoint that accepts PUT and answers with `warnings`.
+    pub async fn with_publish_endpoint_warnings(&self, warnings: &[String]) -> &Self {
+        Mock::given(method("PUT"))
+            .and(path_regex("/api/registry/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "message": "Package published",
+                "warnings": warnings,
             })))
             .mount(self.server())
             .await;

@@ -2887,6 +2887,10 @@ struct LockedRemoveResult {
     /// The skill directory left in place because the package is still a
     /// dependency.
     kept_skills: Option<String>,
+    /// Whether the removed source recorded LPM.dev skills, so the links
+    /// agents see need reconciling, whether or not their set was still in
+    /// `.lpm/skills`.
+    removed_package_skills: bool,
 }
 
 impl LockedRemoveResult {
@@ -2898,6 +2902,7 @@ impl LockedRemoveResult {
             dependencies_removed: Vec::new(),
             cleaned_directories: 0,
             kept_skills: None,
+            removed_package_skills: false,
         }
     }
 }
@@ -2919,7 +2924,20 @@ pub async fn run(project_dir: &Path, package: &str, json_output: bool) -> Result
         run_locked(project_dir, package),
     )
     .await?;
-    render_result(start, package, json_output, result)
+    let dependency_skills = result.removed_package_skills.then(|| {
+        crate::commands::install::reconcile_dependency_skills(
+            project_dir,
+            crate::lpm_skills_config::LpmSkillsPreference::Config,
+            crate::commands::install::InstallOmitPolicy::default(),
+        )
+    });
+    render_result(
+        start,
+        package,
+        json_output,
+        result,
+        dependency_skills.as_ref(),
+    )
 }
 
 async fn run_locked(project_dir: &Path, package: &str) -> Result<LockedRemoveResult, LpmError> {
@@ -3105,6 +3123,7 @@ async fn run_locked(project_dir: &Path, package: &str) -> Result<LockedRemoveRes
         )?);
     }
 
+    let removed_package_skills = skill_plan.is_some();
     if let Some(skill_plan) = skill_plan {
         if let Some(directory) = skill_plan.directory {
             verify_skill_directory(&directory)?;
@@ -3191,6 +3210,7 @@ async fn run_locked(project_dir: &Path, package: &str) -> Result<LockedRemoveRes
         dependencies_removed,
         cleaned_directories,
         kept_skills,
+        removed_package_skills,
     })
 }
 
@@ -3199,6 +3219,7 @@ fn render_result(
     package: &str,
     json_output: bool,
     result: LockedRemoveResult,
+    dependency_skills: Option<&crate::dependency_skills::ReconcileReport>,
 ) -> Result<(), LpmError> {
     let LockedRemoveResult {
         removed,
@@ -3207,27 +3228,34 @@ fn render_result(
         dependencies_removed,
         cleaned_directories,
         kept_skills,
+        removed_package_skills: _,
     } = result;
     if json_output {
+        let mut output = serde_json::to_value(RemoveResult {
+            success: true,
+            package,
+            removed: &removed,
+            preserved: &preserved,
+            originals_elsewhere: &originals_elsewhere,
+            dependencies_removed: &dependencies_removed,
+            kept_skills: kept_skills.as_deref(),
+        })
+        .map_err(|error| {
+            LpmError::Registry(format!("failed to serialize remove output: {error}"))
+        })?;
+        if let Some(reconciled) = dependency_skills {
+            crate::commands::install::attach_dependency_skills(&mut output, reconciled);
+        }
         let stdout = std::io::stdout();
         let mut stdout = stdout.lock();
-        serde_json::to_writer_pretty(
-            &mut stdout,
-            &RemoveResult {
-                success: true,
-                package,
-                removed: &removed,
-                preserved: &preserved,
-                originals_elsewhere: &originals_elsewhere,
-                dependencies_removed: &dependencies_removed,
-                kept_skills: kept_skills.as_deref(),
-            },
-        )
-        .map_err(|error| {
+        serde_json::to_writer_pretty(&mut stdout, &output).map_err(|error| {
             LpmError::Registry(format!("failed to serialize remove output: {error}"))
         })?;
         stdout.write_all(b"\n").map_err(LpmError::Io)?;
         return Ok(());
+    }
+    if let Some(reconciled) = dependency_skills {
+        crate::dependency_skills::print_report(reconciled);
     }
 
     if removed.is_empty()

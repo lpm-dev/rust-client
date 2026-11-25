@@ -1,15 +1,32 @@
 use lpm_common::{LpmError, PackageName};
-use lpm_registry::{Skill, SkillsResponse};
+use lpm_registry::{Skill, SkillDirectory, SkillsResponse};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-pub(super) const MANIFEST_FILE: &str = ".lpm-package-skills.json";
+pub(crate) const MANIFEST_FILE: &str = ".lpm-package-skills.json";
 pub(super) const MANIFEST_VERSION: u32 = 1;
 pub(super) const MAX_MANIFEST_SIZE: u64 = 64 * 1024;
 const MAX_MATERIALIZED_SKILL_SIZE: u64 = 1024 * 1024;
+
+/// How a materialized set came into a project.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SetOrigin {
+    /// An install fetched it for a dependency.
+    #[default]
+    Dependency,
+    /// `lpm skills add` delivered it without the package.
+    Added,
+}
+
+impl SetOrigin {
+    fn is_dependency(&self) -> bool {
+        *self == Self::Dependency
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct PackageSkillsManifest {
@@ -17,6 +34,27 @@ pub(super) struct PackageSkillsManifest {
     pub(super) package: String,
     pub(super) version: Option<String>,
     pub(super) skills: BTreeMap<String, String>,
+    /// The `skills/<name>/` directories of the version that review
+    /// approved, by name, with the digest of the approved files.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) directories: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "SetOrigin::is_dependency")]
+    pub(super) origin: SetOrigin,
+}
+
+/// One package's reviewed skills as an install materialized them, with no
+/// local changes.
+#[derive(Debug, Clone)]
+pub(crate) struct MaterializedSet {
+    /// `owner.package`.
+    pub(crate) package: String,
+    pub(crate) version: Option<String>,
+    /// Each flat skill's name and document.
+    pub(crate) skills: Vec<(String, String)>,
+    /// The approved `skills/<name>/` directories, by name, with the digest
+    /// of their files.
+    pub(crate) directories: BTreeMap<String, String>,
+    pub(crate) origin: SetOrigin,
 }
 
 pub(super) enum PackageManifestStatus {
@@ -35,11 +73,15 @@ pub(crate) fn materialize(
     package: &str,
     version: Option<&str>,
     skills: &[Skill],
+    directories: &[SkillDirectory],
 ) -> Result<PackageSkillsResult, LpmError> {
     let _lock = acquire_mutation_lock(project_dir)?;
     let parsed = PackageName::parse(package)?;
     let package = parsed.short();
     let entries = validated_entries(skills)?;
+    let directories_answered = directories;
+    let directories = validated_directories(directories)?;
+    let directory_count = directories.len();
     let root = project_dir.join(".lpm").join("skills");
     super::path_security::ensure_contained_directory(project_dir, &root, "package skill storage")?;
     let target = root.join(&package);
@@ -55,7 +97,10 @@ pub(crate) fn materialize(
         Err(error) => return Err(LpmError::Io(error)),
     };
 
-    if had_previous && materialized_directory_manifest(&target, &package).is_none() {
+    let previous = had_previous
+        .then(|| materialized_directory_manifest(&target, &package))
+        .flatten();
+    if had_previous && previous.is_none() {
         return Err(LpmError::Registry(format!(
             "package skills contain local changes or an invalid manifest: {}. Back up and move this directory before retrying",
             target.display()
@@ -79,7 +124,27 @@ pub(crate) fn materialize(
         package,
         version: version.map(str::to_string),
         skills: manifest_skills,
+        directories,
+        origin: previous.map_or_else(SetOrigin::default, |previous| previous.origin),
     };
+    let record = version.map(|version| {
+        let approvals = super::reviews::Approvals {
+            skills: manifest.skills.clone(),
+            directories: manifest.directories.clone(),
+            skill_warnings: entries
+                .iter()
+                .filter_map(|entry| {
+                    let issues = entry.warning?;
+                    Some((
+                        entry.name.to_string(),
+                        super::reviews::recorded_warning(issues),
+                    ))
+                })
+                .collect(),
+            directory_warnings: directory_warnings(directories_answered),
+        };
+        (manifest.package.clone(), version.to_string(), approvals)
+    });
     let mut manifest_content = serde_json::to_vec_pretty(&manifest).map_err(|error| {
         LpmError::Registry(format!(
             "failed to serialize package skill manifest: {error}"
@@ -109,11 +174,37 @@ pub(crate) fn materialize(
         let _ = std::fs::remove_dir_all(&staging_path);
         return Err(LpmError::Io(error));
     }
+    if let Some((package, version, approvals)) = record {
+        super::reviews::write(&package, &version, approvals)?;
+    }
 
     Ok(PackageSkillsResult {
-        installed: entries.len(),
+        installed: entries.len() + directory_count,
         directory: target,
     })
+}
+
+/// Marks the set of `package` (`owner.package`) materialized in
+/// `project_dir` as one `lpm skills add` delivered, so it links for agents
+/// although the project doesn't install the package.
+pub(crate) fn mark_added(project_dir: &Path, package: &str) -> Result<(), LpmError> {
+    let _lock = acquire_mutation_lock(project_dir)?;
+    let directory = project_dir.join(".lpm").join("skills").join(package);
+    let Some(mut manifest) = materialized_directory_manifest(&directory, package) else {
+        return Ok(());
+    };
+    if manifest.origin == SetOrigin::Added {
+        return Ok(());
+    }
+    manifest.origin = SetOrigin::Added;
+    let mut content = serde_json::to_vec_pretty(&manifest).map_err(|error| {
+        LpmError::Registry(format!(
+            "failed to serialize package skill manifest: {error}"
+        ))
+    })?;
+    content.push(b'\n');
+    lpm_common::write_file_atomic(&directory.join(MANIFEST_FILE), content)?;
+    Ok(())
 }
 
 /// Why a registry response offers no skills for a version that has some.
@@ -146,7 +237,9 @@ impl SkillsUnavailable {
 }
 
 pub(crate) fn unavailable_reason(response: &SkillsResponse) -> Option<SkillsUnavailable> {
-    let names_skills = response.skills_count.unwrap_or(0) > 0 || !response.skills.is_empty();
+    let names_skills = response.skills_count.unwrap_or(0) > 0
+        || !response.skills.is_empty()
+        || !response.skill_directories.is_empty();
     match response.skills_status.as_deref() {
         Some("pending" | "processing") => Some(SkillsUnavailable::UnderReview),
         Some("rejected") => Some(SkillsUnavailable::Rejected),
@@ -168,8 +261,84 @@ pub(crate) fn validate_response(response: &SkillsResponse) -> Result<(), LpmErro
     validate(&response.skills)
 }
 
+/// Refuses `response` unless it describes `package` (`owner.package`) and,
+/// when one was asked for, `version`, and names the version it describes:
+/// a review record is kept for exactly the release the answer was about.
+pub(crate) fn answers_for(
+    response: &SkillsResponse,
+    package: &str,
+    version: Option<&str>,
+) -> Result<(), LpmError> {
+    let named = response
+        .name
+        .strip_prefix("@lpm.dev/")
+        .unwrap_or(&response.name);
+    let answered = response.version.as_deref();
+    if named != package || answered.is_none() || (version.is_some() && answered != version) {
+        return Err(LpmError::Registry(format!(
+            "the registry answered for {}@{} when asked about {package}@{}",
+            response.name,
+            answered.unwrap_or("an unnamed version"),
+            version.unwrap_or("its latest version")
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate(skills: &[Skill]) -> Result<(), LpmError> {
     validated_entries(skills).map(|_| ())
+}
+
+/// The reviewed skill directories a registry returned, by name, refusing a
+/// name agents couldn't load or a digest LPM doesn't compute.
+fn validated_directories(
+    directories: &[SkillDirectory],
+) -> Result<BTreeMap<String, String>, LpmError> {
+    let mut validated = BTreeMap::new();
+    for directory in directories {
+        if !lpm_skill::is_skill_name(&directory.name) || !is_files_digest(&directory.digest) {
+            return Err(LpmError::Registry(format!(
+                "registry returned an invalid reviewed skill directory: {}",
+                directory.name
+            )));
+        }
+        if validated
+            .insert(directory.name.clone(), directory.digest.clone())
+            .is_some()
+        {
+            return Err(LpmError::Registry(format!(
+                "registry returned duplicate reviewed skill directory: {}",
+                directory.name
+            )));
+        }
+    }
+    Ok(validated)
+}
+
+/// The reviewed directories a registry served with a warning, by name, with
+/// the risks it found as a record keeps them.
+fn directory_warnings(
+    directories: &[SkillDirectory],
+) -> BTreeMap<String, Vec<lpm_registry::SkillReviewIssue>> {
+    directories
+        .iter()
+        .filter_map(|directory| {
+            let issues = directory.warning.as_deref()?;
+            Some((
+                directory.name.clone(),
+                super::reviews::recorded_warning(issues),
+            ))
+        })
+        .collect()
+}
+
+fn is_files_digest(digest: &str) -> bool {
+    digest.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 pub(crate) fn remove(project_dir: &Path, package: &str) -> Result<u64, LpmError> {
@@ -209,9 +378,10 @@ pub(super) fn read_manifest(directory: &Path, expected_package: &str) -> Package
         }
         Err(_) => return PackageManifestStatus::Invalid,
     };
-    if metadata.file_type().is_symlink()
+    if lpm_common::is_symlink_or_junction(&metadata)
         || !metadata.is_file()
         || metadata.len() > MAX_MANIFEST_SIZE
+        || PackageName::parse(&format!("@lpm.dev/{expected_package}")).is_err()
     {
         return PackageManifestStatus::Invalid;
     }
@@ -228,6 +398,10 @@ pub(super) fn read_manifest(directory: &Path, expected_package: &str) -> Package
             .skills
             .keys()
             .all(|name| lpm_common::is_safe_skill_name(name))
+        && manifest
+            .directories
+            .iter()
+            .all(|(name, digest)| lpm_skill::is_skill_name(name) && is_files_digest(digest))
     {
         PackageManifestStatus::Valid(manifest)
     } else {
@@ -258,6 +432,12 @@ pub(crate) fn acquire_mutation_lock(
 }
 
 pub(crate) fn materialization_complete(project_dir: &Path, package_json: &str) -> bool {
+    let package_json = lpm_common::strip_utf8_bom_str(package_json);
+    // Only a `\u` escape can spell `@lpm.dev` in JSON without those bytes.
+    let names_lpm_dev = package_json.contains("@lpm.dev") || package_json.contains("\\u");
+    if !names_lpm_dev {
+        return added_sources_materialized(project_dir);
+    }
     let Ok(value) = serde_json::from_str::<serde_json::Value>(package_json) else {
         return false;
     };
@@ -274,6 +454,18 @@ pub(crate) fn materialization_complete(project_dir: &Path, package_json: &str) -
             .iter()
             .filter(|(name, _)| !packages.contains(name.strip_prefix("@lpm.dev/").unwrap_or(name)))
             .all(|(name, version)| version_is_materialized(project_dir, name, version))
+}
+
+/// Whether every skill `lpm-sources.json` records is materialized in
+/// `project_dir` at its recorded version: [`materialization_complete`] for
+/// a project without direct LPM.dev dependencies, read without its
+/// manifest.
+pub(crate) fn added_sources_materialized(project_dir: &Path) -> bool {
+    added_source_skills(project_dir, &BTreeSet::new()).is_ok_and(|added| {
+        added
+            .iter()
+            .all(|(name, version)| version_is_materialized(project_dir, name, version))
+    })
 }
 
 /// The `@lpm.dev` packages a manifest depends on directly, by short name,
@@ -332,23 +524,64 @@ pub(crate) fn version_is_materialized(project_dir: &Path, name: &str, version: &
     };
     let package = name.short();
     let directory = project_dir.join(".lpm").join("skills").join(&package);
-    materialized_directory_manifest(&directory, &package)
-        .is_some_and(|manifest| manifest.version.as_deref() == Some(version))
+    materialized_directory_manifest(&directory, &package).is_some_and(|manifest| {
+        manifest.version.as_deref() == Some(version) && recorded_on_this_machine(&manifest)
+    })
 }
 
 fn package_materialization_complete(project_dir: &Path, package: &str) -> bool {
     let directory = project_dir.join(".lpm").join("skills").join(package);
-    materialized_directory_manifest(&directory, package).is_some()
+    materialized_directory_manifest(&directory, package)
+        .is_some_and(|manifest| recorded_on_this_machine(&manifest))
+}
+
+/// Whether LPM recorded the registry's answer for this set on this machine,
+/// with exactly the set's skills and approvals, and needn't ask again yet.
+/// A set copied in from elsewhere, such as one a repository commits, isn't.
+fn recorded_on_this_machine(manifest: &PackageSkillsManifest) -> bool {
+    let Some(version) = manifest.version.as_deref() else {
+        return false;
+    };
+    super::reviews::read(&manifest.package, version).is_some_and(|record| {
+        record.skills == manifest.skills
+            && record.directories == manifest.directories
+            && !record.wants_recheck()
+    })
 }
 
 fn materialized_directory_manifest(
     directory: &Path,
     package: &str,
 ) -> Option<PackageSkillsManifest> {
+    read_intact_set(directory, package, false).map(|(manifest, _)| manifest)
+}
+
+/// The set materialized at `directory`, `.lpm/skills/<owner.package>`, when
+/// nothing in it changed since: its manifest is valid and each file
+/// matches the digest the manifest records for it.
+pub(crate) fn materialized_set(directory: &Path) -> Option<MaterializedSet> {
+    let package = directory.file_name().and_then(|name| name.to_str())?;
+    let (manifest, skills) = read_intact_set(directory, package, true)?;
+    Some(MaterializedSet {
+        package: manifest.package,
+        version: manifest.version,
+        skills,
+        directories: manifest.directories,
+        origin: manifest.origin,
+    })
+}
+
+/// The manifest of the intact set at `directory`, with each skill's name
+/// and, when `keep_documents`, its document.
+fn read_intact_set(
+    directory: &Path,
+    package: &str,
+    keep_documents: bool,
+) -> Option<(PackageSkillsManifest, Vec<(String, String)>)> {
     let Ok(metadata) = std::fs::symlink_metadata(directory) else {
         return None;
     };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if lpm_common::is_symlink_or_junction(&metadata) || !metadata.is_dir() {
         return None;
     }
     let PackageManifestStatus::Valid(manifest) = read_manifest(directory, package) else {
@@ -358,6 +591,7 @@ fn materialized_directory_manifest(
         return None;
     };
     let mut seen = BTreeSet::new();
+    let mut documents = Vec::new();
     for entry in entries {
         let Ok(entry) = entry else {
             return None;
@@ -370,7 +604,7 @@ fn materialized_directory_manifest(
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
             return None;
         };
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+        if lpm_common::is_symlink_or_junction(&metadata) || !metadata.is_file() {
             return None;
         }
         if path.extension().is_none_or(|extension| extension != "md") {
@@ -386,13 +620,18 @@ fn materialized_directory_manifest(
             return None;
         }
         seen.insert(skill_name.to_string());
+        if keep_documents {
+            documents.push((skill_name.to_string(), content));
+        }
     }
-    (seen.len() == manifest.skills.len()).then_some(manifest)
+    documents.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    (seen.len() == manifest.skills.len()).then_some((manifest, documents))
 }
 
 struct ValidatedEntry<'a> {
     name: &'a str,
     content: Cow<'a, str>,
+    warning: Option<&'a [lpm_registry::SkillReviewIssue]>,
 }
 
 fn validated_entries(skills: &[Skill]) -> Result<Vec<ValidatedEntry<'_>>, LpmError> {
@@ -415,6 +654,7 @@ fn validated_entries(skills: &[Skill]) -> Result<Vec<ValidatedEntry<'_>>, LpmErr
         entries.push(ValidatedEntry {
             name: skill.name.as_str(),
             content,
+            warning: skill.warning.as_deref(),
         });
     }
     Ok(entries)
@@ -481,13 +721,14 @@ fn push_yaml_string(output: &mut String, value: &str) -> Result<(), LpmError> {
     Ok(())
 }
 
-pub(super) fn digest(content: &[u8]) -> String {
+pub(crate) fn digest(content: &[u8]) -> String {
     hex::encode(Sha256::digest(content))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::isolated_lpm_home;
 
     fn skill(name: &str, content: &str) -> Skill {
         Skill {
@@ -498,6 +739,7 @@ mod tests {
             content: Some(content.to_string()),
             raw_content: None,
             size_bytes: None,
+            warning: None,
         }
     }
 
@@ -509,7 +751,22 @@ mod tests {
             skills_count: Some(count),
             skills_status: status.map(str::to_string),
             skills: Vec::new(),
+            skill_directories: Vec::new(),
         }
+    }
+
+    #[test]
+    fn an_answer_counts_only_for_the_package_and_version_it_names() {
+        let answer = response(None, Some(true), 1);
+        assert!(answers_for(&answer, "owner.package", Some("1.0.0")).is_ok());
+        assert!(answers_for(&answer, "owner.package", None).is_ok());
+        assert!(answers_for(&answer, "owner.other", Some("1.0.0")).is_err());
+        assert!(answers_for(&answer, "owner.package", Some("2.0.0")).is_err());
+        let unversioned = SkillsResponse {
+            version: None,
+            ..response(None, Some(true), 1)
+        };
+        assert!(answers_for(&unversioned, "owner.package", Some("1.0.0")).is_err());
     }
 
     #[test]
@@ -563,6 +820,21 @@ mod tests {
     }
 
     #[test]
+    fn an_unavailable_answer_offering_only_skill_directories_offers_nothing() {
+        let mut answer = response(None, Some(false), 0);
+        answer.skill_directories = vec![SkillDirectory {
+            name: "kit".into(),
+            digest: format!("sha256:{}", "a".repeat(64)),
+            warning: None,
+        }];
+
+        assert_eq!(
+            unavailable_reason(&answer),
+            Some(SkillsUnavailable::Withheld)
+        );
+    }
+
+    #[test]
     fn unavailable_skills_name_the_version_and_keep_existing_skills() {
         let error = validate_response(&response(Some("rejected"), Some(false), 1)).unwrap_err();
 
@@ -574,10 +846,11 @@ mod tests {
 
     #[test]
     fn materialize_rejects_registry_path_traversal_before_writing() {
+        let _lpm_home = isolated_lpm_home();
         let project = tempfile::tempdir().unwrap();
         let skills = vec![skill("../../escape", "bad")];
 
-        let error = materialize(project.path(), "owner.package", Some("1.0.0"), &skills)
+        let error = materialize(project.path(), "owner.package", Some("1.0.0"), &skills, &[])
             .err()
             .expect("unsafe registry skill name must fail");
 
@@ -588,6 +861,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn materialize_rejects_symlinked_skills_parent_without_external_write() {
+        let _lpm_home = isolated_lpm_home();
         let project = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::fs::create_dir(project.path().join(".lpm")).unwrap();
@@ -598,6 +872,7 @@ mod tests {
             "owner.package",
             Some("1.0.0"),
             &[skill("guide", "content")],
+            &[],
         )
         .err()
         .expect("symlinked parent must be rejected");
@@ -626,12 +901,14 @@ mod tests {
 
     #[test]
     fn materialize_reconciles_removed_package_skills() {
+        let _lpm_home = isolated_lpm_home();
         let project = tempfile::tempdir().unwrap();
         materialize(
             project.path(),
             "owner.package",
             Some("1.0.0"),
             &[skill("old", "old"), skill("kept", "before")],
+            &[],
         )
         .unwrap();
 
@@ -640,6 +917,7 @@ mod tests {
             "owner.package",
             Some("2.0.0"),
             &[skill("kept", "after")],
+            &[],
         )
         .unwrap();
 
@@ -653,6 +931,7 @@ mod tests {
 
     #[test]
     fn materialize_reconstructs_redacted_frontmatter_with_the_authored_version() {
+        let _lpm_home = isolated_lpm_home();
         let project = tempfile::tempdir().unwrap();
         let skill: Skill = serde_json::from_value(serde_json::json!({
             "name": "guide",
@@ -663,7 +942,14 @@ mod tests {
         }))
         .unwrap();
 
-        materialize(project.path(), "owner.package", Some("1.0.0"), &[skill]).unwrap();
+        materialize(
+            project.path(),
+            "owner.package",
+            Some("1.0.0"),
+            &[skill],
+            &[],
+        )
+        .unwrap();
 
         let content =
             std::fs::read_to_string(project.path().join(".lpm/skills/owner.package/guide.md"))
@@ -677,18 +963,44 @@ mod tests {
 
     #[test]
     fn materialization_complete_detects_missing_skill_content() {
+        let _lpm_home = isolated_lpm_home();
         let project = tempfile::tempdir().unwrap();
         materialize(
             project.path(),
             "owner.package",
             Some("1.0.0"),
             &[skill("guide", "content")],
+            &[],
         )
         .unwrap();
         std::fs::remove_file(project.path().join(".lpm/skills/owner.package/guide.md")).unwrap();
         let package_json = r#"{"dependencies":{"@lpm.dev/owner.package":"1.0.0"}}"#;
 
         assert!(!materialization_complete(project.path(), package_json));
+    }
+
+    #[test]
+    fn materialization_complete_reads_escaped_names_and_manifests_with_a_byte_order_mark() {
+        let _lpm_home = isolated_lpm_home();
+        let project = tempfile::tempdir().unwrap();
+        let escaped = r#"{"dependencies":{"\u0040lpm.dev/owner.package":"1.0.0"}}"#;
+        assert!(
+            !materialization_complete(project.path(), escaped),
+            "an escaped scope still names an LPM.dev dependency whose skills are missing"
+        );
+        materialize(
+            project.path(),
+            "owner.package",
+            Some("1.0.0"),
+            &[skill("guide", "content")],
+            &[],
+        )
+        .unwrap();
+
+        assert!(materialization_complete(
+            project.path(),
+            "\u{feff}{\"dependencies\":{\"@lpm.dev/owner.package\":\"1.0.0\"}}"
+        ));
     }
 
     #[test]
@@ -730,12 +1042,14 @@ mod tests {
 
     #[test]
     fn remove_deletes_package_owned_skill_directory() {
+        let _lpm_home = isolated_lpm_home();
         let project = tempfile::tempdir().unwrap();
         materialize(
             project.path(),
             "owner.package",
             Some("1.0.0"),
             &[skill("guide", "content")],
+            &[],
         )
         .unwrap();
 

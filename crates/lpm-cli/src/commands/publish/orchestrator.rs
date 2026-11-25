@@ -1113,6 +1113,10 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
                 .security_warnings
                 .iter()
                 .map(|located| format!("Skill security warning: {}", located.message()))
+                .chain(validation.skill_directory_problems.iter().map(|problem| {
+                    format!("{problem}; LPM.dev review won't approve this skill directory as it is")
+                }))
+                .chain(validation.skill_directories_unreviewed.iter().cloned())
                 .collect();
             if !json_output {
                 for notice in &skill_notices {
@@ -1371,6 +1375,22 @@ pub(crate) async fn execute_prepared_for_release(
     release_clients: &ReleasePublishClients,
 ) -> Result<PublishExecutionReport, LpmError> {
     execute_prepared_inner(client, prepared, false, Some(release_clients)).await
+}
+
+/// The warnings the registry answered a publish with, leaving out those the
+/// CLI already reported from its own checks: the registry runs the same
+/// checks, with the same words, for clients that don't.
+fn registry_warnings<'a>(
+    response: &'a serde_json::Value,
+    reported: &'a [String],
+) -> impl Iterator<Item = &'a str> {
+    response
+        .get("warnings")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .filter(move |warning| !reported.iter().any(|known| known == warning))
 }
 
 async fn execute_prepared_inner(
@@ -1860,29 +1880,17 @@ async fn execute_prepared_inner(
                                     ),
                                 );
                             }
-                            if let Some(warnings) = resp.get("warnings").and_then(|w| w.as_array())
-                            {
-                                for w in warnings {
-                                    if let Some(msg) = w.as_str() {
-                                        install_ui::warn_untrusted(
-                                            &lpm_common::sanitize_terminal_inline(msg),
-                                        );
-                                    }
-                                }
+                            for message in registry_warnings(&resp, &skill_notices) {
+                                install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(
+                                    message,
+                                ));
                             }
                         }
                         results.push(PublishResult {
                             warnings: skill_notices
                                 .iter()
                                 .cloned()
-                                .chain(
-                                    resp.get("warnings")
-                                        .and_then(serde_json::Value::as_array)
-                                        .into_iter()
-                                        .flatten()
-                                        .filter_map(serde_json::Value::as_str)
-                                        .map(str::to_string),
-                                )
+                                .chain(registry_warnings(&resp, &skill_notices).map(str::to_string))
                                 .collect(),
                             target: "lpm".into(),
                             success: true,

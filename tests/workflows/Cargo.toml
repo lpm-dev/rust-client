@@ -57,6 +57,7 @@ lpm-runner = { path = "../../crates/lpm-runner" }
 lpm-vault = { path = "../../crates/lpm-vault", features = ["acceptance-test-hooks"] }
 lpm-lockfile = { path = "../../crates/lpm-lockfile" }
 lpm-security = { path = "../../crates/lpm-security" }
+lpm-skill = { path = "../../crates/lpm-skill" }
 lpm-sandbox = { path = "../../crates/lpm-sandbox" }
 lpm-inspect = { path = "../../crates/lpm-inspect" }
 lpm-tunnel = { path = "../../crates/lpm-tunnel" }

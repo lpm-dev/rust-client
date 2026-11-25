@@ -799,6 +799,7 @@ pub(super) fn target_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::isolated_lpm_home;
 
     #[test]
     fn stable_id_distinguishes_skill_kinds_with_the_same_identity() {
@@ -820,6 +821,7 @@ mod tests {
 
     #[test]
     fn package_inventory_verifies_materialized_manifest_digest() {
+        let _lpm_home = isolated_lpm_home();
         let project = tempfile::tempdir().unwrap();
         package::materialize(
             project.path(),
@@ -836,7 +838,9 @@ mod tests {
                 ),
                 raw_content: None,
                 size_bytes: None,
+                warning: None,
             }],
+            &[],
         )
         .unwrap();
 
@@ -867,6 +871,7 @@ mod tests {
 
     #[test]
     fn package_inventory_surfaces_a_missing_manifest_skill_as_needing_attention() {
+        let _lpm_home = isolated_lpm_home();
         let project = tempfile::tempdir().unwrap();
         package::materialize(
             project.path(),
@@ -883,6 +888,7 @@ mod tests {
                     ),
                     raw_content: None,
                     size_bytes: None,
+                    warning: None,
                 },
                 lpm_registry::Skill {
                     name: "missing".into(),
@@ -894,8 +900,10 @@ mod tests {
                     ),
                     raw_content: None,
                     size_bytes: None,
+                    warning: None,
                 },
             ],
+            &[],
         )
         .unwrap();
         std::fs::remove_file(project.path().join(".lpm/skills/owner.package/missing.md")).unwrap();

@@ -171,12 +171,13 @@ async fn install_skills_for_packages(
     let mut warnings = Vec::new();
     for (short_name, version, skills) in fetched {
         let label = format!("@lpm.dev/{short_name}@{version}");
-        let installed = skills.and_then(|skills| {
+        let installed = skills.and_then(|response| {
             crate::commands::skills::package::materialize(
                 project_dir,
                 short_name,
                 Some(version),
-                &skills,
+                &response.skills,
+                &response.skill_directories,
             )
             .map_err(|error| {
                 format!(
@@ -208,7 +209,7 @@ async fn fetch_package_skills(
     client: &RegistryClient,
     short_name: &str,
     version: &str,
-) -> Result<Vec<lpm_registry::Skill>, String> {
+) -> Result<lpm_registry::SkillsResponse, String> {
     let label = format!("@lpm.dev/{short_name}@{version}");
     let response = client
         .get_skills(short_name, Some(version))
@@ -219,6 +220,14 @@ async fn fetch_package_skills(
                 crate::commands::skills::warning_detail(&error)
             )
         })?;
+    crate::commands::skills::package::answers_for(&response, short_name, Some(version)).map_err(
+        |error| {
+            format!(
+                "package skills for {label} were refused: {}; existing skills were kept",
+                crate::commands::skills::warning_detail(&error)
+            )
+        },
+    )?;
     if let Some(reason) = crate::commands::skills::package::unavailable_reason(&response) {
         return Err(reason.message(&label));
     }
@@ -228,5 +237,5 @@ async fn fetch_package_skills(
             crate::commands::skills::warning_detail(&error)
         )
     })?;
-    Ok(response.skills)
+    Ok(response)
 }

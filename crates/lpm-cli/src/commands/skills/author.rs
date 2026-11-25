@@ -25,6 +25,18 @@ pub(crate) struct ValidationReport {
     pub(crate) security_warnings: Vec<LocatedSecurityIssue>,
     pub(crate) total_size_bytes: u64,
     pub(crate) validated_files: Vec<ValidatedSkillFile>,
+    /// The `skills/<name>/` directories, in the standard Agent Skills
+    /// layout, that pass the rules installs check them with.
+    pub(crate) skill_directories: Vec<String>,
+    /// What keeps the others from linking for agents: structural problems
+    /// and blocking scan findings, each naming its path.
+    pub(crate) skill_directory_problems: Vec<String>,
+    /// Scan warnings in the directories, which don't keep them from
+    /// linking or publishing.
+    pub(crate) skill_directory_warnings: Vec<String>,
+    /// The directories that pass but that LPM.dev won't review, so installs
+    /// from LPM.dev never link them, each saying why.
+    pub(crate) skill_directories_unreviewed: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -87,12 +99,22 @@ pub(crate) fn validate_publish_directory(
     use cap_fs_ext::DirExt as _;
 
     let mut host_errors = skills_left_in_lpm_state(project_root)?;
+    let SkillDirectoriesCheck {
+        valid: skill_directories,
+        problems: skill_directory_problems,
+        warnings: skill_directory_warnings,
+        unreviewed: skill_directories_unreviewed,
+    } = check_skill_directories(project_root);
     let skills_dir = match project_root.open_dir_nofollow(AUTHORED_SKILLS_DIR) {
         Ok(directory) => directory,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             host_errors.sort();
             return Ok(ValidationReport {
                 errors: host_errors,
+                skill_directories,
+                skill_directory_problems,
+                skill_directory_warnings,
+                skill_directories_unreviewed,
                 ..ValidationReport::default()
             });
         }
@@ -148,7 +170,140 @@ pub(crate) fn validate_publish_directory(
         security_warnings: report.security_warnings,
         total_size_bytes: report.total_size,
         validated_files,
+        skill_directories,
+        skill_directory_problems,
+        skill_directory_warnings,
+        skill_directories_unreviewed,
     })
+}
+
+/// What checking the `skills/<name>/` directories found.
+struct SkillDirectoriesCheck {
+    /// The directories that pass, as `skills/<name>/`.
+    valid: Vec<String>,
+    /// What keeps a directory from linking for agents.
+    problems: Vec<String>,
+    /// Scan warnings, which don't.
+    warnings: Vec<String>,
+    /// Why LPM.dev won't review some that pass.
+    unreviewed: Vec<String>,
+}
+
+/// Checks the `skills/<name>/` directories at the published root as
+/// installs read and check them: the first ones in name order that hold a
+/// regular `SKILL.md`, never through a link. Links, names installs ignore
+/// and directories past the limit are reported.
+fn check_skill_directories(project_root: &cap_std::fs::Dir) -> SkillDirectoriesCheck {
+    use cap_fs_ext::DirExt as _;
+
+    let mut check = SkillDirectoriesCheck {
+        valid: Vec::new(),
+        problems: Vec::new(),
+        warnings: Vec::new(),
+        unreviewed: Vec::new(),
+    };
+    let mut passed = Vec::new();
+    let root = match project_root.open_dir_nofollow(lpm_skill::SKILL_DIRECTORIES_ROOT) {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return check,
+        Err(error) => {
+            check.problems.push(format!("skills/: {error}"));
+            return check;
+        }
+    };
+    let Ok(entries) = root.entries() else {
+        check
+            .problems
+            .push("skills/: the directory can't be listed".into());
+        return check;
+    };
+    let mut names = Vec::new();
+    for (index, entry) in entries.flatten().enumerate() {
+        if index == lpm_skill::MAX_SKILLS_ROOT_ENTRIES {
+            check.problems.push(format!(
+                "skills/: holds more than {} entries; installs link none of its skills",
+                lpm_skill::MAX_SKILLS_ROOT_ENTRIES
+            ));
+            return check;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Ok(metadata) = root.symlink_metadata(&name) else {
+            continue;
+        };
+        if crate::project_fs::is_link(&metadata) {
+            check.problems.push(format!(
+                "skills/{name}: is a link; installs never follow it"
+            ));
+        } else if metadata.is_dir() {
+            if lpm_skill::is_skill_name(&name) {
+                names.push(name);
+            } else {
+                check.problems.push(format!(
+                    "skills/{name}/: isn't a skill name (lowercase letters, digits and single hyphens); installs ignore it"
+                ));
+            }
+        }
+    }
+    names.sort_unstable();
+    let mut checked = 0;
+    for name in names {
+        let prefix = format!("skills/{name}/");
+        let document = root
+            .symlink_metadata(std::path::Path::new(&name).join(lpm_skill::SKILL_DOCUMENT))
+            .is_ok_and(|metadata| metadata.is_file());
+        if !document {
+            check.problems.push(format!(
+                "{prefix}: has no regular SKILL.md; installs ignore it"
+            ));
+            continue;
+        }
+        if checked == lpm_skill::MAX_SKILL_DIRECTORIES {
+            check.problems.push(format!(
+                "{prefix}: past the first {} skill directories, which installs read",
+                lpm_skill::MAX_SKILL_DIRECTORIES
+            ));
+            continue;
+        }
+        checked += 1;
+        let entries = match crate::dependency_skills::read_skill_directory(project_root, &name) {
+            Ok(entries) => entries,
+            Err(error) => {
+                check.problems.push(format!("{prefix}: {error}"));
+                continue;
+            }
+        };
+        match lpm_skill::check_skill_directory(&name, &entries) {
+            Err(errors) => check
+                .problems
+                .extend(errors.into_iter().map(|error| format!("{prefix}{error}"))),
+            Ok(skill) => {
+                let mut blocked = false;
+                for finding in &skill.findings {
+                    let line = finding.directory_message(&name);
+                    if finding.issue.severity == lpm_skill::SkillSecuritySeverity::Block {
+                        blocked = true;
+                        check.problems.push(line);
+                    } else {
+                        check.warnings.push(line);
+                    }
+                }
+                if !blocked && let Some(problem) = skill.link_problem() {
+                    blocked = true;
+                    check.problems.push(problem);
+                }
+                if !blocked {
+                    check.valid.push(prefix);
+                    passed.push((name, skill.size));
+                }
+            }
+        }
+    }
+    check.unreviewed =
+        lpm_skill::review_plan(passed.iter().map(|(name, size)| (name.as_str(), *size)))
+            .into_iter()
+            .filter_map(|(name, outcome)| outcome.map(|unreviewed| unreviewed.message(name)))
+            .collect();
+    check
 }
 
 /// Errors for skills an older version had authors keep directly in

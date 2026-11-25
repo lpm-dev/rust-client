@@ -5,6 +5,10 @@ expression: envelope
 {
   "success": true,
   "directory_found": false,
+  "skill_directories": [],
+  "skill_directory_problems": [],
+  "skill_directory_warnings": [],
+  "skill_directories_unreviewed": [],
   "valid": 0,
   "files": [],
   "errors": [],

@@ -1,6 +1,8 @@
 //! The CLI's publish-time skill rules for the registry, which checks the
 //! skills in an uploaded tarball with them.
 
+mod directories;
+
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -77,8 +79,12 @@ pub fn skill_entry_role(path: &str, size: f64) -> u8 {
 }
 
 /// The publish limits, as `{"maxSkillSize", "maxTotalSize", "maxSkillCount",
-/// "minBodyLength"}`. A host reads the bytes of at most `maxSkillCount + 1`
-/// skill files.
+/// "minBodyLength", "maxSkillsRootEntries", "maxSkillDirectories",
+/// "maxSkillDirectoryEntries",
+/// "maxSkillDirectoryFileSize", "maxReviewedSkillDirectorySize",
+/// "maxReviewedSkillDirectoriesSize"}`. A host reads the bytes of at most
+/// `maxSkillCount + 1` skill files, and of a skill directory's files only
+/// while they hold at most `maxReviewedSkillDirectorySize` together.
 #[wasm_bindgen]
 pub fn skill_limits_json() -> String {
     serde_json::json!({
@@ -86,8 +92,47 @@ pub fn skill_limits_json() -> String {
         "maxTotalSize": lpm_skill::MAX_TOTAL_SIZE,
         "maxSkillCount": lpm_skill::MAX_SKILL_COUNT,
         "minBodyLength": lpm_skill::MIN_BODY_LENGTH,
+        "maxSkillsRootEntries": lpm_skill::MAX_SKILLS_ROOT_ENTRIES,
+        "maxSkillDirectories": lpm_skill::MAX_SKILL_DIRECTORIES,
+        "maxSkillDirectoryEntries": lpm_skill::MAX_SKILL_DIRECTORY_ENTRIES,
+        "maxSkillDirectoryFileSize": lpm_skill::MAX_SKILL_DIRECTORY_FILE_SIZE,
+        "maxReviewedSkillDirectorySize": lpm_skill::MAX_REVIEWED_SKILL_DIRECTORY_SIZE,
+        "maxReviewedSkillDirectoriesSize": lpm_skill::MAX_REVIEWED_SKILL_DIRECTORIES_SIZE,
     })
     .to_string()
+}
+
+/// The `skills/<name>/` directories whose files
+/// [`check_skill_directories_json`] reads, from `input` in its shape with no
+/// `contentBase64`, as `{"directories": [name, ...], "errors": [...]}`: a
+/// host lists a release's entries, then reads only these directories'
+/// files.
+#[wasm_bindgen]
+pub fn skill_directories_to_read_json(input: &str) -> String {
+    serde_json::to_string(&directories::to_read(input)).unwrap_or_else(|_| {
+        "{\"directories\":[],\"errors\":[\"could not serialize the skill directories to read\"]}"
+            .to_string()
+    })
+}
+
+/// Checks the entries a host found under a tarball's `skills/` directory,
+/// as `{"entries": [{"path", "kind", "size", "contentBase64"}]}` with paths
+/// relative to `skills/` and `kind` one of `file`, `directory`, `symlink`
+/// or `other`, with the rules installs check skill directories with.
+/// Returns `{"directories": [...], "errors": [...]}`: each directory with
+/// its `name`, `status` (`reviewable`, `unreviewed` or `invalid`),
+/// `sizeBytes`, `problems` and scan `warnings`; one that passes every check
+/// with the `digest` installs compare, and a reviewable one with the
+/// `files` review reads (`[{"path", "content"}]`); one that passes every
+/// check also with its `SKILL.md`'s `description` and `body`. A directory whose files
+/// hold more than `maxReviewedSkillDirectorySize` is unreviewed without its
+/// bytes being read.
+#[wasm_bindgen]
+pub fn check_skill_directories_json(input: &str) -> String {
+    serde_json::to_string(&directories::check(input)).unwrap_or_else(|_| {
+        "{\"directories\":[],\"errors\":[\"could not serialize skill directory diagnostics\"]}"
+            .to_string()
+    })
 }
 
 fn validate(input: &str) -> Output {
@@ -235,6 +280,21 @@ mod tests {
 
         assert_eq!(limits["maxSkillCount"], 10);
         assert_eq!(limits["maxSkillSize"], 15 * 1024);
+        assert_eq!(limits["maxReviewedSkillDirectorySize"], 128 * 1024);
+        assert_eq!(limits["maxReviewedSkillDirectoriesSize"], 512 * 1024);
+        assert_eq!(limits["maxSkillDirectories"], 32);
+        assert_eq!(limits["maxSkillsRootEntries"], 4096);
+    }
+
+    #[test]
+    fn checks_skill_directories_through_the_exported_entry_point() {
+        let output: serde_json::Value =
+            serde_json::from_str(&check_skill_directories_json("{\"entries\":[]}")).unwrap();
+
+        assert_eq!(
+            output,
+            serde_json::json!({ "directories": [], "errors": [] })
+        );
     }
 
     #[test]

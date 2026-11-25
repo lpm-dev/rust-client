@@ -13,6 +13,7 @@ mod inventory;
 mod managed;
 pub(crate) mod package;
 mod path_security;
+pub(crate) mod reviews;
 mod source;
 
 use crate::install_ui;
@@ -465,9 +466,12 @@ async fn add_package_skills(
     }
     let response = client.get_skills(&name.short(), version).await?;
     let target = project_dir.join(".lpm").join("skills").join(name.short());
+    package::answers_for(&response, &name.short(), version)?;
     package::validate_response(&response)?;
 
     if args.list || args.dry_run {
+        let review_warning =
+            |skill: &lpm_registry::Skill| skill.warning.as_deref().map(reviews::recorded_warning);
         if json_output {
             println!(
                 "{}",
@@ -480,6 +484,7 @@ async fn add_package_skills(
                         "name": skill.name,
                         "description": skill.description,
                         "size": skill.size_bytes,
+                        "review_warning": review_warning(skill),
                     })).collect::<Vec<_>>(),
                     "dry_run": args.dry_run,
                 }))
@@ -492,6 +497,11 @@ async fn add_package_skills(
             );
             for skill in &response.skills {
                 println!("{}", crate::install_ui::terminal_line!("  {}", &skill.name));
+                if let Some(issues) = review_warning(skill) {
+                    install_ui::warn_untrusted(&crate::dependency_skills::review_warning_note(
+                        &issues,
+                    ));
+                }
             }
             install_ui::phase_line(crate::install_ui::terminal_line!(
                 "would materialize {}",
@@ -512,20 +522,22 @@ async fn add_package_skills(
         &name.short(),
         response.version.as_deref(),
         &response.skills,
+        &response.skill_directories,
     )?;
+    package::mark_added(project_dir, &name.short())?;
+    let linked = reconcile_package_skill_links(project_dir);
     if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "success": true,
-                "kind": "package",
-                "package": name.scoped(),
-                "installed": result.installed,
-                "directory": result.directory,
-            }))
-            .unwrap()
-        );
+        let mut output = serde_json::json!({
+            "success": true,
+            "kind": "package",
+            "package": name.scoped(),
+            "installed": result.installed,
+            "directory": result.directory,
+        });
+        crate::commands::install::attach_dependency_skills(&mut output, &linked);
+        println!("{}", serde_json::to_string_pretty(&output).unwrap());
     } else {
+        crate::dependency_skills::print_report(&linked);
         install_ui::done_untrusted(&format!(
             "Materialized {} package-published {}",
             result.installed,
@@ -537,6 +549,16 @@ async fn add_package_skills(
         ));
     }
     Ok(())
+}
+
+/// Links or unlinks the LPM.dev package skills a command changed, as an
+/// install would.
+fn reconcile_package_skill_links(project_dir: &Path) -> crate::dependency_skills::ReconcileReport {
+    crate::commands::install::reconcile_dependency_skills(
+        project_dir,
+        crate::lpm_skills_config::LpmSkillsPreference::Config,
+        crate::commands::install::InstallOmitPolicy::default(),
+    )
 }
 
 fn select_skills<'a>(
@@ -1025,6 +1047,7 @@ fn print_dependency_view(linked: &crate::dependency_skills::LinkedSkillDetails, 
                 "copy": copy.display().to_string(),
                 "links": links,
                 "healthy": linked.healthy(),
+                "review_warning": linked.review_warning,
             }))
             .unwrap()
         );
@@ -1046,6 +1069,9 @@ fn print_dependency_view(linked: &crate::dependency_skills::LinkedSkillDetails, 
             install_ui::dim(label),
             &value
         ));
+    }
+    if let Some(issues) = &linked.review_warning {
+        install_ui::warn_untrusted(&crate::dependency_skills::review_warning_note(issues));
     }
 }
 
@@ -1158,6 +1184,7 @@ fn print_package_inventory(packages: &[(String, Vec<(String, u64)>)]) {
 
 fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
     let report = author::validate_project(project_dir)?;
+    let valid = report.is_valid() && report.skill_directory_problems.is_empty();
     if json_output {
         let findings = |issues: &[lpm_skill::LocatedSecurityIssue]| {
             issues
@@ -1176,8 +1203,12 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "success": report.is_valid(),
+                "success": valid,
                 "directory_found": report.directory_found,
+                "skill_directories": report.skill_directories,
+                "skill_directory_problems": report.skill_directory_problems,
+                "skill_directory_warnings": report.skill_directory_warnings,
+                "skill_directories_unreviewed": report.skill_directories_unreviewed,
                 "valid": report.valid_files.len(),
                 "files": report.valid_files,
                 "errors": report.errors,
@@ -1189,9 +1220,29 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
             .map_err(|error| LpmError::Registry(format!("failed to serialize validation result: {error}")))?
         );
     } else {
-        if !report.directory_found {
-            install_ui::warn("No lpm-skills/ directory found");
-        } else {
+        if !report.skill_directories.is_empty() || !report.skill_directory_problems.is_empty() {
+            install_ui::phase("Validating skill directories in skills/");
+            for directory in &report.skill_directories {
+                install_ui::detail_line(crate::install_ui::terminal_line!(
+                    "  {} {}",
+                    install_ui::status_ok("valid"),
+                    directory
+                ));
+            }
+            for problem in &report.skill_directory_problems {
+                install_ui::warn_untrusted(problem);
+            }
+            for warning in report
+                .skill_directory_warnings
+                .iter()
+                .chain(&report.skill_directories_unreviewed)
+            {
+                install_ui::warn_untrusted(&format!("warning: {warning}"));
+            }
+        } else if !report.directory_found {
+            install_ui::warn("No lpm-skills/ or skills/ directory found");
+        }
+        if report.directory_found {
             install_ui::phase("Validating package skills in lpm-skills/");
             for file in &report.valid_files {
                 install_ui::detail_line(crate::install_ui::terminal_line!(
@@ -1217,26 +1268,33 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
             install_ui::warn_untrusted(&format!("warning: {}", located.message()));
         }
         if report.is_valid() {
-            if report.valid_files.is_empty() {
-                install_ui::warn("No skills found in lpm-skills/");
-            } else {
+            if !report.valid_files.is_empty() {
                 install_ui::done_untrusted(&format!(
                     "{} package {} valid · {}",
                     report.valid_files.len(),
                     plural(report.valid_files.len(), "skill", "skills"),
                     lpm_common::format_bytes(report.total_size_bytes)
                 ));
+            } else if report.directory_found {
+                install_ui::warn("No skills found in lpm-skills/");
             }
         }
+        if report.skill_directory_problems.is_empty() && !report.skill_directories.is_empty() {
+            install_ui::done_untrusted(&format!(
+                "{} skill {} valid",
+                report.skill_directories.len(),
+                plural(report.skill_directories.len(), "directory", "directories")
+            ));
+        }
     }
-    if report.is_valid() {
+    if valid {
         Ok(())
     } else if json_output {
         Err(LpmError::ExitCode(1))
     } else {
         Err(LpmError::Script(format!(
             "{} skill validation error(s)",
-            report.error_count()
+            report.error_count() + report.skill_directory_problems.len()
         )))
     }
 }
@@ -1278,7 +1336,7 @@ fn clean_skills(project_dir: &Path, args: CleanArgs, json_output: bool) -> Resul
 
     if args.dry_run || plan.targets.is_empty() {
         if json_output {
-            print_clean_json(&plan, args.dry_run, &[], 0, 0)?;
+            print_clean_json(&plan, args.dry_run, &[], 0, 0, None)?;
         } else if args.dry_run {
             install_ui::done("Dry run complete · no files changed");
         } else if !plan.directory_found {
@@ -1337,9 +1395,19 @@ fn clean_skills(project_dir: &Path, args: CleanArgs, json_output: bool) -> Resul
         bytes_removed = bytes_removed.saturating_add(target.size_bytes);
     }
 
+    drop(_lock);
+    let unlinked = reconcile_package_skill_links(project_dir);
     if json_output {
-        print_clean_json(&plan, false, &removed, files_removed, bytes_removed)?;
+        print_clean_json(
+            &plan,
+            false,
+            &removed,
+            files_removed,
+            bytes_removed,
+            Some(&unlinked),
+        )?;
     } else {
+        crate::dependency_skills::print_report(&unlinked);
         install_ui::done_untrusted(&format!(
             "Removed {} package skill {} · {files_removed} {} · {}",
             removed.len(),
@@ -1487,8 +1555,9 @@ fn print_clean_json(
     removed: &[String],
     files_removed: usize,
     bytes_removed: u64,
+    dependency_skills: Option<&crate::dependency_skills::ReconcileReport>,
 ) -> Result<(), LpmError> {
-    let output = serde_json::json!({
+    let mut output = serde_json::json!({
         "success": true,
         "dry_run": dry_run,
         "cleaned": !removed.is_empty(),
@@ -1499,6 +1568,9 @@ fn print_clean_json(
         "preserved_publisher_files": plan.publisher_files,
         "skipped": plan.skipped,
     });
+    if let Some(reconciled) = dependency_skills {
+        crate::commands::install::attach_dependency_skills(&mut output, reconciled);
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&output).map_err(|error| LpmError::Registry(format!(
@@ -1524,6 +1596,7 @@ fn security_severity_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::isolated_lpm_home;
 
     fn valid_package_skill(name: &str) -> String {
         format!(
@@ -1648,6 +1721,7 @@ mod tests {
 
     #[test]
     fn clean_skills_removes_only_manifest_owned_package_directories() {
+        let _lpm_home = isolated_lpm_home();
         let project = tempfile::tempdir().unwrap();
         let skills = project.path().join(".lpm/skills");
         package::materialize(
@@ -1662,7 +1736,9 @@ mod tests {
                 content: Some(valid_package_skill("guide")),
                 raw_content: None,
                 size_bytes: None,
+                warning: None,
             }],
+            &[],
         )
         .unwrap();
         let untracked = skills.join("team-notes");
@@ -1685,6 +1761,7 @@ mod tests {
 
     #[test]
     fn clean_skills_dry_run_does_not_remove_manifest_owned_directories() {
+        let _lpm_home = isolated_lpm_home();
         let project = tempfile::tempdir().unwrap();
         package::materialize(
             project.path(),
@@ -1698,7 +1775,9 @@ mod tests {
                 content: Some(valid_package_skill("guide")),
                 raw_content: None,
                 size_bytes: None,
+                warning: None,
             }],
+            &[],
         )
         .unwrap();
 
@@ -1717,6 +1796,7 @@ mod tests {
 
     #[test]
     fn clean_skills_preserves_a_package_directory_with_untracked_content() {
+        let _lpm_home = isolated_lpm_home();
         let project = tempfile::tempdir().unwrap();
         package::materialize(
             project.path(),
@@ -1730,7 +1810,9 @@ mod tests {
                 content: Some(valid_package_skill("guide")),
                 raw_content: None,
                 size_bytes: None,
+                warning: None,
             }],
+            &[],
         )
         .unwrap();
         let directory = project.path().join(".lpm/skills/owner.package");

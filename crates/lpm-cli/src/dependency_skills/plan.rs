@@ -3,12 +3,13 @@ use super::policy::{ParsedPolicy, SkillsPolicy};
 use crate::commands::audit::discovery::{DiscoveredPackage, ManagerKind};
 use crate::commands::audit::inventory::PackageInventory;
 use lpm_common::LpmError;
+use lpm_registry::SkillReviewIssue;
 use lpm_security::query::{
     DepGraph, DepGraphEntry, PackageContext, PseudoClass, Selector, Truth, evaluate_with_key,
 };
 use lpm_skill::{CheckedSkill, SkillDirectoryEntry, SkillPermission, check_skill_directory};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Why an allowed skill isn't linked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +33,9 @@ pub(crate) enum HoldReason {
     NameConflict,
     /// The skill directory couldn't be read.
     Unreadable,
+    /// An LPM.dev package's skill directory that LPM.dev review hasn't
+    /// approved as it is.
+    NotReviewed,
 }
 
 impl HoldReason {
@@ -40,7 +44,7 @@ impl HoldReason {
     /// becoming readable.
     pub(crate) fn clears_on_its_own(self) -> bool {
         match self {
-            Self::NeedsData | Self::NameConflict | Self::Unreadable => true,
+            Self::NeedsData | Self::NameConflict | Self::Unreadable | Self::NotReviewed => true,
             Self::Invalid
             | Self::Blocked
             | Self::NeedsPackageName
@@ -59,6 +63,7 @@ impl HoldReason {
             Self::Hooks => "hooks",
             Self::NameConflict => "name_conflict",
             Self::Unreadable => "unreadable",
+            Self::NotReviewed => "not_reviewed",
         }
     }
 }
@@ -129,6 +134,9 @@ pub(crate) struct SkillDetails {
     pub(crate) allowed_tools: Vec<String>,
     pub(crate) permission: SkillPermission,
     pub(crate) warnings: usize,
+    /// The risks LPM.dev review found when it served the skill with a
+    /// warning, which may be none it could describe.
+    pub(crate) review_warning: Option<Vec<SkillReviewIssue>>,
     /// The narrowest allowing entry that links the skill.
     pub(crate) suggested: String,
     /// How specifically an allowing entry must name the skill to link it.
@@ -145,7 +153,8 @@ pub(crate) enum PlanMode {
 }
 
 /// What the project's policy makes of every skill its installed
-/// dependencies ship. Planning reads and never writes.
+/// dependencies ship. Planning writes nothing in the project; an apply
+/// plan may note in LPM's cache that a skill directory awaits review.
 #[derive(Debug, Default)]
 pub(crate) struct Plan {
     pub(crate) policy: Option<SkillsPolicy>,
@@ -164,6 +173,26 @@ pub(crate) struct Plan {
     /// such as a parent whose install can't be confirmed, so the next run
     /// plans again.
     pub(crate) incomplete: bool,
+    /// Whether anything could link: the policy allows packages and npm and
+    /// other package skills are on, or LPM.dev package skills are on and
+    /// an install materialized some.
+    pub(crate) considered: bool,
+    /// LPM.dev skill directories the recorded review doesn't name, so a
+    /// reconcile marks their records for the registry to be asked again.
+    pub(crate) pending_reviews: Vec<PendingReview>,
+    /// The LPM.dev packages among [`Self::unlisted`] that link without an
+    /// entry: declared by an importer, or delivered by `lpm add`.
+    pub(crate) automatic_unlisted: BTreeSet<String>,
+}
+
+/// A skill directory an LPM.dev package ships that its review record
+/// doesn't name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingReview {
+    /// `owner.package`.
+    pub(crate) package: String,
+    pub(crate) version: String,
+    pub(crate) directory: String,
 }
 
 /// What the policy decided for one installed instance of a package's skill.
@@ -197,20 +226,42 @@ pub(crate) fn read_manifest(project_dir: &Path) -> Result<serde_json::Value, Lpm
         .map_err(|error| LpmError::Registry(format!("invalid {}: {error}", path.display())))
 }
 
+/// Which kinds of dependency skills a plan links.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Sources {
+    /// The reviewed skills of LPM.dev packages.
+    pub(crate) lpm_dev: bool,
+    /// The skills of npm and other registries' packages the policy allows.
+    pub(crate) other: bool,
+}
+
+/// The project directories whose installs a plan reads: `project_dir`, and
+/// in a workspace root every member.
+pub(crate) fn importer_directories(project_dir: &Path) -> Vec<PathBuf> {
+    let mut directories = vec![project_dir.to_path_buf()];
+    if let Ok(Some(workspace)) = lpm_workspace::discover_workspace(project_dir)
+        && same_directory(&workspace.root, project_dir)
+    {
+        directories.extend(workspace.members.into_iter().map(|member| member.path));
+    }
+    directories
+}
+
 /// The skills earlier links recorded, by package, with how specifically an
 /// entry had to name each: what a plan judges for a package whose skills
 /// couldn't be listed.
 pub(crate) type RecordedSkills = BTreeMap<String, Vec<(String, Naming)>>;
 
-/// Plans `project_dir`'s dependency skills under `policy`. In a workspace
-/// root the plan covers the root and every member. With no allowing entry,
-/// nothing is read. `packages` limits the plan to the skills those
-/// packages ship.
+/// Plans `project_dir`'s dependency skills under `policy`, linking the
+/// kinds `sources` turns on. In a workspace root the plan covers the root
+/// and every member. With nothing to link, nothing is read. `packages`
+/// limits the plan to the skills those packages ship.
 pub(crate) fn plan_project(
     project_dir: &Path,
     parsed: ParsedPolicy,
     manifest: &serde_json::Value,
     mode: PlanMode,
+    sources: Sources,
     packages: Option<&HashSet<String>>,
     recorded: &RecordedSkills,
 ) -> Result<Plan, LpmError> {
@@ -220,44 +271,71 @@ pub(crate) fn plan_project(
         problems,
         ..Plan::default()
     };
+    if plan
+        .policy
+        .as_ref()
+        .is_some_and(|policy| policy.deny_unreadable)
+    {
+        return Ok(plan);
+    }
     let empty = SkillsPolicy {
         allow: Vec::new(),
         deny: Vec::new(),
         targets: super::policy::Targets::Auto,
         deny_unreadable: false,
     };
-    let policy = match plan.policy.as_ref() {
-        Some(policy) if policy.is_active() => policy,
-        _ if mode == PlanMode::Inspect => plan.policy.as_ref().unwrap_or(&empty),
-        _ => return Ok(plan),
+    let policy = plan.policy.as_ref().unwrap_or(&empty);
+    let reads_others = reads_other_packages_skills(policy);
+    let directories = importer_directories(project_dir);
+    let sets: Vec<Vec<super::lpm_dev::ReviewedSet>> = directories
+        .iter()
+        .map(|directory| {
+            if sources.lpm_dev || reads_others {
+                super::lpm_dev::reviewed_sets(directory)
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
+    let kinds = Sources {
+        lpm_dev: sources.lpm_dev && sets.iter().any(|sets| !sets.is_empty()),
+        other: sources.other && !policy.allow.is_empty(),
     };
+    plan.considered = kinds.lpm_dev || kinds.other;
+    if mode == PlanMode::Apply && !plan.considered {
+        return Ok(plan);
+    }
     let needs_analysis = policy
         .allow
         .iter()
         .chain(&policy.deny)
         .any(|entry| uses_behavioral_tags(&entry.selector));
 
-    let mut importers = vec![(project_dir.to_path_buf(), root_dependency_names(manifest))];
-    if let Ok(Some(workspace)) = lpm_workspace::discover_workspace(project_dir)
-        && same_directory(&workspace.root, project_dir)
-    {
-        for member in workspace.members {
-            let member_manifest = read_manifest(&member.path).ok();
+    let mut discoveries = Vec::with_capacity(directories.len());
+    for (index, (directory, sets)) in directories.into_iter().zip(sets).enumerate() {
+        let (names, declared) = if index == 0 {
+            (
+                root_dependency_names(manifest),
+                installed_dependency_names(manifest),
+            )
+        } else {
+            let member_manifest = read_manifest(&directory).ok();
             if member_manifest
                 .as_ref()
                 .is_some_and(|manifest| manifest.pointer("/lpm/skills").is_some())
             {
                 plan.problems
-                    .push(member_policy_problem(project_dir, &member.path));
+                    .push(member_policy_problem(project_dir, &directory));
             }
-            let names = member_manifest
-                .map(|manifest| root_dependency_names(&manifest))
-                .unwrap_or_default();
-            importers.push((member.path, names));
-        }
-    }
-    let mut discoveries = Vec::with_capacity(importers.len());
-    for (directory, names) in importers {
+            member_manifest
+                .map(|manifest| {
+                    (
+                        root_dependency_names(&manifest),
+                        installed_dependency_names(&manifest),
+                    )
+                })
+                .unwrap_or_default()
+        };
         let discovery = match PackageInventory::discover_within(&directory, project_dir) {
             Ok(discovery) => discovery,
             Err(LpmError::NotFound(_)) => {
@@ -265,23 +343,43 @@ pub(crate) fn plan_project(
             }
             Err(error) => return Err(error),
         };
-        discoveries.push((discovery, names));
+        discoveries.push((discovery, names, declared, sets));
     }
-    let named = match (packages, mode) {
-        (Some(packages), _) => Some(packages.clone()),
-        (None, PlanMode::Apply) => named_packages(policy),
-        (None, PlanMode::Inspect) => None,
-    };
     let is_lpm_project = discoveries
         .iter()
-        .any(|(discovery, _)| discovery.manager == ManagerKind::Lpm);
+        .any(|(discovery, _, _, _)| discovery.manager == ManagerKind::Lpm);
+    let scope = Scope {
+        policy,
+        mode,
+        enabled: sources,
+        read: if mode == PlanMode::Inspect {
+            Sources {
+                lpm_dev: true,
+                other: true,
+            }
+        } else {
+            kinds
+        },
+        named: match mode {
+            PlanMode::Apply => named_packages(policy),
+            PlanMode::Inspect => None,
+        },
+        only: packages,
+        reads_others,
+        recorded,
+    };
     let build = |lpm_root: Option<&lpm_common::LpmRoot>| -> Result<Found, LpmError> {
         let store_version = lpm_store::StoreVersion::from_env();
         let importers: Vec<Importer> = discoveries
             .into_iter()
-            .map(|(discovery, root_dependency_names)| {
+            .map(|(discovery, root_dependency_names, declared_names, sets)| {
                 let is_lpm = discovery.manager == ManagerKind::Lpm;
-                let named = named.as_ref();
+                let added =
+                    crate::added_sources_state::load_skill_versions(&discovery.project_root)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(package, version)| (format!("@lpm.dev/{package}"), version))
+                        .collect();
                 let mut inventory = PackageInventory::from_discovery_with_options(
                     discovery,
                     store_version,
@@ -297,16 +395,13 @@ pub(crate) fn plan_project(
                     inventory,
                     is_lpm,
                     root_dependency_names,
-                    named: named.cloned(),
+                    declared_names,
+                    sets,
+                    added,
                 }
             })
             .collect();
-        Ok(candidates_from_importers(
-            &importers,
-            lpm_root,
-            Rules { policy, recorded },
-            mode,
-        ))
+        Ok(candidates_from_importers(&importers, lpm_root, &scope))
     };
     let found = if is_lpm_project {
         let lpm_root = lpm_common::LpmRoot::from_env()?;
@@ -320,7 +415,59 @@ pub(crate) fn plan_project(
     plan.unlisted_allows = found.unlisted_allows;
     plan.problems.extend(found.problems);
     plan.incomplete = found.incomplete;
+    plan.pending_reviews = found.pending_reviews;
+    plan.automatic_unlisted = found.automatic_unlisted;
     Ok(plan)
+}
+
+/// What one plan decides with.
+struct Scope<'a> {
+    policy: &'a SkillsPolicy,
+    mode: PlanMode,
+    /// The kinds the user's settings link.
+    enabled: Sources,
+    /// The kinds whose skills the plan reads.
+    read: Sources,
+    /// The only npm and other packages the policy can allow, when it names
+    /// them.
+    named: Option<HashSet<String>>,
+    /// The only packages the plan reads, when the caller limits it.
+    only: Option<&'a HashSet<String>>,
+    /// Whether an entry reads the skills other packages ship, through `>`,
+    /// so the skills of packages the plan can't link are read for the
+    /// selectors.
+    reads_others: bool,
+    /// The skills earlier links recorded, judged for packages whose skills
+    /// couldn't be listed.
+    recorded: &'a RecordedSkills,
+}
+
+impl Scope<'_> {
+    /// Whether the plan reads the skills `package` ships only for the
+    /// selectors that look at other packages.
+    fn reads_facts(&self, package: &str) -> bool {
+        self.reads_others && self.only.is_none_or(|only| only.contains(package))
+    }
+
+    /// Whether the plan reads the skills `package` ships.
+    fn reads(&self, package: &str) -> bool {
+        if self.only.is_some_and(|only| !only.contains(package)) {
+            return false;
+        }
+        if is_lpm_dev(package) {
+            self.read.lpm_dev
+        } else {
+            self.read.other
+                && self
+                    .named
+                    .as_ref()
+                    .is_none_or(|named| named.contains(package))
+        }
+    }
+}
+
+pub(crate) fn is_lpm_dev(package: &str) -> bool {
+    package.starts_with("@lpm.dev/")
 }
 
 fn same_directory(left: &Path, right: &Path) -> bool {
@@ -341,24 +488,25 @@ fn member_policy_problem(project_dir: &Path, member: &Path) -> String {
     )
 }
 
-/// The names of the only packages the policy can allow, when every
-/// allowing entry names its packages with `#name` and no entry reads the
-/// skills another package ships; `None` otherwise. Packages outside the set
-/// need no reading.
+/// The names of the only npm and other packages the policy can allow, when
+/// every allowing entry names its packages with `#name`; `None` otherwise.
+/// Packages outside the set are read only for the selectors that look at
+/// the skills other packages ship.
 pub(crate) fn named_packages(policy: &SkillsPolicy) -> Option<HashSet<String>> {
-    if policy
-        .allow
-        .iter()
-        .chain(&policy.deny)
-        .any(|entry| reads_parent_skills(&entry.selector))
-    {
-        return None;
-    }
     let mut names = HashSet::new();
     for entry in &policy.allow {
         names.extend(selector_names(&entry.selector)?);
     }
     Some(names)
+}
+
+/// Whether one of `policy`'s entries reads the skills other packages ship.
+pub(crate) fn reads_other_packages_skills(policy: &SkillsPolicy) -> bool {
+    policy
+        .allow
+        .iter()
+        .chain(&policy.deny)
+        .any(|entry| reads_parent_skills(&entry.selector))
 }
 
 /// Whether deciding `selector` for a package looks at its parents other
@@ -431,8 +579,14 @@ struct Importer {
     inventory: PackageInventory,
     is_lpm: bool,
     root_dependency_names: HashSet<String>,
-    /// The only packages the policy can allow, when it names them.
-    named: Option<HashSet<String>>,
+    /// The names its manifest declares dependencies under that the install
+    /// puts in place: its own peers left out.
+    declared_names: HashSet<String>,
+    /// The reviewed LPM.dev skills its install materialized.
+    sets: Vec<super::lpm_dev::ReviewedSet>,
+    /// The LPM.dev packages `lpm add` delivered here, with the version of
+    /// their skills, as `lpm-sources.json` records them.
+    added: HashSet<(String, String)>,
 }
 
 impl Importer {
@@ -454,6 +608,42 @@ impl Importer {
     /// other than LPM laid them out, rather than the store's copies.
     fn opens_in_project(&self) -> bool {
         self.inventory.baseline_index.is_none()
+    }
+
+    /// The reviewed set of `package` at `version`: a set of another version
+    /// vouches for nothing this one ships.
+    fn set_of(&self, package: &str, version: &str) -> Option<usize> {
+        self.sets
+            .iter()
+            .position(|set| set.package == package && set.version == version)
+    }
+
+    /// The `lpm.lock` instances the importer's manifest declares, by the
+    /// names it declares them under: never a peer LPM installed at its root
+    /// for another package, nor one the manifest lists as its own peer.
+    fn declared_instances(&self) -> RootReleases {
+        RootReleases::of(self, |name, _| self.declared_names.contains(name))
+    }
+
+    /// Whether the importer's manifest declares `package`, given
+    /// [`Self::declared_instances`]; without instances, a release the root
+    /// installs under a declared name, or a package at the top of
+    /// `node_modules` under one the lockfile doesn't resolve at the root, an
+    /// alias's included.
+    fn declares(&self, package: &DiscoveredPackage, declared: &RootReleases) -> bool {
+        declared.holds_at_top(package, &self.declared_names)
+    }
+
+    /// Whether `lpm skills add` or `lpm add` delivered the set at `index`, so
+    /// it links whether or not the package is installed here, and however
+    /// deep. A set an install left for a dependency that is gone, left out
+    /// or no longer direct doesn't.
+    fn delivered_by_add(&self, index: usize) -> bool {
+        let set = &self.sets[index];
+        set.added
+            || self
+                .added
+                .contains(&(set.package.clone(), set.version.clone()))
     }
 }
 
@@ -479,11 +669,29 @@ fn is_absent(
         }))
 }
 
-/// A policy decision about one skill of one installed package.
+/// The skills one package ships, with where each one's files come from.
+type PackageSkills = Vec<(String, Origin)>;
+
+/// Where a skill's files come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// `skills/<name>/` in the package as it was published.
+    Directory,
+    /// The flat skill at this index of its LPM.dev package's reviewed set.
+    Reviewed(usize),
+}
+
+/// A policy decision about one skill of one package.
 struct Decided {
     importer: usize,
-    package: usize,
+    /// The package's index in its importer's inventory; `None` for a
+    /// reviewed set whose package the importer didn't install, as `lpm add`
+    /// delivers.
+    package: Option<usize>,
+    /// The package's reviewed set in its importer.
+    set: Option<usize>,
     skill: String,
+    origin: Origin,
     decision: Decision,
     /// How many deny entries can't be decided for the skill yet.
     open_denials: usize,
@@ -503,14 +711,8 @@ struct Found {
     /// Packages whose skills break a rule the same way every run.
     problems: Vec<String>,
     incomplete: bool,
-}
-
-/// What a plan decides by: the policy, and the skills earlier links
-/// recorded.
-#[derive(Clone, Copy)]
-struct Rules<'a> {
-    policy: &'a SkillsPolicy,
-    recorded: &'a RecordedSkills,
+    pending_reviews: Vec<PendingReview>,
+    automatic_unlisted: BTreeSet<String>,
 }
 
 /// Every policy decision across the importers, in the order made.
@@ -523,15 +725,40 @@ struct Decisions {
     /// and that a candidate or an unlisted package reaches through its
     /// parents, when the policy looks at parents.
     unconfirmed: BTreeSet<String>,
+    /// The LPM.dev packages, as `name@version`, without LPM's record of the
+    /// review of their installed version that a candidate or an unlisted
+    /// package reaches through its parents, when a selector reads what
+    /// parents ship.
+    unreviewed: BTreeSet<String>,
+    automatic_unlisted: BTreeSet<String>,
     problems: Vec<String>,
     incomplete: bool,
+}
+
+/// A decided skill's package: name, version and integrity.
+fn identity<'a>(importers: &'a [Importer], entry: &Decided) -> (&'a str, &'a str, Option<&'a str>) {
+    let importer = &importers[entry.importer];
+    match (entry.package, entry.set) {
+        (Some(package), _) => {
+            let package = &importer.inventory.discovery.packages[package];
+            (
+                package.name.as_str(),
+                package.version.as_str(),
+                package.integrity.as_deref(),
+            )
+        }
+        (None, Some(set)) => {
+            let set = &importer.sets[set];
+            (set.package.as_str(), set.version.as_str(), None)
+        }
+        (None, None) => unreachable!("a decided skill comes from a package or a reviewed set"),
+    }
 }
 
 fn candidates_from_importers(
     importers: &[Importer],
     lpm_root: Option<&lpm_common::LpmRoot>,
-    rules: Rules<'_>,
-    mode: PlanMode,
+    scope: &Scope<'_>,
 ) -> Found {
     let project_roots: Vec<Option<cap_std::fs::Dir>> = importers
         .iter()
@@ -551,7 +778,7 @@ fn candidates_from_importers(
             index,
             project_roots[index].as_ref(),
             lpm_root,
-            rules,
+            scope,
             &root,
             &mut decisions,
         ));
@@ -560,10 +787,14 @@ fn candidates_from_importers(
         decisions.incomplete = true;
         decisions.problems.push(problem);
     }
+    if let Some(problem) = unreviewed_parents(&decisions.unreviewed) {
+        decisions.problems.push(problem);
+    }
     let Decisions {
         decided,
         unlisted,
         unlisted_allows,
+        automatic_unlisted,
         problems,
         incomplete,
         ..
@@ -575,23 +806,28 @@ fn candidates_from_importers(
             unlisted_allows,
             problems,
             incomplete,
+            pending_reviews: Vec::new(),
+            automatic_unlisted,
         };
     }
 
-    let package_of =
-        |entry: &Decided| &importers[entry.importer].inventory.discovery.packages[entry.package];
-    let preferred = preferred_instances(&decided, &package_of);
-    let conflicts = name_conflicts(&decided, &preferred, &package_of);
+    let identity_of = |entry: &Decided| {
+        let (name, version, _) = identity(importers, entry);
+        (name, version)
+    };
+    let preferred = preferred_instances(&decided, &identity_of);
+    let conflicts = name_conflicts(&decided, &preferred, &identity_of);
     let mut rulings: HashMap<(&str, String), Vec<InstanceRuling>> = HashMap::new();
     let mut inspected: Vec<Option<(CandidateStatus, Option<SkillDetails>)>> = Vec::new();
-    if mode == PlanMode::Inspect {
+    if scope.mode == PlanMode::Inspect {
         inspected.reserve_exact(decided.len());
         for (position, entry) in decided.iter().enumerate() {
-            let package = package_of(entry);
-            let directory = directories[entry.importer][entry.package]
-                .as_ref()
-                .ok_or_else(|| LpmError::Registry(format!("{} could not be opened", package.name)));
-            let (status, details) = prepare_fully(directory, package, &entry.skill);
+            let (name, version, _) = identity(importers, entry);
+            let directory = entry
+                .package
+                .and_then(|package| directories[entry.importer][package].as_ref());
+            let (status, details) =
+                prepare_fully(directory, name, &entry.skill, review_of(importers, entry));
             let may_link = matches!(entry.decision, Decision::Allowed(_) | Decision::Unknown)
                 && match &status {
                     CandidateStatus::Linkable(_) => true,
@@ -602,10 +838,10 @@ fn candidates_from_importers(
                     .as_ref()
                     .is_none_or(|details| details.requires <= entry.possible_naming);
             rulings
-                .entry((package.name.as_str(), entry.skill.clone()))
+                .entry((name, entry.skill.clone()))
                 .or_default()
                 .push(InstanceRuling {
-                    version: package.version.clone(),
+                    version: version.to_string(),
                     ruling: entry.decision.kind(),
                     open_denials: entry.open_denials,
                     may_link,
@@ -618,21 +854,23 @@ fn candidates_from_importers(
     }
 
     let mut candidates = Vec::with_capacity(preferred.len());
-    for (position, entry) in decided.into_iter().enumerate() {
+    let mut pending_reviews = Vec::new();
+    for (position, entry) in decided.iter().enumerate() {
         if !preferred.contains(&position) {
             continue;
         }
-        let package = package_of(&entry);
-        let skill = entry.skill;
+        let (package, version, integrity) = identity(importers, entry);
+        let importer = &importers[entry.importer];
+        let skill = entry.skill.as_str();
         let instances = rulings
-            .remove(&(package.name.as_str(), skill.clone()))
+            .remove(&(package, skill.to_string()))
             .unwrap_or_default();
-        let directory = directories[entry.importer][entry.package].as_ref();
-        let check = |naming: Naming| {
-            let directory = directory
-                .ok_or_else(|| LpmError::Registry(format!("{} could not be opened", package.name)));
-            prepare(directory, package, &skill, naming)
-        };
+        let directory = entry
+            .package
+            .and_then(|package| directories[entry.importer][package].as_ref());
+        let set = entry.set.map(|set| &importer.sets[set]);
+        let review = review_of(importers, entry);
+        let check = |naming: Naming| prepare(directory, package, skill, naming, review);
         let full = inspected.get_mut(position).and_then(Option::take);
         let inspect =
             |status: CandidateStatus, full: Option<(CandidateStatus, Option<SkillDetails>)>| {
@@ -650,14 +888,14 @@ fn candidates_from_importers(
         let (status, details, blocker) = match entry.decision {
             Decision::NotAllowed => inspect(CandidateStatus::NotAllowed, full),
             Decision::Denied => inspect(CandidateStatus::Denied, full),
-            Decision::Allowed(_) | Decision::Unknown if conflicts.contains_key(&skill) => inspect(
+            Decision::Allowed(_) | Decision::Unknown if conflicts.contains_key(skill) => inspect(
                 held(
                     HoldReason::NameConflict,
                     format!(
                         "{} also ship a skill named `{skill}`; name one with `#<package>:skill({skill})` and deny the others",
-                        conflicts[&skill]
+                        conflicts[skill]
                             .iter()
-                            .filter(|name| **name != package.name)
+                            .filter(|name| **name != package)
                             .cloned()
                             .collect::<Vec<_>>()
                             .join(", ")
@@ -687,11 +925,28 @@ fn candidates_from_importers(
                 }
             }
         };
+        if matches!(review, Review::Directory(None))
+            && matches!(
+                status,
+                CandidateStatus::Held {
+                    reason: HoldReason::NotReviewed,
+                    ..
+                }
+            )
+            && let Some(set) = set.filter(|set| set.recorded)
+            && let Some(short) = package.strip_prefix("@lpm.dev/")
+        {
+            pending_reviews.push(PendingReview {
+                package: short.to_string(),
+                version: set.version.clone(),
+                directory: skill.to_string(),
+            });
+        }
         candidates.push(Candidate {
-            package: package.name.clone(),
-            version: package.version.clone(),
-            integrity: package.integrity.clone(),
-            skill,
+            package: package.to_string(),
+            version: version.to_string(),
+            integrity: integrity.map(str::to_string),
+            skill: skill.to_string(),
             status,
             naming: match entry.decision {
                 Decision::Allowed(naming) => naming,
@@ -721,15 +976,18 @@ fn candidates_from_importers(
         unlisted_allows,
         problems,
         incomplete,
+        pending_reviews,
+        automatic_unlisted,
     }
 }
 
 /// The workspace root's direct dependencies, which `:workspace-root >`
-/// selects in every importer: by graph instance, or by name at the top of
-/// `node_modules` where the lockfile has no instances.
+/// selects in every importer: by graph instance, or, where the lockfile has
+/// no instances, by the release a root name resolves to or by name at the
+/// top of `node_modules`.
 #[derive(Default)]
 struct RootDependencies {
-    instances: HashSet<lpm_common::PackageInstanceId>,
+    releases: RootReleases,
     names: HashSet<String>,
 }
 
@@ -739,29 +997,97 @@ impl RootDependencies {
             return Self::default();
         };
         Self {
-            instances: root
-                .inventory
-                .discovery
-                .retained_lpm_lockfile()
-                .map(|lockfile| {
-                    lockfile
-                        .root_resolutions
-                        .values()
-                        .filter_map(|resolution| resolution.instance_id)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            releases: RootReleases::of(root, |name, resolution| {
+                resolution.instance_id.is_some() || root.root_dependency_names.contains(name)
+            }),
             names: root.root_dependency_names.clone(),
         }
     }
 
     fn selects(&self, package: &DiscoveredPackage) -> bool {
-        match package.instance_id {
-            Some(instance) => self.instances.contains(&instance),
-            None => {
-                self.names.contains(&package.name)
-                    && package.path.strip_prefix("node_modules/") == Some(package.name.as_str())
+        self.releases.holds_at_top(package, &self.names)
+    }
+}
+
+/// The releases an importer's lockfile installs at its root under the names
+/// a filter accepts: by graph instance, and, for a lockfile without
+/// instances, by name and version, whatever name the root gives them.
+#[derive(Default)]
+struct RootReleases {
+    instances: HashSet<lpm_common::PackageInstanceId>,
+    /// Package name to versions, for root resolutions without instances.
+    legacy: HashMap<String, Vec<String>>,
+    /// Every local name the lockfile resolves at the root, accepted or not.
+    resolved: HashSet<String>,
+}
+
+impl RootReleases {
+    fn of(
+        importer: &Importer,
+        accepts: impl Fn(&str, &lpm_lockfile::LockedRootResolution) -> bool,
+    ) -> Self {
+        importer
+            .inventory
+            .discovery
+            .retained_lpm_lockfile()
+            .map(|lockfile| Self::from_resolutions(&lockfile.root_resolutions, accepts))
+            .unwrap_or_default()
+    }
+
+    fn from_resolutions(
+        resolutions: &lpm_lockfile::RootResolutions,
+        accepts: impl Fn(&str, &lpm_lockfile::LockedRootResolution) -> bool,
+    ) -> Self {
+        let mut releases = Self::default();
+        for (name, resolution) in resolutions {
+            releases.resolved.insert(name.clone());
+            if !accepts(name, resolution) {
+                continue;
             }
+            match resolution.instance_id {
+                Some(instance) => {
+                    releases.instances.insert(instance);
+                }
+                None => releases
+                    .legacy
+                    .entry(resolution.package.clone())
+                    .or_default()
+                    .push(resolution.version.clone()),
+            }
+        }
+        releases
+    }
+
+    #[inline]
+    fn holds(&self, package: &DiscoveredPackage) -> bool {
+        self.holds_release(package.instance_id, &package.name, &package.version)
+    }
+
+    /// [`Self::holds`], or, for a package without an instance at the top of
+    /// `node_modules` under a local name in `names` that the lockfile
+    /// doesn't resolve at the root, whether it sits there: a lockfile that
+    /// resolves the name says which release the root installs under it.
+    fn holds_at_top(&self, package: &DiscoveredPackage, names: &HashSet<String>) -> bool {
+        self.holds(package)
+            || package.instance_id.is_none()
+                && package
+                    .path
+                    .strip_prefix("node_modules/")
+                    .is_some_and(|local| names.contains(local) && !self.resolved.contains(local))
+    }
+
+    fn holds_release(
+        &self,
+        instance: Option<lpm_common::PackageInstanceId>,
+        name: &str,
+        version: &str,
+    ) -> bool {
+        match instance {
+            Some(instance) => self.instances.contains(&instance),
+            None => self
+                .legacy
+                .get(name)
+                .is_some_and(|versions| versions.iter().any(|held| held == version)),
         }
     }
 }
@@ -788,141 +1114,217 @@ fn unconfirmed_parents(unconfirmed: &BTreeSet<String>) -> Option<String> {
     ))
 }
 
-/// The packages, as `name@version`, whose installs can't be confirmed among
-/// the ancestors of `from` in `graph`, by graph key.
-fn uncertain_ancestors<'a>(
+/// The ancestors of `from` in `graph`, by graph key.
+fn ancestors<'a>(
     graph: &DepGraph<'a>,
     from: impl IntoIterator<Item = &'a str>,
-    packages: &HashMap<&str, &DiscoveredPackage>,
-) -> Vec<String> {
+) -> HashSet<&'a str> {
     let mut stack: Vec<&str> = from.into_iter().collect();
     let mut seen: HashSet<&str> = HashSet::new();
-    let mut found = Vec::new();
     while let Some(key) = stack.pop() {
         for parent in graph.parents.get(key).into_iter().flatten() {
-            if !seen.insert(parent) {
-                continue;
-            }
-            stack.push(parent);
-            if let Some(package) = packages.get(parent)
-                && package.installed
-                    == Some(crate::commands::audit::discovery::Installation::Unknown)
-            {
-                found.push(format!("{}@{}", package.name, package.version));
+            if seen.insert(parent) {
+                stack.push(parent);
             }
         }
     }
-    found
+    seen
 }
 
-/// Decides every skill one importer's installed packages ship, against that
-/// importer's dependency graph. Returns the directory of each package that
-/// ships skills, opened once for reading them.
+/// The problem naming the LPM.dev parents without LPM's record of what their
+/// installed versions ship, if there are any.
+fn unreviewed_parents(unreviewed: &BTreeSet<String>) -> Option<String> {
+    const SHOWN: usize = 5;
+    if unreviewed.is_empty() {
+        return None;
+    }
+    let mut listed = unreviewed
+        .iter()
+        .take(SHOWN)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if unreviewed.len() > SHOWN {
+        listed.push_str(&format!(" and {} more", unreviewed.len() - SHOWN));
+    }
+    Some(format!(
+        "LPM has no record of the reviewed skills of {listed} on this machine (LPM.dev serves them, and LPM fetches them only for direct dependencies), so selectors that look at what they ship stay undecided"
+    ))
+}
+
+/// Decides every skill one importer's installed packages ship, and the
+/// reviewed sets whose packages it didn't install, against that importer's
+/// dependency graph. Returns the directory of each package that ships
+/// skills, opened once for reading them.
 fn decide_importer(
     importer: &Importer,
     importer_index: usize,
     project_root: Option<&cap_std::fs::Dir>,
     lpm_root: Option<&lpm_common::LpmRoot>,
-    rules: Rules<'_>,
+    scope: &Scope<'_>,
     root: &RootDependencies,
     decisions: &mut Decisions,
 ) -> Vec<Option<cap_std::fs::Dir>> {
     use rayon::prelude::*;
 
-    let Rules { policy, recorded } = rules;
-
     let inventory = &importer.inventory;
     let packages = &inventory.discovery.packages;
+    let sets: Vec<Option<usize>> = packages
+        .iter()
+        .map(|package| importer.set_of(&package.name, &package.version))
+        .collect();
+    let declared = importer.declared_instances();
+    type Listed = (
+        Option<cap_std::fs::Dir>,
+        PackageSkills,
+        Option<ListFailure>,
+        Shipped,
+        bool,
+    );
     let listed: Vec<Listed> = packages
         .par_iter()
-        .map(|package| {
-            if importer
-                .named
-                .as_ref()
-                .is_some_and(|named| !named.contains(&package.name))
-            {
-                return Listed::Unread;
+        .zip(&sets)
+        .map(|(package, set)| {
+            let reads = scope.reads(&package.name);
+            if !reads && !scope.reads_facts(&package.name) {
+                return (None, Vec::new(), None, Shipped::Unknown, false);
             }
             let uncertain =
                 package.installed == Some(crate::commands::audit::discovery::Installation::Unknown);
+            let lpm_dev = is_lpm_dev(&package.name);
+            let reviewed = set.filter(|set| importer.sets[*set].recorded);
+            if !reads && (uncertain || lpm_dev && reviewed.is_none()) {
+                return (None, Vec::new(), None, Shipped::Unknown, false);
+            }
+            let mut skills: PackageSkills = set
+                .map(|set| {
+                    importer.sets[set]
+                        .skills
+                        .iter()
+                        .enumerate()
+                        .map(|(index, skill)| (skill.name.clone(), Origin::Reviewed(index)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut failure = None;
             let directory = match importer.open(package, project_root, lpm_root) {
-                Ok(directory) => directory,
+                Ok(directory) => Some(directory),
                 Err(error)
                     if is_absent(&error, project_root, package, importer.opens_in_project()) =>
                 {
-                    return if uncertain {
-                        Listed::Uncertain {
-                            ships_skills: false,
-                        }
-                    } else {
-                        Listed::Nothing
-                    };
+                    None
                 }
-                Err(error) => return Listed::Failed(error),
+                Err(error) => {
+                    failure = Some(ListFailure::Unreadable(error));
+                    None
+                }
             };
-            match skill_directory_listing(&directory) {
-                Ok(listing) if uncertain => Listed::Uncertain {
-                    ships_skills: !listing.names.is_empty(),
-                },
-                Ok(listing) if !listing.names.is_empty() => Listed::Skills {
-                    directory,
-                    names: listing.names,
-                    unconfirmed: listing.unconfirmed,
-                },
-                Ok(_) => Listed::Nothing,
-                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-                    Listed::Refused(error)
+            let mut unconfirmed = false;
+            if let Some(directory) = directory.as_ref() {
+                match skill_directory_listing(directory) {
+                    Ok(listing) => {
+                        unconfirmed = listing.unconfirmed;
+                        skills.extend(
+                            listing
+                                .names
+                                .into_iter()
+                                .map(|name| (name, Origin::Directory)),
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                        failure = Some(ListFailure::Refused(error));
+                    }
+                    Err(error) => failure = Some(ListFailure::Unreadable(error)),
                 }
-                Err(error) => Listed::Failed(error),
+            }
+            // A reviewed LPM.dev skill comes from the registry, so what the
+            // package ships is known only from LPM's record of the review for
+            // the installed version.
+            let names_known = failure.is_none() && !unconfirmed && (!lpm_dev || reviewed.is_some());
+            let fact_names = |skills: &PackageSkills| -> Vec<String> {
+                match reviewed {
+                    Some(set) => importer.sets[set]
+                        .approved
+                        .iter()
+                        .cloned()
+                        .chain(
+                            skills
+                                .iter()
+                                .filter(|(_, origin)| matches!(origin, Origin::Directory))
+                                .map(|(name, _)| name.clone()),
+                        )
+                        .collect(),
+                    None => skills.iter().map(|(name, _)| name.clone()).collect(),
+                }
+            };
+            if !reads {
+                let facts = if names_known {
+                    Shipped::Names(fact_names(&skills))
+                } else {
+                    Shipped::Unknown
+                };
+                return (
+                    None,
+                    Vec::new(),
+                    failure.map(ListFailure::for_facts),
+                    facts,
+                    unconfirmed,
+                );
+            }
+            if uncertain {
+                let failure =
+                    failure.or_else(|| (!skills.is_empty()).then_some(ListFailure::Uncertain));
+                return (None, Vec::new(), failure, Shipped::Unknown, false);
+            }
+            let facts = if !names_known {
+                Shipped::Unknown
+            } else if lpm_dev {
+                Shipped::Names(fact_names(&skills))
+            } else {
+                Shipped::Listed
+            };
+            if skills.is_empty() {
+                (None, skills, failure, facts, unconfirmed)
+            } else {
+                (directory, skills, failure, facts, unconfirmed)
             }
         })
         .collect();
     let mut directories = Vec::with_capacity(listed.len());
-    let mut skill_names = Vec::with_capacity(listed.len());
+    let mut skills = Vec::with_capacity(listed.len());
     let mut shipped = Vec::with_capacity(listed.len());
     let mut unlisted = Vec::new();
-    for (index, (package, listed)) in packages.iter().zip(listed).enumerate() {
+    for (index, (package, (directory, package_skills, failure, facts, unconfirmed))) in
+        packages.iter().zip(listed).enumerate()
+    {
+        decisions.incomplete |= unconfirmed;
         if matches!(
-            listed,
-            Listed::Uncertain { ships_skills: true } | Listed::Failed(_)
+            failure,
+            Some(ListFailure::Uncertain | ListFailure::Unreadable(_))
         ) {
             unlisted.push(index);
+            if is_lpm_dev(&package.name)
+                && sets[index].is_some_and(|set| {
+                    importer.declares(package, &declared) || importer.delivered_by_add(set)
+                })
+            {
+                decisions.automatic_unlisted.insert(package.name.clone());
+            }
         }
-        let (directory, names, facts) = match listed {
-            Listed::Skills {
-                directory,
-                names,
-                unconfirmed,
-            } => {
-                if unconfirmed {
-                    decisions.incomplete = true;
-                }
-                let facts = if unconfirmed {
-                    Shipped::Unknown
-                } else {
-                    Shipped::Listed
-                };
-                (Some(directory), names, facts)
+        match failure {
+            Some(ListFailure::Uncertain) => {
+                decisions
+                    .unlisted
+                    .entry(package.name.clone())
+                    .or_insert_with(|| UNCERTAIN_INSTALL.to_string());
             }
-            Listed::Nothing => (None, Vec::new(), Shipped::Listed),
-            Listed::Unread => (None, Vec::new(), Shipped::Unknown),
-            Listed::Uncertain { ships_skills } => {
-                if ships_skills {
-                    decisions
-                        .unlisted
-                        .entry(package.name.clone())
-                        .or_insert_with(|| UNCERTAIN_INSTALL.to_string());
-                }
-                (None, Vec::new(), Shipped::Unknown)
-            }
-            Listed::Failed(error) => {
+            Some(ListFailure::Unreadable(error)) => {
                 decisions
                     .unlisted
                     .entry(package.name.clone())
                     .or_insert_with(|| format!("its skills folder could not be read: {error}"));
-                (None, Vec::new(), Shipped::Unknown)
             }
-            Listed::Refused(error) => {
+            Some(ListFailure::Refused(error)) => {
                 let problem = format!(
                     "{}@{}: {error}, so none of its skills are linked",
                     package.name, package.version
@@ -930,16 +1332,42 @@ fn decide_importer(
                 if !decisions.problems.contains(&problem) {
                     decisions.problems.push(problem);
                 }
-                (None, Vec::new(), Shipped::Unknown)
             }
-        };
+            Some(ListFailure::FactsUnreadable(error)) => {
+                decisions.incomplete = true;
+                let problem = format!(
+                    "{}@{}: its skills folder could not be read ({error}), so selectors that look at the skills it ships stay undecided until it can be",
+                    package.name, package.version
+                );
+                if !decisions.problems.contains(&problem) {
+                    decisions.problems.push(problem);
+                }
+            }
+            Some(ListFailure::FactsRefused(error)) => {
+                let problem = format!(
+                    "{}@{}: {error}, so selectors that look at the skills it ships stay undecided",
+                    package.name, package.version
+                );
+                if !decisions.problems.contains(&problem) {
+                    decisions.problems.push(problem);
+                }
+            }
+            None => {}
+        }
         directories.push(directory);
-        skill_names.push(names);
+        skills.push(package_skills);
         shipped.push(facts);
     }
-    if skill_names.iter().all(Vec::is_empty) && unlisted.is_empty() {
+    let orphans: Vec<usize> = (0..importer.sets.len())
+        .filter(|set| !sets.contains(&Some(*set)) && importer.delivered_by_add(*set))
+        .collect();
+    if skills.iter().all(Vec::is_empty) && orphans.is_empty() && unlisted.is_empty() {
         return directories;
     }
+    let skill_names: Vec<Vec<String>> = skills
+        .iter()
+        .map(|skills| skills.iter().map(|(name, _)| name.clone()).collect())
+        .collect();
 
     let graph_key_storage: Vec<String> = if importer.is_lpm {
         packages
@@ -1006,10 +1434,11 @@ fn decide_importer(
             is_workspace_root_dep: false,
             skills: match &shipped[index] {
                 Shipped::Listed => Some(&skill_names[index]),
+                Shipped::Names(names) => Some(names),
                 Shipped::Unknown => None,
             },
             skill: None,
-            malware: None,
+            malware: is_lpm_dev(&package.name).then_some(false),
         })
         .collect();
     let all_packages: HashMap<&str, PackageContext<'_>> = graph_keys
@@ -1019,14 +1448,19 @@ fn decide_importer(
         .map(|(key, context)| (key, copy_context(context)))
         .collect();
 
-    if policy
+    if scope
+        .policy
         .allow
         .iter()
-        .chain(&policy.deny)
+        .chain(&scope.policy.deny)
         .any(|entry| reads_parents(&entry.selector))
     {
-        let by_key: HashMap<&str, &DiscoveredPackage> =
-            graph_keys.iter().copied().zip(packages.iter()).collect();
+        let index_of: HashMap<&str, usize> = graph_keys
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, key)| (key, index))
+            .collect();
         let reached = skill_names
             .iter()
             .enumerate()
@@ -1034,16 +1468,49 @@ fn decide_importer(
             .map(|(index, _)| index)
             .chain(unlisted.iter().copied())
             .map(|index| graph_keys[index]);
-        decisions
-            .unconfirmed
-            .extend(uncertain_ancestors(&graph, reached, &by_key));
+        for key in ancestors(&graph, reached) {
+            let Some(&index) = index_of.get(key) else {
+                continue;
+            };
+            let package = &packages[index];
+            let release = format!("{}@{}", package.name, package.version);
+            if package.installed == Some(crate::commands::audit::discovery::Installation::Unknown) {
+                decisions.unconfirmed.insert(release);
+            } else if scope.reads_others
+                && is_lpm_dev(&package.name)
+                && !sets[index].is_some_and(|set| importer.sets[set].recorded)
+            {
+                decisions.unreviewed.insert(release);
+            }
+        }
     }
     for &index in &unlisted {
         let package = &packages[index];
-        for (skill, requires) in recorded.get(&package.name).into_iter().flatten() {
+        let lpm_dev = is_lpm_dev(&package.name);
+        let enabled = if lpm_dev {
+            scope.enabled.lpm_dev
+        } else {
+            scope.enabled.other
+        };
+        if !enabled {
+            continue;
+        }
+        let automatic = lpm_dev
+            && sets[index].is_some_and(|set| {
+                importer.declares(package, &declared) || importer.delivered_by_add(set)
+            });
+        let set = sets[index].map(|set| &importer.sets[set]);
+        for (skill, requires) in scope.recorded.get(&package.name).into_iter().flatten() {
             let mut candidate = copy_context(&contexts[index]);
             candidate.skill = Some(skill);
-            let ruling = decide(policy, &candidate, graph_keys[index], &graph, &all_packages);
+            let ruling = decide(
+                scope.policy,
+                &candidate,
+                graph_keys[index],
+                &graph,
+                &all_packages,
+                automatic_naming(automatic, set, skill),
+            );
             let allows = match ruling.decision {
                 Decision::Allowed(naming) => naming >= *requires,
                 Decision::Unknown => ruling.possible_naming >= *requires,
@@ -1059,18 +1526,88 @@ fn decide_importer(
         }
     }
     for (index, context) in contexts.iter().enumerate() {
-        for skill in &skill_names[index] {
+        let lpm_dev = is_lpm_dev(context.name);
+        let enabled = if lpm_dev {
+            scope.enabled.lpm_dev
+        } else {
+            scope.enabled.other
+        };
+        let automatic = lpm_dev
+            && sets[index].is_some_and(|set| {
+                importer.declares(&packages[index], &declared) || importer.delivered_by_add(set)
+            });
+        let set = sets[index].map(|set| &importer.sets[set]);
+        for (skill, origin) in &skills[index] {
             let mut candidate = copy_context(context);
             candidate.skill = Some(skill);
-            let ruling = decide(policy, &candidate, graph_keys[index], &graph, &all_packages);
+            let ruling = if enabled {
+                decide(
+                    scope.policy,
+                    &candidate,
+                    graph_keys[index],
+                    &graph,
+                    &all_packages,
+                    automatic_naming(automatic, set, skill),
+                )
+            } else {
+                Ruling::NOT_ALLOWED
+            };
             decisions.decided.push(Decided {
                 importer: importer_index,
-                package: index,
+                package: Some(index),
+                set: sets[index],
                 skill: skill.clone(),
+                origin: *origin,
                 decision: ruling.decision,
                 open_denials: ruling.open_denials,
                 possible_naming: ruling.possible_naming,
                 direct: graph.root_deps.contains(graph_keys[index]),
+            });
+        }
+    }
+    for set_index in orphans {
+        let set = &importer.sets[set_index];
+        let names: Vec<String> = set.skills.iter().map(|skill| skill.name.clone()).collect();
+        let context = PackageContext {
+            name: &set.package,
+            version: &set.version,
+            path: "",
+            analysis: None,
+            has_scripts: false,
+            is_built: false,
+            is_vulnerable: false,
+            is_deprecated: false,
+            is_root: false,
+            is_workspace_root_dep: false,
+            skills: Some(&names),
+            skill: None,
+            malware: Some(false),
+        };
+        for (index, skill) in names.iter().enumerate() {
+            let mut candidate = copy_context(&context);
+            candidate.skill = Some(skill);
+            let ruling = if scope.enabled.lpm_dev {
+                decide(
+                    scope.policy,
+                    &candidate,
+                    "",
+                    &graph,
+                    &all_packages,
+                    automatic_naming(true, Some(set), skill),
+                )
+            } else {
+                Ruling::NOT_ALLOWED
+            };
+            decisions.decided.push(Decided {
+                importer: importer_index,
+                package: None,
+                set: Some(set_index),
+                skill: skill.clone(),
+                origin: Origin::Reviewed(index),
+                decision: ruling.decision,
+                open_denials: ruling.open_denials,
+                possible_naming: ruling.possible_naming,
+                direct: true,
             });
         }
     }
@@ -1085,35 +1622,41 @@ const UNCERTAIN_INSTALL: &str = "an entry on its way in node_modules couldn't be
 enum Shipped {
     /// The names it lists for candidates.
     Listed,
+    /// These names, read only for the selectors: the policy reads what
+    /// other packages ship, but can't link this one's.
+    Names(Vec<String>),
     /// Nothing the facts can rely on: its skills weren't read, couldn't be
     /// listed, or come from a release whose install is uncertain.
     Unknown,
 }
 
-/// What listing one installed package's skills found.
-enum Listed {
-    Nothing,
-    /// Skills it ships; `unconfirmed` when a listed one's `SKILL.md`
-    /// couldn't be inspected, so what it ships tells the selectors nothing
-    /// and the next run lists it again.
-    Skills {
-        directory: cap_std::fs::Dir,
-        names: Vec<String>,
-        unconfirmed: bool,
-    },
-    /// Not read: the policy can't allow it.
-    Unread,
-    /// Whether the importer installed the release is unknown, so nothing
-    /// new links from it, earlier copies stay, and what it ships tells the
-    /// selectors nothing; one that ships skills is reported.
-    Uncertain {
-        ships_skills: bool,
-    },
+/// Why listing one installed package's skills failed.
+enum ListFailure {
+    /// Whether the importer installed the release, which ships skills, is
+    /// unknown: nothing new links from it, and earlier copies stay.
+    Uncertain,
     /// It couldn't be read now: the earlier copies stay and the next run
     /// reads it again.
-    Failed(std::io::Error),
+    Unreadable(std::io::Error),
     /// It breaks a rule the same way every time.
     Refused(std::io::Error),
+    /// A package read only for the selectors that look at the skills other
+    /// packages ship couldn't be read now: those selectors stay undecided
+    /// and the next run reads it again.
+    FactsUnreadable(std::io::Error),
+    /// Such a package breaks a rule the same way every time.
+    FactsRefused(std::io::Error),
+}
+
+impl ListFailure {
+    /// The failure for a package read only for the selectors.
+    fn for_facts(self) -> Self {
+        match self {
+            Self::Unreadable(error) | Self::FactsUnreadable(error) => Self::FactsUnreadable(error),
+            Self::Refused(error) | Self::FactsRefused(error) => Self::FactsRefused(error),
+            Self::Uncertain => Self::Uncertain,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1145,13 +1688,25 @@ struct Ruling {
     possible_naming: Naming,
 }
 
-/// What the policy decides for `candidate`.
+impl Ruling {
+    const NOT_ALLOWED: Self = Self {
+        decision: Decision::NotAllowed,
+        open_denials: 0,
+        possible_naming: Naming::None,
+    };
+}
+
+/// Decides one skill: a matching `deny` entry wins; otherwise it is
+/// allowed as specifically as the allowing entries name it. `automatic`
+/// allows it with no entry, as LPM.dev dependencies are, as specifically as
+/// [`automatic_naming`] says.
 fn decide(
     policy: &SkillsPolicy,
     candidate: &PackageContext<'_>,
     key: &str,
     graph: &DepGraph<'_>,
     all_packages: &HashMap<&str, PackageContext<'_>>,
+    automatic: Option<Naming>,
 ) -> Ruling {
     let mut denied = Truth::False;
     let mut open_denials = 0;
@@ -1198,6 +1753,11 @@ fn decide(
         }
         allowed = allowed.max(truth);
     }
+    if let Some(automatic) = automatic {
+        allowed = Truth::True;
+        naming = naming.max(automatic);
+        possible_naming = possible_naming.max(automatic);
+    }
     let decision = match (allowed, denied) {
         (Truth::False, _) => Decision::NotAllowed,
         (Truth::True, Truth::False) => Decision::Allowed(naming),
@@ -1208,6 +1768,23 @@ fn decide(
         open_denials,
         possible_naming,
     }
+}
+
+/// How specifically an LPM.dev skill that links with no entry is named: at
+/// its package's level, unless review served it with a warning, so only an
+/// entry that names the package links it.
+fn automatic_naming(
+    automatic: bool,
+    set: Option<&super::lpm_dev::ReviewedSet>,
+    skill: &str,
+) -> Option<Naming> {
+    automatic.then(|| {
+        if set.is_some_and(|set| set.review_warned(skill)) {
+            Naming::None
+        } else {
+            Naming::Package
+        }
+    })
 }
 
 /// How specifically the parts of `selector` that hold for `candidate` at
@@ -1283,18 +1860,18 @@ fn bare_id(id: &str) -> &str {
 /// dependency's; then the highest version.
 fn preferred_instances<'a>(
     decided: &[Decided],
-    package_of: &impl Fn(&Decided) -> &'a DiscoveredPackage,
+    identity_of: &impl Fn(&Decided) -> (&'a str, &'a str),
 ) -> HashSet<usize> {
     let mut best: BTreeMap<(&str, &str), usize> = BTreeMap::new();
     let rank = |entry: &Decided| {
         (
             matches!(entry.decision, Decision::Allowed(_) | Decision::Unknown),
             entry.direct,
-            lpm_semver::Version::parse(&package_of(entry).version).ok(),
+            lpm_semver::Version::parse(identity_of(entry).1).ok(),
         )
     };
     for (position, entry) in decided.iter().enumerate() {
-        let name = package_of(entry).name.as_str();
+        let name = identity_of(entry).0;
         let slot = best.entry((name, entry.skill.as_str())).or_insert(position);
         if rank(entry) > rank(&decided[*slot]) {
             *slot = position;
@@ -1308,7 +1885,7 @@ fn preferred_instances<'a>(
 fn name_conflicts<'a>(
     decided: &[Decided],
     preferred: &HashSet<usize>,
-    package_of: &impl Fn(&Decided) -> &'a DiscoveredPackage,
+    identity_of: &impl Fn(&Decided) -> (&'a str, &'a str),
 ) -> HashMap<String, Vec<String>> {
     let mut providers: HashMap<&str, Vec<&str>> = HashMap::new();
     for (position, entry) in decided.iter().enumerate() {
@@ -1316,7 +1893,7 @@ fn name_conflicts<'a>(
             && matches!(entry.decision, Decision::Allowed(_) | Decision::Unknown)
         {
             let names = providers.entry(entry.skill.as_str()).or_default();
-            let package = package_of(entry).name.as_str();
+            let package = identity_of(entry).0;
             if !names.contains(&package) {
                 names.push(package);
             }
@@ -1342,6 +1919,68 @@ fn held(reason: HoldReason, detail: impl Into<String>) -> CandidateStatus {
     }
 }
 
+/// Who vouches for the content of `entry`'s skill.
+fn review_of<'a>(importers: &'a [Importer], entry: &Decided) -> Review<'a> {
+    let (package, _, _) = identity(importers, entry);
+    let set = entry.set.map(|set| &importers[entry.importer].sets[set]);
+    match (entry.origin, set) {
+        (Origin::Reviewed(index), Some(set)) => match &set.skills[index].document {
+            Err(problem) => Review::Unusable(problem),
+            Ok(document) if set.skills[index].verified => {
+                Review::Reviewed(document, set.skills[index].warning.as_deref())
+            }
+            Ok(document) => Review::Unverified(document),
+        },
+        (Origin::Directory, _) if is_lpm_dev(package) => {
+            let skill = entry.skill.as_str();
+            Review::Directory(set.and_then(|set| {
+                Some(Approved {
+                    digest: set.directories.get(skill)?,
+                    warning: set.directory_warnings.get(skill).map(Vec::as_slice),
+                })
+            }))
+        }
+        _ => Review::Local,
+    }
+}
+
+/// Who vouches for a skill's content.
+#[derive(Debug, Clone, Copy)]
+enum Review<'a> {
+    /// No registry review: LPM's checks and scan decide, here.
+    Local,
+    /// An LPM.dev package's `skills/<name>/`: what LPM.dev review approved
+    /// of it, if anything.
+    Directory(Option<Approved<'a>>),
+    /// An LPM.dev package's flat skill, reviewed: its linked document, and
+    /// what review warned about.
+    Reviewed(&'a str, Option<&'a [SkillReviewIssue]>),
+    /// An LPM.dev package's flat skill whose review LPM has no record of on
+    /// this machine: its linked document.
+    Unverified(&'a str),
+    /// An LPM.dev package's flat skill that can't link: why.
+    Unusable(&'a str),
+}
+
+/// The files LPM.dev review approved for a skill directory, by digest, and
+/// what it warned about when it served them with a warning.
+#[derive(Debug, Clone, Copy)]
+struct Approved<'a> {
+    digest: &'a str,
+    warning: Option<&'a [SkillReviewIssue]>,
+}
+
+impl<'a> Review<'a> {
+    /// What LPM.dev review warned about in the content it approved.
+    fn warning(self) -> Option<&'a [SkillReviewIssue]> {
+        match self {
+            Review::Reviewed(_, warning) => warning,
+            Review::Directory(approved) => approved?.warning,
+            Review::Local | Review::Unverified(_) | Review::Unusable(_) => None,
+        }
+    }
+}
+
 /// Why a skill whose decision waits on data is held.
 const UNDECIDED: &str = "a selector reads data this package lacks: a behavioral analysis, a security verdict, or the skills of a package LPM couldn't list";
 
@@ -1351,12 +1990,13 @@ const UNDECIDED_NAMING: &str = "an allowing entry that names it as specifically 
 /// [`prepare_fully`], held when the allowing entries name the skill less
 /// specifically than `naming` it needs.
 fn prepare(
-    directory: Result<&cap_std::fs::Dir, LpmError>,
-    package: &DiscoveredPackage,
+    directory: Option<&cap_std::fs::Dir>,
+    package: &str,
     skill: &str,
     naming: Naming,
+    review: Review<'_>,
 ) -> (CandidateStatus, Option<SkillDetails>) {
-    let (status, details) = prepare_fully(directory, package, skill);
+    let (status, details) = prepare_fully(directory, package, skill, review);
     (require_naming(status, details.as_ref(), naming), details)
 }
 
@@ -1373,7 +2013,13 @@ fn require_naming(
     if naming >= prepared.requires {
         return status;
     }
-    let detail = if prepared.permission == SkillPermission::None {
+    let detail = if prepared.permission == SkillPermission::None && details.review_warning.is_some()
+    {
+        format!(
+            "LPM.dev review warned about it; allow `{}` to link it",
+            details.suggested
+        )
+    } else if prepared.permission == SkillPermission::None {
         format!(
             "the scan found warnings; allow `{}` to link it",
             details.suggested
@@ -1393,36 +2039,59 @@ fn require_naming(
     held(reason, detail)
 }
 
-/// Reads and checks `package`'s `skill` as if an entry named it fully: what
-/// it ships, what it pre-approves, and anything that keeps it out.
+/// Reads and checks one skill of `package` as if an entry named it fully:
+/// what it ships, what it pre-approves, and anything that keeps it out.
+/// LPM.dev review stands in for the scan: a reviewed skill's findings are
+/// reported, not held, but its structure, hooks and grants follow the same
+/// rules.
 fn prepare_fully(
-    directory: Result<&cap_std::fs::Dir, LpmError>,
-    package: &DiscoveredPackage,
+    directory: Option<&cap_std::fs::Dir>,
+    package: &str,
     skill: &str,
+    review: Review<'_>,
 ) -> (CandidateStatus, Option<SkillDetails>) {
-    let directory = match directory {
-        Ok(directory) => directory,
-        Err(error) => return (held(HoldReason::Unreadable, error.to_string()), None),
-    };
-    let entries = match read_skill_directory(directory, skill) {
-        Ok(entries) => entries,
-        Err(error) => return (held(HoldReason::Unreadable, error.to_string()), None),
+    let entries = match review {
+        Review::Unusable(problem) => return (held(HoldReason::Invalid, problem), None),
+        Review::Reviewed(document, _) | Review::Unverified(document) => vec![SkillDirectoryEntry {
+            path: lpm_skill::SKILL_DOCUMENT.to_string(),
+            kind: lpm_skill::SkillEntryKind::File,
+            size: document.len() as u64,
+            content: Some(document.as_bytes().to_vec()),
+        }],
+        Review::Local | Review::Directory(_) => {
+            let Some(directory) = directory else {
+                return (
+                    held(
+                        HoldReason::Unreadable,
+                        format!("{package} could not be opened"),
+                    ),
+                    None,
+                );
+            };
+            match read_skill_directory(directory, skill) {
+                Ok(entries) => entries,
+                Err(error) => return (held(HoldReason::Unreadable, error.to_string()), None),
+            }
+        }
     };
     let checked = match check_skill_directory(skill, &entries) {
         Ok(checked) => checked,
         Err(errors) => return (held(HoldReason::Invalid, errors.join("; ")), None),
     };
     let permission = checked.permission();
+    let reviewed = !matches!(review, Review::Local);
+    let review_warning = review.warning();
     let required = match permission {
         SkillPermission::Broad => Naming::Skill,
         SkillPermission::Hooks => Naming::Package,
-        SkillPermission::None if checked.has_warnings() => Naming::Package,
+        SkillPermission::None if review_warning.is_some() => Naming::Package,
+        SkillPermission::None if checked.has_warnings() && !reviewed => Naming::Package,
         SkillPermission::None => Naming::None,
     };
     let suggested = if required == Naming::Skill {
-        format!("#{}:skill({skill})", package.name)
+        format!("#{package}:skill({skill})")
     } else {
-        format!("#{}", package.name)
+        format!("#{package}")
     };
     let details = SkillDetails {
         description: checked.description.clone(),
@@ -1434,10 +2103,30 @@ fn prepare_fully(
             .iter()
             .filter(|finding| finding.issue.severity == lpm_skill::SkillSecuritySeverity::Warning)
             .count(),
+        review_warning: review_warning.map(<[SkillReviewIssue]>::to_vec),
         suggested,
         requires: required,
     };
-    if checked.is_blocked() {
+    if let Review::Unverified(_) = review {
+        return (
+            held(
+                HoldReason::NotReviewed,
+                "LPM has no record of LPM.dev's review of this version on this machine; an install with LPM.dev package skills on fetches it",
+            ),
+            Some(details),
+        );
+    }
+    if let Review::Directory(approved) = review
+        && approved.map(|approved| approved.digest) != Some(checked.digest.as_str())
+    {
+        let detail = if approved.is_some() {
+            format!("LPM.dev review approved other files for `skills/{skill}/` in this version")
+        } else {
+            format!("LPM.dev hasn't reviewed `skills/{skill}/` in this version")
+        };
+        return (held(HoldReason::NotReviewed, detail), Some(details));
+    }
+    if !reviewed && checked.is_blocked() {
         let rules: Vec<String> = checked
             .findings
             .iter()
@@ -1490,13 +2179,22 @@ fn copy_context<'a>(context: &PackageContext<'a>) -> PackageContext<'a> {
 }
 
 fn root_dependency_names(manifest: &serde_json::Value) -> HashSet<String> {
+    let mut names = installed_dependency_names(manifest);
+    if let Some(entries) = manifest
+        .get("peerDependencies")
+        .and_then(serde_json::Value::as_object)
+    {
+        names.extend(entries.keys().cloned());
+    }
+    names
+}
+
+/// The names a manifest declares dependencies under that an install puts
+/// in place for it: never its own `peerDependencies`, which a consumer
+/// provides.
+fn installed_dependency_names(manifest: &serde_json::Value) -> HashSet<String> {
     let mut names = HashSet::new();
-    for section in [
-        "dependencies",
-        "devDependencies",
-        "optionalDependencies",
-        "peerDependencies",
-    ] {
+    for section in ["dependencies", "devDependencies", "optionalDependencies"] {
         if let Some(entries) = manifest.get(section).and_then(serde_json::Value::as_object) {
             names.extend(entries.keys().cloned());
         }
@@ -1526,6 +2224,26 @@ fn uses_behavioral_tags(selector: &Selector) -> bool {
 mod tests {
     use super::super::policy::PolicyEntry;
     use super::*;
+
+    #[test]
+    fn a_legacy_root_release_counts_under_every_name_the_root_installs_it_under() {
+        let root = |package: &str| lpm_lockfile::LockedRootResolution {
+            package: package.to_string(),
+            version: "1.0.0".to_string(),
+            ..Default::default()
+        };
+        let resolutions = lpm_lockfile::RootResolutions::from([
+            ("ui".to_string(), root("@lpm.dev/acme.ui")),
+            ("@lpm.dev/acme.ui".to_string(), root("@lpm.dev/acme.ui")),
+            ("peer".to_string(), root("peer")),
+        ]);
+
+        let declared = RootReleases::from_resolutions(&resolutions, |name, _| name == "ui");
+
+        assert!(declared.holds_release(None, "@lpm.dev/acme.ui", "1.0.0"));
+        assert!(!declared.holds_release(None, "@lpm.dev/acme.ui", "2.0.0"));
+        assert!(!declared.holds_release(None, "peer", "1.0.0"));
+    }
 
     #[test]
     fn a_selector_may_match_an_unlisted_package_it_names_or_doesnt_limit() {
@@ -1616,6 +2334,7 @@ mod tests {
             "node_modules/tool",
             &DepGraph::empty(),
             &HashMap::new(),
+            None,
         );
         assert!(matches!(ruling.decision, Decision::Denied), "{ruling:?}");
     }
@@ -1636,6 +2355,7 @@ mod tests {
                 "node_modules/tool",
                 &DepGraph::empty(),
                 &HashMap::new(),
+                None,
             )
         };
 
@@ -1713,13 +2433,46 @@ mod tests {
     }
 
     #[test]
+    fn a_legacy_lockfile_infers_a_root_dependency_from_its_path_only_for_names_it_doesnt_resolve() {
+        let resolutions = lpm_lockfile::RootResolutions::from([(
+            "tool".to_string(),
+            lpm_lockfile::LockedRootResolution {
+                package: "tool".to_string(),
+                version: "1.0.0".to_string(),
+                ..Default::default()
+            },
+        )]);
+        let roots = RootDependencies {
+            releases: RootReleases::from_resolutions(&resolutions, |_, _| true),
+            names: HashSet::from(["tool".to_string(), "other".to_string()]),
+        };
+        let mut newer = discovered("tool");
+        newer.version = "2.0.0".to_string();
+        let mut aliased = discovered("@acme/other");
+        aliased.path = "node_modules/other".to_string();
+
+        assert!(roots.selects(&discovered("tool")));
+        assert!(
+            !roots.selects(&newer),
+            "the root resolves tool to 1.0.0, so a 2.0.0 at node_modules/tool is a member's"
+        );
+        assert!(
+            roots.selects(&aliased),
+            "a name the root doesn't resolve is inferred from where it sits"
+        );
+        assert!(!roots.selects(&discovered("stray")));
+    }
+
+    #[test]
     fn a_provider_whose_decision_lacks_data_still_contends_for_its_skill_name() {
         let packages = [discovered("a"), discovered("b")];
         let decided = vec![
             Decided {
                 importer: 0,
-                package: 0,
+                package: Some(0),
+                set: None,
                 skill: "guide".into(),
+                origin: Origin::Directory,
                 decision: Decision::Allowed(Naming::Package),
                 open_denials: 0,
                 possible_naming: Naming::Package,
@@ -1727,8 +2480,10 @@ mod tests {
             },
             Decided {
                 importer: 0,
-                package: 1,
+                package: Some(1),
+                set: None,
                 skill: "guide".into(),
+                origin: Origin::Directory,
                 decision: Decision::Unknown,
                 open_denials: 0,
                 possible_naming: Naming::None,
@@ -1737,7 +2492,8 @@ mod tests {
         ];
         let preferred: HashSet<usize> = [0, 1].into_iter().collect();
         let conflicts = name_conflicts(&decided, &preferred, &|entry: &Decided| {
-            &packages[entry.package]
+            let package = &packages[entry.package.unwrap()];
+            (package.name.as_str(), package.version.as_str())
         });
         assert_eq!(
             conflicts.get("guide").map(Vec::as_slice),

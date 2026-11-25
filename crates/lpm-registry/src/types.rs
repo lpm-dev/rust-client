@@ -1501,6 +1501,37 @@ pub struct SkillsResponse {
 
     #[serde(default)]
     pub skills: Vec<Skill>,
+
+    /// The `skills/<name>/` directories of this version that review
+    /// approved, each by the digest of its files. Absent from registries
+    /// that don't review skill directories.
+    #[serde(default, rename = "skillDirectories")]
+    pub skill_directories: Vec<SkillDirectory>,
+}
+
+/// A reviewed `skills/<name>/` directory: its name and the
+/// `lpm_skill::skill_files_digest` of the files review approved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillDirectory {
+    pub name: String,
+    pub digest: String,
+
+    /// What review found when it served the directory with a warning, as
+    /// [`Skill::warning`] says.
+    #[serde(default)]
+    pub warning: Option<Vec<SkillReviewIssue>>,
+}
+
+/// One risk LPM.dev review found in a skill it served with a warning. The
+/// text is the review's, so it is untrusted for display.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillReviewIssue {
+    pub severity: String,
+
+    #[serde(default)]
+    pub category: Option<String>,
+
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1524,6 +1555,11 @@ pub struct Skill {
 
     #[serde(default, rename = "sizeBytes")]
     pub size_bytes: Option<u64>,
+
+    /// `None` when review approved the skill outright; the risks it found
+    /// when it served the skill with a warning, which may name none.
+    #[serde(default)]
+    pub warning: Option<Vec<SkillReviewIssue>>,
 }
 
 /// GET /api/registry/api-docs

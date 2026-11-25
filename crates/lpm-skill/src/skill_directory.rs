@@ -116,6 +116,17 @@ impl CheckedSkill {
             .any(|finding| finding.issue.severity == SkillSecuritySeverity::Block)
     }
 
+    /// Why installs never link the skill although it passes every check:
+    /// it declares hooks. The CLI and the registry word it alike.
+    pub fn link_problem(&self) -> Option<String> {
+        self.has_hooks.then(|| {
+            format!(
+                "skills/{}/{SKILL_DOCUMENT}: declares hooks, which run commands without the agent deciding to, so installs never link it",
+                self.name
+            )
+        })
+    }
+
     /// Whether the scan found heuristic warnings.
     pub fn has_warnings(&self) -> bool {
         self.findings

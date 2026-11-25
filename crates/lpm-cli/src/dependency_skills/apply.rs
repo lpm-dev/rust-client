@@ -59,6 +59,7 @@ pub(crate) struct Inputs {
     pub(crate) fingerprint: String,
     pub(crate) policy: String,
     pub(crate) lockfile: Option<FileStamp>,
+    pub(crate) members: Vec<String>,
 }
 
 /// What the links should hold for one skill.
@@ -133,6 +134,7 @@ pub(crate) fn desired_skills<'a>(
             continue;
         }
         let kept = previous.policy == policy
+            && reviewed_here(record)
             && snapshot_digest(project_dir, skill).as_deref() == Some(record.digest.as_str());
         held.push(HeldSkill {
             skill: skill.clone(),
@@ -174,10 +176,10 @@ fn revoked(plan: &Plan, skill: &str, package: &str) -> bool {
 /// Whether the copy `record` linked earlier stays while `candidate`, the
 /// version installed now, is held for `reason`: the policy must still
 /// approve that copy as it approved it then, and the copy must be intact.
-/// Waiting for data, or for the installed skill to become readable, that
-/// means the same policy; waiting for a more specific approval, an
-/// allowing entry that names the skill as specifically as the earlier
-/// copy's own grants needed.
+/// Waiting for data, for LPM.dev review, or for the installed skill to
+/// become readable, that means the same policy; waiting for a more
+/// specific approval, an allowing entry that names the skill as
+/// specifically as the earlier copy's own grants needed.
 fn keeps_earlier_copy(
     project_dir: &Path,
     candidate: &Candidate,
@@ -187,7 +189,9 @@ fn keeps_earlier_copy(
     policy: &str,
 ) -> bool {
     let approved = match reason {
-        HoldReason::NeedsData | HoldReason::Unreadable => previous.policy == policy,
+        HoldReason::NeedsData | HoldReason::NotReviewed | HoldReason::Unreadable => {
+            previous.policy == policy
+        }
         HoldReason::NeedsPackageName | HoldReason::NeedsSkillName => {
             candidate.naming >= record.requires
         }
@@ -198,7 +202,16 @@ fn keeps_earlier_copy(
     };
     approved
         && record.package == candidate.package
+        && reviewed_here(record)
         && snapshot_digest(project_dir, &candidate.skill).as_deref() == Some(record.digest.as_str())
+}
+
+/// Whether `record`'s copy may stay under the registry LPM uses now: an
+/// LPM.dev package's copy only under the registry whose review approved it.
+fn reviewed_here(record: &LinkedSkillRecord) -> bool {
+    !super::plan::is_lpm_dev(&record.package)
+        || record.reviewed_by.as_deref()
+            == Some(crate::commands::skills::reviews::issuing_registry())
 }
 
 /// Why a run leaves dependency-skill links alone after a newer LPM
@@ -235,17 +248,20 @@ pub(crate) fn apply(
             return Ok(report);
         }
     };
-    let targets = match plan.policy.as_ref() {
-        Some(policy) if policy.is_active() => {
-            let resolved = resolve_targets(project_dir, &policy.targets);
-            for target in unreachable_targets(project_dir, &policy.targets, &resolved) {
-                report.warnings.push(format!(
-                    "{target} passes through a link, so LPM doesn't link skills into it"
-                ));
-            }
-            resolved
+    let targets = if plan.considered {
+        let wanted = plan
+            .policy
+            .as_ref()
+            .map_or(&Targets::Auto, |policy| &policy.targets);
+        let resolved = resolve_targets(project_dir, wanted);
+        for target in unreachable_targets(project_dir, wanted, &resolved) {
+            report.warnings.push(format!(
+                "{target} passes through a link, so LPM doesn't link skills into it"
+            ));
         }
-        _ => Vec::new(),
+        resolved
+    } else {
+        Vec::new()
     };
     let (desired, held) = desired_skills(project_dir, plan, &previous, &inputs.policy);
     let unreadable = !plan.unlisted.is_empty()
@@ -264,6 +280,7 @@ pub(crate) fn apply(
         fingerprint: inputs.fingerprint,
         policy: inputs.policy,
         lockfile: inputs.lockfile,
+        members: inputs.members,
         created_directories: previous.created_directories.clone(),
         ..LinkState::default()
     };
@@ -303,6 +320,9 @@ pub(crate) fn apply(
                         digest: digest.clone(),
                         permission: prepared.permission.as_str().to_string(),
                         requires: prepared.requires,
+                        reviewed_by: super::plan::is_lpm_dev(&candidate.package).then(|| {
+                            crate::commands::skills::reviews::issuing_registry().to_string()
+                        }),
                         links: Vec::new(),
                         blocked: Vec::new(),
                     },
@@ -402,11 +422,7 @@ pub(crate) fn apply(
     if !complete {
         next.fingerprint.clear();
     }
-    let active = plan
-        .policy
-        .as_ref()
-        .is_some_and(|policy| policy.is_active());
-    if active
+    if plan.considered
         || !next.skills.is_empty()
         || !next.stale.is_empty()
         || !next.created_directories.is_empty()

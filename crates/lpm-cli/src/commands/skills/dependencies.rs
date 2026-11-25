@@ -4,7 +4,7 @@
 use super::{plural, require_confirmation};
 use crate::dependency_skills::{
     InspectedSkill, Inspection, InstanceRuling, ManifestEdit, PlannedChange, PolicyList,
-    ReconcileReport, Settings, SkillStatus,
+    ReconcileReport, Settings, SkillDetails, SkillStatus,
 };
 use crate::install_ui;
 use crate::lpm_skills_config::LpmSkillsPreference;
@@ -41,8 +41,9 @@ pub struct UnlinkArgs {
     /// anything else is added to `deny`.
     #[arg(value_name = "SELECTOR", required_unless_present = "all")]
     pub selectors: Vec<String>,
-    /// Stop linking every dependency skill: drop every `allow` entry and
-    /// keep the `deny` entries.
+    /// Stop linking every dependency skill: drop every `allow` entry, keep
+    /// the `deny` entries, and deny the packages whose skills link without
+    /// an entry.
     #[arg(long, conflicts_with = "selectors")]
     pub all: bool,
     /// Print what would change without changing files.
@@ -64,6 +65,7 @@ pub struct SyncArgs {
 fn settings() -> Result<Settings, LpmError> {
     Ok(
         Settings::resolve(LpmSkillsPreference::Config)?.unwrap_or(Settings {
+            lpm_dev_packages: true,
             other_packages: true,
             omitted: Default::default(),
         }),
@@ -130,6 +132,7 @@ fn skill_json(skill: &InspectedSkill) -> serde_json::Value {
         "allowed_tools": details.map(|details| details.allowed_tools.clone()).unwrap_or_default(),
         "permission": details.map(|details| details.permission.as_str()),
         "warnings": details.map_or(0, |details| details.warnings),
+        "review_warning": details.and_then(|details| details.review_warning.as_ref()),
         "suggested_selector": details
             .filter(|_| skill.blocker.is_none())
             .map(|details| details.suggested.as_str()),
@@ -152,10 +155,28 @@ fn print_inspection(inspection: &Inspection) {
         }
         table.print_stdout();
     }
+    for skill in &inspection.skills {
+        if let Some(note) = skill.details.as_ref().and_then(review_warning_note) {
+            install_ui::warn_untrusted(&format!(
+                "{} from {}@{}: {note}",
+                skill.skill, skill.package, skill.version
+            ));
+        }
+    }
     print_problems(inspection);
     if !inspection.other_packages {
         install_ui::warn(
             "npm and other package skills are turned off for you; turn them on with `lpm config npm-skills --set true`",
+        );
+    }
+    if !inspection.lpm_dev_packages
+        && inspection
+            .skills
+            .iter()
+            .any(|skill| skill.package.starts_with("@lpm.dev/"))
+    {
+        install_ui::warn(
+            "LPM.dev package skills are turned off for you; turn them on with `lpm config lpm-skills --set true`",
         );
     }
     if let Some(skill) = inspection.skills.iter().find(|skill| {
@@ -206,6 +227,14 @@ fn skill_note(skill: &InspectedSkill) -> String {
         (SkillStatus::Linked, _) => skill.links.join(", "),
         _ => String::new(),
     }
+}
+
+/// What LPM.dev review warned about in a skill, for one terminal row.
+fn review_warning_note(details: &SkillDetails) -> Option<String> {
+    details
+        .review_warning
+        .as_deref()
+        .map(crate::dependency_skills::review_warning_note)
 }
 
 fn permission_summary(permission: SkillPermission, tools: &[String]) -> String {
@@ -345,11 +374,25 @@ pub(super) async fn unlink(
         .collect::<Result<Vec<_>, _>>()?;
     let mut edit = ManifestEdit::read(&root)?;
     let shared = Settings {
+        lpm_dev_packages: true,
         other_packages: true,
         ..settings
     };
     let (removed, denied) = if args.all {
-        (edit.clear(PolicyList::Allow), Vec::new())
+        let removed = edit.clear(PolicyList::Allow);
+        let remaining = crate::dependency_skills::inspect_project(&root, &edit.value, shared)?;
+        let still_linked: Vec<String> = linked_after(&remaining)
+            .into_iter()
+            .map(|outcome| format!("#{}", outcome.package))
+            .chain(
+                remaining
+                    .automatic_unlisted
+                    .iter()
+                    .map(|package| format!("#{package}")),
+            )
+            .collect();
+        let denied = edit.add(PolicyList::Deny, &still_linked)?;
+        (removed, denied)
     } else {
         let removed = edit.remove(PolicyList::Allow, &selectors);
         let removed_canonical: Vec<String> = removed
@@ -619,10 +662,16 @@ fn print_policy_preview(
             .as_ref()
             .map(|details| permission_summary(details.permission, &details.allowed_tools))
             .unwrap_or_default();
+        let warned = skill
+            .details
+            .as_ref()
+            .and_then(review_warning_note)
+            .map(|note| format!("; {note}"))
+            .unwrap_or_default();
         let detail = skill.detail.as_deref().unwrap_or_default();
         let line = match change {
             PlannedChange::Link | PlannedChange::Update => format!(
-                "  {} {} from {}@{}{grant}",
+                "  {} {} from {}@{}{grant}{warned}",
                 change.as_str(),
                 skill.skill,
                 skill.package,
@@ -687,7 +736,7 @@ fn grants_prompt(grants: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dependency_skills::{HoldReason, Naming, SkillDetails};
+    use crate::dependency_skills::{HoldReason, Naming};
 
     #[test]
     fn the_link_prompt_counts_the_skills_that_pre_approve_commands_in_agreement() {
@@ -716,6 +765,7 @@ mod tests {
                 allowed_tools: Vec::new(),
                 permission: SkillPermission::None,
                 warnings: 0,
+                review_warning: None,
                 suggested: format!("#{name}-package"),
                 requires: Naming::None,
             }),
@@ -751,7 +801,9 @@ mod tests {
             targets: Vec::new(),
             problems: Vec::new(),
             unlisted: Vec::new(),
+            automatic_unlisted: std::collections::BTreeSet::new(),
             other_packages: true,
+            lpm_dev_packages: true,
             skills,
         }
     }

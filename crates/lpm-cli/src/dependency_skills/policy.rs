@@ -70,6 +70,9 @@ impl SkillsPolicy {
             }
             text.push('\n');
         }
+        if self.deny_unreadable {
+            text.push_str("deny-unreadable\n");
+        }
         match &self.targets {
             Targets::Auto => text.push_str("targets\0auto"),
             Targets::Explicit(targets) => {
@@ -96,10 +99,15 @@ pub(crate) fn read_policy(manifest: &serde_json::Value) -> ParsedPolicy {
     let mut problems = Vec::new();
     let Some(object) = value.as_object() else {
         problems.push(format!(
-            "`lpm.{POLICY_KEY}` must be an object with `allow`, `deny` and `targets`"
+            "`lpm.{POLICY_KEY}` must be an object with `allow`, `deny` and `targets`, so no dependency skills are linked until it is fixed"
         ));
         return ParsedPolicy {
-            policy: None,
+            policy: Some(SkillsPolicy {
+                allow: Vec::new(),
+                deny: Vec::new(),
+                targets: Targets::Auto,
+                deny_unreadable: true,
+            }),
             problems,
         };
     };
@@ -131,16 +139,16 @@ pub(crate) fn read_policy(manifest: &serde_json::Value) -> ParsedPolicy {
     }
 }
 
-/// A digest of the policy's links-deciding content, `inactive` when it
-/// links nothing.
+/// A digest of the policy's links-deciding content, deny entries included
+/// when nothing is allowed; `none` without a policy.
 pub(crate) fn policy_digest(policy: Option<&SkillsPolicy>) -> String {
     use sha2::{Digest as _, Sha256};
-    match policy.filter(|policy| policy.is_active()) {
+    match policy {
         Some(policy) => format!(
             "sha256:{}",
             hex::encode(Sha256::digest(policy.fingerprint_text()))
         ),
-        None => "inactive".to_string(),
+        None => "none".to_string(),
     }
 }
 
@@ -486,10 +494,22 @@ mod tests {
     }
 
     #[test]
-    fn a_policy_that_is_not_an_object_links_nothing() {
+    fn a_policy_that_is_not_an_object_links_nothing_even_automatically() {
         let parsed = parse(r##"{"lpm":{"skills":["#agent-browser"]}}"##);
-        assert!(parsed.policy.is_none());
+        let policy = parsed.policy.unwrap();
+        assert!(policy.deny_unreadable);
+        assert!(!policy.is_active());
         assert_eq!(parsed.problems.len(), 1);
+    }
+
+    #[test]
+    fn a_deny_entry_changes_the_policy_digest_even_with_nothing_allowed() {
+        let empty = parse(r##"{"lpm":{"skills":{}}}"##);
+        let denying = parse(r##"{"lpm":{"skills":{"deny":["#a"]}}}"##);
+        assert_ne!(
+            policy_digest(empty.policy.as_ref()),
+            policy_digest(denying.policy.as_ref())
+        );
     }
 
     #[test]
