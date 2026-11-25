@@ -134,8 +134,8 @@ pub(crate) struct FirewallBypassApproval<'a> {
     /// The native prompt; it names every spec, the scope and the duration.
     pub(crate) prompt: &'a str,
     /// The command a person runs to approve these rules, for automation
-    /// errors.
-    pub(crate) command_hint: &'a str,
+    /// errors, when it can be written safely.
+    pub(crate) command_hint: Option<&'a str>,
     pub(crate) json_output: bool,
 }
 
@@ -185,13 +185,12 @@ pub(crate) fn add_firewall_bypass_rules(
     let existing = load_local_firewall_bypass_rules()?;
     let mut outcome = FirewallBypassAdded::default();
     for rule in approval.rules {
-        let saved = existing
+        match existing
             .iter()
-            .any(|saved| saved.id == rule.id && !saved.is_expired(now));
-        if saved {
-            outcome.unchanged.push(rule);
-        } else {
-            outcome.added.push(rule);
+            .find(|saved| saved.id == rule.id && !saved.is_expired(now))
+        {
+            Some(saved) => outcome.unchanged.push(saved.clone()),
+            None => outcome.added.push(rule),
         }
     }
     if outcome.added.is_empty() {
@@ -204,7 +203,7 @@ pub(crate) fn add_firewall_bypass_rules(
             "Allowing packages past LPM Firewall needs your approval at an interactive terminal.",
             vec![FIREWALL_BYPASS_AUDIT_SCOPE.to_string()],
             project_root.clone(),
-            Some(approval.command_hint.to_string()),
+            approval.command_hint.map(str::to_string),
         ));
     }
     if !confirm_by_typing(approval.prompt)? || !request_native_approval(approval.prompt)? {
@@ -213,7 +212,7 @@ pub(crate) fn add_firewall_bypass_rules(
             "The LPM Firewall bypass was not approved.",
             vec![FIREWALL_BYPASS_AUDIT_SCOPE.to_string()],
             project_root.clone(),
-            Some(approval.command_hint.to_string()),
+            approval.command_hint.map(str::to_string),
         ));
     }
 
@@ -226,6 +225,21 @@ pub(crate) fn add_firewall_bypass_rules(
     })?;
     audit(true, approval.prompt);
     Ok(outcome)
+}
+
+/// Records an `add` refused before any prompt, such as under a managed policy
+/// or for a malware verdict without `--allow-malware`.
+pub(crate) fn record_firewall_bypass_refusal(specs: Vec<String>, reason: &str) {
+    record_audit_event(
+        AuditRecord::new(
+            "firewall-bypass-added",
+            false,
+            vec![FIREWALL_BYPASS_AUDIT_SCOPE.to_string()],
+        )
+        .packages(specs)
+        .source(ApprovalSource::SecurityCommand)
+        .detail(reason),
+    );
 }
 
 /// Linux's polkit dialog can't show LPM's text, so the person confirms the

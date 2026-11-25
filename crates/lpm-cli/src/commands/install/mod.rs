@@ -386,6 +386,9 @@ pub(crate) async fn run_silent_for_audit_fix(
 pub(crate) struct InstallExpectations {
     root: Option<ExpectedInstallRoot>,
     locked_integrities: Option<Arc<LockedIntegrities>>,
+    /// The project whose LPM Firewall bypass rules apply, when the install
+    /// runs elsewhere on its behalf, as `lpm deploy` does.
+    firewall_bypass_root: Option<PathBuf>,
 }
 
 impl InstallExpectations {
@@ -417,6 +420,7 @@ pub(crate) struct InstallCallerContext<'a> {
     pub(crate) policy_project_dir: Option<&'a Path>,
     pub(crate) expected_root: Option<ExpectedInstallRoot>,
     pub(crate) locked_integrities: Option<Arc<LockedIntegrities>>,
+    pub(crate) firewall_bypass_root: Option<&'a Path>,
 }
 
 impl From<RouteTable> for InstallCallerContext<'_> {
@@ -426,6 +430,7 @@ impl From<RouteTable> for InstallCallerContext<'_> {
             policy_project_dir: None,
             expected_root: None,
             locked_integrities: None,
+            firewall_bypass_root: None,
         }
     }
 }
@@ -481,6 +486,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
                 InstallExpectations {
                     root: context.expected_root,
                     locked_integrities: context.locked_integrities,
+                    firewall_bypass_root: context.firewall_bypass_root.map(Path::to_path_buf),
                 },
             )
         })
@@ -685,6 +691,7 @@ async fn run_with_options_under_store_lock(
     } = prepare_install_setup_context(InstallSetupInput {
         project_dir,
         policy_project_dir,
+        firewall_bypass_root: expectations.firewall_bypass_root.as_deref(),
         json_output,
         frozen_lockfile,
         allow_new,

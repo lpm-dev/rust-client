@@ -231,8 +231,10 @@ pub(super) struct NpmFirewallPreflightStats {
     pub(super) bypassed: Vec<BypassedVerdict>,
     /// Why the bypass rules couldn't be read, when a block needed them.
     pub(super) bypass_error: Option<String>,
-    /// Whether `lpm firewall bypass add` can lift blocks for this command.
+    /// Whether rules saved with `lpm firewall bypass add` apply here.
     pub(super) local_bypass_available: bool,
+    /// Whether `lpm firewall bypass add` would accept a new rule here.
+    pub(super) bypass_additions_allowed: bool,
     /// The managed security policy that keeps local bypass rules from
     /// applying, when one does.
     pub(super) managed_policy_path: Option<String>,
@@ -307,6 +309,7 @@ impl NpmFirewallPreflightStats {
 
     fn note_bypass_rules(&mut self, bypass: &FirewallBypassRules) {
         self.local_bypass_available = bypass.local_rules_apply();
+        self.bypass_additions_allowed = bypass.additions_allowed();
         self.managed_policy_path = bypass.managed_policy_path().map(str::to_string);
     }
 
@@ -395,53 +398,72 @@ impl ClassifiedVerdicts {
 }
 
 /// Splits a response's blocks into those a bypass rule lifts and those that
-/// stand. A rule lifts only a block whose row names a version this request
-/// asked about, and only a block its kind may cover; blocks the summary
-/// counts without a row always stand.
+/// stand. Each block row is matched to one version this request asked about,
+/// as many times as it was asked; a row beyond that, or for a version it never
+/// asked about, names nothing and is dropped, so the summary's count of that
+/// block stays unattributed and keeps blocking. Only matched rows can be
+/// lifted, and only by a rule whose kind may cover the block.
 async fn classify_verdicts(
     response: NpmFirewallBatchResponse,
     requested: &[NpmFirewallBatchPackage],
     bypass: &FirewallBypassRules,
 ) -> ClassifiedVerdicts {
-    let block_rows = response
-        .decisions
-        .iter()
-        .filter(|decision| decision.action == NpmFirewallAction::Block)
-        .count() as u64;
+    let mut unmatched: HashMap<&str, Vec<(&str, u32)>> = HashMap::with_capacity(requested.len());
+    for package in requested {
+        let versions = unmatched.entry(package.name.as_str()).or_default();
+        match versions
+            .iter_mut()
+            .find(|(version, _)| *version == package.version)
+        {
+            Some((_, count)) => *count += 1,
+            None => versions.push((package.version.as_str(), 1)),
+        }
+    }
+    let mut decisions = Vec::with_capacity(response.decisions.len());
+    let mut matched_blocks = Vec::new();
+    for decision in response.decisions {
+        if decision.action != NpmFirewallAction::Block {
+            decisions.push(decision);
+            continue;
+        }
+        let remaining = unmatched
+            .get_mut(decision.name.as_str())
+            .and_then(|versions| {
+                versions
+                    .iter_mut()
+                    .find(|(version, _)| *version == decision.version)
+            })
+            .filter(|(_, remaining)| *remaining > 0);
+        if let Some((_, remaining)) = remaining {
+            *remaining -= 1;
+            matched_blocks.push(decision);
+        }
+    }
     let mut classified = ClassifiedVerdicts {
-        decisions: Vec::with_capacity(response.decisions.len()),
+        decisions,
         bypassed: Vec::new(),
-        unattributed: response.summary.block.saturating_sub(block_rows),
+        unattributed: response
+            .summary
+            .block
+            .saturating_sub(matched_blocks.len() as u64),
         bypass_error: None,
     };
-    if block_rows == 0 || bypass.is_empty() {
-        classified.decisions = response.decisions;
+    if matched_blocks.is_empty() || bypass.is_empty() {
+        classified.decisions.extend(matched_blocks);
         return classified;
     }
-    let rules = match bypass.load().await {
-        Ok(rules) => rules,
-        Err(error) => {
-            classified.bypass_error = Some(error);
-            classified.decisions = response.decisions;
-            return classified;
-        }
-    };
-    let requested: HashSet<(&str, &str)> = requested
-        .iter()
-        .map(|package| (package.name.as_str(), package.version.as_str()))
-        .collect();
-    for decision in response.decisions {
-        let applied = (decision.action == NpmFirewallAction::Block
-            && requested.contains(&(decision.name.as_str(), decision.version.as_str())))
-        .then(|| {
-            rules.find(
+    let (rules, local_error) = bypass.load().await;
+    classified.bypass_error = local_error.map(str::to_string);
+    let now = lpm_common::Timestamp::now();
+    for decision in matched_blocks {
+        let applied = rules
+            .find(
                 &decision.name,
                 &decision.version,
                 decision_block_class(&decision),
+                now,
             )
-        })
-        .flatten()
-        .cloned();
+            .cloned();
         match applied {
             Some(rule) => classified.bypassed.push(BypassedVerdict { decision, rule }),
             None => classified.decisions.push(decision),
@@ -1832,7 +1854,14 @@ pub(super) fn finish_npm_firewall_preflight(
     result: NpmFirewallPreflightResult,
     json_output: bool,
 ) -> Result<NpmFirewallPreflightStats, LpmError> {
-    let stats = result.stats;
+    let mut stats = result.stats;
+    let mut seen_bypassed = HashSet::with_capacity(stats.bypassed.len());
+    stats.bypassed.retain(|bypassed| {
+        seen_bypassed.insert((
+            bypassed.decision.name.clone(),
+            bypassed.decision.version.clone(),
+        ))
+    });
     if let Some(failure) = result.failure {
         return Err(failure);
     }
@@ -1889,31 +1918,49 @@ pub(super) fn finish_npm_firewall_preflight(
         ));
         print_firewall_decisions(&blocked);
     }
+    let additions_usable = stats.bypass_additions_allowed && stats.bypass_error.is_none();
     let packages: Vec<_> = blocked
         .iter()
-        .map(|decision| blocked_package(decision, stats.local_bypass_available))
+        .map(|decision| blocked_package(decision, additions_usable))
         .collect();
-    let bypass_command = packages.iter().any(|package| package.bypassable).then(|| {
+    // The command is offered only when running it lets the command finish:
+    // every block is named and liftable by an exact rule, and every version
+    // was checked.
+    let bypass_command = (!packages.is_empty()
+        && packages.iter().all(|package| package.bypassable)
+        && stats.unattributed_block_count == 0
+        && stats.unchecked_reason.is_none())
+    .then(|| {
         let coordinates: Vec<String> = packages
             .iter()
-            .filter(|package| package.bypassable)
             .map(lpm_common::NpmFirewallBlockedPackage::coordinate)
             .collect();
         bypass_add_command(coordinates.iter().map(String::as_str))
     });
+    let has_malware = packages
+        .iter()
+        .any(|package| package.block_class.as_deref() == Some(BlockClass::Malware.as_str()));
     let bypass_unavailable_reason = stats
         .bypass_error
         .as_ref()
-        .map(|error| format!("your bypass rules couldn't be read: {error}"))
+        .map(|error| {
+            format!("your bypass rules couldn't be read: {error}; run `lpm security repair`")
+        })
         .or_else(|| {
             (!stats.local_bypass_available).then(|| {
                 format!(
-                    "{} manages the npm firewall here; ask its administrator to list the version in its `[firewall].bypass`",
+                    "{} manages the npm firewall here; ask its administrator to list the version in its `[firewall].{}`",
                     stats
                         .managed_policy_path
                         .as_deref()
-                        .unwrap_or("a managed security policy")
+                        .unwrap_or("a managed security policy"),
+                    if has_malware { "bypass-malware" } else { "bypass" },
                 )
+            })
+        })
+        .or_else(|| {
+            (!stats.bypass_additions_allowed).then(|| {
+                "`force-security-floor = true` keeps the npm firewall at enforce, so `lpm firewall bypass add` refuses new rules".to_string()
             })
         });
     Err(LpmError::NpmFirewallBlocked(Box::new(
@@ -1963,7 +2010,7 @@ fn distinct_decisions(
 
 fn blocked_package(
     decision: &NpmFirewallDecision,
-    local_bypass_available: bool,
+    additions_usable: bool,
 ) -> lpm_common::NpmFirewallBlockedPackage {
     let display = decision.display.as_ref();
     let class = decision_block_class(decision);
@@ -1982,12 +2029,12 @@ fn blocked_package(
             .and_then(|display| non_empty_display_text(display.report_url.as_deref()))
             .map(str::to_string),
         block_class: Some(class.as_str().to_string()),
-        bypassable: local_bypass_available
+        bypassable: additions_usable
             && crate::firewall_bypass::FirewallBypassSpec::parse(&format!(
                 "{}@{}",
                 decision.name, decision.version
             ))
-            .is_ok()
+            .is_ok_and(|spec| spec.kind() == crate::firewall_bypass::BypassKind::Exact)
             && class.coverable_by(crate::firewall_bypass::BypassKind::Exact, false),
     }
 }

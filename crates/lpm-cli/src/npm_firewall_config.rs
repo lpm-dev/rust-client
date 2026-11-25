@@ -742,17 +742,15 @@ pub(crate) fn resolve_runtime_firewall(
     )?;
     let mode = mode_request.map_or_else(|| effective.posture.firewall_mode(), |r| r.mode());
     let bypass = if mode.is_enabled() {
-        let policy_root = match bypass_scope {
-            BypassRuleScope::ProjectAndGlobal(dir)
-                if !crate::security_approval::project_dir_is_global_install(dir) =>
-            {
-                crate::firewall_bypass::project_policy_root(dir)
-                    .ok()
-                    .map(|root| root.display().to_string())
-            }
-            _ => None,
+        let policy_dir = match bypass_scope {
+            BypassRuleScope::ProjectAndGlobal(dir) => Some(dir),
+            BypassRuleScope::GlobalOnly => None,
         };
-        crate::firewall_bypass::FirewallBypassRules::for_command(&effective, policy_root)?
+        crate::firewall_bypass::FirewallBypassRules::for_command(
+            &effective,
+            policy_dir,
+            !crate::firewall_bypass::forced_floor_refuses_additions(global, &effective)?,
+        )?
     } else {
         crate::firewall_bypass::FirewallBypassRules::none()
     };

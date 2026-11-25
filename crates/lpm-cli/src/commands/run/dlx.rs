@@ -294,6 +294,7 @@ async fn install_dlx_target(
                 }
             }),
             locked_integrities: None,
+            firewall_bypass_root: None,
         }),
         lpm_common::LpmRoot::from_env()?,
     )

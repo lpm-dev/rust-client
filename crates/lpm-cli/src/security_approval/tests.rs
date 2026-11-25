@@ -2141,7 +2141,7 @@ fn add_bypass(
     add_firewall_bypass_rules(FirewallBypassApproval {
         rules,
         prompt: "Allow foldrun@32.8.2 past LPM Firewall in every project",
-        command_hint: "lpm firewall bypass add \"foldrun@32.8.2\"",
+        command_hint: Some("lpm firewall bypass add \"foldrun@32.8.2\""),
         json_output,
     })
 }
@@ -2928,6 +2928,41 @@ fn tightening_the_approved_profile_restores_defaults_without_approval() {
             lpm_registry::client::NpmFirewallPolicyAction::Block,
             "tightening never loosens a stricter approved group"
         );
+    });
+}
+
+#[test]
+fn a_floor_edit_unlock_does_not_stand_in_for_firewall_bypass_approval() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        with_test_native_auth_result("approve", || {
+            unlock_global_scopes_command("floor-edit", &[ApprovalScope::FloorEdit], 600, false, &[])
+        })
+        .unwrap();
+
+        let err =
+            without_test_native_auth(|| add_bypass(vec![bypass_rule("foldrun@32.8.2")], true))
+                .unwrap_err();
+
+        assert_eq!(err.error_code(), "security_approval_required");
+        assert!(load_local_firewall_bypass_rules().unwrap().is_empty());
+    });
+}
+
+#[test]
+fn re_adding_a_saved_rule_reports_the_saved_rule() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        with_test_native_auth_result("approve", || {
+            add_bypass(vec![bypass_rule("foldrun@32.8.2")], false)
+        })
+        .unwrap();
+        let mut with_ttl = bypass_rule("foldrun@32.8.2");
+        with_ttl.expires_at = Some(Timestamp::now() + time::Duration::minutes(30));
+
+        let again = without_test_native_auth(|| add_bypass(vec![with_ttl], true)).unwrap();
+
+        assert_eq!(again.unchanged[0].expires_at, None);
     });
 }
 

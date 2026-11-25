@@ -392,6 +392,18 @@ pub(crate) fn project_policy_root(dir: &Path) -> Result<std::path::PathBuf, LpmE
     Ok(std::fs::canonicalize(&root).unwrap_or(root))
 }
 
+/// [`project_policy_root`] as the text a project rule stores. A root that
+/// isn't valid UTF-8 is refused, so two such roots can never share a key.
+pub(crate) fn project_policy_root_text(dir: &Path) -> Result<String, LpmError> {
+    let root = project_policy_root(dir)?;
+    root.to_str().map(str::to_string).ok_or_else(|| {
+        LpmError::Registry(format!(
+            "{} isn't valid UTF-8, so a project bypass rule can't name it",
+            root.display()
+        ))
+    })
+}
+
 /// The command a person runs to allow `coordinates`, each double-quoted so
 /// POSIX shells, PowerShell and cmd read it unchanged. Callers pass only
 /// validated specs, which contain no quotes.
@@ -403,6 +415,19 @@ pub(crate) fn bypass_add_command<'a>(coordinates: impl IntoIterator<Item = &'a s
         command.push('"');
     }
     command
+}
+
+/// Whether `text` reads the same in double quotes in POSIX shells,
+/// PowerShell and cmd: no quote, variable, substitution or escape character.
+pub(crate) fn shell_safe_in_double_quotes(text: &str) -> bool {
+    !text.is_empty()
+        && text.chars().all(|character| {
+            character.is_alphanumeric()
+                || matches!(
+                    character,
+                    ' ' | '/' | '\\' | '.' | '_' | '-' | '+' | ',' | '=' | '@' | ':' | '~'
+                )
+        })
 }
 
 /// The rule that let a blocked version through, as install output reports it.
@@ -429,6 +454,7 @@ impl AppliedRule {
 struct CompiledRule {
     spec: FirewallBypassSpec,
     covers_malware: bool,
+    expires_at: Option<Timestamp>,
     applied: AppliedRule,
     project: bool,
 }
@@ -467,7 +493,7 @@ impl FirewallBypassSet {
             let project = match rule.scope {
                 FirewallBypassScope::Global => false,
                 FirewallBypassScope::Project => {
-                    if rule.project_root.as_deref() != policy_root || policy_root.is_none() {
+                    if policy_root.is_none() || rule.project_root.as_deref() != policy_root {
                         continue;
                     }
                     true
@@ -481,6 +507,7 @@ impl FirewallBypassSet {
                 .or_default()
                 .push(CompiledRule {
                     covers_malware: rule.covers_malware,
+                    expires_at: rule.expires_at,
                     applied: AppliedRule {
                         spec: rule.spec.clone(),
                         id: Some(rule.id.clone()),
@@ -503,6 +530,7 @@ impl FirewallBypassSet {
                 .or_default()
                 .push(CompiledRule {
                     covers_malware: rule.covers_malware,
+                    expires_at: None,
                     applied: AppliedRule {
                         spec: rule.spec.clone(),
                         id: None,
@@ -519,20 +547,29 @@ impl FirewallBypassSet {
         Self { by_name }
     }
 
-    /// The most specific rule that may lift a `class` block of
-    /// `name@version`.
+    /// The most specific unexpired rule that may lift a `class` block of
+    /// `name@version` at `now`.
     pub(crate) fn find(
         &self,
         name: &str,
         version: &str,
         class: BlockClass,
+        now: Timestamp,
     ) -> Option<&AppliedRule> {
         self.by_name.get(name)?.iter().find_map(|rule| {
-            (class.coverable_by(rule.spec.kind(), rule.covers_malware)
+            (rule.expires_at.is_none_or(|expires_at| expires_at > now)
+                && class.coverable_by(rule.spec.kind(), rule.covers_malware)
                 && rule.spec.matches(name, version))
             .then_some(&rule.applied)
         })
     }
+}
+
+/// The compiled rules and, when the local store couldn't be read, why.
+#[derive(Debug)]
+struct LoadedRules {
+    set: FirewallBypassSet,
+    local_error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -540,9 +577,12 @@ struct FirewallBypassRulesInner {
     managed: Vec<crate::security_approval::ManagedFirewallBypass>,
     local_rules_apply: bool,
     local_rules_stored: bool,
-    policy_root: Option<String>,
+    additions_allowed: bool,
+    /// The directory whose project rules apply, resolved to its policy root
+    /// only when a stored rule needs it.
+    policy_dir: Option<std::path::PathBuf>,
     managed_policy_path: Option<String>,
-    loaded: std::sync::OnceLock<Result<FirewallBypassSet, String>>,
+    loaded: std::sync::OnceLock<LoadedRules>,
 }
 
 /// The bypass rules a command may apply. The local store is read, and its
@@ -556,40 +596,47 @@ pub(crate) struct FirewallBypassRules {
 impl FirewallBypassRules {
     /// No rules saved and no managed policy owning the firewall.
     pub(crate) fn none() -> Self {
+        Self::from_inner(FirewallBypassRulesInner {
+            managed: Vec::new(),
+            local_rules_apply: true,
+            local_rules_stored: false,
+            additions_allowed: true,
+            policy_dir: None,
+            managed_policy_path: None,
+            loaded: std::sync::OnceLock::new(),
+        })
+    }
+
+    fn from_inner(inner: FirewallBypassRulesInner) -> Self {
         Self {
-            inner: std::sync::Arc::new(FirewallBypassRulesInner {
-                managed: Vec::new(),
-                local_rules_apply: true,
-                local_rules_stored: false,
-                policy_root: None,
-                managed_policy_path: None,
-                loaded: std::sync::OnceLock::new(),
-            }),
+            inner: std::sync::Arc::new(inner),
         }
     }
 
-    /// The rules for a command whose project rules key on `policy_root`, or
-    /// that applies only rules for every project when it is `None`.
+    /// The rules for a command whose project rules key on `policy_dir`'s
+    /// policy root, or that applies only rules for every project when it is
+    /// `None`. `additions_allowed` says whether `lpm firewall bypass add` would
+    /// accept a rule here, for block hints.
     pub(crate) fn for_command(
         effective: &crate::security_approval::EffectiveAuthorizedPosture,
-        policy_root: Option<String>,
+        policy_dir: Option<&Path>,
+        additions_allowed: bool,
     ) -> Result<Self, LpmError> {
         let local_rules_apply =
             crate::security_approval::local_firewall_bypass_inactive_reason(effective).is_none();
-        Ok(Self {
-            inner: std::sync::Arc::new(FirewallBypassRulesInner {
-                managed: effective.managed_firewall_bypass.clone(),
-                local_rules_apply,
-                local_rules_stored: local_rules_apply
-                    && crate::security_approval::firewall_bypass_file_exists()?,
-                policy_root,
-                managed_policy_path: effective
-                    .managed_policy
-                    .as_ref()
-                    .map(|policy| policy.path.clone()),
-                loaded: std::sync::OnceLock::new(),
-            }),
-        })
+        Ok(Self::from_inner(FirewallBypassRulesInner {
+            managed: effective.managed_firewall_bypass.clone(),
+            local_rules_apply,
+            local_rules_stored: local_rules_apply
+                && crate::security_approval::firewall_bypass_file_exists()?,
+            additions_allowed: local_rules_apply && additions_allowed,
+            policy_dir: policy_dir.map(Path::to_path_buf),
+            managed_policy_path: effective
+                .managed_policy
+                .as_ref()
+                .map(|policy| policy.path.clone()),
+            loaded: std::sync::OnceLock::new(),
+        }))
     }
 
     /// Rules already in memory, as tests that don't touch the signed store
@@ -602,50 +649,62 @@ impl FirewallBypassRules {
         local_rules_apply: bool,
     ) -> Self {
         let loaded = std::sync::OnceLock::new();
-        let _ = loaded.set(Ok(FirewallBypassSet::compile(
-            if local_rules_apply { local } else { &[] },
-            &managed,
-            policy_root,
-            Timestamp::now(),
-        )));
-        Self {
-            inner: std::sync::Arc::new(FirewallBypassRulesInner {
-                managed,
-                local_rules_apply,
-                local_rules_stored: local_rules_apply && !local.is_empty(),
-                policy_root: policy_root.map(str::to_string),
-                managed_policy_path: (!local_rules_apply)
-                    .then(|| "/etc/lpm/security-policy.toml".to_string()),
-                loaded,
-            }),
-        }
+        let _ = loaded.set(LoadedRules {
+            set: FirewallBypassSet::compile(
+                if local_rules_apply { local } else { &[] },
+                &managed,
+                policy_root,
+                Timestamp::now(),
+            ),
+            local_error: None,
+        });
+        Self::from_inner(FirewallBypassRulesInner {
+            managed,
+            local_rules_apply,
+            local_rules_stored: local_rules_apply && !local.is_empty(),
+            additions_allowed: local_rules_apply,
+            policy_dir: policy_root.map(std::path::PathBuf::from),
+            managed_policy_path: (!local_rules_apply)
+                .then(|| "/etc/lpm/security-policy.toml".to_string()),
+            loaded,
+        })
     }
 
-    /// Rules whose store can't be read, as a tampered store reads.
+    /// Rules whose local store can't be read, as a tampered store reads.
     #[cfg(test)]
-    pub(crate) fn unreadable(error: &str) -> Self {
+    pub(crate) fn unreadable(
+        error: &str,
+        managed: Vec<crate::security_approval::ManagedFirewallBypass>,
+    ) -> Self {
         let loaded = std::sync::OnceLock::new();
-        let _ = loaded.set(Err(error.to_string()));
-        Self {
-            inner: std::sync::Arc::new(FirewallBypassRulesInner {
-                managed: Vec::new(),
-                local_rules_apply: true,
-                local_rules_stored: true,
-                policy_root: None,
-                managed_policy_path: None,
-                loaded,
-            }),
-        }
+        let _ = loaded.set(LoadedRules {
+            set: FirewallBypassSet::compile(&[], &managed, None, Timestamp::now()),
+            local_error: Some(error.to_string()),
+        });
+        Self::from_inner(FirewallBypassRulesInner {
+            managed,
+            local_rules_apply: true,
+            local_rules_stored: true,
+            additions_allowed: true,
+            policy_dir: None,
+            managed_policy_path: None,
+            loaded,
+        })
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.inner.managed.is_empty() && !self.inner.local_rules_stored
     }
 
-    /// Whether `lpm firewall bypass add` can lift a block here; `false`
-    /// when a managed policy owns the firewall.
+    /// Whether rules saved with `lpm firewall bypass add` can lift a block
+    /// here; `false` when a managed policy owns the firewall.
     pub(crate) fn local_rules_apply(&self) -> bool {
         self.inner.local_rules_apply
+    }
+
+    /// Whether `lpm firewall bypass add` would accept a new rule here.
+    pub(crate) fn additions_allowed(&self) -> bool {
+        self.inner.additions_allowed
     }
 
     pub(crate) fn managed_policy_path(&self) -> Option<&str> {
@@ -653,8 +712,9 @@ impl FirewallBypassRules {
     }
 
     /// Reads and verifies the local rules on first use, off the async
-    /// runtime's worker threads.
-    pub(crate) async fn load(&self) -> Result<&FirewallBypassSet, String> {
+    /// runtime's worker threads. Managed rules apply even when the local
+    /// store can't be read; the second value says why it couldn't.
+    pub(crate) async fn load(&self) -> (&FirewallBypassSet, Option<&str>) {
         if self.inner.loaded.get().is_none() {
             let inner = std::sync::Arc::clone(&self.inner);
             let _ = tokio::task::spawn_blocking(move || {
@@ -662,26 +722,48 @@ impl FirewallBypassRules {
             })
             .await;
         }
-        match self.inner.loaded.get_or_init(|| compile_rules(&self.inner)) {
-            Ok(set) => Ok(set),
-            Err(error) => Err(error.clone()),
-        }
+        let loaded = self.inner.loaded.get_or_init(|| compile_rules(&self.inner));
+        (&loaded.set, loaded.local_error.as_deref())
     }
 }
 
-fn compile_rules(inner: &FirewallBypassRulesInner) -> Result<FirewallBypassSet, String> {
-    let local = if inner.local_rules_stored {
-        crate::security_approval::load_local_firewall_bypass_rules()
-            .map_err(|error| error.to_string())?
+fn compile_rules(inner: &FirewallBypassRulesInner) -> LoadedRules {
+    let now = Timestamp::now();
+    let (local, local_error) = if inner.local_rules_stored {
+        match crate::security_approval::load_local_firewall_bypass_rules() {
+            Ok(rules) => (rules, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        }
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
-    Ok(FirewallBypassSet::compile(
-        &local,
-        &inner.managed,
-        inner.policy_root.as_deref(),
-        Timestamp::now(),
-    ))
+    let needs_root = local
+        .iter()
+        .any(|rule| rule.scope == FirewallBypassScope::Project && !rule.is_expired(now));
+    let policy_root = needs_root
+        .then_some(inner.policy_dir.as_deref())
+        .flatten()
+        .filter(|dir| !crate::security_approval::project_dir_is_global_install(dir))
+        .and_then(|dir| project_policy_root_text(dir).ok());
+    LoadedRules {
+        set: FirewallBypassSet::compile(&local, &inner.managed, policy_root.as_deref(), now),
+        local_error,
+    }
+}
+
+/// Whether `force-security-floor = true` keeps the npm firewall at enforce,
+/// counting both `~/.lpm/config.toml` and the approved posture, so
+/// `lpm firewall bypass add` refuses new rules.
+pub(crate) fn forced_floor_refuses_additions(
+    global: &crate::commands::config::GlobalConfig,
+    effective: &crate::security_approval::EffectiveAuthorizedPosture,
+) -> Result<bool, LpmError> {
+    if !crate::security_floor::force_security_floor_enabled(global) {
+        return Ok(false);
+    }
+    let floor = crate::security_floor::current_firewall_floor(global)?
+        .stricter(effective.posture.firewall_mode());
+    Ok(floor == crate::npm_firewall_config::NpmFirewallMode::Enforce)
 }
 
 /// A rule as `lpm firewall bypass list --json` and `lpm security status`
@@ -903,17 +985,19 @@ mod tests {
             None,
         );
 
-        let rule = set.find("foldrun", "32.8.2", BlockClass::Policy).unwrap();
+        let rule = set
+            .find("foldrun", "32.8.2", BlockClass::Policy, Timestamp::now())
+            .unwrap();
 
         assert_eq!(rule.spec, "foldrun@32.8.2");
         assert_eq!(
-            set.find("foldrun", "32.9.0", BlockClass::Policy)
+            set.find("foldrun", "32.9.0", BlockClass::Policy, Timestamp::now())
                 .unwrap()
                 .spec,
             "foldrun@^32.0.0"
         );
         assert_eq!(
-            set.find("foldrun", "31.0.0", BlockClass::Policy)
+            set.find("foldrun", "31.0.0", BlockClass::Policy, Timestamp::now())
                 .unwrap()
                 .spec,
             "foldrun"
@@ -931,16 +1015,27 @@ mod tests {
             None,
         );
 
-        assert!(set.find("foldrun", "32.8.2", BlockClass::Malware).is_none());
         assert!(
-            set.find("foldrun", "32.8.2", BlockClass::Unscanned)
+            set.find("foldrun", "32.8.2", BlockClass::Malware, Timestamp::now())
                 .is_none()
         );
         assert!(
-            set.find("foldrun", "32.8.2", BlockClass::ServerReview)
+            set.find("foldrun", "32.8.2", BlockClass::Unscanned, Timestamp::now())
                 .is_none()
         );
-        assert!(set.find("other", "32.8.2", BlockClass::Policy).is_none());
+        assert!(
+            set.find(
+                "foldrun",
+                "32.8.2",
+                BlockClass::ServerReview,
+                Timestamp::now()
+            )
+            .is_none()
+        );
+        assert!(
+            set.find("other", "32.8.2", BlockClass::Policy, Timestamp::now())
+                .is_none()
+        );
     }
 
     #[test]
@@ -953,17 +1048,17 @@ mod tests {
 
         assert!(
             compiled(&rules, &[], Some("/work/app"))
-                .find("foldrun", "32.8.2", BlockClass::Policy)
+                .find("foldrun", "32.8.2", BlockClass::Policy, Timestamp::now())
                 .is_some()
         );
         assert!(
             compiled(&rules, &[], Some("/work/other"))
-                .find("foldrun", "32.8.2", BlockClass::Policy)
+                .find("foldrun", "32.8.2", BlockClass::Policy, Timestamp::now())
                 .is_none()
         );
         assert!(
             compiled(&rules, &[], None)
-                .find("foldrun", "32.8.2", BlockClass::Policy)
+                .find("foldrun", "32.8.2", BlockClass::Policy, Timestamp::now())
                 .is_none()
         );
     }
@@ -975,7 +1070,7 @@ mod tests {
 
         assert!(
             compiled(&[rule], &[], None)
-                .find("foldrun", "32.8.2", BlockClass::Policy)
+                .find("foldrun", "32.8.2", BlockClass::Policy, Timestamp::now())
                 .is_none()
         );
     }
@@ -991,7 +1086,9 @@ mod tests {
             None,
         );
 
-        let rule = set.find("foldrun", "32.8.2", BlockClass::Malware).unwrap();
+        let rule = set
+            .find("foldrun", "32.8.2", BlockClass::Malware, Timestamp::now())
+            .unwrap();
 
         assert_eq!(rule.source, "managed");
         assert_eq!(rule.id, None);
@@ -1003,5 +1100,36 @@ mod tests {
             bypass_add_command(["@scope/pkg@1.0.0", "foldrun@32.8.2"]),
             "lpm firewall bypass add \"@scope/pkg@1.0.0\" \"foldrun@32.8.2\""
         );
+    }
+
+    #[test]
+    fn bypass_set_checks_expiry_when_a_rule_is_used() {
+        let now = Timestamp::now();
+        let mut rule = local_rule("foldrun@32.8.2", FirewallBypassScope::Global, None);
+        rule.expires_at = Some(now + lpm_common::timestamp::Duration::seconds(5));
+        let set = FirewallBypassSet::compile(&[rule], &[], None, now);
+
+        assert!(
+            set.find("foldrun", "32.8.2", BlockClass::Policy, now)
+                .is_some()
+        );
+        assert!(
+            set.find(
+                "foldrun",
+                "32.8.2",
+                BlockClass::Policy,
+                now + lpm_common::timestamp::Duration::seconds(6)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn shell_safe_text_excludes_expansion_and_quote_characters() {
+        assert!(shell_safe_in_double_quotes("/Users/a b/work-1.2_x"));
+        assert!(shell_safe_in_double_quotes("C:\\Users\\dev\\app"));
+        for unsafe_text in ["$HOME", "`id`", "%PATH%", "a\"b", "a!b", "a^b", "", "a\nb"] {
+            assert!(!shell_safe_in_double_quotes(unsafe_text), "{unsafe_text:?}");
+        }
     }
 }

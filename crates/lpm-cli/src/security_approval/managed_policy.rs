@@ -531,6 +531,8 @@ fn policy_value_has_enforced_controls(value: &toml::Value) -> bool {
             .and_then(toml::Value::as_table)
             .is_some_and(|firewall| {
                 firewall.contains_key(crate::npm_firewall_config::FIREWALL_CONFIG_MODE_KEY)
+                    || firewall.contains_key("bypass")
+                    || firewall.contains_key("bypass-malware")
                     || firewall
                         .get(crate::npm_firewall_config::FIREWALL_NPM_CONFIG_SECTION)
                         .and_then(toml::Value::as_table)

@@ -80,6 +80,8 @@ fn install(
     command.arg(format!("{name}@1.0.0")).output().unwrap()
 }
 
+const AGENT_TOOL_HINT: &str = "  allow lpm firewall bypass add \"agent-tool@1.0.0\"\n";
+
 #[tokio::test]
 async fn blocked_install_names_the_command_that_allows_the_exact_version() {
     let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
@@ -91,7 +93,9 @@ async fn blocked_install_names_the_command_that_allows_the_exact_version() {
     assert!(!output.status.success(), "{stderr}");
     assert!(
         stderr.contains(
-            "✗ Blocked by LPM Firewall\n  reason 1 package blocked by LPM Firewall\n  allow lpm firewall bypass add \"agent-tool@1.0.0\"\n"
+            &format!(
+                "✗ Blocked by LPM Firewall\n  reason 1 package blocked by LPM Firewall\n{AGENT_TOOL_HINT}"
+            )
         ),
         "{stderr}"
     );
@@ -147,7 +151,11 @@ async fn bypassed_version_is_listed_in_the_install_json_security_report() {
         &[stored_rule("agent-tool", serde_json::json!({}))],
     );
 
-    let output = install(&project, &mock, "agent-tool", true);
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TIMING_DETAIL", "1")
+        .args(["install", "--no-skills", "--json", "agent-tool@1.0.0"])
+        .output()
+        .unwrap();
 
     assert!(output.status.success());
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -156,7 +164,13 @@ async fn bypassed_version_is_listed_in_the_install_json_security_report() {
     assert_eq!(firewall["bypassed"][0]["name"], "agent-tool");
     assert_eq!(firewall["bypassed"][0]["rule"]["spec"], "agent-tool");
     assert_eq!(firewall["bypassed"][0]["rule"]["source"], "local");
-    assert!(envelope["timing"]["firewall"].get("bypassed").is_none());
+    for timing in [
+        &envelope["timing"]["firewall"],
+        &envelope["timing"]["detail"]["security"]["firewall"],
+    ] {
+        assert_eq!(timing["bypassed_count"], 1, "{envelope:#}");
+        assert!(timing.get("bypassed").is_none(), "{envelope:#}");
+    }
 }
 
 #[tokio::test]
@@ -215,7 +229,11 @@ async fn expired_bypass_rule_no_longer_applies() {
 
     let output = install(&project, &mock, "agent-tool", false);
 
-    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains(AGENT_TOOL_HINT), "{stderr}");
+    assert!(!stderr.contains("couldn't be read"), "{stderr}");
+    assert!(!project.file_exists("node_modules/agent-tool/package.json"));
 }
 
 #[tokio::test]
@@ -224,12 +242,15 @@ async fn tampered_bypass_store_keeps_the_block_and_says_why() {
     let project = enforcing_project();
     write_signed_firewall_bypass(
         &project,
-        &[stored_rule("agent-tool", serde_json::json!({}))],
+        &[stored_rule(
+            "agent-tool",
+            serde_json::json!({ "reason": "reviewed the report" }),
+        )],
     );
     let store = project.home().join(".lpm/security/firewall-bypass.json");
-    let tampered = std::fs::read_to_string(&store)
-        .unwrap()
-        .replace("\"agent-tool\"", "\"other-tool\"");
+    let original = std::fs::read_to_string(&store).unwrap();
+    let tampered = original.replace("reviewed the report", "reviewed the reportX");
+    assert_ne!(original, tampered);
     std::fs::write(&store, tampered).unwrap();
 
     let output = install(&project, &mock, "agent-tool", false);
@@ -240,6 +261,11 @@ async fn tampered_bypass_store_keeps_the_block_and_says_why() {
         stderr.contains("note your bypass rules couldn't be read"),
         "{stderr}"
     );
+    assert!(
+        !stderr.contains("allow lpm firewall bypass add"),
+        "{stderr}"
+    );
+    assert!(!project.file_exists("node_modules/agent-tool/package.json"));
 }
 
 #[tokio::test]
@@ -272,7 +298,10 @@ async fn project_bypass_rule_applies_only_in_its_project() {
             serde_json::json!({ "scope": "project", "project_root": root }),
         )],
     );
-    assert!(!install(&other, &mock, "agent-tool", false).status.success());
+    let output = install(&other, &mock, "agent-tool", false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains(AGENT_TOOL_HINT), "{stderr}");
 }
 
 #[tokio::test]
