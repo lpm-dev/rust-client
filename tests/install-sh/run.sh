@@ -944,6 +944,26 @@ EOF_SLEEP
   done
   pass "macOS install retries answers that name no single ticket, and a request timeout"
 
+  run_with_ticket_outcomes nullrecord dictrecords arraydeleted arrayticket badbase64 issued
+  [ "$RUN_RC" -eq 0 ] || fail "malformed answers then a ticket failed the install with exit $RUN_RC: $RUN_OUT"
+  [ "$TICKET_LOOKUPS" -eq 6 ] || fail "a malformed answer carrying the ticket was taken as an answer ($TICKET_LOOKUPS lookups, expected 6)"
+  for detail in "an answer about another record" "an unreadable answer" "an unreadable ticket"; do
+    echo "$RUN_OUT" | grep -qF "did not answer ($detail)" || fail "'$detail' was not retried as such: $RUN_OUT"
+  done
+  run_with_ticket_outcomes numericticket numericerror garbage issued
+  [ "$RUN_RC" -eq 0 ] || fail "malformed answers then a ticket failed the install with exit $RUN_RC: $RUN_OUT"
+  [ "$TICKET_LOOKUPS" -eq 4 ] || fail "a numeric field or a non-JSON page was taken as an answer ($TICKET_LOOKUPS lookups, expected 4)"
+  [ "$(echo "$RUN_OUT" | grep -cF "did not answer (an unreadable answer)")" -eq 3 ] \
+    || fail "numeric fields and a non-JSON page were not all retried as unreadable: $RUN_OUT"
+  pass "macOS install takes only a well-formed answer about exactly one record"
+
+  run_with_ticket_outcomes truncated issued
+  [ "$RUN_RC" -eq 0 ] || fail "a truncated answer then a ticket failed the install with exit $RUN_RC: $RUN_OUT"
+  [ "$TICKET_LOOKUPS" -eq 2 ] || fail "a truncated answer was taken as an answer ($TICKET_LOOKUPS lookups, expected 2)"
+  echo "$RUN_OUT" | grep -qF "did not answer (an incomplete answer)" \
+    || fail "a truncated answer was not reported as incomplete: $RUN_OUT"
+  pass "macOS install retries an answer cut off before its end"
+
   run_with_ticket_outcomes withnull
   [ "$RUN_RC" -eq 0 ] || fail "JSON nulls beside the ticket failed the install with exit $RUN_RC: $RUN_OUT"
   [ "$TICKET_LOOKUPS" -eq 1 ] || fail "JSON nulls beside the ticket made the install look it up $TICKET_LOOKUPS times"
@@ -954,6 +974,8 @@ EOF_SLEEP
   [ "$TICKET_LOOKUPS" -eq 2 ] || fail "an oversized answer was looked up $TICKET_LOOKUPS times, expected 2"
   echo "$RUN_OUT" | grep -qF "did not answer (an oversized answer)" \
     || fail "an oversized answer was not reported as one: $RUN_OUT"
+  [ -s "$fdir/ticket-hangups" ] || fail "the install read an oversized answer to its end instead of stopping at 64 KiB"
+  rm -f "$fdir/ticket-hangups"
   pass "macOS install reads at most 64 KiB of an answer from Apple's ticket service"
 
   # A user's ~/.curlrc may follow redirects and fail on HTTP errors; neither

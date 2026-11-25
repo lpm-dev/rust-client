@@ -12,7 +12,11 @@ XCRUN_BIN="${XCRUN_BIN:-/usr/bin/xcrun}"
 STAPLER_BIN="${STAPLER_BIN:-/usr/bin/stapler}"
 # xcrun caches where tools are in TMPDIR and in the per-user temporary
 # directory, which differ when TMPDIR is overridden.
-XCRUN_CACHE_DIRS="${XCRUN_CACHE_DIRS:-${TMPDIR:-/tmp} $(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)}"
+if [ -n "${XCRUN_CACHE_DIR:-}" ]; then
+	XCRUN_CACHE_DIRS=("$XCRUN_CACHE_DIR")
+else
+	XCRUN_CACHE_DIRS=("${TMPDIR:-/tmp}" "$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)")
+fi
 SUDO="${SUDO-sudo}"
 
 usage() {
@@ -48,8 +52,8 @@ hide_path() {
 
 clear_xcrun_cache() {
 	local directory
-	for directory in $XCRUN_CACHE_DIRS; do
-		rm -f "$directory"/xcrun_db*
+	for directory in "${XCRUN_CACHE_DIRS[@]}"; do
+		[ -n "$directory" ] && rm -f "$directory"/xcrun_db*
 	done
 }
 

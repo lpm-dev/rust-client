@@ -682,23 +682,30 @@ NOTARIZATION_TICKET_TRANSIENT_ERRORS=" THROTTLED TRY_AGAIN_LATER SERVICE_UNAVAIL
 # A ticket record is under 4 KiB; anything far larger isn't one.
 NOTARIZATION_TICKET_RESPONSE_MAX_BYTES=65536
 
-# Prints the lookup answer's value at the plist key path $1 as a one-value
-# XML plist. Each field is extracted on its own, so a JSON null elsewhere in
-# the answer, which a plist can't hold, doesn't hide the ones the check reads.
+# Prints the lookup answer's value at key path $1, in plutil's format $2.
+# Each value is extracted on its own, so a JSON null elsewhere in the answer,
+# which a plist can't hold, doesn't hide the ones the check reads.
 notarization_ticket_extract() {
-  "$MACOS_PLUTIL_TOOL" -extract "$1" xml1 -o - "$ticket_response" 2>/dev/null
+  "$MACOS_PLUTIL_TOOL" -extract "$1" "$2" -o - "$ticket_response" 2>/dev/null
+}
+
+# Prints the root element of the value at key path $1: the line after
+# `<plist version="1.0">` in its one-value XML plist.
+notarization_ticket_root() {
+  notarization_ticket_extract "$1" xml1 | sed -n '/^<plist version="1.0">$/{n;p;q;}'
 }
 
 # Prints the string at key path $1. Returns 1 when the answer has no such
 # value and 2 when it isn't a string.
 notarization_ticket_string() {
-  ticket_field_xml=$(notarization_ticket_extract "$1") || return 1
-  case "$ticket_field_xml" in
-    *"<string/>"*) return 0 ;;
-    *"<string>"*) ;;
+  ticket_field_root=$(notarization_ticket_root "$1")
+  case "$ticket_field_root" in
+    '') return 1 ;;
+    '<string/>'|'<string></string>') return 0 ;;
+    '<string>'*'</string>') ;;
     *) return 2 ;;
   esac
-  printf '%s\n' "$ticket_field_xml" | sed -n 's:.*<string>\(.*\)</string>.*:\1:p'
+  printf '%s\n' "$ticket_field_root" | sed -n 's:^<string>\(.*\)</string>$:\1:p'
 }
 
 # Looks up the ticket record named $ticket_record. Sets ticket_lookup to
@@ -710,64 +717,105 @@ notarization_ticket_string() {
 lookup_notarization_ticket() {
   ticket_lookup="unavailable"
   ticket_lookup_detail="no answer"
-  rm -f "$ticket_response" "$ticket_headers" "$ticket_issued"
-  curl -sS --max-time 30 --max-redirs 0 -D "$ticket_headers" -o - \
-    -H 'Content-Type: application/json' \
-    --data "{\"records\":[{\"recordName\":\"$ticket_record\"}]}" \
-    "$NOTARIZATION_TICKET_LOOKUP_URL" | head -c "$((NOTARIZATION_TICKET_RESPONSE_MAX_BYTES + 1))" > "$ticket_response" || true
-  ticket_http_status=$(awk '/^HTTP\//{status=$2} END{print status}' "$ticket_headers" 2>/dev/null || true)
+  rm -f "$ticket_response" "$ticket_headers" "$ticket_issued" "$ticket_transfer"
+  {
+    ticket_transfer_status=0
+    curl -sS --max-time 30 --max-redirs 0 -D "$ticket_headers" -o - \
+      -H 'Content-Type: application/json' \
+      --data "{\"records\":[{\"recordName\":\"$ticket_record\"}]}" \
+      "$NOTARIZATION_TICKET_LOOKUP_URL" || ticket_transfer_status=$?
+    printf '%s\n' "$ticket_transfer_status" > "$ticket_transfer"
+  } | head -c "$((NOTARIZATION_TICKET_RESPONSE_MAX_BYTES + 1))" > "$ticket_response" || true
+  ticket_http_status=$(awk '/^HTTP\//{sub(/\r$/, ""); status=$2} END{print status}' "$ticket_headers" 2>/dev/null || true)
+  case "$ticket_http_status" in
+    [0123456789][0123456789][0123456789]) ;;
+    *) ticket_http_status="" ;;
+  esac
   case "$ticket_http_status" in
     200) ;;
     '') return 0 ;;
-    408|429|5[0-9][0-9]) ticket_lookup_detail="HTTP $ticket_http_status"; return 0 ;;
+    1[0-9][0-9]|408|429|5[0-9][0-9]) ticket_lookup_detail="HTTP $ticket_http_status"; return 0 ;;
     *) ticket_lookup="refused"; ticket_lookup_detail="HTTP $ticket_http_status"; return 0 ;;
   esac
   if [ "$(wc -c < "$ticket_response")" -gt "$NOTARIZATION_TICKET_RESPONSE_MAX_BYTES" ]; then
     ticket_lookup_detail="an oversized answer"
     return 0
   fi
-  if notarization_ticket_extract records.1 >/dev/null || \
-     ! ticket_answered_record=$(notarization_ticket_string records.0.recordName) || \
+  if [ "$(cat "$ticket_transfer" 2>/dev/null)" != 0 ]; then
+    if [ -s "$ticket_response" ]; then
+      ticket_lookup_detail="an incomplete answer"
+    fi
+    return 0
+  fi
+  # `records` must be an array of objects, and hold only one: plutil writes
+  # it as `[`, that record and `]`, whatever the record's key order.
+  ticket_records_json=$(notarization_ticket_extract records json || true)
+  if [ "$ticket_records_json" = "[]" ]; then
+    ticket_lookup_detail="an answer about another record"
+    return 0
+  fi
+  ticket_record_json=$(notarization_ticket_extract records.0 json || true)
+  case "$ticket_records_json:$ticket_record_json" in
+    '['*']:{'*'}') ;;
+    *) ticket_lookup_detail="an unreadable answer"; return 0 ;;
+  esac
+  ticket_field_status=0
+  ticket_answered_record=$(notarization_ticket_string records.0.recordName) || ticket_field_status=$?
+  if [ "$ticket_field_status" -ne 0 ]; then
+    ticket_lookup_detail="an unreadable answer"
+    return 0
+  fi
+  if [ "${#ticket_records_json}" -ne "$((${#ticket_record_json} + 2))" ] || \
      [ "$ticket_answered_record" != "$ticket_record" ]; then
     ticket_lookup_detail="an answer about another record"
     return 0
   fi
-  ticket_field_status=0
-  ticket_server_error=$(notarization_ticket_string records.0.serverErrorCode) || ticket_field_status=$?
-  case "$ticket_field_status" in
-    0)
-      case "$ticket_server_error" in
-        NOT_FOUND) ticket_lookup="not-issued"; return 0 ;;
-        ''|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZ_]*) ticket_server_error="" ;;
-      esac
-      if [ -z "$ticket_server_error" ] || [ "${#ticket_server_error}" -gt 40 ]; then
-        ticket_lookup="refused"
-        ticket_lookup_detail="an unrecognized error"
-        return 0
-      fi
-      ticket_lookup_detail="$ticket_server_error"
-      case "$NOTARIZATION_TICKET_TRANSIENT_ERRORS" in
-        *" $ticket_server_error "*) ;;
-        *) ticket_lookup="refused" ;;
-      esac
-      return 0
-      ;;
-    2) ticket_lookup_detail="an unreadable answer"; return 0 ;;
+  # Every field must have its JSON type before any decides, as self-update's
+  # parser requires.
+  ticket_error_status=0
+  ticket_server_error=$(notarization_ticket_string records.0.serverErrorCode) || ticket_error_status=$?
+  ticket_value_status=0
+  ticket_value=$(notarization_ticket_string records.0.fields.signedTicket.value) || ticket_value_status=$?
+  ticket_deleted=$(notarization_ticket_root records.0.deleted)
+  case "$ticket_error_status:$ticket_value_status:$ticket_deleted" in
+    2:*|*:2:*|*:*:'<false/>'|*:*:'<true/>'|*:*:) ;;
+    *) ticket_error_status=2 ;;
   esac
-  if ticket_deleted_xml=$(notarization_ticket_extract records.0.deleted); then
-    case "$ticket_deleted_xml" in
-      *"<false/>"*) ;;
-      *"<true/>"*) ticket_lookup="not-issued"; return 0 ;;
-      *) ticket_lookup_detail="an unreadable answer"; return 0 ;;
+  case "$ticket_error_status:$ticket_value_status:$ticket_deleted" in
+    2:*|*:2:*) ticket_lookup_detail="an unreadable answer"; return 0 ;;
+  esac
+  if [ "$ticket_error_status" -eq 0 ]; then
+    case "$ticket_server_error" in
+      NOT_FOUND) ticket_lookup="not-issued"; return 0 ;;
+      ''|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZ_]*) ticket_server_error="" ;;
     esac
+    if [ -z "$ticket_server_error" ] || [ "${#ticket_server_error}" -gt 40 ]; then
+      ticket_lookup="refused"
+      ticket_lookup_detail="an unrecognized error"
+      return 0
+    fi
+    ticket_lookup_detail="$ticket_server_error"
+    case "$NOTARIZATION_TICKET_TRANSIENT_ERRORS" in
+      *" $ticket_server_error "*) ;;
+      *) ticket_lookup="refused" ;;
+    esac
+    return 0
   fi
-  ticket_field_status=0
-  ticket_value=$(notarization_ticket_string records.0.fields.signedTicket.value) || ticket_field_status=$?
-  case "$ticket_field_status" in
-    1) ticket_lookup_detail="an answer without a ticket"; return 0 ;;
-    2) ticket_lookup_detail="an unreadable answer"; return 0 ;;
+  if [ "$ticket_deleted" = '<true/>' ]; then
+    ticket_lookup="not-issued"
+    return 0
+  fi
+  if [ "$ticket_value_status" -eq 1 ]; then
+    ticket_lookup_detail="an answer without a ticket"
+    return 0
+  fi
+  # Standard padded base64 only, as self-update's decoder requires: base64 -D
+  # would skip characters outside the alphabet.
+  case "$ticket_value" in
+    *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=]*) ticket_value="" ;;
   esac
-  if ! printf '%s' "$ticket_value" | "$MACOS_BASE64_TOOL" -D > "$ticket_issued" 2>/dev/null || \
+  if [ -z "$ticket_value" ] || [ $((${#ticket_value} % 4)) -ne 0 ] || \
+     ! printf '%s' "$ticket_value" | "$MACOS_BASE64_TOOL" -D > "$ticket_issued" 2>/dev/null || \
      [ ! -s "$ticket_issued" ]; then
     ticket_lookup_detail="an unreadable ticket"
     return 0
@@ -785,6 +833,7 @@ confirm_notarization_ticket() {
   ticket_record="2/2/$3"
   ticket_response="$STAGE_DIR/notarization-ticket.json"
   ticket_headers="$STAGE_DIR/notarization-ticket.headers"
+  ticket_transfer="$STAGE_DIR/notarization-ticket.transfer"
   ticket_issued="$STAGE_DIR/notarization-ticket"
   for ticket_retry_delay in 2 5 15 30 60 ""; do
     lookup_notarization_ticket

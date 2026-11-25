@@ -24,9 +24,12 @@ request is answered with line n of `ticket-outcomes` (default `issued`):
 `deletedstring`, `emptyerror` and `longerror` return malformed `deleted`
 and `serverErrorCode` fields, `withnull` adds JSON nulls to an issued
 ticket, `extrarecord` answers with two records, `emptyticket` with an empty
-ticket,
+ticket, `truncated` closes the connection before its declared length, and
+`nullrecord`/`dictrecords`/`arraydeleted`/`arrayticket`/`badbase64`/
+`numericticket`/`numericerror` carry the issued ticket in a malformed answer,
 `wrongrecord` answers about another record, `garbage` returns a non-JSON
-page, `huge` streams 256 KiB without a length, `drop` closes the
+page, `huge` streams 16 MiB without a length (and notes in `ticket-hangups` a
+client that hangs up first), `drop` closes the
 connection, and a number answers with that status (a 3xx redirects to
 `/redirected-ticket`).
 """
@@ -125,12 +128,41 @@ def main() -> int:
                 self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
                 chunk = b"x" * 65536
-                for _ in range(4):
-                    self.wfile.write(f"{len(chunk):x}\r\n".encode("ascii") + chunk + b"\r\n")
-                self.wfile.write(b"0\r\n\r\n")
+                try:
+                    for _ in range(256):
+                        self.wfile.write(f"{len(chunk):x}\r\n".encode("ascii") + chunk + b"\r\n")
+                        self.wfile.flush()
+                    self.wfile.write(b"0\r\n\r\n")
+                except (BrokenPipeError, ConnectionResetError):
+                    with open(os.path.join(fixture_dir, "ticket-hangups"), "a", encoding="utf-8") as f:
+                        f.write(record_name + "\n")
                 return
             if outcome == "garbage":
                 self.answer(200, b"<html>captive portal</html>")
+                return
+            if outcome == "truncated":
+                body = json.dumps({"records": [{"recordName": record_name, "fields": {"signedTicket": {"value": base64.b64encode(DEFAULT_TICKET).decode("ascii")}}}]}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body) + 100))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                self.close_connection = True
+                self.connection.shutdown(2)
+                return
+            shapes = {
+                "nullrecord": lambda r: {"records": [r, None]},
+                "dictrecords": lambda r: {"records": {"0": r}},
+                "arraydeleted": lambda r: {"records": [dict(r, deleted=[False])]},
+                "arrayticket": lambda r: {"records": [dict(r, fields={"signedTicket": {"value": [r["fields"]["signedTicket"]["value"]]}})]},
+                "badbase64": lambda r: {"records": [dict(r, fields={"signedTicket": {"value": "not base64!"}})]},
+                "numericticket": lambda r: {"records": [dict(r, fields={"signedTicket": {"value": 5}})]},
+            }
+            if outcome in shapes:
+                ticket = base64.b64encode(DEFAULT_TICKET).decode("ascii")
+                record = {"recordName": record_name, "deleted": False, "fields": {"signedTicket": {"value": ticket}}}
+                self.answer(200, json.dumps(shapes[outcome](record)).encode("utf-8"))
                 return
             record = {"recordName": record_name}
             if outcome in ("issued", "other", "deleted", "deletedstring", "withnull", "extrarecord", "emptyticket"):
@@ -164,6 +196,7 @@ def main() -> int:
                     "denied": "ACCESS_DENIED",
                     "emptyerror": "",
                     "longerror": "A" * 41,
+                    "numericerror": 5,
                 }
                 record.update(reason="fixture", serverErrorCode=codes[outcome])
             records = [record, record] if outcome == "extrarecord" else [record]

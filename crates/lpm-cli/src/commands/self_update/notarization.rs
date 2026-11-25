@@ -477,7 +477,24 @@ mod tests {
         numeric_ticket["records"][0]["fields"]["signedTicket"]["value"] =
             serde_json::Value::from(5);
 
-        for answer in [deleted_string, numeric_error, numeric_ticket] {
+        let mut array_deleted = issued(TICKET);
+        array_deleted["records"][0]["deleted"] = serde_json::json!([false]);
+        let mut array_ticket = issued(TICKET);
+        let value = array_ticket["records"][0]["fields"]["signedTicket"]["value"].clone();
+        array_ticket["records"][0]["fields"]["signedTicket"]["value"] = serde_json::json!([value]);
+        let record = issued(TICKET)["records"][0].clone();
+        let null_record = serde_json::json!({ "records": [record, null] });
+        let dict_records = serde_json::json!({ "records": { "0": record } });
+
+        for answer in [
+            deleted_string,
+            numeric_error,
+            numeric_ticket,
+            array_deleted,
+            array_ticket,
+            null_record,
+            dict_records,
+        ] {
             assert_eq!(
                 parse_lookup(&serde_json::to_vec(&answer).unwrap(), RECORD),
                 Lookup::Unavailable("an unreadable answer".to_string()),

@@ -67,7 +67,7 @@ run_helper() {
 		XCODE_SELECT_BIN="$work/runner/bin/xcode-select" \
 		XCRUN_BIN="$work/runner/bin/xcrun" \
 		STAPLER_BIN="$work/runner/bin/stapler" \
-		XCRUN_CACHE_DIRS="$work" \
+		XCRUN_CACHE_DIR="$work/cache dir" \
 		SUDO="" \
 		TMPDIR="$work" \
 		bash "$helper" "$@"
@@ -127,9 +127,10 @@ echo "PASS: restore without hidden tools changes nothing"
 
 make_runner
 printf '%s\n' "$work/runner/Applications/Xcode_26.0.app/Contents/Developer" >"$work/runner/selected"
-: >"$work/xcrun_db"
+mkdir -p "$work/cache dir"
+: >"$work/cache dir/xcrun_db"
 run_helper hide none "$work/state" >/dev/null
-[ ! -e "$work/xcrun_db" ] || fail "hiding developer tools left xcrun's cache of their paths"
+[ ! -e "$work/cache dir/xcrun_db" ] || fail "hiding developer tools left xcrun's cache of their paths"
 run_helper restore "$work/state"
 [ "$(cat "$work/runner/selected")" = "$work/runner/Applications/Xcode_26.0.app/Contents/Developer" ] \
 	|| fail "restore selected $(cat "$work/runner/selected") instead of the Xcode selected before"

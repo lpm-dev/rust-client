@@ -7006,14 +7006,18 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         let install_sh =
             std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh"))
                 .unwrap();
-        let install_sh_requirement = install_sh
-            .lines()
-            .find_map(|line| line.strip_prefix("MACOS_CODE_REQUIREMENT=\""))
-            .and_then(|value| value.strip_suffix('"'))
-            .expect("install.sh pins a code requirement")
+        let assignment = |name: &str| {
+            install_sh
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}=\"")))
+                .and_then(|value| value.strip_suffix('"'))
+                .unwrap_or_else(|| panic!("install.sh sets {name}"))
+                .to_string()
+        };
+        let install_sh_requirement = assignment("MACOS_CODE_REQUIREMENT")
             .replace("\\\"", "\"")
-            .replace("$EXPECTED_BUNDLE_ID", MACOS_EXPECTED_BUNDLE_ID)
-            .replace("$EXPECTED_TEAM_ID", MACOS_EXPECTED_TEAM_ID);
+            .replace("$EXPECTED_BUNDLE_ID", &assignment("EXPECTED_BUNDLE_ID"))
+            .replace("$EXPECTED_TEAM_ID", &assignment("EXPECTED_TEAM_ID"));
 
         assert_eq!(
             format!("={install_sh_requirement}"),

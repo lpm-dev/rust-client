@@ -68,8 +68,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-release-upgrade-1.99.1-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-release-upgrade-1.99.1-
+          key: ${{ runner.os }}-without-developer-tools-1.99.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-without-developer-tools-1.99.1-
 
       - name: Build this updater and its signed-release tests
         run: |
@@ -91,8 +91,6 @@ jobs:
           # install.sh follows GitHub's latest release; lpm self-update follows
           # the npm dist-tags first, which GitHub releases precede.
           installer_stable=$(gh release view --repo lpm-dev/rust-client --json tagName --jq .tagName)
-          updater_stable=$(curl -fsSL https://registry.npmjs.org/@lpm-registry/cli/latest | jq -er .version)
-          updater_nightly=$(curl -fsSL https://registry.npmjs.org/@lpm-registry/cli/nightly | jq -er .version)
           archives=""
           for tag in v0.76.5 v0.77.0-nightly.20260909.177.e3196a5; do
             mkdir -p "$RUNNER_TEMP/releases/$tag"
@@ -103,8 +101,6 @@ jobs:
           done
           {
             echo "INSTALLER_STABLE=${installer_stable#v}"
-            echo "UPDATER_STABLE=$updater_stable"
-            echo "UPDATER_NIGHTLY=$updater_nightly"
             echo "LPM_TEST_MACOS_RELEASE_ARCHIVES=$archives"
           } >> "$GITHUB_ENV"
 
@@ -113,16 +109,31 @@ jobs:
 
       - name: This updater verifies real signed releases
         run: |
+          set -euo pipefail
           unset DEVELOPER_DIR
-          "$SELF_UPDATE_TESTS" --ignored --test-threads=1 signed_macos_release
+          "$SELF_UPDATE_TESTS" --ignored --test-threads=1 signed_macos_release apple_s_ticket_database \
+            | tee "$RUNNER_TEMP/signed-release-tests.log"
+          grep -q 'test result: ok. 4 passed' "$RUNNER_TEMP/signed-release-tests.log"
 
       - name: Fresh install through the official installer
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           unset DEVELOPER_DIR
           rm -rf "$HOME/.lpm"
-          env PATH=/usr/bin:/bin:/usr/sbin:/sbin SHELL=/bin/zsh sh install.sh
-          test "$(LPM_NO_UPDATE_CHECK=1 "$HOME/.lpm/bin/lpm" --version | sed -n 1p)" = "lpm $INSTALLER_STABLE"
+          # The installer asks GitHub's API for the latest release without a
+          # token; hosted runners share that limit, so a refusal is retried.
+          for attempt in 1 2 3; do
+            status=0
+            env PATH=/usr/bin:/bin:/usr/sbin:/sbin SHELL=/bin/zsh sh install.sh > "$RUNNER_TEMP/fresh-install.log" 2>&1 || status=$?
+            cat "$RUNNER_TEMP/fresh-install.log"
+            [ "$status" -ne 0 ] && grep -q 'Failed to detect latest stable version' "$RUNNER_TEMP/fresh-install.log" || break
+            sleep 60
+          done
+          test "$status" -eq 0
+          installer_stable=$(gh release view --repo lpm-dev/rust-client --json tagName --jq .tagName)
+          test "$(LPM_NO_UPDATE_CHECK=1 "$HOME/.lpm/bin/lpm" --version | sed -n 1p)" = "lpm ${installer_stable#v}"
 
       - name: In-place upgrade of an affected install through the official installer
         env:
@@ -172,7 +183,9 @@ jobs:
             echo "::notice::$INSTALLER_STABLE still needs Xcode to update; its users recover through the installer"
           else
             test "$status" -eq 0
-            test "$(LPM_NO_UPDATE_CHECK=1 "$lpm" --version | sed -n 1p)" = "lpm $UPDATER_NIGHTLY"
+            # Read after the update, so a nightly published meanwhile counts.
+            nightly=$(curl -fsSL https://registry.npmjs.org/@lpm-registry/cli/nightly | jq -er .version)
+            test "$(LPM_NO_UPDATE_CHECK=1 "$lpm" --version | sed -n 1p)" = "lpm $nightly"
           fi
 
       - name: Self-update from this build to the latest signed releases
@@ -191,7 +204,9 @@ jobs:
             cp "$RUNNER_TEMP/fixed/lpm-rs" "$app/Contents/MacOS/lpm-rs"
             test "$(LPM_NO_UPDATE_CHECK=1 "$lpm" --version | sed -n 1p)" = "lpm $FIXED_BUILD_VERSION"
             "$lpm" self-update --channel "$channel" --refresh
-            if [ "$channel" = stable ]; then expected="$UPDATER_STABLE"; else expected="$UPDATER_NIGHTLY"; fi
+            if [ "$channel" = stable ]; then tag=latest; else tag=nightly; fi
+            # Read after the update, so a release published meanwhile counts.
+            expected=$(curl -fsSL "https://registry.npmjs.org/@lpm-registry/cli/$tag" | jq -er .version)
             test "$(LPM_NO_UPDATE_CHECK=1 "$lpm" --version | sed -n 1p)" = "lpm $expected"
             /usr/bin/codesign --verify --strict \
               -R '=anchor apple generic and certificate leaf[subject.OU] = "823S8YKMRW" and notarized' "$app"
