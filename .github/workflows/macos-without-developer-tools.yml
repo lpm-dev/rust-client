@@ -1,0 +1,258 @@
+name: macOS without developer tools
+
+# Every hosted macOS runner has Xcode and the Command Line Tools, which most of
+# LPM's users don't. These checks remove them, then install, upgrade and
+# self-update against real signed releases, as such a Mac does. On the oldest
+# and newest macOS that GitHub hosts they also drop all traffic to the hosts
+# macOS asks about notarization tickets and certificate revocation, and to
+# Apple's networks, as a firewall that blocks Apple does.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'Cargo.lock'
+      - 'crates/lpm-cli/Cargo.toml'
+      - 'crates/lpm-cli/src/cli/format.rs'
+      - 'crates/lpm-cli/src/json_contract.rs'
+      - 'crates/lpm-cli/src/release_channel.rs'
+      - 'crates/lpm-cli/src/commands/self_update*'
+      - 'crates/lpm-cli/src/commands/self_update/**'
+      - 'crates/lpm-cli/src/sigstore*'
+      - 'crates/lpm-cli/src/sigstore_verify/**'
+      - 'crates/lpm-common/src/error.rs'
+      - 'crates/lpm-common/src/process_output*'
+      - 'crates/lpm-cli/src/release_lookup.rs'
+      - 'crates/lpm-http/**'
+      - 'install.sh'
+      - 'tests/install-sh/**'
+      - 'scripts/ci/macos-apple-services.sh'
+      - 'scripts/ci/test-macos-apple-services.sh'
+      - 'scripts/ci/macos-developer-tools.sh'
+      - 'scripts/ci/test-macos-developer-tools.sh'
+      - '.github/workflows/macos-without-developer-tools.yml'
+  # The latest releases change without a commit here, so the checks also run
+  # daily.
+  schedule:
+    - cron: '41 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-without-developer-tools-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+
+jobs:
+  macos-without-developer-tools:
+    name: ${{ matrix.runner }}, developer tools ${{ matrix.developer-tools }}, Apple services ${{ matrix.apple-services }}
+    if: ${{ !github.event.pull_request.draft }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            developer-tools: none
+            apple-services: blocked
+            asset: lpm-darwin-arm64.zip
+          - runner: macos-26
+            developer-tools: none
+            apple-services: blocked
+            asset: lpm-darwin-arm64.zip
+          - runner: macos-15-intel
+            developer-tools: command-line-tools
+            apple-services: reachable
+            asset: lpm-darwin-x64.zip
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      ASSET: ${{ matrix.asset }}
+      # A standalone install whose updater runs /usr/bin/stapler.
+      AFFECTED_VERSION: v0.85.0
+      # The last stable release whose updater needs Xcode.
+      LAST_UPDATER_NEEDING_XCODE: 0.88.0
+      DEVELOPER_TOOLS: ${{ matrix.developer-tools }}
+      # What an updater that runs /usr/bin/stapler reports on this Mac: the
+      # shim's own refusal when only the Command Line Tools are installed.
+      UPDATER_NEEDS_XCODE: ${{ matrix.developer-tools == 'command-line-tools' && 'requires Xcode' || 'notarization-ticket validation failed' }}
+      # Older than every release, so this build updates to each of them.
+      FIXED_BUILD_VERSION: 0.0.1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: '1.99.1'
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.runner }}-without-developer-tools-1.99.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ matrix.runner }}-without-developer-tools-1.99.1-
+
+      - name: Build this updater and its signed-release tests
+        run: |
+          set -euo pipefail
+          tests=$(cargo test --locked -p lpm-cli --bin lpm-rs --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .target.name == "lpm-rs") | .executable')
+          test -x "$tests"
+          LPM_BUILD_VERSION="$FIXED_BUILD_VERSION" cargo build --locked -p lpm-cli --bin lpm-rs
+          mkdir -p "$RUNNER_TEMP/fixed"
+          cp target/debug/lpm-rs "$RUNNER_TEMP/fixed/lpm-rs"
+          test "$(LPM_NO_UPDATE_CHECK=1 "$RUNNER_TEMP/fixed/lpm-rs" --version | sed -n 1p)" = "lpm $FIXED_BUILD_VERSION"
+          echo "SELF_UPDATE_TESTS=$tests" >> "$GITHUB_ENV"
+
+      - name: Download real signed releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # install.sh follows GitHub's latest release; lpm self-update follows
+          # the npm dist-tags first, which GitHub releases precede.
+          installer_stable=$(gh release view --repo lpm-dev/rust-client --json tagName --jq .tagName)
+          archives=""
+          for tag in v0.76.5 v0.77.0-nightly.20260909.177.e3196a5; do
+            mkdir -p "$RUNNER_TEMP/releases/$tag"
+            gh release download "$tag" --repo lpm-dev/rust-client --dir "$RUNNER_TEMP/releases/$tag" \
+              --pattern "$ASSET" --pattern SHA256SUMS.txt
+            (cd "$RUNNER_TEMP/releases/$tag" && awk -v asset="$ASSET" '$2 == asset' SHA256SUMS.txt | shasum -a 256 --check)
+            archives="${archives:+$archives:}$RUNNER_TEMP/releases/$tag/$ASSET"
+          done
+          {
+            echo "INSTALLER_STABLE=${installer_stable#v}"
+            echo "LPM_TEST_MACOS_RELEASE_ARCHIVES=$archives"
+          } >> "$GITHUB_ENV"
+
+      # Before anything on this Mac checks a release, so the system has no
+      # notarization answers cached for them.
+      - name: Block Apple's services
+        if: matrix.apple-services == 'blocked'
+        run: bash scripts/ci/macos-apple-services.sh block "$RUNNER_TEMP/apple-services"
+
+      - name: Remove developer tools
+        run: bash scripts/ci/macos-developer-tools.sh hide "$DEVELOPER_TOOLS" "$RUNNER_TEMP/developer-tools"
+
+      - name: This updater verifies real signed releases
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          unset DEVELOPER_DIR
+          "$SELF_UPDATE_TESTS" --ignored --test-threads=1 signed_macos_release \
+            | tee "$RUNNER_TEMP/signed-release-tests.log"
+          grep -q 'test result: ok. 3 passed' "$RUNNER_TEMP/signed-release-tests.log"
+
+      - name: Fresh install through the official installer
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          unset DEVELOPER_DIR
+          rm -rf "$HOME/.lpm"
+          # The version is named: the installer's own latest-release lookup
+          # is unauthenticated, and hosted runners share GitHub's hourly
+          # limit for it. tests/install-sh covers that lookup.
+          env PATH=/usr/bin:/bin:/usr/sbin:/sbin SHELL=/bin/zsh LPM_INSTALL_VERSION="v$INSTALLER_STABLE" sh install.sh
+          test "$(LPM_NO_UPDATE_CHECK=1 "$HOME/.lpm/bin/lpm" --version | sed -n 1p)" = "lpm $INSTALLER_STABLE"
+
+      - name: In-place upgrade of an affected install through the official installer
+        timeout-minutes: 5
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          unset DEVELOPER_DIR
+          rm -rf "$HOME/.lpm"
+          lpm="$HOME/.lpm/bin/lpm"
+          env PATH=/usr/bin:/bin:/usr/sbin:/sbin SHELL=/bin/zsh \
+            LPM_INSTALL_VERSION="$AFFECTED_VERSION" LPM_INSTALL_MIN_VERSION_OVERRIDE=1 sh install.sh
+          test "$(LPM_NO_UPDATE_CHECK=1 "$lpm" --version | sed -n 1p)" = "lpm ${AFFECTED_VERSION#v}"
+          # With LPM_NO_UPDATE_CHECK, no background update check can hold the
+          # update lock when the self-update below starts.
+          LPM_NO_UPDATE_CHECK=1 "$lpm" config release-age --set 3d
+          printf 'kept across upgrades\n' > "$HOME/.lpm/upgrade-sentinel"
+          if "$lpm" self-update > "$RUNNER_TEMP/affected-self-update.log" 2>&1; then
+            cat "$RUNNER_TEMP/affected-self-update.log"
+            echo "::error::$AFFECTED_VERSION updated itself, so developer tools were not removed"
+            exit 1
+          fi
+          grep -q "$UPDATER_NEEDS_XCODE" "$RUNNER_TEMP/affected-self-update.log" \
+            || { cat "$RUNNER_TEMP/affected-self-update.log"; exit 1; }
+          (cd "$HOME/.lpm" && find . -type f ! -path './bin/*' ! -path './libexec/*' -print0 \
+            | xargs -0 shasum -a 256) > "$RUNNER_TEMP/settings"
+          env PATH=/usr/bin:/bin:/usr/sbin:/sbin SHELL=/bin/zsh LPM_INSTALL_VERSION="v$INSTALLER_STABLE" sh install.sh
+          (cd "$HOME/.lpm" && shasum -a 256 --check --quiet "$RUNNER_TEMP/settings")
+          test "$(LPM_NO_UPDATE_CHECK=1 "$lpm" --version | sed -n 1p)" = "lpm $INSTALLER_STABLE"
+          grep -Eqx 'minimum-release-age-secs = (259200|"259200")' "$HOME/.lpm/config.toml"
+          test "$(grep -c '\.lpm/bin' "$HOME/.zshrc")" -eq 1
+
+      - name: The latest stable release's own updater takes the newest nightly
+        timeout-minutes: 5
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          unset DEVELOPER_DIR
+          lpm="$HOME/.lpm/bin/lpm"
+          nightly() { curl -fsSL https://registry.npmjs.org/@lpm-registry/cli/nightly | jq -er .version; }
+          before=$(nightly)
+          status=0
+          "$lpm" self-update --channel nightly --refresh --json \
+            > "$RUNNER_TEMP/latest-self-update.json" 2> "$RUNNER_TEMP/latest-self-update.err" || status=$?
+          cat "$RUNNER_TEMP/latest-self-update.json" "$RUNNER_TEMP/latest-self-update.err"
+          if [ "$(printf '%s\n%s\n' "$INSTALLER_STABLE" "$LAST_UPDATER_NEEDING_XCODE" | sort -V | tail -n 1)" = "$LAST_UPDATER_NEEDING_XCODE" ]; then
+            test "$status" -ne 0
+            grep -q "$UPDATER_NEEDS_XCODE" "$RUNNER_TEMP/latest-self-update.json" "$RUNNER_TEMP/latest-self-update.err"
+            echo "::notice::$INSTALLER_STABLE still needs Xcode to update; its users recover through the installer"
+          else
+            test "$status" -eq 0
+            jq -e '.applied and .verified' "$RUNNER_TEMP/latest-self-update.json"
+            chosen=$(jq -er .latest "$RUNNER_TEMP/latest-self-update.json")
+            [ "$chosen" = "$before" ] || [ "$chosen" = "$(nightly)" ]
+            test "$(LPM_NO_UPDATE_CHECK=1 "$lpm" --version | sed -n 1p)" = "lpm $chosen"
+          fi
+
+      - name: Self-update from this build to the latest signed releases
+        timeout-minutes: 5
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          unset DEVELOPER_DIR
+          lpm="$HOME/.lpm/bin/lpm"
+          app="$HOME/.lpm/libexec/LPM CLI.app"
+          (cd "$HOME/.lpm" && find . -type f ! -path './bin/*' ! -path './libexec/*' ! -name update-check.json -print0 \
+            | xargs -0 shasum -a 256) > "$RUNNER_TEMP/settings"
+          for channel in stable nightly; do
+            rm -rf "$app"
+            mkdir -p "$app/Contents/MacOS"
+            cp "$RUNNER_TEMP/fixed/lpm-rs" "$app/Contents/MacOS/lpm-rs"
+            test "$(LPM_NO_UPDATE_CHECK=1 "$lpm" --version | sed -n 1p)" = "lpm $FIXED_BUILD_VERSION"
+            if [ "$channel" = stable ]; then tag=latest; else tag=nightly; fi
+            before=$(curl -fsSL "https://registry.npmjs.org/@lpm-registry/cli/$tag" | jq -er .version)
+            "$lpm" self-update --channel "$channel" --refresh --json | tee "$RUNNER_TEMP/self-update-$channel.json"
+            jq -e '.applied and .verified' "$RUNNER_TEMP/self-update-$channel.json"
+            chosen=$(jq -er .latest "$RUNNER_TEMP/self-update-$channel.json")
+            # What the updater chose must be the release the dist-tag named,
+            # before or after the update, and must be what got installed.
+            [ "$chosen" = "$before" ] || \
+              [ "$chosen" = "$(curl -fsSL "https://registry.npmjs.org/@lpm-registry/cli/$tag" | jq -er .version)" ]
+            test "$(LPM_NO_UPDATE_CHECK=1 "$lpm" --version | sed -n 1p)" = "lpm $chosen"
+            /usr/bin/codesign --verify --strict \
+              -R '=anchor apple generic and certificate leaf[subject.OU] = "823S8YKMRW" and notarized' "$app"
+          done
+          (cd "$HOME/.lpm" && shasum -a 256 --check --quiet "$RUNNER_TEMP/settings")
+
+      - name: Restore developer tools
+        if: always()
+        run: bash scripts/ci/macos-developer-tools.sh restore "$RUNNER_TEMP/developer-tools"
+
+      - name: Restore Apple's services
+        if: always() && matrix.apple-services == 'blocked'
+        run: bash scripts/ci/macos-apple-services.sh restore "$RUNNER_TEMP/apple-services"

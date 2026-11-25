@@ -30,8 +30,8 @@ pub(crate) mod verify_release;
 mod windows_trust;
 
 use self::download::{
-    StagedAsset, ensure_staged_file_unchanged, fetch_asset_to_staged_file, fetch_bounded,
-    safe_remote_label,
+    StagedAsset, StagedAssetError, ensure_staged_file_unchanged, fetch_asset_to_staged_file,
+    fetch_bounded, safe_remote_label,
 };
 #[cfg(test)]
 use self::download::{create_staged_binary, finish_staged_binary};
@@ -379,8 +379,14 @@ pub async fn run(
         }
         InstallMethod::Standalone => {
             standalone_update = Some(
-                run_standalone_update(&latest, &current_executable, &account_home, !json_output)
-                    .await?,
+                run_standalone_update(
+                    &latest,
+                    &current_executable,
+                    &account_home,
+                    target_channel,
+                    !json_output,
+                )
+                .await?,
             );
         }
     }
@@ -2337,6 +2343,110 @@ fn verify_release_asset_digest(
     })
 }
 
+/// What a standalone update refused that the official installer can take over
+/// from. Other refusals name no installer, since reinstalling wouldn't fix
+/// them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StandaloneRefusal {
+    /// The release's provenance or integrity.
+    ReleaseVerification,
+    /// A verified release, or an installation outside the installer's layout,
+    /// that this updater's checks don't accept. The installer applies its
+    /// current checks afresh.
+    Compatibility,
+}
+
+/// A refusal the official installer can take over from names it, so a
+/// refusal never leaves the user without a way to update. Without cosign the
+/// installer can't tell who published a Linux release's checksums, so a Linux
+/// release the updater couldn't verify is reinstalled only with its signature
+/// required; on macOS the installer checks the app's Developer ID signature,
+/// which only LPM's signing identity can produce. Windows has no such
+/// installer.
+fn with_installer_recovery(
+    error: LpmError,
+    channel: ReleaseChannel,
+    refusal: StandaloneRefusal,
+) -> LpmError {
+    let LpmError::SelfUpdate(reason) = error else {
+        return error;
+    };
+    if !cfg!(unix) {
+        return LpmError::SelfUpdate(reason);
+    }
+    let channel = channel.as_str();
+    let (recovery, reinstall_command) = if refusal == StandaloneRefusal::ReleaseVerification
+        && cfg!(not(target_os = "macos"))
+    {
+        (
+            "If this release keeps failing verification, install cosign and reinstall LPM CLI \
+             with the official installer, which then checks the release's signature itself \
+             and keeps your settings",
+            format!(
+                "curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL={channel} \
+                 LPM_INSTALL_REQUIRE_SIGSTORE=1 sh"
+            ),
+        )
+    } else {
+        (
+            "Reinstall LPM CLI with the official installer, which verifies the release itself \
+             and keeps your settings",
+            format!("curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL={channel} sh"),
+        )
+    };
+    LpmError::StandaloneSelfUpdate {
+        reason,
+        recovery: recovery.to_string(),
+        reinstall_command,
+    }
+}
+
+/// Runs `check` on the staged release asset between two checks that it is
+/// still the verified file. A file that changed or went away is refused as
+/// that, which reinstalling doesn't fix, even when it also made `check` fail;
+/// only a failed check of the verified file names the installer.
+fn check_staged_asset<T>(
+    staged: &StagedAsset,
+    channel: ReleaseChannel,
+    check: impl FnOnce() -> Result<T, LpmError>,
+) -> Result<T, LpmError> {
+    ensure_staged_file_unchanged(&staged.temporary, &staged.sha256)?;
+    let checked = check();
+    ensure_staged_file_unchanged(&staged.temporary, &staged.sha256)?;
+    checked
+        .map_err(|error| with_installer_recovery(error, channel, StandaloneRefusal::Compatibility))
+}
+
+/// Runs the staged app's executable to check its version. A failed probe names
+/// the installer only when the bundle is still the one that was validated; a
+/// bundle that changed afterwards is refused as that, without it.
+#[cfg(target_os = "macos")]
+fn probe_staged_macos_bundle(
+    staged: &StagedMacOSBundle,
+    version: &str,
+    channel: ReleaseChannel,
+) -> Result<(), LpmError> {
+    let Err(error) = VersionProbe::verify_staged_path(&staged.executable, version) else {
+        return Ok(());
+    };
+    let still_validated = validate_macos_app_bundle(&staged.app_bundle)
+        .is_ok_and(|fingerprint| fingerprint == staged.fingerprint);
+    if still_validated {
+        return Err(with_installer_recovery(
+            error,
+            channel,
+            StandaloneRefusal::Compatibility,
+        ));
+    }
+    let probe_failure = match error {
+        LpmError::SelfUpdate(reason) => reason,
+        other => other.to_string(),
+    };
+    Err(LpmError::SelfUpdate(format!(
+        "staged macOS app bundle changed after it was validated ({probe_failure})"
+    )))
+}
+
 /// Download and replace the binary in-place for standalone installations.
 ///
 /// Every fetched byte is anchored to the Sigstore-signed `SHA256SUMS.txt`
@@ -2354,31 +2464,41 @@ async fn run_standalone_update(
     version: &str,
     current_executable: &Path,
     account_home: &Path,
+    channel: ReleaseChannel,
     human_output: bool,
 ) -> Result<StandaloneUpdate, LpmError> {
+    let refused = |refusal| move |error| with_installer_recovery(error, channel, refusal);
     validate_standalone_install_location(current_executable)?;
     #[cfg(not(target_os = "macos"))]
     let _ = account_home;
     #[cfg(target_os = "macos")]
-    let macos_layout = prepare_macos_standalone_layout(current_executable, account_home)?;
+    let macos_layout = prepare_macos_standalone_layout(
+        macos_standalone_layout_for(current_executable, account_home)
+            .map_err(refused(StandaloneRefusal::Compatibility))?,
+    )?;
     #[cfg(target_os = "macos")]
     let staging_anchor = macos_layout.app_parent.join(".lpm-release-asset.zip");
     #[cfg(not(target_os = "macos"))]
     let staging_anchor = current_executable.to_path_buf();
 
-    let assets = verify_and_stage_for_standalone(version, &staging_anchor, human_output).await?;
+    let assets = verify_and_stage_for_standalone(version, &staging_anchor, human_output)
+        .await
+        .map_err(|failure| match failure {
+            StagingFailure::ReleaseVerification(error) => {
+                refused(StandaloneRefusal::ReleaseVerification)(error)
+            }
+            StagingFailure::Local(error) => error,
+        })?;
 
     #[cfg(target_os = "macos")]
     {
-        ensure_staged_file_unchanged(
-            &assets.staged_binary.temporary,
-            &assets.staged_binary.sha256,
-        )?;
-        let staged_bundle = stage_macos_bundle(
-            assets.staged_binary.temporary.path(),
-            &macos_layout.app_parent,
-        )?;
-        VersionProbe::verify_staged_path(&staged_bundle.executable, version)?;
+        let staged_bundle = check_staged_asset(&assets.staged_binary, channel, || {
+            stage_macos_bundle(
+                assets.staged_binary.temporary.path(),
+                &macos_layout.app_parent,
+            )
+        })?;
+        probe_staged_macos_bundle(&staged_bundle, version, channel)?;
         install_staged_macos_bundle(&macos_layout, staged_bundle, version)?;
     }
 
@@ -2386,15 +2506,9 @@ async fn run_standalone_update(
     let sandbox_helper = None;
     #[cfg(not(target_os = "macos"))]
     let sandbox_helper = {
-        VersionProbe::verify_staged(
-            &assets.staged_binary.temporary,
-            &assets.staged_binary.sha256,
-            version,
-        )?;
-        ensure_staged_file_unchanged(
-            &assets.staged_binary.temporary,
-            &assets.staged_binary.sha256,
-        )?;
+        check_staged_asset(&assets.staged_binary, channel, || {
+            VersionProbe::verify_staged_version(&assets.staged_binary.temporary, version)
+        })?;
         let StagedAsset {
             temporary, sha256, ..
         } = assets.staged_binary;
@@ -2587,7 +2701,7 @@ fn macos_standalone_layout_for(
     let internal_executable = app_bundle.join(MACOS_INTERNAL_EXECUTABLE);
     if current_executable != internal_executable {
         return Err(LpmError::SelfUpdate(format!(
-            "macOS standalone updates require execution from {}; reinstall with https://github.com/lpm-dev/rust-client/blob/main/install.sh",
+            "macOS standalone updates require execution from {}",
             internal_executable.display()
         )));
     }
@@ -2601,12 +2715,10 @@ fn macos_standalone_layout_for(
 
 #[cfg(target_os = "macos")]
 fn prepare_macos_standalone_layout(
-    current_executable: &Path,
-    account_home: &Path,
+    layout: MacOSStandaloneLayout,
 ) -> Result<MacOSStandaloneLayout, LpmError> {
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 
-    let layout = macos_standalone_layout_for(current_executable, account_home)?;
     if let Ok(metadata) = std::fs::symlink_metadata(&layout.app_parent) {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(LpmError::SelfUpdate(format!(
@@ -2767,35 +2879,28 @@ struct StagedMacOSBundle {
     staging_root: tempfile::TempDir,
     app_bundle: PathBuf,
     executable: PathBuf,
-    notarization: ConfirmedNotarization,
+    fingerprint: BundleFingerprint,
 }
 
-/// The code-directory hash and stapled notarization ticket of a bundle whose
-/// ticket Apple's ticketing service confirmed.
+/// What identifies a validated app bundle: its code-directory hash and its
+/// stapled notarization ticket.
 #[cfg(target_os = "macos")]
 #[derive(Debug, PartialEq, Eq)]
-struct ConfirmedNotarization {
+struct BundleFingerprint {
     cdhash: String,
-    ticket: Vec<u8>,
+    stapled_ticket: Vec<u8>,
 }
 
 #[cfg(target_os = "macos")]
-enum NotarizationCheck<'a> {
-    AskApple,
-    /// The bundle was moved from one whose ticket Apple confirmed, so it must
-    /// carry the same code and the same ticket instead of asking Apple again.
-    SameAs(&'a ConfirmedNotarization),
-}
-
-#[cfg(target_os = "macos")]
-impl ConfirmedNotarization {
-    fn confirm_same_bundle(&self, installed: &ConfirmedNotarization) -> Result<(), LpmError> {
+impl BundleFingerprint {
+    /// The bundle moved into place must be the staged one that was validated,
+    /// with the same code and the same ticket.
+    fn confirm_same_bundle(&self, installed: &BundleFingerprint) -> Result<(), LpmError> {
         if self == installed {
             return Ok(());
         }
         Err(LpmError::SelfUpdate(
-            "installed macOS app differs from the staged bundle whose notarization ticket Apple confirmed"
-                .to_string(),
+            "installed macOS app differs from the staged bundle that was validated".to_string(),
         ))
     }
 }
@@ -2811,7 +2916,7 @@ fn stage_macos_bundle(
         .tempdir_in(app_parent)
         .map_err(LpmError::Io)?;
     run_macos_validation_tool(
-        "/usr/bin/ditto",
+        MacOSTool::Ditto,
         &[
             OsStr::new("-x"),
             OsStr::new("-k"),
@@ -2821,13 +2926,13 @@ fn stage_macos_bundle(
         "macOS app extraction",
     )?;
     let app_bundle = staging_root.path().join(MACOS_APP_NAME);
-    let notarization = validate_macos_app_bundle(&app_bundle, NotarizationCheck::AskApple)?;
+    let fingerprint = validate_macos_app_bundle(&app_bundle)?;
     let executable = app_bundle.join(MACOS_INTERNAL_EXECUTABLE);
     Ok(StagedMacOSBundle {
         staging_root,
         app_bundle,
         executable,
-        notarization,
+        fingerprint,
     })
 }
 
@@ -2950,30 +3055,54 @@ fn validate_macos_app_inventory(app_bundle: &Path) -> Result<(), LpmError> {
     Ok(())
 }
 
+/// The programs macOS bundle validation runs. Each must ship with macOS and
+/// work without Apple's services: an `xcrun` shim such as `/usr/bin/stapler`
+/// fails on a Mac without Xcode or the Command Line Tools, and Gatekeeper's
+/// assessors answer from the Mac's security policy and Apple's services. An
+/// updater that depends on either can't update every Mac.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MacOSTool {
+    Codesign,
+    Ditto,
+    PlistBuddy,
+}
+
+#[cfg(target_os = "macos")]
+impl MacOSTool {
+    #[cfg(test)]
+    const ALL: [Self; 3] = {
+        // A new variant breaks this match, a reminder to list it here too.
+        match Self::Codesign {
+            Self::Codesign | Self::Ditto | Self::PlistBuddy => {}
+        }
+        [Self::Codesign, Self::Ditto, Self::PlistBuddy]
+    };
+
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Codesign => "/usr/bin/codesign",
+            Self::Ditto => "/usr/bin/ditto",
+            Self::PlistBuddy => "/usr/libexec/PlistBuddy",
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn run_macos_validation_tool(
-    program: &str,
+    tool: MacOSTool,
     arguments: &[&OsStr],
     description: &str,
 ) -> Result<std::process::Output, LpmError> {
-    let output = run_macos_validation_tool_once(program, arguments, description)?;
+    let output = validation::run(tool.path(), arguments, description, Duration::from_secs(60))?;
     if !output.status.success() {
         return Err(macos_validation_failure(description, &output));
     }
     Ok(output)
 }
 
-#[cfg(target_os = "macos")]
-fn run_macos_validation_tool_once(
-    program: &str,
-    arguments: &[&OsStr],
-    description: &str,
-) -> Result<std::process::Output, LpmError> {
-    validation::run(program, arguments, description, Duration::from_secs(60))
-}
-
 /// Names the failure in the tool's own words: its stderr, or its stdout
-/// when stderr is empty, which is where `stapler` reports.
+/// when stderr is empty.
 #[cfg(target_os = "macos")]
 fn macos_validation_failure(description: &str, output: &std::process::Output) -> LpmError {
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2994,53 +3123,11 @@ fn macos_validation_failure(description: &str, output: &std::process::Output) ->
     ))
 }
 
-/// `stapler validate` checks the stapled ticket against Apple's CloudKit
-/// record and exits with `EX_NOHOST` when CloudKit doesn't answer.
-#[cfg(target_os = "macos")]
-const STAPLER_CLOUDKIT_UNREACHABLE: i32 = 68;
-
-/// CloudKit lookups have kept failing for over 20 s at a time, so the checks
-/// spread over about two minutes before giving up, as install.sh's do.
-#[cfg(target_os = "macos")]
-const NOTARIZATION_TICKET_RETRY_DELAYS: [Duration; 5] = [
-    Duration::from_secs(2),
-    Duration::from_secs(5),
-    Duration::from_secs(15),
-    Duration::from_secs(30),
-    Duration::from_secs(60),
-];
-
-/// Validates the bundle's stapled notarization ticket, running `stapler`
-/// again after each of `retry_delays` while CloudKit doesn't answer. Any
-/// other failure, an invalid or missing ticket among them, fails at once.
-#[cfg(target_os = "macos")]
-fn validate_notarization_ticket(
-    stapler: &str,
-    app_bundle: &Path,
-    retry_delays: &[Duration],
-) -> Result<(), LpmError> {
-    const DESCRIPTION: &str = "macOS notarization-ticket validation";
-    let arguments = [OsStr::new("validate"), app_bundle.as_os_str()];
-    let mut retry_delays = retry_delays.iter();
-    loop {
-        let output = run_macos_validation_tool_once(stapler, &arguments, DESCRIPTION)?;
-        if output.status.success() {
-            return Ok(());
-        }
-        match retry_delays.next() {
-            Some(delay) if output.status.code() == Some(STAPLER_CLOUDKIT_UNREACHABLE) => {
-                std::thread::sleep(*delay);
-            }
-            _ => return Err(macos_validation_failure(DESCRIPTION, &output)),
-        }
-    }
-}
-
 #[cfg(target_os = "macos")]
 fn plist_buddy_value(plist: &Path, key: &str) -> Result<String, LpmError> {
     let command = format!("Print :{key}");
     let output = run_macos_validation_tool(
-        "/usr/libexec/PlistBuddy",
+        MacOSTool::PlistBuddy,
         &[OsStr::new("-c"), command.as_ref(), plist.as_os_str()],
         "provisioning-profile metadata validation",
     )?;
@@ -3080,32 +3167,86 @@ fn macos_entitlement_inspection_arguments(app_bundle: &Path) -> [&OsStr; 4] {
     ]
 }
 
+/// The code requirement every LPM macOS app satisfies: a Developer ID
+/// Application signature of LPM's team over its bundle identifier, on code
+/// Apple notarized. `codesign` judges `notarized` itself, from the stapled
+/// ticket when Apple can't be reached. The leading `=` marks inline
+/// requirement text.
 #[cfg(target_os = "macos")]
-fn validate_macos_app_bundle(
-    app_bundle: &Path,
-    notarization_check: NotarizationCheck<'_>,
-) -> Result<ConfirmedNotarization, LpmError> {
+fn macos_code_requirement() -> String {
+    format!(
+        "=anchor apple generic and identifier \"{MACOS_EXPECTED_BUNDLE_ID}\" \
+         and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
+         and certificate leaf[field.1.2.840.113635.100.6.1.13] exists \
+         and certificate leaf[subject.OU] = \"{MACOS_EXPECTED_TEAM_ID}\" \
+         and notarized"
+    )
+}
+
+/// Profiles are about 12 KiB; the bound keeps a hostile one out of memory.
+#[cfg(target_os = "macos")]
+const MACOS_PROVISIONING_PROFILE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Decodes the provisioning profile's CMS envelope in process. `security cms
+/// -D` would import the envelope's certificates into the default keychain,
+/// and fails for an account without one. The profile is a sealed resource of
+/// the code signature verified first, so only its content is needed.
+#[cfg(target_os = "macos")]
+fn decode_provisioning_profile(profile: &Path) -> Result<Vec<u8>, LpmError> {
+    use std::io::Read as _;
+
+    let mut message = Vec::new();
+    std::fs::File::open(profile)
+        .map_err(LpmError::Io)?
+        .take(MACOS_PROVISIONING_PROFILE_MAX_BYTES + 1)
+        .read_to_end(&mut message)
+        .map_err(LpmError::Io)?;
+    if message.len() as u64 > MACOS_PROVISIONING_PROFILE_MAX_BYTES {
+        return Err(LpmError::SelfUpdate(
+            "macOS provisioning profile exceeds its size limit".to_string(),
+        ));
+    }
+    let decode = || {
+        let decoder = security_framework::cms::CMSDecoder::create()?;
+        decoder.update_message(&message)?;
+        decoder.finalize_message()?;
+        decoder.get_content()
+    };
+    decode().map_err(|error| {
+        LpmError::SelfUpdate(format!(
+            "macOS provisioning profile could not be decoded: {error}"
+        ))
+    })
+}
+
+/// Validates an app bundle's contents, code signature and notarization,
+/// signing identity, entitlements and provisioning profile.
+#[cfg(target_os = "macos")]
+fn validate_macos_app_bundle(app_bundle: &Path) -> Result<BundleFingerprint, LpmError> {
     use std::io::Write as _;
 
     validate_macos_app_inventory(app_bundle)?;
+    let requirement = macos_code_requirement();
     run_macos_validation_tool(
-        "/usr/bin/codesign",
+        MacOSTool::Codesign,
         &[
             OsStr::new("--verify"),
             OsStr::new("--strict"),
             OsStr::new("--verbose=4"),
+            OsStr::new("-R"),
+            OsStr::new(&requirement),
             app_bundle.as_os_str(),
         ],
-        "macOS app code-signature validation",
+        "macOS app code-signature and notarization validation",
     )?;
 
     let details = run_macos_validation_tool(
-        "/usr/bin/codesign",
+        MacOSTool::Codesign,
         &[OsStr::new("-dvvv"), app_bundle.as_os_str()],
         "macOS app signing-identity inspection",
     )?;
     let details = format!(
-        "{}{}",
+        "{}\n{}",
         String::from_utf8_lossy(&details.stdout),
         String::from_utf8_lossy(&details.stderr)
     );
@@ -3127,14 +3268,15 @@ fn validate_macos_app_bundle(
             "macOS app signature has no code-directory hash".to_string(),
         ));
     };
-    let notarization = ConfirmedNotarization {
+    let fingerprint = BundleFingerprint {
         cdhash: cdhash.to_string(),
-        ticket: std::fs::read(app_bundle.join("Contents/CodeResources")).map_err(LpmError::Io)?,
+        stapled_ticket: std::fs::read(app_bundle.join("Contents/CodeResources"))
+            .map_err(LpmError::Io)?,
     };
 
     let entitlement_arguments = macos_entitlement_inspection_arguments(app_bundle);
     let signed_entitlements = run_macos_validation_tool(
-        "/usr/bin/codesign",
+        MacOSTool::Codesign,
         &entitlement_arguments,
         "macOS app entitlement inspection",
     )?;
@@ -3150,20 +3292,11 @@ fn validate_macos_app_bundle(
         ));
     }
 
-    let profile = app_bundle.join("Contents/embedded.provisionprofile");
-    let decoded_profile = run_macos_validation_tool(
-        "/usr/bin/security",
-        &[
-            OsStr::new("cms"),
-            OsStr::new("-D"),
-            OsStr::new("-i"),
-            profile.as_os_str(),
-        ],
-        "macOS provisioning-profile decoding",
-    )?;
+    let decoded_profile =
+        decode_provisioning_profile(&app_bundle.join("Contents/embedded.provisionprofile"))?;
     let mut profile_plist = tempfile::NamedTempFile::new().map_err(LpmError::Io)?;
     profile_plist
-        .write_all(&decoded_profile.stdout)
+        .write_all(&decoded_profile)
         .map_err(LpmError::Io)?;
     profile_plist.flush().map_err(LpmError::Io)?;
     let profile_team = plist_buddy_value(profile_plist.path(), "TeamIdentifier:0")?;
@@ -3179,27 +3312,7 @@ fn validate_macos_app_bundle(
                 .to_string(),
         ));
     }
-
-    match notarization_check {
-        NotarizationCheck::AskApple => validate_notarization_ticket(
-            "/usr/bin/stapler",
-            app_bundle,
-            &NOTARIZATION_TICKET_RETRY_DELAYS,
-        )?,
-        NotarizationCheck::SameAs(confirmed) => confirmed.confirm_same_bundle(&notarization)?,
-    }
-    run_macos_validation_tool(
-        "/usr/sbin/spctl",
-        &[
-            OsStr::new("--assess"),
-            OsStr::new("--type"),
-            OsStr::new("execute"),
-            OsStr::new("--verbose=4"),
-            app_bundle.as_os_str(),
-        ],
-        "macOS Gatekeeper validation",
-    )?;
-    Ok(notarization)
+    Ok(fingerprint)
 }
 
 #[cfg(target_os = "macos")]
@@ -3270,10 +3383,8 @@ fn install_staged_macos_bundle(
         installed_lpm = true;
         lpm_common::replace_symlink_atomic(&layout.lpx_link, link_target).map_err(LpmError::Io)?;
         installed_lpx = true;
-        validate_macos_app_bundle(
-            &layout.app_bundle,
-            NotarizationCheck::SameAs(&staged.notarization),
-        )?;
+        let installed = validate_macos_app_bundle(&layout.app_bundle)?;
+        staged.fingerprint.confirm_same_bundle(&installed)?;
         let final_executable = layout.app_bundle.join(MACOS_INTERNAL_EXECUTABLE);
         VersionProbe::verify_staged_path(&final_executable, version)?;
         let expected_executable = std::fs::canonicalize(&final_executable).map_err(LpmError::Io)?;
@@ -3377,9 +3488,7 @@ async fn fetch_verified_release_manifest(
             .await?
             .ok_or_else(|| {
                 LpmError::SelfUpdate(format!(
-                    "release v{version} does not ship SHA256SUMS.txt — this release predates LPM's \
-                     signed-install gate. Install manually from \
-                     https://github.com/lpm-dev/rust-client/releases/v{version}"
+                    "release v{version} does not ship SHA256SUMS.txt, so it can't be verified"
                 ))
             })
     };
@@ -3389,26 +3498,23 @@ async fn fetch_verified_release_manifest(
             .ok_or_else(|| {
                 LpmError::SelfUpdate(format!(
                     "release v{version} ships SHA256SUMS.txt but not SHA256SUMS.txt.sigstore — \
-                     cannot cryptographically verify the manifest. Install manually."
+                     cannot cryptographically verify the manifest"
                 ))
             })
     };
     let release_metadata = async {
-        fetch_github_release(version)
-            .await
-            .map_err(|e| match e {
-                LookupError::NotFound(_) => LpmError::SelfUpdate(format!(
-                    "GitHub has no release at tag v{version} — cannot anchor the Sigstore replay window. \
-                     Install manually."
-                )),
-                LookupError::MalformedResponse(msg) => LpmError::SelfUpdate(format!(
-                    "release v{version} did not expose valid release metadata: {msg}. \
+        fetch_github_release(version).await.map_err(|e| match e {
+            LookupError::NotFound(_) => LpmError::SelfUpdate(format!(
+                "GitHub has no release at tag v{version} — cannot anchor the Sigstore replay window"
+            )),
+            LookupError::MalformedResponse(msg) => LpmError::SelfUpdate(format!(
+                "release v{version} did not expose valid release metadata: {msg}. \
                      Cannot bind the Sigstore attestation to the requested release."
-                )),
-                other => LpmError::Network(format!(
-                    "could not fetch release metadata for v{version}: {other}"
-                )),
-            })
+            )),
+            other => LpmError::Network(format!(
+                "could not fetch release metadata for v{version}: {other}"
+            )),
+        })
     };
 
     let (manifest_bytes, bundle_bytes, release) =
@@ -3419,33 +3525,72 @@ async fn fetch_verified_release_manifest(
     verify_release_manifest(version, &manifest_bytes, &bundle_bytes, &release)
 }
 
+/// Why a standalone release couldn't be staged: it didn't verify, or
+/// something on this machine failed, such as a staged file replaced under the
+/// updater. Only the first is the release's doing.
+#[derive(Debug)]
+enum StagingFailure {
+    ReleaseVerification(LpmError),
+    Local(LpmError),
+}
+
+impl From<LpmError> for StagingFailure {
+    fn from(error: LpmError) -> Self {
+        Self::Local(error)
+    }
+}
+
+impl StagingFailure {
+    /// An asset larger than this updater accepts is the release's doing, so
+    /// a release that outgrows the cap still names the installer.
+    fn from_asset_error(error: StagedAssetError) -> Self {
+        match error {
+            StagedAssetError::TooLarge(error) => Self::ReleaseVerification(error),
+            StagedAssetError::Failed(error) => Self::Local(error),
+        }
+    }
+
+    #[cfg(test)]
+    fn into_error(self) -> LpmError {
+        match self {
+            Self::ReleaseVerification(error) | Self::Local(error) => error,
+        }
+    }
+}
+
 async fn verify_and_stage_for_standalone(
     version: &str,
     staging_anchor: &std::path::Path,
     human_output: bool,
-) -> Result<StandaloneAssets, LpmError> {
+) -> Result<StandaloneAssets, StagingFailure> {
     let (platform, ext) = detect_platform()?;
     let binary_name = standalone_asset_name_for(std::env::consts::OS, platform, ext);
     let asset_url = github_release_download_url(version, &binary_name);
 
     let client = release_http_client()?;
-    let release = fetch_verified_release_manifest(&client, version, human_output).await?;
+    let release = fetch_verified_release_manifest(&client, version, human_output)
+        .await
+        .map_err(StagingFailure::ReleaseVerification)?;
     if !release.entries.contains_key(&binary_name) {
-        return Err(LpmError::SelfUpdate(format!(
-            "SHA256SUMS.txt does not enumerate `{binary_name}` for this platform — release pipeline may be missing artifacts"
+        return Err(StagingFailure::ReleaseVerification(LpmError::SelfUpdate(
+            format!(
+                "SHA256SUMS.txt does not enumerate `{binary_name}` for this platform — release pipeline may be missing artifacts"
+            ),
         )));
     }
 
     let staged = fetch_asset_to_staged_file(&client, &asset_url, ASSET_MAX_BYTES, staging_anchor)
-        .await?
+        .await
+        .map_err(StagingFailure::from_asset_error)?
         .ok_or_else(|| {
-            LpmError::SelfUpdate(format!(
+            StagingFailure::ReleaseVerification(LpmError::SelfUpdate(format!(
                 "release v{version} advertises `{binary_name}` in SHA256SUMS.txt but the asset is missing at {} — release-pipeline bug",
                 safe_remote_label(&asset_url)
-            ))
+            )))
         })?;
 
-    let audit = verify_release_asset_digest(&release, staged.sha256.clone(), &binary_name)?;
+    let audit = verify_release_asset_digest(&release, staged.sha256.clone(), &binary_name)
+        .map_err(StagingFailure::ReleaseVerification)?;
 
     if human_output {
         install_ui::done_untrusted(&format!(
@@ -3480,7 +3625,9 @@ async fn verify_and_stage_for_standalone(
 #[cfg(test)]
 async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAssets, LpmError> {
     let destination = std::env::temp_dir().join("lpm-self-update-test-bin");
-    verify_and_stage_for_standalone(version, &destination, false).await
+    verify_and_stage_for_standalone(version, &destination, false)
+        .await
+        .map_err(StagingFailure::into_error)
 }
 
 /// Atomically swap the running binary at `current_exe` for a verified,
@@ -4091,7 +4238,8 @@ mod tests {
             lpx_link: bin.join("lpx"),
         };
         for archive in archives.iter().chain(archives.first()) {
-            let staged = stage_macos_bundle(archive, &layout.app_parent).unwrap();
+            let staged = stage_macos_bundle(archive, &layout.app_parent)
+                .unwrap_or_else(|error| panic!("{}: {error}", archive.display()));
             let output = std::process::Command::new(&staged.executable)
                 .arg("--version")
                 .output()
@@ -4120,12 +4268,55 @@ mod tests {
                 staged.executable.clone()
             };
             std::fs::remove_file(sealed).unwrap();
-            assert!(
-                validate_macos_app_bundle(&staged.app_bundle, NotarizationCheck::AskApple).is_err()
-            );
+            assert!(validate_macos_app_bundle(&staged.app_bundle).is_err());
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires two signed release archives in LPM_TEST_MACOS_RELEASE_ARCHIVES"]
+    fn signed_macos_release_probe_names_the_installer_only_for_the_validated_bundle() {
+        let archives = std::env::var_os("LPM_TEST_MACOS_RELEASE_ARCHIVES")
+            .expect("set LPM_TEST_MACOS_RELEASE_ARCHIVES to signed release ZIP paths");
+        let archives = std::env::split_paths(&archives).collect::<Vec<_>>();
+        let [first, second, ..] = archives.as_slice() else {
+            panic!("LPM_TEST_MACOS_RELEASE_ARCHIVES must name two signed release archives");
+        };
+        let parent = tempfile::tempdir().unwrap();
+        let staged = stage_macos_bundle(first, parent.path()).unwrap();
+
+        let error = probe_staged_macos_bundle(&staged, "0.0.0", ReleaseChannel::Stable)
+            .expect_err("a release reports its own version, not 0.0.0");
+        assert!(
+            matches!(&error, LpmError::StandaloneSelfUpdate { reason, .. } if reason.contains("exact version 0.0.0")),
+            "a failed probe of the validated bundle must name the installer: {error:?}"
+        );
+
+        // Another genuine release validates too, but isn't the bundle that was.
+        let other_parent = tempfile::tempdir().unwrap();
+        let other = stage_macos_bundle(second, other_parent.path()).unwrap();
+        assert_ne!(other.fingerprint, staged.fingerprint);
+        std::fs::remove_dir_all(&staged.app_bundle).unwrap();
+        std::fs::rename(&other.app_bundle, &staged.app_bundle).unwrap();
+        let error = probe_staged_macos_bundle(&staged, "0.0.0", ReleaseChannel::Stable)
+            .expect_err("a release reports its own version, not 0.0.0");
+        assert!(
+            matches!(&error, LpmError::SelfUpdate(reason) if reason.contains("changed after it was validated")),
+            "another validly signed bundle must be refused as a changed bundle, without the installer: {error:?}"
+        );
+
+        std::fs::write(&staged.executable, b"#!/bin/sh\nexit 1\n").unwrap();
+        let error = probe_staged_macos_bundle(&staged, "0.0.0", ReleaseChannel::Stable)
+            .expect_err("a replaced executable must not pass the probe");
+        assert!(
+            matches!(&error, LpmError::SelfUpdate(reason) if reason.contains("changed after it was validated")),
+            "a bundle changed after validation must be refused as that, without the installer: {error:?}"
+        );
+    }
+
+    /// Whether `codesign` still finds the code notarized depends on what the
+    /// system recorded from the first check; either way the bundle must not
+    /// be installed.
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires signed release archives in LPM_TEST_MACOS_RELEASE_ARCHIVES"]
@@ -4158,9 +4349,8 @@ mod tests {
             .to_string();
 
         assert!(
-            error.contains(
-                "differs from the staged bundle whose notarization ticket Apple confirmed"
-            ),
+            error.contains("differs from the staged bundle that was validated")
+                || error.contains("code-signature and notarization validation"),
             "{error}"
         );
         assert!(!layout.app_bundle.exists());
@@ -4268,7 +4458,7 @@ mod tests {
             staging_root,
             app_bundle: staged_app,
             executable: staged_executable,
-            notarization: fixture_notarization(),
+            fingerprint: fixture_fingerprint(),
         };
 
         let error = install_staged_macos_bundle(&layout, staged, "0.75.0")
@@ -4321,7 +4511,7 @@ mod tests {
             staging_root,
             app_bundle: staged_app,
             executable: staged_executable,
-            notarization: fixture_notarization(),
+            fingerprint: fixture_fingerprint(),
         };
 
         let error = install_staged_macos_bundle(&layout, staged, "0.75.0")
@@ -5218,6 +5408,176 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
             .await;
     }
 
+    /// A release without a manifest can't be verified, which is the release's
+    /// doing.
+    #[tokio::test]
+    async fn release_without_a_manifest_is_a_release_verification_failure() {
+        let server = wiremock::MockServer::start().await;
+        mount_release_metadata(&server).await;
+        mount_placeholder_bundle(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/download/v0.42.0/SHA256SUMS.txt"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        run_standalone_against_server(&server, "0.42.0", || async {
+            let destination = tempfile::tempdir().unwrap();
+            let failure =
+                verify_and_stage_for_standalone("0.42.0", &destination.path().join("lpm"), false)
+                    .await
+                    .expect_err("a release without a manifest must not stage");
+            assert!(
+                matches!(
+                    &failure,
+                    StagingFailure::ReleaseVerification(LpmError::SelfUpdate(reason))
+                        if reason.contains("does not ship SHA256SUMS.txt")
+                ),
+                "{failure:?}"
+            );
+        })
+        .await;
+    }
+
+    /// Serves the published v0.84.0 release, whose manifest and Sigstore
+    /// bundle verify, with `asset` as every platform's release asset. The
+    /// release ships assets only for the targets these tests run on.
+    #[cfg(any(
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64", not(target_env = "musl")),
+        all(windows, target_arch = "x86_64")
+    ))]
+    async fn mount_real_v0_84_0_release(server: &wiremock::MockServer, asset: &'static [u8]) {
+        let (manifest, bundle) = real_v0_84_0_release_assets();
+        let routes = [
+            (
+                "/releases/tags/v0.84.0".to_string(),
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "tag_name": "v0.84.0",
+                    "published_at": REAL_V0_84_0_PUBLISHED_AT,
+                    "target_commitish": REAL_V0_84_0_SOURCE_COMMIT,
+                })),
+            ),
+            (
+                "/download/v0.84.0/SHA256SUMS.txt".to_string(),
+                wiremock::ResponseTemplate::new(200).set_body_bytes(manifest),
+            ),
+            (
+                "/download/v0.84.0/SHA256SUMS.txt.sigstore".to_string(),
+                wiremock::ResponseTemplate::new(200).set_body_bytes(bundle),
+            ),
+        ];
+        for (path, response) in routes {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(path))
+                .respond_with(response)
+                .mount(server)
+                .await;
+        }
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path_regex(r"^/download/v0\.84\.0/lpm-"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(asset))
+            .mount(server)
+            .await;
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64", not(target_env = "musl")),
+        all(windows, target_arch = "x86_64")
+    ))]
+    #[tokio::test]
+    async fn release_asset_that_differs_from_its_signed_digest_is_a_release_verification_failure() {
+        let server = wiremock::MockServer::start().await;
+        mount_real_v0_84_0_release(&server, b"not the signed release asset").await;
+
+        run_standalone_against_server(&server, "0.84.0", || async {
+            let destination = tempfile::tempdir().unwrap();
+            let failure =
+                verify_and_stage_for_standalone("0.84.0", &destination.path().join("lpm"), false)
+                    .await
+                    .expect_err("an asset that isn't the signed one must not stage");
+            assert!(
+                matches!(
+                    &failure,
+                    StagingFailure::ReleaseVerification(LpmError::SelfUpdate(reason))
+                        if reason.contains("SHA-256 mismatch")
+                ),
+                "{failure:?}"
+            );
+        })
+        .await;
+    }
+
+    #[test]
+    fn release_asset_over_the_size_cap_is_a_release_verification_failure() {
+        let too_large = StagedAssetError::TooLarge(LpmError::SelfUpdate("cap".to_string()));
+        let failed = StagedAssetError::Failed(LpmError::SelfUpdate("disk".to_string()));
+
+        assert!(matches!(
+            StagingFailure::from_asset_error(too_large),
+            StagingFailure::ReleaseVerification(_)
+        ));
+        assert!(matches!(
+            StagingFailure::from_asset_error(failed),
+            StagingFailure::Local(_)
+        ));
+    }
+
+    /// Staging errors no step marks as the release's, such as an I/O failure,
+    /// are local.
+    #[test]
+    fn unmarked_staging_errors_are_local() {
+        let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "staging");
+        assert!(matches!(
+            StagingFailure::from(LpmError::Io(error)),
+            StagingFailure::Local(LpmError::Io(_))
+        ));
+    }
+
+    /// Staging that fails on this machine, after the release verified, isn't
+    /// the release's doing.
+    #[cfg(any(
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64", not(target_env = "musl")),
+        all(windows, target_arch = "x86_64")
+    ))]
+    #[tokio::test]
+    async fn staging_that_fails_on_this_machine_is_a_local_failure() {
+        let server = wiremock::MockServer::start().await;
+        mount_real_v0_84_0_release(&server, b"not the signed release asset").await;
+
+        run_standalone_against_server(&server, "0.84.0", || async {
+            let destination = tempfile::tempdir().unwrap();
+            let missing_directory = destination.path().join("missing");
+            let failure =
+                verify_and_stage_for_standalone("0.84.0", &missing_directory.join("lpm"), false)
+                    .await
+                    .expect_err("staging into a missing directory must fail");
+            assert!(
+                matches!(
+                    &failure,
+                    StagingFailure::Local(LpmError::Io(error))
+                        if error.kind() == std::io::ErrorKind::NotFound
+                ),
+                "{failure:?}"
+            );
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn standalone_update_refuses_when_manifest_is_404() {
         let server = wiremock::MockServer::start().await;
@@ -5238,10 +5598,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
                 .expect_err("missing manifest must fail-closed");
             match err {
                 LpmError::SelfUpdate(msg) => {
-                    assert!(
-                        msg.contains("predates LPM's signed-install gate"),
-                        "msg: {msg}"
-                    );
+                    assert!(msg.contains("does not ship SHA256SUMS.txt"), "msg: {msg}");
                     assert!(msg.contains("0.42.0"), "version must appear: {msg}");
                 }
                 other => panic!("expected SelfUpdate, got {other:?}"),
@@ -5440,11 +5797,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
                 .expect_err("missing release tag must fail-closed");
             match err {
                 LpmError::SelfUpdate(msg) => {
-                    assert!(
-                        msg.contains("no release at tag v0.42.0")
-                            || msg.contains("Install manually"),
-                        "msg points the user at manual install: {msg}"
-                    );
+                    assert!(msg.contains("no release at tag v0.42.0"), "msg: {msg}");
                 }
                 other => panic!("expected SelfUpdate, got {other:?}"),
             }
@@ -6839,211 +7192,298 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_validation_refuses_excessive_output() {
-        let result = run_macos_validation_tool(
-            "/bin/sh",
-            &[
-                OsStr::new("-c"),
-                OsStr::new("/usr/bin/head -c 2097152 /dev/zero"),
-            ],
-            "noisy validation fixture",
-        );
-        assert!(result.is_err(), "validation output must be bounded");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_validation_does_not_wait_for_inherited_output_after_parent_exit() {
-        let directory = tempfile::tempdir().unwrap();
-        let pid_file = directory.path().join("child-pid");
-        let script = format!("/bin/sleep 5 & echo $! > '{}'; exit 0", pid_file.display());
-        let started = Instant::now();
-        let result = run_macos_validation_tool(
-            "/bin/sh",
-            &[OsStr::new("-c"), OsStr::new(&script)],
-            "detached output fixture",
-        );
-        let elapsed = started.elapsed();
-        if let Ok(pid) = std::fs::read_to_string(pid_file)
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-        {
-            // SAFETY: the PID belongs to the disposable child created by this test.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-            }
-        }
-        result.unwrap();
-        assert!(
-            elapsed < Duration::from_secs(3),
-            "inherited pipe delayed completion: {elapsed:?}"
-        );
-    }
-
-    /// A `stapler` that exits with `exit_codes[n]` on its nth run, reporting
-    /// on stdout as the real one does, and records each run's arguments.
-    #[cfg(target_os = "macos")]
-    fn fake_stapler(directory: &Path, exit_codes: &[i32]) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
-        let runs = directory.join("runs");
-        let stapler = directory.join("stapler");
-        let codes = exit_codes
-            .iter()
-            .map(i32::to_string)
-            .collect::<Vec<_>>()
-            .join(" ");
-        std::fs::write(
-            &stapler,
-            format!(
-                "#!/bin/sh\n\
-                 printf '%s\\n' \"$*\" >> '{runs}'\n\
-                 code=$(echo '{codes}' | cut -d' ' -f$(($(wc -l < '{runs}'))))\n\
-                 if [ \"$code\" = 0 ]; then echo 'The validate action worked!'; exit 0; fi\n\
-                 echo \"CloudKit's response is inconsistent with expections: (null)\"\n\
-                 echo \"The validate action failed! Error $code.\"\n\
-                 exit \"$code\"\n",
-                runs = runs.display(),
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&stapler, std::fs::Permissions::from_mode(0o755)).unwrap();
-        stapler
-    }
-
-    #[cfg(target_os = "macos")]
-    fn stapler_runs(directory: &Path) -> Vec<String> {
-        std::fs::read_to_string(directory.join("runs"))
-            .unwrap()
-            .lines()
-            .map(str::to_string)
-            .collect()
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn notarization_ticket_check_outlasts_a_brief_cloudkit_outage() {
-        let directory = tempfile::tempdir().unwrap();
-        let stapler = fake_stapler(directory.path(), &[68, 68, 0]);
-
-        validate_notarization_ticket(
-            stapler.to_str().unwrap(),
-            Path::new("/Applications/LPM CLI.app"),
-            &[Duration::ZERO; 2],
-        )
-        .unwrap();
-
-        assert_eq!(
-            stapler_runs(directory.path()),
-            vec!["validate /Applications/LPM CLI.app"; 3]
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn notarization_ticket_check_reports_a_lasting_cloudkit_outage_in_stapler_s_words() {
-        let directory = tempfile::tempdir().unwrap();
-        let stapler = fake_stapler(directory.path(), &[68, 68, 68, 68, 68, 68, 0]);
-
-        let error = validate_notarization_ticket(
-            stapler.to_str().unwrap(),
-            Path::new("/Applications/LPM CLI.app"),
-            &[Duration::ZERO; NOTARIZATION_TICKET_RETRY_DELAYS.len()],
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(
-            error.contains("CloudKit's response is inconsistent"),
-            "{error}"
-        );
-        assert_eq!(
-            stapler_runs(directory.path()).len(),
-            NOTARIZATION_TICKET_RETRY_DELAYS.len() + 1
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn notarization_ticket_retries_wait_out_the_same_cloudkit_outage_as_install_sh() {
+    fn code_requirement_is_the_one_install_sh_enforces() {
         let install_sh =
             std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh"))
                 .unwrap();
-        let schedule = install_sh
-            .lines()
-            .find_map(|line| {
-                line.trim()
-                    .strip_prefix("for ticket_retry_delay in ")?
-                    .strip_suffix("; do")
-            })
-            .expect("install.sh retries the notarization ticket check");
-        let install_sh_delays = schedule
-            .split_whitespace()
-            .filter(|delay| *delay != "\"\"")
-            .map(|delay| Duration::from_secs(delay.parse().unwrap()))
-            .collect::<Vec<_>>();
+        let assignment = |name: &str| {
+            install_sh
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}=\"")))
+                .and_then(|value| value.strip_suffix('"'))
+                .unwrap_or_else(|| panic!("install.sh sets {name}"))
+                .to_string()
+        };
+        let install_sh_requirement = assignment("MACOS_CODE_REQUIREMENT")
+            .replace("\\\"", "\"")
+            .replace("$EXPECTED_BUNDLE_ID", &assignment("EXPECTED_BUNDLE_ID"))
+            .replace("$EXPECTED_TEAM_ID", &assignment("EXPECTED_TEAM_ID"));
 
-        assert_eq!(install_sh_delays, NOTARIZATION_TICKET_RETRY_DELAYS);
+        assert_eq!(
+            format!("={install_sh_requirement}"),
+            macos_code_requirement()
+        );
+    }
+
+    /// `codesign` exits 3 when code fails a requirement and 1 when it can't
+    /// parse one; an Apple platform binary fails LPM's requirement.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn code_requirement_parses_and_rejects_code_lpm_did_not_sign() {
+        let requirement = macos_code_requirement();
+        let output = std::process::Command::new(MacOSTool::Codesign.path())
+            .args(["--verify", "--strict", "-R", &requirement, "/usr/bin/true"])
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[cfg(target_os = "macos")]
-    fn fixture_notarization() -> ConfirmedNotarization {
-        ConfirmedNotarization {
+    #[test]
+    fn provisioning_profile_that_is_oversized_or_not_cms_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let oversized = directory.path().join("oversized.provisionprofile");
+        std::fs::write(
+            &oversized,
+            vec![0_u8; MACOS_PROVISIONING_PROFILE_MAX_BYTES as usize + 1],
+        )
+        .unwrap();
+        let corrupt = directory.path().join("corrupt.provisionprofile");
+        std::fs::write(&corrupt, b"<plist>not a CMS envelope</plist>").unwrap();
+
+        let oversized = decode_provisioning_profile(&oversized)
+            .unwrap_err()
+            .to_string();
+        let corrupt = decode_provisioning_profile(&corrupt)
+            .unwrap_err()
+            .to_string();
+
+        assert!(oversized.contains("exceeds its size limit"), "{oversized}");
+        assert!(corrupt.contains("could not be decoded"), "{corrupt}");
+    }
+
+    /// Every `xcrun` shim in `/usr/bin` is a hard link of `git` (the Command
+    /// Line Tools shims) or of `xcodebuild` (the Xcode-only shims), and needs
+    /// a developer directory that a Mac without developer tools doesn't have.
+    /// Gatekeeper's assessors answer from the Mac's security policy and
+    /// Apple's services, so they can refuse a genuine release.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bundle_validation_runs_only_local_programs_that_ship_with_macos() {
+        use std::os::unix::fs::MetadataExt as _;
+        let file_identity = |path: &str| {
+            let metadata =
+                std::fs::metadata(path).unwrap_or_else(|error| panic!("{path}: {error}"));
+            (metadata.dev(), metadata.ino())
+        };
+        let shims = ["/usr/bin/git", "/usr/bin/xcodebuild"].map(file_identity);
+        let shim_runner_and_assessors = [
+            "/usr/bin/xcrun",
+            "/usr/sbin/spctl",
+            "/usr/bin/syspolicy_check",
+        ];
+
+        for tool in MacOSTool::ALL {
+            assert!(
+                !shim_runner_and_assessors.contains(&tool.path()),
+                "{} can refuse a genuine release on some Macs",
+                tool.path()
+            );
+            assert!(
+                !shims.contains(&file_identity(tool.path())),
+                "{} is an xcrun shim, which needs Xcode or the Command Line Tools",
+                tool.path()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn installer_recovery(channel: ReleaseChannel, refusal: StandaloneRefusal) -> (String, String) {
+        match with_installer_recovery(
+            LpmError::SelfUpdate("refused".to_string()),
+            channel,
+            refusal,
+        ) {
+            LpmError::StandaloneSelfUpdate {
+                reason,
+                recovery,
+                reinstall_command,
+            } => {
+                assert_eq!(reason, "refused");
+                (recovery, reinstall_command)
+            }
+            other => panic!("expected a refusal naming the installer, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refusal_the_installer_can_take_over_names_it_for_its_channel() {
+        for (channel, command) in [
+            (
+                ReleaseChannel::Stable,
+                "curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL=stable sh",
+            ),
+            (
+                ReleaseChannel::Nightly,
+                "curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL=nightly sh",
+            ),
+        ] {
+            let (_, reinstall_command) =
+                installer_recovery(channel, StandaloneRefusal::Compatibility);
+            assert_eq!(reinstall_command, command);
+        }
+    }
+
+    /// Without cosign, the installer can't tell who published a Linux
+    /// release's checksums, so it could install what the updater refused.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn release_refused_by_verification_on_linux_is_reinstalled_only_with_its_signature_checked() {
+        let (recovery, reinstall_command) = installer_recovery(
+            ReleaseChannel::Stable,
+            StandaloneRefusal::ReleaseVerification,
+        );
+
+        assert_eq!(
+            reinstall_command,
+            "curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL=stable LPM_INSTALL_REQUIRE_SIGSTORE=1 sh"
+        );
+        assert!(recovery.contains("cosign"), "{recovery}");
+    }
+
+    /// The installer checks the app's Developer ID signature, which only
+    /// LPM's signing identity can produce.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn release_refused_by_verification_on_macos_is_reinstalled_through_the_developer_id_check() {
+        assert_eq!(
+            installer_recovery(
+                ReleaseChannel::Stable,
+                StandaloneRefusal::ReleaseVerification
+            ),
+            installer_recovery(ReleaseChannel::Stable, StandaloneRefusal::Compatibility)
+        );
+    }
+
+    /// A staged binary that runs the shell `script` when probed.
+    #[cfg(unix)]
+    fn staged_script(directory: &Path, script: &str) -> StagedAsset {
+        use sha2::Digest as _;
+        use std::io::Write as _;
+
+        let body = format!("#!/bin/sh\n{script}\n");
+        let mut temporary = download::create_staged_binary(&directory.join("lpm")).unwrap();
+        temporary.as_file_mut().write_all(body.as_bytes()).unwrap();
+        StagedAsset {
+            byte_len: body.len(),
+            sha256: hex::encode(sha2::Sha256::digest(body.as_bytes())),
+            temporary: download::finish_staged_binary(temporary).unwrap(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_binary_that_reports_another_version_names_the_installer() {
+        let directory = tempfile::tempdir().unwrap();
+        let staged = staged_script(directory.path(), "printf 'lpm 1.2.2\\n'");
+
+        let error = check_staged_asset(&staged, ReleaseChannel::Stable, || {
+            VersionProbe::verify_staged_version(&staged.temporary, "1.2.3")
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, LpmError::StandaloneSelfUpdate { reason, .. } if reason.contains("exact version 1.2.3")),
+            "{error:?}"
+        );
+    }
+
+    /// A staged file that changes while it is checked fails the check too,
+    /// but the refusal is the changed file, which reinstalling doesn't fix.
+    #[cfg(unix)]
+    #[test]
+    fn staged_asset_that_changes_while_checked_is_refused_without_an_installer() {
+        let directory = tempfile::tempdir().unwrap();
+        let staged = staged_script(directory.path(), "printf 'lpm 1.2.3\\n'");
+
+        let error = check_staged_asset(&staged, ReleaseChannel::Stable, || -> Result<(), _> {
+            std::fs::write(staged.temporary.path(), b"replaced").unwrap();
+            Err(LpmError::SelfUpdate(
+                "the replaced asset didn't validate".to_string(),
+            ))
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, LpmError::SelfUpdate(reason) if reason.contains("changed after verification")),
+            "a staged file that changed while checked must be refused as that, naming no installer: {error:?}"
+        );
+    }
+
+    #[test]
+    fn failures_other_than_a_refusal_keep_their_own_error() {
+        let error = with_installer_recovery(
+            LpmError::Network("connection reset".to_string()),
+            ReleaseChannel::Stable,
+            StandaloneRefusal::ReleaseVerification,
+        );
+
+        assert!(
+            matches!(&error, LpmError::Network(message) if message == "connection reset"),
+            "{error:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_refusals_name_no_installer() {
+        let error = with_installer_recovery(
+            LpmError::SelfUpdate("refused".to_string()),
+            ReleaseChannel::Stable,
+            StandaloneRefusal::Compatibility,
+        );
+
+        assert!(
+            matches!(&error, LpmError::SelfUpdate(reason) if reason == "refused"),
+            "{error:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fixture_fingerprint() -> BundleFingerprint {
+        BundleFingerprint {
             cdhash: "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c".to_string(),
-            ticket: b"stapled notarization ticket".to_vec(),
+            stapled_ticket: b"stapled notarization ticket".to_vec(),
         }
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn moved_bundle_with_the_confirmed_code_and_ticket_needs_no_second_ticket_check() {
-        fixture_notarization()
-            .confirm_same_bundle(&fixture_notarization())
+    fn moved_bundle_with_the_validated_code_and_ticket_is_accepted() {
+        fixture_fingerprint()
+            .confirm_same_bundle(&fixture_fingerprint())
             .unwrap();
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn moved_bundle_with_different_code_or_ticket_is_rejected() {
-        let confirmed = fixture_notarization();
+        let validated = fixture_fingerprint();
         for installed in [
-            ConfirmedNotarization {
+            BundleFingerprint {
                 cdhash: "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334".to_string(),
-                ..fixture_notarization()
+                ..fixture_fingerprint()
             },
-            ConfirmedNotarization {
-                ticket: b"replaced notarization ticket".to_vec(),
-                ..fixture_notarization()
+            BundleFingerprint {
+                stapled_ticket: b"replaced notarization ticket".to_vec(),
+                ..fixture_fingerprint()
             },
         ] {
-            let error = confirmed
+            let error = validated
                 .confirm_same_bundle(&installed)
                 .unwrap_err()
                 .to_string();
             assert!(
-                error.contains(
-                    "differs from the staged bundle whose notarization ticket Apple confirmed"
-                ),
+                error.contains("differs from the staged bundle that was validated"),
                 "{error}"
             );
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn notarization_ticket_check_rejects_an_invalid_ticket_at_once() {
-        let directory = tempfile::tempdir().unwrap();
-        let stapler = fake_stapler(directory.path(), &[65, 0]);
-
-        let error = validate_notarization_ticket(
-            stapler.to_str().unwrap(),
-            Path::new("/Applications/LPM CLI.app"),
-            &[Duration::ZERO; 2],
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("Error 65"), "{error}");
-        assert_eq!(stapler_runs(directory.path()).len(), 1);
     }
 }

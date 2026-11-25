@@ -832,25 +832,30 @@ pub enum LpmError {
     )]
     ProvenanceUnavailable(String),
 
-    /// `lpm self-update` standalone path refused to swap the binary
-    /// because the release artifacts failed an integrity gate
-    /// (`SHA256SUMS.txt` missing on a release that predates the
-    /// signed-install gate, Sigstore bundle rejected, SHA mismatch,
-    /// identity pin not satisfied, replay window violated, etc.).
-    /// Distinct from `Network` so the CLI can render remediation copy
-    /// that names the manual install URL.
+    /// `lpm self-update` refused the update: the release didn't verify, or the
+    /// installation, its package manager or this machine's state made the
+    /// update unsafe. The reason says which. Distinct from `Network`, which
+    /// retrying fixes.
     #[error("self-update refused: {0}")]
     #[diagnostic(
         code(lpm::self_update),
         help(
-            "The downloaded release could not be cryptographically verified. \
-             If this is a release that predates LPM's signed-install gate, install \
-             manually from https://github.com/lpm-dev/rust-client/releases. \
-             Otherwise the release artifacts may be tampered or the manifest may be missing — \
-             retry, and if the failure persists report at https://github.com/lpm-dev/rust-client/issues."
+            "Fix what the reason above names, or retry later. If it keeps failing, report it at \
+             https://github.com/lpm-dev/rust-client/issues."
         )
     )]
     SelfUpdate(String),
+
+    /// A standalone install's self-update refused the update, with how the
+    /// official installer can take over: it verifies the release itself and
+    /// installs it in `~/.lpm`, keeping the user's settings.
+    #[error("self-update refused: {reason}")]
+    #[diagnostic(code(lpm::self_update), help("{recovery}:\n{reinstall_command}"))]
+    StandaloneSelfUpdate {
+        reason: String,
+        recovery: String,
+        reinstall_command: String,
+    },
 
     #[error("security floor refused: {0}")]
     #[diagnostic(
@@ -1077,7 +1082,7 @@ impl LpmError {
             LpmError::SelfUpdateRateLimited(_) => "self_update_rate_limited",
             LpmError::ProvenanceVerification(_) => "provenance_verification",
             LpmError::ProvenanceUnavailable(_) => "provenance_unavailable",
-            LpmError::SelfUpdate(_) => "self_update",
+            LpmError::SelfUpdate(_) | LpmError::StandaloneSelfUpdate { .. } => "self_update",
             LpmError::SecurityFloor(_) => "security_floor",
             LpmError::SecurityApprovalStore(_) => "security_approval_store",
             LpmError::SecurityApprovalRequired(_) => "security_approval_required",
@@ -1458,6 +1463,11 @@ mod tests {
             })),
             LpmError::SelfUpdatePaused("x".into()),
             LpmError::SelfUpdateRateLimited("x".into()),
+            LpmError::StandaloneSelfUpdate {
+                reason: "x".into(),
+                recovery: "x".into(),
+                reinstall_command: "x".into(),
+            },
             LpmError::SecurityFloor("x".into()),
             LpmError::SecurityApprovalStore("x".into()),
             LpmError::SudoNotSupported,
@@ -1519,6 +1529,43 @@ mod tests {
         let help = err.help().unwrap().to_string();
         assert!(help.contains("GITHUB_TOKEN"), "help: {help}");
         assert!(help.contains("GH_TOKEN"), "help: {help}");
+    }
+
+    /// A refusal can be about the installation rather than the release, so
+    /// its help points at the reason instead of claiming verification failed.
+    #[test]
+    fn self_update_refusal_help_points_at_the_reason() {
+        let help = LpmError::SelfUpdate("x".into()).help().unwrap().to_string();
+
+        assert!(help.contains("the reason above"), "help: {help}");
+        assert!(
+            !help.contains("could not be cryptographically verified"),
+            "help: {help}"
+        );
+        assert!(
+            !help.to_lowercase().contains("install manually"),
+            "help: {help}"
+        );
+    }
+
+    #[test]
+    fn refused_standalone_self_update_is_a_self_update_error_naming_the_reinstall_command() {
+        let error = LpmError::StandaloneSelfUpdate {
+            reason: "the release is not signed".into(),
+            recovery: "Reinstall LPM CLI with the official installer".into(),
+            reinstall_command: "curl -fsSL https://cli.lpm.dev/install | sh".into(),
+        };
+
+        assert_eq!(error.error_code(), "self_update");
+        assert_eq!(
+            error.to_string(),
+            "self-update refused: the release is not signed"
+        );
+        let help = error.help().unwrap().to_string();
+        assert_eq!(
+            help,
+            "Reinstall LPM CLI with the official installer:\ncurl -fsSL https://cli.lpm.dev/install | sh"
+        );
     }
 
     #[test]

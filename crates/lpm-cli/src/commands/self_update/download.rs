@@ -1,6 +1,38 @@
 use lpm_common::LpmError;
 use sha2::{Digest, Sha256};
 
+/// Why a release asset couldn't be staged.
+#[derive(Debug)]
+pub(super) enum StagedAssetError {
+    /// The asset is larger than this updater accepts, which is the release's
+    /// doing.
+    TooLarge(LpmError),
+    /// Downloading or staging it failed.
+    Failed(LpmError),
+}
+
+impl From<LpmError> for StagedAssetError {
+    fn from(error: LpmError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl From<StagedAssetError> for LpmError {
+    fn from(error: StagedAssetError) -> Self {
+        match error {
+            StagedAssetError::TooLarge(error) | StagedAssetError::Failed(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Display for StagedAssetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge(error) | Self::Failed(error) => error.fmt(formatter),
+        }
+    }
+}
+
 pub(super) async fn fetch_bounded(
     client: &reqwest::Client,
     url: &str,
@@ -33,7 +65,7 @@ async fn fetch_bounded_response(
     client: &reqwest::Client,
     url: &str,
     max_bytes: usize,
-) -> Result<Option<reqwest::Response>, LpmError> {
+) -> Result<Option<reqwest::Response>, StagedAssetError> {
     let response = client
         .get(url)
         .header("User-Agent", "lpm-cli")
@@ -52,20 +84,20 @@ async fn fetch_bounded_response(
         return Ok(None);
     }
     if !status.is_success() {
-        return Err(LpmError::Network(format!(
+        return Err(StagedAssetError::Failed(LpmError::Network(format!(
             "fetch {} returned HTTP {}",
             safe_remote_label(url),
             status.as_u16()
-        )));
+        ))));
     }
 
     if let Some(advertised) = response.content_length()
         && advertised > max_bytes as u64
     {
-        return Err(LpmError::SelfUpdate(format!(
+        return Err(StagedAssetError::TooLarge(LpmError::SelfUpdate(format!(
             "{} advertises {advertised} bytes; cap of {max_bytes} would be exceeded — refusing the download",
             safe_remote_label(url)
-        )));
+        ))));
     }
     Ok(Some(response))
 }
@@ -228,7 +260,7 @@ pub(super) async fn fetch_asset_to_staged_file(
     url: &str,
     max_bytes: usize,
     current_exe: &std::path::Path,
-) -> Result<Option<StagedAsset>, LpmError> {
+) -> Result<Option<StagedAsset>, StagedAssetError> {
     use std::io::Write as _;
 
     let Some(mut response) = fetch_bounded_response(client, url, max_bytes).await? else {
@@ -245,7 +277,9 @@ pub(super) async fn fetch_asset_to_staged_file(
         ))
     })? {
         if byte_len.saturating_add(chunk.len()) > max_bytes {
-            return Err(body_exceeded_cap(url, max_bytes));
+            return Err(StagedAssetError::TooLarge(body_exceeded_cap(
+                url, max_bytes,
+            )));
         }
         temporary.as_file_mut().write_all(&chunk).map_err(|error| {
             LpmError::Io(std::io::Error::new(
@@ -385,10 +419,31 @@ mod tests {
         join_server(server).await.unwrap();
 
         assert!(error.to_string().contains("mid-stream"), "error: {error}");
+        assert!(matches!(error, StagedAssetError::TooLarge(_)), "{error:?}");
         assert_eq!(
             std::fs::read_dir(destination_dir.path()).unwrap().count(),
             0,
             "the partial staged binary must be removed"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn staged_asset_download_refuses_an_advertised_size_over_the_cap_as_too_large() {
+        let (url, server) = spawn_fixed_body_server_with_length(1024, Some(64 * 1024 * 1024));
+        let client = super::super::release_http_client().unwrap();
+        let destination_dir = tempdir().unwrap();
+        let current_exe = destination_dir.path().join("lpm");
+
+        let error = fetch_asset_to_staged_file(&client, &url, 1024 * 1024, &current_exe)
+            .await
+            .expect_err("an advertised size over the cap must be refused");
+        drop(server);
+
+        assert!(matches!(error, StagedAssetError::TooLarge(_)), "{error:?}");
+        assert!(error.to_string().contains("advertises"), "error: {error}");
+        assert_eq!(
+            std::fs::read_dir(destination_dir.path()).unwrap().count(),
+            0
         );
     }
 

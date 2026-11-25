@@ -1564,6 +1564,226 @@ fn self_update_recent_failure_short_circuits_with_backoff_error() {
     );
 }
 
+/// Runs a standalone `lpm self-update` that must be refused, against release
+/// endpoints that know no release, as a human and with `--json`.
+#[cfg(unix)]
+fn refused_standalone_self_update(
+    project: &TempProject,
+    standalone: &std::path::Path,
+    releases: &str,
+    channel: Option<&str>,
+) -> (String, serde_json::Value) {
+    let mut arguments = vec!["self-update"];
+    if let Some(channel) = channel {
+        arguments.extend(["--channel", channel]);
+    }
+    let run = |json: bool| {
+        let mut command = lpm_from_path(project, standalone);
+        command
+            .env(
+                "LPM_GITHUB_RELEASE_BY_TAG_URL_OVERRIDE",
+                format!("{releases}/releases/tags/v{{tag}}"),
+            )
+            .env(
+                "LPM_GITHUB_RELEASE_DOWNLOAD_URL_OVERRIDE",
+                format!("{releases}/download/v{{tag}}/{{file}}"),
+            );
+        if json {
+            command.arg("--json");
+        }
+        let output = command.args(&arguments).output().unwrap();
+        assert!(
+            !output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        output
+    };
+    let human = String::from_utf8(run(false).stderr).unwrap();
+    let json = run(true);
+    let envelope = serde_json::from_slice(&json.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{error}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&json.stdout),
+            String::from_utf8_lossy(&json.stderr),
+        )
+    });
+    (human, envelope)
+}
+
+#[cfg(unix)]
+fn assert_refusal_names(human: &str, envelope: &serde_json::Value, installer: &str) {
+    assert!(human.contains("Self-update refused"), "{human}");
+    assert!(human.contains(installer), "{human}");
+    assert_eq!(envelope["success"], false, "{envelope}");
+    assert_eq!(envelope["error_code"], "self_update", "{envelope}");
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.starts_with("self-update refused: ")),
+        "{envelope}"
+    );
+    assert_eq!(
+        envelope["next_steps"][0]["command"], installer,
+        "{envelope}"
+    );
+}
+
+/// Seeds update caches that name a newer release on both channels, so no
+/// release lookup reaches the network.
+#[cfg(unix)]
+fn seed_newer_releases_on_both_channels(project: &TempProject) {
+    std::fs::create_dir_all(cache_path(project).parent().unwrap()).expect("mkdir ~/.lpm");
+    let payload = serde_json::json!({
+        "latest": "99999.0.0",
+        "lastCheck": now_secs(),
+        "nightly": {
+            "latest": "99999.0.0-nightly.20990101.1.0000000",
+            "lastCheck": now_secs(),
+        },
+    });
+    std::fs::write(cache_path(project), payload.to_string()).expect("seed update caches");
+}
+
+/// Reinstalling doesn't fix an installation directory any account can write
+/// to, so that refusal names no installer and explains itself.
+#[cfg(unix)]
+#[tokio::test]
+async fn refused_shared_writable_standalone_installation_names_no_reinstall() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let releases = support::mock_registry::MockRegistry::start().await;
+    let project = TempProject::empty(r#"{"name":"su","version":"1.0.0"}"#);
+    seed_newer_releases_on_both_channels(&project);
+    let bin = project.home().join(".lpm").join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let standalone = bin.join("lpm");
+    std::fs::copy(support::lpm_binary(), &standalone).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    let (human, envelope) =
+        refused_standalone_self_update(&project, &standalone, &releases.url(), None);
+
+    assert!(human.contains("Self-update refused"), "{human}");
+    assert!(
+        human.contains("shared-writable install directory"),
+        "{human}"
+    );
+    assert!(!human.contains("cli.lpm.dev/install"), "{human}");
+    assert_eq!(envelope["error_code"], "self_update", "{envelope}");
+    assert!(envelope.get("next_steps").is_none(), "{envelope}");
+}
+
+/// A macOS standalone install updates only from the installer's app-bundle
+/// layout, so a copy outside it names the installer, which puts LPM CLI there
+/// and keeps the user's settings.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn standalone_install_outside_the_installer_layout_names_the_installer_for_its_channel() {
+    let releases = support::mock_registry::MockRegistry::start().await;
+    for (channel, installer) in [
+        (
+            None,
+            "curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL=stable sh",
+        ),
+        (
+            Some("nightly"),
+            "curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL=nightly sh",
+        ),
+    ] {
+        let project = TempProject::empty(r#"{"name":"su","version":"1.0.0"}"#);
+        seed_newer_releases_on_both_channels(&project);
+        let bin = project.home().join(".lpm").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let standalone = bin.join("lpm");
+        std::fs::copy(support::lpm_binary(), &standalone).unwrap();
+
+        let (human, envelope) =
+            refused_standalone_self_update(&project, &standalone, &releases.url(), channel);
+
+        assert!(human.contains("require execution from"), "{human}");
+        assert_refusal_names(&human, &envelope, installer);
+        if channel.is_none() {
+            let mut snapshot = envelope;
+            snapshot["error"] = serde_json::json!("<reason>");
+            insta::assert_json_snapshot!(snapshot, @r#"
+            {
+              "schema_version": 1,
+              "success": false,
+              "error": "<reason>",
+              "error_code": "self_update",
+              "next_steps": [
+                {
+                  "description": "Reinstall LPM CLI with the official installer, which verifies the release itself and keeps your settings",
+                  "command": "curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL=stable sh"
+                }
+              ]
+            }
+            "#);
+        }
+    }
+}
+
+/// A release the updater couldn't verify is reinstalled only through a check
+/// that authenticates its publisher: the app's Developer ID signature on
+/// macOS, and on Linux the release's Sigstore signature, which the installer
+/// checks only when told to require it.
+#[cfg(unix)]
+#[tokio::test]
+async fn standalone_release_refused_by_verification_names_an_installer_that_authenticates_it() {
+    let releases = support::mock_registry::MockRegistry::start().await;
+    let project = TempProject::empty(r#"{"name":"su","version":"1.0.0"}"#);
+    seed_newer_releases_on_both_channels(&project);
+    let standalone = if cfg!(target_os = "macos") {
+        project
+            .home()
+            .join(".lpm/libexec/LPM CLI.app/Contents/MacOS/lpm-rs")
+    } else {
+        project.home().join(".lpm/bin/lpm")
+    };
+    std::fs::create_dir_all(standalone.parent().unwrap()).unwrap();
+    std::fs::copy(support::lpm_binary(), &standalone).unwrap();
+
+    let (human, envelope) =
+        refused_standalone_self_update(&project, &standalone, &releases.url(), None);
+
+    let installer = if cfg!(target_os = "macos") {
+        "curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL=stable sh"
+    } else {
+        "curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL=stable LPM_INSTALL_REQUIRE_SIGSTORE=1 sh"
+    };
+    assert_refusal_names(&human, &envelope, installer);
+    // The manifest, its Sigstore bundle and the release are fetched together,
+    // so whichever the mock refuses first names the reason.
+    assert!(
+        human.contains("no release at tag v99999.0.0")
+            || human.contains("release v99999.0.0 does not ship SHA256SUMS.txt")
+            || human.contains(
+                "release v99999.0.0 ships SHA256SUMS.txt but not SHA256SUMS.txt.sigstore"
+            ),
+        "the refusal must come from verifying the release: {human}"
+    );
+    if cfg!(not(target_os = "macos")) {
+        let mut snapshot = envelope;
+        snapshot["error"] = serde_json::json!("<reason>");
+        insta::assert_json_snapshot!(snapshot, @r#"
+        {
+          "schema_version": 1,
+          "success": false,
+          "error": "<reason>",
+          "error_code": "self_update",
+          "next_steps": [
+            {
+              "description": "If this release keeps failing verification, install cosign and reinstall LPM CLI with the official installer, which then checks the release's signature itself and keeps your settings",
+              "command": "curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL=stable LPM_INSTALL_REQUIRE_SIGSTORE=1 sh"
+            }
+          ]
+        }
+        "#);
+    }
+}
+
 // ─── release-workflow signing gate ────────────────────────────────────
 
 const V0_84_0_SOURCE_COMMIT: &str = "35edeab28d25a6851519629e99e478c3cd810c3a";

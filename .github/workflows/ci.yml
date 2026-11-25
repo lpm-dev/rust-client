@@ -124,6 +124,12 @@ jobs:
       - name: Test Apple signing-service retry helper
         run: bash scripts/ci/test-with-apple-service-retry.sh
 
+      - name: Test macOS developer-tools helper
+        run: bash scripts/ci/test-macos-developer-tools.sh
+
+      - name: Test macOS Apple-services helper
+        run: bash scripts/ci/test-macos-apple-services.sh
+
       - name: Test unlocked gnome-keyring helper
         run: bash scripts/ci/test-with-unlocked-gnome-keyring.sh
 
@@ -499,6 +505,11 @@ jobs:
             target/debug/lpm-rs \
             "$RUNNER_TEMP/LPM CLI.app" \
             "$RUNNER_TEMP/lpm-cli.provisionprofile"
+
+      # Only macOS runs the installer's macOS checks, among them that it needs
+      # no developer tools, Gatekeeper assessor or Apple service.
+      - name: Shell installer regressions on macOS
+        run: sh tests/install-sh/run.sh
 
   macos-workspace:
     name: macOS workspace checks
