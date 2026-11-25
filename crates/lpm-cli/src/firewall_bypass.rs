@@ -162,16 +162,16 @@ fn parse_versions(text: &str) -> Result<SpecVersions, String> {
     if matches!(normalized.as_str(), "*" | "x" | "X") {
         return Ok(SpecVersions::Any);
     }
+    if normalized.contains('+') {
+        return Err(format!(
+            "`{normalized}` has build metadata; name the version without it"
+        ));
+    }
     if normalized.starts_with(|c: char| c.is_ascii_digit())
         && !normalized.contains([' ', '|', '<', '>', '^', '~', '*'])
         && !normalized.contains(".x")
         && !normalized.contains(".X")
     {
-        if normalized.contains('+') {
-            return Err(format!(
-                "`{normalized}` has build metadata; name the version without it"
-            ));
-        }
         if let Ok(version) = lpm_semver::Version::parse(&normalized)
             && normalized.split('.').count() >= 3
         {
@@ -837,6 +837,8 @@ mod tests {
             ("@lpm.dev/acme.widget", "@lpm.dev"),
             (".hidden", "not a valid npm package name"),
             ("foldrun@1.2.3+build.4", "build metadata"),
+            ("foldrun@^1.2.3+build.4", "build metadata"),
+            ("foldrun@>=1.0.0+a <2", "build metadata"),
             ("foldrun@>2 <1", "matches no version"),
             ("foldrun@", "empty"),
         ] {
