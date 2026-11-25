@@ -738,9 +738,10 @@ async fn npm_proxy_firewall_block_does_not_fallback_to_direct_npm_registry() {
     assert!(matches!(
         result,
         Err(LpmError::NpmFirewallBlocked(blocked))
-            if blocked.package == npm_name
-                && blocked.verdict == "malicious"
-                && blocked.reason == "test policy block"
+            if blocked.packages[0].name == npm_name
+                && blocked.packages[0].version.is_none()
+                && blocked.packages[0].verdict == "malicious"
+                && blocked.packages[0].reason == "test policy block"
     ));
 }
 

@@ -605,10 +605,11 @@ pub(super) async fn refresh_dependency_install(
                 lpm_root,
             )
             .await
-            .map_err(|e| {
-                LpmError::Script(format!(
+            .map_err(|e| match e {
+                blocked @ LpmError::NpmFirewallBlocked(_) => blocked,
+                e => LpmError::Script(format!(
                     "lpm install failed: {e}. package.json + lockfiles rolled back to pre-add state."
-                ))
+                )),
             })?;
         }
         pm_name @ ("npm" | "pnpm" | "yarn" | "bun") => {

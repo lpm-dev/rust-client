@@ -151,15 +151,92 @@ pub struct SecurityApprovalRequiredErrorContext {
     pub suggested_command: Option<String>,
 }
 
-/// Structured context for a package the LPM firewall blocked, with the
-/// decision a support request can name.
+/// Where an LPM Firewall block came from: the verdict check LPM CLI runs
+/// before downloading, or the registry refusing a download itself.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum NpmFirewallBlockSource {
+    Preflight,
+    Registry,
+}
+
+impl NpmFirewallBlockSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preflight => "preflight",
+            Self::Registry => "registry",
+        }
+    }
+}
+
+/// One package version the LPM Firewall blocked, with the decision a support
+/// request can name.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct NpmFirewallBlockedErrorContext {
-    pub package: String,
+pub struct NpmFirewallBlockedPackage {
+    pub name: String,
+    pub version: Option<String>,
     pub verdict: String,
     pub reason: String,
     pub decision_id: Option<String>,
     pub match_source: Option<String>,
+    pub policy_group: Option<String>,
+    pub summary: Option<String>,
+    pub report_url: Option<String>,
+}
+
+impl NpmFirewallBlockedPackage {
+    /// `name@version`, or the name alone when the version is unknown.
+    pub fn coordinate(&self) -> String {
+        match &self.version {
+            Some(version) => format!("{}@{version}", self.name),
+            None => self.name.clone(),
+        }
+    }
+}
+
+/// Structured context for the packages the LPM Firewall blocked.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct NpmFirewallBlockedErrorContext {
+    pub source: NpmFirewallBlockSource,
+    pub packages: Vec<NpmFirewallBlockedPackage>,
+    /// Blocks the verdict summary counted without a decision row naming the
+    /// package.
+    pub unattributed_count: u64,
+}
+
+impl NpmFirewallBlockedErrorContext {
+    pub fn registry(package: NpmFirewallBlockedPackage) -> Self {
+        Self {
+            source: NpmFirewallBlockSource::Registry,
+            packages: vec![package],
+            unattributed_count: 0,
+        }
+    }
+
+    pub fn blocked_count(&self) -> u64 {
+        (self.packages.len() as u64).saturating_add(self.unattributed_count)
+    }
+}
+
+impl fmt::Display for NpmFirewallBlockedErrorContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let (NpmFirewallBlockSource::Registry, [package]) =
+            (self.source, self.packages.as_slice())
+        {
+            return write!(
+                f,
+                "LPM firewall blocked {} (verdict: {}): {}",
+                package.coordinate(),
+                package.verdict,
+                package.reason
+            );
+        }
+        let count = self.blocked_count();
+        write!(
+            f,
+            "{count} {} blocked by LPM Firewall",
+            if count == 1 { "package" } else { "packages" }
+        )
+    }
 }
 
 impl fmt::Display for ArtifactUnavailableErrorContext {
@@ -509,7 +586,7 @@ pub enum LpmError {
     )]
     Forbidden(String),
 
-    #[error("LPM firewall blocked {} (verdict: {}): {}", .0.package, .0.verdict, .0.reason)]
+    #[error("{0}")]
     #[diagnostic(
         code(lpm::npm_firewall_blocked),
         help("Review the package security report or contact LPM support with the decision ID.")
@@ -1382,13 +1459,19 @@ mod tests {
                 has_passkey: true,
             },
             LpmError::Forbidden("x".into()),
-            LpmError::NpmFirewallBlocked(Box::new(NpmFirewallBlockedErrorContext {
-                package: "is-number@7.0.0".into(),
-                verdict: "malicious".into(),
-                reason: "product_default policy maps malicious to block".into(),
-                decision_id: Some("decision-1".into()),
-                match_source: Some("package".into()),
-            })),
+            LpmError::NpmFirewallBlocked(Box::new(NpmFirewallBlockedErrorContext::registry(
+                NpmFirewallBlockedPackage {
+                    name: "is-number".into(),
+                    version: Some("7.0.0".into()),
+                    verdict: "malicious".into(),
+                    reason: "product_default policy maps malicious to block".into(),
+                    decision_id: Some("decision-1".into()),
+                    match_source: Some("package".into()),
+                    policy_group: None,
+                    summary: None,
+                    report_url: None,
+                },
+            ))),
             LpmError::NpmFirewallEntitlementRequired {
                 message: "A Pro account or active org membership is required.".into(),
                 reason: Some("personal_plan_not_eligible".into()),
@@ -1670,13 +1753,19 @@ mod tests {
         );
         assert_eq!(LpmError::Forbidden("x".into()).error_code(), "forbidden");
         assert_eq!(
-            LpmError::NpmFirewallBlocked(Box::new(NpmFirewallBlockedErrorContext {
-                package: "is-number@7.0.0".into(),
-                verdict: "malicious".into(),
-                reason: "product_default policy maps malicious to block".into(),
-                decision_id: Some("decision-1".into()),
-                match_source: Some("package".into()),
-            }))
+            LpmError::NpmFirewallBlocked(Box::new(NpmFirewallBlockedErrorContext::registry(
+                NpmFirewallBlockedPackage {
+                    name: "is-number".into(),
+                    version: Some("7.0.0".into()),
+                    verdict: "malicious".into(),
+                    reason: "product_default policy maps malicious to block".into(),
+                    decision_id: Some("decision-1".into()),
+                    match_source: Some("package".into()),
+                    policy_group: None,
+                    summary: None,
+                    report_url: None,
+                }
+            )))
             .error_code(),
             "npm_firewall_blocked"
         );

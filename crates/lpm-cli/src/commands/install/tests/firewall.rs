@@ -1,8 +1,9 @@
 use super::*;
 use crate::commands::install::firewall::{
     DEFAULT_NPM_FIREWALL_CHUNK_SIZE, NpmFirewallChunkedPreflightConfig, NpmFirewallLookupMode,
-    NpmFirewallPreflightStats, npm_firewall_chunk_size, npm_firewall_package,
-    npm_firewall_package_from_selected_event, request_npm_firewall_preflight,
+    NpmFirewallPreflightResult, NpmFirewallPreflightStats, finish_npm_firewall_preflight,
+    npm_firewall_chunk_size, npm_firewall_package, npm_firewall_package_from_selected_event,
+    npm_firewall_packages, request_npm_firewall_preflight,
     request_npm_firewall_preflight_with_force, spawn_chunked_npm_firewall_preflight,
 };
 use crate::npm_firewall_config::NpmFirewallMode;
@@ -1624,4 +1625,236 @@ async fn monitor_verdict_cache_refuses_symlinked_cache_directory() {
     }
     assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
     server.verify().await;
+}
+
+fn verdict_decision(name: &str, action: &str) -> serde_json::Value {
+    serde_json::json!({
+        "decisionId": format!("decision-{name}"),
+        "name": name,
+        "version": "1.0.0",
+        "action": action,
+        "verdict": if action == "block" { "malicious" } else { "clean" },
+        "reason": format!("{action} {name}"),
+        "matchSource": "package",
+        "policyMode": "product_default",
+        "enqueueScan": false,
+        "policy": { "group": "lpm_ai_confirmed_malware" },
+        "display": {
+            "summary": format!("{name} summary"),
+            "reportUrl": format!("https://firewall.lpm.dev/npm/{name}/v/1.0.0")
+        }
+    })
+}
+
+fn verdict_response(block: u64, decisions: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({
+        "requestId": "req-test",
+        "policyMode": "product_default",
+        "summary": {
+            "total": 1,
+            "allow": u64::from(block == 0),
+            "warn": 0,
+            "block": block,
+            "unknown": 0,
+            "matched": block
+        },
+        "decisions": decisions
+    })
+}
+
+fn decision(name: &str, action: &str) -> lpm_registry::client::NpmFirewallDecision {
+    serde_json::from_value(verdict_decision(name, action)).unwrap()
+}
+
+#[tokio::test]
+async fn chunked_enforce_firewall_names_blocks_from_every_chunk_and_releases_nothing_after_one() {
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    for name in ["evil-a", "evil-c"] {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/npm-firewall/verdicts"))
+            .and(body_string_contains(format!("\"name\":\"{name}\"")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(verdict_response(1, vec![verdict_decision(name, "block")])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .and(body_string_contains("\"name\":\"good-b\""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(400))
+                .set_body_json(verdict_response(0, Vec::new())),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("firewall-token"),
+    );
+    let (selected_tx, selected_rx) = mpsc::channel(4);
+    let (fetch_tx, mut fetch_rx) = mpsc::channel(4);
+    let join = spawn_chunked_npm_firewall_preflight(
+        selected_rx,
+        fetch_tx,
+        client,
+        chunked_config(NpmFirewallMode::Enforce),
+    );
+
+    selected_tx.send(selected_event("evil-a")).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    selected_tx.send(selected_event("good-b")).await.unwrap();
+    selected_tx.send(selected_event("evil-c")).await.unwrap();
+    drop(selected_tx);
+
+    let result = join.drain().await.expect("enforce preflight completes");
+    assert!(
+        fetch_rx.recv().await.is_none(),
+        "no package may download once a chunk is blocked"
+    );
+    let LpmError::NpmFirewallBlocked(blocked) =
+        finish_npm_firewall_preflight(result, true).unwrap_err()
+    else {
+        panic!("expected a firewall block");
+    };
+    let mut names: Vec<_> = blocked
+        .packages
+        .iter()
+        .map(|package| package.name.as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["evil-a", "evil-c"]);
+    assert_eq!(
+        blocked.source,
+        lpm_common::NpmFirewallBlockSource::Preflight
+    );
+}
+
+#[test]
+fn firewall_block_counted_only_in_the_summary_still_blocks() {
+    let stats = NpmFirewallPreflightStats {
+        mode: NpmFirewallMode::Enforce,
+        block_count: 2,
+        unattributed_block_count: 1,
+        ..NpmFirewallPreflightStats::default()
+    };
+    let result = NpmFirewallPreflightResult {
+        stats,
+        decisions: vec![decision("named-block", "block")],
+        report_error: None,
+    };
+
+    let LpmError::NpmFirewallBlocked(blocked) =
+        finish_npm_firewall_preflight(result, true).unwrap_err()
+    else {
+        panic!("expected a firewall block");
+    };
+
+    assert_eq!(blocked.packages.len(), 1);
+    assert_eq!(blocked.unattributed_count, 1);
+    assert_eq!(blocked.blocked_count(), 2);
+    assert_eq!(blocked.to_string(), "2 packages blocked by LPM Firewall");
+}
+
+#[tokio::test]
+async fn firewall_summary_without_a_block_row_is_recorded_as_unattributed() {
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(verdict_response(1, Vec::new())))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("firewall-token"),
+    );
+    let package = lpm_registry::client::NpmFirewallBatchPackage {
+        name: "summary-only".into(),
+        version: "1.0.0".into(),
+        integrity: None,
+        published_at: None,
+    };
+
+    let result = request_npm_firewall_preflight(
+        NpmFirewallMode::Enforce,
+        NpmFirewallLookupMode::PackageOnly,
+        lpm_registry::client::NpmFirewallPolicyProfile::default(),
+        client,
+        vec![package],
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.stats.unattributed_block_count, 1);
+    assert!(matches!(
+        finish_npm_firewall_preflight(result, true),
+        Err(LpmError::NpmFirewallBlocked(blocked)) if blocked.unattributed_count == 1
+    ));
+}
+
+#[test]
+fn firewall_block_error_names_each_blocked_version_once() {
+    let stats = NpmFirewallPreflightStats {
+        mode: NpmFirewallMode::Enforce,
+        block_count: 2,
+        ..NpmFirewallPreflightStats::default()
+    };
+    let result = NpmFirewallPreflightResult {
+        stats,
+        decisions: vec![decision("twice", "block"), decision("twice", "block")],
+        report_error: None,
+    };
+
+    let LpmError::NpmFirewallBlocked(blocked) =
+        finish_npm_firewall_preflight(result, true).unwrap_err()
+    else {
+        panic!("expected a firewall block");
+    };
+
+    assert_eq!(blocked.packages.len(), 1);
+    let package = &blocked.packages[0];
+    assert_eq!(package.coordinate(), "twice@1.0.0");
+    assert_eq!(
+        package.policy_group.as_deref(),
+        Some("lpm_ai_confirmed_malware")
+    );
+    assert_eq!(
+        package.report_url.as_deref(),
+        Some("https://firewall.lpm.dev/npm/twice/v/1.0.0")
+    );
+}
+
+#[test]
+fn firewall_verdict_request_asks_once_for_peer_instances_of_one_version() {
+    let client = firewall_client();
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let first = package_with_source("shared", "registry+https://registry.npmjs.org");
+    let second = first.clone();
+
+    let requested = npm_firewall_packages(
+        &[first, second],
+        &route_table,
+        &client,
+        NpmFirewallLookupMode::PackageOnly,
+    );
+
+    assert_eq!(requested.len(), 1);
+    assert_eq!(requested[0].name, "shared");
 }

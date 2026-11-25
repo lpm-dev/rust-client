@@ -5871,3 +5871,44 @@ async fn add_rejects_conditional_file_rules_without_conditions_before_mutation()
     assert_eq!(project.read_file("package.json"), before);
     assert!(!project.path().join("vendor").exists());
 }
+
+#[tokio::test]
+async fn lpm_add_reports_a_firewall_blocked_source_dependency_as_a_firewall_block() {
+    let mock = MockRegistry::start().await;
+    mount_release_age_source_package(&mock, "firewall-source-pkg", "blocked-source-dep@1.0.0")
+        .await;
+    let dependency_tarball = make_tarball_from_pkg_json(
+        json!({ "name": "blocked-source-dep", "version": "1.0.0" }),
+        &[],
+    );
+    mock.with_package("blocked-source-dep", "1.0.0", &dependency_tarball)
+        .await;
+    mock.with_npm_firewall_allow("firewall-source-pkg", "1.0.0")
+        .await;
+    mock.with_npm_firewall_block("blocked-source-dep", "1.0.0")
+        .await;
+    let original_manifest = r#"{"name":"add-firewall-dep","version":"1.0.0","dependencies":{}}"#;
+    let project = TempProject::empty(original_manifest);
+    write_npm_firewall_global_config(&project, "enforce");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            "firewall-source-pkg?withDependency=true",
+            "--yes",
+            "--json",
+            "--no-skills",
+        ])
+        .output()
+        .expect("failed to run lpm add");
+
+    assert!(!output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&output.stdout)));
+    assert_eq!(envelope["error_code"], "npm_firewall_blocked", "{envelope}");
+    assert_eq!(
+        envelope["error"]["packages"][0]["name"],
+        "blocked-source-dep"
+    );
+    assert_eq!(project.read_file("package.json"), original_manifest);
+}
