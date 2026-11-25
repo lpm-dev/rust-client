@@ -79,7 +79,8 @@ use firewall::{
 };
 pub(crate) use firewall::{
     NpmFirewallMaterializationPackage, begin_prepared_npm_firewall_materialization_preflight,
-    prepare_npm_firewall_materialization_preflight, registry_materialization_route_is_public_npm,
+    prepare_npm_firewall_materialization_preflight, print_npm_firewall_decisions,
+    registry_materialization_route_is_public_npm,
 };
 pub(crate) use github_source::download_github_archive_to_file;
 pub(crate) use github_source::github_archive_url;
@@ -656,6 +657,7 @@ async fn run_with_options_under_store_lock(
         provenance_timings,
         npm_firewall_lookup_mode,
         npm_firewall_policy_profile,
+        npm_firewall_bypass,
         npm_firewall_chunk_size,
         policy_extension_configs,
         force_security_floor,
@@ -1107,6 +1109,7 @@ async fn run_with_options_under_store_lock(
             npm_firewall_mode,
             npm_firewall_lookup_mode,
             npm_firewall_policy_profile,
+            npm_firewall_bypass: &npm_firewall_bypass,
             policy_extension_configs: &policy_extension_configs,
             workspace_member_deps: &mut workspace_member_deps,
             all_workspace_members: &all_workspace_members,
@@ -1428,6 +1431,7 @@ async fn run_with_options_under_store_lock(
         npm_firewall_mode,
         npm_firewall_lookup_mode,
         npm_firewall_policy_profile,
+        npm_firewall_bypass: npm_firewall_bypass.clone(),
         npm_firewall_chunk_size,
         locked_integrities: expectations.locked_integrities.as_deref(),
         tarball_prefetch_held: expectations.hold_tarball_prefetch(&policy_extension_configs),
@@ -1537,6 +1541,7 @@ async fn run_with_options_under_store_lock(
                 mode: npm_firewall_mode,
                 lookup_mode: npm_firewall_lookup_mode,
                 policy_profile: npm_firewall_policy_profile,
+                bypass: &npm_firewall_bypass,
                 client: &arc_client,
                 route_table: &route_table,
                 packages: &packages,

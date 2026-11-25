@@ -5,6 +5,7 @@ use lpm_registry::client::{
     NpmFirewallDiagnostics, NpmFirewallFlaggedPackageIndexDiagnostics, NpmFirewallPolicyProfile,
 };
 
+use crate::firewall_bypass::{AppliedRule, BlockClass, FirewallBypassRules, bypass_add_command};
 pub(super) use crate::npm_firewall_config::NpmFirewallMode;
 
 const ENV_EXPERIMENT_NPM_FIREWALL_LOOKUP: &str = "LPM_EXPERIMENT_NPM_FIREWALL_LOOKUP";
@@ -59,6 +60,7 @@ pub(crate) struct NpmFirewallMaterializationPreflight {
     mode: NpmFirewallMode,
     lookup_mode: NpmFirewallLookupMode,
     policy_profile: NpmFirewallPolicyProfile,
+    bypass: FirewallBypassRules,
     verdict_packages: Vec<NpmFirewallBatchPackage>,
 }
 
@@ -225,6 +227,15 @@ pub(super) struct NpmFirewallPreflightStats {
     /// command fails on the block either way; this keeps the failure that
     /// names it from being replaced by the later request error.
     pub(super) unchecked_reason: Option<String>,
+    /// Blocked versions that bypass rules let through.
+    pub(super) bypassed: Vec<BypassedVerdict>,
+    /// Why the bypass rules couldn't be read, when a block needed them.
+    pub(super) bypass_error: Option<String>,
+    /// Whether `lpm firewall bypass add` can lift blocks for this command.
+    pub(super) local_bypass_available: bool,
+    /// The managed security policy that keeps local bypass rules from
+    /// applying, when one does.
+    pub(super) managed_policy_path: Option<String>,
     pub(super) unknown_count: u64,
     pub(super) matched_count: u64,
     pub(super) cache_hit_count: u64,
@@ -273,23 +284,30 @@ impl NpmFirewallPreflightStats {
         self.client_timing = timing;
     }
 
-    /// Adds one verdict response and returns whether it blocks anything.
-    fn record_response(&mut self, response: &NpmFirewallBatchResponse, elapsed_ms: u128) -> bool {
+    fn record_response(&mut self, response: &NpmFirewallBatchResponse, elapsed_ms: u128) {
         self.chunk_count = self.chunk_count.saturating_add(1);
         self.chunk_sum_ms = self.chunk_sum_ms.saturating_add(elapsed_ms);
         self.chunk_max_ms = self.chunk_max_ms.max(elapsed_ms);
         self.add_summary(response.summary);
-        let block_rows = response
-            .decisions
-            .iter()
-            .filter(|decision| decision.action == NpmFirewallAction::Block)
-            .count() as u64;
-        self.unattributed_block_count = self
-            .unattributed_block_count
-            .saturating_add(response.summary.block.saturating_sub(block_rows));
         add_worker_diagnostics(&mut self.worker_diagnostics, response.diagnostics.clone());
         add_client_timing(&mut self.client_timing, response.client_timing);
-        block_rows > 0 || response.summary.block > 0
+    }
+
+    /// Adds one classified response and returns its decision rows.
+    fn record_classified(&mut self, classified: ClassifiedVerdicts) -> Vec<NpmFirewallDecision> {
+        self.unattributed_block_count = self
+            .unattributed_block_count
+            .saturating_add(classified.unattributed);
+        self.bypassed.extend(classified.bypassed);
+        if self.bypass_error.is_none() {
+            self.bypass_error = classified.bypass_error;
+        }
+        classified.decisions
+    }
+
+    fn note_bypass_rules(&mut self, bypass: &FirewallBypassRules) {
+        self.local_bypass_available = bypass.local_rules_apply();
+        self.managed_policy_path = bypass.managed_policy_path().map(str::to_string);
     }
 
     pub(super) fn to_json(&self) -> serde_json::Value {
@@ -315,6 +333,7 @@ impl NpmFirewallPreflightStats {
         }
         if self.mode.is_enabled() {
             json["unattributed_block_count"] = serde_json::json!(self.unattributed_block_count);
+            json["bypassed_count"] = serde_json::json!(self.bypassed.len());
         }
         if let Some(diagnostics) = &self.worker_diagnostics {
             json["worker"] = serde_json::to_value(diagnostics).unwrap_or(serde_json::Value::Null);
@@ -324,6 +343,118 @@ impl NpmFirewallPreflightStats {
         }
         json
     }
+}
+
+impl NpmFirewallPreflightStats {
+    /// [`Self::to_json`] plus each version a bypass rule let through, for the
+    /// `security.firewall` report; timing sections keep the counts alone.
+    pub(super) fn to_security_json(&self) -> serde_json::Value {
+        let mut json = self.to_json();
+        if !self.bypassed.is_empty() {
+            json["bypassed"] = serde_json::Value::Array(
+                self.bypassed.iter().map(BypassedVerdict::to_json).collect(),
+            );
+        }
+        json
+    }
+}
+
+/// A blocked version a bypass rule let through, and the rule.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct BypassedVerdict {
+    pub(super) decision: NpmFirewallDecision,
+    pub(super) rule: AppliedRule,
+}
+
+impl BypassedVerdict {
+    fn to_json(&self) -> serde_json::Value {
+        let mut json = npm_firewall_decision_json(&self.decision);
+        json["rule"] = self.rule.to_json();
+        json
+    }
+}
+
+/// One verdict response, checked against the packages it asked about.
+struct ClassifiedVerdicts {
+    /// Rows no bypass rule lifted.
+    decisions: Vec<NpmFirewallDecision>,
+    bypassed: Vec<BypassedVerdict>,
+    /// Blocks the summary counted without a decision row.
+    unattributed: u64,
+    bypass_error: Option<String>,
+}
+
+impl ClassifiedVerdicts {
+    fn blocks(&self) -> bool {
+        self.unattributed > 0
+            || self
+                .decisions
+                .iter()
+                .any(|decision| decision.action == NpmFirewallAction::Block)
+    }
+}
+
+/// Splits a response's blocks into those a bypass rule lifts and those that
+/// stand. A rule lifts only a block whose row names a version this request
+/// asked about, and only a block its kind may cover; blocks the summary
+/// counts without a row always stand.
+async fn classify_verdicts(
+    response: NpmFirewallBatchResponse,
+    requested: &[NpmFirewallBatchPackage],
+    bypass: &FirewallBypassRules,
+) -> ClassifiedVerdicts {
+    let block_rows = response
+        .decisions
+        .iter()
+        .filter(|decision| decision.action == NpmFirewallAction::Block)
+        .count() as u64;
+    let mut classified = ClassifiedVerdicts {
+        decisions: Vec::with_capacity(response.decisions.len()),
+        bypassed: Vec::new(),
+        unattributed: response.summary.block.saturating_sub(block_rows),
+        bypass_error: None,
+    };
+    if block_rows == 0 || bypass.is_empty() {
+        classified.decisions = response.decisions;
+        return classified;
+    }
+    let rules = match bypass.load().await {
+        Ok(rules) => rules,
+        Err(error) => {
+            classified.bypass_error = Some(error);
+            classified.decisions = response.decisions;
+            return classified;
+        }
+    };
+    let requested: HashSet<(&str, &str)> = requested
+        .iter()
+        .map(|package| (package.name.as_str(), package.version.as_str()))
+        .collect();
+    for decision in response.decisions {
+        let applied = (decision.action == NpmFirewallAction::Block
+            && requested.contains(&(decision.name.as_str(), decision.version.as_str())))
+        .then(|| {
+            rules.find(
+                &decision.name,
+                &decision.version,
+                decision_block_class(&decision),
+            )
+        })
+        .flatten()
+        .cloned();
+        match applied {
+            Some(rule) => classified.bypassed.push(BypassedVerdict { decision, rule }),
+            None => classified.decisions.push(decision),
+        }
+    }
+    classified
+}
+
+fn decision_block_class(decision: &NpmFirewallDecision) -> BlockClass {
+    BlockClass::of(
+        &decision.verdict,
+        decision.policy.as_ref().map(|policy| policy.group.as_str()),
+    )
 }
 
 fn add_client_timing(
@@ -515,6 +646,7 @@ impl FirewallSelectedChunk {
 
 struct FirewallChunkResult {
     events: Vec<lpm_resolver::SelectedPackageEvent>,
+    verdict_packages: Vec<NpmFirewallBatchPackage>,
     response: Option<NpmFirewallBatchResponse>,
     elapsed_ms: u128,
     report_error: Option<String>,
@@ -527,6 +659,7 @@ pub(super) struct NpmFirewallChunkedPreflightConfig {
     pub(super) policy_profile: NpmFirewallPolicyProfile,
     pub(super) offline: bool,
     pub(super) chunk_size: usize,
+    pub(super) bypass: FirewallBypassRules,
 }
 
 pub(super) fn spawn_chunked_npm_firewall_preflight(
@@ -543,6 +676,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
             policy_profile,
             offline,
             chunk_size,
+            bypass,
         } = config;
 
         if !mode.is_enabled() {
@@ -555,6 +689,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
         }
         let chunk_size = chunk_size.max(1);
         let mut stats = NpmFirewallPreflightStats::for_mode(mode, lookup_mode);
+        stats.note_bypass_rules(&bypass);
         let mut decisions = Vec::new();
         let mut report_error = None;
         let total_started = Instant::now();
@@ -597,6 +732,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
             client: &preflight_client,
             mode,
             policy_profile,
+            bypass: &bypass,
         };
         let mut chunk = FirewallSelectedChunk::with_capacity(chunk_size);
         let mut receiver_closed = false;
@@ -659,8 +795,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                     };
                     blocked |= apply_firewall_chunk_result(
                         chunk_result,
-                        &fetch_tx,
-                        mode,
+                        &dispatch,
                         blocked || failure.is_some(),
                         &mut stats,
                         &mut decisions,
@@ -730,6 +865,7 @@ struct FirewallChunkDispatch<'a> {
     client: &'a NpmFirewallPreflightClient,
     mode: NpmFirewallMode,
     policy_profile: NpmFirewallPolicyProfile,
+    bypass: &'a FirewallBypassRules,
 }
 
 async fn spawn_or_release_firewall_chunk(
@@ -744,6 +880,7 @@ async fn spawn_or_release_firewall_chunk(
         client,
         mode,
         policy_profile,
+        bypass: _,
     } = *dispatch;
     if chunk.is_empty() {
         return;
@@ -783,6 +920,7 @@ async fn request_firewall_chunk(
         Err(error) if matches!(mode, NpmFirewallMode::Monitor) => {
             return Ok(FirewallChunkResult {
                 events,
+                verdict_packages,
                 response: None,
                 elapsed_ms: started.elapsed().as_millis(),
                 report_error: Some(npm_firewall_preflight_report_error(error)),
@@ -794,6 +932,7 @@ async fn request_firewall_chunk(
     };
     Ok(FirewallChunkResult {
         events,
+        verdict_packages,
         response: Some(response),
         elapsed_ms: started.elapsed().as_millis(),
         report_error: None,
@@ -879,13 +1018,14 @@ fn normalize_npm_firewall_preflight_error(error: LpmError) -> LpmError {
 /// chunk blocks.
 async fn apply_firewall_chunk_result(
     chunk_result: FirewallChunkResult,
-    fetch_tx: &tokio::sync::mpsc::Sender<lpm_resolver::SelectedPackageEvent>,
-    mode: NpmFirewallMode,
+    dispatch: &FirewallChunkDispatch<'_>,
     earlier_block: bool,
     stats: &mut NpmFirewallPreflightStats,
     decisions: &mut Vec<NpmFirewallDecision>,
     report_error: &mut Option<String>,
 ) -> bool {
+    let fetch_tx = dispatch.fetch_tx;
+    let mode = dispatch.mode;
     if let Some(error) = chunk_result.report_error {
         stats.rpc_failed = true;
         stats.chunk_count = stats.chunk_count.saturating_add(1);
@@ -903,7 +1043,7 @@ async fn apply_firewall_chunk_result(
         return false;
     };
 
-    let chunk_has_block = stats.record_response(&response, chunk_result.elapsed_ms);
+    stats.record_response(&response, chunk_result.elapsed_ms);
     tracing::debug!(
         target = "lpm::firewall",
         package_count = response.summary.total,
@@ -915,7 +1055,10 @@ async fn apply_firewall_chunk_result(
         policy_mode = %response.policy_mode,
         "npm firewall verdict chunk completed",
     );
-    decisions.extend(response.decisions);
+    let classified =
+        classify_verdicts(response, &chunk_result.verdict_packages, dispatch.bypass).await;
+    let chunk_has_block = classified.blocks();
+    decisions.extend(stats.record_classified(classified));
     let enforce = matches!(mode, NpmFirewallMode::Enforce);
     if !(enforce && (chunk_has_block || earlier_block)) {
         release_firewall_events(fetch_tx, chunk_result.events).await;
@@ -1342,6 +1485,7 @@ fn collect_monitor_cache_updates(
     }
 }
 
+#[cfg(test)]
 pub(super) async fn request_npm_firewall_preflight(
     mode: NpmFirewallMode,
     lookup_mode: NpmFirewallLookupMode,
@@ -1362,6 +1506,7 @@ pub(super) async fn request_npm_firewall_preflight(
     .await
 }
 
+#[cfg(test)]
 pub(super) async fn request_npm_firewall_preflight_with_force(
     mode: NpmFirewallMode,
     lookup_mode: NpmFirewallLookupMode,
@@ -1371,7 +1516,46 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
     offline: bool,
     force: bool,
 ) -> Result<NpmFirewallPreflightResult, LpmError> {
+    request_npm_firewall_preflight_with_bypass(
+        PreflightSettings {
+            mode,
+            lookup_mode,
+            policy_profile,
+            offline,
+            force,
+            bypass: FirewallBypassRules::none(),
+        },
+        client,
+        verdict_packages,
+    )
+    .await
+}
+
+/// How one verdict preflight runs.
+pub(super) struct PreflightSettings {
+    pub(super) mode: NpmFirewallMode,
+    pub(super) lookup_mode: NpmFirewallLookupMode,
+    pub(super) policy_profile: NpmFirewallPolicyProfile,
+    pub(super) offline: bool,
+    pub(super) force: bool,
+    pub(super) bypass: FirewallBypassRules,
+}
+
+pub(super) async fn request_npm_firewall_preflight_with_bypass(
+    settings: PreflightSettings,
+    client: Arc<RegistryClient>,
+    verdict_packages: Vec<NpmFirewallBatchPackage>,
+) -> Result<NpmFirewallPreflightResult, LpmError> {
+    let PreflightSettings {
+        mode,
+        lookup_mode,
+        policy_profile,
+        offline,
+        force,
+        bypass,
+    } = settings;
     let mut stats = NpmFirewallPreflightStats::for_mode(mode, lookup_mode);
+    stats.note_bypass_rules(&bypass);
     if !mode.is_enabled() {
         return Ok(NpmFirewallPreflightResult::empty(mode, lookup_mode));
     }
@@ -1539,7 +1723,8 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
                 &mut cache_removals,
             );
         }
-        all_decisions.extend(response.decisions);
+        let classified = classify_verdicts(response, chunk, &bypass).await;
+        all_decisions.extend(stats.record_classified(classified));
     }
     if let Some(error) = first_failure.map(npm_firewall_preflight_enforce_error) {
         if !stats_have_block(&stats, &all_decisions) {
@@ -1616,6 +1801,7 @@ pub(super) fn spawn_npm_firewall_preflight(
         mode,
         lookup_mode,
         policy_profile,
+        bypass,
         client,
         route_table,
         packages,
@@ -1627,14 +1813,17 @@ pub(super) fn spawn_npm_firewall_preflight(
         npm_firewall_packages(packages, route_table, client.as_ref(), lookup_mode);
     let client = Arc::clone(client);
     NpmFirewallPreflightJoin {
-        handle: Some(tokio::spawn(request_npm_firewall_preflight_with_force(
-            mode,
-            lookup_mode,
-            policy_profile,
+        handle: Some(tokio::spawn(request_npm_firewall_preflight_with_bypass(
+            PreflightSettings {
+                mode,
+                lookup_mode,
+                policy_profile,
+                offline,
+                force,
+                bypass: bypass.clone(),
+            },
             client,
             verdict_packages,
-            offline,
-            force,
         ))),
     }
 }
@@ -1663,15 +1852,20 @@ pub(super) fn finish_npm_firewall_preflight(
     let warned_count = warned.len().max(stats.warn_count as usize);
 
     if matches!(stats.mode, NpmFirewallMode::Monitor) {
-        if !json_output && (blocked_count > 0 || warned_count > 0) {
+        if !json_output && (blocked_count > 0 || warned_count > 0 || !stats.bypassed.is_empty()) {
             output::warn(&format!(
                 "LPM Firewall monitor: {} would-block, {} warned; command continues because monitor mode is active.",
                 blocked_count, warned_count
             ));
             print_firewall_decisions(&blocked);
             print_firewall_decisions(&warned);
+            print_bypassed_verdicts(&stats.bypassed, true);
         }
         return Ok(stats);
+    }
+
+    if !json_output {
+        print_bypassed_verdicts(&stats.bypassed, false);
     }
 
     if warned_count > 0 && !json_output {
@@ -1695,15 +1889,50 @@ pub(super) fn finish_npm_firewall_preflight(
         ));
         print_firewall_decisions(&blocked);
     }
+    let packages: Vec<_> = blocked
+        .iter()
+        .map(|decision| blocked_package(decision, stats.local_bypass_available))
+        .collect();
+    let bypass_command = packages.iter().any(|package| package.bypassable).then(|| {
+        let coordinates: Vec<String> = packages
+            .iter()
+            .filter(|package| package.bypassable)
+            .map(lpm_common::NpmFirewallBlockedPackage::coordinate)
+            .collect();
+        bypass_add_command(coordinates.iter().map(String::as_str))
+    });
+    let bypass_unavailable_reason = stats
+        .bypass_error
+        .as_ref()
+        .map(|error| format!("your bypass rules couldn't be read: {error}"))
+        .or_else(|| {
+            (!stats.local_bypass_available).then(|| {
+                format!(
+                    "{} manages the npm firewall here; ask its administrator to list the version in its `[firewall].bypass`",
+                    stats
+                        .managed_policy_path
+                        .as_deref()
+                        .unwrap_or("a managed security policy")
+                )
+            })
+        });
     Err(LpmError::NpmFirewallBlocked(Box::new(
         lpm_common::NpmFirewallBlockedErrorContext {
             source: lpm_common::NpmFirewallBlockSource::Preflight,
-            packages: blocked
-                .iter()
-                .map(|decision| blocked_package(decision))
-                .collect(),
+            packages,
             unattributed_count: stats.unattributed_block_count,
             unchecked_reason: stats.unchecked_reason,
+            bypassed: stats
+                .bypassed
+                .iter()
+                .map(|bypassed| lpm_common::NpmFirewallBypassedPackage {
+                    name: bypassed.decision.name.clone(),
+                    version: bypassed.decision.version.clone(),
+                    rule: bypassed.rule.spec.clone(),
+                })
+                .collect(),
+            bypass_command,
+            bypass_unavailable_reason,
         },
     )))
 }
@@ -1732,8 +1961,12 @@ fn distinct_decisions(
         .collect()
 }
 
-fn blocked_package(decision: &NpmFirewallDecision) -> lpm_common::NpmFirewallBlockedPackage {
+fn blocked_package(
+    decision: &NpmFirewallDecision,
+    local_bypass_available: bool,
+) -> lpm_common::NpmFirewallBlockedPackage {
     let display = decision.display.as_ref();
+    let class = decision_block_class(decision);
     lpm_common::NpmFirewallBlockedPackage {
         name: decision.name.clone(),
         version: Some(decision.version.clone()),
@@ -1748,6 +1981,49 @@ fn blocked_package(decision: &NpmFirewallDecision) -> lpm_common::NpmFirewallBlo
         report_url: display
             .and_then(|display| non_empty_display_text(display.report_url.as_deref()))
             .map(str::to_string),
+        block_class: Some(class.as_str().to_string()),
+        bypassable: local_bypass_available
+            && crate::firewall_bypass::FirewallBypassSpec::parse(&format!(
+                "{}@{}",
+                decision.name, decision.version
+            ))
+            .is_ok()
+            && class.coverable_by(crate::firewall_bypass::BypassKind::Exact, false),
+    }
+}
+
+/// Prints the blocked versions bypass rules let through, each with its rule.
+fn print_bypassed_verdicts(bypassed: &[BypassedVerdict], monitor: bool) {
+    if bypassed.is_empty() {
+        return;
+    }
+    let count = bypassed.len();
+    output::warn(&if monitor {
+        format!(
+            "LPM Firewall monitor: your bypass rules would allow {count} blocked {}:",
+            install_ui::packages_word(count)
+        )
+    } else {
+        format!(
+            "LPM Firewall allowed {count} blocked {} because of your bypass rules:",
+            install_ui::packages_word(count)
+        )
+    });
+    for verdict in bypassed {
+        for line in firewall_decision_lines(&verdict.decision) {
+            install_ui::detail_line(line);
+        }
+        let source = if verdict.rule.source == "managed" {
+            " from the managed policy"
+        } else {
+            ""
+        };
+        install_ui::detail_line(install_ui::terminal_line!(
+            "    {} {} {}",
+            install_ui::dim("rule:"),
+            install_ui::field(&verdict.rule.spec),
+            install_ui::dim(&format!("({}{source})", verdict.rule.scope)),
+        ));
     }
 }
 
@@ -1758,6 +2034,7 @@ pub(super) async fn run_npm_firewall_preflight(
         mode,
         lookup_mode,
         policy_profile,
+        bypass,
         client,
         route_table,
         packages,
@@ -1767,14 +2044,17 @@ pub(super) async fn run_npm_firewall_preflight(
     } = request;
     let verdict_packages =
         npm_firewall_packages(packages, route_table, client.as_ref(), lookup_mode);
-    let result = request_npm_firewall_preflight_with_force(
-        mode,
-        lookup_mode,
-        policy_profile,
+    let result = request_npm_firewall_preflight_with_bypass(
+        PreflightSettings {
+            mode,
+            lookup_mode,
+            policy_profile,
+            offline,
+            force,
+            bypass: bypass.clone(),
+        },
         Arc::clone(client),
         verdict_packages,
-        offline,
-        force,
     )
     .await?;
     finish_npm_firewall_preflight(result, json_output)
@@ -1784,6 +2064,7 @@ pub(super) struct NpmFirewallPreflightRequest<'a> {
     pub(super) mode: NpmFirewallMode,
     pub(super) lookup_mode: NpmFirewallLookupMode,
     pub(super) policy_profile: NpmFirewallPolicyProfile,
+    pub(super) bypass: &'a FirewallBypassRules,
     pub(super) client: &'a Arc<RegistryClient>,
     pub(super) route_table: &'a RouteTable,
     pub(super) packages: &'a [InstallPackage],
@@ -1939,10 +2220,12 @@ pub(crate) fn prepare_npm_firewall_materialization_preflight(
     let crate::npm_firewall_config::RuntimeFirewall {
         mode,
         policy_profile,
+        bypass,
     } = crate::npm_firewall_config::resolve_runtime_firewall(
         &global_config,
         project_dir,
         json_output,
+        crate::npm_firewall_config::BypassRuleScope::ProjectAndGlobal(project_dir),
     )?;
     let lookup_mode = NpmFirewallLookupMode::from_env();
     let mut verdict_packages = Vec::with_capacity(packages.len());
@@ -1953,6 +2236,7 @@ pub(crate) fn prepare_npm_firewall_materialization_preflight(
         mode,
         lookup_mode,
         policy_profile,
+        bypass,
         verdict_packages,
     })
 }
@@ -1989,13 +2273,17 @@ pub(crate) async fn begin_prepared_npm_firewall_materialization_preflight(
     preflight: NpmFirewallMaterializationPreflight,
     json_output: bool,
 ) -> Result<NpmFirewallMaterializationVerdict, LpmError> {
-    let request = request_npm_firewall_preflight(
-        preflight.mode,
-        preflight.lookup_mode,
-        preflight.policy_profile,
+    let request = request_npm_firewall_preflight_with_bypass(
+        PreflightSettings {
+            mode: preflight.mode,
+            lookup_mode: preflight.lookup_mode,
+            policy_profile: preflight.policy_profile,
+            offline: false,
+            force: false,
+            bypass: preflight.bypass,
+        },
         Arc::new(client.clone_with_config()),
         preflight.verdict_packages,
-        false,
     );
     let state = if matches!(preflight.mode, NpmFirewallMode::Monitor) {
         MaterializationVerdictState::Pending(NpmFirewallPreflightJoin {
@@ -2025,7 +2313,7 @@ fn npm_firewall_materialization_json(
         return None;
     }
 
-    let mut json = result.stats.to_json();
+    let mut json = result.stats.to_security_json();
     if let Some(report_error) = &result.report_error {
         json["monitor_error"] = serde_json::Value::String(report_error.clone());
     }
@@ -2080,6 +2368,10 @@ fn npm_firewall_decision_json(decision: &NpmFirewallDecision) -> serde_json::Val
         });
     }
     json
+}
+
+pub(crate) fn print_npm_firewall_decisions(decisions: &[&NpmFirewallDecision]) {
+    print_firewall_decisions(decisions);
 }
 
 fn print_firewall_decisions(decisions: &[&NpmFirewallDecision]) {

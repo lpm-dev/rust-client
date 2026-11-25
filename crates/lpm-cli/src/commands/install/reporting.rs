@@ -443,7 +443,7 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
         json["timing"]["resolve"]["dispatcher"] = metadata_dispatcher.clone();
         json["timing"]["resolve"]["metadata_dispatcher"] = metadata_dispatcher;
         json["security"] = serde_json::json!({
-            "firewall": npm_firewall_stats.to_json(),
+            "firewall": npm_firewall_stats.to_security_json(),
             "policy_extensions": policy_extension_stats.to_json(),
         });
         json["timing"]["policy_extensions"] = policy_extension_stats.to_json();

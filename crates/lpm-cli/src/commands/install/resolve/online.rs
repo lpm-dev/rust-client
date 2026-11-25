@@ -28,6 +28,8 @@ pub(in crate::commands::install) struct OnlineResolutionPhaseInput<'a> {
     pub(in crate::commands::install) npm_firewall_lookup_mode: NpmFirewallLookupMode,
     pub(in crate::commands::install) npm_firewall_policy_profile:
         lpm_registry::client::NpmFirewallPolicyProfile,
+    pub(in crate::commands::install) npm_firewall_bypass:
+        crate::firewall_bypass::FirewallBypassRules,
     pub(in crate::commands::install) npm_firewall_chunk_size: usize,
     /// The integrities a migrated lockfile recorded, which a tarball-URL
     /// dependency is held to before it's extracted.
@@ -118,6 +120,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         npm_firewall_mode,
         npm_firewall_lookup_mode,
         npm_firewall_policy_profile,
+        npm_firewall_bypass,
         npm_firewall_chunk_size,
         locked_integrities,
         tarball_prefetch_held,
@@ -384,6 +387,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                                         mode: npm_firewall_mode,
                                         lookup_mode: npm_firewall_lookup_mode,
                                         policy_profile: npm_firewall_policy_profile,
+                                        bypass: npm_firewall_bypass.clone(),
                                         offline,
                                         chunk_size: npm_firewall_chunk_size,
                                     },

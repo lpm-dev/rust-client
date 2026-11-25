@@ -279,6 +279,9 @@ pub(crate) enum Commands {
     /// Manage temporary approvals for guarded security weakeners.
     Security(security::SecurityArgs),
 
+    /// Manage LPM Firewall exceptions for specific package versions.
+    Firewall(security::FirewallArgs),
+
     /// Manage ephemeral caches under ~/.lpm/cache/ (metadata, tasks, dlx, mcp)
     /// and prune the global package store under ~/.lpm/store/.
     ///

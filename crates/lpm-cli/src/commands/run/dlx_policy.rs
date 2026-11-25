@@ -148,6 +148,7 @@ pub(super) fn authorize(
         &global,
         project_dir,
         options.reserve_stdout,
+        crate::npm_firewall_config::BypassRuleScope::GlobalOnly,
     )?;
     crate::source_analysis_config::resolve_install_time_source_analysis(
         &global,

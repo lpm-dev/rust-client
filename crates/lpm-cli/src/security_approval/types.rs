@@ -374,6 +374,34 @@ pub struct EffectiveAuthorizedPosture {
     pub approved_posture_source: PostureSourceKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub managed_policy: Option<ManagedPolicyStatus>,
+    /// The managed policy's `[firewall].bypass` and `bypass-malware` lists.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub managed_firewall_bypass: Vec<ManagedFirewallBypass>,
+}
+
+/// One entry of the managed policy's `[firewall].bypass` or
+/// `[firewall].bypass-malware` list.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ManagedFirewallBypass {
+    pub spec: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub covers_malware: bool,
+}
+
+/// The LPM Firewall bypass rules `lpm security status` reports.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FirewallBypassStatus {
+    /// Whether rules added with `lpm firewall bypass add` apply here.
+    pub local_rules_apply: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inactive_reason: Option<String>,
+    /// Active local rules; expired ones are left out.
+    pub rules: Vec<crate::firewall_bypass::FirewallBypassRule>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub managed_rules: Vec<ManagedFirewallBypass>,
+    /// Why the local rule store couldn't be read, when it couldn't.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -391,6 +419,7 @@ pub struct SecurityStatus {
     pub active_runtime_overrides: Vec<RuntimeOverride>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_unlocks: Vec<UnlockGrant>,
+    pub firewall_bypass: FirewallBypassStatus,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -418,6 +447,7 @@ pub(super) struct ManagedPolicy {
     pub(super) typosquat_guard: Option<crate::commands::config::TyposquatGuardSelection>,
     pub(super) firewall_mode: Option<crate::npm_firewall_config::NpmFirewallMode>,
     pub(super) firewall_policies: Option<lpm_registry::client::NpmFirewallPolicyProfile>,
+    pub(super) firewall_bypass: Vec<ManagedFirewallBypass>,
     pub(super) install_time_source_analysis: Option<bool>,
 }
 

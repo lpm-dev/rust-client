@@ -1,11 +1,13 @@
 use super::*;
 use crate::commands::install::firewall::{
     DEFAULT_NPM_FIREWALL_CHUNK_SIZE, NpmFirewallChunkedPreflightConfig, NpmFirewallLookupMode,
-    NpmFirewallPreflightResult, NpmFirewallPreflightStats, finish_npm_firewall_preflight,
-    npm_firewall_chunk_size, npm_firewall_package, npm_firewall_package_from_selected_event,
-    npm_firewall_packages, request_npm_firewall_preflight,
+    NpmFirewallPreflightResult, NpmFirewallPreflightStats, PreflightSettings,
+    finish_npm_firewall_preflight, npm_firewall_chunk_size, npm_firewall_package,
+    npm_firewall_package_from_selected_event, npm_firewall_packages,
+    request_npm_firewall_preflight, request_npm_firewall_preflight_with_bypass,
     request_npm_firewall_preflight_with_force, spawn_chunked_npm_firewall_preflight,
 };
+use crate::firewall_bypass::{FirewallBypassRule, FirewallBypassRules, FirewallBypassScope};
 use crate::npm_firewall_config::NpmFirewallMode;
 
 fn package_with_source(name: &str, source: &str) -> InstallPackage {
@@ -374,6 +376,7 @@ async fn chunked_enforce_firewall_preflight_exchanges_ci_oidc_token_once() {
             policy_profile: lpm_registry::client::NpmFirewallPolicyProfile::default(),
             offline: false,
             chunk_size: 1,
+            bypass: crate::firewall_bypass::FirewallBypassRules::none(),
         },
     );
 
@@ -475,6 +478,7 @@ fn chunked_config(mode: NpmFirewallMode) -> NpmFirewallChunkedPreflightConfig {
         policy_profile: lpm_registry::client::NpmFirewallPolicyProfile::default(),
         offline: false,
         chunk_size: 1,
+        bypass: crate::firewall_bypass::FirewallBypassRules::none(),
     }
 }
 
@@ -1864,6 +1868,302 @@ fn firewall_verdict_request_asks_once_for_peer_instances_of_one_version() {
 
     assert_eq!(requested.len(), 1);
     assert_eq!(requested[0].name, "shared");
+}
+
+fn global_rule(raw: &str) -> FirewallBypassRule {
+    FirewallBypassRule::new(
+        &crate::firewall_bypass::FirewallBypassSpec::parse(raw).unwrap(),
+        FirewallBypassScope::Global,
+        None,
+        false,
+        lpm_common::Timestamp::now(),
+    )
+}
+
+fn grouped_block(name: &str, verdict: &str, group: &str) -> serde_json::Value {
+    let mut decision = verdict_decision(name, "block");
+    decision["verdict"] = serde_json::json!(verdict);
+    decision["policy"] = serde_json::json!({ "group": group });
+    decision
+}
+
+async fn verdict_server(response: serde_json::Value) -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response))
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn enforce_with_rules(
+    response: serde_json::Value,
+    requested: &[&str],
+    bypass: FirewallBypassRules,
+) -> NpmFirewallPreflightResult {
+    let server = verdict_server(response).await;
+    let client = std::sync::Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("firewall-token"),
+    );
+    request_npm_firewall_preflight_with_bypass(
+        PreflightSettings {
+            mode: NpmFirewallMode::Enforce,
+            lookup_mode: NpmFirewallLookupMode::PackageOnly,
+            policy_profile: lpm_registry::client::NpmFirewallPolicyProfile::default(),
+            offline: false,
+            force: false,
+            bypass,
+        },
+        client,
+        requested
+            .iter()
+            .map(|name| lpm_registry::client::NpmFirewallBatchPackage {
+                name: (*name).to_string(),
+                version: "1.0.0".into(),
+                integrity: None,
+                published_at: None,
+            })
+            .collect(),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn bypass_rule_lets_a_policy_block_through_and_reports_the_rule() {
+    let result = enforce_with_rules(
+        verdict_response(
+            1,
+            vec![grouped_block(
+                "agent-tool",
+                "suspicious",
+                "lpm_ai_agent_control_surface",
+            )],
+        ),
+        &["agent-tool"],
+        FirewallBypassRules::preloaded(&[global_rule("agent-tool")], Vec::new(), None, true),
+    )
+    .await;
+
+    let stats = finish_npm_firewall_preflight(result, true).expect("the rule lifts the block");
+
+    assert_eq!(stats.bypassed.len(), 1);
+    assert_eq!(stats.bypassed[0].rule.spec, "agent-tool");
+    let json = stats.to_security_json();
+    assert_eq!(json["bypassed_count"], 1);
+    assert_eq!(json["bypassed"][0]["name"], "agent-tool");
+    assert_eq!(json["bypassed"][0]["rule"]["spec"], "agent-tool");
+    assert_eq!(stats.to_json().get("bypassed"), None);
+}
+
+#[tokio::test]
+async fn name_rule_does_not_lift_a_malware_block() {
+    let result = enforce_with_rules(
+        verdict_response(
+            1,
+            vec![grouped_block(
+                "hijacked",
+                "malicious",
+                "lpm_ai_confirmed_malware",
+            )],
+        ),
+        &["hijacked"],
+        FirewallBypassRules::preloaded(&[global_rule("hijacked")], Vec::new(), None, true),
+    )
+    .await;
+
+    let LpmError::NpmFirewallBlocked(blocked) =
+        finish_npm_firewall_preflight(result, true).unwrap_err()
+    else {
+        panic!("expected a firewall block");
+    };
+
+    assert_eq!(blocked.packages[0].block_class.as_deref(), Some("malware"));
+    assert!(!blocked.packages[0].bypassable);
+    assert_eq!(blocked.bypass_command, None);
+}
+
+#[tokio::test]
+async fn bypass_rule_lifts_no_block_row_for_a_version_the_request_did_not_ask_about() {
+    let result = enforce_with_rules(
+        verdict_response(
+            1,
+            vec![grouped_block(
+                "unrequested",
+                "suspicious",
+                "lpm_ai_suspicious",
+            )],
+        ),
+        &["requested"],
+        FirewallBypassRules::preloaded(&[global_rule("unrequested")], Vec::new(), None, true),
+    )
+    .await;
+
+    assert!(result.stats.bypassed.is_empty());
+    assert!(finish_npm_firewall_preflight(result, true).is_err());
+}
+
+#[tokio::test]
+async fn block_error_offers_one_bypass_command_for_every_liftable_block() {
+    let result = enforce_with_rules(
+        serde_json::json!({
+            "requestId": "req-test",
+            "policyMode": "product_default",
+            "summary": { "total": 2, "allow": 0, "warn": 0, "block": 2, "unknown": 0, "matched": 2 },
+            "decisions": [
+                grouped_block("first-tool", "suspicious", "lpm_ai_telemetry"),
+                grouped_block("@scope/second", "suspicious", "lpm_ai_agent_control_surface"),
+            ]
+        }),
+        &["first-tool", "@scope/second"],
+        FirewallBypassRules::none(),
+    )
+    .await;
+
+    let LpmError::NpmFirewallBlocked(blocked) =
+        finish_npm_firewall_preflight(result, true).unwrap_err()
+    else {
+        panic!("expected a firewall block");
+    };
+
+    assert_eq!(
+        blocked.bypass_command.as_deref(),
+        Some("lpm firewall bypass add \"first-tool@1.0.0\" \"@scope/second@1.0.0\"")
+    );
+}
+
+#[tokio::test]
+async fn block_error_explains_why_a_managed_policy_leaves_no_bypass() {
+    let result = enforce_with_rules(
+        verdict_response(
+            1,
+            vec![grouped_block(
+                "agent-tool",
+                "suspicious",
+                "lpm_ai_agent_control_surface",
+            )],
+        ),
+        &["agent-tool"],
+        FirewallBypassRules::preloaded(&[global_rule("agent-tool")], Vec::new(), None, false),
+    )
+    .await;
+
+    let LpmError::NpmFirewallBlocked(blocked) =
+        finish_npm_firewall_preflight(result, true).unwrap_err()
+    else {
+        panic!("expected a firewall block");
+    };
+
+    assert_eq!(blocked.bypass_command, None);
+    assert!(
+        blocked
+            .bypass_unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("[firewall].bypass")),
+        "{:?}",
+        blocked.bypass_unavailable_reason
+    );
+}
+
+#[tokio::test]
+async fn block_error_says_when_the_bypass_rules_could_not_be_read() {
+    let result = enforce_with_rules(
+        verdict_response(
+            1,
+            vec![grouped_block(
+                "agent-tool",
+                "suspicious",
+                "lpm_ai_agent_control_surface",
+            )],
+        ),
+        &["agent-tool"],
+        FirewallBypassRules::unreadable("failed signature verification"),
+    )
+    .await;
+
+    let LpmError::NpmFirewallBlocked(blocked) =
+        finish_npm_firewall_preflight(result, true).unwrap_err()
+    else {
+        panic!("expected a firewall block");
+    };
+
+    assert!(
+        blocked
+            .bypass_unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("failed signature verification")),
+        "{:?}",
+        blocked.bypass_unavailable_reason
+    );
+}
+
+#[tokio::test]
+async fn managed_bypass_entry_lifts_a_block_where_local_rules_do_not_apply() {
+    let result = enforce_with_rules(
+        verdict_response(
+            1,
+            vec![grouped_block(
+                "agent-tool",
+                "suspicious",
+                "lpm_ai_agent_control_surface",
+            )],
+        ),
+        &["agent-tool"],
+        FirewallBypassRules::preloaded(
+            &[],
+            vec![crate::security_approval::ManagedFirewallBypass {
+                spec: "agent-tool@1.0.0".into(),
+                covers_malware: false,
+            }],
+            None,
+            false,
+        ),
+    )
+    .await;
+
+    let stats = finish_npm_firewall_preflight(result, true).unwrap();
+
+    assert_eq!(stats.bypassed[0].rule.source, "managed");
+}
+
+#[tokio::test]
+async fn chunked_enforce_firewall_releases_a_chunk_whose_only_block_a_rule_lifts() {
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let server = verdict_server(verdict_response(
+        1,
+        vec![grouped_block("left-pad", "suspicious", "lpm_ai_telemetry")],
+    ))
+    .await;
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("firewall-token"),
+    );
+    let (selected_tx, selected_rx) = mpsc::channel(1);
+    let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+    let mut config = chunked_config(NpmFirewallMode::Enforce);
+    config.bypass =
+        FirewallBypassRules::preloaded(&[global_rule("left-pad@1.0.0")], Vec::new(), None, true);
+    let join = spawn_chunked_npm_firewall_preflight(selected_rx, fetch_tx, client, config);
+
+    selected_tx.send(selected_event("left-pad")).await.unwrap();
+    drop(selected_tx);
+    let (result, released) = tokio::join!(join.drain(), fetch_rx.recv());
+
+    assert_eq!(
+        released.expect("the lifted package downloads").name,
+        "left-pad"
+    );
+    let stats = finish_npm_firewall_preflight(result.unwrap(), true).unwrap();
+    assert_eq!(stats.bypassed.len(), 1);
 }
 
 #[tokio::test]

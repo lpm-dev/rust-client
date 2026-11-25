@@ -357,6 +357,8 @@ pub(super) fn parse_lpm_worker_error_body(body: &str) -> Option<LpmError> {
                         policy_group: None,
                         summary: display_text("summary", 600),
                         report_url: display_text("reportUrl", 600),
+                        block_class: None,
+                        bypassable: false,
                     },
                 ),
             )))

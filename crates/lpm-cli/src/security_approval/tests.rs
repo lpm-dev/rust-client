@@ -538,6 +538,7 @@ mode = "enforce"
             &crate::commands::config::GlobalConfig::empty(),
             &project,
             true,
+            crate::npm_firewall_config::BypassRuleScope::GlobalOnly,
         )
         .unwrap()
         .mode;
@@ -564,6 +565,7 @@ mode = "enforce"
             &firewall_global_config("off"),
             &project,
             true,
+            crate::npm_firewall_config::BypassRuleScope::GlobalOnly,
         )
         .unwrap_err();
 
@@ -1732,7 +1734,12 @@ fn resolve_firewall(
     config: &crate::commands::config::GlobalConfig,
     project: &Path,
 ) -> Result<crate::npm_firewall_config::RuntimeFirewall, LpmError> {
-    crate::npm_firewall_config::resolve_runtime_firewall(config, project, true)
+    crate::npm_firewall_config::resolve_runtime_firewall(
+        config,
+        project,
+        true,
+        crate::npm_firewall_config::BypassRuleScope::GlobalOnly,
+    )
 }
 
 #[test]
@@ -2113,6 +2120,271 @@ fn security_status_reports_config_policy_that_differs_from_the_effective_profile
         assert_eq!(
             status.effective_floor.firewall_policies["lpm_ai_confirmed_malware"],
             "block"
+        );
+    });
+}
+
+fn bypass_rule(raw: &str) -> crate::firewall_bypass::FirewallBypassRule {
+    crate::firewall_bypass::FirewallBypassRule::new(
+        &crate::firewall_bypass::FirewallBypassSpec::parse(raw).unwrap(),
+        crate::firewall_bypass::FirewallBypassScope::Global,
+        None,
+        false,
+        Timestamp::now(),
+    )
+}
+
+fn add_bypass(
+    rules: Vec<crate::firewall_bypass::FirewallBypassRule>,
+    json_output: bool,
+) -> Result<FirewallBypassAdded, LpmError> {
+    add_firewall_bypass_rules(FirewallBypassApproval {
+        rules,
+        prompt: "Allow foldrun@32.8.2 past LPM Firewall in every project",
+        command_hint: "lpm firewall bypass add \"foldrun@32.8.2\"",
+        json_output,
+    })
+}
+
+#[test]
+fn approved_firewall_bypass_is_saved_in_the_signed_store() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        let added = with_test_native_auth_result("approve", || {
+            add_bypass(vec![bypass_rule("foldrun@32.8.2")], false)
+        })
+        .unwrap();
+
+        assert_eq!(added.added.len(), 1);
+        let saved = load_local_firewall_bypass_rules().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].spec, "foldrun@32.8.2");
+        let audit = std::fs::read_to_string(audit_log_path().unwrap()).unwrap();
+        assert!(audit.contains("firewall-bypass-added"), "{audit}");
+    });
+}
+
+#[test]
+fn declined_firewall_bypass_saves_nothing() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        let err = with_test_native_auth_result("deny", || {
+            add_bypass(vec![bypass_rule("foldrun@32.8.2")], false)
+        })
+        .unwrap_err();
+
+        assert_eq!(err.error_code(), "security_approval_required");
+        assert!(load_local_firewall_bypass_rules().unwrap().is_empty());
+    });
+}
+
+#[test]
+fn firewall_bypass_in_automation_asks_a_person_to_run_the_command() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        let err =
+            without_test_native_auth(|| add_bypass(vec![bypass_rule("foldrun@32.8.2")], true))
+                .unwrap_err();
+
+        let LpmError::SecurityApprovalRequired(context) = &err else {
+            panic!("expected an approval error, got {err}");
+        };
+        assert_eq!(
+            context.suggested_command.as_deref(),
+            Some("lpm firewall bypass add \"foldrun@32.8.2\"")
+        );
+        assert!(load_local_firewall_bypass_rules().unwrap().is_empty());
+    });
+}
+
+#[test]
+fn adding_a_saved_firewall_bypass_again_asks_for_nothing() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        with_test_native_auth_result("approve", || {
+            add_bypass(vec![bypass_rule("foldrun@32.8.2")], false)
+        })
+        .unwrap();
+
+        let again =
+            without_test_native_auth(|| add_bypass(vec![bypass_rule("foldrun@32.8.2")], true))
+                .unwrap();
+
+        assert!(again.added.is_empty());
+        assert_eq!(again.unchanged.len(), 1);
+    });
+}
+
+#[test]
+fn firewall_bypass_is_refused_where_a_managed_policy_owns_the_firewall() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_managed_policy(
+            temp.path(),
+            r#"
+[firewall]
+mode = "enforce"
+"#,
+        );
+
+        let err = with_test_native_auth_result("approve", || {
+            add_bypass(vec![bypass_rule("foldrun@32.8.2")], false)
+        })
+        .unwrap_err();
+
+        assert_eq!(err.error_code(), "security_floor");
+        assert!(err.to_string().contains("[firewall].bypass"), "{err}");
+        assert!(load_local_firewall_bypass_rules().unwrap().is_empty());
+    });
+}
+
+#[test]
+fn removing_firewall_bypass_rules_needs_no_approval_and_empties_the_store() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        with_test_native_auth_result("approve", || {
+            add_bypass(
+                vec![bypass_rule("foldrun@32.8.2"), bypass_rule("left-pad")],
+                false,
+            )
+        })
+        .unwrap();
+
+        let removed = without_test_native_auth(|| {
+            remove_firewall_bypass_rules(|rule| rule.spec == "left-pad", "firewall-bypass-removed")
+        })
+        .unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(load_local_firewall_bypass_rules().unwrap().len(), 1);
+
+        let cleared = without_test_native_auth(|| {
+            remove_firewall_bypass_rules(|_| true, "firewall-bypass-cleared")
+        })
+        .unwrap();
+        assert_eq!(cleared.len(), 1);
+        assert!(!firewall_bypass_file_exists().unwrap());
+    });
+}
+
+#[test]
+fn tampered_firewall_bypass_store_is_rejected_and_repair_quarantines_it() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        with_test_native_auth_result("approve", || {
+            add_bypass(vec![bypass_rule("foldrun@32.8.2")], false)
+        })
+        .unwrap();
+        let path = firewall_bypass_path().unwrap();
+        let tampered = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("foldrun@32.8.2", "foldrun@32.8.3");
+        std::fs::write(&path, tampered).unwrap();
+
+        assert!(load_local_firewall_bypass_rules().is_err());
+        let status = load_security_status(None, true).unwrap();
+        assert!(status.firewall_bypass.error.is_some());
+        assert!(status.firewall_bypass.rules.is_empty());
+
+        let report = repair_security_state().unwrap();
+        assert!(
+            report
+                .quarantined
+                .iter()
+                .any(|entry| entry.original_path.ends_with("firewall-bypass.json")),
+            "{report:?}"
+        );
+        assert!(load_local_firewall_bypass_rules().unwrap().is_empty());
+    });
+}
+
+#[test]
+fn firewall_bypass_store_from_a_newer_lpm_applies_no_rules() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_signed_json(
+            &firewall_bypass_path().unwrap(),
+            &serde_json::json!({
+                "kind": "firewall-bypass",
+                "schema_version": 2,
+                "rules": [],
+            }),
+        )
+        .unwrap();
+
+        let err = load_local_firewall_bypass_rules().unwrap_err();
+
+        assert!(err.to_string().contains("newer LPM CLI"), "{err}");
+    });
+}
+
+#[test]
+fn signed_json_of_another_kind_is_not_read_as_firewall_bypass_rules() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_signed_json(
+            &firewall_bypass_path().unwrap(),
+            &serde_json::json!({ "schema_version": 1, "rules": [] }),
+        )
+        .unwrap();
+
+        assert!(load_local_firewall_bypass_rules().is_err());
+    });
+}
+
+#[test]
+fn security_status_reports_active_firewall_bypass_rules_and_managed_entries() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        with_test_native_auth_result("approve", || {
+            add_bypass(vec![bypass_rule("foldrun@32.8.2")], false)
+        })
+        .unwrap();
+        write_managed_policy(
+            temp.path(),
+            r#"
+[firewall]
+bypass = ["left-pad@^1.0.0"]
+bypass-malware = ["evil@1.0.0"]
+"#,
+        );
+
+        let status = load_security_status(None, true).unwrap();
+
+        assert!(status.firewall_bypass.local_rules_apply);
+        assert_eq!(status.firewall_bypass.rules[0].spec, "foldrun@32.8.2");
+        assert_eq!(
+            status.firewall_bypass.managed_rules,
+            vec![
+                ManagedFirewallBypass {
+                    spec: "left-pad@^1.0.0".into(),
+                    covers_malware: false,
+                },
+                ManagedFirewallBypass {
+                    spec: "evil@1.0.0".into(),
+                    covers_malware: true,
+                },
+            ]
+        );
+    });
+}
+
+#[test]
+fn managed_bypass_malware_entries_must_name_exact_versions() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_managed_policy(
+            temp.path(),
+            r#"
+[firewall]
+bypass-malware = ["evil"]
+"#,
+        );
+
+        let err = load_effective_authorized_posture().unwrap_err();
+
+        assert!(
+            err.to_string().contains("must name an exact version"),
+            "{err}"
         );
     });
 }

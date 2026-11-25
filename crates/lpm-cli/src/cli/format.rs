@@ -453,6 +453,17 @@ pub(crate) fn json_error_value(error: &lpm_common::LpmError) -> serde_json::Valu
                     .iter()
                     .map(npm_firewall_blocked_package_json)
                     .collect::<Vec<_>>(),
+                "bypassed": blocked
+                    .bypassed
+                    .iter()
+                    .map(|bypassed| serde_json::json!({
+                        "name": bypassed.name,
+                        "version": bypassed.version,
+                        "rule": bypassed.rule,
+                    }))
+                    .collect::<Vec<_>>(),
+                "bypass_command": blocked.bypass_command,
+                "bypass_unavailable_reason": blocked.bypass_unavailable_reason,
             }
         }),
         lpm_common::LpmError::PoolAttributionUnconfirmed { reason } => serde_json::json!({
@@ -537,6 +548,8 @@ fn npm_firewall_blocked_package_json(
         "reason": package.reason,
         "decision_id": package.decision_id,
         "match_source": package.match_source,
+        "block_class": package.block_class,
+        "bypassable": package.bypassable,
     });
     if let Some(group) = &package.policy_group {
         json["policy"] = serde_json::json!({ "group": group });
@@ -577,6 +590,14 @@ fn next_steps_for_error(error: &lpm_common::LpmError) -> Option<serde_json::Valu
         lpm_common::LpmError::TyposquatSuspected(context) => {
             context.suggested_command.as_deref().map(|command| {
                 crate::json_contract::command_next_steps("Install the suggested package", command)
+            })
+        }
+        lpm_common::LpmError::NpmFirewallBlocked(blocked) => {
+            blocked.bypass_command.as_deref().map(|command| {
+                crate::json_contract::command_next_steps(
+                    "Review each report, then allow the blocked versions past LPM Firewall; a person approves it with Touch ID, Windows Hello or a password",
+                    command,
+                )
             })
         }
         lpm_common::LpmError::SecurityApprovalRequired(approval) => {
@@ -1251,6 +1272,43 @@ fn npm_firewall_blocked_lines(
                     &format!("some packages weren't checked: {reason}"),
                 );
             }
+            for bypassed in &blocked.bypassed {
+                push_untrusted_detail(
+                    &mut lines,
+                    "allowed",
+                    &format!(
+                        "{}@{} by your bypass rule {}",
+                        bypassed.name, bypassed.version, bypassed.rule
+                    ),
+                );
+            }
+            for package in &blocked.packages {
+                match package.block_class.as_deref() {
+                    Some("malware") => push_untrusted_detail(
+                        &mut lines,
+                        "malware",
+                        &format!(
+                            "{} is flagged as malware; read its report first (`lpm firewall bypass add --help` explains `--allow-malware`)",
+                            package.coordinate()
+                        ),
+                    ),
+                    Some("server_review") => push_untrusted_detail(
+                        &mut lines,
+                        "held",
+                        &format!(
+                            "{} is held for LPM review, which a local rule can't lift",
+                            package.coordinate()
+                        ),
+                    ),
+                    _ => {}
+                }
+            }
+            if let Some(reason) = &blocked.bypass_unavailable_reason {
+                push_untrusted_detail(&mut lines, "note", reason);
+            }
+            if let Some(command) = &blocked.bypass_command {
+                push_detail(&mut lines, "allow", install_ui::yellow(command));
+            }
             lines
         }
     }
@@ -1660,6 +1718,8 @@ mod tests {
                     policy_group: None,
                     summary: None,
                     report_url: None,
+                    block_class: None,
+                    bypassable: false,
                 },
             ),
         ));
@@ -1692,9 +1752,14 @@ mod tests {
                     policy_group: Some("lpm_ai_agent_control_surface".into()),
                     summary: Some("`foldrun talk` can send a credential to a gateway.".into()),
                     report_url: Some("https://firewall.lpm.dev/npm/foldrun/v/32.8.2".into()),
+                    block_class: Some("policy".into()),
+                    bypassable: true,
                 }],
                 unattributed_count,
                 unchecked_reason: None,
+                bypassed: Vec::new(),
+                bypass_command: Some("lpm firewall bypass add \"foldrun@32.8.2\"".into()),
+                bypass_unavailable_reason: None,
             },
         ))
     }
@@ -1709,6 +1774,7 @@ mod tests {
             [
                 "Blocked by LPM Firewall",
                 "  reason 1 package blocked by LPM Firewall",
+                "  allow lpm firewall bypass add \"foldrun@32.8.2\"",
             ]
         );
     }

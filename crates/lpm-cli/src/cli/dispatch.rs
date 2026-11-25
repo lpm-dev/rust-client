@@ -1983,6 +1983,10 @@ async fn async_main(cli: Cli) -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::policy::run(action, &cwd, cli.json).await
         }
+        Commands::Firewall(args) => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::firewall::run(&args.action, &client, &cwd, cli.json).await
+        }
         Commands::Security(args) => {
             let status_dir = match &args.action {
                 commands::security::SecurityCmd::Status {

@@ -102,6 +102,12 @@ pub(crate) struct PolicyArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct FirewallArgs {
+    #[command(subcommand)]
+    pub(crate) action: commands::firewall::FirewallCmd,
+}
+
+#[derive(Args)]
 pub(crate) struct SecurityArgs {
     #[command(subcommand)]
     pub(crate) action: commands::security::SecurityCmd,

@@ -561,6 +561,8 @@ async fn download_tarball_maps_firewall_block_error() {
                     policy_group: None,
                     summary: None,
                     report_url: None,
+                    block_class: None,
+                    bypassable: false,
                 }
             )
         ),

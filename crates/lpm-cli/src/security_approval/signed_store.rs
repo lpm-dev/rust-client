@@ -408,6 +408,7 @@ fn signed_security_state_paths() -> Result<Vec<PathBuf>, LpmError> {
     push_existing_path(&mut paths, approved_posture_path()?)?;
     push_existing_path(&mut paths, approved_global_trust_path()?)?;
     push_existing_path(&mut paths, audit_head_path()?)?;
+    push_existing_path(&mut paths, firewall_bypass_path()?)?;
     push_existing_json_files(&mut paths, approved_projects_dir()?)?;
     push_existing_json_files(&mut paths, unlocks_dir()?)?;
     paths.sort();

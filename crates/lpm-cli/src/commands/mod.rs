@@ -18,6 +18,7 @@ pub mod download;
 pub mod env;
 pub mod fetch;
 pub mod filter;
+pub mod firewall;
 pub mod global;
 mod global_util;
 pub mod graph;

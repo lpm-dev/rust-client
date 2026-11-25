@@ -45,3 +45,11 @@ pub(super) fn audit_head_path() -> Result<PathBuf, LpmError> {
 pub(super) fn unlocks_lock_path() -> Result<PathBuf, LpmError> {
     Ok(security_dir()?.join("unlocks.lock"))
 }
+
+pub(super) fn firewall_bypass_path() -> Result<PathBuf, LpmError> {
+    Ok(security_dir()?.join("firewall-bypass.json"))
+}
+
+pub(super) fn firewall_bypass_lock_path() -> Result<PathBuf, LpmError> {
+    Ok(security_dir()?.join("firewall-bypass.lock"))
+}

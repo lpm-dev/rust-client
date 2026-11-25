@@ -1,0 +1,53 @@
+---
+source: tests/workflows/tests/firewall_bypass.rs
+expression: envelope
+---
+{
+  "schema_version": 1,
+  "success": true,
+  "firewall_mode": "off",
+  "local_rules_apply": true,
+  "inactive_reason": null,
+  "rules": [
+    {
+      "id": "fwb_10",
+      "spec": "agent-tool",
+      "name": "agent-tool",
+      "versions": null,
+      "kind": "any",
+      "scope": "global",
+      "project_root": null,
+      "covers_malware": false,
+      "source": "local",
+      "added_at": "2026-11-25T10:00:00+00:00",
+      "expires_at": null,
+      "expired": false,
+      "reason": "reviewed the report",
+      "added_verdict": null
+    },
+    {
+      "id": "fwb_14",
+      "spec": "hijacked@1.0.0",
+      "name": "hijacked",
+      "versions": "1.0.0",
+      "kind": "exact",
+      "scope": "global",
+      "project_root": null,
+      "covers_malware": true,
+      "source": "local",
+      "added_at": "2026-11-25T10:00:00+00:00",
+      "expires_at": "2026-01-01T00:00:00+00:00",
+      "expired": true,
+      "reason": null,
+      "added_verdict": null
+    }
+  ],
+  "managed_rules": [
+    {
+      "spec": "left-pad@^1.0.0",
+      "covers_malware": false,
+      "source": "managed"
+    }
+  ],
+  "count": 2
+}

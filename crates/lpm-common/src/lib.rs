@@ -83,8 +83,8 @@ pub use command_name::{PortableCommandNameError, validate_portable_command_name}
 pub use error::{
     ArtifactUnavailableErrorContext, ArtifactUnavailableKind, EngineMismatchErrorContext, LpmError,
     NpmFirewallBlockSource, NpmFirewallBlockedErrorContext, NpmFirewallBlockedPackage,
-    ResolutionErrorContext, ResolutionFailureKind, SecurityApprovalRequiredErrorContext,
-    TyposquatErrorContext, TyposquatErrorFinding,
+    NpmFirewallBypassedPackage, ResolutionErrorContext, ResolutionFailureKind,
+    SecurityApprovalRequiredErrorContext, TyposquatErrorContext, TyposquatErrorFinding,
 };
 pub use global_fs::{GlobalInstallDirectory, GlobalInstallsDirectory, GlobalStateDirectories};
 pub use integrity::{Integrity, SriComparison, compare_sri};
