@@ -2083,3 +2083,52 @@ async fn batch_enforce_checks_the_batches_after_a_failed_one() {
     assert_eq!(blocked.packages[0].name, "p-512");
     assert!(blocked.unchecked_reason.is_some());
 }
+
+#[tokio::test]
+async fn chunked_enforce_releases_nothing_an_allowed_chunk_clears_after_a_failure() {
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .and(body_string_contains("\"name\":\"broken-a\""))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .and(body_string_contains("\"name\":\"clean-c\""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(verdict_response(
+                    0,
+                    vec![verdict_decision("clean-c", "allow")],
+                ))
+                .set_delay(std::time::Duration::from_millis(300)),
+        )
+        .mount(&server)
+        .await;
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("firewall-token"),
+    );
+    let (selected_tx, selected_rx) = mpsc::channel(4);
+    let (fetch_tx, mut fetch_rx) = mpsc::channel(4);
+    let join = spawn_chunked_npm_firewall_preflight(
+        selected_rx,
+        fetch_tx,
+        client,
+        chunked_config(NpmFirewallMode::Enforce),
+    );
+
+    selected_tx.send(selected_event("clean-c")).await.unwrap();
+    selected_tx.send(selected_event("broken-a")).await.unwrap();
+    drop(selected_tx);
+
+    assert!(join.drain().await.is_err());
+    assert!(fetch_rx.recv().await.is_none());
+}

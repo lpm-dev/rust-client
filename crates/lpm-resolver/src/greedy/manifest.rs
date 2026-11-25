@@ -856,6 +856,9 @@ pub(super) fn exact_metadata_fast_path_eligible(
 pub(super) enum ExactMetadataFetchOutcome {
     Hit(FetchedMetadata),
     Fallback,
+    /// LPM Firewall refused the version; the packument would only be refused
+    /// or name nothing better, so the refusal is the answer.
+    Refused(ResolveError),
 }
 
 pub(super) async fn try_fetch_exact_metadata_for_resolver(
@@ -902,6 +905,12 @@ pub(super) async fn try_fetch_exact_metadata_for_resolver(
                 "npm version document for {canonical}@{version} omitted install distribution fields; falling back to the packument"
             );
         }
+        Err(
+            error @ ResolveError::Registry {
+                failure: crate::RegistryFetchFailure::FirewallBlocked(_),
+                ..
+            },
+        ) => return ExactMetadataFetchOutcome::Refused(error),
         Err(error) => {
             lpm_registry::timing::record_exact_document_fallback(
                 lpm_registry::timing::ExactDocumentFallbackReason::FetchError,

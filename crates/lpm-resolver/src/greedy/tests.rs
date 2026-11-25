@@ -8242,3 +8242,43 @@ fn process_edge_defers_selected_event_under_incompatible_optional_and_promotes_o
     let orphan_id = state.resolved[&CanonicalKey::npm("orphan-child")][0].1;
     assert!(!state.nodes[orphan_id as usize].host_materializable);
 }
+
+#[tokio::test]
+async fn exact_metadata_fast_path_reports_a_firewall_refusal_instead_of_falling_back() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": "blocked_by_lpm_firewall",
+            "package": "blocked-exact@1.0.0",
+            "verdict": "malicious",
+            "reason": "the registry policy refused this download"
+        })))
+        .mount(&server)
+        .await;
+    let client = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_npm_registry_url(server.uri())
+        .with_cache_dir(None);
+    let routes = RouteTable::from_mode_only(RouteMode::Direct);
+
+    let outcome = try_fetch_exact_metadata_for_resolver(
+        &client,
+        &routes,
+        &CanonicalKey::npm("blocked-exact"),
+        "1.0.0",
+        &ResolverPolicy::default(),
+        false,
+        false,
+    )
+    .await;
+
+    assert!(matches!(
+        outcome,
+        ExactMetadataFetchOutcome::Refused(ResolveError::Registry {
+            failure: crate::RegistryFetchFailure::FirewallBlocked(_),
+            ..
+        })
+    ));
+}

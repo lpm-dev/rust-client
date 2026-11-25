@@ -1100,6 +1100,10 @@ impl MetadataFetchScheduler {
                         drop(permit);
                         Ok(fetched)
                     }
+                    ExactMetadataFetchOutcome::Refused(error) => {
+                        drop(permit);
+                        Err(error)
+                    }
                     ExactMetadataFetchOutcome::Fallback => {
                         drop(active_fetch);
                         let mut exact_permit = Some(permit);
