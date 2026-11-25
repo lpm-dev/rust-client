@@ -861,13 +861,14 @@ impl LauncherBinding {
 }
 
 impl VersionProbe {
+    /// Runs the staged binary and checks the version it reports. The caller
+    /// checks that the staged file is still the verified one, before and
+    /// after.
     #[cfg(any(not(target_os = "macos"), test))]
-    pub(super) fn verify_staged(
+    pub(super) fn verify_staged_version(
         temporary: &tempfile::NamedTempFile,
-        expected_sha256: &str,
         version: &str,
     ) -> Result<(), LpmError> {
-        super::download::ensure_staged_file_unchanged(temporary, expected_sha256)?;
         let path = temporary.path();
         let path = std::fs::canonicalize(path).map_err(|error| {
             LpmError::SelfUpdate(format!(
@@ -2612,7 +2613,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn staged_release_probe_rejects_a_binary_with_the_wrong_embedded_version() {
-        use sha2::Digest as _;
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt;
 
@@ -2626,10 +2626,9 @@ mod tests {
             .as_file()
             .set_permissions(std::fs::Permissions::from_mode(0o755))
             .unwrap();
-        let sha256 = hex::encode(sha2::Sha256::digest(body));
         let temporary = super::super::download::finish_staged_binary(temporary).unwrap();
 
-        let error = VersionProbe::verify_staged(&temporary, &sha256, "1.2.3").unwrap_err();
+        let error = VersionProbe::verify_staged_version(&temporary, "1.2.3").unwrap_err();
         assert!(
             error.to_string().contains("exact version 1.2.3"),
             "unexpected error: {error}"

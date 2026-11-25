@@ -18,17 +18,20 @@ fail() {
 # every host has one address in Apple's IPv4 network and one in its IPv6
 # network, and ocsp.apple.com is served only from outside Apple's networks.
 #
-# curl reaches a host by name at the first address the hosts file pins it to,
-# or at an address of its own when the hosts file doesn't name it; at a
-# --resolve address it uses that one. An address is unreachable when the
+# curl reaches a host by name when any address the hosts file pins it to is
+# reachable, as curl tries each, or at an address of its own when the hosts
+# file doesn't name it; at a --resolve address it uses that one. An address is unreachable when the
 # firewall's active rules name it or a network holding it. Without IPv6
 # (no-ipv6) no IPv6 address is reached. A host in never-answers times out
 # whatever happens. A "host status" line in answers-anyway connects whatever
-# is blocked and then exits with that status, such as 35 for a TLS error.
+# is blocked and then exits with that status, such as 35 for a TLS error or
+# 28 for a service that accepts and then stalls. Like curl -w
+# '%{time_connect}', it prints 0.000000 when no connection opened.
 #
-# pfctl applies the rules it is given, none of them when inert-firewall
-# exists, the IPv4 ones only when inert-ipv6 exists, and refuses them when
-# pfctl-fails exists.
+# pfctl applies the rules it is given: none of them when inert-firewall
+# exists, none of the IPv6 entries when inert-ipv6 exists, none of the network
+# entries when inert-networks exists, and it refuses them when pfctl-fails
+# exists.
 make_runner() {
 	rm -rf "$work/runner" "$work/state"
 	mkdir -p "$work/runner/bin"
@@ -37,6 +40,7 @@ make_runner() {
 	printf '17.253.0.1\n' >"$work/runner/dns-a"
 	printf '2a01:b740::1\n' >"$work/runner/dns-aaaa"
 	printf '2.22.144.17\n' >"$work/runner/dns-a.ocsp.apple.com"
+	printf '2a02:26f0::1\n' >"$work/runner/dns-aaaa.ocsp.apple.com"
 	: >"$work/runner/active-rules"
 	: >"$work/runner/never-answers"
 	: >"$work/runner/answers-anyway"
@@ -48,7 +52,9 @@ case "\$1" in
 -E)
 	[ -e "$work/runner/pfctl-fails" ] && { echo "pfctl: syntax error" >&2; exit 1; }
 	if [ -e "$work/runner/inert-ipv6" ]; then
-		grep -v inet6 "\$3" >"$work/runner/active-rules"
+		awk '{ out = ""; for (i = 1; i <= NF; i++) if (\$i !~ /:/) out = out \$i " "; print out }' "\$3" >"$work/runner/active-rules"
+	elif [ -e "$work/runner/inert-networks" ]; then
+		awk '{ out = ""; for (i = 1; i <= NF; i++) if (\$i !~ /\//) out = out \$i " "; print out }' "\$3" >"$work/runner/active-rules"
 	elif [ ! -e "$work/runner/inert-firewall" ]; then
 		cp "\$3" "$work/runner/active-rules"
 	fi
@@ -79,25 +85,35 @@ while [ "\$#" -gt 0 ]; do
 done
 host="\${url#https://}"
 host="\${host%/}"
-grep -Fxq "\$host" "$work/runner/never-answers" && exit 28
+unconnected() { printf '0.000000'; exit "\$1"; }
+connected() { printf '0.050000'; exit "\$1"; }
+grep -Fxq "\$host" "$work/runner/never-answers" && unconnected 28
 status=\$(awk -v host="\$host" '\$1 == host { print \$2 }' "$work/runner/answers-anyway")
-[ -n "\$status" ] && exit "\$status"
-if [ -z "\$address" ]; then
-	address=\$(awk -v host="\$host" '\$2 == host { print \$1; exit }' "$work/runner/hosts")
-	[ -n "\$address" ] || exit 0
-fi
-address="\${address#[}"
-address="\${address%]}"
-case "\$address" in
-*:*) [ -e "$work/runner/no-ipv6" ] && exit 7 ;;
-esac
+[ -n "\$status" ] && connected "\$status"
 rules="$work/runner/active-rules"
-grep -Eq "[ {]\$address[ }]" "\$rules" && exit 28
-case "\$address" in
-17.*) grep -Fq '17.0.0.0/8' "\$rules" && exit 28 ;;
-2a01:b740:*) grep -Fq '2a01:b740::/32' "\$rules" && exit 28 ;;
-esac
-exit 0
+reachable() {
+	case "\$1" in
+	*:*) [ -e "$work/runner/no-ipv6" ] && return 1 ;;
+	esac
+	grep -Eq "[ {]\$1[ }]" "\$rules" && return 1
+	case "\$1" in
+	17.*) grep -Fq '17.0.0.0/8' "\$rules" && return 1 ;;
+	2a01:b740:*) grep -Fq '2a01:b740::/32' "\$rules" && return 1 ;;
+	esac
+	return 0
+}
+if [ -n "\$address" ]; then
+	address="\${address#[}"
+	address="\${address%]}"
+	if reachable "\$address"; then connected 0; fi
+	unconnected 28
+fi
+pinned=\$(awk -v host="\$host" '\$2 == host { print \$1 }' "$work/runner/hosts")
+[ -n "\$pinned" ] || connected 0
+for address in \$pinned; do
+	if reachable "\$address"; then connected 0; fi
+done
+unconnected 28
 EOF
 	printf '#!/bin/bash\necho "dscacheutil $*" >>"%s"\n' "$work/runner/calls" >"$work/runner/bin/dscacheutil"
 	printf '#!/bin/bash\necho "killall $*" >>"%s"\n' "$work/runner/calls" >"$work/runner/bin/killall"
@@ -134,12 +150,24 @@ expect_block_failure() {
 }
 
 make_runner
+: >"$work/runner/dns-aaaa.www.apple.com"
 run_helper block "$work/state" >/dev/null || fail "block did not confirm Apple's services unreachable"
-for host in api.apple-cloudkit.com ocsp2.apple.com crl.apple.com valid.apple.com; do
+for host in api.apple-cloudkit.com ocsp2.apple.com crl.apple.com valid.apple.com certs.apple.com www.apple.com; do
 	grep -Fxq "17.253.0.1 $host" "$work/runner/hosts" || fail "$host is not pinned to its address"
 	grep -Fxq "$host 17.253.0.1" "$work/state/targets" || fail "$host's address in Apple's network was not checked"
 done
-for host in api.apple-cloudkit.com ocsp.apple.com ocsp2.apple.com crl.apple.com valid.apple.com; do
+grep -Fxq "100::1 www.apple.com" "$work/runner/hosts" \
+	|| fail "a host DNS gave no IPv6 address is not pinned to a dropped one, so an IPv6 lookup could reach it"
+grep -Fq ' 100::1 ' "$work/runner/active-rules" || fail "the IPv6 placeholder a host is pinned to is not dropped"
+grep -Fxq "192.0.2.1 ocsp.apple.com" "$work/runner/hosts" && fail "a host with an IPv4 address was pinned to the placeholder too"
+if grep -Fq ' 17.253.0.1 ' "$work/runner/active-rules"; then
+	fail "an address inside Apple's network is listed on its own, so the network entry is never shown to work"
+fi
+grep -Fxq "2a02:26f0::1 ocsp.apple.com" "$work/runner/hosts" || fail "ocsp.apple.com is not pinned to its IPv6 address outside Apple's networks"
+grep -Fxq "ocsp.apple.com" "$work/state/targets" || fail "ocsp.apple.com was not checked by name"
+grep -Fq ' 2a02:26f0::1 ' "$work/runner/active-rules" \
+	|| fail "the firewall does not drop an IPv6 address outside Apple's networks that an Apple host resolves to"
+for host in api.apple-cloudkit.com ocsp2.apple.com crl.apple.com valid.apple.com certs.apple.com; do
 	grep -Fxq "2a01:b740::1 $host" "$work/runner/hosts" || fail "$host is not pinned to its IPv6 address"
 	grep -Fxq "$host [2a01:b740::1]" "$work/state/targets" || fail "$host's IPv6 address was not checked"
 	grep -Fxq "$host" "$work/state/targets" || fail "$host was not checked by name"
@@ -169,13 +197,23 @@ expect_block_failure after-blocking "ocsp.apple.com is still reachable" "a TLS e
 echo "PASS: a service that connects and then fails TLS still counts as reachable"
 
 make_runner
+printf 'ocsp.apple.com 28\n' >"$work/runner/answers-anyway"
+expect_block_failure after-blocking "ocsp.apple.com is still reachable" "a service that accepts and then stalls was taken for a blocked one"
+echo "PASS: a service that accepts a connection and then stalls still counts as reachable"
+
+make_runner
 : >"$work/runner/inert-firewall"
 expect_block_failure after-blocking "still reachable" "block reported Apple's services unreachable while the firewall let them through"
 echo "PASS: block fails when the firewall doesn't stop the traffic"
 
 make_runner
+: >"$work/runner/inert-networks"
+expect_block_failure after-blocking "api.apple-cloudkit.com is still reachable" "block reported Apple's network unreachable while only single addresses were dropped"
+echo "PASS: block fails when the firewall drops single addresses but not Apple's networks"
+
+make_runner
 : >"$work/runner/inert-ipv6"
-expect_block_failure after-blocking "still reachable at [2a01:b740::1]" "block reported Apple's IPv6 network unreachable while the firewall let it through"
+expect_block_failure after-blocking "api.apple-cloudkit.com is still reachable" "block reported Apple's IPv6 network unreachable while the firewall let it through"
 echo "PASS: block fails when the firewall doesn't stop traffic to Apple's IPv6 network"
 
 make_runner

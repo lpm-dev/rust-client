@@ -2344,9 +2344,8 @@ fn verify_release_asset_digest(
 }
 
 /// What a standalone update refused that the official installer can take over
-/// from. Refusals of the installation's location or permissions, of staged
-/// files that changed, and failed replacements get no installer: reinstalling
-/// wouldn't fix them.
+/// from. Other refusals name no installer, since reinstalling wouldn't fix
+/// them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StandaloneRefusal {
     /// The release's provenance or integrity.
@@ -2362,7 +2361,7 @@ enum StandaloneRefusal {
 /// installer can't tell who published a Linux release's checksums, so a Linux
 /// release the updater couldn't verify is reinstalled only with its signature
 /// required; on macOS the installer checks the app's Developer ID signature,
-/// which only LPM's release workflow can produce. Windows has no such
+/// which only LPM's signing identity can produce. Windows has no such
 /// installer.
 fn with_installer_recovery(
     error: LpmError,
@@ -2438,7 +2437,12 @@ async fn run_standalone_update(
 
     let assets = verify_and_stage_for_standalone(version, &staging_anchor, human_output)
         .await
-        .map_err(refused(StandaloneRefusal::ReleaseVerification))?;
+        .map_err(|failure| match failure {
+            StagingFailure::ReleaseVerification(error) => {
+                refused(StandaloneRefusal::ReleaseVerification)(error)
+            }
+            StagingFailure::Local(error) => error,
+        })?;
 
     #[cfg(target_os = "macos")]
     {
@@ -2460,12 +2464,12 @@ async fn run_standalone_update(
     let sandbox_helper = None;
     #[cfg(not(target_os = "macos"))]
     let sandbox_helper = {
-        VersionProbe::verify_staged(
+        ensure_staged_file_unchanged(
             &assets.staged_binary.temporary,
             &assets.staged_binary.sha256,
-            version,
-        )
-        .map_err(refused(StandaloneRefusal::Compatibility))?;
+        )?;
+        VersionProbe::verify_staged_version(&assets.staged_binary.temporary, version)
+            .map_err(refused(StandaloneRefusal::Compatibility))?;
         ensure_staged_file_unchanged(
             &assets.staged_binary.temporary,
             &assets.staged_binary.sha256,
@@ -3449,9 +3453,8 @@ async fn fetch_verified_release_manifest(
             .await?
             .ok_or_else(|| {
                 LpmError::SelfUpdate(format!(
-                    "release v{version} does not ship SHA256SUMS.txt — this release predates LPM's \
-                     signed-install gate. Install manually from \
-                     https://github.com/lpm-dev/rust-client/releases/v{version}"
+                    "release v{version} does not ship SHA256SUMS.txt, so it can't be verified; \
+                     only releases from before LPM's signed-install gate lack one"
                 ))
             })
     };
@@ -3461,26 +3464,23 @@ async fn fetch_verified_release_manifest(
             .ok_or_else(|| {
                 LpmError::SelfUpdate(format!(
                     "release v{version} ships SHA256SUMS.txt but not SHA256SUMS.txt.sigstore — \
-                     cannot cryptographically verify the manifest. Install manually."
+                     cannot cryptographically verify the manifest"
                 ))
             })
     };
     let release_metadata = async {
-        fetch_github_release(version)
-            .await
-            .map_err(|e| match e {
-                LookupError::NotFound(_) => LpmError::SelfUpdate(format!(
-                    "GitHub has no release at tag v{version} — cannot anchor the Sigstore replay window. \
-                     Install manually."
-                )),
-                LookupError::MalformedResponse(msg) => LpmError::SelfUpdate(format!(
-                    "release v{version} did not expose valid release metadata: {msg}. \
+        fetch_github_release(version).await.map_err(|e| match e {
+            LookupError::NotFound(_) => LpmError::SelfUpdate(format!(
+                "GitHub has no release at tag v{version} — cannot anchor the Sigstore replay window"
+            )),
+            LookupError::MalformedResponse(msg) => LpmError::SelfUpdate(format!(
+                "release v{version} did not expose valid release metadata: {msg}. \
                      Cannot bind the Sigstore attestation to the requested release."
-                )),
-                other => LpmError::Network(format!(
-                    "could not fetch release metadata for v{version}: {other}"
-                )),
-            })
+            )),
+            other => LpmError::Network(format!(
+                "could not fetch release metadata for v{version}: {other}"
+            )),
+        })
     };
 
     let (manifest_bytes, bundle_bytes, release) =
@@ -3491,33 +3491,62 @@ async fn fetch_verified_release_manifest(
     verify_release_manifest(version, &manifest_bytes, &bundle_bytes, &release)
 }
 
+/// Why a standalone release couldn't be staged: it didn't verify, or
+/// something on this machine failed, such as a staged file replaced under the
+/// updater. Only the first is the release's doing.
+#[derive(Debug)]
+enum StagingFailure {
+    ReleaseVerification(LpmError),
+    Local(LpmError),
+}
+
+impl From<LpmError> for StagingFailure {
+    fn from(error: LpmError) -> Self {
+        Self::Local(error)
+    }
+}
+
+impl StagingFailure {
+    #[cfg(test)]
+    fn into_error(self) -> LpmError {
+        match self {
+            Self::ReleaseVerification(error) | Self::Local(error) => error,
+        }
+    }
+}
+
 async fn verify_and_stage_for_standalone(
     version: &str,
     staging_anchor: &std::path::Path,
     human_output: bool,
-) -> Result<StandaloneAssets, LpmError> {
+) -> Result<StandaloneAssets, StagingFailure> {
     let (platform, ext) = detect_platform()?;
     let binary_name = standalone_asset_name_for(std::env::consts::OS, platform, ext);
     let asset_url = github_release_download_url(version, &binary_name);
 
     let client = release_http_client()?;
-    let release = fetch_verified_release_manifest(&client, version, human_output).await?;
+    let release = fetch_verified_release_manifest(&client, version, human_output)
+        .await
+        .map_err(StagingFailure::ReleaseVerification)?;
     if !release.entries.contains_key(&binary_name) {
-        return Err(LpmError::SelfUpdate(format!(
-            "SHA256SUMS.txt does not enumerate `{binary_name}` for this platform — release pipeline may be missing artifacts"
+        return Err(StagingFailure::ReleaseVerification(LpmError::SelfUpdate(
+            format!(
+                "SHA256SUMS.txt does not enumerate `{binary_name}` for this platform — release pipeline may be missing artifacts"
+            ),
         )));
     }
 
     let staged = fetch_asset_to_staged_file(&client, &asset_url, ASSET_MAX_BYTES, staging_anchor)
         .await?
         .ok_or_else(|| {
-            LpmError::SelfUpdate(format!(
+            StagingFailure::ReleaseVerification(LpmError::SelfUpdate(format!(
                 "release v{version} advertises `{binary_name}` in SHA256SUMS.txt but the asset is missing at {} — release-pipeline bug",
                 safe_remote_label(&asset_url)
-            ))
+            )))
         })?;
 
-    let audit = verify_release_asset_digest(&release, staged.sha256.clone(), &binary_name)?;
+    let audit = verify_release_asset_digest(&release, staged.sha256.clone(), &binary_name)
+        .map_err(StagingFailure::ReleaseVerification)?;
 
     if human_output {
         install_ui::done_untrusted(&format!(
@@ -3552,7 +3581,9 @@ async fn verify_and_stage_for_standalone(
 #[cfg(test)]
 async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAssets, LpmError> {
     let destination = std::env::temp_dir().join("lpm-self-update-test-bin");
-    verify_and_stage_for_standalone(version, &destination, false).await
+    verify_and_stage_for_standalone(version, &destination, false)
+        .await
+        .map_err(StagingFailure::into_error)
 }
 
 /// Atomically swap the running binary at `current_exe` for a verified,
@@ -5291,6 +5322,37 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
             .await;
     }
 
+    /// A release that doesn't verify is the release's doing, so its refusal
+    /// is the one that names an installer which authenticates the release.
+    #[tokio::test]
+    async fn release_that_fails_to_verify_is_a_release_verification_failure() {
+        let server = wiremock::MockServer::start().await;
+        mount_release_metadata(&server).await;
+        mount_placeholder_bundle(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/download/v0.42.0/SHA256SUMS.txt"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        run_standalone_against_server(&server, "0.42.0", || async {
+            let destination = tempfile::tempdir().unwrap();
+            let failure =
+                verify_and_stage_for_standalone("0.42.0", &destination.path().join("lpm"), false)
+                    .await
+                    .expect_err("a release without a manifest must not stage");
+            assert!(
+                matches!(
+                    &failure,
+                    StagingFailure::ReleaseVerification(LpmError::SelfUpdate(reason))
+                        if reason.contains("does not ship SHA256SUMS.txt")
+                ),
+                "{failure:?}"
+            );
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn standalone_update_refuses_when_manifest_is_404() {
         let server = wiremock::MockServer::start().await;
@@ -5311,10 +5373,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
                 .expect_err("missing manifest must fail-closed");
             match err {
                 LpmError::SelfUpdate(msg) => {
-                    assert!(
-                        msg.contains("predates LPM's signed-install gate"),
-                        "msg: {msg}"
-                    );
+                    assert!(msg.contains("does not ship SHA256SUMS.txt"), "msg: {msg}");
                     assert!(msg.contains("0.42.0"), "version must appear: {msg}");
                 }
                 other => panic!("expected SelfUpdate, got {other:?}"),
@@ -5513,11 +5572,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
                 .expect_err("missing release tag must fail-closed");
             match err {
                 LpmError::SelfUpdate(msg) => {
-                    assert!(
-                        msg.contains("no release at tag v0.42.0")
-                            || msg.contains("Install manually"),
-                        "msg points the user at manual install: {msg}"
-                    );
+                    assert!(msg.contains("no release at tag v0.42.0"), "msg: {msg}");
                 }
                 other => panic!("expected SelfUpdate, got {other:?}"),
             }
@@ -7069,7 +7124,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     }
 
     /// The installer checks the app's Developer ID signature, which only
-    /// LPM's release workflow can produce.
+    /// LPM's signing identity can produce.
     #[cfg(target_os = "macos")]
     #[test]
     fn release_refused_by_verification_on_macos_is_reinstalled_through_the_developer_id_check() {

@@ -832,22 +832,16 @@ pub enum LpmError {
     )]
     ProvenanceUnavailable(String),
 
-    /// `lpm self-update` standalone path refused to swap the binary
-    /// because the release artifacts failed an integrity gate
-    /// (`SHA256SUMS.txt` missing on a release that predates the
-    /// signed-install gate, Sigstore bundle rejected, SHA mismatch,
-    /// identity pin not satisfied, replay window violated, etc.).
-    /// Distinct from `Network` so the CLI can render remediation copy
-    /// that names the manual install URL.
+    /// `lpm self-update` refused the update: the release didn't verify, or the
+    /// installation, its package manager or this machine's state made the
+    /// update unsafe. The reason says which. Distinct from `Network`, which
+    /// retrying fixes.
     #[error("self-update refused: {0}")]
     #[diagnostic(
         code(lpm::self_update),
         help(
-            "The downloaded release could not be cryptographically verified. \
-             If this is a release that predates LPM's signed-install gate, install \
-             manually from https://github.com/lpm-dev/rust-client/releases. \
-             Otherwise the release artifacts may be tampered or the manifest may be missing — \
-             retry, and if the failure persists report at https://github.com/lpm-dev/rust-client/issues."
+            "Fix what the reason above names, or retry later. If it keeps failing, report it at \
+             https://github.com/lpm-dev/rust-client/issues."
         )
     )]
     SelfUpdate(String),
@@ -1535,6 +1529,23 @@ mod tests {
         let help = err.help().unwrap().to_string();
         assert!(help.contains("GITHUB_TOKEN"), "help: {help}");
         assert!(help.contains("GH_TOKEN"), "help: {help}");
+    }
+
+    /// A refusal can be about the installation rather than the release, so
+    /// its help points at the reason instead of claiming verification failed.
+    #[test]
+    fn self_update_refusal_help_points_at_the_reason() {
+        let help = LpmError::SelfUpdate("x".into()).help().unwrap().to_string();
+
+        assert!(help.contains("the reason above"), "help: {help}");
+        assert!(
+            !help.contains("could not be cryptographically verified"),
+            "help: {help}"
+        );
+        assert!(
+            !help.to_lowercase().contains("install manually"),
+            "help: {help}"
+        );
     }
 
     #[test]

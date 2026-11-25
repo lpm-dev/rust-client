@@ -1754,8 +1754,14 @@ async fn standalone_release_refused_by_verification_names_an_installer_that_auth
         "curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL=stable LPM_INSTALL_REQUIRE_SIGSTORE=1 sh"
     };
     assert_refusal_names(&human, &envelope, installer);
+    // The manifest, its Sigstore bundle and the release are fetched together,
+    // so whichever the mock refuses first names the reason.
     assert!(
-        !human.contains("require execution from") && !human.contains("shared-writable"),
+        human.contains("no release at tag v99999.0.0")
+            || human.contains("release v99999.0.0 does not ship SHA256SUMS.txt")
+            || human.contains(
+                "release v99999.0.0 ships SHA256SUMS.txt but not SHA256SUMS.txt.sigstore"
+            ),
         "the refusal must come from verifying the release: {human}"
     );
     if cfg!(not(target_os = "macos")) {
