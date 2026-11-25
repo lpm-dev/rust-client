@@ -20,17 +20,19 @@ fail() {
 #
 # curl reaches a host by name when any address the hosts file pins it to is
 # reachable, as curl tries each, or at an address of its own when the hosts
-# file doesn't name it; at a --resolve address it uses that one. An address is unreachable when the
-# firewall's active rules name it or a network holding it. Without IPv6
-# (no-ipv6) no IPv6 address is reached. A host in never-answers times out
-# whatever happens. A "host status" line in answers-anyway connects whatever
-# is blocked and then exits with that status, such as 35 for a TLS error or
-# 28 for a service that accepts and then stalls. Like curl -w
-# '%{time_connect}', it prints 0.000000 when no connection opened.
+# file doesn't name it; at a --resolve address it uses that one. An address
+# is unreachable when the firewall's active rules drop the <apple_services>
+# table and the table names it or a network holding it. Without IPv6 (no-ipv6) no IPv6 address is reached. A host in
+# never-answers times out whatever happens. A "host status" line in
+# answers-anyway connects whatever is blocked and then exits with that
+# status, such as 35 for a TLS error or 28 for a service that accepts and
+# then stalls. Like curl -w '%{num_connects}', it prints how many
+# connections it opened.
 #
 # pfctl applies the rules it is given: none of them when inert-firewall
 # exists, none of the IPv6 entries when inert-ipv6 exists, none of the network
-# entries when inert-networks exists, and it refuses them when pfctl-fails
+# entries when inert-networks exists, the rule in rule-override in place of
+# the block rule when that exists, and it refuses them when pfctl-fails
 # exists.
 make_runner() {
 	rm -rf "$work/runner" "$work/state"
@@ -52,9 +54,11 @@ case "\$1" in
 -E)
 	[ -e "$work/runner/pfctl-fails" ] && { echo "pfctl: syntax error" >&2; exit 1; }
 	if [ -e "$work/runner/inert-ipv6" ]; then
-		awk '{ out = ""; for (i = 1; i <= NF; i++) if (\$i !~ /:/) out = out \$i " "; print out }' "\$3" >"$work/runner/active-rules"
+		awk '{ out = ""; for (i = 1; i <= NF; i++) if (\$i !~ /:/) out = out (out == "" ? "" : " ") \$i; print out }' "\$3" >"$work/runner/active-rules"
 	elif [ -e "$work/runner/inert-networks" ]; then
-		awk '{ out = ""; for (i = 1; i <= NF; i++) if (\$i !~ /\//) out = out \$i " "; print out }' "\$3" >"$work/runner/active-rules"
+		awk '{ out = ""; for (i = 1; i <= NF; i++) if (\$i !~ /\//) out = out (out == "" ? "" : " ") \$i; print out }' "\$3" >"$work/runner/active-rules"
+	elif [ -e "$work/runner/rule-override" ]; then
+		{ grep -v '^block ' "\$3"; cat "$work/runner/rule-override"; } >"$work/runner/active-rules"
 	elif [ ! -e "$work/runner/inert-firewall" ]; then
 		cp "\$3" "$work/runner/active-rules"
 	fi
@@ -85,8 +89,8 @@ while [ "\$#" -gt 0 ]; do
 done
 host="\${url#https://}"
 host="\${host%/}"
-unconnected() { printf '0.000000'; exit "\$1"; }
-connected() { printf '0.050000'; exit "\$1"; }
+unconnected() { printf '0'; exit "\$1"; }
+connected() { printf '1'; exit "\$1"; }
 grep -Fxq "\$host" "$work/runner/never-answers" && unconnected 28
 status=\$(awk -v host="\$host" '\$1 == host { print \$2 }' "$work/runner/answers-anyway")
 [ -n "\$status" ] && connected "\$status"
@@ -95,6 +99,7 @@ reachable() {
 	case "\$1" in
 	*:*) [ -e "$work/runner/no-ipv6" ] && return 1 ;;
 	esac
+	grep -Fxq 'block drop out quick from any to <apple_services>' "\$rules" || return 0
 	grep -Eq "[ {]\$1[ }]" "\$rules" && return 1
 	case "\$1" in
 	17.*) grep -Fq '17.0.0.0/8' "\$rules" && return 1 ;;
@@ -151,8 +156,12 @@ expect_block_failure() {
 
 make_runner
 : >"$work/runner/dns-aaaa.www.apple.com"
+: >"$work/runner/dns-a.certs.apple.com"
 run_helper block "$work/state" >/dev/null || fail "block did not confirm Apple's services unreachable"
-for host in api.apple-cloudkit.com ocsp2.apple.com crl.apple.com valid.apple.com certs.apple.com www.apple.com; do
+grep -Fxq "192.0.2.1 certs.apple.com" "$work/runner/hosts" \
+	|| fail "a host DNS gave no IPv4 address is not pinned to a dropped one, so an IPv4 lookup could reach it"
+grep -Fq ' 192.0.2.1 ' "$work/runner/active-rules" || fail "the IPv4 placeholder a host is pinned to is not dropped"
+for host in api.apple-cloudkit.com ocsp2.apple.com crl.apple.com valid.apple.com www.apple.com; do
 	grep -Fxq "17.253.0.1 $host" "$work/runner/hosts" || fail "$host is not pinned to its address"
 	grep -Fxq "$host 17.253.0.1" "$work/state/targets" || fail "$host's address in Apple's network was not checked"
 done
@@ -200,6 +209,11 @@ make_runner
 printf 'ocsp.apple.com 28\n' >"$work/runner/answers-anyway"
 expect_block_failure after-blocking "ocsp.apple.com is still reachable" "a service that accepts and then stalls was taken for a blocked one"
 echo "PASS: a service that accepts a connection and then stalls still counts as reachable"
+
+make_runner
+printf 'pass out quick from any to <apple_services>\n' >"$work/runner/rule-override"
+expect_block_failure after-blocking "still reachable" "block reported Apple's services unreachable while its rule let the table's traffic through"
+echo "PASS: block fails when the rule doesn't drop the table's traffic"
 
 make_runner
 : >"$work/runner/inert-firewall"

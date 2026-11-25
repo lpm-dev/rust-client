@@ -37,15 +37,16 @@ flush_name_cache() {
 }
 
 # Succeeds when a TCP connection to $1 on port 443 opens, at the address $2
-# when given rather than the one its name resolves to. curl's time_connect
-# stays 0 when no connection opened, whatever failed afterwards: a TLS error,
-# or a service that accepts and then stalls, still opened one.
+# when given rather than the one its name resolves to. curl counts the
+# connections it opened, whatever failed afterwards: a TLS error, or a service
+# that accepts and then stalls, still opened one. No proxy or ~/.curlrc may
+# stand in for the destination.
 connects() {
-	local resolve=() connected
+	local resolve=() opened
 	[ -n "${2:-}" ] && resolve=(--resolve "$1:443:$2")
-	connected=$("$CURL_BIN" -sS -o /dev/null --connect-timeout 5 --max-time 15 -w '%{time_connect}' \
-		${resolve[@]+"${resolve[@]}"} "https://$1/" 2>/dev/null) || true
-	awk -v seconds="${connected:-0}" 'BEGIN { exit !(seconds + 0 > 0) }'
+	opened=$("$CURL_BIN" -q -sS -o /dev/null --noproxy '*' --connect-timeout 5 --max-time 15 \
+		-w '%{num_connects}' ${resolve[@]+"${resolve[@]}"} "https://$1/" 2>/dev/null) || true
+	[ "${opened:-0}" -gt 0 ] 2>/dev/null
 }
 
 # Prints "host address" for each address DNS gives host $1. dig asks the DNS

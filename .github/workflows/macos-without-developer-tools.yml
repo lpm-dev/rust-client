@@ -208,7 +208,7 @@ jobs:
           cat "$RUNNER_TEMP/latest-self-update.json" "$RUNNER_TEMP/latest-self-update.err"
           if [ "$(printf '%s\n%s\n' "$INSTALLER_STABLE" "$LAST_UPDATER_NEEDING_XCODE" | sort -V | tail -n 1)" = "$LAST_UPDATER_NEEDING_XCODE" ]; then
             test "$status" -ne 0
-            cat "$RUNNER_TEMP/latest-self-update.json" "$RUNNER_TEMP/latest-self-update.err" | grep -q "$UPDATER_NEEDS_XCODE"
+            grep -q "$UPDATER_NEEDS_XCODE" "$RUNNER_TEMP/latest-self-update.json" "$RUNNER_TEMP/latest-self-update.err"
             echo "::notice::$INSTALLER_STABLE still needs Xcode to update; its users recover through the installer"
           else
             test "$status" -eq 0

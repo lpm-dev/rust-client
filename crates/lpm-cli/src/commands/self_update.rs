@@ -30,8 +30,8 @@ pub(crate) mod verify_release;
 mod windows_trust;
 
 use self::download::{
-    StagedAsset, ensure_staged_file_unchanged, fetch_asset_to_staged_file, fetch_bounded,
-    safe_remote_label,
+    StagedAsset, StagedAssetError, ensure_staged_file_unchanged, fetch_asset_to_staged_file,
+    fetch_bounded, safe_remote_label,
 };
 #[cfg(test)]
 use self::download::{create_staged_binary, finish_staged_binary};
@@ -2401,6 +2401,22 @@ fn with_installer_recovery(
     }
 }
 
+/// Runs `check` on the staged release asset between two checks that it is
+/// still the verified file. A file that changed or went away is refused as
+/// that, which reinstalling doesn't fix, even when it also made `check` fail;
+/// only a failed check of the verified file names the installer.
+fn check_staged_asset<T>(
+    staged: &StagedAsset,
+    channel: ReleaseChannel,
+    check: impl FnOnce() -> Result<T, LpmError>,
+) -> Result<T, LpmError> {
+    ensure_staged_file_unchanged(&staged.temporary, &staged.sha256)?;
+    let checked = check();
+    ensure_staged_file_unchanged(&staged.temporary, &staged.sha256)?;
+    checked
+        .map_err(|error| with_installer_recovery(error, channel, StandaloneRefusal::Compatibility))
+}
+
 /// Download and replace the binary in-place for standalone installations.
 ///
 /// Every fetched byte is anchored to the Sigstore-signed `SHA256SUMS.txt`
@@ -2446,15 +2462,12 @@ async fn run_standalone_update(
 
     #[cfg(target_os = "macos")]
     {
-        ensure_staged_file_unchanged(
-            &assets.staged_binary.temporary,
-            &assets.staged_binary.sha256,
-        )?;
-        let staged_bundle = stage_macos_bundle(
-            assets.staged_binary.temporary.path(),
-            &macos_layout.app_parent,
-        )
-        .map_err(refused(StandaloneRefusal::Compatibility))?;
+        let staged_bundle = check_staged_asset(&assets.staged_binary, channel, || {
+            stage_macos_bundle(
+                assets.staged_binary.temporary.path(),
+                &macos_layout.app_parent,
+            )
+        })?;
         VersionProbe::verify_staged_path(&staged_bundle.executable, version)
             .map_err(refused(StandaloneRefusal::Compatibility))?;
         install_staged_macos_bundle(&macos_layout, staged_bundle, version)?;
@@ -2464,16 +2477,9 @@ async fn run_standalone_update(
     let sandbox_helper = None;
     #[cfg(not(target_os = "macos"))]
     let sandbox_helper = {
-        ensure_staged_file_unchanged(
-            &assets.staged_binary.temporary,
-            &assets.staged_binary.sha256,
-        )?;
-        VersionProbe::verify_staged_version(&assets.staged_binary.temporary, version)
-            .map_err(refused(StandaloneRefusal::Compatibility))?;
-        ensure_staged_file_unchanged(
-            &assets.staged_binary.temporary,
-            &assets.staged_binary.sha256,
-        )?;
+        check_staged_asset(&assets.staged_binary, channel, || {
+            VersionProbe::verify_staged_version(&assets.staged_binary.temporary, version)
+        })?;
         let StagedAsset {
             temporary, sha256, ..
         } = assets.staged_binary;
@@ -3453,8 +3459,7 @@ async fn fetch_verified_release_manifest(
             .await?
             .ok_or_else(|| {
                 LpmError::SelfUpdate(format!(
-                    "release v{version} does not ship SHA256SUMS.txt, so it can't be verified; \
-                     only releases from before LPM's signed-install gate lack one"
+                    "release v{version} does not ship SHA256SUMS.txt, so it can't be verified"
                 ))
             })
     };
@@ -3537,7 +3542,11 @@ async fn verify_and_stage_for_standalone(
     }
 
     let staged = fetch_asset_to_staged_file(&client, &asset_url, ASSET_MAX_BYTES, staging_anchor)
-        .await?
+        .await
+        .map_err(|error| match error {
+            StagedAssetError::TooLarge(error) => StagingFailure::ReleaseVerification(error),
+            StagedAssetError::Failed(error) => StagingFailure::Local(error),
+        })?
         .ok_or_else(|| {
             StagingFailure::ReleaseVerification(LpmError::SelfUpdate(format!(
                 "release v{version} advertises `{binary_name}` in SHA256SUMS.txt but the asset is missing at {} — release-pipeline bug",
@@ -5323,9 +5332,9 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     }
 
     /// A release that doesn't verify is the release's doing, so its refusal
-    /// is the one that names an installer which authenticates the release.
+    /// names an installer that authenticates the release.
     #[tokio::test]
-    async fn release_that_fails_to_verify_is_a_release_verification_failure() {
+    async fn release_without_a_manifest_is_a_release_verification_failure() {
         let server = wiremock::MockServer::start().await;
         mount_release_metadata(&server).await;
         mount_placeholder_bundle(&server).await;
@@ -5349,6 +5358,94 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
                 ),
                 "{failure:?}"
             );
+        })
+        .await;
+    }
+
+    /// Serves the published v0.84.0 release, whose manifest and Sigstore
+    /// bundle verify, with `asset` as every platform's release asset.
+    async fn mount_real_v0_84_0_release(server: &wiremock::MockServer, asset: &'static [u8]) {
+        let (manifest, bundle) = real_v0_84_0_release_assets();
+        let routes = [
+            (
+                "/releases/tags/v0.84.0".to_string(),
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "tag_name": "v0.84.0",
+                    "published_at": REAL_V0_84_0_PUBLISHED_AT,
+                    "target_commitish": REAL_V0_84_0_SOURCE_COMMIT,
+                })),
+            ),
+            (
+                "/download/v0.84.0/SHA256SUMS.txt".to_string(),
+                wiremock::ResponseTemplate::new(200).set_body_bytes(manifest),
+            ),
+            (
+                "/download/v0.84.0/SHA256SUMS.txt.sigstore".to_string(),
+                wiremock::ResponseTemplate::new(200).set_body_bytes(bundle),
+            ),
+        ];
+        for (path, response) in routes {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(path))
+                .respond_with(response)
+                .mount(server)
+                .await;
+        }
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path_regex(r"^/download/v0\.84\.0/lpm-"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(asset))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn release_asset_that_differs_from_its_signed_digest_is_a_release_verification_failure() {
+        let server = wiremock::MockServer::start().await;
+        mount_real_v0_84_0_release(&server, b"not the signed release asset").await;
+
+        run_standalone_against_server(&server, "0.84.0", || async {
+            let destination = tempfile::tempdir().unwrap();
+            let failure =
+                verify_and_stage_for_standalone("0.84.0", &destination.path().join("lpm"), false)
+                    .await
+                    .expect_err("an asset that isn't the signed one must not stage");
+            assert!(
+                matches!(
+                    &failure,
+                    StagingFailure::ReleaseVerification(LpmError::SelfUpdate(reason))
+                        if reason.contains("SHA-256 mismatch")
+                ),
+                "{failure:?}"
+            );
+        })
+        .await;
+    }
+
+    /// Staging errors that don't come from the release, such as an unsupported
+    /// platform, are local unless a staging step says otherwise.
+    #[test]
+    fn staging_errors_are_local_unless_marked_as_the_release_s() {
+        assert!(matches!(
+            StagingFailure::from(LpmError::SelfUpdate("unsupported platform".to_string())),
+            StagingFailure::Local(_)
+        ));
+    }
+
+    /// Staging that fails on this machine, after the release verified, isn't
+    /// the release's doing.
+    #[tokio::test]
+    async fn staging_that_fails_on_this_machine_is_a_local_failure() {
+        let server = wiremock::MockServer::start().await;
+        mount_real_v0_84_0_release(&server, b"not the signed release asset").await;
+
+        run_standalone_against_server(&server, "0.84.0", || async {
+            let destination = tempfile::tempdir().unwrap();
+            let missing_directory = destination.path().join("missing");
+            let failure =
+                verify_and_stage_for_standalone("0.84.0", &missing_directory.join("lpm"), false)
+                    .await
+                    .expect_err("staging into a missing directory must fail");
+            assert!(matches!(&failure, StagingFailure::Local(_)), "{failure:?}");
         })
         .await;
     }
@@ -7134,6 +7231,66 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
                 StandaloneRefusal::ReleaseVerification
             ),
             installer_recovery(ReleaseChannel::Stable, StandaloneRefusal::Compatibility)
+        );
+    }
+
+    /// A staged binary that runs the shell `script` when probed.
+    #[cfg(unix)]
+    fn staged_script(directory: &Path, script: &str) -> StagedAsset {
+        use sha2::Digest as _;
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let body = format!("#!/bin/sh\n{script}\n");
+        let mut temporary = download::create_staged_binary(&directory.join("lpm")).unwrap();
+        temporary.as_file_mut().write_all(body.as_bytes()).unwrap();
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        StagedAsset {
+            byte_len: body.len(),
+            sha256: hex::encode(sha2::Sha256::digest(body.as_bytes())),
+            temporary: download::finish_staged_binary(temporary).unwrap(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_binary_that_reports_another_version_names_the_installer() {
+        let directory = tempfile::tempdir().unwrap();
+        let staged = staged_script(directory.path(), "printf 'lpm 1.2.2\\n'");
+
+        let error = check_staged_asset(&staged, ReleaseChannel::Stable, || {
+            VersionProbe::verify_staged_version(&staged.temporary, "1.2.3")
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, LpmError::StandaloneSelfUpdate { reason, .. } if reason.contains("exact version 1.2.3")),
+            "{error:?}"
+        );
+    }
+
+    /// A staged file that changes while it is checked fails the check too,
+    /// but the refusal is the changed file, which reinstalling doesn't fix.
+    #[cfg(unix)]
+    #[test]
+    fn staged_asset_that_changes_while_checked_is_refused_without_an_installer() {
+        let directory = tempfile::tempdir().unwrap();
+        let staged = staged_script(directory.path(), "printf 'lpm 1.2.3\\n'");
+
+        let error = check_staged_asset(&staged, ReleaseChannel::Stable, || -> Result<(), _> {
+            std::fs::write(staged.temporary.path(), b"replaced").unwrap();
+            Err(LpmError::SelfUpdate(
+                "the replaced asset didn't validate".to_string(),
+            ))
+        })
+        .unwrap_err();
+
+        assert!(
+            !matches!(error, LpmError::StandaloneSelfUpdate { .. }),
+            "a staged file that went away named the installer: {error:?}"
         );
     }
 
