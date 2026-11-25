@@ -3576,10 +3576,43 @@ mod tests {
                 format!("x=a as {{[{}]:number}};eval(y);", nested("(", "k", ")", 32)),
                 0,
             ),
+            ("index.ts", format!("x=a{};eval(y);", " as T".repeat(33)), 1),
+            (
+                "index.ts",
+                format!("x=a{};eval(y);", " satisfies T".repeat(33)),
+                1,
+            ),
+            ("index.ts", format!("x={}a;eval(y);", "<T>".repeat(33)), 1),
+            ("index.ts", format!("x=a{};eval(y);", "!".repeat(33)), 1),
+            (
+                "index.ts",
+                format!("x={};eval(y);", nested("(", "a<T>", ")", 31)),
+                0,
+            ),
+            (
+                "index.ts",
+                format!("x={};eval(y);", nested("(", "a<T>", ")", 32)),
+                1,
+            ),
         ] {
             let result = analyze_on_a_worker_stack(filename, source.clone());
             assert!(result.source.eval);
             assert_eq!(result.unparsed_files, unparsed, "{source}");
+        }
+    }
+
+    #[test]
+    fn code_after_a_top_level_await_parsed_again_is_analyzed() {
+        // Found to be a module, each source's statement that starts with
+        // `await` ends earlier than its script reading did, and the code after
+        // it runs.
+        for source in [
+            "await / a; x = /;0/ + eval(y);\nexport {};\n",
+            "await /a/\neval(y)\nexport {};\n",
+        ] {
+            let result = analyze_on_a_worker_stack("index.js", source.to_owned());
+            assert_eq!(result.unparsed_files, 0, "{source}");
+            assert!(result.source.eval, "{source}");
         }
     }
 

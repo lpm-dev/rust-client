@@ -952,6 +952,14 @@ mod tests {
                 "await\nlet\nx = eval(y)\nexport {};\n",
                 &["await\nlet", "x = eval(y)", "export {};"][..],
             ),
+            (
+                "await / a; x = /;0/ + eval(y);\nexport {};\n",
+                &["await / a; x = /;", "0/ + eval(y);", "export {};"][..],
+            ),
+            (
+                "await /a/\neval(y)\nexport {};\n",
+                &["await /a/", "eval(y)", "export {};"][..],
+            ),
         ] {
             let allocator = Allocator::default();
             let parsed = Parser::new(&allocator, source, SourceType::unambiguous()).parse();

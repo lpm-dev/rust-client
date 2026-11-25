@@ -134,9 +134,13 @@ Linear time:
   again too. It then drops the statements it covered, so none overlap and
   none is lost. The module record keeps a dynamic import or `import.meta`
   recorded again only once.
-- A rewind leaves no stale entry in `last_parenthesized` or `pure_walks`:
-  only a parse of the same source can build another node where an entry
-  points, and it records its own.
+- Neither cache can answer for the wrong node. `last_parenthesized` is
+  keyed by where a `ParenthesizedExpression` starts, and only a parse of
+  the same source can build another one there, which records its own.
+  `pure_walks` is keyed by a node's address: the arena never frees or
+  reuses a node, rewinds included, and no node on a walked path changes
+  after its walk. The one rewrite of a node after it is built, in
+  `parse_lhs_expression_rest`, comes before any walk that could reach it.
 
 `lpm-security`'s `behavioral/syntax.rs` sets the floor from the stack its
 thread has left, retries a source that runs out on a 64 MiB stack, and

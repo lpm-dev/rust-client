@@ -55,7 +55,9 @@ pub struct ParserState<'a> {
     /// Where each walk for a `/*#__PURE__*/` comment started, as the address of the expression
     /// after the comment, and whether it found a call. Nested `/*#__PURE__*/(` wraps each level's
     /// expression around one a level inside it walked, so a walk stops at the first start it
-    /// reaches and takes its answer. Each node is then walked at most once.
+    /// reaches and takes its answer. Each node is then walked at most once. An address can't
+    /// name another node: the arena never frees or reuses one, and no node on a walked path
+    /// changes after its walk.
     pub pure_walks: FxHashMap<Address, bool>,
 
     /// Zero outside speculative expression type arguments; otherwise their nesting depth.
