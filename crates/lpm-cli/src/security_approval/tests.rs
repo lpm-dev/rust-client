@@ -690,6 +690,32 @@ mode = "enforce"
 }
 
 #[test]
+fn managed_firewall_protection_disable_refuses_while_the_policy_sets_a_firewall_profile() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_managed_policy(
+            temp.path(),
+            r#"
+[firewall]
+mode = "enforce"
+
+[firewall.npm.policies]
+lpm_ai_agent_control_surface = "block"
+"#,
+        );
+
+        let err = remove_managed_firewall_protection().unwrap_err();
+
+        assert!(err.to_string().contains("[firewall.npm.policies]"), "{err}");
+        let effective = load_effective_authorized_posture().unwrap();
+        assert_eq!(
+            effective.sources.firewall_mode,
+            PostureSourceKind::ManagedPolicy
+        );
+    });
+}
+
+#[test]
 fn security_status_does_not_report_absent_firewall_config_as_runtime_override() {
     let temp = tempdir().unwrap();
     let project = temp.path().join("project");

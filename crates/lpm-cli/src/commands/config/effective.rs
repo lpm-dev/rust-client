@@ -927,35 +927,34 @@ fn add_firewall_policy_entries(
             }
             _ => Cow::Borrowed(policy_source(key)),
         };
-        let (candidate, candidate_source) = match requested
+        let (value, source) = match requested
             .as_ref()
             .and_then(|requested| crate::npm_firewall_config::policy_action(requested, key))
         {
-            Some(action) => (action, config_source),
+            Some(action) => select_security_value(
+                action,
+                &config_source,
+                approved_action,
+                posture.sources.firewall_policies,
+                |candidate, floor| {
+                    crate::npm_firewall_config::policy_action_loosens(
+                        firewall_mode,
+                        candidate,
+                        approved_mode,
+                        floor,
+                    )
+                },
+            ),
+            // Without a table installs run `tableless` as resolved: the
+            // default, raised to any stricter approved action.
             None => match crate::npm_firewall_config::policy_action(&tableless, key) {
-                Some(action) if action != approved_action => {
-                    (action, Cow::Borrowed(DEFAULT_SOURCE))
-                }
+                Some(action) if action != approved_action => (action, DEFAULT_SOURCE.to_string()),
                 _ => (
                     approved_action,
-                    Cow::Borrowed(posture_source(posture.sources.firewall_policies)),
+                    posture_source(posture.sources.firewall_policies).to_string(),
                 ),
             },
         };
-        let (value, source) = select_security_value(
-            candidate,
-            &candidate_source,
-            approved_action,
-            posture.sources.firewall_policies,
-            |candidate, floor| {
-                crate::npm_firewall_config::policy_action_loosens(
-                    firewall_mode,
-                    candidate,
-                    approved_mode,
-                    floor,
-                )
-            },
-        );
         entries.push(EffectiveConfigEntry::new(
             format!("firewall.npm.policies.{key}"),
             value.as_str(),

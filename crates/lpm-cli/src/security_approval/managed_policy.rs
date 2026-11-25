@@ -632,6 +632,15 @@ pub(crate) fn remove_managed_firewall_protection() -> Result<ManagedProtectionRe
             "must be a TOML table at the top level",
         ));
     };
+    if crate::npm_firewall_config::firewall_policy_table(top)
+        .map_err(|message| managed_policy_error(&path, format!("is invalid: {message}")))?
+        .is_some()
+    {
+        return Err(managed_policy_error(
+            &path,
+            "sets `[firewall.npm.policies]`, which needs `[firewall].mode`; remove that table from the policy before turning managed firewall protection off",
+        ));
+    }
     let removed = top
         .get_mut(crate::npm_firewall_config::FIREWALL_CONFIG_SECTION)
         .and_then(toml::Value::as_table_mut)

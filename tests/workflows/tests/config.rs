@@ -2854,6 +2854,22 @@ fn config_list_reports_the_approved_firewall_policy_when_config_has_none() {
 }
 
 #[test]
+fn config_list_reports_the_default_where_no_table_asks_for_an_approved_looser_policy() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    support::write_signed_firewall_posture(
+        &project,
+        "enforce",
+        &[("lpm_ai_confirmed_malware", "allow")],
+    );
+    seed_config(&project, "[firewall]\nmode = \"enforce\"\n");
+
+    let entry = config_list_entry(&project, "firewall.npm.policies.lpm_ai_confirmed_malware");
+
+    assert_eq!(entry["value"], "block", "{entry}");
+    assert_eq!(entry["source"], "built-in default", "{entry}");
+}
+
+#[test]
 fn config_list_reports_the_approved_firewall_policy_over_a_looser_config_value() {
     let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
     support::write_signed_firewall_posture(&project, "enforce", &[]);
