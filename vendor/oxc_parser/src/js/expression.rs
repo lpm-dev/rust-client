@@ -1,7 +1,7 @@
 use std::num::NonZeroU32;
 
 use cow_utils::CowUtils;
-use oxc_allocator::{ArenaBox, ArenaVec, GetAllocator, ReplaceWith};
+use oxc_allocator::{Address, ArenaBox, ArenaVec, GetAddress, GetAllocator, ReplaceWith};
 use oxc_ast::ast::*;
 use oxc_data_structures::buffered_vec::BufferedVec;
 #[cfg(feature = "regular_expression")]
@@ -1923,7 +1923,10 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         comments: (u32, NonZeroU32),
         expr: &mut Expression<'a>,
     ) {
-        if Self::set_pure_on_call_or_new_expr(expr) {
+        let start = expr.address();
+        let applied = Self::set_pure_on_call_or_new_expr(expr, self.state.last_pure_walk);
+        self.state.last_pure_walk = Some((start, applied));
+        if applied {
             self.lexer.trivia_builder.mark_pure_comments_applied(comments);
         }
     }
@@ -1940,11 +1943,26 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         }
     }
 
-    /// Walks down a member chain in a loop: the parser reads a chain without recursing, so
-    /// recursing once per member here could overflow the stack.
-    fn set_pure_on_call_or_new_expr(mut expr: &mut Expression<'a>) -> bool {
+    /// Walks down wrappers and a member chain in a loop: the parser reads a chain without
+    /// recursing, so recursing once per member here could overflow the stack. Reaching the
+    /// expression the previous walk started at, `walked`, it takes that walk's answer.
+    fn set_pure_on_call_or_new_expr(
+        mut expr: &mut Expression<'a>,
+        walked: Option<(Address, bool)>,
+    ) -> bool {
         loop {
-            expr = match expr.get_inner_expression_mut() {
+            if let Some((address, applied)) = walked
+                && expr.address() == address
+            {
+                return applied;
+            }
+            expr = match expr {
+                Expression::ParenthesizedExpression(wrapper) => &mut wrapper.expression,
+                Expression::TSAsExpression(wrapper) => &mut wrapper.expression,
+                Expression::TSSatisfiesExpression(wrapper) => &mut wrapper.expression,
+                Expression::TSInstantiationExpression(wrapper) => &mut wrapper.expression,
+                Expression::TSNonNullExpression(wrapper) => &mut wrapper.expression,
+                Expression::TSTypeAssertion(wrapper) => &mut wrapper.expression,
                 Expression::CallExpression(call_expr) => {
                     call_expr.pure = true;
                     return true;

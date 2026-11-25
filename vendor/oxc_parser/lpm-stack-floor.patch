@@ -16,7 +16,21 @@
      lexer::{Kind, LexerCheckpoint, Token, cold_branch},
  };
  
-@@ -108,13 +110,85 @@
+@@ -20,6 +22,13 @@
+     has_fatal_error: bool,
+ }
+ 
++impl ParserCheckpoint<'_> {
++    /// Start of the token the parser was at when the checkpoint was taken.
++    pub(crate) fn token_start(&self) -> u32 {
++        self.cur_token.start()
++    }
++}
++
+ impl<'a, C: Config> ParserImpl<'a, C> {
+     /// Get current token's span start.
+     #[inline]
+@@ -108,13 +117,87 @@
          if self.token.escaped() && kind.is_any_keyword() {
              self.report_escaped_keyword(self.token.span());
          }
@@ -29,13 +43,13 @@
 +    /// `ParseOptions::stack_floor` or speculative parses have spent more
 +    /// than `ParseOptions::speculation_budget` allows, and on every token
 +    /// read after that. The fatal error moves the lexer to the end of the source,
-+    /// so every caller unwinds without reading more tokens.
++    /// so every caller unwinds without reading more tokens. Reaching either limit
++    /// raises the lexer's `stop_below` past every address, so this is one
++    /// comparison per token.
 +    #[inline]
 +    fn check_parse_limits(&mut self) {
-+        if self.stack_exhausted.get()
-+            || self.lexer.speculation_budget_exhausted()
-+            || self.below_stack_floor()
-+        {
++        let marker = 0u8;
++        if (&raw const marker).addr() < self.lexer.stop_below() {
 +            self.stop_at_parse_limit();
 +        }
 +    }
@@ -70,6 +84,7 @@
 +    #[inline(never)]
 +    fn stop_at_stack_floor(&mut self) {
 +        self.stack_exhausted.set(true);
++        self.lexer.stop_before_every_token();
 +        self.set_fatal_error(diagnostics::stack_exhausted(self.token.span()));
 +    }
 +
@@ -92,6 +107,7 @@
 +    #[inline(never)]
 +    pub(crate) fn stack_floor_error(&self, span: Span) -> ParserDiagnostic<'a> {
 +        self.stack_exhausted.set(true);
++        self.lexer.stop_before_every_token();
 +        diagnostics::stack_exhausted(span)
 +    }
 +
@@ -102,7 +118,7 @@
          self.prev_token_end = self.token.end();
          self.token = self.lexer.next_jsx_child();
      }
-@@ -170,6 +244,9 @@
+@@ -170,6 +253,9 @@
          if self.token.escaped() && self.token.kind().is_any_keyword() {
              self.report_escaped_keyword(self.token.span());
          }
@@ -112,7 +128,7 @@
          self.prev_token_end = self.token.end();
          self.token = next;
      }
-@@ -263,6 +340,7 @@
+@@ -263,6 +349,7 @@
  
      /// Move to the next token, lexing it as a JSX attribute value.
      pub(crate) fn advance_for_jsx_attribute_value(&mut self) {
@@ -197,6 +213,15 @@
  
 --- a/src/js/expression.rs
 +++ b/src/js/expression.rs
+@@ -1,7 +1,7 @@
+ use std::num::NonZeroU32;
+ 
+ use cow_utils::CowUtils;
+-use oxc_allocator::{ArenaBox, ArenaVec, GetAllocator, ReplaceWith};
++use oxc_allocator::{Address, ArenaBox, ArenaVec, GetAddress, GetAllocator, ReplaceWith};
+ use oxc_ast::ast::*;
+ use oxc_data_structures::buffered_vec::BufferedVec;
+ #[cfg(feature = "regular_expression")]
 @@ -408,6 +408,7 @@
          }
  
@@ -205,7 +230,19 @@
              Expression::new_parenthesized_expression(self.end_span(start), expression, self)
          } else {
              expression
-@@ -1939,34 +1940,36 @@
+@@ -1922,7 +1923,10 @@
+         comments: (u32, NonZeroU32),
+         expr: &mut Expression<'a>,
+     ) {
+-        if Self::set_pure_on_call_or_new_expr(expr) {
++        let start = expr.address();
++        let applied = Self::set_pure_on_call_or_new_expr(expr, self.state.last_pure_walk);
++        self.state.last_pure_walk = Some((start, applied));
++        if applied {
+             self.lexer.trivia_builder.mark_pure_comments_applied(comments);
+         }
+     }
+@@ -1939,34 +1943,51 @@
          }
      }
  
@@ -214,7 +251,19 @@
 -            Expression::CallExpression(call_expr) => {
 -                call_expr.pure = true;
 -                true
--            }
++    /// Walks down wrappers and a member chain in a loop: the parser reads a chain without
++    /// recursing, so recursing once per member here could overflow the stack. Reaching the
++    /// expression the previous walk started at, `walked`, it takes that walk's answer.
++    fn set_pure_on_call_or_new_expr(
++        mut expr: &mut Expression<'a>,
++        walked: Option<(Address, bool)>,
++    ) -> bool {
++        loop {
++            if let Some((address, applied)) = walked
++                && expr.address() == address
++            {
++                return applied;
+             }
 -            Expression::NewExpression(new_expr) => {
 -                new_expr.pure = true;
 -                true
@@ -224,11 +273,13 @@
 -            }
 -            Expression::ChainExpression(chain_expr) => match &mut chain_expr.expression {
 -                ChainElement::CallExpression(call_expr) => {
-+    /// Walks down a member chain in a loop: the parser reads a chain without recursing, so
-+    /// recursing once per member here could overflow the stack.
-+    fn set_pure_on_call_or_new_expr(mut expr: &mut Expression<'a>) -> bool {
-+        loop {
-+            expr = match expr.get_inner_expression_mut() {
++            expr = match expr {
++                Expression::ParenthesizedExpression(wrapper) => &mut wrapper.expression,
++                Expression::TSAsExpression(wrapper) => &mut wrapper.expression,
++                Expression::TSSatisfiesExpression(wrapper) => &mut wrapper.expression,
++                Expression::TSInstantiationExpression(wrapper) => &mut wrapper.expression,
++                Expression::TSNonNullExpression(wrapper) => &mut wrapper.expression,
++                Expression::TSTypeAssertion(wrapper) => &mut wrapper.expression,
 +                Expression::CallExpression(call_expr) => {
                      call_expr.pure = true;
 -                    true
@@ -389,7 +440,16 @@
  }
 --- a/src/lexer/mod.rs
 +++ b/src/lexer/mod.rs
-@@ -130,6 +130,20 @@
+@@ -5,7 +5,7 @@
+ //!     * [rustc](https://github.com/rust-lang/rust/blob/1.82.0/compiler/rustc_lexer/src)
+ //!     * [v8](https://v8.dev/blog/scanner)
+ 
+-use std::mem;
++use std::{cell::Cell, mem};
+ 
+ use rustc_hash::FxHashMap;
+ 
+@@ -130,6 +130,25 @@
  
      /// Config
      pub(crate) config: C,
@@ -404,28 +464,46 @@
 +    /// `ParseOptions::speculation_budget`, with `u64::MAX` for no limit.
 +    speculation_limit: u64,
 +
++    /// The stack address below which the parser stops before reading another token:
++    /// `ParseOptions::stack_floor`, and `usize::MAX` once a parse limit is reached. One
++    /// comparison per token covers both limits.
++    stop_below: Cell<usize>,
++
 +    /// A rewind left the lexer having read more beyond its position than
 +    /// `speculation_limit` allows.
 +    speculation_budget_exhausted: bool,
  }
  
  impl<'a, C: Config> Lexer<'a, C> {
-@@ -176,9 +190,27 @@
+@@ -176,9 +195,40 @@
              escaped_templates: FxHashMap::default(),
              tokens,
              config,
 +            bytes_rewound: 0,
 +            bytes_skipped: 0,
 +            speculation_limit: u64::MAX,
++            stop_below: Cell::new(0),
 +            speculation_budget_exhausted: false,
          }
      }
  
-+    /// Limit the bytes the lexer may read beyond its position, by rewinding, to `budget`.
-+    /// `0` is no limit.
-+    pub(crate) fn with_speculation_budget(mut self, budget: u64) -> Self {
++    /// Stop the parse below `stack_floor`, and once the lexer has read more than `budget`
++    /// bytes beyond its position by rewinding. `0` is no limit for either.
++    pub(crate) fn with_parse_limits(mut self, stack_floor: usize, budget: u64) -> Self {
++        self.stop_below.set(stack_floor);
 +        self.speculation_limit = if budget == 0 { u64::MAX } else { budget };
 +        self
++    }
++
++    /// See [`Self::stop_below`].
++    #[inline]
++    pub(crate) fn stop_below(&self) -> usize {
++        self.stop_below.get()
++    }
++
++    /// Make the parser stop before every token it reads from now on.
++    pub(crate) fn stop_before_every_token(&self) {
++        self.stop_below.set(usize::MAX);
 +    }
 +
 +    /// Whether a rewind went past the speculation budget. Every rewind, the parser's and the
@@ -438,7 +516,7 @@
      /// Create a [`Lexer`], and call `f` with it. Returns what `f` returns.
      ///
      /// The `Lexer` is passed to `f`, not returned, because that's what makes `'brand`
-@@ -239,10 +271,22 @@
+@@ -239,10 +289,23 @@
          self.errors.truncate(checkpoint.errors_len);
  
          self.tokens.truncate(checkpoint.tokens_len);
@@ -447,6 +525,7 @@
 +        self.bytes_rewound += u64::from(from.saturating_sub(self.offset()));
 +        if self.bytes_read_ahead() > self.speculation_limit {
 +            self.speculation_budget_exhausted = true;
++            self.stop_before_every_token();
 +        }
          self.trivia_builder.rewind(checkpoint.trivia);
      }
@@ -461,7 +540,7 @@
      /// Make rewinding to `checkpoint` keep the comments and irregular whitespace lexed after it.
      pub(crate) fn keep_trivia(&self, checkpoint: &mut LexerCheckpoint<'a>) {
          self.trivia_builder.keep_trivia(&mut checkpoint.trivia);
-@@ -570,7 +614,9 @@
+@@ -570,7 +633,9 @@
      /// Advance source cursor to end of file.
      #[inline]
      pub fn advance_to_end(&mut self) {
@@ -482,6 +561,15 @@
  
  mod ast_builder;
  pub mod config;
+@@ -96,7 +96,7 @@
+ };
+ use oxc_data_structures::brands::{BrandOrigin, BrandScope, Unbranded};
+ use oxc_diagnostics::Diagnostics;
+-use oxc_span::{SourceType, Span};
++use oxc_span::{GetSpan, SourceType, Span};
+ use oxc_syntax::module_record::ModuleRecord;
+ 
+ pub use crate::lexer::{Kind, Token};
 @@ -221,6 +221,17 @@
  
      /// Whether the file is [flow](https://flow.org).
@@ -560,7 +648,7 @@
                  brand_origin,
 -            ),
 +            )
-+            .with_speculation_budget(options.speculation_budget),
++            .with_parse_limits(options.stack_floor, options.speculation_budget),
              source_type,
              source_text,
              errors: vec![],
@@ -582,18 +670,113 @@
          }
      }
  
+@@ -836,7 +885,14 @@
+             if self.lexer.config.tokens() { checkpoints.len() } else { 0 },
+             self,
+         );
++        let mut reparsed_until = 0;
+         for (stmt_index, checkpoint) in checkpoints {
++            // A statement parsed again can take in the candidates after it, as in
++            // `await\nawait 0`. They are part of it, and parsing each of them again as well
++            // took time and memory quadratic in their number.
++            if checkpoint.token_start() < reparsed_until {
++                continue;
++            }
+             // Only the statement is parsed again, so trivia after it is not lexed again.
+             self.rewind_keeping_trivia(checkpoint);
+             let replacement_start = replacements.len();
+@@ -857,6 +913,8 @@
+                 p.parse_statement_list_item(StatementContext::Program)
+             });
+ 
++            reparsed_until = self.prev_token_end;
++
+             // Replace the statement if the index is valid
+             if stmt_index < statements.len() {
+                 statements[stmt_index] = stmt;
+@@ -883,6 +941,15 @@
+                 edits.push((edit_start..original_index, replacement_start..replacements.len()));
+             }
+         }
++
++        // Drop the statements that a statement parsed again took in, so none overlap.
++        let mut covered_until = 0;
++        statements.retain(|statement| {
++            let span = statement.span();
++            let covered = span.start < covered_until;
++            covered_until = covered_until.max(span.end);
++            !covered
++        });
+ 
+         if let Some(mut tokens) = original_tokens {
+             let mut read = 0;
+--- a/src/module_record.rs
++++ b/src/module_record.rs
+@@ -5,6 +5,7 @@
+ use oxc_ecmascript::BoundNames;
+ use oxc_span::{GetSpan, Span};
+ use oxc_syntax::module_record::*;
++use rustc_hash::FxHashMap;
+ 
+ use crate::diagnostics;
+ 
+@@ -157,6 +158,20 @@
+             }
+         }
+ 
++        // A local export looks its name up among the import entries. Past a few of them, an
++        // index by local name keeps many exports of many imports linear. It keeps the first
++        // entry for each name, as the search does.
++        let imports_by_local_name = (module_record.import_entries.len() > 16).then(|| {
++            let mut index = FxHashMap::with_capacity_and_hasher(
++                module_record.import_entries.len(),
++                Default::default(),
++            );
++            for (position, import) in module_record.import_entries.iter().enumerate() {
++                index.entry(import.local_name.name).or_insert(position);
++            }
++            index
++        });
++
+         // Retain local exports in their original buffer, avoiding a second arena allocation.
+         // 10. For each ExportEntry Record ee of exportEntries, do
+         export_entries.retain_mut(|entry| {
+@@ -167,11 +182,16 @@
+                     // 1. Append ee to localExportEntries.
+                     return true;
+                 };
+-                let Some(import) = module_record
+-                    .import_entries
+-                    .iter()
+-                    .find(|import| import.local_name.name == local_name.name)
+-                else {
++                let import = match &imports_by_local_name {
++                    Some(index) => index
++                        .get(&local_name.name)
++                        .map(|&position| &module_record.import_entries[position]),
++                    None => module_record
++                        .import_entries
++                        .iter()
++                        .find(|import| import.local_name.name == local_name.name),
++                };
++                let Some(import) = import else {
+                     // i. If ee.[[LocalName]] is not an element of importedBoundNames, then
+                     // 1. Append ee to localExportEntries.
+                     return true;
 --- a/src/state.rs
 +++ b/src/state.rs
-@@ -1,5 +1,7 @@
+@@ -1,6 +1,8 @@
 -use rustc_hash::{FxHashMap, FxHashSet};
 +use std::collections::BTreeMap;
  
+-use oxc_allocator::{Allocator, ArenaVec};
 +use rustc_hash::FxHashSet;
 +
- use oxc_allocator::{Allocator, ArenaVec};
++use oxc_allocator::{Address, Allocator, ArenaVec};
  use oxc_ast::ast::Expression;
  use oxc_span::Span;
-@@ -43,6 +45,13 @@
+ 
+@@ -43,6 +45,19 @@
      /// Like `cover_elements`, each cover list owns the entries above its recorded length.
      pub cover_parenthesized: ArenaVec<'a, u32>,
  
@@ -604,10 +787,16 @@
 +    /// can build another `ParenthesizedExpression` that starts there, and it records its own.
 +    pub last_parenthesized: (u32, u32),
 +
++    /// Where the walk for the last `/*#__PURE__*/` comment started, as the address of the
++    /// expression after it, and whether it found a call. Nested `/*#__PURE__*/(` wraps each
++    /// level's expression around the one the level inside it walked, so a walk stops there and
++    /// takes its answer instead of walking every wrapper inside it again.
++    pub last_pure_walk: Option<(Address, bool)>,
++
      /// Zero outside speculative expression type arguments; otherwise their nesting depth.
      pub type_argument_depth: u32,
  
-@@ -51,12 +60,17 @@
+@@ -51,12 +66,17 @@
  
      /// Temporary storage for `CoverInitializedName` `({ foo = bar })`.
      /// Keyed by `ObjectProperty`'s span.start.
@@ -627,11 +816,12 @@
  
      /// Statements that may need reparsing when `sourceType` is `unambiguous`.
      ///
-@@ -81,10 +95,11 @@
+@@ -81,10 +101,12 @@
              mentions_await: false,
              cover_depth: 0,
              cover_parenthesized: ArenaVec::new_in(&allocator),
 +            last_parenthesized: (u32::MAX, u32::MAX),
++            last_pure_walk: None,
              type_argument_depth: 0,
              type_argument_lookahead: None,
 -            cover_initialized_name: FxHashMap::default(),

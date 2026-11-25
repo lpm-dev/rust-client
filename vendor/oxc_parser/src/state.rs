@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use rustc_hash::FxHashSet;
 
-use oxc_allocator::{Allocator, ArenaVec};
+use oxc_allocator::{Address, Allocator, ArenaVec};
 use oxc_ast::ast::Expression;
 use oxc_span::Span;
 
@@ -52,6 +52,12 @@ pub struct ParserState<'a> {
     /// can build another `ParenthesizedExpression` that starts there, and it records its own.
     pub last_parenthesized: (u32, u32),
 
+    /// Where the walk for the last `/*#__PURE__*/` comment started, as the address of the
+    /// expression after it, and whether it found a call. Nested `/*#__PURE__*/(` wraps each
+    /// level's expression around the one the level inside it walked, so a walk stops there and
+    /// takes its answer instead of walking every wrapper inside it again.
+    pub last_pure_walk: Option<(Address, bool)>,
+
     /// Zero outside speculative expression type arguments; otherwise their nesting depth.
     pub type_argument_depth: u32,
 
@@ -96,6 +102,7 @@ impl<'a> ParserState<'a> {
             cover_depth: 0,
             cover_parenthesized: ArenaVec::new_in(&allocator),
             last_parenthesized: (u32::MAX, u32::MAX),
+            last_pure_walk: None,
             type_argument_depth: 0,
             type_argument_lookahead: None,
             cover_initialized_name: BTreeMap::new(),

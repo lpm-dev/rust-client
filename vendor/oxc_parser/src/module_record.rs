@@ -5,6 +5,7 @@ use oxc_diagnostics::OxcDiagnostic;
 use oxc_ecmascript::BoundNames;
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::module_record::*;
+use rustc_hash::FxHashMap;
 
 use crate::diagnostics;
 
@@ -157,6 +158,20 @@ impl<'a> ModuleRecordBuilder<'a> {
             }
         }
 
+        // A local export looks its name up among the import entries. Past a few of them, an
+        // index by local name keeps many exports of many imports linear. It keeps the first
+        // entry for each name, as the search does.
+        let imports_by_local_name = (module_record.import_entries.len() > 16).then(|| {
+            let mut index = FxHashMap::with_capacity_and_hasher(
+                module_record.import_entries.len(),
+                Default::default(),
+            );
+            for (position, import) in module_record.import_entries.iter().enumerate() {
+                index.entry(import.local_name.name).or_insert(position);
+            }
+            index
+        });
+
         // Retain local exports in their original buffer, avoiding a second arena allocation.
         // 10. For each ExportEntry Record ee of exportEntries, do
         export_entries.retain_mut(|entry| {
@@ -167,11 +182,16 @@ impl<'a> ModuleRecordBuilder<'a> {
                     // 1. Append ee to localExportEntries.
                     return true;
                 };
-                let Some(import) = module_record
-                    .import_entries
-                    .iter()
-                    .find(|import| import.local_name.name == local_name.name)
-                else {
+                let import = match &imports_by_local_name {
+                    Some(index) => index
+                        .get(&local_name.name)
+                        .map(|&position| &module_record.import_entries[position]),
+                    None => module_record
+                        .import_entries
+                        .iter()
+                        .find(|import| import.local_name.name == local_name.name),
+                };
+                let Some(import) = import else {
                     // i. If ee.[[LocalName]] is not an element of importedBoundNames, then
                     // 1. Append ee to localExportEntries.
                     return true;

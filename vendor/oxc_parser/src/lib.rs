@@ -96,7 +96,7 @@ use oxc_ast::{
 };
 use oxc_data_structures::brands::{BrandOrigin, BrandScope, Unbranded};
 use oxc_diagnostics::Diagnostics;
-use oxc_span::{SourceType, Span};
+use oxc_span::{GetSpan, SourceType, Span};
 use oxc_syntax::module_record::ModuleRecord;
 
 pub use crate::lexer::{Kind, Token};
@@ -634,7 +634,7 @@ impl<'a, C: ParserConfig> ParserImpl<'a, C> {
                 config.lexer_config(),
                 brand_origin,
             )
-            .with_speculation_budget(options.speculation_budget),
+            .with_parse_limits(options.stack_floor, options.speculation_budget),
             source_type,
             source_text,
             errors: vec![],
@@ -885,7 +885,14 @@ impl<'a, C: ParserConfig> ParserImpl<'a, C> {
             if self.lexer.config.tokens() { checkpoints.len() } else { 0 },
             self,
         );
+        let mut reparsed_until = 0;
         for (stmt_index, checkpoint) in checkpoints {
+            // A statement parsed again can take in the candidates after it, as in
+            // `await\nawait 0`. They are part of it, and parsing each of them again as well
+            // took time and memory quadratic in their number.
+            if checkpoint.token_start() < reparsed_until {
+                continue;
+            }
             // Only the statement is parsed again, so trivia after it is not lexed again.
             self.rewind_keeping_trivia(checkpoint);
             let replacement_start = replacements.len();
@@ -905,6 +912,8 @@ impl<'a, C: ParserConfig> ParserImpl<'a, C> {
             let stmt = self.context_add(Context::Await, |p| {
                 p.parse_statement_list_item(StatementContext::Program)
             });
+
+            reparsed_until = self.prev_token_end;
 
             // Replace the statement if the index is valid
             if stmt_index < statements.len() {
@@ -932,6 +941,15 @@ impl<'a, C: ParserConfig> ParserImpl<'a, C> {
                 edits.push((edit_start..original_index, replacement_start..replacements.len()));
             }
         }
+
+        // Drop the statements that a statement parsed again took in, so none overlap.
+        let mut covered_until = 0;
+        statements.retain(|statement| {
+            let span = statement.span();
+            let covered = span.start < covered_until;
+            covered_until = covered_until.max(span.end);
+            !covered
+        });
 
         if let Some(mut tokens) = original_tokens {
             let mut read = 0;
