@@ -5,7 +5,7 @@
 //!     * [rustc](https://github.com/rust-lang/rust/blob/1.82.0/compiler/rustc_lexer/src)
 //!     * [v8](https://v8.dev/blog/scanner)
 
-use std::mem;
+use std::{cell::Cell, mem};
 
 use rustc_hash::FxHashMap;
 
@@ -141,6 +141,11 @@ pub struct Lexer<'a, C: Config> {
     /// `ParseOptions::speculation_budget`, with `u64::MAX` for no limit.
     speculation_limit: u64,
 
+    /// The stack address below which the parser stops before reading another token:
+    /// `ParseOptions::stack_floor`, and `usize::MAX` once a parse limit is reached. One
+    /// comparison per token covers both limits.
+    stop_below: Cell<usize>,
+
     /// A rewind left the lexer having read more beyond its position than
     /// `speculation_limit` allows.
     speculation_budget_exhausted: bool,
@@ -193,15 +198,28 @@ impl<'a, C: Config> Lexer<'a, C> {
             bytes_rewound: 0,
             bytes_skipped: 0,
             speculation_limit: u64::MAX,
+            stop_below: Cell::new(0),
             speculation_budget_exhausted: false,
         }
     }
 
-    /// Limit the bytes the lexer may read beyond its position, by rewinding, to `budget`.
-    /// `0` is no limit.
-    pub(crate) fn with_speculation_budget(mut self, budget: u64) -> Self {
+    /// Stop the parse below `stack_floor`, and once the lexer has read more than `budget`
+    /// bytes beyond its position by rewinding. `0` is no limit for either.
+    pub(crate) fn with_parse_limits(mut self, stack_floor: usize, budget: u64) -> Self {
+        self.stop_below.set(stack_floor);
         self.speculation_limit = if budget == 0 { u64::MAX } else { budget };
         self
+    }
+
+    /// See [`Self::stop_below`].
+    #[inline]
+    pub(crate) fn stop_below(&self) -> usize {
+        self.stop_below.get()
+    }
+
+    /// Make the parser stop before every token it reads from now on.
+    pub(crate) fn stop_before_every_token(&self) {
+        self.stop_below.set(usize::MAX);
     }
 
     /// Whether a rewind went past the speculation budget. Every rewind, the parser's and the
@@ -276,6 +294,7 @@ impl<'a, C: Config> Lexer<'a, C> {
         self.bytes_rewound += u64::from(from.saturating_sub(self.offset()));
         if self.bytes_read_ahead() > self.speculation_limit {
             self.speculation_budget_exhausted = true;
+            self.stop_before_every_token();
         }
         self.trivia_builder.rewind(checkpoint.trivia);
     }

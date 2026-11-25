@@ -96,7 +96,7 @@ use oxc_ast::{
 };
 use oxc_data_structures::brands::{BrandOrigin, BrandScope, Unbranded};
 use oxc_diagnostics::Diagnostics;
-use oxc_span::{SourceType, Span};
+use oxc_span::{GetSpan, SourceType, Span};
 use oxc_syntax::module_record::ModuleRecord;
 
 pub use crate::lexer::{Kind, Token};
@@ -634,7 +634,7 @@ impl<'a, C: ParserConfig> ParserImpl<'a, C> {
                 config.lexer_config(),
                 brand_origin,
             )
-            .with_speculation_budget(options.speculation_budget),
+            .with_parse_limits(options.stack_floor, options.speculation_budget),
             source_type,
             source_text,
             errors: vec![],
@@ -885,7 +885,16 @@ impl<'a, C: ParserConfig> ParserImpl<'a, C> {
             if self.lexer.config.tokens() { checkpoints.len() } else { 0 },
             self,
         );
+        let original_spans: Vec<Span> = statements.iter().map(GetSpan::span).collect();
+        let mut replaced_statements = Vec::new();
+        let mut reparsed_until = 0;
         for (stmt_index, checkpoint) in checkpoints {
+            // A statement parsed again can take in the candidates after it, as in
+            // `await\nawait 0`. They are part of it, and parsing each of them again as well
+            // took time and memory quadratic in their number.
+            if checkpoint.token_start() < reparsed_until {
+                continue;
+            }
             // Only the statement is parsed again, so trivia after it is not lexed again.
             self.rewind_keeping_trivia(checkpoint);
             let replacement_start = replacements.len();
@@ -901,14 +910,27 @@ impl<'a, C: ParserConfig> ParserImpl<'a, C> {
             }
             let edit_start = original_index;
 
-            // Parse the statement with await context enabled (TopLevel context is already set)
-            let stmt = self.context_add(Context::Await, |p| {
-                p.parse_statement_list_item(StatementContext::Program)
-            });
+            // Parse the statement with await context enabled (TopLevel context is already set).
+            // It can end inside a statement the first parse read, as `await\nawait /x/` does
+            // inside `await / x / foo()`: parse on to the end of one, so the rest is parsed again.
+            let mut reparsed = ArenaVec::new_in(self);
+            loop {
+                let start = self.prev_token_end;
+                let stmt = self.context_add(Context::Await, |p| {
+                    p.parse_statement_list_item(StatementContext::Program)
+                });
+                reparsed.push(stmt);
+                let end = self.prev_token_end;
+                let following = original_spans.partition_point(|span| span.start < end);
+                let ends_inside = following > 0 && original_spans[following - 1].end > end;
+                if !ends_inside || end <= start || self.has_fatal_error() {
+                    break;
+                }
+            }
 
-            // Replace the statement if the index is valid
+            reparsed_until = self.prev_token_end;
             if stmt_index < statements.len() {
-                statements[stmt_index] = stmt;
+                replaced_statements.push((stmt_index, reparsed));
             }
 
             if self.lexer.config.tokens() {
@@ -932,6 +954,30 @@ impl<'a, C: ParserConfig> ParserImpl<'a, C> {
                 edits.push((edit_start..original_index, replacement_start..replacements.len()));
             }
         }
+
+        if !replaced_statements.is_empty() {
+            let added: usize = replaced_statements.iter().map(|(_, new)| new.len() - 1).sum();
+            let mut replaced_statements = replaced_statements.into_iter().peekable();
+            let mut rebuilt = ArenaVec::with_capacity_in(statements.len() + added, self);
+            for (index, statement) in statements.drain(..).enumerate() {
+                match replaced_statements.next_if(|(replaced, _)| *replaced == index) {
+                    Some((_, new)) => rebuilt.extend(new),
+                    None => rebuilt.push(statement),
+                }
+            }
+            *statements = rebuilt;
+        }
+
+        // Drop the statements that statements parsed again took in, so none overlap. One that
+        // reaches past them, which only a parse again stopped by an error leaves, stays: an
+        // overlap loses no code.
+        let mut covered_until = 0;
+        statements.retain(|statement| {
+            let span = statement.span();
+            let covered = span.start < covered_until && span.end <= covered_until;
+            covered_until = covered_until.max(span.end);
+            !covered
+        });
 
         if let Some(mut tokens) = original_tokens {
             let mut read = 0;

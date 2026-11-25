@@ -3490,6 +3490,141 @@ mod tests {
     }
 
     #[test]
+    fn expressions_in_more_wrappers_than_real_code_has_are_read_without_parsing_in_linear_time() {
+        // The rules read through wrappers, and read an initializer again for
+        // each reference to it.
+        let analyze = |filename: &'static str, source: String| {
+            std::thread::Builder::new()
+                .stack_size(256 * 1024 * 1024)
+                .spawn(move || {
+                    let started = std::time::Instant::now();
+                    let result = analyze_bytes(filename, source.as_bytes());
+                    (result, started.elapsed())
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        };
+        let depth = 10_000;
+        let references = 20_000;
+        let parenthesized = nested("(", "function(){}", ")", depth);
+        for (filename, source) in [
+            (
+                "index.js",
+                format!(
+                    "eval(y);const f={parenthesized};{}",
+                    "f();".repeat(references)
+                ),
+            ),
+            (
+                "index.js",
+                format!(
+                    "eval(y);const f={parenthesized};var x;{}",
+                    "x=f;".repeat(references)
+                ),
+            ),
+            (
+                "index.ts",
+                format!(
+                    "eval(y);const f=function(){{}}{};{}",
+                    "!".repeat(depth),
+                    "f();".repeat(references)
+                ),
+            ),
+        ] {
+            let flat = format!("{}eval(y);", "x;".repeat(source.len() / 2));
+            let (flat_result, flat_time) = analyze(filename, flat);
+            let (result, nested_time) = analyze(filename, source);
+            assert_eq!(flat_result.unparsed_files, 0);
+            assert!(result.source.eval);
+            assert_eq!(result.unparsed_files, 1, "{filename}");
+            assert!(
+                nested_time < flat_time * 5 + std::time::Duration::from_millis(200),
+                "{filename}: nested {nested_time:?}, flat {flat_time:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn expressions_in_as_many_wrappers_as_real_code_could_have_are_parsed() {
+        // A run of wrappers continues only into the expression a wrapper
+        // wraps, and into the last expression of a sequence, as the rules read
+        // through them.
+        for (filename, source, unparsed) in [
+            (
+                "index.js",
+                format!("x={};", nested("(", "eval(y)", ")", 32)),
+                0,
+            ),
+            (
+                "index.js",
+                format!("x={};", nested("(", "eval(y)", ")", 33)),
+                1,
+            ),
+            (
+                "index.js",
+                format!("x={};", nested("(", "eval(y)", ",0)", 40)),
+                0,
+            ),
+            (
+                "index.js",
+                format!("x={};", nested("(0,", "eval(y)", ")", 40)),
+                1,
+            ),
+            (
+                "index.ts",
+                format!("x=a as {{[{}]:number}};eval(y);", nested("(", "k", ")", 32)),
+                0,
+            ),
+            ("index.ts", format!("x=a{};eval(y);", " as T".repeat(33)), 1),
+            (
+                "index.ts",
+                format!("x=a{};eval(y);", " satisfies T".repeat(33)),
+                1,
+            ),
+            ("index.ts", format!("x={}a;eval(y);", "<T>".repeat(33)), 1),
+            ("index.ts", format!("x=a{};eval(y);", "!".repeat(33)), 1),
+            (
+                "index.ts",
+                format!("x={};eval(y);", nested("(", "a<T>", ")", 31)),
+                0,
+            ),
+            (
+                "index.ts",
+                format!("x={};eval(y);", nested("(", "a<T>", ")", 32)),
+                1,
+            ),
+        ] {
+            let result = analyze_on_a_worker_stack(filename, source.clone());
+            assert!(result.source.eval);
+            assert_eq!(result.unparsed_files, unparsed, "{source}");
+        }
+    }
+
+    #[test]
+    fn code_after_a_top_level_await_parsed_again_is_analyzed() {
+        // Found to be a module, each source's statement that starts with
+        // `await` ends earlier than its script reading did, and the code after
+        // it runs.
+        for source in [
+            "await / a; x = /;0/ + eval(y);\nexport {};\n",
+            "await /a/\neval(y)\nexport {};\n",
+        ] {
+            let result = analyze_on_a_worker_stack("index.js", source.to_owned());
+            assert_eq!(result.unparsed_files, 0, "{source}");
+            assert!(result.source.eval, "{source}");
+        }
+    }
+
+    #[test]
+    fn a_source_in_too_many_wrappers_keeps_its_comments_and_literals_masked() {
+        let source = format!("/* eval(y) */x='eval(y)';x={};", nested("(", "a", ")", 33));
+        let result = analyze_on_a_worker_stack("index.js", source);
+        assert_eq!(result.unparsed_files, 1);
+        assert!(!result.source.eval);
+    }
+
+    #[test]
     fn generic_arrow_heads_nested_in_defaults_are_read_without_parsing_in_linear_time() {
         // A TypeScript `<` that may open a generic arrow function is parsed
         // as one and, when no `=>` follows its parameters, parsed again as a

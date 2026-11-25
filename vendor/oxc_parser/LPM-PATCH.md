@@ -2,10 +2,11 @@
 
 This is `oxc_parser` 0.160.0 from crates.io (oxc commit
 `87e38f3270b00341695e02e8aaf681e9e985e4a3`, `crates/oxc_parser`), MIT
-licensed (see `LICENSE`), with three changes: the parser can stop at a
-stack floor instead of overflowing its thread's stack, it can stop at a
-budget for the work it spends on speculative parses, and nested
-parentheses and member chains take it linear time and constant stack. The workspace uses it through `[patch.crates-io]` in the root
+licensed (see `LICENSE`), with three kinds of change: the parser can stop
+at a stack floor instead of overflowing its thread's stack, it can stop at
+a budget for the work it spends on speculative parses, and the inputs that
+made upstream's parse quadratic without speculating take it linear time.
+The workspace uses it through `[patch.crates-io]` in the root
 `Cargo.toml`.
 
 ## Why
@@ -26,29 +27,42 @@ quadratic in the source's length: `x=<T>(a=<T>(a=…0)));` and
 `x=async(a=async(a=…await 0)=>0)=>0;` read each level again for every level
 around it.
 
-Upstream 0.160 also walks every parenthesis inside a closing one to find
-where the expression innermost in them starts, so `((((…a…))))` took
-quadratic time without speculating: 80,000 levels, which fit on a 64 MiB
-stack, took four seconds. And before parsing the arguments of an
-`async(…)` that mention `await` again as parameters, it walked every entry
-recorded for literals ending in a spread and a comma (`[...a,]`) anywhere
-before them, reading almost nothing again: a 4 MiB file of those and of
-`async(await)=>0` would have taken about 25 seconds, within the budget.
+Some upstream work grows with what was parsed before it while reading
+little or nothing again, so no budget on bytes read again bounds it. In
+release builds:
+
+- closing a parenthesis walked every parenthesis inside it to find where
+  the expression innermost in them starts: 80,000 nested levels took 4 s;
+- parsing the arguments of an `async(…)` again walked every entry recorded
+  for a literal ending in a spread and a comma (`[...a,]`) before them: a
+  4 MiB file of those and `async(await)=>0` would have taken about 25 s;
+- each local export searched every import entry for its name: 40,000 of
+  each took 3 s, and a 4 MiB module would take about half an hour;
+- each `/*#__PURE__*/` before nested parentheses walked every parenthesis
+  inside it to find its call: 40,000 levels took 1.1 s;
+- a source whose module syntax is found late parses each statement that
+  starts with `await` again, and one parse again can take in the
+  candidates after it, which were parsed again anyway: 8,000 lines of
+  `await` took 0.5 s and 1 GB.
 
 ## What changed
 
-`lpm-stack-floor.patch` is the whole change against the published crate:
+`lpm-stack-floor.patch` is the whole change against the published crate.
+
+Stack floor:
 
 - `ParseOptions::stack_floor`: the lowest stack address the parser may use.
   The default, `0`, never stops, so every other user of the parser behaves
   exactly as upstream.
 - Before moving to each token, the parser compares the stack pointer with
-  the floor: in `advance`, the JSX variants, and `advance_to`, which moves
-  to a token the lexer has already read. Every level of nesting in the
-  source reads at least one token, so the parser can't go deeper than the
-  frames between two tokens past it. Below the floor it records a fatal
-  error, which moves the lexer to the end of the source, so every caller
-  unwinds without reading more.
+  the lexer's `stop_below`: in `advance`, the JSX variants, and
+  `advance_to`, which moves to a token the lexer has already read.
+  `stop_below` starts at the floor and goes past every address once either
+  limit is reached, so one comparison per token checks both. Every level of
+  nesting in the source reads at least one token, so the parser can't go
+  deeper than the frames between two tokens past the floor. There it
+  records a fatal error, which moves the lexer to the end of the source, so
+  every caller unwinds without reading more.
 - Recursions that run over nodes already parsed and read no token check
   the floor once per level themselves, because their frames per level can
   be larger than those of the parse that built the nodes:
@@ -66,6 +80,12 @@ before them, reading almost nothing again: a 4 MiB file of those and of
     the parser, so they record the stop in a `Cell` and fail; the parse
     then stops at the next token it reads, and reports the stop even if it
     reads none.
+- Two recursions over a member chain, which the parser reads in a loop
+  and so without using stack per member, are loops instead:
+  `set_pure_on_call_or_new_expr`, for `/*#__PURE__*/a.b.c…`, and
+  `jsx_member_expression_eq`, which compares `<a.b.c…>` with its closing
+  tag. A debug build overflowed its stack on 200,000 members; a release
+  build relied on the optimizer turning the tail calls into loops.
 - Once the floor is reached, every later token read records the fatal error
   again. A speculative parse rewinds the fatal error away, and the parser
   then reads the other interpretation. If only reads below the floor
@@ -74,6 +94,9 @@ before them, reading almost nothing again: a 4 MiB file of those and of
   speculative parse rewinds the fatal error away, because the speculation's
   outcome, and so the AST, may then differ from a parse with more stack.
   Callers discard a parse that reports it.
+
+Speculation budget:
+
 - `ParseOptions::speculation_budget`: how much work the parser may spend
   on speculative parses. The lexer counts the bytes it moves back over in
   every rewind, the parser's and its own lookaheads', and the bytes it
@@ -81,29 +104,43 @@ before them, reading almost nothing again: a 4 MiB file of those and of
   source. Their difference is what it has read beyond its position, so in
   all it has read at most its position plus that. The counts change only in
   rewinds and skips, and the lexer compares them with the budget at every
-  rewind, its own lookaheads' included, so a parse pays nothing for them
-  per token. Going past the budget stops the parse at the next token it
-  reads, the same way the floor does, sticky across later rewinds, and
+  rewind, so a parse pays nothing for them per token. Going past the budget
+  stops the parse at the next token it reads, the same way the floor does,
+  sticky across later rewinds, and
   `ParserReturn::speculation_budget_exhausted` reports it. A parse that
   reached the floor reports only that, so it can still be retried on a
   larger stack. The default, `0`, never stops.
-- Two recursions over a member chain, which the parser reads in a loop
-  and so without using stack per member, are loops instead:
-  `set_pure_on_call_or_new_expr`, for `/*#__PURE__*/a.b.c…`, and
-  `jsx_member_expression_eq`, which compares `<a.b.c…>` with its closing
-  tag. Each recursed once per member, and a debug build overflowed its
-  stack on 200,000 members; a release build relied on the optimizer
-  turning the tail calls into loops.
-- `ParserState::cover_initialized_name` and `trailing_commas` are ordered
-  maps, so parsing the arguments of `async(…)` again drops the entries
-  inside them with `split_off` instead of walking every entry before them.
+
+Linear time:
+
 - `ParserState::last_parenthesized` keeps the start of the
   `ParenthesizedExpression` built last and of the expression innermost in
   its parentheses. Each place that builds one records it, and closing a
-  chain of parentheses reads the innermost start from there instead of
-  walking the chain. A rewind leaves no stale entry: only a parse of the
-  same offset can build another `ParenthesizedExpression` starting there,
-  and it records its own.
+  chain of parentheses reads the innermost start from there.
+- `ParserState::cover_initialized_name` and `trailing_commas` are ordered
+  maps, so parsing the arguments of `async(…)` again drops the entries
+  inside them with `split_off`.
+- `ModuleRecordBuilder::resolve_export_entries` looks local exports up in
+  an index of the import entries by local name once there are more than 16
+  of them and a local export to look up, keeping the first entry for each
+  name as the search did.
+- `ParserState::pure_walks` keeps where each walk for a `/*#__PURE__*/`
+  comment started and what it found. A walk that reaches one of those
+  expressions takes its answer, so no node is walked twice.
+- `reparse_potential_top_level_awaits` skips the candidates that a
+  statement parsed again took in. When a statement parsed again ends inside
+  one the first parse read, as `await\nawait /x/` ends inside the script's
+  `await / x / foo()`, it parses on to the end of one, so the rest is parsed
+  again too. It then drops the statements it covered, so none overlap and
+  none is lost. The module record keeps a dynamic import or `import.meta`
+  recorded again only once.
+- Neither cache can answer for the wrong node. `last_parenthesized` is
+  keyed by where a `ParenthesizedExpression` starts, and only a parse of
+  the same source can build another one there, which records its own.
+  `pure_walks` is keyed by a node's address: the arena never frees or
+  reuses a node, rewinds included, and no node on a walked path changes
+  after its walk. The one rewrite of a node after it is built, in
+  `parse_lhs_expression_rest`, comes before any walk that could reach it.
 
 `lpm-security`'s `behavioral/syntax.rs` sets the floor from the stack its
 thread has left, retries a source that runs out on a 64 MiB stack, and
@@ -112,7 +149,8 @@ parse a speculation budget of twice the source's length, and at least
 64 KiB, and reads a source that exceeds it without parsing it. Across the
 370,776 JavaScript and TypeScript files of a local package store, the most
 any file read beyond its position was 0.75 bytes per byte, and no file used
-more than 30% of its budget.
+more than 30% of its budget. On 300 MB of those files, a release build
+parses about 2% slower than the published crate.
 
 ## Upgrading oxc
 
@@ -125,15 +163,17 @@ more than 30% of its budget.
    -x .cargo_vcs_info.json -x Cargo.lock`, with `a/` and `b/` file headers.
 4. Look for every place the parser moves to a new token, and for new
    recursion that reads no token, such as conversions between AST shapes
-   after a parse, and give them floor checks like the ones above.
-   Look for walks over nodes already built, like the one through nested
-   parentheses, that run once per level of nesting, and for work at each
-   rewind or parse again that grows with what was parsed before it, not
-   with the bytes read again, like the walk over recorded literals. `lpm-security`'s
+   after a parse, and give them floor checks like the ones above. Look for
+   walks over nodes already built that run once per level of nesting, and
+   for work that grows with what was parsed before it, not with the bytes
+   read again, like the walks listed under "Why". Time nested and repeated
+   shapes in a release build, doubling their size.
+   `lpm-security`'s
    `parenthesized_lists_parsed_just_above_the_floor_become_parameters_or_expressions_without_overflowing`
-   test parses each shape it lists to the deepest nesting that fits. If the
-   release changes how the parser speculates or takes checkpoints, measure
-   again how much speculative work real code takes, against
+   test parses each shape it lists to the deepest nesting that fits, and
+   its `syntax.rs` timing tests cover the walks above. If the release
+   changes how the parser speculates or takes checkpoints, measure again
+   how much speculative work real code takes, against
    `PARSE_SPECULATION_PER_BYTE` in `lpm-security`'s `behavioral/syntax.rs`,
    and check that the sources its budget tests nest still speculate.
 5. Bump every `oxc_*` dependency in the workspace to the same release:

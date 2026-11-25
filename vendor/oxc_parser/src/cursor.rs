@@ -22,6 +22,13 @@ pub struct ParserCheckpoint<'a> {
     has_fatal_error: bool,
 }
 
+impl ParserCheckpoint<'_> {
+    /// Start of the token the parser was at when the checkpoint was taken.
+    pub(crate) fn token_start(&self) -> u32 {
+        self.cur_token.start()
+    }
+}
+
 impl<'a, C: Config> ParserImpl<'a, C> {
     /// Get current token's span start.
     #[inline]
@@ -119,13 +126,13 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     /// `ParseOptions::stack_floor` or speculative parses have spent more
     /// than `ParseOptions::speculation_budget` allows, and on every token
     /// read after that. The fatal error moves the lexer to the end of the source,
-    /// so every caller unwinds without reading more tokens.
+    /// so every caller unwinds without reading more tokens. Reaching either limit
+    /// raises the lexer's `stop_below` past every address, so this is one
+    /// comparison per token.
     #[inline]
     fn check_parse_limits(&mut self) {
-        if self.stack_exhausted.get()
-            || self.lexer.speculation_budget_exhausted()
-            || self.below_stack_floor()
-        {
+        let marker = 0u8;
+        if (&raw const marker).addr() < self.lexer.stop_below() {
             self.stop_at_parse_limit();
         }
     }
@@ -160,6 +167,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     #[inline(never)]
     fn stop_at_stack_floor(&mut self) {
         self.stack_exhausted.set(true);
+        self.lexer.stop_before_every_token();
         self.set_fatal_error(diagnostics::stack_exhausted(self.token.span()));
     }
 
@@ -182,6 +190,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     #[inline(never)]
     pub(crate) fn stack_floor_error(&self, span: Span) -> ParserDiagnostic<'a> {
         self.stack_exhausted.set(true);
+        self.lexer.stop_before_every_token();
         diagnostics::stack_exhausted(span)
     }
 
