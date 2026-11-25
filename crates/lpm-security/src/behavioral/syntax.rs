@@ -726,36 +726,59 @@ mod tests {
         assert!(parsed.fatal_error);
     }
 
+    /// How long parsing `source`, which is valid, takes on a stack deep
+    /// enough for it.
+    fn time_to_parse(source: String) -> std::time::Duration {
+        std::thread::Builder::new()
+            .stack_size(512 * 1024 * 1024)
+            .spawn(move || {
+                let allocator = Allocator::default();
+                let started = std::time::Instant::now();
+                let parsed = Parser::new(&allocator, &source, SourceType::cjs())
+                    .with_options(ParseOptions {
+                        stack_floor: current_stack_floor().unwrap(),
+                        ..ParseOptions::default()
+                    })
+                    .parse();
+                let elapsed = started.elapsed();
+                assert!(!parsed.stack_exhausted && !parsed.fatal_error);
+                elapsed
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
     #[test]
     fn parentheses_nested_tens_of_thousands_of_levels_deep_parse_in_linear_time() {
         // Each closing parenthesis records where the expression innermost in
         // it starts, and must not walk every parenthesis inside it to find it.
-        let time_to_parse = |source: String| {
-            std::thread::Builder::new()
-                .stack_size(512 * 1024 * 1024)
-                .spawn(move || {
-                    let allocator = Allocator::default();
-                    let started = std::time::Instant::now();
-                    let parsed = Parser::new(&allocator, &source, SourceType::cjs())
-                        .with_options(ParseOptions {
-                            stack_floor: current_stack_floor().unwrap(),
-                            ..ParseOptions::default()
-                        })
-                        .parse();
-                    let elapsed = started.elapsed();
-                    assert!(!parsed.stack_exhausted && !parsed.fatal_error);
-                    elapsed
-                })
-                .unwrap()
-                .join()
-                .unwrap()
-        };
         let depth = 40_000;
         let nested = time_to_parse(format!("x={}a{};", "(".repeat(depth), ")".repeat(depth)));
         let flat = time_to_parse("x;".repeat(depth + 1));
         assert!(
             nested < flat * 5 + std::time::Duration::from_millis(200),
             "nested {nested:?}, flat {flat:?}"
+        );
+    }
+
+    #[test]
+    fn async_arrow_heads_parsed_again_after_many_spread_literals_parse_in_linear_time() {
+        // Parsing the arguments of an `async(…)` again as parameters forgets
+        // what was recorded about the literals inside them, and must not walk
+        // what was recorded about every literal before them.
+        let literals = 32_768;
+        let source = format!(
+            "{}{}",
+            "[...a,];".repeat(literals),
+            "async(a=function(){await})=>0;".repeat(literals / 2)
+        );
+        let flat = "x;".repeat(source.len() / 2);
+        let parsed_again = time_to_parse(source);
+        let flat = time_to_parse(flat);
+        assert!(
+            parsed_again < flat * 5 + std::time::Duration::from_millis(200),
+            "parsed again {parsed_again:?}, flat {flat:?}"
         );
     }
 

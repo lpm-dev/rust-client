@@ -662,6 +662,7 @@ fn destructured_methods<'a>(semantic: &Semantic<'a>) -> HashMap<SymbolId, &'a st
                 PropertyKey::StaticStringLiteral(key) | PropertyKey::StringLiteral(key) => {
                     key.value.as_str()
                 }
+                PropertyKey::TemplateLiteral(key) => key.single_quasi().and_then(JSStr::as_str),
                 _ => None,
             };
             if let Some(name) = name

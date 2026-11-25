@@ -149,6 +149,17 @@
                      Expression::new_parenthesized_expression(self.end_span(start), expression, self)
                  } else {
                      expression
+@@ -373,8 +374,8 @@
+         {
+             // Discard what `rewind` does not restore, and parse the list as parameters.
+             self.state.cover_elements.truncate(base);
+-            self.state.cover_initialized_name.retain(|&start, _| start < lparen);
+-            self.state.trailing_commas.retain(|&start, _| start < lparen);
++            self.state.cover_initialized_name.split_off(&lparen);
++            self.state.trailing_commas.split_off(&lparen);
+             self.deferred_script_errors.truncate(deferred_script_errors_len);
+             if !had_module_syntax {
+                 self.module_record_builder.unset_module_syntax();
 --- a/src/js/cover.rs
 +++ b/src/js/cover.rs
 @@ -797,15 +797,31 @@
@@ -573,7 +584,16 @@
  
 --- a/src/state.rs
 +++ b/src/state.rs
-@@ -43,6 +43,13 @@
+@@ -1,5 +1,7 @@
+-use rustc_hash::{FxHashMap, FxHashSet};
++use std::collections::BTreeMap;
+ 
++use rustc_hash::FxHashSet;
++
+ use oxc_allocator::{Allocator, ArenaVec};
+ use oxc_ast::ast::Expression;
+ use oxc_span::Span;
+@@ -43,6 +45,13 @@
      /// Like `cover_elements`, each cover list owns the entries above its recorded length.
      pub cover_parenthesized: ArenaVec<'a, u32>,
  
@@ -587,11 +607,37 @@
      /// Zero outside speculative expression type arguments; otherwise their nesting depth.
      pub type_argument_depth: u32,
  
-@@ -81,6 +88,7 @@
+@@ -51,12 +60,17 @@
+ 
+     /// Temporary storage for `CoverInitializedName` `({ foo = bar })`.
+     /// Keyed by `ObjectProperty`'s span.start.
+-    pub cover_initialized_name: FxHashMap<u32, CoverInitializedName<'a>>,
++    ///
++    /// Ordered, as `trailing_commas` is, so that parsing the arguments of `async(…)` again as
++    /// parameters drops the entries inside them without visiting every entry before them.
++    /// Neither map forgets an entry no conversion consumes, so visiting them all made each
++    /// parse again cost the number of literals before it.
++    pub cover_initialized_name: BTreeMap<u32, CoverInitializedName<'a>>,
+ 
+     /// Trailing comma spans for `ArrayExpression` and `ObjectExpression` ending in a spread.
+     /// Used for error reporting when covering a rest assignment target.
+     /// Keyed by the expression start and consumed when checked.
+-    pub trailing_commas: FxHashMap<u32, Span>,
++    pub trailing_commas: BTreeMap<u32, Span>,
+ 
+     /// Statements that may need reparsing when `sourceType` is `unambiguous`.
+     ///
+@@ -81,10 +95,11 @@
              mentions_await: false,
              cover_depth: 0,
              cover_parenthesized: ArenaVec::new_in(&allocator),
 +            last_parenthesized: (u32::MAX, u32::MAX),
              type_argument_depth: 0,
              type_argument_lookahead: None,
-             cover_initialized_name: FxHashMap::default(),
+-            cover_initialized_name: FxHashMap::default(),
+-            trailing_commas: FxHashMap::default(),
++            cover_initialized_name: BTreeMap::new(),
++            trailing_commas: BTreeMap::new(),
+             potential_await_reparse: Vec::new(),
+             encountered_await_identifier: false,
+         }

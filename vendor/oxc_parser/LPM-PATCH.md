@@ -29,7 +29,11 @@ around it.
 Upstream 0.160 also walks every parenthesis inside a closing one to find
 where the expression innermost in them starts, so `((((…a…))))` took
 quadratic time without speculating: 80,000 levels, which fit on a 64 MiB
-stack, took four seconds.
+stack, took four seconds. And before parsing the arguments of an
+`async(…)` that mention `await` again as parameters, it walked every entry
+recorded for literals ending in a spread and a comma (`[...a,]`) anywhere
+before them, reading almost nothing again: a 4 MiB file of those and of
+`async(await)=>0` would have taken about 25 seconds, within the budget.
 
 ## What changed
 
@@ -90,6 +94,9 @@ stack, took four seconds.
   tag. Each recursed once per member, and a debug build overflowed its
   stack on 200,000 members; a release build relied on the optimizer
   turning the tail calls into loops.
+- `ParserState::cover_initialized_name` and `trailing_commas` are ordered
+  maps, so parsing the arguments of `async(…)` again drops the entries
+  inside them with `split_off` instead of walking every entry before them.
 - `ParserState::last_parenthesized` keeps the start of the
   `ParenthesizedExpression` built last and of the expression innermost in
   its parentheses. Each place that builds one records it, and closing a
@@ -120,7 +127,9 @@ more than 30% of its budget.
    recursion that reads no token, such as conversions between AST shapes
    after a parse, and give them floor checks like the ones above.
    Look for walks over nodes already built, like the one through nested
-   parentheses, that run once per level of nesting. `lpm-security`'s
+   parentheses, that run once per level of nesting, and for work at each
+   rewind or parse again that grows with what was parsed before it, not
+   with the bytes read again, like the walk over recorded literals. `lpm-security`'s
    `parenthesized_lists_parsed_just_above_the_floor_become_parameters_or_expressions_without_overflowing`
    test parses each shape it lists to the deepest nesting that fits. If the
    release changes how the parser speculates or takes checkpoints, measure

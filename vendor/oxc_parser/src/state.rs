@@ -1,4 +1,6 @@
-use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::BTreeMap;
+
+use rustc_hash::FxHashSet;
 
 use oxc_allocator::{Allocator, ArenaVec};
 use oxc_ast::ast::Expression;
@@ -58,12 +60,17 @@ pub struct ParserState<'a> {
 
     /// Temporary storage for `CoverInitializedName` `({ foo = bar })`.
     /// Keyed by `ObjectProperty`'s span.start.
-    pub cover_initialized_name: FxHashMap<u32, CoverInitializedName<'a>>,
+    ///
+    /// Ordered, as `trailing_commas` is, so that parsing the arguments of `async(…)` again as
+    /// parameters drops the entries inside them without visiting every entry before them.
+    /// Neither map forgets an entry no conversion consumes, so visiting them all made each
+    /// parse again cost the number of literals before it.
+    pub cover_initialized_name: BTreeMap<u32, CoverInitializedName<'a>>,
 
     /// Trailing comma spans for `ArrayExpression` and `ObjectExpression` ending in a spread.
     /// Used for error reporting when covering a rest assignment target.
     /// Keyed by the expression start and consumed when checked.
-    pub trailing_commas: FxHashMap<u32, Span>,
+    pub trailing_commas: BTreeMap<u32, Span>,
 
     /// Statements that may need reparsing when `sourceType` is `unambiguous`.
     ///
@@ -91,8 +98,8 @@ impl<'a> ParserState<'a> {
             last_parenthesized: (u32::MAX, u32::MAX),
             type_argument_depth: 0,
             type_argument_lookahead: None,
-            cover_initialized_name: FxHashMap::default(),
-            trailing_commas: FxHashMap::default(),
+            cover_initialized_name: BTreeMap::new(),
+            trailing_commas: BTreeMap::new(),
             potential_await_reparse: Vec::new(),
             encountered_await_identifier: false,
         }

@@ -154,7 +154,7 @@ fn aliased_filesystem_methods_keep_their_imported_identity() {
         "import {rmSync as remove} from 'node:fs'; import {homedir as home} from 'node:os'; remove(home(),{recursive:true});",
         "destructiveFilesystem"
     ));
-    for key in ["rmSync", "'rmSync'", "['rmSync']"] {
+    for key in ["rmSync", "'rmSync'", "['rmSync']", "[`rmSync`]"] {
         let source = format!(
             "const {{{key}:remove}}=require('fs'); const os=require('os'); remove(os.homedir(),{{recursive:true}});"
         );

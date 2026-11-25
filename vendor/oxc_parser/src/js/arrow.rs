@@ -374,8 +374,8 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         {
             // Discard what `rewind` does not restore, and parse the list as parameters.
             self.state.cover_elements.truncate(base);
-            self.state.cover_initialized_name.retain(|&start, _| start < lparen);
-            self.state.trailing_commas.retain(|&start, _| start < lparen);
+            self.state.cover_initialized_name.split_off(&lparen);
+            self.state.trailing_commas.split_off(&lparen);
             self.deferred_script_errors.truncate(deferred_script_errors_len);
             if !had_module_syntax {
                 self.module_record_builder.unset_module_syntax();
