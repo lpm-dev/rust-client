@@ -21,8 +21,14 @@ request is answered with line n of `ticket-outcomes` (default `issued`):
 `issued` returns the ticket in `ticket-issued` (default
 `fixture-notarization-ticket`), `other` returns a different ticket,
 `notfound`/`deleted`/`throttled`/`denied` return those record states,
+`deletedstring`, `emptyerror` and `longerror` return malformed `deleted`
+and `serverErrorCode` fields, `withnull` adds JSON nulls to an issued
+ticket, `extrarecord` answers with two records, `emptyticket` with an empty
+ticket,
 `wrongrecord` answers about another record, `garbage` returns a non-JSON
-page, `drop` closes the connection, and a number answers with that status.
+page, `huge` streams 256 KiB without a length, `drop` closes the
+connection, and a number answers with that status (a 3xx redirects to
+`/redirected-ticket`).
 """
 
 import base64
@@ -108,14 +114,26 @@ def main() -> int:
                 return
             if outcome.isdigit():
                 self.send_response(int(outcome))
+                if outcome.startswith("3"):
+                    self.send_header("Location", "/redirected-ticket")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
+                return
+            if outcome == "huge":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                chunk = b"x" * 65536
+                for _ in range(4):
+                    self.wfile.write(f"{len(chunk):x}\r\n".encode("ascii") + chunk + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
                 return
             if outcome == "garbage":
                 self.answer(200, b"<html>captive portal</html>")
                 return
             record = {"recordName": record_name}
-            if outcome in ("issued", "other", "deleted"):
+            if outcome in ("issued", "other", "deleted", "deletedstring", "withnull", "extrarecord", "emptyticket"):
                 ticket = DEFAULT_TICKET
                 issued = os.path.join(fixture_dir, "ticket-issued")
                 if os.path.isfile(issued):
@@ -123,6 +141,8 @@ def main() -> int:
                         ticket = f.read()
                 if outcome == "other":
                     ticket = b"another-release-ticket"
+                if outcome == "emptyticket":
+                    ticket = b""
                 record.update(
                     recordType="DeveloperIDTicket",
                     fields={
@@ -131,8 +151,10 @@ def main() -> int:
                             "type": "BYTES",
                         }
                     },
-                    deleted=outcome == "deleted",
+                    deleted="yes" if outcome == "deletedstring" else outcome == "deleted",
                 )
+                if outcome == "withnull":
+                    record.update(deleted=None, zoneID=None)
             elif outcome == "wrongrecord":
                 record.update(recordName="2/2/" + "0" * 40, fields={})
             else:
@@ -140,9 +162,12 @@ def main() -> int:
                     "notfound": "NOT_FOUND",
                     "throttled": "THROTTLED",
                     "denied": "ACCESS_DENIED",
+                    "emptyerror": "",
+                    "longerror": "A" * 41,
                 }
                 record.update(reason="fixture", serverErrorCode=codes[outcome])
-            self.answer(200, json.dumps({"records": [record]}).encode("utf-8"))
+            records = [record, record] if outcome == "extrarecord" else [record]
+            self.answer(200, json.dumps({"records": records}).encode("utf-8"))
 
         def answer(self, status: int, body: bytes) -> None:
             self.send_response(status)

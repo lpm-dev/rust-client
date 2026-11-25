@@ -2984,7 +2984,13 @@ enum MacOSTool {
 #[cfg(target_os = "macos")]
 impl MacOSTool {
     #[cfg(test)]
-    const ALL: [Self; 4] = [Self::Codesign, Self::Ditto, Self::PlistBuddy, Self::Spctl];
+    const ALL: [Self; 4] = {
+        // A new tool must be listed here, or this match stops compiling.
+        match Self::Codesign {
+            Self::Codesign | Self::Ditto | Self::PlistBuddy | Self::Spctl => {}
+        }
+        [Self::Codesign, Self::Ditto, Self::PlistBuddy, Self::Spctl]
+    };
 
     const fn path(self) -> &'static str {
         match self {
@@ -3076,11 +3082,11 @@ fn macos_entitlement_inspection_arguments(app_bundle: &Path) -> [&OsStr; 4] {
 }
 
 /// The code requirement every LPM macOS app satisfies: a Developer ID
-/// Application signature of LPM's team over its bundle identifier, plus a
-/// notarization ticket. Until a code directory's ticket is cached system-wide
-/// the ticket can only come from the app itself, so on a Mac that hasn't seen
-/// this code the check verifies the stapled ticket's Apple signature without
-/// the network. The leading `=` marks inline requirement text.
+/// Application signature of LPM's team over its bundle identifier, and code
+/// Apple notarized. The system confirms `notarized` from the stapled ticket,
+/// its ticket cache or Apple's service, so only the ticket-record comparison
+/// proves which ticket the app carries. The leading `=` marks inline
+/// requirement text.
 #[cfg(target_os = "macos")]
 fn macos_code_requirement() -> String {
     format!(
@@ -3157,7 +3163,7 @@ fn inspect_signed_macos_app_bundle(app_bundle: &Path) -> Result<StapledNotarizat
         "macOS app signing-identity inspection",
     )?;
     let details = format!(
-        "{}{}",
+        "{}\n{}",
         String::from_utf8_lossy(&details.stdout),
         String::from_utf8_lossy(&details.stderr)
     );
@@ -4171,9 +4177,52 @@ mod tests {
         }
     }
 
-    /// Before Apple's record is cached the `notarized` requirement rejects a
-    /// swapped ticket, and afterwards the record comparison does; either way
-    /// the bundle must not stage.
+    /// The record comparison against Apple's live ticket database, which the
+    /// staging test below can't reach when the `notarized` requirement
+    /// rejects a swapped ticket first.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires two signed release archives in LPM_TEST_MACOS_RELEASE_ARCHIVES"]
+    async fn apple_s_ticket_database_confirms_only_the_ticket_it_issued_for_the_code() {
+        let archives = std::env::var_os("LPM_TEST_MACOS_RELEASE_ARCHIVES")
+            .expect("set LPM_TEST_MACOS_RELEASE_ARCHIVES to signed release ZIP paths");
+        let archives = std::env::split_paths(&archives).collect::<Vec<_>>();
+        let [first, second, ..] = archives.as_slice() else {
+            panic!("LPM_TEST_MACOS_RELEASE_ARCHIVES must name two signed release archives");
+        };
+        let mut signed = Vec::new();
+        for archive in [first, second] {
+            let parent = tempfile::tempdir().unwrap();
+            let staged = stage_macos_bundle(archive, parent.path(), false)
+                .await
+                .unwrap_or_else(|error| panic!("{}: {error}", archive.display()));
+            signed.push(staged.notarization);
+        }
+        async fn confirm(cdhash: &str, ticket: &[u8]) -> Result<(), LpmError> {
+            notarization::confirm_stapled_ticket(
+                &notarization::lookup_client()?,
+                notarization::TICKET_LOOKUP_URL,
+                cdhash,
+                ticket,
+                &notarization::RETRY_DELAYS,
+                |_, _| {},
+            )
+            .await
+        }
+
+        confirm(&signed[0].cdhash, &signed[0].ticket).await.unwrap();
+        for ticket in [signed[1].ticket.as_slice(), b"not a notarization ticket"] {
+            let error = confirm(&signed[0].cdhash, ticket)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not the one Apple issued"), "{error}");
+        }
+    }
+
+    /// Depending on what the system already knows of the code, the `notarized`
+    /// requirement or the ticket-record comparison rejects a swapped ticket;
+    /// either way the bundle must not stage.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     #[ignore = "requires two signed release archives in LPM_TEST_MACOS_RELEASE_ARCHIVES"]
@@ -6949,6 +6998,70 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         assert!(output.status.success());
         use std::os::unix::ffi::OsStrExt;
         assert_eq!(output.stdout, argument.as_bytes());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn code_requirement_is_the_one_install_sh_enforces() {
+        let install_sh =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh"))
+                .unwrap();
+        let install_sh_requirement = install_sh
+            .lines()
+            .find_map(|line| line.strip_prefix("MACOS_CODE_REQUIREMENT=\""))
+            .and_then(|value| value.strip_suffix('"'))
+            .expect("install.sh pins a code requirement")
+            .replace("\\\"", "\"")
+            .replace("$EXPECTED_BUNDLE_ID", MACOS_EXPECTED_BUNDLE_ID)
+            .replace("$EXPECTED_TEAM_ID", MACOS_EXPECTED_TEAM_ID);
+
+        assert_eq!(
+            format!("={install_sh_requirement}"),
+            macos_code_requirement()
+        );
+    }
+
+    /// `codesign` exits 3 when code fails a requirement and 1 when it can't
+    /// parse one; an Apple platform binary fails LPM's requirement.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn code_requirement_parses_and_rejects_code_lpm_did_not_sign() {
+        let requirement = macos_code_requirement();
+        let output = std::process::Command::new(MacOSTool::Codesign.path())
+            .args(["--verify", "--strict", "-R", &requirement, "/usr/bin/true"])
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provisioning_profile_that_is_oversized_or_not_cms_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let oversized = directory.path().join("oversized.provisionprofile");
+        std::fs::write(
+            &oversized,
+            vec![0_u8; MACOS_PROVISIONING_PROFILE_MAX_BYTES as usize + 1],
+        )
+        .unwrap();
+        let corrupt = directory.path().join("corrupt.provisionprofile");
+        std::fs::write(&corrupt, b"<plist>not a CMS envelope</plist>").unwrap();
+
+        let oversized = decode_provisioning_profile(&oversized)
+            .unwrap_err()
+            .to_string();
+        let corrupt = decode_provisioning_profile(&corrupt)
+            .unwrap_err()
+            .to_string();
+
+        assert!(oversized.contains("exceeds its size limit"), "{oversized}");
+        assert!(corrupt.contains("could not be decoded"), "{corrupt}");
     }
 
     /// Every `xcrun` shim in `/usr/bin` is a hard link of `git` (the Command

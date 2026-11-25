@@ -503,6 +503,11 @@ jobs:
             "$RUNNER_TEMP/LPM CLI.app" \
             "$RUNNER_TEMP/lpm-cli.provisionprofile"
 
+      # Only macOS runs the installer's macOS checks, among them that it needs
+      # no Xcode or Command Line Tools.
+      - name: Shell installer regressions on macOS
+        run: sh tests/install-sh/run.sh
+
   macos-workspace:
     name: macOS workspace checks
     needs: [macos-workspace-tests, macos-build-checks]

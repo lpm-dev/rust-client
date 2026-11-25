@@ -30,10 +30,10 @@ EXPECTED_BUNDLE_ID="dev.lpm.cli"
 EXPECTED_TEAM_ID="823S8YKMRW"
 EXPECTED_ACCESS_GROUP="$EXPECTED_TEAM_ID.dev.lpm.vault.shared"
 EXPECTED_PROFILE_ACCESS_GROUP="$EXPECTED_TEAM_ID.*"
-# A Developer ID Application signature of LPM's team, plus a notarization
-# ticket. Until a code directory's ticket is cached system-wide the ticket can
-# only come from the app itself, so on a Mac that hasn't seen this code the
-# check verifies the stapled ticket's Apple signature without the network.
+# A Developer ID Application signature of LPM's team, and code Apple
+# notarized. The system confirms `notarized` from the stapled ticket, its
+# ticket cache or Apple's service, so only the ticket-record comparison below
+# proves which ticket the app carries.
 MACOS_CODE_REQUIREMENT="anchor apple generic and identifier \"$EXPECTED_BUNDLE_ID\" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$EXPECTED_TEAM_ID\" and notarized"
 # v0.76.5 is the last signed app bundle that does not declare an icon.
 MACOS_ICON_FIRST_VERSION="v0.76.6"
@@ -202,16 +202,21 @@ is_loopback_http() {
     *) return 1 ;;
   esac
   loopback_authority=${loopback_authority%%/*}
+  # Only the exact host, then an optional all-digit port: anything else, a
+  # user-info `@` among it, would let curl reach another host.
   case "$loopback_authority" in
-    127.0.0.1|localhost|'[::1]') return 0 ;;
-    127.0.0.1:*|localhost:*|'[::1]':*)
-      loopback_port=${loopback_authority##*:}
-      case "$loopback_port" in
-        ''|*[!0-9]*) return 1 ;;
-        *) return 0 ;;
-      esac
-      ;;
+    127.0.0.1*) loopback_port=${loopback_authority#127.0.0.1} ;;
+    localhost*) loopback_port=${loopback_authority#localhost} ;;
+    '[::1]'*) loopback_port=${loopback_authority#'[::1]'} ;;
     *) return 1 ;;
+  esac
+  case "$loopback_port" in
+    '') return 0 ;;
+    :*) loopback_port=${loopback_port#:} ;;
+    *) return 1 ;;
+  esac
+  case "$loopback_port" in
+    ''|*[!0123456789]*) return 1 ;;
   esac
 }
 
@@ -674,43 +679,72 @@ require_reported_version() {
 
 # Record errors Apple's ticket service reports for load or outages.
 NOTARIZATION_TICKET_TRANSIENT_ERRORS=" THROTTLED TRY_AGAIN_LATER SERVICE_UNAVAILABLE INTERNAL_ERROR ZONE_BUSY "
+# A ticket record is under 4 KiB; anything far larger isn't one.
+NOTARIZATION_TICKET_RESPONSE_MAX_BYTES=65536
 
-notarization_ticket_field() {
-  "$MACOS_PLISTBUDDY_TOOL" -c "Print :records:0:$1" "$ticket_plist" 2>/dev/null
+# Prints the lookup answer's value at the plist key path $1 as a one-value
+# XML plist. Each field is extracted on its own, so a JSON null elsewhere in
+# the answer, which a plist can't hold, doesn't hide the ones the check reads.
+notarization_ticket_extract() {
+  "$MACOS_PLUTIL_TOOL" -extract "$1" xml1 -o - "$ticket_response" 2>/dev/null
+}
+
+# Prints the string at key path $1. Returns 1 when the answer has no such
+# value and 2 when it isn't a string.
+notarization_ticket_string() {
+  ticket_field_xml=$(notarization_ticket_extract "$1") || return 1
+  case "$ticket_field_xml" in
+    *"<string/>"*) return 0 ;;
+    *"<string>"*) ;;
+    *) return 2 ;;
+  esac
+  printf '%s\n' "$ticket_field_xml" | sed -n 's:.*<string>\(.*\)</string>.*:\1:p'
 }
 
 # Looks up the ticket record named $ticket_record. Sets ticket_lookup to
 # issued (Apple's ticket is in $ticket_issued), not-issued (no ticket, or a
 # revoked one), refused (an error asking again won't change) or unavailable,
-# and ticket_lookup_detail to what the service said.
+# and ticket_lookup_detail to what the service said. The user's ~/.curlrc
+# still applies, for its proxy settings, so redirects are refused and the
+# status is read from the response headers rather than curl's exit status.
 lookup_notarization_ticket() {
   ticket_lookup="unavailable"
   ticket_lookup_detail="no answer"
-  rm -f "$ticket_response" "$ticket_plist" "$ticket_issued"
-  ticket_http_status=$(curl -sS --max-time 30 -o "$ticket_response" -w '%{http_code}' \
+  rm -f "$ticket_response" "$ticket_headers" "$ticket_issued"
+  curl -sS --max-time 30 --max-redirs 0 -D "$ticket_headers" -o - \
     -H 'Content-Type: application/json' \
     --data "{\"records\":[{\"recordName\":\"$ticket_record\"}]}" \
-    "$NOTARIZATION_TICKET_LOOKUP_URL") || return 0
+    "$NOTARIZATION_TICKET_LOOKUP_URL" | head -c "$((NOTARIZATION_TICKET_RESPONSE_MAX_BYTES + 1))" > "$ticket_response" || true
+  ticket_http_status=$(awk '/^HTTP\//{status=$2} END{print status}' "$ticket_headers" 2>/dev/null || true)
   case "$ticket_http_status" in
     200) ;;
-    429|5[0-9][0-9]) ticket_lookup_detail="HTTP $ticket_http_status"; return 0 ;;
+    '') return 0 ;;
+    408|429|5[0-9][0-9]) ticket_lookup_detail="HTTP $ticket_http_status"; return 0 ;;
     *) ticket_lookup="refused"; ticket_lookup_detail="HTTP $ticket_http_status"; return 0 ;;
   esac
-  if ! "$MACOS_PLUTIL_TOOL" -convert xml1 -o "$ticket_plist" "$ticket_response" >/dev/null 2>&1; then
-    ticket_lookup_detail="an unreadable answer"
+  if [ "$(wc -c < "$ticket_response")" -gt "$NOTARIZATION_TICKET_RESPONSE_MAX_BYTES" ]; then
+    ticket_lookup_detail="an oversized answer"
     return 0
   fi
-  if "$MACOS_PLISTBUDDY_TOOL" -c 'Print :records:1' "$ticket_plist" >/dev/null 2>&1 || \
-     [ "$(notarization_ticket_field recordName || true)" != "$ticket_record" ]; then
+  if notarization_ticket_extract records.1 >/dev/null || \
+     ! ticket_answered_record=$(notarization_ticket_string records.0.recordName) || \
+     [ "$ticket_answered_record" != "$ticket_record" ]; then
     ticket_lookup_detail="an answer about another record"
     return 0
   fi
-  ticket_server_error=$(notarization_ticket_field serverErrorCode || true)
-  case "$ticket_server_error" in
-    '') ;;
-    NOT_FOUND) ticket_lookup="not-issued"; return 0 ;;
-    *[!A-Z_]*) ticket_lookup="refused"; ticket_lookup_detail="an unrecognized error"; return 0 ;;
-    *)
+  ticket_field_status=0
+  ticket_server_error=$(notarization_ticket_string records.0.serverErrorCode) || ticket_field_status=$?
+  case "$ticket_field_status" in
+    0)
+      case "$ticket_server_error" in
+        NOT_FOUND) ticket_lookup="not-issued"; return 0 ;;
+        ''|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZ_]*) ticket_server_error="" ;;
+      esac
+      if [ -z "$ticket_server_error" ] || [ "${#ticket_server_error}" -gt 40 ]; then
+        ticket_lookup="refused"
+        ticket_lookup_detail="an unrecognized error"
+        return 0
+      fi
       ticket_lookup_detail="$ticket_server_error"
       case "$NOTARIZATION_TICKET_TRANSIENT_ERRORS" in
         *" $ticket_server_error "*) ;;
@@ -718,15 +752,21 @@ lookup_notarization_ticket() {
       esac
       return 0
       ;;
+    2) ticket_lookup_detail="an unreadable answer"; return 0 ;;
   esac
-  if [ "$(notarization_ticket_field deleted || true)" = "true" ]; then
-    ticket_lookup="not-issued"
-    return 0
+  if ticket_deleted_xml=$(notarization_ticket_extract records.0.deleted); then
+    case "$ticket_deleted_xml" in
+      *"<false/>"*) ;;
+      *"<true/>"*) ticket_lookup="not-issued"; return 0 ;;
+      *) ticket_lookup_detail="an unreadable answer"; return 0 ;;
+    esac
   fi
-  if ! ticket_value=$(notarization_ticket_field fields:signedTicket:value); then
-    ticket_lookup_detail="an answer without a ticket"
-    return 0
-  fi
+  ticket_field_status=0
+  ticket_value=$(notarization_ticket_string records.0.fields.signedTicket.value) || ticket_field_status=$?
+  case "$ticket_field_status" in
+    1) ticket_lookup_detail="an answer without a ticket"; return 0 ;;
+    2) ticket_lookup_detail="an unreadable answer"; return 0 ;;
+  esac
   if ! printf '%s' "$ticket_value" | "$MACOS_BASE64_TOOL" -D > "$ticket_issued" 2>/dev/null || \
      [ ! -s "$ticket_issued" ]; then
     ticket_lookup_detail="an unreadable ticket"
@@ -744,7 +784,7 @@ confirm_notarization_ticket() {
   ticket_label="$2"
   ticket_record="2/2/$3"
   ticket_response="$STAGE_DIR/notarization-ticket.json"
-  ticket_plist="$STAGE_DIR/notarization-ticket.plist"
+  ticket_headers="$STAGE_DIR/notarization-ticket.headers"
   ticket_issued="$STAGE_DIR/notarization-ticket"
   for ticket_retry_delay in 2 5 15 30 60 ""; do
     lookup_notarization_ticket
@@ -842,20 +882,20 @@ validate_macos_bundle() {
     return 1
   fi
   signature_details=$("$MACOS_CODESIGN_TOOL" -dvvv "$app_bundle" 2>&1) || return 1
-  signed_team=$(printf '%s\n' "$signature_details" | awk -F= '/^TeamIdentifier=/{print $2}')
-  signed_identifier=$(printf '%s\n' "$signature_details" | awk -F= '/^Identifier=/{print $2}')
+  signed_team=$(printf '%s\n' "$signature_details" | sed -n 's/^TeamIdentifier=//p')
+  signed_identifier=$(printf '%s\n' "$signature_details" | sed -n 's/^Identifier=//p')
   if [ "$signed_team" != "$EXPECTED_TEAM_ID" ] || [ "$signed_identifier" != "$EXPECTED_BUNDLE_ID" ]; then
     echo "ERROR: $app_label has an unexpected signing identity."
     return 1
   fi
-  signed_hash_type=$(printf '%s\n' "$signature_details" | awk -F= '/^Hash type=/{split($2, value, " "); print value[1]}')
+  signed_hash_type=$(printf '%s\n' "$signature_details" | sed -n 's/^Hash type=\([^ ]*\).*/\1/p')
   if [ "$signed_hash_type" != "sha256" ]; then
     echo "ERROR: $app_label is not signed with a SHA-256 code directory."
     return 1
   fi
-  app_cdhash=$(printf '%s\n' "$signature_details" | awk -F= '/^CDHash=/{print $2}')
+  app_cdhash=$(printf '%s\n' "$signature_details" | sed -n 's/^CDHash=//p')
   case "$app_cdhash" in
-    *[!0-9a-f]*|'')
+    *[!0123456789abcdef]*|'')
       echo "ERROR: $app_label has no well-formed code-directory hash."
       return 1
       ;;

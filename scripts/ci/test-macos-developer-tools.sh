@@ -44,11 +44,18 @@ selected=\$(cat "$work/runner/selected")
 [ -n "\$selected" ] && [ -d "\$selected" ] || exit 1
 echo "\$selected/usr/bin/\$2"
 EOF
+	# Like /usr/bin/stapler: it refuses to run without Xcode selected, unless
+	# working-stapler exists, when it runs and rejects an unstapled bundle.
 	cat >"$work/runner/bin/stapler" <<EOF
 #!/bin/bash
+[ "\$1" = validate ] && [ "\$#" -eq 2 ] || exit 99
+if [ -e "$work/runner/working-stapler" ]; then
+	echo "\$2 does not have a ticket stapled to it."
+	exit 65
+fi
 case "\$(cat "$work/runner/selected")" in
 *.app/Contents/Developer) exit 0 ;;
-*) echo "xcode-select: error: tool 'stapler' requires Xcode" >&2; exit 1 ;;
+*) echo "xcode-select: error: tool 'stapler' requires Xcode, but active developer directory '\$(cat "$work/runner/selected")' is a command line tools instance" >&2; exit 1 ;;
 esac
 EOF
 	chmod +x "$work/runner/bin/"*
@@ -60,6 +67,7 @@ run_helper() {
 		XCODE_SELECT_BIN="$work/runner/bin/xcode-select" \
 		XCRUN_BIN="$work/runner/bin/xcrun" \
 		STAPLER_BIN="$work/runner/bin/stapler" \
+		XCRUN_CACHE_DIRS="$work" \
 		SUDO="" \
 		TMPDIR="$work" \
 		bash "$helper" "$@"
@@ -97,6 +105,14 @@ run_helper restore "$work/state"
 echo "PASS: a runner with only the Command Line Tools is verified and restored"
 
 make_runner
+: >"$work/runner/working-stapler"
+if run_helper hide command-line-tools "$work/state" >/dev/null 2>&1; then
+	fail "a stapler that runs and merely rejects its input was taken for Apple's Xcode-only shim"
+fi
+run_helper restore "$work/state"
+echo "PASS: a working stapler is not mistaken for a Mac with only the Command Line Tools"
+
+make_runner
 rm -rf "$work/runner/CommandLineTools"
 if run_helper hide command-line-tools "$work/state" >/dev/null 2>&1; then
 	fail "a runner without the Command Line Tools cannot stand for one that has only them"
@@ -108,3 +124,13 @@ make_runner
 run_helper restore "$work/state"
 [ "$(apps)" = "Safari.app Xcode.app Xcode_16.4.app Xcode_26.0.app " ] || fail "restore without hidden tools changed apps"
 echo "PASS: restore without hidden tools changes nothing"
+
+make_runner
+printf '%s\n' "$work/runner/Applications/Xcode_26.0.app/Contents/Developer" >"$work/runner/selected"
+: >"$work/xcrun_db"
+run_helper hide none "$work/state" >/dev/null
+[ ! -e "$work/xcrun_db" ] || fail "hiding developer tools left xcrun's cache of their paths"
+run_helper restore "$work/state"
+[ "$(cat "$work/runner/selected")" = "$work/runner/Applications/Xcode_26.0.app/Contents/Developer" ] \
+	|| fail "restore selected $(cat "$work/runner/selected") instead of the Xcode selected before"
+echo "PASS: restore selects the developer directory selected before"

@@ -25,7 +25,7 @@ Later versions accept both signing identities, so `lpm self-update` works again 
 curl -fsSL https://cli.lpm.dev/install | sh
 ```
 
-The installer and later versions of `lpm self-update` check the ticket with tools every Mac ships with, so `lpm self-update` works again after this one reinstall.
+The installer checks the ticket with tools every Mac ships with, and so does `lpm self-update` from this release on. The reinstall installs this release or a later one, so later updates work through `lpm self-update` again.
 
 ### macOS standalone upgrades from 0.76.5
 

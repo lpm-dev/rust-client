@@ -10,6 +10,9 @@ COMMAND_LINE_TOOLS_DIR="${MACOS_COMMAND_LINE_TOOLS_DIR:-/Library/Developer/Comma
 XCODE_SELECT_BIN="${XCODE_SELECT_BIN:-/usr/bin/xcode-select}"
 XCRUN_BIN="${XCRUN_BIN:-/usr/bin/xcrun}"
 STAPLER_BIN="${STAPLER_BIN:-/usr/bin/stapler}"
+# xcrun caches where tools are in TMPDIR and in the per-user temporary
+# directory, which differ when TMPDIR is overridden.
+XCRUN_CACHE_DIRS="${XCRUN_CACHE_DIRS:-${TMPDIR:-/tmp} $(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)}"
 SUDO="${SUDO-sudo}"
 
 usage() {
@@ -43,10 +46,18 @@ hide_path() {
 	printf '%s\t%s\n' "$path" "$hidden" >>"$state_dir/moved"
 }
 
+clear_xcrun_cache() {
+	local directory
+	for directory in $XCRUN_CACHE_DIRS; do
+		rm -f "$directory"/xcrun_db*
+	done
+}
+
 hide() {
 	local mode="$1" state_dir="$2"
 	[ ! -e "$state_dir/moved" ] || fail "$state_dir already records hidden developer tools"
 	mkdir -p "$state_dir/hidden"
+	env -u DEVELOPER_DIR "$XCODE_SELECT_BIN" -p >"$state_dir/selected" 2>/dev/null || : >"$state_dir/selected"
 	: >"$state_dir/moved"
 	local app
 	while IFS= read -r app; do
@@ -61,7 +72,7 @@ hide() {
 		[ -d "$COMMAND_LINE_TOOLS_DIR" ] || fail "this runner has no Command Line Tools at $COMMAND_LINE_TOOLS_DIR"
 		$SUDO "$XCODE_SELECT_BIN" --switch "$COMMAND_LINE_TOOLS_DIR"
 	fi
-	rm -f "${TMPDIR:-/tmp}"/xcrun_db*
+	clear_xcrun_cache
 	verify "$mode"
 }
 
@@ -79,9 +90,14 @@ verify() {
 	else
 		selected=$(env -u DEVELOPER_DIR "$XCODE_SELECT_BIN" -p)
 		[ "$selected" = "$COMMAND_LINE_TOOLS_DIR" ] || fail "the selected developer directory is $selected"
-		if env -u DEVELOPER_DIR "$STAPLER_BIN" validate "$COMMAND_LINE_TOOLS_DIR" >/dev/null 2>&1; then
-			fail "$STAPLER_BIN still runs, so this is not a Mac with only the Command Line Tools"
-		fi
+		# A stapler that runs rejects this directory too, so only the shim's
+		# own refusal shows that stapler needs Xcode here.
+		local refusal
+		refusal=$(env -u DEVELOPER_DIR "$STAPLER_BIN" validate "$COMMAND_LINE_TOOLS_DIR" 2>&1 || true)
+		case "$refusal" in
+		*"requires Xcode"*) ;;
+		*) fail "$STAPLER_BIN did not refuse to run without Xcode: $refusal" ;;
+		esac
 	fi
 	echo "developer tools: $mode"
 }
@@ -93,8 +109,14 @@ restore() {
 	while IFS=$'\t' read -r original hidden; do
 		$SUDO mv "$hidden" "$original" || status=1
 	done < <(tail -r "$state_dir/moved" 2>/dev/null || tac "$state_dir/moved")
-	$SUDO "$XCODE_SELECT_BIN" --reset || status=1
-	rm -f "${TMPDIR:-/tmp}"/xcrun_db*
+	local selected
+	selected=$(cat "$state_dir/selected" 2>/dev/null || true)
+	if [ -n "$selected" ]; then
+		$SUDO "$XCODE_SELECT_BIN" --switch "$selected" || status=1
+	else
+		$SUDO "$XCODE_SELECT_BIN" --reset || status=1
+	fi
+	clear_xcrun_cache
 	[ "$status" -eq 0 ] || fail "some developer tools could not be restored"
 	rm -f "$state_dir/moved"
 }

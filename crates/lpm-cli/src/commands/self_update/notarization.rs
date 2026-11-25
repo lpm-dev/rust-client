@@ -67,9 +67,8 @@ pub(super) fn lookup_client() -> Result<reqwest::Client, LpmError> {
 ///
 /// While the service gives no usable answer, it is asked again after each of
 /// `retry_delays`, and `on_retry` hears of each wait and what the service
-/// said first. A ticket that
-/// differs from the stapled one, a missing or revoked ticket, and any other
-/// refusal fail at once.
+/// said first. A ticket that differs from the stapled one, a missing or
+/// revoked ticket, and any other refusal fail at once.
 pub(super) async fn confirm_stapled_ticket(
     client: &reqwest::Client,
     lookup_url: &str,
@@ -136,7 +135,7 @@ fn record_name(cdhash: &str) -> Result<String, LpmError> {
 
 async fn lookup(client: &reqwest::Client, lookup_url: &str, record_name: &str) -> Lookup {
     let request = serde_json::json!({ "records": [{ "recordName": record_name }] });
-    let mut response = match client
+    let response = match client
         .post(lookup_url)
         .header("User-Agent", "lpm-cli")
         .json(&request)
@@ -149,32 +148,22 @@ async fn lookup(client: &reqwest::Client, lookup_url: &str, record_name: &str) -
         }
     };
     let status = response.status();
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+    if status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+    {
         return Lookup::Unavailable(format!("HTTP {}", status.as_u16()));
     }
     if status != reqwest::StatusCode::OK {
         return Lookup::Refused(format!("HTTP {}", status.as_u16()));
     }
-    let mut body = Vec::with_capacity(
-        response
-            .content_length()
-            .map_or(0, |length| (length as usize).min(RESPONSE_MAX_BYTES)),
-    );
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) if body.len() + chunk.len() <= RESPONSE_MAX_BYTES => {
-                body.extend_from_slice(&chunk);
-            }
-            Ok(Some(_)) => return Lookup::Unavailable("an oversized answer".to_string()),
-            Ok(None) => break,
-            Err(error) => {
-                return Lookup::Unavailable(
-                    lpm_http::display_error(&error.without_url()).to_string(),
-                );
-            }
+    match lpm_http::read_body_capped(response, RESPONSE_MAX_BYTES).await {
+        Ok(body) => parse_lookup(&body, record_name),
+        Err(lpm_http::ResponseBodyError::Read(error)) => {
+            Lookup::Unavailable(lpm_http::display_error(&error.without_url()).to_string())
         }
+        Err(_) => Lookup::Unavailable("an oversized answer".to_string()),
     }
-    parse_lookup(&body, record_name)
 }
 
 #[derive(serde::Deserialize)]
@@ -187,8 +176,7 @@ struct LookupResponse {
 struct TicketRecord {
     record_name: String,
     server_error_code: Option<String>,
-    #[serde(default)]
-    deleted: bool,
+    deleted: Option<bool>,
     fields: Option<TicketFields>,
 }
 
@@ -208,7 +196,7 @@ fn parse_lookup(body: &[u8], record_name: &str) -> Lookup {
         return Lookup::Unavailable("an unreadable answer".to_string());
     };
     let [record] = records.as_slice() else {
-        return Lookup::Unavailable("an answer about other records".to_string());
+        return Lookup::Unavailable("an answer about another record".to_string());
     };
     if record.record_name != record_name {
         return Lookup::Unavailable("an answer about another record".to_string());
@@ -224,7 +212,7 @@ fn parse_lookup(body: &[u8], record_name: &str) -> Lookup {
             Lookup::Refused(code.to_string())
         };
     }
-    if record.deleted {
+    if record.deleted == Some(true) {
         return Lookup::NotIssued;
     }
     let Some(value) = record
@@ -348,16 +336,18 @@ mod tests {
             ResponseTemplate::new(503),
             ResponseTemplate::new(200).set_body_json(record_error("THROTTLED")),
             ResponseTemplate::new(429),
+            ResponseTemplate::new(408),
             ResponseTemplate::new(200).set_body_string("<html>captive portal</html>"),
+            ResponseTemplate::new(200).set_body_bytes(vec![b' '; RESPONSE_MAX_BYTES + 1]),
             ResponseTemplate::new(200).set_body_json(issued(TICKET)),
         ])
         .await;
 
-        let (result, waits) = confirm(&server, 5).await;
+        let (result, waits) = confirm(&server, 6).await;
 
         result.unwrap();
-        assert_eq!(waits.len(), 4);
-        assert_eq!(lookups(&server).await, 5);
+        assert_eq!(waits.len(), 6);
+        assert_eq!(lookups(&server).await, 7);
     }
 
     #[tokio::test]
@@ -476,6 +466,80 @@ mod tests {
         ));
     }
 
+    /// install.sh's harness feeds the same malformed records to its parser.
+    #[test]
+    fn malformed_record_fields_are_classified_as_install_sh_classifies_them() {
+        let mut deleted_string = issued(TICKET);
+        deleted_string["records"][0]["deleted"] = serde_json::Value::from("yes");
+        let mut numeric_error = record_error("NOT_FOUND");
+        numeric_error["records"][0]["serverErrorCode"] = serde_json::Value::from(5);
+        let mut numeric_ticket = issued(TICKET);
+        numeric_ticket["records"][0]["fields"]["signedTicket"]["value"] =
+            serde_json::Value::from(5);
+
+        for answer in [deleted_string, numeric_error, numeric_ticket] {
+            assert_eq!(
+                parse_lookup(&serde_json::to_vec(&answer).unwrap(), RECORD),
+                Lookup::Unavailable("an unreadable answer".to_string()),
+                "{answer}"
+            );
+        }
+        assert_eq!(
+            parse_lookup(&serde_json::to_vec(&record_error("")).unwrap(), RECORD),
+            Lookup::Refused("an unrecognized error".to_string())
+        );
+    }
+
+    #[test]
+    fn answers_that_name_no_single_ticket_are_not_taken_as_one() {
+        let mut two_records = issued(TICKET);
+        let record = two_records["records"][0].clone();
+        two_records["records"].as_array_mut().unwrap().push(record);
+        let mut empty_ticket = issued(b"");
+        empty_ticket["records"][0]["fields"]["signedTicket"]["value"] = serde_json::Value::from("");
+        let mut undecodable_ticket = issued(TICKET);
+        undecodable_ticket["records"][0]["fields"]["signedTicket"]["value"] =
+            serde_json::Value::from("not base64!");
+
+        for (answer, detail) in [
+            (
+                serde_json::json!({ "records": [] }),
+                "an answer about another record",
+            ),
+            (two_records, "an answer about another record"),
+            (empty_ticket, "an unreadable ticket"),
+            (undecodable_ticket, "an unreadable ticket"),
+        ] {
+            assert_eq!(
+                parse_lookup(&serde_json::to_vec(&answer).unwrap(), RECORD),
+                Lookup::Unavailable(detail.to_string()),
+                "{answer}"
+            );
+        }
+    }
+
+    #[test]
+    fn null_fields_apple_may_add_do_not_hide_the_ticket() {
+        let mut answer = issued(TICKET);
+        answer["records"][0]["deleted"] = serde_json::Value::Null;
+        answer["records"][0]["zoneID"] = serde_json::Value::Null;
+
+        assert_eq!(
+            parse_lookup(&serde_json::to_vec(&answer).unwrap(), RECORD),
+            Lookup::Issued(TICKET.to_vec())
+        );
+    }
+
+    #[test]
+    fn overlong_server_error_is_not_echoed() {
+        let answer = serde_json::to_vec(&record_error(&"A".repeat(41))).unwrap();
+
+        assert_eq!(
+            parse_lookup(&answer, RECORD),
+            Lookup::Refused("an unrecognized error".to_string())
+        );
+    }
+
     #[test]
     fn unrecognized_server_error_is_not_echoed() {
         let answer = serde_json::to_vec(&record_error("\u{1b}[31mbad")).unwrap();
@@ -520,6 +584,33 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(install_sh_delays, RETRY_DELAYS);
+    }
+
+    #[test]
+    fn ticket_lookup_classifies_answers_by_the_same_limits_as_install_sh() {
+        let install_sh = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh"),
+        )
+        .unwrap();
+        let assignment = |name: &str| {
+            install_sh
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}=")))
+                .unwrap_or_else(|| panic!("install.sh sets {name}"))
+                .trim_matches('"')
+                .to_string()
+        };
+
+        assert_eq!(
+            assignment("NOTARIZATION_TICKET_TRANSIENT_ERRORS")
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            TRANSIENT_SERVER_ERRORS
+        );
+        assert_eq!(
+            assignment("NOTARIZATION_TICKET_RESPONSE_MAX_BYTES"),
+            RESPONSE_MAX_BYTES.to_string()
+        );
     }
 
     #[test]

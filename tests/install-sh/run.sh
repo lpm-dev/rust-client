@@ -199,7 +199,7 @@ write_signed_release() {
 build_clean_path() {
   CLEAN_PATH_DIR="$(mktemp -d)"
   # Tools install.sh shells out to during the integrity flow.
-  for tool in sh id uname mktemp rm basename dirname grep awk curl sed cat tr cut chmod mv mkdir ln find readlink cp cmp sleep; do
+  for tool in sh id uname mktemp rm basename dirname grep awk curl sed cat tr cut chmod mv mkdir ln find readlink cp cmp sleep head wc; do
     src="$(command -v "$tool" 2>/dev/null || true)"
     if [ -n "$src" ]; then
       ln -s "$src" "$CLEAN_PATH_DIR/$tool"
@@ -227,6 +227,14 @@ staged_override() {
 }
 case " $* " in
   *" --verify "*)
+    expected_requirement='=anchor apple generic and identifier "dev.lpm.cli" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "823S8YKMRW" and notarized'
+    requirement=""
+    previous=""
+    for argument in "$@"; do
+      [ "$previous" = -R ] && requirement="$argument"
+      previous="$argument"
+    done
+    [ "$requirement" = "$expected_requirement" ] || { echo "test-requirement: code failed to satisfy specified code requirement(s)" >&2; exit 3; }
     if staged_override tamper-staged-ticket; then
       printf 'replaced-notarization-ticket' > "$bundle/Contents/CodeResources"
     fi
@@ -244,6 +252,8 @@ case " $* " in
     fi
     if staged_override staged-cdhash; then
       echo "CDHash=$(cat "$LPM_TEST_TOOL_STATE/staged-cdhash")" >&2
+    elif [ -n "${LPM_TEST_TOOL_STATE:-}" ] && [ -e "$LPM_TEST_TOOL_STATE/cdhash" ]; then
+      echo "CDHash=$(cat "$LPM_TEST_TOOL_STATE/cdhash")" >&2
     else
       echo 'CDHash=0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c' >&2
     fi
@@ -512,17 +522,34 @@ echo "$out" | grep -q "127.0.0.1" || fail "expected loopback-only error: $out"
 for spoofed_url in \
   "http://localhost.attacker.example/x" \
   "http://127.0.0.1.attacker.example/x" \
-  "http://localhost:80.attacker.example/x"
+  "http://localhost:80.attacker.example/x" \
+  "http://127.0.0.1:1@attacker.example:80/x" \
+  "http://localhost:x@attacker.example:80/x" \
+  "http://[::1]:1@attacker.example:80/x" \
+  "http://127.0.0.1@attacker.example/x"
 do
+  for override in LPM_INSTALL_TEST_API_URL LPM_INSTALL_TEST_DOWNLOAD_BASE; do
+    actual_exit=0
+    out="$(env "$override=$spoofed_url" sh "$INSTALL_SH" 2>&1)" || actual_exit=$?
+    [ "$actual_exit" -ne 0 ] || fail "$override must fail closed for $spoofed_url"
+    echo "$out" | grep -q "must point at 127.0.0.1" || fail "$override accepted $spoofed_url: $out"
+  done
   actual_exit=0
-  out="$(LPM_INSTALL_TEST_API_URL="$spoofed_url" sh "$INSTALL_SH" 2>&1)" || actual_exit=$?
-  [ "$actual_exit" -ne 0 ] || fail "loopback-prefix hostname should fail-closed: $spoofed_url"
+  out="$(LPM_INSTALL_TEST_API_URL=http://127.0.0.1:1/x LPM_INSTALL_TEST_DOWNLOAD_BASE=http://127.0.0.1:1 \
+    LPM_INSTALL_TEST_TICKET_LOOKUP_URL="$spoofed_url" sh "$INSTALL_SH" 2>&1)" || actual_exit=$?
+  [ "$actual_exit" -ne 0 ] || fail "the ticket lookup override must fail closed for $spoofed_url"
+  if [ "$HOST_OS" = "Darwin" ]; then
+    echo "$out" | grep -q "LPM_INSTALL_TEST_TICKET_LOOKUP_URL must point at 127.0.0.1" \
+      || fail "the ticket lookup override accepted $spoofed_url: $out"
+  fi
 done
-actual_exit=0
-out="$(LPM_INSTALL_TEST_CODESIGN="/tmp/fake-codesign" sh "$INSTALL_SH" 2>&1)" || actual_exit=$?
-[ "$actual_exit" -ne 0 ] || fail "macOS tool override should require loopback endpoints"
-echo "$out" | grep -q "loopback test endpoints" \
-  || fail "tool-override failure did not explain the loopback requirement: $out"
+for override in LPM_INSTALL_TEST_CODESIGN LPM_INSTALL_TEST_OPENSSL LPM_INSTALL_TEST_SPCTL LPM_INSTALL_TEST_TICKET_LOOKUP_URL; do
+  actual_exit=0
+  out="$(env "$override=http://127.0.0.1:1/fake" sh "$INSTALL_SH" 2>&1)" || actual_exit=$?
+  [ "$actual_exit" -ne 0 ] || fail "$override should require loopback endpoints"
+  echo "$out" | grep -q "loopback test endpoints" \
+    || fail "$override failure did not explain the loopback requirement: $out"
+done
 pass "test-override env vars are loopback-gated"
 
 # ── Case 5: happy path ─────────────────────────────────────────
@@ -886,7 +913,9 @@ EOF_SLEEP
     "notfound:Apple has not issued a notarization ticket" \
     "deleted:Apple has not issued a notarization ticket" \
     "denied:refused to look up the ticket of downloaded LPM CLI.app (ACCESS_DENIED)" \
-    "400:refused to look up the ticket of downloaded LPM CLI.app (HTTP 400)"
+    "400:refused to look up the ticket of downloaded LPM CLI.app (HTTP 400)" \
+    "emptyerror:refused to look up the ticket of downloaded LPM CLI.app (an unrecognized error)" \
+    "longerror:refused to look up the ticket of downloaded LPM CLI.app (an unrecognized error)"
   do
     outcome="${refusal%%:*}"
     expected_error="${refusal#*:}"
@@ -899,6 +928,72 @@ EOF_SLEEP
     [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "ticket outcome '$outcome' must not install anything"
   done
   pass "macOS install rejects a ticket Apple didn't issue, a revoked one, and refused lookups without retrying"
+
+  run_with_ticket_outcomes deletedstring issued
+  [ "$RUN_RC" -eq 0 ] || fail "a malformed deleted field then a ticket failed the install with exit $RUN_RC: $RUN_OUT"
+  [ "$TICKET_LOOKUPS" -eq 2 ] || fail "a record whose deleted field isn't a boolean was taken as an answer ($TICKET_LOOKUPS lookups)"
+  echo "$RUN_OUT" | grep -qF "did not answer (an unreadable answer)" \
+    || fail "a malformed deleted field was not reported as unreadable: $RUN_OUT"
+  pass "macOS install doesn't take a record with a malformed deleted field as an answer"
+
+  run_with_ticket_outcomes extrarecord emptyticket 408 issued
+  [ "$RUN_RC" -eq 0 ] || fail "answers naming no single ticket then a ticket failed the install with exit $RUN_RC: $RUN_OUT"
+  [ "$TICKET_LOOKUPS" -eq 4 ] || fail "answers naming no single ticket were taken as one ($TICKET_LOOKUPS lookups, expected 4)"
+  for detail in "an answer about another record" "an unreadable ticket" "HTTP 408"; do
+    echo "$RUN_OUT" | grep -qF "did not answer ($detail)" || fail "'$detail' was not retried as such: $RUN_OUT"
+  done
+  pass "macOS install retries answers that name no single ticket, and a request timeout"
+
+  run_with_ticket_outcomes withnull
+  [ "$RUN_RC" -eq 0 ] || fail "JSON nulls beside the ticket failed the install with exit $RUN_RC: $RUN_OUT"
+  [ "$TICKET_LOOKUPS" -eq 1 ] || fail "JSON nulls beside the ticket made the install look it up $TICKET_LOOKUPS times"
+  pass "macOS install reads the ticket past JSON nulls in the answer"
+
+  run_with_ticket_outcomes huge issued
+  [ "$RUN_RC" -eq 0 ] || fail "an oversized answer then a ticket failed the install with exit $RUN_RC: $RUN_OUT"
+  [ "$TICKET_LOOKUPS" -eq 2 ] || fail "an oversized answer was looked up $TICKET_LOOKUPS times, expected 2"
+  echo "$RUN_OUT" | grep -qF "did not answer (an oversized answer)" \
+    || fail "an oversized answer was not reported as one: $RUN_OUT"
+  pass "macOS install reads at most 64 KiB of an answer from Apple's ticket service"
+
+  # A user's ~/.curlrc may follow redirects and fail on HTTP errors; neither
+  # may change what the lookup decides.
+  printf '{"records":[{"recordName":"2/2/0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c","fields":{"signedTicket":{"value":"%s","type":"BYTES"}}}]}' \
+    "$(printf 'fixture-notarization-ticket' | base64)" > "$fdir/redirected-ticket"
+  curlrc_home="$(mktemp -d)"
+  printf 'location\nfail\n' > "$curlrc_home/.curlrc"
+  for refusal in "302:(HTTP 302)" "403:(HTTP 403)"; do
+    outcome="${refusal%%:*}"
+    RUN_INSTALL_ROOT_OVERRIDE="$curlrc_home"
+    run_with_ticket_outcomes "$outcome" issued
+    unset RUN_INSTALL_ROOT_OVERRIDE
+    [ "$RUN_RC" -ne 0 ] || fail "with a ~/.curlrc, ticket outcome '$outcome' must fail the install"
+    [ "$TICKET_LOOKUPS" -eq 1 ] || fail "with a ~/.curlrc, ticket outcome '$outcome' was retried ($TICKET_LOOKUPS lookups)"
+    echo "$RUN_OUT" | grep -qF "refused to look up the ticket of downloaded LPM CLI.app ${refusal#*:}" \
+      || fail "with a ~/.curlrc, ticket outcome '$outcome' was reported as something else: $RUN_OUT"
+  done
+  rm -rf "$curlrc_home" "$fdir/redirected-ticket"
+  pass "macOS install decides on Apple's answer whatever ~/.curlrc says"
+
+  for malformed_cdhash in \
+    'ABCDEABCDEABCDEABCDEABCDEABCDEABCDEABCDE' \
+    '0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3' \
+    '0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c0'
+  do
+    printf '%s' "$malformed_cdhash" > "$tool_state/cdhash"
+    harness_lang="${LANG-}" harness_lc_all="${LC_ALL-}"
+    export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+    run_with_ticket_outcomes issued
+    LANG="$harness_lang" LC_ALL="$harness_lc_all"
+    [ -n "$LANG" ] || unset LANG
+    [ -n "$LC_ALL" ] || unset LC_ALL
+    rm -f "$tool_state/cdhash"
+    [ "$RUN_RC" -ne 0 ] || fail "code-directory hash '$malformed_cdhash' must fail the install"
+    [ "$TICKET_LOOKUPS" -eq 0 ] || fail "code-directory hash '$malformed_cdhash' was looked up with Apple"
+    echo "$RUN_OUT" | grep -q "has no well-formed code-directory hash" \
+      || fail "code-directory hash '$malformed_cdhash' was reported as something else: $RUN_OUT"
+  done
+  pass "macOS install looks up only a 40-digit lower-case code-directory hash, in any locale"
 
   : > "$tool_state/sha1-code-directory"
   run_with_ticket_outcomes issued
