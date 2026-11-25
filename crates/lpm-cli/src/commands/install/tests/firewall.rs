@@ -2109,6 +2109,7 @@ async fn chunked_enforce_releases_nothing_an_allowed_chunk_clears_after_a_failur
                 ))
                 .set_delay(std::time::Duration::from_millis(300)),
         )
+        .expect(1)
         .mount(&server)
         .await;
     let client = Arc::new(
@@ -2125,10 +2126,16 @@ async fn chunked_enforce_releases_nothing_an_allowed_chunk_clears_after_a_failur
         chunked_config(NpmFirewallMode::Enforce),
     );
 
+    let started = std::time::Instant::now();
     selected_tx.send(selected_event("clean-c")).await.unwrap();
     selected_tx.send(selected_event("broken-a")).await.unwrap();
     drop(selected_tx);
 
     assert!(join.drain().await.is_err());
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(300),
+        "drain returned before the allowed chunk's verdict arrived"
+    );
     assert!(fetch_rx.recv().await.is_none());
+    server.verify().await;
 }

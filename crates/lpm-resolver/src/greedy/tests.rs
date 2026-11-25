@@ -8282,3 +8282,61 @@ async fn exact_metadata_fast_path_reports_a_firewall_refusal_instead_of_falling_
         })
     ));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_reports_an_exact_document_firewall_refusal_without_the_packument() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    reject_selected_histories(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/blocked-exact/1.0.0"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": "blocked_by_lpm_firewall",
+            "package": "blocked-exact@1.0.0",
+            "verdict": "malicious",
+            "reason": "the registry policy refused this download"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/blocked-exact"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(metadata_json_version(
+                "blocked-exact",
+                "1.0.0",
+                &[],
+            )),
+        )
+        .with_priority(5)
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let result = resolve_greedy_fused(
+        Arc::new(
+            RegistryClient::new()
+                .with_base_url(server.uri())
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        ),
+        HashMap::from([("blocked-exact".to_string(), "1.0.0".to_string())]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        true,
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(ResolveError::Registry {
+            failure: crate::RegistryFetchFailure::FirewallBlocked(_),
+            ..
+        })
+    ));
+    server.verify().await;
+}
