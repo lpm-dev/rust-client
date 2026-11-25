@@ -143,7 +143,7 @@ fn resolve_release_url(env_var: &str, default_url: &str) -> String {
 /// Accept an override URL if it's HTTPS (any host) or HTTP pointed at
 /// a loopback address (tests + local dev mirrors). Anything else
 /// (HTTP non-loopback, unsupported scheme, malformed URL) is refused.
-fn accept_override(url: &str) -> bool {
+pub(crate) fn accept_override(url: &str) -> bool {
     let parsed = match reqwest::Url::parse(url) {
         Ok(u) => u,
         Err(_) => return false,

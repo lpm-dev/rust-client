@@ -1273,11 +1273,14 @@ fn rejects_bundle_with_unknown_rekor_log_id() {
     )
     .expect_err("unknown logId must reject");
     match err {
-        VerifyError::RekorSet(msg) => assert!(
-            msg.contains("no pinned Rekor key"),
-            "expected unknown-logId diagnostic, got: {msg}"
+        VerifyError::MissingTrustMaterial {
+            check: "Rekor SET",
+            detail,
+        } => assert!(
+            detail.contains("no pinned Rekor key"),
+            "expected unknown-logId diagnostic, got: {detail}"
         ),
-        other => panic!("expected VerifyError::RekorSet, got: {other:?}"),
+        other => panic!("expected Rekor SET MissingTrustMaterial, got: {other:?}"),
     }
 }
 
@@ -1305,8 +1308,11 @@ fn rejects_bundle_with_rekor_key_outside_validity_at_integrated_time() {
     )
     .expect_err("out-of-window key must reject");
     let msg = match err {
-        VerifyError::RekorSet(msg) => msg,
-        other => panic!("expected VerifyError::RekorSet, got: {other:?}"),
+        VerifyError::MissingTrustMaterial {
+            check: "Rekor SET",
+            detail,
+        } => detail,
+        other => panic!("expected Rekor SET MissingTrustMaterial, got: {other:?}"),
     };
     assert!(
         msg.contains("no pinned Rekor key"),
@@ -2126,11 +2132,14 @@ fn rejects_inclusion_proof_with_wrong_pinned_rekor_key_for_log_id() {
     let err = verify_inclusion_proof(&tlog, std::slice::from_ref(&other_key))
         .expect_err("logId without a pinned key must reject");
     match err {
-        VerifyError::InclusionProof(msg) => assert!(
-            msg.contains("no pinned Rekor key"),
-            "expected unknown-logId diagnostic, got: {msg}"
+        VerifyError::MissingTrustMaterial {
+            check: "Rekor inclusion proof",
+            detail,
+        } => assert!(
+            detail.contains("no pinned Rekor key"),
+            "expected unknown-logId diagnostic, got: {detail}"
         ),
-        other => panic!("expected InclusionProof, got: {other:?}"),
+        other => panic!("expected inclusion-proof MissingTrustMaterial, got: {other:?}"),
     }
 }
 
@@ -2244,11 +2253,14 @@ fn rejects_chain_when_top_cert_not_signed_by_any_trusted_root() {
     let err = verify_cert_chain(&chain, &roots, ts_year(2025))
         .expect_err("chain to an untrusted root must reject");
     match err {
-        VerifyError::Chain(msg) => assert!(
-            msg.contains("does not match any trusted Fulcio root"),
-            "expected anchor-rejection diagnostic, got: {msg}"
+        VerifyError::MissingTrustMaterial {
+            check: "X.509 chain",
+            detail,
+        } => assert!(
+            detail.contains("does not match any trusted Fulcio root"),
+            "expected anchor-rejection diagnostic, got: {detail}"
         ),
-        other => panic!("expected Chain, got: {other:?}"),
+        other => panic!("expected chain MissingTrustMaterial, got: {other:?}"),
     }
 }
 
@@ -2319,10 +2331,13 @@ fn rejects_chain_when_no_trust_anchors_active_at_integrated_time() {
     let err = verify_cert_chain(&chain, &[], ts_year(2025))
         .expect_err("empty trust-anchor set must reject");
     match err {
-        VerifyError::Chain(msg) => {
-            assert!(msg.contains("no Fulcio roots active"), "got: {msg}")
+        VerifyError::MissingTrustMaterial {
+            check: "X.509 chain",
+            detail,
+        } => {
+            assert!(detail.contains("no Fulcio roots active"), "got: {detail}")
         }
-        other => panic!("expected Chain, got: {other:?}"),
+        other => panic!("expected chain MissingTrustMaterial, got: {other:?}"),
     }
 }
 
@@ -2542,11 +2557,14 @@ fn rejects_anchor_lacking_ca_flag_during_try_anchor_signature_path() {
     // not "anchor misconfigured" (security through robust
     // failure mode).
     match err {
-        VerifyError::Chain(msg) => assert!(
-            msg.contains("does not match any trusted Fulcio root"),
-            "expected unanchored diagnostic, got: {msg}"
+        VerifyError::MissingTrustMaterial {
+            check: "X.509 chain",
+            detail,
+        } => assert!(
+            detail.contains("does not match any trusted Fulcio root"),
+            "expected unanchored diagnostic, got: {detail}"
         ),
-        other => panic!("expected VerifyError::Chain, got: {other:?}"),
+        other => panic!("expected chain MissingTrustMaterial, got: {other:?}"),
     }
 }
 
@@ -2818,11 +2836,14 @@ fn rejects_sct_with_unknown_log_id() {
     )
     .expect_err("unknown logId must reject");
     match err {
-        VerifyError::Sct(msg) => assert!(
-            msg.contains("no SCT in the leaf cert's extension verified"),
-            "got: {msg}"
+        VerifyError::MissingTrustMaterial {
+            check: "SCT",
+            detail,
+        } => assert!(
+            detail.contains("no SCT in the leaf cert's extension verified"),
+            "got: {detail}"
         ),
-        other => panic!("expected VerifyError::Sct, got: {other:?}"),
+        other => panic!("expected SCT MissingTrustMaterial, got: {other:?}"),
     }
 }
 

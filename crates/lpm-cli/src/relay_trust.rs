@@ -1,8 +1,8 @@
 //! Relay key authorization anchored to LPM's GitHub Actions signing identity.
 
 use crate::sigstore_verify::{
-    IdentityExpectations, VerifiedProvenance, VerifyOptions, extract_subject_digest_from_statement,
-    verify_sigstore_bundle,
+    IdentityExpectations, TrustRefresh, VerifiedProvenance, VerifyOptions,
+    extract_subject_digest_from_statement, verify_sigstore_bundle_refreshing,
 };
 use lpm_common::LpmError;
 use sha2::{Digest, Sha256};
@@ -45,6 +45,7 @@ async fn fetch_approved_pins() -> Result<Vec<String>, LpmError> {
         &bundle,
         lpm_common::Timestamp::now().unix_seconds(),
     )
+    .await
 }
 
 async fn fetch_asset(
@@ -64,7 +65,11 @@ async fn fetch_asset(
         .map_err(trust_error)
 }
 
-fn verify_approved_pins(manifest: &[u8], bundle: &[u8], now: i64) -> Result<Vec<String>, LpmError> {
+async fn verify_approved_pins(
+    manifest: &[u8],
+    bundle: &[u8],
+    now: i64,
+) -> Result<Vec<String>, LpmError> {
     if manifest.len() > MANIFEST_CAP || bundle.len() > BUNDLE_CAP {
         return Err(trust_error("the signed key list exceeds the size limit"));
     }
@@ -73,8 +78,14 @@ fn verify_approved_pins(manifest: &[u8], bundle: &[u8], now: i64) -> Result<Vec<
         expected_san_uri_prefix: Some("https://github.com/lpm-dev/rust-client/".into()),
         expected_workflow_path: Some(WORKFLOW.into()),
     };
-    let verified =
-        verify_sigstore_bundle(bundle, &identity, VerifyOptions::strict()).map_err(trust_error)?;
+    let verified = verify_sigstore_bundle_refreshing(
+        bundle,
+        &identity,
+        VerifyOptions::strict(),
+        TrustRefresh::WhenMissing,
+    )
+    .await
+    .map_err(trust_error)?;
     validate_approved_pins(manifest, &verified, now)
 }
 
@@ -204,13 +215,13 @@ mod tests {
         assert!(validate_approved_pins(&bytes, &verified, NOW).is_err());
     }
 
-    #[test]
-    fn signed_key_list_rejects_forged_and_unrelated_bundles() {
+    #[tokio::test]
+    async fn signed_key_list_rejects_forged_and_unrelated_bundles() {
         let bytes = serde_json::to_vec(&manifest()).unwrap();
-        assert!(verify_approved_pins(&bytes, b"{}", NOW).is_err());
+        assert!(verify_approved_pins(&bytes, b"{}", NOW).await.is_err());
         let fixture =
             include_bytes!("../tests/fixtures/sigstore_bundles/20-real-npm-axios-1.14.0.json");
-        assert!(verify_approved_pins(&bytes, fixture, NOW).is_err());
+        assert!(verify_approved_pins(&bytes, fixture, NOW).await.is_err());
     }
 
     #[test]
@@ -227,11 +238,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn signed_key_list_rejects_oversized_inputs_and_excess_keys() {
+    #[tokio::test]
+    async fn signed_key_list_rejects_oversized_inputs_and_excess_keys() {
         let bytes = serde_json::to_vec(&manifest()).unwrap();
-        assert!(verify_approved_pins(&vec![0; MANIFEST_CAP + 1], b"{}", NOW).is_err());
-        assert!(verify_approved_pins(&bytes, &vec![0; BUNDLE_CAP + 1], NOW).is_err());
+        assert!(
+            verify_approved_pins(&vec![0; MANIFEST_CAP + 1], b"{}", NOW)
+                .await
+                .is_err()
+        );
+        assert!(
+            verify_approved_pins(&bytes, &vec![0; BUNDLE_CAP + 1], NOW)
+                .await
+                .is_err()
+        );
         let mut manifest = manifest();
         manifest["spki_sha256"] =
             serde_json::json!((0..17).map(|pin| format!("{pin:064x}")).collect::<Vec<_>>());

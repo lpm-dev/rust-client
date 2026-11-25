@@ -4,7 +4,8 @@
 //! in-toto statement attached to a Sigstore bundle. The data schema in
 //! [`crate::sigstore`] is the precondition for these checks:
 //!
-//! - vendored Sigstore trust root.
+//! - Sigstore trust root: built into the binary, refreshed from
+//!   Sigstore's TUF repository when a signature needs newer keys.
 //! - DSSE envelope verification against the leaf cert.
 //! - X.509 chain validation at `integratedTime`.
 //! - embedded SCT verification.
@@ -30,6 +31,8 @@ mod sct;
 #[cfg(test)]
 mod tests;
 mod trust_root;
+mod trust_store;
+pub(crate) mod tuf;
 
 pub use self::bundle::{
     CertificateBuildClaims, IdentityExpectations, VerifiedProvenance, VerifyOptions,
@@ -45,6 +48,7 @@ pub use self::rekor_body::verify_rekor_body;
 pub use self::rekor_set::verify_rekor_set;
 pub use self::sct::verify_embedded_sct;
 pub use self::trust_root::{CtLogKey, FulcioRoot, RekorKey, TrustRoot, trust_root};
+pub use self::trust_store::{TrustRefresh, verify_sigstore_bundle_refreshing};
 
 #[cfg(test)]
 use self::bundle::{

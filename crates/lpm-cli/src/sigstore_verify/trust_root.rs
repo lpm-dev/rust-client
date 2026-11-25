@@ -2,7 +2,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use lpm_common::Timestamp;
 use lpm_common::timestamp::Duration;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use super::VerifyError;
@@ -14,8 +14,8 @@ pub(super) const EMBEDDED_TRUST_ROOT_JSON: &[u8] =
 /// only — does not affect fail-closed behaviour.
 pub(super) const TRUST_ROOT_EXPIRY_WARN_DAYS: i64 = 30;
 
-/// Vendored Sigstore trust root. Parsed once at startup from
-/// `assets/sigstore_trusted_root.json` and cached via [`trust_root`].
+/// A parsed Sigstore trust root: the Fulcio certificate authorities,
+/// Rekor logs and CT logs bundles are verified against.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct TrustRoot {
@@ -81,11 +81,39 @@ impl ValidityWindow {
 #[derive(Debug, serde::Deserialize)]
 struct TrustedRootJson {
     #[serde(rename = "certificateAuthorities", default)]
-    certificate_authorities: Vec<TrustedRootCa>,
+    certificate_authorities: Vec<serde_json::Value>,
     #[serde(default)]
-    tlogs: Vec<TrustedRootLog>,
+    tlogs: Vec<serde_json::Value>,
     #[serde(default)]
-    ctlogs: Vec<TrustedRootLog>,
+    ctlogs: Vec<serde_json::Value>,
+}
+
+fn deserialize_entry<T: serde::de::DeserializeOwned>(
+    value: serde_json::Value,
+) -> Result<T, VerifyError> {
+    serde_json::from_value(value).map_err(|e| VerifyError::TrustRoot(format!("JSON parse: {e}")))
+}
+
+fn collect_entries<T>(
+    values: Vec<serde_json::Value>,
+    skip_unreadable: bool,
+    parse: impl Fn(serde_json::Value) -> Result<T, VerifyError>,
+) -> Result<Vec<T>, VerifyError> {
+    let mut entries = Vec::with_capacity(values.len());
+    for value in values {
+        match parse(value) {
+            Ok(entry) => entries.push(entry),
+            Err(error) if skip_unreadable => {
+                tracing::debug!(
+                    target: "lpm_cli::sigstore_verify",
+                    %error,
+                    "skipping a Sigstore trust root entry this version can't read",
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(entries)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -150,47 +178,44 @@ impl From<TrustedRootValidFor> for ValidityWindow {
 #[allow(dead_code)]
 impl TrustRoot {
     /// Parse a trust root from raw JSON bytes. Pure — no I/O, no
-    /// global state. Use [`trust_root`] for the production
-    /// embedded-bytes entry; this is the test seam and is also
-    /// available for future code that wants to consume a non-embedded
-    /// root. Callers that accept non-embedded roots must preserve the
-    /// same fail-closed validation semantics as the embedded path.
+    /// global state. Use [`trust_root`] for the one verification
+    /// uses; bytes passed here must come from the binary or from
+    /// Sigstore's TUF repository through [`super::tuf`].
     pub fn parse(bytes: &[u8]) -> Result<TrustRoot, VerifyError> {
+        Self::parse_entries(bytes, false)
+    }
+
+    /// Parse a trust root from Sigstore's TUF repository, skipping any
+    /// entry this version can't read rather than refusing the whole
+    /// root. Sigstore can add entries in shapes newer than this
+    /// version, and the entries it can read must stay usable.
+    pub fn parse_skipping_unreadable(bytes: &[u8]) -> Result<TrustRoot, VerifyError> {
+        Self::parse_entries(bytes, true)
+    }
+
+    fn parse_entries(bytes: &[u8], skip_unreadable: bool) -> Result<TrustRoot, VerifyError> {
         let raw: TrustedRootJson = serde_json::from_slice(bytes)
             .map_err(|e| VerifyError::TrustRoot(format!("JSON parse: {e}")))?;
-
-        let fulcio_roots = raw
-            .certificate_authorities
-            .into_iter()
-            .map(parse_fulcio_root)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let rekor_keys = raw
-            .tlogs
-            .into_iter()
-            .map(parse_log_key)
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(|(log_id, spki_der, valid_for)| RekorKey {
+        let fulcio_roots =
+            collect_entries(raw.certificate_authorities, skip_unreadable, |value| {
+                parse_fulcio_root(deserialize_entry(value)?)
+            })?;
+        let rekor_keys = collect_entries(raw.tlogs, skip_unreadable, |value| {
+            let (log_id, spki_der, valid_for) = parse_log_key(deserialize_entry(value)?)?;
+            Ok(RekorKey {
                 log_id,
                 spki_der,
                 valid_for,
             })
-            .collect();
-
-        let ctlog_keys = raw
-            .ctlogs
-            .into_iter()
-            .map(parse_log_key)
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(|(log_id, spki_der, valid_for)| CtLogKey {
+        })?;
+        let ctlog_keys = collect_entries(raw.ctlogs, skip_unreadable, |value| {
+            let (log_id, spki_der, valid_for) = parse_log_key(deserialize_entry(value)?)?;
+            Ok(CtLogKey {
                 log_id,
                 spki_der,
                 valid_for,
             })
-            .collect();
-
+        })?;
         Ok(TrustRoot {
             fulcio_roots,
             rekor_keys,
@@ -330,45 +355,9 @@ fn parse_log_key(raw: TrustedRootLog) -> Result<(Vec<u8>, Vec<u8>, ValidityWindo
     Ok((log_id, spki_der, raw.public_key.valid_for.into()))
 }
 
-/// Cached parsed trust root, populated on first [`trust_root`] call.
-static TRUST_ROOT_CELL: OnceLock<Result<Arc<TrustRoot>, String>> = OnceLock::new();
-
-/// Production accessor: lazily loads the embedded trust root, runs
-/// the startup expiry check, and emits the 30-day warn if applicable.
-/// Subsequent calls return a cheap `Arc::clone` of the cached root.
-///
-/// Error semantics: parse failures and post-expiry rejection are both
-/// surfaced via the cached `Err` variant — once this function
-/// returns an error for the process lifetime, it always will. That's
-/// load-bearing: a verifier path that succeeded the first call must
-/// not silently start failing mid-install because something flapped.
-#[allow(dead_code)] // wired into provenance_bundle
+/// The trust root verification uses: the newest one Sigstore's TUF
+/// repository has delivered to this machine, or the one built into the
+/// binary. See [`super::trust_store`].
 pub fn trust_root() -> Result<Arc<TrustRoot>, VerifyError> {
-    let cached = TRUST_ROOT_CELL.get_or_init(|| {
-        let parsed =
-            TrustRoot::parse(EMBEDDED_TRUST_ROOT_JSON).map_err(|e| format!("parse failed: {e}"))?;
-        let now = SystemTime::now();
-
-        if let Some(expires) = parsed.within_warn_window(now) {
-            tracing::warn!(
-                target: "lpm_cli::sigstore_verify",
-                expires_at = %expires.to_plain_utc(),
-                "vendored Sigstore trust root expires within {} days; update lpm to refresh",
-                TRUST_ROOT_EXPIRY_WARN_DAYS,
-            );
-        }
-
-        if let Err(VerifyError::TrustRootExpired { missing_roles }) = parsed.check_expiry(now) {
-            return Err(format!(
-                "vendored Sigstore trust root has no currently-active key for role(s) \
-                 {missing_roles}; update lpm to refresh"
-            ));
-        }
-
-        Ok(Arc::new(parsed))
-    });
-    match cached {
-        Ok(arc) => Ok(Arc::clone(arc)),
-        Err(msg) => Err(VerifyError::TrustRoot(msg.clone())),
-    }
+    super::trust_store::global().current()
 }

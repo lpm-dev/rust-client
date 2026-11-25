@@ -68,9 +68,10 @@ pub fn verify_cert_chain(
         )));
     }
     if fulcio_roots.is_empty() {
-        return Err(VerifyError::Chain(
-            "no Fulcio roots active at integratedTime — cannot anchor any chain".into(),
-        ));
+        return Err(VerifyError::MissingTrustMaterial {
+            check: "X.509 chain",
+            detail: "no Fulcio roots active at integratedTime — cannot anchor any chain".into(),
+        });
     }
 
     let at_time_dt: Timestamp = at_time.into();
@@ -162,12 +163,15 @@ pub fn verify_cert_chain(
         }
     }
 
-    Err(VerifyError::Chain(format!(
-        "bundle chain's top cert does not match any trusted Fulcio root and \
-         is not signed by any trusted Fulcio root \
-         ({} candidate root(s) active at integratedTime)",
-        fulcio_roots.len()
-    )))
+    Err(VerifyError::MissingTrustMaterial {
+        check: "X.509 chain",
+        detail: format!(
+            "bundle chain's top cert does not match any trusted Fulcio root and \
+             is not signed by any trusted Fulcio root \
+             ({} candidate root(s) active at integratedTime)",
+            fulcio_roots.len()
+        ),
+    })
 }
 
 /// X.509 extension enforcement for a cert acting as a CA — every

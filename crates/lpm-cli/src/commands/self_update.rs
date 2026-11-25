@@ -5,8 +5,9 @@ use crate::release_lookup::{
     is_newer_semver, operating_system_home_dir, probe_release, read_cache_at, write_cache_at,
 };
 use crate::sigstore_verify::{
-    CertificateBuildClaims, IdentityExpectations, VerifiedProvenance, VerifyError, VerifyOptions,
-    extract_subject_digest_from_statement, verify_sigstore_bundle,
+    CertificateBuildClaims, IdentityExpectations, TrustRefresh, VerifiedProvenance, VerifyError,
+    VerifyOptions, extract_subject_digest_from_statement, verify_sigstore_bundle,
+    verify_sigstore_bundle_refreshing,
 };
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
@@ -2218,19 +2219,41 @@ struct VerifiedReleaseManifest {
     entries: HashMap<String, String>,
 }
 
+/// The signing identity of LPM's release workflow.
+fn release_signing_identity() -> IdentityExpectations {
+    IdentityExpectations {
+        expected_issuer: Some("https://token.actions.githubusercontent.com".to_string()),
+        expected_san_uri_prefix: Some("https://github.com/lpm-dev/rust-client/".to_string()),
+        expected_workflow_path: Some(".github/workflows/release.yml".to_string()),
+    }
+}
+
+/// Verify a release's `SHA256SUMS.txt` without fetching Sigstore's current
+/// trust root. `lpm internal-verify-release` uses it so a release that
+/// passes verifies even for a client that can't reach Sigstore's repository.
 fn verify_release_manifest(
     version: &str,
     manifest_bytes: &[u8],
     bundle_bytes: &[u8],
     release: &GithubRelease,
 ) -> Result<VerifiedReleaseManifest, LpmError> {
-    let expectations = IdentityExpectations {
-        expected_issuer: Some("https://token.actions.githubusercontent.com".to_string()),
-        expected_san_uri_prefix: Some("https://github.com/lpm-dev/rust-client/".to_string()),
-        expected_workflow_path: Some(".github/workflows/release.yml".to_string()),
-    };
-    let options = VerifyOptions::strict();
+    let verified = verify_sigstore_bundle(
+        bundle_bytes,
+        &release_signing_identity(),
+        VerifyOptions::strict(),
+    )
+    .map_err(map_verify_error)?;
+    check_release_manifest(version, manifest_bytes, verified, release)
+}
 
+/// Check what a verified Sigstore bundle attests against the release and
+/// its `SHA256SUMS.txt`.
+fn check_release_manifest(
+    version: &str,
+    manifest_bytes: &[u8],
+    verified: VerifiedProvenance,
+    release: &GithubRelease,
+) -> Result<VerifiedReleaseManifest, LpmError> {
     let VerifiedProvenance {
         snapshot,
         build,
@@ -2239,7 +2262,7 @@ fn verify_release_manifest(
         leaf_cert_sha256,
         log_id,
         log_index,
-    } = verify_sigstore_bundle(bundle_bytes, &expectations, options).map_err(map_verify_error)?;
+    } = verified;
 
     let source_commit = validate_release_provenance(
         version,
@@ -3522,7 +3545,15 @@ async fn fetch_verified_release_manifest(
     if human_output {
         install_ui::phase("Verifying Sigstore attestation");
     }
-    verify_release_manifest(version, &manifest_bytes, &bundle_bytes, &release)
+    let verified = verify_sigstore_bundle_refreshing(
+        &bundle_bytes,
+        &release_signing_identity(),
+        VerifyOptions::strict(),
+        TrustRefresh::BeforeVerifying,
+    )
+    .await
+    .map_err(map_verify_error)?;
+    check_release_manifest(version, &manifest_bytes, verified, &release)
 }
 
 /// Why a standalone release couldn't be staged: it didn't verify, or
