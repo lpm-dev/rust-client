@@ -6,8 +6,8 @@ use crate::release_lookup::{
 };
 use crate::sigstore_verify::{
     CertificateBuildClaims, IdentityExpectations, TrustRefresh, VerifiedProvenance, VerifyError,
-    VerifyOptions, extract_subject_digest_from_statement, verify_sigstore_bundle,
-    verify_sigstore_bundle_refreshing,
+    VerifyOptions, extract_subject_digest_from_statement, verify_sigstore_bundle_refreshing,
+    verify_sigstore_bundle_with_built_in_trust_root,
 };
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
@@ -2228,8 +2228,8 @@ fn release_signing_identity() -> IdentityExpectations {
     }
 }
 
-/// Verify a release's `SHA256SUMS.txt` without fetching Sigstore's current
-/// trust root. `lpm internal-verify-release` uses it so a release that
+/// Verify a release's `SHA256SUMS.txt` against the trust root built into
+/// this binary only. `lpm internal-verify-release` uses it so a release that
 /// passes verifies even for a client that can't reach Sigstore's repository.
 fn verify_release_manifest(
     version: &str,
@@ -2237,7 +2237,7 @@ fn verify_release_manifest(
     bundle_bytes: &[u8],
     release: &GithubRelease,
 ) -> Result<VerifiedReleaseManifest, LpmError> {
-    let verified = verify_sigstore_bundle(
+    let verified = verify_sigstore_bundle_with_built_in_trust_root(
         bundle_bytes,
         &release_signing_identity(),
         VerifyOptions::strict(),
@@ -5161,7 +5161,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     #[test]
     fn real_v0_84_0_certificate_names_its_build() {
         let (_, bundle) = real_v0_84_0_release_assets();
-        let verified = verify_sigstore_bundle(
+        let verified = crate::sigstore_verify::verify_sigstore_bundle(
             &bundle,
             &IdentityExpectations::none(),
             VerifyOptions::strict(),
@@ -5208,7 +5208,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
             verified.source_commit,
             "faa77c3cb0ccea39886f12e7005575bae4273505"
         );
-        let certificate = verify_sigstore_bundle(
+        let certificate = crate::sigstore_verify::verify_sigstore_bundle(
             &bundle,
             &IdentityExpectations::none(),
             VerifyOptions::strict(),
@@ -5234,7 +5234,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
             verified.source_commit,
             "daa536a898e160442cbab72191131164c3e7656a"
         );
-        let certificate = verify_sigstore_bundle(
+        let certificate = crate::sigstore_verify::verify_sigstore_bundle(
             &bundle,
             &IdentityExpectations::none(),
             VerifyOptions::strict(),

@@ -169,27 +169,39 @@ pub(crate) async fn refresh<F: Fetcher>(
             .ok()
             .map(|root| (stored, root))
     });
+    let embedded_version = embedded.version();
     let (mut root, mut roots) = match &stored {
-        Some((stored, root)) => (root.clone(), stored.roots.clone()),
+        Some((stored, root)) => {
+            let newer_than_embedded = stored
+                .roots
+                .iter()
+                .filter(|text| {
+                    Signed::<Root>::parse(text.as_bytes())
+                        .is_ok_and(|root| root.version() > embedded_version)
+                })
+                .cloned()
+                .collect();
+            (root.clone(), newer_than_embedded)
+        }
         None => (embedded, Vec::new()),
     };
-    let starting_root = root.signed.clone();
-
+    // A root that replaced the timestamp or snapshot keys may restart those
+    // roles' version numbers, so the old versions no longer bound them. Each
+    // step counts: keys rotated away and back may have restarted too.
+    let mut keys_rotated = false;
     for _ in 0..MAX_ROOT_ROTATIONS {
         let next = root.version() + 1;
         let path = format!("{next}.root.json");
         let Some(bytes) = fetch(fetcher, &path, ROOT_MAX_BYTES).await? else {
             break;
         };
-        root = rotate_root(&root, &bytes)?;
+        let rotated = rotate_root(&root, &bytes)?;
+        keys_rotated |= root.signed.role_keys_differ(&rotated.signed, "timestamp")
+            || root.signed.role_keys_differ(&rotated.signed, "snapshot");
+        root = rotated;
         roots.push(into_text(bytes, &path)?);
     }
     root.ensure_unexpired(now)?;
-
-    // A root that replaced the timestamp or snapshot keys may restart those
-    // roles' version numbers, so the old versions no longer bound them.
-    let keys_rotated = starting_root.role_keys_differ(&root.signed, "timestamp")
-        || starting_root.role_keys_differ(&root.signed, "snapshot");
     let previous = stored
         .filter(|_| !keys_rotated)
         .map(|(stored, _)| PreviousVersions::from_stored(stored, &root.signed));
@@ -231,18 +243,6 @@ pub(crate) async fn refresh<F: Fetcher>(
     let snapshot = Signed::<Snapshot>::parse(&snapshot_text)?;
     snapshot.verify_with(&root.signed)?;
     expect_version("snapshot", snapshot_meta.version, snapshot.version())?;
-    if let Some(previous) = previous.as_ref().and_then(|p| p.snapshot.as_ref()) {
-        for (name, old) in &previous.signed.meta {
-            let offered = snapshot
-                .signed
-                .meta
-                .get(name)
-                .ok_or_else(|| TufError::Missing(format!("{name} in its snapshot")))?;
-            not_older("snapshot", old.version, offered.version)?;
-        }
-    }
-    snapshot.ensure_unexpired(now)?;
-
     let targets_meta =
         snapshot
             .signed
@@ -252,6 +252,16 @@ pub(crate) async fn refresh<F: Fetcher>(
                 role: "snapshot",
                 detail: "it records no targets.json".into(),
             })?;
+    // Only targets.json matters to this client, so delegated roles Sigstore
+    // adds or removes don't affect it.
+    if let Some(old) = previous
+        .as_ref()
+        .and_then(|p| p.snapshot.as_ref())
+        .and_then(|snapshot| snapshot.signed.meta.get("targets.json"))
+    {
+        not_older("targets", old.version, targets_meta.version)?;
+    }
+    snapshot.ensure_unexpired(now)?;
     let targets_path = versioned_path(&root, targets_meta.version, "targets.json");
     let targets_text = fetch_required(
         fetcher,
@@ -337,8 +347,15 @@ fn rotate_root(trusted: &Signed<Root>, bytes: &[u8]) -> Result<Signed<Root>, Tuf
     Ok(next)
 }
 
+/// Follow stored roots from `root`. Stored roots no newer than `root` are
+/// skipped: a binary built with a newer TUF root reads a cache written by
+/// an older one.
 fn follow_roots(mut root: Signed<Root>, newer: &[String]) -> Result<Signed<Root>, TufError> {
     for text in newer {
+        let stored = Signed::<Root>::parse(text.as_bytes())?;
+        if stored.version() <= root.version() {
+            continue;
+        }
         root = rotate_root(&root, text.as_bytes())?;
     }
     Ok(root)

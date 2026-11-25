@@ -288,6 +288,21 @@ impl TrustRoot {
         })
     }
 
+    /// The roles with no entry at all, active or retired.
+    pub fn roles_without_entries(&self) -> Vec<&'static str> {
+        let mut empty = Vec::new();
+        if self.fulcio_roots.is_empty() {
+            empty.push(FULCIO_ROLE);
+        }
+        if self.rekor_keys.is_empty() {
+            empty.push(REKOR_ROLE);
+        }
+        if self.ctlog_keys.is_empty() {
+            empty.push(CT_LOG_ROLE);
+        }
+        empty
+    }
+
     /// The roles with no key active at `now`.
     pub fn roles_without_active_key(&self, now: SystemTime) -> Vec<&'static str> {
         let mut missing = Vec::new();
@@ -337,9 +352,9 @@ impl TrustRoot {
     }
 
     /// Whether [`Self::next_role_retirement_at`] is within
-    /// `TRUST_ROOT_EXPIRY_WARN_DAYS` of `now`. Used by [`trust_root`]'s
-    /// startup `tracing::warn`. Returns `None` when no anchor or
-    /// when the anchor is further out than the warn window.
+    /// `TRUST_ROOT_EXPIRY_WARN_DAYS` of `now`, for the trust store's
+    /// diagnostic log when it loads a trust root. Returns `None` when no
+    /// anchor or when the anchor is further out than the warn window.
     pub fn within_warn_window(&self, now: SystemTime) -> Option<Timestamp> {
         let soonest = self.next_role_retirement_at(now)?;
         let now_dt: Timestamp = now.into();

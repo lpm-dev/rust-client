@@ -1,4 +1,4 @@
-use super::test_support::{RoleSet, TestKey, repository_files};
+use super::test_support::{RoleSet, TestKey, repository_files, repository_files_listing, resigned};
 use super::*;
 use lpm_common::Timestamp as Time;
 use serde_json::{Value, json};
@@ -413,7 +413,7 @@ fn an_older_targets_version_than_the_stored_snapshot_records_is_refused() {
     assert_eq!(
         error,
         TufError::Rollback {
-            role: "snapshot",
+            role: "targets",
             trusted: 5,
             offered: 4
         }
@@ -599,5 +599,169 @@ fn one_key_under_two_ids_and_encodings_counts_once_toward_the_threshold() {
             valid: 1,
             threshold: 2
         }
+    );
+}
+
+#[test]
+fn a_cache_written_before_the_built_in_root_was_updated_still_verifies() {
+    let roles = RoleSet::new();
+    let repository =
+        synthetic_repository(&roles, 1, 1, 1).with("2.root.json", roles.signed_root(2));
+    let stored = refreshed(&roles.signed_root(1), None, &repository, now()).unwrap();
+    assert_eq!(stored.roots.len(), 1);
+
+    let verified = stored.verified_trusted_root(&roles.signed_root(2)).unwrap();
+
+    assert_eq!(verified.bytes, SYNTHETIC_TRUSTED_ROOT);
+}
+
+#[test]
+fn a_delegated_role_sigstore_drops_does_not_block_refreshes() {
+    let roles = RoleSet::new();
+    let embedded = roles.signed_root(1);
+    let with_delegation = Repository {
+        files: repository_files_listing(
+            &roles,
+            1,
+            1,
+            1,
+            SYNTHETIC_TRUSTED_ROOT,
+            &["registry.npmjs.org"],
+        ),
+        requested: Mutex::default(),
+    };
+    let stored = refreshed(&embedded, None, &with_delegation, now()).unwrap();
+
+    refreshed(
+        &embedded,
+        Some(&stored),
+        &synthetic_repository(&roles, 2, 2, 2),
+        now(),
+    )
+    .expect("only targets.json is held to its stored version");
+}
+
+#[test]
+fn a_root_listing_a_key_this_client_cannot_read_still_verifies() {
+    let roles = RoleSet::new();
+    let root_signers: Vec<&TestKey> = roles.root.iter().collect();
+    let next = resigned(&roles.signed_root(2), &root_signers, |signed| {
+        signed["keys"]["future"] = json!({"keytype": "post-quantum", "keyval": {"x": [1, 2]}});
+    });
+    let repository = synthetic_repository(&roles, 1, 1, 1).with("2.root.json", next);
+
+    let metadata = refreshed(&roles.signed_root(1), None, &repository, now()).unwrap();
+
+    assert_eq!(metadata.roots.len(), 1);
+}
+
+#[test]
+fn a_root_whose_own_keys_did_not_sign_it_is_refused() {
+    let roles = RoleSet::new();
+    let successor = RoleSet {
+        root: vec![TestKey::p256(60)],
+        ..roles.clone()
+    };
+    let old_keys: Vec<&TestKey> = roles.root.iter().collect();
+    let repository =
+        synthetic_repository(&roles, 1, 1, 1).with("2.root.json", successor.root(2, &old_keys));
+
+    let error = refreshed(&roles.signed_root(1), None, &repository, now()).unwrap_err();
+
+    assert_eq!(
+        error,
+        TufError::Threshold {
+            role: "root",
+            valid: 0,
+            threshold: 1
+        }
+    );
+}
+
+#[test]
+fn a_threshold_of_two_is_met_by_two_distinct_keys_only() {
+    let roles = RoleSet {
+        root: vec![TestKey::p256(70), TestKey::ed25519(71)],
+        root_threshold: 2,
+        ..RoleSet::new()
+    };
+    let both: Vec<&TestKey> = roles.root.iter().collect();
+    let one = [&roles.root[0]];
+    let accepted = synthetic_repository(&roles, 1, 1, 1).with("2.root.json", roles.root(2, &both));
+    let refused = synthetic_repository(&roles, 1, 1, 1).with("2.root.json", roles.root(2, &one));
+
+    refreshed(&roles.root(1, &both), None, &accepted, now()).unwrap();
+    let error = refreshed(&roles.root(1, &both), None, &refused, now()).unwrap_err();
+
+    assert_eq!(
+        error,
+        TufError::Threshold {
+            role: "root",
+            valid: 1,
+            threshold: 2
+        }
+    );
+}
+
+#[test]
+fn a_key_of_an_unsupported_type_never_counts() {
+    let roles = RoleSet::new();
+    let root_signers: Vec<&TestKey> = roles.root.iter().collect();
+    let keyid = roles.root[0].keyid();
+    let next = resigned(&roles.signed_root(2), &root_signers, |signed| {
+        signed["keys"][&keyid]["keytype"] = json!("rsa");
+        signed["keys"][&keyid]["scheme"] = json!("rsassa-pss-sha256");
+    });
+    let repository = synthetic_repository(&roles, 1, 1, 1).with("2.root.json", next);
+
+    let error = refreshed(&roles.signed_root(1), None, &repository, now()).unwrap_err();
+
+    assert_eq!(
+        error,
+        TufError::Threshold {
+            role: "root",
+            valid: 0,
+            threshold: 1
+        }
+    );
+}
+
+#[test]
+fn metadata_of_version_zero_or_another_specification_is_refused() {
+    let roles = RoleSet::new();
+    let root_signers: Vec<&TestKey> = roles.root.iter().collect();
+    for (field, value) in [("version", json!(0)), ("spec_version", json!("2.0"))] {
+        let embedded = resigned(&roles.signed_root(1), &root_signers, |signed| {
+            signed[field] = value.clone();
+        });
+
+        let error = refreshed(
+            &embedded,
+            None,
+            &synthetic_repository(&roles, 1, 1, 1),
+            now(),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, TufError::Malformed { role: "root", .. }),
+            "{field}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_snapshot_that_differs_from_its_recorded_hash_is_refused() {
+    let roles = RoleSet::new();
+    let mut repository = synthetic_repository(&roles, 1, 1, 1);
+    let snapshot = repository.files.get_mut("1.snapshot.json").unwrap();
+    let space = snapshot.iter().position(|&byte| byte == b' ').unwrap();
+    snapshot[space] = b'\t';
+
+    let error = refreshed(&roles.signed_root(1), None, &repository, now()).unwrap_err();
+
+    assert!(
+        matches!(&error, TufError::Mismatch { name, .. } if name == "snapshot.json"),
+        "{error}"
     );
 }

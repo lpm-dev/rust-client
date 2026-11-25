@@ -38,7 +38,7 @@ impl TestKey {
         }
     }
 
-    fn keyid(&self) -> String {
+    pub(crate) fn keyid(&self) -> String {
         hex::encode(Sha256::digest(self.metadata().to_string()))
     }
 
@@ -136,6 +136,31 @@ pub(crate) fn repository_files(
     targets_version: u64,
     trusted_root: &[u8],
 ) -> BTreeMap<String, Vec<u8>> {
+    repository_files_listing(
+        roles,
+        timestamp_version,
+        snapshot_version,
+        targets_version,
+        trusted_root,
+        &[],
+    )
+}
+
+/// [`repository_files`] whose snapshot also lists `delegated` roles at
+/// version 1.
+pub(crate) fn repository_files_listing(
+    roles: &RoleSet,
+    timestamp_version: u64,
+    snapshot_version: u64,
+    targets_version: u64,
+    trusted_root: &[u8],
+    delegated: &[&str],
+) -> BTreeMap<String, Vec<u8>> {
+    let mut meta = serde_json::Map::new();
+    meta.insert("targets.json".into(), json!({"version": targets_version}));
+    for role in delegated {
+        meta.insert(format!("{role}.json"), json!({"version": 1}));
+    }
     let target_hash = hex::encode(Sha256::digest(trusted_root));
     let targets = envelope(
         json!({
@@ -155,7 +180,7 @@ pub(crate) fn repository_files(
             "spec_version": "1.0",
             "version": snapshot_version,
             "expires": "2099-01-01T00:00:00Z",
-            "meta": {"targets.json": {"version": targets_version}},
+            "meta": meta,
         }),
         &[&roles.snapshot],
     );
@@ -192,4 +217,15 @@ pub(crate) fn repository_files(
         (targets_path, targets),
         (target_path, trusted_root.to_vec()),
     ])
+}
+
+/// Re-sign `document` with `signers` after `edit` changes its signed part.
+pub(crate) fn resigned(
+    document: &[u8],
+    signers: &[&TestKey],
+    edit: impl FnOnce(&mut Value),
+) -> Vec<u8> {
+    let mut parsed: Value = serde_json::from_slice(document).unwrap();
+    edit(&mut parsed["signed"]);
+    envelope(parsed["signed"].take(), signers)
 }

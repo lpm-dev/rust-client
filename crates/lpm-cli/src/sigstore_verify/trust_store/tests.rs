@@ -560,6 +560,102 @@ async fn a_process_that_cannot_cache_still_refuses_a_rollback() {
     assert!(refresh.contains("went back"), "{refresh}");
 }
 
+#[tokio::test]
+async fn a_fetched_trust_root_missing_a_role_keeps_the_held_one() {
+    let roles = RoleSet::new();
+    let mut renamed: serde_json::Value = serde_json::from_slice(EMBEDDED_TRUST_ROOT_JSON).unwrap();
+    let logs = renamed.as_object_mut().unwrap().remove("tlogs").unwrap();
+    renamed["transparencyLogs"] = logs;
+    let server = sigstore_serving(&roles, &serde_json::to_vec(&renamed).unwrap(), 1).await;
+    let store = store_holding(
+        &roles,
+        EMBEDDED_TRUST_ROOT_JSON.to_vec(),
+        1,
+        None,
+        Repository::Url(server.uri()),
+    );
+
+    verify_lpm_release(&store, TrustRefresh::BeforeVerifying)
+        .await
+        .expect("the held trust root still verifies the release");
+    let refresh = store.refresh().await.unwrap_err();
+    assert!(refresh.contains("Rekor"), "{refresh}");
+}
+
+#[tokio::test]
+async fn a_fetch_another_process_made_within_the_hour_is_reused() {
+    let roles = RoleSet::new();
+    let server = sigstore_serving(&roles, EMBEDDED_TRUST_ROOT_JSON, 1).await;
+    let cache = tempfile::tempdir().unwrap();
+    let cache_file = cache.path().join(CACHE_FILE_NAME);
+    let first = store_holding(
+        &roles,
+        trust_root_without_the_axios_log(),
+        1,
+        Some(cache_file.clone()),
+        Repository::Url(server.uri()),
+    );
+    first.refresh().await.unwrap();
+    let second = store_holding(
+        &roles,
+        trust_root_without_the_axios_log(),
+        1,
+        Some(cache_file),
+        Repository::Url(server.uri()),
+    );
+
+    verify_lpm_release(&second, TrustRefresh::BeforeVerifying)
+        .await
+        .unwrap();
+
+    assert_eq!(timestamp_requests(&server).await, 1);
+}
+
+#[tokio::test]
+async fn a_failed_fetch_is_retried_after_a_minute_not_an_hour() {
+    let roles = RoleSet::new();
+    let server = failing_repository().await;
+    let store = store_holding(
+        &roles,
+        trust_root_without_the_axios_log(),
+        1,
+        None,
+        Repository::Url(server.uri()),
+    );
+    store.refresh().await.unwrap_err();
+    server.reset().await;
+    mount(
+        &server,
+        repository_files(&roles, 1, 1, 1, EMBEDDED_TRUST_ROOT_JSON),
+    )
+    .await;
+
+    store.refresh().await.unwrap_err();
+    let failed_at = store.last_fetch.lock().await.as_ref().unwrap().0;
+    *store.last_fetch.lock().await = Some((
+        failed_at - RETRY_FAILED_FETCH_AFTER,
+        Err("an earlier failure".into()),
+    ));
+
+    store.refresh().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_release_gate_verifies_with_the_built_in_trust_root_only() {
+    let release_workflow = IdentityExpectations {
+        expected_issuer: Some("https://token.actions.githubusercontent.com".into()),
+        expected_san_uri_prefix: Some("https://github.com/lpm-dev/rust-client/".into()),
+        expected_workflow_path: Some(".github/workflows/release.yml".into()),
+    };
+
+    verify_sigstore_bundle_with_built_in_trust_root(
+        LPM_RELEASE_BUNDLE,
+        &release_workflow,
+        VerifyOptions::strict(),
+    )
+    .expect("the built-in trust root verifies a release");
+}
+
 #[test]
 fn repository_overrides_must_be_https_or_loopback() {
     let default = Repository::Url(DEFAULT_REPOSITORY_URL.to_string());

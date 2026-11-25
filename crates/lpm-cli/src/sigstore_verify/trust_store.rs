@@ -13,7 +13,7 @@
 
 use super::bundle::verify_sigstore_bundle_with;
 use super::trust_root::EMBEDDED_TRUST_ROOT_JSON;
-use super::tuf::{self, Fetcher, Freshness, TrustedMetadata, VerifiedTrustedRoot};
+use super::tuf::{self, Fetcher, Freshness, TrustedMetadata};
 use super::{IdentityExpectations, TrustRoot, VerifiedProvenance, VerifyError, VerifyOptions};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -38,12 +38,16 @@ pub(crate) const REPOSITORY_URL_OVERRIDE_ENV: &str = "LPM_SIGSTORE_TUF_URL_OVERR
 
 const CACHE_FILE_NAME: &str = "sigstore-trust.json";
 const CACHE_SCHEMA_VERSION: u32 = 1;
-const CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const CACHE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// How long one fetch's outcome stands before a signature that needs newer
 /// keys may fetch again. Most commands finish well within it; it bounds what
 /// a long-running process, such as an MCP server, misses.
 const REFETCH_AFTER: Duration = Duration::from_secs(60 * 60);
+
+/// How long a failed fetch's outcome stands, so a long-running process
+/// recovers soon after the network does.
+const RETRY_FAILED_FETCH_AFTER: Duration = Duration::from_secs(60);
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -70,6 +74,10 @@ enum Repository {
 #[derive(Serialize, Deserialize)]
 struct CacheFile {
     schema_version: u32,
+    /// When a process fetched this metadata, in seconds since the Unix
+    /// epoch. Other processes skip their own fetch within
+    /// [`REFETCH_AFTER`] of it.
+    fetched_at: u64,
     metadata: TrustedMetadata,
 }
 
@@ -101,6 +109,18 @@ pub async fn verify_sigstore_bundle_refreshing(
     refresh: TrustRefresh,
 ) -> Result<VerifiedProvenance, VerifyError> {
     global().verify(body, expectations, options, refresh).await
+}
+
+/// Verify `body` against the trust root built into this binary, ignoring
+/// any fetched one. The release gate uses it, so a release it accepts
+/// verifies even on a machine that has never reached Sigstore's repository.
+pub fn verify_sigstore_bundle_with_built_in_trust_root(
+    body: &[u8],
+    expectations: &IdentityExpectations,
+    options: VerifyOptions,
+) -> Result<VerifiedProvenance, VerifyError> {
+    let built_in = TrustRoot::parse(EMBEDDED_TRUST_ROOT_JSON)?;
+    verify_sigstore_bundle_with(body, expectations, options, &built_in)
 }
 
 impl TrustStore {
@@ -170,17 +190,32 @@ impl TrustStore {
         }
     }
 
-    /// Fetch Sigstore's current trust root and use it from now on. Calls
-    /// within [`REFETCH_AFTER`] of a fetch return its outcome instead, and
-    /// concurrent calls share one fetch.
+    /// Fetch Sigstore's current trust root and use it from now on.
+    ///
+    /// Concurrent calls share one fetch. A call within [`REFETCH_AFTER`] of
+    /// a fetch in this process, or within [`RETRY_FAILED_FETCH_AFTER`] of a
+    /// failed one, returns that outcome. When another process cached a fetch
+    /// within [`REFETCH_AFTER`], its trust root is used without fetching.
     async fn refresh(&self) -> Result<(), String> {
         let mut last_fetch = self.last_fetch.lock().await;
-        if let Some((at, outcome)) = last_fetch.as_ref()
-            && at.elapsed() < REFETCH_AFTER
-        {
-            return outcome.clone();
+        if let Some((at, outcome)) = last_fetch.as_ref() {
+            let stands_for = if outcome.is_ok() {
+                REFETCH_AFTER
+            } else {
+                RETRY_FAILED_FETCH_AFTER
+            };
+            if at.elapsed() < stands_for {
+                return outcome.clone();
+            }
         }
-        let outcome = self.fetch_current().await;
+        let outcome = match self.recently_fetched_root() {
+            Some(root) => {
+                *self.current.write().unwrap_or_else(PoisonError::into_inner) =
+                    Some(Arc::new(root));
+                Ok(())
+            }
+            None => self.fetch_current().await,
+        };
         *last_fetch = Some((Instant::now(), outcome.clone()));
         outcome
     }
@@ -236,21 +271,10 @@ impl TrustStore {
     }
 
     fn load(&self) -> Result<TrustRoot, VerifyError> {
-        let cached = self
-            .read_cached_trusted_root()
-            .filter(|cached| cached.targets_version >= self.embedded_targets_version)
-            .and_then(|cached| {
-                usable_trust_root(&cached.bytes, SystemTime::now())
-                    .inspect_err(|error| {
-                        tracing::debug!(
-                            target: "lpm_cli::sigstore_verify",
-                            %error,
-                            "ignoring the cached Sigstore trust root",
-                        );
-                    })
-                    .ok()
-            });
-        let root = match cached {
+        let root = match self
+            .read_cache_file()
+            .and_then(|cache| self.usable_cached_root(cache))
+        {
             Some(root) => root,
             None => TrustRoot::parse(&self.embedded_trusted_root)?,
         };
@@ -265,7 +289,47 @@ impl TrustStore {
         Ok(root)
     }
 
+    /// The cached trust root, if a process cached it within
+    /// [`REFETCH_AFTER`] and it is one this store would use.
+    fn recently_fetched_root(&self) -> Option<TrustRoot> {
+        let cache = self.read_cache_file()?;
+        let now = lpm_common::Timestamp::now().unix_seconds();
+        let age = u64::try_from(now).ok()?.checked_sub(cache.fetched_at)?;
+        if age >= REFETCH_AFTER.as_secs() {
+            return None;
+        }
+        self.usable_cached_root(cache)
+    }
+
+    /// The trust root a cache file holds, when it verifies against the
+    /// built-in TUF root, is no older than the built-in trust root, and has a
+    /// usable key for every role.
+    fn usable_cached_root(&self, cache: CacheFile) -> Option<TrustRoot> {
+        let ignore = |error: String| {
+            tracing::debug!(
+                target: "lpm_cli::sigstore_verify",
+                %error,
+                "ignoring the cached Sigstore trust root",
+            );
+        };
+        let cached = cache
+            .metadata
+            .verified_trusted_root(&self.embedded_tuf_root)
+            .map_err(|error| ignore(error.to_string()))
+            .ok()?;
+        if cached.targets_version < self.embedded_targets_version {
+            return None;
+        }
+        usable_trust_root(&cached.bytes, SystemTime::now())
+            .map_err(ignore)
+            .ok()
+    }
+
     fn read_cached_metadata(&self) -> Option<TrustedMetadata> {
+        self.read_cache_file().map(|cache| cache.metadata)
+    }
+
+    fn read_cache_file(&self) -> Option<CacheFile> {
         let path = self.cache_file.as_ref()?;
         let file = match std::fs::File::open(path) {
             Ok(file) => file,
@@ -289,21 +353,7 @@ impl TrustStore {
             return None;
         }
         let cache: CacheFile = serde_json::from_slice(&bytes).ok()?;
-        (cache.schema_version == CACHE_SCHEMA_VERSION).then_some(cache.metadata)
-    }
-
-    fn read_cached_trusted_root(&self) -> Option<VerifiedTrustedRoot> {
-        let metadata = self.read_cached_metadata()?;
-        metadata
-            .verified_trusted_root(&self.embedded_tuf_root)
-            .inspect_err(|error| {
-                tracing::debug!(
-                    target: "lpm_cli::sigstore_verify",
-                    %error,
-                    "ignoring the cached Sigstore trust root",
-                );
-            })
-            .ok()
+        (cache.schema_version == CACHE_SCHEMA_VERSION).then_some(cache)
     }
 
     /// The newer of the cached metadata and what this process last verified,
@@ -349,10 +399,15 @@ impl TrustStore {
                 }
                 let cache = CacheFile {
                     schema_version: CACHE_SCHEMA_VERSION,
+                    fetched_at: u64::try_from(lpm_common::Timestamp::now().unix_seconds())
+                        .unwrap_or_default(),
                     metadata,
                 };
                 let bytes = serde_json::to_vec(&cache)
                     .map_err(|error| lpm_common::LpmError::Io(std::io::Error::other(error)))?;
+                if bytes.len() as u64 > CACHE_MAX_BYTES {
+                    return Ok(());
+                }
                 lpm_common::write_file_atomic_with_options(
                     path,
                     bytes,
@@ -375,22 +430,24 @@ impl TrustStore {
 }
 
 /// Parse a trust root Sigstore's repository delivered, refusing one in which
-/// a role has no usable key because of entries this version can't read.
-/// Using it would fail every verification the held trust root still passes.
-/// A role whose readable keys Sigstore retired is a decision, and stands.
+/// a role has no usable key because its entries are missing or in a form
+/// this version can't read, as after a schema change. Using it would fail
+/// every verification the held trust root still passes. A role whose
+/// readable keys Sigstore retired is a decision, and stands.
 fn usable_trust_root(bytes: &[u8], now: SystemTime) -> Result<TrustRoot, String> {
     let (root, skipped) =
         TrustRoot::parse_skipping_unreadable(bytes).map_err(|error| error.to_string())?;
+    let empty = root.roles_without_entries();
     let unusable: Vec<&str> = root
         .roles_without_active_key(now)
         .into_iter()
-        .filter(|role| skipped.contains(role))
+        .filter(|role| skipped.contains(role) || empty.contains(role))
         .collect();
     if unusable.is_empty() {
         Ok(root)
     } else {
         Err(format!(
-            "its {} entries are in a form this version of LPM can't read",
+            "it has no {} entry this version of LPM can read",
             unusable.join(", ")
         ))
     }
@@ -438,7 +495,12 @@ struct HttpFetcher {
 impl HttpFetcher {
     fn new(base: &str) -> Result<Self, String> {
         let client = lpm_http::client_builder()
-            .https_only(base.starts_with("https://"))
+            .https_only(
+                reqwest::Url::parse(base)
+                    .map_err(|error| error.to_string())?
+                    .scheme()
+                    == "https",
+            )
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .build()

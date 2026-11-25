@@ -46,11 +46,19 @@ pub(super) struct Common {
     expires: String,
 }
 
+// Keys, roles, files and targets this client can't read are left out
+// rather than refusing the whole document: Sigstore can add entries in
+// shapes newer than this client, and the ones it reads must stay usable.
+// A key left out never counts toward a threshold, and a file left out is
+// reported missing only when the client needs it.
+
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct Root {
     #[serde(flatten)]
     pub(super) common: Common,
+    #[serde(deserialize_with = "readable_entries")]
     keys: BTreeMap<String, Key>,
+    #[serde(deserialize_with = "readable_entries")]
     roles: BTreeMap<String, RoleKeys>,
     #[serde(default)]
     pub(super) consistent_snapshot: bool,
@@ -60,6 +68,7 @@ pub(super) struct Root {
 pub(super) struct Timestamp {
     #[serde(flatten)]
     pub(super) common: Common,
+    #[serde(deserialize_with = "readable_entries")]
     pub(super) meta: BTreeMap<String, MetaFile>,
 }
 
@@ -67,6 +76,7 @@ pub(super) struct Timestamp {
 pub(super) struct Snapshot {
     #[serde(flatten)]
     pub(super) common: Common,
+    #[serde(deserialize_with = "readable_entries")]
     pub(super) meta: BTreeMap<String, MetaFile>,
 }
 
@@ -74,7 +84,20 @@ pub(super) struct Snapshot {
 pub(super) struct Targets {
     #[serde(flatten)]
     pub(super) common: Common,
+    #[serde(deserialize_with = "readable_entries")]
     pub(super) targets: BTreeMap<String, TargetFile>,
+}
+
+fn readable_entries<'de, D, T>(deserializer: D) -> Result<BTreeMap<String, T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    let raw = BTreeMap::<String, serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|(name, value)| Some((name, serde_json::from_value(value).ok()?)))
+        .collect())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -143,6 +166,9 @@ impl<T: Role> Signed<T> {
         let common = signed.common();
         if common.kind != T::NAME {
             return Err(malformed(format!("its _type is {:?}", common.kind)));
+        }
+        if common.version == 0 {
+            return Err(malformed("its version is 0".into()));
         }
         if common.spec_version.split('.').next() != Some("1") {
             return Err(malformed(format!(

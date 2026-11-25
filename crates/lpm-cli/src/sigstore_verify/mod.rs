@@ -48,7 +48,10 @@ pub use self::rekor_body::verify_rekor_body;
 pub use self::rekor_set::verify_rekor_set;
 pub use self::sct::verify_embedded_sct;
 pub use self::trust_root::{CtLogKey, FulcioRoot, RekorKey, TrustRoot, trust_root};
-pub use self::trust_store::{TrustRefresh, verify_sigstore_bundle_refreshing};
+pub use self::trust_store::{
+    TrustRefresh, verify_sigstore_bundle_refreshing,
+    verify_sigstore_bundle_with_built_in_trust_root,
+};
 
 #[cfg(test)]
 use self::bundle::{

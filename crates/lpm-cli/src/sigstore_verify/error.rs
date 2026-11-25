@@ -131,8 +131,9 @@ pub enum VerifyError {
     /// signed-input could not be reconstructed (TBS DER manipulation
     /// failed), the SCT signature did not verify under the pinned
     /// key, or zero SCTs in the list verified (the threshold is "at
-    /// least one valid"). When every SCT names a CT log the trust root
-    /// has no key for, the error is [`Self::MissingTrustMaterial`].
+    /// least one valid"). When none verifies and one names a CT log
+    /// the trust root has no key for, the error is
+    /// [`Self::MissingTrustMaterial`].
     #[error("SCT verification failed: {0}")]
     Sct(String),
 
