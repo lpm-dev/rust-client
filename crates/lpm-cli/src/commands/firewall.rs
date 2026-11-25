@@ -364,14 +364,15 @@ fn added_verdict(preview: Option<&Preview>) -> Option<AddedVerdict> {
 }
 
 /// The command a person runs to add `specs` in `scope` with the same
-/// duration and malware coverage, or `None` when a spec or the project root
-/// can't be written into a shell command unchanged. The `--reason` note is left out:
-/// it's free text, and the person can add it again.
+/// duration, malware coverage and note, or `None` when a spec or the project
+/// root can't be written into a shell command unchanged. A note a shell would
+/// expand is left out; the person can add it again.
 fn add_command_hint(
     specs: &[&FirewallBypassSpec],
     scope: &RuleScope,
     ttl_secs: Option<u64>,
     allow_malware: bool,
+    reason: Option<&str>,
 ) -> Option<String> {
     let coordinates: Vec<String> = specs.iter().map(ToString::to_string).collect();
     if !coordinates
@@ -396,7 +397,22 @@ fn add_command_hint(
     if allow_malware {
         command.push_str(" --allow-malware");
     }
+    if let Some(reason) = reason.filter(|reason| reason_shell_safe(reason)) {
+        command.push_str(" --reason \"");
+        command.push_str(reason);
+        command.push('"');
+    }
     Some(command)
+}
+
+/// Whether a note reads the same in double quotes in every shell: free text,
+/// so it is held to a deny list rather than the paths' allow list.
+fn reason_shell_safe(reason: &str) -> bool {
+    !reason.is_empty()
+        && !reason.chars().any(|character| {
+            matches!(character, '"' | '$' | '`' | '\\' | '!' | '%')
+                || lpm_common::is_terminal_control(character)
+        })
 }
 
 /// `ttl_secs` as `--ttl` reads it back: whole days, hours or minutes, else
@@ -655,10 +671,25 @@ async fn add(
             };
             let batches = approval_batches(&pending_specs, prompt_for);
             for (index, batch) in batches.iter().enumerate() {
-                let remaining: Vec<&FirewallBypassSpec> =
-                    batches[index..].iter().flatten().copied().collect();
-                let command_hint =
-                    add_command_hint(&remaining, &scope, ttl_secs, request.allow_malware);
+                // Everything not yet saved, narrowings included, so rerunning
+                // the hint finishes the whole request.
+                let waiting: Vec<String> = batches[index..]
+                    .iter()
+                    .flatten()
+                    .map(ToString::to_string)
+                    .chain(narrowing.iter().map(|rule| rule.spec.clone()))
+                    .collect();
+                let remaining: Vec<&FirewallBypassSpec> = specs
+                    .iter()
+                    .filter(|spec| waiting.contains(&spec.to_string()))
+                    .collect();
+                let command_hint = add_command_hint(
+                    &remaining,
+                    &scope,
+                    ttl_secs,
+                    request.allow_malware,
+                    request.reason,
+                );
                 let prompt = prompt_for(batch);
                 let rules = batch
                     .iter()
@@ -1071,7 +1102,8 @@ mod tests {
                 &refs(&specs(&["@scope/pkg@^1.2.0", "foldrun@32.8.2"])),
                 &global(),
                 Some(30 * 86_400),
-                false
+                false,
+                None
             )
             .as_deref(),
             Some("lpm firewall bypass add \"@scope/pkg@^1.2.0\" \"foldrun@32.8.2\" --ttl 30d")
@@ -1085,7 +1117,8 @@ mod tests {
                 &refs(&specs(&["foldrun@32.8.2"])),
                 &project("/work/my app"),
                 None,
-                true
+                true,
+                None
             )
             .as_deref(),
             Some(
@@ -1109,7 +1142,8 @@ mod tests {
                     &refs(&specs(&["foldrun@32.8.2"])),
                     &project(root),
                     None,
-                    false
+                    false,
+                    None
                 ),
                 None,
                 "{root}"
@@ -1229,7 +1263,13 @@ mod tests {
     #[test]
     fn add_command_hint_is_left_out_for_a_name_a_shell_would_expand() {
         assert_eq!(
-            add_command_hint(&refs(&specs(&["bang!tool@1.0.0"])), &global(), None, false),
+            add_command_hint(
+                &refs(&specs(&["bang!tool@1.0.0"])),
+                &global(),
+                None,
+                false,
+                None
+            ),
             None
         );
     }
@@ -1252,5 +1292,44 @@ mod tests {
 
         assert!(prompt.ends_with("\"/work/app now\""), "{prompt}");
         assert!(!prompt.ends_with(" now"), "{prompt}");
+    }
+
+    #[test]
+    fn approval_prompt_shows_invisible_and_reordering_characters_in_a_root() {
+        let prompt = approval_prompt(
+            &refs(&specs(&["foldrun"])),
+            &project("/work/a\u{200b}pp\u{202e}"),
+            None,
+            false,
+        );
+
+        assert!(
+            prompt.ends_with("\"/work/a\\u{200b}pp\\u{202e}\""),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn add_command_hint_carries_a_note_a_shell_reads_unchanged() {
+        let hint = |reason| {
+            add_command_hint(
+                &refs(&specs(&["foldrun@32.8.2"])),
+                &global(),
+                None,
+                false,
+                Some(reason),
+            )
+        };
+
+        assert_eq!(
+            hint("reviewed the report, ticket SEC-12").as_deref(),
+            Some(
+                "lpm firewall bypass add \"foldrun@32.8.2\" --reason \"reviewed the report, ticket SEC-12\""
+            )
+        );
+        assert_eq!(
+            hint("costs $5").as_deref(),
+            Some("lpm firewall bypass add \"foldrun@32.8.2\"")
+        );
     }
 }

@@ -3353,3 +3353,57 @@ fn forced_floor_holds_an_approved_group_a_partial_table_leaves_out() {
         );
     });
 }
+
+#[test]
+fn a_rule_sharing_an_id_with_a_saved_one_is_judged_a_new_rule() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        let saved = bypass_rule("benign@1.0.0");
+        with_test_native_auth_result("approve", || add_bypass(vec![saved.clone()], false)).unwrap();
+        let mut colliding = bypass_rule_expiring_in("hostile@6.6.6", 30);
+        colliding.id = saved.id.clone();
+        colliding.covers_malware = true;
+
+        let sorted = sort_firewall_bypass_requests(vec![colliding.clone()]).unwrap();
+        let commit = commit_firewall_bypass_rules(&[], &[colliding], "").unwrap();
+
+        assert_eq!(sorted.needs_approval.len(), 1);
+        assert!(sorted.narrowed.is_empty());
+        assert!(matches!(commit, FirewallBypassCommit::NeedsApproval(_)));
+        assert_eq!(load_local_firewall_bypass_rules().unwrap(), vec![saved]);
+    });
+}
+
+#[test]
+fn the_add_preview_keeps_what_installs_may_run_where_the_approved_firewall_is_off() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        persist_authorized_posture(&AuthorizedPosture {
+            firewall_mode: crate::npm_firewall_config::NpmFirewallMode::Off
+                .as_str()
+                .to_string(),
+            firewall_policies: std::collections::BTreeMap::from([(
+                crate::npm_firewall_config::LPM_AI_TELEMETRY_POLICY_KEY.to_string(),
+                "block".to_string(),
+            )]),
+            ..AuthorizedPosture::default()
+        })
+        .unwrap();
+        let config = firewall_policy_global_config(
+            "enforce",
+            &[(
+                crate::npm_firewall_config::LPM_AI_TELEMETRY_POLICY_KEY,
+                "warn",
+            )],
+        );
+        let effective = load_effective_authorized_posture().unwrap();
+
+        let profile =
+            crate::npm_firewall_config::preview_policy_profile(&config, &effective).unwrap();
+
+        assert_eq!(
+            profile.lpm_ai_telemetry,
+            lpm_registry::client::NpmFirewallPolicyAction::Warn
+        );
+    });
+}

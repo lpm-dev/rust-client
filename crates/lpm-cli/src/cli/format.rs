@@ -1351,6 +1351,16 @@ pub(crate) fn npm_firewall_block_detail_lines(
             push_detail(&mut lines, "report", install_ui::hyperlink(report_url));
         }
     }
+    for bypassed in blocked.bypassed.iter().filter(|_| include_packages) {
+        push_untrusted_detail(
+            &mut lines,
+            "allowed",
+            &format!(
+                "{}@{} by your bypass rule {}",
+                bypassed.name, bypassed.version, bypassed.rule
+            ),
+        );
+    }
     push_unreported_block_lines(&mut lines, blocked);
     push_block_class_lines(&mut lines, blocked);
     lines

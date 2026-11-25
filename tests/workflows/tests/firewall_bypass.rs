@@ -60,6 +60,16 @@ fn stored_rule(spec: &str, extra: serde_json::Value) -> serde_json::Value {
     rule
 }
 
+/// A project root as the CLI keys rules on it: canonical, and on Windows
+/// without the `\\?\` prefix canonical paths carry there.
+fn cli_project_root(dir: &std::path::Path) -> String {
+    let root = std::fs::canonicalize(dir).unwrap().display().to_string();
+    match root.strip_prefix(r"\\?\") {
+        Some(plain) if cfg!(windows) => plain.to_string(),
+        _ => root,
+    }
+}
+
 fn enforcing_project() -> TempProject {
     let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
     write_npm_firewall_global_config(&project, "enforce");
@@ -278,10 +288,7 @@ async fn tampered_bypass_store_keeps_the_block_and_says_why() {
 async fn project_bypass_rule_applies_only_in_its_project() {
     let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
     let project = enforcing_project();
-    let root = std::fs::canonicalize(project.path())
-        .unwrap()
-        .display()
-        .to_string();
+    let root = cli_project_root(project.path());
     write_signed_firewall_bypass(
         &project,
         &[stored_rule(
@@ -473,10 +480,7 @@ fn bypass_remove_and_clear_need_no_approval() {
 async fn global_install_block_names_a_rule_for_every_project() {
     let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
     let project = enforcing_project();
-    let root = std::fs::canonicalize(project.path())
-        .unwrap()
-        .display()
-        .to_string();
+    let root = cli_project_root(project.path());
     write_signed_firewall_bypass(
         &project,
         &[stored_rule(
@@ -786,7 +790,7 @@ fn bypass_add_json_that_needs_approval_changes_nothing() {
     assert_eq!(envelope["error_code"], "security_approval_required");
     assert_eq!(
         envelope["next_steps"][0]["command"],
-        "lpm firewall bypass add \"other-tool\" --ttl 30m"
+        "lpm firewall bypass add \"agent-tool\" \"other-tool\" --ttl 30m"
     );
     let rules = saved_rules(&project);
     assert_eq!(rules.len(), 1);

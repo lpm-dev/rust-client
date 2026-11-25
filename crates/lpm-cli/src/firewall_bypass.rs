@@ -154,9 +154,9 @@ fn split_spec(raw: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// The longest version or range a rule may hold, so the approval prompt
-/// names it whole.
-const MAX_VERSION_TEXT_CHARS: usize = 80;
+/// The longest range a rule may hold, so the approval prompt names it whole.
+/// An exact version is a real published version and may be longer.
+const MAX_RANGE_CHARS: usize = 80;
 
 fn parse_versions(text: &str) -> Result<SpecVersions, String> {
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -171,13 +171,13 @@ fn parse_versions(text: &str) -> Result<SpecVersions, String> {
             "`{normalized}` has build metadata; name the version without it"
         ));
     }
-    if normalized.chars().count() > MAX_VERSION_TEXT_CHARS {
-        return Err(format!(
-            "the version or range is longer than {MAX_VERSION_TEXT_CHARS} characters; name a shorter one"
-        ));
-    }
     if let Some(version) = canonical_version(&normalized) {
         return Ok(SpecVersions::Exact(version));
+    }
+    if normalized.chars().count() > MAX_RANGE_CHARS {
+        return Err(format!(
+            "the range is longer than {MAX_RANGE_CHARS} characters; name a shorter range or exact versions"
+        ));
     }
     let bare = normalized
         .strip_prefix('=')
@@ -452,9 +452,42 @@ fn plain_drive_path(verbatim: &str) -> Option<&str> {
             .split('\\')
             .filter(|part| !part.is_empty())
             .all(|part| {
-                part != "." && part != ".." && !part.ends_with('.') && !part.ends_with(' ')
+                part != "."
+                    && part != ".."
+                    && !part.ends_with('.')
+                    && !part.ends_with(' ')
+                    && !reserved_device_name(part)
             });
     unchanged_by_win32.then_some(rest)
+}
+
+/// A name Win32 reads as a device rather than a file, with or without an
+/// extension: `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, and the
+/// superscript-digit forms.
+fn reserved_device_name(part: &str) -> bool {
+    let stem = part.split('.').next().unwrap_or(part).trim_end();
+    let upper = stem.to_ascii_uppercase();
+    match upper.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" => true,
+        _ => ["COM", "LPT"].iter().any(|prefix| {
+            upper.strip_prefix(prefix).is_some_and(|digit| {
+                matches!(
+                    digit,
+                    "1" | "2"
+                        | "3"
+                        | "4"
+                        | "5"
+                        | "6"
+                        | "7"
+                        | "8"
+                        | "9"
+                        | "\u{b9}"
+                        | "\u{b2}"
+                        | "\u{b3}"
+                )
+            })
+        }),
+    }
 }
 
 /// [`project_policy_root`] as the text a project rule stores. A root that
@@ -500,15 +533,16 @@ pub(crate) fn shell_safe_in_double_quotes(text: &str) -> bool {
         })
 }
 
-/// A project root as prompts show it: whole, with any control character
-/// written as a visible escape so two roots never look alike.
+/// A project root as prompts show it: whole, with every control, invisible
+/// or reordering character written as a visible escape, so two roots never
+/// look alike.
 pub(crate) fn visible_root(root: &str) -> std::borrow::Cow<'_, str> {
-    if !root.chars().any(char::is_control) {
+    if !root.chars().any(lpm_common::is_terminal_control) {
         return std::borrow::Cow::Borrowed(root);
     }
     let mut visible = String::with_capacity(root.len() + 8);
     for character in root.chars() {
-        if character.is_control() {
+        if lpm_common::is_terminal_control(character) {
             visible.extend(character.escape_unicode());
         } else {
             visible.push(character);
@@ -983,10 +1017,6 @@ mod tests {
             ("foldrun@= 1.2.3", "write the exact version as `1.2.3`"),
             ("foldrun@=v1.2.3", "write the exact version as `1.2.3`"),
             (
-                "foldrun@1.0.0-a-prerelease-label-long-enough-to-crowd-the-approval-prompt-right-out-of-view",
-                "longer than 80",
-            ),
-            (
                 "foldrun@>=0.0.0-this-range-is-long-enough-to-crowd-out-the-rest-of-the-approval-prompt-text",
                 "longer than 80",
             ),
@@ -996,6 +1026,15 @@ mod tests {
             let error = FirewallBypassSpec::parse(raw).unwrap_err();
             assert!(error.contains(needle), "{raw}: {error}");
         }
+    }
+
+    #[test]
+    fn a_long_exact_version_stays_approvable() {
+        let parsed = spec(
+            "foldrun@0.0.0-canary-a-prerelease-label-long-enough-to-pass-the-range-cap-20261125-and-then-some",
+        );
+
+        assert_eq!(parsed.kind(), BypassKind::Exact);
     }
 
     #[test]
@@ -1109,10 +1148,27 @@ mod tests {
             r"\\?\C:\work\..\app",
             r"\\?\C:\work/app",
             r"\\?\C",
+            r"\\?\C:\work\aux\app",
+            r"\\?\C:\work\com1.txt",
             r"C:\work\app",
         ] {
             assert_eq!(plain_drive_path(verbatim), None, "{verbatim}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn project_policy_root_drops_the_verbatim_prefix_on_windows() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("package.json"), r#"{"name":"app"}"#).unwrap();
+
+        let root = project_policy_root(temp.path()).unwrap();
+
+        assert!(
+            !root.to_string_lossy().starts_with(r"\\?\"),
+            "{}",
+            root.display()
+        );
     }
 
     #[test]

@@ -139,7 +139,7 @@ pub use symlink::{
     remove_path_entry_counting_freed_bytes, remove_symlink_or_junction_entry,
 };
 pub use terminal::{
-    sanitize_for_terminal, sanitize_server_text, sanitize_terminal_inline,
+    is_terminal_control, sanitize_for_terminal, sanitize_server_text, sanitize_terminal_inline,
     sanitize_terminal_multiline,
 };
 pub use timestamp::Timestamp;

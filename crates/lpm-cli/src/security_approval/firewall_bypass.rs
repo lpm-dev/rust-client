@@ -185,7 +185,18 @@ pub(crate) fn load_firewall_bypass_status(
     }
 }
 
-/// How a requested rule compares with the saved rule of the same id.
+/// Whether `saved` is the rule `requested` names. The id is a short digest,
+/// so two different rules can share one; matching every field it digests
+/// keeps a request from ever standing in for another rule.
+fn same_rule(saved: &FirewallBypassRule, requested: &FirewallBypassRule) -> bool {
+    saved.id == requested.id
+        && saved.spec == requested.spec
+        && saved.scope == requested.scope
+        && saved.project_root == requested.project_root
+        && saved.covers_malware == requested.covers_malware
+}
+
+/// How a requested rule compares with the saved rule it names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FirewallBypassChange {
     /// No unexpired rule is saved; adding it needs approval.
@@ -271,7 +282,7 @@ pub(crate) fn sort_firewall_bypass_requests(
     for rule in rules {
         let saved = existing
             .iter()
-            .find(|saved| saved.id == rule.id && !saved.is_expired(now));
+            .find(|saved| same_rule(saved, &rule) && !saved.is_expired(now));
         match (firewall_bypass_change(saved, &rule), saved) {
             (FirewallBypassChange::Unchanged, Some(saved)) => sorted.unchanged.push(saved.clone()),
             (FirewallBypassChange::Narrowed, _) => sorted.narrowed.push(rule),
@@ -347,7 +358,7 @@ pub(crate) fn commit_firewall_bypass_rules(
         for (rule, is_approved) in requested {
             let live = saved
                 .iter()
-                .position(|saved| saved.id == rule.id && !saved.is_expired(now));
+                .position(|saved| same_rule(saved, rule) && !saved.is_expired(now));
             let change = firewall_bypass_change(live.map(|index| &saved[index]), rule);
             let bucket = match change {
                 FirewallBypassChange::Unchanged => {
@@ -368,7 +379,7 @@ pub(crate) fn commit_firewall_bypass_rules(
             match live {
                 Some(index) => saved[index] = merged.clone(),
                 None => {
-                    saved.retain(|existing| existing.id != rule.id);
+                    saved.retain(|existing| !same_rule(existing, rule));
                     saved.push(merged.clone());
                 }
             }

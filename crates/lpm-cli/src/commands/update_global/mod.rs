@@ -1151,6 +1151,11 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
                     "could not plan:".red(),
                     reason_safe
                 );
+                if let Some(blocked) = failure.firewall_block.as_deref() {
+                    for line in crate::cli::npm_firewall_block_detail_lines(blocked, true) {
+                        install_ui::detail_line(line);
+                    }
+                }
             }
         }
     }
