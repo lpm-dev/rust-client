@@ -122,16 +122,21 @@ Linear time:
   inside them with `split_off`.
 - `ModuleRecordBuilder::resolve_export_entries` looks local exports up in
   an index of the import entries by local name once there are more than 16
-  of them, keeping the first entry for each name as the search did.
-- `ParserState::last_pure_walk` keeps where the walk for the last
-  `/*#__PURE__*/` comment started and what it found. A walk that reaches
-  that expression takes its answer.
+  of them and a local export to look up, keeping the first entry for each
+  name as the search did.
+- `ParserState::pure_walks` keeps where each walk for a `/*#__PURE__*/`
+  comment started and what it found. A walk that reaches one of those
+  expressions takes its answer, so no node is walked twice.
 - `reparse_potential_top_level_awaits` skips the candidates that a
-  statement parsed again took in, and drops the statements it covered, so
-  no two statements overlap.
-- A rewind leaves no stale entry in `last_parenthesized` or
-  `last_pure_walk`: only a parse of the same source can build another node
-  where an entry points, and it records its own.
+  statement parsed again took in. When a statement parsed again ends inside
+  one the first parse read, as `await\nawait /x/` ends inside the script's
+  `await / x / foo()`, it parses on to the end of one, so the rest is parsed
+  again too. It then drops the statements it covered, so none overlap and
+  none is lost. The module record keeps a dynamic import or `import.meta`
+  recorded again only once.
+- A rewind leaves no stale entry in `last_parenthesized` or `pure_walks`:
+  only a parse of the same source can build another node where an entry
+  points, and it records its own.
 
 `lpm-security`'s `behavioral/syntax.rs` sets the floor from the stack its
 thread has left, retries a source that runs out on a 64 MiB stack, and

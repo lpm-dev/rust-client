@@ -76,9 +76,10 @@ const PARSE_SPECULATION_FLOOR: u64 = 64 * 1024;
 
 /// The most parentheses, TypeScript wrappers (`as`, `satisfies`, `!`, `<T>`)
 /// and sequences, through their last expression, an expression may sit in
-/// directly. The rules read through them, and read a binding's initializer
-/// again for each reference to it, so an initializer wrapped thousands of
-/// times made the analysis quadratic. Real code wraps at most 5 deep.
+/// directly for the rules to run on its source. The rules read through them,
+/// and read a binding's initializer again for each reference to it, so an
+/// initializer wrapped thousands of times made the analysis quadratic. Real
+/// code wraps at most 5 deep.
 const MAX_WRAPPER_RUN: u32 = 32;
 
 fn parse_speculation_budget(source: &str) -> u64 {
@@ -117,9 +118,9 @@ struct LiteralSpans<'s> {
     wrapper_run: u32,
     /// The most wrappers any expression visited sits in directly.
     longest_wrapper_run: u32,
-    /// The last expression of the sequence being visited, which alone
-    /// continues the sequence's run of wrappers.
-    sequence_last: Option<Address>,
+    /// The expression that continues the run of the wrapper being visited:
+    /// the one it wraps, or the last expression of a sequence.
+    run_continues_into: Option<Address>,
 }
 
 /// Whether nodes of this kind get a scope that `var` declarations are
@@ -205,32 +206,28 @@ impl<'a> Visit<'a> for LiteralSpans<'_> {
         if self.reached_floor() {
             return;
         }
-        let sequence_last = self.sequence_last.take();
+        let continued_into = self.run_continues_into.take();
         let outer_run = self.wrapper_run;
-        let continues = sequence_last.is_none_or(|last| last == expression.address());
-        self.wrapper_run = match expression {
-            Expression::ParenthesizedExpression(_)
-            | Expression::TSAsExpression(_)
-            | Expression::TSSatisfiesExpression(_)
-            | Expression::TSNonNullExpression(_)
-            | Expression::TSTypeAssertion(_)
-            | Expression::TSInstantiationExpression(_)
-            | Expression::SequenceExpression(_) => {
-                if continues {
-                    outer_run + 1
-                } else {
-                    1
-                }
-            }
-            _ => 0,
+        let wrapped = match expression {
+            Expression::ParenthesizedExpression(wrapper) => Some(&wrapper.expression),
+            Expression::TSAsExpression(wrapper) => Some(&wrapper.expression),
+            Expression::TSSatisfiesExpression(wrapper) => Some(&wrapper.expression),
+            Expression::TSNonNullExpression(wrapper) => Some(&wrapper.expression),
+            Expression::TSTypeAssertion(wrapper) => Some(&wrapper.expression),
+            Expression::TSInstantiationExpression(wrapper) => Some(&wrapper.expression),
+            Expression::SequenceExpression(sequence) => sequence.expressions.last(),
+            _ => None,
+        };
+        self.wrapper_run = match wrapped {
+            Some(_) if continued_into == Some(expression.address()) => outer_run + 1,
+            Some(_) => 1,
+            None => 0,
         };
         self.longest_wrapper_run = self.longest_wrapper_run.max(self.wrapper_run);
-        if let Expression::SequenceExpression(sequence) = expression {
-            self.sequence_last = sequence.expressions.last().map(GetAddress::address);
-        }
+        self.run_continues_into = wrapped.map(GetAddress::address);
         walk::walk_expression(self, expression);
         self.wrapper_run = outer_run;
-        self.sequence_last = sequence_last;
+        self.run_continues_into = continued_into;
     }
 
     fn visit_statement(&mut self, statement: &Statement<'a>) {
@@ -338,8 +335,6 @@ enum Unparsed {
     /// Parsing it would take more speculative work than
     /// [`PARSE_SPECULATION_PER_BYTE`] allows.
     OverSpeculationBudget,
-    /// An expression sits in more wrappers directly than [`MAX_WRAPPER_RUN`].
-    WrapperChain,
 }
 
 /// Parses `source` and runs the syntax passes over it, masking its comments
@@ -387,7 +382,7 @@ fn parse_above(
         stopped: false,
         wrapper_run: 0,
         longest_wrapper_run: 0,
-        sequence_last: None,
+        run_continues_into: None,
     };
     std::panic::catch_unwind(AssertUnwindSafe(|| {
         literals.visit_program(&parsed.program);
@@ -396,11 +391,12 @@ fn parse_above(
     if literals.stopped {
         return Err(Unparsed::OutOfStack);
     }
-    if literals.longest_wrapper_run > MAX_WRAPPER_RUN {
-        return Err(Unparsed::WrapperChain);
-    }
     let random_literal = (!parsed.fatal_error).then_some(literals.random_literal);
-    let complete = !parsed.fatal_error && !parsed.diagnostics.has_errors();
+    // A source with a longer run of wrappers keeps its comments and literals
+    // masked, but the rules that read through wrappers don't run on it.
+    let complete = !parsed.fatal_error
+        && !parsed.diagnostics.has_errors()
+        && literals.longest_wrapper_run <= MAX_WRAPPER_RUN;
     let resolution_budget = (source.len() as u64)
         .saturating_mul(RESOLUTION_LOOKUPS_PER_BYTE)
         .max(RESOLUTION_LOOKUPS_FLOOR);
@@ -466,8 +462,7 @@ fn parse(
             Err(
                 Unparsed::TooDeep
                 | Unparsed::TooManyNestedReferences
-                | Unparsed::OverSpeculationBudget
-                | Unparsed::WrapperChain,
+                | Unparsed::OverSpeculationBudget,
             ) => return None,
             Err(Unparsed::OutOfStack) => {}
         }
@@ -856,20 +851,30 @@ mod tests {
     #[test]
     fn pure_comments_on_nested_parentheses_apply_in_linear_time() {
         // A pure comment applies to the call inside the parentheses after it,
-        // and each level must not walk every parenthesis inside it again.
+        // and each level must not walk every parenthesis inside it again, even
+        // when a pure comment inside a computed key walks in between.
         let depth = 30_000;
-        let source = format!(
-            "{}a(){};",
-            "/*#__PURE__*/(".repeat(depth),
-            ")".repeat(depth)
-        );
-        let flat = "x;".repeat(source.len() / 2);
-        let applied = time_to_parse(source, SourceType::cjs());
-        let flat = time_to_parse(flat, SourceType::cjs());
-        assert!(
-            applied < flat * 5 + std::time::Duration::from_millis(200),
-            "applied {applied:?}, flat {flat:?}"
-        );
+        for source in [
+            format!(
+                "{}a(){};",
+                "/*#__PURE__*/(".repeat(depth),
+                ")".repeat(depth)
+            ),
+            format!(
+                "{}a{};",
+                "/*#__PURE__*/(".repeat(depth),
+                ")[/*#__PURE__*/k()]".repeat(depth)
+            ),
+        ] {
+            let flat = "x;".repeat(source.len() / 2);
+            let end = source[source.len() - 40..].to_owned();
+            let applied = time_to_parse(source, SourceType::cjs());
+            let flat = time_to_parse(flat, SourceType::cjs());
+            assert!(
+                applied < flat * 5 + std::time::Duration::from_millis(200),
+                "{end}: applied {applied:?}, flat {flat:?}"
+            );
+        }
     }
 
     #[test]
@@ -930,22 +935,43 @@ mod tests {
 
     #[test]
     fn a_top_level_await_parsed_again_replaces_the_statements_it_takes_in() {
-        // Found to be a module, the source is `await await 0;` and an export:
-        // the first statement parsed again takes in the next two.
+        // Found to be a module, `await\nawait\n0;` is one statement. In
+        // `await\nawait /x/\nfoo();` the second line was `await / x / foo()`
+        // as a script, so the statement parsed again ends inside it, and
+        // `foo();` is parsed again too.
+        for (source, expected) in [
+            (
+                "await\nawait\n0;\nexport {};\n",
+                &["await\nawait\n0;", "export {};"][..],
+            ),
+            (
+                "await\nawait /x/\nfoo();\nexport {};\n",
+                &["await\nawait /x/", "foo();", "export {};"][..],
+            ),
+        ] {
+            let allocator = Allocator::default();
+            let parsed = Parser::new(&allocator, source, SourceType::unambiguous()).parse();
+            assert!(parsed.diagnostics.is_empty(), "{source}");
+            let statements: Vec<&str> = parsed
+                .program
+                .body
+                .iter()
+                .map(|statement| {
+                    let span = oxc_span::GetSpan::span(statement);
+                    &source[span.start as usize..span.end as usize]
+                })
+                .collect();
+            assert_eq!(statements, expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn a_top_level_await_parsed_again_records_its_dynamic_import_once() {
         let allocator = Allocator::default();
-        let source = "await\nawait\n0;\nexport {};\n";
+        let source = "await\nimport('x');\nexport {};\n";
         let parsed = Parser::new(&allocator, source, SourceType::unambiguous()).parse();
         assert!(parsed.diagnostics.is_empty());
-        let statements: Vec<&str> = parsed
-            .program
-            .body
-            .iter()
-            .map(|statement| {
-                let span = oxc_span::GetSpan::span(statement);
-                &source[span.start as usize..span.end as usize]
-            })
-            .collect();
-        assert_eq!(statements, ["await\nawait\n0;", "export {};"]);
+        assert_eq!(parsed.module_record.dynamic_imports.len(), 1);
     }
 
     #[test]
@@ -996,7 +1022,7 @@ mod tests {
             stopped: false,
             wrapper_run: 0,
             longest_wrapper_run: 0,
-            sequence_last: None,
+            run_continues_into: None,
         };
         let unwound = std::panic::catch_unwind(AssertUnwindSafe(|| {
             literals.visit_program(&parsed.program);

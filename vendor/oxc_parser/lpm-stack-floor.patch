@@ -222,7 +222,15 @@
  use oxc_ast::ast::*;
  use oxc_data_structures::buffered_vec::BufferedVec;
  #[cfg(feature = "regular_expression")]
-@@ -408,6 +408,7 @@
+@@ -9,6 +9,7 @@
+ use oxc_span::{GetSpan, Span};
+ use oxc_str::{Ident, JSStr, Str};
+ use oxc_syntax::precedence::Precedence;
++use rustc_hash::FxHashMap;
+ 
+ use super::{
+     grammar::CoverGrammar,
+@@ -408,6 +409,7 @@
          }
  
          if self.options.preserve_parens {
@@ -230,19 +238,19 @@
              Expression::new_parenthesized_expression(self.end_span(start), expression, self)
          } else {
              expression
-@@ -1922,7 +1923,10 @@
+@@ -1922,7 +1924,10 @@
          comments: (u32, NonZeroU32),
          expr: &mut Expression<'a>,
      ) {
 -        if Self::set_pure_on_call_or_new_expr(expr) {
 +        let start = expr.address();
-+        let applied = Self::set_pure_on_call_or_new_expr(expr, self.state.last_pure_walk);
-+        self.state.last_pure_walk = Some((start, applied));
++        let applied = Self::set_pure_on_call_or_new_expr(expr, &self.state.pure_walks);
++        self.state.pure_walks.insert(start, applied);
 +        if applied {
              self.lexer.trivia_builder.mark_pure_comments_applied(comments);
          }
      }
-@@ -1939,34 +1943,51 @@
+@@ -1939,34 +1944,49 @@
          }
      }
  
@@ -252,16 +260,14 @@
 -                call_expr.pure = true;
 -                true
 +    /// Walks down wrappers and a member chain in a loop: the parser reads a chain without
-+    /// recursing, so recursing once per member here could overflow the stack. Reaching the
-+    /// expression the previous walk started at, `walked`, it takes that walk's answer.
++    /// recursing, so recursing once per member here could overflow the stack. Reaching an
++    /// expression an earlier walk started at, it takes that walk's answer from `walked`.
 +    fn set_pure_on_call_or_new_expr(
 +        mut expr: &mut Expression<'a>,
-+        walked: Option<(Address, bool)>,
++        walked: &FxHashMap<Address, bool>,
 +    ) -> bool {
 +        loop {
-+            if let Some((address, applied)) = walked
-+                && expr.address() == address
-+            {
++            if let Some(&applied) = walked.get(&expr.address()) {
 +                return applied;
              }
 -            Expression::NewExpression(new_expr) => {
@@ -670,10 +676,12 @@
          }
      }
  
-@@ -836,7 +885,14 @@
+@@ -836,7 +885,16 @@
              if self.lexer.config.tokens() { checkpoints.len() } else { 0 },
              self,
          );
++        let original_spans: Vec<Span> = statements.iter().map(GetSpan::span).collect();
++        let mut replaced_statements = Vec::new();
 +        let mut reparsed_until = 0;
          for (stmt_index, checkpoint) in checkpoints {
 +            // A statement parsed again can take in the candidates after it, as in
@@ -685,21 +693,59 @@
              // Only the statement is parsed again, so trivia after it is not lexed again.
              self.rewind_keeping_trivia(checkpoint);
              let replacement_start = replacements.len();
-@@ -857,6 +913,8 @@
-                 p.parse_statement_list_item(StatementContext::Program)
-             });
+@@ -852,14 +910,27 @@
+             }
+             let edit_start = original_index;
  
+-            // Parse the statement with await context enabled (TopLevel context is already set)
+-            let stmt = self.context_add(Context::Await, |p| {
+-                p.parse_statement_list_item(StatementContext::Program)
+-            });
++            // Parse the statement with await context enabled (TopLevel context is already set).
++            // It can end inside a statement the first parse read, as `await\nawait /x/` does
++            // inside `await / x / foo()`: parse on to the end of one, so the rest is parsed again.
++            let mut reparsed = ArenaVec::new_in(self);
++            loop {
++                let start = self.prev_token_end;
++                let stmt = self.context_add(Context::Await, |p| {
++                    p.parse_statement_list_item(StatementContext::Program)
++                });
++                reparsed.push(stmt);
++                let end = self.prev_token_end;
++                let following = original_spans.partition_point(|span| span.start < end);
++                let ends_inside = following > 0 && original_spans[following - 1].end > end;
++                if !ends_inside || end <= start || self.has_fatal_error() {
++                    break;
++                }
++            }
+ 
+-            // Replace the statement if the index is valid
 +            reparsed_until = self.prev_token_end;
-+
-             // Replace the statement if the index is valid
              if stmt_index < statements.len() {
-                 statements[stmt_index] = stmt;
-@@ -883,6 +941,15 @@
+-                statements[stmt_index] = stmt;
++                replaced_statements.push((stmt_index, reparsed));
+             }
+ 
+             if self.lexer.config.tokens() {
+@@ -883,6 +954,28 @@
                  edits.push((edit_start..original_index, replacement_start..replacements.len()));
              }
          }
 +
-+        // Drop the statements that a statement parsed again took in, so none overlap.
++        if !replaced_statements.is_empty() {
++            let added: usize = replaced_statements.iter().map(|(_, new)| new.len() - 1).sum();
++            let mut replaced_statements = replaced_statements.into_iter().peekable();
++            let mut rebuilt = ArenaVec::with_capacity_in(statements.len() + added, self);
++            for (index, statement) in statements.drain(..).enumerate() {
++                match replaced_statements.next_if(|(replaced, _)| *replaced == index) {
++                    Some((_, new)) => rebuilt.extend(new),
++                    None => rebuilt.push(statement),
++                }
++            }
++            *statements = rebuilt;
++        }
++
++        // Drop the statements that statements parsed again took in, so none overlap.
 +        let mut covered_until = 0;
 +        statements.retain(|statement| {
 +            let span = statement.span();
@@ -720,14 +766,42 @@
  
  use crate::diagnostics;
  
-@@ -157,6 +158,20 @@
+@@ -60,8 +61,20 @@
+             &exported_bindings_duplicated,
+             &skipped_default_exports,
+         );
+-        module_record.dynamic_imports = dynamic_imports.into_vec();
+-        module_record.import_metas = import_metas.into_vec();
++        // A statement parsed again as a module records its dynamic imports and `import.meta`
++        // again, after the ones that follow it.
++        let mut dynamic_imports = dynamic_imports.into_vec();
++        if !dynamic_imports.is_sorted_by(|a, b| a.span.start < b.span.start) {
++            dynamic_imports.sort_unstable_by_key(|import| import.span.start);
++            dynamic_imports.dedup_by_key(|import| import.span);
++        }
++        module_record.dynamic_imports = dynamic_imports;
++        let mut import_metas = import_metas.into_vec();
++        if !import_metas.is_sorted_by(|a, b| a.start < b.start) {
++            import_metas.sort_unstable_by_key(|span| span.start);
++            import_metas.dedup();
++        }
++        module_record.import_metas = import_metas;
+         (module_record, errors)
+     }
+ 
+@@ -157,6 +170,25 @@
              }
          }
  
 +        // A local export looks its name up among the import entries. Past a few of them, an
 +        // index by local name keeps many exports of many imports linear. It keeps the first
 +        // entry for each name, as the search does.
-+        let imports_by_local_name = (module_record.import_entries.len() > 16).then(|| {
++        let imports_by_local_name = (module_record.import_entries.len() > 16
++            && export_entries.iter().any(|entry| {
++                entry.module_request.is_none()
++                    && matches!(entry.local_name, ExportLocalName::Name(_))
++            }))
++        .then(|| {
 +            let mut index = FxHashMap::with_capacity_and_hasher(
 +                module_record.import_entries.len(),
 +                Default::default(),
@@ -741,7 +815,7 @@
          // Retain local exports in their original buffer, avoiding a second arena allocation.
          // 10. For each ExportEntry Record ee of exportEntries, do
          export_entries.retain_mut(|entry| {
-@@ -167,11 +182,16 @@
+@@ -167,11 +199,16 @@
                      // 1. Append ee to localExportEntries.
                      return true;
                  };
@@ -766,12 +840,11 @@
 --- a/src/state.rs
 +++ b/src/state.rs
 @@ -1,6 +1,8 @@
--use rustc_hash::{FxHashMap, FxHashSet};
 +use std::collections::BTreeMap;
++
+ use rustc_hash::{FxHashMap, FxHashSet};
  
 -use oxc_allocator::{Allocator, ArenaVec};
-+use rustc_hash::FxHashSet;
-+
 +use oxc_allocator::{Address, Allocator, ArenaVec};
  use oxc_ast::ast::Expression;
  use oxc_span::Span;
@@ -787,11 +860,11 @@
 +    /// can build another `ParenthesizedExpression` that starts there, and it records its own.
 +    pub last_parenthesized: (u32, u32),
 +
-+    /// Where the walk for the last `/*#__PURE__*/` comment started, as the address of the
-+    /// expression after it, and whether it found a call. Nested `/*#__PURE__*/(` wraps each
-+    /// level's expression around the one the level inside it walked, so a walk stops there and
-+    /// takes its answer instead of walking every wrapper inside it again.
-+    pub last_pure_walk: Option<(Address, bool)>,
++    /// Where each walk for a `/*#__PURE__*/` comment started, as the address of the expression
++    /// after the comment, and whether it found a call. Nested `/*#__PURE__*/(` wraps each level's
++    /// expression around one a level inside it walked, so a walk stops at the first start it
++    /// reaches and takes its answer. Each node is then walked at most once.
++    pub pure_walks: FxHashMap<Address, bool>,
 +
      /// Zero outside speculative expression type arguments; otherwise their nesting depth.
      pub type_argument_depth: u32,
@@ -821,7 +894,7 @@
              cover_depth: 0,
              cover_parenthesized: ArenaVec::new_in(&allocator),
 +            last_parenthesized: (u32::MAX, u32::MAX),
-+            last_pure_walk: None,
++            pure_walks: FxHashMap::default(),
              type_argument_depth: 0,
              type_argument_lookahead: None,
 -            cover_initialized_name: FxHashMap::default(),

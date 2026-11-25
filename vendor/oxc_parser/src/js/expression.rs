@@ -9,6 +9,7 @@ use oxc_regular_expression::ast::Pattern;
 use oxc_span::{GetSpan, Span};
 use oxc_str::{Ident, JSStr, Str};
 use oxc_syntax::precedence::Precedence;
+use rustc_hash::FxHashMap;
 
 use super::{
     grammar::CoverGrammar,
@@ -1924,8 +1925,8 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         expr: &mut Expression<'a>,
     ) {
         let start = expr.address();
-        let applied = Self::set_pure_on_call_or_new_expr(expr, self.state.last_pure_walk);
-        self.state.last_pure_walk = Some((start, applied));
+        let applied = Self::set_pure_on_call_or_new_expr(expr, &self.state.pure_walks);
+        self.state.pure_walks.insert(start, applied);
         if applied {
             self.lexer.trivia_builder.mark_pure_comments_applied(comments);
         }
@@ -1944,16 +1945,14 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     }
 
     /// Walks down wrappers and a member chain in a loop: the parser reads a chain without
-    /// recursing, so recursing once per member here could overflow the stack. Reaching the
-    /// expression the previous walk started at, `walked`, it takes that walk's answer.
+    /// recursing, so recursing once per member here could overflow the stack. Reaching an
+    /// expression an earlier walk started at, it takes that walk's answer from `walked`.
     fn set_pure_on_call_or_new_expr(
         mut expr: &mut Expression<'a>,
-        walked: Option<(Address, bool)>,
+        walked: &FxHashMap<Address, bool>,
     ) -> bool {
         loop {
-            if let Some((address, applied)) = walked
-                && expr.address() == address
-            {
+            if let Some(&applied) = walked.get(&expr.address()) {
                 return applied;
             }
             expr = match expr {

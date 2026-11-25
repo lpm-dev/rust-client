@@ -3547,18 +3547,48 @@ mod tests {
 
     #[test]
     fn expressions_in_as_many_wrappers_as_real_code_could_have_are_parsed() {
-        // A sequence continues the run of wrappers only through its last
-        // expression, as the rules read through it.
-        for (source, unparsed) in [
-            (format!("x={};", nested("(", "eval(y)", ")", 32)), 0),
-            (format!("x={};", nested("(", "eval(y)", ")", 33)), 1),
-            (format!("x={};", nested("(", "eval(y)", ",0)", 40)), 0),
-            (format!("x={};", nested("(0,", "eval(y)", ")", 40)), 1),
+        // A run of wrappers continues only into the expression a wrapper
+        // wraps, and into the last expression of a sequence, as the rules read
+        // through them.
+        for (filename, source, unparsed) in [
+            (
+                "index.js",
+                format!("x={};", nested("(", "eval(y)", ")", 32)),
+                0,
+            ),
+            (
+                "index.js",
+                format!("x={};", nested("(", "eval(y)", ")", 33)),
+                1,
+            ),
+            (
+                "index.js",
+                format!("x={};", nested("(", "eval(y)", ",0)", 40)),
+                0,
+            ),
+            (
+                "index.js",
+                format!("x={};", nested("(0,", "eval(y)", ")", 40)),
+                1,
+            ),
+            (
+                "index.ts",
+                format!("x=a as {{[{}]:number}};eval(y);", nested("(", "k", ")", 32)),
+                0,
+            ),
         ] {
-            let result = analyze_on_a_worker_stack("index.js", source.clone());
+            let result = analyze_on_a_worker_stack(filename, source.clone());
             assert!(result.source.eval);
             assert_eq!(result.unparsed_files, unparsed, "{source}");
         }
+    }
+
+    #[test]
+    fn a_source_in_too_many_wrappers_keeps_its_comments_and_literals_masked() {
+        let source = format!("/* eval(y) */x='eval(y)';x={};", nested("(", "a", ")", 33));
+        let result = analyze_on_a_worker_stack("index.js", source);
+        assert_eq!(result.unparsed_files, 1);
+        assert!(!result.source.eval);
     }
 
     #[test]

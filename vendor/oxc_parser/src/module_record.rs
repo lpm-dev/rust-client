@@ -61,8 +61,20 @@ impl<'a> ModuleRecordBuilder<'a> {
             &exported_bindings_duplicated,
             &skipped_default_exports,
         );
-        module_record.dynamic_imports = dynamic_imports.into_vec();
-        module_record.import_metas = import_metas.into_vec();
+        // A statement parsed again as a module records its dynamic imports and `import.meta`
+        // again, after the ones that follow it.
+        let mut dynamic_imports = dynamic_imports.into_vec();
+        if !dynamic_imports.is_sorted_by(|a, b| a.span.start < b.span.start) {
+            dynamic_imports.sort_unstable_by_key(|import| import.span.start);
+            dynamic_imports.dedup_by_key(|import| import.span);
+        }
+        module_record.dynamic_imports = dynamic_imports;
+        let mut import_metas = import_metas.into_vec();
+        if !import_metas.is_sorted_by(|a, b| a.start < b.start) {
+            import_metas.sort_unstable_by_key(|span| span.start);
+            import_metas.dedup();
+        }
+        module_record.import_metas = import_metas;
         (module_record, errors)
     }
 
@@ -161,7 +173,12 @@ impl<'a> ModuleRecordBuilder<'a> {
         // A local export looks its name up among the import entries. Past a few of them, an
         // index by local name keeps many exports of many imports linear. It keeps the first
         // entry for each name, as the search does.
-        let imports_by_local_name = (module_record.import_entries.len() > 16).then(|| {
+        let imports_by_local_name = (module_record.import_entries.len() > 16
+            && export_entries.iter().any(|entry| {
+                entry.module_request.is_none()
+                    && matches!(entry.local_name, ExportLocalName::Name(_))
+            }))
+        .then(|| {
             let mut index = FxHashMap::with_capacity_and_hasher(
                 module_record.import_entries.len(),
                 Default::default(),
