@@ -948,6 +948,10 @@ mod tests {
                 "await\nawait /x/\nfoo();\nexport {};\n",
                 &["await\nawait /x/", "foo();", "export {};"][..],
             ),
+            (
+                "await\nlet\nx = eval(y)\nexport {};\n",
+                &["await\nlet", "x = eval(y)", "export {};"][..],
+            ),
         ] {
             let allocator = Allocator::default();
             let parsed = Parser::new(&allocator, source, SourceType::unambiguous()).parse();
@@ -979,7 +983,7 @@ mod tests {
         // A source whose module syntax is found late parses its statements
         // that start with `await` again, and one parse again can take in the
         // statements after it.
-        let awaits = 6_000;
+        let awaits = 10_000;
         let source = format!("{}0;\nexport {{}};\n", "await\n".repeat(awaits));
         let flat = "x;".repeat(source.len() / 2);
         let parsed_again = time_to_parse(source, SourceType::unambiguous());

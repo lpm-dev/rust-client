@@ -968,11 +968,13 @@ impl<'a, C: ParserConfig> ParserImpl<'a, C> {
             *statements = rebuilt;
         }
 
-        // Drop the statements that statements parsed again took in, so none overlap.
+        // Drop the statements that statements parsed again took in, so none overlap. One that
+        // reaches past them, which only a parse again stopped by an error leaves, stays: an
+        // overlap loses no code.
         let mut covered_until = 0;
         statements.retain(|statement| {
             let span = statement.span();
-            let covered = span.start < covered_until;
+            let covered = span.start < covered_until && span.end <= covered_until;
             covered_until = covered_until.max(span.end);
             !covered
         });
