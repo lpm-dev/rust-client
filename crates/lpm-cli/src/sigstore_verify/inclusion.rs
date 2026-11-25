@@ -38,11 +38,12 @@ pub fn verify_inclusion_proof(
     let rekor_key = rekor_keys
         .iter()
         .find(|k| k.log_id == log_id_bytes && k.valid_for.contains(integrated_time))
-        .ok_or_else(|| {
-            VerifyError::InclusionProof(format!(
+        .ok_or_else(|| VerifyError::MissingTrustMaterial {
+            check: "Rekor inclusion proof",
+            detail: format!(
                 "no pinned Rekor key for logId={} valid at integratedTime={}",
                 tlog_entry.log_id.key_id, tlog_entry.integrated_time,
-            ))
+            ),
         })?;
 
     let checkpoint_envelope = extract_checkpoint_envelope(&proof.checkpoint)?;

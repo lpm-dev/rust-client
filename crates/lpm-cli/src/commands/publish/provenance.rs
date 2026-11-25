@@ -47,6 +47,7 @@ pub(crate) async fn materialize_provenance_request(
     match request {
         ProvenanceRequest::Disabled => Ok(None),
         ProvenanceRequest::File(file) => load_provenance_request_file(&file)
+            .await
             .map(ResolvedProvenance::File)
             .map(Some),
         ProvenanceRequest::Generate => {
@@ -59,11 +60,11 @@ pub(crate) async fn materialize_provenance_request(
     }
 }
 
-pub(super) fn load_provenance_request_file(
+pub(super) async fn load_provenance_request_file(
     request: &ProvenanceFileRequest,
 ) -> Result<super::types::LoadedProvenanceFile, LpmError> {
     match request {
-        ProvenanceFileRequest::AmbientPath(path) => load_provenance_file(path),
+        ProvenanceFileRequest::AmbientPath(path) => load_provenance_file(path).await,
         ProvenanceFileRequest::ProjectFile {
             display_path,
             relative_path,
@@ -75,7 +76,7 @@ pub(super) fn load_provenance_request_file(
                 &display_path.to_string_lossy(),
             )?;
             let bytes = read_open_provenance_file_with_known_size(file, display_path, known_size)?;
-            load_provenance_bytes(display_path, bytes)
+            load_provenance_bytes(display_path, bytes).await
         }
     }
 }
@@ -1317,8 +1318,8 @@ mod tests {
     // replacement cannot happen there; see `publish_common`'s
     // `an_open_tarball_source_root_keeps_its_directory_in_place`.
     #[cfg(unix)]
-    #[test]
-    fn project_relative_provenance_keeps_the_selected_project_generation() {
+    #[tokio::test]
+    async fn project_relative_provenance_keeps_the_selected_project_generation() {
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join("project");
         let displaced = root.path().join("displaced");
@@ -1348,6 +1349,7 @@ mod tests {
         };
 
         let error = load_provenance_request_file(&request)
+            .await
             .expect_err("the selected invalid provenance generation must be loaded")
             .to_string();
 

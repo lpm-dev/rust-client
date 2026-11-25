@@ -540,14 +540,48 @@ pub(crate) fn verify_bundle_or_err(
     url: &str,
     expectation: &NpmArtifactExpectation,
 ) -> Result<VerifiedNpmProvenance, LpmError> {
-    use crate::sigstore_verify::{
-        IdentityExpectations, VerifyOptions, extract_npm_subject_sha512, verify_sigstore_bundle,
-    };
-    match verify_sigstore_bundle(
+    use crate::sigstore_verify::{IdentityExpectations, VerifyOptions, verify_sigstore_bundle};
+    let outcome = verify_sigstore_bundle(
         body,
         &IdentityExpectations::none(),
         VerifyOptions::npm_attestation(),
-    ) {
+    );
+    npm_provenance_from(body, url, expectation, outcome)
+}
+
+/// [`verify_bundle_or_err`] for a bundle just fetched from the registry:
+/// when the Sigstore trust root this machine holds lacks a key the bundle
+/// needs, Sigstore's current trust root is fetched before the bundle is
+/// judged.
+pub(crate) async fn verify_fetched_bundle_or_err(
+    body: &[u8],
+    url: &str,
+    expectation: &NpmArtifactExpectation,
+) -> Result<VerifiedNpmProvenance, LpmError> {
+    use crate::sigstore_verify::{
+        IdentityExpectations, TrustRefresh, VerifyOptions, verify_sigstore_bundle_refreshing,
+    };
+    let outcome = verify_sigstore_bundle_refreshing(
+        body,
+        &IdentityExpectations::none(),
+        VerifyOptions::npm_attestation(),
+        TrustRefresh::WhenMissing,
+    )
+    .await;
+    npm_provenance_from(body, url, expectation, outcome)
+}
+
+fn npm_provenance_from(
+    body: &[u8],
+    url: &str,
+    expectation: &NpmArtifactExpectation,
+    outcome: Result<
+        crate::sigstore_verify::VerifiedProvenance,
+        crate::sigstore_verify::VerifyError,
+    >,
+) -> Result<VerifiedNpmProvenance, LpmError> {
+    use crate::sigstore_verify::extract_npm_subject_sha512;
+    match outcome {
         Ok(verified) => {
             let (subject_name, subject_sha512) =
                 extract_npm_subject_sha512(body).map_err(|error| {

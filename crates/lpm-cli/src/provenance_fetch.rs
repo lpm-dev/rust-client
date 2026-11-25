@@ -34,7 +34,8 @@
 
 use crate::provenance_bundle::{
     AttestationUrlPolicy, FetchBundleError, NpmArtifactExpectation, ProvenanceHttpClient,
-    fetch_bundle_bytes, parse_sigstore_bundle, read_cache, verify_bundle_or_err, write_cache,
+    fetch_bundle_bytes, parse_sigstore_bundle, read_cache, verify_fetched_bundle_or_err,
+    write_cache,
 };
 use futures::StreamExt;
 use lpm_common::LpmError;
@@ -846,7 +847,7 @@ pub(crate) async fn fetch_provenance_evidence(
     // claimed signed provenance but failed crypto). Transport-class
     // failures are already absorbed above at `fetch_bundle_bytes`.
     let verify_start = Instant::now();
-    let evidence = verify_bundle_or_err(&buf, url, &expectation)?;
+    let evidence = verify_fetched_bundle_or_err(&buf, url, &expectation).await?;
     if let Some(t) = timings {
         t.record_verify(name, version, verify_start.elapsed());
     }

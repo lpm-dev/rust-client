@@ -104,6 +104,7 @@ pub fn verify_embedded_sct(
 
     // Per-SCT verification. Threshold: ≥1 must verify.
     let mut verified = 0usize;
+    let mut saw_unknown_log = false;
     let mut last_err: Option<String> = None;
     for (i, serialized) in sct_serialized_list.iter().enumerate() {
         let parsed = match parse_serialized_sct(serialized) {
@@ -117,6 +118,7 @@ pub fn verify_embedded_sct(
             .iter()
             .find(|k| k.log_id == parsed.log_id && k.valid_for.contains(at_time))
         else {
+            saw_unknown_log = true;
             last_err = Some(format!(
                 "sct[{i}]: no pinned CT log key matches logId={} valid at integratedTime",
                 hex::encode(&parsed.log_id)
@@ -130,12 +132,20 @@ pub fn verify_embedded_sct(
         verified += 1;
     }
     if verified == 0 {
-        return Err(VerifyError::Sct(format!(
+        let detail = format!(
             "no SCT in the leaf cert's extension verified under any pinned CT log key (\
              {} candidate(s) in list); last error: {}",
             sct_serialized_list.len(),
             last_err.unwrap_or_else(|| "unknown".into())
-        )));
+        );
+        return Err(if saw_unknown_log {
+            VerifyError::MissingTrustMaterial {
+                check: "SCT",
+                detail,
+            }
+        } else {
+            VerifyError::Sct(detail)
+        });
     }
     Ok(())
 }

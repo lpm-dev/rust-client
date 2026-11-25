@@ -145,6 +145,7 @@ rayon = { workspace = true }
 p256 = { workspace = true }
 # p384 for the Fulcio root chain (Phase 1.3) — Fulcio roots are P-384.
 p384 = { workspace = true }
+ed25519-dalek = { workspace = true }
 ecdsa = { workspace = true }
 
 # Phase 46 P4: x509 cert parsing for Sigstore attestation SAN extraction

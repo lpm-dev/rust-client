@@ -44,17 +44,15 @@ pub enum VerifyError {
     #[error("Rekor body is malformed: {0}")]
     RekorBodyMalformed(String),
 
-    /// The vendored Sigstore trust root could not be parsed (JSON
-    /// shape drift, base64 decode failure on cert / key material,
-    /// missing required field, etc.).
-    #[error("vendored Sigstore trust root failed to load: {0}")]
+    /// A Sigstore trust root could not be parsed (JSON shape drift,
+    /// base64 decode failure on cert / key material, missing required
+    /// field, etc.).
+    #[error("Sigstore trust root failed to load: {0}")]
     TrustRoot(String),
 
-    /// The vendored trust root no longer has at least one currently-
+    /// The trust root in use no longer has at least one currently-
     /// active key for every role (Fulcio CA, Rekor signing key, CT
-    /// log key). The artifact is stale; the user must update `lpm`
-    /// to a release that ships a refreshed root before any Sigstore
-    /// verification can succeed.
+    /// log key). Sigstore's current trust root may have newer ones.
     ///
     /// Trust roots intentionally carry retired entries alongside
     /// active ones so that bundles signed during retired windows
@@ -62,17 +60,30 @@ pub enum VerifyError {
     /// — so a single past `validFor.end` is NOT expiry; the
     /// artifact is expired when an entire role has gone retired-
     /// only.
-    #[error(
-        "vendored Sigstore trust root has no currently-active key for role(s): {missing_roles}; \
-         update lpm to refresh"
-    )]
+    #[error("Sigstore trust root has no currently-active key for role(s): {missing_roles}")]
     TrustRootExpired { missing_roles: String },
 
+    /// The bundle names a Fulcio certificate authority, Rekor log or
+    /// CT log that the trust root in use doesn't hold, or holds only
+    /// for other times than the bundle's `integratedTime`. Sigstore's
+    /// current trust root may hold it. `check` names the verification
+    /// step that needed it.
+    #[error("{check} verification failed: {detail}")]
+    MissingTrustMaterial { check: &'static str, detail: String },
+
+    /// The trust root lacked what the bundle needs, and fetching
+    /// Sigstore's current trust root to look for it failed.
+    #[error("{error} (Sigstore's current trust root could not be fetched: {refresh})")]
+    TrustRootNotRefreshed {
+        error: Box<VerifyError>,
+        refresh: String,
+    },
+
     /// Rekor SET (Signed Entry Timestamp) verification failed:
-    /// signature did not verify under the pinned Rekor key, the
-    /// pinned key for the entry's `logID` is absent / not active at
-    /// `integratedTime`, the SET signature was not valid DER, or the
-    /// pinned key's SPKI did not decode as ECDSA P-256.
+    /// signature did not verify under the pinned Rekor key, the SET
+    /// signature was not valid DER, or the pinned key's SPKI did not
+    /// decode as ECDSA P-256. A `logID` the trust root has no key for
+    /// is [`Self::MissingTrustMaterial`].
     #[error("Rekor SET verification failed: {0}")]
     RekorSet(String),
 
@@ -104,8 +115,9 @@ pub enum VerifyError {
     /// X.509 chain validation failed: a cert's notBefore/notAfter
     /// window did not contain `integratedTime`, an issuer/subject
     /// pair didn't line up, a link's signature didn't verify under
-    /// its parent, no path to a trusted Fulcio root could be built,
-    /// or the chain used an unsupported signature algorithm.
+    /// its parent, or the chain used an unsupported signature
+    /// algorithm. A chain no trusted Fulcio root anchors is
+    /// [`Self::MissingTrustMaterial`].
     /// AIA fetch is intentionally NOT implemented (the verifier
     /// refuses to fetch missing intermediates from the URL embedded
     /// in the cert — Sigstore bundles always ship the full chain,
@@ -117,10 +129,11 @@ pub enum VerifyError {
     /// failed: leaf cert has no SCT extension at the documented
     /// OID, the SCT list TLS encoding was malformed, the precert
     /// signed-input could not be reconstructed (TBS DER manipulation
-    /// failed), no pinned CT log key matched the SCT's `logId` at
-    /// `integratedTime`, the SCT signature did not verify under the
-    /// pinned key, or zero SCTs in the list verified (the threshold
-    /// is "at least one valid").
+    /// failed), the SCT signature did not verify under the pinned
+    /// key, or zero SCTs in the list verified (the threshold is "at
+    /// least one valid"). When none verifies and one names a CT log
+    /// the trust root has no key for, the error is
+    /// [`Self::MissingTrustMaterial`].
     #[error("SCT verification failed: {0}")]
     Sct(String),
 
@@ -147,6 +160,18 @@ pub enum VerifyError {
         expected: String,
         actual: String,
     },
+}
+
+impl VerifyError {
+    /// Whether a newer trust root from Sigstore could make the bundle
+    /// verify: the trust root in use lacks a key or certificate
+    /// authority the bundle needs.
+    pub fn is_missing_trust_material(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingTrustMaterial { .. } | Self::TrustRootExpired { .. }
+        )
+    }
 }
 
 /// Policy for which Rekor inclusion artifacts a bundle must carry to

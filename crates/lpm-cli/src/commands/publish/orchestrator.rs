@@ -2621,7 +2621,7 @@ async fn precompute_file_provenance_artifacts(
     let ProvenanceRequest::File(request) = input.provenance_request else {
         return Ok(HashMap::new());
     };
-    let file = load_provenance_request_file(request)?;
+    let file = load_provenance_request_file(request).await?;
     let provenance = ResolvedProvenance::File(file);
     let npm_target_count = input
         .targets

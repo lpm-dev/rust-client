@@ -983,6 +983,10 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     // Disable update check (would make network calls)
     cmd.set_env("LPM_NO_UPDATE_CHECK", OsStr::new("1"));
 
+    // Verify against the Sigstore trust root built into the binary and never
+    // fetch Sigstore's current one. Tests of that fetch set their own value.
+    cmd.set_env("LPM_SIGSTORE_TUF_URL_OVERRIDE", OsStr::new("off"));
+
     // Workflow tests use the shipped npm route. Requests addressed to
     // registry.npmjs.org go to the mock the project last targeted, or else to
     // a closed local port, so no test reaches the real registry. Lockfiles

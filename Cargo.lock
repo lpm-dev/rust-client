@@ -3572,6 +3572,7 @@ dependencies = [
  "diffy",
  "dirs",
  "ecdsa",
+ "ed25519-dalek",
  "ferralk-glob",
  "flate2",
  "futures",

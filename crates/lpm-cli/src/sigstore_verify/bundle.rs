@@ -19,6 +19,7 @@ use super::{
 /// Verifier-time options. Currently carries the
 /// [`RekorInclusionProofPolicy`] only; future knobs can live here
 /// without breaking the public API.
+#[derive(Debug, Clone, Copy)]
 pub struct VerifyOptions {
     pub rekor_inclusion_policy: RekorInclusionProofPolicy,
 }
@@ -193,6 +194,17 @@ pub fn verify_sigstore_bundle(
     expectations: &IdentityExpectations,
     options: VerifyOptions,
 ) -> Result<VerifiedProvenance, VerifyError> {
+    let trust = trust_root()?;
+    verify_sigstore_bundle_with(body, expectations, options, &trust)
+}
+
+/// [`verify_sigstore_bundle`] against a given trust root.
+pub(super) fn verify_sigstore_bundle_with(
+    body: &[u8],
+    expectations: &IdentityExpectations,
+    options: VerifyOptions,
+    trust: &TrustRoot,
+) -> Result<VerifiedProvenance, VerifyError> {
     // Dot-namespaced span names match the existing Tracy integration
     // convention (`linker.prepare`, `linker.one`, etc.) so Tracy
     // captures and `tracing-flame` outputs render the verifier in
@@ -204,7 +216,7 @@ pub fn verify_sigstore_bundle(
         let _span = tracing::debug_span!("provenance.verify.parse").entered();
         parse_bundle_components(body)?
     };
-    let trust = trust_root()?;
+    trust.check_expiry(SystemTime::now())?;
 
     let at_time = parse_integrated_time(&components.tlog_entry.integrated_time)?;
     let log_index = parse_log_index(&components.tlog_entry.log_index)?;
@@ -249,7 +261,7 @@ pub fn verify_sigstore_bundle(
     // fall back to the active trust anchors. Chain validation has
     // already cleared the path, so a match is guaranteed.
     let issuer_spki_der =
-        find_leaf_issuer_spki(&leaf_parsed, &components.chain_der, &trust, at_time)?;
+        find_leaf_issuer_spki(&leaf_parsed, &components.chain_der, trust, at_time)?;
     {
         let _span = tracing::debug_span!("provenance.verify.sct").entered();
         verify_embedded_sct(

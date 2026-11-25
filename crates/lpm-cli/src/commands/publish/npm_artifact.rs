@@ -81,20 +81,20 @@ pub(crate) async fn prepare_npm_target_artifact(
     })
 }
 
-pub(crate) fn load_provenance_file(path: &Path) -> Result<LoadedProvenanceFile, LpmError> {
+pub(crate) async fn load_provenance_file(path: &Path) -> Result<LoadedProvenanceFile, LpmError> {
     let file = open_provenance_file(path)?;
     let bytes = read_open_provenance_file(file, path)?;
-    parse_provenance_file_bytes(path, bytes)
+    parse_provenance_file_bytes(path, bytes).await
 }
 
-pub(super) fn load_provenance_bytes(
+pub(super) async fn load_provenance_bytes(
     path: &Path,
     bytes: Vec<u8>,
 ) -> Result<LoadedProvenanceFile, LpmError> {
     if bytes.len() as u64 > PROVENANCE_FILE_MAX_BYTES {
         return Err(provenance_file_too_large(path, bytes.len() as u64));
     }
-    parse_provenance_file_bytes(path, bytes)
+    parse_provenance_file_bytes(path, bytes).await
 }
 
 pub(super) fn read_open_provenance_file(
@@ -138,7 +138,7 @@ fn provenance_file_too_large(path: &Path, size: u64) -> LpmError {
     ))
 }
 
-fn parse_provenance_file_bytes(
+async fn parse_provenance_file_bytes(
     path: &Path,
     bytes: Vec<u8>,
 ) -> Result<LoadedProvenanceFile, LpmError> {
@@ -160,11 +160,13 @@ fn parse_provenance_file_bytes(
     let statement = provenance_statement_from_bundle(&bundle)?;
     validate_slsa_provenance_statement(&statement)?;
 
-    let verified = crate::sigstore_verify::verify_sigstore_bundle(
+    let verified = crate::sigstore_verify::verify_sigstore_bundle_refreshing(
         data.as_bytes(),
         &crate::sigstore_verify::IdentityExpectations::none(),
         crate::sigstore_verify::VerifyOptions::npm_attestation(),
+        crate::sigstore_verify::TrustRefresh::WhenMissing,
     )
+    .await
     .map_err(|e| {
         LpmError::Registry(format!(
             "provenance file {} failed Sigstore verification: {e}",
@@ -629,22 +631,24 @@ mod tests {
         assert!(error.to_string().contains("signing identity"));
     }
 
-    #[test]
-    fn load_provenance_file_rejects_oversized_regular_file() {
+    #[tokio::test]
+    async fn load_provenance_file_rejects_oversized_regular_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("too-large.sigstore");
         let file = std::fs::File::create(&path).unwrap();
         file.set_len(PROVENANCE_FILE_MAX_BYTES + 1).unwrap();
 
-        let err = load_provenance_file(&path).unwrap_err();
+        let err = load_provenance_file(&path).await.unwrap_err();
 
         assert!(err.to_string().contains("too large"));
     }
 
     #[cfg(unix)]
-    #[test]
-    fn load_provenance_file_rejects_special_file() {
-        let err = load_provenance_file(Path::new("/dev/null")).unwrap_err();
+    #[tokio::test]
+    async fn load_provenance_file_rejects_special_file() {
+        let err = load_provenance_file(Path::new("/dev/null"))
+            .await
+            .unwrap_err();
 
         assert!(err.to_string().contains("regular file"));
     }
@@ -665,8 +669,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn load_provenance_file_rejects_fifo_without_blocking() {
+    #[tokio::test]
+    async fn load_provenance_file_rejects_fifo_without_blocking() {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
 
@@ -678,7 +682,7 @@ mod tests {
         let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
         assert_eq!(rc, 0, "mkfifo must create the test fifo");
 
-        let err = load_provenance_file(&path).unwrap_err();
+        let err = load_provenance_file(&path).await.unwrap_err();
 
         assert!(err.to_string().contains("regular file"));
     }

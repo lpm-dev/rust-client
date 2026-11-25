@@ -38,11 +38,12 @@ pub fn verify_rekor_set(
     let rekor_key = rekor_keys
         .iter()
         .find(|k| k.log_id == log_id_bytes && k.valid_for.contains(integrated_time))
-        .ok_or_else(|| {
-            VerifyError::RekorSet(format!(
+        .ok_or_else(|| VerifyError::MissingTrustMaterial {
+            check: "Rekor SET",
+            detail: format!(
                 "no pinned Rekor key for logId={} valid at integratedTime={}",
                 tlog_entry.log_id.key_id, tlog_entry.integrated_time,
-            ))
+            ),
         })?;
 
     let verifying_key = p256_verifying_key_from_spki(&rekor_key.spki_der).map_err(|e| {
