@@ -2110,6 +2110,8 @@ mod tests {
                     policy_group: None,
                     summary: None,
                     report_url: None,
+                    block_class: None,
+                    bypassable: false,
                 },
             ),
         ))
