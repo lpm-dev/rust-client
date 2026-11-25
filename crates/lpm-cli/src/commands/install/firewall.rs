@@ -595,9 +595,11 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
         let mut chunk = FirewallSelectedChunk::with_capacity(chunk_size);
         let mut receiver_closed = false;
         let mut tasks = tokio::task::JoinSet::new();
-        // After an enforced block the install fails, so later chunks are still
-        // checked to name every blocked package, but nothing more downloads.
+        // After an enforced block, or a failed request, the install fails, so
+        // later chunks are still checked to name every blocked package, but
+        // nothing more downloads.
         let mut blocked = false;
+        let mut failure: Option<LpmError> = None;
 
         loop {
             tokio::select! {
@@ -618,7 +620,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                                 spawn_or_release_firewall_chunk(
                                     &mut chunk,
                                     &dispatch,
-                                    blocked,
+                                    blocked || failure.is_some(),
                                     &mut stats,
                                     &mut tasks,
                                 )
@@ -630,7 +632,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                             spawn_or_release_firewall_chunk(
                                 &mut chunk,
                                 &dispatch,
-                                blocked,
+                                blocked || failure.is_some(),
                                 &mut stats,
                                 &mut tasks,
                             )
@@ -644,17 +646,16 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                         .map_err(|error| LpmError::Registry(format!("npm firewall chunk task panicked: {error}")))?
                     {
                         Ok(chunk_result) => chunk_result,
-                        Err(error) if blocked => {
-                            stats.unchecked_reason.get_or_insert_with(|| error.to_string());
+                        Err(error) => {
+                            failure.get_or_insert(error);
                             continue;
                         }
-                        Err(error) => return Err(error),
                     };
                     blocked |= apply_firewall_chunk_result(
                         chunk_result,
                         &fetch_tx,
                         mode,
-                        blocked,
+                        blocked || failure.is_some(),
                         &mut stats,
                         &mut decisions,
                         &mut report_error,
@@ -669,6 +670,12 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
             }
         }
 
+        if let Some(error) = failure {
+            if !blocked {
+                return Err(error);
+            }
+            stats.unchecked_reason = Some(error.to_string());
+        }
         stats.batch_ms = total_started.elapsed().as_millis();
         Ok(NpmFirewallPreflightResult {
             stats,
@@ -1470,6 +1477,9 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
     let mut total_block_live = 0u64;
     let mut last_request_id = String::new();
     let mut last_policy_mode = String::new();
+    // In enforce mode a failed batch doesn't stop the others: a block they
+    // find is what the install reports, with this failure as unchecked.
+    let mut first_failure = None;
 
     for chunk in packages_to_check.chunks(MAX_FIREWALL_BATCH_PACKAGES) {
         let chunk_started = Instant::now();
@@ -1491,12 +1501,9 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
                     report_error: Some(npm_firewall_preflight_report_error(error)),
                 });
             }
-            Err(error) if stats_have_block(&stats, &all_decisions) => {
-                stats.unchecked_reason = Some(error.to_string());
-                break;
-            }
             Err(error) => {
-                return Err(npm_firewall_preflight_enforce_error(error));
+                first_failure.get_or_insert(error);
+                continue;
             }
         };
         let chunk_ms = chunk_started.elapsed().as_millis();
@@ -1520,6 +1527,12 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
             );
         }
         all_decisions.extend(response.decisions);
+    }
+    if let Some(error) = first_failure {
+        if !stats_have_block(&stats, &all_decisions) {
+            return Err(npm_firewall_preflight_enforce_error(error));
+        }
+        stats.unchecked_reason = Some(error.to_string());
     }
     stats.batch_ms = started.elapsed().as_millis();
 

@@ -781,11 +781,7 @@ async fn fetch_exact_metadata_with_source(
                 },
             );
         }
-        ResolveError::DependencyFetch {
-            package: canonical.to_string(),
-            version: version.to_string(),
-            detail: failure.error.to_string(),
-        }
+        registry_fetch_error_for(canonical, version, failure.error)
     })?;
     if raw.timings.selected_from_history {
         timings.route = "npm_direct_selected_history";
@@ -1690,11 +1686,7 @@ async fn fetch_full_metadata_for_policy(
     let direct_full = client
         .refetch_npm_metadata_direct_full(name)
         .await
-        .map_err(|e| ResolveError::DependencyFetch {
-            package: canonical.to_string(),
-            version: "*".to_string(),
-            detail: e.to_string(),
-        })?;
+        .map_err(|error| registry_fetch_error(canonical, error))?;
     Ok(parse_full_fetched_metadata(
         direct_full,
         include_speculation,
@@ -1908,6 +1900,15 @@ fn metadata_fetch_error(canonical: &CanonicalKey, error: lpm_common::LpmError) -
 /// A fetch for a package whose metadata the resolver already holds: a
 /// registry refusal, such as an LPM Firewall block, keeps its kind.
 fn registry_fetch_error(canonical: &CanonicalKey, error: lpm_common::LpmError) -> ResolveError {
+    registry_fetch_error_for(canonical, "*", error)
+}
+
+/// [`registry_fetch_error`] for a fetch of one `version`.
+fn registry_fetch_error_for(
+    canonical: &CanonicalKey,
+    version: &str,
+    error: lpm_common::LpmError,
+) -> ResolveError {
     if let Some(failure) = crate::RegistryFetchFailure::from_lpm_error(&error) {
         return ResolveError::Registry {
             package: canonical.to_string(),
@@ -1916,7 +1917,7 @@ fn registry_fetch_error(canonical: &CanonicalKey, error: lpm_common::LpmError) -
     }
     ResolveError::DependencyFetch {
         package: canonical.to_string(),
-        version: "*".to_string(),
+        version: version.to_string(),
         detail: error.to_string(),
     }
 }
@@ -2092,6 +2093,27 @@ mod tests {
             failure.into_lpm_error(&package),
             lpm_common::LpmError::NpmFirewallBlocked(blocked)
                 if blocked.packages[0].coordinate() == "foldrun@32.8.2"
+        ));
+    }
+
+    #[test]
+    fn a_firewall_block_on_a_version_fetch_keeps_its_typed_error() {
+        let canonical = CanonicalKey::from_dep_name("foldrun");
+
+        assert!(matches!(
+            registry_fetch_error_for(&canonical, "32.8.2", firewall_block()),
+            ResolveError::Registry {
+                failure: crate::RegistryFetchFailure::FirewallBlocked(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            registry_fetch_error_for(
+                &canonical,
+                "32.8.2",
+                lpm_common::LpmError::Registry("connection reset".into())
+            ),
+            ResolveError::DependencyFetch { version, .. } if version == "32.8.2"
         ));
     }
 }
