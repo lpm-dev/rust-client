@@ -399,7 +399,10 @@ pub struct FirewallBypassStatus {
     /// every project, and the project's own.
     #[serde(serialize_with = "crate::firewall_bypass::serialize_rules")]
     pub rules: Vec<crate::firewall_bypass::FirewallBypassRule>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "crate::firewall_bypass::serialize_managed_rules"
+    )]
     pub managed_rules: Vec<ManagedFirewallBypass>,
     /// Why the local rule store couldn't be read, when it couldn't.
     #[serde(skip_serializing_if = "Option::is_none")]

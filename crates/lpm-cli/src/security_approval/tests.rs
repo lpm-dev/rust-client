@@ -3188,6 +3188,105 @@ fn a_narrowing_judged_before_a_shorter_expiry_never_lengthens_the_rule() {
 }
 
 #[test]
+fn the_add_preview_never_uses_a_looser_profile_than_installs_may_run() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[(
+            crate::npm_firewall_config::LPM_AI_TELEMETRY_POLICY_KEY,
+            "allow",
+        )]);
+        let config = firewall_policy_global_config(
+            "enforce",
+            &[
+                (
+                    crate::npm_firewall_config::LPM_AI_CONFIRMED_MALWARE_POLICY_KEY,
+                    "allow",
+                ),
+                (
+                    crate::npm_firewall_config::LPM_AI_TELEMETRY_POLICY_KEY,
+                    "allow",
+                ),
+            ],
+        );
+        let effective = load_effective_authorized_posture().unwrap();
+
+        let profile =
+            crate::npm_firewall_config::preview_policy_profile(&config, &effective).unwrap();
+
+        assert_eq!(
+            profile.lpm_ai_confirmed_malware,
+            lpm_registry::client::NpmFirewallPolicyAction::Block
+        );
+        assert_eq!(
+            profile.lpm_ai_telemetry,
+            lpm_registry::client::NpmFirewallPolicyAction::Allow
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_bypass_entries_load_when_the_local_store_cannot_even_be_checked() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_managed_policy(temp.path(), "[firewall]\nbypass = [\"agent-tool@1.0.0\"]\n");
+        let effective = load_effective_authorized_posture().unwrap();
+        let security_dir = security_dir().unwrap();
+        std::fs::create_dir_all(&security_dir).unwrap();
+        std::fs::set_permissions(&security_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let rules =
+            crate::firewall_bypass::FirewallBypassRules::for_command(&effective, None, true);
+        let loaded = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (set, error) = rules.load().await;
+                (
+                    set.find(
+                        "agent-tool",
+                        "1.0.0",
+                        crate::firewall_bypass::BlockClass::Policy,
+                        Timestamp::now(),
+                    )
+                    .map(|rule| rule.source),
+                    error.is_some(),
+                )
+            });
+        std::fs::set_permissions(&security_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(loaded, (Some("managed"), true));
+    });
+}
+
+#[test]
+fn security_status_reports_managed_rules_in_the_bypass_list_shape() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_managed_policy(
+            temp.path(),
+            "[firewall]\nmode = \"enforce\"\nbypass = [\"agent-tool@1.0.0\"]\n",
+        );
+
+        let status = serde_json::to_value(load_security_status(None, true).unwrap()).unwrap();
+
+        assert_eq!(
+            status["firewall_bypass"]["managed_rules"][0],
+            serde_json::json!({
+                "spec": "agent-tool@1.0.0",
+                "covers_malware": false,
+                "source": "managed",
+            })
+        );
+    });
+}
+
+#[test]
 fn forced_floor_holds_an_approved_group_a_partial_table_leaves_out() {
     let temp = tempdir().unwrap();
     with_test_env(temp.path(), || {

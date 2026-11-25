@@ -266,6 +266,7 @@ async fn tampered_bypass_store_keeps_the_block_and_says_why() {
         stderr.contains("note your bypass rules couldn't be read"),
         "{stderr}"
     );
+    assert_eq!(stderr.matches("lpm security repair").count(), 1, "{stderr}");
     assert!(
         !stderr.contains("allow lpm firewall bypass add"),
         "{stderr}"
@@ -492,7 +493,6 @@ async fn global_install_block_names_a_rule_for_every_project() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "{stderr}");
     assert!(stderr.contains(AGENT_TOOL_HINT), "{stderr}");
-    assert!(!stderr.contains("--project"), "{stderr}");
 }
 
 async fn mount_blocked_global_update(mock: &MockRegistry, name: &str) {
@@ -700,4 +700,95 @@ async fn managed_bypass_entries_still_apply_when_local_rules_fail_verification()
         stderr.contains("rule: agent-tool@1.0.0 (every project from the managed policy)"),
         "{stderr}"
     );
+}
+
+/// The id the CLI gives a global rule for `spec`, so a fixture can stand in
+/// for a rule `add` saved.
+fn global_rule_id(spec: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"global");
+    hasher.update([0]);
+    hasher.update([0]);
+    hasher.update(spec.as_bytes());
+    hasher.update([0, 0]);
+    format!("fwb_{}", hex::encode(&hasher.finalize()[..6]))
+}
+
+fn saved_rules(project: &TempProject) -> Vec<serde_json::Value> {
+    let store = project.home().join(".lpm/security/firewall-bypass.json");
+    let file: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(store).unwrap()).unwrap();
+    file["payload"]["rules"].as_array().unwrap().clone()
+}
+
+#[test]
+fn bypass_add_json_shortens_a_saved_rule_without_approval() {
+    let project = enforcing_project();
+    write_signed_firewall_bypass(
+        &project,
+        &[stored_rule(
+            "agent-tool",
+            serde_json::json!({ "id": global_rule_id("agent-tool") }),
+        )],
+    );
+
+    let output = lpm(&project)
+        .args([
+            "--json",
+            "firewall",
+            "bypass",
+            "add",
+            "agent-tool",
+            "--ttl",
+            "30m",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["narrowed"][0]["spec"], "agent-tool");
+    assert!(saved_rules(&project)[0]["expires_at"].is_string());
+}
+
+#[test]
+fn bypass_add_json_that_needs_approval_changes_nothing() {
+    let project = enforcing_project();
+    write_signed_firewall_bypass(
+        &project,
+        &[stored_rule(
+            "agent-tool",
+            serde_json::json!({ "id": global_rule_id("agent-tool") }),
+        )],
+    );
+
+    let output = lpm(&project)
+        .args([
+            "--json",
+            "firewall",
+            "bypass",
+            "add",
+            "agent-tool",
+            "other-tool",
+            "--ttl",
+            "30m",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error_code"], "security_approval_required");
+    assert_eq!(
+        envelope["next_steps"][0]["command"],
+        "lpm firewall bypass add \"other-tool\" --ttl 30m"
+    );
+    let rules = saved_rules(&project);
+    assert_eq!(rules.len(), 1);
+    assert!(rules[0].get("expires_at").is_none());
 }

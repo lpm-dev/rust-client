@@ -154,8 +154,9 @@ fn split_spec(raw: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// The longest range a rule may hold, so the approval prompt names it whole.
-const MAX_RANGE_CHARS: usize = 80;
+/// The longest version or range a rule may hold, so the approval prompt
+/// names it whole.
+const MAX_VERSION_TEXT_CHARS: usize = 80;
 
 fn parse_versions(text: &str) -> Result<SpecVersions, String> {
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -170,12 +171,19 @@ fn parse_versions(text: &str) -> Result<SpecVersions, String> {
             "`{normalized}` has build metadata; name the version without it"
         ));
     }
+    if normalized.chars().count() > MAX_VERSION_TEXT_CHARS {
+        return Err(format!(
+            "the version or range is longer than {MAX_VERSION_TEXT_CHARS} characters; name a shorter one"
+        ));
+    }
     if let Some(version) = canonical_version(&normalized) {
         return Ok(SpecVersions::Exact(version));
     }
-    if let Some(bare) = normalized.strip_prefix(['=', 'v', 'V'])
-        && canonical_version(bare).is_some()
-    {
+    let bare = normalized
+        .strip_prefix('=')
+        .map_or(normalized.as_str(), str::trim_start);
+    let bare = bare.strip_prefix(['v', 'V']).unwrap_or(bare);
+    if bare != normalized && canonical_version(bare).is_some() {
         return Err(format!("write the exact version as `{bare}`"));
     }
     if normalized
@@ -185,11 +193,6 @@ fn parse_versions(text: &str) -> Result<SpecVersions, String> {
     {
         return Err(format!(
             "`{normalized}` looks like a dist-tag, which moves between versions; name an exact version or a range"
-        ));
-    }
-    if normalized.chars().count() > MAX_RANGE_CHARS {
-        return Err(format!(
-            "the range is longer than {MAX_RANGE_CHARS} characters; add a shorter range or exact versions"
         ));
     }
     let req = lpm_semver::StrictVersionReq::parse(&normalized)
@@ -425,7 +428,33 @@ pub(crate) fn project_policy_root(dir: &Path) -> Result<std::path::PathBuf, LpmE
     let root = lpm_workspace::find_workspace_root(package_root)
         .map_err(|error| LpmError::Workspace(error.to_string()))?
         .unwrap_or_else(|| package_root.to_path_buf());
-    Ok(std::fs::canonicalize(&root).unwrap_or(root))
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
+    if cfg!(windows)
+        && let Some(plain) = root.to_str().and_then(plain_drive_path)
+    {
+        return Ok(std::path::PathBuf::from(plain));
+    }
+    Ok(root)
+}
+
+/// A Windows verbatim path (`\\?\C:\work\app`) as people and shells write
+/// it (`C:\work\app`), when dropping the prefix keeps its meaning: a drive
+/// path with no `/`, no `.` or `..` component, and no component ending in a
+/// dot or space, which the plain form would rewrite.
+fn plain_drive_path(verbatim: &str) -> Option<&str> {
+    let rest = verbatim.strip_prefix(r"\\?\")?;
+    let path = match rest.as_bytes() {
+        [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic() => &rest[3..],
+        _ => return None,
+    };
+    let unchanged_by_win32 = !path.contains('/')
+        && path
+            .split('\\')
+            .filter(|part| !part.is_empty())
+            .all(|part| {
+                part != "." && part != ".." && !part.ends_with('.') && !part.ends_with(' ')
+            });
+    unchanged_by_win32.then_some(rest)
 }
 
 /// [`project_policy_root`] as the text a project rule stores. A root that
@@ -699,14 +728,16 @@ impl FirewallBypassRules {
         effective: &crate::security_approval::EffectiveAuthorizedPosture,
         policy_dir: Option<&Path>,
         additions_allowed: bool,
-    ) -> Result<Self, LpmError> {
+    ) -> Self {
         let local_rules_apply =
             crate::security_approval::local_firewall_bypass_inactive_reason(effective).is_none();
-        Ok(Self::from_inner(FirewallBypassRulesInner {
+        Self::from_inner(FirewallBypassRulesInner {
             managed: effective.managed_firewall_bypass.clone(),
             local_rules_apply,
+            // A store that can't even be checked is read later, on a block,
+            // where its error is reported and managed rules still apply.
             local_rules_stored: local_rules_apply
-                && crate::security_approval::firewall_bypass_file_exists()?,
+                && crate::security_approval::firewall_bypass_file_exists().unwrap_or(true),
             additions_allowed: local_rules_apply && additions_allowed,
             policy_dir: policy_dir.map(Path::to_path_buf),
             managed_policy_path: effective
@@ -714,7 +745,7 @@ impl FirewallBypassRules {
                 .as_ref()
                 .map(|policy| policy.path.clone()),
             loaded: std::sync::OnceLock::new(),
-        }))
+        })
     }
 
     /// Rules already in memory, as tests that don't touch the signed store
@@ -870,18 +901,33 @@ pub(crate) fn rule_json(
     })
 }
 
+/// A managed policy's rule as `lpm firewall bypass list --json` and
+/// `lpm security status` report it.
+pub(crate) fn managed_rule_json(
+    rule: &crate::security_approval::ManagedFirewallBypass,
+) -> serde_json::Value {
+    serde_json::json!({
+        "spec": rule.spec,
+        "covers_malware": rule.covers_malware,
+        "source": "managed",
+    })
+}
+
+/// Serializes managed rules as [`managed_rule_json`] reports them.
+pub(crate) fn serialize_managed_rules<S: serde::Serializer>(
+    rules: &[crate::security_approval::ManagedFirewallBypass],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(rules.iter().map(managed_rule_json))
+}
+
 /// Serializes local rules as [`rule_json`] reports them.
 pub(crate) fn serialize_rules<S: serde::Serializer>(
     rules: &[FirewallBypassRule],
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
-    use serde::ser::SerializeSeq;
     let now = Timestamp::now();
-    let mut seq = serializer.serialize_seq(Some(rules.len()))?;
-    for rule in rules {
-        seq.serialize_element(&rule_json(rule, "local", now))?;
-    }
-    seq.end()
+    serializer.collect_seq(rules.iter().map(|rule| rule_json(rule, "local", now)))
 }
 
 #[cfg(test)]
@@ -934,6 +980,12 @@ mod tests {
             ("foldrun@=1.2.3", "write the exact version as `1.2.3`"),
             ("foldrun@v1.2.3", "write the exact version as `1.2.3`"),
             ("foldrun@vnext", "dist-tag"),
+            ("foldrun@= 1.2.3", "write the exact version as `1.2.3`"),
+            ("foldrun@=v1.2.3", "write the exact version as `1.2.3`"),
+            (
+                "foldrun@1.0.0-a-prerelease-label-long-enough-to-crowd-the-approval-prompt-right-out-of-view",
+                "longer than 80",
+            ),
             (
                 "foldrun@>=0.0.0-this-range-is-long-enough-to-crowd-out-the-rest-of-the-approval-prompt-text",
                 "longer than 80",
@@ -1045,6 +1097,22 @@ mod tests {
             )
             .id
         );
+    }
+
+    #[test]
+    fn a_verbatim_drive_path_loses_its_prefix_only_where_that_keeps_its_meaning() {
+        assert_eq!(plain_drive_path(r"\\?\C:\work\app"), Some(r"C:\work\app"));
+        assert_eq!(plain_drive_path(r"\\?\C:\"), Some(r"C:\"));
+        for verbatim in [
+            r"\\?\UNC\server\share\app",
+            r"\\?\C:\work\app.",
+            r"\\?\C:\work\..\app",
+            r"\\?\C:\work/app",
+            r"\\?\C",
+            r"C:\work\app",
+        ] {
+            assert_eq!(plain_drive_path(verbatim), None, "{verbatim}");
+        }
     }
 
     #[test]

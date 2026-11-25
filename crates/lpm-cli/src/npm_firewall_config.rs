@@ -558,6 +558,20 @@ fn enforced_rank(mode: NpmFirewallMode, action: NpmFirewallPolicyAction) -> u8 {
     }
 }
 
+/// The profile `lpm firewall bypass add` previews a version with: what
+/// installs run, but never looser than the approved profile, since installs
+/// refuse an unapproved looser table and the preview must not hide a block.
+pub(crate) fn preview_policy_profile(
+    global: &GlobalConfig,
+    effective: &crate::security_approval::EffectiveAuthorizedPosture,
+) -> Result<NpmFirewallPolicyProfile, LpmError> {
+    let runtime = runtime_policy_profile(runtime_policy_request(global, effective)?, effective);
+    Ok(stricter_policy_profile(
+        &runtime,
+        &effective.posture.firewall_policy_profile(),
+    ))
+}
+
 /// The modes a requested profile and the approved one are compared at. A
 /// managed profile binds whenever the firewall runs, so both sides use the
 /// requested mode. When the mode itself loosens, that is the mode check's to
@@ -750,7 +764,7 @@ pub(crate) fn resolve_runtime_firewall(
             &effective,
             policy_dir,
             !crate::firewall_bypass::forced_floor_refuses_additions(global, &effective)?,
-        )?
+        )
     } else {
         crate::firewall_bypass::FirewallBypassRules::none()
     };

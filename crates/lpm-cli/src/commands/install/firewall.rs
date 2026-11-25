@@ -1954,7 +1954,9 @@ pub(super) fn finish_npm_firewall_preflight(
         .as_ref()
         .filter(|_| some_rule_could_lift)
         .map(|error| {
-            format!("your bypass rules couldn't be read: {error}; run `lpm security repair`")
+            // The store's error already names its remedy: repair, or update
+            // LPM CLI for a newer file.
+            format!("your bypass rules couldn't be read: {error}")
         })
         .or_else(|| {
             (some_rule_could_lift && !stats.local_bypass_available).then(|| {

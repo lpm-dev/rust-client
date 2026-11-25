@@ -48,7 +48,7 @@ pub enum BypassCmd {
         #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = ".")]
         project: Option<PathBuf>,
 
-        /// Remove the rule after this long (`30m`, `12h`, `30d`).
+        /// Stop applying the rule after this long (`30m`, `12h`, `30d`).
         #[arg(long, value_name = "DURATION")]
         ttl: Option<String>,
 
@@ -213,7 +213,7 @@ enum Preview {
 
 async fn preview_exact_specs(
     client: &RegistryClient,
-    specs: &[FirewallBypassSpec],
+    specs: &[&FirewallBypassSpec],
     profile: lpm_registry::client::NpmFirewallPolicyProfile,
 ) -> HashMap<String, Preview> {
     let packages: Vec<NpmFirewallBatchPackage> = specs
@@ -241,18 +241,40 @@ async fn preview_exact_specs(
         .await
     {
         Ok(response) => {
-            let unnamed_blocks = response.summary.block
-                > response
-                    .decisions
-                    .iter()
-                    .filter(|decision| decision.action == NpmFirewallAction::Block)
-                    .count() as u64;
-            let mut blocked: HashMap<(String, String), NpmFirewallDecision> = response
-                .decisions
-                .into_iter()
-                .filter(|decision| decision.action == NpmFirewallAction::Block)
-                .map(|decision| ((decision.name.clone(), decision.version.clone()), decision))
+            // As installs count them: a block row for a version this preview
+            // didn't ask about, or a second row for one it did, names nothing
+            // and leaves every unblocked answer unconfirmed.
+            let requested: std::collections::HashSet<(&str, &str)> = packages
+                .iter()
+                .map(|package| (package.name.as_str(), package.version.as_str()))
                 .collect();
+            let summary_blocks = response.summary.block;
+            let mut block_rows: u64 = 0;
+            let mut blocked: HashMap<(String, String), NpmFirewallDecision> =
+                HashMap::with_capacity(packages.len());
+            for decision in response.decisions {
+                if decision.action != NpmFirewallAction::Block {
+                    continue;
+                }
+                block_rows += 1;
+                if !requested.contains(&(decision.name.as_str(), decision.version.as_str())) {
+                    continue;
+                }
+                let key = (decision.name.clone(), decision.version.clone());
+                match blocked.entry(key) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(decision);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut slot) => {
+                        if block_class_of(&decision).lift_difficulty()
+                            > block_class_of(slot.get()).lift_difficulty()
+                        {
+                            slot.insert(decision);
+                        }
+                    }
+                }
+            }
+            let unnamed_blocks = summary_blocks.max(block_rows) > blocked.len() as u64;
             for package in packages {
                 let key = (package.name, package.version);
                 let preview = match blocked.remove(&key) {
@@ -289,7 +311,7 @@ fn block_class_of(decision: &NpmFirewallDecision) -> BlockClass {
 /// `--allow-malware` for anything but a version LPM Firewall currently
 /// blocks as malware.
 fn check_previews(
-    specs: &[FirewallBypassSpec],
+    specs: &[&FirewallBypassSpec],
     previews: &HashMap<String, Preview>,
     allow_malware: bool,
 ) -> Result<(), LpmError> {
@@ -454,7 +476,7 @@ fn approval_batches<'a>(
 }
 
 fn print_add_request(
-    specs: &[FirewallBypassSpec],
+    specs: &[&FirewallBypassSpec],
     previews: &HashMap<String, Preview>,
     scope: &RuleScope,
 ) {
@@ -539,9 +561,12 @@ async fn add(
     if request.allow_malware
         && let Some(spec) = specs.iter().find(|spec| spec.kind() != BypassKind::Exact)
     {
-        return Err(LpmError::InvalidPackageName(format!(
-            "`--allow-malware` applies only to exact versions such as `name@1.2.3`; `{spec}` names more"
-        )));
+        return Err(refuse_add(
+            &specs,
+            LpmError::InvalidPackageName(format!(
+                "`--allow-malware` applies only to exact versions such as `name@1.2.3`; `{spec}` names more"
+            )),
+        ));
     }
     let ttl_secs = parse_ttl(request.ttl)?;
     let now = Timestamp::now();
@@ -561,21 +586,6 @@ async fn add(
         ));
     }
 
-    let previews = if json_output {
-        HashMap::new()
-    } else {
-        let profile = crate::npm_firewall_config::runtime_policy_profile(
-            crate::npm_firewall_config::config_policy_request(&global)?,
-            &effective,
-        );
-        let previews = preview_exact_specs(client, &specs, profile).await;
-        if let Err(error) = check_previews(&specs, &previews, request.allow_malware) {
-            return Err(refuse_add(&specs, error));
-        }
-        print_add_request(&specs, &previews, &scope);
-        previews
-    };
-
     let rules: Vec<FirewallBypassRule> = specs
         .iter()
         .map(|spec| {
@@ -590,7 +600,6 @@ async fn add(
             rule.reason = request
                 .reason
                 .map(|reason| lpm_common::sanitize_server_text(reason, 200));
-            rule.added_verdict = added_verdict(previews.get(&spec.to_string()));
             rule
         })
         .collect();
@@ -601,15 +610,12 @@ async fn add(
         rules_total: sorted.rules_total,
         ..security_approval::FirewallBypassAdded::default()
     };
-    let mut needs_approval = sorted.needs_approval;
-    if !sorted.narrowed.is_empty() {
-        let mut narrowed =
-            security_approval::save_narrowed_firewall_bypass_rules(&sorted.narrowed)?;
-        needs_approval.append(&mut narrowed.needs_approval);
-        outcome.absorb(narrowed);
-    }
 
-    let mut pending: HashMap<String, FirewallBypassRule> = needs_approval
+    // Only rules that add or extend what LPM Firewall lets through are
+    // previewed and approved; a narrowing is saved once they are, so a
+    // refused or declined `add` changes nothing.
+    let mut pending: HashMap<String, FirewallBypassRule> = sorted
+        .needs_approval
         .into_iter()
         .map(|rule| (rule.spec.clone(), rule))
         .collect();
@@ -617,33 +623,73 @@ async fn add(
         .iter()
         .filter(|spec| pending.contains_key(&spec.to_string()))
         .collect();
-    let command_hint = add_command_hint(&pending_specs, &scope, ttl_secs, request.allow_malware);
-    let prompt_for = |batch: &[&FirewallBypassSpec]| {
-        approval_prompt(batch, &scope, ttl_secs, request.allow_malware)
-    };
-    for batch in approval_batches(&pending_specs, prompt_for) {
-        let rules = batch
-            .iter()
-            .filter_map(|spec| pending.remove(&spec.to_string()))
-            .collect();
-        let prompt = prompt_for(&batch);
-        let added = security_approval::add_firewall_bypass_rules(
-            security_approval::FirewallBypassApproval {
-                rules,
-                prompt: &prompt,
-                command_hint: command_hint.as_deref(),
-                json_output,
-            },
-        );
-        match added {
-            Ok(batch_outcome) => outcome.absorb(batch_outcome),
-            Err(error) => {
-                if !json_output {
-                    report_added(&outcome, &scope);
-                }
-                return Err(error);
-            }
+    if !json_output && !pending_specs.is_empty() {
+        let profile = crate::npm_firewall_config::preview_policy_profile(&global, &effective)?;
+        let previews = preview_exact_specs(client, &pending_specs, profile).await;
+        if let Err(error) = check_previews(&pending_specs, &previews, request.allow_malware) {
+            return Err(refuse_add(&specs, error));
         }
+        print_add_request(&pending_specs, &previews, &scope);
+        for (spec, rule) in &mut pending {
+            rule.added_verdict = added_verdict(previews.get(spec));
+        }
+    }
+
+    let approve = |outcome: &mut security_approval::FirewallBypassAdded,
+                   specs_to_approve: &[&FirewallBypassSpec],
+                   pending: &mut HashMap<String, FirewallBypassRule>|
+     -> Result<(), LpmError> {
+        let prompt_for = |batch: &[&FirewallBypassSpec]| {
+            approval_prompt(batch, &scope, ttl_secs, request.allow_malware)
+        };
+        let batches = approval_batches(specs_to_approve, prompt_for);
+        for (index, batch) in batches.iter().enumerate() {
+            let remaining: Vec<&FirewallBypassSpec> =
+                batches[index..].iter().flatten().copied().collect();
+            let command_hint =
+                add_command_hint(&remaining, &scope, ttl_secs, request.allow_malware);
+            let prompt = prompt_for(batch);
+            let rules = batch
+                .iter()
+                .filter_map(|spec| pending.remove(&spec.to_string()))
+                .collect();
+            let batch_outcome = security_approval::add_firewall_bypass_rules(
+                security_approval::FirewallBypassApproval {
+                    rules,
+                    prompt: &prompt,
+                    command_hint: command_hint.as_deref(),
+                    json_output,
+                },
+            )?;
+            outcome.absorb(batch_outcome);
+        }
+        Ok(())
+    };
+    let approved = approve(&mut outcome, &pending_specs, &mut pending).and_then(|()| {
+        if sorted.narrowed.is_empty() {
+            return Ok(());
+        }
+        let mut narrowed =
+            security_approval::save_narrowed_firewall_bypass_rules(&sorted.narrowed)?;
+        // A rule removed or shortened since it was judged a narrowing now adds
+        // or extends one, so it needs approval like any other.
+        let mut raced: HashMap<String, FirewallBypassRule> =
+            std::mem::take(&mut narrowed.needs_approval)
+                .into_iter()
+                .map(|rule| (rule.spec.clone(), rule))
+                .collect();
+        outcome.absorb(narrowed);
+        let raced_specs: Vec<&FirewallBypassSpec> = specs
+            .iter()
+            .filter(|spec| raced.contains_key(&spec.to_string()))
+            .collect();
+        approve(&mut outcome, &raced_specs, &mut raced)
+    });
+    if let Err(error) = approved {
+        if !json_output {
+            report_added(&outcome, &scope);
+        }
+        return Err(error);
     }
 
     if json_output {
@@ -751,11 +797,7 @@ fn list(
             "managed_rules": effective
                 .managed_firewall_bypass
                 .iter()
-                .map(|rule| serde_json::json!({
-                    "spec": rule.spec,
-                    "covers_malware": rule.covers_malware,
-                    "source": "managed",
-                }))
+                .map(crate::firewall_bypass::managed_rule_json)
                 .collect::<Vec<_>>(),
             "count": rules.len(),
         }));
@@ -825,22 +867,20 @@ fn remove(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let scope = RuleScope::resolve(cwd, project)?;
+    // A rule id is itself a valid package name, so every target parses as a
+    // spec and also matches a rule by id.
     let mut selectors = Vec::with_capacity(targets.len());
     for target in targets {
-        let spec = match FirewallBypassSpec::parse(target) {
-            Ok(spec) => Some(spec.to_string()),
-            Err(_) if is_rule_id(target) => None,
-            Err(error) => {
-                return Err(LpmError::InvalidPackageName(format!(
-                    "`{}`: {error}",
-                    lpm_common::sanitize_server_text(target, 120)
-                )));
-            }
-        };
-        selectors.push((target, spec));
+        let spec = FirewallBypassSpec::parse(target).map_err(|error| {
+            LpmError::InvalidPackageName(format!(
+                "`{}`: {error}",
+                lpm_common::sanitize_server_text(target, 120)
+            ))
+        })?;
+        selectors.push((target, spec.to_string()));
     }
-    let selects = |rule: &FirewallBypassRule, (target, spec): &(&String, Option<String>)| {
-        rule.id == **target || (scope.holds(rule) && spec.as_deref() == Some(rule.spec.as_str()))
+    let selects = |rule: &FirewallBypassRule, (target, spec): &(&String, String)| {
+        rule.id == **target || (scope.holds(rule) && *spec == rule.spec)
     };
     let (removed, rules_total) = security_approval::remove_firewall_bypass_rules(
         |rule| selectors.iter().any(|selector| selects(rule, selector)),
@@ -853,13 +893,6 @@ fn remove(
         .collect();
     report_removed(&removed, &not_found, rules_total, json_output);
     Ok(())
-}
-
-/// `fwb_` and twelve lowercase hex digits, as [`FirewallBypassRule`] ids are.
-fn is_rule_id(target: &str) -> bool {
-    target.strip_prefix("fwb_").is_some_and(|hex| {
-        hex.len() == 12 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    })
 }
 
 fn clear(
@@ -1108,10 +1141,11 @@ mod tests {
             blocked("lpm_ai_confirmed_malware", "malicious"),
         )]);
 
-        let error = check_previews(&specs(&["foldrun@32.8.2"]), &previews, false).unwrap_err();
+        let error =
+            check_previews(&refs(&specs(&["foldrun@32.8.2"])), &previews, false).unwrap_err();
 
         assert!(error.to_string().contains("--allow-malware"), "{error}");
-        assert!(check_previews(&specs(&["foldrun@32.8.2"]), &previews, true).is_ok());
+        assert!(check_previews(&refs(&specs(&["foldrun@32.8.2"])), &previews, true).is_ok());
     }
 
     #[test]
@@ -1121,8 +1155,8 @@ mod tests {
             blocked("lpm_ai_agent_control_surface", "suspicious"),
         )]);
 
-        assert!(check_previews(&specs(&["foldrun@32.8.2"]), &previews, true).is_err());
-        assert!(check_previews(&specs(&["foldrun@32.8.2"]), &previews, false).is_ok());
+        assert!(check_previews(&refs(&specs(&["foldrun@32.8.2"])), &previews, true).is_err());
+        assert!(check_previews(&refs(&specs(&["foldrun@32.8.2"])), &previews, false).is_ok());
     }
 
     #[test]
@@ -1132,7 +1166,8 @@ mod tests {
             Preview::Unavailable("offline".into()),
         )]);
 
-        let error = check_previews(&specs(&["foldrun@32.8.2"]), &previews, true).unwrap_err();
+        let error =
+            check_previews(&refs(&specs(&["foldrun@32.8.2"])), &previews, true).unwrap_err();
 
         assert!(error.to_string().contains("couldn't check"), "{error}");
     }
@@ -1146,7 +1181,8 @@ mod tests {
 
         for allow_malware in [false, true] {
             let error =
-                check_previews(&specs(&["foldrun@32.8.2"]), &previews, allow_malware).unwrap_err();
+                check_previews(&refs(&specs(&["foldrun@32.8.2"])), &previews, allow_malware)
+                    .unwrap_err();
             assert!(error.to_string().contains("held for LPM review"), "{error}");
         }
     }
@@ -1182,19 +1218,6 @@ mod tests {
             add_command_hint(&refs(&specs(&["bang!tool@1.0.0"])), &global(), None, false),
             None
         );
-    }
-
-    #[test]
-    fn rule_ids_are_recognised_only_in_their_exact_form() {
-        assert!(is_rule_id("fwb_0123456789ab"));
-        for target in [
-            "fwb_utils",
-            "fwb_0123456789AB",
-            "fwb_0123456789abc",
-            "foldrun",
-        ] {
-            assert!(!is_rule_id(target), "{target}");
-        }
     }
 
     #[test]
