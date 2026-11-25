@@ -5,6 +5,11 @@
 # the Sigstore attestation that ships next to them.
 crates/lpm-cli/tests/fixtures/release_manifests/*-SHA256SUMS.txt -text
 
+# Sigstore's trust root and TUF metadata are checked against the lengths and
+# hashes Sigstore signed, so a CRLF checkout must not rewrite them.
+crates/lpm-cli/assets/sigstore_*.json -text
+crates/lpm-cli/tests/fixtures/sigstore_tuf/*.json -text
+
 # Lifecycle-script fixtures are the exact script bytes the static gate
 # classifies; a CRLF checkout would hand it a `\r` no package.json string has.
 crates/lpm-security/tests/fixtures/postinstall-scripts/scripts/*.txt -text
