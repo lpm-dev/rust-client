@@ -14,6 +14,7 @@ interface SkillListItemProps {
 
 function badgeClass(skill: Skill): string {
   if (skill.category === 'package') return `${styles.badge} ${styles.badgePackage}`;
+  if (skill.category === 'dependency') return `${styles.badge} ${styles.badgeDependency}`;
   if (skill.category === 'external') return `${styles.badge} ${styles.badgeExternal}`;
   return styles.badge;
 }

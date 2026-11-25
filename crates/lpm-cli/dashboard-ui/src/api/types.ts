@@ -1,6 +1,6 @@
 export type SkillId = string;
 
-export type SkillCategory = 'managed' | 'package' | 'external';
+export type SkillCategory = 'managed' | 'package' | 'dependency' | 'external';
 export type SkillScope = 'global' | 'project';
 export type SkillState = 'enabled' | 'disabled' | 'mixed' | 'unavailable';
 export type SkillAction = 'enable' | 'disable' | 'update' | 'remove';

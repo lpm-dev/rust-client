@@ -91,20 +91,32 @@ fn config_lpm_skills_set_false_persists_boolean_and_migrates_legacy_key() {
         )
     });
     assert_eq!(
-        envelope["auto-install-lpm-skills"],
+        envelope["skills.lpm-dev-packages"],
         serde_json::json!(false)
+    );
+    assert_eq!(
+        envelope["auto-install-lpm-skills"],
+        serde_json::json!(false),
+        "the envelope keeps the key earlier releases printed"
     );
     insta::assert_json_snapshot!(envelope, @r###"
     {
       "success": true,
+      "skills.lpm-dev-packages": false,
       "auto-install-lpm-skills": false
     }
     "###);
 
     let content = std::fs::read_to_string(config_path(&project)).expect("config file must exist");
+    let written: toml::Value = toml::from_str(&content).unwrap();
+    assert_eq!(
+        written["skills"]["lpm-dev-packages"].as_bool(),
+        Some(false),
+        "wizard must persist a native TOML boolean under [skills], got:\n{content}"
+    );
     assert!(
-        content.contains("auto-install-lpm-skills = false"),
-        "wizard must persist a native TOML boolean, got:\n{content}"
+        !content.contains("auto-install-lpm-skills"),
+        "wizard must replace the legacy key, got:\n{content}"
     );
     assert!(
         content.contains("registry = \"https://registry.example.test\""),
@@ -114,6 +126,73 @@ fn config_lpm_skills_set_false_persists_boolean_and_migrates_legacy_key() {
         !content.contains("noSkills"),
         "wizard must remove the migrated legacy key, got:\n{content}"
     );
+}
+
+#[test]
+fn the_legacy_lpm_skills_key_reads_and_deletes_the_setting_that_replaced_it() {
+    let project = TempProject::empty(r#"{"name":"config-lpm-skills","version":"1.0.0"}"#);
+    let run = |args: &[&str]| -> serde_json::Value {
+        let output = lpm(&project).arg("--json").args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+
+    run(&["config", "set", "auto-install-lpm-skills", "false"]);
+    let read = run(&["config", "get", "auto-install-lpm-skills"]);
+    assert_eq!(read["found"], serde_json::json!(true), "{read:#}");
+    assert_eq!(read["value"], serde_json::json!(false), "{read:#}");
+
+    let deleted = run(&["config", "delete", "auto-install-lpm-skills"]);
+    assert_eq!(deleted["existed"], serde_json::json!(true), "{deleted:#}");
+    let config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(config_path(&project)).unwrap()).unwrap();
+    assert!(
+        config
+            .get("skills")
+            .and_then(|skills| skills.get("lpm-dev-packages"))
+            .is_none(),
+        "{config:#?}"
+    );
+
+    seed_config(
+        &project,
+        "noSkills = true\n[skills]\nlpm-dev-packages = false\n",
+    );
+    run(&["config", "delete", "skills.lpm-dev-packages"]);
+    let content = std::fs::read_to_string(config_path(&project)).unwrap();
+    assert!(
+        !content.contains("noSkills"),
+        "deleting the setting must not leave an older key deciding it:\n{content}"
+    );
+}
+
+#[test]
+fn config_set_refuses_to_replace_the_skills_section_with_one_value() {
+    let project = TempProject::empty(r#"{"name":"config-lpm-skills","version":"1.0.0"}"#);
+    seed_config(&project, "[skills]\nother-packages = true\n");
+
+    let output = lpm(&project)
+        .args(["config", "set", "skills", "false"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "a scalar must not replace [skills]"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("skills.other-packages"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(config_path(&project)).unwrap()).unwrap();
+    assert_eq!(config["skills"]["other-packages"].as_bool(), Some(true));
 }
 
 #[test]
@@ -1126,15 +1205,13 @@ fn config_mutations_wait_for_one_shared_transaction_lock_and_preserve_prior_upda
         let mut child = command.spawn().expect("spawn config mutation");
 
         wait_for_lock_contention(&mut child, &marker_path, &lock_path);
-        let mut config = std::fs::OpenOptions::new()
-            .append(true)
-            .open(config_path(&project))
-            .expect("open config as the active transaction owner");
-        std::io::Write::write_all(
-            &mut config,
-            format!("lock-holder-update-{index} = true\n").as_bytes(),
+        let current = std::fs::read_to_string(config_path(&project))
+            .expect("read config as the active transaction owner");
+        std::fs::write(
+            config_path(&project),
+            format!("lock-holder-update-{index} = true\n{current}"),
         )
-        .expect("append a concurrent config transaction update");
+        .expect("write a concurrent config transaction update as a top-level key");
         drop(transaction_lock);
 
         let output = child.wait_with_output().expect("finish config mutation");
@@ -1153,7 +1230,8 @@ fn config_mutations_wait_for_one_shared_transaction_lock_and_preserve_prior_upda
         config["minimum-release-age-exclude"],
         toml::Value::Array(vec![toml::Value::String("react".to_string())])
     );
-    assert_eq!(config["auto-install-lpm-skills"].as_bool(), Some(false));
+    assert_eq!(config["skills"]["lpm-dev-packages"].as_bool(), Some(false));
+    assert!(config.get("auto-install-lpm-skills").is_none());
     assert!(config.get("registry").is_none());
     for index in 0..4 {
         assert_eq!(
@@ -1231,7 +1309,8 @@ fn config_list_json_reports_every_known_effective_key() {
             "engine-strict",
             "strict-peer-dependencies",
             "auto-install-peers",
-            "auto-install-lpm-skills",
+            "skills.lpm-dev-packages",
+            "skills.other-packages",
             "audit-after-install",
             "linker",
             "workspace-concurrency",

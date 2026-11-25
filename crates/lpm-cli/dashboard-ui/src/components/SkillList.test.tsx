@@ -88,3 +88,20 @@ it('filter controls render a sized search icon and inset sort chevron', () => {
   expect(markup).toContain('height="20"');
   expect(markup).toContain('data-ui-icon="sort-chevron"');
 });
+
+it('a dependency skill row is badged as a dependency', () => {
+  const skill: Skill = {
+    ...externalSkill(),
+    id: 'dependency:browser-tool',
+    name: 'browser-tool',
+    namespace: 'browser-tool',
+    category: 'dependency',
+  };
+
+  const markup = renderToStaticMarkup(
+    <SkillListItem skill={skill} selected={false} tabbable={false} onSelect={() => {}} />,
+  );
+
+  expect(markup).toContain('badgeDependency');
+  expect(markup).toContain('>dependency<');
+});

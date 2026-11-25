@@ -12,7 +12,9 @@
 
 mod apply;
 mod discovery;
+mod edit;
 mod git_exclude;
+mod inspect;
 mod links;
 mod plan;
 mod policy;
@@ -23,8 +25,19 @@ mod tests;
 
 pub(crate) use apply::{ReconcileReport, SkillChange};
 pub(crate) use discovery::skill_directory_names;
+pub(crate) use edit::{ManifestEdit, PolicyList};
+pub(crate) use inspect::{
+    InspectedSkill, Inspection, PlannedChange, SkillStatus, drift, inspect_project,
+};
+pub(crate) use plan::read_manifest;
+#[cfg(test)]
+pub(crate) use plan::{HoldReason, Naming, SkillDetails};
+pub(crate) use plan::{InstanceRuling, may_match_any};
+pub(crate) use policy::validate_selector;
+pub(crate) use state::{LinkKind, LinkedSkillRecord};
 
 use crate::lpm_skills_config::LpmSkillsPreference;
+use cap_fs_ext::DirExt as _;
 use lpm_common::LpmError;
 use sha2::{Digest as _, Sha256};
 use std::io::Read as _;
@@ -200,6 +213,217 @@ fn still_blocked(project_dir: &Path, skill: &str, path: &str) -> bool {
     }
 }
 
+/// The absolute paths of the target entries LPM linked dependency skills
+/// at, so inventories of agent folders don't count them as unmanaged.
+pub(crate) fn linked_entry_paths(project_dir: &Path) -> Vec<std::path::PathBuf> {
+    match state::read_state(project_dir) {
+        state::StoredState::Present(recorded) => recorded
+            .skills
+            .values()
+            .flat_map(|record| record.links.iter())
+            .map(|link| links::project_path(project_dir, &link.path))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A dependency skill LPM linked, read back from its copy.
+pub(crate) struct LinkedSkillDetails {
+    pub(crate) name: String,
+    pub(crate) record: LinkedSkillRecord,
+    pub(crate) copy: std::path::PathBuf,
+    /// The copy checked again as installs check skills; `None` when it
+    /// can't be read, no longer passes, or no longer holds the bytes LPM
+    /// linked.
+    pub(crate) checked: Option<lpm_skill::CheckedSkill>,
+    /// Each recorded entry, with whether it is still LPM's and still shows
+    /// the copy.
+    pub(crate) links: Vec<(state::LinkRecord, bool)>,
+}
+
+impl LinkedSkillDetails {
+    /// The copy holds what LPM linked and every entry still shows it.
+    pub(crate) fn healthy(&self) -> bool {
+        self.checked.is_some() && self.links.iter().all(|(_, intact)| *intact)
+    }
+}
+
+/// Every dependency skill LPM linked in the project, each copy checked
+/// again with the strict rules installs apply.
+pub(crate) fn linked_skill_details(project_dir: &Path) -> Vec<LinkedSkillDetails> {
+    let state::StoredState::Present(recorded) = state::read_state(project_dir) else {
+        return Vec::new();
+    };
+    let root = state::open_root(project_dir).ok().flatten();
+    let mut directories: std::collections::BTreeMap<String, Option<links::TargetDir>> =
+        std::collections::BTreeMap::new();
+    recorded
+        .skills
+        .into_iter()
+        .map(|(name, record)| {
+            let checked = root
+                .as_ref()
+                .and_then(|root| root.open_dir_nofollow(&name).ok())
+                .and_then(|copy| discovery::read_skill_tree(&copy).ok())
+                .and_then(|entries| lpm_skill::check_skill_directory(&name, &entries).ok())
+                .filter(|checked| checked.digest == record.digest);
+            let links = record
+                .links
+                .iter()
+                .map(|link| {
+                    let intact = link.path.rsplit_once('/').is_some_and(|(target, _)| {
+                        directories
+                            .entry(target.to_string())
+                            .or_insert_with(|| {
+                                links::TargetDir::open(project_dir, target).ok().flatten()
+                            })
+                            .as_ref()
+                            .is_some_and(|directory| {
+                                directory
+                                    .inspect(project_dir, &name)
+                                    .is_intact(link.kind, &record.digest)
+                            })
+                    });
+                    (link.clone(), intact)
+                })
+                .collect();
+            LinkedSkillDetails {
+                copy: state::snapshot_dir(project_dir, &name),
+                name,
+                record,
+                checked,
+                links,
+            }
+        })
+        .collect()
+}
+
+/// The dependency skill LPM linked at `path`, an entry in one of the
+/// project's targets: its name and package.
+pub(crate) fn linked_entry_owner(project_dir: &Path, path: &Path) -> Option<(String, String)> {
+    let state::StoredState::Present(recorded) = state::read_state(project_dir) else {
+        return None;
+    };
+    recorded.skills.into_iter().find_map(|(skill, record)| {
+        record
+            .links
+            .iter()
+            .any(|link| links::project_path(project_dir, &link.path) == path)
+            .then_some((skill, record.package))
+    })
+}
+
+/// Every dependency skill LPM linked in the project.
+pub(crate) fn linked_skills(project_dir: &Path) -> Vec<(String, LinkedSkillRecord)> {
+    match state::read_state(project_dir) {
+        state::StoredState::Present(recorded) => recorded.skills.into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Points out the skills that `packages`, just installed into
+/// `project_dir` by name, ship and the project could link but doesn't, with
+/// the entries that link them. Prints nothing when the run skips skill work
+/// or the user turned these skills off, and reads nothing more when none of
+/// `packages` ships a skill.
+pub(crate) fn print_unlinked_skill_hints(
+    project_dir: &Path,
+    packages: &[&str],
+    preference: LpmSkillsPreference,
+) {
+    let Ok(Some(settings)) = Settings::resolve(preference) else {
+        return;
+    };
+    if !settings.other_packages {
+        return;
+    }
+    let shipping: std::collections::HashSet<String> = packages
+        .iter()
+        .filter(|package| ships_skills(project_dir, package))
+        .map(|package| (*package).to_string())
+        .collect();
+    if shipping.is_empty() {
+        return;
+    }
+    let root = skills_root(project_dir);
+    let Ok(manifest) = plan::read_manifest(&root) else {
+        return;
+    };
+    let Ok(inspection) = inspect::inspect_packages(&root, &manifest, settings, &shipping) else {
+        return;
+    };
+    for hint in unlinked_skill_hints(packages, &inspection.skills) {
+        crate::output::info(&lpm_common::sanitize_terminal_inline(&hint));
+    }
+}
+
+/// Whether the package installed at `node_modules/<package>` ships a skill.
+fn ships_skills(project_dir: &Path, package: &str) -> bool {
+    let mut path = project_dir.join("node_modules");
+    path.extend(package.split('/'));
+    cap_std::fs::Dir::open_ambient_dir(&path, cap_std::ambient_authority())
+        .ok()
+        .and_then(|directory| skill_directory_names(&directory).ok())
+        .is_some_and(|names| !names.is_empty())
+}
+
+/// One line per package of `packages` naming the skills it ships that the
+/// policy doesn't allow yet and nothing keeps from linking, with the
+/// narrowest entries that link them. Denied skills, skills that could never
+/// link and skills the policy already allows are left out.
+fn unlinked_skill_hints(packages: &[&str], skills: &[inspect::InspectedSkill]) -> Vec<String> {
+    let mut hints = Vec::new();
+    for package in packages {
+        let mut names: Vec<&str> = Vec::new();
+        let mut selectors: Vec<&str> = Vec::new();
+        for skill in skills.iter().filter(|skill| {
+            skill.package == *package
+                && skill.status == inspect::SkillStatus::NotAllowed
+                && skill.blocker.is_none()
+        }) {
+            let Some(details) = skill.details.as_ref() else {
+                continue;
+            };
+            if !names.contains(&skill.skill.as_str()) {
+                names.push(&skill.skill);
+            }
+            if !selectors.contains(&details.suggested.as_str()) {
+                selectors.push(&details.suggested);
+            }
+        }
+        if names.is_empty() {
+            continue;
+        }
+        let quoted: Vec<String> = selectors
+            .iter()
+            .map(|selector| format!("'{selector}'"))
+            .collect();
+        hints.push(format!(
+            "{package} ships {} {}; let agents use {} with: lpm skills link {}",
+            if names.len() == 1 {
+                "the skill"
+            } else {
+                "the skills"
+            },
+            names.join(", "),
+            if names.len() == 1 { "it" } else { "them" },
+            quoted.join(" "),
+        ));
+    }
+    hints
+}
+
+/// Refuses a change to the skills policy while a newer LPM's record of the
+/// links is in place: this LPM couldn't apply the change.
+pub(crate) fn ensure_links_are_ours(project_dir: &Path) -> Result<(), LpmError> {
+    match state::read_state(project_dir) {
+        state::StoredState::Newer(reason) => Err(LpmError::Script(format!(
+            "{reason}; update LPM before changing which dependency skills it links"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Where dependency skills live for `project_dir`: its workspace root in a
 /// workspace, else the project itself.
 pub(crate) fn skills_root(project_dir: &Path) -> std::path::PathBuf {
@@ -217,6 +441,18 @@ pub(crate) fn reconcile_project(project_dir: &Path, settings: Settings) -> Recon
         warnings: vec![format!("dependency skills were not linked: {error}")],
         ..ReconcileReport::default()
     })
+}
+
+/// Reconciles the project's links now, for the commands that change or
+/// check them: unlike [`reconcile_project`], it plans even when the links
+/// look current, and reports failure as an error.
+pub(crate) fn reconcile_now(
+    project_dir: &Path,
+    settings: Settings,
+) -> Result<ReconcileReport, LpmError> {
+    let lock = state::acquire_lock(project_dir)?;
+    let manifest = plan::read_manifest(project_dir)?;
+    reconcile_locked(project_dir, &manifest, settings, &lock)
 }
 
 fn try_reconcile(project_dir: &Path, settings: Settings) -> Result<ReconcileReport, LpmError> {
@@ -315,7 +551,14 @@ fn reconcile_locked(
         policy: policy::policy_digest(parsed.policy.as_ref()),
         lockfile,
     };
-    let plan = plan::plan_project(project_dir, parsed, manifest, &recorded_skills)?;
+    let plan = plan::plan_project(
+        project_dir,
+        parsed,
+        manifest,
+        plan::PlanMode::Apply,
+        None,
+        &recorded_skills,
+    )?;
     apply::apply(project_dir, &plan, inputs, lock)
 }
 

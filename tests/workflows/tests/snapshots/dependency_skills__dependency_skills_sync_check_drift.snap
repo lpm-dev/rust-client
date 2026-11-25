@@ -1,0 +1,11 @@
+---
+source: tests/workflows/tests/dependency_skills.rs
+expression: check
+---
+{
+  "success": false,
+  "in_sync": false,
+  "differences": [
+    ".agents/skills/browser-tool is missing or isn't LPM's link"
+  ]
+}

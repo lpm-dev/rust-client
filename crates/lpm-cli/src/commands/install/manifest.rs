@@ -1628,20 +1628,34 @@ pub async fn run_add_packages(
             // 6. All steps succeeded — commit the transaction so the manifest
             // edits persist.
             tx.commit();
-            Ok::<(), LpmError>(())
+            Ok::<Vec<String>, LpmError>(
+                staged
+                    .entries
+                    .iter()
+                    .map(|entry| entry.name.clone())
+                    .collect(),
+            )
         });
-        let javascript_result: Result<(), LpmError> =
+        let javascript_result: Result<Vec<String>, LpmError> =
             if let Some(capture) = javascript_capture.as_ref() {
                 report_capture::scope(Arc::clone(capture), javascript_install).await
             } else {
                 javascript_install.await
             };
-        javascript_result?;
+        let requested = javascript_result?;
         let dependency_skills = reconciles_skills.then(|| {
             super::reconcile_dependency_skills(project_dir, lpm_skills_preference, omit_policy)
         });
-        if !json_output && let Some(reconciled) = &dependency_skills {
-            crate::dependency_skills::print_report(reconciled);
+        if !json_output {
+            if let Some(reconciled) = &dependency_skills {
+                crate::dependency_skills::print_report(reconciled);
+            }
+            let requested: Vec<&str> = requested.iter().map(String::as_str).collect();
+            crate::dependency_skills::print_unlinked_skill_hints(
+                project_dir,
+                &requested,
+                lpm_skills_preference,
+            );
         }
         if let Some(transaction) = swift_transaction.take() {
             workspace_lockfile::commit_manifest_transaction(transaction);

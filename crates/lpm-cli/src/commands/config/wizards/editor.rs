@@ -1,5 +1,90 @@
-use console::{Term, measure_text_width};
+use console::{Key, Term, measure_text_width};
+use lpm_common::color::Painted;
 use std::io::{self, Write};
+
+/// One on/off setting of a [`run_toggles`] editor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Toggle {
+    pub(super) title: &'static str,
+    pub(super) detail: &'static str,
+    pub(super) enabled: bool,
+}
+
+/// Runs an editor over `toggles`: arrows move, left, right or space flip,
+/// Enter saves and Esc cancels. Returns the toggles as saved.
+pub(super) fn run_toggles(
+    term: &mut Term,
+    prompt: &str,
+    help: &str,
+    mut toggles: Vec<Toggle>,
+) -> io::Result<Vec<Toggle>> {
+    run(term, |term| {
+        let count = toggles.len().max(1);
+        let mut cursor = 0;
+        let mut previous_line_count = 0;
+        loop {
+            let frame = format_toggle_frame(prompt, help, &toggles, cursor);
+            draw_frame(term, &frame, &mut previous_line_count)?;
+            match term.read_key()? {
+                Key::ArrowUp | Key::Char('k') => cursor = (cursor + count - 1) % count,
+                Key::ArrowDown | Key::Char('j') => cursor = (cursor + 1) % count,
+                Key::ArrowLeft
+                | Key::ArrowRight
+                | Key::Char('h')
+                | Key::Char('l')
+                | Key::Char(' ') => {
+                    if let Some(toggle) = toggles.get_mut(cursor) {
+                        toggle.enabled = !toggle.enabled;
+                    }
+                }
+                Key::Enter => return Ok(toggles),
+                Key::Escape | Key::CtrlC => return Err(io::ErrorKind::Interrupted.into()),
+                _ => {}
+            }
+        }
+    })
+}
+
+pub(super) fn format_toggle_frame(
+    prompt: &str,
+    help: &str,
+    toggles: &[Toggle],
+    cursor: usize,
+) -> String {
+    let mut frame = String::with_capacity(360 * toggles.len().max(1));
+    frame.push_str(&format!("◆  {}\n", prompt.cyan().bold()));
+    frame.push_str(&format!("│  {}\n", help.dimmed()));
+    frame.push_str("│\n");
+    for (index, toggle) in toggles.iter().enumerate() {
+        let active = index == cursor;
+        let marker = if active {
+            "›".cyan().bold()
+        } else {
+            " ".to_string()
+        };
+        let title = if active {
+            toggle.title.bold()
+        } else {
+            toggle.title.to_string()
+        };
+        frame.push_str(&format!("│  {marker} {title}\n"));
+        frame.push_str(&format!("│    {}\n", toggle.detail.dimmed()));
+        frame.push_str(&format!("│    {}\n", format_bool_options(toggle.enabled)));
+        if index + 1 < toggles.len() {
+            frame.push_str("│\n");
+        }
+    }
+    frame.push_str("└\n");
+    frame
+}
+
+fn format_bool_options(enabled: bool) -> String {
+    if enabled {
+        format!("{} {}  ○ Disabled", "●".cyan(), "Enabled".bold())
+    } else {
+        format!("○ Enabled  {} {}", "●".cyan(), "Disabled".bold())
+    }
+}
 
 pub(super) fn run<T>(
     term: &mut Term,
