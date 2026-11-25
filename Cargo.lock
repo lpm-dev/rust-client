@@ -4302,9 +4302,11 @@ dependencies = [
 name = "lpm-skill"
 version = "0.89.0"
 dependencies = [
+ "hex",
  "regex",
  "serde",
  "serde_yaml",
+ "sha2 0.11.1",
 ]
 
 [[package]]

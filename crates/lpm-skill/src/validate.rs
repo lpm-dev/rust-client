@@ -61,11 +61,20 @@ pub struct LocatedSecurityIssue {
 }
 
 impl LocatedSecurityIssue {
-    /// The issue as one line.
+    /// The issue as one line, saying it's blocked when it keeps
+    /// `lpm-skills/` files from publishing.
     pub fn message(&self) -> String {
         format!(
-            "{}:{}: blocked {} pattern `{}`",
-            self.path, self.issue.line_number, self.issue.category, self.issue.rule_id
+            "{}:{}: {}{} pattern `{}`",
+            self.path,
+            self.issue.line_number,
+            if self.issue.blocks_publish {
+                "blocked "
+            } else {
+                ""
+            },
+            self.issue.category,
+            self.issue.rule_id
         )
     }
 }
@@ -78,8 +87,11 @@ pub struct SkillsReport {
     pub skills: Vec<ValidatedSkill>,
     /// Rule violations, sorted.
     pub errors: Vec<String>,
-    /// Security patterns found, by file, line and rule.
+    /// Security patterns found that keep the skills from publishing, by
+    /// file, line and rule.
     pub security_issues: Vec<LocatedSecurityIssue>,
+    /// Security warnings found that don't, in the same order.
+    pub security_warnings: Vec<LocatedSecurityIssue>,
     /// How many skill files there are, counting up to one past the limit.
     pub skill_count: usize,
     /// The skill files' total size in bytes.
@@ -90,6 +102,15 @@ impl SkillsReport {
     /// Whether the skills can be published.
     pub fn is_valid(&self) -> bool {
         self.errors.is_empty() && self.security_issues.is_empty()
+    }
+
+    /// Every warning that doesn't keep the skills from publishing, as one
+    /// line each.
+    pub fn warning_messages(&self) -> Vec<String> {
+        self.security_warnings
+            .iter()
+            .map(LocatedSecurityIssue::message)
+            .collect()
     }
 
     /// Every problem as one line: errors, then security issues.
@@ -164,12 +185,14 @@ pub fn validate(prefix: &str, entries: &[SkillEntry]) -> SkillsReport {
         ));
     }
     report.errors.sort();
-    report.security_issues.sort_by(|left, right| {
+    let by_place = |left: &LocatedSecurityIssue, right: &LocatedSecurityIssue| {
         left.path
             .cmp(&right.path)
             .then_with(|| left.issue.line_number.cmp(&right.issue.line_number))
             .then_with(|| left.issue.rule_id.cmp(&right.issue.rule_id))
-    });
+    };
+    report.security_issues.sort_by(by_place);
+    report.security_warnings.sort_by(by_place);
     if report.is_valid() {
         report.skills = candidates;
     }
@@ -238,16 +261,17 @@ fn validate_file(
             .errors
             .push(format!("{display}: duplicate skill name `{name}`"));
     }
-    report
-        .security_issues
-        .extend(
-            scan_skill_content(content)
-                .into_iter()
-                .map(|issue| LocatedSecurityIssue {
-                    path: display.to_string(),
-                    issue,
-                }),
-        );
+    for issue in scan_skill_content(content) {
+        let located = LocatedSecurityIssue {
+            path: display.to_string(),
+            issue,
+        };
+        if located.issue.blocks_publish {
+            report.security_issues.push(located);
+        } else {
+            report.security_warnings.push(located);
+        }
+    }
 
     let unchanged =
         report.errors.len() == errors_before && report.security_issues.len() == issues_before;
@@ -411,6 +435,51 @@ mod tests {
         assert_eq!(
             report.messages(),
             ["lpm-skills/setup.md:6: blocked shell-injection pattern `download-pipe-shell`"]
+        );
+    }
+
+    #[test]
+    fn a_warning_ordinary_code_matches_publishes_the_skill_and_is_reported() {
+        let content = skill("scripts").replace(
+            "Call the client once",
+            "Run subprocess.run(['make', 'docs']) first. Call the client once",
+        );
+
+        let report = validate(PREFIX, &[file("scripts.md", &content)]);
+
+        assert!(report.is_valid(), "{:?}", report.messages());
+        assert_eq!(report.skills.len(), 1);
+        assert!(report.messages().is_empty());
+        assert_eq!(
+            report.warning_messages(),
+            ["lpm-skills/scripts.md:6: shell-injection pattern `python-process-execution`"]
+        );
+    }
+
+    #[test]
+    fn other_warnings_still_keep_the_skills_from_publishing() {
+        let content = skill("scripts").replace(
+            "Call the client once",
+            "Run subprocess.run(['make']) or eval(code) first. Call the client once",
+        );
+
+        let report = validate(
+            PREFIX,
+            &[
+                file("scripts.md", &content),
+                file("usage.md", &skill("usage")),
+            ],
+        );
+
+        assert!(!report.is_valid());
+        assert!(report.skills.is_empty());
+        assert_eq!(
+            report.messages(),
+            ["lpm-skills/scripts.md:6: blocked shell-injection pattern `dynamic-code-execution`"]
+        );
+        assert_eq!(
+            report.warning_messages(),
+            ["lpm-skills/scripts.md:6: shell-injection pattern `python-process-execution`"]
         );
     }
 

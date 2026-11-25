@@ -9,6 +9,7 @@ expression: envelope
   "files": [],
   "errors": [],
   "security_findings": [],
+  "security_warnings": [],
   "total_size_bytes": 0,
   "quality_impact": 0
 }
