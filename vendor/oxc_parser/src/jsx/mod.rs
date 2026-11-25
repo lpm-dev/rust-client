@@ -661,27 +661,31 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         }
     }
 
+    /// Compares the names in a loop: the parser reads `<a.b.c>` without recursing, so
+    /// recursing once per member here could overflow the stack.
     fn jsx_member_expression_eq(
-        lhs: &JSXMemberExpression<'a>,
-        rhs: &JSXMemberExpression<'a>,
+        mut lhs: &JSXMemberExpression<'a>,
+        mut rhs: &JSXMemberExpression<'a>,
     ) -> bool {
-        if lhs.property.name != rhs.property.name {
-            return false;
-        }
-        match (&lhs.object, &rhs.object) {
-            (
-                JSXMemberExpressionObject::IdentifierReference(lhs),
-                JSXMemberExpressionObject::IdentifierReference(rhs),
-            ) => lhs.name == rhs.name,
-            (
-                JSXMemberExpressionObject::MemberExpression(lhs),
-                JSXMemberExpressionObject::MemberExpression(rhs),
-            ) => Self::jsx_member_expression_eq(lhs, rhs),
-            (
-                JSXMemberExpressionObject::ThisExpression(_),
-                JSXMemberExpressionObject::ThisExpression(_),
-            ) => true,
-            _ => false,
+        loop {
+            if lhs.property.name != rhs.property.name {
+                return false;
+            }
+            (lhs, rhs) = match (&lhs.object, &rhs.object) {
+                (
+                    JSXMemberExpressionObject::IdentifierReference(lhs),
+                    JSXMemberExpressionObject::IdentifierReference(rhs),
+                ) => return lhs.name == rhs.name,
+                (
+                    JSXMemberExpressionObject::MemberExpression(lhs),
+                    JSXMemberExpressionObject::MemberExpression(rhs),
+                ) => (lhs, rhs),
+                (
+                    JSXMemberExpressionObject::ThisExpression(_),
+                    JSXMemberExpressionObject::ThisExpression(_),
+                ) => return true,
+                _ => return false,
+            };
         }
     }
 }

@@ -67,9 +67,10 @@ const RESOLUTION_LOOKUPS_FLOOR: u64 = 1 << 20;
 /// Work the parser may spend on speculative parses, per byte of source and
 /// for any source: the bytes it reads again after rewinds. A TypeScript `<`
 /// that may open a generic arrow function or type arguments is parsed one
-/// way and, when that fails, parsed again the other way with all it holds,
-/// so nested speculation can make parsing quadratic. Real code spends under
-/// one per byte.
+/// way and, when that fails, parsed again the other way with all it holds.
+/// The arguments of an `async(…)` that mention `await` are parsed again as
+/// parameters when `=>` follows. Nested speculation can make parsing
+/// quadratic. Real code spends under one per byte.
 const PARSE_SPECULATION_PER_BYTE: u64 = 2;
 const PARSE_SPECULATION_FLOOR: u64 = 64 * 1024;
 
@@ -617,13 +618,14 @@ mod tests {
         // through them without reading a token. At the deepest nesting the
         // parse fits above the floor, that recursion must fit too.
         let (js, ts) = (SourceType::cjs(), SourceType::ts());
-        let shapes: [(SourceType, &str, &str, &str, &str, &str); 16] = [
+        let shapes: [(SourceType, &str, &str, &str, &str, &str); 17] = [
             (js, "x=(", "[", "a", "]", ");"),
             (js, "x=(", "[", "a", "]", "=0);"),
             (js, "x=(", "{a:", "b", "}", ");"),
             (js, "x=(", "{a:", "b", "}", "=0);"),
             (js, "x=(", "[a=", "0", "]", ");"),
             (js, "x=(", "[", "a", "]", ",b);"),
+            (js, "x=", "(", "a", ")", "=0;"),
             (js, "x=(", "[", "a", "]", ")=>0;"),
             (js, "x=(", "[", "a", "]", "=0)=>0;"),
             (js, "x=(", "{a:", "b", "}", ")=>0;"),
@@ -667,6 +669,44 @@ mod tests {
                     .unwrap();
                 assert!(deepest >= 100, "{prefix}{open}{close}{suffix}: {deepest}");
             }
+        }
+    }
+
+    #[test]
+    fn pure_comments_and_jsx_names_on_member_chains_of_any_length_parse_without_overflowing() {
+        // The parser reads a member chain without recursing, so what runs
+        // over the chain afterwards must not recurse once per member either.
+        for (filename, source) in [
+            (
+                "index.js",
+                format!("x=/*#__PURE__*/a{};", ".a".repeat(200_000)),
+            ),
+            (
+                "index.jsx",
+                format!("x=<a{0}></a{0}>;", ".b".repeat(200_000)),
+            ),
+        ] {
+            let parsed = std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn(move || {
+                    let allocator = Allocator::default();
+                    let source_type = SourceType::from_path(filename).unwrap();
+                    let parsed = Parser::new(&allocator, &source, source_type)
+                        .with_options(ParseOptions {
+                            stack_floor: current_stack_floor().unwrap(),
+                            ..ParseOptions::default()
+                        })
+                        .parse();
+                    (
+                        parsed.stack_exhausted,
+                        parsed.fatal_error,
+                        parsed.diagnostics.has_errors(),
+                    )
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            assert_eq!(parsed, (false, false, false), "{filename}");
         }
     }
 

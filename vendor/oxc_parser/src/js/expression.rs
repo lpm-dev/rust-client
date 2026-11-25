@@ -1940,34 +1940,36 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         }
     }
 
-    fn set_pure_on_call_or_new_expr(expr: &mut Expression<'a>) -> bool {
-        match expr.get_inner_expression_mut() {
-            Expression::CallExpression(call_expr) => {
-                call_expr.pure = true;
-                true
-            }
-            Expression::NewExpression(new_expr) => {
-                new_expr.pure = true;
-                true
-            }
-            expr @ match_member_expression!(Expression) => {
-                Self::set_pure_on_call_or_new_expr(expr.to_member_expression_mut().object_mut())
-            }
-            Expression::ChainExpression(chain_expr) => match &mut chain_expr.expression {
-                ChainElement::CallExpression(call_expr) => {
+    /// Walks down a member chain in a loop: the parser reads a chain without recursing, so
+    /// recursing once per member here could overflow the stack.
+    fn set_pure_on_call_or_new_expr(mut expr: &mut Expression<'a>) -> bool {
+        loop {
+            expr = match expr.get_inner_expression_mut() {
+                Expression::CallExpression(call_expr) => {
                     call_expr.pure = true;
-                    true
+                    return true;
                 }
-                element @ match_member_expression!(ChainElement) => {
-                    Self::set_pure_on_call_or_new_expr(
-                        element.to_member_expression_mut().object_mut(),
-                    )
+                Expression::NewExpression(new_expr) => {
+                    new_expr.pure = true;
+                    return true;
                 }
-                ChainElement::TSNonNullExpression(non_null_expr) => {
-                    Self::set_pure_on_call_or_new_expr(&mut non_null_expr.expression)
+                expr @ match_member_expression!(Expression) => {
+                    expr.to_member_expression_mut().object_mut()
                 }
-            },
-            _ => false,
+                Expression::ChainExpression(chain_expr) => match &mut chain_expr.expression {
+                    ChainElement::CallExpression(call_expr) => {
+                        call_expr.pure = true;
+                        return true;
+                    }
+                    element @ match_member_expression!(ChainElement) => {
+                        element.to_member_expression_mut().object_mut()
+                    }
+                    ChainElement::TSNonNullExpression(non_null_expr) => {
+                        &mut non_null_expr.expression
+                    }
+                },
+                _ => return false,
+            };
         }
     }
 

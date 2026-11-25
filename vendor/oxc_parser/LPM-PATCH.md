@@ -3,9 +3,9 @@
 This is `oxc_parser` 0.160.0 from crates.io (oxc commit
 `87e38f3270b00341695e02e8aaf681e9e985e4a3`, `crates/oxc_parser`), MIT
 licensed (see `LICENSE`), with three changes: the parser can stop at a
-stack floor instead of overflowing its thread's stack, and at a budget for
-the work it spends on speculative parses, and nested parentheses take it
-linear time. The workspace uses it through `[patch.crates-io]` in the root
+stack floor instead of overflowing its thread's stack, it can stop at a
+budget for the work it spends on speculative parses, and nested
+parentheses and member chains take it linear time and constant stack. The workspace uses it through `[patch.crates-io]` in the root
 `Cargo.toml`.
 
 ## Why
@@ -19,9 +19,11 @@ registry's release scan.
 
 The parser also speculates. In TypeScript, a `<` that may open a generic
 arrow function or type arguments is parsed one way and, when that fails,
-rewound and parsed again the other way, with everything nested in it.
-Nested speculation can make a parse take time quadratic in the source's
-length: `x=<T>(a=<T>(a=…0)));` reads each level again for every level
+rewound and parsed again the other way, with everything nested in it. The
+arguments of an `async(…)` that mention `await` are parsed again as
+parameters when `=>` follows. Nested speculation can make a parse take time
+quadratic in the source's length: `x=<T>(a=<T>(a=…0)));` and
+`x=async(a=async(a=…await 0)=>0)=>0;` read each level again for every level
 around it.
 
 Upstream 0.160 also walks every parenthesis inside a closing one to find
@@ -47,7 +49,9 @@ stack, took four seconds.
   the floor once per level themselves, because their frames per level can
   be larger than those of the parse that built the nodes:
   - the cover grammar that turns an expression into a destructuring
-    assignment target (`AssignmentTarget::cover` in `js/grammar.rs`);
+    assignment target (`AssignmentTarget::cover` in `js/grammar.rs`, and
+    `SimpleAssignmentTarget::cover`, which nested parentheses recurse
+    through on their own);
   - the conversions that turn the elements of a parenthesized list into
     arrow parameters once `=>` follows it
     (`cover_expression_to_binding_pattern` and
@@ -79,6 +83,13 @@ stack, took four seconds.
   `ParserReturn::speculation_budget_exhausted` reports it. A parse that
   reached the floor reports only that, so it can still be retried on a
   larger stack. The default, `0`, never stops.
+- Two recursions over a member chain, which the parser reads in a loop
+  and so without using stack per member, are loops instead:
+  `set_pure_on_call_or_new_expr`, for `/*#__PURE__*/a.b.c…`, and
+  `jsx_member_expression_eq`, which compares `<a.b.c…>` with its closing
+  tag. Each recursed once per member, and a debug build overflowed its
+  stack on 200,000 members; a release build relied on the optimizer
+  turning the tail calls into loops.
 - `ParserState::last_parenthesized` keeps the start of the
   `ParenthesizedExpression` built last and of the expression innermost in
   its parentheses. Each place that builds one records it, and closing a

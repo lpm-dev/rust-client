@@ -35,6 +35,10 @@ impl<'a, C: Config> CoverGrammar<'a, Expression<'a>, C> for AssignmentTarget<'a>
 
 impl<'a, C: Config> CoverGrammar<'a, Expression<'a>, C> for SimpleAssignmentTarget<'a> {
     fn cover(expr: Expression<'a>, p: &mut ParserImpl<'a, C>) -> Self {
+        // Nested parentheses recurse here without passing through `AssignmentTarget::cover`.
+        if p.below_stack_floor() {
+            return p.stopped_at_stack_floor();
+        }
         match expr {
             Expression::Identifier(ident) => {
                 SimpleAssignmentTarget::AssignmentTargetIdentifier(ident)

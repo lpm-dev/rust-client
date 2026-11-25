@@ -3513,6 +3513,33 @@ mod tests {
     }
 
     #[test]
+    fn async_arrow_heads_that_mention_await_nested_in_defaults_are_read_without_parsing_in_linear_time()
+     {
+        // The arguments of an `async(…)` that mention `await` are parsed
+        // again as parameters when `=>` follows, with every head nested in
+        // their defaults.
+        let source = format!(
+            "x={};eval(y);",
+            nested("async(a=", "await 0", ")=>0", 3_000)
+        );
+        assert!(syntax::exhausts_the_speculation_budget("index.js", &source));
+        let flat = format!("{}eval(y);", "x;".repeat(source.len() / 2));
+        let started = std::time::Instant::now();
+        let flat_result = analyze_on_a_worker_stack("index.js", flat);
+        let flat_time = started.elapsed();
+        let started = std::time::Instant::now();
+        let result = analyze_on_a_worker_stack("index.js", source);
+        let nested_time = started.elapsed();
+        assert_eq!(flat_result.unparsed_files, 0);
+        assert!(result.source.eval);
+        assert_eq!(result.unparsed_files, 1);
+        assert!(
+            nested_time < flat_time * 5 + std::time::Duration::from_millis(200),
+            "nested {nested_time:?}, flat {flat_time:?}"
+        );
+    }
+
+    #[test]
     fn arrow_heads_after_many_lexer_errors_are_analyzed_in_linear_time() {
         // A checkpoint taken at each parenthesized list that may be arrow
         // parameters must not copy every diagnostic the lexer has recorded.

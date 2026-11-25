@@ -194,6 +194,67 @@
              Expression::new_parenthesized_expression(self.end_span(start), expression, self)
          } else {
              expression
+@@ -1939,34 +1940,36 @@
+         }
+     }
+ 
+-    fn set_pure_on_call_or_new_expr(expr: &mut Expression<'a>) -> bool {
+-        match expr.get_inner_expression_mut() {
+-            Expression::CallExpression(call_expr) => {
+-                call_expr.pure = true;
+-                true
+-            }
+-            Expression::NewExpression(new_expr) => {
+-                new_expr.pure = true;
+-                true
+-            }
+-            expr @ match_member_expression!(Expression) => {
+-                Self::set_pure_on_call_or_new_expr(expr.to_member_expression_mut().object_mut())
+-            }
+-            Expression::ChainExpression(chain_expr) => match &mut chain_expr.expression {
+-                ChainElement::CallExpression(call_expr) => {
++    /// Walks down a member chain in a loop: the parser reads a chain without recursing, so
++    /// recursing once per member here could overflow the stack.
++    fn set_pure_on_call_or_new_expr(mut expr: &mut Expression<'a>) -> bool {
++        loop {
++            expr = match expr.get_inner_expression_mut() {
++                Expression::CallExpression(call_expr) => {
+                     call_expr.pure = true;
+-                    true
++                    return true;
+                 }
+-                element @ match_member_expression!(ChainElement) => {
+-                    Self::set_pure_on_call_or_new_expr(
+-                        element.to_member_expression_mut().object_mut(),
+-                    )
++                Expression::NewExpression(new_expr) => {
++                    new_expr.pure = true;
++                    return true;
+                 }
+-                ChainElement::TSNonNullExpression(non_null_expr) => {
+-                    Self::set_pure_on_call_or_new_expr(&mut non_null_expr.expression)
++                expr @ match_member_expression!(Expression) => {
++                    expr.to_member_expression_mut().object_mut()
+                 }
+-            },
+-            _ => false,
++                Expression::ChainExpression(chain_expr) => match &mut chain_expr.expression {
++                    ChainElement::CallExpression(call_expr) => {
++                        call_expr.pure = true;
++                        return true;
++                    }
++                    element @ match_member_expression!(ChainElement) => {
++                        element.to_member_expression_mut().object_mut()
++                    }
++                    ChainElement::TSNonNullExpression(non_null_expr) => {
++                        &mut non_null_expr.expression
++                    }
++                },
++                _ => return false,
++            };
+         }
+     }
+ 
 --- a/src/js/grammar.rs
 +++ b/src/js/grammar.rs
 @@ -14,6 +14,11 @@
@@ -208,7 +269,18 @@
          match expr {
              Expression::ArrayExpression(array_expr) => {
                  let pat = ArrayAssignmentTarget::cover(array_expr.unbox(), p);
-@@ -303,6 +308,12 @@
+@@ -30,6 +35,10 @@
+ 
+ impl<'a, C: Config> CoverGrammar<'a, Expression<'a>, C> for SimpleAssignmentTarget<'a> {
+     fn cover(expr: Expression<'a>, p: &mut ParserImpl<'a, C>) -> Self {
++        // Nested parentheses recurse here without passing through `AssignmentTarget::cover`.
++        if p.below_stack_floor() {
++            return p.stopped_at_stack_floor();
++        }
+         match expr {
+             Expression::Identifier(ident) => {
+                 SimpleAssignmentTarget::AssignmentTargetIdentifier(ident)
+@@ -303,6 +312,12 @@
  
      /// Check that `expression` covers a `BindingIdentifier` or a `BindingPattern`.
      pub(super) fn check_cover_binding(&self, expression: &Expression<'a>) -> CoverCheck<'a> {
@@ -221,7 +293,7 @@
          match expression {
              Expression::Identifier(ident) if !self.is_cover_parenthesized(ident.span.start) => {
                  Ok(())
-@@ -376,6 +387,9 @@
+@@ -376,6 +391,9 @@
      /// Check that an assignment target, which an expression was already refined to, covers
      /// a `BindingIdentifier` or a `BindingPattern`.
      fn check_cover_binding_target(&self, target: &AssignmentTarget<'a>) -> CoverCheck<'a> {
@@ -231,7 +303,7 @@
          match target {
              AssignmentTarget::AssignmentTargetIdentifier(ident)
                  if !self.is_cover_parenthesized(ident.span.start) =>
-@@ -452,6 +466,9 @@
+@@ -452,6 +470,9 @@
          &mut self,
          expression: Expression<'a>,
      ) -> BindingPattern<'a> {
@@ -241,7 +313,7 @@
          match expression {
              Expression::Identifier(ident) => {
                  BindingPattern::new_binding_identifier(ident.span, ident.name, self)
-@@ -555,6 +572,9 @@
+@@ -555,6 +576,9 @@
          &mut self,
          target: AssignmentTarget<'a>,
      ) -> BindingPattern<'a> {
@@ -251,6 +323,59 @@
          match target {
              AssignmentTarget::AssignmentTargetIdentifier(ident) => {
                  BindingPattern::new_binding_identifier(ident.span, ident.name, self)
+--- a/src/jsx/mod.rs
++++ b/src/jsx/mod.rs
+@@ -661,27 +661,31 @@
+         }
+     }
+ 
++    /// Compares the names in a loop: the parser reads `<a.b.c>` without recursing, so
++    /// recursing once per member here could overflow the stack.
+     fn jsx_member_expression_eq(
+-        lhs: &JSXMemberExpression<'a>,
+-        rhs: &JSXMemberExpression<'a>,
++        mut lhs: &JSXMemberExpression<'a>,
++        mut rhs: &JSXMemberExpression<'a>,
+     ) -> bool {
+-        if lhs.property.name != rhs.property.name {
+-            return false;
+-        }
+-        match (&lhs.object, &rhs.object) {
+-            (
+-                JSXMemberExpressionObject::IdentifierReference(lhs),
+-                JSXMemberExpressionObject::IdentifierReference(rhs),
+-            ) => lhs.name == rhs.name,
+-            (
+-                JSXMemberExpressionObject::MemberExpression(lhs),
+-                JSXMemberExpressionObject::MemberExpression(rhs),
+-            ) => Self::jsx_member_expression_eq(lhs, rhs),
+-            (
+-                JSXMemberExpressionObject::ThisExpression(_),
+-                JSXMemberExpressionObject::ThisExpression(_),
+-            ) => true,
+-            _ => false,
++        loop {
++            if lhs.property.name != rhs.property.name {
++                return false;
++            }
++            (lhs, rhs) = match (&lhs.object, &rhs.object) {
++                (
++                    JSXMemberExpressionObject::IdentifierReference(lhs),
++                    JSXMemberExpressionObject::IdentifierReference(rhs),
++                ) => return lhs.name == rhs.name,
++                (
++                    JSXMemberExpressionObject::MemberExpression(lhs),
++                    JSXMemberExpressionObject::MemberExpression(rhs),
++                ) => (lhs, rhs),
++                (
++                    JSXMemberExpressionObject::ThisExpression(_),
++                    JSXMemberExpressionObject::ThisExpression(_),
++                ) => return true,
++                _ => return false,
++            };
+         }
+     }
+ }
 --- a/src/lexer/mod.rs
 +++ b/src/lexer/mod.rs
 @@ -130,6 +130,20 @@
