@@ -408,6 +408,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         }
 
         if self.options.preserve_parens {
+            self.state.last_parenthesized = (start, self.innermost_parenthesized_start(&expression));
             Expression::new_parenthesized_expression(self.end_span(start), expression, self)
         } else {
             expression

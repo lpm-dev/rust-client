@@ -123,7 +123,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     #[inline]
     fn check_parse_limits(&mut self) {
         if self.stack_exhausted.get()
-            || self.speculation_budget_exhausted
+            || self.lexer.speculation_budget_exhausted()
             || self.below_stack_floor()
         {
             self.stop_at_parse_limit();
@@ -149,7 +149,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     #[cold]
     #[inline(never)]
     fn stop_at_parse_limit(&mut self) {
-        if self.speculation_budget_exhausted && !self.stack_exhausted.get() {
+        if self.lexer.speculation_budget_exhausted() && !self.stack_exhausted.get() {
             self.set_fatal_error(diagnostics::speculation_budget_exhausted(self.token.span()));
         } else {
             self.stop_at_stack_floor();
@@ -451,22 +451,10 @@ impl<'a, C: Config> ParserImpl<'a, C> {
             self.lexer.errors.push(fatal_error.error);
         }
         self.lexer.rewind(lexer);
-        self.check_speculation_budget();
         self.token = cur_token;
         self.prev_token_end = prev_token_end;
         self.errors.truncate(errors_pos);
         self.state.cover_parenthesized.truncate(cover_parenthesized_len);
-    }
-
-    /// Sets the budget's stop once the work spent on speculation passes it:
-    /// the bytes the lexer has read beyond its position, which a rewind made
-    /// it read or will make it read again. A parse already stopped at the
-    /// stack floor is unwinding, and reads nothing again.
-    #[inline]
-    fn check_speculation_budget(&mut self) {
-        if !self.stack_exhausted.get() && self.lexer.bytes_read_ahead() > self.speculation_limit {
-            self.speculation_budget_exhausted = true;
-        }
     }
 
     /// Rewind to `checkpoint`, keeping the comments and irregular whitespace lexed after it.

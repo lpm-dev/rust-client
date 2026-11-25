@@ -185,6 +185,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 }
                 let expression = Expression::new_identifier(span, name, self);
                 let expression = if self.options.preserve_parens {
+                    self.state.last_parenthesized = (start, span.start);
                     Expression::new_parenthesized_expression(self.end_span(start), expression, self)
                 } else {
                     expression

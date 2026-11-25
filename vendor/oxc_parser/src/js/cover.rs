@@ -797,15 +797,31 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         // Record where the innermost expression starts, which is what an enclosing check
         // finds: inner parentheses leave no node without `preserve_parens`, and an assignment
         // target drops them in `((a)) = b`.
+        let innermost = self.innermost_parenthesized_start(&expression);
         self.state.cover_parenthesized.truncate(parenthesized_base);
         if self.state.cover_depth > 0 {
-            self.state.cover_parenthesized.push(expression.without_parentheses().span().start);
+            self.state.cover_parenthesized.push(innermost);
         }
 
         if self.options.preserve_parens {
+            self.state.last_parenthesized = (start, innermost);
             Expression::new_parenthesized_expression(self.end_span(start), expression, self)
         } else {
             expression
+        }
+    }
+
+    /// Where the expression innermost in the parentheses around `expression` starts: the
+    /// start of `expression` without the `ParenthesizedExpression`s that wrap it.
+    #[inline]
+    pub(super) fn innermost_parenthesized_start(&self, expression: &Expression<'a>) -> u32 {
+        match expression {
+            Expression::ParenthesizedExpression(inner)
+                if inner.span.start == self.state.last_parenthesized.0 =>
+            {
+                self.state.last_parenthesized.1
+            }
+            expression => expression.without_parentheses().span().start,
         }
     }
 

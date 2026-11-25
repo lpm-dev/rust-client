@@ -33,7 +33,7 @@
 +    #[inline]
 +    fn check_parse_limits(&mut self) {
 +        if self.stack_exhausted.get()
-+            || self.speculation_budget_exhausted
++            || self.lexer.speculation_budget_exhausted()
 +            || self.below_stack_floor()
 +        {
 +            self.stop_at_parse_limit();
@@ -59,7 +59,7 @@
 +    #[cold]
 +    #[inline(never)]
 +    fn stop_at_parse_limit(&mut self) {
-+        if self.speculation_budget_exhausted && !self.stack_exhausted.get() {
++        if self.lexer.speculation_budget_exhausted() && !self.stack_exhausted.get() {
 +            self.set_fatal_error(diagnostics::speculation_budget_exhausted(self.token.span()));
 +        } else {
 +            self.stop_at_stack_floor();
@@ -120,29 +120,6 @@
          self.prev_token_end = self.token.end();
          self.token = self.lexer.next_jsx_attribute_value();
      }
-@@ -373,10 +451,22 @@
-             self.lexer.errors.push(fatal_error.error);
-         }
-         self.lexer.rewind(lexer);
-+        self.check_speculation_budget();
-         self.token = cur_token;
-         self.prev_token_end = prev_token_end;
-         self.errors.truncate(errors_pos);
-         self.state.cover_parenthesized.truncate(cover_parenthesized_len);
-+    }
-+
-+    /// Sets the budget's stop once the work spent on speculation passes it:
-+    /// the bytes the lexer has read beyond its position, which a rewind made
-+    /// it read or will make it read again. A parse already stopped at the
-+    /// stack floor is unwinding, and reads nothing again.
-+    #[inline]
-+    fn check_speculation_budget(&mut self) {
-+        if !self.stack_exhausted.get() && self.lexer.bytes_read_ahead() > self.speculation_limit {
-+            self.speculation_budget_exhausted = true;
-+        }
-     }
- 
-     /// Rewind to `checkpoint`, keeping the comments and irregular whitespace lexed after it.
 --- a/src/diagnostics.rs
 +++ b/src/diagnostics.rs
 @@ -94,6 +94,16 @@
@@ -162,6 +139,61 @@
      file_appears_to_be_binary() => {
          ts_error("1490", "File appears to be binary.")
      };
+--- a/src/js/arrow.rs
++++ b/src/js/arrow.rs
+@@ -185,6 +185,7 @@
+                 }
+                 let expression = Expression::new_identifier(span, name, self);
+                 let expression = if self.options.preserve_parens {
++                    self.state.last_parenthesized = (start, span.start);
+                     Expression::new_parenthesized_expression(self.end_span(start), expression, self)
+                 } else {
+                     expression
+--- a/src/js/cover.rs
++++ b/src/js/cover.rs
+@@ -797,15 +797,31 @@
+         // Record where the innermost expression starts, which is what an enclosing check
+         // finds: inner parentheses leave no node without `preserve_parens`, and an assignment
+         // target drops them in `((a)) = b`.
++        let innermost = self.innermost_parenthesized_start(&expression);
+         self.state.cover_parenthesized.truncate(parenthesized_base);
+         if self.state.cover_depth > 0 {
+-            self.state.cover_parenthesized.push(expression.without_parentheses().span().start);
++            self.state.cover_parenthesized.push(innermost);
+         }
+ 
+         if self.options.preserve_parens {
++            self.state.last_parenthesized = (start, innermost);
+             Expression::new_parenthesized_expression(self.end_span(start), expression, self)
+         } else {
+             expression
++        }
++    }
++
++    /// Where the expression innermost in the parentheses around `expression` starts: the
++    /// start of `expression` without the `ParenthesizedExpression`s that wrap it.
++    #[inline]
++    pub(super) fn innermost_parenthesized_start(&self, expression: &Expression<'a>) -> u32 {
++        match expression {
++            Expression::ParenthesizedExpression(inner)
++                if inner.span.start == self.state.last_parenthesized.0 =>
++            {
++                self.state.last_parenthesized.1
++            }
++            expression => expression.without_parentheses().span().start,
+         }
+     }
+ 
+--- a/src/js/expression.rs
++++ b/src/js/expression.rs
+@@ -408,6 +408,7 @@
+         }
+ 
+         if self.options.preserve_parens {
++            self.state.last_parenthesized = (start, self.innermost_parenthesized_start(&expression));
+             Expression::new_parenthesized_expression(self.end_span(start), expression, self)
+         } else {
+             expression
 --- a/src/js/grammar.rs
 +++ b/src/js/grammar.rs
 @@ -14,6 +14,11 @@
@@ -221,7 +253,7 @@
                  BindingPattern::new_binding_identifier(ident.span, ident.name, self)
 --- a/src/lexer/mod.rs
 +++ b/src/lexer/mod.rs
-@@ -130,6 +130,13 @@
+@@ -130,6 +130,20 @@
  
      /// Config
      pub(crate) config: C,
@@ -232,39 +264,68 @@
 +    /// Bytes the lexer has skipped without reading, by moving to the end of
 +    /// the source after a fatal error.
 +    bytes_skipped: u64,
++
++    /// `ParseOptions::speculation_budget`, with `u64::MAX` for no limit.
++    speculation_limit: u64,
++
++    /// A rewind left the lexer having read more beyond its position than
++    /// `speculation_limit` allows.
++    speculation_budget_exhausted: bool,
  }
  
  impl<'a, C: Config> Lexer<'a, C> {
-@@ -176,6 +183,8 @@
+@@ -176,9 +190,27 @@
              escaped_templates: FxHashMap::default(),
              tokens,
              config,
 +            bytes_rewound: 0,
 +            bytes_skipped: 0,
++            speculation_limit: u64::MAX,
++            speculation_budget_exhausted: false,
          }
      }
  
-@@ -239,10 +248,19 @@
++    /// Limit the bytes the lexer may read beyond its position, by rewinding, to `budget`.
++    /// `0` is no limit.
++    pub(crate) fn with_speculation_budget(mut self, budget: u64) -> Self {
++        self.speculation_limit = if budget == 0 { u64::MAX } else { budget };
++        self
++    }
++
++    /// Whether a rewind went past the speculation budget. Every rewind, the parser's and the
++    /// lexer's own lookaheads', checks it, and it stays set.
++    #[inline]
++    pub(crate) fn speculation_budget_exhausted(&self) -> bool {
++        self.speculation_budget_exhausted
++    }
++
+     /// Create a [`Lexer`], and call `f` with it. Returns what `f` returns.
+     ///
+     /// The `Lexer` is passed to `f`, not returned, because that's what makes `'brand`
+@@ -239,10 +271,22 @@
          self.errors.truncate(checkpoint.errors_len);
  
          self.tokens.truncate(checkpoint.tokens_len);
 +        let from = self.offset();
          self.source.set_position(checkpoint.source_position);
 +        self.bytes_rewound += u64::from(from.saturating_sub(self.offset()));
++        if self.bytes_read_ahead() > self.speculation_limit {
++            self.speculation_budget_exhausted = true;
++        }
          self.trivia_builder.rewind(checkpoint.trivia);
      }
  
 +    /// Bytes the lexer has read beyond its current position: those it read
 +    /// and then rewound over, less those it skipped without reading. In all
 +    /// it has read at most its position plus this many bytes.
-+    pub(crate) fn bytes_read_ahead(&self) -> u64 {
++    fn bytes_read_ahead(&self) -> u64 {
 +        self.bytes_rewound.saturating_sub(self.bytes_skipped)
 +    }
 +
      /// Make rewinding to `checkpoint` keep the comments and irregular whitespace lexed after it.
      pub(crate) fn keep_trivia(&self, checkpoint: &mut LexerCheckpoint<'a>) {
          self.trivia_builder.keep_trivia(&mut checkpoint.trivia);
-@@ -570,7 +588,9 @@
+@@ -570,7 +614,9 @@
      /// Advance source cursor to end of file.
      #[inline]
      pub fn advance_to_end(&mut self) {
@@ -285,7 +346,7 @@
  
  mod ast_builder;
  pub mod config;
-@@ -221,6 +221,15 @@
+@@ -221,6 +221,17 @@
  
      /// Whether the file is [flow](https://flow.org).
      pub is_flow_language: bool,
@@ -296,12 +357,14 @@
 +    pub stack_exhausted: bool,
 +
 +    /// Whether parsing stopped at [`ParseOptions::speculation_budget`].
-+    /// [`fatal_error`](ParserReturn::fatal_error) is set too.
++    /// [`fatal_error`](ParserReturn::fatal_error) is set too. A parse that
++    /// reached [`ParseOptions::stack_floor`] reports only that: on a larger
++    /// stack it is checked against the budget again.
 +    pub speculation_budget_exhausted: bool,
  }
  
  // `ParserReturn` is the output of `ParserImpl::parse`.
-@@ -291,6 +300,33 @@
+@@ -291,6 +302,33 @@
      ///
      /// Default: `true`
      pub enable_ident_hashes: bool,
@@ -335,7 +398,7 @@
  }
  
  impl Default for ParseOptions {
-@@ -302,6 +338,8 @@
+@@ -302,6 +340,8 @@
              preserve_parens: true,
              allow_v8_intrinsics: false,
              enable_ident_hashes: true,
@@ -344,7 +407,7 @@
          }
      }
  }
-@@ -563,6 +601,16 @@
+@@ -563,6 +603,10 @@
  
      /// Precomputed typescript detection
      is_ts: bool,
@@ -352,35 +415,58 @@
 +    /// Parsing reached [`ParseOptions::stack_floor`]. A `Cell`, so that a
 +    /// check that reads no token and borrows the parser can record it.
 +    stack_exhausted: Cell<bool>,
-+
-+    /// [`ParseOptions::speculation_budget`], with `u64::MAX` for no limit.
-+    speculation_limit: u64,
-+
-+    /// Parsing reached [`ParseOptions::speculation_budget`].
-+    speculation_budget_exhausted: bool,
  }
  
  impl<'a, C: ParserConfig> ParserImpl<'a, C> {
-@@ -602,6 +650,13 @@
+@@ -589,7 +633,8 @@
+                 source_type,
+                 config.lexer_config(),
+                 brand_origin,
+-            ),
++            )
++            .with_speculation_budget(options.speculation_budget),
+             source_type,
+             source_text,
+             errors: vec![],
+@@ -602,6 +647,7 @@
              ast: ParserAstBuilder::new(allocator),
              module_record_builder: ModuleRecordBuilder::new(allocator, source_type),
              is_ts: source_type.is_typescript(),
 +            stack_exhausted: Cell::new(false),
-+            speculation_limit: if options.speculation_budget == 0 {
-+                u64::MAX
-+            } else {
-+                options.speculation_budget
-+            },
-+            speculation_budget_exhausted: false,
          }
      }
  
-@@ -719,6 +774,8 @@
+@@ -719,6 +765,9 @@
              tokens,
              fatal_error: has_fatal_error,
              is_flow_language,
 +            stack_exhausted: self.stack_exhausted.get(),
-+            speculation_budget_exhausted: self.speculation_budget_exhausted,
++            speculation_budget_exhausted: self.lexer.speculation_budget_exhausted()
++                && !self.stack_exhausted.get(),
          }
      }
  
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -43,6 +43,13 @@
+     /// Like `cover_elements`, each cover list owns the entries above its recorded length.
+     pub cover_parenthesized: ArenaVec<'a, u32>,
+ 
++    /// The start of the `ParenthesizedExpression` built last, and the start of the expression
++    /// innermost in its parentheses. A chain of parentheses, `((a))`, reads its innermost
++    /// expression's start from here instead of walking the chain at each level, which is
++    /// quadratic in its length. A rewind leaves no stale entry: only a parse of the same offset
++    /// can build another `ParenthesizedExpression` that starts there, and it records its own.
++    pub last_parenthesized: (u32, u32),
++
+     /// Zero outside speculative expression type arguments; otherwise their nesting depth.
+     pub type_argument_depth: u32,
+ 
+@@ -81,6 +88,7 @@
+             mentions_await: false,
+             cover_depth: 0,
+             cover_parenthesized: ArenaVec::new_in(&allocator),
++            last_parenthesized: (u32::MAX, u32::MAX),
+             type_argument_depth: 0,
+             type_argument_lookahead: None,
+             cover_initialized_name: FxHashMap::default(),

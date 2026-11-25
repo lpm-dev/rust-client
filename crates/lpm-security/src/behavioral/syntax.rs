@@ -561,6 +561,30 @@ impl<'s> SourceContext<'s> {
     }
 }
 
+/// Whether parsing `source`, named `filename`, on a stack deep enough for
+/// it, stops at the speculation budget [`parse`] gives it.
+#[cfg(test)]
+pub(super) fn exhausts_the_speculation_budget(filename: &str, source: &str) -> bool {
+    let source_type = SourceType::from_path(filename).unwrap();
+    let source = source.to_owned();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let allocator = Allocator::default();
+            Parser::new(&allocator, &source, source_type)
+                .with_options(ParseOptions {
+                    stack_floor: current_stack_floor().unwrap(),
+                    speculation_budget: parse_speculation_budget(&source),
+                    ..ParseOptions::default()
+                })
+                .parse()
+                .speculation_budget_exhausted
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,6 +668,55 @@ mod tests {
                 assert!(deepest >= 100, "{prefix}{open}{close}{suffix}: {deepest}");
             }
         }
+    }
+
+    #[test]
+    fn lookahead_that_reads_past_the_speculation_budget_stops_the_parse() {
+        // Deciding whether `(` starts a function type reads tokens ahead and
+        // rewinds only the lexer; no speculative parse follows to check the
+        // budget.
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, "type T = (LongTypeName);", SourceType::ts())
+            .with_options(ParseOptions {
+                speculation_budget: 1,
+                ..ParseOptions::default()
+            })
+            .parse();
+        assert!(parsed.speculation_budget_exhausted);
+        assert!(parsed.fatal_error);
+    }
+
+    #[test]
+    fn parentheses_nested_tens_of_thousands_of_levels_deep_parse_in_linear_time() {
+        // Each closing parenthesis records where the expression innermost in
+        // it starts, and must not walk every parenthesis inside it to find it.
+        let time_to_parse = |source: String| {
+            std::thread::Builder::new()
+                .stack_size(512 * 1024 * 1024)
+                .spawn(move || {
+                    let allocator = Allocator::default();
+                    let started = std::time::Instant::now();
+                    let parsed = Parser::new(&allocator, &source, SourceType::cjs())
+                        .with_options(ParseOptions {
+                            stack_floor: current_stack_floor().unwrap(),
+                            ..ParseOptions::default()
+                        })
+                        .parse();
+                    let elapsed = started.elapsed();
+                    assert!(!parsed.stack_exhausted && !parsed.fatal_error);
+                    elapsed
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        };
+        let depth = 40_000;
+        let nested = time_to_parse(format!("x={}a{};", "(".repeat(depth), ")".repeat(depth)));
+        let flat = time_to_parse("x;".repeat(depth + 1));
+        assert!(
+            nested < flat * 5 + std::time::Duration::from_millis(200),
+            "nested {nested:?}, flat {flat:?}"
+        );
     }
 
     /// Visits `source` with the floor `room` bytes below where the visit

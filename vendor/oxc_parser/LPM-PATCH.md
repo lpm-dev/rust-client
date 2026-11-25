@@ -2,10 +2,11 @@
 
 This is `oxc_parser` 0.160.0 from crates.io (oxc commit
 `87e38f3270b00341695e02e8aaf681e9e985e4a3`, `crates/oxc_parser`), MIT
-licensed (see `LICENSE`), with two changes: the parser can stop at a stack
-floor instead of overflowing its thread's stack, and at a budget for the
-work it spends on speculative parses. The workspace uses it through
-`[patch.crates-io]` in the root `Cargo.toml`.
+licensed (see `LICENSE`), with three changes: the parser can stop at a
+stack floor instead of overflowing its thread's stack, and at a budget for
+the work it spends on speculative parses, and nested parentheses take it
+linear time. The workspace uses it through `[patch.crates-io]` in the root
+`Cargo.toml`.
 
 ## Why
 
@@ -22,6 +23,11 @@ rewound and parsed again the other way, with everything nested in it.
 Nested speculation can make a parse take time quadratic in the source's
 length: `x=<T>(a=<T>(a=…0)));` reads each level again for every level
 around it.
+
+Upstream 0.160 also walks every parenthesis inside a closing one to find
+where the expression innermost in them starts, so `((((…a…))))` took
+quadratic time without speculating: 80,000 levels, which fit on a 64 MiB
+stack, took four seconds.
 
 ## What changed
 
@@ -66,13 +72,20 @@ around it.
   skips without reading when a fatal error moves it to the end of the
   source. Their difference is what it has read beyond its position, so in
   all it has read at most its position plus that. The counts change only in
-  rewinds and skips, and the parser compares them with the budget at each
-  of its rewinds, so a parse pays nothing for them per token. A parse
-  already stopped at the floor is unwinding and isn't checked against the
-  budget, so it can still be retried on a larger stack. Going past the
-  budget stops the parse the same way the floor does, sticky across later
-  rewinds, and `ParserReturn::speculation_budget_exhausted` reports it. The
-  default, `0`, never stops.
+  rewinds and skips, and the lexer compares them with the budget at every
+  rewind, its own lookaheads' included, so a parse pays nothing for them
+  per token. Going past the budget stops the parse at the next token it
+  reads, the same way the floor does, sticky across later rewinds, and
+  `ParserReturn::speculation_budget_exhausted` reports it. A parse that
+  reached the floor reports only that, so it can still be retried on a
+  larger stack. The default, `0`, never stops.
+- `ParserState::last_parenthesized` keeps the start of the
+  `ParenthesizedExpression` built last and of the expression innermost in
+  its parentheses. Each place that builds one records it, and closing a
+  chain of parentheses reads the innermost start from there instead of
+  walking the chain. A rewind leaves no stale entry: only a parse of the
+  same offset can build another `ParenthesizedExpression` starting there,
+  and it records its own.
 
 `lpm-security`'s `behavioral/syntax.rs` sets the floor from the stack its
 thread has left, retries a source that runs out on a 64 MiB stack, and
@@ -95,7 +108,8 @@ more than 30% of its budget.
 4. Look for every place the parser moves to a new token, and for new
    recursion that reads no token, such as conversions between AST shapes
    after a parse, and give them floor checks like the ones above.
-   `lpm-security`'s
+   Look for walks over nodes already built, like the one through nested
+   parentheses, that run once per level of nesting. `lpm-security`'s
    `parenthesized_lists_parsed_just_above_the_floor_become_parameters_or_expressions_without_overflowing`
    test parses each shape it lists to the deepest nesting that fits. If the
    release changes how the parser speculates or takes checkpoints, measure

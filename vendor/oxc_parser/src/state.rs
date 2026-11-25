@@ -43,6 +43,13 @@ pub struct ParserState<'a> {
     /// Like `cover_elements`, each cover list owns the entries above its recorded length.
     pub cover_parenthesized: ArenaVec<'a, u32>,
 
+    /// The start of the `ParenthesizedExpression` built last, and the start of the expression
+    /// innermost in its parentheses. A chain of parentheses, `((a))`, reads its innermost
+    /// expression's start from here instead of walking the chain at each level, which is
+    /// quadratic in its length. A rewind leaves no stale entry: only a parse of the same offset
+    /// can build another `ParenthesizedExpression` that starts there, and it records its own.
+    pub last_parenthesized: (u32, u32),
+
     /// Zero outside speculative expression type arguments; otherwise their nesting depth.
     pub type_argument_depth: u32,
 
@@ -81,6 +88,7 @@ impl<'a> ParserState<'a> {
             mentions_await: false,
             cover_depth: 0,
             cover_parenthesized: ArenaVec::new_in(&allocator),
+            last_parenthesized: (u32::MAX, u32::MAX),
             type_argument_depth: 0,
             type_argument_lookahead: None,
             cover_initialized_name: FxHashMap::default(),

@@ -228,7 +228,9 @@ pub struct ParserReturn<'a> {
     pub stack_exhausted: bool,
 
     /// Whether parsing stopped at [`ParseOptions::speculation_budget`].
-    /// [`fatal_error`](ParserReturn::fatal_error) is set too.
+    /// [`fatal_error`](ParserReturn::fatal_error) is set too. A parse that
+    /// reached [`ParseOptions::stack_floor`] reports only that: on a larger
+    /// stack it is checked against the budget again.
     pub speculation_budget_exhausted: bool,
 }
 
@@ -605,12 +607,6 @@ struct ParserImpl<'a, C: ParserConfig> {
     /// Parsing reached [`ParseOptions::stack_floor`]. A `Cell`, so that a
     /// check that reads no token and borrows the parser can record it.
     stack_exhausted: Cell<bool>,
-
-    /// [`ParseOptions::speculation_budget`], with `u64::MAX` for no limit.
-    speculation_limit: u64,
-
-    /// Parsing reached [`ParseOptions::speculation_budget`].
-    speculation_budget_exhausted: bool,
 }
 
 impl<'a, C: ParserConfig> ParserImpl<'a, C> {
@@ -637,7 +633,8 @@ impl<'a, C: ParserConfig> ParserImpl<'a, C> {
                 source_type,
                 config.lexer_config(),
                 brand_origin,
-            ),
+            )
+            .with_speculation_budget(options.speculation_budget),
             source_type,
             source_text,
             errors: vec![],
@@ -651,12 +648,6 @@ impl<'a, C: ParserConfig> ParserImpl<'a, C> {
             module_record_builder: ModuleRecordBuilder::new(allocator, source_type),
             is_ts: source_type.is_typescript(),
             stack_exhausted: Cell::new(false),
-            speculation_limit: if options.speculation_budget == 0 {
-                u64::MAX
-            } else {
-                options.speculation_budget
-            },
-            speculation_budget_exhausted: false,
         }
     }
 
@@ -775,7 +766,8 @@ impl<'a, C: ParserConfig> ParserImpl<'a, C> {
             fatal_error: has_fatal_error,
             is_flow_language,
             stack_exhausted: self.stack_exhausted.get(),
-            speculation_budget_exhausted: self.speculation_budget_exhausted,
+            speculation_budget_exhausted: self.lexer.speculation_budget_exhausted()
+                && !self.stack_exhausted.get(),
         }
     }
 

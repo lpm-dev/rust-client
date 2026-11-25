@@ -137,6 +137,13 @@ pub struct Lexer<'a, C: Config> {
     /// Bytes the lexer has skipped without reading, by moving to the end of
     /// the source after a fatal error.
     bytes_skipped: u64,
+
+    /// `ParseOptions::speculation_budget`, with `u64::MAX` for no limit.
+    speculation_limit: u64,
+
+    /// A rewind left the lexer having read more beyond its position than
+    /// `speculation_limit` allows.
+    speculation_budget_exhausted: bool,
 }
 
 impl<'a, C: Config> Lexer<'a, C> {
@@ -185,7 +192,23 @@ impl<'a, C: Config> Lexer<'a, C> {
             config,
             bytes_rewound: 0,
             bytes_skipped: 0,
+            speculation_limit: u64::MAX,
+            speculation_budget_exhausted: false,
         }
+    }
+
+    /// Limit the bytes the lexer may read beyond its position, by rewinding, to `budget`.
+    /// `0` is no limit.
+    pub(crate) fn with_speculation_budget(mut self, budget: u64) -> Self {
+        self.speculation_limit = if budget == 0 { u64::MAX } else { budget };
+        self
+    }
+
+    /// Whether a rewind went past the speculation budget. Every rewind, the parser's and the
+    /// lexer's own lookaheads', checks it, and it stays set.
+    #[inline]
+    pub(crate) fn speculation_budget_exhausted(&self) -> bool {
+        self.speculation_budget_exhausted
     }
 
     /// Create a [`Lexer`], and call `f` with it. Returns what `f` returns.
@@ -251,13 +274,16 @@ impl<'a, C: Config> Lexer<'a, C> {
         let from = self.offset();
         self.source.set_position(checkpoint.source_position);
         self.bytes_rewound += u64::from(from.saturating_sub(self.offset()));
+        if self.bytes_read_ahead() > self.speculation_limit {
+            self.speculation_budget_exhausted = true;
+        }
         self.trivia_builder.rewind(checkpoint.trivia);
     }
 
     /// Bytes the lexer has read beyond its current position: those it read
     /// and then rewound over, less those it skipped without reading. In all
     /// it has read at most its position plus this many bytes.
-    pub(crate) fn bytes_read_ahead(&self) -> u64 {
+    fn bytes_read_ahead(&self) -> u64 {
         self.bytes_rewound.saturating_sub(self.bytes_skipped)
     }
 

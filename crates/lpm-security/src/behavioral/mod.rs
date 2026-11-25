@@ -3495,6 +3495,7 @@ mod tests {
         // as one and, when no `=>` follows its parameters, parsed again as a
         // type assertion, with every head nested in its defaults.
         let source = format!("x={};eval(y);", nested("<T>(a=y,b=", "0", ")", 3_000));
+        assert!(syntax::exhausts_the_speculation_budget("index.ts", &source));
         let flat = format!("{}eval(y);", "x;".repeat(source.len() / 2));
         let started = std::time::Instant::now();
         let flat_result = analyze_on_a_worker_stack("index.ts", flat);
@@ -3554,6 +3555,7 @@ mod tests {
                 2_000
             )
         );
+        assert!(syntax::exhausts_the_speculation_budget("index.ts", &source));
         let flat = format!("{}eval(y);", "x;".repeat(source.len() / 2));
         let started = std::time::Instant::now();
         let flat_result = analyze_on_a_worker_stack("index.ts", flat);
