@@ -2318,6 +2318,14 @@ impl RegistryClient {
             .await;
         match result {
             Ok(metadata) => Ok(metadata),
+            // The firewall refuses the version itself, so the exact document
+            // would be refused too or answer with something less telling.
+            Err(error @ LpmError::NpmFirewallBlocked(_)) => {
+                Err(Box::new(PackageMetadataFetchError {
+                    error,
+                    timings: failed_timings,
+                }))
+            }
             Err(error) => {
                 tracing::debug!("selected npm history for {name}@{version} unavailable: {error}");
                 match self

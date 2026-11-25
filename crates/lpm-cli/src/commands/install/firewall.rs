@@ -1528,9 +1528,9 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
         }
         all_decisions.extend(response.decisions);
     }
-    if let Some(error) = first_failure {
+    if let Some(error) = first_failure.map(npm_firewall_preflight_enforce_error) {
         if !stats_have_block(&stats, &all_decisions) {
-            return Err(npm_firewall_preflight_enforce_error(error));
+            return Err(error);
         }
         stats.unchecked_reason = Some(error.to_string());
     }
