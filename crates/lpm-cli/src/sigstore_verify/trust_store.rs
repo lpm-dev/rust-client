@@ -125,8 +125,11 @@ pub fn verify_sigstore_bundle_with_built_in_trust_root(
 
 impl TrustStore {
     fn from_environment() -> Self {
-        let cache_file = lpm_common::LpmRoot::from_env()
-            .ok()
+        // Unit tests build their own stores; the shared one must not read
+        // the developer's cache, so it verifies with the built-in root.
+        let cache_file = (!cfg!(test))
+            .then(|| lpm_common::LpmRoot::from_env().ok())
+            .flatten()
             .map(|root| root.cache_metadata().join(CACHE_FILE_NAME));
         Self {
             embedded_tuf_root: Cow::Borrowed(EMBEDDED_TUF_ROOT),
@@ -454,8 +457,8 @@ fn usable_trust_root(bytes: &[u8], now: SystemTime) -> Result<TrustRoot, String>
 }
 
 fn repository_from_environment() -> Repository {
-    // Unit tests build their own stores, so the shared one never reaches
-    // the network.
+    // Unit tests build their own stores; the shared one never reaches the
+    // network.
     if cfg!(test) {
         return Repository::Disabled;
     }

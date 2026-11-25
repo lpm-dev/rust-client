@@ -259,6 +259,16 @@ impl<T: Role> Signed<T> {
 
 impl Root {
     /// Whether the keys or threshold for `role` differ between two roots.
+    /// How many distinct keys of `role` this client can verify, and the
+    /// role's threshold.
+    #[cfg(test)]
+    pub(super) fn supported_keys(&self, role: &str) -> (usize, usize) {
+        self.role_keys(role)
+            .map_or((0, 0), |(identities, threshold)| {
+                (identities.len(), threshold as usize)
+            })
+    }
+
     pub(super) fn role_keys_differ(&self, other: &Root, role: &str) -> bool {
         self.role_keys(role) != other.role_keys(role)
     }

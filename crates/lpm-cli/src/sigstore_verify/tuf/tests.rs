@@ -765,3 +765,22 @@ fn a_snapshot_that_differs_from_its_recorded_hash_is_refused() {
         "{error}"
     );
 }
+
+#[test]
+fn a_cache_a_newer_binary_wrote_still_verifies_for_an_older_one() {
+    let roles = RoleSet::new();
+    let older_built_in = roles.signed_root(1);
+    let newer_built_in = roles.signed_root(2);
+    let repository = synthetic_repository(&roles, 1, 1, 1)
+        .with("2.root.json", roles.signed_root(2))
+        .with("3.root.json", roles.signed_root(3));
+    let written_by_older = refreshed(&older_built_in, None, &repository, now()).unwrap();
+
+    let written_by_newer =
+        refreshed(&newer_built_in, Some(&written_by_older), &repository, now()).unwrap();
+
+    let verified = written_by_newer
+        .verified_trusted_root(&older_built_in)
+        .unwrap();
+    assert_eq!(verified.bytes, SYNTHETIC_TRUSTED_ROOT);
+}

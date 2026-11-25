@@ -699,6 +699,20 @@ async fn sigstores_live_repository_serves_the_built_in_trust_root() {
         verified.targets_version
     );
     assert!(
+        metadata.roots.is_empty(),
+        "Sigstore published {} TUF root version(s) newer than the built-in one. Replace \
+         crates/lpm-cli/assets/sigstore_tuf_root.json with the newest root.",
+        metadata.roots.len()
+    );
+    for (role, supported, threshold) in metadata.key_support(EMBEDDED_TUF_ROOT).unwrap() {
+        assert!(
+            supported > threshold,
+            "Sigstore's {role} role has {supported} key(s) LPM can verify, against a threshold \
+             of {threshold}. One more change to a key type LPM can't verify stops refreshes; \
+             add support for the new key type."
+        );
+    }
+    assert!(
         verified.bytes == EMBEDDED_TRUST_ROOT_JSON,
         "Sigstore published a new trust root under targets version {}. Replace \
          crates/lpm-cli/assets/sigstore_trusted_root.json with it, set \

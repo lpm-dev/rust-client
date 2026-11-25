@@ -136,6 +136,23 @@ impl TrustedMetadata {
         })
     }
 
+    /// For the root and targets roles of the newest stored root: how many
+    /// of their keys this client can verify, and the role's threshold.
+    #[cfg(test)]
+    pub(crate) fn key_support(
+        &self,
+        embedded_root: &[u8],
+    ) -> Result<Vec<(&'static str, usize, usize)>, TufError> {
+        let root = follow_roots(Signed::<Root>::parse(embedded_root)?, &self.roots)?;
+        Ok(["root", "targets"]
+            .into_iter()
+            .map(|role| {
+                let (supported, threshold) = root.signed.supported_keys(role);
+                (role, supported, threshold)
+            })
+            .collect())
+    }
+
     pub(crate) fn verified_trusted_root(
         &self,
         embedded_root: &[u8],
@@ -169,20 +186,10 @@ pub(crate) async fn refresh<F: Fetcher>(
             .ok()
             .map(|root| (stored, root))
     });
-    let embedded_version = embedded.version();
+    // Stored roots older than the built-in one stay, so a binary built with
+    // an older TUF root can still follow them.
     let (mut root, mut roots) = match &stored {
-        Some((stored, root)) => {
-            let newer_than_embedded = stored
-                .roots
-                .iter()
-                .filter(|text| {
-                    Signed::<Root>::parse(text.as_bytes())
-                        .is_ok_and(|root| root.version() > embedded_version)
-                })
-                .cloned()
-                .collect();
-            (root.clone(), newer_than_embedded)
-        }
+        Some((stored, root)) => (root.clone(), stored.roots.clone()),
         None => (embedded, Vec::new()),
     };
     // A root that replaced the timestamp or snapshot keys may restart those
