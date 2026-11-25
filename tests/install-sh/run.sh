@@ -237,6 +237,11 @@ case " $* " in
   *" -dvvv "*)
     echo 'Identifier=dev.lpm.cli' >&2
     echo 'TeamIdentifier=823S8YKMRW' >&2
+    if [ -n "${LPM_TEST_TOOL_STATE:-}" ] && [ -e "$LPM_TEST_TOOL_STATE/sha1-code-directory" ]; then
+      echo 'Hash type=sha1 size=20' >&2
+    else
+      echo 'Hash type=sha256 size=32' >&2
+    fi
     if staged_override staged-cdhash; then
       echo "CDHash=$(cat "$LPM_TEST_TOOL_STATE/staged-cdhash")" >&2
     else
@@ -246,16 +251,20 @@ case " $* " in
 esac
 exit 0
 EOF
-    cat > "$CLEAN_PATH_DIR/security" <<'EOF'
+    # Decodes a provisioning profile the way `openssl smime -out` does.
+    cat > "$CLEAN_PATH_DIR/openssl" <<'EOF'
 #!/bin/sh
-cat <<'PLIST'
+[ "$1 $2 $3 $4 $5 $6" = "smime -verify -noverify -nosigs -inform DER" ] || exit 99
+while [ "$#" -gt 0 ]; do
+  [ "$1" = -out ] && out="$2"
+  shift
+done
+cat > "$out" <<'PLIST'
 <?xml version="1.0"?><plist><dict><key>TeamIdentifier</key><array><string>823S8YKMRW</string></array><key>Entitlements</key><dict><key>com.apple.application-identifier</key><string>823S8YKMRW.dev.lpm.cli</string><key>keychain-access-groups</key><array><string>823S8YKMRW.*</string></array></dict></dict></plist>
 PLIST
 EOF
     printf '#!/bin/sh\nexit 0\n' > "$CLEAN_PATH_DIR/spctl"
-    printf '#!/bin/sh\nexit 0\n' > "$CLEAN_PATH_DIR/xcrun"
-    chmod +x "$CLEAN_PATH_DIR/codesign" "$CLEAN_PATH_DIR/security" \
-      "$CLEAN_PATH_DIR/spctl" "$CLEAN_PATH_DIR/xcrun"
+    chmod +x "$CLEAN_PATH_DIR/codesign" "$CLEAN_PATH_DIR/openssl" "$CLEAN_PATH_DIR/spctl"
   fi
 }
 
@@ -267,14 +276,14 @@ run_install_sh() {
     install_root="$(mktemp -d)"
   fi
   test_codesign=""
-  test_security=""
+  test_openssl=""
   test_spctl=""
-  test_xcrun=""
+  test_ticket_lookup=""
   if [ "$(PATH="$CLEAN_PATH_DIR" uname -s)" = "Darwin" ]; then
     test_codesign="$CLEAN_PATH_DIR/codesign"
-    test_security="$CLEAN_PATH_DIR/security"
+    test_openssl="$CLEAN_PATH_DIR/openssl"
     test_spctl="$CLEAN_PATH_DIR/spctl"
-    test_xcrun="$CLEAN_PATH_DIR/xcrun"
+    test_ticket_lookup="http://127.0.0.1:$SERVER_PORT/ticket-lookup"
   fi
   set +e
   RUN_OUT="$(
@@ -282,9 +291,9 @@ run_install_sh() {
     LPM_INSTALL_TEST_API_URL="http://127.0.0.1:$SERVER_PORT/api.json" \
     LPM_INSTALL_TEST_DOWNLOAD_BASE="http://127.0.0.1:$SERVER_PORT" \
     LPM_INSTALL_TEST_CODESIGN="$test_codesign" \
-    LPM_INSTALL_TEST_SECURITY="$test_security" \
+    LPM_INSTALL_TEST_OPENSSL="$test_openssl" \
     LPM_INSTALL_TEST_SPCTL="$test_spctl" \
-    LPM_INSTALL_TEST_XCRUN="$test_xcrun" \
+    LPM_INSTALL_TEST_TICKET_LOOKUP_URL="$test_ticket_lookup" \
     LPM_INSTALL_TEST_INTERRUPT_AFTER="${LPM_INSTALL_TEST_INTERRUPT_AFTER:-}" \
     LPM_MV_FAILURE_COUNT_FILE="${LPM_MV_FAILURE_COUNT_FILE:-}" \
     LPM_TEST_TOOL_STATE="${LPM_TEST_TOOL_STATE:-}" \
@@ -390,6 +399,32 @@ build_clean_path
 # ── Case 1: syntax check ─────────────────────────────────────────
 sh -n "$INSTALL_SH" || fail "install.sh has shell syntax errors"
 pass "install.sh shell syntax"
+
+# ── Case 1b: every macOS tool the installer runs ships with macOS ─
+# Each xcrun shim in /usr/bin is a hard link of git (the Command Line Tools
+# shims) or xcodebuild (the Xcode-only shims, stapler among them), and fails
+# on a Mac without developer tools.
+if grep -v '^[[:space:]]*#' "$INSTALL_SH" | grep -Eq '(^|[^[:alnum:]_])(xcrun|stapler|xcode-select)([^[:alnum:]_]|$)'; then
+  fail "install.sh runs a developer tool: $(grep -n -E '(xcrun|stapler|xcode-select)' "$INSTALL_SH" | grep -v ':[[:space:]]*#')"
+fi
+if [ "$HOST_OS" = "Darwin" ]; then
+  shim_identities="$(stat -f '%d:%i' /usr/bin/git /usr/bin/xcodebuild)"
+  harness_clean_path_dir="${CLEAN_PATH_DIR:-}"
+  build_clean_path
+  absolute_tools="$(sed -n 's/^MACOS_[A-Z0-9_]*_TOOL="\(\/[^"]*\)"$/\1/p' "$INSTALL_SH")"
+  [ -n "$absolute_tools" ] || fail "found no macOS tool paths in install.sh"
+  for tool in $absolute_tools $(find "$CLEAN_PATH_DIR" -type l); do
+    resolved="$tool"
+    [ -L "$tool" ] && resolved="$(readlink "$tool")"
+    [ -x "$resolved" ] || fail "$resolved does not ship with this macOS"
+    if printf '%s\n' "$shim_identities" | grep -Fxq "$(stat -L -f '%d:%i' "$resolved")"; then
+      fail "install.sh runs $resolved, an xcrun shim that needs Xcode or the Command Line Tools"
+    fi
+  done
+  rm -rf "$CLEAN_PATH_DIR"
+  CLEAN_PATH_DIR="$harness_clean_path_dir"
+  pass "install.sh runs only macOS tools that work without Xcode or the Command Line Tools"
+fi
 
 # ── Case 2: sudo transition fails before installer activity ───
 sudo_path_dir="$(mktemp -d)"
@@ -758,112 +793,123 @@ if [ "$HOST_OS" = "Darwin" ]; then
   rm -rf "$fdir"
   pass "icon-bearing macOS release requires its declared icon"
 
-  # stapler validate exits 68 (EX_NOHOST) while Apple's CloudKit ticket
-  # lookup doesn't answer. Apple is asked about the downloaded bundle only;
-  # the staged copy must carry the same code and the same stapled ticket.
+  # The fixture server stands in for Apple's ticket database: each lookup is
+  # answered with the next scripted outcome. Apple is asked about the
+  # downloaded bundle only; the staged copy must carry the same code and the
+  # same stapled ticket.
   tool_state="$(mktemp -d)"
-  rm -f "$CLEAN_PATH_DIR/xcrun" "$CLEAN_PATH_DIR/sleep"
-  cat > "$CLEAN_PATH_DIR/xcrun" <<'EOF'
-#!/bin/sh
-[ "$1" = stapler ] && [ "$2" = validate ] && [ "$#" -eq 3 ] || exit 99
-printf '%s\n' "$3" >> "$LPM_TEST_TOOL_STATE/stapler-runs"
-run=$(grep -c '' "$LPM_TEST_TOOL_STATE/stapler-runs")
-status=$(sed -n "${run}p" "$LPM_TEST_TOOL_STATE/stapler-outcomes")
-[ "$status" -eq 0 ] || echo "The validate action failed! Error $status."
-exit "$status"
-EOF
-  cat > "$CLEAN_PATH_DIR/sleep" <<'EOF'
+  rm -f "$CLEAN_PATH_DIR/sleep"
+  cat > "$CLEAN_PATH_DIR/sleep" <<'EOF_SLEEP'
 #!/bin/sh
 printf '%s\n' "$*" >> "$LPM_TEST_TOOL_STATE/sleep-requests"
-EOF
-  chmod +x "$CLEAN_PATH_DIR/xcrun" "$CLEAN_PATH_DIR/sleep"
+EOF_SLEEP
+  chmod +x "$CLEAN_PATH_DIR/sleep"
   fdir="$(mktemp -d)"
   printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
   write_release_asset "$fdir" 'notarization-retry-binary-bytes'
   sha="$($SHA_TOOL "$fdir/$RELEASE_ASSET" | awk '{print $1}')"
   printf '%s  %s\n' "$sha" "$RELEASE_ASSET" > "$fdir/SHA256SUMS.txt"
   printf 'dummy-sigstore-bundle' > "$fdir/SHA256SUMS.txt.sigstore"
-  run_with_stapler_outcomes() {
-    printf '%s\n' "$@" > "$tool_state/stapler-outcomes"
-    : > "$tool_state/stapler-runs"
+  run_with_ticket_outcomes() {
+    printf '%s\n' "$@" > "$fdir/ticket-outcomes"
+    : > "$fdir/ticket-requests"
     : > "$tool_state/sleep-requests"
     trap 'stop_server' EXIT
     start_server "$fdir"
     LPM_TEST_TOOL_STATE="$tool_state" run_install_sh
     stop_server
     trap - EXIT
-    STAPLER_RUNS="$(grep -c '' "$tool_state/stapler-runs" || true)"
+    TICKET_LOOKUPS="$(grep -c '' "$fdir/ticket-requests" || true)"
     SLEEP_REQUESTS="$(tr '\n' ' ' < "$tool_state/sleep-requests")"
   }
 
-  run_with_stapler_outcomes 68 68 0
+  run_with_ticket_outcomes issued
+  [ "$RUN_RC" -eq 0 ] || fail "a confirmed notarization ticket failed the install with exit $RUN_RC: $RUN_OUT"
+  [ "$TICKET_LOOKUPS" -eq 1 ] || fail "one install looked up its notarization ticket $TICKET_LOOKUPS times, expected once"
+  [ "$(cat "$fdir/ticket-requests")" = "2/2/0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c" ] \
+    || fail "the ticket lookup asked for '$(cat "$fdir/ticket-requests")' instead of the SHA-256 code directory's record"
+  [ -z "$SLEEP_REQUESTS" ] || fail "a confirmed notarization ticket still waited '$SLEEP_REQUESTS'"
+  [ -L "$RUN_INSTALL_DIR/lpm" ] || fail "install with a confirmed notarization ticket did not link lpm"
+  pass "macOS install confirms the stapled ticket with Apple's ticket database once"
+
+  run_with_ticket_outcomes 503 503 issued
   [ "$RUN_RC" -eq 0 ] \
-    || fail "a brief CloudKit outage failed the install with exit $RUN_RC: $RUN_OUT"
-  [ "$STAPLER_RUNS" -eq 3 ] || fail "brief CloudKit outage ran stapler $STAPLER_RUNS times, expected 3"
+    || fail "a brief outage of Apple's ticket service failed the install with exit $RUN_RC: $RUN_OUT"
+  [ "$TICKET_LOOKUPS" -eq 3 ] || fail "a brief outage looked the ticket up $TICKET_LOOKUPS times, expected 3"
   [ "$SLEEP_REQUESTS" = "2 5 " ] || fail "notarization ticket retries waited '$SLEEP_REQUESTS', expected '2 5 '"
   echo "$RUN_OUT" | grep -q "checking the notarization ticket again in 2s" \
     || fail "notarization ticket retry was not announced: $RUN_OUT"
-  [ -L "$RUN_INSTALL_DIR/lpm" ] || fail "install after a brief CloudKit outage did not link lpm"
-  pass "macOS install outlasts a brief CloudKit outage while checking the notarization ticket"
+  [ -L "$RUN_INSTALL_DIR/lpm" ] || fail "install after a brief outage did not link lpm"
+  pass "macOS install outlasts a brief outage of Apple's ticket service"
 
-  run_with_stapler_outcomes 68 68 68 68 68 0
+  run_with_ticket_outcomes throttled 429 garbage wrongrecord drop issued
   [ "$RUN_RC" -eq 0 ] \
-    || fail "a two-minute CloudKit outage failed the install with exit $RUN_RC: $RUN_OUT"
-  [ "$STAPLER_RUNS" -eq 6 ] || fail "two-minute CloudKit outage ran stapler $STAPLER_RUNS times, expected 6"
+    || fail "an outage of about two minutes failed the install with exit $RUN_RC: $RUN_OUT"
+  [ "$TICKET_LOOKUPS" -eq 6 ] || fail "an outage of about two minutes looked the ticket up $TICKET_LOOKUPS times, expected 6"
   [ "$SLEEP_REQUESTS" = "2 5 15 30 60 " ] \
     || fail "notarization ticket retries waited '$SLEEP_REQUESTS', expected '2 5 15 30 60 '"
-  [ -L "$RUN_INSTALL_DIR/lpm" ] || fail "install after a two-minute CloudKit outage did not link lpm"
-  pass "macOS install outlasts a CloudKit outage of about two minutes"
+  [ -L "$RUN_INSTALL_DIR/lpm" ] || fail "install after an outage of about two minutes did not link lpm"
+  pass "macOS install retries every answer of Apple's ticket service that may change"
 
-  run_with_stapler_outcomes 68 68 68 68 68 68 0
-  [ "$RUN_RC" -ne 0 ] || fail "a lasting CloudKit outage must fail the install"
-  [ "$STAPLER_RUNS" -eq 6 ] || fail "lasting CloudKit outage ran stapler $STAPLER_RUNS times, expected 6"
+  run_with_ticket_outcomes 503 503 503 503 503 503 issued
+  [ "$RUN_RC" -ne 0 ] || fail "a lasting outage of Apple's ticket service must fail the install"
+  [ "$TICKET_LOOKUPS" -eq 6 ] || fail "a lasting outage looked the ticket up $TICKET_LOOKUPS times, expected 6"
   [ "$SLEEP_REQUESTS" = "2 5 15 30 60 " ] \
-    || fail "lasting CloudKit outage waited '$SLEEP_REQUESTS', expected '2 5 15 30 60 '"
-  echo "$RUN_OUT" | grep -q "Apple's notarization service did not answer while checking downloaded" \
-    || fail "lasting CloudKit outage was reported as something else: $RUN_OUT"
-  [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "lasting CloudKit outage must not install anything"
-  pass "macOS install fails closed on a lasting CloudKit outage"
-
-  run_with_stapler_outcomes 0 68 68 68 68 68 68
-  [ "$RUN_RC" -eq 0 ] \
-    || fail "CloudKit going quiet after the downloaded bundle passed failed the install with exit $RUN_RC: $RUN_OUT"
-  [ "$STAPLER_RUNS" -eq 1 ] || fail "one install asked Apple about its notarization ticket $STAPLER_RUNS times, expected once"
-  [ -z "$SLEEP_REQUESTS" ] || fail "a confirmed notarization ticket still waited '$SLEEP_REQUESTS'"
-  [ -L "$RUN_INSTALL_DIR/lpm" ] || fail "install with a confirmed notarization ticket did not link lpm"
-  pass "macOS install asks Apple about the notarization ticket once"
+    || fail "a lasting outage waited '$SLEEP_REQUESTS', expected '2 5 15 30 60 '"
+  echo "$RUN_OUT" | grep -q "Apple's notarization service did not answer while checking downloaded LPM CLI.app (HTTP 503)" \
+    || fail "a lasting outage was reported as something else: $RUN_OUT"
+  [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "a lasting outage must not install anything"
+  pass "macOS install fails closed on a lasting outage of Apple's ticket service"
 
   printf '%s' 'a1b2c3d4e5f60718293a4b5c6d7e8f9001122334' > "$tool_state/staged-cdhash"
-  run_with_stapler_outcomes 0 0
+  run_with_ticket_outcomes issued
   rm -f "$tool_state/staged-cdhash"
   [ "$RUN_RC" -ne 0 ] || fail "a staged copy with different code must fail the install"
-  [ "$STAPLER_RUNS" -eq 1 ] || fail "a staged copy with different code was checked with Apple instead of against the download"
+  [ "$TICKET_LOOKUPS" -eq 1 ] || fail "a staged copy with different code was checked with Apple instead of against the download"
   echo "$RUN_OUT" | grep -q "staged LPM CLI.app differs from the downloaded bundle" \
     || fail "a staged copy with different code was reported as something else: $RUN_OUT"
   [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "a staged copy with different code must not install anything"
   pass "macOS install rejects a staged copy whose code differs from the confirmed download"
 
   : > "$tool_state/tamper-staged-ticket"
-  run_with_stapler_outcomes 0 0
+  run_with_ticket_outcomes issued
   rm -f "$tool_state/tamper-staged-ticket"
   [ "$RUN_RC" -ne 0 ] || fail "a staged copy with a different ticket must fail the install"
-  [ "$STAPLER_RUNS" -eq 1 ] || fail "a staged copy with a different ticket was checked with Apple instead of against the download"
+  [ "$TICKET_LOOKUPS" -eq 1 ] || fail "a staged copy with a different ticket was checked with Apple instead of against the download"
   echo "$RUN_OUT" | grep -q "staged LPM CLI.app differs from the downloaded bundle" \
     || fail "a staged copy with a different ticket was reported as something else: $RUN_OUT"
   [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "a staged copy with a different ticket must not install anything"
   pass "macOS install rejects a staged copy whose stapled ticket differs from the confirmed download"
 
-  run_with_stapler_outcomes 65 0
-  [ "$RUN_RC" -ne 0 ] || fail "an invalid notarization ticket must fail the install"
-  [ "$STAPLER_RUNS" -eq 1 ] || fail "invalid notarization ticket was retried ($STAPLER_RUNS stapler runs)"
-  [ -z "$SLEEP_REQUESTS" ] || fail "invalid notarization ticket waited '$SLEEP_REQUESTS'"
-  echo "$RUN_OUT" | grep -q "does not contain a valid notarization ticket" \
-    || fail "invalid notarization ticket failure was unclear: $RUN_OUT"
-  [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "invalid notarization ticket must not install anything"
-  pass "macOS install rejects an invalid notarization ticket without retrying"
+  for refusal in \
+    "other:is not the one Apple issued for its code" \
+    "notfound:Apple has not issued a notarization ticket" \
+    "deleted:Apple has not issued a notarization ticket" \
+    "denied:refused to look up the ticket of downloaded LPM CLI.app (ACCESS_DENIED)" \
+    "400:refused to look up the ticket of downloaded LPM CLI.app (HTTP 400)"
+  do
+    outcome="${refusal%%:*}"
+    expected_error="${refusal#*:}"
+    run_with_ticket_outcomes "$outcome" issued
+    [ "$RUN_RC" -ne 0 ] || fail "ticket outcome '$outcome' must fail the install"
+    [ "$TICKET_LOOKUPS" -eq 1 ] || fail "ticket outcome '$outcome' was retried ($TICKET_LOOKUPS lookups)"
+    [ -z "$SLEEP_REQUESTS" ] || fail "ticket outcome '$outcome' waited '$SLEEP_REQUESTS'"
+    echo "$RUN_OUT" | grep -qF "$expected_error" \
+      || fail "ticket outcome '$outcome' was reported as something else: $RUN_OUT"
+    [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "ticket outcome '$outcome' must not install anything"
+  done
+  pass "macOS install rejects a ticket Apple didn't issue, a revoked one, and refused lookups without retrying"
+
+  : > "$tool_state/sha1-code-directory"
+  run_with_ticket_outcomes issued
+  rm -f "$tool_state/sha1-code-directory"
+  [ "$RUN_RC" -ne 0 ] || fail "a bundle without a SHA-256 code directory must fail the install"
+  [ "$TICKET_LOOKUPS" -eq 0 ] || fail "a bundle without a SHA-256 code directory was looked up with Apple"
+  echo "$RUN_OUT" | grep -q "is not signed with a SHA-256 code directory" \
+    || fail "a bundle without a SHA-256 code directory was reported as something else: $RUN_OUT"
+  pass "macOS install requires the SHA-256 code directory Apple's ticket is filed under"
 
   rm -rf "$fdir" "$tool_state"
-  printf '#!/bin/sh\nexit 0\n' > "$CLEAN_PATH_DIR/xcrun"
   rm -f "$CLEAN_PATH_DIR/sleep"
   ln -s "$(command -v sleep)" "$CLEAN_PATH_DIR/sleep"
 fi

@@ -14,12 +14,25 @@ path (mid-stream guard). The `.NOCL` suffix is stripped from the URL.
 
 A fixture file named `*.STATUS` holds an HTTP status code; the URL
 without that suffix answers with that status and an empty body.
+
+POST /ticket-lookup stands in for Apple's notarization ticket database.
+Each request's record name is appended to `ticket-requests`; the nth
+request is answered with line n of `ticket-outcomes` (default `issued`):
+`issued` returns the ticket in `ticket-issued` (default
+`fixture-notarization-ticket`), `other` returns a different ticket,
+`notfound`/`deleted`/`throttled`/`denied` return those record states,
+`wrongrecord` answers about another record, `garbage` returns a non-JSON
+page, `drop` closes the connection, and a number answers with that status.
 """
 
+import base64
 import http.server
+import json
 import os
 import socketserver
 import sys
+
+DEFAULT_TICKET = b"fixture-notarization-ticket"
 
 
 def main() -> int:
@@ -67,6 +80,76 @@ def main() -> int:
             self.send_response(404)
             self.send_header("Content-Length", "0")
             self.end_headers()
+
+        def do_POST(self) -> None:  # noqa: N802 — stdlib API
+            if self.path != "/ticket-lookup":
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            request = json.loads(self.rfile.read(length))
+            record_name = request["records"][0]["recordName"]
+            requests = os.path.join(fixture_dir, "ticket-requests")
+            with open(requests, "a", encoding="utf-8") as f:
+                f.write(record_name + "\n")
+            with open(requests, encoding="utf-8") as f:
+                index = len(f.read().splitlines()) - 1
+            outcome = "issued"
+            outcomes = os.path.join(fixture_dir, "ticket-outcomes")
+            if os.path.isfile(outcomes):
+                with open(outcomes, encoding="utf-8") as f:
+                    lines = f.read().split()
+                if index < len(lines):
+                    outcome = lines[index]
+            if outcome == "drop":
+                self.close_connection = True
+                self.connection.shutdown(2)
+                return
+            if outcome.isdigit():
+                self.send_response(int(outcome))
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if outcome == "garbage":
+                self.answer(200, b"<html>captive portal</html>")
+                return
+            record = {"recordName": record_name}
+            if outcome in ("issued", "other", "deleted"):
+                ticket = DEFAULT_TICKET
+                issued = os.path.join(fixture_dir, "ticket-issued")
+                if os.path.isfile(issued):
+                    with open(issued, "rb") as f:
+                        ticket = f.read()
+                if outcome == "other":
+                    ticket = b"another-release-ticket"
+                record.update(
+                    recordType="DeveloperIDTicket",
+                    fields={
+                        "signedTicket": {
+                            "value": base64.b64encode(ticket).decode("ascii"),
+                            "type": "BYTES",
+                        }
+                    },
+                    deleted=outcome == "deleted",
+                )
+            elif outcome == "wrongrecord":
+                record.update(recordName="2/2/" + "0" * 40, fields={})
+            else:
+                codes = {
+                    "notfound": "NOT_FOUND",
+                    "throttled": "THROTTLED",
+                    "denied": "ACCESS_DENIED",
+                }
+                record.update(reason="fixture", serverErrorCode=codes[outcome])
+            self.answer(200, json.dumps({"records": [record]}).encode("utf-8"))
+
+        def answer(self, status: int, body: bytes) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def log_message(self, fmt: str, *args: object) -> None:  # noqa: N802
             return

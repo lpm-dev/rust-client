@@ -5,6 +5,10 @@ use std::time::{Duration, Instant};
 
 const OUTPUT_LIMIT: usize = 1024 * 1024;
 
+/// The only environment a validation program gets. Variables of the caller's,
+/// such as `DEVELOPER_DIR`, would otherwise change what the system tools do.
+const VALIDATION_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
 pub(super) fn run(
     program: &str,
     arguments: &[&OsStr],
@@ -16,7 +20,10 @@ pub(super) fn run(
     let mut session = lpm_common::process_output::CaptureSession::default();
     let output = session
         .capture_output(
-            Command::new(program).args(arguments),
+            Command::new(program)
+                .args(arguments)
+                .env_clear()
+                .env("PATH", VALIDATION_PATH),
             OUTPUT_LIMIT + 1,
             |_| {
                 if started.elapsed() >= timeout {
@@ -62,5 +69,66 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("deadline"));
         assert!(started.elapsed() < Duration::from_secs(3));
         lpm_common::with_exclusive_lock(&lock_path, || Ok::<_, LpmError>(())).unwrap();
+    }
+
+    #[test]
+    fn macos_validation_refuses_excessive_output() {
+        let result = run(
+            "/bin/sh",
+            &[
+                OsStr::new("-c"),
+                OsStr::new("/usr/bin/head -c 2097152 /dev/zero"),
+            ],
+            "noisy validation fixture",
+            Duration::from_secs(60),
+        );
+        assert!(result.is_err(), "validation output must be bounded");
+    }
+
+    #[test]
+    fn macos_validation_does_not_wait_for_inherited_output_after_parent_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("child-pid");
+        let script = format!("/bin/sleep 5 & echo $! > '{}'; exit 0", pid_file.display());
+        let started = Instant::now();
+        let result = run(
+            "/bin/sh",
+            &[OsStr::new("-c"), OsStr::new(&script)],
+            "detached output fixture",
+            Duration::from_secs(60),
+        );
+        let elapsed = started.elapsed();
+        if let Ok(pid) = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+        {
+            // SAFETY: the PID belongs to the disposable child created by this test.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        result.unwrap();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "inherited pipe delayed completion: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn validation_programs_see_only_the_system_path() {
+        let output = run(
+            "/usr/bin/env",
+            &[],
+            "environment fixture",
+            Duration::from_secs(60),
+        )
+        .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("PATH={VALIDATION_PATH}\n")
+        );
     }
 }

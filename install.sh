@@ -30,6 +30,11 @@ EXPECTED_BUNDLE_ID="dev.lpm.cli"
 EXPECTED_TEAM_ID="823S8YKMRW"
 EXPECTED_ACCESS_GROUP="$EXPECTED_TEAM_ID.dev.lpm.vault.shared"
 EXPECTED_PROFILE_ACCESS_GROUP="$EXPECTED_TEAM_ID.*"
+# A Developer ID Application signature of LPM's team, plus a notarization
+# ticket. Until a code directory's ticket is cached system-wide the ticket can
+# only come from the app itself, so on a Mac that hasn't seen this code the
+# check verifies the stapled ticket's Apple signature without the network.
+MACOS_CODE_REQUIREMENT="anchor apple generic and identifier \"$EXPECTED_BUNDLE_ID\" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$EXPECTED_TEAM_ID\" and notarized"
 # v0.76.5 is the last signed app bundle that does not declare an icon.
 MACOS_ICON_FIRST_VERSION="v0.76.6"
 MACOS_BUNDLE=0
@@ -226,24 +231,39 @@ if [ -n "${LPM_INSTALL_TEST_INTERRUPT_AFTER:-}" ] && { \
   exit 1
 fi
 
+# Every macOS tool below ships with macOS. None may be an xcrun shim such as
+# /usr/bin/stapler, which fails on a Mac without Xcode or the Command Line
+# Tools.
+MACOS_BASE64_TOOL="/usr/bin/base64"
 MACOS_CODESIGN_TOOL="/usr/bin/codesign"
-MACOS_SECURITY_TOOL="/usr/bin/security"
-MACOS_SPCTL_TOOL="/usr/sbin/spctl"
-MACOS_XCRUN_TOOL="/usr/bin/xcrun"
 MACOS_DITTO_TOOL="/usr/bin/ditto"
+MACOS_OPENSSL_TOOL="/usr/bin/openssl"
+MACOS_PLISTBUDDY_TOOL="/usr/libexec/PlistBuddy"
+MACOS_PLUTIL_TOOL="/usr/bin/plutil"
+MACOS_SPCTL_TOOL="/usr/sbin/spctl"
 MACOS_UNZIP_TOOL="/usr/bin/unzip"
 
-if [ -n "${LPM_INSTALL_TEST_CODESIGN:-}${LPM_INSTALL_TEST_SECURITY:-}${LPM_INSTALL_TEST_SPCTL:-}${LPM_INSTALL_TEST_XCRUN:-}" ]; then
+# Apple publishes the ticket it issues for each notarized code directory as a
+# record in a public CloudKit database, named after the code-directory hash.
+# `stapler validate` compares that record with the ticket stapled to the app;
+# the installer does the same with curl.
+NOTARIZATION_TICKET_LOOKUP_URL="https://api.apple-cloudkit.com/database/1/com.apple.gk.ticket-delivery/production/public/records/lookup"
+
+if [ -n "${LPM_INSTALL_TEST_CODESIGN:-}${LPM_INSTALL_TEST_OPENSSL:-}${LPM_INSTALL_TEST_SPCTL:-}${LPM_INSTALL_TEST_TICKET_LOOKUP_URL:-}" ]; then
   if [ "$OS" != "Darwin" ] || \
      [ -z "${LPM_INSTALL_TEST_API_URL:-}" ] || \
      [ -z "${LPM_INSTALL_TEST_DOWNLOAD_BASE:-}" ]; then
     echo "ERROR: macOS tool overrides require both loopback test endpoints on macOS"
     exit 1
   fi
+  if [ -n "${LPM_INSTALL_TEST_TICKET_LOOKUP_URL:-}" ] && ! is_loopback_http "$LPM_INSTALL_TEST_TICKET_LOOKUP_URL"; then
+    echo "ERROR: LPM_INSTALL_TEST_TICKET_LOOKUP_URL must point at 127.0.0.1 / localhost / [::1] over http"
+    exit 1
+  fi
   MACOS_CODESIGN_TOOL="${LPM_INSTALL_TEST_CODESIGN:-$MACOS_CODESIGN_TOOL}"
-  MACOS_SECURITY_TOOL="${LPM_INSTALL_TEST_SECURITY:-$MACOS_SECURITY_TOOL}"
+  MACOS_OPENSSL_TOOL="${LPM_INSTALL_TEST_OPENSSL:-$MACOS_OPENSSL_TOOL}"
   MACOS_SPCTL_TOOL="${LPM_INSTALL_TEST_SPCTL:-$MACOS_SPCTL_TOOL}"
-  MACOS_XCRUN_TOOL="${LPM_INSTALL_TEST_XCRUN:-$MACOS_XCRUN_TOOL}"
+  NOTARIZATION_TICKET_LOOKUP_URL="${LPM_INSTALL_TEST_TICKET_LOOKUP_URL:-$NOTARIZATION_TICKET_LOOKUP_URL}"
 fi
 
 REQUESTED_VERSION="${LPM_INSTALL_VERSION:-}"
@@ -652,30 +672,104 @@ require_reported_version() {
   fi
 }
 
-# stapler validate checks the stapled ticket against Apple's CloudKit record
-# and exits with EX_NOHOST when CloudKit doesn't answer. CloudKit lookups have
-# kept failing for over 20 s at a time, so the checks spread over about two
-# minutes before giving up.
-STAPLER_CLOUDKIT_UNREACHABLE=68
+# Record errors Apple's ticket service reports for load or outages.
+NOTARIZATION_TICKET_TRANSIENT_ERRORS=" THROTTLED TRY_AGAIN_LATER SERVICE_UNAVAILABLE INTERNAL_ERROR ZONE_BUSY "
 
-validate_notarization_ticket() {
+notarization_ticket_field() {
+  "$MACOS_PLISTBUDDY_TOOL" -c "Print :records:0:$1" "$ticket_plist" 2>/dev/null
+}
+
+# Looks up the ticket record named $ticket_record. Sets ticket_lookup to
+# issued (Apple's ticket is in $ticket_issued), not-issued (no ticket, or a
+# revoked one), refused (an error asking again won't change) or unavailable,
+# and ticket_lookup_detail to what the service said.
+lookup_notarization_ticket() {
+  ticket_lookup="unavailable"
+  ticket_lookup_detail="no answer"
+  rm -f "$ticket_response" "$ticket_plist" "$ticket_issued"
+  ticket_http_status=$(curl -sS --max-time 30 -o "$ticket_response" -w '%{http_code}' \
+    -H 'Content-Type: application/json' \
+    --data "{\"records\":[{\"recordName\":\"$ticket_record\"}]}" \
+    "$NOTARIZATION_TICKET_LOOKUP_URL") || return 0
+  case "$ticket_http_status" in
+    200) ;;
+    429|5[0-9][0-9]) ticket_lookup_detail="HTTP $ticket_http_status"; return 0 ;;
+    *) ticket_lookup="refused"; ticket_lookup_detail="HTTP $ticket_http_status"; return 0 ;;
+  esac
+  if ! "$MACOS_PLUTIL_TOOL" -convert xml1 -o "$ticket_plist" "$ticket_response" >/dev/null 2>&1; then
+    ticket_lookup_detail="an unreadable answer"
+    return 0
+  fi
+  if "$MACOS_PLISTBUDDY_TOOL" -c 'Print :records:1' "$ticket_plist" >/dev/null 2>&1 || \
+     [ "$(notarization_ticket_field recordName || true)" != "$ticket_record" ]; then
+    ticket_lookup_detail="an answer about another record"
+    return 0
+  fi
+  ticket_server_error=$(notarization_ticket_field serverErrorCode || true)
+  case "$ticket_server_error" in
+    '') ;;
+    NOT_FOUND) ticket_lookup="not-issued"; return 0 ;;
+    *[!A-Z_]*) ticket_lookup="refused"; ticket_lookup_detail="an unrecognized error"; return 0 ;;
+    *)
+      ticket_lookup_detail="$ticket_server_error"
+      case "$NOTARIZATION_TICKET_TRANSIENT_ERRORS" in
+        *" $ticket_server_error "*) ;;
+        *) ticket_lookup="refused" ;;
+      esac
+      return 0
+      ;;
+  esac
+  if [ "$(notarization_ticket_field deleted || true)" = "true" ]; then
+    ticket_lookup="not-issued"
+    return 0
+  fi
+  if ! ticket_value=$(notarization_ticket_field fields:signedTicket:value); then
+    ticket_lookup_detail="an answer without a ticket"
+    return 0
+  fi
+  if ! printf '%s' "$ticket_value" | "$MACOS_BASE64_TOOL" -D > "$ticket_issued" 2>/dev/null || \
+     [ ! -s "$ticket_issued" ]; then
+    ticket_lookup_detail="an unreadable ticket"
+    return 0
+  fi
+  ticket_lookup="issued"
+}
+
+# Confirms that Apple's ticket database holds exactly the ticket stapled to an
+# app bundle, for the code directory whose SHA-256 hash is $3. The service has
+# kept failing for over 20 s at a time, so the lookups spread over about two
+# minutes before giving up.
+confirm_notarization_ticket() {
   ticket_bundle="$1"
   ticket_label="$2"
+  ticket_record="2/2/$3"
+  ticket_response="$STAGE_DIR/notarization-ticket.json"
+  ticket_plist="$STAGE_DIR/notarization-ticket.plist"
+  ticket_issued="$STAGE_DIR/notarization-ticket"
   for ticket_retry_delay in 2 5 15 30 60 ""; do
-    ticket_status=0
-    "$MACOS_XCRUN_TOOL" stapler validate "$ticket_bundle" || ticket_status=$?
-    if [ "$ticket_status" -eq 0 ]; then
-      return 0
-    fi
-    if [ "$ticket_status" -ne "$STAPLER_CLOUDKIT_UNREACHABLE" ]; then
-      echo "ERROR: $ticket_label does not contain a valid notarization ticket."
-      return 1
-    fi
+    lookup_notarization_ticket
+    case "$ticket_lookup" in
+      issued)
+        if cmp -s "$ticket_issued" "$ticket_bundle/Contents/CodeResources"; then
+          return 0
+        fi
+        echo "ERROR: the notarization ticket stapled to $ticket_label is not the one Apple issued for its code."
+        return 1
+        ;;
+      not-issued)
+        echo "ERROR: Apple has not issued a notarization ticket for $ticket_label, or has revoked it."
+        return 1
+        ;;
+      refused)
+        echo "ERROR: Apple's notarization service refused to look up the ticket of $ticket_label ($ticket_lookup_detail)."
+        return 1
+        ;;
+    esac
     if [ -z "$ticket_retry_delay" ]; then
-      echo "ERROR: Apple's notarization service did not answer while checking $ticket_label. Try again in a few minutes."
+      echo "ERROR: Apple's notarization service did not answer while checking $ticket_label ($ticket_lookup_detail). Try again in a few minutes."
       return 1
     fi
-    echo "Apple's notarization service did not answer; checking the notarization ticket again in ${ticket_retry_delay}s..."
+    echo "Apple's notarization service did not answer ($ticket_lookup_detail); checking the notarization ticket again in ${ticket_retry_delay}s..."
     sleep "$ticket_retry_delay"
   done
 }
@@ -709,7 +803,7 @@ validate_macos_bundle() {
     fi
   done
 
-  declared_icon=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$app_contents/Info.plist" 2>/dev/null || true)
+  declared_icon=$("$MACOS_PLISTBUDDY_TOOL" -c 'Print :CFBundleIconFile' "$app_contents/Info.plist" 2>/dev/null || true)
   icon_required=0
   if ! version_lt "$VERSION" "$MACOS_ICON_FIRST_VERSION"; then
     icon_required=1
@@ -743,8 +837,8 @@ validate_macos_bundle() {
     return 1
   fi
 
-  if ! "$MACOS_CODESIGN_TOOL" --verify --strict --verbose=4 "$app_bundle"; then
-    echo "ERROR: $app_label failed code-signature validation."
+  if ! "$MACOS_CODESIGN_TOOL" --verify --strict --verbose=4 -R "=$MACOS_CODE_REQUIREMENT" "$app_bundle"; then
+    echo "ERROR: $app_label failed code-signature and notarization validation."
     return 1
   fi
   signature_details=$("$MACOS_CODESIGN_TOOL" -dvvv "$app_bundle" 2>&1) || return 1
@@ -754,9 +848,20 @@ validate_macos_bundle() {
     echo "ERROR: $app_label has an unexpected signing identity."
     return 1
   fi
+  signed_hash_type=$(printf '%s\n' "$signature_details" | awk -F= '/^Hash type=/{split($2, value, " "); print value[1]}')
+  if [ "$signed_hash_type" != "sha256" ]; then
+    echo "ERROR: $app_label is not signed with a SHA-256 code directory."
+    return 1
+  fi
   app_cdhash=$(printf '%s\n' "$signature_details" | awk -F= '/^CDHash=/{print $2}')
-  if [ -z "$app_cdhash" ]; then
-    echo "ERROR: $app_label has no code-directory hash."
+  case "$app_cdhash" in
+    *[!0-9a-f]*|'')
+      echo "ERROR: $app_label has no well-formed code-directory hash."
+      return 1
+      ;;
+  esac
+  if [ "${#app_cdhash}" -ne 40 ]; then
+    echo "ERROR: $app_label has no well-formed code-directory hash."
     return 1
   fi
 
@@ -765,23 +870,26 @@ validate_macos_bundle() {
     echo "ERROR: $app_label has no readable signed entitlements."
     return 1
   fi
-  signed_access_groups=$(/usr/libexec/PlistBuddy -c 'Print :keychain-access-groups' "$signed_entitlements" 2>/dev/null) || return 1
+  signed_access_groups=$("$MACOS_PLISTBUDDY_TOOL" -c 'Print :keychain-access-groups' "$signed_entitlements" 2>/dev/null) || return 1
   if ! plist_array_contains_exact "$signed_access_groups" "$EXPECTED_ACCESS_GROUP"; then
     echo "ERROR: $app_label does not have the LPM Vault shared Keychain access group."
     return 1
   fi
 
+  # security cms -D would import the profile's certificates into the default
+  # keychain, and fails for an account without one. The profile is a sealed
+  # resource of the code signature verified above, so it only needs decoding.
   profile_plist="$STAGE_DIR/profile.plist"
-  if ! "$MACOS_SECURITY_TOOL" cms -D -i "$app_profile" > "$profile_plist"; then
+  if ! "$MACOS_OPENSSL_TOOL" smime -verify -noverify -nosigs -inform DER -in "$app_profile" -out "$profile_plist" 2>/dev/null; then
     echo "ERROR: $app_label has an unreadable provisioning profile."
     return 1
   fi
-  profile_team=$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$profile_plist" 2>/dev/null) || return 1
+  profile_team=$("$MACOS_PLISTBUDDY_TOOL" -c 'Print :TeamIdentifier:0' "$profile_plist" 2>/dev/null) || return 1
   profile_application=$(
-    /usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.application-identifier' "$profile_plist" 2>/dev/null ||
-      /usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$profile_plist" 2>/dev/null
+    "$MACOS_PLISTBUDDY_TOOL" -c 'Print :Entitlements:com.apple.application-identifier' "$profile_plist" 2>/dev/null ||
+      "$MACOS_PLISTBUDDY_TOOL" -c 'Print :Entitlements:application-identifier' "$profile_plist" 2>/dev/null
   ) || return 1
-  profile_access_groups=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:keychain-access-groups' "$profile_plist" 2>/dev/null) || return 1
+  profile_access_groups=$("$MACOS_PLISTBUDDY_TOOL" -c 'Print :Entitlements:keychain-access-groups' "$profile_plist" 2>/dev/null) || return 1
   if [ "$profile_team" != "$EXPECTED_TEAM_ID" ] || \
      [ "$profile_application" != "$EXPECTED_TEAM_ID.$EXPECTED_BUNDLE_ID" ] || \
      { ! plist_array_contains_exact "$profile_access_groups" "$EXPECTED_ACCESS_GROUP" && \
@@ -791,7 +899,7 @@ validate_macos_bundle() {
   fi
 
   if [ -z "$confirmed_bundle" ]; then
-    validate_notarization_ticket "$app_bundle" "$app_label" || return 1
+    confirm_notarization_ticket "$app_bundle" "$app_label" "$app_cdhash" || return 1
   elif [ "$app_cdhash" != "$confirmed_cdhash" ] || \
        ! cmp -s "$confirmed_bundle/Contents/CodeResources" "$app_ticket"; then
     echo "ERROR: $app_label differs from the downloaded bundle whose notarization ticket Apple confirmed."

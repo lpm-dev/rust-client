@@ -3644,6 +3644,7 @@ dependencies = [
  "rustix",
  "same-file",
  "secrecy",
+ "security-framework 3.7.0",
  "serde",
  "serde_json",
  "serde_yaml",

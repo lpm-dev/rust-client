@@ -20,6 +20,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod cargo_metadata;
 mod download;
+#[cfg(any(target_os = "macos", test))]
+mod notarization;
 mod probe;
 #[cfg(any(windows, test))]
 mod sandbox_helper;
@@ -2377,7 +2379,9 @@ async fn run_standalone_update(
         let staged_bundle = stage_macos_bundle(
             assets.staged_binary.temporary.path(),
             &macos_layout.app_parent,
-        )?;
+            human_output,
+        )
+        .await?;
         VersionProbe::verify_staged_path(&staged_bundle.executable, version)?;
         install_staged_macos_bundle(&macos_layout, staged_bundle, version)?;
     }
@@ -2767,29 +2771,25 @@ struct StagedMacOSBundle {
     staging_root: tempfile::TempDir,
     app_bundle: PathBuf,
     executable: PathBuf,
-    notarization: ConfirmedNotarization,
+    /// Apple's notarization service confirmed this ticket for this code.
+    notarization: StapledNotarization,
 }
 
-/// The code-directory hash and stapled notarization ticket of a bundle whose
-/// ticket Apple's ticketing service confirmed.
+/// The code-directory hash and stapled notarization ticket of a bundle.
 #[cfg(target_os = "macos")]
 #[derive(Debug, PartialEq, Eq)]
-struct ConfirmedNotarization {
+struct StapledNotarization {
+    /// The SHA-256 code-directory hash, truncated to 20 bytes, in lower-case
+    /// hex.
     cdhash: String,
     ticket: Vec<u8>,
 }
 
 #[cfg(target_os = "macos")]
-enum NotarizationCheck<'a> {
-    AskApple,
-    /// The bundle was moved from one whose ticket Apple confirmed, so it must
-    /// carry the same code and the same ticket instead of asking Apple again.
-    SameAs(&'a ConfirmedNotarization),
-}
-
-#[cfg(target_os = "macos")]
-impl ConfirmedNotarization {
-    fn confirm_same_bundle(&self, installed: &ConfirmedNotarization) -> Result<(), LpmError> {
+impl StapledNotarization {
+    /// A bundle moved from one whose ticket Apple confirmed must carry the
+    /// same code and the same ticket, instead of Apple being asked again.
+    fn confirm_same_bundle(&self, installed: &StapledNotarization) -> Result<(), LpmError> {
         if self == installed {
             return Ok(());
         }
@@ -2801,9 +2801,10 @@ impl ConfirmedNotarization {
 }
 
 #[cfg(target_os = "macos")]
-fn stage_macos_bundle(
+async fn stage_macos_bundle(
     archive_path: &Path,
     app_parent: &Path,
+    human_output: bool,
 ) -> Result<StagedMacOSBundle, LpmError> {
     validate_macos_bundle_zip(archive_path)?;
     let staging_root = tempfile::Builder::new()
@@ -2811,7 +2812,7 @@ fn stage_macos_bundle(
         .tempdir_in(app_parent)
         .map_err(LpmError::Io)?;
     run_macos_validation_tool(
-        "/usr/bin/ditto",
+        MacOSTool::Ditto,
         &[
             OsStr::new("-x"),
             OsStr::new("-k"),
@@ -2821,13 +2822,31 @@ fn stage_macos_bundle(
         "macOS app extraction",
     )?;
     let app_bundle = staging_root.path().join(MACOS_APP_NAME);
-    let notarization = validate_macos_app_bundle(&app_bundle, NotarizationCheck::AskApple)?;
+    let stapled = inspect_signed_macos_app_bundle(&app_bundle)?;
+    notarization::confirm_stapled_ticket(
+        &notarization::lookup_client()?,
+        notarization::TICKET_LOOKUP_URL,
+        &stapled.cdhash,
+        &stapled.ticket,
+        &notarization::RETRY_DELAYS,
+        |delay, detail| {
+            if human_output {
+                install_ui::phase_untrusted(&format!(
+                    "Apple's notarization service did not answer ({detail}); checking the \
+                     notarization ticket again in {}s",
+                    delay.as_secs()
+                ));
+            }
+        },
+    )
+    .await?;
+    assess_macos_app_bundle_with_gatekeeper(&app_bundle)?;
     let executable = app_bundle.join(MACOS_INTERNAL_EXECUTABLE);
     Ok(StagedMacOSBundle {
         staging_root,
         app_bundle,
         executable,
-        notarization,
+        notarization: stapled,
     })
 }
 
@@ -2950,30 +2969,48 @@ fn validate_macos_app_inventory(app_bundle: &Path) -> Result<(), LpmError> {
     Ok(())
 }
 
+/// The programs macOS bundle validation runs. Each must ship with macOS: an
+/// `xcrun` shim such as `/usr/bin/stapler` fails on a Mac without Xcode or the
+/// Command Line Tools, and an updater that runs one can never update there.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MacOSTool {
+    Codesign,
+    Ditto,
+    PlistBuddy,
+    Spctl,
+}
+
+#[cfg(target_os = "macos")]
+impl MacOSTool {
+    #[cfg(test)]
+    const ALL: [Self; 4] = [Self::Codesign, Self::Ditto, Self::PlistBuddy, Self::Spctl];
+
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Codesign => "/usr/bin/codesign",
+            Self::Ditto => "/usr/bin/ditto",
+            Self::PlistBuddy => "/usr/libexec/PlistBuddy",
+            Self::Spctl => "/usr/sbin/spctl",
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn run_macos_validation_tool(
-    program: &str,
+    tool: MacOSTool,
     arguments: &[&OsStr],
     description: &str,
 ) -> Result<std::process::Output, LpmError> {
-    let output = run_macos_validation_tool_once(program, arguments, description)?;
+    let output = validation::run(tool.path(), arguments, description, Duration::from_secs(60))?;
     if !output.status.success() {
         return Err(macos_validation_failure(description, &output));
     }
     Ok(output)
 }
 
-#[cfg(target_os = "macos")]
-fn run_macos_validation_tool_once(
-    program: &str,
-    arguments: &[&OsStr],
-    description: &str,
-) -> Result<std::process::Output, LpmError> {
-    validation::run(program, arguments, description, Duration::from_secs(60))
-}
-
 /// Names the failure in the tool's own words: its stderr, or its stdout
-/// when stderr is empty, which is where `stapler` reports.
+/// when stderr is empty.
 #[cfg(target_os = "macos")]
 fn macos_validation_failure(description: &str, output: &std::process::Output) -> LpmError {
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2994,53 +3031,11 @@ fn macos_validation_failure(description: &str, output: &std::process::Output) ->
     ))
 }
 
-/// `stapler validate` checks the stapled ticket against Apple's CloudKit
-/// record and exits with `EX_NOHOST` when CloudKit doesn't answer.
-#[cfg(target_os = "macos")]
-const STAPLER_CLOUDKIT_UNREACHABLE: i32 = 68;
-
-/// CloudKit lookups have kept failing for over 20 s at a time, so the checks
-/// spread over about two minutes before giving up, as install.sh's do.
-#[cfg(target_os = "macos")]
-const NOTARIZATION_TICKET_RETRY_DELAYS: [Duration; 5] = [
-    Duration::from_secs(2),
-    Duration::from_secs(5),
-    Duration::from_secs(15),
-    Duration::from_secs(30),
-    Duration::from_secs(60),
-];
-
-/// Validates the bundle's stapled notarization ticket, running `stapler`
-/// again after each of `retry_delays` while CloudKit doesn't answer. Any
-/// other failure, an invalid or missing ticket among them, fails at once.
-#[cfg(target_os = "macos")]
-fn validate_notarization_ticket(
-    stapler: &str,
-    app_bundle: &Path,
-    retry_delays: &[Duration],
-) -> Result<(), LpmError> {
-    const DESCRIPTION: &str = "macOS notarization-ticket validation";
-    let arguments = [OsStr::new("validate"), app_bundle.as_os_str()];
-    let mut retry_delays = retry_delays.iter();
-    loop {
-        let output = run_macos_validation_tool_once(stapler, &arguments, DESCRIPTION)?;
-        if output.status.success() {
-            return Ok(());
-        }
-        match retry_delays.next() {
-            Some(delay) if output.status.code() == Some(STAPLER_CLOUDKIT_UNREACHABLE) => {
-                std::thread::sleep(*delay);
-            }
-            _ => return Err(macos_validation_failure(DESCRIPTION, &output)),
-        }
-    }
-}
-
 #[cfg(target_os = "macos")]
 fn plist_buddy_value(plist: &Path, key: &str) -> Result<String, LpmError> {
     let command = format!("Print :{key}");
     let output = run_macos_validation_tool(
-        "/usr/libexec/PlistBuddy",
+        MacOSTool::PlistBuddy,
         &[OsStr::new("-c"), command.as_ref(), plist.as_os_str()],
         "provisioning-profile metadata validation",
     )?;
@@ -3080,27 +3075,84 @@ fn macos_entitlement_inspection_arguments(app_bundle: &Path) -> [&OsStr; 4] {
     ]
 }
 
+/// The code requirement every LPM macOS app satisfies: a Developer ID
+/// Application signature of LPM's team over its bundle identifier, plus a
+/// notarization ticket. Until a code directory's ticket is cached system-wide
+/// the ticket can only come from the app itself, so on a Mac that hasn't seen
+/// this code the check verifies the stapled ticket's Apple signature without
+/// the network. The leading `=` marks inline requirement text.
 #[cfg(target_os = "macos")]
-fn validate_macos_app_bundle(
-    app_bundle: &Path,
-    notarization_check: NotarizationCheck<'_>,
-) -> Result<ConfirmedNotarization, LpmError> {
+fn macos_code_requirement() -> String {
+    format!(
+        "=anchor apple generic and identifier \"{MACOS_EXPECTED_BUNDLE_ID}\" \
+         and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
+         and certificate leaf[field.1.2.840.113635.100.6.1.13] exists \
+         and certificate leaf[subject.OU] = \"{MACOS_EXPECTED_TEAM_ID}\" \
+         and notarized"
+    )
+}
+
+/// Profiles are about 12 KiB; the bound keeps a hostile one out of memory.
+#[cfg(target_os = "macos")]
+const MACOS_PROVISIONING_PROFILE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Decodes the provisioning profile's CMS envelope in process. `security cms
+/// -D` would import the envelope's certificates into the default keychain,
+/// and fails for an account without one. The profile is a sealed resource of
+/// the code signature verified first, so only its content is needed.
+#[cfg(target_os = "macos")]
+fn decode_provisioning_profile(profile: &Path) -> Result<Vec<u8>, LpmError> {
+    use std::io::Read as _;
+
+    let mut message = Vec::new();
+    std::fs::File::open(profile)
+        .map_err(LpmError::Io)?
+        .take(MACOS_PROVISIONING_PROFILE_MAX_BYTES + 1)
+        .read_to_end(&mut message)
+        .map_err(LpmError::Io)?;
+    if message.len() as u64 > MACOS_PROVISIONING_PROFILE_MAX_BYTES {
+        return Err(LpmError::SelfUpdate(
+            "macOS provisioning profile exceeds its size limit".to_string(),
+        ));
+    }
+    let decode = || {
+        let decoder = security_framework::cms::CMSDecoder::create()?;
+        decoder.update_message(&message)?;
+        decoder.finalize_message()?;
+        decoder.get_content()
+    };
+    decode().map_err(|error| {
+        LpmError::SelfUpdate(format!(
+            "macOS provisioning profile could not be decoded: {error}"
+        ))
+    })
+}
+
+/// Checks everything about an app bundle that needs no network: its
+/// contents, its code signature and notarization requirement, its signing
+/// identity, entitlements and provisioning profile. Returns its SHA-256
+/// code-directory hash and stapled ticket.
+#[cfg(target_os = "macos")]
+fn inspect_signed_macos_app_bundle(app_bundle: &Path) -> Result<StapledNotarization, LpmError> {
     use std::io::Write as _;
 
     validate_macos_app_inventory(app_bundle)?;
+    let requirement = macos_code_requirement();
     run_macos_validation_tool(
-        "/usr/bin/codesign",
+        MacOSTool::Codesign,
         &[
             OsStr::new("--verify"),
             OsStr::new("--strict"),
             OsStr::new("--verbose=4"),
+            OsStr::new("-R"),
+            OsStr::new(&requirement),
             app_bundle.as_os_str(),
         ],
-        "macOS app code-signature validation",
+        "macOS app code-signature and notarization validation",
     )?;
 
     let details = run_macos_validation_tool(
-        "/usr/bin/codesign",
+        MacOSTool::Codesign,
         &[OsStr::new("-dvvv"), app_bundle.as_os_str()],
         "macOS app signing-identity inspection",
     )?;
@@ -3122,19 +3174,25 @@ fn validate_macos_app_bundle(
             "macOS app has an unexpected Team ID or bundle identifier".to_string(),
         ));
     }
+    if detail_value("Hash type").and_then(|value| value.split_whitespace().next()) != Some("sha256")
+    {
+        return Err(LpmError::SelfUpdate(
+            "macOS app signature does not have a SHA-256 code directory".to_string(),
+        ));
+    }
     let Some(cdhash) = detail_value("CDHash").filter(|cdhash| !cdhash.is_empty()) else {
         return Err(LpmError::SelfUpdate(
             "macOS app signature has no code-directory hash".to_string(),
         ));
     };
-    let notarization = ConfirmedNotarization {
+    let notarization = StapledNotarization {
         cdhash: cdhash.to_string(),
         ticket: std::fs::read(app_bundle.join("Contents/CodeResources")).map_err(LpmError::Io)?,
     };
 
     let entitlement_arguments = macos_entitlement_inspection_arguments(app_bundle);
     let signed_entitlements = run_macos_validation_tool(
-        "/usr/bin/codesign",
+        MacOSTool::Codesign,
         &entitlement_arguments,
         "macOS app entitlement inspection",
     )?;
@@ -3150,20 +3208,11 @@ fn validate_macos_app_bundle(
         ));
     }
 
-    let profile = app_bundle.join("Contents/embedded.provisionprofile");
-    let decoded_profile = run_macos_validation_tool(
-        "/usr/bin/security",
-        &[
-            OsStr::new("cms"),
-            OsStr::new("-D"),
-            OsStr::new("-i"),
-            profile.as_os_str(),
-        ],
-        "macOS provisioning-profile decoding",
-    )?;
+    let decoded_profile =
+        decode_provisioning_profile(&app_bundle.join("Contents/embedded.provisionprofile"))?;
     let mut profile_plist = tempfile::NamedTempFile::new().map_err(LpmError::Io)?;
     profile_plist
-        .write_all(&decoded_profile.stdout)
+        .write_all(&decoded_profile)
         .map_err(LpmError::Io)?;
     profile_plist.flush().map_err(LpmError::Io)?;
     let profile_team = plist_buddy_value(profile_plist.path(), "TeamIdentifier:0")?;
@@ -3179,17 +3228,13 @@ fn validate_macos_app_bundle(
                 .to_string(),
         ));
     }
+    Ok(notarization)
+}
 
-    match notarization_check {
-        NotarizationCheck::AskApple => validate_notarization_ticket(
-            "/usr/bin/stapler",
-            app_bundle,
-            &NOTARIZATION_TICKET_RETRY_DELAYS,
-        )?,
-        NotarizationCheck::SameAs(confirmed) => confirmed.confirm_same_bundle(&notarization)?,
-    }
+#[cfg(target_os = "macos")]
+fn assess_macos_app_bundle_with_gatekeeper(app_bundle: &Path) -> Result<(), LpmError> {
     run_macos_validation_tool(
-        "/usr/sbin/spctl",
+        MacOSTool::Spctl,
         &[
             OsStr::new("--assess"),
             OsStr::new("--type"),
@@ -3199,7 +3244,7 @@ fn validate_macos_app_bundle(
         ],
         "macOS Gatekeeper validation",
     )?;
-    Ok(notarization)
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -3270,10 +3315,9 @@ fn install_staged_macos_bundle(
         installed_lpm = true;
         lpm_common::replace_symlink_atomic(&layout.lpx_link, link_target).map_err(LpmError::Io)?;
         installed_lpx = true;
-        validate_macos_app_bundle(
-            &layout.app_bundle,
-            NotarizationCheck::SameAs(&staged.notarization),
-        )?;
+        let installed = inspect_signed_macos_app_bundle(&layout.app_bundle)?;
+        staged.notarization.confirm_same_bundle(&installed)?;
+        assess_macos_app_bundle_with_gatekeeper(&layout.app_bundle)?;
         let final_executable = layout.app_bundle.join(MACOS_INTERNAL_EXECUTABLE);
         VersionProbe::verify_staged_path(&final_executable, version)?;
         let expected_executable = std::fs::canonicalize(&final_executable).map_err(LpmError::Io)?;
@@ -4072,9 +4116,9 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    #[test]
+    #[tokio::test]
     #[ignore = "requires signed release archives in LPM_TEST_MACOS_RELEASE_ARCHIVES"]
-    fn signed_macos_releases_pass_validation_and_reject_removed_sealed_resources() {
+    async fn signed_macos_releases_pass_validation_and_reject_removed_sealed_resources() {
         let archives = std::env::var_os("LPM_TEST_MACOS_RELEASE_ARCHIVES")
             .expect("set LPM_TEST_MACOS_RELEASE_ARCHIVES to signed release ZIP paths");
         let archives = std::env::split_paths(&archives).collect::<Vec<_>>();
@@ -4091,7 +4135,9 @@ mod tests {
             lpx_link: bin.join("lpx"),
         };
         for archive in archives.iter().chain(archives.first()) {
-            let staged = stage_macos_bundle(archive, &layout.app_parent).unwrap();
+            let staged = stage_macos_bundle(archive, &layout.app_parent, false)
+                .await
+                .unwrap_or_else(|error| panic!("{}: {error}", archive.display()));
             let output = std::process::Command::new(&staged.executable)
                 .arg("--version")
                 .output()
@@ -4111,7 +4157,8 @@ mod tests {
         }
         for archive in archives {
             let parent = tempfile::tempdir().unwrap();
-            let staged = stage_macos_bundle(&archive, parent.path())
+            let staged = stage_macos_bundle(&archive, parent.path(), false)
+                .await
                 .unwrap_or_else(|error| panic!("{}: {error}", archive.display()));
             let icon = staged.app_bundle.join("Contents/Resources/LPMCLI.icns");
             let sealed = if icon.exists() {
@@ -4120,16 +4167,81 @@ mod tests {
                 staged.executable.clone()
             };
             std::fs::remove_file(sealed).unwrap();
+            assert!(inspect_signed_macos_app_bundle(&staged.app_bundle).is_err());
+        }
+    }
+
+    /// Before Apple's record is cached the `notarized` requirement rejects a
+    /// swapped ticket, and afterwards the record comparison does; either way
+    /// the bundle must not stage.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires two signed release archives in LPM_TEST_MACOS_RELEASE_ARCHIVES"]
+    async fn signed_macos_release_carrying_another_release_s_ticket_is_not_staged() {
+        let archives = std::env::var_os("LPM_TEST_MACOS_RELEASE_ARCHIVES")
+            .expect("set LPM_TEST_MACOS_RELEASE_ARCHIVES to signed release ZIP paths");
+        let archives = std::env::split_paths(&archives).collect::<Vec<_>>();
+        let [first, second, ..] = archives.as_slice() else {
+            panic!("LPM_TEST_MACOS_RELEASE_ARCHIVES must name two signed release archives");
+        };
+        let extracted = |archive: &Path| {
+            let root = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new("/usr/bin/ditto")
+                .args([
+                    OsStr::new("-x"),
+                    OsStr::new("-k"),
+                    archive.as_os_str(),
+                    root.path().as_os_str(),
+                ])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            root
+        };
+        let donor = extracted(second);
+        let donor_ticket = std::fs::read(
+            donor
+                .path()
+                .join(MACOS_APP_NAME)
+                .join("Contents/CodeResources"),
+        )
+        .unwrap();
+
+        for ticket in [donor_ticket, b"not a notarization ticket".to_vec()] {
+            let swapped = extracted(first);
+            let app_bundle = swapped.path().join(MACOS_APP_NAME);
+            std::fs::write(app_bundle.join("Contents/CodeResources"), &ticket).unwrap();
+            let archive = swapped.path().join("swapped.zip");
+            let status = std::process::Command::new("/usr/bin/ditto")
+                .args([
+                    OsStr::new("-c"),
+                    OsStr::new("-k"),
+                    OsStr::new("--keepParent"),
+                    app_bundle.as_os_str(),
+                    archive.as_os_str(),
+                ])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let parent = tempfile::tempdir().unwrap();
+
+            let error = stage_macos_bundle(&archive, parent.path(), false)
+                .await
+                .unwrap_err()
+                .to_string();
+
             assert!(
-                validate_macos_app_bundle(&staged.app_bundle, NotarizationCheck::AskApple).is_err()
+                error.contains("not the one Apple issued")
+                    || error.contains("code-signature and notarization validation"),
+                "{error}"
             );
         }
     }
 
     #[cfg(target_os = "macos")]
-    #[test]
+    #[tokio::test]
     #[ignore = "requires signed release archives in LPM_TEST_MACOS_RELEASE_ARCHIVES"]
-    fn signed_macos_release_whose_ticket_changes_after_staging_is_not_installed() {
+    async fn signed_macos_release_whose_ticket_changes_after_staging_is_not_installed() {
         let archives = std::env::var_os("LPM_TEST_MACOS_RELEASE_ARCHIVES")
             .expect("set LPM_TEST_MACOS_RELEASE_ARCHIVES to signed release ZIP paths");
         let archive = std::env::split_paths(&archives)
@@ -4146,7 +4258,9 @@ mod tests {
             lpm_link: bin.join("lpm"),
             lpx_link: bin.join("lpx"),
         };
-        let staged = stage_macos_bundle(&archive, &layout.app_parent).unwrap();
+        let staged = stage_macos_bundle(&archive, &layout.app_parent, false)
+            .await
+            .unwrap();
         std::fs::write(
             staged.app_bundle.join("Contents/CodeResources"),
             b"replaced notarization ticket",
@@ -6837,158 +6951,33 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         assert_eq!(output.stdout, argument.as_bytes());
     }
 
+    /// Every `xcrun` shim in `/usr/bin` is a hard link of `git` (the Command
+    /// Line Tools shims) or of `xcodebuild` (the Xcode-only shims), and needs
+    /// a developer directory that a Mac without developer tools doesn't have.
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_validation_refuses_excessive_output() {
-        let result = run_macos_validation_tool(
-            "/bin/sh",
-            &[
-                OsStr::new("-c"),
-                OsStr::new("/usr/bin/head -c 2097152 /dev/zero"),
-            ],
-            "noisy validation fixture",
-        );
-        assert!(result.is_err(), "validation output must be bounded");
-    }
+    fn macos_bundle_validation_runs_only_programs_that_ship_with_macos() {
+        use std::os::unix::fs::MetadataExt as _;
+        let file_identity = |path: &str| {
+            let metadata =
+                std::fs::metadata(path).unwrap_or_else(|error| panic!("{path}: {error}"));
+            (metadata.dev(), metadata.ino())
+        };
+        let shims = ["/usr/bin/git", "/usr/bin/xcodebuild"].map(file_identity);
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_validation_does_not_wait_for_inherited_output_after_parent_exit() {
-        let directory = tempfile::tempdir().unwrap();
-        let pid_file = directory.path().join("child-pid");
-        let script = format!("/bin/sleep 5 & echo $! > '{}'; exit 0", pid_file.display());
-        let started = Instant::now();
-        let result = run_macos_validation_tool(
-            "/bin/sh",
-            &[OsStr::new("-c"), OsStr::new(&script)],
-            "detached output fixture",
-        );
-        let elapsed = started.elapsed();
-        if let Ok(pid) = std::fs::read_to_string(pid_file)
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-        {
-            // SAFETY: the PID belongs to the disposable child created by this test.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-            }
+        for tool in MacOSTool::ALL {
+            assert_ne!(tool.path(), "/usr/bin/xcrun");
+            assert!(
+                !shims.contains(&file_identity(tool.path())),
+                "{} is an xcrun shim, which needs Xcode or the Command Line Tools",
+                tool.path()
+            );
         }
-        result.unwrap();
-        assert!(
-            elapsed < Duration::from_secs(3),
-            "inherited pipe delayed completion: {elapsed:?}"
-        );
-    }
-
-    /// A `stapler` that exits with `exit_codes[n]` on its nth run, reporting
-    /// on stdout as the real one does, and records each run's arguments.
-    #[cfg(target_os = "macos")]
-    fn fake_stapler(directory: &Path, exit_codes: &[i32]) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
-        let runs = directory.join("runs");
-        let stapler = directory.join("stapler");
-        let codes = exit_codes
-            .iter()
-            .map(i32::to_string)
-            .collect::<Vec<_>>()
-            .join(" ");
-        std::fs::write(
-            &stapler,
-            format!(
-                "#!/bin/sh\n\
-                 printf '%s\\n' \"$*\" >> '{runs}'\n\
-                 code=$(echo '{codes}' | cut -d' ' -f$(($(wc -l < '{runs}'))))\n\
-                 if [ \"$code\" = 0 ]; then echo 'The validate action worked!'; exit 0; fi\n\
-                 echo \"CloudKit's response is inconsistent with expections: (null)\"\n\
-                 echo \"The validate action failed! Error $code.\"\n\
-                 exit \"$code\"\n",
-                runs = runs.display(),
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&stapler, std::fs::Permissions::from_mode(0o755)).unwrap();
-        stapler
     }
 
     #[cfg(target_os = "macos")]
-    fn stapler_runs(directory: &Path) -> Vec<String> {
-        std::fs::read_to_string(directory.join("runs"))
-            .unwrap()
-            .lines()
-            .map(str::to_string)
-            .collect()
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn notarization_ticket_check_outlasts_a_brief_cloudkit_outage() {
-        let directory = tempfile::tempdir().unwrap();
-        let stapler = fake_stapler(directory.path(), &[68, 68, 0]);
-
-        validate_notarization_ticket(
-            stapler.to_str().unwrap(),
-            Path::new("/Applications/LPM CLI.app"),
-            &[Duration::ZERO; 2],
-        )
-        .unwrap();
-
-        assert_eq!(
-            stapler_runs(directory.path()),
-            vec!["validate /Applications/LPM CLI.app"; 3]
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn notarization_ticket_check_reports_a_lasting_cloudkit_outage_in_stapler_s_words() {
-        let directory = tempfile::tempdir().unwrap();
-        let stapler = fake_stapler(directory.path(), &[68, 68, 68, 68, 68, 68, 0]);
-
-        let error = validate_notarization_ticket(
-            stapler.to_str().unwrap(),
-            Path::new("/Applications/LPM CLI.app"),
-            &[Duration::ZERO; NOTARIZATION_TICKET_RETRY_DELAYS.len()],
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(
-            error.contains("CloudKit's response is inconsistent"),
-            "{error}"
-        );
-        assert_eq!(
-            stapler_runs(directory.path()).len(),
-            NOTARIZATION_TICKET_RETRY_DELAYS.len() + 1
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn notarization_ticket_retries_wait_out_the_same_cloudkit_outage_as_install_sh() {
-        let install_sh =
-            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh"))
-                .unwrap();
-        let schedule = install_sh
-            .lines()
-            .find_map(|line| {
-                line.trim()
-                    .strip_prefix("for ticket_retry_delay in ")?
-                    .strip_suffix("; do")
-            })
-            .expect("install.sh retries the notarization ticket check");
-        let install_sh_delays = schedule
-            .split_whitespace()
-            .filter(|delay| *delay != "\"\"")
-            .map(|delay| Duration::from_secs(delay.parse().unwrap()))
-            .collect::<Vec<_>>();
-
-        assert_eq!(install_sh_delays, NOTARIZATION_TICKET_RETRY_DELAYS);
-    }
-
-    #[cfg(target_os = "macos")]
-    fn fixture_notarization() -> ConfirmedNotarization {
-        ConfirmedNotarization {
+    fn fixture_notarization() -> StapledNotarization {
+        StapledNotarization {
             cdhash: "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c".to_string(),
             ticket: b"stapled notarization ticket".to_vec(),
         }
@@ -7007,11 +6996,11 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     fn moved_bundle_with_different_code_or_ticket_is_rejected() {
         let confirmed = fixture_notarization();
         for installed in [
-            ConfirmedNotarization {
+            StapledNotarization {
                 cdhash: "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334".to_string(),
                 ..fixture_notarization()
             },
-            ConfirmedNotarization {
+            StapledNotarization {
                 ticket: b"replaced notarization ticket".to_vec(),
                 ..fixture_notarization()
             },
@@ -7027,23 +7016,5 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
                 "{error}"
             );
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn notarization_ticket_check_rejects_an_invalid_ticket_at_once() {
-        let directory = tempfile::tempdir().unwrap();
-        let stapler = fake_stapler(directory.path(), &[65, 0]);
-
-        let error = validate_notarization_ticket(
-            stapler.to_str().unwrap(),
-            Path::new("/Applications/LPM CLI.app"),
-            &[Duration::ZERO; 2],
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("Error 65"), "{error}");
-        assert_eq!(stapler_runs(directory.path()).len(), 1);
     }
 }

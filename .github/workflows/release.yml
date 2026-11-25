@@ -1884,6 +1884,13 @@ jobs:
           printf '{"tag_name":"v%s","published_at":"%s"}\n' "$version" "$published_at" \
             > "staged-release/release-v${version}.json"
 
+          python_prefix=$(python3 -c 'import sys; print(sys.base_prefix)')
+          case "$python_prefix" in
+            /Library/Developer/*|/Applications/Xcode*)
+              echo "::error::python3 comes from developer tools ($python_prefix), which this smoke test removes"
+              exit 1
+              ;;
+          esac
           python3 -m http.server 8765 --bind 127.0.0.1 \
             --directory staged-release >"$RUNNER_TEMP/lpm-release-server.log" 2>&1 &
           server_pid=$!
@@ -1904,7 +1911,15 @@ jobs:
 
           test ! -e "$HOME/.lpm/bin/lpm"
 
-          LPM_INSTALL_TEST_DOWNLOAD_BASE=http://127.0.0.1:8765 sh install.sh
+          # Users' Macs mostly have neither Xcode nor the Command Line Tools,
+          # so the installer must not need them.
+          bash scripts/ci/macos-developer-tools.sh hide none "$RUNNER_TEMP/developer-tools"
+          (
+            unset DEVELOPER_DIR
+            env PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+              LPM_INSTALL_TEST_DOWNLOAD_BASE=http://127.0.0.1:8765 sh install.sh
+          )
+          bash scripts/ci/macos-developer-tools.sh restore "$RUNNER_TEMP/developer-tools"
 
           app="$HOME/.lpm/libexec/LPM CLI.app"
           executable="$app/Contents/MacOS/lpm-rs"
@@ -1947,6 +1962,10 @@ jobs:
 
           scripts/ci/with-apple-service-retry.sh stapler validate "$app"
           /usr/sbin/spctl --assess --type execute --verbose=4 "$app"
+
+      - name: Restore developer tools
+        if: always() && matrix.platform == 'macos'
+        run: bash scripts/ci/macos-developer-tools.sh restore "$RUNNER_TEMP/developer-tools"
 
   seal-candidate:
     name: Seal stable release candidate

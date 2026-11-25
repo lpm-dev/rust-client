@@ -124,6 +124,9 @@ jobs:
       - name: Test Apple signing-service retry helper
         run: bash scripts/ci/test-with-apple-service-retry.sh
 
+      - name: Test macOS developer-tools helper
+        run: bash scripts/ci/test-macos-developer-tools.sh
+
       - name: Test unlocked gnome-keyring helper
         run: bash scripts/ci/test-with-unlocked-gnome-keyring.sh
 
