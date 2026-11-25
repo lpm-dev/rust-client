@@ -22,6 +22,7 @@ expression: envelope
   "files_skipped": 0,
   "dependencies_installed": 0,
   "external_imports": [],
+  "unresolved_imports": [],
   "config": {},
   "alias": null,
   "warnings": [],

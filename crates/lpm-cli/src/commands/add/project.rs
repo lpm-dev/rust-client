@@ -127,44 +127,62 @@ pub(super) fn detect_buyer_alias(project_dir: &Path, target_dir: &Path) -> Optio
             .and_then(|options| options.get("baseUrl"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or(".");
+        // TypeScript tries a key's targets in order, so only the first can
+        // stand behind an import LPM CLI writes.
+        let entries: Vec<(&str, Option<&str>)> = paths
+            .iter()
+            .map(|(key, targets)| {
+                let first = targets
+                    .as_array()
+                    .and_then(|targets| targets.first())
+                    .and_then(serde_json::Value::as_str);
+                (key.as_str(), first)
+            })
+            .collect();
         let mut best: Option<(usize, String)> = None;
-        for (key, targets) in paths {
-            let Some(alias_prefix) = key.strip_suffix('*') else {
+        for &(key, first_target) in &entries {
+            // A catch-all `*` key maps bare specifiers, so it names no alias.
+            let Some(key_prefix) = suffix_wildcard_prefix(key).filter(|prefix| !prefix.is_empty())
+            else {
                 continue;
             };
-            let Some(targets) = targets.as_array() else {
+            let Some(target_prefix) = first_target.and_then(suffix_wildcard_prefix) else {
                 continue;
             };
-            for mapped in targets.iter().filter_map(serde_json::Value::as_str) {
-                let Some(mapped_prefix) = mapped.strip_suffix('*') else {
+            let Some(mapped_base) = normalize_relative_mapping(base_url, target_prefix) else {
+                continue;
+            };
+            let Ok(alias_suffix) = target_relative.strip_prefix(&mapped_base) else {
+                continue;
+            };
+            // `K*` → `M*` imports the file `M<rest>` as `K<rest>`. Under a
+            // directory `M` the rest starts with the folder, so `#*` gives
+            // `#components/`. Under a prefix such as `./src/ui` it starts with
+            // `/`, so `@ui*` gives `@ui/buttons/`.
+            let mut alias = key_prefix.to_string();
+            let mut separator = !maps_a_directory(target_prefix);
+            for component in alias_suffix.components() {
+                let std::path::Component::Normal(segment) = component else {
                     continue;
                 };
-                let Some(mapped_base) = normalize_relative_mapping(base_url, mapped_prefix) else {
-                    continue;
-                };
-                let Ok(alias_suffix) = target_relative.strip_prefix(&mapped_base) else {
-                    continue;
-                };
-                let mut alias = alias_prefix.to_string();
-                for component in alias_suffix.components() {
-                    let std::path::Component::Normal(segment) = component else {
-                        continue;
-                    };
-                    if !alias.ends_with('/') {
-                        alias.push('/');
-                    }
-                    alias.push_str(&segment.to_string_lossy());
-                }
-                if !alias.ends_with('/') {
+                if separator {
                     alias.push('/');
                 }
-                let depth = mapped_base.components().count();
-                if best
-                    .as_ref()
-                    .is_none_or(|(best_depth, _)| depth > *best_depth)
-                {
-                    best = Some((depth, alias));
-                }
+                alias.push_str(&segment.to_string_lossy());
+                separator = true;
+            }
+            if separator {
+                alias.push('/');
+            }
+            if is_shadowed(&alias, key, key_prefix, target_prefix, &entries, base_url) {
+                continue;
+            }
+            let depth = mapped_base.components().count();
+            if best
+                .as_ref()
+                .is_none_or(|(best_depth, _)| depth > *best_depth)
+            {
+                best = Some((depth, alias));
             }
         }
         if let Some((_, alias)) = best {
@@ -172,6 +190,77 @@ pub(super) fn detect_buyer_alias(project_dir: &Path, target_dir: &Path) -> Optio
         }
     }
     None
+}
+
+/// The text before a `paths` pattern's only `*`, when the `*` ends it.
+fn suffix_wildcard_prefix(pattern: &str) -> Option<&str> {
+    pattern
+        .strip_suffix('*')
+        .filter(|prefix| !prefix.contains('*'))
+}
+
+/// TypeScript pastes the `*` text straight after the target, so only an empty
+/// target or one that ends in `/` maps a folder. `.*` maps `.src/x`, not
+/// `./src/x`.
+fn maps_a_directory(target_prefix: &str) -> bool {
+    target_prefix.is_empty() || target_prefix.ends_with('/')
+}
+
+/// Whether another `paths` key that TypeScript may prefer, a longer one or one
+/// that ties with `key`, would claim some of the imports `alias` produces and
+/// send them somewhere other than `key` does. An exact key, a key with text after its
+/// `*`, or a key whose first target is a fixed file always counts, since LPM
+/// CLI can't follow it.
+fn is_shadowed(
+    alias: &str,
+    key: &str,
+    key_prefix: &str,
+    target_prefix: &str,
+    entries: &[(&str, Option<&str>)],
+    base_url: &str,
+) -> bool {
+    entries.iter().any(|&(other_key, other_target)| {
+        let literal = other_key.split('*').next().unwrap_or(other_key);
+        // TypeScript takes the key declared first on an equal prefix. Counting
+        // a tie in either order is conservative and keeps the check simple.
+        let ties = literal.len() == key_prefix.len() && other_key.contains('*');
+        if other_key == key
+            || (literal.len() <= key_prefix.len() && !ties)
+            || !literal.starts_with(key_prefix)
+            || !(alias.starts_with(literal) || literal.starts_with(alias))
+        {
+            return false;
+        }
+        let expected = format!("{target_prefix}{}", &literal[key_prefix.len()..]);
+        let consistent = suffix_wildcard_prefix(other_key).is_some()
+            && other_target
+                .and_then(suffix_wildcard_prefix)
+                .is_some_and(|other_target| {
+                    maps_a_directory(&expected) == maps_a_directory(other_target)
+                        && normalize_relative_mapping(base_url, &expected)
+                            == normalize_relative_mapping(base_url, other_target)
+                });
+        !consistent
+    })
+}
+
+/// The prompt answer that asks for relative imports. An empty answer takes the
+/// prompt's default, which is the detected alias when there is one.
+pub(super) const RELATIVE_IMPORTS_ANSWER: &str = "-";
+
+/// The consumer alias a prompt answer gives. Accepting the detected alias
+/// keeps it exactly, since it already follows the project's `paths`. Typed
+/// input follows the `importAlias` boundary rule, and an empty answer or
+/// [`RELATIVE_IMPORTS_ANSWER`] means relative imports.
+pub(super) fn alias_from_prompt(answer: &str, detected: Option<&str>) -> Option<String> {
+    let answer = answer.trim();
+    if answer == RELATIVE_IMPORTS_ANSWER {
+        return None;
+    }
+    if detected == Some(answer) {
+        return Some(answer.to_owned());
+    }
+    crate::lpm_config::import_alias_prefix(answer)
 }
 
 fn normalize_relative_mapping(base_url: &str, mapped_prefix: &str) -> Option<PathBuf> {
@@ -404,6 +493,203 @@ mod tests {
             );
         }
         assert!(detect_buyer_alias(project.path(), &project.path().join("components")).is_none());
+    }
+
+    #[test]
+    fn buyer_alias_follows_a_paths_key_without_a_slash_as_written() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("tsconfig.json"),
+            r##"{"compilerOptions":{"paths":{"#*":["./src/*"]}}}"##,
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_buyer_alias(project.path(), &project.path().join("src/components")).as_deref(),
+            Some("#components/")
+        );
+        assert_eq!(
+            detect_buyer_alias(project.path(), &project.path().join("src")).as_deref(),
+            Some("#")
+        );
+    }
+
+    #[test]
+    fn buyer_alias_keeps_the_slash_a_mapping_without_a_trailing_slash_implies() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{"@ui*":["./src/ui*"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_buyer_alias(project.path(), &project.path().join("src/ui/buttons")).as_deref(),
+            Some("@ui/buttons/")
+        );
+        assert_eq!(
+            detect_buyer_alias(project.path(), &project.path().join("src/ui")).as_deref(),
+            Some("@ui/")
+        );
+
+        std::fs::write(
+            project.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{"@*":["./src/*"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_buyer_alias(project.path(), &project.path().join("src")).as_deref(),
+            Some("@")
+        );
+    }
+
+    #[test]
+    fn buyer_alias_uses_only_the_first_target_of_a_key() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{"@/*":["./src/*","./src/components/*"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_buyer_alias(project.path(), &project.path().join("src/components")).as_deref(),
+            Some("@/components/")
+        );
+    }
+
+    #[test]
+    fn buyer_alias_skips_an_alias_that_a_more_specific_key_maps_elsewhere() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{"@/*":["./src/*"],"@/components/*":["./other/*"]}}}"#,
+        )
+        .unwrap();
+        assert!(
+            detect_buyer_alias(project.path(), &project.path().join("src/components")).is_none()
+        );
+
+        std::fs::write(
+            project.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{"@/*":["./src/*"],"@/components/*":["./src/components/*"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_buyer_alias(project.path(), &project.path().join("src/components")).as_deref(),
+            Some("@/components/")
+        );
+    }
+
+    #[test]
+    fn a_prompt_answer_keeps_the_detected_alias_and_normalizes_typed_input() {
+        assert_eq!(alias_from_prompt("@", Some("@")).as_deref(), Some("@"));
+        assert_eq!(alias_from_prompt(" @ ", Some("@")).as_deref(), Some("@"));
+        assert_eq!(alias_from_prompt("@", None).as_deref(), Some("@/"));
+        assert_eq!(
+            alias_from_prompt("@/components", Some("@/ui/")).as_deref(),
+            Some("@/components/")
+        );
+        assert_eq!(alias_from_prompt("#", None).as_deref(), Some("#"));
+        assert_eq!(alias_from_prompt("", Some("@/")), None);
+        assert_eq!(alias_from_prompt("-", Some("@/")), None);
+    }
+
+    #[test]
+    fn buyer_alias_puts_a_slash_after_a_dot_target() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("tsconfig.json"),
+            r##"{"compilerOptions":{"paths":{"#*":[".*"]}}}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_buyer_alias(project.path(), &project.path().join("src/components")).as_deref(),
+            Some("#/src/components/")
+        );
+
+        std::fs::write(
+            project.path().join("tsconfig.json"),
+            r##"{"compilerOptions":{"baseUrl":"./src","paths":{"#*":["..*"]}}}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_buyer_alias(project.path(), &project.path().join("lib")).as_deref(),
+            Some("#/lib/")
+        );
+    }
+
+    #[test]
+    fn buyer_alias_skips_an_alias_a_longer_key_maps_without_its_slash() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{"@/*":["./src/*"],"@/components/*":["./src/components*"]}}}"#,
+        )
+        .unwrap();
+        assert!(detect_buyer_alias(project.path(), &project.path().join("src")).is_none());
+    }
+
+    #[test]
+    fn buyer_alias_skips_an_alias_an_exact_or_inner_wildcard_key_overlaps() {
+        let project = tempfile::tempdir().unwrap();
+        for paths in [
+            r#"{"@/*":["./src/*"],"@/components/util":["./other.ts"]}"#,
+            r#"{"@/*":["./src/*"],"@/components/*.js":["./other/*.js"]}"#,
+            r#"{"@/*":["./src/*"],"@/components/*":["./src/index.ts"]}"#,
+        ] {
+            std::fs::write(
+                project.path().join("tsconfig.json"),
+                format!(r#"{{"compilerOptions":{{"paths":{paths}}}}}"#),
+            )
+            .unwrap();
+            assert!(
+                detect_buyer_alias(project.path(), &project.path().join("src/components"))
+                    .is_none(),
+                "{paths}"
+            );
+        }
+    }
+
+    #[test]
+    fn buyer_alias_skips_an_alias_a_same_prefix_pattern_overlaps() {
+        let project = tempfile::tempdir().unwrap();
+        for paths in [
+            r#"{"@/*.js":["./legacy/*.js"],"@/*":["./src/*"]}"#,
+            r#"{"@/*":["./src/*"],"@/*.js":["./legacy/*.js"]}"#,
+        ] {
+            std::fs::write(
+                project.path().join("tsconfig.json"),
+                format!(r#"{{"compilerOptions":{{"paths":{paths}}}}}"#),
+            )
+            .unwrap();
+            assert!(
+                detect_buyer_alias(project.path(), &project.path().join("src/components"))
+                    .is_none(),
+                "{paths}"
+            );
+        }
+    }
+
+    #[test]
+    fn buyer_alias_ignores_a_catch_all_paths_key() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{"*":["./src/*"],"@/*":["./src/*"]}}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_buyer_alias(project.path(), &project.path().join("src/components")).as_deref(),
+            Some("@/components/")
+        );
+        std::fs::write(
+            project.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{"*":["./src/*"]}}}"#,
+        )
+        .unwrap();
+        assert!(
+            detect_buyer_alias(project.path(), &project.path().join("src/components")).is_none()
+        );
     }
 
     #[test]

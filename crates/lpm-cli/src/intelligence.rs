@@ -1087,20 +1087,23 @@ pub fn detect_phantom_deps(
 ) -> PhantomDepResult {
     let imports = scan_source_imports(project_dir);
 
+    let builtins = node_builtins();
     let mut package_imports: HashMap<String, Vec<&SourceImport>> = HashMap::new();
     for import in &imports {
+        if is_node_builtin_specifier(&import.specifier, &builtins) {
+            continue;
+        }
         if let Some(ref pkg) = import.package_name {
             package_imports.entry(pkg.clone()).or_default().push(import);
         }
     }
 
     let declared_set: HashSet<&str> = declared_deps.keys().map(|k| k.as_str()).collect();
-    let builtins = node_builtins();
 
     let mut phantoms = Vec::new();
 
     for (pkg_name, occurrences) in &package_imports {
-        if declared_set.contains(pkg_name.as_str()) || builtins.contains(pkg_name.as_str()) {
+        if declared_set.contains(pkg_name.as_str()) {
             continue;
         }
 
@@ -1166,7 +1169,7 @@ pub fn verify_imports(
             None => continue,
         };
 
-        if builtins.contains(pkg_name.as_str()) {
+        if is_node_builtin_specifier(&import.specifier, &builtins) {
             continue;
         }
 
@@ -1237,6 +1240,38 @@ fn node_builtins() -> HashSet<&'static str> {
         "perf_hooks",
         "async_hooks",
         "diagnostics_channel",
+        "http2",
+        "inspector",
+        "sys",
+        "trace_events",
+        "wasi",
+        "_http_agent",
+        "_http_client",
+        "_http_common",
+        "_http_incoming",
+        "_http_outgoing",
+        "_http_server",
+        "_stream_duplex",
+        "_stream_passthrough",
+        "_stream_readable",
+        "_stream_transform",
+        "_stream_wrap",
+        "_stream_writable",
+        "_tls_common",
+        "_tls_wrap",
+        // Built-in subpaths
+        "assert/strict",
+        "dns/promises",
+        "fs/promises",
+        "inspector/promises",
+        "path/posix",
+        "path/win32",
+        "readline/promises",
+        "stream/consumers",
+        "stream/promises",
+        "stream/web",
+        "timers/promises",
+        "util/types",
         // node:-prefixed
         "node:fs",
         "node:path",
@@ -1256,6 +1291,14 @@ fn node_builtins() -> HashSet<&'static str> {
     ]
     .into_iter()
     .collect()
+}
+
+/// Whether `specifier` loads a Node built-in: `node:<name>`, or exactly a
+/// built-in name or one of Node's built-in subpaths such as `fs/promises`.
+/// Anything else, such as `punycode/` or `process/browser`, loads an npm
+/// package.
+pub(crate) fn is_node_builtin_specifier(specifier: &str, builtins: &HashSet<&str>) -> bool {
+    specifier.starts_with("node:") || builtins.contains(specifier)
 }
 
 pub(crate) fn node_builtin_package_names() -> HashSet<&'static str> {
@@ -1894,6 +1937,32 @@ mod tests {
         let error = scan_source_imports_with_limits(root, limits).unwrap_err();
 
         assert!(error.to_string().contains("import finding"));
+    }
+
+    #[test]
+    fn detect_phantom_deps_treats_only_exact_builtin_specifiers_as_builtins() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("package.json"), r#"{"name":"root"}"#).unwrap();
+        std::fs::write(
+            root.join("app.js"),
+            r#"
+            import { readFile } from "fs/promises";
+            import { connect } from "http2";
+            import polyfill from "http2/browser";
+            import punycode from "punycode/";
+            import process from "process/browser";
+            "#,
+        )
+        .unwrap();
+
+        let result = detect_phantom_deps(root, &HashMap::new(), &HashSet::new());
+        let names: HashSet<&str> = result
+            .phantom_imports
+            .iter()
+            .map(|phantom| phantom.package_name.as_str())
+            .collect();
+        assert_eq!(names, HashSet::from(["http2", "process", "punycode"]));
     }
 
     #[test]
