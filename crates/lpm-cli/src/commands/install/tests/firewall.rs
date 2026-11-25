@@ -2701,3 +2701,28 @@ async fn chunked_enforce_releases_nothing_an_allowed_chunk_clears_after_a_failur
     assert!(fetch_rx.recv().await.is_none());
     server.verify().await;
 }
+
+#[tokio::test]
+async fn an_excess_row_never_hides_a_versions_hardest_block() {
+    let result = enforce_with_rules(
+        block_summary(
+            2,
+            vec![
+                grouped_block("twice", "suspicious", "lpm_ai_telemetry"),
+                grouped_block("twice", "malicious", "lpm_ai_confirmed_malware"),
+            ],
+        ),
+        &["twice"],
+        FirewallBypassRules::preloaded(&[global_rule("twice")], Vec::new(), None, true),
+    )
+    .await;
+
+    assert!(result.stats.bypassed.is_empty());
+    assert_eq!(result.stats.unattributed_block_count, 1);
+    let LpmError::NpmFirewallBlocked(blocked) =
+        finish_npm_firewall_preflight(result, true).unwrap_err()
+    else {
+        panic!("expected a firewall block");
+    };
+    assert_eq!(blocked.packages[0].block_class.as_deref(), Some("malware"));
+}

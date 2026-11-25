@@ -726,7 +726,7 @@ enum UpgradeResult {
 struct UpdateFailure {
     reason: String,
     firewall_block: Option<Box<lpm_common::NpmFirewallBlockedErrorContext>>,
-    /// The nested install already printed the block's details.
+    /// The nested install already listed the blocked versions.
     details_shown: bool,
 }
 
@@ -747,9 +747,13 @@ impl UpdateFailure {
         }
     }
 
-    /// For a failure whose install printed its own output.
-    fn shown_by_install(mut self, shown: bool) -> Self {
-        self.details_shown = shown;
+    /// For a failure whose install printed its own output: it lists blocked
+    /// versions it found before download, but not a registry's refusal.
+    fn shown_by_install(mut self, output_shown: bool) -> Self {
+        self.details_shown = output_shown
+            && self.firewall_block.as_deref().is_some_and(|blocked| {
+                blocked.source == lpm_common::NpmFirewallBlockSource::Preflight
+            });
         self
     }
 
@@ -1265,12 +1269,10 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
                     install_ui::bold(&package_safe),
                     reason_safe,
                 ));
-                if let Some(blocked) = failure
-                    .firewall_block
-                    .as_deref()
-                    .filter(|_| !failure.details_shown)
-                {
-                    for line in crate::cli::npm_firewall_block_detail_lines(blocked) {
+                if let Some(blocked) = failure.firewall_block.as_deref() {
+                    for line in
+                        crate::cli::npm_firewall_block_detail_lines(blocked, !failure.details_shown)
+                    {
                         install_ui::detail_line(line);
                     }
                 }

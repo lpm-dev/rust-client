@@ -11,7 +11,7 @@ impl SigningSecretReadError {
     fn into_lpm_error(self) -> LpmError {
         match self {
             Self::Missing => security_store_error(
-                "security approval signing secret is missing; existing signed security state cannot be verified",
+                "security approval signing secret is missing; existing signed security state cannot be verified; run `lpm security repair` to quarantine it, or restore the original signing secret",
             ),
             Self::Corrupt(message) | Self::Unavailable(message) => security_store_error(message),
         }

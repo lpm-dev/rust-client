@@ -408,9 +408,10 @@ async fn classify_verdicts(
     requested: &[NpmFirewallBatchPackage],
     bypass: &FirewallBypassRules,
 ) -> ClassifiedVerdicts {
-    let mut unmatched: HashMap<&str, Vec<(&str, u32)>> = HashMap::with_capacity(requested.len());
+    let mut requested_counts: HashMap<&str, Vec<(&str, u32)>> =
+        HashMap::with_capacity(requested.len());
     for package in requested {
-        let versions = unmatched.entry(package.name.as_str()).or_default();
+        let versions = requested_counts.entry(package.name.as_str()).or_default();
         match versions
             .iter_mut()
             .find(|(version, _)| *version == package.version)
@@ -420,26 +421,38 @@ async fn classify_verdicts(
         }
     }
     let mut decisions = Vec::with_capacity(response.decisions.len());
-    let mut matched_blocks = Vec::new();
     let mut block_rows: u64 = 0;
+    let mut group_of: HashMap<(String, String), usize> = HashMap::new();
+    let mut groups: Vec<((String, String), Vec<NpmFirewallDecision>)> = Vec::new();
     for decision in response.decisions {
         if decision.action != NpmFirewallAction::Block {
             decisions.push(decision);
             continue;
         }
         block_rows += 1;
-        let remaining = unmatched
-            .get_mut(decision.name.as_str())
-            .and_then(|versions| {
-                versions
-                    .iter_mut()
-                    .find(|(version, _)| *version == decision.version)
-            })
-            .filter(|(_, remaining)| *remaining > 0);
-        if let Some((_, remaining)) = remaining {
-            *remaining -= 1;
-            matched_blocks.push(decision);
+        let key = (decision.name.clone(), decision.version.clone());
+        match group_of.get(&key) {
+            Some(&index) => groups[index].1.push(decision),
+            None => {
+                group_of.insert(key.clone(), groups.len());
+                groups.push((key, vec![decision]));
+            }
         }
+    }
+    // Each version keeps its hardest rows, as many as it was requested, so an
+    // excess row never hides a block a rule can't lift.
+    let mut matched_blocks = Vec::with_capacity(groups.len());
+    for ((name, version), mut rows) in groups {
+        let requested_count = requested_counts
+            .get(name.as_str())
+            .and_then(|versions| versions.iter().find(|(requested, _)| *requested == version))
+            .map_or(0, |(_, count)| *count as usize);
+        if requested_count == 0 {
+            continue;
+        }
+        rows.sort_by_key(|row| std::cmp::Reverse(decision_block_class(row).lift_difficulty()));
+        rows.truncate(requested_count);
+        matched_blocks.extend(rows);
     }
     let mut classified = ClassifiedVerdicts {
         decisions,

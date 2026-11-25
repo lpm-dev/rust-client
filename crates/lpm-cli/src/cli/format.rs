@@ -1329,14 +1329,15 @@ fn push_block_class_lines(
 }
 
 /// The rows a command prints under its own line for a firewall block that
-/// stopped a nested install whose output it hid: each blocked version with
-/// its report, the unnamed and unchecked blocks, and why a malware or review
-/// block takes no plain rule.
+/// stopped a nested install: each blocked version with its report, unless
+/// the install already listed them, then the unnamed and unchecked blocks and
+/// why a malware or review block takes no plain rule.
 pub(crate) fn npm_firewall_block_detail_lines(
     blocked: &lpm_common::NpmFirewallBlockedErrorContext,
+    include_packages: bool,
 ) -> Vec<install_ui::TerminalLine> {
     let mut lines = Vec::with_capacity(blocked.packages.len() * 2 + 2);
-    for package in &blocked.packages {
+    for package in blocked.packages.iter().filter(|_| include_packages) {
         push_untrusted_detail(
             &mut lines,
             "blocked",
@@ -1808,6 +1809,28 @@ mod tests {
                 bypass_unavailable_reason: None,
             },
         ))
+    }
+
+    #[test]
+    fn block_detail_lines_list_versions_only_where_the_install_did_not() {
+        let lpm_common::LpmError::NpmFirewallBlocked(blocked) = preflight_block(1) else {
+            unreachable!("preflight_block builds a firewall block");
+        };
+        let plain = |include_packages| {
+            npm_firewall_block_detail_lines(&blocked, include_packages)
+                .iter()
+                .map(|line| console::strip_ansi_codes(line).into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            plain(true)[0],
+            "  blocked foldrun@32.8.2 - `foldrun talk` can send a credential to a gateway."
+        );
+        assert_eq!(
+            plain(false),
+            ["  unnamed 1 of them blocked without a package name in the verdict response"]
+        );
     }
 
     #[test]

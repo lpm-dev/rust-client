@@ -86,18 +86,23 @@ pub(super) fn firewall_bypass_store_quarantine_reason(value: serde_json::Value) 
     }
 }
 
-/// Runs `change` on the local rules under the store's lock and saves the
-/// result, dropping rules that have expired. An empty store is removed so a
-/// command with no rules reads nothing. Returns `change`'s result and how
-/// many rules the store keeps.
+/// Runs `change` on the local rules under the store's lock and, when it
+/// changed them, saves the result without the rules that have expired. An
+/// empty store is removed so a command with no rules reads nothing. Returns
+/// `change`'s result and how many unexpired rules the store keeps.
 fn update_local_firewall_bypass_rules<T>(
     change: impl FnOnce(&mut Vec<FirewallBypassRule>) -> T,
 ) -> Result<(T, usize), LpmError> {
     std::fs::create_dir_all(security_dir()?)?;
     lpm_common::with_exclusive_lock(firewall_bypass_lock_path()?, || {
         let mut rules = load_local_firewall_bypass_rules()?;
+        let before = rules.clone();
         let result = change(&mut rules);
         let now = Timestamp::now();
+        if rules == before {
+            let unexpired = rules.iter().filter(|rule| !rule.is_expired(now)).count();
+            return Ok((result, unexpired));
+        }
         rules.retain(|rule| !rule.is_expired(now));
         let rules_kept = rules.len();
         let path = firewall_bypass_path()?;
@@ -291,16 +296,13 @@ fn bypass_audit(event: &str, allowed: bool, rules: &[FirewallBypassRule], detail
     record_audit_event(record);
 }
 
-/// What one `add` saved, and what it couldn't save without approval.
+/// What one `add` saved.
 #[derive(Debug, Default)]
 pub(crate) struct FirewallBypassAdded {
     pub(crate) added: Vec<FirewallBypassRule>,
     pub(crate) extended: Vec<FirewallBypassRule>,
     pub(crate) narrowed: Vec<FirewallBypassRule>,
     pub(crate) unchanged: Vec<FirewallBypassRule>,
-    /// Requested rules that would add or extend a rule, left unsaved because
-    /// no approval covered them.
-    pub(crate) needs_approval: Vec<FirewallBypassRule>,
     pub(crate) rules_total: usize,
 }
 
@@ -310,23 +312,39 @@ impl FirewallBypassAdded {
         self.extended.extend(other.extended);
         self.narrowed.extend(other.narrowed);
         self.unchanged.extend(other.unchanged);
-        self.needs_approval.extend(other.needs_approval);
         self.rules_total = other.rules_total;
     }
 }
 
-/// Saves `requested` under the store's lock, each judged against the rule
-/// saved at that moment, so a concurrent `remove` or a newer expiry is never
-/// undone without approval. With `approved`, new and extended rules are saved
-/// too; otherwise they come back in `needs_approval`.
-fn save_against_live(
-    requested: &[FirewallBypassRule],
-    approved: bool,
-) -> Result<FirewallBypassAdded, LpmError> {
-    let (mut outcome, rules_total) = update_local_firewall_bypass_rules(|saved| {
+/// What committing a request did.
+pub(crate) enum FirewallBypassCommit {
+    Saved(FirewallBypassAdded),
+    /// Nothing was saved: these rules, held without approval, would by now
+    /// add or extend one.
+    NeedsApproval(Vec<FirewallBypassRule>),
+}
+
+/// Saves `approved` and `unapproved` in one write under the store's lock,
+/// each judged against the rule saved at that moment. An approved rule is
+/// saved whatever changed since; an unapproved one only while it still
+/// narrows the saved rule. When any unapproved rule would by now add or extend
+/// one, the store is left as it was and those rules come back for approval,
+/// so a concurrent `remove` or a newer expiry is never undone without it.
+pub(crate) fn commit_firewall_bypass_rules(
+    approved: &[FirewallBypassRule],
+    unapproved: &[FirewallBypassRule],
+    approval_note: &str,
+) -> Result<FirewallBypassCommit, LpmError> {
+    let (commit, rules_total) = update_local_firewall_bypass_rules(|saved| {
+        let original = saved.clone();
         let now = Timestamp::now();
         let mut outcome = FirewallBypassAdded::default();
-        for rule in requested {
+        let mut needs_approval = Vec::new();
+        let requested = approved
+            .iter()
+            .map(|rule| (rule, true))
+            .chain(unapproved.iter().map(|rule| (rule, false)));
+        for (rule, is_approved) in requested {
             let live = saved
                 .iter()
                 .position(|saved| saved.id == rule.id && !saved.is_expired(now));
@@ -339,10 +357,10 @@ fn save_against_live(
                     continue;
                 }
                 FirewallBypassChange::Narrowed => &mut outcome.narrowed,
-                FirewallBypassChange::New if approved => &mut outcome.added,
-                FirewallBypassChange::Extended if approved => &mut outcome.extended,
+                FirewallBypassChange::New if is_approved => &mut outcome.added,
+                FirewallBypassChange::Extended if is_approved => &mut outcome.extended,
                 FirewallBypassChange::New | FirewallBypassChange::Extended => {
-                    outcome.needs_approval.push(rule.clone());
+                    needs_approval.push(rule.clone());
                     continue;
                 }
             };
@@ -356,20 +374,26 @@ fn save_against_live(
             }
             bucket.push(merged);
         }
-        outcome
+        if needs_approval.is_empty() {
+            FirewallBypassCommit::Saved(outcome)
+        } else {
+            *saved = original;
+            FirewallBypassCommit::NeedsApproval(needs_approval)
+        }
     })?;
+    let FirewallBypassCommit::Saved(mut outcome) = commit else {
+        return Ok(commit);
+    };
     outcome.rules_total = rules_total;
-    Ok(outcome)
-}
-
-/// Saves rules that only expire sooner or carry a new note. They let nothing
-/// more past LPM Firewall, so they need no approval; the audit log records
-/// them. A rule that would add or extend one by the time the store is locked
-/// comes back in `needs_approval`.
-pub(crate) fn save_narrowed_firewall_bypass_rules(
-    rules: &[FirewallBypassRule],
-) -> Result<FirewallBypassAdded, LpmError> {
-    let outcome = save_against_live(rules, false)?;
+    let allowed: Vec<FirewallBypassRule> = outcome
+        .added
+        .iter()
+        .chain(&outcome.extended)
+        .cloned()
+        .collect();
+    if !allowed.is_empty() {
+        bypass_audit("firewall-bypass-added", true, &allowed, approval_note);
+    }
     if !outcome.narrowed.is_empty() {
         bypass_audit(
             "firewall-bypass-narrowed",
@@ -378,10 +402,10 @@ pub(crate) fn save_narrowed_firewall_bypass_rules(
             "shortened or annotated LPM Firewall bypass rules",
         );
     }
-    Ok(outcome)
+    Ok(FirewallBypassCommit::Saved(outcome))
 }
 
-/// Rules to add and how to ask for them.
+/// Rules to approve and how to ask for them.
 pub(crate) struct FirewallBypassApproval<'a> {
     pub(crate) rules: Vec<FirewallBypassRule>,
     /// The native prompt; it names every spec, the scope and the duration.
@@ -392,30 +416,24 @@ pub(crate) struct FirewallBypassApproval<'a> {
     pub(crate) json_output: bool,
 }
 
-/// Saves `approval.rules` after a fresh native approval. When every rule is
-/// already saved or only narrows the saved one, none is needed; nothing else,
-/// such as a FloorEdit unlock, stands in for the prompt.
-pub(crate) fn add_firewall_bypass_rules(
-    approval: FirewallBypassApproval<'_>,
-) -> Result<FirewallBypassAdded, LpmError> {
+/// Asks the person at the terminal to approve `approval.rules` with a fresh
+/// native approval; saves nothing. Nothing else, such as a FloorEdit unlock,
+/// stands in for the prompt, and `--json` never prompts.
+pub(crate) fn approve_firewall_bypass_rules(
+    approval: &FirewallBypassApproval<'_>,
+) -> Result<(), LpmError> {
     let effective = load_effective_authorized_posture()?;
     if let Some(reason) = local_firewall_bypass_inactive_reason(&effective) {
         bypass_audit("firewall-bypass-added", false, &approval.rules, &reason);
         return Err(LpmError::SecurityFloor(reason));
     }
-
-    let unapproved = save_narrowed_firewall_bypass_rules(&approval.rules)?;
-    if unapproved.needs_approval.is_empty() {
-        return Ok(unapproved);
-    }
-
     // `--json` is checked on its own so it never prompts, even where tests
     // stand in for the person at a terminal.
     if approval.json_output || is_automation(approval.json_output) {
         bypass_audit(
             "firewall-bypass-added",
             false,
-            &unapproved.needs_approval,
+            &approval.rules,
             "refused without an interactive approval terminal",
         );
         return Err(approval_required_error(
@@ -432,7 +450,7 @@ pub(crate) fn add_firewall_bypass_rules(
         bypass_audit(
             "firewall-bypass-added",
             false,
-            &unapproved.needs_approval,
+            &approval.rules,
             "the person at the terminal declined",
         );
         return Err(approval_required_error(
@@ -445,19 +463,44 @@ pub(crate) fn add_firewall_bypass_rules(
             approval.command_hint.map(str::to_string),
         ));
     }
+    Ok(())
+}
 
-    let mut outcome = unapproved;
-    let pending = std::mem::take(&mut outcome.needs_approval);
-    let approved = save_against_live(&pending, true)?;
-    let saved: Vec<FirewallBypassRule> = approved
-        .added
-        .iter()
-        .chain(&approved.extended)
-        .cloned()
-        .collect();
-    bypass_audit("firewall-bypass-added", true, &saved, approval.prompt);
-    outcome.absorb(approved);
-    Ok(outcome)
+pub(crate) fn rules_kept_changing_error() -> LpmError {
+    LpmError::SecurityApprovalStore(
+        "the LPM Firewall bypass rules kept changing while this command ran; run it again"
+            .to_string(),
+    )
+}
+
+/// [`approve_firewall_bypass_rules`] and [`commit_firewall_bypass_rules`] as
+/// `lpm firewall bypass add` composes them, without its verdict preview:
+/// saves `approval.rules`, asking for approval when any adds or extends a rule.
+#[cfg(test)]
+pub(crate) fn add_firewall_bypass_rules(
+    approval: FirewallBypassApproval<'_>,
+) -> Result<FirewallBypassAdded, LpmError> {
+    let effective = load_effective_authorized_posture()?;
+    if let Some(reason) = local_firewall_bypass_inactive_reason(&effective) {
+        bypass_audit("firewall-bypass-added", false, &approval.rules, &reason);
+        return Err(LpmError::SecurityFloor(reason));
+    }
+    let mut approved: Vec<FirewallBypassRule> = Vec::new();
+    let mut unapproved = approval.rules.clone();
+    for _ in 0..3 {
+        match commit_firewall_bypass_rules(&approved, &unapproved, approval.prompt)? {
+            FirewallBypassCommit::Saved(outcome) => return Ok(outcome),
+            FirewallBypassCommit::NeedsApproval(pending) => {
+                approve_firewall_bypass_rules(&FirewallBypassApproval {
+                    rules: pending.clone(),
+                    ..approval
+                })?;
+                unapproved.retain(|rule| !pending.iter().any(|waiting| waiting.id == rule.id));
+                approved.extend(pending);
+            }
+        }
+    }
+    Err(rules_kept_changing_error())
 }
 
 /// Records an `add` refused before any prompt, such as under a managed policy

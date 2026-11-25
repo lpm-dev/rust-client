@@ -3155,11 +3155,45 @@ fn a_narrowing_judged_before_a_concurrent_remove_is_not_saved_without_approval()
         assert_eq!(sorted.narrowed.len(), 1);
         remove_firewall_bypass_rules(|_| true, "firewall-bypass-cleared").unwrap();
 
-        let saved = save_narrowed_firewall_bypass_rules(&sorted.narrowed).unwrap();
+        let commit = commit_firewall_bypass_rules(&[], &sorted.narrowed, "").unwrap();
 
-        assert!(saved.narrowed.is_empty());
-        assert_eq!(saved.needs_approval.len(), 1);
+        assert!(matches!(
+            commit,
+            FirewallBypassCommit::NeedsApproval(waiting) if waiting.len() == 1
+        ));
         assert!(load_local_firewall_bypass_rules().unwrap().is_empty());
+    });
+}
+
+#[test]
+fn a_request_with_a_rule_that_now_needs_approval_saves_nothing() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        with_test_native_auth_result("approve", || {
+            add_bypass(
+                vec![bypass_rule("foldrun@32.8.2"), bypass_rule("left-pad@1.3.0")],
+                false,
+            )
+        })
+        .unwrap();
+        let sorted = sort_firewall_bypass_requests(vec![
+            bypass_rule_expiring_in("foldrun@32.8.2", 30),
+            bypass_rule_expiring_in("left-pad@1.3.0", 30),
+        ])
+        .unwrap();
+        assert_eq!(sorted.narrowed.len(), 2);
+        remove_firewall_bypass_rules(
+            |rule| rule.spec == "left-pad@1.3.0",
+            "firewall-bypass-removed",
+        )
+        .unwrap();
+
+        let commit = commit_firewall_bypass_rules(&[], &sorted.narrowed, "").unwrap();
+
+        assert!(matches!(commit, FirewallBypassCommit::NeedsApproval(_)));
+        let saved = load_local_firewall_bypass_rules().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].expires_at, None);
     });
 }
 
@@ -3175,11 +3209,11 @@ fn a_narrowing_judged_before_a_shorter_expiry_never_lengthens_the_rule() {
             sort_firewall_bypass_requests(vec![bypass_rule_expiring_in("foldrun@32.8.2", 30)])
                 .unwrap();
         let shortest = bypass_rule_expiring_in("foldrun@32.8.2", 10);
-        save_narrowed_firewall_bypass_rules(std::slice::from_ref(&shortest)).unwrap();
+        commit_firewall_bypass_rules(&[], std::slice::from_ref(&shortest), "").unwrap();
 
-        let saved = save_narrowed_firewall_bypass_rules(&sorted.narrowed).unwrap();
+        let commit = commit_firewall_bypass_rules(&[], &sorted.narrowed, "").unwrap();
 
-        assert!(saved.narrowed.is_empty());
+        assert!(matches!(commit, FirewallBypassCommit::NeedsApproval(_)));
         assert_eq!(
             load_local_firewall_bypass_rules().unwrap()[0].expires_at,
             shortest.expires_at
