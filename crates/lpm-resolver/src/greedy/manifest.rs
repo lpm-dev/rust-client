@@ -1838,12 +1838,39 @@ pub(super) fn complete_metadata_fetch(
         }
         Err(error) => {
             if let Some(edges) = completion.parked.remove(&request) {
+                // A firewall refusal of one exact version answers only the
+                // edges that pin it; a range that waited on the same request
+                // fetches the packument instead.
+                let refused_version = request.exact_version.as_deref().filter(|_| {
+                    matches!(
+                        error,
+                        ResolveError::Registry {
+                            failure: crate::RegistryFetchFailure::FirewallBlocked(_),
+                            ..
+                        }
+                    )
+                });
+                let mut waiting_ranges = Vec::new();
                 for edge in edges {
+                    if let Some(version) = refused_version
+                        && edge
+                            .range
+                            .exact_version()
+                            .is_none_or(|pinned| pinned.to_string() != version)
+                    {
+                        waiting_ranges.push(edge);
+                        continue;
+                    }
                     propagate_fetch_error(&edge, &error, completion.state)?;
                     completion
                         .pending_root_constraints
                         .complete_root_edge(&edge, &mut completion.state.task_queue);
                 }
+                waiting_ranges.sort_by(|left, right| {
+                    (left.parent, left.local_name.as_str())
+                        .cmp(&(right.parent, right.local_name.as_str()))
+                });
+                completion.state.task_queue.extend(waiting_ranges);
             }
             Ok(false)
         }

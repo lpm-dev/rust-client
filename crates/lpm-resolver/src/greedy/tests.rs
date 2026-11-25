@@ -8340,3 +8340,127 @@ async fn fusion_reports_an_exact_document_firewall_refusal_without_the_packument
     ));
     server.verify().await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_fetches_the_packument_for_a_range_that_waited_on_a_refused_exact_version() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let packument = |name: &str, latest: &str, versions: serde_json::Value| {
+        let time: serde_json::Map<String, serde_json::Value> = versions
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|version| {
+                (
+                    version.clone(),
+                    serde_json::json!("2025-01-01T00:00:00.000Z"),
+                )
+            })
+            .collect();
+        serde_json::json!({
+            "name": name,
+            "dist-tags": { "latest": latest },
+            "versions": versions,
+            "time": time
+        })
+    };
+    let manifest = |name: &str, version: &str, field: &str, deps: serde_json::Value| {
+        serde_json::json!({
+            "name": name,
+            "version": version,
+            field: deps,
+            "dist": {
+                "tarball": format!("https://example.invalid/{name}-{version}.tgz"),
+                "integrity": "sha512-test"
+            }
+        })
+    };
+
+    let server = MockServer::start().await;
+    reject_selected_histories(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/pinner"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(packument(
+            "pinner",
+            "1.0.0",
+            serde_json::json!({
+                "1.0.0": manifest("pinner", "1.0.0", "optionalDependencies", serde_json::json!({ "shared": "1.0.0" }))
+            }),
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/ranger"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(packument(
+                    "ranger",
+                    "1.0.0",
+                    serde_json::json!({
+                        "1.0.0": manifest("ranger", "1.0.0", "dependencies", serde_json::json!({ "shared": "^1.0.0" }))
+                    }),
+                ))
+                .set_delay(std::time::Duration::from_millis(150)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/shared/1.0.0"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_json(serde_json::json!({
+                    "error": "blocked_by_lpm_firewall",
+                    "package": "shared@1.0.0",
+                    "verdict": "malicious",
+                    "reason": "the registry policy refused this download"
+                }))
+                .set_delay(std::time::Duration::from_millis(500)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/shared"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(packument(
+            "shared",
+            "1.0.1",
+            serde_json::json!({
+                "1.0.0": manifest("shared", "1.0.0", "dependencies", serde_json::json!({})),
+                "1.0.1": manifest("shared", "1.0.1", "dependencies", serde_json::json!({}))
+            }),
+        )))
+        .with_priority(5)
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    let result = resolve_greedy_fused(
+        Arc::new(
+            RegistryClient::new()
+                .with_base_url(server.uri())
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        ),
+        HashMap::from([
+            ("pinner".to_string(), "^1.0.0".to_string()),
+            ("ranger".to_string(), "^1.0.0".to_string()),
+        ]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        true,
+    )
+    .await
+    .expect("the range should resolve from the packument");
+
+    let shared: Vec<String> = result
+        .packages
+        .iter()
+        .filter(|package| package.package.canonical_name() == "shared")
+        .map(|package| package.version.to_string())
+        .collect();
+    assert_eq!(shared, ["1.0.1"]);
+    server.verify().await;
+}
