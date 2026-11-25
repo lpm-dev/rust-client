@@ -1913,6 +1913,9 @@ fn managed_policy_firewall_policies_set_the_effective_profile() {
         write_managed_policy(
             temp.path(),
             r#"
+[firewall]
+mode = "enforce"
+
 [firewall.npm.policies]
 lpm_ai_agent_control_surface = "block"
 "#,
@@ -1942,12 +1945,37 @@ lpm_ai_agent_control_surface = "block"
 }
 
 #[test]
+fn managed_policy_rejects_firewall_policies_without_a_firewall_mode() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_managed_policy(
+            temp.path(),
+            r#"
+[firewall.npm.policies]
+lpm_ai_agent_control_surface = "block"
+"#,
+        );
+
+        let err = load_effective_authorized_posture().unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("must set `[firewall].mode` when it sets `[firewall.npm.policies]`"),
+            "{err}"
+        );
+    });
+}
+
+#[test]
 fn managed_policy_rejects_invalid_firewall_policy_action() {
     let temp = tempdir().unwrap();
     with_test_env(temp.path(), || {
         write_managed_policy(
             temp.path(),
             r#"
+[firewall]
+mode = "enforce"
+
 [firewall.npm.policies]
 lpm_ai_confirmed_malware = "ignore"
 "#,
@@ -2091,35 +2119,6 @@ fn security_status_reports_config_policy_that_differs_from_the_effective_profile
 }
 
 #[test]
-fn runtime_firewall_enforces_a_managed_policy_table_where_the_approved_firewall_is_off() {
-    let temp = tempdir().unwrap();
-    let project = temp.path().join("project");
-    std::fs::create_dir_all(&project).unwrap();
-
-    with_test_env(temp.path(), || {
-        write_managed_policy(
-            temp.path(),
-            r#"
-[firewall.npm.policies]
-lpm_ai_telemetry = "block"
-"#,
-        );
-        let config = firewall_policy_global_config(
-            "enforce",
-            &[(
-                crate::npm_firewall_config::LPM_AI_TELEMETRY_POLICY_KEY,
-                "allow",
-            )],
-        );
-
-        let err = resolve_firewall(&config, &project).unwrap_err();
-
-        assert_eq!(err.error_code(), "security_floor");
-        assert!(err.to_string().contains("[firewall.npm.policies]"), "{err}");
-    });
-}
-
-#[test]
 fn runtime_firewall_reports_a_looser_mode_without_listing_unchanged_policies() {
     let temp = tempdir().unwrap();
     let project = temp.path().join("project");
@@ -2149,31 +2148,6 @@ fn runtime_firewall_reports_a_looser_mode_without_listing_unchanged_policies() {
             context.suggested_command.as_deref(),
             Some("lpm config firewall")
         );
-    });
-}
-
-#[test]
-fn persistent_firewall_policy_loosening_is_refused_under_a_managed_table_with_the_firewall_off() {
-    let temp = tempdir().unwrap();
-    with_test_env(temp.path(), || {
-        write_managed_policy(
-            temp.path(),
-            r#"
-[firewall.npm.policies]
-lpm_ai_confirmed_malware = "block"
-"#,
-        );
-        let requested = lpm_registry::client::NpmFirewallPolicyProfile {
-            lpm_ai_confirmed_malware: lpm_registry::client::NpmFirewallPolicyAction::Allow,
-            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
-        };
-
-        let err = with_test_native_auth_result("approve", || {
-            authorize_persistent_npm_firewall_policies(&requested, false, "lpm config firewall")
-        })
-        .unwrap_err();
-
-        assert_eq!(err.error_code(), "security_floor");
     });
 }
 

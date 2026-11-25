@@ -877,6 +877,7 @@ fn add_firewall_policy_entries(
 ) -> Result<(), LpmError> {
     let requested = crate::npm_firewall_config::config_policy_request(global)?;
     let approved = posture.posture.firewall_policy_profile();
+    let tableless = crate::npm_firewall_config::runtime_policy_profile(None, posture);
     let approved_mode = posture.posture.firewall_mode();
     let policies = global
         .get_table("firewall")
@@ -931,10 +932,15 @@ fn add_firewall_policy_entries(
             .and_then(|requested| crate::npm_firewall_config::policy_action(requested, key))
         {
             Some(action) => (action, config_source),
-            None => (
-                approved_action,
-                Cow::Borrowed(posture_source(posture.sources.firewall_policies)),
-            ),
+            None => match crate::npm_firewall_config::policy_action(&tableless, key) {
+                Some(action) if action != approved_action => {
+                    (action, Cow::Borrowed(DEFAULT_SOURCE))
+                }
+                _ => (
+                    approved_action,
+                    Cow::Borrowed(posture_source(posture.sources.firewall_policies)),
+                ),
+            },
         };
         let (value, source) = select_security_value(
             candidate,

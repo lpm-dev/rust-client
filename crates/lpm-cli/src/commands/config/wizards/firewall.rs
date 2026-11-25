@@ -547,20 +547,17 @@ fn insert_missing_policy_action(
     actions.insert(index, action);
 }
 
-/// The profile installs use now: the `config.toml` table when there is one,
-/// else the approved profile.
+/// The profile installs use now.
 fn read_firewall_policy_profile(
     config_path: &std::path::Path,
 ) -> Result<NpmFirewallPolicyProfile, LpmError> {
     let cfg = read_config(config_path)?;
-    match crate::npm_firewall_config::config_policy_request(&GlobalConfig::from_value(cfg)?)? {
-        Some(profile) => Ok(profile),
-        None => Ok(
-            crate::security_approval::load_effective_authorized_posture()?
-                .posture
-                .firewall_policy_profile(),
-        ),
-    }
+    let request =
+        crate::npm_firewall_config::config_policy_request(&GlobalConfig::from_value(cfg)?)?;
+    Ok(crate::npm_firewall_config::runtime_policy_profile(
+        request,
+        &crate::security_approval::load_effective_authorized_posture()?,
+    ))
 }
 
 /// Whether saving enforce mode must also save `profile`: it differs from the

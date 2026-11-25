@@ -85,32 +85,65 @@ async fn install_refuses_config_firewall_policy_looser_than_the_approved_policy(
     assert!(!project.file_exists("node_modules/guarded-policy/package.json"));
 }
 
-#[tokio::test]
-async fn install_sends_the_signed_firewall_policy_when_config_has_no_policy_table() {
-    let mock = registry_with_package("approved-policy").await;
+async fn install_sending_policy(
+    name: &str,
+    approved: &[(&str, &str)],
+    config: &[(&str, &str)],
+    expected_body: &str,
+) {
+    let mock = registry_with_package(name).await;
     Mock::given(method("POST"))
         .and(path(VERDICTS_PATH))
-        .and(body_string_contains(r#""lpmAiConfirmedMalware":"allow""#))
-        .respond_with(allow_response("approved-policy"))
+        .and(body_string_contains(expected_body))
+        .respond_with(allow_response(name))
         .expect(1)
         .mount(mock.server())
         .await;
     let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
-    write_signed_firewall_posture(
-        &project,
-        "enforce",
-        &[("lpm_ai_confirmed_malware", "allow")],
-    );
-    write_npm_firewall_global_config_with_policies(&project, "enforce", &[]);
+    write_signed_firewall_posture(&project, "enforce", approved);
+    write_npm_firewall_global_config_with_policies(&project, "enforce", config);
 
-    let output = install(&project, &mock, "approved-policy");
+    let output = install(&project, &mock, name);
 
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );
-    assert!(project.file_exists("node_modules/approved-policy/package.json"));
+    assert!(project.file_exists(&format!("node_modules/{name}/package.json")));
+}
+
+#[tokio::test]
+async fn install_runs_the_default_policy_when_config_has_no_table_and_the_approved_one_is_looser() {
+    install_sending_policy(
+        "approved-policy",
+        &[("lpm_ai_confirmed_malware", "allow")],
+        &[],
+        r#""lpmAiConfirmedMalware":"block""#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn install_keeps_a_stricter_approved_policy_when_config_has_no_table() {
+    install_sending_policy(
+        "strict-policy",
+        &[("lpm_ai_agent_control_surface", "block")],
+        &[],
+        r#""lpmAiAgentControlSurface":"block""#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn install_sends_an_approved_looser_policy_the_config_asks_for() {
+    install_sending_policy(
+        "requested-policy",
+        &[("lpm_ai_confirmed_malware", "allow")],
+        &[("lpm_ai_confirmed_malware", "allow")],
+        r#""lpmAiConfirmedMalware":"allow""#,
+    )
+    .await;
 }
 
 #[tokio::test]

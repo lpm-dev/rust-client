@@ -1262,6 +1262,12 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
                 .transpose()
         })
         .map_err(|message| managed_policy_error(&path, format!("is invalid: {message}")))?;
+    if firewall_policies.is_some() && firewall_mode.is_none() {
+        return Err(managed_policy_error(
+            &path,
+            "must set `[firewall].mode` when it sets `[firewall.npm.policies]`; otherwise the firewall the profile governs can be turned off locally",
+        ));
+    }
     let install_time_source_analysis = table
         .get(crate::source_analysis_config::INSTALL_TIME_SOURCE_ANALYSIS_KEY)
         .map(|value| {

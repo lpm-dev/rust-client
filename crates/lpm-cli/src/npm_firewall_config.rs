@@ -437,6 +437,36 @@ fn enforced_rank(mode: NpmFirewallMode, action: NpmFirewallPolicyAction) -> u8 {
     }
 }
 
+/// The profile a command runs with: the `config.toml` table when there is
+/// one, else the default raised to the approved profile wherever that is
+/// stricter. An approved looser action is a permission the table has to ask
+/// for; a managed profile applies as written.
+pub(crate) fn runtime_policy_profile(
+    request: Option<NpmFirewallPolicyProfile>,
+    effective: &crate::security_approval::EffectiveAuthorizedPosture,
+) -> NpmFirewallPolicyProfile {
+    request.unwrap_or_else(|| {
+        tableless_policy_profile(
+            effective.posture.firewall_policy_profile(),
+            matches!(
+                effective.sources.firewall_policies,
+                crate::security_approval::PostureSourceKind::ManagedPolicy
+            ),
+        )
+    })
+}
+
+fn tableless_policy_profile(
+    approved: NpmFirewallPolicyProfile,
+    managed: bool,
+) -> NpmFirewallPolicyProfile {
+    if managed {
+        approved
+    } else {
+        stricter_policy_profile(&NpmFirewallPolicyProfile::default(), &approved)
+    }
+}
+
 /// The profile that is at least as strict as both `current` and `proposed` in
 /// every group, so adopting it never loosens anything.
 pub(crate) fn stricter_policy_profile(
@@ -542,8 +572,7 @@ pub(crate) fn resolve_runtime_firewall(
     )?;
     Ok(RuntimeFirewall {
         mode: mode_request.map_or_else(|| effective.posture.firewall_mode(), |r| r.mode()),
-        policy_profile: policy_request
-            .unwrap_or_else(|| effective.posture.firewall_policy_profile()),
+        policy_profile: runtime_policy_profile(policy_request, &effective),
     })
 }
 
@@ -1071,6 +1100,27 @@ mod tests {
             policy_profile_from_overrides(&overrides),
             NpmFirewallPolicyProfile::default()
         );
+    }
+
+    #[test]
+    fn without_a_table_an_approved_looser_action_waits_for_a_request() {
+        let approved = NpmFirewallPolicyProfile {
+            lpm_ai_confirmed_malware: NpmFirewallPolicyAction::Allow,
+            lpm_ai_agent_control_surface: NpmFirewallPolicyAction::Block,
+            ..NpmFirewallPolicyProfile::default()
+        };
+
+        let runtime = tableless_policy_profile(approved, false);
+
+        assert_eq!(
+            runtime.lpm_ai_confirmed_malware,
+            NpmFirewallPolicyAction::Block
+        );
+        assert_eq!(
+            runtime.lpm_ai_agent_control_surface,
+            NpmFirewallPolicyAction::Block
+        );
+        assert_eq!(tableless_policy_profile(approved, true), approved);
     }
 
     #[test]
