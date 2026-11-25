@@ -2089,3 +2089,125 @@ fn security_status_reports_config_policy_that_differs_from_the_effective_profile
         );
     });
 }
+
+#[test]
+fn runtime_firewall_enforces_a_managed_policy_table_where_the_approved_firewall_is_off() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    with_test_env(temp.path(), || {
+        write_managed_policy(
+            temp.path(),
+            r#"
+[firewall.npm.policies]
+lpm_ai_telemetry = "block"
+"#,
+        );
+        let config = firewall_policy_global_config(
+            "enforce",
+            &[(
+                crate::npm_firewall_config::LPM_AI_TELEMETRY_POLICY_KEY,
+                "allow",
+            )],
+        );
+
+        let err = resolve_firewall(&config, &project).unwrap_err();
+
+        assert_eq!(err.error_code(), "security_floor");
+        assert!(err.to_string().contains("[firewall.npm.policies]"), "{err}");
+    });
+}
+
+#[test]
+fn runtime_firewall_reports_a_looser_mode_without_listing_unchanged_policies() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[]);
+        let config = firewall_policy_global_config(
+            "monitor",
+            &[(
+                crate::npm_firewall_config::LPM_AI_CONFIRMED_MALWARE_POLICY_KEY,
+                "block",
+            )],
+        );
+
+        let err = without_test_native_auth(|| resolve_firewall(&config, &project)).unwrap_err();
+
+        let LpmError::SecurityApprovalRequired(context) = &err else {
+            panic!("expected an approval error, got {err}");
+        };
+        assert!(
+            !context.message.contains("[firewall.npm.policies]"),
+            "{}",
+            context.message
+        );
+        assert_ne!(
+            context.suggested_command.as_deref(),
+            Some("lpm config firewall")
+        );
+    });
+}
+
+#[test]
+fn persistent_firewall_policy_loosening_is_refused_under_a_managed_table_with_the_firewall_off() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_managed_policy(
+            temp.path(),
+            r#"
+[firewall.npm.policies]
+lpm_ai_confirmed_malware = "block"
+"#,
+        );
+        let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_confirmed_malware: lpm_registry::client::NpmFirewallPolicyAction::Allow,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        let err = with_test_native_auth_result("approve", || {
+            authorize_persistent_npm_firewall_policies(&requested, false, "lpm config firewall")
+        })
+        .unwrap_err();
+
+        assert_eq!(err.error_code(), "security_floor");
+    });
+}
+
+#[test]
+fn tightening_the_approved_profile_restores_defaults_without_approval() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[
+            (
+                crate::npm_firewall_config::LPM_AI_CONFIRMED_MALWARE_POLICY_KEY,
+                "allow",
+            ),
+            (
+                crate::npm_firewall_config::LPM_AI_TELEMETRY_POLICY_KEY,
+                "block",
+            ),
+        ]);
+
+        without_test_native_auth(|| {
+            tighten_persistent_npm_firewall_policies(
+                &lpm_registry::client::NpmFirewallPolicyProfile::default(),
+            )
+        })
+        .unwrap();
+
+        let profile = load_authorized_posture().unwrap().firewall_policy_profile();
+        assert_eq!(
+            profile.lpm_ai_confirmed_malware,
+            lpm_registry::client::NpmFirewallPolicyAction::Block
+        );
+        assert_eq!(
+            profile.lpm_ai_telemetry,
+            lpm_registry::client::NpmFirewallPolicyAction::Block,
+            "tightening never loosens a stricter approved group"
+        );
+    });
+}

@@ -46,7 +46,7 @@ pub use approval::{
     ensure_project_scope_candidate_authorized, ensure_project_trust_candidate_authorized,
     ensure_runtime_install_time_source_analysis_authorized, ensure_runtime_sigstore_posture,
     ensure_runtime_sigstore_posture_for_global, ensure_runtime_typosquat_guard_config_authorized,
-    record_project_scope_candidate_narrowing,
+    record_project_scope_candidate_narrowing, tighten_persistent_npm_firewall_policies,
 };
 pub use helpers::format_unlock_duration;
 pub(crate) use managed_policy::{

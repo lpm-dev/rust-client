@@ -437,6 +437,26 @@ fn enforced_rank(mode: NpmFirewallMode, action: NpmFirewallPolicyAction) -> u8 {
     }
 }
 
+/// The profile that is at least as strict as both `current` and `proposed` in
+/// every group, so adopting it never loosens anything.
+pub(crate) fn stricter_policy_profile(
+    current: &NpmFirewallPolicyProfile,
+    proposed: &NpmFirewallPolicyProfile,
+) -> NpmFirewallPolicyProfile {
+    let mut stricter = *current;
+    for key in POLICY_KEYS {
+        if let (Some(slot), Some(proposed_action)) = (
+            policy_action_mut(&mut stricter, key),
+            policy_action(proposed, key),
+        ) && enforced_rank(NpmFirewallMode::Enforce, proposed_action)
+            > enforced_rank(NpmFirewallMode::Enforce, *slot)
+        {
+            *slot = proposed_action;
+        }
+    }
+    stricter
+}
+
 pub(crate) fn describe_loosened_policies(loosened: &[LoosenedFirewallPolicy]) -> String {
     let mut text = String::with_capacity(loosened.len() * 48);
     for (index, entry) in loosened.iter().enumerate() {

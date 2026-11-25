@@ -86,7 +86,7 @@ async fn install_refuses_config_firewall_policy_looser_than_the_approved_policy(
 }
 
 #[tokio::test]
-async fn install_sends_the_config_firewall_policy_the_signed_posture_approved() {
+async fn install_sends_the_signed_firewall_policy_when_config_has_no_policy_table() {
     let mock = registry_with_package("approved-policy").await;
     Mock::given(method("POST"))
         .and(path(VERDICTS_PATH))
@@ -101,11 +101,7 @@ async fn install_sends_the_config_firewall_policy_the_signed_posture_approved() 
         "enforce",
         &[("lpm_ai_confirmed_malware", "allow")],
     );
-    write_npm_firewall_global_config_with_policies(
-        &project,
-        "enforce",
-        &[("lpm_ai_confirmed_malware", "allow")],
-    );
+    write_npm_firewall_global_config_with_policies(&project, "enforce", &[]);
 
     let output = install(&project, &mock, "approved-policy");
 

@@ -933,10 +933,18 @@ pub fn authorize_persistent_npm_firewall_policies(
 ) -> Result<(), LpmError> {
     let enforce = crate::npm_firewall_config::NpmFirewallMode::Enforce;
     let effective = load_effective_authorized_posture()?;
+    let policies_managed = matches!(
+        effective.sources.firewall_policies,
+        PostureSourceKind::ManagedPolicy
+    );
     let weakened = crate::npm_firewall_config::loosened_firewall_policies(
         enforce,
         requested,
-        effective.posture.firewall_mode(),
+        if policies_managed {
+            enforce
+        } else {
+            effective.posture.firewall_mode()
+        },
         &effective.posture.firewall_policy_profile(),
     );
     if let Some(first) = weakened.first()
@@ -985,6 +993,22 @@ pub fn authorize_persistent_npm_firewall_policies(
     }
     posture.firewall_mode = enforce.as_str().to_string();
     posture.firewall_policies = policies;
+    persist_authorized_posture(&posture)
+}
+
+/// Raises the approved npm firewall profile to `config_profile` wherever that
+/// is stricter, as saving a firewall mode or deleting `[firewall.npm.policies]`
+/// does. It never loosens a group, so it asks for nothing.
+pub fn tighten_persistent_npm_firewall_policies(
+    config_profile: &lpm_registry::client::NpmFirewallPolicyProfile,
+) -> Result<(), LpmError> {
+    let mut posture = load_authorized_posture()?;
+    let current = posture.firewall_policy_profile();
+    let tightened = crate::npm_firewall_config::stricter_policy_profile(&current, config_profile);
+    if tightened == current {
+        return Ok(());
+    }
+    posture.firewall_policies = crate::npm_firewall_config::policy_profile_overrides(&tightened);
     persist_authorized_posture(&posture)
 }
 
@@ -1138,11 +1162,25 @@ pub(crate) fn ensure_runtime_npm_firewall_config_authorized_with_effective(
     let approved_mode = effective.posture.firewall_mode();
     let requested_mode = mode_request.map_or(approved_mode, |request| request.mode());
     let mode_loosens = requested_mode.loosens(approved_mode);
+    let policies_managed = matches!(
+        effective.sources.firewall_policies,
+        PostureSourceKind::ManagedPolicy
+    );
+    // A managed profile binds whenever the firewall runs, whatever mode the
+    // approved posture holds. A looser mode is the mode check's to report, so
+    // the profile is then compared at the approved mode alone.
+    let (policy_requested_mode, policy_approved_mode) = if policies_managed {
+        (requested_mode, requested_mode)
+    } else if mode_loosens {
+        (approved_mode, approved_mode)
+    } else {
+        (requested_mode, approved_mode)
+    };
     let loosened_policies = policy_request.map_or_else(Vec::new, |requested| {
         crate::npm_firewall_config::loosened_firewall_policies(
-            requested_mode,
+            policy_requested_mode,
             requested,
-            approved_mode,
+            policy_approved_mode,
             &effective.posture.firewall_policy_profile(),
         )
     });
@@ -1181,23 +1219,20 @@ pub(crate) fn ensure_runtime_npm_firewall_config_authorized_with_effective(
         if loosened_policies.is_empty() {
             return None;
         }
-        let policies_managed = matches!(
-            effective.sources.firewall_policies,
-            PostureSourceKind::ManagedPolicy
-        ) || matches!(
-            effective.sources.firewall_mode,
-            PostureSourceKind::ManagedPolicy
-        );
-        policies_managed
-            .then_some(effective.managed_policy.as_ref())
-            .flatten()
-            .map(|managed_policy| {
-                managed_policy_scope_error(
-                    managed_policy,
-                    ApprovalScope::FirewallDisable,
-                    crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_PATH,
-                )
-            })
+        (policies_managed
+            || matches!(
+                effective.sources.firewall_mode,
+                PostureSourceKind::ManagedPolicy
+            ))
+        .then_some(effective.managed_policy.as_ref())
+        .flatten()
+        .map(|managed_policy| {
+            managed_policy_scope_error(
+                managed_policy,
+                ApprovalScope::FirewallDisable,
+                crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_PATH,
+            )
+        })
     });
     if let Some(err) = managed_error {
         record_audit_event(

@@ -635,9 +635,40 @@ pub(super) fn guard_generic_delete_against_force_floor(
         "force-security-floor" if crate::security_floor::force_security_floor_enabled(global) => {
             authorize_force_floor_removal()?;
         }
-        _ => {}
+        _ => {
+            if let Some(after) = firewall_policy_profile_after_delete(global, key)? {
+                crate::security_floor::reject_looser_firewall_policy_write(global, &after)?;
+            }
+        }
     }
     Ok(())
+}
+
+/// The `[firewall.npm.policies]` profile `config.toml` asks for once `key` is
+/// deleted, or `None` when deleting `key` leaves that table alone.
+pub(super) fn firewall_policy_profile_after_delete(
+    config: &GlobalConfig,
+    key: &str,
+) -> Result<Option<lpm_registry::client::NpmFirewallPolicyProfile>, LpmError> {
+    let firewall = crate::npm_firewall_config::FIREWALL_CONFIG_SECTION;
+    let affects_policies = key == firewall
+        || key == "firewall.npm"
+        || key == "firewall.npm.policies"
+        || key.starts_with("firewall.npm.policies.");
+    if !affects_policies {
+        return Ok(None);
+    }
+    let mut after = config.table().clone();
+    remove_config_value_at_path(&mut after, key);
+    crate::npm_firewall_config::firewall_policy_table(&after)
+        .and_then(|policies| {
+            policies
+                .map(crate::npm_firewall_config::parse_policy_table)
+                .transpose()
+        })
+        .map(Option::unwrap_or_default)
+        .map(Some)
+        .map_err(LpmError::Registry)
 }
 
 fn authorize_force_floor_removal() -> Result<(), LpmError> {

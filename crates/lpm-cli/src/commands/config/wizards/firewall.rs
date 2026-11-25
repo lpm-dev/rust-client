@@ -79,7 +79,10 @@ pub(in crate::commands::config) async fn run_firewall_wizard(
             let initial_profile = read_firewall_policy_profile(config_path)?;
             let profile = prompt_firewall_policy_profile(initial_profile)?;
             let existing_cfg = read_config(config_path)?;
-            if should_persist_firewall_policy_profile(&existing_cfg, profile) {
+            let approved = crate::security_approval::load_effective_authorized_posture()?
+                .posture
+                .firewall_policy_profile();
+            if should_persist_firewall_policy_profile(&existing_cfg, profile, approved) {
                 FirewallWizardSelection::CustomEnforce(profile)
             } else {
                 FirewallWizardSelection::Mode(NpmFirewallMode::Enforce)
@@ -155,11 +158,16 @@ async fn apply_firewall_selection(
                     proposed_command,
                 )?;
             }
-            None => crate::security_approval::authorize_persistent_npm_firewall_mode(
-                mode,
-                json_output,
-                proposed_command,
-            )?,
+            None => {
+                crate::security_approval::authorize_persistent_npm_firewall_mode(
+                    mode,
+                    json_output,
+                    proposed_command,
+                )?;
+                crate::security_approval::tighten_persistent_npm_firewall_policies(
+                    &crate::npm_firewall_config::config_policy_profile(config)?,
+                )?;
+            }
         }
         persist_firewall_mode_in_config_value(config, mode)?;
         if let Some(profile) = selection.policy_profile() {
@@ -539,18 +547,32 @@ fn insert_missing_policy_action(
     actions.insert(index, action);
 }
 
+/// The profile installs use now: the `config.toml` table when there is one,
+/// else the approved profile.
 fn read_firewall_policy_profile(
     config_path: &std::path::Path,
 ) -> Result<NpmFirewallPolicyProfile, LpmError> {
     let cfg = read_config(config_path)?;
-    crate::npm_firewall_config::config_policy_profile(&GlobalConfig::from_value(cfg)?)
+    match crate::npm_firewall_config::config_policy_request(&GlobalConfig::from_value(cfg)?)? {
+        Some(profile) => Ok(profile),
+        None => Ok(
+            crate::security_approval::load_effective_authorized_posture()?
+                .posture
+                .firewall_policy_profile(),
+        ),
+    }
 }
 
+/// Whether saving enforce mode must also save `profile`: it differs from the
+/// default or from the approved profile, or `config.toml` already has a table.
 fn should_persist_firewall_policy_profile(
     cfg: &toml::Value,
     profile: NpmFirewallPolicyProfile,
+    approved: NpmFirewallPolicyProfile,
 ) -> bool {
-    profile != NpmFirewallPolicyProfile::default() || firewall_policy_table_exists(cfg)
+    profile != NpmFirewallPolicyProfile::default()
+        || firewall_policy_table_exists(cfg)
+        || profile != approved
 }
 
 fn firewall_policy_table_exists(cfg: &toml::Value) -> bool {
@@ -886,7 +908,8 @@ mod tests {
 
         assert!(!should_persist_firewall_policy_profile(
             &cfg,
-            NpmFirewallPolicyProfile::default()
+            NpmFirewallPolicyProfile::default(),
+            NpmFirewallPolicyProfile::default(),
         ));
     }
 
@@ -916,7 +939,23 @@ mod tests {
 
         assert!(should_persist_firewall_policy_profile(
             &cfg,
-            NpmFirewallPolicyProfile::default()
+            NpmFirewallPolicyProfile::default(),
+            NpmFirewallPolicyProfile::default(),
+        ));
+    }
+
+    #[test]
+    fn default_enforce_policy_persists_to_replace_an_approved_custom_profile() {
+        let cfg = toml::Value::Table(toml::map::Map::new());
+        let approved = NpmFirewallPolicyProfile {
+            lpm_ai_confirmed_malware: NpmFirewallPolicyAction::Allow,
+            ..NpmFirewallPolicyProfile::default()
+        };
+
+        assert!(should_persist_firewall_policy_profile(
+            &cfg,
+            NpmFirewallPolicyProfile::default(),
+            approved,
         ));
     }
 }

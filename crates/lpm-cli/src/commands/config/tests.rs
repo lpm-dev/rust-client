@@ -1431,3 +1431,72 @@ async fn sigstore_wizard_overwrites_existing_value() {
         Some("deny"),
     );
 }
+
+#[tokio::test]
+async fn firewall_mode_wizard_returns_an_approved_looser_profile_to_the_config_profile() {
+    let (_dir, path, _env) = tmp_config();
+    crate::security_approval::persist_authorized_posture(
+        &crate::security_approval::AuthorizedPosture {
+            firewall_mode: "enforce".to_string(),
+            firewall_policies: std::collections::BTreeMap::from([(
+                crate::npm_firewall_config::LPM_AI_CONFIRMED_MALWARE_POLICY_KEY.to_string(),
+                "allow".to_string(),
+            )]),
+            ..crate::security_approval::load_authorized_posture().unwrap()
+        },
+    )
+    .unwrap();
+
+    run_firewall_wizard(&path, Some("enforce"), true)
+        .await
+        .unwrap();
+
+    let posture = crate::security_approval::load_authorized_posture().unwrap();
+    assert!(
+        posture.firewall_policies.is_empty(),
+        "{:?}",
+        posture.firewall_policies
+    );
+}
+
+#[test]
+fn deleting_a_stricter_firewall_policy_is_refused_under_a_forced_floor() {
+    let config = global_config(
+        "force-security-floor = true\n\n[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_agent_control_surface = \"block\"\n",
+    );
+
+    for key in [
+        "firewall.npm.policies.lpm_ai_agent_control_surface",
+        "firewall.npm.policies",
+        "firewall.npm",
+    ] {
+        assert!(
+            io::guard_generic_delete_against_force_floor(&config, key).is_err(),
+            "{key}"
+        );
+    }
+    assert!(
+        io::guard_generic_delete_against_force_floor(
+            &global_config("[firewall.npm.policies]\nlpm_ai_agent_control_surface = \"block\"\n"),
+            "firewall.npm.policies"
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn firewall_policy_profile_after_delete_ignores_keys_outside_the_policy_table() {
+    let config = global_config("[firewall]\nmode = \"enforce\"\n");
+
+    assert!(
+        io::firewall_policy_profile_after_delete(&config, "firewall.mode")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        io::firewall_policy_profile_after_delete(&config, "firewall")
+            .unwrap()
+            .unwrap(),
+        lpm_registry::client::NpmFirewallPolicyProfile::default()
+    );
+}
