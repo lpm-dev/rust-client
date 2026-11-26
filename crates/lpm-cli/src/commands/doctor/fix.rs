@@ -182,7 +182,9 @@ pub(super) async fn apply(
             Err(error) => {
                 let label = planned_action_label(action, check)
                     .unwrap_or_else(|_| action.label().to_string());
-                super::render_autofix_failed(&label, &error);
+                if !json_output {
+                    super::render_autofix_failed(&label, &error);
+                }
                 report.failed.push(FixFailure {
                     action: label,
                     error: error.to_string(),

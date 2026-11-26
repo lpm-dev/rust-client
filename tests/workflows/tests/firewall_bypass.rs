@@ -721,6 +721,9 @@ async fn doctor_fix_names_what_a_block_stopped_in_its_failed_install() {
         "{text}"
     );
     assert!(text.contains(AGENT_TOOL_HINT), "{text}");
+    let json_stderr = String::from_utf8_lossy(&json.stderr);
+    assert!(!json_stderr.contains("lpm install failed"), "{json_stderr}");
+    assert!(!json_stderr.contains("blocked agent-tool"), "{json_stderr}");
     let envelope: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     let failed = &envelope["fixes_failed"][0];
     assert_eq!(failed["action"], "lpm install", "{envelope:#}");
