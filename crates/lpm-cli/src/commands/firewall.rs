@@ -2285,14 +2285,19 @@ mod tests {
             std::fs::create_dir_all(&lpm_home).unwrap();
             let (locked_tx, locked_rx) = std::sync::mpsc::channel();
             let (approved_tx, approved_rx) = std::sync::mpsc::channel::<()>();
-            // Holds the config lock from before `add` starts and writes the
-            // forced floor only once `add` is past its approval prompt.
+            // Holds the config lock from before `add` starts, and writes the
+            // forced floor only once `add` is past its approval prompt and
+            // has had time to reach the lock, so an `add` that skipped the
+            // lock would save first.
             let writer = std::thread::spawn(move || {
                 let lock = lpm_common::try_acquire_exclusive_lock(lpm_home.join(".config.lock"))
                     .unwrap()
                     .expect("nothing else holds the config lock");
                 locked_tx.send(()).unwrap();
-                approved_rx.recv().unwrap();
+                approved_rx
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .expect("add reached its approval prompt");
+                std::thread::sleep(std::time::Duration::from_millis(200));
                 std::fs::write(
                     lpm_home.join("config.toml"),
                     "force-security-floor = true\n\n[firewall]\nmode = \"enforce\"\n",
@@ -2305,7 +2310,7 @@ mod tests {
             let scope = global();
             let mut prompts = 0;
 
-            let error = run_add(
+            let result = run_add(
                 &plan(&specs, &scope, None, false),
                 vec![rule(&specs[0], None)],
                 |_| {
@@ -2313,9 +2318,11 @@ mod tests {
                     approved_tx.send(()).unwrap();
                     Ok(())
                 },
-            )
-            .unwrap_err();
+            );
+            // Lets the writer stop waiting if `add` never prompted.
+            drop(approved_tx);
             writer.join().unwrap();
+            let error = result.unwrap_err();
 
             assert!(
                 error.to_string().contains("force-security-floor"),

@@ -860,9 +860,9 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
             }
             failure => failure,
         };
-        // A block names every version a rule lifted; a failed request lets
-        // through only what downloaded before it.
-        if failure.is_none() {
+        // A block names every version a rule lifted, downloaded or not;
+        // otherwise only what was released to download was let through.
+        if blocked {
             stats.bypassed.append(&mut held_bypassed);
         }
         stats.batch_ms = total_started.elapsed().as_millis();
