@@ -12,13 +12,13 @@ pub enum VerifyError {
     DsseSignature(String),
 
     /// A semantically-checked Rekor body field disagreed with the
-    /// bundle's DSSE envelope or the leaf cert. Today's hard-fail
+    /// bundle's DSSE envelope or the leaf cert. The Rekor v1 hard-fail
     /// fields: `publicKey` (binds the Rekor entry to the same
-    /// signing identity that signed the DSSE envelope) and
-    /// `payloadHash` (binds the Rekor entry to exactly the in-toto
-    /// statement we're about to trust). Envelope hash is advisory
-    /// only and never produces this variant; see
-    /// [`verify_rekor_body`].
+    /// signing identity that signed the DSSE envelope), `payloadHash`
+    /// (binds the Rekor entry to exactly the in-toto statement we're
+    /// about to trust) and `signature` (binds it to the envelope's own
+    /// signature). Envelope hash is advisory only and never produces
+    /// this variant; see [`verify_rekor_body`].
     #[error(
         "Rekor body field `{field}` mismatch: expected sha256={expected_sha256}, \
          actual sha256={actual_sha256}"
@@ -29,11 +29,15 @@ pub enum VerifyError {
         actual_sha256: String,
     },
 
-    /// Rekor body's `apiVersion` is not in the supported set
-    /// (`0.0.2`, `0.0.1`). Reject rather than skip so a future signer
-    /// emitting an unknown shape doesn't bypass verification silently.
-    #[error("Rekor body apiVersion `{api_version}` is not in the supported set (0.0.1, 0.0.2)")]
-    RekorBodyUnknownVersion { api_version: String },
+    /// A Rekor v1 `intoto` or `dsse` body's `apiVersion` is not one the
+    /// verifier supports (`intoto` 0.0.2, `dsse` 0.0.1). Reject rather
+    /// than skip so a future signer emitting an unknown shape doesn't
+    /// bypass verification silently.
+    #[error(
+        "Rekor `{kind}` entry version `{api_version}` is not supported \
+         (intoto 0.0.2, dsse 0.0.1)"
+    )]
+    RekorBodyUnknownVersion { kind: String, api_version: String },
 
     /// Rekor body could not be parsed at all: `canonicalizedBody`
     /// wasn't base64, the decoded bytes weren't JSON, top-level
@@ -87,12 +91,11 @@ pub enum VerifyError {
     #[error("Rekor SET verification failed: {0}")]
     RekorSet(String),
 
-    /// The Rekor body did not carry a Signed Entry Timestamp, but
-    /// the caller's [`RekorInclusionProofPolicy`] required one
-    /// (`RequireSet` or `RequireBoth`). The inclusion-proof path is
-    /// the alternative offline anchor; under `Either`
-    /// or `RequireInclusionProof` this case is not an error.
-    #[error("Rekor SET is required by policy but missing from the bundle")]
+    /// The Rekor v1 entry did not carry a Signed Entry Timestamp, but
+    /// one was required: by the caller's [`RekorInclusionProofPolicy`]
+    /// (`RequireSet` or `RequireBoth`), or by a version 0.1 bundle, whose
+    /// entries carry a SET.
+    #[error("Rekor SET is required but missing from the bundle")]
     RekorSetMissing,
 
     /// An RFC 3161 signed timestamp in the bundle did not verify: it
@@ -113,12 +116,11 @@ pub enum VerifyError {
     #[error("Rekor inclusion proof verification failed: {0}")]
     InclusionProof(String),
 
-    /// The Rekor body did not carry an inclusion proof, but the
-    /// caller's [`RekorInclusionProofPolicy`] required one
-    /// (`RequireInclusionProof` or `RequireBoth`). The SET path is
-    /// the alternative offline anchor; under `Either`
-    /// or `RequireSet` this case is not an error.
-    #[error("Rekor inclusion proof is required by policy but missing from the bundle")]
+    /// The tlog entry did not carry an inclusion proof, but one was
+    /// required: by the caller's [`RekorInclusionProofPolicy`]
+    /// (`RequireInclusionProof` or `RequireBoth`), by a bundle version
+    /// after 0.1, or by a Rekor v2 entry, which has no SET.
+    #[error("Rekor inclusion proof is required but missing from the bundle")]
     InclusionProofMissing,
 
     /// X.509 chain validation failed: a cert's notBefore/notAfter
@@ -192,13 +194,12 @@ impl VerifyError {
 /// (some npm cohorts ship SET-only, others inclusion-proof-only,
 /// some both). `RequireBoth` is the self-update default because binary
 /// replacement is the highest-trust operation, so it requires both
-/// offline anchors. The variant is the *single* caller authority on what's
+/// offline anchors. The variant is the *single* authority on what's
 /// required; there is intentionally no parallel `require_inclusion_proof:
-/// bool` (adding one re-creates a dual-authority bug).
-///
-/// The bundle format adds one rule of its own under every policy: only a
-/// version 0.1 bundle may go without an inclusion proof, so SET-only
-/// bundles are v0.1 bundles.
+/// bool` (adding one re-creates a dual-authority bug). The composed
+/// verifier raises the caller's policy to what the bundle's version
+/// requires: a SET in a version 0.1 bundle, an inclusion proof in any
+/// later one. So under `Either`, SET-only bundles are v0.1 bundles.
 ///
 /// Whatever the policy, the time the certificate is checked at must be
 /// signed: by the SET, or by an RFC 3161 timestamp in its place. A bundle
@@ -214,8 +215,7 @@ pub enum RekorInclusionProofPolicy {
     /// RFC 3161 timestamp must sign the time.
     Either,
     /// SET must be present and verify. Inclusion proof is verified
-    /// when present, and required only when the bundle's version
-    /// requires it.
+    /// only when present (advisory).
     RequireSet,
     /// Inclusion proof must be present and verify. SET is verified
     /// only when present; without it, an RFC 3161 timestamp must sign the
