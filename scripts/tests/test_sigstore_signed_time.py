@@ -1,11 +1,12 @@
 import importlib.util
 import io
 import json
+import math
 from pathlib import Path
 import tempfile
 import unittest
 from contextlib import redirect_stdout
-from decimal import Decimal
+from fractions import Fraction
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location(
@@ -69,15 +70,20 @@ class SigstoreSignedTimeTests(unittest.TestCase):
         self.assertEqual(run(rekor_v2), '2026-05-13T19:23:33Z')
 
     def test_fractional_seconds_are_read_exactly(self):
+        whole = signed_time.generalized_time_epoch('20260513192333Z')
         self.assertEqual(
-            signed_time.generalized_time_epoch('20260513192333.25Z'),
-            signed_time.generalized_time_epoch('20260513192333Z') + Decimal('0.25'),
+            signed_time.generalized_time_epoch('20260513192333.25Z'), whole + Fraction(1, 4)
         )
         self.assertEqual(signed_time.generalized_time_epoch('19700101000001Z'), 1)
+        # Twenty nines stay within the second, which a 28-digit decimal
+        # would round up into the next.
+        long_fraction = signed_time.generalized_time_epoch('20260513192333.' + '9' * 20 + 'Z')
+        self.assertLess(long_fraction, whole + 1)
+        self.assertEqual(math.floor(long_fraction), whole)
 
     def test_the_range_rounds_outward_so_a_fraction_past_its_end_is_caught(self):
         original = signed_time.candidate_times
-        signed_time.candidate_times = lambda _bundle: [Decimal('100.5'), Decimal('200.25')]
+        signed_time.candidate_times = lambda _bundle: [Fraction(201, 2), Fraction(801, 4)]
         try:
             self.assertEqual(run({}, '--epoch-range'), '100 201')
             self.assertEqual(run({}, '--epoch'), '100')

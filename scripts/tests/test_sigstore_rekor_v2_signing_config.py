@@ -67,6 +67,10 @@ class SigningConfigTests(unittest.TestCase):
             checked(dict(STAGED, futureUrls=[]))
         with self.assertRaises(SystemExit):
             checked(dict(STAGED, ca_urls=STAGED['caUrls']))
+        # The same name twice, which json.loads would collapse to the last.
+        raw = json.dumps(STAGED)[:-1] + ', "caUrls": [{"url": "https://fulcio.sigstore.dev"}]}'
+        with self.assertRaises(SystemExit):
+            signing_config.checked_config(raw.encode())
 
 
 if __name__ == '__main__':

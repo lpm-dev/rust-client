@@ -704,8 +704,9 @@ fn an_ed25519_log_signs_under_the_name_its_key_id_commits_to() {
 
 #[test]
 fn a_bundle_signed_through_sigstores_production_rekor_v2_log_verifies() {
-    // Signed by the daily release trust check through log2025-1 and
-    // timestamp.sigstore.dev, verified against the trust root built in.
+    // The release trust workflow's identity signed this bundle through
+    // log2025-1 and timestamp.sigstore.dev, so it verifies against the
+    // trust root built in, under that identity.
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/sigstore_bundles/24-real-rekor-v2-release-trust.json");
     let bundle = std::fs::read(path).unwrap();

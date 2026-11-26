@@ -16,7 +16,7 @@ usage: sigstore-signed-time.py [--epoch | --epoch-range] <bundle>
 
 import base64
 import datetime
-import decimal
+import fractions
 import json
 import math
 import sys
@@ -47,12 +47,16 @@ def children(contents):
 
 def generalized_time_epoch(text):
     """Seconds since the epoch, exactly, of a DER GeneralizedTime such as
-    20260513192333Z or 20260513192333.25Z."""
+    20260513192333Z or 20260513192333.25Z, however many digits its
+    fraction has."""
     whole, _, fraction = text.rstrip("Z").partition(".")
     seconds = datetime.datetime.strptime(whole, "%Y%m%d%H%M%S").replace(
         tzinfo=datetime.timezone.utc
     )
-    return int((seconds - EPOCH).total_seconds()) + decimal.Decimal(f"0.{fraction or 0}")
+    elapsed = fractions.Fraction(int((seconds - EPOCH).total_seconds()))
+    if fraction:
+        elapsed += fractions.Fraction(int(fraction), 10 ** len(fraction))
+    return elapsed
 
 
 def timestamp_time(response):
@@ -99,7 +103,7 @@ def candidate_times(bundle):
             entry.get("verification") or {}
         ).get("signedEntryTimestamp")
         if integrated and signed and not is_rekor_v2_entry(entry):
-            return [decimal.Decimal(integrated)]
+            return [fractions.Fraction(integrated)]
     timestamps = (material.get("timestampVerificationData") or {}).get("rfc3161Timestamps") or []
     times = [timestamp_time(base64.b64decode(t["signedTimestamp"])) for t in timestamps]
     if not times:

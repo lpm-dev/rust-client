@@ -59,11 +59,24 @@ def canonical_fields(value, fields, what):
     return result
 
 
+def unique_keys(pairs):
+    """A JSON object's fields, refusing one given twice: json.loads would
+    keep the last, while another parser may keep the first."""
+    fields = {}
+    for name, value in pairs:
+        if name in fields:
+            sys.exit(f"the signing config gives `{name}` twice")
+        fields[name] = value
+    return fields
+
+
 def checked_config(config):
     """The config rebuilt from its checked fields only. Every service it
     names must be an HTTPS URL on sigstore.dev: cosign sends the job's OIDC
     token to the certificate authority it names."""
-    fields = canonical_fields(json.loads(config), CONFIG_FIELDS, "top level")
+    fields = canonical_fields(
+        json.loads(config, object_pairs_hook=unique_keys), CONFIG_FIELDS, "top level"
+    )
     for name in SERVICE_LISTS:
         services = []
         for service in fields.get(name) or []:
