@@ -1,6 +1,8 @@
+#[cfg(test)]
+use super::extract_tar_archive_with_writers;
 use super::{
-    DecompressedLimitReader, ExtractedFileDigest, ExtractionLimits, InspectionMode,
-    extract_tar_archive_with_writers,
+    ArchiveEnd, DecompressedLimitReader, ExtractedFileDigest, ExtractionLimits, ExtractionRecord,
+    InspectionMode, extract_tar_archive_until,
 };
 use flate2::read::GzDecoder;
 use lpm_common::LpmError;
@@ -31,6 +33,8 @@ struct DecodedReader {
     length: usize,
     finished: bool,
     writer_failed: Arc<crate::writers::FailureSignal>,
+    /// [`StreamFormat::reader`], for errors.
+    reader: &'static str,
 }
 
 impl Read for DecodedReader {
@@ -76,14 +80,17 @@ impl Read for DecodedReader {
                 }
                 Err(_) => {
                     self.finished = true;
-                    return Err(io::Error::other("gzip decoder stopped before completion"));
+                    return Err(io::Error::other(format!(
+                        "{} stopped before completion",
+                        self.reader
+                    )));
                 }
             }
         }
         let bytes = self
             .current
             .as_ref()
-            .ok_or_else(|| io::Error::other("gzip decoder returned an empty buffer"))?;
+            .ok_or_else(|| io::Error::other(format!("{} returned an empty buffer", self.reader)))?;
         let count = output.len().min(self.length - self.offset);
         output[..count].copy_from_slice(&bytes[self.offset..self.offset + count]);
         self.offset += count;
@@ -91,9 +98,58 @@ impl Read for DecodedReader {
     }
 }
 
-type SerialDecoder<R> = DecompressedLimitReader<
+/// What the pipeline's input reader yields.
+#[derive(Clone, Copy)]
+pub(super) enum StreamFormat {
+    /// A gzip-compressed tar archive, decoded on the reading thread.
+    Gzip,
+    /// A tar archive the caller has already decompressed, read to its end.
+    Tar,
+}
+
+impl StreamFormat {
+    /// What the reading thread does, for its name and errors.
+    fn reader(self) -> &'static str {
+        match self {
+            Self::Gzip => "gzip decoder",
+            Self::Tar => "tar stream reader",
+        }
+    }
+}
+
+type GzipDecoder<R> = DecompressedLimitReader<
     super::timeline::TimelineReader<GzDecoder<super::timeline::TimelineReader<R>>>,
 >;
+
+enum SerialDecoder<R> {
+    Gzip(Box<GzipDecoder<R>>),
+    /// The caller's tar stream as npm's tar reads it, and whether it has
+    /// ended: the walk reads to the end, and the drain after it must not read
+    /// the caller's reader again. The limit counts what the stream reads,
+    /// payloads it skips included.
+    Tar(
+        Box<
+            super::npm_tar::NpmTarStream<
+                DecompressedLimitReader<super::timeline::TimelineReader<R>>,
+            >,
+        >,
+        bool,
+    ),
+}
+
+impl<R: Read> Read for SerialDecoder<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Gzip(decoder) => decoder.read(output),
+            Self::Tar(_, true) => Ok(0),
+            Self::Tar(reader, ended) => {
+                let read = reader.read(output)?;
+                *ended = read == 0 && !output.is_empty();
+                Ok(read)
+            }
+        }
+    }
+}
 
 enum DecodedInput<R: Read> {
     Parallel(DecodedReader),
@@ -118,21 +174,37 @@ impl<R: Read> Read for DecodedInput<R> {
     }
 }
 
-fn serial_decoder<R: Read>(reader: R, limits: ExtractionLimits) -> SerialDecoder<R> {
-    DecompressedLimitReader::new(
-        super::timeline::TimelineReader::decoded(GzDecoder::new(
-            super::timeline::TimelineReader::input(reader),
-        )),
-        limits.max_decompressed_stream_size(),
-    )
+fn serial_decoder<R: Read>(
+    reader: R,
+    format: StreamFormat,
+    limits: ExtractionLimits,
+) -> SerialDecoder<R> {
+    let limit = limits.max_decompressed_stream_size();
+    match format {
+        StreamFormat::Gzip => SerialDecoder::Gzip(Box::new(DecompressedLimitReader::new(
+            super::timeline::TimelineReader::decoded(GzDecoder::new(
+                super::timeline::TimelineReader::input(reader),
+            )),
+            limit,
+        ))),
+        StreamFormat::Tar => SerialDecoder::Tar(
+            Box::new(super::npm_tar::NpmTarStream::new(
+                DecompressedLimitReader::for_tar_stream(
+                    super::timeline::TimelineReader::decoded(reader),
+                    limit,
+                ),
+            )),
+            false,
+        ),
+    }
 }
 
 fn take_reader<R>(input: &Mutex<Option<R>>) -> io::Result<R> {
     input
         .lock()
-        .map_err(|_| io::Error::other("gzip input lock poisoned"))?
+        .map_err(|_| io::Error::other("pipeline input lock poisoned"))?
         .take()
-        .ok_or_else(|| io::Error::other("gzip input already consumed"))
+        .ok_or_else(|| io::Error::other("pipeline input already consumed"))
 }
 
 struct CancelOnDrop<F: FnOnce()>(Option<F>);
@@ -157,7 +229,25 @@ pub(super) fn extract(
     limits: ExtractionLimits,
     cancel_input: impl FnOnce(),
 ) -> Result<Vec<ExtractedFileDigest>, LpmError> {
-    with_decoder(reader, limits, cancel_input, |decoded| {
+    extract_stream(
+        reader,
+        target_dir,
+        limits,
+        StreamFormat::Gzip,
+        true,
+        cancel_input,
+    )
+}
+
+pub(super) fn extract_stream<E: ExtractionRecord>(
+    reader: impl Read + Send,
+    target_dir: &Path,
+    limits: ExtractionLimits,
+    format: StreamFormat,
+    compute_blake3: bool,
+    cancel_input: impl FnOnce(),
+) -> Result<Vec<E>, LpmError> {
+    with_decoder(reader, format, limits, cancel_input, |decoded| {
         let writer_setup = decoded.writer_failure_signal().map_or(
             crate::writers::WriterSetup::Disabled,
             |signal| {
@@ -166,11 +256,11 @@ pub(super) fn extract(
                     .with_failure_signal(signal)
             },
         );
-        extract_tar_archive_with_writers(
+        extract_tar_archive_until(
             decoded,
             target_dir,
             limits,
-            true,
+            compute_blake3,
             |_, _| false,
             |_| {},
             InspectionMode::WithoutCallback,
@@ -180,12 +270,17 @@ pub(super) fn extract(
                     .map_err(LpmError::Io)
             },
             writer_setup,
+            match format {
+                StreamFormat::Gzip => ArchiveEnd::FirstZeroBlock,
+                StreamFormat::Tar => ArchiveEnd::EndOfInput,
+            },
         )
     })
 }
 
 fn with_decoder<T, R: Read + Send>(
     reader: R,
+    format: StreamFormat,
     limits: ExtractionLimits,
     cancel_input: impl FnOnce(),
     consume: impl FnOnce(DecodedInput<R>) -> Result<T, LpmError>,
@@ -199,7 +294,7 @@ fn with_decoder<T, R: Read + Send>(
         for _ in 0..BUFFER_COUNT {
             recycle_tx
                 .send(vec![0; BUFFER_SIZE])
-                .map_err(|_| LpmError::Io(io::Error::other("gzip buffer pool disconnected")))?;
+                .map_err(|_| LpmError::Io(io::Error::other("decode buffer pool disconnected")))?;
         }
         let decoder_span = tracing::trace_span!(target: "lpm_install_timeline", "pipeline_decoder");
         #[cfg(test)]
@@ -211,11 +306,17 @@ fn with_decoder<T, R: Read + Send>(
         let worker = spawn_error.map_or_else(
             || {
                 std::thread::Builder::new()
-                    .name("lpm-gzip".into())
+                    .name(
+                        match format {
+                            StreamFormat::Gzip => "lpm-gzip",
+                            StreamFormat::Tar => "lpm-tar",
+                        }
+                        .into(),
+                    )
                     .spawn_scoped(scope, move || {
                         let _entered = decoder_span.enter();
                         match take_reader(input) {
-                            Ok(reader) => decode(reader, limits, ready_tx, recycle_rx),
+                            Ok(reader) => decode(reader, format, limits, ready_tx, recycle_rx),
                             Err(error) => {
                                 let _ = ready_tx.send(Message::Finished(Err(error)));
                             }
@@ -228,8 +329,10 @@ fn with_decoder<T, R: Read + Send>(
             Ok(worker) => worker,
             Err(_) => {
                 let reader = take_reader(input)?;
-                let decoded =
-                    std::io::BufReader::with_capacity(64 * 1024, serial_decoder(reader, limits));
+                let decoded = std::io::BufReader::with_capacity(
+                    64 * 1024,
+                    serial_decoder(reader, format, limits),
+                );
                 let result = consume(DecodedInput::Serial(Box::new(decoded)));
                 if result.is_err() {
                     cancellation.cancel();
@@ -246,15 +349,19 @@ fn with_decoder<T, R: Read + Send>(
             length: 0,
             finished: false,
             writer_failed: Arc::default(),
+            reader: format.reader(),
         };
         let result = consume(DecodedInput::Parallel(decoded));
         // A failed consumer can leave the producer blocked inside its input reader.
         if result.is_err() {
             cancellation.cancel();
         }
-        let joined = worker
-            .join()
-            .map_err(|_| LpmError::Io(io::Error::other("gzip decoder worker panicked")));
+        let joined = worker.join().map_err(|_| {
+            LpmError::Io(io::Error::other(format!(
+                "{} worker panicked",
+                format.reader()
+            )))
+        });
         cancellation.0 = None;
         result.and_then(|files| joined.map(|()| files))
     })
@@ -262,11 +369,12 @@ fn with_decoder<T, R: Read + Send>(
 
 fn decode(
     reader: impl Read,
+    format: StreamFormat,
     limits: ExtractionLimits,
     ready: SyncSender<Message>,
     recycle: Receiver<Vec<u8>>,
 ) {
-    let mut decoder = serial_decoder(reader, limits);
+    let mut decoder = serial_decoder(reader, format, limits);
     while let Ok(mut bytes) = recycle.recv() {
         let mut length = 0;
         while length < bytes.len() {
@@ -587,6 +695,7 @@ mod tests {
         let entered_rx = Mutex::new(entered_rx);
         let result = with_decoder(
             reader,
+            StreamFormat::Gzip,
             DEFAULT_EXTRACTION_LIMITS,
             || {
                 let _ = cancel_tx.send(());
@@ -705,6 +814,7 @@ mod tests {
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _: Result<(), LpmError> = with_decoder(
                 Stalled(receiver),
+                StreamFormat::Gzip,
                 DEFAULT_EXTRACTION_LIMITS,
                 || {
                     cancelled.set(true);
@@ -719,6 +829,185 @@ mod tests {
             Some(&"injected consumer panic")
         );
         assert!(cancelled.get());
+    }
+
+    fn tar_stream(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        for (name, bytes) in entries {
+            let mut header = tar::Header::new_ustar();
+            header.as_mut_bytes()[..name.len()].copy_from_slice(name);
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append(&header, *bytes).unwrap();
+        }
+        tar.into_inner().unwrap()
+    }
+
+    #[test]
+    fn tar_stream_extracts_every_entry_and_lists_a_repeated_path_again() {
+        let large = (0..BUFFER_SIZE * 3 + 5)
+            .map(|i| (i % 241) as u8)
+            .collect::<Vec<_>>();
+        let tar = tar_stream(&[
+            (b"package/a", b"first"),
+            (b"package/dir/large.bin", &large),
+            (b"package/a", b"final"),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let cancelled = Cell::new(false);
+        let files = crate::extract_tar_from_reader_pipelined(
+            ShortReads(tar.as_slice()),
+            root.path(),
+            || cancelled.set(true),
+        )
+        .unwrap();
+        assert_eq!(
+            files,
+            [Path::new("a"), Path::new("dir/large.bin"), Path::new("a")]
+        );
+        assert_eq!(std::fs::read(root.path().join("a")).unwrap(), b"final");
+        assert_eq!(
+            std::fs::read(root.path().join("dir/large.bin")).unwrap(),
+            large
+        );
+        assert!(!cancelled.get());
+    }
+
+    #[test]
+    fn tar_stream_extracts_entries_after_a_lone_zero_block_as_npm_does() {
+        let first = tar_stream(&[(b"package/a.js", b"first")]);
+        let second = tar_stream(&[(b"package/hidden.js", b"second")]);
+        // One zero block between the entries, as a crafted archive can carry; npm's tar reads on.
+        let mut stream = first[..1024].to_vec();
+        stream.extend_from_slice(&[0; 512]);
+        stream.extend_from_slice(&second);
+        let root = tempfile::tempdir().unwrap();
+        let files = crate::extract_tar_from_reader_pipelined(stream.as_slice(), root.path(), || {})
+            .unwrap();
+        assert_eq!(files, [Path::new("a.js"), Path::new("hidden.js")]);
+        assert_eq!(
+            std::fs::read(root.path().join("hidden.js")).unwrap(),
+            b"second"
+        );
+    }
+
+    #[test]
+    fn tar_stream_extracts_a_file_npm_reads_inside_a_directory_s_payload() {
+        let hidden = tar_stream(&[(b"package/hidden.js", b"payload")]);
+        let hidden = &hidden[..1024];
+        // A directory header that claims a payload: npm's tar reads a directory's
+        // payload as empty, so the entry inside it is one npm unpacks.
+        let mut directory = tar::Header::new_ustar();
+        directory.set_path("package/lib/").unwrap();
+        directory.set_entry_type(tar::EntryType::Directory);
+        directory.set_size(hidden.len() as u64);
+        directory.set_mode(0o755);
+        directory.set_cksum();
+        let mut stream = directory.as_bytes().to_vec();
+        stream.extend_from_slice(hidden);
+        stream.extend_from_slice(&[0; 1024]);
+        let root = tempfile::tempdir().unwrap();
+        let files = crate::extract_tar_from_reader_pipelined(stream.as_slice(), root.path(), || {})
+            .unwrap();
+        assert_eq!(files, [Path::new("hidden.js")]);
+        assert_eq!(
+            std::fs::read(root.path().join("hidden.js")).unwrap(),
+            b"payload"
+        );
+    }
+
+    #[test]
+    fn the_serial_tar_route_reads_the_caller_reader_once_past_its_end() {
+        struct FailsAfterEnd(io::Cursor<Vec<u8>>, bool);
+        impl Read for FailsAfterEnd {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                if self.1 {
+                    return Err(io::Error::other("read again after the end"));
+                }
+                let read = self.0.read(output)?;
+                self.1 = read == 0 && !output.is_empty();
+                Ok(read)
+            }
+        }
+        // Without its end blocks, the route reads the caller's reader to its end.
+        let mut tar = tar_stream(&[(b"package/a.js", b"content")]);
+        tar.truncate(tar.len() - 1024);
+        let root = tempfile::tempdir().unwrap();
+        FAIL_DECODER_SPAWN.set(true);
+        let files = extract_stream::<std::path::PathBuf>(
+            FailsAfterEnd(io::Cursor::new(tar), false),
+            root.path(),
+            DEFAULT_EXTRACTION_LIMITS,
+            StreamFormat::Tar,
+            false,
+            || {},
+        )
+        .unwrap();
+        assert_eq!(files, [Path::new("a.js")]);
+    }
+
+    #[test]
+    fn tar_stream_ends_at_two_zero_blocks_and_leaves_what_follows_to_the_caller() {
+        let mut tar = tar_stream(&[(b"package/a", b"content")]);
+        let end = (512 + 512 + 1024) as u64;
+        tar.truncate(end as usize);
+        tar.extend_from_slice(&[0; 100]);
+        tar.extend_from_slice(b"garbage npm ignores after the end of the archive");
+        let mut input = io::Cursor::new(tar);
+        let root = tempfile::tempdir().unwrap();
+        let files =
+            crate::extract_tar_from_reader_pipelined(&mut input, root.path(), || {}).unwrap();
+        assert_eq!(files, [Path::new("a")]);
+        assert_eq!(input.position(), end);
+    }
+
+    #[test]
+    fn tar_stream_with_a_parent_entry_is_rejected_and_outputs_are_removed() {
+        let tar = tar_stream(&[(b"package/a", b"kept?"), (b"package/../escape", b"x")]);
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("out");
+        assert!(crate::extract_tar_from_reader_pipelined(tar.as_slice(), &output, || {}).is_err());
+        assert!(!output.join("a").exists());
+        assert!(!root.path().join("escape").exists());
+    }
+
+    #[test]
+    fn tar_stream_past_the_extraction_limits_is_rejected_and_outputs_are_removed() {
+        let tar = tar_stream(&[(b"package/large", &vec![1; 64 * 1024])]);
+        let root = tempfile::tempdir().unwrap();
+        let limits = ExtractionLimits {
+            max_extraction_size: 128,
+            max_file_count: 1,
+            ..DEFAULT_EXTRACTION_LIMITS
+        };
+        assert!(
+            extract_stream::<std::path::PathBuf>(
+                tar.as_slice(),
+                root.path(),
+                limits,
+                StreamFormat::Tar,
+                false,
+                || {},
+            )
+            .is_err()
+        );
+        assert!(!root.path().join("large").exists());
+
+        let mut bounded = DecompressedLimitReader::for_tar_stream(&[0u8; 16][..], 4);
+        let error = bounded.read_to_end(&mut Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("tar stream exceeded"), "{error}");
+    }
+
+    #[test]
+    fn truncated_tar_stream_is_rejected_and_outputs_are_removed() {
+        let mut tar = tar_stream(&[(b"package/large", &vec![1; BUFFER_SIZE * 2])]);
+        tar.truncate(BUFFER_SIZE);
+        let root = tempfile::tempdir().unwrap();
+        assert!(
+            crate::extract_tar_from_reader_pipelined(tar.as_slice(), root.path(), || {}).is_err()
+        );
+        assert!(!root.path().join("large").exists());
     }
 
     #[test]

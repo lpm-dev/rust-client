@@ -9,6 +9,7 @@
 //! flate2/zlib-rs on the npm size distribution). Oversized inputs fall back to
 //! flate2's streaming `GzDecoder` so peak allocation stays bounded.
 
+mod npm_tar;
 #[cfg_attr(
     all(test, unix),
     expect(
@@ -24,6 +25,7 @@ mod writers;
 
 use flate2::read::GzDecoder;
 use lpm_common::{Integrity, LpmError};
+pub use npm_tar::NpmTarStream;
 use output::OutputTree;
 use std::collections::{HashMap, hash_map::RandomState};
 use std::ffi::OsStr;
@@ -1197,6 +1199,37 @@ pub fn extract_tarball_from_reader_pipelined_digests(
     pipeline::extract(reader, target_dir, DEFAULT_EXTRACTION_LIMITS, cancel_input)
 }
 
+/// Extract an uncompressed tar stream, reading it on a separate thread so the
+/// caller's reader (a download, with its hashing and decompression) runs
+/// alongside the tar walk and the file writes. At most 1 MiB of the stream is
+/// read ahead.
+///
+/// The stream is held to the limits of a decompressed tarball, entry names
+/// lose their first component as with every other entry point, and no
+/// per-file digests are computed. The archive ends where npm's tar ends it:
+/// a lone zero block is read past, and bytes after two zero blocks in a row
+/// are left unread in the caller's reader. Returns the extracted files' paths
+/// relative to `target_dir`, one per archive entry, so a repeated path is
+/// listed again.
+///
+/// The reader moves to a scoped worker. On extraction failure or unwinding,
+/// `cancel_input` must unblock any pending read before that worker can join.
+/// A reader whose reads always finish can use an empty cancellation callback.
+pub fn extract_tar_from_reader_pipelined(
+    reader: impl Read + Send,
+    target_dir: &Path,
+    cancel_input: impl FnOnce(),
+) -> Result<Vec<PathBuf>, LpmError> {
+    pipeline::extract_stream(
+        reader,
+        target_dir,
+        DEFAULT_EXTRACTION_LIMITS,
+        pipeline::StreamFormat::Tar,
+        false,
+        cancel_input,
+    )
+}
+
 /// Digest-enabled file-backed extraction that buffers only small archives and
 /// has no per-file callback.
 pub fn extract_tarball_from_reader_hybrid_digests(
@@ -1551,6 +1584,7 @@ struct DecompressedLimitReader<R> {
     inner: R,
     bytes_read: u64,
     limit: u64,
+    stream: &'static str,
 }
 
 impl<R> DecompressedLimitReader<R> {
@@ -1559,6 +1593,14 @@ impl<R> DecompressedLimitReader<R> {
             inner,
             bytes_read: 0,
             limit,
+            stream: "gzip decompression",
+        }
+    }
+
+    fn for_tar_stream(inner: R, limit: u64) -> Self {
+        Self {
+            stream: "tar stream",
+            ..Self::new(inner, limit)
         }
     }
 }
@@ -1576,7 +1618,7 @@ impl<R: std::io::Read> std::io::Read for DecompressedLimitReader<R> {
                 0 => Ok(0),
                 _ => Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("gzip decompression exceeded {}-byte limit", self.limit),
+                    format!("{} exceeded {}-byte limit", self.stream, self.limit),
                 )),
             };
         }
@@ -1622,6 +1664,52 @@ where
     )
 }
 
+/// Where a tar walk stops.
+#[derive(Clone, Copy)]
+enum ArchiveEnd {
+    /// At the first zero block, as the tar crate and `lpm install` read an archive.
+    FirstZeroBlock,
+    /// At the end of the input, past zero blocks, so every entry any extractor could unpack is
+    /// read: npm's tar reads on after a lone zero block ([`visit_tar_archive_to_end`]).
+    EndOfInput,
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Extraction forwards independent limits, inspection and writer controls."
+)]
+fn extract_tar_archive_with_writers<R, P, I, D, E>(
+    reader: R,
+    target_dir: &Path,
+    limits: ExtractionLimits,
+    compute_blake3: bool,
+    buffer_predicate: P,
+    inspector: I,
+    inspection_mode: InspectionMode,
+    drain_after_entries: D,
+    writer_setup: writers::WriterSetup,
+) -> Result<Vec<E>, LpmError>
+where
+    R: std::io::Read,
+    P: Fn(&Path, u64) -> bool,
+    I: for<'a> FnMut(EntryInfo<'a>),
+    D: FnOnce(R) -> Result<(), LpmError>,
+    E: ExtractionRecord,
+{
+    extract_tar_archive_until(
+        reader,
+        target_dir,
+        limits,
+        compute_blake3,
+        buffer_predicate,
+        inspector,
+        inspection_mode,
+        drain_after_entries,
+        writer_setup,
+        ArchiveEnd::FirstZeroBlock,
+    )
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Extraction forwards independent limits, inspection and writer controls."
@@ -1632,7 +1720,7 @@ where
     name = "tar_materialization",
     skip_all
 )]
-fn extract_tar_archive_with_writers<R, P, I, D, E>(
+fn extract_tar_archive_until<R, P, I, D, E>(
     reader: R,
     target_dir: &Path,
     limits: ExtractionLimits,
@@ -1642,6 +1730,7 @@ fn extract_tar_archive_with_writers<R, P, I, D, E>(
     inspection_mode: InspectionMode,
     drain_after_entries: D,
     mut writer_setup: writers::WriterSetup,
+    end: ArchiveEnd,
 ) -> Result<Vec<E>, LpmError>
 where
     R: std::io::Read,
@@ -1665,201 +1754,195 @@ where
     let mut output = OutputTree::new(extraction_root, target_dir.to_path_buf())?;
     let mut seen_archive_paths = CaseFoldPathIndex::new();
 
-    let visit_result = visit_tar_archive(
-        reader,
-        TarArchiveLimits {
-            max_entry_bytes: limits.max_file_size,
-            ..TarArchiveLimits::new(limits.max_file_count)
-        },
-        |mut entry| {
-            let size = entry.size();
-            if size > limits.max_file_size {
-                return Err(LpmError::Registry(format!(
-                    "file too large in tarball: {} bytes (max {})",
-                    size, limits.max_file_size
-                )));
+    let tar_limits = TarArchiveLimits {
+        max_entry_bytes: limits.max_file_size,
+        ..TarArchiveLimits::new(limits.max_file_count)
+    };
+    let visitor = |mut entry: BoundedTarEntry<'_, R>| {
+        let size = entry.size();
+        if size > limits.max_file_size {
+            return Err(LpmError::Registry(format!(
+                "file too large in tarball: {} bytes (max {})",
+                size, limits.max_file_size
+            )));
+        }
+        total_size = total_size.saturating_add(size);
+        if total_size > limits.max_extraction_size {
+            return Err(LpmError::Registry(format!(
+                "tarball extraction size limit exceeded ({} bytes)",
+                limits.max_extraction_size
+            )));
+        }
+
+        let original_path = entry.path().to_path_buf();
+        let Some(relative_path) = sanitize_entry_path(&original_path)? else {
+            return Ok(ControlFlow::<()>::Continue(()));
+        };
+
+        output.prepare_parent(&relative_path, &mut path_ledger_budget)?;
+
+        if entry.header().entry_type().is_file() {
+            let path_match = seen_archive_paths.classify(
+                &relative_path,
+                &extracted_files,
+                parallel.as_ref().map(|(_, pending)| pending),
+            )?;
+            let duplicate_path = matches!(path_match, ArchivePathMatch::ExactDuplicate { .. });
+            if !duplicate_path
+                && size <= writers::MAX_ENTRY_BYTES as u64
+                && parallel.is_none()
+                && let Some(pool) = writer_setup.start_if_ready(extracted_files.len())
+            {
+                let pending = writers::PendingEntries::new(&pool);
+                parallel = Some((pool, pending));
             }
-            total_size = total_size.saturating_add(size);
-            if total_size > limits.max_extraction_size {
-                return Err(LpmError::Registry(format!(
-                    "tarball extraction size limit exceeded ({} bytes)",
-                    limits.max_extraction_size
-                )));
+
+            if !duplicate_path || E::RETAIN_DUPLICATE_PATHS {
+                path_ledger_budget.reserve(&relative_path)?;
             }
+            let exec_bits = entry.header().mode().unwrap_or(0o644) & 0o111;
 
-            let original_path = entry.path().to_path_buf();
-            let Some(relative_path) = sanitize_entry_path(&original_path)? else {
-                return Ok(ControlFlow::<()>::Continue(()));
-            };
-
-            output.prepare_parent(&relative_path, &mut path_ledger_budget)?;
-
-            if entry.header().entry_type().is_file() {
-                let path_match = seen_archive_paths.classify(
-                    &relative_path,
-                    &extracted_files,
-                    parallel.as_ref().map(|(_, pending)| pending),
-                )?;
-                let duplicate_path = matches!(path_match, ArchivePathMatch::ExactDuplicate { .. });
-                if !duplicate_path
-                    && size <= writers::MAX_ENTRY_BYTES as u64
-                    && parallel.is_none()
-                    && let Some(pool) = writer_setup.start_if_ready(extracted_files.len())
-                {
-                    let pending = writers::PendingEntries::new(&pool);
-                    parallel = Some((pool, pending));
-                }
-
-                if !duplicate_path || E::RETAIN_DUPLICATE_PATHS {
-                    path_ledger_budget.reserve(&relative_path)?;
-                }
-                let exec_bits = entry.header().mode().unwrap_or(0o644) & 0o111;
-
-                if let Some((pool, pending)) = &mut parallel {
-                    if duplicate_path {
-                        pending.drain(pool, &mut extracted_files, &mut accepted_identities)?;
-                    } else if size > writers::MAX_ENTRY_BYTES as u64 {
-                        // Too large to buffer for a writer: write it here while
-                        // the writers finish the files queued ahead of it.
-                        pending.make_room(
-                            pool,
-                            0,
-                            &mut extracted_files,
-                            &mut accepted_identities,
-                        )?;
-                        let (file, digest) = write_entry_here(
-                            &output,
-                            &relative_path,
-                            false,
-                            &mut entry,
-                            EntryBytes::Stream {
-                                size,
-                                buffer: &mut copy_buffer,
-                            },
-                            exec_bits,
-                            compute_blake3,
-                        )?;
-                        let record_index = extracted_files.len() + pending.len();
-                        pending.push_written(
-                            relative_path,
-                            writers::Written {
-                                output: file.complete()?,
-                                digest,
-                            },
-                        );
-                        if let ArchivePathMatch::New { folded_hash } = path_match {
-                            seen_archive_paths.record_new(folded_hash, record_index);
-                        }
-                        return Ok(ControlFlow::<()>::Continue(()));
-                    } else {
-                        let length = usize::try_from(size).map_err(|_| {
-                            std::io::Error::other("tarball entry exceeds address space")
-                        })?;
-                        pending.make_room(
-                            pool,
-                            length,
-                            &mut extracted_files,
-                            &mut accepted_identities,
-                        )?;
-                        let mut bytes = vec![0; length];
-                        pending.make_room(
-                            pool,
-                            bytes.capacity(),
-                            &mut extracted_files,
-                            &mut accepted_identities,
-                        )?;
-                        entry.read_exact(&mut bytes)?;
-                        let capacity = bytes.capacity();
-                        pool.submit(writers::Job {
-                            sequence: pending.next_sequence(),
-                            target: output.new_file(&relative_path)?,
-                            bytes,
-                            exec_bits,
-                            compute_blake3,
-                        })?;
-                        let record_index = extracted_files.len() + pending.len();
-                        pending.push(relative_path, capacity);
-                        if let ArchivePathMatch::New { folded_hash } = path_match {
-                            seen_archive_paths.record_new(folded_hash, record_index);
-                        }
-                        return Ok(ControlFlow::<()>::Continue(()));
-                    }
-                }
-
-                let buffered_bytes = if buffer_predicate(&relative_path, size) {
-                    let mut buf = Vec::with_capacity(size as usize);
-                    entry.read_to_end(&mut buf).map_err(LpmError::Io)?;
-                    Some(buf)
-                } else {
-                    None
-                };
-                let (pending, blake3_digest) = write_entry_here(
-                    &output,
-                    &relative_path,
-                    duplicate_path,
-                    &mut entry,
-                    match &buffered_bytes {
-                        Some(bytes) => EntryBytes::Buffered(bytes),
-                        None => EntryBytes::Stream {
+            if let Some((pool, pending)) = &mut parallel {
+                if duplicate_path {
+                    pending.drain(pool, &mut extracted_files, &mut accepted_identities)?;
+                } else if size > writers::MAX_ENTRY_BYTES as u64 {
+                    // Too large to buffer for a writer: write it here while
+                    // the writers finish the files queued ahead of it.
+                    pending.make_room(pool, 0, &mut extracted_files, &mut accepted_identities)?;
+                    let (file, digest) = write_entry_here(
+                        &output,
+                        &relative_path,
+                        false,
+                        &mut entry,
+                        EntryBytes::Stream {
                             size,
                             buffer: &mut copy_buffer,
                         },
-                    },
-                    exec_bits,
-                    compute_blake3,
-                )?;
-
-                let extracted_file = E::from_extracted_file(relative_path, blake3_digest)?;
-                let accepted_identity = match inspection_mode {
-                    InspectionMode::WithCallback => {
-                        output.validate_parent_for_inspection()?;
-                        pending.validate()?;
-                        pending.commit();
-                        inspector(EntryInfo {
-                            relative_path: extracted_file.relative_path(),
-                            size,
-                            bytes: buffered_bytes.as_deref(),
-                            blake3_digest,
-                        });
-                        output.accepted_file_identity(extracted_file.relative_path())?
-                    }
-                    InspectionMode::WithoutCallback => {
-                        let identity = pending.identity()?;
-                        pending.commit();
-                        identity
-                    }
-                };
-
-                match path_match {
-                    ArchivePathMatch::New { folded_hash } => {
-                        let record_index = extracted_files.len();
-                        extracted_files.push(extracted_file);
-                        accepted_identities.push(accepted_identity);
+                        exec_bits,
+                        compute_blake3,
+                    )?;
+                    let record_index = extracted_files.len() + pending.len();
+                    pending.push_written(
+                        relative_path,
+                        writers::Written {
+                            output: file.complete()?,
+                            digest,
+                        },
+                    );
+                    if let ArchivePathMatch::New { folded_hash } = path_match {
                         seen_archive_paths.record_new(folded_hash, record_index);
                     }
-                    ArchivePathMatch::ExactDuplicate { record_index }
-                        if !E::RETAIN_DUPLICATE_PATHS =>
-                    {
-                        let Some((previous, identity)) = extracted_files
-                            .get_mut(record_index)
-                            .zip(accepted_identities.get_mut(record_index))
-                        else {
-                            return Err(LpmError::Registry(
-                                "invalid duplicate archive path ledger index".into(),
-                            ));
-                        };
-                        *previous = extracted_file;
-                        *identity = accepted_identity;
+                    return Ok(ControlFlow::<()>::Continue(()));
+                } else {
+                    let length = usize::try_from(size).map_err(|_| {
+                        std::io::Error::other("tarball entry exceeds address space")
+                    })?;
+                    pending.make_room(
+                        pool,
+                        length,
+                        &mut extracted_files,
+                        &mut accepted_identities,
+                    )?;
+                    let mut bytes = vec![0; length];
+                    pending.make_room(
+                        pool,
+                        bytes.capacity(),
+                        &mut extracted_files,
+                        &mut accepted_identities,
+                    )?;
+                    entry.read_exact(&mut bytes)?;
+                    let capacity = bytes.capacity();
+                    pool.submit(writers::Job {
+                        sequence: pending.next_sequence(),
+                        target: output.new_file(&relative_path)?,
+                        bytes,
+                        exec_bits,
+                        compute_blake3,
+                    })?;
+                    let record_index = extracted_files.len() + pending.len();
+                    pending.push(relative_path, capacity);
+                    if let ArchivePathMatch::New { folded_hash } = path_match {
+                        seen_archive_paths.record_new(folded_hash, record_index);
                     }
-                    ArchivePathMatch::ExactDuplicate { .. } => {
-                        extracted_files.push(extracted_file);
-                        accepted_identities.push(accepted_identity);
-                    }
+                    return Ok(ControlFlow::<()>::Continue(()));
                 }
             }
-            Ok(ControlFlow::<()>::Continue(()))
-        },
-    );
+
+            let buffered_bytes = if buffer_predicate(&relative_path, size) {
+                let mut buf = Vec::with_capacity(size as usize);
+                entry.read_to_end(&mut buf).map_err(LpmError::Io)?;
+                Some(buf)
+            } else {
+                None
+            };
+            let (pending, blake3_digest) = write_entry_here(
+                &output,
+                &relative_path,
+                duplicate_path,
+                &mut entry,
+                match &buffered_bytes {
+                    Some(bytes) => EntryBytes::Buffered(bytes),
+                    None => EntryBytes::Stream {
+                        size,
+                        buffer: &mut copy_buffer,
+                    },
+                },
+                exec_bits,
+                compute_blake3,
+            )?;
+
+            let extracted_file = E::from_extracted_file(relative_path, blake3_digest)?;
+            let accepted_identity = match inspection_mode {
+                InspectionMode::WithCallback => {
+                    output.validate_parent_for_inspection()?;
+                    pending.validate()?;
+                    pending.commit();
+                    inspector(EntryInfo {
+                        relative_path: extracted_file.relative_path(),
+                        size,
+                        bytes: buffered_bytes.as_deref(),
+                        blake3_digest,
+                    });
+                    output.accepted_file_identity(extracted_file.relative_path())?
+                }
+                InspectionMode::WithoutCallback => {
+                    let identity = pending.identity()?;
+                    pending.commit();
+                    identity
+                }
+            };
+
+            match path_match {
+                ArchivePathMatch::New { folded_hash } => {
+                    let record_index = extracted_files.len();
+                    extracted_files.push(extracted_file);
+                    accepted_identities.push(accepted_identity);
+                    seen_archive_paths.record_new(folded_hash, record_index);
+                }
+                ArchivePathMatch::ExactDuplicate { record_index } if !E::RETAIN_DUPLICATE_PATHS => {
+                    let Some((previous, identity)) = extracted_files
+                        .get_mut(record_index)
+                        .zip(accepted_identities.get_mut(record_index))
+                    else {
+                        return Err(LpmError::Registry(
+                            "invalid duplicate archive path ledger index".into(),
+                        ));
+                    };
+                    *previous = extracted_file;
+                    *identity = accepted_identity;
+                }
+                ArchivePathMatch::ExactDuplicate { .. } => {
+                    extracted_files.push(extracted_file);
+                    accepted_identities.push(accepted_identity);
+                }
+            }
+        }
+        Ok(ControlFlow::<()>::Continue(()))
+    };
+    let visit_result = match end {
+        ArchiveEnd::FirstZeroBlock => visit_tar_archive(reader, tar_limits, visitor),
+        ArchiveEnd::EndOfInput => visit_tar_archive_to_end(reader, tar_limits, visitor),
+    };
 
     let writers_result = if let Some((pool, mut pending)) = parallel {
         let drained = pending.drain(&pool, &mut extracted_files, &mut accepted_identities);
@@ -1926,20 +2009,18 @@ fn stream_entry_to_disk(
     buffer: &mut [u8],
 ) -> Result<Option<[u8; 32]>, LpmError> {
     use std::io::Write;
-    if !compute_blake3 {
-        std::io::copy(entry, file).map_err(LpmError::Io)?;
-        return Ok(None);
-    }
-    let mut hasher = blake3::Hasher::new();
+    let mut hasher = compute_blake3.then(blake3::Hasher::new);
     while remaining > 0 {
         let count = remaining.min(buffer.len() as u64) as usize;
         let chunk = &mut buffer[..count];
         entry.read_exact(chunk).map_err(LpmError::Io)?;
         file.write_all(chunk).map_err(LpmError::Io)?;
-        hasher.update(chunk);
+        if let Some(hasher) = &mut hasher {
+            hasher.update(chunk);
+        }
         remaining -= count as u64;
     }
-    Ok(Some(*hasher.finalize().as_bytes()))
+    Ok(hasher.map(|hasher| *hasher.finalize().as_bytes()))
 }
 
 /// Extract a .tgz directly from an in-memory byte slice.
