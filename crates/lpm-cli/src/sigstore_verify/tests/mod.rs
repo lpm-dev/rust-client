@@ -2907,6 +2907,11 @@ fn an_sct_timestamp_past_the_year_9999_is_refused_on_every_platform() {
             "{timestamp_ms}: {refused:?}"
         );
     }
+
+    // The last millisecond of the year 9999 is still a time to judge.
+    let (leaf_der, issuer_spki, mut ct_log_key) = leaf_with_sct_at(YEAR_10000_MS - 1);
+    ct_log_key.valid_for.end = None;
+    verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key)).unwrap();
 }
 
 /// A leaf whose embedded SCT a fresh CT log key signed at `timestamp_ms`,
