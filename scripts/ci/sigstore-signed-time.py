@@ -58,8 +58,8 @@ def generalized_time_epoch(text):
     )
     elapsed = fractions.Fraction(int((seconds - EPOCH).total_seconds()))
     if fraction:
-        # Parsed as a decimal, not an int: Python refuses ints over 4,300
-        # digits from text.
+        # Parsed as a decimal, not an int: CPython reads ints from text only
+        # up to 4,300 digits, which its C decimal module doesn't limit.
         elapsed += fractions.Fraction(decimal.Decimal(f"0.{fraction}"))
     return elapsed
 
