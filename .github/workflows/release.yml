@@ -2520,11 +2520,12 @@ jobs:
                 existing-release/SHA256SUMS.txt \
                 existing-release/SHA256SUMS.txt.sigstore \
                 "$SOURCE_SHA"
-              signed_time=$(python3 -I scripts/ci/sigstore-signed-time.py --epoch \
-                existing-release/SHA256SUMS.txt.sigstore)
+              signed_range=$(python3 -I scripts/ci/sigstore-signed-time.py \
+                --epoch-range existing-release/SHA256SUMS.txt.sigstore)
+              read -r earliest_signed latest_signed <<<"$signed_range"
               published_epoch=$(date -d "$published_at" +%s)
-              if [ "$signed_time" -lt $((published_epoch - 3600)) ] || \
-                 [ "$signed_time" -gt $((published_epoch + 86400)) ]; then
+              if [ "$earliest_signed" -lt $((published_epoch - 3600)) ] || \
+                 [ "$latest_signed" -gt $((published_epoch + 86400)) ]; then
                 echo "::error::The existing Sigstore proof is outside the self-update replay window."
                 exit 1
               fi

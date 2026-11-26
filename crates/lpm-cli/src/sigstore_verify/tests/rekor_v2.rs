@@ -700,6 +700,7 @@ fn an_ed25519_log_signs_under_the_name_its_key_id_commits_to() {
     log.trusted.log_id = vec![0; 32];
     let why = verify_checkpoint(&envelope, &log.trusted, LogStyle::RekorV2).unwrap_err();
     assert!(why.contains("no signature from the log"), "{why}");
+}
 
 /// Run by the daily release trust check on a bundle it has just signed
 /// through Sigstore's production Rekor v2 log with its GitHub Actions
@@ -728,12 +729,15 @@ fn a_bundle_signed_through_sigstores_live_rekor_v2_log_verifies() {
     let verified =
         verify_sigstore_bundle_with(&bundle, &identity, VerifyOptions::strict(), &trust).unwrap();
 
-    let age = std::time::SystemTime::now()
-        .duration_since(verified.signed_at)
-        .expect("signed in the future");
+    // The runner's clock and the timestamp authority's may disagree by a
+    // little.
+    let now = std::time::SystemTime::now();
+    let skew = std::time::Duration::from_secs(60);
     assert!(
-        age < std::time::Duration::from_secs(3600),
-        "the timestamp is {age:?} old"
+        verified.signed_at <= now + skew
+            && verified.signed_at + std::time::Duration::from_secs(3600) >= now,
+        "the timestamp {:?} isn't from the last hour",
+        verified.signed_at
     );
     let (_, digest) =
         super::super::extract_subject_digest_from_statement(&verified.statement, "sha256", true)

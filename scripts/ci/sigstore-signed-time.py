@@ -5,7 +5,12 @@ earliest RFC 3161 timestamp, which is all a Rekor v2 bundle has. Nothing is
 verified here: release checks use the time to stand in for a publication
 time that the updater under test then checks against what it verifies.
 
-usage: sigstore-signed-time.py [--epoch] <bundle>
+With --epoch-range, prints the earliest and latest candidate times in
+seconds since the epoch: every timestamp, since the updater uses the
+earliest one that verifies, which may not be the earliest one present. A
+window holding both holds whichever the updater uses.
+
+usage: sigstore-signed-time.py [--epoch | --epoch-range] <bundle>
 """
 
 import base64
@@ -50,27 +55,37 @@ def timestamp_time(response):
     return datetime.datetime.strptime(text, "%Y%m%d%H%M%S").replace(tzinfo=datetime.timezone.utc)
 
 
-def signed_time(bundle):
-    material = bundle["verificationMaterial"]
-    for entry in material.get("tlogEntries", []):
+def candidate_times(bundle):
+    """The integrated time a SET signs, else every timestamp's time."""
+    material = bundle.get("verificationMaterial") or {}
+    for entry in material.get("tlogEntries") or []:
         integrated = int(entry.get("integratedTime") or 0)
-        if integrated and entry.get("inclusionPromise"):
-            return datetime.datetime.fromtimestamp(integrated, datetime.timezone.utc)
-    timestamps = material.get("timestampVerificationData", {}).get("rfc3161Timestamps", [])
+        promise = entry.get("inclusionPromise") or (entry.get("verification") or {}).get(
+            "inclusionPromise"
+        )
+        if integrated and promise:
+            return [datetime.datetime.fromtimestamp(integrated, datetime.timezone.utc)]
+    timestamps = (material.get("timestampVerificationData") or {}).get("rfc3161Timestamps") or []
     times = [timestamp_time(base64.b64decode(t["signedTimestamp"])) for t in timestamps]
     if not times:
         sys.exit("the bundle has neither a Rekor SET nor an RFC 3161 timestamp")
-    return min(times)
+    return times
 
 
 def main(argv):
-    epoch = argv[1:2] == ["--epoch"]
-    paths = argv[2:] if epoch else argv[1:]
+    usage = "usage: sigstore-signed-time.py [--epoch | --epoch-range] <bundle>"
+    mode = argv[1] if len(argv) == 3 and argv[1] in ("--epoch", "--epoch-range") else None
+    paths = argv[2:] if mode else argv[1:]
     if len(paths) != 1:
-        sys.exit("usage: sigstore-signed-time.py [--epoch] <bundle>")
+        sys.exit(usage)
     with open(paths[0], encoding="utf-8") as file:
-        time = signed_time(json.load(file))
-    print(int(time.timestamp()) if epoch else time.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        times = candidate_times(json.load(file))
+    if mode == "--epoch-range":
+        print(int(min(times).timestamp()), int(max(times).timestamp()))
+    elif mode == "--epoch":
+        print(int(min(times).timestamp()))
+    else:
+        print(min(times).strftime("%Y-%m-%dT%H:%M:%SZ"))
 
 
 if __name__ == "__main__":

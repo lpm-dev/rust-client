@@ -53,5 +53,30 @@ class SigstoreSignedTimeTests(unittest.TestCase):
             run(rekor_v2)
 
 
+    def test_a_set_nested_the_way_rekors_api_returned_it_counts(self):
+        release = bundle(FIXTURES / 'sigstore_bundles' / '21-real-lpm-release-v0.84.0.json')
+        entry = release['verificationMaterial']['tlogEntries'][0]
+        integrated = int(entry['integratedTime'])
+        entry['verification'] = {'inclusionPromise': entry.pop('inclusionPromise')}
+        self.assertEqual(run(release, '--epoch'), str(integrated))
+
+    def test_the_range_covers_every_timestamp(self):
+        rekor_v2 = bundle(FIXTURES / 'sigstore_conformance' / 'rekor2-dsse-happy-path' / 'bundle.sigstore.json')
+        later = bundle(FIXTURES / 'sigstore_conformance' / 'rekor2-timestamp-with-embedded-cert' / 'bundle.sigstore.json')
+        timestamps = rekor_v2['verificationMaterial']['timestampVerificationData']['rfc3161Timestamps']
+        timestamps.insert(0, later['verificationMaterial']['timestampVerificationData']['rfc3161Timestamps'][0])
+        earliest, latest = run(rekor_v2, '--epoch-range').split()
+        self.assertEqual(int(earliest), 1754506296)
+        self.assertEqual(int(latest), 1778700213)
+
+    def test_null_fields_read_as_absent(self):
+        rekor_v2 = bundle(FIXTURES / 'sigstore_conformance' / 'rekor2-dsse-happy-path' / 'bundle.sigstore.json')
+        rekor_v2['verificationMaterial']['tlogEntries'] = None
+        self.assertEqual(run(rekor_v2), '2026-05-13T19:23:33Z')
+        rekor_v2['verificationMaterial']['timestampVerificationData'] = None
+        with self.assertRaises(SystemExit):
+            run(rekor_v2)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -2,9 +2,10 @@
 
 Reads Sigstore's TUF repository and writes `signing_config_rekor_v2.v0.2.json`
 while Sigstore stages Rekor v2 in it, else the main `signing_config.v0.2.json`.
-Only TUF's target hashes are checked, not its signatures: the config just
-lists service URLs, and LPM verifies what gets signed against its own trust
-root.
+Only TUF's target hashes are checked, not its signatures, so the config is
+refused unless every service it names is an HTTPS URL on sigstore.dev:
+cosign sends the job's OIDC token to the certificate authority it names.
+LPM verifies what gets signed against its own trust root.
 
 usage: sigstore-rekor-v2-signing-config.py <output>
 """
@@ -12,10 +13,22 @@ usage: sigstore-rekor-v2-signing-config.py <output>
 import hashlib
 import json
 import sys
+import urllib.parse
 import urllib.request
 
 REPOSITORY = "https://tuf-repo-cdn.sigstore.dev"
 CONFIGS = ("signing_config_rekor_v2.v0.2.json", "signing_config.v0.2.json")
+SERVICE_LISTS = ("caUrls", "oidcUrls", "rekorTlogUrls", "tsaUrls")
+
+
+def check_services(config):
+    """Every service the config names must be HTTPS on sigstore.dev."""
+    for field in SERVICE_LISTS:
+        for service in json.loads(config).get(field) or []:
+            url = urllib.parse.urlsplit(service.get("url", ""))
+            host = url.hostname or ""
+            if url.scheme != "https" or not (host == "sigstore.dev" or host.endswith(".sigstore.dev")):
+                sys.exit(f"the signing config names a service outside sigstore.dev: {service.get('url')}")
 
 
 def fetch(path):
@@ -39,6 +52,7 @@ def main(argv):
         config = fetch(f"targets/{digest}.{name}")
         if hashlib.sha256(config).hexdigest() != digest:
             sys.exit(f"{name} does not match the hash Sigstore's targets list")
+        check_services(config)
         with open(argv[1], "wb") as file:
             file.write(config)
         print(name)
