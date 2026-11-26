@@ -386,12 +386,6 @@ pub struct TlogEntry {
     pub canonicalized_body: String,
 }
 
-// Consumers of these accessors land alongside the install-time
-// verifier; the schema bump is a precondition that ships ahead of the
-// verifier so the data model is in place when verifier code wires in.
-// `#[allow(dead_code)]` matches the pattern used for
-// the M2 SPKI pin slots — declared up front, consumed in a follow-up.
-#[allow(dead_code)]
 impl TlogEntry {
     /// The SET (base64), preferring the Sigstore bundle's top-level
     /// inclusion promise, falling back through Rekor's `verification`
@@ -624,6 +618,15 @@ pub async fn sign_and_record_with_endpoints(
 
     // Step 4: Upload to Rekor
     let tlog_entry = rekor_upload(&endpoints.rekor, &dsse_envelope, &cert_pem).await?;
+    // Rekor answers with the entry it logged. One that doesn't record this
+    // envelope and its signer would make a bundle no verifier accepts, on a
+    // version that can't be published again.
+    let leaf_der = cert_chain_der
+        .first()
+        .ok_or_else(|| LpmError::Registry("Fulcio returned no certificate".into()))?;
+    crate::sigstore_verify::verify_rekor_body(&tlog_entry, &dsse_envelope, leaf_der).map_err(
+        |e| LpmError::Registry(format!("Rekor logged another entry than LPM uploaded: {e}")),
+    )?;
 
     // Step 5: Build the bundle
     let verification_material = VerificationMaterial {
@@ -1938,7 +1941,7 @@ mod tests {
     }
 
     #[test]
-    fn rekor_upload_converts_the_first_intoto_entry_of_a_shard() {
+    fn a_rekor_response_for_the_first_intoto_entry_of_a_shard_converts() {
         let entry = tlog_entry_from_rekor_response(&first_entry_in_a_shard().to_string()).unwrap();
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(
@@ -2466,7 +2469,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(match_path("/api/v1/log/entries"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(real_rekor_response()))
+            .respond_with(RekorLoggingTheUpload)
             .mount(&rekor)
             .await;
 
@@ -2493,9 +2496,69 @@ mod tests {
             2
         );
         assert_eq!(bundle.verification_material.tlog_entries.len(), 1);
-        assert_eq!(
-            bundle.verification_material.tlog_entries[0].log_index,
-            "3637620348"
+        assert_eq!(bundle.verification_material.tlog_entries[0].log_index, "7");
+    }
+
+    /// Rekor answering an upload by logging it as sent, as the first entry
+    /// of a new shard.
+    struct RekorLoggingTheUpload;
+
+    impl wiremock::Respond for RekorLoggingTheUpload {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            use sha2::Digest as _;
+            let mut leaf = sha2::Sha256::new();
+            leaf.update([0x00]);
+            leaf.update(&request.body);
+            let leaf = leaf.finalize();
+            ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "uuid": {
+                    "body": BASE64.encode(&request.body),
+                    "integratedTime": 1_793_592_285_u64,
+                    "logID": "c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d",
+                    "logIndex": 7,
+                    "verification": {
+                        "signedEntryTimestamp": BASE64.encode(b"set"),
+                        "inclusionProof": {
+                            "checkpoint": format!(
+                                "rekor.sigstore.dev - 1\n1\n{}\n\n\u{2014} rekor.sigstore.dev wNI9agE=\n",
+                                BASE64.encode(leaf)
+                            ),
+                            "hashes": [],
+                            "logIndex": 0,
+                            "rootHash": hex::encode(leaf),
+                            "treeSize": 1
+                        }
+                    }
+                }
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_and_record_refuses_an_entry_rekor_logged_for_another_envelope() {
+        // A whole, consistent entry, but for another upload: LPM's v0.84.0
+        // release.
+        let fulcio = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                format!("{PEM_CERT_LEAF}{PEM_CERT_ROOT}").into_bytes(),
+                "application/pem-certificate-chain",
+            ))
+            .mount(&fulcio)
+            .await;
+        let rekor = rekor_answering(real_rekor_response()).await;
+        let endpoints = SigstoreEndpoints::for_test(fulcio.uri(), rekor.uri());
+        let jwt = make_jwt(
+            r#"{"sub":"ci@example.com","iss":"https://token.actions.githubusercontent.com"}"#,
+        );
+
+        let err = sign_and_record_with_endpoints(&jwt, b"{\"_type\":\"in-toto\"}", &endpoints)
+            .await
+            .expect_err("an entry for another envelope must not be published");
+        assert!(
+            err.to_string().contains("another entry than LPM uploaded"),
+            "{err}"
         );
     }
 
