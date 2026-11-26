@@ -314,17 +314,27 @@ pub struct Certificate {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TlogEntry {
-    /// Log index in the transparency log.
-    #[serde(rename = "logIndex")]
+    /// Log index in the transparency log. Protobuf JSON writes int64 as a
+    /// string and leaves out a zero, the first entry of a new log.
+    #[serde(
+        rename = "logIndex",
+        default = "zero_string",
+        deserialize_with = "de_string_from_str_or_num"
+    )]
     pub log_index: String,
 
-    /// Log ID (Rekor instance identifier).
-    #[serde(rename = "logId")]
+    /// Log ID (Rekor instance identifier). Empty when the bundle leaves it
+    /// out, as Rekor v2 means to.
+    #[serde(rename = "logId", default)]
     pub log_id: LogId,
 
     /// Seconds since the epoch when Rekor v1 integrated the entry. Rekor
     /// v2 has no integrated time, and its bundles leave the field out.
-    #[serde(rename = "integratedTime", default)]
+    #[serde(
+        rename = "integratedTime",
+        default,
+        deserialize_with = "de_string_from_str_or_num"
+    )]
     pub integrated_time: String,
 
     /// The entry's kind and version, which its body repeats. Bundles
@@ -415,7 +425,7 @@ pub struct KindVersion {
     pub version: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct LogId {
     /// Hex-encoded key ID of the Rekor log.
     #[serde(rename = "keyId")]
@@ -467,20 +477,56 @@ pub struct RekorInclusionProof {
     /// rather than relying on a fixed struct.
     pub checkpoint: serde_json::Value,
 
-    /// Sibling hashes along the Merkle path from leaf to root.
+    /// Sibling hashes along the Merkle path from leaf to root. Protobuf
+    /// JSON leaves the list out when it's empty, for a one-entry tree.
+    #[serde(default)]
     pub hashes: Vec<String>,
 
     // Sigstore Bundle v0.3 protobuf JSON encodes int64 as JSON
     // strings (JS-interop convention); LPM's own publish path emits
-    // bare numbers. Accept both via `de_i64_from_str_or_num`.
-    #[serde(rename = "logIndex", deserialize_with = "de_i64_from_str_or_num")]
+    // bare numbers. Accept both via `de_i64_from_str_or_num`. Rekor v2
+    // verifiers ignore this field, the root hash and the tree size, which
+    // repeat values the entry and its signed checkpoint give, so a bundle
+    // may leave them out.
+    #[serde(
+        rename = "logIndex",
+        default,
+        deserialize_with = "de_i64_from_str_or_num"
+    )]
     pub log_index: i64,
 
-    #[serde(rename = "rootHash")]
+    #[serde(rename = "rootHash", default)]
     pub root_hash: String,
 
-    #[serde(rename = "treeSize", deserialize_with = "de_i64_from_str_or_num")]
+    #[serde(
+        rename = "treeSize",
+        default,
+        deserialize_with = "de_i64_from_str_or_num"
+    )]
     pub tree_size: i64,
+}
+
+fn zero_string() -> String {
+    "0".into()
+}
+
+/// An int64 field kept as its decimal string, from a JSON string or a bare
+/// number: protobuf JSON writes the former, other producers the latter.
+fn de_string_from_str_or_num<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StrOrNum {
+        Num(i64),
+        Str(String),
+    }
+    Ok(match StrOrNum::deserialize(deserializer)? {
+        StrOrNum::Num(n) => n.to_string(),
+        StrOrNum::Str(s) => s,
+    })
 }
 
 /// Accept i64 as either a bare JSON number (LPM publish path) or a

@@ -24,6 +24,27 @@ fn conformance_identity() -> IdentityExpectations {
     }
 }
 
+/// Why the suite expects each vendored DSSE `_fail` case to be refused.
+fn expected_refusal(case: &str) -> Option<fn(&VerifyError) -> bool> {
+    fn body_mismatch(error: &VerifyError, expected: &str) -> bool {
+        matches!(error, VerifyError::RekorBodyMismatch { field, .. } if *field == expected)
+    }
+    Some(match case {
+        "dsse-invalid-sig_fail" | "rekor2-dsse-invalid-sig_fail" => {
+            |error| matches!(error, VerifyError::DsseSignature(_))
+        }
+        "dsse-mismatch-envelope_fail" => |error| body_mismatch(error, "payloadHash"),
+        "rekor2-dsse-mismatch-envelope_fail" => |error| body_mismatch(error, "digest"),
+        "rekor2-dsse-mismatch-sig_fail" => |error| body_mismatch(error, "signature"),
+        "intoto-expired-certificate_fail"
+        | "intoto-set-outside-signing-cert-validity_fail"
+        | "intoto-tsa-timestamp-outside-cert-validity_fail" => {
+            |error| matches!(error, VerifyError::Chain(why) if why.contains("does not contain the signing time"))
+        }
+        _ => return None,
+    })
+}
+
 #[test]
 fn vendored_dsse_conformance_cases_verify_or_fail_as_the_suite_expects() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sigstore_conformance");
@@ -51,7 +72,15 @@ fn vendored_dsse_conformance_cases_verify_or_fail_as_the_suite_expects() {
             let outcome =
                 verify_sigstore_bundle_with(&bundle, &conformance_identity(), options, &trust);
             if name.ends_with("_fail") {
-                assert!(outcome.is_err(), "{name} must be refused under {options:?}");
+                let expected = expected_refusal(&name)
+                    .unwrap_or_else(|| panic!("{name} has no expected refusal"));
+                match outcome {
+                    Err(error) => assert!(
+                        expected(&error),
+                        "{name} was refused under {options:?} for another reason: {error:?}"
+                    ),
+                    Ok(_) => panic!("{name} must be refused under {options:?}"),
+                }
             } else if let Err(error) = outcome {
                 panic!("{name} must verify under {options:?}: {error}");
             }
@@ -62,7 +91,7 @@ fn vendored_dsse_conformance_cases_verify_or_fail_as_the_suite_expects() {
 }
 
 #[test]
-fn rekor_v1_checkpoints_from_sigstores_conformance_cases() {
+fn sigstores_rekor_v1_checkpoint_cases_verify_or_fail_as_the_suite_expects() {
     let trust = TrustRoot::parse(EMBEDDED_TRUST_ROOT_JSON).unwrap();
     let entry = |case: &str| -> crate::sigstore::TlogEntry {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

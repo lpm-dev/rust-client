@@ -1703,13 +1703,8 @@ fn rfc3161_timestamp_only_bundle_rejects_because_no_embedded_sct_is_present() {
     let leaf_der = build_leaf_with_optional_sct(&leaf_kp, &issuer, None);
     let issuer_spki = issuer_spki_from_cert(&issuer.cert);
     let (_, ct_log_key) = synth_ct_log_key(2025);
-    let err = verify_embedded_sct(
-        &leaf_der,
-        &issuer_spki,
-        std::slice::from_ref(&ct_log_key),
-        ts_year(2025),
-    )
-    .expect_err("RFC-3161-only bundle (no embedded SCT) must reject");
+    let err = verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key))
+        .expect_err("RFC-3161-only bundle (no embedded SCT) must reject");
     match err {
         VerifyError::Sct(msg) => assert!(
             msg.contains("no embedded SCT"),
@@ -2864,6 +2859,39 @@ fn synth_ct_log_key(at_year: i32) -> (SigningKey, CtLogKey) {
 
 #[test]
 fn verifies_valid_embedded_sct_against_pinned_ct_log_key() {
+    let (leaf_with_sct_der, issuer_spki, ct_log_key) = leaf_with_sct_at(1_700_000_000_000);
+    verify_embedded_sct(
+        &leaf_with_sct_der,
+        &issuer_spki,
+        std::slice::from_ref(&ct_log_key),
+    )
+    .expect("synthetic SCT must verify under the pinned CT log key");
+}
+
+#[test]
+fn an_sct_is_checked_under_the_ct_log_key_valid_at_its_own_time() {
+    // 1_700_000_000_000 ms is 2023-11-14T22:13:20Z. The key retired a few
+    // days later, before an artifact signed with the certificate might be
+    // timestamped; what matters is when the log signed the SCT.
+    let (leaf_der, issuer_spki, mut ct_log_key) = leaf_with_sct_at(1_700_000_000_000);
+    ct_log_key.valid_for = ValidityWindow {
+        start: Timestamp::parse_rfc3339("2023-11-01T00:00:00Z").unwrap(),
+        end: Some(Timestamp::parse_rfc3339("2023-11-15T00:00:00Z").unwrap()),
+    };
+    verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key)).unwrap();
+
+    ct_log_key.valid_for = ValidityWindow {
+        start: Timestamp::parse_rfc3339("2023-11-15T00:00:00Z").unwrap(),
+        end: None,
+    };
+    let refused = verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key))
+        .unwrap_err();
+    assert!(refused.is_missing_trust_material(), "{refused:?}");
+}
+
+/// A leaf whose embedded SCT a fresh CT log key signed at `timestamp_ms`,
+/// with the leaf's issuer SPKI and that key.
+fn leaf_with_sct_at(timestamp_ms: u64) -> (Vec<u8>, Vec<u8>, CtLogKey) {
     // The full positive path with a SHARED leaf keypair across
     // both rcgen builds — that's what makes the two TBSes
     // byte-equal except for the SCT extension entry.
@@ -2873,9 +2901,7 @@ fn verifies_valid_embedded_sct_against_pinned_ct_log_key() {
     let issuer_key_hash = Sha256::digest(&issuer_spki).to_vec();
 
     let (ct_signing_key, ct_log_key) = synth_ct_log_key(2025);
-    let timestamp_ms = 1_700_000_000_000u64;
     let sct_extensions: &[u8] = &[];
-
     // Build leaf v1 WITHOUT SCT and extract its TBS — that's the
     // precert TBS the CT log signs over.
     let leaf_without_sct_der = build_leaf_with_optional_sct(&leaf_kp, &issuer, None);
@@ -2926,13 +2952,7 @@ fn verifies_valid_embedded_sct_against_pinned_ct_log_key() {
              (shared leaf keypair pins SerialNumber + SPKI)"
     );
 
-    verify_embedded_sct(
-        &leaf_with_sct_der,
-        &issuer_spki,
-        std::slice::from_ref(&ct_log_key),
-        ts_year(2025),
-    )
-    .expect("synthetic SCT must verify under the pinned CT log key");
+    (leaf_with_sct_der, issuer_spki, ct_log_key)
 }
 
 #[test]
@@ -2942,13 +2962,8 @@ fn rejects_leaf_with_no_embedded_sct_extension() {
     let leaf_der = build_leaf_with_optional_sct(&leaf_kp, &issuer, None);
     let issuer_spki = issuer_spki_from_cert(&issuer.cert);
     let (_, ct_log_key) = synth_ct_log_key(2025);
-    let err = verify_embedded_sct(
-        &leaf_der,
-        &issuer_spki,
-        std::slice::from_ref(&ct_log_key),
-        ts_year(2025),
-    )
-    .expect_err("leaf without SCT extension must reject");
+    let err = verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key))
+        .expect_err("leaf without SCT extension must reject");
     match err {
         VerifyError::Sct(msg) => assert!(msg.contains("no embedded SCT"), "got: {msg}"),
         other => panic!("expected VerifyError::Sct, got: {other:?}"),
@@ -2978,7 +2993,6 @@ fn rejects_sct_with_unknown_log_id() {
         &leaf_der,
         &issuer_spki,
         std::slice::from_ref(&pinned_unrelated_key),
-        ts_year(2025),
     )
     .expect_err("unknown logId must reject");
     match err {
@@ -3012,13 +3026,8 @@ fn rejects_sct_with_forged_signature_under_pinned_key() {
     );
     let sct_list = encode_sct_list(&[&serialized]);
     let leaf_der = build_leaf_with_optional_sct(&leaf_kp, &issuer, Some(&sct_list));
-    let err = verify_embedded_sct(
-        &leaf_der,
-        &issuer_spki,
-        std::slice::from_ref(&ct_log_key),
-        ts_year(2025),
-    )
-    .expect_err("forged-key SCT must reject");
+    let err = verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key))
+        .expect_err("forged-key SCT must reject");
     match err {
         VerifyError::Sct(msg) => assert!(
             msg.contains("no SCT in the leaf cert's extension verified"),
@@ -3046,13 +3055,8 @@ fn rejects_sct_with_unsupported_signature_algorithm() {
     );
     let sct_list = encode_sct_list(&[&serialized]);
     let leaf_der = build_leaf_with_optional_sct(&leaf_kp, &issuer, Some(&sct_list));
-    let err = verify_embedded_sct(
-        &leaf_der,
-        &issuer_spki,
-        std::slice::from_ref(&ct_log_key),
-        ts_year(2025),
-    )
-    .expect_err("non-sha256/ecdsa SCT must reject");
+    let err = verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key))
+        .expect_err("non-sha256/ecdsa SCT must reject");
     match err {
         VerifyError::Sct(msg) => assert!(
             msg.contains("no SCT in the leaf cert's extension verified"),
@@ -3075,13 +3079,8 @@ fn rejects_sct_extension_with_malformed_tls_list() {
 
     let issuer_spki = issuer_spki_from_cert(&issuer.cert);
     let (_, ct_log_key) = synth_ct_log_key(2025);
-    let err = verify_embedded_sct(
-        &leaf_der,
-        &issuer_spki,
-        std::slice::from_ref(&ct_log_key),
-        ts_year(2025),
-    )
-    .expect_err("malformed SCT list must reject");
+    let err = verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key))
+        .expect_err("malformed SCT list must reject");
     match err {
         VerifyError::Sct(msg) => assert!(
             msg.contains("SCT list TLS encoding is malformed"),
@@ -3889,13 +3888,8 @@ fn microbench_per_step_primitive_timings() {
         let _ = leaf_parsed; // shape sanity
         let keys = std::slice::from_ref(&bundle.ct_log_key);
         measure("verify_embedded_sct", || {
-            verify_embedded_sct(
-                &bundle.leaf_with_sct_der,
-                &bundle.issuer_spki,
-                keys,
-                ts_year(2025),
-            )
-            .expect("embedded SCT must verify under bench setup");
+            verify_embedded_sct(&bundle.leaf_with_sct_der, &bundle.issuer_spki, keys)
+                .expect("embedded SCT must verify under bench setup");
         });
     }
 

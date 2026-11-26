@@ -211,7 +211,9 @@ fn a_rekor_v2_entry_from_a_log_outside_the_trust_root_needs_newer_trust_material
 }
 
 #[test]
-fn a_rekor_v2_entry_signed_outside_its_logs_validity_window_is_refused() {
+fn a_rekor_v2_log_is_found_by_identity_whatever_its_window_says() {
+    // A checkpoint carries no time to check the log's key against: a
+    // timestamp just before a new log's window opens still verifies.
     let bundle = conformance_bundle(DSSE_CASE);
     let entry = tlog_entry(&bundle);
     let mut trust = conformance_trust(DSSE_CASE);
@@ -226,8 +228,103 @@ fn a_rekor_v2_entry_signed_outside_its_logs_validity_window_is_refused() {
             end: Some(Timestamp::parse_rfc3339("2026-01-01T00:00:00Z").unwrap()),
         };
     }
-    let refused = verify(&bundle, &trust, VerifyOptions::npm_attestation()).unwrap_err();
-    assert!(refused.is_missing_trust_material(), "{refused:?}");
+    verify(&bundle, &trust, VerifyOptions::npm_attestation()).unwrap();
+}
+
+#[test]
+fn a_rekor_v2_entry_that_does_not_name_its_log_is_matched_by_its_checkpoint() {
+    let mut bundle = conformance_bundle(DSSE_CASE);
+    let entry = bundle["verificationMaterial"]["tlogEntries"][0]
+        .as_object_mut()
+        .unwrap();
+    entry.remove("logId");
+    let proof = entry["inclusionProof"].as_object_mut().unwrap();
+    for repeated in ["logIndex", "rootHash", "treeSize"] {
+        proof.remove(repeated);
+    }
+    entry.insert("logIndex".into(), serde_json::json!(4_026_478));
+    let verified = verify(
+        &bundle,
+        &conformance_trust(DSSE_CASE),
+        VerifyOptions::strict(),
+    )
+    .unwrap();
+    assert_eq!(
+        verified.log_id,
+        "09OnDKEw7/hpZiYVPoTRzRbglHk0sylsUovegnRUlJY="
+    );
+    assert_eq!(verified.log_index, 4_026_478);
+}
+
+#[test]
+fn a_rekor_v2_log_the_trust_root_names_by_its_checkpoint_key_id_is_found() {
+    let bundle = conformance_bundle(DSSE_CASE);
+    let entry = tlog_entry(&bundle);
+    let log_id = decode_log_id(&entry.log_id.key_id).unwrap();
+    for checkpoint_key_id in [log_id.clone(), log_id[..4].to_vec()] {
+        let mut trust = conformance_trust(DSSE_CASE);
+        for log in trust
+            .rekor_keys
+            .iter_mut()
+            .filter(|log| log.log_id == log_id)
+        {
+            log.log_id = vec![0; 32];
+            log.checkpoint_key_id = Some(checkpoint_key_id.clone());
+        }
+        verify(&bundle, &trust, VerifyOptions::npm_attestation()).unwrap();
+    }
+}
+
+#[test]
+fn a_hashedrekord_entry_must_record_the_leaf_certificate_as_a_p256_sha256_signature() {
+    type ChangeRecord = fn(&mut serde_json::Value);
+    let cases: [(&str, ChangeRecord); 4] = [
+        ("key", |record| {
+            record["signature"]["verifier"]["keyDetails"] =
+                serde_json::json!("PKIX_ECDSA_P384_SHA_384");
+        }),
+        ("digest where", |record| {
+            record["data"]["algorithm"] = serde_json::json!("SHA2_384");
+        }),
+        ("bare public key", |record| {
+            let verifier = record["signature"]["verifier"].as_object_mut().unwrap();
+            let certificate = verifier.remove("x509Certificate").unwrap();
+            verifier.insert("publicKey".into(), certificate);
+        }),
+        ("x509Certificate", |record| {
+            record["signature"]["verifier"]["x509Certificate"]["rawBytes"] =
+                serde_json::json!(BASE64.encode(b"another certificate"));
+        }),
+    ];
+    for (expected, change) in cases {
+        let mut bundle = conformance_bundle(DSSE_CASE);
+        let entry = &mut bundle["verificationMaterial"]["tlogEntries"][0];
+        let mut body: serde_json::Value = serde_json::from_slice(
+            &BASE64
+                .decode(entry["canonicalizedBody"].as_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        change(&mut body["spec"]["hashedRekordV002"]);
+        entry["canonicalizedBody"] =
+            serde_json::json!(BASE64.encode(serde_json::to_vec(&body).unwrap()));
+        let refused = verify(
+            &bundle,
+            &conformance_trust(DSSE_CASE),
+            VerifyOptions::npm_attestation(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                VerifyError::RekorBodyMalformed(why) if why.contains(expected)
+            ) || matches!(
+                &refused,
+                VerifyError::RekorBodyMismatch { field, .. } if *field == expected
+            ),
+            "{expected}: {refused:?}"
+        );
+    }
 }
 
 #[test]
@@ -273,7 +370,7 @@ fn a_bundle_whose_named_kind_disagrees_with_its_entry_is_refused() {
 }
 
 #[test]
-fn checkpoints_from_sigstores_conformance_cases() {
+fn sigstores_rekor_v2_checkpoint_cases_verify_or_fail_as_the_suite_expects() {
     let verifies = [
         "rekor2-dsse-happy-path",
         "rekor2-checkpoint-cosigned",
@@ -518,4 +615,27 @@ fn a_log_is_named_by_the_host_of_its_base_url() {
         Some("log.test.example")
     );
     assert_eq!(log_name(""), None);
+}
+
+#[test]
+fn an_ed25519_log_signs_under_the_name_its_key_id_commits_to() {
+    // The trust root's 32-byte key ID for an Ed25519 log is the hash of the
+    // log's name and key, so a name that isn't the base URL's host, such as
+    // one with a port, is still the log's.
+    let mut log = test_log(1);
+    let name = "log.test.example:8443";
+    log.trusted.base_url = format!("https://{name}");
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    hasher.update([b'\n', 0x01]);
+    hasher.update(log.key.verifying_key().as_bytes());
+    log.trusted.log_id = hasher.finalize().to_vec();
+
+    let text = checkpoint_text(name, "736");
+    let envelope = format!("{text}\n{}", log.signature_line(name, &text));
+    verify_checkpoint(&envelope, &log.trusted, LogStyle::RekorV2).unwrap();
+
+    log.trusted.log_id = vec![0; 32];
+    let why = verify_checkpoint(&envelope, &log.trusted, LogStyle::RekorV2).unwrap_err();
+    assert!(why.contains("no signature from the log"), "{why}");
 }

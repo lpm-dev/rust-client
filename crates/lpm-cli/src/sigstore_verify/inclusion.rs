@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 
 use super::checkpoint::{Checkpoint, LogStyle, verify_checkpoint};
 use super::rekor_body::json_value_kind;
-use super::rekor_set::{decode_log_id, parse_integrated_time, parse_log_index};
+use super::rekor_set::{decode_log_id, parse_log_index};
 use super::{RekorKey, VerifyError};
 
 /// Verify the Rekor Merkle inclusion proof attached to `tlog_entry`.
@@ -30,19 +30,18 @@ pub fn verify_inclusion_proof(
         .resolved_inclusion_proof()
         .ok_or(VerifyError::InclusionProofMissing)?;
 
-    let integrated_time = parse_integrated_time(&tlog_entry.integrated_time)
-        .map_err(|e| VerifyError::InclusionProof(format!("{e}")))?;
+    // A checkpoint carries no time to check the log's key against, and
+    // without a SET the entry's `integratedTime` is unsigned. The log is
+    // found by its ID, as Sigstore's verifiers find it; a SET, when there is
+    // one, checks the key at the time it signs.
     let log_id_bytes = decode_log_id(&tlog_entry.log_id.key_id)
         .map_err(|e| VerifyError::InclusionProof(format!("{e}")))?;
     let rekor_key = rekor_keys
         .iter()
-        .find(|k| k.log_id == log_id_bytes && k.valid_for.contains(integrated_time))
+        .find(|k| k.log_id == log_id_bytes)
         .ok_or_else(|| VerifyError::MissingTrustMaterial {
             check: "Rekor inclusion proof",
-            detail: format!(
-                "no pinned Rekor key for logId={} valid at integratedTime={}",
-                tlog_entry.log_id.key_id, tlog_entry.integrated_time,
-            ),
+            detail: format!("no pinned Rekor key for logId={}", tlog_entry.log_id.key_id),
         })?;
 
     let checkpoint_envelope = extract_checkpoint_envelope(&proof.checkpoint)?;
@@ -175,7 +174,9 @@ fn verify_leaf_inclusion(
 /// `inclusion_proof.checkpoint` field. The Sigstore Bundle v0.3 spec
 /// wraps it as `{ "envelope": "..." }`; some signers / older bundles
 /// emit a bare string. Accept both.
-fn extract_checkpoint_envelope(value: &serde_json::Value) -> Result<String, VerifyError> {
+pub(super) fn extract_checkpoint_envelope(
+    value: &serde_json::Value,
+) -> Result<String, VerifyError> {
     match value {
         serde_json::Value::String(s) => Ok(s.clone()),
         serde_json::Value::Object(obj) => obj

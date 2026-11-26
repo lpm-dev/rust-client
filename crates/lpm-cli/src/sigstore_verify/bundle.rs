@@ -5,8 +5,9 @@ use sha2::{Digest, Sha256};
 use std::time::SystemTime;
 use x509_parser::prelude::*;
 
+use super::checkpoint::names_log;
 use super::dsse::verify_dsse_signature;
-use super::inclusion::verify_rekor_v2_inclusion_proof;
+use super::inclusion::{extract_checkpoint_envelope, verify_rekor_v2_inclusion_proof};
 use super::rekor_body::{RekorEntryVersion, rekor_entry_version, verify_hashedrekord_v002};
 use super::rekor_set::{decode_log_id, parse_log_index};
 use super::sct::der_decode_length;
@@ -287,10 +288,12 @@ pub(super) fn verify_sigstore_bundle_with(
 
     {
         let _span = tracing::debug_span!("provenance.verify.dsse").entered();
-        verify_dsse(&components.dsse_envelope, &leaf_parsed)?;
-        // A Rekor v2 entry logs one signature; that one must be valid.
-        if entry_version == RekorEntryVersion::V2 {
-            verify_dsse_signature(&components.dsse_envelope, &leaf_parsed, &signature)?;
+        match entry_version {
+            RekorEntryVersion::V1 => verify_dsse(&components.dsse_envelope, &leaf_parsed)?,
+            // A Rekor v2 entry logs one signature; that one must be valid.
+            RekorEntryVersion::V2 => {
+                verify_dsse_signature(&components.dsse_envelope, &leaf_parsed, &signature)?
+            }
         }
     }
 
@@ -306,7 +309,6 @@ pub(super) fn verify_sigstore_bundle_with(
             &components.leaf_cert_der,
             &issuer_spki_der,
             &trust.ctlog_keys,
-            signed_at,
         )?;
     }
 
@@ -327,6 +329,7 @@ pub(super) fn verify_sigstore_bundle_with(
         }
     }
 
+    let mut log_id = components.tlog_entry.log_id.key_id.clone();
     {
         let _span = tracing::debug_span!("provenance.verify.inclusion_proof").entered();
         match entry_version {
@@ -336,7 +339,7 @@ pub(super) fn verify_sigstore_bundle_with(
                 options.rekor_inclusion_policy,
             )?,
             RekorEntryVersion::V2 => {
-                verify_rekor_v2_inclusion(&components.tlog_entry, trust, signed_at)?
+                log_id = verify_rekor_v2_inclusion(&components.tlog_entry, trust)?;
             }
         }
     }
@@ -358,7 +361,7 @@ pub(super) fn verify_sigstore_bundle_with(
         statement: components.statement,
         signed_at,
         leaf_cert_sha256,
-        log_id: components.tlog_entry.log_id.key_id.clone(),
+        log_id,
         log_index,
     })
 }
@@ -386,25 +389,48 @@ fn verify_rekor_v1_inclusion(
 }
 
 /// A Rekor v2 entry's inclusion proof, which every policy requires: the
-/// entry carries no SET.
+/// entry carries no SET. Returns the log's ID, base64-encoded as bundles
+/// carry it.
+///
+/// The log is found by the entry's `logId`, or, since Rekor means to stop
+/// sending one, by the checkpoint signature naming a log in the trust
+/// root. A checkpoint carries no time to check the log's key against, so
+/// the log's window in the trust root isn't consulted, as Sigstore's
+/// verifiers don't.
 fn verify_rekor_v2_inclusion(
     tlog_entry: &crate::sigstore::TlogEntry,
     trust: &TrustRoot,
-    signed_at: SystemTime,
-) -> Result<(), VerifyError> {
-    let log_id = decode_log_id(&tlog_entry.log_id.key_id)
-        .map_err(|e| VerifyError::InclusionProof(e.to_string()))?;
-    let log = trust.rekor_log_at(&log_id, signed_at).ok_or_else(|| {
-        VerifyError::MissingTrustMaterial {
-            check: "Rekor inclusion proof",
-            detail: format!(
-                "no Rekor log for logId={} valid at the signing time {}",
-                tlog_entry.log_id.key_id,
-                lpm_common::Timestamp::from(signed_at).to_rfc3339()
-            ),
-        }
-    })?;
-    verify_rekor_v2_inclusion_proof(tlog_entry, log)
+) -> Result<String, VerifyError> {
+    let missing = |detail: String| VerifyError::MissingTrustMaterial {
+        check: "Rekor inclusion proof",
+        detail,
+    };
+    let log = if tlog_entry.log_id.key_id.is_empty() {
+        let proof = tlog_entry
+            .resolved_inclusion_proof()
+            .ok_or(VerifyError::InclusionProofMissing)?;
+        let envelope = extract_checkpoint_envelope(&proof.checkpoint)?;
+        trust
+            .rekor_keys
+            .iter()
+            .find(|log| names_log(&envelope, log))
+            .ok_or_else(|| missing("no Rekor log in the trust root signed its checkpoint".into()))?
+    } else {
+        let log_id = decode_log_id(&tlog_entry.log_id.key_id)
+            .map_err(|e| VerifyError::InclusionProof(e.to_string()))?;
+        trust.rekor_log(&log_id).ok_or_else(|| {
+            missing(format!(
+                "no Rekor log for logId={}",
+                tlog_entry.log_id.key_id
+            ))
+        })?
+    };
+    verify_rekor_v2_inclusion_proof(tlog_entry, log)?;
+    Ok(if tlog_entry.log_id.key_id.is_empty() {
+        BASE64.encode(&log.log_id)
+    } else {
+        tlog_entry.log_id.key_id.clone()
+    })
 }
 
 /// Parsed bundle components, with the heavy DER + DSSE work done
