@@ -639,7 +639,7 @@ pub(super) fn guard_generic_delete_against_force_floor(
             if let Some(after) =
                 firewall_policy_profile_after_delete(global, key, effective_policy_table_base)?
             {
-                crate::security_floor::reject_looser_firewall_policy_write(global, &after)?;
+                crate::security_floor::reject_looser_firewall_policy_delete(global, &after)?;
             }
         }
     }

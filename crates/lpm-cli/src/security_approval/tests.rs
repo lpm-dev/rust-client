@@ -2233,7 +2233,42 @@ fn forced_floor_measures_a_write_against_what_installs_run_not_an_unapproved_tab
 }
 
 #[test]
-fn forced_floor_judges_a_change_only_by_the_groups_it_changes() {
+fn forced_floor_refuses_an_editor_save_that_would_sign_a_group_left_loose_by_hand() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[]);
+        let mut config = firewall_policy_global_config(
+            "enforce",
+            &[(
+                crate::npm_firewall_config::LPM_AI_DEPENDENCY_SCRIPT_POLICY_KEY,
+                "warn",
+            )],
+        );
+        config.table_mut().insert(
+            "force-security-floor".to_string(),
+            toml::Value::Boolean(true),
+        );
+        let repairs_another_group = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_dependency_script_policy: lpm_registry::client::NpmFirewallPolicyAction::Warn,
+            lpm_ai_agent_control_surface: lpm_registry::client::NpmFirewallPolicyAction::Block,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        let err = crate::security_floor::reject_looser_firewall_policy_write(
+            &config,
+            &repairs_another_group,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("lpm_ai_dependency_script_policy"),
+            "{err}"
+        );
+    });
+}
+
+#[test]
+fn forced_floor_judges_a_delete_only_by_the_groups_it_changes() {
     let temp = tempdir().unwrap();
     with_test_env(temp.path(), || {
         approve_enforced_firewall(&[]);
@@ -2265,9 +2300,9 @@ fn forced_floor_judges_a_change_only_by_the_groups_it_changes() {
         };
 
         let restored =
-            crate::security_floor::reject_looser_firewall_policy_write(&config, &restores_malware);
+            crate::security_floor::reject_looser_firewall_policy_delete(&config, &restores_malware);
         let loosened =
-            crate::security_floor::reject_looser_firewall_policy_write(&config, &loosens_scripts)
+            crate::security_floor::reject_looser_firewall_policy_delete(&config, &loosens_scripts)
                 .unwrap_err();
 
         assert!(restored.is_ok(), "{restored:?}");

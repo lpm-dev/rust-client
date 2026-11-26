@@ -359,14 +359,31 @@ pub fn reject_looser_firewall_mode_write(
     Ok(())
 }
 
-/// Refuses a `[firewall.npm.policies]` write or delete that handles a policy
-/// group it changes, a group the table leaves out included, more leniently
-/// than installs enforce now, while `force-security-floor = true` is active.
-/// A group the change leaves as it was is not its doing, so restoring one
-/// group never waits on another that is still loose.
+/// Refuses a `[firewall.npm.policies]` profile the firewall editor saves, and
+/// signs into the approved posture, when it handles any policy group more
+/// leniently than installs enforce now, while `force-security-floor = true`
+/// is active. Every group counts, a group left loose by hand included, since
+/// the save signs them all.
 pub fn reject_looser_firewall_policy_write(
     global: &GlobalConfig,
     requested: &lpm_registry::client::NpmFirewallPolicyProfile,
+) -> Result<(), LpmError> {
+    if !force_security_floor_enabled(global) {
+        return Ok(());
+    }
+    let effective = crate::security_approval::load_effective_authorized_posture()?;
+    let floor = crate::npm_firewall_config::enforced_policy_profile(global, &effective)?;
+    reject_policy_below_floor(&floor, requested)
+}
+
+/// Refuses deleting a `config.toml` key when the profile installs would run
+/// afterwards handles a group the delete changes more leniently than installs
+/// enforce now, while `force-security-floor = true` is active. A delete signs
+/// nothing, so a group it leaves as it was is not its doing, and restoring
+/// one group never waits on another that is still loose.
+pub fn reject_looser_firewall_policy_delete(
+    global: &GlobalConfig,
+    after: &lpm_registry::client::NpmFirewallPolicyProfile,
 ) -> Result<(), LpmError> {
     if !force_security_floor_enabled(global) {
         return Ok(());
@@ -379,11 +396,11 @@ pub fn reject_looser_firewall_policy_write(
     let floor = crate::npm_firewall_config::enforced_policy_profile(global, &effective)?;
     let mut changed = floor;
     for key in crate::npm_firewall_config::POLICY_KEYS {
-        let requested_action = crate::npm_firewall_config::policy_action(requested, key);
-        if requested_action != crate::npm_firewall_config::policy_action(&current, key)
+        let after_action = crate::npm_firewall_config::policy_action(after, key);
+        if after_action != crate::npm_firewall_config::policy_action(&current, key)
             && let (Some(slot), Some(action)) = (
                 crate::npm_firewall_config::policy_action_mut(&mut changed, key),
-                requested_action,
+                after_action,
             )
         {
             *slot = action;
