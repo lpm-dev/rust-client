@@ -73,6 +73,12 @@ fn dsse_envelope_signed_with(signing_key: &SigningKey, raw_payload: &[u8]) -> Ds
     }
 }
 
+/// The envelope's one signature, decoded, as the composed verifier hands
+/// it to the Rekor body check.
+fn envelope_signature(envelope: &DsseEnvelope) -> Vec<u8> {
+    BASE64.decode(&envelope.signatures[0].sig).unwrap()
+}
+
 fn dsse_envelope_signed_with_der(signing_key: &SigningKey, raw_payload: &[u8]) -> DsseEnvelope {
     let payload_b64 = BASE64.encode(raw_payload);
     let pae_bytes = pae(PAYLOAD_TYPE, raw_payload);
@@ -326,35 +332,49 @@ fn build_rekor_body_0_0_2(envelope: &DsseEnvelope, leaf_cert_der: &[u8]) -> serd
     })
 }
 
-/// Build a Rekor body 0.0.1 JSON for the given envelope + cert.
-/// Difference vs 0.0.2: the inner envelope is base64-encoded as a
-/// string instead of nested as an object.
-fn build_rekor_body_0_0_1(envelope: &DsseEnvelope, leaf_cert_der: &[u8]) -> serde_json::Value {
-    let cert_pem = der_to_canonical_pem(leaf_cert_der);
-    let cert_pem_b64 = BASE64.encode(cert_pem.as_bytes());
+/// An `intoto` 0.0.1 body as Rekor logs it: its `Canonicalize` keeps the
+/// public key and the hashes and drops the envelope, which the schema
+/// marks write-only.
+fn build_canonical_rekor_body_0_0_1(
+    envelope: &DsseEnvelope,
+    leaf_cert_der: &[u8],
+) -> serde_json::Value {
+    let cert_pem_b64 = BASE64.encode(der_to_canonical_pem(leaf_cert_der).as_bytes());
     let raw_payload = BASE64.decode(envelope.payload.as_bytes()).unwrap();
-    let payload_hash = hex::encode(Sha256::digest(&raw_payload));
-
-    let payload_double_b64 = BASE64.encode(envelope.payload.as_bytes());
-    let sig_double_b64 = BASE64.encode(envelope.signatures[0].sig.as_bytes());
-    let inner_envelope = serde_json::json!({
-        "payloadType": &envelope.payload_type,
-        "payload": payload_double_b64,
-        "signatures": [{
-            "sig": sig_double_b64,
-            "publicKey": cert_pem_b64,
-        }],
-    });
-    let envelope_b64 = BASE64.encode(serde_json::to_vec(&inner_envelope).unwrap());
-
     serde_json::json!({
         "apiVersion": "0.0.1",
         "kind": "intoto",
         "spec": {
+            "publicKey": cert_pem_b64,
             "content": {
-                "envelope": envelope_b64,
-                "payloadHash": { "algorithm": "sha256", "value": payload_hash },
+                "hash": { "algorithm": "sha256", "value": "0".repeat(64) },
+                "payloadHash": {
+                    "algorithm": "sha256",
+                    "value": hex::encode(Sha256::digest(&raw_payload)),
+                },
             },
+        },
+    })
+}
+
+/// A `dsse` 0.0.1 body as Rekor logs it for the given envelope + cert:
+/// the signature text as submitted, and the certificate as its verifier.
+fn build_rekor_dsse_body(envelope: &DsseEnvelope, leaf_cert_der: &[u8]) -> serde_json::Value {
+    let cert_pem_b64 = BASE64.encode(der_to_canonical_pem(leaf_cert_der).as_bytes());
+    let raw_payload = BASE64.decode(envelope.payload.as_bytes()).unwrap();
+    serde_json::json!({
+        "apiVersion": "0.0.1",
+        "kind": "dsse",
+        "spec": {
+            "envelopeHash": { "algorithm": "sha256", "value": "0".repeat(64) },
+            "payloadHash": {
+                "algorithm": "sha256",
+                "value": hex::encode(Sha256::digest(&raw_payload)),
+            },
+            "signatures": [{
+                "signature": &envelope.signatures[0].sig,
+                "verifier": cert_pem_b64,
+            }],
         },
     })
 }
@@ -419,18 +439,101 @@ fn verifies_valid_rekor_body_0_0_2() {
     let envelope = dsse_envelope_signed_with(&signing_key, PAYLOAD);
     let body = build_rekor_body_0_0_2(&envelope, &cert_der);
     let tlog = tlog_entry_with_body(&body);
-    verify_rekor_body(&tlog, &envelope, &cert_der)
+    verify_rekor_body(&tlog, &envelope, &cert_der, &envelope_signature(&envelope))
         .expect("LPM-canonical 0.0.2 body must verify against its own envelope + cert");
 }
 
 #[test]
-fn verifies_valid_rekor_body_0_0_1() {
+fn refuses_intoto_0_0_1_entry_which_logs_no_signature() {
     let (cert_der, signing_key) = p256_cert_and_signing_key();
     let envelope = dsse_envelope_signed_with(&signing_key, PAYLOAD);
-    let body = build_rekor_body_0_0_1(&envelope, &cert_der);
+    let body = build_canonical_rekor_body_0_0_1(&envelope, &cert_der);
     let tlog = tlog_entry_with_body(&body);
-    verify_rekor_body(&tlog, &envelope, &cert_der)
-        .expect("LPM-canonical 0.0.1 body must verify against its own envelope + cert");
+    let err = verify_rekor_body(&tlog, &envelope, &cert_der, &envelope_signature(&envelope))
+        .expect_err("an intoto 0.0.1 entry records no signature to check");
+    match err {
+        VerifyError::RekorBodyUnknownVersion { kind, api_version } => {
+            assert_eq!((kind.as_str(), api_version.as_str()), ("intoto", "0.0.1"));
+        }
+        other => panic!("expected RekorBodyUnknownVersion, got: {other:?}"),
+    }
+}
+
+#[test]
+fn verifies_valid_rekor_dsse_body() {
+    let (cert_der, signing_key) = p256_cert_and_signing_key();
+    let envelope = dsse_envelope_signed_with(&signing_key, PAYLOAD);
+    let body = build_rekor_dsse_body(&envelope, &cert_der);
+    let tlog = tlog_entry_with_body(&body);
+    verify_rekor_body(&tlog, &envelope, &cert_der, &envelope_signature(&envelope))
+        .expect("a dsse 0.0.1 body must verify against its own envelope + cert");
+}
+
+#[test]
+fn rejects_rekor_dsse_body_logging_the_signature_encoded_twice() {
+    // A dsse entry logs the signature text as the signer submitted it,
+    // encoded once.
+    let (cert_der, signing_key) = p256_cert_and_signing_key();
+    let envelope = dsse_envelope_signed_with(&signing_key, PAYLOAD);
+    let mut body = build_rekor_dsse_body(&envelope, &cert_der);
+    body["spec"]["signatures"][0]["signature"] =
+        serde_json::Value::String(BASE64.encode(envelope.signatures[0].sig.as_bytes()));
+    let tlog = tlog_entry_with_body(&body);
+    let err = verify_rekor_body(&tlog, &envelope, &cert_der, &envelope_signature(&envelope))
+        .expect_err("a dsse signature encoded twice must reject");
+    expect_rekor_body_mismatch(err, "signature");
+}
+
+#[test]
+fn rejects_rekor_dsse_body_whose_signature_is_not_base64() {
+    let (cert_der, signing_key) = p256_cert_and_signing_key();
+    let envelope = dsse_envelope_signed_with(&signing_key, PAYLOAD);
+    let mut body = build_rekor_dsse_body(&envelope, &cert_der);
+    body["spec"]["signatures"][0]["signature"] = serde_json::Value::String("not!base64".into());
+    let tlog = tlog_entry_with_body(&body);
+    let err = verify_rekor_body(&tlog, &envelope, &cert_der, &envelope_signature(&envelope))
+        .expect_err("a logged signature that isn't base64 must reject");
+    let msg = expect_rekor_body_malformed(err);
+    assert!(
+        msg.contains("base64"),
+        "expected base64 diagnostic, got: {msg}"
+    );
+}
+
+#[test]
+fn rejects_rekor_bodies_logging_two_signatures_even_when_the_first_matches() {
+    // The bundle's envelope carries one signature, so an entry logging two
+    // records a different envelope.
+    let (cert_der, signing_key) = p256_cert_and_signing_key();
+    let envelope = dsse_envelope_signed_with(&signing_key, PAYLOAD);
+    let other = dsse_envelope_signed_with(&signing_key, b"another payload");
+
+    let mut dsse = build_rekor_dsse_body(&envelope, &cert_der);
+    let mut second = dsse["spec"]["signatures"][0].clone();
+    second["signature"] = serde_json::Value::String(other.signatures[0].sig.clone());
+    dsse["spec"]["signatures"]
+        .as_array_mut()
+        .unwrap()
+        .push(second);
+
+    let mut intoto = build_rekor_body_0_0_2(&envelope, &cert_der);
+    let mut second = intoto["spec"]["content"]["envelope"]["signatures"][0].clone();
+    second["sig"] = serde_json::Value::String(BASE64.encode(other.signatures[0].sig.as_bytes()));
+    intoto["spec"]["content"]["envelope"]["signatures"]
+        .as_array_mut()
+        .unwrap()
+        .push(second);
+
+    for body in [dsse, intoto] {
+        let tlog = tlog_entry_with_body(&body);
+        let err = verify_rekor_body(&tlog, &envelope, &cert_der, &envelope_signature(&envelope))
+            .expect_err("an entry logging two signatures must reject");
+        let msg = expect_rekor_body_malformed(err);
+        assert!(
+            msg.contains("logs 2 signatures"),
+            "expected signature-count diagnostic, got: {msg}"
+        );
+    }
 }
 
 #[test]
@@ -460,7 +563,7 @@ fn accepts_rekor_body_with_field_reordered_or_extra_whitespace() {
         canonicalized_body: BASE64.encode(serde_json::to_vec(&reparsed).unwrap()),
     };
 
-    verify_rekor_body(&tlog, &envelope, &cert_der).expect(
+    verify_rekor_body(&tlog, &envelope, &cert_der, &envelope_signature(&envelope)).expect(
         "verifier must accept a Rekor body with reordered keys and pretty-print \
              whitespace — semantic, not byte-bound",
     );
@@ -478,7 +581,7 @@ fn accepts_rekor_body_with_envelope_hash_mismatch_alone() {
     let mut body = build_rekor_body_0_0_2(&envelope, &cert_der);
     body["spec"]["content"]["hash"]["value"] = serde_json::Value::String("0".repeat(64));
     let tlog = tlog_entry_with_body(&body);
-    verify_rekor_body(&tlog, &envelope, &cert_der).expect(
+    verify_rekor_body(&tlog, &envelope, &cert_der, &envelope_signature(&envelope)).expect(
         "envelope-hash mismatch alone must NOT reject — it is advisory only \
              (the hard-fails on publicKey + payloadHash carry the security claim)",
     );
@@ -495,9 +598,55 @@ fn rejects_bundle_with_rekor_body_payload_hash_mismatch() {
     let mut body = build_rekor_body_0_0_2(&envelope, &cert_der);
     body["spec"]["content"]["payloadHash"]["value"] = serde_json::Value::String("f".repeat(64));
     let tlog = tlog_entry_with_body(&body);
-    let err = verify_rekor_body(&tlog, &envelope, &cert_der)
+    let err = verify_rekor_body(&tlog, &envelope, &cert_der, &envelope_signature(&envelope))
         .expect_err("payloadHash mismatch must reject");
     expect_rekor_body_mismatch(err, "payloadHash");
+}
+
+#[test]
+fn rejects_rekor_body_logging_another_signature_by_the_same_signer() {
+    let (cert_der, signing_key) = p256_cert_and_signing_key();
+    let envelope = dsse_envelope_signed_with(&signing_key, PAYLOAD);
+    let logged = dsse_envelope_signed_with(&signing_key, b"another payload");
+    let mut body = build_rekor_body_0_0_2(&envelope, &cert_der);
+    body["spec"]["content"]["envelope"]["signatures"][0]["sig"] =
+        serde_json::Value::String(BASE64.encode(logged.signatures[0].sig.as_bytes()));
+    let tlog = tlog_entry_with_body(&body);
+    let err = verify_rekor_body(&tlog, &envelope, &cert_der, &envelope_signature(&envelope))
+        .expect_err("an entry logging another signature must reject");
+    // Both digests are over signature bytes, so each side can be checked.
+    match err {
+        VerifyError::RekorBodyMismatch {
+            field: "signature",
+            expected_sha256,
+            actual_sha256,
+        } => {
+            assert_eq!(
+                expected_sha256,
+                hex::encode(Sha256::digest(envelope_signature(&envelope)))
+            );
+            assert_eq!(
+                actual_sha256,
+                hex::encode(Sha256::digest(envelope_signature(&logged)))
+            );
+        }
+        other => panic!("expected a signature mismatch, got: {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_intoto_0_0_2_body_logging_the_signature_encoded_once() {
+    // An intoto 0.0.2 entry base64-encodes the envelope's base64
+    // signature again; the signature encoded once isn't what it logs.
+    let (cert_der, signing_key) = p256_cert_and_signing_key();
+    let envelope = dsse_envelope_signed_with(&signing_key, PAYLOAD);
+    let mut body = build_rekor_body_0_0_2(&envelope, &cert_der);
+    body["spec"]["content"]["envelope"]["signatures"][0]["sig"] =
+        serde_json::Value::String(envelope.signatures[0].sig.clone());
+    let tlog = tlog_entry_with_body(&body);
+    let err = verify_rekor_body(&tlog, &envelope, &cert_der, &envelope_signature(&envelope))
+        .expect_err("a 0.0.2 signature encoded once must reject");
+    expect_rekor_body_mismatch(err, "signature");
 }
 
 #[test]
@@ -511,8 +660,13 @@ fn rejects_bundle_with_rekor_body_cert_mismatch() {
     let envelope = dsse_envelope_signed_with(&signing_key, PAYLOAD);
     let body = build_rekor_body_0_0_2(&envelope, &cert_der_a);
     let tlog = tlog_entry_with_body(&body);
-    let err = verify_rekor_body(&tlog, &envelope, &cert_der_b)
-        .expect_err("publicKey mismatch must reject");
+    let err = verify_rekor_body(
+        &tlog,
+        &envelope,
+        &cert_der_b,
+        &envelope_signature(&envelope),
+    )
+    .expect_err("publicKey mismatch must reject");
     expect_rekor_body_mismatch(err, "publicKey");
 }
 
@@ -523,10 +677,10 @@ fn rejects_bundle_with_rekor_body_unknown_api_version() {
     let mut body = build_rekor_body_0_0_2(&envelope, &cert_der);
     body["apiVersion"] = serde_json::Value::String("0.0.99".into());
     let tlog = tlog_entry_with_body(&body);
-    let err =
-        verify_rekor_body(&tlog, &envelope, &cert_der).expect_err("unknown apiVersion must reject");
+    let err = verify_rekor_body(&tlog, &envelope, &cert_der, &envelope_signature(&envelope))
+        .expect_err("unknown apiVersion must reject");
     match err {
-        VerifyError::RekorBodyUnknownVersion { api_version } => {
+        VerifyError::RekorBodyUnknownVersion { api_version, .. } => {
             assert_eq!(api_version, "0.0.99");
         }
         other => panic!("expected RekorBodyUnknownVersion, got: {other:?}"),
@@ -540,8 +694,8 @@ fn rejects_bundle_with_rekor_body_unknown_kind() {
     let mut body = build_rekor_body_0_0_2(&envelope, &cert_der);
     body["kind"] = serde_json::Value::String("rekord".into());
     let tlog = tlog_entry_with_body(&body);
-    let err =
-        verify_rekor_body(&tlog, &envelope, &cert_der).expect_err("non-intoto kind must reject");
+    let err = verify_rekor_body(&tlog, &envelope, &cert_der, &envelope_signature(&envelope))
+        .expect_err("non-intoto kind must reject");
     let msg = expect_rekor_body_malformed(err);
     assert!(msg.contains("kind"), "expected kind diagnostic, got: {msg}");
 }
@@ -562,8 +716,8 @@ fn rejects_bundle_with_canonicalized_body_not_base64() {
         verification: None,
         canonicalized_body: "not!!base64!!".into(),
     };
-    let err =
-        verify_rekor_body(&tlog, &envelope, &cert_der).expect_err("malformed base64 must reject");
+    let err = verify_rekor_body(&tlog, &envelope, &cert_der, &envelope_signature(&envelope))
+        .expect_err("malformed base64 must reject");
     let msg = expect_rekor_body_malformed(err);
     assert!(
         msg.contains("base64"),
@@ -587,8 +741,8 @@ fn rejects_bundle_with_canonicalized_body_not_json() {
         verification: None,
         canonicalized_body: BASE64.encode(b"this is not JSON"),
     };
-    let err =
-        verify_rekor_body(&tlog, &envelope, &cert_der).expect_err("non-JSON body must reject");
+    let err = verify_rekor_body(&tlog, &envelope, &cert_der, &envelope_signature(&envelope))
+        .expect_err("non-JSON body must reject");
     let msg = expect_rekor_body_malformed(err);
     assert!(
         msg.contains("not valid JSON"),
@@ -3200,7 +3354,7 @@ fn rejects_bundle_with_missing_payload_hash_field() {
         .unwrap()
         .remove("payloadHash");
     let tlog = tlog_entry_with_body(&body);
-    let err = verify_rekor_body(&tlog, &envelope, &cert_der)
+    let err = verify_rekor_body(&tlog, &envelope, &cert_der, &envelope_signature(&envelope))
         .expect_err("missing payloadHash must reject");
     let msg = expect_rekor_body_malformed(err);
     assert!(
@@ -3740,6 +3894,128 @@ fn rejects_proof_only_bundle_with_malformed_outer_log_index() {
         }
         other => panic!("expected a Rekor log-index error, got {other:?}"),
     }
+}
+
+/// The real npm attestation relabelled `media_type` (or unlabelled), with
+/// its inclusion proofs removed so it relies on its SET alone. A v0.1
+/// label also moves the leaf into the chain field that version carries.
+fn real_npm_bundle_with_set_only(media_type: Option<&str>) -> Vec<u8> {
+    let body = load_fixture_bundle(REAL_NPM_FIXTURE);
+    let mut root: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let mut changed_entries = 0;
+    for attestation in root["attestations"].as_array_mut().unwrap() {
+        let bundle = attestation["bundle"].as_object_mut().unwrap();
+        match media_type {
+            Some(media_type) => {
+                bundle.insert("mediaType".into(), media_type.into());
+            }
+            None => {
+                bundle.remove("mediaType");
+            }
+        }
+        let material = bundle
+            .get_mut("verificationMaterial")
+            .and_then(|m| m.as_object_mut())
+            .unwrap();
+        if media_type.is_some_and(|m| m.contains("0.1"))
+            && let Some(leaf) = material.remove("certificate")
+        {
+            material.insert(
+                "x509CertificateChain".into(),
+                serde_json::json!({ "certificates": [leaf] }),
+            );
+        }
+        for entry in material["tlogEntries"].as_array_mut().unwrap() {
+            entry.as_object_mut().unwrap().remove("inclusionProof");
+            changed_entries += 1;
+        }
+    }
+    assert!(changed_entries > 0, "fixture must contain tlog entries");
+    serde_json::to_vec(&root).unwrap()
+}
+
+/// The policies that accept a bundle without an inclusion proof.
+const POLICIES_NOT_REQUIRING_A_PROOF: [RekorInclusionProofPolicy; 2] = [
+    RekorInclusionProofPolicy::Either,
+    RekorInclusionProofPolicy::RequireSet,
+];
+
+#[test]
+fn a_v0_1_bundle_may_rely_on_its_set_alone() {
+    for media_type in [
+        "application/vnd.dev.sigstore.bundle+json;version=0.1",
+        "application/vnd.dev.sigstore.bundle.v0.1+json",
+    ] {
+        for policy in POLICIES_NOT_REQUIRING_A_PROOF {
+            verify_sigstore_bundle(
+                &real_npm_bundle_with_set_only(Some(media_type)),
+                &IdentityExpectations::none(),
+                VerifyOptions {
+                    rekor_inclusion_policy: policy,
+                },
+            )
+            .unwrap_or_else(|e| {
+                panic!("a {media_type} bundle may rely on its SET under {policy:?}: {e:?}")
+            });
+        }
+    }
+}
+
+#[test]
+fn a_set_only_bundle_not_labelled_v0_1_is_refused_for_lacking_an_inclusion_proof() {
+    // Every bundle version after 0.1 requires the proof, so one whose
+    // version isn't known to be 0.1 is held to that rule too.
+    for media_type in [
+        Some("application/vnd.dev.sigstore.bundle+json;version=0.2"),
+        Some("application/vnd.dev.sigstore.bundle.v0.3+json"),
+        Some("application/vnd.dev.sigstore.bundle.v0.4+json"),
+        Some("application/json"),
+        None,
+    ] {
+        for policy in POLICIES_NOT_REQUIRING_A_PROOF {
+            let error = verify_sigstore_bundle(
+                &real_npm_bundle_with_set_only(media_type),
+                &IdentityExpectations::none(),
+                VerifyOptions {
+                    rekor_inclusion_policy: policy,
+                },
+            )
+            .expect_err("a bundle after v0.1 must carry an inclusion proof");
+            assert!(
+                matches!(error, VerifyError::InclusionProofMissing),
+                "{media_type:?} under {policy:?}: expected InclusionProofMissing, got {error:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_v0_1_bundle_without_a_set_is_refused_for_lacking_one() {
+    // A version 0.1 bundle's entries carry a SET; without one the bundle
+    // is refused for that, not for its unsigned time.
+    let body = load_fixture_bundle(REAL_NPM_FIXTURE);
+    let mut root: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    for attestation in root["attestations"].as_array_mut().unwrap() {
+        attestation["bundle"]["mediaType"] =
+            "application/vnd.dev.sigstore.bundle+json;version=0.1".into();
+        if let Some(entries) =
+            attestation["bundle"]["verificationMaterial"]["tlogEntries"].as_array_mut()
+        {
+            for entry in entries {
+                entry.as_object_mut().unwrap().remove("inclusionPromise");
+            }
+        }
+    }
+    let error = verify_sigstore_bundle(
+        &serde_json::to_vec(&root).unwrap(),
+        &IdentityExpectations::none(),
+        VerifyOptions::npm_attestation(),
+    )
+    .expect_err("a v0.1 bundle must carry a SET");
+    assert!(
+        matches!(error, VerifyError::RekorSetMissing),
+        "expected RekorSetMissing, got {error:?}"
+    );
 }
 
 #[test]

@@ -619,14 +619,20 @@ pub async fn sign_and_record_with_endpoints(
     // Step 4: Upload to Rekor
     let tlog_entry = rekor_upload(&endpoints.rekor, &dsse_envelope, &cert_pem).await?;
     // Rekor answers with the entry it logged. One that doesn't record this
-    // envelope and its signer would make a bundle no verifier accepts, on a
-    // version that can't be published again.
+    // envelope, its signer and its signature would make a bundle no verifier
+    // accepts, on a version that can't be published again.
     let leaf_der = cert_chain_der
         .first()
         .ok_or_else(|| LpmError::Registry("Fulcio returned no certificate".into()))?;
-    crate::sigstore_verify::verify_rekor_body(&tlog_entry, &dsse_envelope, leaf_der).map_err(
-        |e| LpmError::Registry(format!("Rekor logged another entry than LPM uploaded: {e}")),
-    )?;
+    crate::sigstore_verify::verify_rekor_body(
+        &tlog_entry,
+        &dsse_envelope,
+        leaf_der,
+        signature.to_der().as_bytes(),
+    )
+    .map_err(|e| {
+        LpmError::Registry(format!("Rekor logged another entry than LPM uploaded: {e}"))
+    })?;
 
     // Step 5: Build the bundle
     let verification_material = VerificationMaterial {
