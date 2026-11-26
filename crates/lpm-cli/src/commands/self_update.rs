@@ -1834,7 +1834,7 @@ const BUNDLE_MAX_BYTES: usize = 1024 * 1024;
 /// guard only trips on a hostile server streaming junk.
 const ASSET_MAX_BYTES: usize = 256 * 1024 * 1024;
 
-/// Replay-window: bundle `integratedTime` must lie within
+/// Replay-window: the bundle's signing time must lie within
 /// `[published_at - PRE_WINDOW, published_at + POST_WINDOW]`. The
 /// 1-hour pre-window absorbs the GitHub Actions run minting the
 /// attestation before the Release object is finalized; the 24-hour
@@ -1852,7 +1852,7 @@ struct AttestationAudit {
     publisher: Option<String>,
     workflow_path: Option<String>,
     workflow_ref: Option<String>,
-    integrated_time: lpm_common::Timestamp,
+    signed_at: lpm_common::Timestamp,
     log_index: i64,
     log_id: String,
     leaf_cert_sha256: String,
@@ -2210,7 +2210,7 @@ struct VerifiedReleaseManifest {
     publisher: Option<String>,
     workflow_path: Option<String>,
     workflow_ref: Option<String>,
-    integrated_time: lpm_common::Timestamp,
+    signed_at: lpm_common::Timestamp,
     log_index: i64,
     log_id: String,
     leaf_cert_sha256: String,
@@ -2323,7 +2323,7 @@ fn check_release_manifest(
         publisher: snapshot.publisher,
         workflow_path: snapshot.workflow_path,
         workflow_ref: snapshot.workflow_ref,
-        integrated_time: signed_at_utc,
+        signed_at: signed_at_utc,
         log_index,
         log_id,
         leaf_cert_sha256,
@@ -2355,7 +2355,7 @@ fn verify_release_asset_digest(
         publisher: release.publisher.clone(),
         workflow_path: release.workflow_path.clone(),
         workflow_ref: release.workflow_ref.clone(),
-        integrated_time: release.integrated_time,
+        signed_at: release.signed_at,
         log_index: release.log_index,
         log_id: release.log_id.clone(),
         leaf_cert_sha256: release.leaf_cert_sha256.clone(),
@@ -2474,7 +2474,7 @@ fn probe_staged_macos_bundle(
 ///
 /// Every fetched byte is anchored to the Sigstore-signed `SHA256SUMS.txt`
 /// manifest: the bundle's identity must match `lpm-dev/rust-client`'s
-/// release workflow, its `integratedTime` must lie inside a sane window
+/// release workflow, its signing time must lie inside a sane window
 /// around the GitHub Release `published_at`, the manifest's own hash
 /// must match the bundle's in-toto subject digest, and the downloaded
 /// binary's hash must match the manifest line for this platform. Any
@@ -2604,7 +2604,7 @@ async fn run_standalone_update(
         publisher = assets.audit.publisher.as_deref().unwrap_or("<absent>"),
         workflow_path = assets.audit.workflow_path.as_deref().unwrap_or("<absent>"),
         workflow_ref = assets.audit.workflow_ref.as_deref().unwrap_or("<absent>"),
-        integrated_time = %assets.audit.integrated_time.to_plain_utc(),
+        signed_at = %assets.audit.signed_at.to_plain_utc(),
         log_index = assets.audit.log_index,
         log_id = %assets.audit.log_id,
         leaf_cert_sha256 = %assets.audit.leaf_cert_sha256,
@@ -2636,7 +2636,7 @@ fn audit_json(audit: &AttestationAudit) -> serde_json::Value {
         "publisher": audit.publisher,
         "workflow_path": audit.workflow_path,
         "workflow_ref": audit.workflow_ref,
-        "integrated_time": audit.integrated_time.to_rfc3339(),
+        "integrated_time": audit.signed_at.to_rfc3339(),
         "log_index": audit.log_index,
         "log_id": audit.log_id,
         "leaf_cert_sha256": audit.leaf_cert_sha256,
@@ -3625,10 +3625,10 @@ async fn verify_and_stage_for_standalone(
 
     if human_output {
         install_ui::done_untrusted(&format!(
-            "Verified Sigstore attestation for {} ({}, integratedTime {})",
+            "Verified Sigstore attestation for {} ({}, signed {})",
             binary_name,
             lpm_common::format_bytes(staged.byte_len as u64),
-            audit.integrated_time.to_plain_utc()
+            audit.signed_at.to_plain_utc()
         ));
     }
 
@@ -5299,7 +5299,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
             publisher: Some("github:lpm-dev/rust-client".to_string()),
             workflow_path: Some(".github/workflows/release.yml".to_string()),
             workflow_ref: Some("refs/tags/v1.2.3".to_string()),
-            integrated_time: lpm_common::Timestamp::parse_rfc3339("2026-05-19T12:34:56Z").unwrap(),
+            signed_at: lpm_common::Timestamp::parse_rfc3339("2026-05-19T12:34:56Z").unwrap(),
             log_index: 9876543210,
             log_id: "c0d23d6ad406973f9559f3ba2d1ca01f8.. (truncated)".to_string(),
             leaf_cert_sha256: "feedface".to_string(),

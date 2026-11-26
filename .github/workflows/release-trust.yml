@@ -9,6 +9,9 @@ name: Release trust
 #   revoked. Clients check the stapled ticket offline and can't see either.
 # - Sigstore still serves the trust root built into LPM, so releases ship
 #   Sigstore's current keys.
+# - A signature made through Sigstore's production Rekor v2 log, with an
+#   RFC 3161 timestamp, verifies in LPM, before npm, GitHub or LPM's own
+#   releases start signing that way.
 # - The latest stable updates itself to the newest nightly, so a signing or
 #   packaging change on main that installed updaters would refuse fails
 #   here before a stable release carries it. Until the first nightly after a
@@ -21,6 +24,8 @@ on:
       - 'crates/lpm-cli/src/sigstore_verify/**'
       - 'scripts/ci/previous-stable-update-gate.sh'
       - 'scripts/ci/semver-newer.py'
+      - 'scripts/ci/sigstore-rekor-v2-signing-config.py'
+      - 'scripts/ci/sigstore-signed-time.py'
       - 'scripts/ci/with-apple-service-retry.sh'
       - '.github/workflows/release-trust.yml'
   schedule:
@@ -90,10 +95,14 @@ jobs:
           exit "$failed"
 
   sigstore:
-    name: Sigstore serves the trust root built into LPM
+    name: Sigstore's live trust root and Rekor v2 log work with LPM
     if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
+      # Signs through Sigstore with this workflow's identity.
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -121,6 +130,52 @@ jobs:
             | tee "$RUNNER_TEMP/sigstore-live.log"
           # A renamed test would match nothing, and cargo passes an empty run.
           grep -q '^test result: ok. 1 passed' "$RUNNER_TEMP/sigstore-live.log"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: "v3.0.6"
+
+      - name: Sign through Sigstore's production Rekor v2 log
+        run: |
+          set -euo pipefail
+          signed="$RUNNER_TEMP/rekor-v2"
+          mkdir -p "$signed"
+          python3 -I scripts/ci/sigstore-rekor-v2-signing-config.py "$signed/signing-config.json"
+          printf 'release trust check %s %s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > "$signed/subject.txt"
+          printf '{"check":"rekor-v2"}\n' > "$signed/predicate.json"
+          cosign attest-blob --yes \
+            --signing-config "$signed/signing-config.json" \
+            --type https://cli.lpm.dev/release-trust/rekor-v2 \
+            --predicate "$signed/predicate.json" \
+            --bundle "$signed/bundle.sigstore.json" \
+            "$signed/subject.txt"
+          kind=$(jq -er '.verificationMaterial.tlogEntries[0].kindVersion | "\(.kind) \(.version)"' \
+            "$signed/bundle.sigstore.json")
+          if [ "$kind" != "hashedrekord 0.0.2" ]; then
+            echo "::error::Sigstore's signing config logged the signature as $kind, not to Rekor v2"
+            exit 1
+          fi
+
+      - name: Verify the Rekor v2 bundle with LPM
+        run: |
+          set -euo pipefail
+          signed="$RUNNER_TEMP/rekor-v2"
+          LPM_LIVE_REKOR_V2_BUNDLE="$signed/bundle.sigstore.json" \
+          LPM_LIVE_REKOR_V2_SUBJECT_SHA256=$(sha256sum "$signed/subject.txt" | cut -d' ' -f1) \
+            cargo test --locked -p lpm-cli --bin lpm-rs -- --ignored --exact \
+            sigstore_verify::tests::rekor_v2::a_bundle_signed_through_sigstores_live_rekor_v2_log_verifies \
+            | tee "$RUNNER_TEMP/rekor-v2-live.log"
+          grep -q '^test result: ok. 1 passed' "$RUNNER_TEMP/rekor-v2-live.log"
+
+      - name: Keep the Rekor v2 bundle
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rekor-v2-bundle
+          path: ${{ runner.temp }}/rekor-v2/
+          if-no-files-found: ignore
+          retention-days: 14
 
   previous-stable-updates-to-newest:
     name: Latest stable updates itself to the newest release (${{ matrix.runner }})

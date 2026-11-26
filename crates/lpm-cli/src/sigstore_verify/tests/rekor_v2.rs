@@ -700,6 +700,45 @@ fn an_ed25519_log_signs_under_the_name_its_key_id_commits_to() {
     log.trusted.log_id = vec![0; 32];
     let why = verify_checkpoint(&envelope, &log.trusted, LogStyle::RekorV2).unwrap_err();
     assert!(why.contains("no signature from the log"), "{why}");
+
+/// Run by the daily release trust check on a bundle it has just signed
+/// through Sigstore's production Rekor v2 log with its GitHub Actions
+/// identity. `LPM_LIVE_REKOR_V2_BUNDLE` names the bundle and
+/// `LPM_LIVE_REKOR_V2_SUBJECT_SHA256` the digest it attests.
+#[test]
+#[ignore = "needs a bundle signed through Sigstore's production Rekor v2 log"]
+fn a_bundle_signed_through_sigstores_live_rekor_v2_log_verifies() {
+    let path = std::env::var("LPM_LIVE_REKOR_V2_BUNDLE").expect("LPM_LIVE_REKOR_V2_BUNDLE");
+    let subject_sha256 = std::env::var("LPM_LIVE_REKOR_V2_SUBJECT_SHA256")
+        .expect("LPM_LIVE_REKOR_V2_SUBJECT_SHA256");
+    let bundle = std::fs::read(path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bundle).unwrap();
+    assert_eq!(
+        parsed["verificationMaterial"]["tlogEntries"][0]["kindVersion"],
+        serde_json::json!({"kind": "hashedrekord", "version": "0.0.2"}),
+        "the bundle is not a Rekor v2 entry"
+    );
+
+    let trust = TrustRoot::parse(super::super::trust_root::EMBEDDED_TRUST_ROOT_JSON).unwrap();
+    let identity = IdentityExpectations {
+        expected_issuer: Some("https://token.actions.githubusercontent.com".into()),
+        expected_san_uri_prefix: Some("https://github.com/lpm-dev/rust-client/".into()),
+        expected_workflow_path: Some(".github/workflows/release-trust.yml".into()),
+    };
+    let verified =
+        verify_sigstore_bundle_with(&bundle, &identity, VerifyOptions::strict(), &trust).unwrap();
+
+    let age = std::time::SystemTime::now()
+        .duration_since(verified.signed_at)
+        .expect("signed in the future");
+    assert!(
+        age < std::time::Duration::from_secs(3600),
+        "the timestamp is {age:?} old"
+    );
+    let (_, digest) =
+        super::super::extract_subject_digest_from_statement(&verified.statement, "sha256", true)
+            .unwrap();
+    assert_eq!(digest, subject_sha256);
 }
 
 #[test]

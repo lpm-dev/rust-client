@@ -141,31 +141,11 @@ serve="$work/serve"
 mkdir -p "$serve/download/$version" "$serve/release"
 cp -p "$release_dir"/* "$serve/download/$version/"
 
-# The updater checks that the release was published close to when Rekor
-# recorded its signature, and from the commit the signature names.
+# The updater checks that the release was published close to when it was
+# signed, and from the commit the signature names.
 if [ -z "$published_at" ]; then
-  published_at=$(python3 -I - "$release_dir/SHA256SUMS.txt.sigstore" <<'PY'
-import datetime, json, sys
-
-def find(value):
-    if isinstance(value, dict):
-        if "integratedTime" in value:
-            return value["integratedTime"]
-        values = value.values()
-    elif isinstance(value, list):
-        values = value
-    else:
-        return None
-    for item in values:
-        found = find(item)
-        if found is not None:
-            return found
-    return None
-
-integrated = int(find(json.load(open(sys.argv[1]))))
-print(datetime.datetime.fromtimestamp(integrated, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
-PY
-)
+  published_at=$(python3 -I "$repo_root/scripts/ci/sigstore-signed-time.py" \
+    "$release_dir/SHA256SUMS.txt.sigstore")
 fi
 printf '{"name":"@lpm-registry/cli","version":"%s"}\n' "$version" > "$serve/npm.json"
 printf '{"tag_name":"v%s","published_at":"%s","target_commitish":"%s"}\n' \
