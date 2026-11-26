@@ -2870,9 +2870,9 @@ fn verifies_valid_embedded_sct_against_pinned_ct_log_key() {
 
 #[test]
 fn an_sct_is_checked_under_the_ct_log_key_valid_at_its_own_time() {
-    // 1_700_000_000_000 ms is 2023-11-14T22:13:20Z. The key retired a few
-    // days later, before an artifact signed with the certificate might be
-    // timestamped; what matters is when the log signed the SCT.
+    // The key retired shortly after the log signed the SCT, before an
+    // artifact signed with the certificate might be timestamped; what
+    // matters is when the log signed the SCT.
     let (leaf_der, issuer_spki, mut ct_log_key) = leaf_with_sct_at(1_700_000_000_000);
     ct_log_key.valid_for = ValidityWindow {
         start: Timestamp::parse_rfc3339("2023-11-01T00:00:00Z").unwrap(),
@@ -2887,6 +2887,20 @@ fn an_sct_is_checked_under_the_ct_log_key_valid_at_its_own_time() {
     let refused = verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key))
         .unwrap_err();
     assert!(refused.is_missing_trust_material(), "{refused:?}");
+}
+
+#[test]
+fn an_sct_timestamp_past_what_the_clock_can_hold_is_refused_not_a_panic() {
+    // Windows' clock can't hold this time at all; elsewhere no key is valid
+    // then. Either way the SCT is refused and verification goes on.
+    let (leaf_der, issuer_spki, ct_log_key) = leaf_with_sct_at(u64::MAX);
+    let refused = verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key))
+        .unwrap_err();
+    assert!(
+        matches!(&refused, VerifyError::Sct(why) if why.contains("out of range"))
+            || refused.is_missing_trust_material(),
+        "{refused:?}"
+    );
 }
 
 /// A leaf whose embedded SCT a fresh CT log key signed at `timestamp_ms`,

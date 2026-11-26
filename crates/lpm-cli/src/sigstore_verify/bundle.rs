@@ -405,32 +405,40 @@ fn verify_rekor_v2_inclusion(
         check: "Rekor inclusion proof",
         detail,
     };
-    let log = if tlog_entry.log_id.key_id.is_empty() {
-        let proof = tlog_entry
-            .resolved_inclusion_proof()
-            .ok_or(VerifyError::InclusionProofMissing)?;
-        let envelope = extract_checkpoint_envelope(&proof.checkpoint)?;
-        trust
-            .rekor_keys
-            .iter()
-            .find(|log| names_log(&envelope, log))
-            .ok_or_else(|| missing("no Rekor log in the trust root signed its checkpoint".into()))?
-    } else {
+    if !tlog_entry.log_id.key_id.is_empty() {
         let log_id = decode_log_id(&tlog_entry.log_id.key_id)
             .map_err(|e| VerifyError::InclusionProof(e.to_string()))?;
-        trust.rekor_log(&log_id).ok_or_else(|| {
+        let log = trust.rekor_log(&log_id).ok_or_else(|| {
             missing(format!(
                 "no Rekor log for logId={}",
                 tlog_entry.log_id.key_id
             ))
-        })?
-    };
-    verify_rekor_v2_inclusion_proof(tlog_entry, log)?;
-    Ok(if tlog_entry.log_id.key_id.is_empty() {
-        BASE64.encode(&log.log_id)
-    } else {
-        tlog_entry.log_id.key_id.clone()
-    })
+        })?;
+        verify_rekor_v2_inclusion_proof(tlog_entry, log)?;
+        return Ok(tlog_entry.log_id.key_id.clone());
+    }
+
+    // A log in the trust root may also co-sign another log's checkpoints,
+    // so every log the checkpoint names is tried.
+    let proof = tlog_entry
+        .resolved_inclusion_proof()
+        .ok_or(VerifyError::InclusionProofMissing)?;
+    let envelope = extract_checkpoint_envelope(&proof.checkpoint)?;
+    let mut refused = None;
+    for log in trust
+        .rekor_keys
+        .iter()
+        .filter(|log| names_log(&envelope, log))
+    {
+        match verify_rekor_v2_inclusion_proof(tlog_entry, log) {
+            Ok(()) => return Ok(BASE64.encode(&log.log_id)),
+            Err(error) => {
+                refused.get_or_insert(error);
+            }
+        }
+    }
+    Err(refused
+        .unwrap_or_else(|| missing("no Rekor log in the trust root signed its checkpoint".into())))
 }
 
 /// Parsed bundle components, with the heavy DER + DSSE work done

@@ -113,7 +113,12 @@ pub fn verify_embedded_sct(
                 continue;
             }
         };
-        let sct_time = SystemTime::UNIX_EPOCH + Duration::from_millis(parsed.timestamp_ms);
+        let Some(sct_time) =
+            SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(parsed.timestamp_ms))
+        else {
+            last_err = Some(format!("sct[{i}]: its timestamp is out of range"));
+            continue;
+        };
         let Some(key) = ctlog_keys
             .iter()
             .find(|k| k.log_id == parsed.log_id && k.valid_for.contains(sct_time))

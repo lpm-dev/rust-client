@@ -639,3 +639,35 @@ fn an_ed25519_log_signs_under_the_name_its_key_id_commits_to() {
     let why = verify_checkpoint(&envelope, &log.trusted, LogStyle::RekorV2).unwrap_err();
     assert!(why.contains("no signature from the log"), "{why}");
 }
+
+#[test]
+fn a_rekor_v2_entry_without_a_log_id_is_matched_past_a_log_that_only_cosigned() {
+    // Another log in the trust root co-signed the checkpoint, and is listed
+    // first: its signature names it, but the checkpoint isn't its own.
+    let mut bundle = conformance_bundle(DSSE_CASE);
+    let entry = bundle["verificationMaterial"]["tlogEntries"][0]
+        .as_object_mut()
+        .unwrap();
+    entry.remove("logId");
+    let envelope = entry["inclusionProof"]["checkpoint"]["envelope"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (text, signatures) = envelope.split_once("\n\n").unwrap();
+    let text = format!("{text}\n");
+    let mut cosigner = test_log(4);
+    cosigner.trusted.base_url = "https://cosigner.test.example".into();
+    let cosigned = format!(
+        "{text}\n{}{signatures}",
+        cosigner.signature_line("cosigner.test.example", &text)
+    );
+    entry["inclusionProof"]["checkpoint"]["envelope"] = serde_json::json!(cosigned);
+
+    let mut trust = conformance_trust(DSSE_CASE);
+    trust.rekor_keys.insert(0, cosigner.trusted);
+    let verified = verify(&bundle, &trust, VerifyOptions::npm_attestation()).unwrap();
+    assert_eq!(
+        verified.log_id,
+        "09OnDKEw7/hpZiYVPoTRzRbglHk0sylsUovegnRUlJY="
+    );
+}
