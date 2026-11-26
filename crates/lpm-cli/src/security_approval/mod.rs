@@ -210,9 +210,9 @@ mod prelude {
         read_audit_log_tail, record_audit_event,
     };
     pub(super) use super::helpers::{
-        canonical_global_root, canonical_project_root, format_scope_list, format_unlock_duration,
-        is_automation, normalized_packages, normalized_scopes, project_dir_is_global_install,
-        scope_names, suggested_unlock_command,
+        ProjectRoot, canonical_global_root, canonical_project_root, format_scope_list,
+        format_unlock_duration, is_automation, normalized_packages, normalized_scopes,
+        project_dir_is_global_install, scope_names, suggested_unlock_command,
     };
     pub(super) use super::managed_policy::{load_managed_policy, managed_policy_error};
     pub(super) use super::native_auth::request_native_approval;

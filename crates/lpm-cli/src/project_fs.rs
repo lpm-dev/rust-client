@@ -112,6 +112,38 @@ pub(crate) fn project_relative_path(
     relative
 }
 
+/// A Windows verbatim path (`\\?\C:\work\app`) as people and shells write
+/// it (`C:\work\app`), when dropping the prefix keeps its meaning: a drive
+/// path with no `/`, no `.` or `..` component, and no component ending in a
+/// dot or space, which the plain form would rewrite.
+pub(crate) fn plain_drive_path(verbatim: &str) -> Option<&str> {
+    let rest = verbatim.strip_prefix(r"\\?\")?;
+    let path = match rest.as_bytes() {
+        [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic() => &rest[3..],
+        _ => return None,
+    };
+    let unchanged_by_win32 = !path.contains('/')
+        && path
+            .split('\\')
+            .filter(|part| !part.is_empty())
+            .all(|part| {
+                part != "."
+                    && part != ".."
+                    && !part.ends_with('.')
+                    && !part.ends_with(' ')
+                    && !reserved_device_name(part)
+            });
+    unchanged_by_win32.then_some(rest)
+}
+
+/// A name Win32 reads as a device rather than a file, with or without an
+/// extension or spaces before it.
+fn reserved_device_name(part: &str) -> bool {
+    crate::patch_fs::is_windows_reserved_component(
+        part.split('.').next().unwrap_or(part).trim_end(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +189,26 @@ mod tests {
             ),
             std::path::Path::new("/elsewhere")
         );
+    }
+
+    #[test]
+    fn a_verbatim_drive_path_loses_its_prefix_only_where_that_keeps_its_meaning() {
+        assert_eq!(plain_drive_path(r"\\?\C:\work\app"), Some(r"C:\work\app"));
+        assert_eq!(plain_drive_path(r"\\?\C:\"), Some(r"C:\"));
+        for verbatim in [
+            r"\\?\UNC\server\share\app",
+            r"\\?\C:\work\app.",
+            r"\\?\C:\work\..\app",
+            r"\\?\C:\work/app",
+            r"\\?\C",
+            r"\\?\C:\work\aux\app",
+            r"\\?\C:\work\com1.txt",
+            r"\\?\C:\work\CONIN$",
+            r"\\?\C:\work\conout$.log\app",
+            r"\\?\C:\work\con .txt",
+            r"C:\work\app",
+        ] {
+            assert_eq!(plain_drive_path(verbatim), None, "{verbatim}");
+        }
     }
 }

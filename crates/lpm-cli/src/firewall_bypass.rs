@@ -466,43 +466,11 @@ pub(crate) fn project_policy_root(dir: &Path) -> Result<std::path::PathBuf, LpmE
         .unwrap_or_else(|| package_root.to_path_buf());
     let root = std::fs::canonicalize(&root).unwrap_or(root);
     if cfg!(windows)
-        && let Some(plain) = root.to_str().and_then(plain_drive_path)
+        && let Some(plain) = root.to_str().and_then(crate::project_fs::plain_drive_path)
     {
         return Ok(std::path::PathBuf::from(plain));
     }
     Ok(root)
-}
-
-/// A Windows verbatim path (`\\?\C:\work\app`) as people and shells write
-/// it (`C:\work\app`), when dropping the prefix keeps its meaning: a drive
-/// path with no `/`, no `.` or `..` component, and no component ending in a
-/// dot or space, which the plain form would rewrite.
-fn plain_drive_path(verbatim: &str) -> Option<&str> {
-    let rest = verbatim.strip_prefix(r"\\?\")?;
-    let path = match rest.as_bytes() {
-        [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic() => &rest[3..],
-        _ => return None,
-    };
-    let unchanged_by_win32 = !path.contains('/')
-        && path
-            .split('\\')
-            .filter(|part| !part.is_empty())
-            .all(|part| {
-                part != "."
-                    && part != ".."
-                    && !part.ends_with('.')
-                    && !part.ends_with(' ')
-                    && !reserved_device_name(part)
-            });
-    unchanged_by_win32.then_some(rest)
-}
-
-/// A name Win32 reads as a device rather than a file, with or without an
-/// extension or spaces before it.
-fn reserved_device_name(part: &str) -> bool {
-    crate::patch_fs::is_windows_reserved_component(
-        part.split('.').next().unwrap_or(part).trim_end(),
-    )
 }
 
 /// [`project_policy_root`] as the text a project rule stores. A root that
@@ -1196,27 +1164,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_verbatim_drive_path_loses_its_prefix_only_where_that_keeps_its_meaning() {
-        assert_eq!(plain_drive_path(r"\\?\C:\work\app"), Some(r"C:\work\app"));
-        assert_eq!(plain_drive_path(r"\\?\C:\"), Some(r"C:\"));
-        for verbatim in [
-            r"\\?\UNC\server\share\app",
-            r"\\?\C:\work\app.",
-            r"\\?\C:\work\..\app",
-            r"\\?\C:\work/app",
-            r"\\?\C",
-            r"\\?\C:\work\aux\app",
-            r"\\?\C:\work\com1.txt",
-            r"\\?\C:\work\CONIN$",
-            r"\\?\C:\work\conout$.log\app",
-            r"\\?\C:\work\con .txt",
-            r"C:\work\app",
-        ] {
-            assert_eq!(plain_drive_path(verbatim), None, "{verbatim}");
-        }
-    }
-
     #[cfg(windows)]
     #[test]
     fn project_policy_root_drops_the_verbatim_prefix_on_windows() {
@@ -1260,7 +1207,7 @@ mod tests {
         let canonical = std::fs::canonicalize(temp.path()).unwrap();
         let expected = canonical
             .to_str()
-            .and_then(plain_drive_path)
+            .and_then(crate::project_fs::plain_drive_path)
             .map_or_else(|| canonical.clone(), std::path::PathBuf::from);
 
         assert_eq!(project_policy_root(&member).unwrap(), expected);

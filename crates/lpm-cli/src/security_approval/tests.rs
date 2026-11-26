@@ -3504,3 +3504,104 @@ fn the_add_preview_keeps_what_installs_may_run_where_the_approved_firewall_is_of
         );
     });
 }
+
+const VERBATIM_WINDOWS_ROOT: &str = r"\\?\C:\work\app";
+
+#[test]
+fn a_windows_project_root_is_written_without_the_verbatim_prefix_and_names_both_forms() {
+    let root = ProjectRoot::from_resolved(VERBATIM_WINDOWS_ROOT.to_owned(), true);
+
+    assert_eq!(root.as_str(), r"C:\work\app");
+    assert!(root.names(r"C:\work\app"));
+    assert!(root.names(VERBATIM_WINDOWS_ROOT));
+    assert!(!root.names(r"C:\work\other"));
+    assert!(!root.names(r"\\?\C:\work\other"));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_project_root_on_windows_names_a_real_directory_as_a_plain_drive_path() {
+    let temp = tempdir().unwrap();
+
+    let root = ProjectRoot::of(temp.path());
+
+    assert!(!root.as_str().starts_with(r"\\?\"), "{}", root.as_str());
+    assert!(
+        root.verbatim()
+            .is_some_and(|verbatim| verbatim.starts_with(r"\\?\")),
+        "{root:?}"
+    );
+}
+
+#[test]
+fn a_project_root_keeps_its_verbatim_form_where_the_plain_one_would_mean_another_path() {
+    for verbatim in [r"\\?\UNC\server\share\app", r"\\?\C:\work\con\app"] {
+        let root = ProjectRoot::from_resolved(verbatim.to_owned(), true);
+        assert_eq!(root.as_str(), verbatim);
+        assert_eq!(root.verbatim(), None, "{verbatim}");
+    }
+    let elsewhere = ProjectRoot::from_resolved(VERBATIM_WINDOWS_ROOT.to_owned(), false);
+    assert_eq!(elsewhere.as_str(), VERBATIM_WINDOWS_ROOT);
+}
+
+#[test]
+fn a_project_approval_saved_under_the_verbatim_root_still_counts_and_moves_on_the_next_save() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        // How a version that kept the prefix saved the approval on Windows.
+        let saved_with_prefix = ProjectRoot::from_resolved(VERBATIM_WINDOWS_ROOT.to_owned(), false);
+        let approved = ApprovedProjectPolicyState {
+            schema_version: APPROVED_PROJECT_STATE_SCHEMA_VERSION,
+            updated_at: Timestamp::now(),
+            project_root: VERBATIM_WINDOWS_ROOT.to_owned(),
+            trusted_dependencies: BTreeMap::new(),
+            trusted_scopes: vec!["@acme".to_owned()],
+            capability_request_hash: None,
+        };
+        super::project_state::persist_project_policy_state_at(&saved_with_prefix, &approved)
+            .unwrap();
+        let root = ProjectRoot::from_resolved(VERBATIM_WINDOWS_ROOT.to_owned(), true);
+
+        let loaded = super::project_state::load_approved_project_policy_state_at(&root).unwrap();
+        assert_eq!(loaded.trusted_scopes, ["@acme"]);
+
+        super::project_state::persist_project_policy_state_at(&root, &loaded).unwrap();
+        let plain = ProjectRoot::from_resolved(r"C:\work\app".to_owned(), false);
+        let moved = super::project_state::load_approved_project_policy_state_at(&plain).unwrap();
+        assert_eq!(moved.project_root, r"C:\work\app");
+        assert_eq!(moved.trusted_scopes, ["@acme"]);
+        let left_behind =
+            super::project_state::load_approved_project_policy_state_at(&saved_with_prefix)
+                .unwrap();
+        assert!(left_behind.trusted_scopes.is_empty(), "{left_behind:?}");
+        assert_eq!(
+            std::fs::read_dir(super::paths::approved_projects_dir().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+    });
+}
+
+#[test]
+fn a_project_unlock_granted_under_the_verbatim_root_still_applies_to_the_project() {
+    let mut grant = super::unlocks::create_unlock_grant_for_scopes(
+        &[ApprovalScope::TrustBulkApprove],
+        Path::new("/work/app"),
+        60,
+        None,
+        &[],
+    );
+    let root = ProjectRoot::from_resolved(VERBATIM_WINDOWS_ROOT.to_owned(), true);
+    let other = ProjectRoot::from_resolved(r"\\?\C:\work\other".to_owned(), true);
+
+    grant.project_root = Some(VERBATIM_WINDOWS_ROOT.to_owned());
+    assert!(super::unlocks::project_grant_names(&grant, &root));
+    assert!(!super::unlocks::project_grant_names(&grant, &other));
+
+    grant.project_root = Some(r"C:\work\app".to_owned());
+    assert!(super::unlocks::project_grant_names(&grant, &root));
+
+    grant.project_root = None;
+    assert!(!super::unlocks::project_grant_names(&grant, &root));
+}
