@@ -1680,3 +1680,57 @@ fn a_pinned_signing_certificate_with_an_unhandled_critical_extension_is_refused(
     };
     assert!(why.contains("critical extension"), "{why}");
 }
+
+#[test]
+fn a_rekor_v1_bundle_without_a_set_needs_no_integrated_time() {
+    // Without a SET nothing signs `integratedTime`, so the bundle may leave
+    // it out, and its value picks neither the time nor the log's key.
+    let case = "intoto-with-custom-trust-root";
+    let trust = TrustRoot::parse(&conformance_file(case, "trusted_root.json")).unwrap();
+    let mut bundle: serde_json::Value =
+        serde_json::from_slice(&conformance_file(case, "bundle.sigstore.json")).unwrap();
+    let entry = bundle["verificationMaterial"]["tlogEntries"][0]
+        .as_object_mut()
+        .unwrap();
+    entry.remove("inclusionPromise");
+    entry.remove("integratedTime");
+    let verified = verify_sigstore_bundle_with(
+        &serde_json::to_vec(&bundle).unwrap(),
+        &IdentityExpectations::none(),
+        VerifyOptions::npm_attestation(),
+        &trust,
+    )
+    .unwrap();
+    assert_eq!(rfc3339(verified.signed_at), "2023-02-01T00:00:00Z");
+}
+
+#[test]
+fn a_bundle_whose_envelope_carries_a_second_signature_is_refused() {
+    // A timestamp, a Rekor v2 entry and Sigstore's verifiers all name one
+    // signature. With a second, a timestamp over arbitrary bytes in the
+    // first slot could date a signature it never saw.
+    let case = "intoto-with-custom-trust-root";
+    let trust = TrustRoot::parse(&conformance_file(case, "trusted_root.json")).unwrap();
+    let mut bundle: serde_json::Value =
+        serde_json::from_slice(&conformance_file(case, "bundle.sigstore.json")).unwrap();
+    let signatures = bundle["dsseEnvelope"]["signatures"].as_array_mut().unwrap();
+    let copy = signatures[0].clone();
+    signatures.insert(
+        0,
+        serde_json::json!({"sig": BASE64.encode(b"timestamped bytes")}),
+    );
+    signatures.push(copy);
+    for options in [VerifyOptions::npm_attestation(), VerifyOptions::strict()] {
+        let refused = verify_sigstore_bundle_with(
+            &serde_json::to_vec(&bundle).unwrap(),
+            &IdentityExpectations::none(),
+            options,
+            &trust,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&refused, VerifyError::DsseSignature(why) if why.contains("exactly one")),
+            "{refused:?}"
+        );
+    }
+}

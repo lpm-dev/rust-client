@@ -129,33 +129,6 @@ fn verifies_when_at_least_one_of_multiple_signatures_matches() {
         .expect("verifier must accept the envelope when one signature verifies");
 }
 
-#[test]
-fn the_signature_a_bundle_logs_must_itself_verify() {
-    // `verify_dsse` accepts an envelope one of whose signatures verifies;
-    // the one a Rekor v2 entry logs and a timestamp covers must be valid
-    // on its own.
-    let (cert_der, signing_key) = p256_cert_and_signing_key();
-    let mut envelope = dsse_envelope_signed_with(&signing_key, PAYLOAD);
-    let garbage = [7u8; 64];
-    envelope.signatures.insert(
-        0,
-        DsseSignature {
-            keyid: String::new(),
-            sig: BASE64.encode(garbage),
-        },
-    );
-    let (_, cert) = X509Certificate::from_der(&cert_der).unwrap();
-    verify_dsse(&envelope, &cert).unwrap();
-
-    let valid = BASE64.decode(&envelope.signatures[1].sig).unwrap();
-    dsse::verify_dsse_signature(&envelope, &cert, &valid).unwrap();
-    let refused = dsse::verify_dsse_signature(&envelope, &cert, &garbage).unwrap_err();
-    assert!(
-        matches!(&refused, VerifyError::DsseSignature(why) if why.contains("did not verify")),
-        "{refused:?}"
-    );
-}
-
 // ── verify_dsse() failure cases ───────────────────────────────
 
 #[test]

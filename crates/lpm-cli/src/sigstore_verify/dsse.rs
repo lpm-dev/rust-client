@@ -36,10 +36,8 @@ pub(crate) fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
 /// each signature covers `PAE(payload_type, decoded_payload)` where
 /// `decoded_payload` is the base64-decoded `envelope.payload` bytes.
 /// Verification succeeds when at least one signature in the envelope
-/// verifies against the leaf cert's SPKI; envelopes carrying multiple
-/// signatures are common when several signers attest to the same
-/// statement, and any one valid signature attests the leaf cert's
-/// key signed this exact PAE.
+/// verifies against the leaf cert's SPKI. The composed bundle verifier
+/// first requires a Sigstore bundle's envelope to carry exactly one.
 ///
 /// Sigstore's profile fixes the signing algorithm at ECDSA P-256;
 /// the leaf cert's SPKI must encode an `ecPublicKey` with the P-256
@@ -92,31 +90,6 @@ pub fn verify_dsse(envelope: &DsseEnvelope, cert: &X509Certificate<'_>) -> Resul
             if parse_errors.len() == 1 { "y" } else { "ies" },
             parse_errors.join("; ")
         )))
-    }
-}
-
-/// Verify one particular signature from the envelope, as an RFC 3161
-/// timestamp or a Rekor v2 entry names it, against the leaf cert's key.
-pub(super) fn verify_dsse_signature(
-    envelope: &DsseEnvelope,
-    cert: &X509Certificate<'_>,
-    signature: &[u8],
-) -> Result<(), VerifyError> {
-    let verifying_key = extract_p256_verifying_key(cert)?;
-    let raw_payload = BASE64
-        .decode(envelope.payload.as_bytes())
-        .map_err(|e| VerifyError::DsseSignature(format!("payload not valid base64: {e}")))?;
-    let pae_bytes = pae(&envelope.payload_type, &raw_payload);
-    match signature_verifies(&verifying_key, &pae_bytes, signature) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(VerifyError::DsseSignature(
-            "the envelope's first signature, which the bundle logs and timestamps, did not \
-             verify against the leaf cert's signing key"
-                .into(),
-        )),
-        Err(parse_error) => Err(VerifyError::DsseSignature(format!(
-            "the envelope's first signature did not parse: {parse_error}"
-        ))),
     }
 }
 
