@@ -384,21 +384,46 @@ pub fn reject_looser_firewall_policy_write(
         .stricter(effective.posture.firewall_mode());
     let local = crate::security_approval::load_authorized_posture()?;
     let local_profile = local.firewall_policy_profile();
+    let mut floors = vec![
+        PolicyFloor {
+            mode: installs_mode,
+            profile: &enforced,
+            source: PolicyFloorSource::Enforced,
+        },
+        PolicyFloor {
+            mode: local.firewall_mode(),
+            profile: &local_profile,
+            source: PolicyFloorSource::ApprovedPosture,
+        },
+    ];
+    // The save's managed check refuses what this floor names, so the advice
+    // is one that check also accepts: a managed profile binds at the
+    // `enforce` the save sets, and a managed mode alone at its own mode.
+    let policies_managed = matches!(
+        effective.sources.firewall_policies,
+        crate::security_approval::PostureSourceKind::ManagedPolicy
+    );
+    let managed_profile = effective.posture.firewall_policy_profile();
+    if policies_managed
+        || matches!(
+            effective.sources.firewall_mode,
+            crate::security_approval::PostureSourceKind::ManagedPolicy
+        )
+    {
+        floors.push(PolicyFloor {
+            mode: if policies_managed {
+                crate::npm_firewall_config::NpmFirewallMode::Enforce
+            } else {
+                effective.posture.firewall_mode()
+            },
+            profile: &managed_profile,
+            source: PolicyFloorSource::ManagedPolicy,
+        });
+    }
     reject_policy_below_floors(
         crate::npm_firewall_config::NpmFirewallMode::Enforce,
         requested,
-        &[
-            PolicyFloor {
-                mode: installs_mode,
-                profile: &enforced,
-                source: PolicyFloorSource::Enforced,
-            },
-            PolicyFloor {
-                mode: local.firewall_mode(),
-                profile: &local_profile,
-                source: PolicyFloorSource::ApprovedPosture,
-            },
-        ],
+        &floors,
     )
 }
 
@@ -450,6 +475,8 @@ enum PolicyFloorSource {
     Enforced,
     /// The local approved posture a save rewrites.
     ApprovedPosture,
+    /// The managed security policy, which a save may not loosen.
+    ManagedPolicy,
 }
 
 impl PolicyFloorSource {
@@ -457,6 +484,7 @@ impl PolicyFloorSource {
         match self {
             Self::Enforced => "LPM CLI enforces",
             Self::ApprovedPosture => "your approved posture holds",
+            Self::ManagedPolicy => "the managed security policy holds",
         }
     }
 }

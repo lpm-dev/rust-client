@@ -2356,6 +2356,42 @@ fn forced_floor_names_one_action_that_passes_every_floor_an_editor_save_meets() 
 }
 
 #[test]
+fn forced_floor_advice_includes_what_a_managed_profile_holds_at_the_saved_mode() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_managed_policy(
+            temp.path(),
+            "[firewall]\nmode = \"monitor\"\n\n[firewall.npm.policies]\nlpm_ai_telemetry = \"block\"\n",
+        );
+        let config = forced_floor_config("monitor");
+
+        for requested_action in [
+            lpm_registry::client::NpmFirewallPolicyAction::Allow,
+            lpm_registry::client::NpmFirewallPolicyAction::Warn,
+        ] {
+            let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+                lpm_ai_telemetry: requested_action,
+                ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+            };
+
+            let message =
+                crate::security_floor::reject_looser_firewall_policy_write(&config, &requested)
+                    .unwrap_err()
+                    .to_string();
+
+            assert!(
+                message.contains("would loosen the `block` the managed security policy holds"),
+                "{message}"
+            );
+            assert!(
+                message.contains("Keep it at `block` or stricter"),
+                "{message}"
+            );
+        }
+    });
+}
+
+#[test]
 fn forced_floor_refuses_an_editor_save_that_would_sign_a_group_left_loose_by_hand() {
     let temp = tempdir().unwrap();
     with_test_env(temp.path(), || {
