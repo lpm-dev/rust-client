@@ -1256,10 +1256,14 @@ mod tests {
         std::fs::create_dir_all(&member).unwrap();
         std::fs::write(member.join("package.json"), r#"{"name":"app"}"#).unwrap();
 
-        assert_eq!(
-            project_policy_root(&member).unwrap(),
-            std::fs::canonicalize(temp.path()).unwrap()
-        );
+        // Windows canonical paths carry `\\?\`, which a plain drive root drops.
+        let canonical = std::fs::canonicalize(temp.path()).unwrap();
+        let expected = canonical
+            .to_str()
+            .and_then(plain_drive_path)
+            .map_or_else(|| canonical.clone(), std::path::PathBuf::from);
+
+        assert_eq!(project_policy_root(&member).unwrap(), expected);
     }
 
     fn local_rule(raw: &str, scope: FirewallBypassScope, root: Option<&str>) -> FirewallBypassRule {

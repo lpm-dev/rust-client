@@ -1932,6 +1932,35 @@ mod tests {
     }
 
     #[test]
+    fn a_removal_record_counts_its_rules_in_words() {
+        let temp = tempfile::tempdir().unwrap();
+        security_approval::test_support::with_test_env(temp.path(), || {
+            let specs = specs(&["one@1.0.0", "two@1.0.0", "three@1.0.0"]);
+            save(&[
+                rule(&specs[0], None),
+                rule(&specs[1], None),
+                rule(&specs[2], None),
+            ]);
+
+            security_approval::remove_firewall_bypass_rules(
+                |rule| rule.spec == "one@1.0.0",
+                "firewall-bypass-removed",
+            )
+            .unwrap();
+            security_approval::remove_firewall_bypass_rules(|_| true, "firewall-bypass-removed")
+                .unwrap();
+
+            assert_eq!(
+                security_approval::test_support::audit_details("firewall-bypass-removed"),
+                [
+                    Some("removed 1 LPM Firewall bypass rule".to_string()),
+                    Some("removed 2 LPM Firewall bypass rules".to_string()),
+                ]
+            );
+        });
+    }
+
+    #[test]
     fn add_records_a_refusal_for_a_setup_error_once_its_specs_are_known() {
         let temp = tempfile::tempdir().unwrap();
         security_approval::test_support::with_test_env(temp.path(), || {

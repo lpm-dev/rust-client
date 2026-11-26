@@ -604,7 +604,11 @@ pub(crate) fn remove_firewall_bypass_rules(
             event,
             true,
             &removed,
-            &format!("removed {} LPM Firewall bypass rules", removed.len()),
+            &format!(
+                "removed {} LPM Firewall bypass {}",
+                removed.len(),
+                if removed.len() == 1 { "rule" } else { "rules" }
+            ),
         );
     }
     Ok((removed, rules_total))
