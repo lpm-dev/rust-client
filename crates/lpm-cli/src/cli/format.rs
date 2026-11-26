@@ -236,10 +236,13 @@ pub(crate) fn print_json_clap_error(error: &clap::Error, help_hint: Option<&str>
 }
 
 fn print_json_error(error: &lpm_common::LpmError) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json_error_value(error)).unwrap()
-    );
+    let mut json = json_error_value(error);
+    // A command can fail after an install let a blocked version through, as
+    // when `lpm migrate` verification fails, and the version stays installed.
+    if let Some(security) = crate::commands::install::process_firewall_bypasses_security_json() {
+        json["security"] = security;
+    }
+    println!("{}", serde_json::to_string_pretty(&json).unwrap());
 }
 
 /// The shared JSON error envelope for `error`, as the CLI prints it.

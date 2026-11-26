@@ -1544,24 +1544,20 @@ async fn migrate_json_reports_the_version_a_bypass_rule_let_through() {
 }
 
 #[tokio::test]
-async fn workspace_migrate_json_reports_the_version_a_bypass_rule_let_through() {
+async fn a_command_that_fails_after_its_install_still_reports_what_a_rule_let_through() {
     let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
-    let project =
-        TempProject::empty(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#);
-    project.write_file(
-        "packages/app/package.json",
-        r#"{"name":"app","version":"1.0.0","dependencies":{"agent-tool":"1.0.0"}}"#,
+    let project = TempProject::empty(
+        r#"{"name":"consumer","version":"1.0.0","scripts":{"test":"exit 1"},"dependencies":{"agent-tool":"1.0.0"}}"#,
     );
     project.write_file(
         "package-lock.json",
         &serde_json::json!({
-            "name": "root",
+            "name": "consumer",
+            "version": "1.0.0",
             "lockfileVersion": 3,
             "requires": true,
             "packages": {
-                "": { "name": "root", "workspaces": ["packages/*"] },
-                "node_modules/app": { "resolved": "packages/app", "link": true },
-                "packages/app": { "name": "app", "version": "1.0.0", "dependencies": { "agent-tool": "1.0.0" } },
+                "": { "name": "consumer", "version": "1.0.0", "dependencies": { "agent-tool": "1.0.0" } },
                 "node_modules/agent-tool": {
                     "version": "1.0.0",
                     "resolved": "https://registry.npmjs.org/agent-tool/-/agent-tool-1.0.0.tgz",
@@ -1575,6 +1571,87 @@ async fn workspace_migrate_json_reports_the_version_a_bypass_rule_let_through() 
     write_signed_firewall_bypass(
         &project,
         &[stored_rule("agent-tool", serde_json::json!({}))],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "migrate", "--no-ci", "--no-npmrc"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(project.file_exists("node_modules/agent-tool/package.json"));
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "{error}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    assert_eq!(envelope["success"], false, "{envelope:#}");
+    let firewall = &envelope["security"]["firewall"];
+    assert_eq!(firewall["mode"], "enforce", "{envelope:#}");
+    assert_eq!(
+        firewall["bypassed"][0]["name"], "agent-tool",
+        "{envelope:#}"
+    );
+}
+
+#[tokio::test]
+async fn workspace_migrate_json_reports_the_version_a_bypass_rule_let_through() {
+    let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
+    mock.with_package("lib-tool", "1.0.0", &make_tarball("lib-tool", "1.0.0"))
+        .await;
+    mount_block_verdict(
+        &mock,
+        "lib-tool",
+        "suspicious",
+        "lpm_ai_agent_control_surface",
+    )
+    .await;
+    let project =
+        TempProject::empty(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#);
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"app","version":"1.0.0","dependencies":{"agent-tool":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "packages/lib/package.json",
+        r#"{"name":"lib","version":"1.0.0","dependencies":{"lib-tool":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "package-lock.json",
+        &serde_json::json!({
+            "name": "root",
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": {
+                "": { "name": "root", "workspaces": ["packages/*"] },
+                "node_modules/app": { "resolved": "packages/app", "link": true },
+                "packages/app": { "name": "app", "version": "1.0.0", "dependencies": { "agent-tool": "1.0.0" } },
+                "node_modules/lib": { "resolved": "packages/lib", "link": true },
+                "packages/lib": { "name": "lib", "version": "1.0.0", "dependencies": { "lib-tool": "1.0.0" } },
+                "node_modules/lib-tool": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/lib-tool/-/lib-tool-1.0.0.tgz",
+                    "integrity": compute_integrity(&make_tarball("lib-tool", "1.0.0")),
+                },
+                "node_modules/agent-tool": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/agent-tool/-/agent-tool-1.0.0.tgz",
+                    "integrity": compute_integrity(&make_tarball("agent-tool", "1.0.0")),
+                },
+            },
+        })
+        .to_string(),
+    );
+    write_npm_firewall_global_config(&project, "enforce");
+    write_signed_firewall_bypass(
+        &project,
+        &[
+            stored_rule("agent-tool", serde_json::json!({})),
+            stored_rule("lib-tool", serde_json::json!({ "id": "fwb_lib" })),
+        ],
     );
 
     let output = lpm_with_registry(&project, &mock.url())
@@ -1597,15 +1674,14 @@ async fn workspace_migrate_json_reports_the_version_a_bypass_rule_let_through() 
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let firewall = &envelope["security"]["firewall"];
     assert_eq!(firewall["mode"], "enforce", "{envelope:#}");
-    assert_eq!(
-        firewall["bypassed"].as_array().map(Vec::len),
-        Some(1),
-        "{envelope:#}"
-    );
-    assert_eq!(
-        firewall["bypassed"][0]["name"], "agent-tool",
-        "{envelope:#}"
-    );
+    let mut names: Vec<&str> = firewall["bypassed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["name"].as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["agent-tool", "lib-tool"], "{envelope:#}");
 }
 
 #[tokio::test]

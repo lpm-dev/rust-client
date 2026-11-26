@@ -1116,7 +1116,12 @@ async fn run_locked(
         }
         if emit_output {
             swift_traversal.preview.ensure_unchanged()?;
-            display::print_dry_run(&mut swift_traversal.preview.packages, json_output)?;
+            display::print_dry_run(
+                &mut swift_traversal.preview.packages,
+                json_output,
+                firewall_json,
+                firewall_bypass_report.take().security_json(),
+            )?;
         }
         return Ok(());
     }

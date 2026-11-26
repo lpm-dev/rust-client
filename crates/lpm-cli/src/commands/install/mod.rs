@@ -472,6 +472,25 @@ pub(crate) struct FirewallBypassReport {
     record: std::sync::Mutex<FirewallBypassRecord>,
 }
 
+/// Every version bypass rules let through in this process, which a command
+/// that fails after an install adds to its JSON error.
+static PROCESS_FIREWALL_BYPASSES: FirewallBypassReport = FirewallBypassReport {
+    record: std::sync::Mutex::new(FirewallBypassRecord {
+        mode: None,
+        bypassed: Vec::new(),
+    }),
+};
+
+/// The `security` object a JSON error carries when an install in this
+/// process let a version past a block through a bypass rule.
+pub(crate) fn process_firewall_bypasses_security_json() -> Option<serde_json::Value> {
+    PROCESS_FIREWALL_BYPASSES
+        .record
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .security_json()
+}
+
 impl FirewallBypassReport {
     fn record(&self, stats: &NpmFirewallPreflightStats) {
         if stats.bypassed.is_empty() {

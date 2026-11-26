@@ -385,7 +385,12 @@ async fn run_fix_inner(
                     match crate::commands::install::run_silent_for_audit_fix(client, project_dir)
                         .await
                     {
-                        Ok(firewall_bypassed) => firewall_bypassed,
+                        Ok(firewall_bypassed) => {
+                            if !json_output {
+                                firewall_bypassed.print();
+                            }
+                            firewall_bypassed
+                        }
                         Err(error) => {
                             if !json_output {
                                 install_ui::warn("install failed — restored original package.json");
@@ -1292,7 +1297,6 @@ fn emit_audit_fix_report(
         return;
     }
 
-    firewall_bypassed.print();
     if fixes.is_empty() {
         if skipped.is_empty() {
             install_ui::done("No OSV vulnerabilities found in direct dependencies");

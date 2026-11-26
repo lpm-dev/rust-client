@@ -6,12 +6,16 @@ use std::path::Path;
 pub(super) fn print_dry_run(
     packages: &mut Vec<super::preview::PackagePreview>,
     json_output: bool,
+    firewall: Option<serde_json::Value>,
+    security: Option<serde_json::Value>,
 ) -> Result<(), LpmError> {
     let mut previews = std::mem::take(packages).into_iter();
     let Some(mut root) = previews.next() else {
         return Ok(());
     };
     root.source_dependencies.extend(previews);
+    root.firewall = firewall;
+    root.security = security;
     if json_output {
         let stdout = std::io::stdout();
         let mut stdout = stdout.lock();

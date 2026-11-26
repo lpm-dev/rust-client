@@ -1887,6 +1887,15 @@ pub(super) fn finish_npm_firewall_preflight(
     result: NpmFirewallPreflightResult,
     json_output: bool,
 ) -> Result<NpmFirewallPreflightStats, LpmError> {
+    let stats = report_npm_firewall_preflight(result, json_output)?;
+    super::PROCESS_FIREWALL_BYPASSES.record(&stats);
+    Ok(stats)
+}
+
+fn report_npm_firewall_preflight(
+    result: NpmFirewallPreflightResult,
+    json_output: bool,
+) -> Result<NpmFirewallPreflightStats, LpmError> {
     let mut stats = result.stats;
     let mut seen_bypassed = HashSet::with_capacity(stats.bypassed.len());
     stats.bypassed.retain(|bypassed| {

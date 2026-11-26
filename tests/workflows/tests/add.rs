@@ -6037,6 +6037,67 @@ async fn lpm_add_json_lists_a_source_package_a_bypass_rule_let_through_with_the_
 }
 
 #[tokio::test]
+async fn lpm_add_dry_run_json_reports_a_source_package_a_bypass_rule_let_through() {
+    let mock = MockRegistry::start().await;
+    let source_tarball = make_tarball_from_pkg_json(
+        json!({ "name": "bypassed-preview", "version": "1.0.0" }),
+        &[],
+    );
+    mock.with_package("bypassed-preview", "1.0.0", &source_tarball)
+        .await;
+    mock.with_npm_firewall_block("bypassed-preview", "1.0.0")
+        .await;
+    let project =
+        TempProject::empty(r#"{"name":"add-firewall","version":"1.0.0","dependencies":{}}"#);
+    write_lpm_proxy_npmrc(&project, &mock.url());
+    write_npm_firewall_global_config(&project, "enforce");
+    support::write_signed_firewall_bypass(
+        &project,
+        &[json!({
+            "id": "fwb_preview",
+            "spec": "bypassed-preview@1.0.0",
+            "scope": "global",
+            "covers_malware": true,
+            "added_at": "2026-11-25T10:00:00Z",
+        })],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            "bypassed-preview",
+            "--yes",
+            "--json",
+            "--dry-run",
+            "--path",
+            "components",
+            "--no-skills",
+        ])
+        .output()
+        .expect("failed to run lpm add --dry-run");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let preview: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        preview["firewall"]["bypassed"][0]["name"], "bypassed-preview",
+        "{preview:#}"
+    );
+    assert_eq!(
+        preview["security"]["firewall"]["bypassed"][0]["rule"]["spec"], "bypassed-preview@1.0.0",
+        "{preview:#}"
+    );
+    assert!(
+        !project.file_exists("components"),
+        "a dry run writes nothing"
+    );
+}
+
+#[tokio::test]
 async fn lpm_add_json_reports_a_bypass_rule_a_swift_source_dependency_install_used() {
     let mock = MockRegistry::start().await;
     let root = "@lpm.dev/swift.bypass-root";
