@@ -598,6 +598,18 @@ impl AddRefusal {
             settings_unreadable: true,
         }
     }
+
+    /// What the audit log keeps of the refusal.
+    fn audit_detail(&self) -> String {
+        if self.settings_unreadable {
+            format!(
+                "LPM CLI couldn't read the settings `add` checks ({})",
+                self.error.error_code()
+            )
+        } else {
+            self.error.to_string()
+        }
+    }
 }
 
 impl From<LpmError> for AddRefusal {
@@ -615,18 +627,10 @@ fn refuse_add(
     project_root: Option<&str>,
     refusal: AddRefusal,
 ) -> LpmError {
-    let detail = if refusal.settings_unreadable {
-        format!(
-            "LPM CLI couldn't read the settings `add` checks ({})",
-            refusal.error.error_code()
-        )
-    } else {
-        refusal.error.to_string()
-    };
     security_approval::record_firewall_bypass_refusal(
         specs.iter().map(ToString::to_string).collect(),
         project_root,
-        &detail,
+        &refusal.audit_detail(),
     );
     refusal.error
 }
@@ -789,19 +793,20 @@ async fn approve_and_save(
     // One record for a request that saved nothing, whatever ended it: a
     // decline, a refusal, a store error, an expired `--ttl` or rules that
     // kept changing, with what the person approved before it.
-    if let Err(error) = &saved {
+    saved.map_err(|refusal| {
+        let detail = refusal.audit_detail();
         let detail = if approved_prompts.is_empty() {
-            error.to_string()
+            detail
         } else {
-            format!("{error}; approved: {}", approved_prompts.join("; "))
+            format!("{detail}; approved: {}", approved_prompts.join("; "))
         };
         security_approval::record_firewall_bypass_refusal(
             plan.specs.iter().map(ToString::to_string).collect(),
             plan.scope.project_root.as_deref(),
             &detail,
         );
-    }
-    saved
+        refusal.error
+    })
 }
 
 async fn approve_and_save_attempts(
@@ -810,7 +815,7 @@ async fn approve_and_save_attempts(
     sorted: security_approval::FirewallBypassRequests,
     approve: &mut impl FnMut(&security_approval::FirewallBypassApproval<'_>) -> Result<(), LpmError>,
     approved_prompts: &mut Vec<String>,
-) -> Result<security_approval::FirewallBypassAdded, LpmError> {
+) -> Result<security_approval::FirewallBypassAdded, AddRefusal> {
     let mut pending = sorted.needs_approval;
     let mut narrowing = sorted.narrowed;
     let mut unchanged = sorted.unchanged;
@@ -836,7 +841,8 @@ async fn approve_and_save_attempts(
                 let profile = match preview_profile {
                     Some(profile) => profile,
                     None => *preview_profile.insert(
-                        crate::npm_firewall_config::enforced_policy_profile(global, effective)?,
+                        crate::npm_firewall_config::enforced_policy_profile(global, effective)
+                            .map_err(AddRefusal::settings_unreadable)?,
                     ),
                 };
                 let previews = preview_exact_specs(client, &pending_specs, profile).await;
@@ -875,7 +881,8 @@ async fn approve_and_save_attempts(
                 return Err(security_approval::bypass_expired_before_save_error(
                     command_hint,
                     plan.scope.project_root.clone(),
-                ));
+                )
+                .into());
             }
             // A rule removed, expired or shortened since it was judged a
             // narrowing or already saved now adds or extends one, so it is
@@ -891,10 +898,10 @@ async fn approve_and_save_attempts(
             }
         }
     }
-    Err(security_approval::rules_kept_changing_error(
-        command_hint,
-        plan.scope.project_root.clone(),
-    ))
+    Err(
+        security_approval::rules_kept_changing_error(command_hint, plan.scope.project_root.clone())
+            .into(),
+    )
 }
 
 fn describe_expiry(rule: &FirewallBypassRule) -> String {
@@ -2072,6 +2079,37 @@ mod tests {
                     )
                 );
             }
+        });
+    }
+
+    #[test]
+    fn a_preview_that_cannot_read_its_settings_records_only_the_kind() {
+        let temp = tempfile::tempdir().unwrap();
+        security_approval::test_support::with_test_env(temp.path(), || {
+            let specs = specs(&["fresh@1.0.0"]);
+            let scope = global();
+            let table: toml::Table = toml::from_str(
+                "[firewall]\nmode = \"enforce\"\n[firewall.npm.policies]\nlpm_ai_telemetry = \"npm_SECRETVALUE\"\n",
+            )
+            .unwrap();
+            let config = crate::commands::config::GlobalConfig::from_table(table);
+            let effective = security_approval::load_effective_authorized_posture().unwrap();
+            let mut planned = plan(&specs, &scope, None, false);
+            planned.preview = Some((&config, &effective));
+
+            let error = run_add(&planned, vec![rule(&specs[0], None)], |_| {
+                panic!("nothing is approved without a preview")
+            })
+            .unwrap_err();
+
+            assert!(error.to_string().contains("npm_SECRETVALUE"), "{error}");
+            assert_eq!(
+                security_approval::test_support::audit_details("firewall-bypass-added"),
+                [Some(format!(
+                    "LPM CLI couldn't read the settings `add` checks ({})",
+                    error.error_code()
+                ))]
+            );
         });
     }
 

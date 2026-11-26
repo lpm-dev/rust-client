@@ -18,14 +18,22 @@ async fn registry_blocking(name: &str, verdict: &str, group: &str) -> MockRegist
     let mock = MockRegistry::start().await;
     mock.with_package(name, "1.0.0", &make_tarball(name, "1.0.0"))
         .await;
-    Mock::given(method("POST"))
-        .and(path(VERDICTS_PATH))
-        .and(body_string_contains(format!("\"name\":\"{name}\"")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "requestId": "bypass-test",
-            "policyMode": "enforce",
-            "summary": { "total": 1, "allow": 0, "warn": 0, "block": 1, "unknown": 0, "matched": 1 },
-            "decisions": [{
+    mount_block_verdict(&mock, name, verdict, group).await;
+    mock
+}
+
+/// LPM Firewall blocks `name@1.0.0` with `verdict`, under the policy `group`.
+async fn mount_block_verdict(mock: &MockRegistry, name: &str, verdict: &str, group: &str) {
+    mount_block_verdicts(mock, &[name], verdict, group).await;
+}
+
+/// LPM Firewall blocks every one of `names` at 1.0.0 in a request that asks
+/// about them all.
+async fn mount_block_verdicts(mock: &MockRegistry, names: &[&str], verdict: &str, group: &str) {
+    let decisions: Vec<serde_json::Value> = names
+        .iter()
+        .map(|name| {
+            serde_json::json!({
                 "decisionId": format!("bypass-test:{name}"),
                 "name": name,
                 "version": "1.0.0",
@@ -40,11 +48,29 @@ async fn registry_blocking(name: &str, verdict: &str, group: &str) -> MockRegist
                     "summary": "The package can send a credential to a gateway.",
                     "reportUrl": format!("https://firewall.lpm.dev/npm/{name}/v/1.0.0")
                 }
-            }]
+            })
+        })
+        .collect();
+    let mut request = Mock::given(method("POST")).and(path(VERDICTS_PATH));
+    for name in names {
+        request = request.and(body_string_contains(format!("\"name\":\"{name}\"")));
+    }
+    request
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "requestId": "bypass-test",
+            "policyMode": "enforce",
+            "summary": {
+                "total": names.len(),
+                "allow": 0,
+                "warn": 0,
+                "block": names.len(),
+                "unknown": 0,
+                "matched": names.len()
+            },
+            "decisions": decisions
         })))
         .mount(mock.server())
         .await;
-    mock
 }
 
 fn stored_rule(spec: &str, extra: serde_json::Value) -> serde_json::Value {
@@ -639,15 +665,37 @@ async fn dev_auto_install_names_what_a_block_stopped_and_the_command_that_allows
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "{stderr}");
     assert!(!String::from_utf8_lossy(&output.stdout).contains("dev-ran"));
-    assert!(stderr.contains("agent-tool@1.0.0"), "{stderr}");
+    assert!(
+        stderr
+            .contains("blocked agent-tool@1.0.0 - The package can send a credential to a gateway."),
+        "{stderr}"
+    );
     assert!(stderr.contains("✗ Blocked by LPM Firewall"), "{stderr}");
     assert!(stderr.contains(AGENT_TOOL_HINT), "{stderr}");
 }
 
 #[tokio::test]
 async fn doctor_fix_names_what_a_block_stopped_in_its_failed_install() {
-    let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
-    let project = project_depending_on_a_blocked_tool();
+    let mock = MockRegistry::start().await;
+    for name in ["agent-tool", "helper-tool"] {
+        mock.with_package(name, "1.0.0", &make_tarball(name, "1.0.0"))
+            .await;
+    }
+    mount_block_verdicts(
+        &mock,
+        &["agent-tool", "helper-tool"],
+        "suspicious",
+        "lpm_ai_agent_control_surface",
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{"name":"consumer","version":"1.0.0","dependencies":{"agent-tool":"1.0.0","helper-tool":"1.0.0"}}"#,
+    );
+    write_npm_firewall_global_config(&project, "enforce");
+    write_signed_firewall_bypass(
+        &project,
+        &[stored_rule("helper-tool", serde_json::json!({}))],
+    );
 
     let terminal = lpm_with_registry(&project, &mock.url())
         .args(["--color", "never", "doctor", "--fix", "--yes"])
@@ -664,12 +712,27 @@ async fn doctor_fix_names_what_a_block_stopped_in_its_failed_install() {
         String::from_utf8_lossy(&terminal.stderr)
     );
     assert!(text.contains("lpm install failed"), "{text}");
-    assert!(text.contains("agent-tool@1.0.0"), "{text}");
+    assert!(
+        text.contains("blocked agent-tool@1.0.0 - The package can send a credential to a gateway."),
+        "{text}"
+    );
+    assert!(
+        text.contains("allowed helper-tool@1.0.0 by your bypass rule helper-tool"),
+        "{text}"
+    );
     assert!(text.contains(AGENT_TOOL_HINT), "{text}");
     let envelope: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     let failed = &envelope["fixes_failed"][0];
     assert_eq!(failed["action"], "lpm install", "{envelope:#}");
     assert_eq!(failed["error_code"], "npm_firewall_blocked", "{envelope:#}");
+    assert_eq!(
+        failed["block"]["packages"][0]["name"], "agent-tool",
+        "{envelope:#}"
+    );
+    assert_eq!(
+        failed["block"]["bypassed"][0]["name"], "helper-tool",
+        "{envelope:#}"
+    );
 }
 
 async fn mount_blocked_global_update(mock: &MockRegistry, name: &str) {
