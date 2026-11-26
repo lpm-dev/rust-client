@@ -22,6 +22,7 @@ pub(super) struct FixReport {
 pub(super) struct FixFailure {
     action: String,
     error: String,
+    error_code: &'static str,
 }
 
 #[derive(Default)]
@@ -180,6 +181,7 @@ pub(super) async fn apply(
                 report.failed.push(FixFailure {
                     action: label,
                     error: error.to_string(),
+                    error_code: error.error_code(),
                 });
             }
         }

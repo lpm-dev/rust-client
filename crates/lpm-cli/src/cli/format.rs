@@ -1255,26 +1255,43 @@ fn npm_firewall_blocked_lines(
                 "Blocked by LPM Firewall",
             ))];
             push_untrusted_detail(&mut lines, "reason", &blocked.to_string());
-            push_unreported_block_lines(&mut lines, blocked);
-            for bypassed in &blocked.bypassed {
-                push_untrusted_detail(
-                    &mut lines,
-                    "allowed",
-                    &format!(
-                        "{}@{} by your bypass rule {}",
-                        bypassed.name, bypassed.version, bypassed.rule
-                    ),
-                );
-            }
-            push_block_class_lines(&mut lines, blocked);
-            if let Some(reason) = &blocked.bypass_unavailable_reason {
-                push_untrusted_detail(&mut lines, "note", reason);
-            }
-            if let Some(command) = &blocked.bypass_command {
-                push_detail(&mut lines, "allow", install_ui::yellow(command));
-            }
+            push_block_explanation(&mut lines, blocked);
             lines
         }
+    }
+}
+
+/// What a block error explains under its reason: unnamed blocks, versions a
+/// rule let through, why a rule can't lift a block, and the command that
+/// lets the rest through.
+fn push_block_explanation(
+    lines: &mut Vec<SlimErrorLine>,
+    blocked: &lpm_common::NpmFirewallBlockedErrorContext,
+) {
+    push_unreported_block_lines(lines, blocked);
+    push_bypassed_lines(lines, blocked);
+    push_block_class_lines(lines, blocked);
+    if let Some(reason) = &blocked.bypass_unavailable_reason {
+        push_untrusted_detail(lines, "note", reason);
+    }
+    if let Some(command) = &blocked.bypass_command {
+        push_detail(lines, "allow", install_ui::yellow(command));
+    }
+}
+
+fn push_bypassed_lines(
+    lines: &mut Vec<SlimErrorLine>,
+    blocked: &lpm_common::NpmFirewallBlockedErrorContext,
+) {
+    for bypassed in &blocked.bypassed {
+        push_untrusted_detail(
+            lines,
+            "allowed",
+            &format!(
+                "{}@{} by your bypass rule {}",
+                bypassed.name, bypassed.version, bypassed.rule
+            ),
+        );
     }
 }
 
@@ -1337,9 +1354,44 @@ pub(crate) fn npm_firewall_block_detail_lines(
     include_packages: bool,
 ) -> Vec<install_ui::TerminalLine> {
     let mut lines = Vec::with_capacity(blocked.packages.len() * 2 + 2);
-    for package in blocked.packages.iter().filter(|_| include_packages) {
+    if include_packages {
+        push_blocked_package_lines(&mut lines, blocked);
+        push_bypassed_lines(&mut lines, blocked);
+    }
+    push_unreported_block_lines(&mut lines, blocked);
+    push_block_class_lines(&mut lines, blocked);
+    terminal_lines(lines)
+}
+
+/// Each blocked version with its report, for a command whose install ran
+/// without showing them before the block error explains the rest.
+pub(crate) fn npm_firewall_block_package_lines(
+    blocked: &lpm_common::NpmFirewallBlockedErrorContext,
+) -> Vec<install_ui::TerminalLine> {
+    let mut lines = Vec::with_capacity(blocked.packages.len() * 2);
+    push_blocked_package_lines(&mut lines, blocked);
+    terminal_lines(lines)
+}
+
+/// The blocked versions and everything the block error would explain, for a
+/// command that keeps going after its quiet install was blocked, as
+/// `lpm doctor --fix` does.
+pub(crate) fn npm_firewall_block_failure_lines(
+    blocked: &lpm_common::NpmFirewallBlockedErrorContext,
+) -> Vec<install_ui::TerminalLine> {
+    let mut lines = Vec::with_capacity(blocked.packages.len() * 2 + blocked.bypassed.len() + 2);
+    push_blocked_package_lines(&mut lines, blocked);
+    push_block_explanation(&mut lines, blocked);
+    terminal_lines(lines)
+}
+
+fn push_blocked_package_lines(
+    lines: &mut Vec<SlimErrorLine>,
+    blocked: &lpm_common::NpmFirewallBlockedErrorContext,
+) {
+    for package in &blocked.packages {
         push_untrusted_detail(
-            &mut lines,
+            lines,
             "blocked",
             &format!(
                 "{} - {}",
@@ -1348,21 +1400,12 @@ pub(crate) fn npm_firewall_block_detail_lines(
             ),
         );
         if let Some(report_url) = &package.report_url {
-            push_detail(&mut lines, "report", install_ui::hyperlink(report_url));
+            push_detail(lines, "report", install_ui::hyperlink(report_url));
         }
     }
-    for bypassed in blocked.bypassed.iter().filter(|_| include_packages) {
-        push_untrusted_detail(
-            &mut lines,
-            "allowed",
-            &format!(
-                "{}@{} by your bypass rule {}",
-                bypassed.name, bypassed.version, bypassed.rule
-            ),
-        );
-    }
-    push_unreported_block_lines(&mut lines, blocked);
-    push_block_class_lines(&mut lines, blocked);
+}
+
+fn terminal_lines(lines: Vec<SlimErrorLine>) -> Vec<install_ui::TerminalLine> {
     lines
         .into_iter()
         .map(|line| match line {

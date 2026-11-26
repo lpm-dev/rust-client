@@ -1226,13 +1226,20 @@ async fn probe_auth(
     }
 }
 
-fn render_autofix_failed(action: &str, error: &impl std::fmt::Display) {
-    let error = error.to_string();
+fn render_autofix_failed(action: &str, error: &LpmError) {
     install_ui::failed_untrusted(&format!(
         "{} failed: {}",
         lpm_common::sanitize_terminal_inline(action),
-        lpm_common::sanitize_terminal_inline(&error)
+        lpm_common::sanitize_terminal_inline(&error.to_string())
     ));
+    // A quiet install showed nothing of a firewall block, and doctor keeps
+    // going, so the block's versions and the command that allows them are
+    // shown with the failure.
+    if let LpmError::NpmFirewallBlocked(blocked) = error {
+        for line in crate::cli::npm_firewall_block_failure_lines(blocked) {
+            install_ui::detail_line(line);
+        }
+    }
 }
 
 fn replace_project_node_modules_link(project_dir: &Path) -> Result<(), LpmError> {

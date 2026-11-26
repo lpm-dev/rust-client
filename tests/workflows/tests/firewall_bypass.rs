@@ -616,6 +616,62 @@ async fn global_install_ignores_a_project_rule_for_a_workspace_that_holds_lpm_ho
     assert!(stderr.contains(AGENT_TOOL_HINT), "{stderr}");
 }
 
+/// A project whose dependency LPM Firewall blocks, with no rule for it.
+fn project_depending_on_a_blocked_tool() -> TempProject {
+    let project = TempProject::empty(
+        r#"{"name":"consumer","version":"1.0.0","scripts":{"dev":"node index.js"},"dependencies":{"agent-tool":"1.0.0"}}"#,
+    );
+    project.write_file("index.js", "console.log('dev-ran');\n");
+    write_npm_firewall_global_config(&project, "enforce");
+    project
+}
+
+#[tokio::test]
+async fn dev_auto_install_names_what_a_block_stopped_and_the_command_that_allows_it() {
+    let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
+    let project = project_depending_on_a_blocked_tool();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--color", "never", "dev", "--no-open", "--no-dashboard"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("dev-ran"));
+    assert!(stderr.contains("agent-tool@1.0.0"), "{stderr}");
+    assert!(stderr.contains("✗ Blocked by LPM Firewall"), "{stderr}");
+    assert!(stderr.contains(AGENT_TOOL_HINT), "{stderr}");
+}
+
+#[tokio::test]
+async fn doctor_fix_names_what_a_block_stopped_in_its_failed_install() {
+    let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
+    let project = project_depending_on_a_blocked_tool();
+
+    let terminal = lpm_with_registry(&project, &mock.url())
+        .args(["--color", "never", "doctor", "--fix", "--yes"])
+        .output()
+        .unwrap();
+    let json = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "doctor", "--fix", "--yes"])
+        .output()
+        .unwrap();
+
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&terminal.stdout),
+        String::from_utf8_lossy(&terminal.stderr)
+    );
+    assert!(text.contains("lpm install failed"), "{text}");
+    assert!(text.contains("agent-tool@1.0.0"), "{text}");
+    assert!(text.contains(AGENT_TOOL_HINT), "{text}");
+    let envelope: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let failed = &envelope["fixes_failed"][0];
+    assert_eq!(failed["action"], "lpm install", "{envelope:#}");
+    assert_eq!(failed["error_code"], "npm_firewall_blocked", "{envelope:#}");
+}
+
 async fn mount_blocked_global_update(mock: &MockRegistry, name: &str) {
     let bin_path = format!("bin/{name}.js");
     let tarball = support::mock_registry::make_tarball_from_pkg_json(

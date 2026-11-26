@@ -3859,6 +3859,15 @@ async fn auto_install_if_stale(
             let elapsed = start.elapsed();
             Ok(format!("installed in {}", format_duration(elapsed)))
         }
+        // A firewall block keeps its kind, so the error names the command that
+        // lets the versions through. The install showed the versions under
+        // the gag, so they are shown here.
+        Err(LpmError::NpmFirewallBlocked(blocked)) => {
+            for line in crate::cli::npm_firewall_block_package_lines(&blocked) {
+                crate::install_ui::detail_line(line);
+            }
+            Err(LpmError::NpmFirewallBlocked(blocked))
+        }
         // A project the install refuses, as on a drive that can't hold
         // node_modules, keeps the error's own kind, which names no script.
         Err(LpmError::ProjectFile(message)) => Err(LpmError::ProjectFile(format!(

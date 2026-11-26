@@ -583,18 +583,52 @@ fn invalid_ttl(raw: &str) -> LpmError {
     ))
 }
 
+/// Why `add` refused before any prompt.
+struct AddRefusal {
+    error: LpmError,
+    /// The settings `add` checks couldn't be read. Their error can quote the
+    /// file, credentials included, so the audit log keeps only its kind.
+    settings_unreadable: bool,
+}
+
+impl AddRefusal {
+    fn settings_unreadable(error: LpmError) -> Self {
+        Self {
+            error,
+            settings_unreadable: true,
+        }
+    }
+}
+
+impl From<LpmError> for AddRefusal {
+    fn from(error: LpmError) -> Self {
+        Self {
+            error,
+            settings_unreadable: false,
+        }
+    }
+}
+
 /// Refuses before any prompt, and records the refusal in the audit log.
 fn refuse_add(
     specs: &[FirewallBypassSpec],
     project_root: Option<&str>,
-    error: LpmError,
+    refusal: AddRefusal,
 ) -> LpmError {
+    let detail = if refusal.settings_unreadable {
+        format!(
+            "LPM CLI couldn't read the settings `add` checks ({})",
+            refusal.error.error_code()
+        )
+    } else {
+        refusal.error.to_string()
+    };
     security_approval::record_firewall_bypass_refusal(
         specs.iter().map(ToString::to_string).collect(),
         project_root,
-        &error.to_string(),
+        &detail,
     );
-    error
+    refusal.error
 }
 
 /// What `add` settles before any prompt.
@@ -612,26 +646,32 @@ fn plan_add(
     request: &AddRequest<'_>,
     specs: &[FirewallBypassSpec],
     scope: &RuleScope,
-) -> Result<AddSetup, LpmError> {
+) -> Result<AddSetup, AddRefusal> {
     if request.allow_malware
         && let Some(spec) = specs.iter().find(|spec| spec.kind() != BypassKind::Exact)
     {
         return Err(LpmError::InvalidPackageName(format!(
             "`--allow-malware` applies only to exact versions such as `name@1.2.3`; `{spec}` names more"
-        )));
+        ))
+        .into());
     }
     let ttl_secs = parse_ttl(request.ttl)?;
     let now = Timestamp::now();
     let expires_at = expiry_after(now, ttl_secs, request.ttl.unwrap_or_default())?;
-    let global = crate::commands::config::GlobalConfig::load_checked()?;
-    let effective = security_approval::load_effective_authorized_posture()?;
+    let global = crate::commands::config::GlobalConfig::load_checked()
+        .map_err(AddRefusal::settings_unreadable)?;
+    let effective = security_approval::load_effective_authorized_posture()
+        .map_err(AddRefusal::settings_unreadable)?;
     if let Some(reason) = security_approval::local_firewall_bypass_inactive_reason(&effective) {
-        return Err(LpmError::SecurityFloor(reason));
+        return Err(LpmError::SecurityFloor(reason).into());
     }
-    if forced_floor_refuses_additions(&global, &effective)? {
+    if forced_floor_refuses_additions(&global, &effective)
+        .map_err(AddRefusal::settings_unreadable)?
+    {
         return Err(LpmError::SecurityFloor(
             "`force-security-floor = true` keeps the npm firewall at enforce, so new bypass rules are refused; lower the floor intentionally in ~/.lpm/config.toml first".to_string(),
-        ));
+        )
+        .into());
     }
 
     let rules: Vec<FirewallBypassRule> = specs
@@ -1993,13 +2033,45 @@ mod tests {
                 "force-security-floor = true\n[firewall]\nmode = \"sometimes\"\n",
             )
             .unwrap();
-            let invalid_config = run_add_command(None);
+            let invalid_mode = run_add_command(None);
+            std::fs::write(
+                lpm_home.join("config.toml"),
+                "registry-token = \"npm_SECRETVALUE\n",
+            )
+            .unwrap();
+            let unparsable = run_add_command(None);
 
+            assert!(
+                invalid_ttl
+                    .to_string()
+                    .contains("invalid `--ttl` value `soon`")
+            );
+            assert!(
+                invalid_mode.to_string().contains("sometimes"),
+                "{invalid_mode}"
+            );
+            assert!(
+                unparsable.to_string().contains("npm_SECRETVALUE"),
+                "{unparsable}"
+            );
             let records = security_approval::test_support::audit_records("firewall-bypass-added");
-            assert_eq!(records.len(), 2, "{records:?}");
+            assert_eq!(records.len(), 3, "{records:?}");
             assert!(records.iter().all(|record| !record.allowed), "{records:?}");
             assert_eq!(records[0].detail, Some(invalid_ttl.to_string()));
-            assert_eq!(records[1].detail, Some(invalid_config.to_string()));
+            // A settings file can hold credentials, so only the kind of a
+            // failure to read it is kept.
+            for (record, error) in records[1..].iter().zip([&invalid_mode, &unparsable]) {
+                assert_eq!(
+                    record.detail.as_deref(),
+                    Some(
+                        format!(
+                            "LPM CLI couldn't read the settings `add` checks ({})",
+                            error.error_code()
+                        )
+                        .as_str()
+                    )
+                );
+            }
         });
     }
 
