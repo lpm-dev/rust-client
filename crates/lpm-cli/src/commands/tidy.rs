@@ -100,6 +100,10 @@ struct TidyReport {
     removed: Vec<RemovedDependency>,
     ignored: Vec<IgnoredFinding>,
     elapsed_ms: u128,
+    /// What LPM Firewall bypass rules let through in the reinstall `--fix`
+    /// runs, in the `security.firewall` shape other commands report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    security: Option<Value>,
 }
 
 #[derive(Default)]
@@ -169,9 +173,10 @@ pub async fn run(
 
     let mut analysis = analyze_project(project_dir, &manifest, &config)?;
     let mut removed = Vec::new();
+    let mut firewall_bypassed = crate::commands::install::FirewallBypassRecord::default();
 
     if fix {
-        removed = apply_fix(
+        (removed, firewall_bypassed) = apply_fix(
             client,
             project_dir,
             &manifest_path,
@@ -206,6 +211,7 @@ pub async fn run(
         removed,
         ignored: analysis.ignored,
         elapsed_ms,
+        security: firewall_bypassed.security_json(),
     };
 
     if json_output {
@@ -1020,14 +1026,23 @@ async fn apply_fix(
     manifest: &mut Value,
     analysis: &Analysis,
     json_output: bool,
-) -> Result<Vec<RemovedDependency>, LpmError> {
+) -> Result<
+    (
+        Vec<RemovedDependency>,
+        crate::commands::install::FirewallBypassRecord,
+    ),
+    LpmError,
+> {
     let fixable: Vec<&UnusedDependency> = analysis
         .unused
         .iter()
         .filter(|dependency| dependency.fixable)
         .collect();
     if fixable.is_empty() {
-        return Ok(Vec::new());
+        return Ok((
+            Vec::new(),
+            crate::commands::install::FirewallBypassRecord::default(),
+        ));
     }
 
     let project_dirs = [project_dir.to_path_buf()];
@@ -1056,7 +1071,7 @@ async fn apply_fix(
                 .map_err(|error| LpmError::Registry(error.to_string()))?;
             write_file_atomic(manifest_path, format!("{updated}\n")).map_err(LpmError::Io)?;
 
-            reconcile_install(client, project_dir, json_output).await?;
+            let firewall_bypassed = reconcile_install(client, project_dir, json_output).await?;
             let removed_names = removed
                 .iter()
                 .map(|entry| entry.name.clone())
@@ -1067,7 +1082,7 @@ async fn apply_fix(
                 &HashMap::new(),
             )?;
             crate::commands::install::workspace_lockfile::commit_manifest_transaction(transaction);
-            Ok(removed)
+            Ok((removed, firewall_bypassed))
         },
     )
     .await
@@ -1131,11 +1146,15 @@ fn remove_empty_dependency_sections(manifest: &mut Value) {
     }
 }
 
+/// Reinstalls after `--fix`, returning what LPM Firewall bypass rules let
+/// through for the report.
 async fn reconcile_install(
     client: &RegistryClient,
     project_dir: &Path,
     json_output: bool,
-) -> Result<(), LpmError> {
+) -> Result<crate::commands::install::FirewallBypassRecord, LpmError> {
+    let firewall_bypass_report =
+        std::sync::Arc::new(crate::commands::install::FirewallBypassReport::default());
     crate::commands::install::run_with_options_with_lpm_root(
         client,
         project_dir,
@@ -1169,10 +1188,15 @@ async fn reconcile_install(
         &[],
         !json_output,
         false,
-        None,
+        Some(
+            crate::commands::install::InstallCallerContext::reporting_firewall_bypasses(
+                std::sync::Arc::clone(&firewall_bypass_report),
+            ),
+        ),
         lpm_common::LpmRoot::from_env()?,
     )
-    .await
+    .await?;
+    Ok(firewall_bypass_report.take())
 }
 
 impl TidyConfig {

@@ -1624,6 +1624,77 @@ async fn audit_fix_updates_vulnerable_direct_dependency_and_reinstalls_lockfile(
     assert_eq!(pkg.version, "1.0.1");
 }
 
+/// Runs `lpm audit fix` where the version it moves to is blocked by LPM
+/// Firewall and an exact rule lets it through.
+async fn audit_fix_through_a_bypass_rule(json: bool) -> std::process::Output {
+    let project = TempProject::empty(
+        r#"{"name":"audit-fix-bypass","version":"1.0.0","dependencies":{"vuln-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    install_vulnerable_direct_dep_with_fixed_version(&project, &mock).await;
+    mock.with_osv_querybatch(vec![vec![osv_fixed_vuln(
+        "GHSA-test-bypass",
+        "vuln-pkg",
+        "1.0.1",
+    )]])
+    .await;
+    mock.with_npm_firewall_block("vuln-pkg", "1.0.1").await;
+    support::write_npm_firewall_global_config(&project, "enforce");
+    support::write_signed_firewall_bypass(
+        &project,
+        &[serde_json::json!({
+            "id": "fwb_fixed",
+            "spec": "vuln-pkg@1.0.1",
+            "scope": "global",
+            "covers_malware": true,
+            "added_at": "2026-11-25T10:00:00Z",
+        })],
+    );
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    command.env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()));
+    if json {
+        command.arg("--json");
+    } else {
+        command.args(["--color", "never"]);
+    }
+    command.args(["audit", "fix"]).output().unwrap()
+}
+
+#[tokio::test]
+async fn audit_fix_json_reports_the_version_a_bypass_rule_let_through() {
+    let out = audit_fix_through_a_bypass_rule(true).await;
+
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(envelope["fixed"], 1, "{envelope:#}");
+    let firewall = &envelope["security"]["firewall"];
+    assert_eq!(firewall["mode"], "enforce", "{envelope:#}");
+    assert_eq!(firewall["bypassed"][0]["name"], "vuln-pkg", "{envelope:#}");
+    assert_eq!(firewall["bypassed"][0]["version"], "1.0.1", "{envelope:#}");
+}
+
+#[tokio::test]
+async fn audit_fix_prints_the_version_a_bypass_rule_let_through() {
+    let out = audit_fix_through_a_bypass_rule(false).await;
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("! LPM Firewall allowed 1 blocked package because of your bypass rules:\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("    rule: vuln-pkg@1.0.1 (every project)\n"),
+        "{stderr}"
+    );
+}
+
 #[tokio::test]
 async fn workspace_member_audit_fix_preserves_the_sibling_root_lockfile_projection() {
     let project = TempProject::empty(

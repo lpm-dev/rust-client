@@ -5973,6 +5973,70 @@ async fn lpm_add_json_reports_a_source_dependency_a_bypass_rule_let_through() {
 }
 
 #[tokio::test]
+async fn lpm_add_json_lists_a_source_package_a_bypass_rule_let_through_with_the_command_s_other_bypasses()
+ {
+    let mock = MockRegistry::start().await;
+    let source_tarball = make_tarball_from_pkg_json(
+        json!({ "name": "bypassed-source", "version": "1.0.0" }),
+        &[],
+    );
+    mock.with_package("bypassed-source", "1.0.0", &source_tarball)
+        .await;
+    mock.with_npm_firewall_block("bypassed-source", "1.0.0")
+        .await;
+    let project =
+        TempProject::empty(r#"{"name":"add-firewall","version":"1.0.0","dependencies":{}}"#);
+    write_lpm_proxy_npmrc(&project, &mock.url());
+    write_npm_firewall_global_config(&project, "enforce");
+    support::write_signed_firewall_bypass(
+        &project,
+        &[json!({
+            "id": "fwb_source",
+            "spec": "bypassed-source@1.0.0",
+            "scope": "global",
+            "covers_malware": true,
+            "added_at": "2026-11-25T10:00:00Z",
+        })],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            "bypassed-source",
+            "--yes",
+            "--json",
+            "--path",
+            "components",
+            "--no-skills",
+        ])
+        .output()
+        .expect("failed to run lpm add");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["firewall"]["bypassed"][0]["name"], "bypassed-source",
+        "{envelope:#}"
+    );
+    let security = &envelope["security"]["firewall"];
+    assert_eq!(security["mode"], "enforce", "{envelope:#}");
+    assert_eq!(
+        security["bypassed"].as_array().map(Vec::len),
+        Some(1),
+        "{envelope:#}"
+    );
+    assert_eq!(
+        security["bypassed"][0]["rule"]["spec"], "bypassed-source@1.0.0",
+        "{envelope:#}"
+    );
+}
+
+#[tokio::test]
 async fn lpm_add_json_reports_a_bypass_rule_a_swift_source_dependency_install_used() {
     let mock = MockRegistry::start().await;
     let root = "@lpm.dev/swift.bypass-root";

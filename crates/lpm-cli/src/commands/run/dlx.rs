@@ -249,6 +249,11 @@ async fn install_dlx_target(
         client.invalidate_routed_metadata_cache(&route, &target.package_name, expected_version);
     }
 
+    // With stdout reserved for the tool, the install is quiet, and what
+    // bypass rules let through is reported here, on stderr.
+    let firewall_bypass_report = options
+        .reserve_stdout
+        .then(|| std::sync::Arc::new(crate::commands::install::FirewallBypassReport::default()));
     crate::commands::install::run_with_options_with_lpm_root(
         client,
         install.root(),
@@ -295,11 +300,15 @@ async fn install_dlx_target(
             }),
             locked_integrities: None,
             firewall_bypass_root: None,
-            firewall_bypass_report: None,
+            firewall_bypass_report: firewall_bypass_report.clone(),
         }),
         lpm_common::LpmRoot::from_env()?,
     )
-    .await
+    .await?;
+    if let Some(report) = firewall_bypass_report {
+        report.take().print();
+    }
+    Ok(())
 }
 
 /// The cache entry's key: the target, and the receipt of the caller policy

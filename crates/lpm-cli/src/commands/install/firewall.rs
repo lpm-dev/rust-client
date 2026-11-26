@@ -2371,8 +2371,13 @@ pub(crate) fn prepare_npm_firewall_materialization_preflight(
 pub(crate) struct NpmFirewallMaterializationVerdict(MaterializationVerdictState);
 
 enum MaterializationVerdictState {
-    Settled(NpmFirewallMaterializationJson),
+    Settled(Box<SettledMaterialization>),
     Pending(NpmFirewallPreflightJoin),
+}
+
+struct SettledMaterialization {
+    json: NpmFirewallMaterializationJson,
+    stats: NpmFirewallPreflightStats,
 }
 
 impl NpmFirewallMaterializationVerdict {
@@ -2381,8 +2386,25 @@ impl NpmFirewallMaterializationVerdict {
         self,
         json_output: bool,
     ) -> Result<NpmFirewallMaterializationJson, LpmError> {
+        Ok(self.settled(json_output).await?.json)
+    }
+
+    /// [`Self::settle`], also handing what bypass rules let through to the
+    /// command's `report`, as `lpm add` reports its source package with the
+    /// installs it runs.
+    pub(crate) async fn settle_into(
+        self,
+        json_output: bool,
+        report: &super::FirewallBypassReport,
+    ) -> Result<NpmFirewallMaterializationJson, LpmError> {
+        let settled = self.settled(json_output).await?;
+        report.record(&settled.stats);
+        Ok(settled.json)
+    }
+
+    async fn settled(self, json_output: bool) -> Result<SettledMaterialization, LpmError> {
         match self.0 {
-            MaterializationVerdictState::Settled(json) => Ok(json),
+            MaterializationVerdictState::Settled(settled) => Ok(*settled),
             MaterializationVerdictState::Pending(join) => {
                 finish_npm_firewall_materialization(join.drain().await?, json_output)
             }
@@ -2415,10 +2437,10 @@ pub(crate) async fn begin_prepared_npm_firewall_materialization_preflight(
             handle: Some(tokio::spawn(request)),
         })
     } else {
-        MaterializationVerdictState::Settled(finish_npm_firewall_materialization(
+        MaterializationVerdictState::Settled(Box::new(finish_npm_firewall_materialization(
             request.await?,
             json_output,
-        )?)
+        )?))
     };
     Ok(NpmFirewallMaterializationVerdict(state))
 }
@@ -2426,9 +2448,10 @@ pub(crate) async fn begin_prepared_npm_firewall_materialization_preflight(
 fn finish_npm_firewall_materialization(
     result: NpmFirewallPreflightResult,
     json_output: bool,
-) -> Result<NpmFirewallMaterializationJson, LpmError> {
-    let firewall_json = npm_firewall_materialization_json(&result);
-    finish_npm_firewall_preflight(result, json_output).map(|_| firewall_json)
+) -> Result<SettledMaterialization, LpmError> {
+    let json = npm_firewall_materialization_json(&result);
+    finish_npm_firewall_preflight(result, json_output)
+        .map(|stats| SettledMaterialization { json, stats })
 }
 
 fn npm_firewall_materialization_json(

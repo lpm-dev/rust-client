@@ -702,6 +702,7 @@ async fn run_locked(
         ));
     }
 
+    let firewall_bypass_report = swift_traversal.firewall_bypass_report();
     let firewall_verdict = begin_prepared_npm_firewall_materialization_preflight(
         client,
         firewall_preflight,
@@ -724,7 +725,9 @@ async fn run_locked(
     let downloaded = client
         .download_tarball_routed(&route_table, &target.route_name(), tarball_url)
         .await?;
-    let firewall_json = firewall_verdict.settle(json_output).await?;
+    let firewall_json = firewall_verdict
+        .settle_into(json_output, &firewall_bypass_report)
+        .await?;
 
     // Verify integrity. Fast path: SRI compare against the
     // SHA-512 hash already computed during download. Slow path: stream-
@@ -1509,7 +1512,6 @@ async fn run_locked(
     // (no `lpm.config.json`) keeps the download-manager contract:
     // copy bytes, surface external imports, let the user install deps
     // themselves.
-    let firewall_bypass_report = swift_traversal.firewall_bypass_report();
     let dependency_outcome = if !no_install_deps && lpm_config.is_some() {
         handle_dependencies(
             client,

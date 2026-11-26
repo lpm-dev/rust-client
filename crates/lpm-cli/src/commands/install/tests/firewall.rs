@@ -2420,6 +2420,31 @@ fn one_version_bypassed_in_two_chunks_is_reported_once() {
     assert_eq!(stats.bypassed.len(), 1);
 }
 
+#[test]
+fn a_command_report_lists_a_version_its_installs_each_let_through_once() {
+    let bypassed = BypassedVerdict {
+        decision: decision("rechecked", "block"),
+        rule: crate::firewall_bypass::AppliedRule {
+            spec: "rechecked".into(),
+            id: Some("fwb_1".into()),
+            scope: crate::firewall_bypass::FirewallBypassScope::Global,
+            project_root: None,
+            source: "local",
+        },
+    };
+    let stats = NpmFirewallPreflightStats {
+        mode: NpmFirewallMode::Enforce,
+        bypassed: vec![bypassed],
+        ..NpmFirewallPreflightStats::default()
+    };
+    let report = crate::commands::install::FirewallBypassReport::default();
+
+    report.record(&stats);
+    report.record(&stats);
+
+    assert_eq!(report.take().bypassed_json().len(), 1);
+}
+
 #[tokio::test]
 async fn a_review_hold_under_a_managed_policy_names_no_rule_to_add() {
     let result = enforce_with_rules(

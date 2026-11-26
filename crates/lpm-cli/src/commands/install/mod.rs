@@ -336,11 +336,15 @@ pub async fn run_with_options(
     .await
 }
 
+/// Installs `project_dir` without output for a command that reports in its
+/// own words, as `lpm audit fix` and `lpm doctor --fix` do, and returns what
+/// LPM Firewall bypass rules let through for that command to report.
 pub(crate) async fn run_silent_for_audit_fix(
     client: &RegistryClient,
     project_dir: &Path,
-) -> Result<(), LpmError> {
+) -> Result<FirewallBypassRecord, LpmError> {
     let lpm_root = lpm_common::LpmRoot::from_env()?;
+    let firewall_bypass_report = Arc::new(FirewallBypassReport::default());
     run_with_options_with_lpm_root(
         client,
         project_dir,
@@ -374,10 +378,13 @@ pub(crate) async fn run_silent_for_audit_fix(
         &[],
         false,
         false,
-        None,
+        Some(InstallCallerContext::reporting_firewall_bypasses(
+            Arc::clone(&firewall_bypass_report),
+        )),
         lpm_root,
     )
-    .await
+    .await?;
+    Ok(firewall_bypass_report.take())
 }
 
 /// What a caller requires of the packages an install resolves, checked
@@ -455,9 +462,11 @@ impl InstallCallerContext<'_> {
     }
 }
 
-/// What LPM Firewall bypass rules let through during an install, collected
-/// for a command that runs the install and reports in its own words, as
-/// `lpm install -g`, `lpm global update`, `lpm upgrade` and `lpm add` do.
+/// What LPM Firewall bypass rules let through during the installs a command
+/// runs, collected for a command that reports in its own words instead of
+/// the install's report, such as `lpm install -g`, `lpm add` or `lpm deploy`.
+/// A quiet install never hides it: the command prints it or adds it to its
+/// JSON.
 #[derive(Debug, Default)]
 pub(crate) struct FirewallBypassReport {
     record: std::sync::Mutex<FirewallBypassRecord>,
@@ -473,7 +482,16 @@ impl FirewallBypassReport {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         record.mode = Some(stats.mode);
-        record.bypassed.extend(stats.bypassed.iter().cloned());
+        // A command can run several installs over one project, each
+        // checking the same versions again.
+        for bypassed in &stats.bypassed {
+            if !record.bypassed.iter().any(|recorded| {
+                recorded.decision.name == bypassed.decision.name
+                    && recorded.decision.version == bypassed.decision.version
+            }) {
+                record.bypassed.push(bypassed.clone());
+            }
+        }
     }
 
     pub(crate) fn take(&self) -> FirewallBypassRecord {

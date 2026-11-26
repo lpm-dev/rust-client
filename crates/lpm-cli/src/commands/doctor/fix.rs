@@ -16,6 +16,8 @@ use super::lockfile::fix_obsolete_binary_lockfile;
 pub(super) struct FixReport {
     pub(super) applied: Vec<String>,
     pub(super) failed: Vec<FixFailure>,
+    /// What LPM Firewall bypass rules let through in the project install.
+    pub(super) firewall_bypassed: crate::commands::install::FirewallBypassRecord,
 }
 
 #[derive(serde::Serialize)]
@@ -173,6 +175,7 @@ pub(super) async fn apply(
             project_dir,
             json_output,
             &mut runtime_context,
+            &mut report.firewall_bypassed,
         )
         .await;
 
@@ -209,6 +212,7 @@ async fn apply_one(
     project_dir: &Path,
     json_output: bool,
     runtime_context: &mut RuntimeInstallContext,
+    firewall_bypassed: &mut crate::commands::install::FirewallBypassRecord,
 ) -> Result<Option<String>, LpmError> {
     match action {
         DoctorFix::ReplaceNodeModulesLink => {
@@ -225,7 +229,10 @@ async fn apply_one(
         }
         DoctorFix::InstallProject => {
             phase(json_output, "fixing: lpm install");
-            run_doctor_install(client, project_dir).await?;
+            *firewall_bypassed = run_doctor_install(client, project_dir).await?;
+            if !json_output {
+                firewall_bypassed.print();
+            }
             Ok(Some("lpm install".into()))
         }
         DoctorFix::RemoveObsoleteBinaryLockfile => {
