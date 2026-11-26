@@ -2817,3 +2817,189 @@ fn zero_or_invalid_blocking_thread_cap_does_not_panic() {
             .success();
     }
 }
+
+fn config_list_entry(project: &TempProject, key: &str) -> serde_json::Value {
+    let output = lpm(project)
+        .args(["config", "list", "--json"])
+        .output()
+        .expect("failed to run lpm config list --json");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    envelope["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["key"] == key)
+        .cloned()
+        .unwrap_or_else(|| panic!("{key} is listed"))
+}
+
+#[test]
+fn config_list_reports_the_approved_firewall_policy_when_config_has_none() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    support::write_signed_firewall_posture(
+        &project,
+        "enforce",
+        &[("critical_vulnerability", "block")],
+    );
+    seed_config(&project, "[firewall]\nmode = \"enforce\"\n");
+
+    let entry = config_list_entry(&project, "firewall.npm.policies.critical_vulnerability");
+
+    assert_eq!(entry["value"], "block");
+}
+
+#[test]
+fn config_list_reports_the_default_where_no_table_asks_for_an_approved_looser_policy() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    support::write_signed_firewall_posture(
+        &project,
+        "enforce",
+        &[("lpm_ai_confirmed_malware", "allow")],
+    );
+    seed_config(&project, "[firewall]\nmode = \"enforce\"\n");
+
+    let entry = config_list_entry(&project, "firewall.npm.policies.lpm_ai_confirmed_malware");
+
+    assert_eq!(entry["value"], "block", "{entry}");
+    assert_eq!(entry["source"], "built-in default", "{entry}");
+}
+
+#[test]
+fn config_list_reports_the_approved_policy_for_a_group_a_partial_table_leaves_out() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    support::write_signed_firewall_posture(
+        &project,
+        "enforce",
+        &[("lpm_ai_agent_control_surface", "block")],
+    );
+    seed_config(
+        &project,
+        "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_telemetry = \"block\"\n",
+    );
+
+    let entry = config_list_entry(
+        &project,
+        "firewall.npm.policies.lpm_ai_agent_control_surface",
+    );
+
+    assert_eq!(entry["value"], "block", "{entry}");
+    assert_eq!(entry["source"], "approved security posture", "{entry}");
+}
+
+#[test]
+fn config_list_reports_the_managed_policy_over_a_looser_value_under_a_stricter_local_mode() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    std::fs::create_dir_all(project.home().join(".lpm")).unwrap();
+    std::fs::write(
+        project.home().join(".lpm/security-policy.toml"),
+        "[firewall]\nmode = \"monitor\"\n\n[firewall.npm.policies]\nlpm_ai_agent_control_surface = \"block\"\n",
+    )
+    .unwrap();
+    seed_config(
+        &project,
+        "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_agent_control_surface = \"warn\"\n",
+    );
+
+    let entry = config_list_entry(
+        &project,
+        "firewall.npm.policies.lpm_ai_agent_control_surface",
+    );
+
+    assert_eq!(entry["value"], "block", "{entry}");
+}
+
+#[test]
+fn config_list_reports_the_default_for_an_approved_looser_group_a_partial_table_leaves_out() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    support::write_signed_firewall_posture(
+        &project,
+        "enforce",
+        &[("lpm_ai_confirmed_malware", "allow")],
+    );
+    seed_config(
+        &project,
+        "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_telemetry = \"block\"\n",
+    );
+
+    let entry = config_list_entry(&project, "firewall.npm.policies.lpm_ai_confirmed_malware");
+
+    assert_eq!(entry["value"], "block", "{entry}");
+    assert_eq!(entry["source"], "built-in default", "{entry}");
+}
+
+#[test]
+fn config_list_reports_the_approved_firewall_policy_over_a_looser_config_value() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    support::write_signed_firewall_posture(&project, "enforce", &[]);
+    seed_config(
+        &project,
+        "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_confirmed_malware = \"allow\"\n",
+    );
+
+    let entry = config_list_entry(&project, "firewall.npm.policies.lpm_ai_confirmed_malware");
+
+    assert_eq!(entry["value"], "block");
+}
+
+#[test]
+fn deleting_a_policy_key_never_copies_a_managed_action_into_the_local_posture() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    std::fs::create_dir_all(project.home().join(".lpm")).unwrap();
+    std::fs::write(
+        project.home().join(".lpm/security-policy.toml"),
+        "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_telemetry = \"block\"\n",
+    )
+    .unwrap();
+    seed_config(
+        &project,
+        "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_suspicious = \"warn\"\ncritical_vulnerability = \"block\"\n",
+    );
+
+    let output = lpm(&project)
+        .args([
+            "config",
+            "delete",
+            "firewall.npm.policies.lpm_ai_suspicious",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let posture_path = project.home().join(".lpm/security/approved-posture.json");
+    let posture: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(posture_path).unwrap()).unwrap();
+    assert!(
+        posture["payload"]["firewall_policies"]
+            .get("lpm_ai_telemetry")
+            .is_none(),
+        "{posture}"
+    );
+    assert_eq!(
+        posture["payload"]["firewall_policies"]["critical_vulnerability"], "block",
+        "{posture}"
+    );
+}
+
+#[test]
+fn config_list_reports_telemetry_held_at_an_approved_action_as_installs_send_it() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    support::write_signed_firewall_posture(&project, "monitor", &[("lpm_ai_telemetry", "block")]);
+    seed_config(
+        &project,
+        "[firewall]\nmode = \"monitor\"\n\n[firewall.npm.policies]\nlpm_ai_suspicious = \"warn\"\n",
+    );
+
+    let entry = config_list_entry(&project, "firewall.npm.policies.lpm_ai_telemetry");
+
+    assert_eq!(entry["value"], "block", "{entry}");
+    assert_eq!(entry["source"], "approved security posture", "{entry}");
+}

@@ -26,7 +26,8 @@ pub(crate) use wizards::{
 use effective::EffectiveConfig;
 use io::{
     config_value_at_path, config_value_for_display, config_value_to_json,
-    guard_generic_delete_against_force_floor, guard_generic_set_against_force_floor, read_config,
+    firewall_policy_profile_after_delete, guard_generic_delete_against_force_floor,
+    guard_generic_set_against_force_floor, local_policy_table_base, read_config,
     remove_config_value_at_path,
 };
 pub(crate) use io::{redact_config_json_value, update_config};
@@ -529,6 +530,11 @@ pub async fn run(
                     )?;
                     }
                     _ => {}
+                }
+                if let Some(after) =
+                    firewall_policy_profile_after_delete(config, key, local_policy_table_base)?
+                {
+                    crate::security_approval::tighten_persistent_npm_firewall_policies(&after)?;
                 }
                 let existed = remove_config_value_at_path(config.table_mut(), key);
                 Ok(((existed, floor_weakened), existed))

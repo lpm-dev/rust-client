@@ -814,7 +814,7 @@ fn add_security_entries(
         firewall_source,
         GROUP_SECURITY,
     ));
-    add_firewall_policy_entries(entries, global, user_source)?;
+    add_firewall_policy_entries(entries, global, user_source, posture, firewall)?;
 
     let integrity = crate::commands::config::resolve_object_integrity_policy(global)?;
     entries.push(EffectiveConfigEntry::new(
@@ -872,8 +872,21 @@ fn add_firewall_policy_entries(
     entries: &mut Vec<EffectiveConfigEntry>,
     global: &GlobalConfig,
     user_source: &str,
+    posture: &EffectiveAuthorizedPosture,
+    firewall_mode: crate::npm_firewall_config::NpmFirewallMode,
 ) -> Result<(), LpmError> {
-    let profile = crate::npm_firewall_config::config_policy_profile(global)?;
+    let requested = crate::npm_firewall_config::config_policy_request(global)?;
+    let runtime_requested = crate::npm_firewall_config::runtime_policy_request(global, posture)?;
+    let approved = posture.posture.firewall_policy_profile();
+    let tableless = crate::npm_firewall_config::runtime_policy_profile(None, posture);
+    let (requested_mode, floor_mode) = crate::npm_firewall_config::policy_comparison_modes(
+        firewall_mode,
+        posture.posture.firewall_mode(),
+        matches!(
+            posture.sources.firewall_policies,
+            PostureSourceKind::ManagedPolicy
+        ),
+    );
     let policies = global
         .get_table("firewall")
         .and_then(|table| table.get("npm"))
@@ -887,38 +900,20 @@ fn add_firewall_policy_entries(
             DEFAULT_SOURCE
         }
     };
-    let values = [
-        (
-            crate::npm_firewall_config::TRUSTED_PUBLIC_MALICIOUS_ADVISORIES_POLICY_KEY,
-            profile.trusted_public_malicious_advisories,
-        ),
-        (
-            crate::npm_firewall_config::LPM_AI_CONFIRMED_MALWARE_POLICY_KEY,
-            profile.lpm_ai_confirmed_malware,
-        ),
-        (
-            crate::npm_firewall_config::LPM_AI_DEPENDENCY_SCRIPT_POLICY_KEY,
-            profile.lpm_ai_dependency_script_policy,
-        ),
-        (
-            crate::npm_firewall_config::LPM_AI_AGENT_CONTROL_SURFACE_POLICY_KEY,
-            profile.lpm_ai_agent_control_surface,
-        ),
-        (
-            crate::npm_firewall_config::LPM_AI_TELEMETRY_POLICY_KEY,
-            profile.lpm_ai_telemetry,
-        ),
-        (
-            crate::npm_firewall_config::CRITICAL_VULNERABILITY_POLICY_KEY,
-            profile.critical_vulnerability,
-        ),
-        (
-            crate::npm_firewall_config::LPM_AI_SUSPICIOUS_POLICY_KEY,
-            profile.lpm_ai_suspicious,
-        ),
-    ];
-    for (key, value) in values {
-        let source: Cow<'_, str> = match key {
+    for key in [
+        crate::npm_firewall_config::TRUSTED_PUBLIC_MALICIOUS_ADVISORIES_POLICY_KEY,
+        crate::npm_firewall_config::LPM_AI_CONFIRMED_MALWARE_POLICY_KEY,
+        crate::npm_firewall_config::LPM_AI_DEPENDENCY_SCRIPT_POLICY_KEY,
+        crate::npm_firewall_config::LPM_AI_AGENT_CONTROL_SURFACE_POLICY_KEY,
+        crate::npm_firewall_config::LPM_AI_TELEMETRY_POLICY_KEY,
+        crate::npm_firewall_config::CRITICAL_VULNERABILITY_POLICY_KEY,
+        crate::npm_firewall_config::LPM_AI_SUSPICIOUS_POLICY_KEY,
+    ] {
+        let Some(approved_action) = crate::npm_firewall_config::policy_action(&approved, key)
+        else {
+            continue;
+        };
+        let config_source: Cow<'_, str> = match key {
             crate::npm_firewall_config::LPM_AI_SUSPICIOUS_POLICY_KEY
                 if policies.is_some_and(|policies| {
                     policies.contains_key(
@@ -939,6 +934,47 @@ fn add_firewall_policy_entries(
                 }
             }
             _ => Cow::Borrowed(policy_source(key)),
+        };
+        // Only a group the table names is a request; the rest run as they
+        // would without a table.
+        let named = config_source.as_ref() != DEFAULT_SOURCE;
+        let literal = requested
+            .as_ref()
+            .filter(|_| named)
+            .and_then(|requested| crate::npm_firewall_config::policy_action(requested, key));
+        let sent = runtime_requested
+            .as_ref()
+            .and_then(|requested| crate::npm_firewall_config::policy_action(requested, key));
+        let (value, source) = match literal {
+            // Telemetry following `lpm_ai_suspicious` holds at a stricter
+            // approved action; installs send that, and the posture set it.
+            Some(action) if sent.is_some_and(|sent| sent != action) => (
+                sent.unwrap_or(action),
+                posture_source(posture.sources.firewall_policies).to_string(),
+            ),
+            Some(action) => select_security_value(
+                action,
+                &config_source,
+                approved_action,
+                posture.sources.firewall_policies,
+                |candidate, floor| {
+                    crate::npm_firewall_config::policy_action_loosens(
+                        requested_mode,
+                        candidate,
+                        floor_mode,
+                        floor,
+                    )
+                },
+            ),
+            // Without a table installs run `tableless` as resolved: the
+            // default, raised to any stricter approved action.
+            None => match crate::npm_firewall_config::policy_action(&tableless, key) {
+                Some(action) if action != approved_action => (action, DEFAULT_SOURCE.to_string()),
+                _ => (
+                    approved_action,
+                    posture_source(posture.sources.firewall_policies).to_string(),
+                ),
+            },
         };
         entries.push(EffectiveConfigEntry::new(
             format!("firewall.npm.policies.{key}"),

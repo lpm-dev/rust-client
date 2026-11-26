@@ -729,13 +729,27 @@ pub fn write_signed_unlock_for(project: &TempProject, project_dir: &Path, scopes
 }
 
 pub fn write_npm_firewall_global_config(project: &TempProject, mode: &str) {
+    write_npm_firewall_global_config_with_policies(project, mode, &[]);
+}
+
+/// Write `~/.lpm/config.toml` with a firewall mode and, when `policies` is
+/// not empty, a `[firewall.npm.policies]` table.
+pub fn write_npm_firewall_global_config_with_policies(
+    project: &TempProject,
+    mode: &str,
+    policies: &[(&str, &str)],
+) {
     let lpm_dir = project.home().join(".lpm");
     std::fs::create_dir_all(&lpm_dir).expect("create isolated lpm home");
-    std::fs::write(
-        lpm_dir.join("config.toml"),
-        format!("[firewall]\nmode = \"{mode}\"\n"),
-    )
-    .expect("write isolated npm firewall config");
+    let mut config = format!("[firewall]\nmode = \"{mode}\"\n");
+    if !policies.is_empty() {
+        config.push_str("\n[firewall.npm.policies]\n");
+        for (key, action) in policies {
+            config.push_str(&format!("{key} = \"{action}\"\n"));
+        }
+    }
+    std::fs::write(lpm_dir.join("config.toml"), config)
+        .expect("write isolated npm firewall config");
 }
 
 pub fn write_lpm_proxy_npmrc(project: &TempProject, registry_url: &str) {
@@ -750,14 +764,38 @@ pub fn write_lpm_proxy_npmrc(project: &TempProject, registry_url: &str) {
 /// guard floor for workflow scenarios that intentionally exercise an
 /// approved machine-wide typosquat setting.
 pub fn write_signed_typosquat_guard_posture(project: &TempProject, typosquat_guard: &str) {
-    write_signed_posture(project, typosquat_guard, &[]);
+    write_signed_posture(project, typosquat_guard, &[], serde_json::Map::new());
 }
 
 pub fn write_signed_release_age_exclusion_posture(project: &TempProject, exclusions: &[&str]) {
-    write_signed_posture(project, "default", exclusions);
+    write_signed_posture(project, "default", exclusions, serde_json::Map::new());
 }
 
-fn write_signed_posture(project: &TempProject, typosquat_guard: &str, exclusions: &[&str]) {
+/// Write a signed approved machine posture whose npm firewall mode and
+/// approved `[firewall.npm.policies]` actions are `mode` and `policies`.
+pub fn write_signed_firewall_posture(project: &TempProject, mode: &str, policies: &[(&str, &str)]) {
+    let mut firewall = serde_json::Map::new();
+    firewall.insert("firewall_mode".into(), serde_json::json!(mode));
+    if !policies.is_empty() {
+        firewall.insert(
+            "firewall_policies".into(),
+            serde_json::Value::Object(
+                policies
+                    .iter()
+                    .map(|(key, action)| ((*key).to_string(), serde_json::json!(action)))
+                    .collect(),
+            ),
+        );
+    }
+    write_signed_posture(project, "default", &[], firewall);
+}
+
+fn write_signed_posture(
+    project: &TempProject,
+    typosquat_guard: &str,
+    exclusions: &[&str],
+    extra_fields: serde_json::Map<String, serde_json::Value>,
+) {
     use hmac::{KeyInit, Mac};
 
     let security_dir = project.home().join(".lpm/security");
@@ -766,7 +804,7 @@ fn write_signed_posture(project: &TempProject, typosquat_guard: &str, exclusions
     std::fs::write(security_dir.join("signing-secret.hex"), hex::encode(secret))
         .expect("write security signing secret");
 
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "schema_version": 1,
         "updated_at": lpm_common::Timestamp::now().to_rfc3339(),
         "script_policy": "deny",
@@ -778,6 +816,10 @@ fn write_signed_posture(project: &TempProject, typosquat_guard: &str, exclusions
         "sigstore_verify": "deny",
         "typosquat_guard": typosquat_guard,
     });
+    payload
+        .as_object_mut()
+        .expect("posture payload is an object")
+        .extend(extra_fields);
     let mut mac = HmacSha256::new_from_slice(&secret).expect("valid hmac secret");
     mac.update(&serde_json::to_vec(&payload).expect("serialize posture payload"));
     let envelope = serde_json::json!({

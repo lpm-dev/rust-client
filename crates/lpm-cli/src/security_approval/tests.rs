@@ -1,34 +1,7 @@
 use super::prelude::*;
+use super::test_support::{guarded_attempts, with_test_env};
 use super::*;
 use tempfile::tempdir;
-
-fn with_test_env<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
-    let policy_path = dir.join("managed-security-policy.toml");
-    let lpm_home = dir.join("lpm-home");
-    let _env = crate::test_env::ScopedEnv::update([
-        ("LPM_HOME", Some(lpm_home.as_os_str().to_owned())),
-        (SECURITY_DIR_ENV, Some(dir.as_os_str().to_owned())),
-        (
-            SECURITY_POLICY_PATH_ENV,
-            Some(policy_path.as_os_str().to_owned()),
-        ),
-        (
-            TEST_SECRET_ENV,
-            Some(std::ffi::OsString::from(
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            )),
-        ),
-        (
-            TEST_AUTH_RESULT_ENV,
-            Some(std::ffi::OsString::from("approve")),
-        ),
-        ("LPM_NPM_FIREWALL", None),
-        ("LPM_EXPERIMENT_NPM_FIREWALL", None),
-        ("LPM_PROVENANCE_ENFORCE", None),
-        ("LPM_FORCE_FILE_VAULT", None),
-    ]);
-    f()
-}
 
 fn with_file_secret_env<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
     with_test_env(dir, || {
@@ -99,6 +72,49 @@ fn firewall_global_config(mode: &str) -> crate::commands::config::GlobalConfig {
         toml::Value::Table(firewall),
     );
     crate::commands::config::GlobalConfig::from_table(table)
+}
+
+fn firewall_policy_global_config(
+    mode: &str,
+    policies: &[(&str, &str)],
+) -> crate::commands::config::GlobalConfig {
+    let mut config = firewall_global_config(mode);
+    let mut policy_table = toml::map::Map::new();
+    for (key, action) in policies {
+        policy_table.insert(
+            (*key).to_string(),
+            toml::Value::String((*action).to_string()),
+        );
+    }
+    let mut npm = toml::map::Map::new();
+    npm.insert(
+        crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_SECTION.to_string(),
+        toml::Value::Table(policy_table),
+    );
+    config
+        .table_mut()
+        .get_mut(crate::npm_firewall_config::FIREWALL_CONFIG_SECTION)
+        .and_then(toml::Value::as_table_mut)
+        .unwrap()
+        .insert(
+            crate::npm_firewall_config::FIREWALL_NPM_CONFIG_SECTION.to_string(),
+            toml::Value::Table(npm),
+        );
+    config
+}
+
+fn approve_enforced_firewall(policies: &[(&str, &str)]) {
+    persist_authorized_posture(&AuthorizedPosture {
+        firewall_mode: crate::npm_firewall_config::NpmFirewallMode::Enforce
+            .as_str()
+            .to_string(),
+        firewall_policies: policies
+            .iter()
+            .map(|(key, action)| ((*key).to_string(), (*action).to_string()))
+            .collect(),
+        ..AuthorizedPosture::default()
+    })
+    .unwrap();
 }
 
 #[test]
@@ -518,12 +534,13 @@ fn runtime_firewall_mode_uses_managed_policy_floor_when_config_is_absent() {
 mode = "enforce"
 "#,
         );
-        let mode = crate::npm_firewall_config::resolve_runtime_mode(
+        let mode = crate::npm_firewall_config::resolve_runtime_firewall(
             &crate::commands::config::GlobalConfig::empty(),
             &project,
             true,
         )
-        .unwrap();
+        .unwrap()
+        .mode;
 
         assert_eq!(mode, crate::npm_firewall_config::NpmFirewallMode::Enforce);
     });
@@ -543,7 +560,7 @@ fn runtime_firewall_mode_rejects_explicit_config_below_managed_policy_floor() {
 mode = "enforce"
 "#,
         );
-        let err = crate::npm_firewall_config::resolve_runtime_mode(
+        let err = crate::npm_firewall_config::resolve_runtime_firewall(
             &firewall_global_config("off"),
             &project,
             true,
@@ -641,6 +658,32 @@ mode = "enforce"
         assert_eq!(
             effective.sources.firewall_mode,
             PostureSourceKind::BuiltinDefault
+        );
+    });
+}
+
+#[test]
+fn managed_firewall_protection_disable_refuses_while_the_policy_sets_a_firewall_profile() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_managed_policy(
+            temp.path(),
+            r#"
+[firewall]
+mode = "enforce"
+
+[firewall.npm.policies]
+lpm_ai_agent_control_surface = "block"
+"#,
+        );
+
+        let err = remove_managed_firewall_protection().unwrap_err();
+
+        assert!(err.to_string().contains("[firewall.npm.policies]"), "{err}");
+        let effective = load_effective_authorized_posture().unwrap();
+        assert_eq!(
+            effective.sources.firewall_mode,
+            PostureSourceKind::ManagedPolicy
         );
     });
 }
@@ -1303,9 +1346,12 @@ fn runtime_firewall_env_downgrade_records_env_source() {
                 &effective,
                 &project,
                 true,
-                crate::npm_firewall_config::NpmFirewallModeRequest::from_env(
-                    crate::npm_firewall_config::NpmFirewallMode::Off,
+                Some(
+                    crate::npm_firewall_config::NpmFirewallModeRequest::from_env(
+                        crate::npm_firewall_config::NpmFirewallMode::Off,
+                    ),
                 ),
+                None,
             )
         })
         .unwrap_err();
@@ -1658,5 +1704,991 @@ fn diagnostic_sigstore_posture_honors_unlocks_and_managed_policy_without_mutatio
         );
         assert!(expired_path.exists());
         assert!(!audit_log_path().unwrap().exists());
+    });
+}
+
+fn with_test_native_auth_result<T>(result: &str, f: impl FnOnce() -> T) -> T {
+    struct RestoreTestAuth(Option<std::ffi::OsString>);
+
+    impl Drop for RestoreTestAuth {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.as_ref() {
+                    Some(value) => std::env::set_var(TEST_AUTH_RESULT_ENV, value),
+                    None => std::env::remove_var(TEST_AUTH_RESULT_ENV),
+                }
+            }
+        }
+    }
+
+    let _restore = RestoreTestAuth(std::env::var_os(TEST_AUTH_RESULT_ENV));
+    unsafe {
+        std::env::set_var(TEST_AUTH_RESULT_ENV, result);
+    }
+    f()
+}
+
+fn resolve_firewall(
+    config: &crate::commands::config::GlobalConfig,
+    project: &Path,
+) -> Result<crate::npm_firewall_config::RuntimeFirewall, LpmError> {
+    crate::npm_firewall_config::resolve_runtime_firewall(config, project, true)
+}
+
+#[test]
+fn runtime_firewall_requires_approval_for_config_policy_that_allows_approved_blocks() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[]);
+        let config = firewall_policy_global_config(
+            "enforce",
+            &[(
+                crate::npm_firewall_config::LPM_AI_CONFIRMED_MALWARE_POLICY_KEY,
+                "allow",
+            )],
+        );
+
+        let err = without_test_native_auth(|| resolve_firewall(&config, &project)).unwrap_err();
+
+        let LpmError::SecurityApprovalRequired(context) = &err else {
+            panic!("expected an approval error, got {err}");
+        };
+        assert!(
+            context
+                .message
+                .contains("lpm_ai_confirmed_malware = allow (approved: block)"),
+            "{}",
+            context.message
+        );
+        assert_eq!(
+            context.suggested_command.as_deref(),
+            Some("lpm config firewall")
+        );
+        assert_eq!(
+            context.requested_scopes,
+            vec!["firewall-disable".to_string()]
+        );
+    });
+}
+
+#[test]
+fn runtime_firewall_uses_config_policy_the_signed_posture_approved() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[(
+            crate::npm_firewall_config::LPM_AI_CONFIRMED_MALWARE_POLICY_KEY,
+            "allow",
+        )]);
+        let config = firewall_policy_global_config(
+            "enforce",
+            &[(
+                crate::npm_firewall_config::LPM_AI_CONFIRMED_MALWARE_POLICY_KEY,
+                "allow",
+            )],
+        );
+
+        let firewall = without_test_native_auth(|| resolve_firewall(&config, &project)).unwrap();
+
+        assert_eq!(
+            firewall.policy_profile.lpm_ai_confirmed_malware,
+            lpm_registry::client::NpmFirewallPolicyAction::Allow
+        );
+    });
+}
+
+#[test]
+fn runtime_firewall_accepts_stricter_config_policy_without_approval() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[]);
+        let config = firewall_policy_global_config(
+            "enforce",
+            &[(
+                crate::npm_firewall_config::LPM_AI_AGENT_CONTROL_SURFACE_POLICY_KEY,
+                "block",
+            )],
+        );
+
+        let firewall = without_test_native_auth(|| resolve_firewall(&config, &project)).unwrap();
+
+        assert_eq!(
+            firewall.policy_profile.lpm_ai_agent_control_surface,
+            lpm_registry::client::NpmFirewallPolicyAction::Block
+        );
+    });
+}
+
+#[test]
+fn runtime_firewall_policy_needs_no_approval_where_the_approved_firewall_is_off() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    with_test_env(temp.path(), || {
+        let config = firewall_policy_global_config(
+            "enforce",
+            &[(
+                crate::npm_firewall_config::LPM_AI_CONFIRMED_MALWARE_POLICY_KEY,
+                "allow",
+            )],
+        );
+
+        let firewall = without_test_native_auth(|| resolve_firewall(&config, &project)).unwrap();
+
+        assert_eq!(
+            firewall.mode,
+            crate::npm_firewall_config::NpmFirewallMode::Enforce
+        );
+        assert_eq!(
+            firewall.policy_profile.lpm_ai_confirmed_malware,
+            lpm_registry::client::NpmFirewallPolicyAction::Allow
+        );
+    });
+}
+
+#[test]
+fn runtime_firewall_uses_approved_policies_when_config_has_no_policy_table() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[(
+            crate::npm_firewall_config::CRITICAL_VULNERABILITY_POLICY_KEY,
+            "block",
+        )]);
+
+        let firewall = resolve_firewall(&firewall_global_config("enforce"), &project).unwrap();
+
+        assert_eq!(
+            firewall.policy_profile.critical_vulnerability,
+            lpm_registry::client::NpmFirewallPolicyAction::Block
+        );
+    });
+}
+
+#[test]
+fn runtime_firewall_refuses_policy_loosening_under_managed_firewall_mode() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    with_test_env(temp.path(), || {
+        write_managed_policy(
+            temp.path(),
+            r#"
+[firewall]
+mode = "enforce"
+"#,
+        );
+        let config = firewall_policy_global_config(
+            "enforce",
+            &[(
+                crate::npm_firewall_config::TRUSTED_PUBLIC_MALICIOUS_ADVISORIES_POLICY_KEY,
+                "warn",
+            )],
+        );
+
+        let err = resolve_firewall(&config, &project).unwrap_err();
+
+        assert_eq!(err.error_code(), "security_floor");
+        assert!(err.to_string().contains("[firewall.npm.policies]"), "{err}");
+    });
+}
+
+#[test]
+fn managed_policy_firewall_policies_set_the_effective_profile() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_managed_policy(
+            temp.path(),
+            r#"
+[firewall]
+mode = "enforce"
+
+[firewall.npm.policies]
+lpm_ai_agent_control_surface = "block"
+"#,
+        );
+
+        let effective = load_effective_authorized_posture().unwrap();
+
+        assert_eq!(
+            effective
+                .posture
+                .firewall_policy_profile()
+                .lpm_ai_agent_control_surface,
+            lpm_registry::client::NpmFirewallPolicyAction::Block
+        );
+        assert_eq!(
+            effective.sources.firewall_policies,
+            PostureSourceKind::ManagedPolicy
+        );
+        assert!(
+            effective
+                .managed_policy
+                .unwrap()
+                .enforced_controls
+                .contains(&"firewall.npm.policies".to_string())
+        );
+    });
+}
+
+#[test]
+fn managed_policy_rejects_firewall_policies_without_a_firewall_mode() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_managed_policy(
+            temp.path(),
+            r#"
+[firewall.npm.policies]
+lpm_ai_agent_control_surface = "block"
+"#,
+        );
+
+        let err = load_effective_authorized_posture().unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("must set `[firewall].mode` when it sets `[firewall.npm.policies]`"),
+            "{err}"
+        );
+    });
+}
+
+#[test]
+fn managed_policy_rejects_invalid_firewall_policy_action() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_managed_policy(
+            temp.path(),
+            r#"
+[firewall]
+mode = "enforce"
+
+[firewall.npm.policies]
+lpm_ai_confirmed_malware = "ignore"
+"#,
+        );
+
+        let err = load_effective_authorized_posture().unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "invalid `[firewall.npm.policies].lpm_ai_confirmed_malware` value `ignore`"
+            ),
+            "{err}"
+        );
+    });
+}
+
+#[test]
+fn persistent_firewall_policy_loosening_is_signed_after_native_approval() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[]);
+        let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_confirmed_malware: lpm_registry::client::NpmFirewallPolicyAction::Allow,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        with_test_native_auth_result("approve", || {
+            authorize_persistent_npm_firewall_policies(&requested, false, "lpm config firewall")
+        })
+        .unwrap();
+
+        let posture = load_authorized_posture().unwrap();
+        assert_eq!(posture.firewall_policy_profile(), requested);
+        assert_eq!(
+            posture.firewall_mode(),
+            crate::npm_firewall_config::NpmFirewallMode::Enforce
+        );
+    });
+}
+
+#[test]
+fn persistent_firewall_policy_loosening_is_refused_when_native_approval_is_denied() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[]);
+        let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_dependency_script_policy: lpm_registry::client::NpmFirewallPolicyAction::Warn,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        let err = with_test_native_auth_result("deny", || {
+            authorize_persistent_npm_firewall_policies(&requested, false, "lpm config firewall")
+        })
+        .unwrap_err();
+
+        assert_eq!(err.error_code(), "security_approval_required");
+        assert_eq!(
+            load_authorized_posture().unwrap().firewall_policy_profile(),
+            lpm_registry::client::NpmFirewallPolicyProfile::default()
+        );
+    });
+}
+
+#[test]
+fn persistent_firewall_policy_tightening_needs_no_approval() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[]);
+        let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_telemetry: lpm_registry::client::NpmFirewallPolicyAction::Block,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        without_test_native_auth(|| {
+            authorize_persistent_npm_firewall_policies(&requested, true, "lpm config firewall")
+        })
+        .unwrap();
+
+        assert_eq!(
+            load_authorized_posture().unwrap().firewall_policy_profile(),
+            requested
+        );
+    });
+}
+
+#[test]
+fn persistent_firewall_policy_loosening_is_refused_under_managed_firewall_mode() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_managed_policy(
+            temp.path(),
+            r#"
+[firewall]
+mode = "enforce"
+"#,
+        );
+        let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_confirmed_malware: lpm_registry::client::NpmFirewallPolicyAction::Allow,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        let err = with_test_native_auth_result("approve", || {
+            authorize_persistent_npm_firewall_policies(&requested, false, "lpm config firewall")
+        })
+        .unwrap_err();
+
+        assert_eq!(err.error_code(), "security_floor");
+        assert!(
+            err.to_string()
+                .contains("[firewall.npm.policies].lpm_ai_confirmed_malware"),
+            "{err}"
+        );
+    });
+}
+
+#[test]
+fn security_status_reports_config_policy_that_differs_from_the_effective_profile() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        let config_dir = temp.path().join("lpm-home");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_confirmed_malware = \"allow\"\n",
+        )
+        .unwrap();
+
+        let status = load_security_status(None, true).unwrap();
+
+        let override_entry = status
+            .active_runtime_overrides
+            .iter()
+            .find(|entry| entry.control == "[firewall.npm.policies]")
+            .expect("policy override is reported");
+        assert_eq!(override_entry.value, "lpm_ai_confirmed_malware=allow");
+        assert_eq!(
+            status.effective_floor.firewall_policies["lpm_ai_confirmed_malware"],
+            "block"
+        );
+    });
+}
+
+#[test]
+fn security_status_blames_config_only_for_the_policy_groups_its_table_names() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[(
+            crate::npm_firewall_config::LPM_AI_CONFIRMED_MALWARE_POLICY_KEY,
+            "allow",
+        )]);
+        let config_dir = temp.path().join("lpm-home");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_telemetry = \"warn\"\n",
+        )
+        .unwrap();
+
+        let status = load_security_status(None, true).unwrap();
+
+        assert!(
+            !status
+                .active_runtime_overrides
+                .iter()
+                .any(|entry| entry.control == "[firewall.npm.policies]"),
+            "{:?}",
+            status.active_runtime_overrides
+        );
+    });
+}
+
+#[test]
+fn security_status_lists_no_override_for_a_table_asking_for_the_approved_action() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[(
+            crate::npm_firewall_config::LPM_AI_DEPENDENCY_SCRIPT_POLICY_KEY,
+            "warn",
+        )]);
+        let config_dir = temp.path().join("lpm-home");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_dependency_script_policy = \"warn\"\nlpm_ai_confirmed_malware = \"warn\"\n",
+        )
+        .unwrap();
+
+        let status = load_security_status(None, true).unwrap();
+
+        let policies: Vec<&str> = status
+            .active_runtime_overrides
+            .iter()
+            .filter(|entry| entry.control == "[firewall.npm.policies]")
+            .map(|entry| entry.value.as_str())
+            .collect();
+        assert_eq!(policies, ["lpm_ai_confirmed_malware=warn"]);
+    });
+}
+
+#[test]
+fn forced_floor_measures_a_write_against_what_installs_run_not_an_unapproved_table() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[]);
+        let mut config = firewall_policy_global_config(
+            "enforce",
+            &[(
+                crate::npm_firewall_config::LPM_AI_CONFIRMED_MALWARE_POLICY_KEY,
+                "allow",
+            )],
+        );
+        config.table_mut().insert(
+            "force-security-floor".to_string(),
+            toml::Value::Boolean(true),
+        );
+        let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_confirmed_malware: lpm_registry::client::NpmFirewallPolicyAction::Warn,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        let err = crate::security_floor::reject_looser_firewall_policy_write(&config, &requested)
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("lpm_ai_confirmed_malware"),
+            "{err}"
+        );
+    });
+}
+
+const MANAGED_LOOSER_SCRIPT_POLICY: &str = "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_dependency_script_policy = \"warn\"\n";
+
+#[test]
+fn an_editor_save_that_loosens_the_local_posture_under_a_looser_managed_profile_asks_first() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[]);
+        write_managed_policy(temp.path(), MANAGED_LOOSER_SCRIPT_POLICY);
+        let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_dependency_script_policy: lpm_registry::client::NpmFirewallPolicyAction::Warn,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        let err = with_test_native_auth_result("deny", || {
+            authorize_persistent_npm_firewall_policies(&requested, false, "lpm config firewall")
+        })
+        .unwrap_err();
+
+        assert_eq!(err.error_code(), "security_approval_required", "{err}");
+        assert_eq!(
+            load_authorized_posture()
+                .unwrap()
+                .firewall_policy_profile()
+                .lpm_ai_dependency_script_policy,
+            lpm_registry::client::NpmFirewallPolicyAction::Block
+        );
+    });
+}
+
+#[test]
+fn forced_floor_holds_an_editor_save_at_the_local_posture_under_a_looser_managed_profile() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[]);
+        write_managed_policy(temp.path(), MANAGED_LOOSER_SCRIPT_POLICY);
+        let mut config = firewall_policy_global_config("enforce", &[]);
+        config.table_mut().insert(
+            "force-security-floor".to_string(),
+            toml::Value::Boolean(true),
+        );
+        let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_dependency_script_policy: lpm_registry::client::NpmFirewallPolicyAction::Warn,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        let err = crate::security_floor::reject_looser_firewall_policy_write(&config, &requested)
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("lpm_ai_dependency_script_policy"),
+            "{message}"
+        );
+        assert!(message.contains("force-security-floor"), "{message}");
+        assert!(!message.contains("config.toml"), "{message}");
+    });
+}
+
+fn forced_floor_config(mode: &str) -> crate::commands::config::GlobalConfig {
+    let mut config = firewall_policy_global_config(mode, &[]);
+    config.table_mut().insert(
+        "force-security-floor".to_string(),
+        toml::Value::Boolean(true),
+    );
+    config
+}
+
+fn approve_firewall_mode(mode: crate::npm_firewall_config::NpmFirewallMode) {
+    persist_authorized_posture(&AuthorizedPosture {
+        firewall_mode: mode.as_str().to_string(),
+        ..AuthorizedPosture::default()
+    })
+    .unwrap();
+}
+
+#[test]
+fn forced_floor_lets_an_editor_save_raise_monitor_to_enforce_with_an_action_monitor_treats_alike() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_firewall_mode(crate::npm_firewall_config::NpmFirewallMode::Monitor);
+        let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_dependency_script_policy: lpm_registry::client::NpmFirewallPolicyAction::Warn,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        crate::security_floor::reject_looser_firewall_policy_write(
+            &forced_floor_config("monitor"),
+            &requested,
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+fn forced_floor_lets_an_editor_save_turn_the_firewall_on_with_a_custom_profile() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_telemetry: lpm_registry::client::NpmFirewallPolicyAction::Allow,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        crate::security_floor::reject_looser_firewall_policy_write(
+            &forced_floor_config("off"),
+            &requested,
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+fn forced_floor_names_one_action_that_passes_every_floor_an_editor_save_meets() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[(
+            crate::npm_firewall_config::LPM_AI_SUSPICIOUS_POLICY_KEY,
+            "block",
+        )]);
+        write_managed_policy(
+            temp.path(),
+            "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_suspicious = \"warn\"\n",
+        );
+        let config = forced_floor_config("enforce");
+
+        for requested_action in [
+            lpm_registry::client::NpmFirewallPolicyAction::Allow,
+            lpm_registry::client::NpmFirewallPolicyAction::Warn,
+        ] {
+            let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+                lpm_ai_suspicious: requested_action,
+                ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+            };
+
+            let message =
+                crate::security_floor::reject_looser_firewall_policy_write(&config, &requested)
+                    .unwrap_err()
+                    .to_string();
+
+            assert!(
+                message.contains("would loosen the `block` your approved posture holds"),
+                "{message}"
+            );
+            assert!(
+                message.contains("Keep it at `block` or stricter"),
+                "{message}"
+            );
+        }
+    });
+}
+
+/// An editor save under `managed_policy` and `force-security-floor = true` at
+/// `config_mode`, loosening telemetry to each of `requested_actions`, is
+/// refused by the managed check, which names `refused_group` and records each
+/// try.
+fn assert_managed_check_refuses_first(
+    managed_policy: &str,
+    config_mode: &str,
+    extra: lpm_registry::client::NpmFirewallPolicyProfile,
+    requested_actions: &[lpm_registry::client::NpmFirewallPolicyAction],
+    refused_group: &str,
+) {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_managed_policy(temp.path(), managed_policy);
+        let config = forced_floor_config(config_mode);
+
+        for requested_action in requested_actions {
+            let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+                lpm_ai_telemetry: *requested_action,
+                ..extra
+            };
+
+            let message = crate::security_floor::reject_firewall_policy_save(&config, &requested)
+                .unwrap_err()
+                .to_string();
+
+            assert!(
+                message.contains(&format!(
+                    "keeps `[firewall.npm.policies].{refused_group}` at `block`"
+                )),
+                "{message}"
+            );
+            assert!(!message.contains("force-security-floor"), "{message}");
+        }
+        assert_eq!(guarded_attempts(), requested_actions.len());
+    });
+}
+
+#[test]
+fn an_editor_save_meets_the_managed_check_before_the_forced_floor() {
+    let telemetry_block =
+        "[firewall]\nmode = \"{mode}\"\n\n[firewall.npm.policies]\nlpm_ai_telemetry = \"block\"\n";
+    let looser = [
+        lpm_registry::client::NpmFirewallPolicyAction::Allow,
+        lpm_registry::client::NpmFirewallPolicyAction::Warn,
+    ];
+    // Installs run at monitor, where the managed `block` alone holds the group.
+    assert_managed_check_refuses_first(
+        &telemetry_block.replace("{mode}", "monitor"),
+        "monitor",
+        lpm_registry::client::NpmFirewallPolicyProfile::default(),
+        &looser,
+        "lpm_ai_telemetry",
+    );
+    // Installs run at enforce, where what they enforce ties the managed floor.
+    assert_managed_check_refuses_first(
+        &telemetry_block.replace("{mode}", "enforce"),
+        "enforce",
+        lpm_registry::client::NpmFirewallPolicyProfile::default(),
+        &looser,
+        "lpm_ai_telemetry",
+    );
+    // A save that loosens several groups the policy holds is refused on the
+    // first, still by the managed check.
+    assert_managed_check_refuses_first(
+        &telemetry_block.replace("{mode}", "enforce"),
+        "enforce",
+        lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_confirmed_malware: lpm_registry::client::NpmFirewallPolicyAction::Warn,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        },
+        &[lpm_registry::client::NpmFirewallPolicyAction::Allow],
+        "lpm_ai_confirmed_malware",
+    );
+}
+
+#[test]
+fn a_managed_mode_alone_names_the_loosest_action_its_mode_accepts() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_managed_policy(temp.path(), "[firewall]\nmode = \"monitor\"\n");
+        let config = forced_floor_config("monitor");
+        let dependency_scripts = |action| lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_dependency_script_policy: action,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        let message = crate::security_floor::reject_firewall_policy_save(
+            &config,
+            &dependency_scripts(lpm_registry::client::NpmFirewallPolicyAction::Allow),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            message.contains("holds the npm firewall at `monitor` mode or stricter"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "at `monitor` `[firewall.npm.policies].{}` can't be looser than `warn`",
+                crate::npm_firewall_config::LPM_AI_DEPENDENCY_SCRIPT_POLICY_KEY
+            )),
+            "{message}"
+        );
+        assert!(!message.contains("`block`"), "{message}");
+        assert_eq!(guarded_attempts(), 1);
+        // Monitor reports `warn` and `block` alike, so the action it names passes.
+        crate::security_floor::reject_firewall_policy_save(
+            &config,
+            &dependency_scripts(lpm_registry::client::NpmFirewallPolicyAction::Warn),
+        )
+        .unwrap();
+        assert_eq!(guarded_attempts(), 1);
+    });
+}
+
+#[test]
+fn forced_floor_refuses_an_editor_save_that_would_sign_a_group_left_loose_by_hand() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[]);
+        let mut config = firewall_policy_global_config(
+            "enforce",
+            &[(
+                crate::npm_firewall_config::LPM_AI_DEPENDENCY_SCRIPT_POLICY_KEY,
+                "warn",
+            )],
+        );
+        config.table_mut().insert(
+            "force-security-floor".to_string(),
+            toml::Value::Boolean(true),
+        );
+        let repairs_another_group = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_dependency_script_policy: lpm_registry::client::NpmFirewallPolicyAction::Warn,
+            lpm_ai_agent_control_surface: lpm_registry::client::NpmFirewallPolicyAction::Block,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        let err = crate::security_floor::reject_looser_firewall_policy_write(
+            &config,
+            &repairs_another_group,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("lpm_ai_dependency_script_policy"),
+            "{err}"
+        );
+    });
+}
+
+#[test]
+fn forced_floor_measures_a_delete_at_the_mode_installs_run() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_firewall_mode(crate::npm_firewall_config::NpmFirewallMode::Monitor);
+        let mut config = firewall_policy_global_config(
+            "monitor",
+            &[(
+                crate::npm_firewall_config::LPM_AI_SUSPICIOUS_POLICY_KEY,
+                "block",
+            )],
+        );
+        config.table_mut().insert(
+            "force-security-floor".to_string(),
+            toml::Value::Boolean(true),
+        );
+        let after_delete = |action| lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_suspicious: action,
+            lpm_ai_telemetry: action,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        let reports_as_much = crate::security_floor::reject_looser_firewall_policy_delete(
+            &config,
+            &after_delete(lpm_registry::client::NpmFirewallPolicyAction::Warn),
+        );
+        let reports_less = crate::security_floor::reject_looser_firewall_policy_delete(
+            &config,
+            &after_delete(lpm_registry::client::NpmFirewallPolicyAction::Allow),
+        );
+
+        assert!(reports_as_much.is_ok(), "{reports_as_much:?}");
+        assert_eq!(reports_less.unwrap_err().error_code(), "security_floor");
+    });
+}
+
+#[test]
+fn forced_floor_judges_a_delete_only_by_the_groups_it_changes() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[]);
+        let mut config = firewall_policy_global_config(
+            "enforce",
+            &[
+                (
+                    crate::npm_firewall_config::LPM_AI_CONFIRMED_MALWARE_POLICY_KEY,
+                    "warn",
+                ),
+                (
+                    crate::npm_firewall_config::LPM_AI_DEPENDENCY_SCRIPT_POLICY_KEY,
+                    "warn",
+                ),
+            ],
+        );
+        config.table_mut().insert(
+            "force-security-floor".to_string(),
+            toml::Value::Boolean(true),
+        );
+        let restores_malware = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_dependency_script_policy: lpm_registry::client::NpmFirewallPolicyAction::Warn,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+        let loosens_scripts = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_confirmed_malware: lpm_registry::client::NpmFirewallPolicyAction::Warn,
+            lpm_ai_dependency_script_policy: lpm_registry::client::NpmFirewallPolicyAction::Allow,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        let restored =
+            crate::security_floor::reject_looser_firewall_policy_delete(&config, &restores_malware);
+        let loosened =
+            crate::security_floor::reject_looser_firewall_policy_delete(&config, &loosens_scripts)
+                .unwrap_err();
+
+        assert!(restored.is_ok(), "{restored:?}");
+        assert!(
+            loosened
+                .to_string()
+                .contains("lpm_ai_dependency_script_policy"),
+            "{loosened}"
+        );
+    });
+}
+
+#[test]
+fn runtime_firewall_reports_a_looser_mode_without_listing_unchanged_policies() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[]);
+        let config = firewall_policy_global_config(
+            "monitor",
+            &[(
+                crate::npm_firewall_config::LPM_AI_CONFIRMED_MALWARE_POLICY_KEY,
+                "block",
+            )],
+        );
+
+        let err = without_test_native_auth(|| resolve_firewall(&config, &project)).unwrap_err();
+
+        let LpmError::SecurityApprovalRequired(context) = &err else {
+            panic!("expected an approval error, got {err}");
+        };
+        assert!(
+            !context.message.contains("[firewall.npm.policies]"),
+            "{}",
+            context.message
+        );
+        assert_ne!(
+            context.suggested_command.as_deref(),
+            Some("lpm config firewall")
+        );
+    });
+}
+
+#[test]
+fn tightening_the_approved_profile_restores_defaults_without_approval() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[
+            (
+                crate::npm_firewall_config::LPM_AI_CONFIRMED_MALWARE_POLICY_KEY,
+                "allow",
+            ),
+            (
+                crate::npm_firewall_config::LPM_AI_TELEMETRY_POLICY_KEY,
+                "block",
+            ),
+        ]);
+
+        without_test_native_auth(|| {
+            tighten_persistent_npm_firewall_policies(
+                &lpm_registry::client::NpmFirewallPolicyProfile::default(),
+            )
+        })
+        .unwrap();
+
+        let profile = load_authorized_posture().unwrap().firewall_policy_profile();
+        assert_eq!(
+            profile.lpm_ai_confirmed_malware,
+            lpm_registry::client::NpmFirewallPolicyAction::Block
+        );
+        assert_eq!(
+            profile.lpm_ai_telemetry,
+            lpm_registry::client::NpmFirewallPolicyAction::Block,
+            "tightening never loosens a stricter approved group"
+        );
+    });
+}
+
+#[test]
+fn forced_floor_holds_an_approved_group_a_partial_table_leaves_out() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[(
+            crate::npm_firewall_config::LPM_AI_AGENT_CONTROL_SURFACE_POLICY_KEY,
+            "block",
+        )]);
+        let mut config = firewall_policy_global_config(
+            "enforce",
+            &[(
+                crate::npm_firewall_config::LPM_AI_TELEMETRY_POLICY_KEY,
+                "block",
+            )],
+        );
+        config.table_mut().insert(
+            "force-security-floor".to_string(),
+            toml::Value::Boolean(true),
+        );
+        let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_telemetry: lpm_registry::client::NpmFirewallPolicyAction::Block,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        let err = crate::security_floor::reject_looser_firewall_policy_write(&config, &requested)
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("lpm_ai_agent_control_surface"),
+            "{err}"
+        );
     });
 }

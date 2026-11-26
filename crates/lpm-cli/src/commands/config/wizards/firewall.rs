@@ -76,10 +76,13 @@ pub(in crate::commands::config) async fn run_firewall_wizard(
             .interact()
             .map_err(prompt_err)?;
         if new_value == "enforce" {
-            let initial_profile = read_firewall_policy_profile(config_path)?;
-            let profile = prompt_firewall_policy_profile(initial_profile)?;
+            let profile =
+                prompt_firewall_policy_profile(read_firewall_policy_profiles(config_path)?)?;
             let existing_cfg = read_config(config_path)?;
-            if should_persist_firewall_policy_profile(&existing_cfg, profile) {
+            let approved = crate::security_approval::load_effective_authorized_posture()?
+                .posture
+                .firewall_policy_profile();
+            if should_persist_firewall_policy_profile(&existing_cfg, profile, approved) {
                 FirewallWizardSelection::CustomEnforce(profile)
             } else {
                 FirewallWizardSelection::Mode(NpmFirewallMode::Enforce)
@@ -114,7 +117,7 @@ pub(in crate::commands::config) async fn run_firewall_wizard(
         config_path,
         selection,
         json_output,
-        &format!("lpm config firewall --set {}", mode.as_str()),
+        &firewall_selection_retry_command(selection),
     )
     .await?;
     announce_firewall_selection_set(selection, json_output);
@@ -146,11 +149,26 @@ async fn apply_firewall_selection(
     update_config(config_path, |config| {
         validate_firewall_selection_target(config, selection)?;
         crate::security_floor::reject_looser_firewall_mode_write(config, mode)?;
-        crate::security_approval::authorize_persistent_npm_firewall_mode(
-            mode,
-            json_output,
-            proposed_command,
-        )?;
+        match selection.policy_profile() {
+            Some(profile) => {
+                crate::security_floor::reject_firewall_policy_save(config, &profile)?;
+                crate::security_approval::authorize_persistent_npm_firewall_policies(
+                    &profile,
+                    json_output,
+                    proposed_command,
+                )?;
+            }
+            None => {
+                crate::security_approval::authorize_persistent_npm_firewall_mode(
+                    mode,
+                    json_output,
+                    proposed_command,
+                )?;
+                crate::security_approval::tighten_persistent_npm_firewall_policies(
+                    &crate::npm_firewall_config::config_policy_profile(config)?,
+                )?;
+            }
+        }
         persist_firewall_mode_in_config_value(config, mode)?;
         if let Some(profile) = selection.policy_profile() {
             persist_firewall_policy_profile_in_config_value(config, profile)?;
@@ -469,12 +487,18 @@ struct FirewallPolicyEditorRow {
 }
 
 impl FirewallPolicyEditorRow {
-    fn new(group: FirewallPolicyGroup, action: NpmFirewallPolicyAction) -> Self {
+    fn new(
+        group: FirewallPolicyGroup,
+        action: NpmFirewallPolicyAction,
+        offered: impl IntoIterator<Item = NpmFirewallPolicyAction>,
+    ) -> Self {
         let default_actions = group.field.default_actions();
         let mut actions = Vec::with_capacity(default_actions.len() + 1);
         actions.extend_from_slice(default_actions);
-        if !actions.contains(&action) {
-            insert_missing_policy_action(&mut actions, action);
+        for candidate in std::iter::once(action).chain(offered) {
+            if !actions.contains(&candidate) {
+                insert_missing_policy_action(&mut actions, candidate);
+            }
         }
         Self {
             group,
@@ -529,18 +553,59 @@ fn insert_missing_policy_action(
     actions.insert(index, action);
 }
 
-fn read_firewall_policy_profile(
-    config_path: &std::path::Path,
-) -> Result<NpmFirewallPolicyProfile, LpmError> {
-    let cfg = read_config(config_path)?;
-    crate::npm_firewall_config::config_policy_profile(&GlobalConfig::from_value(cfg)?)
+/// The command that redoes `selection`: a custom profile is chosen in the
+/// editor, while a mode alone is one flag.
+fn firewall_selection_retry_command(selection: FirewallWizardSelection) -> String {
+    match selection {
+        FirewallWizardSelection::CustomEnforce(_) => "lpm config firewall".to_string(),
+        FirewallWizardSelection::Mode(mode) => {
+            format!("lpm config firewall --set {}", mode.as_str())
+        }
+    }
 }
 
+/// What the policy editor opens on: the profile installs use now, and the
+/// profiles a save is measured against, whose actions every row also offers
+/// so the person can always pick one a save accepts.
+#[derive(Clone, Debug)]
+struct FirewallPolicyEditorProfiles {
+    current: NpmFirewallPolicyProfile,
+    offered: Vec<NpmFirewallPolicyProfile>,
+}
+
+fn read_firewall_policy_profiles(
+    config_path: &std::path::Path,
+) -> Result<FirewallPolicyEditorProfiles, LpmError> {
+    let global = GlobalConfig::from_value(read_config(config_path)?)?;
+    let effective = crate::security_approval::load_effective_authorized_posture()?;
+    let request = crate::npm_firewall_config::runtime_policy_request(&global, &effective)?;
+    // A save is measured against what installs enforce, the effective approved
+    // profile at the mode the editor saves, and the local posture it rewrites
+    // wherever that posture binds.
+    let mut offered = vec![
+        crate::npm_firewall_config::enforced_policy_profile(&global, &effective)?,
+        effective.posture.firewall_policy_profile(),
+    ];
+    let local = crate::security_approval::load_authorized_posture()?;
+    if local.firewall_mode() != NpmFirewallMode::Off {
+        offered.push(local.firewall_policy_profile());
+    }
+    Ok(FirewallPolicyEditorProfiles {
+        current: crate::npm_firewall_config::runtime_policy_profile(request, &effective),
+        offered,
+    })
+}
+
+/// Whether saving enforce mode must also save `profile`: it differs from the
+/// default or from the approved profile, or `config.toml` already has a table.
 fn should_persist_firewall_policy_profile(
     cfg: &toml::Value,
     profile: NpmFirewallPolicyProfile,
+    approved: NpmFirewallPolicyProfile,
 ) -> bool {
-    profile != NpmFirewallPolicyProfile::default() || firewall_policy_table_exists(cfg)
+    profile != NpmFirewallPolicyProfile::default()
+        || firewall_policy_table_exists(cfg)
+        || profile != approved
 }
 
 fn firewall_policy_table_exists(cfg: &toml::Value) -> bool {
@@ -555,26 +620,24 @@ fn firewall_policy_table_exists(cfg: &toml::Value) -> bool {
 }
 
 fn prompt_firewall_policy_profile(
-    initial_profile: NpmFirewallPolicyProfile,
+    profiles: FirewallPolicyEditorProfiles,
 ) -> Result<NpmFirewallPolicyProfile, LpmError> {
     let mut term = Term::stderr();
-    run_firewall_policy_editor(&mut term, initial_profile).map_err(prompt_err)
+    run_firewall_policy_editor(&mut term, profiles).map_err(prompt_err)
 }
 
 fn run_firewall_policy_editor(
     term: &mut Term,
-    initial_profile: NpmFirewallPolicyProfile,
+    profiles: FirewallPolicyEditorProfiles,
 ) -> io::Result<NpmFirewallPolicyProfile> {
-    super::editor::run(term, |term| {
-        interact_firewall_policy_editor(term, initial_profile)
-    })
+    super::editor::run(term, |term| interact_firewall_policy_editor(term, profiles))
 }
 
 fn interact_firewall_policy_editor(
     term: &mut Term,
-    initial_profile: NpmFirewallPolicyProfile,
+    profiles: FirewallPolicyEditorProfiles,
 ) -> io::Result<NpmFirewallPolicyProfile> {
-    let mut rows = firewall_policy_rows_from_profile(initial_profile);
+    let mut rows = firewall_policy_rows(&profiles);
     let mut cursor = 0;
     let mut previous_line_count = 0;
 
@@ -609,14 +672,16 @@ fn interact_firewall_policy_editor(
     }
 }
 
-fn firewall_policy_rows_from_profile(
-    profile: NpmFirewallPolicyProfile,
-) -> Vec<FirewallPolicyEditorRow> {
+fn firewall_policy_rows(profiles: &FirewallPolicyEditorProfiles) -> Vec<FirewallPolicyEditorRow> {
     let mut rows = Vec::with_capacity(FIREWALL_POLICY_GROUPS.len());
     for group in FIREWALL_POLICY_GROUPS {
         rows.push(FirewallPolicyEditorRow::new(
             group,
-            group.field.action(profile),
+            group.field.action(profiles.current),
+            profiles
+                .offered
+                .iter()
+                .map(|profile| group.field.action(*profile)),
         ));
     }
     rows
@@ -691,9 +756,22 @@ fn policy_action_label(action: NpmFirewallPolicyAction) -> &'static str {
 mod tests {
     use super::*;
 
+    fn firewall_policy_rows_from_profile(
+        current: NpmFirewallPolicyProfile,
+        enforced: NpmFirewallPolicyProfile,
+    ) -> Vec<FirewallPolicyEditorRow> {
+        firewall_policy_rows(&FirewallPolicyEditorProfiles {
+            current,
+            offered: vec![enforced],
+        })
+    }
+
     #[test]
     fn firewall_policy_editor_frame_shows_every_policy_group_on_one_prompt() {
-        let rows = firewall_policy_rows_from_profile(NpmFirewallPolicyProfile::default());
+        let rows = firewall_policy_rows_from_profile(
+            NpmFirewallPolicyProfile::default(),
+            NpmFirewallPolicyProfile::default(),
+        );
 
         let frame = format_firewall_policy_editor_frame(&rows, 0);
         let plain = console::strip_ansi_codes(&frame);
@@ -732,7 +810,10 @@ mod tests {
 
     #[test]
     fn firewall_policy_editor_defaults_telemetry_to_warn_and_offers_block() {
-        let rows = firewall_policy_rows_from_profile(NpmFirewallPolicyProfile::default());
+        let rows = firewall_policy_rows_from_profile(
+            NpmFirewallPolicyProfile::default(),
+            NpmFirewallPolicyProfile::default(),
+        );
         let telemetry = row_for(&rows, FirewallPolicyField::LpmAiTelemetry);
 
         assert_eq!(
@@ -748,7 +829,10 @@ mod tests {
 
     #[test]
     fn firewall_policy_editor_defaults_dependency_script_policy_to_block() {
-        let rows = firewall_policy_rows_from_profile(NpmFirewallPolicyProfile::default());
+        let rows = firewall_policy_rows_from_profile(
+            NpmFirewallPolicyProfile::default(),
+            NpmFirewallPolicyProfile::default(),
+        );
         let script_policy = row_for(&rows, FirewallPolicyField::LpmAiDependencyScriptPolicy);
 
         assert_eq!(
@@ -788,11 +872,152 @@ mod tests {
             crate::npm_firewall_config::config_policy_profile(&GlobalConfig::from_table(top))
                 .unwrap();
 
-        let rows = firewall_policy_rows_from_profile(profile);
+        let rows = firewall_policy_rows_from_profile(profile, profile);
 
         assert_eq!(
             row_for(&rows, FirewallPolicyField::LpmAiTelemetry).action,
             NpmFirewallPolicyAction::Block
+        );
+    }
+
+    #[test]
+    fn a_custom_profile_save_meets_the_managed_policy_before_the_forced_floor() {
+        let temp = tempfile::tempdir().unwrap();
+        crate::security_approval::test_support::with_test_env(temp.path(), || {
+            std::fs::write(
+                temp.path().join("managed-security-policy.toml"),
+                "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_telemetry = \"block\"\n",
+            )
+            .unwrap();
+            let config_path = temp.path().join("config.toml");
+            let config = "force-security-floor = true\n\n[firewall]\nmode = \"enforce\"\n";
+            std::fs::write(&config_path, config).unwrap();
+            let looser_telemetry = NpmFirewallPolicyProfile {
+                lpm_ai_telemetry: NpmFirewallPolicyAction::Warn,
+                ..NpmFirewallPolicyProfile::default()
+            };
+
+            let message = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(apply_firewall_selection(
+                    &config_path,
+                    FirewallWizardSelection::CustomEnforce(looser_telemetry),
+                    true,
+                    "lpm config firewall",
+                ))
+                .unwrap_err()
+                .to_string();
+
+            assert!(
+                message.contains("managed security policy")
+                    && message
+                        .contains("keeps `[firewall.npm.policies].lpm_ai_telemetry` at `block`"),
+                "{message}"
+            );
+            assert!(!message.contains("force-security-floor"), "{message}");
+            assert_eq!(
+                crate::security_approval::test_support::guarded_attempts(),
+                1
+            );
+            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), config);
+        });
+    }
+
+    fn offered_suspicious_actions(
+        config: &str,
+        local: &[(&str, &str)],
+        managed: &str,
+    ) -> Vec<NpmFirewallPolicyAction> {
+        let temp = tempfile::tempdir().unwrap();
+        crate::security_approval::test_support::with_test_env(temp.path(), || {
+            crate::security_approval::persist_authorized_posture(
+                &crate::security_approval::AuthorizedPosture {
+                    firewall_mode: NpmFirewallMode::Enforce.as_str().to_string(),
+                    firewall_policies: local
+                        .iter()
+                        .map(|(key, action)| ((*key).to_string(), (*action).to_string()))
+                        .collect(),
+                    ..crate::security_approval::AuthorizedPosture::default()
+                },
+            )
+            .unwrap();
+            std::fs::write(temp.path().join("managed-security-policy.toml"), managed).unwrap();
+            let config_path = temp.path().join("config.toml");
+            std::fs::write(&config_path, config).unwrap();
+
+            let rows = firewall_policy_rows(&read_firewall_policy_profiles(&config_path).unwrap());
+
+            row_for(&rows, FirewallPolicyField::LpmAiSuspicious)
+                .actions
+                .clone()
+        })
+    }
+
+    #[test]
+    fn the_editor_offers_the_local_action_a_save_is_measured_against() {
+        let actions = offered_suspicious_actions(
+            "[firewall]\nmode = \"enforce\"\n",
+            &[("lpm_ai_suspicious", "block")],
+            "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_telemetry = \"block\"\n",
+        );
+
+        assert!(
+            actions.contains(&NpmFirewallPolicyAction::Block),
+            "{actions:?}"
+        );
+    }
+
+    #[test]
+    fn the_editor_offers_a_managed_action_that_binds_once_enforce_is_chosen() {
+        let actions = offered_suspicious_actions(
+            "[firewall]\nmode = \"monitor\"\n\n[firewall.npm.policies]\nlpm_ai_suspicious = \"warn\"\n",
+            &[],
+            "[firewall]\nmode = \"monitor\"\n\n[firewall.npm.policies]\nlpm_ai_suspicious = \"block\"\n",
+        );
+
+        assert!(
+            actions.contains(&NpmFirewallPolicyAction::Block),
+            "{actions:?}"
+        );
+    }
+
+    #[test]
+    fn an_editor_save_retries_through_the_editor() {
+        assert_eq!(
+            firewall_selection_retry_command(FirewallWizardSelection::CustomEnforce(
+                NpmFirewallPolicyProfile::default()
+            )),
+            "lpm config firewall"
+        );
+        assert_eq!(
+            firewall_selection_retry_command(FirewallWizardSelection::Mode(
+                NpmFirewallMode::Monitor
+            )),
+            "lpm config firewall --set monitor"
+        );
+    }
+
+    #[test]
+    fn every_editor_row_offers_the_action_installs_enforce() {
+        let current = NpmFirewallPolicyProfile {
+            lpm_ai_suspicious: NpmFirewallPolicyAction::Warn,
+            ..NpmFirewallPolicyProfile::default()
+        };
+        let enforced = NpmFirewallPolicyProfile {
+            lpm_ai_suspicious: NpmFirewallPolicyAction::Block,
+            ..NpmFirewallPolicyProfile::default()
+        };
+
+        let rows = firewall_policy_rows_from_profile(current, enforced);
+
+        let suspicious = row_for(&rows, FirewallPolicyField::LpmAiSuspicious);
+        assert_eq!(suspicious.action, NpmFirewallPolicyAction::Warn);
+        assert!(
+            suspicious.actions.contains(&NpmFirewallPolicyAction::Block),
+            "{:?}",
+            suspicious.actions
         );
     }
 
@@ -808,14 +1033,17 @@ mod tests {
             critical_vulnerability: NpmFirewallPolicyAction::Block,
         };
 
-        let rows = firewall_policy_rows_from_profile(profile);
+        let rows = firewall_policy_rows_from_profile(profile, profile);
 
         assert_eq!(firewall_policy_profile_from_rows(&rows), profile);
     }
 
     #[test]
     fn firewall_policy_editor_orders_critical_vulnerability_actions_like_blocking_groups() {
-        let rows = firewall_policy_rows_from_profile(NpmFirewallPolicyProfile::default());
+        let rows = firewall_policy_rows_from_profile(
+            NpmFirewallPolicyProfile::default(),
+            NpmFirewallPolicyProfile::default(),
+        );
         let critical = rows
             .iter()
             .find(|row| row.group.field == FirewallPolicyField::CriticalVulnerability)
@@ -834,7 +1062,10 @@ mod tests {
 
     #[test]
     fn firewall_policy_editor_defaults_ai_agent_control_surface_to_warn() {
-        let rows = firewall_policy_rows_from_profile(NpmFirewallPolicyProfile::default());
+        let rows = firewall_policy_rows_from_profile(
+            NpmFirewallPolicyProfile::default(),
+            NpmFirewallPolicyProfile::default(),
+        );
         let ai_agent = rows
             .iter()
             .find(|row| row.group.field == FirewallPolicyField::LpmAiAgentControlSurface)
@@ -853,10 +1084,11 @@ mod tests {
 
     #[test]
     fn firewall_policy_editor_preserves_manual_ai_suspicious_block_action() {
-        let rows = firewall_policy_rows_from_profile(NpmFirewallPolicyProfile {
+        let manual_block = NpmFirewallPolicyProfile {
             lpm_ai_suspicious: NpmFirewallPolicyAction::Block,
             ..NpmFirewallPolicyProfile::default()
-        });
+        };
+        let rows = firewall_policy_rows_from_profile(manual_block, manual_block);
         let ai_suspicious = rows
             .iter()
             .find(|row| row.group.field == FirewallPolicyField::LpmAiSuspicious)
@@ -876,7 +1108,8 @@ mod tests {
 
         assert!(!should_persist_firewall_policy_profile(
             &cfg,
-            NpmFirewallPolicyProfile::default()
+            NpmFirewallPolicyProfile::default(),
+            NpmFirewallPolicyProfile::default(),
         ));
     }
 
@@ -906,7 +1139,23 @@ mod tests {
 
         assert!(should_persist_firewall_policy_profile(
             &cfg,
-            NpmFirewallPolicyProfile::default()
+            NpmFirewallPolicyProfile::default(),
+            NpmFirewallPolicyProfile::default(),
+        ));
+    }
+
+    #[test]
+    fn default_enforce_policy_persists_to_replace_an_approved_custom_profile() {
+        let cfg = toml::Value::Table(toml::map::Map::new());
+        let approved = NpmFirewallPolicyProfile {
+            lpm_ai_confirmed_malware: NpmFirewallPolicyAction::Allow,
+            ..NpmFirewallPolicyProfile::default()
+        };
+
+        assert!(should_persist_firewall_policy_profile(
+            &cfg,
+            NpmFirewallPolicyProfile::default(),
+            approved,
         ));
     }
 }

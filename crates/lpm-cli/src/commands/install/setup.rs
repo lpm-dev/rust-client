@@ -113,8 +113,6 @@ pub(super) fn prepare_install_setup_context(
         .enabled()
         .then(crate::provenance_fetch::ProvenanceTimings::default);
     let npm_firewall_lookup_mode = NpmFirewallLookupMode::from_env();
-    let npm_firewall_policy_profile =
-        crate::npm_firewall_config::config_policy_profile(&global_config)?;
     let npm_firewall_chunk_size = npm_firewall_chunk_size_from_env();
     let policy_extension_configs = load_policy_extension_configs(&global_config)?;
     let force_security_floor = crate::security_floor::force_security_floor_enabled(&global_config);
@@ -133,7 +131,10 @@ pub(super) fn prepare_install_setup_context(
     let pkg = lpm_workspace::read_package_json(&pkg_json_path)
         .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
 
-    let npm_firewall_mode = check_project_policy(
+    let crate::npm_firewall_config::RuntimeFirewall {
+        mode: npm_firewall_mode,
+        policy_profile: npm_firewall_policy_profile,
+    } = check_project_policy(
         &global_config,
         input.project_dir,
         input.policy_project_dir,
@@ -275,14 +276,14 @@ pub(super) fn check_project_policy(
     manifest_path: &Path,
     package: &lpm_workspace::PackageJson,
     json_output: bool,
-) -> Result<crate::npm_firewall_config::NpmFirewallMode, LpmError> {
+) -> Result<crate::npm_firewall_config::RuntimeFirewall, LpmError> {
     super::strict_deps::check(project_dir, package)?;
     crate::security_approval::ensure_project_policy_authorized(
         policy_project_dir,
         json_output,
         crate::security_approval::ApprovalSource::ProjectConfig,
     )?;
-    let firewall_mode = crate::npm_firewall_config::resolve_runtime_mode(
+    let firewall = crate::npm_firewall_config::resolve_runtime_firewall(
         global_config,
         policy_project_dir,
         json_output,
@@ -294,7 +295,7 @@ pub(super) fn check_project_policy(
         package,
         json_output,
     )?;
-    Ok(firewall_mode)
+    Ok(firewall)
 }
 
 /// Whether the install adds missing peers itself: the manifest's

@@ -635,9 +635,65 @@ pub(super) fn guard_generic_delete_against_force_floor(
         "force-security-floor" if crate::security_floor::force_security_floor_enabled(global) => {
             authorize_force_floor_removal()?;
         }
-        _ => {}
+        _ => {
+            if let Some(after) =
+                firewall_policy_profile_after_delete(global, key, effective_policy_table_base)?
+            {
+                crate::security_floor::reject_looser_firewall_policy_delete(global, &after)?;
+            }
+        }
     }
     Ok(())
+}
+
+/// The profile installs run once `key` is deleted from `config.toml`, or
+/// `None` when deleting `key` leaves `[firewall.npm.policies]` alone.
+/// `base` gives what the approved profile makes of the groups a table leaves
+/// out, and is asked only for a key that touches the policies.
+pub(super) fn firewall_policy_profile_after_delete(
+    config: &GlobalConfig,
+    key: &str,
+    base: impl FnOnce() -> Result<crate::npm_firewall_config::PolicyTableBase, LpmError>,
+) -> Result<Option<lpm_registry::client::NpmFirewallPolicyProfile>, LpmError> {
+    let firewall = crate::npm_firewall_config::FIREWALL_CONFIG_SECTION;
+    let affects_policies = key == firewall
+        || key == "firewall.npm"
+        || key == "firewall.npm.policies"
+        || key.starts_with("firewall.npm.policies.");
+    if !affects_policies {
+        return Ok(None);
+    }
+    let mut after = config.table().clone();
+    remove_config_value_at_path(&mut after, key);
+    let after = GlobalConfig::from_value(toml::Value::Table(after))?;
+    let base = base()?;
+    Ok(Some(
+        crate::npm_firewall_config::config_policy_request_over(&after, base)?
+            .unwrap_or(base.tableless),
+    ))
+}
+
+/// What the effective approved posture makes of the groups a table leaves
+/// out, as installs read it.
+pub(super) fn effective_policy_table_base()
+-> Result<crate::npm_firewall_config::PolicyTableBase, LpmError> {
+    let effective = crate::security_approval::load_effective_authorized_posture()?;
+    Ok(crate::npm_firewall_config::PolicyTableBase::of_posture(
+        &effective,
+    ))
+}
+
+/// The same as the local signed posture alone sets it, without a managed
+/// policy's actions, for updating that posture: a managed action copied there
+/// would outlive its removal from the policy.
+pub(super) fn local_policy_table_base()
+-> Result<crate::npm_firewall_config::PolicyTableBase, LpmError> {
+    let local = crate::security_approval::load_authorized_posture()?;
+    Ok(crate::npm_firewall_config::PolicyTableBase::of(
+        local.firewall_policy_profile(),
+        local.firewall_mode(),
+        false,
+    ))
 }
 
 fn authorize_force_floor_removal() -> Result<(), LpmError> {
