@@ -84,6 +84,34 @@ async fn acquire_config_lock(
     acquire_config_lock_with_timeout(path, std::time::Duration::from_secs(30)).await
 }
 
+/// Each config lock a caller found held and had to wait for, so a test can
+/// tell a command is waiting on it.
+#[cfg(test)]
+pub(crate) static CONTENDED_CONFIG_LOCKS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Waits until a caller has found `path` held, or panics after `timeout`.
+#[cfg(test)]
+pub(crate) fn wait_for_config_lock_contention(
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !CONTENDED_CONFIG_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|contended| contended == path)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "nothing waited on the config lock {}",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 async fn acquire_config_lock_with_timeout(
     path: &std::path::Path,
     timeout: std::time::Duration,
@@ -93,6 +121,11 @@ async fn acquire_config_lock_with_timeout(
         if let Some(lock) = lpm_common::try_acquire_exclusive_lock(path)? {
             return Ok(lock);
         }
+        #[cfg(test)]
+        CONTENDED_CONFIG_LOCKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(path.to_path_buf());
         if started.elapsed() >= timeout {
             return Err(LpmError::Registry(format!(
                 "timed out after {} seconds waiting for the config transaction lock {}. Another \

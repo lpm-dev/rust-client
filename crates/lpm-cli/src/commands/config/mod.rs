@@ -24,6 +24,8 @@ pub(crate) use wizards::{
 };
 
 use effective::EffectiveConfig;
+#[cfg(test)]
+pub(crate) use io::wait_for_config_lock_contention;
 use io::{
     config_value_at_path, config_value_for_display, config_value_to_json,
     firewall_policy_profile_after_delete, guard_generic_delete_against_force_floor,

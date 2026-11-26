@@ -2287,17 +2287,21 @@ mod tests {
             let (approved_tx, approved_rx) = std::sync::mpsc::channel::<()>();
             // Holds the config lock from before `add` starts, and writes the
             // forced floor only once `add` is past its approval prompt and
-            // has had time to reach the lock, so an `add` that skipped the
-            // lock would save first.
+            // waiting on the lock, so an `add` that skipped the lock saves
+            // first and fails the test.
             let writer = std::thread::spawn(move || {
-                let lock = lpm_common::try_acquire_exclusive_lock(lpm_home.join(".config.lock"))
+                let lock_path = lpm_home.join(".config.lock");
+                let lock = lpm_common::try_acquire_exclusive_lock(&lock_path)
                     .unwrap()
                     .expect("nothing else holds the config lock");
                 locked_tx.send(()).unwrap();
                 approved_rx
                     .recv_timeout(std::time::Duration::from_secs(30))
                     .expect("add reached its approval prompt");
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                crate::commands::config::wait_for_config_lock_contention(
+                    &lock_path,
+                    std::time::Duration::from_secs(10),
+                );
                 std::fs::write(
                     lpm_home.join("config.toml"),
                     "force-security-floor = true\n\n[firewall]\nmode = \"enforce\"\n",
