@@ -1777,6 +1777,64 @@ async fn an_install_whose_verdict_request_fails_first_reports_no_held_back_versi
     assert!(envelope.get("security").is_none(), "{envelope:#}");
 }
 
+#[tokio::test]
+async fn a_blocked_install_lists_what_it_downloaded_in_the_block_alone() {
+    let mock = MockRegistry::start().await;
+    mock.with_package("agent-tool", "1.0.0", &make_tarball("agent-tool", "1.0.0"))
+        .await;
+    mount_block_verdict(
+        &mock,
+        "agent-tool",
+        "suspicious",
+        "lpm_ai_agent_control_surface",
+    )
+    .await;
+    mock.with_package("evil-tool", "1.0.0", &make_tarball("evil-tool", "1.0.0"))
+        .await;
+    mount_block_verdicts_after(
+        &mock,
+        &["evil-tool"],
+        "suspicious",
+        "lpm_ai_agent_control_surface",
+        std::time::Duration::from_millis(1500),
+    )
+    .await;
+    let project = enforcing_project();
+    write_signed_firewall_bypass(
+        &project,
+        &[stored_rule("agent-tool", serde_json::json!({}))],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_EXPERIMENT_NPM_FIREWALL_CHUNK_SIZE", "1")
+        .args([
+            "--json",
+            "install",
+            "--no-skills",
+            "agent-tool@1.0.0",
+            "evil-tool@1.0.0",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(mock.tarball_request_count("agent-tool", "1.0.0").await, 1);
+    let envelope = json_envelope(&output);
+    assert_eq!(
+        envelope["error_code"], "npm_firewall_blocked",
+        "{envelope:#}"
+    );
+    assert_eq!(
+        envelope["error"]["packages"][0]["name"], "evil-tool",
+        "{envelope:#}"
+    );
+    assert_eq!(
+        envelope["error"]["bypassed"][0]["name"], "agent-tool",
+        "{envelope:#}"
+    );
+    assert!(envelope.get("security").is_none(), "{envelope:#}");
+}
+
 /// `lpm doctor --fix` in JSON and then in a terminal, over a project whose
 /// install checks `agent-tool`, which a rule lifts, and `unchecked-tool`,
 /// whose verdict request fails, each answered after its delay.
@@ -2359,7 +2417,7 @@ fn assert_interrupted_after_reporting_agent_tool(output: &std::process::Output, 
             "the notice must come before the error: {stderr}"
         );
         assert!(
-            stderr[notice..error].contains("agent-tool@1.0.0"),
+            stderr[notice..error].contains("› agent-tool@1.0.0 - "),
             "the notice names the version before the error: {stderr}"
         );
         assert_eq!(stderr.matches(AGENT_TOOL_ALLOWED).count(), 1, "{stderr}");

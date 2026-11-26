@@ -175,11 +175,12 @@ fn exit_with_clap_error(error: clap::Error, json_output: bool, help_hint: Option
 pub(super) fn exit_with_lpm_error(error: &lpm_common::LpmError, json_output: bool) -> ! {
     // The process exits without dropping an install still running in another
     // task, so what it let through is reported here, before the error.
-    crate::commands::install::settle_firewall_bypasses_before_exit(json_output);
+    let firewall_bypassed =
+        crate::commands::install::settle_firewall_bypasses_before_exit(json_output, error);
     super::install_timeline::finish("error");
     super::dispatch::keep_state_ignored_at_exit();
     if json_output && !matches!(error, lpm_common::LpmError::ExitCode(_)) {
-        print_json_error(error);
+        print_json_error(error, &firewall_bypassed);
     } else if !json_output && !matches!(error, lpm_common::LpmError::ExitCode(_)) {
         render_slim_error(error);
     }
@@ -238,11 +239,14 @@ pub(crate) fn print_json_clap_error(error: &clap::Error, help_hint: Option<&str>
     );
 }
 
-fn print_json_error(error: &lpm_common::LpmError) {
+fn print_json_error(
+    error: &lpm_common::LpmError,
+    firewall_bypassed: &crate::commands::install::FirewallBypassRecord,
+) {
     let mut json = json_error_value(error);
     // A command can fail after an install let a blocked version through, as
     // when `lpm migrate` verification fails, and the version stays installed.
-    if let Some(security) = crate::commands::install::process_firewall_bypasses_security_json() {
+    if let Some(security) = firewall_bypassed.security_json() {
         json["security"] = security;
     }
     println!("{}", serde_json::to_string_pretty(&json).unwrap());

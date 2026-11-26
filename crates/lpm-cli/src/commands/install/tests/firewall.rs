@@ -3280,3 +3280,161 @@ async fn a_request_failure_reports_no_lifted_version_the_downloader_never_took()
     assert!(bypassed_names(&drained.stats).is_empty());
     assert!(released.close().bypassed.is_empty());
 }
+
+#[tokio::test]
+async fn a_check_settles_its_record_unless_an_exit_closed_it_first() {
+    let process = super::super::FirewallBypassReport::default();
+    let (fetch_tx, _fetch_rx) = tokio::sync::mpsc::channel(2);
+    let settled = super::super::ReleasedFirewallBypasses::default();
+    assert!(settled.hand_off(
+        NpmFirewallMode::Enforce,
+        [&lifted_verdict("member-tool").await],
+        fetch_tx.reserve().await.unwrap(),
+        selected_event("member-tool"),
+        &fetch_tx,
+    ));
+
+    assert!(settled.settle_into(&process));
+    assert_eq!(record_names(&process.take()), ["member-tool"]);
+
+    let taken_by_exit = super::super::ReleasedFirewallBypasses::default();
+    taken_by_exit.close();
+    assert!(!taken_by_exit.settle_into(&process));
+}
+
+#[tokio::test]
+async fn a_second_closer_waits_until_the_first_has_added_the_record() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let released = Arc::new(super::super::ReleasedFirewallBypasses::default());
+    let process = Arc::new(super::super::FirewallBypassReport::default());
+    let (fetch_tx, _fetch_rx) = tokio::sync::mpsc::channel(1);
+    assert!(released.hand_off(
+        NpmFirewallMode::Enforce,
+        [&lifted_verdict("member-tool").await],
+        fetch_tx.reserve().await.unwrap(),
+        selected_event("member-tool"),
+        &fetch_tx,
+    ));
+    // Holding the process record pauses the first closer while it adds.
+    let held = process.record.lock().unwrap();
+    let first = {
+        let (released, process) = (Arc::clone(&released), Arc::clone(&process));
+        std::thread::spawn(move || released.close_into(&process))
+    };
+    while released.state.try_lock().is_ok() {
+        std::thread::yield_now();
+    }
+    let second_done = Arc::new(AtomicBool::new(false));
+    let second = {
+        let (released, second_done) = (Arc::clone(&released), Arc::clone(&second_done));
+        std::thread::spawn(move || {
+            let record = released.close();
+            second_done.store(true, Ordering::SeqCst);
+            record
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        !second_done.load(Ordering::SeqCst),
+        "the second closer must wait while the first adds the record"
+    );
+    drop(held);
+
+    assert_eq!(record_names(&first.join().unwrap()), ["member-tool"]);
+    assert!(second.join().unwrap().bypassed.is_empty());
+    assert_eq!(record_names(&process.take()), ["member-tool"]);
+}
+
+#[tokio::test]
+async fn an_exit_waits_for_a_notice_being_written_and_does_not_repeat_it() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let notices = Arc::new(super::super::FirewallBypassNotices::new());
+    let lifted = lifted_verdict("member-tool").await;
+    let (writing_tx, writing_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let member = {
+        let (notices, lifted) = (Arc::clone(&notices), lifted.clone());
+        std::thread::spawn(move || {
+            notices.show(std::slice::from_ref(&lifted), |_| {
+                writing_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+            });
+        })
+    };
+    writing_rx.recv().unwrap();
+    let exit_done = Arc::new(AtomicBool::new(false));
+    let exit_wrote = Arc::new(AtomicBool::new(false));
+    let exit = {
+        let (notices, exit_done, exit_wrote) = (
+            Arc::clone(&notices),
+            Arc::clone(&exit_done),
+            Arc::clone(&exit_wrote),
+        );
+        std::thread::spawn(move || {
+            notices.close_for_exit(
+                &super::super::FirewallBypassRecord {
+                    mode: Some(NpmFirewallMode::Enforce),
+                    bypassed: vec![lifted],
+                },
+                |_| exit_wrote.store(true, Ordering::SeqCst),
+            );
+            exit_done.store(true, Ordering::SeqCst);
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        !exit_done.load(Ordering::SeqCst),
+        "the exit must wait for the notice being written"
+    );
+    go_tx.send(()).unwrap();
+
+    member.join().unwrap();
+    exit.join().unwrap();
+    assert!(
+        !exit_wrote.load(Ordering::SeqCst),
+        "the notice printed once"
+    );
+}
+
+#[tokio::test]
+async fn a_block_reports_what_its_check_lifted_itself() {
+    let listed = lifted_verdict("listed-tool").await;
+    let elsewhere = lifted_verdict("elsewhere-tool").await;
+    let recorded = || super::super::FirewallBypassRecord {
+        mode: Some(NpmFirewallMode::Enforce),
+        bypassed: vec![listed.clone(), elsewhere.clone()],
+    };
+    let block =
+        LpmError::NpmFirewallBlocked(Box::new(lpm_common::NpmFirewallBlockedErrorContext {
+            source: lpm_common::NpmFirewallBlockSource::Preflight,
+            packages: Vec::new(),
+            unattributed_count: 0,
+            unchecked_reason: None,
+            bypassed: vec![lpm_common::NpmFirewallBypassedPackage {
+                name: "listed-tool".into(),
+                version: "1.0.0".into(),
+                rule: "listed-tool".into(),
+            }],
+            bypass_command: None,
+            bypass_unavailable_reason: None,
+        }));
+
+    assert_eq!(
+        record_names(&super::super::without_versions_the_error_lists(
+            recorded(),
+            &block
+        )),
+        ["elsewhere-tool"]
+    );
+    assert_eq!(
+        record_names(&super::super::without_versions_the_error_lists(
+            recorded(),
+            &LpmError::Registry("another member failed".into())
+        )),
+        ["listed-tool", "elsewhere-tool"]
+    );
+}
