@@ -214,11 +214,14 @@ fn parse_versions(text: &str) -> Result<SpecVersions, String> {
     })
 }
 
-/// `text` as an exact version when it is written the canonical way: three
-/// numeric parts and an optional prerelease, as in `1.2.3` or `1.0.0-rc.x`.
-/// Whether `text` starts with the three numeric parts of an exact version.
+/// Whether `text` is shaped like an exact version: three numeric parts, then
+/// optionally `-` and a prerelease of identifier characters. A range such as
+/// `1.0.0-rc.1 || 2.0.0` is not.
 fn has_exact_version_shape(text: &str) -> bool {
-    let core = text.split_once('-').map_or(text, |(core, _)| core);
+    let (core, prerelease) = match text.split_once('-') {
+        Some((core, prerelease)) => (core, Some(prerelease)),
+        None => (text, None),
+    };
     let mut parts = core.split('.');
     let numeric = |part: Option<&str>| {
         part.is_some_and(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
@@ -227,8 +230,16 @@ fn has_exact_version_shape(text: &str) -> bool {
         && numeric(parts.next())
         && numeric(parts.next())
         && parts.next().is_none()
+        && prerelease.is_none_or(|prerelease| {
+            !prerelease.is_empty()
+                && prerelease
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+        })
 }
 
+/// `text` as an exact version when it is written the canonical way: three
+/// numeric parts and an optional prerelease, as in `1.2.3` or `1.0.0-rc.x`.
 fn canonical_version(text: &str) -> Option<lpm_semver::Version> {
     if !has_exact_version_shape(text) {
         return None;
@@ -510,7 +521,33 @@ pub(crate) fn project_policy_root_text(dir: &Path) -> Result<String, LpmError> {
 /// POSIX shells, PowerShell and cmd read it unchanged. Callers pass only
 /// validated specs, which contain no quotes.
 pub(crate) fn bypass_add_command<'a>(coordinates: impl IntoIterator<Item = &'a str>) -> String {
-    let mut command = String::from("lpm firewall bypass add");
+    bypass_add_command_with("", coordinates)
+}
+
+/// `lpm firewall bypass add` with `options`, written as the command line
+/// reads them, before the double-quoted `coordinates`. Specs come last so a
+/// spec starting with `-` can follow `--`, quoted because Windows PowerShell
+/// 5.1 drops a bare `--` before running a program.
+pub(crate) fn bypass_add_command_with<'a>(
+    options: &str,
+    coordinates: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let coordinates: Vec<&str> = coordinates.into_iter().collect();
+    let mut command = String::with_capacity(
+        32 + options.len()
+            + coordinates
+                .iter()
+                .map(|coordinate| coordinate.len() + 3)
+                .sum::<usize>(),
+    );
+    command.push_str("lpm firewall bypass add");
+    command.push_str(options);
+    if coordinates
+        .iter()
+        .any(|coordinate| coordinate.starts_with('-'))
+    {
+        command.push_str(" \"--\"");
+    }
     for coordinate in coordinates {
         command.push_str(" \"");
         command.push_str(coordinate);
@@ -1362,6 +1399,23 @@ mod tests {
 
         assert_eq!(rule.source, "managed");
         assert_eq!(rule.id, None);
+    }
+
+    #[test]
+    fn bypass_add_command_ends_options_before_a_spec_starting_with_a_dash() {
+        assert_eq!(
+            bypass_add_command(["-legacy@1.0.0", "foldrun@32.8.2"]),
+            "lpm firewall bypass add \"--\" \"-legacy@1.0.0\" \"foldrun@32.8.2\""
+        );
+    }
+
+    #[test]
+    fn a_range_starting_with_a_prerelease_keeps_the_range_message() {
+        let error =
+            FirewallBypassSpec::parse(&format!("foldrun@1.0.0-rc.1{}", " || 2.0.0".repeat(32)))
+                .unwrap_err();
+
+        assert!(error.contains("80 characters"), "{error}");
     }
 
     #[test]

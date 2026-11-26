@@ -545,8 +545,9 @@ fn project_root_of(rules: &[FirewallBypassRule]) -> Option<String> {
     rules.iter().find_map(|rule| rule.project_root.clone())
 }
 
-/// Records an `add` refused before any prompt, such as under a managed policy
-/// or for a malware verdict without `--allow-malware`.
+/// Records an `add` that saved nothing: refused before any prompt, such as
+/// under a managed policy or for a malware verdict without `--allow-malware`,
+/// or approved and then discarded.
 pub(crate) fn record_firewall_bypass_refusal(specs: Vec<String>, reason: &str) {
     record_audit_event(
         AuditRecord::new(

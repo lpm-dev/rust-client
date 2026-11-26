@@ -3,9 +3,9 @@
 
 use crate::firewall_bypass::{
     AddedVerdict, BlockClass, BypassKind, FirewallBypassRule, FirewallBypassScope,
-    FirewallBypassSpec, MAX_SPECS_PER_APPROVAL, bypass_add_command, forced_floor_refuses_additions,
-    project_policy_root_text, rule_json, shell_safe_in_double_quotes, spec_shell_safe,
-    visible_root,
+    FirewallBypassSpec, MAX_SPECS_PER_APPROVAL, bypass_add_command_with,
+    forced_floor_refuses_additions, project_policy_root_text, rule_json,
+    shell_safe_in_double_quotes, spec_shell_safe, visible_root,
 };
 use crate::install_ui;
 use crate::security_approval;
@@ -394,30 +394,33 @@ fn add_command_hint(
     {
         return None;
     }
-    let mut command = bypass_add_command(coordinates.iter().map(String::as_str));
+    let mut options = String::new();
     if let Some(root) = &scope.project_root {
         if !shell_safe_in_double_quotes(root) {
             return None;
         }
-        command.push_str(" --project \"");
-        command.push_str(root);
-        command.push('"');
+        options.push_str(" --project \"");
+        options.push_str(root);
+        options.push('"');
     }
     if let Some(ttl_secs) = ttl_secs {
-        command.push_str(" --ttl ");
-        command.push_str(&ttl_argument(ttl_secs));
+        options.push_str(" --ttl ");
+        options.push_str(&ttl_argument(ttl_secs));
     }
     if allow_malware {
-        command.push_str(" --allow-malware");
+        options.push_str(" --allow-malware");
     }
     if let Some(reason) = reason.filter(|reason| reason_shell_safe(reason)) {
         // One quoted word: `=` keeps a note starting with `-` the value, and
         // PowerShell only reads quotes that open a word.
-        command.push_str(" \"--reason=");
-        command.push_str(reason);
-        command.push('"');
+        options.push_str(" \"--reason=");
+        options.push_str(reason);
+        options.push('"');
     }
-    Some(command)
+    Some(bypass_add_command_with(
+        &options,
+        coordinates.iter().map(String::as_str),
+    ))
 }
 
 /// Whether a note reads the same in double quotes in every shell: free text,
@@ -773,10 +776,12 @@ async fn approve_and_save(
         )? {
             security_approval::FirewallBypassCommit::Saved(outcome) => return Ok(outcome),
             security_approval::FirewallBypassCommit::Expired => {
-                return Err(security_approval::bypass_expired_before_save_error(
+                let error = security_approval::bypass_expired_before_save_error(
                     command_hint,
                     plan.scope.project_root.clone(),
-                ));
+                );
+                record_discarded_approvals(plan.specs, &approved_prompts, &error);
+                return Err(error);
             }
             // A rule removed, expired or shortened since it was judged a
             // narrowing or already saved now adds or extends one, so it is
@@ -792,10 +797,22 @@ async fn approve_and_save(
             }
         }
     }
-    Err(security_approval::rules_kept_changing_error(
-        command_hint,
-        plan.scope.project_root.clone(),
-    ))
+    let error =
+        security_approval::rules_kept_changing_error(command_hint, plan.scope.project_root.clone());
+    record_discarded_approvals(plan.specs, &approved_prompts, &error);
+    Err(error)
+}
+
+/// Keeps approvals a person gave on record when the request is then saved
+/// nowhere, as declines and refusals are.
+fn record_discarded_approvals(specs: &[FirewallBypassSpec], prompts: &[String], error: &LpmError) {
+    if prompts.is_empty() {
+        return;
+    }
+    security_approval::record_firewall_bypass_refusal(
+        specs.iter().map(ToString::to_string).collect(),
+        &format!("{error}; approved: {}", prompts.join("; ")),
+    );
 }
 
 fn describe_expiry(rule: &FirewallBypassRule) -> String {
@@ -1144,7 +1161,7 @@ mod tests {
                 None
             )
             .as_deref(),
-            Some("lpm firewall bypass add \"@scope/pkg@^1.2.0\" \"foldrun@32.8.2\" --ttl 30d")
+            Some("lpm firewall bypass add --ttl 30d \"@scope/pkg@^1.2.0\" \"foldrun@32.8.2\"")
         );
     }
 
@@ -1160,7 +1177,7 @@ mod tests {
             )
             .as_deref(),
             Some(
-                "lpm firewall bypass add \"foldrun@32.8.2\" --project \"/work/my app\" --allow-malware"
+                "lpm firewall bypass add --project \"/work/my app\" --allow-malware \"foldrun@32.8.2\""
             )
         );
     }
@@ -1391,16 +1408,16 @@ mod tests {
         assert_eq!(
             hint("reviewed the report, ticket SEC-12").as_deref(),
             Some(
-                "lpm firewall bypass add \"foldrun@32.8.2\" \"--reason=reviewed the report, ticket SEC-12\""
+                "lpm firewall bypass add \"--reason=reviewed the report, ticket SEC-12\" \"foldrun@32.8.2\""
             )
         );
         assert_eq!(
             hint("-reviewed").as_deref(),
-            Some("lpm firewall bypass add \"foldrun@32.8.2\" \"--reason=-reviewed\"")
+            Some("lpm firewall bypass add \"--reason=-reviewed\" \"foldrun@32.8.2\"")
         );
         assert_eq!(
             hint("").as_deref(),
-            Some("lpm firewall bypass add \"foldrun@32.8.2\" \"--reason=\"")
+            Some("lpm firewall bypass add \"--reason=\" \"foldrun@32.8.2\"")
         );
         for unsafe_note in [
             "costs $5",
@@ -1432,9 +1449,38 @@ mod tests {
             .collect()
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn a_hinted_note_reads_back_through_a_shell_as_the_same_note() {
+    /// The words of `hint` after `lpm firewall`, split as every supported
+    /// shell splits a command whose quoted words hold no quote or escape.
+    fn quoted_words(hint: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut word = String::new();
+        let mut quoted = false;
+        let mut started = false;
+        for character in hint.strip_prefix("lpm firewall ").unwrap().chars() {
+            match character {
+                '"' => {
+                    quoted = !quoted;
+                    started = true;
+                }
+                ' ' if !quoted => {
+                    if started {
+                        words.push(std::mem::take(&mut word));
+                        started = false;
+                    }
+                }
+                other => {
+                    word.push(other);
+                    started = true;
+                }
+            }
+        }
+        if started {
+            words.push(word);
+        }
+        words
+    }
+
+    fn parse_hinted_add(words: Vec<String>) -> (Vec<String>, Option<String>, Option<String>) {
         use clap::Parser;
 
         #[derive(Parser)]
@@ -1443,34 +1489,73 @@ mod tests {
             command: FirewallCmd,
         }
 
-        for note in [
-            "reviewed the report, ticket SEC-12",
-            "-reviewed",
-            "",
-            "a; b | c & d (e) {f} <g> 'quoted' x.y",
-            "na\u{ef}ve \u{fc}nicode",
-        ] {
-            let hint = add_command_hint(
-                &refs(&specs(&["foldrun@32.8.2"])),
-                &global(),
-                None,
-                false,
-                Some(note),
-            )
-            .unwrap();
-            let mut argv = vec!["lpm".to_string()];
-            argv.extend(words_a_shell_reads(&hint));
+        let mut argv = vec!["lpm".to_string()];
+        argv.extend(words);
+        let cli = Cli::try_parse_from(&argv).unwrap_or_else(|error| panic!("{argv:?}: {error}"));
+        let FirewallCmd::Bypass {
+            action: BypassCmd::Add {
+                specs, reason, ttl, ..
+            },
+        } = cli.command
+        else {
+            panic!("expected `bypass add` from {argv:?}");
+        };
+        (specs, reason, ttl)
+    }
 
-            let cli = Cli::try_parse_from(&argv).unwrap_or_else(|error| panic!("{hint}: {error}"));
+    const HINTED_NOTES: [&str; 5] = [
+        "reviewed the report, ticket SEC-12",
+        "-reviewed",
+        "",
+        "a; b | c & d (e) {f} <g> 'quoted' x.y",
+        "na\u{ef}ve \u{fc}nicode",
+    ];
 
-            let FirewallCmd::Bypass {
-                action: BypassCmd::Add { specs, reason, .. },
-            } = cli.command
-            else {
-                panic!("expected `bypass add` from {hint}");
-            };
-            assert_eq!(specs, ["foldrun@32.8.2"], "{hint}");
-            assert_eq!(reason.as_deref(), Some(note), "{hint}");
+    fn hint_for(specs_text: &[&str], note: &str) -> String {
+        add_command_hint(
+            &refs(&specs(specs_text)),
+            &global(),
+            Some(1_800),
+            false,
+            Some(note),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_hinted_command_parses_back_as_the_same_request() {
+        for note in HINTED_NOTES {
+            for specs_text in [
+                &["foldrun@32.8.2"][..],
+                &["-legacy@1.0.0", "foldrun@32.8.2"][..],
+            ] {
+                let hint = hint_for(specs_text, note);
+
+                let (specs, reason, ttl) = parse_hinted_add(quoted_words(&hint));
+
+                assert_eq!(specs, specs_text, "{hint}");
+                assert_eq!(reason.as_deref(), Some(note), "{hint}");
+                assert_eq!(ttl.as_deref(), Some("30m"), "{hint}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hinted_command_reads_back_through_a_shell_as_the_same_request() {
+        for note in HINTED_NOTES {
+            for specs_text in [
+                &["foldrun@32.8.2"][..],
+                &["-legacy@1.0.0", "foldrun@32.8.2"][..],
+            ] {
+                let hint = hint_for(specs_text, note);
+
+                let (specs, reason, ttl) = parse_hinted_add(words_a_shell_reads(&hint));
+
+                assert_eq!(specs, specs_text, "{hint}");
+                assert_eq!(reason.as_deref(), Some(note), "{hint}");
+                assert_eq!(ttl.as_deref(), Some("30m"), "{hint}");
+            }
         }
     }
 
@@ -1623,7 +1708,7 @@ mod tests {
             assert!(
                 matches!(error, LpmError::SecurityApprovalStore(message) if message == "declined")
             );
-            let whole = "lpm firewall bypass add \"a@1.0.0\" \"b@1.0.0\" \"c@1.0.0\" \"d@1.0.0\" \"e@1.0.0\" \"f@1.0.0\" \"held@1.0.0\" \"same@1.0.0\" --ttl 30m";
+            let whole = "lpm firewall bypass add --ttl 30m \"a@1.0.0\" \"b@1.0.0\" \"c@1.0.0\" \"d@1.0.0\" \"e@1.0.0\" \"f@1.0.0\" \"held@1.0.0\" \"same@1.0.0\"";
             assert_eq!(hints, [Some(whole.to_string()), Some(whole.to_string())]);
             assert_eq!(saved_specs(), ["held@1.0.0", "same@1.0.0"]);
             assert!(
@@ -1679,13 +1764,21 @@ mod tests {
             let specs = specs(&["late@1.0.0"]);
             let mut late = rule(&specs[0], None);
             late.expires_at =
-                Timestamp::now().checked_add(lpm_common::timestamp::Duration::milliseconds(50));
+                Timestamp::now().checked_add(lpm_common::timestamp::Duration::milliseconds(500));
             let scope = global();
 
-            let error = run_add(&plan(&specs, &scope, Some(1), false), vec![late], |_| {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                Ok(())
-            })
+            let error = run_add(
+                &plan(&specs, &scope, Some(1), false),
+                vec![late],
+                |approval| {
+                    assert!(
+                        !approval.rules[0].is_expired(Timestamp::now()),
+                        "the rule must still be live when approval starts"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(700));
+                    Ok(())
+                },
+            )
             .unwrap_err();
 
             assert!(error.to_string().contains("--ttl"), "{error}");
@@ -1695,15 +1788,20 @@ mod tests {
             };
             assert_eq!(
                 approval.suggested_command.as_deref(),
-                Some("lpm firewall bypass add \"late@1.0.0\" --ttl 1")
+                Some("lpm firewall bypass add --ttl 1 \"late@1.0.0\"")
             );
             assert!(
                 security_approval::load_local_firewall_bypass_rules()
                     .unwrap()
                     .is_empty()
             );
+            let audit = security_approval::test_support::audit_details("firewall-bypass-added");
+            assert_eq!(audit.len(), 1, "{audit:?}");
+            let detail = audit[0].as_deref().unwrap_or_default();
+            assert!(detail.contains("--ttl"), "{detail}");
             assert!(
-                security_approval::test_support::audit_details("firewall-bypass-added").is_empty()
+                detail.contains("approved: Allow late@1.0.0 past LPM Firewall in every project"),
+                "{detail}"
             );
         });
     }

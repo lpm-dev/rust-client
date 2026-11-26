@@ -195,7 +195,7 @@ pub async fn run(
             Ok(plan) => plans.push(plan),
             Err(error) => {
                 let failure = UpdateFailure::planning(&error);
-                if !json_output {
+                if !json_output && failure.prints_while_planning() {
                     let name_safe = sanitize_for_terminal(&target.name);
                     let reason_safe = sanitize_for_terminal(&failure.reason);
                     output::warn_line(install_ui::terminal_line!(
@@ -757,6 +757,12 @@ impl UpdateFailure {
         self
     }
 
+    /// Whether planning announces this failure as it happens. A firewall
+    /// block waits for the results, which print it once with its details.
+    fn prints_while_planning(&self) -> bool {
+        self.firewall_block.is_none()
+    }
+
     /// The reason as printed above [`Self::detail_lines`]: a lone registry
     /// refusal keeps its reason there and leaves naming the version to them.
     fn terminal_reason(&self) -> std::borrow::Cow<'_, str> {
@@ -765,8 +771,8 @@ impl UpdateFailure {
                 match (blocked.source, blocked.packages.as_slice()) {
                     (lpm_common::NpmFirewallBlockSource::Registry, [package]) => {
                         std::borrow::Cow::Owned(format!(
-                            "blocked by LPM Firewall: {}",
-                            package.reason
+                            "blocked by LPM Firewall (verdict: {}): {}",
+                            package.verdict, package.reason
                         ))
                     }
                     _ => std::borrow::Cow::Borrowed(&self.reason),
@@ -1419,6 +1425,17 @@ mod tests {
     }
 
     #[test]
+    fn a_firewall_block_found_while_planning_waits_for_the_results_to_print() {
+        let blocked = UpdateFailure::planning(&firewall_block(
+            lpm_common::NpmFirewallBlockSource::Registry,
+        ));
+        let missing = UpdateFailure::planning(&LpmError::NotFound("not found: gone".into()));
+
+        assert!(!blocked.prints_while_planning());
+        assert!(missing.prints_while_planning());
+    }
+
+    #[test]
     fn a_lone_update_names_a_refused_version_once_with_its_reason_and_report() {
         let failure = UpdateFailure::from_error(&firewall_block(
             lpm_common::NpmFirewallBlockSource::Registry,
@@ -1429,6 +1446,7 @@ mod tests {
         let text = rendered.join("\n");
 
         assert_eq!(text.matches("agent-tool@2.0.0").count(), 1, "{text}");
+        assert!(text.contains("verdict: suspicious"), "{text}");
         assert!(
             text.contains("client policy maps lpm_ai_agent_control_surface to block"),
             "{text}"

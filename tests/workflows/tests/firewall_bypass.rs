@@ -799,7 +799,7 @@ fn bypass_add_json_that_needs_approval_changes_nothing() {
     assert_eq!(envelope["error_code"], "security_approval_required");
     assert_eq!(
         envelope["next_steps"][0]["command"],
-        "lpm firewall bypass add \"agent-tool\" \"other-tool\" --ttl 30m"
+        "lpm firewall bypass add --ttl 30m \"agent-tool\" \"other-tool\""
     );
     let rules = saved_rules(&project);
     assert_eq!(rules.len(), 1);
