@@ -1761,6 +1761,59 @@ async fn an_install_whose_later_verdict_request_fails_still_reports_what_a_rule_
 }
 
 #[tokio::test]
+async fn a_wrapper_reports_what_a_rule_let_through_before_a_verdict_request_failed() {
+    let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
+    mock.with_package(
+        "unchecked-tool",
+        "1.0.0",
+        &make_tarball("unchecked-tool", "1.0.0"),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path(VERDICTS_PATH))
+        .and(body_string_contains("\"name\":\"unchecked-tool\""))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(mock.server())
+        .await;
+    let project = TempProject::empty(
+        r#"{"name":"consumer","version":"1.0.0","dependencies":{"agent-tool":"1.0.0","unchecked-tool":"1.0.0"}}"#,
+    );
+    write_npm_firewall_global_config(&project, "enforce");
+    write_signed_firewall_bypass(
+        &project,
+        &[stored_rule("agent-tool", serde_json::json!({}))],
+    );
+    let doctor = |json: bool| {
+        let mut command = lpm_with_registry(&project, &mock.url());
+        command.env("LPM_EXPERIMENT_NPM_FIREWALL_CHUNK_SIZE", "1");
+        if json {
+            command.arg("--json");
+        } else {
+            command.args(["--color", "never"]);
+        }
+        command.args(["doctor", "--fix", "--yes"]).output().unwrap()
+    };
+
+    let json = doctor(true);
+    let terminal = doctor(false);
+
+    let envelope: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(
+        envelope["fixes_failed"][0]["action"], "lpm install",
+        "{envelope:#}"
+    );
+    assert_eq!(
+        envelope["security"]["firewall"]["bypassed"][0]["name"], "agent-tool",
+        "{envelope:#}"
+    );
+    let stderr = String::from_utf8_lossy(&terminal.stderr);
+    assert!(
+        stderr.contains("! LPM Firewall allowed 1 blocked package because of your bypass rules:\n"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
 async fn workspace_migrate_json_reports_the_version_a_bypass_rule_let_through() {
     let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
     mock.with_package("lib-tool", "1.0.0", &make_tarball("lib-tool", "1.0.0"))

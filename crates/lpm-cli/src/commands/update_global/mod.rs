@@ -750,8 +750,6 @@ impl UpdateFailure {
         }
     }
 
-    /// For a failure whose install printed its own output: it lists blocked
-    /// versions it found before download, but not a registry's refusal.
     /// Keeps what bypass rules let through before the update failed, and
     /// whether its install already printed it.
     fn with_firewall_bypassed(
@@ -764,6 +762,8 @@ impl UpdateFailure {
         self
     }
 
+    /// For a failure whose install printed its own output: it lists blocked
+    /// versions it found before download, but not a registry's refusal.
     fn shown_by_install(mut self, output_shown: bool) -> Self {
         self.details_shown = output_shown
             && self.firewall_block.as_deref().is_some_and(|blocked| {

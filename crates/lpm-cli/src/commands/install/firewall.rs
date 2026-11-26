@@ -1863,6 +1863,7 @@ pub(super) fn spawn_npm_firewall_preflight(
         offline,
         force,
         json_output: _,
+        firewall_bypass_report: _,
     } = request;
     let verdict_packages =
         npm_firewall_packages(packages, route_table, client.as_ref(), lookup_mode);
@@ -1881,6 +1882,22 @@ pub(super) fn spawn_npm_firewall_preflight(
             verdict_packages,
         ))),
     }
+}
+
+/// Settles `result` for an install whose command keeps `report`. A request
+/// failure ends the install as an error, so what a rule let through before it
+/// is handed to the report first.
+pub(super) fn finish_npm_firewall_preflight_into(
+    result: NpmFirewallPreflightResult,
+    json_output: bool,
+    report: Option<&super::FirewallBypassReport>,
+) -> Result<NpmFirewallPreflightStats, LpmError> {
+    if result.failure.is_some()
+        && let Some(report) = report
+    {
+        report.record(&result.stats);
+    }
+    finish_npm_firewall_preflight(result, json_output)
 }
 
 pub(super) fn finish_npm_firewall_preflight(
@@ -1909,6 +1926,7 @@ fn report_npm_firewall_preflight(
         if !json_output {
             print_bypassed_verdicts(&stats.bypassed, false);
         }
+        super::PROCESS_FIREWALL_BYPASSES.record(&stats);
         return Err(failure);
     }
     // A failed request in monitor mode still leaves what the requests before
@@ -2155,6 +2173,7 @@ pub(super) async fn run_npm_firewall_preflight(
         offline,
         force,
         json_output,
+        firewall_bypass_report,
     } = request;
     let verdict_packages =
         npm_firewall_packages(packages, route_table, client.as_ref(), lookup_mode);
@@ -2171,7 +2190,7 @@ pub(super) async fn run_npm_firewall_preflight(
         verdict_packages,
     )
     .await?;
-    finish_npm_firewall_preflight(result, json_output)
+    finish_npm_firewall_preflight_into(result, json_output, firewall_bypass_report)
 }
 
 pub(super) struct NpmFirewallPreflightRequest<'a> {
@@ -2185,6 +2204,8 @@ pub(super) struct NpmFirewallPreflightRequest<'a> {
     pub(super) offline: bool,
     pub(super) force: bool,
     pub(super) json_output: bool,
+    /// Where the command keeps what bypass rules let through.
+    pub(super) firewall_bypass_report: Option<&'a super::FirewallBypassReport>,
 }
 
 pub(super) fn npm_firewall_packages(

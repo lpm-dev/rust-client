@@ -74,8 +74,9 @@ use fetch_overlap::*;
 use firewall::{
     NpmFirewallChunkedPreflightConfig, NpmFirewallLookupMode, NpmFirewallMode, NpmFirewallOutcome,
     NpmFirewallPreflightJoin, NpmFirewallPreflightRequest, NpmFirewallPreflightStats,
-    finish_npm_firewall_preflight, npm_firewall_chunk_size_from_env, npm_firewall_has_packages,
-    run_npm_firewall_preflight, spawn_chunked_npm_firewall_preflight, spawn_npm_firewall_preflight,
+    finish_npm_firewall_preflight_into, npm_firewall_chunk_size_from_env,
+    npm_firewall_has_packages, run_npm_firewall_preflight, spawn_chunked_npm_firewall_preflight,
+    spawn_npm_firewall_preflight,
 };
 pub(crate) use firewall::{
     NpmFirewallMaterializationPackage, begin_prepared_npm_firewall_materialization_preflight,
@@ -1694,9 +1695,10 @@ async fn run_with_options_under_store_lock(
     let monitor_only = matches!(npm_firewall_mode, NpmFirewallMode::Monitor);
     let npm_firewall = match npm_firewall_preflight_join.take() {
         Some(join) if monitor_only => NpmFirewallOutcome::Pending(join),
-        Some(join) => NpmFirewallOutcome::Settled(Box::new(finish_npm_firewall_preflight(
+        Some(join) => NpmFirewallOutcome::Settled(Box::new(finish_npm_firewall_preflight_into(
             join.drain().await?,
             json_output,
+            expectations.firewall_bypass_report.as_deref(),
         )?)),
         None => {
             let request = NpmFirewallPreflightRequest {
@@ -1710,6 +1712,7 @@ async fn run_with_options_under_store_lock(
                 offline,
                 force,
                 json_output,
+                firewall_bypass_report: expectations.firewall_bypass_report.as_deref(),
             };
             if monitor_only {
                 NpmFirewallOutcome::Pending(spawn_npm_firewall_preflight(request))

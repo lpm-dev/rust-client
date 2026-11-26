@@ -1403,6 +1403,7 @@ pub(super) async fn run_offline_install_phase(
         offline: true,
         force: false,
         json_output,
+        firewall_bypass_report,
     })
     .await?;
     if let Some(report) = firewall_bypass_report {
