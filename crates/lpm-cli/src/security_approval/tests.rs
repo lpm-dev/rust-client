@@ -2263,6 +2263,98 @@ fn forced_floor_holds_an_editor_save_at_the_local_posture_under_a_looser_managed
     });
 }
 
+fn forced_floor_config(mode: &str) -> crate::commands::config::GlobalConfig {
+    let mut config = firewall_policy_global_config(mode, &[]);
+    config.table_mut().insert(
+        "force-security-floor".to_string(),
+        toml::Value::Boolean(true),
+    );
+    config
+}
+
+fn approve_firewall_mode(mode: crate::npm_firewall_config::NpmFirewallMode) {
+    persist_authorized_posture(&AuthorizedPosture {
+        firewall_mode: mode.as_str().to_string(),
+        ..AuthorizedPosture::default()
+    })
+    .unwrap();
+}
+
+#[test]
+fn forced_floor_lets_an_editor_save_raise_monitor_to_enforce_with_an_action_monitor_treats_alike() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_firewall_mode(crate::npm_firewall_config::NpmFirewallMode::Monitor);
+        let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_dependency_script_policy: lpm_registry::client::NpmFirewallPolicyAction::Warn,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        crate::security_floor::reject_looser_firewall_policy_write(
+            &forced_floor_config("monitor"),
+            &requested,
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+fn forced_floor_lets_an_editor_save_turn_the_firewall_on_with_a_custom_profile() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_telemetry: lpm_registry::client::NpmFirewallPolicyAction::Allow,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        crate::security_floor::reject_looser_firewall_policy_write(
+            &forced_floor_config("off"),
+            &requested,
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+fn forced_floor_names_one_action_that_passes_every_floor_an_editor_save_meets() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[(
+            crate::npm_firewall_config::LPM_AI_SUSPICIOUS_POLICY_KEY,
+            "block",
+        )]);
+        write_managed_policy(
+            temp.path(),
+            "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_suspicious = \"warn\"\n",
+        );
+        let config = forced_floor_config("enforce");
+
+        for requested_action in [
+            lpm_registry::client::NpmFirewallPolicyAction::Allow,
+            lpm_registry::client::NpmFirewallPolicyAction::Warn,
+        ] {
+            let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+                lpm_ai_suspicious: requested_action,
+                ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+            };
+
+            let message =
+                crate::security_floor::reject_looser_firewall_policy_write(&config, &requested)
+                    .unwrap_err()
+                    .to_string();
+
+            assert!(
+                message.contains("would loosen the `block` your approved posture holds"),
+                "{message}"
+            );
+            assert!(
+                message.contains("Keep it at `block` or stricter"),
+                "{message}"
+            );
+        }
+    });
+}
+
 #[test]
 fn forced_floor_refuses_an_editor_save_that_would_sign_a_group_left_loose_by_hand() {
     let temp = tempdir().unwrap();

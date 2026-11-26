@@ -374,18 +374,31 @@ pub fn reject_looser_firewall_policy_write(
     }
     let effective = crate::security_approval::load_effective_authorized_posture()?;
     let enforced = crate::npm_firewall_config::enforced_policy_profile(global, &effective)?;
-    reject_policy_below_floor(
-        requested,
-        crate::npm_firewall_config::NpmFirewallMode::Enforce,
-        &enforced,
-        PolicyFloorSource::Enforced,
-    )?;
+    // An editor save also sets `enforce`, so its profile takes effect at once
+    // and is measured against what installs do now, at the mode they run.
+    let installs_mode = crate::npm_firewall_config::runtime_request_mode(global)?
+        .map_or_else(
+            || effective.posture.firewall_mode(),
+            |request| request.mode(),
+        )
+        .stricter(effective.posture.firewall_mode());
     let local = crate::security_approval::load_authorized_posture()?;
-    reject_policy_below_floor(
+    let local_profile = local.firewall_policy_profile();
+    reject_policy_below_floors(
+        crate::npm_firewall_config::NpmFirewallMode::Enforce,
         requested,
-        local.firewall_mode(),
-        &local.firewall_policy_profile(),
-        PolicyFloorSource::ApprovedPosture,
+        &[
+            PolicyFloor {
+                mode: installs_mode,
+                profile: &enforced,
+                source: PolicyFloorSource::Enforced,
+            },
+            PolicyFloor {
+                mode: local.firewall_mode(),
+                profile: &local_profile,
+                source: PolicyFloorSource::ApprovedPosture,
+            },
+        ],
     )
 }
 
@@ -419,11 +432,14 @@ pub fn reject_looser_firewall_policy_delete(
             *slot = action;
         }
     }
-    reject_policy_below_floor(
-        &changed,
+    reject_policy_below_floors(
         crate::npm_firewall_config::NpmFirewallMode::Enforce,
-        &floor,
-        PolicyFloorSource::Enforced,
+        &changed,
+        &[PolicyFloor {
+            mode: crate::npm_firewall_config::NpmFirewallMode::Enforce,
+            profile: &floor,
+            source: PolicyFloorSource::Enforced,
+        }],
     )
 }
 
@@ -445,50 +461,66 @@ impl PolicyFloorSource {
     }
 }
 
-/// Refuses `requested` when it handles a group more leniently than `floor`
-/// does at `floor_mode`. The floor is a signed or enforced action rather than
-/// a `config.toml` value, so the advice is to keep the group at the weakest
-/// action that passes or lift the forced floor.
-fn reject_policy_below_floor(
-    requested: &lpm_registry::client::NpmFirewallPolicyProfile,
-    floor_mode: crate::npm_firewall_config::NpmFirewallMode,
-    floor: &lpm_registry::client::NpmFirewallPolicyProfile,
+/// A profile a policy write may not drop below while `force-security-floor =
+/// true` is active, and the mode its actions are measured at.
+struct PolicyFloor<'a> {
+    mode: crate::npm_firewall_config::NpmFirewallMode,
+    profile: &'a lpm_registry::client::NpmFirewallPolicyProfile,
     source: PolicyFloorSource,
+}
+
+/// Refuses `requested`, run at `requested_mode`, when it handles a group more
+/// leniently than any of `floors`. A floor is a signed or enforced action
+/// rather than a `config.toml` value, so the advice is the weakest action that
+/// passes every floor, named with the floor that needs it, or to lift the
+/// forced floor.
+fn reject_policy_below_floors(
+    requested_mode: crate::npm_firewall_config::NpmFirewallMode,
+    requested: &lpm_registry::client::NpmFirewallPolicyProfile,
+    floors: &[PolicyFloor<'_>],
 ) -> Result<(), LpmError> {
-    use crate::npm_firewall_config::NpmFirewallMode;
+    use crate::npm_firewall_config::{policy_action, policy_action_loosens};
     use lpm_registry::client::NpmFirewallPolicyAction;
-    let loosened = crate::npm_firewall_config::loosened_firewall_policies(
-        NpmFirewallMode::Enforce,
-        requested,
-        floor_mode,
-        floor,
-    );
-    if let Some(first) = loosened.first() {
-        let weakest_passing = [
-            NpmFirewallPolicyAction::Allow,
-            NpmFirewallPolicyAction::Warn,
-            NpmFirewallPolicyAction::Block,
-        ]
-        .into_iter()
-        .find(|candidate| {
-            !crate::npm_firewall_config::policy_action_loosens(
-                NpmFirewallMode::Enforce,
-                *candidate,
-                floor_mode,
-                first.approved,
-            )
-        })
-        .unwrap_or(first.approved);
+    const BY_STRICTNESS: [NpmFirewallPolicyAction; 3] = [
+        NpmFirewallPolicyAction::Allow,
+        NpmFirewallPolicyAction::Warn,
+        NpmFirewallPolicyAction::Block,
+    ];
+    for key in crate::npm_firewall_config::POLICY_KEYS {
+        let Some(requested_action) = policy_action(requested, key) else {
+            continue;
+        };
+        let mut binding: Option<(&PolicyFloor<'_>, NpmFirewallPolicyAction, usize)> = None;
+        for floor in floors {
+            let Some(floor_action) = policy_action(floor.profile, key) else {
+                continue;
+            };
+            let passing = BY_STRICTNESS
+                .iter()
+                .position(|candidate| {
+                    !policy_action_loosens(requested_mode, *candidate, floor.mode, floor_action)
+                })
+                .unwrap_or(BY_STRICTNESS.len() - 1);
+            if binding.is_none_or(|(_, _, strictest)| passing > strictest) {
+                binding = Some((floor, floor_action, passing));
+            }
+        }
+        let Some((floor, floor_action, passing)) = binding else {
+            continue;
+        };
+        if !policy_action_loosens(requested_mode, requested_action, floor.mode, floor_action) {
+            continue;
+        }
         return Err(LpmError::SecurityFloor(format!(
             "setting `{}.{}` to `{}` would loosen the `{}` {} for it while \
              `force-security-floor = true` is active. Keep it at `{}` or stricter, or remove \
              `force-security-floor` first.",
             crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_PATH,
-            first.key,
-            first.requested.as_str(),
-            first.approved.as_str(),
-            source.describe(),
-            weakest_passing.as_str(),
+            key,
+            requested_action.as_str(),
+            floor_action.as_str(),
+            floor.source.describe(),
+            BY_STRICTNESS[passing].as_str(),
         )));
     }
     Ok(())
@@ -659,11 +691,14 @@ mod tests {
     fn forced_floor_refuses_a_looser_firewall_policy_write() {
         let requested = malware_floor(lpm_registry::client::NpmFirewallPolicyAction::Allow);
 
-        let err = reject_policy_below_floor(
-            &requested,
+        let err = reject_policy_below_floors(
             crate::npm_firewall_config::NpmFirewallMode::Enforce,
-            &malware_floor(lpm_registry::client::NpmFirewallPolicyAction::Block),
-            PolicyFloorSource::Enforced,
+            &requested,
+            &[PolicyFloor {
+                mode: crate::npm_firewall_config::NpmFirewallMode::Enforce,
+                profile: &malware_floor(lpm_registry::client::NpmFirewallPolicyAction::Block),
+                source: PolicyFloorSource::Enforced,
+            }],
         )
         .unwrap_err();
 
@@ -681,11 +716,14 @@ mod tests {
 
     #[test]
     fn forced_floor_names_the_weakest_action_that_passes_at_the_floor_mode() {
-        let err = reject_policy_below_floor(
+        let err = reject_policy_below_floors(
+            crate::npm_firewall_config::NpmFirewallMode::Enforce,
             &malware_floor(lpm_registry::client::NpmFirewallPolicyAction::Allow),
-            crate::npm_firewall_config::NpmFirewallMode::Monitor,
-            &malware_floor(lpm_registry::client::NpmFirewallPolicyAction::Block),
-            PolicyFloorSource::ApprovedPosture,
+            &[PolicyFloor {
+                mode: crate::npm_firewall_config::NpmFirewallMode::Monitor,
+                profile: &malware_floor(lpm_registry::client::NpmFirewallPolicyAction::Block),
+                source: PolicyFloorSource::ApprovedPosture,
+            }],
         )
         .unwrap_err();
 
@@ -702,11 +740,14 @@ mod tests {
         let requested = lpm_registry::client::NpmFirewallPolicyProfile::default();
 
         assert!(
-            reject_policy_below_floor(
-                &requested,
+            reject_policy_below_floors(
                 crate::npm_firewall_config::NpmFirewallMode::Enforce,
-                &malware_floor(lpm_registry::client::NpmFirewallPolicyAction::Warn),
-                PolicyFloorSource::Enforced,
+                &requested,
+                &[PolicyFloor {
+                    mode: crate::npm_firewall_config::NpmFirewallMode::Enforce,
+                    profile: &malware_floor(lpm_registry::client::NpmFirewallPolicyAction::Warn),
+                    source: PolicyFloorSource::Enforced,
+                }],
             )
             .is_ok()
         );
