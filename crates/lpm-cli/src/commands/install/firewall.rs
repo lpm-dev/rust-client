@@ -1158,7 +1158,7 @@ async fn hand_off_firewall_events(
                 })
                 .collect()
         };
-        if !released.hand_off(mode, carried, permit, event) {
+        if !released.hand_off(mode, carried, permit, event, fetch_tx) {
             break;
         }
     }
@@ -2180,6 +2180,7 @@ pub(super) fn print_bypassed_verdicts(bypassed: &[BypassedVerdict], monitor: boo
     if bypassed.is_empty() {
         return;
     }
+    super::note_firewall_bypasses_shown(bypassed);
     let count = bypassed.len();
     output::warn(&if monitor {
         format!(

@@ -3100,18 +3100,88 @@ async fn a_lifted_version_still_waiting_for_room_to_download_is_not_kept() {
     assert_eq!(record_names(&released.close()), ["lifted-a"]);
 }
 
+/// A version a rule lifted, as the check records it.
+async fn lifted_verdict(name: &str) -> BypassedVerdict {
+    enforce_with_rules(
+        verdict_response(
+            1,
+            vec![grouped_block(name, "suspicious", "lpm_ai_telemetry")],
+        ),
+        &[name],
+        FirewallBypassRules::preloaded(&[global_rule(name)], Vec::new(), None, true),
+    )
+    .await
+    .stats
+    .bypassed
+    .remove(0)
+}
+
 #[tokio::test]
 async fn nothing_is_handed_off_once_the_install_closes_the_record() {
     let released = super::super::ReleasedFirewallBypasses::default();
+    let lifted = lifted_verdict("late").await;
     let (fetch_tx, mut fetch_rx) = tokio::sync::mpsc::channel(1);
     let permit = fetch_tx.reserve().await.unwrap();
 
     assert!(released.close().bypassed.is_empty());
     assert!(!released.hand_off(
         NpmFirewallMode::Enforce,
-        std::iter::empty(),
+        [&lifted],
         permit,
         selected_event("late"),
+        &fetch_tx,
     ));
+    assert!(fetch_rx.try_recv().is_err());
+    assert!(released.close().bypassed.is_empty());
+}
+
+#[tokio::test]
+async fn nothing_is_handed_off_once_the_downloader_stops() {
+    let released = super::super::ReleasedFirewallBypasses::default();
+    let lifted = lifted_verdict("orphan").await;
+    let (fetch_tx, fetch_rx) = tokio::sync::mpsc::channel(1);
+    let permit = fetch_tx.reserve().await.unwrap();
+    drop(fetch_rx);
+
+    assert!(!released.hand_off(
+        NpmFirewallMode::Enforce,
+        [&lifted],
+        permit,
+        selected_event("orphan"),
+        &fetch_tx,
+    ));
+    assert!(released.close().bypassed.is_empty());
+}
+
+#[tokio::test]
+async fn an_error_exit_closes_every_record_an_install_still_holds() {
+    let registry = std::sync::Mutex::new(Vec::new());
+    let process = super::super::FirewallBypassReport::default();
+    let running = super::super::ReleasedFirewallBypasses::open_in(&registry);
+    drop(super::super::ReleasedFirewallBypasses::open_in(&registry));
+    let lifted = lifted_verdict("member-tool").await;
+    let later = lifted_verdict("later-tool").await;
+    let (fetch_tx, mut fetch_rx) = tokio::sync::mpsc::channel(2);
+    assert!(running.hand_off(
+        NpmFirewallMode::Enforce,
+        [&lifted],
+        fetch_tx.reserve().await.unwrap(),
+        selected_event("member-tool"),
+        &fetch_tx,
+    ));
+
+    super::super::close_open_releases(&registry, &process);
+
+    assert_eq!(record_names(&process.take()), ["member-tool"]);
+    assert!(registry.lock().unwrap().is_empty());
+    // A member still running hands off nothing more.
+    assert!(!running.hand_off(
+        NpmFirewallMode::Enforce,
+        [&later],
+        fetch_tx.reserve().await.unwrap(),
+        selected_event("later-tool"),
+        &fetch_tx,
+    ));
+    assert_eq!(fetch_rx.recv().await.unwrap().name, "member-tool");
     assert!(fetch_rx.try_recv().is_err());
 }

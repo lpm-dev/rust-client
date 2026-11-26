@@ -173,6 +173,9 @@ fn exit_with_clap_error(error: clap::Error, json_output: bool, help_hint: Option
 }
 
 pub(super) fn exit_with_lpm_error(error: &lpm_common::LpmError, json_output: bool) -> ! {
+    // The process exits without dropping an install still running in another
+    // task, so what it let through is reported here, before the error.
+    crate::commands::install::settle_firewall_bypasses_before_exit(json_output);
     super::install_timeline::finish("error");
     super::dispatch::keep_state_ignored_at_exit();
     if json_output && !matches!(error, lpm_common::LpmError::ExitCode(_)) {

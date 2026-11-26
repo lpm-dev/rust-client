@@ -507,6 +507,78 @@ static PROCESS_FIREWALL_BYPASSES: FirewallBypassReport = FirewallBypassReport {
     }),
 };
 
+type OpenReleases = std::sync::Mutex<Vec<std::sync::Weak<ReleasedFirewallBypasses>>>;
+
+/// Each install's record of what its streaming firewall check handed to the
+/// downloader, so a command that exits on an error while an install still
+/// runs in another task, as a workspace member's does, reports it first.
+static OPEN_RELEASES: OpenReleases = std::sync::Mutex::new(Vec::new());
+
+/// Every version this process printed as let through, so a command exiting
+/// on an error prints only what its terminal never showed.
+static SHOWN_FIREWALL_BYPASSES: std::sync::Mutex<std::collections::BTreeSet<(String, String)>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn note_firewall_bypasses_shown(verdicts: &[firewall::BypassedVerdict]) {
+    let mut shown = SHOWN_FIREWALL_BYPASSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for verdict in verdicts {
+        shown.insert((
+            verdict.decision.name.clone(),
+            verdict.decision.version.clone(),
+        ));
+    }
+}
+
+/// Before a command exits on an error: adds what any install still running
+/// handed to the downloader to the process record, and in a terminal prints
+/// every version a rule let through that the command never showed, as when
+/// Ctrl-C or an error ends a quiet install before its command prints it.
+pub(crate) fn settle_firewall_bypasses_before_exit(json_output: bool) {
+    close_open_releases(&OPEN_RELEASES, &PROCESS_FIREWALL_BYPASSES);
+    if json_output {
+        return;
+    }
+    let unshown = {
+        let record = PROCESS_FIREWALL_BYPASSES
+            .record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let shown = SHOWN_FIREWALL_BYPASSES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        FirewallBypassRecord {
+            mode: record.mode,
+            bypassed: record
+                .bypassed
+                .iter()
+                .filter(|verdict| {
+                    !shown.contains(&(
+                        verdict.decision.name.clone(),
+                        verdict.decision.version.clone(),
+                    ))
+                })
+                .cloned()
+                .collect(),
+        }
+    };
+    unshown.print();
+}
+
+/// Closes every record in `open` that an install still holds into `into`,
+/// so nothing more is handed off and everything that was is reported.
+fn close_open_releases(open: &OpenReleases, into: &FirewallBypassReport) {
+    let open = std::mem::take(
+        &mut *open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    for released in open.iter().filter_map(std::sync::Weak::upgrade) {
+        into.record_all(&released.close());
+    }
+}
+
 /// The `security` object a JSON error carries when an install in this
 /// process let a version past a block through a bypass rule.
 pub(crate) fn process_firewall_bypasses_security_json() -> Option<serde_json::Value> {
@@ -716,7 +788,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
     // the tokio reactor; the held handle lives for the lifetime of
     // the inner future and releases when the future returns.
     let store_lock_path = lpm_root.store_lock();
-    let released_firewall_bypasses = Arc::new(ReleasedFirewallBypasses::default());
+    let released_firewall_bypasses = ReleasedFirewallBypasses::open();
     // Declared before the install so it reports after the install, and the
     // streaming check it owns, are dropped.
     let _unsettled_notice = UnsettledFirewallBypassNotice {
@@ -789,21 +861,37 @@ struct ReleasedFirewallBypassState {
 }
 
 impl ReleasedFirewallBypasses {
+    /// A record an error exit can still reach while the install runs.
+    fn open() -> Arc<Self> {
+        Self::open_in(&OPEN_RELEASES)
+    }
+
+    fn open_in(registry: &OpenReleases) -> Arc<Self> {
+        let released = Arc::new(Self::default());
+        let mut open = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        open.retain(|entry| entry.strong_count() > 0);
+        open.push(Arc::downgrade(&released));
+        released
+    }
+
     /// Records `lifted` and sends `event` through `permit` as one step,
-    /// unless the install has closed the record. Returns whether `event` was
-    /// sent.
+    /// unless the install has closed the record or the downloader has
+    /// stopped. Returns whether `event` was sent.
     fn hand_off<'a>(
         &self,
         mode: crate::npm_firewall_config::NpmFirewallMode,
         lifted: impl IntoIterator<Item = &'a firewall::BypassedVerdict>,
         permit: tokio::sync::mpsc::Permit<'_, lpm_resolver::SelectedPackageEvent>,
         event: lpm_resolver::SelectedPackageEvent,
+        downloader: &tokio::sync::mpsc::Sender<lpm_resolver::SelectedPackageEvent>,
     ) -> bool {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.closed {
+        if state.closed || downloader.is_closed() {
             return false;
         }
         state.record.add(mode, lifted);
