@@ -633,16 +633,12 @@ pub(super) fn guard_generic_set_against_force_floor(
                 reject_looser_typosquat_guard_write(global, requested)?;
             }
         }
-        INSTALL_TIME_SOURCE_ANALYSIS_KEY
-            if crate::security_floor::force_security_floor_enabled(global)
-                && crate::source_analysis_config::read_install_time_source_analysis(global)?
-                && matches!(parse_config_bool(value), Ok(false)) =>
-        {
-            return Err(crate::security_floor::security_floor_write_error(
-                INSTALL_TIME_SOURCE_ANALYSIS_KEY,
-                value,
-                "true",
-            ));
+        INSTALL_TIME_SOURCE_ANALYSIS_KEY => {
+            if let Ok(requested) = parse_config_bool(value) {
+                crate::security_floor::reject_looser_install_time_source_analysis_write(
+                    global, requested,
+                )?;
+            }
         }
         _ => {}
     }
@@ -670,15 +666,12 @@ pub(super) fn guard_generic_delete_against_force_floor(
         TYPOSQUAT_GUARD_KEY => {
             reject_looser_typosquat_guard_write(global, TyposquatGuardSelection::Default)?
         }
-        INSTALL_TIME_SOURCE_ANALYSIS_KEY => guard_generic_set_against_force_floor(
-            global,
-            key,
-            if crate::source_analysis_config::DEFAULT_INSTALL_TIME_SOURCE_ANALYSIS {
-                "true"
-            } else {
-                "false"
-            },
-        )?,
+        INSTALL_TIME_SOURCE_ANALYSIS_KEY => {
+            crate::security_floor::reject_looser_install_time_source_analysis_write(
+                global,
+                crate::source_analysis_config::DEFAULT_INSTALL_TIME_SOURCE_ANALYSIS,
+            )?
+        }
         "force-security-floor" if crate::security_floor::force_security_floor_enabled(global) => {
             authorize_force_floor_removal()?;
         }

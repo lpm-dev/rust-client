@@ -157,6 +157,9 @@ pub(in crate::commands::config) fn reject_looser_typosquat_guard_write(
     if !crate::security_floor::force_security_floor_enabled(global) {
         return Ok(());
     }
+    crate::security_approval::reject_a_save_a_managed_policy_holds(
+        crate::security_approval::PersistentSecuritySetting::TyposquatGuard(requested),
+    )?;
     let floor = global
         .get_typosquat_guard_mode()
         .unwrap_or(TyposquatGuardSelection::Default);

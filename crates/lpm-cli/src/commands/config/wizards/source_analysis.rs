@@ -40,16 +40,7 @@ pub(in crate::commands::config) async fn run_source_analysis_wizard(
     };
 
     update_config(config_path, |config| {
-        if !enabled
-            && crate::security_floor::force_security_floor_enabled(config)
-            && crate::source_analysis_config::read_install_time_source_analysis(config)?
-        {
-            return Err(crate::security_floor::security_floor_write_error(
-                INSTALL_TIME_SOURCE_ANALYSIS_KEY,
-                "false",
-                "true",
-            ));
-        }
+        crate::security_floor::reject_looser_install_time_source_analysis_write(config, enabled)?;
         crate::security_approval::authorize_persistent_install_time_source_analysis(
             enabled,
             json_output,

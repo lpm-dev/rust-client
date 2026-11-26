@@ -1235,6 +1235,7 @@ fn guard_generic_set_rejects_disabling_force_floor_when_enabled() {
 
 #[test]
 fn guard_generic_set_rejects_case_insensitive_source_analysis_disable_under_force_floor() {
+    let (_dir, _path, _env) = tmp_config();
     let config =
         global_config("force-security-floor = true\ninstall-time-source-analysis = true\n");
     let err =
@@ -1247,6 +1248,7 @@ fn guard_generic_set_rejects_case_insensitive_source_analysis_disable_under_forc
 
 #[test]
 fn guard_generic_delete_rejects_lowering_release_age_to_default() {
+    let (_dir, _path, _env) = tmp_config();
     let config =
         global_config("force-security-floor = true\nminimum-release-age-secs = \"259200\"\n");
     let err = guard_generic_delete_against_force_floor(&config, RELEASE_AGE_KEY).unwrap_err();
@@ -1264,6 +1266,7 @@ fn guard_generic_delete_rejects_unsetting_force_floor_when_enabled() {
 
 #[test]
 fn guard_generic_delete_rejects_unsetting_enabled_typosquat_guard_under_force_floor() {
+    let (_dir, _path, _env) = tmp_config();
     let config = global_config("force-security-floor = true\ntyposquat-guard = \"on\"\n");
 
     let err = guard_generic_delete_against_force_floor(&config, TYPOSQUAT_GUARD_KEY).unwrap_err();
@@ -1274,6 +1277,7 @@ fn guard_generic_delete_rejects_unsetting_enabled_typosquat_guard_under_force_fl
 
 #[test]
 fn guard_generic_delete_allows_removing_disabled_typosquat_guard_under_force_floor() {
+    let (_dir, _path, _env) = tmp_config();
     let config = global_config("force-security-floor = true\ntyposquat-guard = \"off\"\n");
 
     guard_generic_delete_against_force_floor(&config, TYPOSQUAT_GUARD_KEY).unwrap();

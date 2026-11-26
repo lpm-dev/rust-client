@@ -3003,3 +3003,148 @@ fn config_list_reports_telemetry_held_at_an_approved_action_as_installs_send_it(
     assert_eq!(entry["value"], "block", "{entry}");
     assert_eq!(entry["source"], "approved security posture", "{entry}");
 }
+
+/// A save that loosens a setting a managed security policy holds is refused
+/// naming that policy, and recorded, even while `force-security-floor = true`
+/// holds the same setting: lowering the floor wouldn't let the save through.
+#[test]
+fn a_save_a_managed_policy_holds_names_the_policy_before_the_forced_floor() {
+    struct Case {
+        held: &'static str,
+        args: &'static [&'static str],
+        knob: &'static str,
+        scope: &'static str,
+    }
+    let cases = [
+        Case {
+            held: "script-policy = \"deny\"\n",
+            args: &["config", "set", "script-policy", "allow"],
+            knob: "script-policy",
+            scope: "scripts-allow",
+        },
+        Case {
+            held: "script-policy = \"deny\"\n",
+            args: &["config", "scripts", "--set", "allow"],
+            knob: "script-policy",
+            scope: "scripts-allow",
+        },
+        Case {
+            held: "minimum-release-age-secs = 259200\n",
+            args: &["config", "set", "minimum-release-age-secs", "0"],
+            knob: "minimum-release-age-secs",
+            scope: "cooldown-bypass",
+        },
+        Case {
+            held: "minimum-release-age-secs = 259200\n",
+            args: &["config", "delete", "minimum-release-age-secs"],
+            knob: "minimum-release-age-secs",
+            scope: "cooldown-bypass",
+        },
+        Case {
+            held: "release-age-policy = \"strict\"\n",
+            args: &["config", "set", "release-age-policy", "direct"],
+            knob: "release-age-policy",
+            scope: "cooldown-window",
+        },
+        Case {
+            held: "[sandbox]\nmode = \"strict\"\n",
+            args: &["config", "set", "sandbox", "none"],
+            knob: "[sandbox].mode",
+            scope: "sandbox-none",
+        },
+        Case {
+            held: "[sandbox]\nmode = \"strict\"\n",
+            args: &["config", "sandbox", "--set", "none"],
+            knob: "[sandbox].mode",
+            scope: "sandbox-none",
+        },
+        Case {
+            held: "[sigstore]\nverify = \"deny\"\n",
+            args: &["config", "set", "sigstore", "verify=off"],
+            knob: "[sigstore].verify",
+            scope: "provenance-unverified",
+        },
+        Case {
+            held: "typosquat-guard = \"on\"\n",
+            args: &["config", "set", "typosquat-guard", "off"],
+            knob: "typosquat-guard",
+            scope: "typosquat-disable",
+        },
+        Case {
+            held: "typosquat-guard = \"on\"\n",
+            args: &["config", "typosquat", "--set", "off"],
+            knob: "typosquat-guard",
+            scope: "typosquat-disable",
+        },
+        Case {
+            held: "[firewall]\nmode = \"enforce\"\n",
+            args: &["config", "set", "firewall", "off"],
+            knob: "[firewall].mode",
+            scope: "firewall-disable",
+        },
+        Case {
+            held: "[firewall]\nmode = \"enforce\"\n",
+            args: &["config", "delete", "firewall.mode"],
+            knob: "[firewall].mode",
+            scope: "firewall-disable",
+        },
+        Case {
+            held: "install-time-source-analysis = true\n",
+            args: &["config", "set", "install-time-source-analysis", "false"],
+            knob: "install-time-source-analysis",
+            scope: "source-analysis-disable",
+        },
+    ];
+
+    let mut failures = Vec::new();
+    for case in cases {
+        let project = TempProject::empty(r#"{"name":"config-managed-floor","version":"1.0.0"}"#);
+        let policy_path = project.home().join(".lpm/security-policy.toml");
+        std::fs::create_dir_all(policy_path.parent().unwrap()).unwrap();
+        std::fs::write(&policy_path, case.held).unwrap();
+        let config = format!("force-security-floor = true\n{}", case.held);
+        seed_config(&project, &config);
+
+        let output = lpm(&project)
+            .arg("--json")
+            .args(case.args)
+            .output()
+            .unwrap();
+
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "{:?}: {error}: {}{}",
+                    case.args,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        let names_the_policy = envelope["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&format!(
+                "managed security policy `{}` keeps `{}`",
+                policy_path.display(),
+                case.knob
+            ));
+        let refusals = std::fs::read_to_string(project.home().join(".lpm/security/audit.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["payload"].clone())
+            .filter(|payload| {
+                payload["event"] == "persistent-guarded-attempt"
+                    && payload["allowed"] == false
+                    && payload["scopes"] == serde_json::json!([case.scope])
+            })
+            .count();
+        let config_kept = std::fs::read_to_string(config_path(&project)).unwrap() == config;
+        if output.status.success() || !names_the_policy || refusals != 1 || !config_kept {
+            failures.push(format!(
+                "{:?}: refusals recorded {refusals}, config kept {config_kept}: {envelope}",
+                case.args
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}

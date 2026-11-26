@@ -339,9 +339,6 @@ pub async fn run(
                     RELEASE_AGE_POLICY_KEY => {
                         let requested =
                             crate::release_age_config::ReleaseAgePolicy::parse(key, value)?;
-                        crate::security_floor::reject_looser_release_age_policy_write(
-                            config, requested,
-                        )?;
                         crate::security_approval::authorize_persistent_release_age_policy(
                             requested,
                             json_output,
@@ -482,10 +479,6 @@ pub async fn run(
                         &format!("lpm config delete {key}"),
                     )?,
                     RELEASE_AGE_POLICY_KEY => {
-                        crate::security_floor::reject_looser_release_age_policy_write(
-                            config,
-                            crate::release_age_config::ReleaseAgePolicy::Direct,
-                        )?;
                         crate::security_approval::authorize_persistent_release_age_policy(
                             crate::release_age_config::ReleaseAgePolicy::Direct,
                             json_output,

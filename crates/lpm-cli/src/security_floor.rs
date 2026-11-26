@@ -270,6 +270,9 @@ pub fn reject_looser_script_policy_write(
     if !force_security_floor_enabled(global) {
         return Ok(());
     }
+    crate::security_approval::reject_a_save_a_managed_policy_holds(
+        crate::security_approval::PersistentSecuritySetting::ScriptPolicy(requested),
+    )?;
     let floor = current_script_policy_floor(global);
     if requested.loosens(floor) {
         return Err(security_floor_write_error(
@@ -288,6 +291,9 @@ pub fn reject_looser_release_age_write(
     if !force_security_floor_enabled(global) {
         return Ok(());
     }
+    crate::security_approval::reject_a_save_a_managed_policy_holds(
+        crate::security_approval::PersistentSecuritySetting::MinimumReleaseAgeSecs(requested_secs),
+    )?;
     let floor = current_release_age_floor_secs(global);
     if requested_secs < floor {
         return Err(security_floor_write_error(
@@ -306,6 +312,9 @@ pub fn reject_looser_release_age_policy_write(
     if !force_security_floor_enabled(global) {
         return Ok(());
     }
+    crate::security_approval::reject_a_save_a_managed_policy_holds(
+        crate::security_approval::PersistentSecuritySetting::ReleaseAgePolicy(requested),
+    )?;
     let floor = current_release_age_policy_floor(global);
     if requested.loosens(floor) {
         return Err(security_floor_write_error(
@@ -324,12 +333,35 @@ pub fn reject_looser_sigstore_write(
     if !force_security_floor_enabled(global) {
         return Ok(());
     }
+    crate::security_approval::reject_a_save_a_managed_policy_holds(
+        crate::security_approval::PersistentSecuritySetting::SigstoreVerify(requested),
+    )?;
     let floor = current_sigstore_floor(global);
     if sigstore_loosens(requested, floor) {
         return Err(security_floor_write_error(
             "[sigstore].verify",
             sigstore_mode_name(requested),
             sigstore_mode_name(floor),
+        ));
+    }
+    Ok(())
+}
+
+pub fn reject_looser_install_time_source_analysis_write(
+    global: &GlobalConfig,
+    requested: bool,
+) -> Result<(), LpmError> {
+    if !force_security_floor_enabled(global) {
+        return Ok(());
+    }
+    crate::security_approval::reject_a_save_a_managed_policy_holds(
+        crate::security_approval::PersistentSecuritySetting::InstallTimeSourceAnalysis(requested),
+    )?;
+    if !requested && crate::source_analysis_config::read_install_time_source_analysis(global)? {
+        return Err(security_floor_write_error(
+            crate::source_analysis_config::INSTALL_TIME_SOURCE_ANALYSIS_KEY,
+            "false",
+            "true",
         ));
     }
     Ok(())
@@ -348,6 +380,9 @@ pub fn reject_looser_firewall_mode_write(
     if !force_security_floor_enabled(global) {
         return Ok(());
     }
+    crate::security_approval::reject_a_save_a_managed_policy_holds(
+        crate::security_approval::PersistentSecuritySetting::FirewallMode(requested),
+    )?;
     let floor = current_firewall_floor(global)?;
     if requested.loosens(floor) {
         return Err(security_floor_write_error(
@@ -562,6 +597,9 @@ pub fn reject_looser_sandbox_mode_write(
     if !force_security_floor_enabled(global) {
         return Ok(());
     }
+    crate::security_approval::reject_a_save_a_managed_policy_holds(
+        crate::security_approval::PersistentSecuritySetting::SandboxMode(requested),
+    )?;
     let floor = current_sandbox_floor_mode(global);
     if requested.loosens(floor) {
         return Err(security_floor_write_error(
@@ -643,16 +681,43 @@ mod tests {
 
     #[test]
     fn reject_looser_release_age_write_blocks_lower_value_when_force_enabled() {
-        let cfg = global_cfg(None, Some("259200"), true);
-        let err = reject_looser_release_age_write(&cfg, 0).unwrap_err();
-        assert_eq!(err.error_code(), "security_floor");
-        assert!(err.to_string().contains("minimum-release-age-secs"));
+        let temp = tempfile::tempdir().unwrap();
+        crate::security_approval::test_support::with_test_env(temp.path(), || {
+            let cfg = global_cfg(None, Some("259200"), true);
+            let err = reject_looser_release_age_write(&cfg, 0).unwrap_err();
+            assert_eq!(err.error_code(), "security_floor");
+            assert!(err.to_string().contains("minimum-release-age-secs"));
+        });
+    }
+
+    #[test]
+    fn a_floor_check_without_a_managed_policy_leaves_the_signed_posture_unread() {
+        let temp = tempfile::tempdir().unwrap();
+        crate::security_approval::test_support::with_test_env(temp.path(), || {
+            std::fs::write(
+                temp.path().join("approved-posture.json"),
+                "not a signed posture",
+            )
+            .unwrap();
+            let cfg = global_cfg(None, Some("259200"), true);
+
+            let err = reject_looser_release_age_write(&cfg, 0).unwrap_err();
+
+            assert!(
+                err.to_string()
+                    .contains("would loosen the current machine floor `259200`"),
+                "{err}"
+            );
+        });
     }
 
     #[test]
     fn reject_looser_script_policy_write_allows_tightening() {
-        let cfg = global_cfg(Some("allow"), None, true);
-        reject_looser_script_policy_write(&cfg, ScriptPolicy::Triage).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        crate::security_approval::test_support::with_test_env(temp.path(), || {
+            let cfg = global_cfg(Some("allow"), None, true);
+            reject_looser_script_policy_write(&cfg, ScriptPolicy::Triage).unwrap();
+        });
     }
 
     #[test]
