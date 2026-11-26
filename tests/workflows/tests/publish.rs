@@ -208,6 +208,7 @@ impl wiremock::Respond for RekorLoggingTheUpload {
         let mut leaf = Sha256::new();
         leaf.update([0x00]);
         leaf.update(&request.body);
+        let leaf = leaf.finalize();
         ResponseTemplate::new(201).set_body_json(serde_json::json!({
             "uuid": {
                 "body": BASE64.encode(&request.body),
@@ -217,10 +218,13 @@ impl wiremock::Respond for RekorLoggingTheUpload {
                 "verification": {
                     "signedEntryTimestamp": BASE64.encode(b"workflow-test-set"),
                     "inclusionProof": {
-                        "checkpoint": "rekor.sigstore.dev - 1\n1\nroot=\n\n",
+                        "checkpoint": format!(
+                            "rekor.sigstore.dev - 1\n1\n{}\n\n\u{2014} rekor.sigstore.dev wNI9ag==\n",
+                            BASE64.encode(leaf)
+                        ),
                         "hashes": [],
                         "logIndex": 0,
-                        "rootHash": hex::encode(leaf.finalize()),
+                        "rootHash": hex::encode(leaf),
                         "treeSize": 1
                     }
                 }

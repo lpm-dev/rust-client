@@ -953,7 +953,7 @@ fn tlog_entry_from_rekor_response(response: &str) -> Result<TlogEntry, String> {
     let body = BASE64
         .decode(entry.body.as_bytes())
         .map_err(|e| format!("Rekor's entry body is not base64: {e}"))?;
-    let header: KindVersionHeader = serde_json::from_slice(&body)
+    let header: crate::sigstore_verify::EntryHeader = serde_json::from_slice(&body)
         .map_err(|e| format!("Rekor's entry body doesn't name its kind and version: {e}"))?;
     let signed_entry_timestamp = &entry.verification.signed_entry_timestamp;
     if BASE64
@@ -982,6 +982,12 @@ fn tlog_entry_from_rekor_response(response: &str) -> Result<TlogEntry, String> {
     .map_err(|e| format!("Rekor's inclusion proof doesn't fit its tree: {e}"))?;
     if computed_root != root_hash {
         return Err("Rekor's inclusion proof doesn't lead to its root".into());
+    }
+    let (checkpoint_size, checkpoint_root) =
+        crate::sigstore_verify::unverified_tree_head(&proof.checkpoint)
+            .map_err(|e| format!("Rekor's checkpoint is malformed: {e}"))?;
+    if checkpoint_size != proof.tree_size || checkpoint_root != root_hash {
+        return Err("Rekor's checkpoint is for another tree than its inclusion proof".into());
     }
 
     Ok(TlogEntry {
@@ -1012,13 +1018,6 @@ fn tlog_entry_from_rekor_response(response: &str) -> Result<TlogEntry, String> {
         verification: None,
         canonicalized_body: entry.body,
     })
-}
-
-#[derive(serde::Deserialize)]
-struct KindVersionHeader {
-    kind: String,
-    #[serde(rename = "apiVersion")]
-    api_version: String,
 }
 
 /// Issuers whose JWTs we will accept the `sub` claim from. Fulcio is
@@ -1805,7 +1804,11 @@ mod tests {
             json["kindVersion"],
             serde_json::json!({"kind": "dsse", "version": "0.0.1"})
         );
-        assert!(json["inclusionPromise"]["signedEntryTimestamp"].is_string());
+        let mut response = real_rekor_response();
+        assert_eq!(
+            json["inclusionPromise"]["signedEntryTimestamp"],
+            entry_of(&mut response)["verification"]["signedEntryTimestamp"]
+        );
         let proof = &json["inclusionProof"];
         assert_eq!(proof["logIndex"], "3515716086");
         assert_eq!(proof["treeSize"], "3995884690");
@@ -1870,16 +1873,15 @@ mod tests {
         ] {
             assert_eq!(converted[field], written[field], "{field}");
         }
-        let set = |entry: &serde_json::Value| {
-            BASE64
-                .decode(
-                    entry["inclusionPromise"]["signedEntryTimestamp"]
-                        .as_str()
-                        .unwrap(),
-                )
-                .is_ok()
-        };
-        assert!(set(&converted) && set(written));
+        let mut response = real_rekor_response();
+        assert_eq!(
+            converted["inclusionPromise"]["signedEntryTimestamp"],
+            entry_of(&mut response)["verification"]["signedEntryTimestamp"]
+        );
+        assert_eq!(
+            json_kind(&written["inclusionPromise"]["signedEntryTimestamp"]),
+            "string"
+        );
         for field in ["logIndex", "treeSize", "rootHash", "hashes", "checkpoint"] {
             assert_eq!(
                 json_kind(&converted["inclusionProof"][field]),
@@ -1909,6 +1911,7 @@ mod tests {
         let mut leaf = sha2::Sha256::new();
         leaf.update([0x00]);
         leaf.update(body);
+        let leaf = leaf.finalize();
         serde_json::json!({
             "uuid": {
                 "body": BASE64.encode(body),
@@ -1918,10 +1921,13 @@ mod tests {
                 "verification": {
                     "signedEntryTimestamp": BASE64.encode(b"set"),
                     "inclusionProof": {
-                        "checkpoint": "rekor.sigstore.dev - 1\n1\nroot=\n\n",
+                        "checkpoint": format!(
+                            "rekor.sigstore.dev - 1\n1\n{}\n\n\u{2014} rekor.sigstore.dev wNI9ag==\n",
+                            BASE64.encode(leaf)
+                        ),
                         "hashes": [],
                         "logIndex": 0,
-                        "rootHash": hex::encode(leaf.finalize()),
+                        "rootHash": hex::encode(leaf),
                         "treeSize": 1
                     }
                 }
@@ -1948,7 +1954,19 @@ mod tests {
         let remove = |value: &mut serde_json::Value, field: &str| {
             value.as_object_mut().unwrap().remove(field);
         };
-        let cases: [(&str, Change, &str); 19] = [
+        let cases: [(&str, Change, &str); 20] = [
+            (
+                "a checkpoint for another tree",
+                |entry| {
+                    let checkpoint = entry["verification"]["inclusionProof"]["checkpoint"]
+                        .as_str()
+                        .unwrap()
+                        .replacen("\n3995884690\n", "\n3995884691\n", 1);
+                    entry["verification"]["inclusionProof"]["checkpoint"] =
+                        serde_json::json!(checkpoint);
+                },
+                "for another tree",
+            ),
             (
                 "no index across the log",
                 |entry| {
@@ -2237,51 +2255,6 @@ mod tests {
         });
         let entry: TlogEntry = serde_json::from_value(legacy_shape).unwrap();
         assert_eq!(entry.resolved_inclusion_proof().unwrap().tree_size, 99);
-    }
-
-    #[tokio::test]
-    async fn bundle_persists_spec_compliant_top_level_inclusion_promise_and_proof() {
-        // End-to-end: build a bundle through the publish flow and
-        // assert the persisted TlogEntry shape is Sigstore Bundle v0.3
-        // spec-compliant — top-level `inclusionPromise` /
-        // `inclusionProof`, no `verification` envelope written.
-        let server = rekor_answering(real_rekor_response()).await;
-
-        let entry = rekor_upload(&server.uri(), &dsse_fixture(), "cert")
-            .await
-            .unwrap();
-
-        let json = serde_json::to_value(&entry).unwrap();
-        let obj = json.as_object().unwrap();
-        assert!(
-            obj.contains_key("inclusionPromise"),
-            "spec shape requires top-level inclusionPromise; got keys: {:?}",
-            obj.keys().collect::<Vec<_>>()
-        );
-        assert!(
-            obj.contains_key("inclusionProof"),
-            "spec shape requires top-level inclusionProof"
-        );
-        assert!(
-            !obj.contains_key("verification"),
-            "publish path must not write Rekor's `verification` envelope to the bundle wire \
-             format; lift its contents into the top-level fields instead"
-        );
-    }
-
-    #[tokio::test]
-    async fn rekor_empty_object_response_errors() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(match_path("/api/v1/log/entries"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
-            .mount(&server)
-            .await;
-
-        let err = rekor_upload(&server.uri(), &dsse_fixture(), "cert")
-            .await
-            .expect_err("expected error");
-        assert!(format!("{err}").contains("exactly one entry"));
     }
 
     #[tokio::test]
