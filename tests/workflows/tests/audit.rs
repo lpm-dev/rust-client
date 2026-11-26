@@ -1752,6 +1752,10 @@ async fn an_interrupted_audit_fix_prints_the_version_a_bypass_rule_let_through()
         notice < error,
         "the notice must come before the error: {stderr}"
     );
+    assert!(
+        stderr[notice..error].contains("vuln-pkg@1.0.1"),
+        "the notice names the version before the error: {stderr}"
+    );
     assert_eq!(stderr.matches(notice_text).count(), 1, "{stderr}");
 }
 

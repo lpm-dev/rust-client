@@ -1783,7 +1783,12 @@ async fn an_install_whose_verdict_request_fails_first_reports_no_held_back_versi
 async fn doctor_with_a_failing_verdict_request(
     lifted_after: std::time::Duration,
     failure_after: std::time::Duration,
-) -> (std::process::Output, [usize; 2], std::process::Output) {
+) -> (
+    std::process::Output,
+    [usize; 2],
+    std::process::Output,
+    [usize; 2],
+) {
     let mock = MockRegistry::start().await;
     mock.with_package("agent-tool", "1.0.0", &make_tarball("agent-tool", "1.0.0"))
         .await;
@@ -1831,12 +1836,16 @@ async fn doctor_with_a_failing_verdict_request(
         verdict_requests_naming(&mock, "unchecked-tool").await,
     ];
     let terminal = doctor(false);
-    (json, json_requests, terminal)
+    let terminal_requests = [
+        verdict_requests_naming(&mock, "agent-tool").await - json_requests[0],
+        verdict_requests_naming(&mock, "unchecked-tool").await - json_requests[1],
+    ];
+    (json, json_requests, terminal, terminal_requests)
 }
 
 #[tokio::test]
 async fn a_wrapper_reports_what_a_rule_let_through_before_a_verdict_request_failed() {
-    let (json, _, terminal) = doctor_with_a_failing_verdict_request(
+    let (json, _, terminal, _) = doctor_with_a_failing_verdict_request(
         std::time::Duration::ZERO,
         std::time::Duration::from_millis(1500),
     )
@@ -1857,7 +1866,7 @@ async fn a_wrapper_reports_what_a_rule_let_through_before_a_verdict_request_fail
 
 #[tokio::test]
 async fn a_wrapper_reports_no_lifted_version_held_back_after_a_verdict_request_failed() {
-    let (json, json_requests, terminal) = doctor_with_a_failing_verdict_request(
+    let (json, json_requests, terminal, terminal_requests) = doctor_with_a_failing_verdict_request(
         std::time::Duration::from_millis(1500),
         std::time::Duration::ZERO,
     )
@@ -1881,6 +1890,15 @@ async fn a_wrapper_reports_no_lifted_version_held_back_after_a_verdict_request_f
     );
     assert!(envelope.get("security").is_none(), "{envelope:#}");
     let stderr = String::from_utf8_lossy(&terminal.stderr);
+    assert!(
+        stderr.contains("npm firewall verdict preflight failed"),
+        "{stderr}"
+    );
+    assert_eq!(
+        terminal_requests,
+        [1, 1],
+        "the terminal run asks about each version once"
+    );
     assert!(!stderr.contains("LPM Firewall allowed"), "{stderr}");
 }
 
@@ -2339,6 +2357,10 @@ fn assert_interrupted_after_reporting_agent_tool(output: &std::process::Output, 
         assert!(
             notice < error,
             "the notice must come before the error: {stderr}"
+        );
+        assert!(
+            stderr[notice..error].contains("agent-tool@1.0.0"),
+            "the notice names the version before the error: {stderr}"
         );
         assert_eq!(stderr.matches(AGENT_TOOL_ALLOWED).count(), 1, "{stderr}");
     }

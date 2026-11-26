@@ -1119,7 +1119,7 @@ async fn apply_firewall_chunk_result(
     if !release {
         held_bypassed.append(&mut classified.bypassed);
     } else if enforce {
-        hand_off_firewall_events(
+        let delivered = hand_off_firewall_events(
             fetch_tx,
             chunk_result.events,
             &classified.bypassed,
@@ -1127,6 +1127,16 @@ async fn apply_firewall_chunk_result(
             dispatch.released_bypasses,
         )
         .await;
+        // A version none of whose events reached the downloader was let
+        // through by nothing, so it stays with the held ones.
+        let lifted = std::mem::take(&mut classified.bypassed);
+        for (verdict, delivered) in lifted.into_iter().zip(delivered) {
+            if delivered {
+                classified.bypassed.push(verdict);
+            } else {
+                held_bypassed.push(verdict);
+            }
+        }
     } else {
         release_firewall_events(fetch_tx, chunk_result.events).await;
     }
@@ -1136,32 +1146,43 @@ async fn apply_firewall_chunk_result(
 
 /// Sends each of `events` to the downloader together with the lifted
 /// versions it carries, so the install's record of `released` names exactly
-/// what reached the downloader, and stops once the install closes it.
+/// what reached the downloader, and stops once the install closes it or the
+/// downloader stops. Returns, for each of `lifted`, whether an event carrying
+/// it was sent.
 async fn hand_off_firewall_events(
     fetch_tx: &tokio::sync::mpsc::Sender<lpm_resolver::SelectedPackageEvent>,
     events: Vec<lpm_resolver::SelectedPackageEvent>,
     lifted: &[BypassedVerdict],
     mode: NpmFirewallMode,
     released: &super::ReleasedFirewallBypasses,
-) {
+) -> Vec<bool> {
+    let mut delivered = vec![false; lifted.len()];
     for event in events {
         let Ok(permit) = fetch_tx.reserve().await else {
             break;
         };
-        let carried: Vec<&BypassedVerdict> = if lifted.is_empty() {
-            Vec::new()
-        } else {
-            lifted
-                .iter()
-                .filter(|verdict| {
-                    verdict.decision.name == event.name && verdict.decision.version == event.version
-                })
-                .collect()
-        };
-        if !released.hand_off(mode, carried, permit, event, fetch_tx) {
+        let carried: Vec<usize> = lifted
+            .iter()
+            .enumerate()
+            .filter(|(_, verdict)| {
+                verdict.decision.name == event.name && verdict.decision.version == event.version
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if !released.hand_off(
+            mode,
+            carried.iter().map(|&index| &lifted[index]),
+            permit,
+            event,
+            fetch_tx,
+        ) {
             break;
         }
+        for index in carried {
+            delivered[index] = true;
+        }
     }
+    delivered
 }
 
 async fn release_firewall_events(
@@ -2180,7 +2201,16 @@ pub(super) fn print_bypassed_verdicts(bypassed: &[BypassedVerdict], monitor: boo
     if bypassed.is_empty() {
         return;
     }
-    super::note_firewall_bypasses_shown(bypassed);
+    super::FIREWALL_BYPASS_NOTICES.show(bypassed, |bypassed| {
+        write_bypassed_verdicts(bypassed, monitor);
+    });
+}
+
+/// Writes the notice [`print_bypassed_verdicts`] prints.
+pub(super) fn write_bypassed_verdicts(bypassed: &[BypassedVerdict], monitor: bool) {
+    if bypassed.is_empty() {
+        return;
+    }
     let count = bypassed.len();
     output::warn(&if monitor {
         format!(
