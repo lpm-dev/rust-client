@@ -34,8 +34,8 @@ pub fn verify_inclusion_proof(
     // without a SET the entry's `integratedTime` is unsigned. The log is
     // found by its ID, as Sigstore's verifiers find it; a SET, when there is
     // one, checks the key at the time it signs.
-    let log_id_bytes = decode_log_id(&tlog_entry.log_id.key_id)
-        .map_err(|e| VerifyError::InclusionProof(format!("{e}")))?;
+    let log_id_bytes =
+        decode_log_id(&tlog_entry.log_id.key_id).map_err(VerifyError::InclusionProof)?;
     let rekor_key = rekor_keys
         .iter()
         .find(|k| k.log_id == log_id_bytes)

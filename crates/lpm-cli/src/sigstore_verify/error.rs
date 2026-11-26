@@ -37,8 +37,8 @@ pub enum VerifyError {
 
     /// Rekor body could not be parsed at all: `canonicalizedBody`
     /// wasn't base64, the decoded bytes weren't JSON, top-level
-    /// `kind` wasn't `intoto`, or required fields were missing /
-    /// of the wrong shape. Distinct from [`Self::RekorBodyMismatch`]
+    /// `kind` wasn't one the verifier reads, or required fields were
+    /// missing / of the wrong shape. Distinct from [`Self::RekorBodyMismatch`]
     /// which is reserved for "we parsed the body but its claims
     /// disagree with the bundle."
     #[error("Rekor body is malformed: {0}")]

@@ -717,19 +717,47 @@ fn a_rekor_v2_entry_without_a_log_id_is_matched_past_a_log_that_only_cosigned() 
         .to_string();
     let (text, signatures) = envelope.split_once("\n\n").unwrap();
     let text = format!("{text}\n");
-    let mut cosigner = test_log(4);
-    cosigner.trusted.base_url = "https://cosigner.test.example".into();
+    let cosigner = || {
+        let mut cosigner = test_log(4);
+        cosigner.trusted.base_url = "https://cosigner.test.example".into();
+        cosigner
+    };
     let cosigned = format!(
         "{text}\n{}{signatures}",
-        cosigner.signature_line("cosigner.test.example", &text)
+        cosigner().signature_line("cosigner.test.example", &text)
     );
     entry["inclusionProof"]["checkpoint"]["envelope"] = serde_json::json!(cosigned);
 
     let mut trust = conformance_trust(DSSE_CASE);
-    trust.rekor_keys.insert(0, cosigner.trusted);
+    trust.rekor_keys.insert(0, cosigner().trusted);
     let verified = verify(&bundle, &trust, VerifyOptions::npm_attestation()).unwrap();
     assert_eq!(
         verified.log_id,
         "09OnDKEw7/hpZiYVPoTRzRbglHk0sylsUovegnRUlJY="
+    );
+
+    // A trust root holding only the co-signer lacks the log that signed
+    // under the checkpoint's origin, which a newer one may hold.
+    trust.rekor_keys = vec![cosigner().trusted];
+    let refused = verify(&bundle, &trust, VerifyOptions::npm_attestation()).unwrap_err();
+    assert!(refused.is_missing_trust_material(), "{refused:?}");
+
+    // A checkpoint signed only by witnesses has no signature under its
+    // origin, which no trust root could supply.
+    let witnessed_only = format!(
+        "{text}\n{}",
+        cosigner().signature_line("cosigner.test.example", &text)
+    );
+    bundle["verificationMaterial"]["tlogEntries"][0]["inclusionProof"]["checkpoint"]["envelope"] =
+        serde_json::json!(witnessed_only);
+    let refused = verify(
+        &bundle,
+        &conformance_trust(DSSE_CASE),
+        VerifyOptions::npm_attestation(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&refused, VerifyError::InclusionProof(why) if why.contains("no signature under its origin")),
+        "{refused:?}"
     );
 }

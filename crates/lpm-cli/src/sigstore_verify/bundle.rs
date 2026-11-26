@@ -407,8 +407,8 @@ fn verify_rekor_v2_inclusion(
         detail,
     };
     if !tlog_entry.log_id.key_id.is_empty() {
-        let log_id = decode_log_id(&tlog_entry.log_id.key_id)
-            .map_err(|e| VerifyError::InclusionProof(e.to_string()))?;
+        let log_id =
+            decode_log_id(&tlog_entry.log_id.key_id).map_err(VerifyError::InclusionProof)?;
         let log = trust.rekor_log(&log_id).ok_or_else(|| {
             missing(format!(
                 "no Rekor log for logId={}",
@@ -425,9 +425,7 @@ fn verify_rekor_v2_inclusion(
         .resolved_inclusion_proof()
         .ok_or(VerifyError::InclusionProofMissing)?;
     let envelope = extract_checkpoint_envelope(&proof.checkpoint)?;
-    let named = logs_signing(&envelope, &trust.rekor_keys).map_err(|why| {
-        VerifyError::InclusionProof(format!("the checkpoint is malformed: {why}"))
-    })?;
+    let named = logs_signing(&envelope, &trust.rekor_keys).map_err(VerifyError::InclusionProof)?;
     let mut refused = None;
     for log in named {
         match verify_rekor_v2_inclusion_proof(tlog_entry, log) {

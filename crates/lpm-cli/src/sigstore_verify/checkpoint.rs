@@ -86,22 +86,38 @@ pub(super) fn verify_checkpoint(
 
 /// The logs among `logs` that one of `envelope`'s signature lines names
 /// as the signer under the checkpoint's origin, whether or not it
-/// verifies: how a Rekor v2 entry that doesn't name its log finds it. A
-/// note that doesn't parse is an error, not a log the trust root lacks.
+/// verifies: how a Rekor v2 entry that doesn't name its log finds it.
+///
+/// A note that doesn't parse, or carries no signature under its origin,
+/// is an error: no trust root could supply what it lacks. One signed under
+/// its origin by a log `logs` doesn't hold yields no logs.
 pub(super) fn logs_signing<'a>(
     envelope: &str,
     logs: &'a [RekorKey],
 ) -> Result<Vec<&'a RekorKey>, String> {
-    let (text, signatures) = split_note(envelope)?;
-    let origin = parse_checkpoint_text(text)?.origin;
-    let lines = signature_lines(signatures)?.collect::<Result<Vec<_>, _>>()?;
+    let malformed = |why: String| format!("the checkpoint is malformed: {why}");
+    let (text, signatures) = split_note(envelope).map_err(malformed)?;
+    let origin = parse_checkpoint_text(text).map_err(malformed)?.origin;
+    let lines = signature_lines(signatures)
+        .and_then(|lines| lines.collect::<Result<Vec<_>, _>>())
+        .map_err(malformed)?;
+    let by_origin: Vec<&[u8]> = lines
+        .iter()
+        .filter(|(name, _)| *name == origin)
+        .map(|(_, signature)| &signature[..4])
+        .collect();
+    if by_origin.is_empty() {
+        return Err(format!(
+            "the checkpoint carries no signature under its origin `{origin}`"
+        ));
+    }
     Ok(logs
         .iter()
         .filter(|log| {
             LogSigner::new(log, LogStyle::RekorV2).is_ok_and(|signer| {
-                lines.iter().any(|(name, signature)| {
-                    *name == origin && signer.signs_as(name, &signature[..4])
-                })
+                by_origin
+                    .iter()
+                    .any(|key_id| signer.signs_as(&origin, key_id))
             })
         })
         .collect())

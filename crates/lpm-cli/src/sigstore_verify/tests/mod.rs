@@ -2890,15 +2890,16 @@ fn an_sct_is_checked_under_the_ct_log_key_valid_at_its_own_time() {
 }
 
 #[test]
-fn an_sct_timestamp_past_what_the_clock_can_hold_is_refused_not_a_panic() {
-    // Windows' clock can't hold this time at all; elsewhere no key is valid
-    // then. Either way the SCT is refused and verification goes on.
-    let (leaf_der, issuer_spki, ct_log_key) = leaf_with_sct_at(u64::MAX);
+fn an_sct_timestamp_past_the_year_9999_is_refused_on_every_platform() {
+    // Windows' clock can't hold this time at all, and elsewhere a validity
+    // window would read it as the end of the year 9999: inside a key's
+    // open-ended window. The SCT itself verifies under the key.
+    let (leaf_der, issuer_spki, mut ct_log_key) = leaf_with_sct_at(u64::MAX);
+    ct_log_key.valid_for.end = None;
     let refused = verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key))
         .unwrap_err();
     assert!(
-        matches!(&refused, VerifyError::Sct(why) if why.contains("out of range"))
-            || refused.is_missing_trust_material(),
+        matches!(&refused, VerifyError::Sct(why) if why.contains("out of range")),
         "{refused:?}"
     );
 }

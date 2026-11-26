@@ -33,7 +33,7 @@ pub fn verify_rekor_set(
     };
 
     let log_index = parse_log_index(&tlog_entry.log_index)?;
-    let log_id_bytes = decode_log_id(&tlog_entry.log_id.key_id)?;
+    let log_id_bytes = decode_log_id(&tlog_entry.log_id.key_id).map_err(VerifyError::RekorSet)?;
 
     let rekor_key = rekor_keys
         .iter()
@@ -145,26 +145,22 @@ fn integrated_time_secs(t: &SystemTime) -> i64 {
 /// 32 B → 64 hex chars OR 44 base64 chars (with padding); the
 /// length disambiguates the two encodings without false positives
 /// because hex characters are a subset of base64 characters.
-pub(super) fn decode_log_id(raw: &str) -> Result<Vec<u8>, VerifyError> {
+pub(super) fn decode_log_id(raw: &str) -> Result<Vec<u8>, String> {
     // An entry that names no log is malformed, not one from a log the trust
     // root lacks.
     if raw.is_empty() {
-        return Err(VerifyError::RekorSet(
-            "TlogEntry.logId.keyId is empty, so the entry names no log".into(),
-        ));
+        return Err("TlogEntry.logId.keyId is empty, so the entry names no log".into());
     }
     if raw.len() == 64 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
         return hex::decode(raw).map_err(|e| {
-            VerifyError::RekorSet(format!(
-                "TlogEntry.logId.keyId looked like hex but failed to decode: {e}"
-            ))
+            format!("TlogEntry.logId.keyId looked like hex but failed to decode: {e}")
         });
     }
     BASE64.decode(raw.as_bytes()).map_err(|e| {
-        VerifyError::RekorSet(format!(
+        format!(
             "TlogEntry.logId.keyId `{raw}` is neither valid hex (Rekor canonical) \
              nor valid base64 (Sigstore Bundle v0.3 protobuf JSON): {e}"
-        ))
+        )
     })
 }
 

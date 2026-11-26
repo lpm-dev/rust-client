@@ -113,9 +113,16 @@ pub fn verify_embedded_sct(
                 continue;
             }
         };
-        let Some(sct_time) =
-            SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(parsed.timestamp_ms))
-        else {
+        // Past the year 9999 validity windows can't place the time, and
+        // Windows' clock can't hold it some way further on; such an SCT is
+        // refused on every platform alike.
+        let sct_time = i64::try_from(parsed.timestamp_ms)
+            .ok()
+            .and_then(lpm_common::Timestamp::from_unix_milliseconds)
+            .and_then(|_| {
+                SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(parsed.timestamp_ms))
+            });
+        let Some(sct_time) = sct_time else {
             last_err = Some(format!("sct[{i}]: its timestamp is out of range"));
             continue;
         };
