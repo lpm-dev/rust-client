@@ -181,6 +181,19 @@ pub struct NpmFirewallBlockedPackage {
     pub policy_group: Option<String>,
     pub summary: Option<String>,
     pub report_url: Option<String>,
+    /// `policy`, `unscanned`, `malware` or `server_review`, for preflight
+    /// blocks.
+    pub block_class: Option<String>,
+    /// Whether `lpm firewall bypass add name@version` can lift this block.
+    pub bypassable: bool,
+}
+
+/// A blocked version a bypass rule let through.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct NpmFirewallBypassedPackage {
+    pub name: String,
+    pub version: String,
+    pub rule: String,
 }
 
 impl NpmFirewallBlockedPackage {
@@ -203,6 +216,13 @@ pub struct NpmFirewallBlockedErrorContext {
     pub unattributed_count: u64,
     /// Why some packages went unchecked after these blocks were found.
     pub unchecked_reason: Option<String>,
+    /// Blocked versions that bypass rules let through in the same command.
+    pub bypassed: Vec<NpmFirewallBypassedPackage>,
+    /// The command that allows every bypassable package, for a person to run.
+    pub bypass_command: Option<String>,
+    /// Why no bypass rule can lift these blocks here, such as a managed
+    /// policy owning the firewall.
+    pub bypass_unavailable_reason: Option<String>,
 }
 
 impl NpmFirewallBlockedErrorContext {
@@ -212,6 +232,9 @@ impl NpmFirewallBlockedErrorContext {
             packages: vec![package],
             unattributed_count: 0,
             unchecked_reason: None,
+            bypassed: Vec::new(),
+            bypass_command: None,
+            bypass_unavailable_reason: None,
         }
     }
 
@@ -1473,6 +1496,8 @@ mod tests {
                     policy_group: None,
                     summary: None,
                     report_url: None,
+                    block_class: None,
+                    bypassable: false,
                 },
             ))),
             LpmError::NpmFirewallEntitlementRequired {
@@ -1767,6 +1792,8 @@ mod tests {
                     policy_group: None,
                     summary: None,
                     report_url: None,
+                    block_class: None,
+                    bypassable: false,
                 }
             )))
             .error_code(),

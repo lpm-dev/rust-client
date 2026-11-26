@@ -21,6 +21,8 @@ expression: envelope
         "reason": "client policy maps lpm_ai_confirmed_malware to block",
         "decision_id": "firewall-json:blocked-one",
         "match_source": "package",
+        "block_class": "malware",
+        "bypassable": false,
         "policy": {
           "group": "lpm_ai_confirmed_malware"
         },
@@ -36,6 +38,8 @@ expression: envelope
         "reason": "client policy maps lpm_ai_confirmed_malware to block",
         "decision_id": "firewall-json:blocked-two",
         "match_source": "package",
+        "block_class": "malware",
+        "bypassable": false,
         "policy": {
           "group": "lpm_ai_confirmed_malware"
         },
@@ -44,6 +48,9 @@ expression: envelope
           "report_url": "https://firewall.lpm.dev/npm/blocked-two/v/1.0.0"
         }
       }
-    ]
+    ],
+    "bypassed": [],
+    "bypass_command": null,
+    "bypass_unavailable_reason": null
   }
 }

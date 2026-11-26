@@ -42,7 +42,7 @@ impl SurfaceBaseline {
     }
 }
 
-pub const EXPECTED_SURFACE_COUNT: usize = 181;
+pub const EXPECTED_SURFACE_COUNT: usize = 182;
 
 pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Info",
@@ -123,6 +123,7 @@ pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Migrate",
     "Vault",
     "Security",
+    "Firewall",
     "SelfUpdate",
     "InternalHostsFile",
     "InternalProxyService",
@@ -2292,6 +2293,21 @@ pub const SURFACES: &[SurfaceBaseline] = &[
             "crates/lpm-cli/src/commands/env/links.rs",
             "crates/lpm-vault/src/links.rs",
             "tests/workflows/tests/env_folder_links.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 182,
+        name: "`lpm firewall bypass add / list / remove / clear`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/firewall.rs",
+            "crates/lpm-cli/src/firewall_bypass.rs",
+            "crates/lpm-cli/src/security_approval/firewall_bypass.rs",
+            "tests/workflows/tests/firewall_bypass.rs",
         ],
     },
 ];

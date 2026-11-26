@@ -24,13 +24,15 @@ pub(crate) use wizards::{
 };
 
 use effective::EffectiveConfig;
+#[cfg(test)]
+pub(crate) use io::wait_for_config_lock_contention;
 use io::{
     config_value_at_path, config_value_for_display, config_value_to_json,
     firewall_policy_profile_after_delete, guard_generic_delete_against_force_floor,
     guard_generic_set_against_force_floor, local_policy_table_base, read_config,
     remove_config_value_at_path,
 };
-pub(crate) use io::{redact_config_json_value, update_config};
+pub(crate) use io::{redact_config_json_value, update_config, with_config_transaction_lock};
 use wizards::{
     FIREWALL_GUIDED_MENU_LABEL, INTEGRITY_GUIDED_MENU_LABEL, INTEGRITY_KEY,
     RELEASE_AGE_GUIDED_MENU_LABEL, RELEASE_AGE_KEY, RELEASE_AGE_POLICY_KEY, SANDBOX_MODE_VALUES,

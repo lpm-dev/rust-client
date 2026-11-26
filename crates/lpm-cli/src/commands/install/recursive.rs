@@ -798,6 +798,7 @@ async fn run_workspace_target_install(
                 policy_project_dir: None,
                 expected_root: None,
                 locked_integrities: Some(locked),
+                firewall_bypass_root: None,
             })
         })
         .transpose()?;

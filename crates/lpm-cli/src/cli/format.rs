@@ -453,6 +453,17 @@ pub(crate) fn json_error_value(error: &lpm_common::LpmError) -> serde_json::Valu
                     .iter()
                     .map(npm_firewall_blocked_package_json)
                     .collect::<Vec<_>>(),
+                "bypassed": blocked
+                    .bypassed
+                    .iter()
+                    .map(|bypassed| serde_json::json!({
+                        "name": bypassed.name,
+                        "version": bypassed.version,
+                        "rule": bypassed.rule,
+                    }))
+                    .collect::<Vec<_>>(),
+                "bypass_command": blocked.bypass_command,
+                "bypass_unavailable_reason": blocked.bypass_unavailable_reason,
             }
         }),
         lpm_common::LpmError::PoolAttributionUnconfirmed { reason } => serde_json::json!({
@@ -537,6 +548,8 @@ fn npm_firewall_blocked_package_json(
         "reason": package.reason,
         "decision_id": package.decision_id,
         "match_source": package.match_source,
+        "block_class": package.block_class,
+        "bypassable": package.bypassable,
     });
     if let Some(group) = &package.policy_group {
         json["policy"] = serde_json::json!({ "group": group });
@@ -577,6 +590,14 @@ fn next_steps_for_error(error: &lpm_common::LpmError) -> Option<serde_json::Valu
         lpm_common::LpmError::TyposquatSuspected(context) => {
             context.suggested_command.as_deref().map(|command| {
                 crate::json_contract::command_next_steps("Install the suggested package", command)
+            })
+        }
+        lpm_common::LpmError::NpmFirewallBlocked(blocked) => {
+            blocked.bypass_command.as_deref().map(|command| {
+                crate::json_contract::command_next_steps(
+                    "Review each report, then allow the blocked versions past LPM Firewall; a person approves it with Touch ID, Windows Hello or a password",
+                    command,
+                )
             })
         }
         lpm_common::LpmError::SecurityApprovalRequired(approval) => {
@@ -1234,26 +1255,163 @@ fn npm_firewall_blocked_lines(
                 "Blocked by LPM Firewall",
             ))];
             push_untrusted_detail(&mut lines, "reason", &blocked.to_string());
-            if blocked.unattributed_count > 0 {
-                push_detail(
-                    &mut lines,
-                    "unnamed",
-                    install_ui::yellow(&format!(
-                        "{} of them blocked without a package name in the verdict response",
-                        blocked.unattributed_count
-                    )),
-                );
-            }
-            if let Some(reason) = &blocked.unchecked_reason {
-                push_untrusted_detail(
-                    &mut lines,
-                    "unchecked",
-                    &format!("some packages weren't checked: {reason}"),
-                );
-            }
+            push_block_explanation(&mut lines, blocked);
             lines
         }
     }
+}
+
+/// What a block error explains under its reason: unnamed blocks, versions a
+/// rule let through, why a rule can't lift a block, and the command that
+/// lets the rest through.
+fn push_block_explanation(
+    lines: &mut Vec<SlimErrorLine>,
+    blocked: &lpm_common::NpmFirewallBlockedErrorContext,
+) {
+    push_unreported_block_lines(lines, blocked);
+    push_bypassed_lines(lines, blocked);
+    push_block_class_lines(lines, blocked);
+    if let Some(reason) = &blocked.bypass_unavailable_reason {
+        push_untrusted_detail(lines, "note", reason);
+    }
+    if let Some(command) = &blocked.bypass_command {
+        push_detail(lines, "allow", install_ui::yellow(command));
+    }
+}
+
+fn push_bypassed_lines(
+    lines: &mut Vec<SlimErrorLine>,
+    blocked: &lpm_common::NpmFirewallBlockedErrorContext,
+) {
+    for bypassed in &blocked.bypassed {
+        push_untrusted_detail(
+            lines,
+            "allowed",
+            &format!(
+                "{}@{} by your bypass rule {}",
+                bypassed.name, bypassed.version, bypassed.rule
+            ),
+        );
+    }
+}
+
+fn push_unreported_block_lines(
+    lines: &mut Vec<SlimErrorLine>,
+    blocked: &lpm_common::NpmFirewallBlockedErrorContext,
+) {
+    if blocked.unattributed_count > 0 {
+        push_detail(
+            lines,
+            "unnamed",
+            install_ui::yellow(&format!(
+                "{} of them blocked without a package name in the verdict response",
+                blocked.unattributed_count
+            )),
+        );
+    }
+    if let Some(reason) = &blocked.unchecked_reason {
+        push_untrusted_detail(
+            lines,
+            "unchecked",
+            &format!("some packages weren't checked: {reason}"),
+        );
+    }
+}
+
+fn push_block_class_lines(
+    lines: &mut Vec<SlimErrorLine>,
+    blocked: &lpm_common::NpmFirewallBlockedErrorContext,
+) {
+    for package in &blocked.packages {
+        match package.block_class.as_deref() {
+            Some("malware") => push_untrusted_detail(
+                lines,
+                "malware",
+                &format!(
+                    "{} is flagged as malware; read its report first (`lpm firewall bypass add --help` explains `--allow-malware`)",
+                    package.coordinate()
+                ),
+            ),
+            Some("server_review") => push_untrusted_detail(
+                lines,
+                "held",
+                &format!(
+                    "{} is held for LPM review, which a local rule can't lift",
+                    package.coordinate()
+                ),
+            ),
+            _ => {}
+        }
+    }
+}
+
+/// The rows a command prints under its own line for a firewall block that
+/// stopped a nested install: each blocked version with its report, unless
+/// the install already listed them, then the unnamed and unchecked blocks and
+/// why a malware or review block takes no plain rule.
+pub(crate) fn npm_firewall_block_detail_lines(
+    blocked: &lpm_common::NpmFirewallBlockedErrorContext,
+    include_packages: bool,
+) -> Vec<install_ui::TerminalLine> {
+    let mut lines = Vec::with_capacity(blocked.packages.len() * 2 + 2);
+    if include_packages {
+        push_blocked_package_lines(&mut lines, blocked);
+        push_bypassed_lines(&mut lines, blocked);
+    }
+    push_unreported_block_lines(&mut lines, blocked);
+    push_block_class_lines(&mut lines, blocked);
+    terminal_lines(lines)
+}
+
+/// Each blocked version with its report, for a command whose install ran
+/// without showing them before the block error explains the rest.
+pub(crate) fn npm_firewall_block_package_lines(
+    blocked: &lpm_common::NpmFirewallBlockedErrorContext,
+) -> Vec<install_ui::TerminalLine> {
+    let mut lines = Vec::with_capacity(blocked.packages.len() * 2);
+    push_blocked_package_lines(&mut lines, blocked);
+    terminal_lines(lines)
+}
+
+/// The blocked versions and everything the block error would explain, for a
+/// command that keeps going after its quiet install was blocked, as
+/// `lpm doctor --fix` does.
+pub(crate) fn npm_firewall_block_failure_lines(
+    blocked: &lpm_common::NpmFirewallBlockedErrorContext,
+) -> Vec<install_ui::TerminalLine> {
+    let mut lines = Vec::with_capacity(blocked.packages.len() * 2 + blocked.bypassed.len() + 2);
+    push_blocked_package_lines(&mut lines, blocked);
+    push_block_explanation(&mut lines, blocked);
+    terminal_lines(lines)
+}
+
+fn push_blocked_package_lines(
+    lines: &mut Vec<SlimErrorLine>,
+    blocked: &lpm_common::NpmFirewallBlockedErrorContext,
+) {
+    for package in &blocked.packages {
+        push_untrusted_detail(
+            lines,
+            "blocked",
+            &format!(
+                "{} - {}",
+                package.coordinate(),
+                package.summary.as_deref().unwrap_or(&package.verdict)
+            ),
+        );
+        if let Some(report_url) = &package.report_url {
+            push_detail(lines, "report", install_ui::hyperlink(report_url));
+        }
+    }
+}
+
+fn terminal_lines(lines: Vec<SlimErrorLine>) -> Vec<install_ui::TerminalLine> {
+    lines
+        .into_iter()
+        .map(|line| match line {
+            SlimErrorLine::Failed(line) | SlimErrorLine::Detail(line) => line,
+        })
+        .collect()
 }
 
 fn npm_firewall_registry_refusal_lines(
@@ -1660,6 +1818,8 @@ mod tests {
                     policy_group: None,
                     summary: None,
                     report_url: None,
+                    block_class: None,
+                    bypassable: false,
                 },
             ),
         ));
@@ -1692,11 +1852,38 @@ mod tests {
                     policy_group: Some("lpm_ai_agent_control_surface".into()),
                     summary: Some("`foldrun talk` can send a credential to a gateway.".into()),
                     report_url: Some("https://firewall.lpm.dev/npm/foldrun/v/32.8.2".into()),
+                    block_class: Some("policy".into()),
+                    bypassable: true,
                 }],
                 unattributed_count,
                 unchecked_reason: None,
+                bypassed: Vec::new(),
+                bypass_command: Some("lpm firewall bypass add \"foldrun@32.8.2\"".into()),
+                bypass_unavailable_reason: None,
             },
         ))
+    }
+
+    #[test]
+    fn block_detail_lines_list_versions_only_where_the_install_did_not() {
+        let lpm_common::LpmError::NpmFirewallBlocked(blocked) = preflight_block(1) else {
+            unreachable!("preflight_block builds a firewall block");
+        };
+        let plain = |include_packages| {
+            npm_firewall_block_detail_lines(&blocked, include_packages)
+                .iter()
+                .map(|line| console::strip_ansi_codes(line).into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            plain(true)[0],
+            "  blocked foldrun@32.8.2 - `foldrun talk` can send a credential to a gateway."
+        );
+        assert_eq!(
+            plain(false),
+            ["  unnamed 1 of them blocked without a package name in the verdict response"]
+        );
     }
 
     #[test]
@@ -1709,6 +1896,7 @@ mod tests {
             [
                 "Blocked by LPM Firewall",
                 "  reason 1 package blocked by LPM Firewall",
+                "  allow lpm firewall bypass add \"foldrun@32.8.2\"",
             ]
         );
     }

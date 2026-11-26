@@ -50,6 +50,18 @@ pub(crate) async fn update_config<R>(
     Ok(result)
 }
 
+/// Runs `body` holding the transaction lock every config write takes, so
+/// neither `config.toml` nor a posture change made through it lands until
+/// `body` returns.
+pub(crate) async fn with_config_transaction_lock<R, E: From<LpmError>>(
+    body: impl FnOnce() -> Result<R, E>,
+) -> Result<R, E> {
+    let path = lpm_common::LpmRoot::from_env()?.root().join("config.toml");
+    ensure_config_parent(&path)?;
+    let _lock = acquire_config_lock(&path.with_file_name(".config.lock")).await?;
+    body()
+}
+
 fn ensure_config_parent(path: &std::path::Path) -> Result<(), LpmError> {
     let Some(parent) = path.parent() else {
         return Ok(());
@@ -72,6 +84,34 @@ async fn acquire_config_lock(
     acquire_config_lock_with_timeout(path, std::time::Duration::from_secs(30)).await
 }
 
+/// Each config lock a caller found held and had to wait for, so a test can
+/// tell a command is waiting on it.
+#[cfg(test)]
+pub(crate) static CONTENDED_CONFIG_LOCKS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Waits until a caller has found `path` held, or panics after `timeout`.
+#[cfg(test)]
+pub(crate) fn wait_for_config_lock_contention(
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !CONTENDED_CONFIG_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|contended| contended == path)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "nothing waited on the config lock {}",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 async fn acquire_config_lock_with_timeout(
     path: &std::path::Path,
     timeout: std::time::Duration,
@@ -81,9 +121,16 @@ async fn acquire_config_lock_with_timeout(
         if let Some(lock) = lpm_common::try_acquire_exclusive_lock(path)? {
             return Ok(lock);
         }
+        #[cfg(test)]
+        CONTENDED_CONFIG_LOCKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(path.to_path_buf());
         if started.elapsed() >= timeout {
             return Err(LpmError::Registry(format!(
-                "timed out after {} seconds waiting for the config transaction lock {}",
+                "timed out after {} seconds waiting for the config transaction lock {}. Another \
+                 LPM command is changing your settings, possibly waiting at an approval prompt; \
+                 finish or cancel it, then retry.",
                 timeout.as_secs_f64(),
                 path.display()
             )));
@@ -815,6 +862,12 @@ mod tests {
 
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert!(error.to_string().contains("timed out"), "got: {error}");
+        assert!(
+            error
+                .to_string()
+                .contains("finish or cancel it, then retry"),
+            "got: {error}"
+        );
     }
 
     #[test]

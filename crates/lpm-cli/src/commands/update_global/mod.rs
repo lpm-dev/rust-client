@@ -194,10 +194,10 @@ pub async fn run(
         match result {
             Ok(plan) => plans.push(plan),
             Err(error) => {
-                let reason = update_failure_reason(&error);
-                if !json_output {
+                let failure = UpdateFailure::planning(&error);
+                if !json_output && failure.prints_while_planning() {
                     let name_safe = sanitize_for_terminal(&target.name);
-                    let reason_safe = sanitize_for_terminal(&reason);
+                    let reason_safe = sanitize_for_terminal(&failure.reason);
                     output::warn_line(install_ui::terminal_line!(
                         "planning {}: {}",
                         install_ui::bold(&name_safe),
@@ -208,7 +208,7 @@ pub async fn run(
                 // block the bulk update.
                 plans.push(UpgradePlan::PlanError {
                     package: target.name,
-                    reason,
+                    failure,
                 });
             }
         }
@@ -240,7 +240,9 @@ pub async fn run(
                 if !install_registry.seed_metadata_for_command(&prep.name, &route, metadata) {
                     ordered_results[index] = Some(UpgradeResult::Failed {
                         package: prep.name.clone(),
-                        reason: "failed to retain validated global-update metadata".to_string(),
+                        failure: UpdateFailure::message(
+                            "failed to retain validated global-update metadata",
+                        ),
                     });
                     continue;
                 }
@@ -271,7 +273,7 @@ pub async fn run(
                     Err(e) => {
                         ordered_results[index] = Some(UpgradeResult::Failed {
                             package,
-                            reason: e.to_string(),
+                            failure: UpdateFailure::from_error(&e),
                         })
                     }
                 }
@@ -279,8 +281,8 @@ pub async fn run(
             UpgradePlan::AlreadyCurrent { package, version } => {
                 ordered_results[index] = Some(UpgradeResult::AlreadyCurrent { package, version });
             }
-            UpgradePlan::PlanError { package, reason } => {
-                ordered_results[index] = Some(UpgradeResult::Failed { package, reason });
+            UpgradePlan::PlanError { package, failure } => {
+                ordered_results[index] = Some(UpgradeResult::Failed { package, failure });
             }
         }
     }
@@ -296,7 +298,7 @@ pub async fn run(
                 Ok(output) => UpgradeResult::Upgraded(output),
                 Err((package, error)) => UpgradeResult::Failed {
                     package,
-                    reason: error.to_string(),
+                    failure: UpdateFailure::from_error(&error).shown_by_install(!json_output),
                 },
             },
         );
@@ -439,13 +441,10 @@ enum UpgradePlan {
         prior_snapshot: Box<serde_json::Value>,
     },
     /// No version change AND no saved_spec change.
-    AlreadyCurrent {
-        package: String,
-        version: String,
-    },
+    AlreadyCurrent { package: String, version: String },
     PlanError {
         package: String,
-        reason: String,
+        failure: UpdateFailure,
     },
 }
 
@@ -717,8 +716,171 @@ enum UpgradeResult {
     },
     Failed {
         package: String,
-        reason: String,
+        failure: UpdateFailure,
     },
+}
+
+/// Why a package didn't update. A firewall block keeps its details so the
+/// output can name the bypass command that lets the update through.
+#[derive(Debug, Clone)]
+struct UpdateFailure {
+    reason: String,
+    firewall_block: Option<Box<lpm_common::NpmFirewallBlockedErrorContext>>,
+    /// The nested install already listed the blocked versions.
+    details_shown: bool,
+}
+
+impl UpdateFailure {
+    fn from_error(error: &LpmError) -> Self {
+        Self::with_reason(error.to_string(), error)
+    }
+
+    fn planning(error: &LpmError) -> Self {
+        Self::with_reason(update_failure_reason(error), error)
+    }
+
+    fn message(reason: &str) -> Self {
+        Self {
+            reason: reason.to_string(),
+            firewall_block: None,
+            details_shown: false,
+        }
+    }
+
+    /// For a failure whose install printed its own output: it lists blocked
+    /// versions it found before download, but not a registry's refusal.
+    fn shown_by_install(mut self, output_shown: bool) -> Self {
+        self.details_shown = output_shown
+            && self.firewall_block.as_deref().is_some_and(|blocked| {
+                blocked.source == lpm_common::NpmFirewallBlockSource::Preflight
+            });
+        self
+    }
+
+    /// Whether planning announces this failure as it happens. A firewall
+    /// block waits for the results, which print it once with its details.
+    fn prints_while_planning(&self) -> bool {
+        self.firewall_block.is_none()
+    }
+
+    /// The reason as printed above [`Self::detail_lines`]: a lone registry
+    /// refusal keeps its reason there and leaves naming the version to them.
+    fn terminal_reason(&self) -> std::borrow::Cow<'_, str> {
+        match self.firewall_block.as_deref() {
+            Some(blocked) if !self.details_shown => {
+                match (blocked.source, blocked.packages.as_slice()) {
+                    (lpm_common::NpmFirewallBlockSource::Registry, [package]) => {
+                        std::borrow::Cow::Owned(format!(
+                            "blocked by LPM Firewall (verdict: {}): {}",
+                            package.verdict, package.reason
+                        ))
+                    }
+                    _ => std::borrow::Cow::Borrowed(&self.reason),
+                }
+            }
+            _ => std::borrow::Cow::Borrowed(&self.reason),
+        }
+    }
+
+    /// The lines printed under this failure: the blocked versions unless the
+    /// install listed them, and the block's notes.
+    fn detail_lines(&self) -> Vec<install_ui::TerminalLine> {
+        self.firewall_block
+            .as_deref()
+            .map(|blocked| {
+                crate::cli::npm_firewall_block_detail_lines(blocked, !self.details_shown)
+            })
+            .unwrap_or_default()
+    }
+
+    fn with_reason(reason: String, error: &LpmError) -> Self {
+        let firewall_block = match error {
+            LpmError::NpmFirewallBlocked(blocked) => Some(blocked.clone()),
+            _ => None,
+        };
+        Self {
+            reason,
+            firewall_block,
+            details_shown: false,
+        }
+    }
+
+    fn to_json(&self, package: &str, action: &str) -> serde_json::Value {
+        let mut json = serde_json::json!({
+            "package": package,
+            "action": action,
+            "reason": self.reason,
+        });
+        if let Some(blocked) = &self.firewall_block {
+            let envelope =
+                crate::cli::json_error_value(&LpmError::NpmFirewallBlocked(blocked.clone()));
+            json["error_code"] = envelope["error_code"].clone();
+            json["error"] = envelope["error"].clone();
+        }
+        json
+    }
+}
+
+/// One `lpm firewall bypass add` command for every blocked version a rule can
+/// let through, so a person approves them with one prompt. A failure joins
+/// only when its own block offered a command, which means a rule lifts all
+/// of its blocks.
+fn combined_bypass_command<'a>(
+    failures: impl IntoIterator<Item = &'a UpdateFailure>,
+) -> Option<String> {
+    let mut coordinates: Vec<String> = failures
+        .into_iter()
+        .filter_map(|failure| failure.firewall_block.as_deref())
+        .filter(|blocked| blocked.bypass_command.is_some())
+        .flat_map(|blocked| {
+            blocked
+                .packages
+                .iter()
+                .map(lpm_common::NpmFirewallBlockedPackage::coordinate)
+        })
+        .collect();
+    coordinates.sort_unstable();
+    coordinates.dedup();
+    (!coordinates.is_empty())
+        .then(|| crate::firewall_bypass::bypass_add_command(coordinates.iter().map(String::as_str)))
+}
+
+const BYPASS_NEXT_STEP: &str = "Review each report, then allow the blocked versions past LPM Firewall; a person approves it with Touch ID, Windows Hello or a password";
+
+fn print_firewall_bypass_hint<'a>(failures: impl IntoIterator<Item = &'a UpdateFailure>) {
+    let failures: Vec<&UpdateFailure> = failures.into_iter().collect();
+    let mut notes: Vec<&str> = failures
+        .iter()
+        .filter_map(|failure| failure.firewall_block.as_deref())
+        .filter_map(|blocked| blocked.bypass_unavailable_reason.as_deref())
+        .collect();
+    notes.sort_unstable();
+    notes.dedup();
+    for note in notes {
+        install_ui::detail_line(install_ui::terminal_line!(
+            "  {} {}",
+            install_ui::dim("note"),
+            install_ui::field(note),
+        ));
+    }
+    if let Some(command) = combined_bypass_command(failures) {
+        install_ui::detail_line(install_ui::terminal_line!(
+            "  {} {}",
+            install_ui::dim("allow"),
+            install_ui::yellow(&command),
+        ));
+    }
+}
+
+fn with_bypass_next_step<'a>(
+    mut envelope: serde_json::Value,
+    failures: impl IntoIterator<Item = &'a UpdateFailure>,
+) -> serde_json::Value {
+    if let Some(command) = combined_bypass_command(failures) {
+        envelope["next_steps"] =
+            crate::json_contract::command_next_steps(BYPASS_NEXT_STEP, &command);
+    }
+    envelope
 }
 
 struct BatchUpgrade {
@@ -757,7 +919,7 @@ async fn execute_upgrade_batch(
                 index,
                 UpgradeResult::Failed {
                     package: prep.name.clone(),
-                    reason: error.to_string(),
+                    failure: UpdateFailure::from_error(&error),
                 },
             )),
         }
@@ -775,13 +937,13 @@ async fn execute_upgrade_batch(
     }) {
         Ok(prepared) => prepared,
         Err(error) => {
-            let reason = error.to_string();
+            let failure = UpdateFailure::from_error(&error);
             results.extend(locked.into_iter().map(|upgrade| {
                 (
                     upgrade.index,
                     UpgradeResult::Failed {
                         package: upgrade.prep.name.clone(),
-                        reason: reason.clone(),
+                        failure: failure.clone(),
                     },
                 )
             }));
@@ -802,7 +964,7 @@ async fn execute_upgrade_batch(
                 upgrade.index,
                 UpgradeResult::Failed {
                     package: upgrade.prep.name.clone(),
-                    reason: error.to_string(),
+                    failure: UpdateFailure::from_error(&error),
                 },
             )),
         }
@@ -843,7 +1005,7 @@ async fn execute_upgrade_batch(
                 upgrade.index,
                 UpgradeResult::Failed {
                     package: upgrade.prep.name.clone(),
-                    reason: error.to_string(),
+                    failure: UpdateFailure::from_error(&error),
                 },
             )),
         }
@@ -864,20 +1026,20 @@ async fn execute_upgrade_batch(
                         Ok(output) => UpgradeResult::Upgraded(output),
                         Err(error) => UpgradeResult::Failed {
                             package: upgrade.prep.name.clone(),
-                            reason: error.to_string(),
+                            failure: UpdateFailure::from_error(&error),
                         },
                     };
                     results.push((upgrade.index, result));
                 }
             }
             Err(error) => {
-                let reason = error.to_string();
+                let failure = UpdateFailure::from_error(&error);
                 results.extend(commit_ready.into_iter().map(|upgrade| {
                     (
                         upgrade.index,
                         UpgradeResult::Failed {
                             package: upgrade.prep.name.clone(),
-                            reason: reason.clone(),
+                            failure: failure.clone(),
                         },
                     )
                 }));
@@ -956,22 +1118,20 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
                     "action": "skip",
                     "current": version,
                 }),
-                UpgradePlan::PlanError { package, reason } => serde_json::json!({
-                    "package": package,
-                    "action": "plan_error",
-                    "reason": reason,
-                }),
+                UpgradePlan::PlanError { package, failure } => {
+                    failure.to_json(package, "plan_error")
+                }
             })
             .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+        let envelope = with_bypass_next_step(
+            serde_json::json!({
                 "success": !any_plan_error,
                 "dry_run": true,
                 "plans": entries,
-            }))
-            .unwrap()
+            }),
+            plan_failures(plans),
         );
+        println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
         return;
     }
     let mut any_action = false;
@@ -1018,21 +1178,39 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
                     format!("@{version_safe}").dimmed()
                 );
             }
-            UpgradePlan::PlanError { package, reason } => {
+            UpgradePlan::PlanError { package, failure } => {
                 let package_safe = sanitize_for_terminal(package);
-                let reason_safe = sanitize_for_terminal(reason);
+                let reason_safe = sanitize_for_terminal(&failure.terminal_reason());
                 eprintln!(
                     "  {} {} {}",
                     package_safe.bold(),
                     "could not plan:".red(),
                     reason_safe
                 );
+                for line in failure.detail_lines() {
+                    install_ui::detail_line(line);
+                }
             }
         }
     }
+    print_firewall_bypass_hint(plan_failures(plans));
     if !any_action {
         output::info("Nothing to update.");
     }
+}
+
+fn plan_failures(plans: &[UpgradePlan]) -> impl Iterator<Item = &UpdateFailure> {
+    plans.iter().filter_map(|plan| match plan {
+        UpgradePlan::PlanError { failure, .. } => Some(failure),
+        _ => None,
+    })
+}
+
+fn result_failures(results: &[UpgradeResult]) -> impl Iterator<Item = &UpdateFailure> {
+    results.iter().filter_map(|result| match result {
+        UpgradeResult::Failed { failure, .. } => Some(failure),
+        _ => None,
+    })
 }
 
 fn emit_results(results: &[UpgradeResult], json_output: bool) {
@@ -1065,25 +1243,21 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
                     "action": "skip",
                     "current": version,
                 }),
-                UpgradeResult::Failed { package, reason } => serde_json::json!({
-                    "package": package,
-                    "action": "failed",
-                    "reason": reason,
-                }),
+                UpgradeResult::Failed { package, failure } => failure.to_json(package, "failed"),
             })
             .collect();
         let any_failure = results
             .iter()
             .any(|r| matches!(r, UpgradeResult::Failed { .. }));
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+        let envelope = with_bypass_next_step(
+            serde_json::json!({
                 "success": !any_failure,
                 "dry_run": false,
                 "results": entries,
-            }))
-            .unwrap()
+            }),
+            result_failures(results),
         );
+        println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
         return;
     }
     for r in results {
@@ -1126,17 +1300,21 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
                     install_ui::dim(&format!("@{version_safe}")),
                 ));
             }
-            UpgradeResult::Failed { package, reason } => {
+            UpgradeResult::Failed { package, failure } => {
                 let package_safe = sanitize_for_terminal(package);
-                let reason_safe = sanitize_for_terminal(reason);
+                let reason_safe = sanitize_for_terminal(&failure.terminal_reason());
                 output::warn_line(install_ui::terminal_line!(
                     "{}: {}",
                     install_ui::bold(&package_safe),
                     reason_safe,
                 ));
+                for line in failure.detail_lines() {
+                    install_ui::detail_line(line);
+                }
             }
         }
     }
+    print_firewall_bypass_hint(result_failures(results));
 }
 
 /// Manifest-only mutation: change `[packages.<pkg>].saved_spec` to
@@ -1193,6 +1371,91 @@ fn execute_saved_spec_rewrite(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn firewall_block(source: lpm_common::NpmFirewallBlockSource) -> LpmError {
+        LpmError::NpmFirewallBlocked(Box::new(lpm_common::NpmFirewallBlockedErrorContext {
+            source,
+            packages: vec![lpm_common::NpmFirewallBlockedPackage {
+                name: "agent-tool".into(),
+                version: Some("2.0.0".into()),
+                verdict: "suspicious".into(),
+                reason: "client policy maps lpm_ai_agent_control_surface to block".into(),
+                decision_id: None,
+                match_source: Some("package".into()),
+                policy_group: Some("lpm_ai_agent_control_surface".into()),
+                summary: None,
+                report_url: Some("https://firewall.lpm.dev/npm/agent-tool/v/2.0.0".into()),
+                block_class: Some("policy".into()),
+                bypassable: true,
+            }],
+            unattributed_count: 0,
+            unchecked_reason: None,
+            bypassed: Vec::new(),
+            bypass_command: None,
+            bypass_unavailable_reason: None,
+        }))
+    }
+
+    fn plain_detail_lines(failure: &UpdateFailure) -> Vec<String> {
+        failure
+            .detail_lines()
+            .iter()
+            .map(|line| console::strip_ansi_codes(line).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_lone_update_lists_a_registry_refusal_its_install_never_printed() {
+        let blocked_rows = |source| {
+            let failure = UpdateFailure::from_error(&firewall_block(source)).shown_by_install(true);
+            plain_detail_lines(&failure)
+                .into_iter()
+                .filter(|line| line.contains("agent-tool@2.0.0"))
+                .count()
+        };
+
+        assert_eq!(
+            blocked_rows(lpm_common::NpmFirewallBlockSource::Registry),
+            1
+        );
+        assert_eq!(
+            blocked_rows(lpm_common::NpmFirewallBlockSource::Preflight),
+            0
+        );
+    }
+
+    #[test]
+    fn a_firewall_block_found_while_planning_waits_for_the_results_to_print() {
+        let blocked = UpdateFailure::planning(&firewall_block(
+            lpm_common::NpmFirewallBlockSource::Registry,
+        ));
+        let missing = UpdateFailure::planning(&LpmError::NotFound("not found: gone".into()));
+
+        assert!(!blocked.prints_while_planning());
+        assert!(missing.prints_while_planning());
+    }
+
+    #[test]
+    fn a_lone_update_names_a_refused_version_once_with_its_reason_and_report() {
+        let failure = UpdateFailure::from_error(&firewall_block(
+            lpm_common::NpmFirewallBlockSource::Registry,
+        ))
+        .shown_by_install(true);
+        let mut rendered = vec![failure.terminal_reason().into_owned()];
+        rendered.extend(plain_detail_lines(&failure));
+        let text = rendered.join("\n");
+
+        assert_eq!(text.matches("agent-tool@2.0.0").count(), 1, "{text}");
+        assert!(text.contains("verdict: suspicious"), "{text}");
+        assert!(
+            text.contains("client policy maps lpm_ai_agent_control_surface to block"),
+            "{text}"
+        );
+        assert!(
+            text.contains("https://firewall.lpm.dev/npm/agent-tool/v/2.0.0"),
+            "{text}"
+        );
+    }
 
     #[test]
     fn a_registrys_404_reads_as_not_found_with_its_message() {

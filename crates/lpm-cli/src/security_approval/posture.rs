@@ -145,6 +145,10 @@ pub fn load_effective_authorized_posture() -> Result<EffectiveAuthorizedPosture,
         sources,
         approved_posture_path: approved_path.display().to_string(),
         approved_posture_source,
+        managed_firewall_bypass: managed_policy
+            .as_ref()
+            .map(|policy| policy.firewall_bypass.clone())
+            .unwrap_or_default(),
         managed_policy: managed_policy.map(|policy| policy.status),
     })
 }
@@ -305,6 +309,8 @@ pub fn load_security_status(
         }
     };
 
+    let firewall_bypass =
+        super::firewall_bypass::load_firewall_bypass_status(&effective, project_dir, global);
     Ok(SecurityStatus {
         target,
         project_root,
@@ -315,5 +321,6 @@ pub fn load_security_status(
         managed_policy: effective.managed_policy,
         active_runtime_overrides,
         active_unlocks,
+        firewall_bypass,
     })
 }

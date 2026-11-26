@@ -706,18 +706,29 @@ pub(crate) fn runtime_request_mode(
     Ok(request)
 }
 
-/// The firewall mode and policy profile a command runs with, after checking
-/// that neither is weaker than the approved posture allows.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// The firewall mode, policy profile and bypass rules a command runs with,
+/// after checking that neither mode nor profile is weaker than the approved
+/// posture allows.
+#[derive(Clone, Debug)]
 pub(crate) struct RuntimeFirewall {
     pub(crate) mode: NpmFirewallMode,
     pub(crate) policy_profile: NpmFirewallPolicyProfile,
+    pub(crate) bypass: crate::firewall_bypass::FirewallBypassRules,
+}
+
+/// Which bypass rules a command applies: those for every project, and the
+/// project rules of the project `ProjectAndGlobal` names when it has one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum BypassRuleScope<'a> {
+    ProjectAndGlobal(&'a Path),
+    GlobalOnly,
 }
 
 pub(crate) fn resolve_runtime_firewall(
     global: &GlobalConfig,
     project_dir: &Path,
     json_output: bool,
+    bypass_scope: BypassRuleScope<'_>,
 ) -> Result<RuntimeFirewall, LpmError> {
     let effective = crate::security_approval::load_effective_authorized_posture()?;
     let mode_request = runtime_request_mode(global)?;
@@ -729,9 +740,24 @@ pub(crate) fn resolve_runtime_firewall(
         mode_request,
         policy_request.as_ref(),
     )?;
+    let mode = mode_request.map_or_else(|| effective.posture.firewall_mode(), |r| r.mode());
+    let bypass = if mode.is_enabled() {
+        let policy_dir = match bypass_scope {
+            BypassRuleScope::ProjectAndGlobal(dir) => Some(dir),
+            BypassRuleScope::GlobalOnly => None,
+        };
+        crate::firewall_bypass::FirewallBypassRules::for_command(
+            &effective,
+            policy_dir,
+            !crate::firewall_bypass::forced_floor_refuses_additions(global, &effective)?,
+        )
+    } else {
+        crate::firewall_bypass::FirewallBypassRules::none()
+    };
     Ok(RuntimeFirewall {
-        mode: mode_request.map_or_else(|| effective.posture.firewall_mode(), |r| r.mode()),
+        mode,
         policy_profile: runtime_policy_profile(policy_request, &effective),
+        bypass,
     })
 }
 

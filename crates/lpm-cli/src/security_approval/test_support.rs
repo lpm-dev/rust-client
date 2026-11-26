@@ -38,3 +38,40 @@ pub(crate) fn guarded_attempts() -> usize {
         .matches("\"event\":\"persistent-guarded-attempt\"")
         .count()
 }
+
+/// The details of every `event` in the audit log, oldest first.
+pub(crate) fn audit_details(event: &str) -> Vec<Option<String>> {
+    audit_records(event)
+        .into_iter()
+        .map(|record| record.detail)
+        .collect()
+}
+
+/// What tests check of an audit record.
+#[derive(Debug)]
+pub(crate) struct RecordedAudit {
+    pub(crate) allowed: bool,
+    pub(crate) detail: Option<String>,
+    pub(crate) project_root: Option<String>,
+}
+
+/// Every `event` in the audit log, oldest first.
+pub(crate) fn audit_records(event: &str) -> Vec<RecordedAudit> {
+    let Ok(content) = std::fs::read_to_string(audit_log_path().unwrap()) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<SignedAuditEnvelope>(line)
+                .unwrap()
+                .payload
+        })
+        .filter(|payload| payload.event == event)
+        .map(|payload| RecordedAudit {
+            allowed: payload.allowed,
+            detail: payload.detail,
+            project_root: payload.project_root,
+        })
+        .collect()
+}

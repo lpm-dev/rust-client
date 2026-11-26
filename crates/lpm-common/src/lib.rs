@@ -83,8 +83,8 @@ pub use command_name::{PortableCommandNameError, validate_portable_command_name}
 pub use error::{
     ArtifactUnavailableErrorContext, ArtifactUnavailableKind, EngineMismatchErrorContext, LpmError,
     NpmFirewallBlockSource, NpmFirewallBlockedErrorContext, NpmFirewallBlockedPackage,
-    ResolutionErrorContext, ResolutionFailureKind, SecurityApprovalRequiredErrorContext,
-    TyposquatErrorContext, TyposquatErrorFinding,
+    NpmFirewallBypassedPackage, ResolutionErrorContext, ResolutionFailureKind,
+    SecurityApprovalRequiredErrorContext, TyposquatErrorContext, TyposquatErrorFinding,
 };
 pub use global_fs::{GlobalInstallDirectory, GlobalInstallsDirectory, GlobalStateDirectories};
 pub use integrity::{Integrity, SriComparison, compare_sri};
@@ -139,7 +139,7 @@ pub use symlink::{
     remove_path_entry_counting_freed_bytes, remove_symlink_or_junction_entry,
 };
 pub use terminal::{
-    sanitize_for_terminal, sanitize_server_text, sanitize_terminal_inline,
+    is_terminal_control, sanitize_for_terminal, sanitize_server_text, sanitize_terminal_inline,
     sanitize_terminal_multiline,
 };
 pub use timestamp::Timestamp;

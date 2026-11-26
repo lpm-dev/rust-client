@@ -739,6 +739,36 @@ fn print_security_status(status: &security_approval::SecurityStatus) {
         ]);
     }
     rows.print_stdout();
+
+    print_firewall_bypass_status(&status.firewall_bypass);
+}
+
+fn print_firewall_bypass_status(bypass: &security_approval::FirewallBypassStatus) {
+    println!();
+    println!("{}", install_ui::section("firewall bypass rules"));
+    let mut rows = install_ui::Table::new();
+    if let Some(error) = &bypass.error {
+        rows.row([install_ui::red("unreadable"), install_ui::field(error)]);
+    } else if let Some(reason) = &bypass.inactive_reason {
+        rows.row([install_ui::yellow("inactive"), install_ui::field(reason)]);
+    }
+    if bypass.rules.is_empty() && bypass.managed_rules.is_empty() && bypass.error.is_none() {
+        rows.row([install_ui::dim("none")]);
+    }
+    for rule in &bypass.rules {
+        rows.row([
+            install_ui::field(&rule.spec),
+            install_ui::dim(rule.project_root.as_deref().unwrap_or("every project")),
+            install_ui::dim(&rule.id),
+        ]);
+    }
+    for rule in &bypass.managed_rules {
+        rows.row([
+            install_ui::field(&rule.spec),
+            install_ui::dim("managed policy"),
+        ]);
+    }
+    rows.print_stdout();
 }
 
 fn source_name(source: security_approval::PostureSourceKind) -> &'static str {

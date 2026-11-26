@@ -3930,6 +3930,32 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/env_folder_links.rs", 16)],
         last_audited_at: "2026-11-17",
     },
+    // ── id 182: lpm firewall bypass add / list / remove / clear ──
+    SurfaceV2 {
+        id: 182,
+        scenarios: 14,
+        failure_modes_tested: &[
+            "a block a rule can lift names the exact bypass command, in the terminal and in next_steps",
+            "a rule lets a blocked version install and the install names the rule",
+            "the install JSON lists each version a rule let through under security.firewall",
+            "a name rule never lifts a malware block",
+            "an exact rule approved for malware lifts that version",
+            "an expired rule no longer applies",
+            "a tampered rule store applies no rules and the block says why",
+            "a project rule applies only in its project",
+            "a managed firewall policy turns local rules off and applies its own bypass list",
+            "add in JSON mode never prompts and returns the command for a person",
+            "add rejects a dist-tag",
+            "list reports saved and managed rules in its JSON envelope",
+            "remove and clear need no approval and empty the store",
+        ],
+        failure_modes_known: &[
+            "the Touch ID, Windows Hello and polkit prompts themselves, which the workflow harness can't answer",
+        ],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/firewall_bypass.rs", 14)],
+        last_audited_at: "2026-11-25",
+    },
 ];
 
 // ─── Cross-command flow inventory ─────────────────────────────────────

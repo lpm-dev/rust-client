@@ -241,7 +241,7 @@ fn push_neutralized_control(
 /// separators). Joiners U+200C/U+200D stay: scripts and emoji need them, and
 /// they can't reorder text.
 #[inline]
-fn is_terminal_control(ch: char) -> bool {
+pub fn is_terminal_control(ch: char) -> bool {
     matches!(
         ch as u32,
         0x00..=0x1f

@@ -531,6 +531,8 @@ fn policy_value_has_enforced_controls(value: &toml::Value) -> bool {
             .and_then(toml::Value::as_table)
             .is_some_and(|firewall| {
                 firewall.contains_key(crate::npm_firewall_config::FIREWALL_CONFIG_MODE_KEY)
+                    || firewall.contains_key("bypass")
+                    || firewall.contains_key("bypass-malware")
                     || firewall
                         .get(crate::npm_firewall_config::FIREWALL_NPM_CONFIG_SECTION)
                         .and_then(toml::Value::as_table)
@@ -1264,6 +1266,7 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
         .transpose()?
         .map(|raw| parse_policy_firewall(&path, raw))
         .transpose()?;
+    let firewall_bypass = parse_managed_firewall_bypass(&path, firewall)?;
     let firewall_policies = crate::npm_firewall_config::firewall_policy_table(table)
         .and_then(|policies| {
             policies
@@ -1320,6 +1323,9 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
     if firewall_policies.is_some() {
         enforced_controls.push("firewall.npm.policies".to_string());
     }
+    if !firewall_bypass.is_empty() {
+        enforced_controls.push("firewall.bypass".to_string());
+    }
     if install_time_source_analysis.is_some() {
         enforced_controls
             .push(crate::source_analysis_config::INSTALL_TIME_SOURCE_ANALYSIS_KEY.to_string());
@@ -1341,8 +1347,58 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
         typosquat_guard,
         firewall_mode,
         firewall_policies,
+        firewall_bypass,
         install_time_source_analysis,
     }))
+}
+
+/// `[firewall].bypass` names versions the managed policy lets past LPM
+/// Firewall blocks other than malware; `[firewall].bypass-malware` names exact
+/// versions it lets past malware blocks too.
+fn parse_managed_firewall_bypass(
+    path: &Path,
+    firewall: Option<&toml::map::Map<String, toml::Value>>,
+) -> Result<Vec<ManagedFirewallBypass>, LpmError> {
+    let Some(firewall) = firewall else {
+        return Ok(Vec::new());
+    };
+    let mut rules = Vec::new();
+    for (key, covers_malware) in [("bypass", false), ("bypass-malware", true)] {
+        let Some(value) = firewall.get(key) else {
+            continue;
+        };
+        let entries = value.as_array().ok_or_else(|| {
+            managed_policy_error(
+                path,
+                format!("must set `[firewall].{key}` to an array of package specs"),
+            )
+        })?;
+        rules.reserve(entries.len());
+        for entry in entries {
+            let raw = entry.as_str().ok_or_else(|| {
+                managed_policy_error(path, format!("must list strings in `[firewall].{key}`"))
+            })?;
+            let spec = crate::firewall_bypass::FirewallBypassSpec::parse(raw).map_err(|error| {
+                managed_policy_error(
+                    path,
+                    format!("has an invalid `[firewall].{key}` entry `{raw}`: {error}"),
+                )
+            })?;
+            if covers_malware && spec.kind() != crate::firewall_bypass::BypassKind::Exact {
+                return Err(managed_policy_error(
+                    path,
+                    format!(
+                        "has `[firewall].{key}` entry `{raw}`, which must name an exact version"
+                    ),
+                ));
+            }
+            rules.push(ManagedFirewallBypass {
+                spec: spec.to_string(),
+                covers_malware,
+            });
+        }
+    }
+    Ok(rules)
 }
 
 #[cfg(any(test, all(windows, not(debug_assertions))))]

@@ -966,7 +966,7 @@ pub(super) async fn run_link_and_finish(
                 "total_ms": elapsed.as_millis(),
             },
             "security": {
-                "firewall": npm_firewall_stats.to_json(),
+                "firewall": npm_firewall_stats.to_security_json(),
                 "policy_extensions": policy_extension_stats.to_json(),
             },
             "warnings": [],

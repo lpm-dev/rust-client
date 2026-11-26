@@ -22,6 +22,12 @@ pub(super) struct FixReport {
 pub(super) struct FixFailure {
     action: String,
     error: String,
+    error_code: &'static str,
+    /// An LPM Firewall block's error object, naming the blocked versions,
+    /// the versions bypass rules let through, and the command that allows
+    /// the rest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block: Option<serde_json::Value>,
 }
 
 #[derive(Default)]
@@ -176,10 +182,15 @@ pub(super) async fn apply(
             Err(error) => {
                 let label = planned_action_label(action, check)
                     .unwrap_or_else(|_| action.label().to_string());
-                super::render_autofix_failed(&label, &error);
+                if !json_output {
+                    super::render_autofix_failed(&label, &error);
+                }
                 report.failed.push(FixFailure {
                     action: label,
                     error: error.to_string(),
+                    error_code: error.error_code(),
+                    block: matches!(error, LpmError::NpmFirewallBlocked(_))
+                        .then(|| crate::cli::json_error_value(&error)["error"].take()),
                 });
             }
         }

@@ -26,7 +26,7 @@ pub(super) fn canonical_global_root() -> Result<String, LpmError> {
     ))
 }
 
-pub(super) fn project_dir_is_global_install(project_dir: &Path) -> bool {
+pub(crate) fn project_dir_is_global_install(project_dir: &Path) -> bool {
     let Ok(root) = lpm_common::LpmRoot::from_env() else {
         return false;
     };

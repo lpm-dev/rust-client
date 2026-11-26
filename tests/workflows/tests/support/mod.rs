@@ -760,6 +760,34 @@ pub fn write_lpm_proxy_npmrc(project: &TempProject, registry_url: &str) {
     );
 }
 
+/// Write the signed `lpm firewall bypass` rule store with `rules`, each a
+/// stored rule object (`id`, `spec`, `scope`, `added_at`, …).
+pub fn write_signed_firewall_bypass(project: &TempProject, rules: &[serde_json::Value]) {
+    use hmac::{KeyInit, Mac};
+
+    let security_dir = project.home().join(".lpm/security");
+    std::fs::create_dir_all(&security_dir).expect("create security dir");
+    let secret = [42u8; 32];
+    std::fs::write(security_dir.join("signing-secret.hex"), hex::encode(secret))
+        .expect("write security signing secret");
+    let payload = serde_json::json!({
+        "kind": "firewall-bypass",
+        "schema_version": 1,
+        "rules": rules,
+    });
+    let mut mac = HmacSha256::new_from_slice(&secret).expect("valid hmac secret");
+    mac.update(&serde_json::to_vec(&payload).expect("serialize bypass payload"));
+    let envelope = serde_json::json!({
+        "payload": payload,
+        "signature": hex::encode(mac.finalize().into_bytes()),
+    });
+    std::fs::write(
+        security_dir.join("firewall-bypass.json"),
+        serde_json::to_string_pretty(&envelope).expect("serialize bypass envelope"),
+    )
+    .expect("write signed firewall bypass store");
+}
+
 /// Write a signed approved machine posture with a specific typosquat
 /// guard floor for workflow scenarios that intentionally exercise an
 /// approved machine-wide typosquat setting.

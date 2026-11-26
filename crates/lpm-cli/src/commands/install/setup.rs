@@ -3,6 +3,7 @@ use super::*;
 pub(super) struct InstallSetupInput<'a> {
     pub(super) project_dir: &'a Path,
     pub(super) policy_project_dir: &'a Path,
+    pub(super) firewall_bypass_root: Option<&'a Path>,
     pub(super) json_output: bool,
     pub(super) frozen_lockfile: FrozenLockfileMode,
     pub(super) allow_new: bool,
@@ -24,6 +25,7 @@ pub(super) struct InstallSetupContext {
     pub(super) provenance_timings: Option<crate::provenance_fetch::ProvenanceTimings>,
     pub(super) npm_firewall_lookup_mode: NpmFirewallLookupMode,
     pub(super) npm_firewall_policy_profile: lpm_registry::client::NpmFirewallPolicyProfile,
+    pub(super) npm_firewall_bypass: crate::firewall_bypass::FirewallBypassRules,
     pub(super) npm_firewall_chunk_size: usize,
     pub(super) policy_extension_configs: Vec<policy_extensions::PolicyExtensionConfig>,
     pub(super) force_security_floor: bool,
@@ -54,6 +56,7 @@ pub(crate) fn validate_dependency_free_dev_config(project_dir: &Path) -> Result<
     let setup = prepare_install_setup_context(InstallSetupInput {
         project_dir,
         policy_project_dir: project_dir,
+        firewall_bypass_root: None,
         json_output: false,
         frozen_lockfile: FrozenLockfileMode::Never,
         allow_new: false,
@@ -134,10 +137,12 @@ pub(super) fn prepare_install_setup_context(
     let crate::npm_firewall_config::RuntimeFirewall {
         mode: npm_firewall_mode,
         policy_profile: npm_firewall_policy_profile,
+        bypass: npm_firewall_bypass,
     } = check_project_policy(
         &global_config,
         input.project_dir,
         input.policy_project_dir,
+        input.firewall_bypass_root,
         &pkg_json_path,
         &pkg,
         input.json_output,
@@ -242,6 +247,7 @@ pub(super) fn prepare_install_setup_context(
         provenance_timings,
         npm_firewall_lookup_mode,
         npm_firewall_policy_profile,
+        npm_firewall_bypass,
         npm_firewall_chunk_size,
         policy_extension_configs,
         force_security_floor,
@@ -273,6 +279,7 @@ pub(super) fn check_project_policy(
     global_config: &crate::commands::config::GlobalConfig,
     project_dir: &Path,
     policy_project_dir: &Path,
+    firewall_bypass_root: Option<&Path>,
     manifest_path: &Path,
     package: &lpm_workspace::PackageJson,
     json_output: bool,
@@ -287,6 +294,13 @@ pub(super) fn check_project_policy(
         global_config,
         policy_project_dir,
         json_output,
+        match firewall_bypass_root {
+            Some(root) => crate::npm_firewall_config::BypassRuleScope::ProjectAndGlobal(root),
+            None if policy_project_dir == project_dir => {
+                crate::npm_firewall_config::BypassRuleScope::ProjectAndGlobal(project_dir)
+            }
+            None => crate::npm_firewall_config::BypassRuleScope::GlobalOnly,
+        },
     )?;
     crate::typosquat_guard::guard_manifest_direct_dependencies_in_context(
         project_dir,
@@ -319,6 +333,7 @@ mod tests {
         InstallSetupInput {
             project_dir,
             policy_project_dir: project_dir,
+            firewall_bypass_root: None,
             json_output: false,
             frozen_lockfile: FrozenLockfileMode::default(),
             allow_new: false,

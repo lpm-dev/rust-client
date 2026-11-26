@@ -9,6 +9,7 @@
 mod approval;
 pub(crate) use approval::check_runtime_sigstore_posture;
 mod audit;
+mod firewall_bypass;
 mod helpers;
 mod managed_policy;
 mod native_auth;
@@ -51,7 +52,17 @@ pub use approval::{
     record_project_scope_candidate_narrowing, reject_firewall_policies_a_managed_policy_holds,
     tighten_persistent_npm_firewall_policies,
 };
+pub(crate) use firewall_bypass::{
+    FirewallBypassAdded, FirewallBypassApproval, FirewallBypassCommit, FirewallBypassRequests,
+    approve_firewall_bypass_rules, bypass_expired_before_save_error,
+    commit_firewall_bypass_rules_if, firewall_bypass_file_exists, load_local_firewall_bypass_rules,
+    local_firewall_bypass_inactive_reason, record_firewall_bypass_refusal,
+    remove_firewall_bypass_rules, rules_kept_changing_error, sort_firewall_bypass_requests,
+};
+#[cfg(test)]
+pub(crate) use firewall_bypass::{add_firewall_bypass_rules, commit_firewall_bypass_rules};
 pub use helpers::format_unlock_duration;
+pub(crate) use helpers::project_dir_is_global_install;
 pub(crate) use managed_policy::{
     apply_managed_protection_with_privilege, load_managed_protection_status,
     run_internal_managed_protection,
@@ -60,6 +71,8 @@ pub(crate) use managed_policy::{
 pub(crate) use managed_policy::{
     install_managed_firewall_protection, remove_managed_firewall_protection,
 };
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use native_auth::macos_local_auth_reason;
 #[allow(unused_imports)]
 pub use paths::security_dir;
 pub(crate) use posture::begin_authorized_posture_transaction;
@@ -74,10 +87,11 @@ pub(crate) use types::ManagedProtectionAction;
 #[allow(unused_imports)]
 pub use types::{
     ApprovalScope, ApprovalSource, AuthorizedPosture, AuthorizedPostureView,
-    EffectiveAuthorizedPosture, EffectivePostureSources, ManagedPolicyStatus,
-    ManagedProtectionChange, ManagedProtectionReport, ManagedProtectionStatus, PostureSourceKind,
-    QuarantinedSecurityState, RuntimeOverride, SecurityRepairReport, SecurityStatus, UnlockGrant,
-    UnlockLimits, UnlockRevocation, UnlockTargetKind,
+    EffectiveAuthorizedPosture, EffectivePostureSources, FirewallBypassStatus,
+    ManagedFirewallBypass, ManagedPolicyStatus, ManagedProtectionChange, ManagedProtectionReport,
+    ManagedProtectionStatus, PostureSourceKind, QuarantinedSecurityState, RuntimeOverride,
+    SecurityRepairReport, SecurityStatus, UnlockGrant, UnlockLimits, UnlockRevocation,
+    UnlockTargetKind,
 };
 #[allow(unused_imports)]
 pub use unlocks::{
@@ -203,7 +217,8 @@ mod prelude {
     pub(super) use super::native_auth::request_native_approval;
     pub(super) use super::paths::{
         approved_global_trust_path, approved_posture_path, approved_projects_dir, audit_head_path,
-        audit_lock_path, audit_log_path, security_dir, signing_secret_path, unlocks_dir,
+        audit_lock_path, audit_log_path, firewall_bypass_lock_path, firewall_bypass_path,
+        security_dir, signing_secret_path, unlocks_dir,
     };
     pub(super) use super::posture::{
         load_authorized_posture, load_effective_authorized_posture, persist_authorized_posture,
@@ -222,11 +237,12 @@ mod prelude {
     pub(super) use super::types::{
         ApprovalScope, ApprovalSource, ApprovedGlobalTrustState, ApprovedProjectPolicyState,
         AuditEvent, AuditHead, AuthorizedPosture, AuthorizedPostureView,
-        EffectiveAuthorizedPosture, EffectivePostureSources, ManagedPolicy, ManagedPolicyStatus,
-        ManagedProtectionChange, ManagedProtectionReport, ManagedProtectionStatus,
-        PostureSourceKind, QuarantinedSecurityState, RuntimeOverride, SecurityRepairReport,
-        SecurityStatus, SignedAuditEnvelope, SignedEnvelope, StoredUnlockGrant, UnlockGrant,
-        UnlockLimits, UnlockRevocation, UnlockTargetKind,
+        EffectiveAuthorizedPosture, EffectivePostureSources, FirewallBypassStatus,
+        ManagedFirewallBypass, ManagedPolicy, ManagedPolicyStatus, ManagedProtectionChange,
+        ManagedProtectionReport, ManagedProtectionStatus, PostureSourceKind,
+        QuarantinedSecurityState, RuntimeOverride, SecurityRepairReport, SecurityStatus,
+        SignedAuditEnvelope, SignedEnvelope, StoredUnlockGrant, UnlockGrant, UnlockLimits,
+        UnlockRevocation, UnlockTargetKind,
     };
     pub(super) use super::unlocks::{
         create_global_unlock_grant, create_global_unlock_grant_for_scopes, create_unlock_grant,

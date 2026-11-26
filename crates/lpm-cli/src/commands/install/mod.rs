@@ -79,7 +79,8 @@ use firewall::{
 };
 pub(crate) use firewall::{
     NpmFirewallMaterializationPackage, begin_prepared_npm_firewall_materialization_preflight,
-    prepare_npm_firewall_materialization_preflight, registry_materialization_route_is_public_npm,
+    prepare_npm_firewall_materialization_preflight, print_npm_firewall_decisions,
+    registry_materialization_route_is_public_npm,
 };
 pub(crate) use github_source::download_github_archive_to_file;
 pub(crate) use github_source::github_archive_url;
@@ -385,6 +386,9 @@ pub(crate) async fn run_silent_for_audit_fix(
 pub(crate) struct InstallExpectations {
     root: Option<ExpectedInstallRoot>,
     locked_integrities: Option<Arc<LockedIntegrities>>,
+    /// The project whose LPM Firewall bypass rules apply, when the install
+    /// runs elsewhere on its behalf, as `lpm deploy` does.
+    firewall_bypass_root: Option<PathBuf>,
 }
 
 impl InstallExpectations {
@@ -416,6 +420,7 @@ pub(crate) struct InstallCallerContext<'a> {
     pub(crate) policy_project_dir: Option<&'a Path>,
     pub(crate) expected_root: Option<ExpectedInstallRoot>,
     pub(crate) locked_integrities: Option<Arc<LockedIntegrities>>,
+    pub(crate) firewall_bypass_root: Option<&'a Path>,
 }
 
 impl From<RouteTable> for InstallCallerContext<'_> {
@@ -425,6 +430,7 @@ impl From<RouteTable> for InstallCallerContext<'_> {
             policy_project_dir: None,
             expected_root: None,
             locked_integrities: None,
+            firewall_bypass_root: None,
         }
     }
 }
@@ -480,6 +486,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
                 InstallExpectations {
                     root: context.expected_root,
                     locked_integrities: context.locked_integrities,
+                    firewall_bypass_root: context.firewall_bypass_root.map(Path::to_path_buf),
                 },
             )
         })
@@ -656,6 +663,7 @@ async fn run_with_options_under_store_lock(
         provenance_timings,
         npm_firewall_lookup_mode,
         npm_firewall_policy_profile,
+        npm_firewall_bypass,
         npm_firewall_chunk_size,
         policy_extension_configs,
         force_security_floor,
@@ -683,6 +691,7 @@ async fn run_with_options_under_store_lock(
     } = prepare_install_setup_context(InstallSetupInput {
         project_dir,
         policy_project_dir,
+        firewall_bypass_root: expectations.firewall_bypass_root.as_deref(),
         json_output,
         frozen_lockfile,
         allow_new,
@@ -1107,6 +1116,7 @@ async fn run_with_options_under_store_lock(
             npm_firewall_mode,
             npm_firewall_lookup_mode,
             npm_firewall_policy_profile,
+            npm_firewall_bypass: &npm_firewall_bypass,
             policy_extension_configs: &policy_extension_configs,
             workspace_member_deps: &mut workspace_member_deps,
             all_workspace_members: &all_workspace_members,
@@ -1428,6 +1438,7 @@ async fn run_with_options_under_store_lock(
         npm_firewall_mode,
         npm_firewall_lookup_mode,
         npm_firewall_policy_profile,
+        npm_firewall_bypass: npm_firewall_bypass.clone(),
         npm_firewall_chunk_size,
         locked_integrities: expectations.locked_integrities.as_deref(),
         tarball_prefetch_held: expectations.hold_tarball_prefetch(&policy_extension_configs),
@@ -1537,6 +1548,7 @@ async fn run_with_options_under_store_lock(
                 mode: npm_firewall_mode,
                 lookup_mode: npm_firewall_lookup_mode,
                 policy_profile: npm_firewall_policy_profile,
+                bypass: &npm_firewall_bypass,
                 client: &arc_client,
                 route_table: &route_table,
                 packages: &packages,
