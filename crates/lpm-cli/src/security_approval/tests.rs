@@ -2232,6 +2232,64 @@ fn forced_floor_measures_a_write_against_what_installs_run_not_an_unapproved_tab
     });
 }
 
+const MANAGED_LOOSER_SCRIPT_POLICY: &str = "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_dependency_script_policy = \"warn\"\n";
+
+#[test]
+fn an_editor_save_that_loosens_the_local_posture_under_a_looser_managed_profile_asks_first() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[]);
+        write_managed_policy(temp.path(), MANAGED_LOOSER_SCRIPT_POLICY);
+        let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_dependency_script_policy: lpm_registry::client::NpmFirewallPolicyAction::Warn,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        let err = with_test_native_auth_result("deny", || {
+            authorize_persistent_npm_firewall_policies(&requested, false, "lpm config firewall")
+        })
+        .unwrap_err();
+
+        assert_eq!(err.error_code(), "security_approval_required", "{err}");
+        assert_eq!(
+            load_authorized_posture()
+                .unwrap()
+                .firewall_policy_profile()
+                .lpm_ai_dependency_script_policy,
+            lpm_registry::client::NpmFirewallPolicyAction::Block
+        );
+    });
+}
+
+#[test]
+fn forced_floor_holds_an_editor_save_at_the_local_posture_under_a_looser_managed_profile() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_enforced_firewall(&[]);
+        write_managed_policy(temp.path(), MANAGED_LOOSER_SCRIPT_POLICY);
+        let mut config = firewall_policy_global_config("enforce", &[]);
+        config.table_mut().insert(
+            "force-security-floor".to_string(),
+            toml::Value::Boolean(true),
+        );
+        let requested = lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_dependency_script_policy: lpm_registry::client::NpmFirewallPolicyAction::Warn,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        let err = crate::security_floor::reject_looser_firewall_policy_write(&config, &requested)
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("lpm_ai_dependency_script_policy"),
+            "{message}"
+        );
+        assert!(message.contains("force-security-floor"), "{message}");
+        assert!(!message.contains("config.toml"), "{message}");
+    });
+}
+
 #[test]
 fn forced_floor_refuses_an_editor_save_that_would_sign_a_group_left_loose_by_hand() {
     let temp = tempdir().unwrap();

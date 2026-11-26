@@ -973,6 +973,20 @@ pub fn authorize_persistent_npm_firewall_policies(
         record_persistent_guarded_attempt(ApprovalScope::FirewallDisable, false, &err.to_string());
         return Err(err);
     }
+    // The save rewrites the local posture, which binds again once a managed
+    // policy goes away, so a group it loosens there needs approval too.
+    let mut posture = load_authorized_posture()?;
+    let mut weakened = weakened;
+    for entry in crate::npm_firewall_config::loosened_firewall_policies(
+        enforce,
+        requested,
+        posture.firewall_mode(),
+        &posture.firewall_policy_profile(),
+    ) {
+        if !weakened.iter().any(|existing| existing.key == entry.key) {
+            weakened.push(entry);
+        }
+    }
     if !weakened.is_empty() {
         confirm_persistent_weakening(
             ApprovalScope::FirewallDisable,
@@ -986,7 +1000,6 @@ pub fn authorize_persistent_npm_firewall_policies(
         )?;
     }
 
-    let mut posture = load_authorized_posture()?;
     let policies = crate::npm_firewall_config::policy_profile_overrides(requested);
     if posture.firewall_mode() == enforce && posture.firewall_policies == policies {
         return Ok(());

@@ -361,9 +361,10 @@ pub fn reject_looser_firewall_mode_write(
 
 /// Refuses a `[firewall.npm.policies]` profile the firewall editor saves, and
 /// signs into the approved posture, when it handles any policy group more
-/// leniently than installs enforce now, while `force-security-floor = true`
-/// is active. Every group counts, a group left loose by hand included, since
-/// the save signs them all.
+/// leniently than installs enforce now, or than the local posture it rewrites,
+/// while `force-security-floor = true` is active. Every group counts, a group
+/// left loose by hand included, since the save signs them all; the local
+/// posture counts because it binds again once a managed policy goes away.
 pub fn reject_looser_firewall_policy_write(
     global: &GlobalConfig,
     requested: &lpm_registry::client::NpmFirewallPolicyProfile,
@@ -372,15 +373,25 @@ pub fn reject_looser_firewall_policy_write(
         return Ok(());
     }
     let effective = crate::security_approval::load_effective_authorized_posture()?;
-    let floor = crate::npm_firewall_config::enforced_policy_profile(global, &effective)?;
-    reject_policy_below_floor(&floor, requested)
+    let enforced = crate::npm_firewall_config::enforced_policy_profile(global, &effective)?;
+    reject_policy_below_floor(
+        requested,
+        crate::npm_firewall_config::NpmFirewallMode::Enforce,
+        &enforced,
+    )?;
+    let local = crate::security_approval::load_authorized_posture()?;
+    reject_policy_below_floor(
+        requested,
+        local.firewall_mode(),
+        &local.firewall_policy_profile(),
+    )
 }
 
 /// Refuses deleting a `config.toml` key when the profile installs would run
 /// afterwards handles a group the delete changes more leniently than installs
-/// enforce now, while `force-security-floor = true` is active. A delete signs
-/// nothing, so a group it leaves as it was is not its doing, and restoring
-/// one group never waits on another that is still loose.
+/// enforce now, while `force-security-floor = true` is active. A delete only
+/// ever tightens what is signed, so a group it leaves as it was is not its
+/// doing, and restoring one group never waits on another that is still loose.
 pub fn reject_looser_firewall_policy_delete(
     global: &GlobalConfig,
     after: &lpm_registry::client::NpmFirewallPolicyProfile,
@@ -406,26 +417,39 @@ pub fn reject_looser_firewall_policy_delete(
             *slot = action;
         }
     }
-    reject_policy_below_floor(&floor, &changed)
+    reject_policy_below_floor(
+        &changed,
+        crate::npm_firewall_config::NpmFirewallMode::Enforce,
+        &floor,
+    )
 }
 
+/// Refuses `requested` when it handles a group more leniently than `floor`
+/// does at `floor_mode`. The floor is a signed or enforced action rather than
+/// a `config.toml` value, so the advice is to keep the group or lift the
+/// forced floor.
 fn reject_policy_below_floor(
-    floor: &lpm_registry::client::NpmFirewallPolicyProfile,
     requested: &lpm_registry::client::NpmFirewallPolicyProfile,
+    floor_mode: crate::npm_firewall_config::NpmFirewallMode,
+    floor: &lpm_registry::client::NpmFirewallPolicyProfile,
 ) -> Result<(), LpmError> {
-    let enforce = crate::npm_firewall_config::NpmFirewallMode::Enforce;
-    let loosened =
-        crate::npm_firewall_config::loosened_firewall_policies(enforce, requested, enforce, floor);
+    let loosened = crate::npm_firewall_config::loosened_firewall_policies(
+        crate::npm_firewall_config::NpmFirewallMode::Enforce,
+        requested,
+        floor_mode,
+        floor,
+    );
     if let Some(first) = loosened.first() {
-        return Err(security_floor_write_error(
-            &format!(
-                "{}.{}",
-                crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_PATH,
-                first.key
-            ),
+        return Err(LpmError::SecurityFloor(format!(
+            "setting `{}.{}` to `{}` would loosen the `{}` LPM CLI enforces for it while \
+             `force-security-floor = true` is active. Keep it at `{}` or stricter, or remove \
+             `force-security-floor` first.",
+            crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_PATH,
+            first.key,
             first.requested.as_str(),
             first.approved.as_str(),
-        ));
+            first.approved.as_str(),
+        )));
     }
     Ok(())
 }
@@ -596,8 +620,9 @@ mod tests {
         let requested = malware_floor(lpm_registry::client::NpmFirewallPolicyAction::Allow);
 
         let err = reject_policy_below_floor(
-            &malware_floor(lpm_registry::client::NpmFirewallPolicyAction::Block),
             &requested,
+            crate::npm_firewall_config::NpmFirewallMode::Enforce,
+            &malware_floor(lpm_registry::client::NpmFirewallPolicyAction::Block),
         )
         .unwrap_err();
 
@@ -619,8 +644,9 @@ mod tests {
 
         assert!(
             reject_policy_below_floor(
+                &requested,
+                crate::npm_firewall_config::NpmFirewallMode::Enforce,
                 &malware_floor(lpm_registry::client::NpmFirewallPolicyAction::Warn),
-                &requested
             )
             .is_ok()
         );
