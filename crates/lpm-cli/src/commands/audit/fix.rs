@@ -388,6 +388,13 @@ async fn run_fix_inner(
                 }
                 if let Err(error) = install.result {
                     if !json_output {
+                        // The quiet install showed nothing of a block; its
+                        // error explains the rest.
+                        if let LpmError::NpmFirewallBlocked(blocked) = &error {
+                            for line in crate::cli::npm_firewall_block_package_lines(blocked) {
+                                install_ui::detail_line(line);
+                            }
+                        }
                         install_ui::warn("install failed — restored original package.json");
                     }
                     return Err(error);

@@ -1712,6 +1712,55 @@ async fn a_command_that_fails_after_its_install_still_reports_what_a_rule_let_th
 }
 
 #[tokio::test]
+async fn an_install_whose_later_verdict_request_fails_still_reports_what_a_rule_let_through() {
+    let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
+    mock.with_package(
+        "unchecked-tool",
+        "1.0.0",
+        &make_tarball("unchecked-tool", "1.0.0"),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path(VERDICTS_PATH))
+        .and(body_string_contains("\"name\":\"unchecked-tool\""))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(mock.server())
+        .await;
+    let project = enforcing_project();
+    write_signed_firewall_bypass(
+        &project,
+        &[stored_rule("agent-tool", serde_json::json!({}))],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_EXPERIMENT_NPM_FIREWALL_CHUNK_SIZE", "1")
+        .args([
+            "--json",
+            "install",
+            "--no-skills",
+            "agent-tool@1.0.0",
+            "unchecked-tool@1.0.0",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "{error}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    assert_eq!(envelope["success"], false, "{envelope:#}");
+    assert_eq!(
+        envelope["security"]["firewall"]["bypassed"][0]["name"], "agent-tool",
+        "{envelope:#}"
+    );
+}
+
+#[tokio::test]
 async fn workspace_migrate_json_reports_the_version_a_bypass_rule_let_through() {
     let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
     mock.with_package("lib-tool", "1.0.0", &make_tarball("lib-tool", "1.0.0"))

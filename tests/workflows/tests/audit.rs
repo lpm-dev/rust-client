@@ -1662,6 +1662,34 @@ async fn audit_fix_through_a_bypass_rule(json: bool) -> std::process::Output {
 }
 
 #[tokio::test]
+async fn audit_fix_names_the_version_a_firewall_block_stopped() {
+    let project = TempProject::empty(
+        r#"{"name":"audit-fix-blocked","version":"1.0.0","dependencies":{"vuln-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    install_vulnerable_direct_dep_with_fixed_version(&project, &mock).await;
+    mock.with_osv_querybatch(vec![vec![osv_fixed_vuln(
+        "GHSA-test-blocked",
+        "vuln-pkg",
+        "1.0.1",
+    )]])
+    .await;
+    mock.with_npm_firewall_block("vuln-pkg", "1.0.1").await;
+    support::write_npm_firewall_global_config(&project, "enforce");
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args(["--color", "never", "audit", "fix"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("blocked vuln-pkg@1.0.1"), "{stderr}");
+    assert!(stderr.contains("✗ Blocked by LPM Firewall"), "{stderr}");
+}
+
+#[tokio::test]
 async fn audit_fix_json_reports_the_version_a_bypass_rule_let_through() {
     let out = audit_fix_through_a_bypass_rule(true).await;
 
