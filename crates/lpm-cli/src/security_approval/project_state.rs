@@ -1,8 +1,8 @@
 use super::prelude::*;
 
-fn project_policy_state_path(project_dir: &Path) -> Result<PathBuf, LpmError> {
-    let root = canonical_project_root(project_dir);
-    let id = hex::encode(Sha256::digest(root.as_bytes()));
+/// Where the approved state of the project at `root` is kept.
+fn project_policy_state_path(root: &ProjectRoot) -> Result<PathBuf, LpmError> {
+    let id = hex::encode(Sha256::digest(root.storage_key().as_bytes()));
     Ok(approved_projects_dir()?.join(format!("{id}.json")))
 }
 
@@ -96,31 +96,39 @@ pub(super) fn candidate_project_scope_policy_state(
 pub(super) fn load_approved_project_policy_state(
     project_dir: &Path,
 ) -> Result<ApprovedProjectPolicyState, LpmError> {
-    Ok(
-        read_signed_json(&project_policy_state_path(project_dir)?)?.unwrap_or_else(|| {
-            ApprovedProjectPolicyState {
-                schema_version: APPROVED_PROJECT_STATE_SCHEMA_VERSION,
-                updated_at: Timestamp::now(),
-                project_root: canonical_project_root(project_dir),
-                trusted_dependencies: BTreeMap::new(),
-                trusted_scopes: Vec::new(),
-                capability_request_hash: None,
-            }
-        }),
-    )
+    let root = ProjectRoot::of(project_dir);
+    let Some(mut state) =
+        read_signed_json::<ApprovedProjectPolicyState>(&project_policy_state_path(&root)?)?
+    else {
+        return Ok(ApprovedProjectPolicyState {
+            schema_version: APPROVED_PROJECT_STATE_SCHEMA_VERSION,
+            updated_at: Timestamp::now(),
+            project_root: root.as_str().to_owned(),
+            trusted_dependencies: BTreeMap::new(),
+            trusted_scopes: Vec::new(),
+            capability_request_hash: None,
+        });
+    };
+    // A state saved while roots kept the verbatim prefix names the same
+    // project, so it compares equal to an unchanged one and isn't rewritten.
+    if root.names(&state.project_root) {
+        state.project_root = root.as_str().to_owned();
+    }
+    Ok(state)
 }
 
 pub(super) fn persist_project_policy_state(
     project_dir: &Path,
     state: &ApprovedProjectPolicyState,
 ) -> Result<(), LpmError> {
+    let root = ProjectRoot::of(project_dir);
     let mut normalized = state.clone();
     normalized.schema_version = APPROVED_PROJECT_STATE_SCHEMA_VERSION;
     normalized.updated_at = Timestamp::now();
-    normalized.project_root = canonical_project_root(project_dir);
+    normalized.project_root = root.as_str().to_owned();
     normalized.trusted_scopes.sort();
     normalized.trusted_scopes.dedup();
-    write_signed_json(&project_policy_state_path(project_dir)?, &normalized)
+    write_signed_json(&project_policy_state_path(&root)?, &normalized)
 }
 
 pub(super) fn current_global_trust_state(

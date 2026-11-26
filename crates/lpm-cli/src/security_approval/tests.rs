@@ -3504,3 +3504,152 @@ fn the_add_preview_keeps_what_installs_may_run_where_the_approved_firewall_is_of
         );
     });
 }
+
+const VERBATIM_WINDOWS_ROOT: &str = r"\\?\C:\work\app";
+
+#[test]
+fn a_windows_project_root_is_written_without_the_verbatim_prefix_and_names_both_forms() {
+    let root = ProjectRoot::from_resolved(VERBATIM_WINDOWS_ROOT.to_owned(), true);
+
+    assert_eq!(root.as_str(), r"C:\work\app");
+    assert!(root.names(r"C:\work\app"));
+    assert!(root.names(VERBATIM_WINDOWS_ROOT));
+    assert!(!root.names(r"C:\work\other"));
+    assert!(!root.names(r"\\?\C:\work\other"));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_project_root_on_windows_names_a_real_directory_as_a_plain_drive_path() {
+    let temp = tempdir().unwrap();
+
+    let root = ProjectRoot::of(temp.path());
+
+    assert!(!root.as_str().starts_with(r"\\?\"), "{}", root.as_str());
+    assert!(
+        root.verbatim()
+            .is_some_and(|verbatim| verbatim.starts_with(r"\\?\")),
+        "{root:?}"
+    );
+}
+
+#[test]
+fn a_project_root_keeps_its_verbatim_form_where_the_plain_one_would_mean_another_path() {
+    for verbatim in [r"\\?\UNC\server\share\app", r"\\?\C:\work\con\app"] {
+        let root = ProjectRoot::from_resolved(verbatim.to_owned(), true);
+        assert_eq!(root.as_str(), verbatim);
+        assert_eq!(root.verbatim(), None, "{verbatim}");
+    }
+    let elsewhere = ProjectRoot::from_resolved(VERBATIM_WINDOWS_ROOT.to_owned(), false);
+    assert_eq!(elsewhere.as_str(), VERBATIM_WINDOWS_ROOT);
+}
+
+/// A project in `temp` that trusts esbuild, as a Windows directory resolving
+/// to [`VERBATIM_WINDOWS_ROOT`] would be.
+fn windows_shaped_project(temp: &Path) -> (PathBuf, lpm_workspace::TrustedDependencies) {
+    let project = temp.join("app");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("package.json"),
+        r#"{"name":"demo","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let mut bindings = std::collections::HashMap::new();
+    bindings.insert(
+        "esbuild@0.25.1".to_string(),
+        lpm_workspace::TrustedDependencyBinding {
+            integrity: Some("sha512-demo".to_string()),
+            script_hash: Some("sha256-demo".to_string()),
+            ..Default::default()
+        },
+    );
+    (project, lpm_workspace::TrustedDependencies::Rich(bindings))
+}
+
+#[test]
+fn a_project_approval_saved_with_the_verbatim_root_still_counts_and_an_unchanged_check_leaves_it() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        let (project, trusted) = windows_shaped_project(temp.path());
+        super::test_support::resolving_on_windows(&project, VERBATIM_WINDOWS_ROOT, || {
+            // Where and how a version that kept the prefix saved the approval.
+            let mut approved =
+                super::project_state::candidate_project_policy_state(&project, &trusted).unwrap();
+            approved.project_root = VERBATIM_WINDOWS_ROOT.to_owned();
+            let saved = super::paths::approved_projects_dir().unwrap().join(format!(
+                "{}.json",
+                hex::encode(Sha256::digest(VERBATIM_WINDOWS_ROOT.as_bytes()))
+            ));
+            write_signed_json(&saved, &approved).unwrap();
+            let before = std::fs::read(&saved).unwrap();
+
+            ensure_project_trust_candidate_authorized(
+                &project,
+                &trusted,
+                true,
+                ApprovalSource::ProjectConfig,
+            )
+            .unwrap();
+
+            assert_eq!(std::fs::read(&saved).unwrap(), before);
+            assert_eq!(
+                std::fs::read_dir(super::paths::approved_projects_dir().unwrap())
+                    .unwrap()
+                    .count(),
+                1
+            );
+            let loaded = load_approved_project_policy_state(&project).unwrap();
+            assert_eq!(loaded.project_root, r"C:\work\app");
+            assert!(loaded.trusted_dependencies.contains_key("esbuild@0.25.1"));
+        });
+    });
+}
+
+#[test]
+fn a_project_unlock_granted_under_the_verbatim_root_still_applies_lists_and_revokes() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        let (project, _) = windows_shaped_project(temp.path());
+        let other = temp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        super::test_support::resolving_on_windows(&project, VERBATIM_WINDOWS_ROOT, || {
+            // How a version that kept the prefix saved the grant.
+            let mut grant = super::unlocks::create_unlock_grant_for_scopes(
+                &[
+                    ApprovalScope::TrustBulkApprove,
+                    ApprovalScope::ProvenanceUnverified,
+                ],
+                &project,
+                600,
+                None,
+                &[],
+            );
+            grant.project_root = Some(VERBATIM_WINDOWS_ROOT.to_owned());
+            super::unlocks::persist_unlock_grant(&grant).unwrap();
+
+            assert!(
+                has_active_project_unlock(ApprovalScope::TrustBulkApprove, &project, None, &[])
+                    .unwrap()
+            );
+            assert_eq!(list_active_project_unlocks(&project).unwrap().len(), 1);
+            check_runtime_sigstore_posture(&project, crate::provenance_fetch::EnforceMode::Off)
+                .unwrap();
+            assert!(list_active_project_unlocks(&other).unwrap().is_empty());
+
+            let revocations = lock_project_scopes_command(
+                "trust-bulk-approve",
+                &[ApprovalScope::TrustBulkApprove],
+                &project,
+                &[],
+            )
+            .unwrap();
+
+            assert_eq!(revocations.len(), 1);
+            assert_eq!(revocations[0].project_root.as_deref(), Some(r"C:\work\app"));
+            let kept = list_active_project_unlocks(&project).unwrap();
+            assert_eq!(kept.len(), 1);
+            assert_eq!(kept[0].project_root.as_deref(), Some(r"C:\work\app"));
+            assert_eq!(kept[0].scopes, [ApprovalScope::ProvenanceUnverified]);
+        });
+    });
+}

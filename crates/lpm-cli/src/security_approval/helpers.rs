@@ -13,11 +13,75 @@ pub(super) fn is_automation(json_output: bool) -> bool {
         )
 }
 
+/// A project's resolved root as approvals, unlocks and audit records name
+/// it. Windows resolves a directory to a verbatim path (`\\?\C:\work\app`);
+/// the root is written the way people and shells write it (`C:\work\app`)
+/// when that means the same, as firewall bypass rules write it. Records saved
+/// before kept the verbatim form, which [`ProjectRoot::names`] still accepts,
+/// and approval state stays filed under it ([`ProjectRoot::storage_key`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProjectRoot {
+    written: String,
+    verbatim: Option<String>,
+}
+
+impl ProjectRoot {
+    pub(super) fn of(project_dir: &Path) -> Self {
+        #[cfg(test)]
+        if let Some(resolved) = super::test_support::resolved_on_windows(project_dir) {
+            return Self::from_resolved(resolved, true);
+        }
+        let resolved = std::fs::canonicalize(project_dir)
+            .unwrap_or_else(|_| project_dir.to_path_buf())
+            .display()
+            .to_string();
+        Self::from_resolved(resolved, cfg!(windows))
+    }
+
+    /// The root for `resolved`, the directory as the file system resolved
+    /// it, written plainly where `windows` resolves to verbatim paths.
+    pub(super) fn from_resolved(resolved: String, windows: bool) -> Self {
+        if windows && let Some(plain) = crate::project_fs::plain_drive_path(&resolved) {
+            return Self {
+                written: plain.to_owned(),
+                verbatim: Some(resolved),
+            };
+        }
+        Self {
+            written: resolved,
+            verbatim: None,
+        }
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        &self.written
+    }
+
+    pub(super) fn into_string(self) -> String {
+        self.written
+    }
+
+    /// The verbatim form records saved before named this root by, where it
+    /// differs from how the root is written now.
+    pub(super) fn verbatim(&self) -> Option<&str> {
+        self.verbatim.as_deref()
+    }
+
+    /// The root as the file system resolved it, which keys the project's
+    /// approval state: the key it always had, so no state moves and every
+    /// version finds the same file.
+    pub(super) fn storage_key(&self) -> &str {
+        self.verbatim().unwrap_or(&self.written)
+    }
+
+    /// Whether `saved`, a root a record holds, names this project.
+    pub(super) fn names(&self, saved: &str) -> bool {
+        saved == self.written || self.verbatim() == Some(saved)
+    }
+}
+
 pub(super) fn canonical_project_root(project_dir: &Path) -> String {
-    std::fs::canonicalize(project_dir)
-        .unwrap_or_else(|_| project_dir.to_path_buf())
-        .display()
-        .to_string()
+    ProjectRoot::of(project_dir).into_string()
 }
 
 pub(super) fn canonical_global_root() -> Result<String, LpmError> {

@@ -126,29 +126,40 @@ pub fn list_active_global_unlocks() -> Result<Vec<UnlockGrant>, LpmError> {
 }
 
 pub fn list_active_project_unlocks(project_dir: &Path) -> Result<Vec<UnlockGrant>, LpmError> {
-    let root = canonical_project_root(project_dir);
+    let root = ProjectRoot::of(project_dir);
     let mut grants: Vec<_> = read_active_unlocks()?
         .into_iter()
         .filter(|grant| {
-            grant.target == UnlockTargetKind::Project
-                && grant.project_root.as_deref() == Some(root.as_str())
+            grant.target == UnlockTargetKind::Project && project_grant_names(grant, &root)
         })
         .collect();
     grants.sort_by_key(|left| left.expires_at);
     Ok(grants)
 }
 
+/// Whether a project unlock was granted for the project at `root`.
+pub(super) fn project_grant_names(grant: &UnlockGrant, root: &ProjectRoot) -> bool {
+    grant
+        .project_root
+        .as_deref()
+        .is_some_and(|saved| root.names(saved))
+}
+
 fn grant_matches_lock_request(
     grant: &UnlockGrant,
     target: UnlockTargetKind,
-    project_root: Option<&str>,
+    project_root: Option<&ProjectRoot>,
     scopes: &[ApprovalScope],
     packages: &[String],
 ) -> bool {
     if grant.target != target {
         return false;
     }
-    if target == UnlockTargetKind::Project && grant.project_root.as_deref() != project_root {
+    let same_project = match project_root {
+        Some(root) => project_grant_names(grant, root),
+        None => grant.project_root.is_none(),
+    };
+    if target == UnlockTargetKind::Project && !same_project {
         return false;
     }
     if !grant.scopes.iter().any(|scope| scopes.contains(scope)) {
@@ -174,14 +185,14 @@ fn revoke_unlocks(
 
     let requested_packages = normalized_packages(packages);
     let _lock = lpm_common::acquire_exclusive_lock(super::paths::unlocks_lock_path()?)?;
-    let project_root = project_root.map(canonical_project_root);
+    let project_root = project_root.map(ProjectRoot::of);
     let mut revocations = Vec::new();
 
     for entry in read_active_unlock_entries()? {
         if !grant_matches_lock_request(
             &entry.grant,
             target,
-            project_root.as_deref(),
+            project_root.as_ref(),
             &requested_scopes,
             &requested_packages,
         ) {
@@ -205,11 +216,18 @@ fn revoke_unlocks(
         let revoked_scopes = normalized_scopes(&revoked_scopes);
         let remaining_scopes = normalized_scopes(&remaining_scopes);
 
+        // A grant saved with the verbatim root is recorded, and kept, under
+        // the root as it is written now.
+        let grant_root = match (&project_root, entry.grant.target) {
+            (Some(root), UnlockTargetKind::Project) => Some(root.as_str().to_owned()),
+            _ => entry.grant.project_root.clone(),
+        };
         if remaining_scopes.is_empty() {
             std::fs::remove_file(&entry.path)?;
         } else {
             let mut updated = entry.grant.clone();
             updated.scopes = remaining_scopes.clone();
+            updated.project_root.clone_from(&grant_root);
             write_signed_json(&entry.path, &updated)?;
         }
 
@@ -217,7 +235,7 @@ fn revoke_unlocks(
             .packages(entry.grant.packages.clone())
             .source(source)
             .unlock_id(entry.grant.id.clone());
-        if let Some(root) = entry.grant.project_root.clone() {
+        if let Some(root) = grant_root.clone() {
             audit = audit.project_root(root);
         }
         let detail = if remaining_scopes.is_empty() {
@@ -233,7 +251,7 @@ fn revoke_unlocks(
         revocations.push(UnlockRevocation {
             id: entry.grant.id,
             target: entry.grant.target,
-            project_root: entry.grant.project_root,
+            project_root: grant_root,
             revoked_scopes,
             remaining_scopes,
             packages: entry.grant.packages,
@@ -297,12 +315,12 @@ pub(super) fn find_active_project_unlock(
     min_release_age_secs: Option<u64>,
     packages: &[String],
 ) -> Result<Option<UnlockGrant>, LpmError> {
-    let root = canonical_project_root(project_dir);
+    let root = ProjectRoot::of(project_dir);
     for grant in read_active_unlocks()? {
         if grant.target != UnlockTargetKind::Project {
             continue;
         }
-        if grant.project_root.as_deref() != Some(root.as_str()) {
+        if !project_grant_names(&grant, &root) {
             continue;
         }
         if !grant.scopes.contains(&scope) {

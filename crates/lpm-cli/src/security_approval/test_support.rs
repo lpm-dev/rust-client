@@ -75,3 +75,35 @@ pub(crate) fn audit_records(event: &str) -> Vec<RecordedAudit> {
         })
         .collect()
 }
+
+thread_local! {
+    static RESOLVED_ON_WINDOWS: std::cell::RefCell<Option<(PathBuf, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` with `dir` resolving to `resolved`, a verbatim path such as
+/// `\\?\C:\work\app`, the way Windows resolves a directory, so the code that
+/// names projects can be tested on every platform.
+pub(crate) fn resolving_on_windows<T>(dir: &Path, resolved: &str, f: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            RESOLVED_ON_WINDOWS.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    RESOLVED_ON_WINDOWS.with(|slot| {
+        *slot.borrow_mut() = Some((dir.to_path_buf(), resolved.to_owned()));
+    });
+    let _reset = Reset;
+    f()
+}
+
+/// What [`resolving_on_windows`] makes `dir` resolve to, if anything.
+pub(super) fn resolved_on_windows(dir: &Path) -> Option<String> {
+    RESOLVED_ON_WINDOWS.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(resolving, _)| resolving == dir)
+            .map(|(_, resolved)| resolved.clone())
+    })
+}

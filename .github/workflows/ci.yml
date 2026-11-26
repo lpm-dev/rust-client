@@ -846,6 +846,9 @@ jobs:
       - name: Windows live port kill workflow test
         run: cargo test --locked -p lpm-workflows --test ports ports_kill_range_json_with_yes_terminates_live_listener_process
 
+      - name: Windows project roots in security status
+        run: cargo test --locked -p lpm-workflows --test security security_status_json_defaults_to_project_target
+
   # Lint and the macOS job run Clippy on Unix only, so code behind
   # `cfg(windows)` or `cfg(not(unix))` is linted nowhere else.
   windows-clippy:

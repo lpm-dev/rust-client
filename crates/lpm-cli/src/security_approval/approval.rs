@@ -1324,7 +1324,7 @@ pub(crate) fn check_runtime_sigstore_posture(
     }
     // Diagnostics must not prune expired grants or create an unlock lock file.
     let dir = unlocks_dir()?;
-    let root = canonical_project_root(project_dir);
+    let root = ProjectRoot::of(project_dir);
     if dir.try_exists()? {
         let now = Timestamp::now();
         for entry in std::fs::read_dir(dir)? {
@@ -1335,7 +1335,7 @@ pub(crate) fn check_runtime_sigstore_posture(
             if let Some(grant) = read_signed_json::<UnlockGrant>(&path)?
                 && grant.expires_at > now
                 && grant.target == UnlockTargetKind::Project
-                && grant.project_root.as_deref() == Some(root.as_str())
+                && super::unlocks::project_grant_names(&grant, &root)
                 && grant.scopes.contains(&ApprovalScope::ProvenanceUnverified)
                 && unlock_grant_covers_packages(&grant, &[])
             {
