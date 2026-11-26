@@ -2983,6 +2983,10 @@ fn deleting_a_policy_key_never_copies_a_managed_action_into_the_local_posture() 
             .is_none(),
         "{posture}"
     );
+    assert_eq!(
+        posture["payload"]["firewall_policies"]["critical_vulnerability"], "block",
+        "{posture}"
+    );
 }
 
 #[test]
