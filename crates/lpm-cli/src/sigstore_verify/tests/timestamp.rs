@@ -420,6 +420,9 @@ enum Ess {
     /// `SigningCertificateV2` with the signer's hash and this certificate's
     /// issuer and serial number.
     V2IssuerSerialOf(Vec<u8>),
+    /// `SigningCertificateV2` naming its hash algorithm, and the signer's
+    /// hash under the second algorithm.
+    V2Hashed(&'static [u8], &'static [u8]),
 }
 
 /// What a synthesized token says; [`Token::default`] is a valid token
@@ -517,6 +520,24 @@ fn ess_attribute(ess: &Ess, signer: &[u8]) -> Option<Vec<u8>> {
                 ),
             )
         }
+        Ess::V2Hashed(named_algorithm, hashed_with) => (
+            OID_SIGNING_CERTIFICATE_V2,
+            tlv(
+                der::TAG_SEQUENCE,
+                &[
+                    &algorithm(named_algorithm),
+                    &tlv(
+                        der::TAG_OCTET_STRING,
+                        &[&if *hashed_with == OID_SHA384 {
+                            sha2::Sha384::digest(signer).to_vec()
+                        } else {
+                            Sha256::digest(signer).to_vec()
+                        }],
+                    ),
+                    &issuer_serial(signer),
+                ],
+            ),
+        ),
         Ess::V1 => (
             OID_SIGNING_CERTIFICATE,
             tlv(
@@ -1050,6 +1071,23 @@ fn the_signing_certificate_attribute_must_name_the_signer() {
         ..Token::default()
     };
     assert!(refusal(&wrong, &authority).contains("signing certificate attribute"));
+}
+
+#[test]
+fn the_signing_certificate_attribute_may_name_its_hash_algorithm() {
+    let authority = test_authority(|_| {});
+    for (named, hashed_with) in [(OID_SHA256, OID_SHA256), (OID_SHA384, OID_SHA384)] {
+        let token = Token {
+            ess: Ess::V2Hashed(named, hashed_with),
+            ..Token::default()
+        };
+        verify_token(&token, &authority).unwrap();
+    }
+    let mismatched = Token {
+        ess: Ess::V2Hashed(OID_SHA384, OID_SHA256),
+        ..Token::default()
+    };
+    assert!(refusal(&mismatched, &authority).contains("names another certificate"));
 }
 
 #[test]
