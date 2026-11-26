@@ -302,6 +302,52 @@ async fn monitor_reports_what_a_rule_would_allow_when_a_later_verdict_batch_fail
 }
 
 #[tokio::test]
+async fn an_install_whose_later_verdict_request_fails_prints_what_a_rule_let_through() {
+    let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
+    mock.with_package(
+        "unchecked-tool",
+        "1.0.0",
+        &make_tarball("unchecked-tool", "1.0.0"),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path(VERDICTS_PATH))
+        .and(body_string_contains("\"name\":\"unchecked-tool\""))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(mock.server())
+        .await;
+    let project = enforcing_project();
+    write_signed_firewall_bypass(
+        &project,
+        &[stored_rule("agent-tool", serde_json::json!({}))],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_EXPERIMENT_NPM_FIREWALL_CHUNK_SIZE", "1")
+        .args([
+            "--color",
+            "never",
+            "install",
+            "--no-skills",
+            "agent-tool@1.0.0",
+            "unchecked-tool@1.0.0",
+        ])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("! LPM Firewall allowed 1 blocked package because of your bypass rules:\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("    rule: agent-tool (every project)\n"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
 async fn name_rule_never_lets_a_malware_version_through() {
     let mock = registry_blocking("hijacked", "malicious", "lpm_ai_confirmed_malware").await;
     let project = enforcing_project();

@@ -2409,6 +2409,7 @@ fn one_version_bypassed_in_two_chunks_is_reported_once() {
         ..NpmFirewallPreflightStats::default()
     };
     let result = NpmFirewallPreflightResult {
+        failure: None,
         stats,
         decisions: Vec::new(),
         report_error: None,

@@ -861,6 +861,15 @@ async fn approve_and_save_attempts(
                         pending.iter().find(|rule| rule.spec == coordinate).cloned()
                     })
                     .collect();
+                // Read again before each prompt, since a managed policy that
+                // turns local rules off can appear while one is open.
+                let effective = security_approval::load_effective_authorized_posture()
+                    .map_err(AddRefusal::settings_unreadable)?;
+                if let Some(reason) =
+                    security_approval::local_firewall_bypass_inactive_reason(&effective)
+                {
+                    return Err(LpmError::SecurityFloor(reason).into());
+                }
                 approve(&security_approval::FirewallBypassApproval {
                     rules,
                     prompt: &prompt,
@@ -2100,6 +2109,36 @@ mod tests {
             let error = run_add(&planned, vec![rule(&specs[0], None)], |_| {
                 panic!("nothing is approved without a preview")
             })
+            .unwrap_err();
+
+            assert!(error.to_string().contains("npm_SECRETVALUE"), "{error}");
+            assert_eq!(
+                security_approval::test_support::audit_details("firewall-bypass-added"),
+                [Some(format!(
+                    "LPM CLI couldn't read the settings `add` checks ({})",
+                    error.error_code()
+                ))]
+            );
+        });
+    }
+
+    #[test]
+    fn an_approval_that_cannot_read_the_managed_policy_records_only_the_kind() {
+        let temp = tempfile::tempdir().unwrap();
+        security_approval::test_support::with_test_env(temp.path(), || {
+            let specs = specs(&["fresh@1.0.0"]);
+            let scope = global();
+            std::fs::write(
+                temp.path().join("managed-security-policy.toml"),
+                "registry-token = \"npm_SECRETVALUE\n",
+            )
+            .unwrap();
+
+            let error = run_add(
+                &plan(&specs, &scope, None, false),
+                vec![rule(&specs[0], None)],
+                |_| panic!("nothing is approved when the settings can't be read"),
+            )
             .unwrap_err();
 
             assert!(error.to_string().contains("npm_SECRETVALUE"), "{error}");

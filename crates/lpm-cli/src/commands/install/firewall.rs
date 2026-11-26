@@ -1879,6 +1879,10 @@ pub(super) fn finish_npm_firewall_preflight(
         ))
     });
     if let Some(failure) = result.failure {
+        // A chunk a rule lifted was released to download before the failure.
+        if !json_output {
+            print_bypassed_verdicts(&stats.bypassed, false);
+        }
         return Err(failure);
     }
     // A failed request in monitor mode still leaves what the requests before

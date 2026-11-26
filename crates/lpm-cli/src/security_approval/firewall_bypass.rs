@@ -424,15 +424,12 @@ pub(crate) struct FirewallBypassApproval<'a> {
 
 /// Asks the person at the terminal to approve `approval.rules` with a fresh
 /// native approval; saves and records nothing, so the caller records one
-/// refusal for the whole request. Nothing else, such as a FloorEdit unlock,
+/// refusal for the whole request. The caller checks first that local rules
+/// still apply. Nothing else, such as a FloorEdit unlock,
 /// stands in for the prompt, and `--json` never prompts.
 pub(crate) fn approve_firewall_bypass_rules(
     approval: &FirewallBypassApproval<'_>,
 ) -> Result<(), LpmError> {
-    let effective = load_effective_authorized_posture()?;
-    if let Some(reason) = local_firewall_bypass_inactive_reason(&effective) {
-        return Err(LpmError::SecurityFloor(reason));
-    }
     // `--json` is checked on its own so it never prompts, even where tests
     // stand in for the person at a terminal.
     if approval.json_output || is_automation(approval.json_output) {
