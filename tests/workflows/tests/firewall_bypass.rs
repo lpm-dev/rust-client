@@ -1301,6 +1301,12 @@ async fn batch_global_update_prints_what_a_bypass_rule_let_through_under_its_too
         1,
         "{text}"
     );
+    assert!(
+        text.contains(
+            "✓ Upgraded update-tool 1.0.0 → 1.1.0\n! LPM Firewall allowed 1 blocked package because of your bypass rules:\n"
+        ),
+        "{text}"
+    );
     assert!(text.contains("rule: update-tool"), "{text}");
 }
 

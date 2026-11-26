@@ -1,18 +1,28 @@
 use super::run_locked;
+use crate::commands::install::FirewallBypassReport;
 use crate::output;
 use lpm_common::{LpmError, sanitize_terminal_inline};
 use lpm_registry::{RegistryClient, VersionMetadata};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Default)]
 pub(super) struct SwiftTraversal {
     resolved: HashMap<String, String>,
     warnings: Vec<String>,
     pub(super) preview: super::preview::PreviewState,
+    firewall_bypass_report: Arc<FirewallBypassReport>,
 }
 
 impl SwiftTraversal {
+    /// What LPM Firewall bypass rules let through in every install the
+    /// traversal runs, so the root `add` reports its source dependencies'
+    /// installs too.
+    pub(super) fn firewall_bypass_report(&self) -> Arc<FirewallBypassReport> {
+        Arc::clone(&self.firewall_bypass_report)
+    }
+
     pub(super) fn record_resolution(
         &mut self,
         package: &str,

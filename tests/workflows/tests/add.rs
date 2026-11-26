@@ -5971,3 +5971,86 @@ async fn lpm_add_json_reports_a_source_dependency_a_bypass_rule_let_through() {
         "{envelope:#}"
     );
 }
+
+#[tokio::test]
+async fn lpm_add_json_reports_a_bypass_rule_a_swift_source_dependency_install_used() {
+    let mock = MockRegistry::start().await;
+    let root = "@lpm.dev/swift.bypass-root";
+    let child = "@lpm.dev/swift.bypass-child";
+    mount_swift_source_package(
+        &mock,
+        root,
+        "1.0.0",
+        &[("1.0.0", json!({ child: "1.0.0" }), "root\n")],
+    )
+    .await;
+    // Without `dependencies` in `lpm.config.json`, the child's own
+    // `package.json` dependencies are installed.
+    let child_tarball = make_tarball_from_pkg_json(
+        json!({
+            "name": child,
+            "version": "1.0.0",
+            "dependencies": { "blocked-source-dep": "1.0.0" },
+        }),
+        &[
+            (
+                "lpm.config.json",
+                br#"{"ecosystem":"swift","files":[{"src":"Source.swift","dest":"swift.bypass-child-1.0.0.swift"}]}"#,
+            ),
+            ("Source.swift", b"child\n"),
+        ],
+    );
+    mock.mount_full_package_metadata_routes(
+        child,
+        "1.0.0",
+        &[("1.0.0", json!({}), Some(child_tarball))],
+    )
+    .await;
+    let dependency_tarball = make_tarball_from_pkg_json(
+        json!({ "name": "blocked-source-dep", "version": "1.0.0" }),
+        &[],
+    );
+    mock.with_package("blocked-source-dep", "1.0.0", &dependency_tarball)
+        .await;
+    mock.with_npm_firewall_block("blocked-source-dep", "1.0.0")
+        .await;
+    let project = TempProject::empty(
+        r#"{"name":"add-swift-firewall-dep","version":"1.0.0","dependencies":{}}"#,
+    );
+    write_npm_firewall_global_config(&project, "enforce");
+    support::write_signed_firewall_bypass(
+        &project,
+        &[json!({
+            "id": "fwb_blocked",
+            "spec": "blocked-source-dep@1.0.0",
+            "scope": "global",
+            "covers_malware": true,
+            "added_at": "2026-11-25T10:00:00Z",
+        })],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["add", root, "--yes", "--json", "--no-skills"])
+        .output()
+        .expect("failed to run lpm add");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(project.file_exists("node_modules/blocked-source-dep/package.json"));
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["package"]["name"], root, "{envelope:#}");
+    let firewall = &envelope["security"]["firewall"];
+    assert_eq!(firewall["mode"], "enforce", "{envelope:#}");
+    assert_eq!(
+        firewall["bypassed"][0]["name"], "blocked-source-dep",
+        "{envelope:#}"
+    );
+    assert_eq!(
+        firewall["bypassed"][0]["rule"]["spec"], "blocked-source-dep@1.0.0",
+        "{envelope:#}"
+    );
+}

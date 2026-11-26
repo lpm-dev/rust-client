@@ -1509,8 +1509,7 @@ async fn run_locked(
     // (no `lpm.config.json`) keeps the download-manager contract:
     // copy bytes, surface external imports, let the user install deps
     // themselves.
-    let firewall_bypass_report =
-        std::sync::Arc::new(crate::commands::install::FirewallBypassReport::default());
+    let firewall_bypass_report = swift_traversal.firewall_bypass_report();
     let dependency_outcome = if !no_install_deps && lpm_config.is_some() {
         handle_dependencies(
             client,
