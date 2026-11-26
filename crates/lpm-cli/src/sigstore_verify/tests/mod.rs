@@ -2891,17 +2891,22 @@ fn an_sct_is_checked_under_the_ct_log_key_valid_at_its_own_time() {
 
 #[test]
 fn an_sct_timestamp_past_the_year_9999_is_refused_on_every_platform() {
-    // Windows' clock can't hold this time at all, and elsewhere a validity
-    // window would read it as the end of the year 9999: inside a key's
-    // open-ended window. The SCT itself verifies under the key.
-    let (leaf_der, issuer_spki, mut ct_log_key) = leaf_with_sct_at(u64::MAX);
-    ct_log_key.valid_for.end = None;
-    let refused = verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key))
-        .unwrap_err();
-    assert!(
-        matches!(&refused, VerifyError::Sct(why) if why.contains("out of range")),
-        "{refused:?}"
-    );
+    // A validity window would read such a time as the end of the year 9999:
+    // inside a key's open-ended window. The first millisecond of the year
+    // 10000 fits every platform's clock; the largest timestamp fits none.
+    // Either way the SCT itself verifies under the key.
+    const YEAR_10000_MS: u64 = 253_402_300_800_000;
+    for timestamp_ms in [YEAR_10000_MS, u64::MAX] {
+        let (leaf_der, issuer_spki, mut ct_log_key) = leaf_with_sct_at(timestamp_ms);
+        ct_log_key.valid_for.end = None;
+        let refused =
+            verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key))
+                .unwrap_err();
+        assert!(
+            matches!(&refused, VerifyError::Sct(why) if why.contains("out of range")),
+            "{timestamp_ms}: {refused:?}"
+        );
+    }
 }
 
 /// A leaf whose embedded SCT a fresh CT log key signed at `timestamp_ms`,
