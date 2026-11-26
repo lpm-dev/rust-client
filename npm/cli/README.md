@@ -6,6 +6,31 @@ Fast, secure, all-in-one package manager written in Rust.
 npm install -g @lpm-registry/cli --allow-scripts=@lpm-registry/cli
 ```
 
+Install it globally with `-g`. Without `-g`, npm adds LPM CLI to the current
+project only, and `lpm` on your `PATH` stays whatever it was before.
+
+If npm stops with `EACCES: permission denied`, your global npm folder belongs
+to root, as it does when Node comes from the nodejs.org installer. Don't rerun
+the command with `sudo`. On macOS or Linux, use the standalone installer
+instead:
+
+```bash
+curl -fsSL https://cli.lpm.dev/install | sh
+```
+
+Or give npm a global folder you own, then run the install command again:
+
+```bash
+npm config set prefix ~/.npm-global
+export PATH="$HOME/.npm-global/bin:$PATH"
+```
+
+Add the `export` line to your shell profile, such as `~/.zshrc` or
+`~/.bashrc`, so new terminals find `lpm`.
+
+If `lpm --version` still shows an older version after the install, an older
+copy comes first on your `PATH`. `which -a lpm` lists every copy.
+
 This package is the npm gateway for the native LPM CLI. It installs the
 matching platform package, such as
 `@lpm-registry/cli-darwin-arm64`, `@lpm-registry/cli-linux-x64`, or
@@ -87,9 +112,7 @@ commands:
 npm install -g @lpm-registry/cli --allow-scripts=@lpm-registry/cli
 ```
 
-Do not run this install with `sudo`. Configure a user-writable npm global
-prefix, or use the Homebrew or standalone installer. Run all LPM CLI user
-commands without `sudo`.
+Run all LPM CLI commands, and every install, without `sudo`.
 
 Other install methods are documented at
 [github.com/lpm-dev/rust-client](https://github.com/lpm-dev/rust-client).
