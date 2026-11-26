@@ -1,34 +1,7 @@
 use super::prelude::*;
+use super::test_support::with_test_env;
 use super::*;
 use tempfile::tempdir;
-
-fn with_test_env<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
-    let policy_path = dir.join("managed-security-policy.toml");
-    let lpm_home = dir.join("lpm-home");
-    let _env = crate::test_env::ScopedEnv::update([
-        ("LPM_HOME", Some(lpm_home.as_os_str().to_owned())),
-        (SECURITY_DIR_ENV, Some(dir.as_os_str().to_owned())),
-        (
-            SECURITY_POLICY_PATH_ENV,
-            Some(policy_path.as_os_str().to_owned()),
-        ),
-        (
-            TEST_SECRET_ENV,
-            Some(std::ffi::OsString::from(
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            )),
-        ),
-        (
-            TEST_AUTH_RESULT_ENV,
-            Some(std::ffi::OsString::from("approve")),
-        ),
-        ("LPM_NPM_FIREWALL", None),
-        ("LPM_EXPERIMENT_NPM_FIREWALL", None),
-        ("LPM_PROVENANCE_ENFORCE", None),
-        ("LPM_FORCE_FILE_VAULT", None),
-    ]);
-    f()
-}
 
 fn with_file_secret_env<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
     with_test_env(dir, || {

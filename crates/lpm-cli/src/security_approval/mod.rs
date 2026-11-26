@@ -17,6 +17,8 @@ mod posture;
 mod project_state;
 mod signed_store;
 #[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(test)]
 mod tests;
 mod types;
 mod unlocks;
