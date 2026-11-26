@@ -916,6 +916,19 @@ async fn rekor_upload(
     let inclusion_proof = verification
         .inclusion_proof
         .ok_or_else(|| LpmError::Registry("Rekor's response carries no inclusion proof".into()))?;
+    // Rekor v1 sends the proof whole. The zero values bundles may leave
+    // out would otherwise fill in a partial one.
+    let proof_is_complete = inclusion_proof
+        .checkpoint
+        .as_str()
+        .is_some_and(|checkpoint| !checkpoint.is_empty())
+        && !inclusion_proof.root_hash.is_empty()
+        && (0..inclusion_proof.tree_size).contains(&inclusion_proof.log_index);
+    if !proof_is_complete {
+        return Err(LpmError::Registry(
+            "Rekor's response carries an incomplete inclusion proof".into(),
+        ));
+    }
 
     Ok(TlogEntry {
         log_index,
@@ -1755,11 +1768,15 @@ mod tests {
         };
         let mut malformed_proof = rekor_api_verification();
         malformed_proof["inclusionProof"]["treeSize"] = serde_json::json!("eight");
+        let mut partial_proof = rekor_api_verification();
+        partial_proof["inclusionProof"] =
+            serde_json::json!({ "checkpoint": "rekor.sigstore.dev - 1\n8\nabc=\n\n" });
         for (verification, expected) in [
             (None, "no signed entry timestamp"),
             (without("signedEntryTimestamp"), "no signed entry timestamp"),
             (without("inclusionProof"), "no inclusion proof"),
             (Some(malformed_proof), "`verification` is malformed"),
+            (Some(partial_proof), "incomplete inclusion proof"),
         ] {
             let server = MockServer::start().await;
             let mut entry = serde_json::json!({

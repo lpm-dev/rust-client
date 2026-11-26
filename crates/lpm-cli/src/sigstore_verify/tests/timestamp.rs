@@ -1734,3 +1734,30 @@ fn a_bundle_whose_envelope_carries_a_second_signature_is_refused() {
         );
     }
 }
+
+#[test]
+fn a_bundle_whose_envelope_carries_no_signature_or_a_repeated_one_is_refused() {
+    let case = "intoto-with-custom-trust-root";
+    let trust = TrustRoot::parse(&conformance_file(case, "trusted_root.json")).unwrap();
+    let bundle: serde_json::Value =
+        serde_json::from_slice(&conformance_file(case, "bundle.sigstore.json")).unwrap();
+    let only = bundle["dsseEnvelope"]["signatures"][0].clone();
+    for signatures in [
+        serde_json::json!([]),
+        serde_json::json!([only.clone(), only]),
+    ] {
+        let mut bundle = bundle.clone();
+        bundle["dsseEnvelope"]["signatures"] = signatures;
+        let refused = verify_sigstore_bundle_with(
+            &serde_json::to_vec(&bundle).unwrap(),
+            &IdentityExpectations::none(),
+            VerifyOptions::npm_attestation(),
+            &trust,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&refused, VerifyError::DsseSignature(why) if why.contains("exactly one")),
+            "{refused:?}"
+        );
+    }
+}
