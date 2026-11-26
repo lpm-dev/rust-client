@@ -56,7 +56,7 @@ pub enum VerifyError {
     ///
     /// Trust roots intentionally carry retired entries alongside
     /// active ones so that bundles signed during retired windows
-    /// can still verify against the integratedTime they declare
+    /// can still verify against the time they were signed at
     /// — so a single past `validFor.end` is NOT expiry; the
     /// artifact is expired when an entire role has gone retired-
     /// only.
@@ -65,7 +65,7 @@ pub enum VerifyError {
 
     /// The bundle names a Fulcio certificate authority, Rekor log or
     /// CT log that the trust root in use doesn't hold, or holds only
-    /// for other times than the bundle's `integratedTime`. Sigstore's
+    /// for other times than the bundle's signing time. Sigstore's
     /// current trust root may hold it. `check` names the verification
     /// step that needed it.
     #[error("{check} verification failed: {detail}")]
@@ -122,7 +122,7 @@ pub enum VerifyError {
     InclusionProofMissing,
 
     /// X.509 chain validation failed: a cert's notBefore/notAfter
-    /// window did not contain `integratedTime`, an issuer/subject
+    /// window did not contain the signing time, an issuer/subject
     /// pair didn't line up, a link's signature didn't verify under
     /// its parent, or the chain used an unsupported signature
     /// algorithm. A chain no trusted Fulcio root anchors is

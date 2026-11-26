@@ -26,9 +26,10 @@ pub(super) enum LogStyle {
     /// without a port, over an origin naming the shard. Its signature is
     /// the one with the log's key ID, as Rekor's own verifier finds it.
     RekorV1,
-    /// Rekor v2 signs under its name, the host of its base URL, which is
-    /// also the checkpoint's origin. Its signature is the one with both
-    /// that name and the log's key ID.
+    /// Rekor v2 signs under its name, which is also the checkpoint's
+    /// origin. Its signature is the one with both that name and the log's
+    /// key ID. The name is the host of its base URL, or for an Ed25519 log
+    /// a name its full key ID in the trust root commits to.
     RekorV2,
 }
 
@@ -83,22 +84,27 @@ pub(super) fn verify_checkpoint(
     })
 }
 
-/// Whether one of `envelope`'s signature lines names `log` as its signer,
-/// whether or not it verifies: how a Rekor v2 entry that doesn't name its
-/// log finds it.
-pub(super) fn names_log(envelope: &str, log: &RekorKey) -> bool {
-    let Ok(signer) = LogSigner::new(log, LogStyle::RekorV2) else {
-        return false;
-    };
-    let Ok((_, signatures)) = split_note(envelope) else {
-        return false;
-    };
-    let Ok(lines) = signature_lines(signatures) else {
-        return false;
-    };
-    lines
-        .flatten()
-        .any(|(name, signature)| signer.signs_as(name, &signature[..4]))
+/// The logs among `logs` that one of `envelope`'s signature lines names
+/// as the signer under the checkpoint's origin, whether or not it
+/// verifies: how a Rekor v2 entry that doesn't name its log finds it. A
+/// note that doesn't parse is an error, not a log the trust root lacks.
+pub(super) fn logs_signing<'a>(
+    envelope: &str,
+    logs: &'a [RekorKey],
+) -> Result<Vec<&'a RekorKey>, String> {
+    let (text, signatures) = split_note(envelope)?;
+    let origin = parse_checkpoint_text(text)?.origin;
+    let lines = signature_lines(signatures)?.collect::<Result<Vec<_>, _>>()?;
+    Ok(logs
+        .iter()
+        .filter(|log| {
+            LogSigner::new(log, LogStyle::RekorV2).is_ok_and(|signer| {
+                lines.iter().any(|(name, signature)| {
+                    *name == origin && signer.signs_as(name, &signature[..4])
+                })
+            })
+        })
+        .collect())
 }
 
 /// Which signature lines on a checkpoint are a log's.
@@ -124,8 +130,9 @@ impl<'a> LogSigner<'a> {
     /// A Rekor v2 log signs under its name. For an Ed25519 log the trust
     /// root's 32-byte key ID commits to that name, so a name whose key ID it
     /// is counts even when it isn't the base URL's host, as with a port or
-    /// a path; otherwise the name is the host. Rekor v1 is matched by key ID
-    /// alone, as Rekor's own verifier matches it.
+    /// a path; otherwise the name is the host. A four-byte checkpoint key
+    /// ID commits to nothing, so it doesn't stand in for the host. Rekor v1
+    /// is matched by key ID alone, as Rekor's own verifier matches it.
     fn signs_as(&self, name: &str, key_id: &[u8]) -> bool {
         match &self.key {
             LogKey::Ecdsa { .. } => {
@@ -157,8 +164,9 @@ fn signature_lines(
     Ok(signatures.split_terminator('\n').map(parse_signature_line))
 }
 
-/// The name a Rekor v2 log signs its checkpoints with: the host of its
-/// base URL, which may be given without a scheme.
+/// The name a Rekor v2 log signs its checkpoints with unless its key ID
+/// commits to another: the host of its base URL, which may be given
+/// without a scheme.
 pub(super) fn log_name(base_url: &str) -> Option<String> {
     let parsed = url::Url::parse(base_url)
         .ok()

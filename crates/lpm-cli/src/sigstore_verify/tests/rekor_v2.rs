@@ -257,6 +257,68 @@ fn a_rekor_v2_entry_that_does_not_name_its_log_is_matched_by_its_checkpoint() {
 }
 
 #[test]
+fn an_empty_log_id_object_is_a_log_id_left_out() {
+    // Protobuf JSON writes an empty `LogId` message as `{}`.
+    let mut bundle = conformance_bundle(DSSE_CASE);
+    bundle["verificationMaterial"]["tlogEntries"][0]["logId"] = serde_json::json!({});
+    let verified = verify(
+        &bundle,
+        &conformance_trust(DSSE_CASE),
+        VerifyOptions::npm_attestation(),
+    )
+    .unwrap();
+    assert_eq!(
+        verified.log_id,
+        "09OnDKEw7/hpZiYVPoTRzRbglHk0sylsUovegnRUlJY="
+    );
+}
+
+#[test]
+fn a_rekor_v2_entry_reports_the_trust_roots_log_id_however_it_spells_it() {
+    let mut bundle = conformance_bundle(DSSE_CASE);
+    let log_id = decode_log_id(&tlog_entry(&bundle).log_id.key_id).unwrap();
+    bundle["verificationMaterial"]["tlogEntries"][0]["logId"]["keyId"] =
+        serde_json::json!(hex::encode(&log_id));
+    let verified = verify(
+        &bundle,
+        &conformance_trust(DSSE_CASE),
+        VerifyOptions::npm_attestation(),
+    )
+    .unwrap();
+    assert_eq!(
+        verified.log_id,
+        "09OnDKEw7/hpZiYVPoTRzRbglHk0sylsUovegnRUlJY="
+    );
+}
+
+#[test]
+fn a_malformed_checkpoint_on_an_entry_that_does_not_name_its_log_is_refused() {
+    // Not knowing which log signed it says nothing about the trust root.
+    let mut bundle = conformance_bundle(DSSE_CASE);
+    let entry = bundle["verificationMaterial"]["tlogEntries"][0]
+        .as_object_mut()
+        .unwrap();
+    entry.remove("logId");
+    let envelope = entry["inclusionProof"]["checkpoint"]["envelope"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    entry["inclusionProof"]["checkpoint"]["envelope"] = serde_json::json!(format!(
+        "{envelope}\u{2014} witness.test.example not-base64!\n"
+    ));
+    let refused = verify(
+        &bundle,
+        &conformance_trust(DSSE_CASE),
+        VerifyOptions::npm_attestation(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&refused, VerifyError::InclusionProof(why) if why.contains("malformed")),
+        "{refused:?}"
+    );
+}
+
+#[test]
 fn a_rekor_v2_log_the_trust_root_names_by_its_checkpoint_key_id_is_found() {
     let bundle = conformance_bundle(DSSE_CASE);
     let entry = tlog_entry(&bundle);

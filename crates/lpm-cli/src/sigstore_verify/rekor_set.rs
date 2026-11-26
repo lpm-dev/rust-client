@@ -146,6 +146,13 @@ fn integrated_time_secs(t: &SystemTime) -> i64 {
 /// length disambiguates the two encodings without false positives
 /// because hex characters are a subset of base64 characters.
 pub(super) fn decode_log_id(raw: &str) -> Result<Vec<u8>, VerifyError> {
+    // An entry that names no log is malformed, not one from a log the trust
+    // root lacks.
+    if raw.is_empty() {
+        return Err(VerifyError::RekorSet(
+            "TlogEntry.logId.keyId is empty, so the entry names no log".into(),
+        ));
+    }
     if raw.len() == 64 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
         return hex::decode(raw).map_err(|e| {
             VerifyError::RekorSet(format!(

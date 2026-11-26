@@ -7,7 +7,7 @@
 //! - Sigstore trust root: built into the binary, refreshed from
 //!   Sigstore's TUF repository when a signature needs newer keys.
 //! - DSSE envelope verification against the leaf cert.
-//! - X.509 chain validation at `integratedTime`, and again at the time of
+//! - X.509 chain validation at the signing time, and again at the time of
 //!   every RFC 3161 signed timestamp that verifies.
 //! - embedded SCT verification.
 //! - semantic Rekor body match: an `intoto` or `dsse` entry from Rekor

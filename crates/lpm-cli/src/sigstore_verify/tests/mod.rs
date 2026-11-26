@@ -3690,6 +3690,32 @@ fn verifies_real_npm_attestation_for_axios_1_14_0() {
 }
 
 #[test]
+fn a_rekor_v1_entry_naming_no_log_is_malformed_not_from_an_unknown_log() {
+    // An unknown log would send the verifier for newer trust material.
+    let body = load_fixture_bundle(REAL_NPM_FIXTURE);
+    let mut root: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    for attestation in root["attestations"].as_array_mut().unwrap() {
+        if let Some(entries) =
+            attestation["bundle"]["verificationMaterial"]["tlogEntries"].as_array_mut()
+        {
+            for entry in entries {
+                entry["logId"] = serde_json::json!({});
+            }
+        }
+    }
+    let error = verify_sigstore_bundle(
+        &serde_json::to_vec(&root).unwrap(),
+        &IdentityExpectations::none(),
+        VerifyOptions::npm_attestation(),
+    )
+    .expect_err("an entry naming no log can't be checked");
+    assert!(
+        matches!(&error, VerifyError::RekorSet(why) if why.contains("names no log")),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn rejects_proof_only_bundle_with_malformed_outer_log_index() {
     let body = load_fixture_bundle(REAL_NPM_FIXTURE);
     let mut root: serde_json::Value =

@@ -427,8 +427,9 @@ pub struct KindVersion {
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct LogId {
-    /// Hex-encoded key ID of the Rekor log.
-    #[serde(rename = "keyId")]
+    /// Hex-encoded key ID of the Rekor log. Protobuf JSON leaves an empty
+    /// one out, as `"logId": {}`.
+    #[serde(rename = "keyId", default)]
     pub key_id: String,
 }
 

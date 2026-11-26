@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::time::SystemTime;
 use x509_parser::prelude::*;
 
-use super::checkpoint::names_log;
+use super::checkpoint::logs_signing;
 use super::dsse::verify_dsse_signature;
 use super::inclusion::{extract_checkpoint_envelope, verify_rekor_v2_inclusion_proof};
 use super::rekor_body::{RekorEntryVersion, rekor_entry_version, verify_hashedrekord_v002};
@@ -19,9 +19,10 @@ use super::{
 
 // The composed verifier runs each cryptographic phase to completion
 // before trusting output from that phase. All downstream validity-window
-// checks use the signing time (Rekor v1's `integratedTime`, or an RFC 3161
-// timestamp), not wall-clock time, so historical bundles verify against
-// the Fulcio and CT keys active when they were signed.
+// checks use signed times (Rekor v1's `integratedTime` under a SET, an RFC
+// 3161 timestamp, or an SCT's own time), not wall-clock time, so
+// historical bundles verify against the Fulcio and CT keys active when
+// they were signed.
 /// Verifier-time options. Currently carries the
 /// [`RekorInclusionProofPolicy`] only; future knobs can live here
 /// without breaking the public API.
@@ -102,8 +103,8 @@ pub struct VerifiedProvenance {
     pub build: CertificateBuildClaims,
     pub statement: serde_json::Value,
     /// When the signature was made, as far as signed evidence shows: the
-    /// integrated time Rekor v1 signed in the entry's SET, or for a Rekor
-    /// v2 entry the earliest RFC 3161 timestamp.
+    /// integrated time Rekor v1 signed in the entry's SET, or else the
+    /// earliest RFC 3161 timestamp that verifies.
     pub signed_at: SystemTime,
     pub leaf_cert_sha256: String,
     pub log_id: String,
@@ -242,10 +243,10 @@ pub(super) fn verify_sigstore_bundle_with(
         )?
     };
 
-    // The time the certificate is checked at and the SCT's log is chosen
-    // by. For Rekor v1, the integrated time its SET signs (the bundle's
-    // unsigned value under `Either` without a SET). Rekor v2 records no
-    // time, so its entries need a timestamp, and the earliest one counts.
+    // The time the certificate is checked at. For Rekor v1, the integrated
+    // time its SET signs (the bundle's unsigned value under `Either`
+    // without a SET). Rekor v2 records no time, so its entries need a
+    // timestamp, and the earliest one counts.
     let signed_at = match entry_version {
         RekorEntryVersion::V1 => {
             let _span = tracing::debug_span!("provenance.verify.set").entered();
@@ -389,8 +390,8 @@ fn verify_rekor_v1_inclusion(
 }
 
 /// A Rekor v2 entry's inclusion proof, which every policy requires: the
-/// entry carries no SET. Returns the log's ID, base64-encoded as bundles
-/// carry it.
+/// entry carries no SET. Returns the ID the trust root gives the log,
+/// base64-encoded as bundles carry it, however the bundle spells it.
 ///
 /// The log is found by the entry's `logId`, or, since Rekor means to stop
 /// sending one, by the checkpoint signature naming a log in the trust
@@ -415,7 +416,7 @@ fn verify_rekor_v2_inclusion(
             ))
         })?;
         verify_rekor_v2_inclusion_proof(tlog_entry, log)?;
-        return Ok(tlog_entry.log_id.key_id.clone());
+        return Ok(BASE64.encode(&log.log_id));
     }
 
     // A log in the trust root may also co-sign another log's checkpoints,
@@ -424,12 +425,11 @@ fn verify_rekor_v2_inclusion(
         .resolved_inclusion_proof()
         .ok_or(VerifyError::InclusionProofMissing)?;
     let envelope = extract_checkpoint_envelope(&proof.checkpoint)?;
+    let named = logs_signing(&envelope, &trust.rekor_keys).map_err(|why| {
+        VerifyError::InclusionProof(format!("the checkpoint is malformed: {why}"))
+    })?;
     let mut refused = None;
-    for log in trust
-        .rekor_keys
-        .iter()
-        .filter(|log| names_log(&envelope, log))
-    {
+    for log in named {
         match verify_rekor_v2_inclusion_proof(tlog_entry, log) {
             Ok(()) => return Ok(BASE64.encode(&log.log_id)),
             Err(error) => {
