@@ -330,55 +330,60 @@ pub(crate) fn commit_firewall_bypass_rules<'a>(
     unapproved: impl IntoIterator<Item = &'a FirewallBypassRule>,
     approval_note: &str,
 ) -> Result<FirewallBypassCommit, LpmError> {
-    let (commit, rules_total) = update_local_firewall_bypass_rules(|saved, now| {
-        let original = saved.clone();
-        let mut outcome = FirewallBypassAdded::default();
-        let mut needs_approval = Vec::new();
-        let requested: Vec<(&FirewallBypassRule, bool)> = approved
-            .iter()
-            .map(|rule| (rule, true))
-            .chain(unapproved.into_iter().map(|rule| (rule, false)))
-            .collect();
-        if requested.iter().any(|(rule, _)| rule.is_expired(now)) {
-            return FirewallBypassCommit::Expired;
-        }
-        for (rule, is_approved) in requested {
-            let live = saved
+    let ((commit, approved_narrowing), rules_total) =
+        update_local_firewall_bypass_rules(|saved, now| {
+            let original = saved.clone();
+            let mut outcome = FirewallBypassAdded::default();
+            let mut needs_approval = Vec::new();
+            let mut approved_narrowing = false;
+            let requested: Vec<(&FirewallBypassRule, bool)> = approved
                 .iter()
-                .position(|saved| saved.is_same_rule_as(rule) && !saved.is_expired(now));
-            let change = firewall_bypass_change(live.map(|index| &saved[index]), rule);
-            let bucket = match change {
-                FirewallBypassChange::Unchanged => {
-                    if let Some(index) = live {
-                        outcome.unchanged.push(saved[index].clone());
-                    }
-                    continue;
-                }
-                FirewallBypassChange::Narrowed => &mut outcome.narrowed,
-                FirewallBypassChange::New if is_approved => &mut outcome.added,
-                FirewallBypassChange::Extended if is_approved => &mut outcome.extended,
-                FirewallBypassChange::New | FirewallBypassChange::Extended => {
-                    needs_approval.push(rule.clone());
-                    continue;
-                }
-            };
-            let merged = merged_rule(live.map(|index| &saved[index]), rule.clone(), change);
-            match live {
-                Some(index) => saved[index] = merged.clone(),
-                None => {
-                    saved.retain(|existing| !existing.is_same_rule_as(rule));
-                    saved.push(merged.clone());
-                }
+                .map(|rule| (rule, true))
+                .chain(unapproved.into_iter().map(|rule| (rule, false)))
+                .collect();
+            if requested.iter().any(|(rule, _)| rule.is_expired(now)) {
+                return (FirewallBypassCommit::Expired, false);
             }
-            bucket.push(merged);
-        }
-        if needs_approval.is_empty() {
-            FirewallBypassCommit::Saved(outcome)
-        } else {
-            *saved = original;
-            FirewallBypassCommit::NeedsApproval(needs_approval)
-        }
-    })?;
+            for (rule, is_approved) in requested {
+                let live = saved
+                    .iter()
+                    .position(|saved| saved.is_same_rule_as(rule) && !saved.is_expired(now));
+                let change = firewall_bypass_change(live.map(|index| &saved[index]), rule);
+                let bucket = match change {
+                    FirewallBypassChange::Unchanged => {
+                        if let Some(index) = live {
+                            outcome.unchanged.push(saved[index].clone());
+                        }
+                        continue;
+                    }
+                    FirewallBypassChange::Narrowed => {
+                        approved_narrowing |= is_approved;
+                        &mut outcome.narrowed
+                    }
+                    FirewallBypassChange::New if is_approved => &mut outcome.added,
+                    FirewallBypassChange::Extended if is_approved => &mut outcome.extended,
+                    FirewallBypassChange::New | FirewallBypassChange::Extended => {
+                        needs_approval.push(rule.clone());
+                        continue;
+                    }
+                };
+                let merged = merged_rule(live.map(|index| &saved[index]), rule.clone(), change);
+                match live {
+                    Some(index) => saved[index] = merged.clone(),
+                    None => {
+                        saved.retain(|existing| !existing.is_same_rule_as(rule));
+                        saved.push(merged.clone());
+                    }
+                }
+                bucket.push(merged);
+            }
+            if needs_approval.is_empty() {
+                (FirewallBypassCommit::Saved(outcome), approved_narrowing)
+            } else {
+                *saved = original;
+                (FirewallBypassCommit::NeedsApproval(needs_approval), false)
+            }
+        })?;
     let FirewallBypassCommit::Saved(mut outcome) = commit else {
         return Ok(commit);
     };
@@ -393,12 +398,15 @@ pub(crate) fn commit_firewall_bypass_rules<'a>(
         bypass_audit("firewall-bypass-added", true, &allowed, approval_note);
     }
     if !outcome.narrowed.is_empty() {
-        bypass_audit(
-            "firewall-bypass-narrowed",
-            true,
-            &outcome.narrowed,
-            "shortened or annotated LPM Firewall bypass rules",
-        );
+        // A rule approved as an addition can arrive as a narrowing when
+        // another command saved a longer one meanwhile; what the person
+        // approved stays on record either way.
+        let detail = if approved_narrowing {
+            format!("shortened or annotated LPM Firewall bypass rules; {approval_note}")
+        } else {
+            "shortened or annotated LPM Firewall bypass rules".to_string()
+        };
+        bypass_audit("firewall-bypass-narrowed", true, &outcome.narrowed, &detail);
     }
     Ok(FirewallBypassCommit::Saved(outcome))
 }

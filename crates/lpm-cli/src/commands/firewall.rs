@@ -1642,20 +1642,19 @@ mod tests {
     }
 
     #[test]
-    fn add_saves_nothing_when_its_expiry_passed_before_the_save() {
+    fn add_saves_nothing_when_its_expiry_passes_during_approval() {
         let temp = tempfile::tempdir().unwrap();
         security_approval::test_support::with_test_env(temp.path(), || {
             let specs = specs(&["late@1.0.0"]);
             let mut late = rule(&specs[0], None);
             late.expires_at =
-                Timestamp::now().checked_add(lpm_common::timestamp::Duration::seconds(-1));
+                Timestamp::now().checked_add(lpm_common::timestamp::Duration::milliseconds(50));
             let scope = global();
 
-            let error = run_add(
-                &plan(&specs, &scope, Some(1), false),
-                vec![late],
-                |_| Ok(()),
-            )
+            let error = run_add(&plan(&specs, &scope, Some(1), false), vec![late], |_| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                Ok(())
+            })
             .unwrap_err();
 
             assert!(error.to_string().contains("--ttl"), "{error}");

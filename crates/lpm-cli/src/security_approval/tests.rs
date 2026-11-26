@@ -1,5 +1,5 @@
 use super::prelude::*;
-use super::test_support::{guarded_attempts, with_test_env};
+use super::test_support::{audit_details, guarded_attempts, with_test_env};
 use super::*;
 use tempfile::tempdir;
 
@@ -3368,6 +3368,35 @@ fn the_bypass_store_keeps_what_a_change_judged_unexpired_at_its_instant() {
         .unwrap();
 
         assert_eq!(load_local_firewall_bypass_rules().unwrap(), vec![kept]);
+    });
+}
+
+#[test]
+fn an_approved_rule_a_concurrent_save_made_a_narrowing_keeps_its_approval_in_the_audit() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        commit_firewall_bypass_rules(&[bypass_rule("foldrun@32.8.2")], [], "approved: first")
+            .unwrap();
+        let shorter = bypass_rule_expiring_in("foldrun@32.8.2", 30);
+
+        let commit = commit_firewall_bypass_rules(
+            std::slice::from_ref(&shorter),
+            [],
+            "approved: Allow foldrun@32.8.2 past LPM Firewall in every project for 30m",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            commit,
+            FirewallBypassCommit::Saved(saved) if saved.narrowed.len() == 1
+        ));
+        assert_eq!(
+            audit_details("firewall-bypass-narrowed"),
+            [Some(
+                "shortened or annotated LPM Firewall bypass rules; approved: Allow foldrun@32.8.2 past LPM Firewall in every project for 30m"
+                    .to_string()
+            )]
+        );
     });
 }
 
