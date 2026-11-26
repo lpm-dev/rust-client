@@ -428,19 +428,19 @@ pub struct KindVersion {
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct LogId {
-    /// Hex-encoded key ID of the Rekor log. Protobuf JSON leaves an empty
-    /// one out, as `"logId": {}`.
+    /// The Rekor log's key ID: base64 as protobuf JSON encodes it, which
+    /// LPM's publish path writes, or hex as Rekor's API gives it, which the
+    /// verifier also reads. Protobuf JSON leaves an empty one out, as
+    /// `"logId": {}`.
     #[serde(rename = "keyId", default)]
     pub key_id: String,
 }
 
-/// Rekor's `verification` envelope as returned by
-/// `POST /api/v1/log/entries`. This shape is NOT part of the Sigstore
-/// bundle (which carries these on the TlogEntry directly). The publish
-/// flow reads Rekor's response through it and moves the fields into
-/// [`TlogEntry::inclusion_promise`] / [`TlogEntry::inclusion_proof`];
-/// the verifier reads it from an entry copied from Rekor verbatim.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+/// Rekor's `verification` envelope as `POST /api/v1/log/entries` returns
+/// it. This shape is NOT part of the Sigstore bundle (which carries these
+/// on the TlogEntry directly); the verifier reads it from an entry copied
+/// from Rekor verbatim.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RekorVerification {
     /// The SET, base64-encoded.
     #[serde(
@@ -485,8 +485,8 @@ pub struct RekorInclusionProof {
     pub hashes: Vec<String>,
 
     // Sigstore Bundle v0.3 protobuf JSON encodes int64 as JSON
-    // strings (JS-interop convention); LPM's own publish path emits
-    // bare numbers. Accept both via `de_i64_from_str_or_num`. Rekor v2
+    // strings (JS-interop convention), as LPM's publish path writes them;
+    // some producers write bare numbers, which are read too. Rekor v2
     // verifiers ignore this field, the root hash and the tree size, which
     // repeat values the entry and its signed checkpoint give, so a bundle
     // may leave them out.
@@ -538,9 +538,9 @@ where
     })
 }
 
-/// Accept i64 as either a bare JSON number (LPM publish path) or a
-/// JSON string (Sigstore Bundle v0.3 protobuf JSON encoding, which
-/// strings int64 to avoid JS precision loss).
+/// Accept i64 as either a JSON string (Sigstore Bundle v0.3 protobuf JSON
+/// encoding, which strings int64 to avoid JS precision loss) or a bare JSON
+/// number, as some producers write it.
 fn de_i64_from_str_or_num<'de, D>(deserializer: D) -> Result<i64, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -884,13 +884,13 @@ struct RekorApiEntry {
     /// The canonicalized entry body, base64-encoded.
     body: String,
     #[serde(rename = "integratedTime")]
-    integrated_time: i64,
+    integrated_time: u64,
     /// Hex, where the bundle's log ID is base64.
     #[serde(rename = "logID")]
     log_id: String,
     /// The index across the log's shards.
     #[serde(rename = "logIndex")]
-    log_index: i64,
+    log_index: u64,
     verification: RekorApiVerification,
 }
 
@@ -942,6 +942,14 @@ fn tlog_entry_from_rekor_response(response: &str) -> Result<TlogEntry, String> {
         }
     };
     let log_id = hash(&entry.log_id, "log ID")?;
+    // The verifier reads both as non-negative int64s, and the integrated
+    // time as one it can place, before the year 10000.
+    let log_index = i64::try_from(entry.log_index)
+        .map_err(|_| "Rekor's log index is out of range".to_string())?;
+    let integrated_time = i64::try_from(entry.integrated_time)
+        .ok()
+        .filter(|&seconds| lpm_common::Timestamp::from_unix_seconds(seconds).is_some())
+        .ok_or_else(|| "Rekor's integrated time is out of range".to_string())?;
     let body = BASE64
         .decode(entry.body.as_bytes())
         .map_err(|e| format!("Rekor's entry body is not base64: {e}"))?;
@@ -971,17 +979,17 @@ fn tlog_entry_from_rekor_response(response: &str) -> Result<TlogEntry, String> {
         proof.tree_size,
         &hashes,
     )
-    .map_err(|e| format!("Rekor's inclusion proof is incomplete: {e}"))?;
+    .map_err(|e| format!("Rekor's inclusion proof doesn't fit its tree: {e}"))?;
     if computed_root != root_hash {
         return Err("Rekor's inclusion proof doesn't lead to its root".into());
     }
 
     Ok(TlogEntry {
-        log_index: entry.log_index.to_string(),
+        log_index: log_index.to_string(),
         log_id: LogId {
             key_id: BASE64.encode(&log_id),
         },
-        integrated_time: entry.integrated_time.to_string(),
+        integrated_time: integrated_time.to_string(),
         kind_version: Some(KindVersion {
             kind: header.kind,
             version: header.api_version,
@@ -1839,11 +1847,11 @@ mod tests {
     }
 
     #[test]
-    fn a_converted_rekor_response_matches_what_sigstore_js_wrote_for_the_same_entry() {
-        // GitHub's attest action, built on sigstore-js, wrote the release
-        // bundle from Rekor's response to the same upload. The response
-        // here was fetched later: Rekor signed its SET afresh, and its proof
-        // is against a larger tree, so those match in shape only.
+    fn a_converted_rekor_response_has_sigstore_js_fields_and_its_refetched_proof_in_shape() {
+        // The release bundle holds this entry as sigstore-js converted
+        // Rekor's response to the upload. The response here was fetched
+        // later: Rekor signed its SET afresh, and its proof is against a
+        // larger tree, so those match in shape only.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/sigstore_bundles/21-real-lpm-release-v0.84.0.json");
         let bundle: serde_json::Value =
@@ -1892,13 +1900,115 @@ mod tests {
         }
     }
 
+    /// Rekor's response to an `intoto` 0.0.2 upload, as LPM's publish path
+    /// sends, logged as the first entry of a new shard: a one-leaf tree,
+    /// whose audit path is empty.
+    fn first_entry_in_a_shard() -> serde_json::Value {
+        use sha2::Digest as _;
+        let body = br#"{"apiVersion":"0.0.2","kind":"intoto","spec":{}}"#;
+        let mut leaf = sha2::Sha256::new();
+        leaf.update([0x00]);
+        leaf.update(body);
+        serde_json::json!({
+            "uuid": {
+                "body": BASE64.encode(body),
+                "integratedTime": 1_793_592_285_u64,
+                "logID": "c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d",
+                "logIndex": 3_637_620_348_u64,
+                "verification": {
+                    "signedEntryTimestamp": BASE64.encode(b"set"),
+                    "inclusionProof": {
+                        "checkpoint": "rekor.sigstore.dev - 1\n1\nroot=\n\n",
+                        "hashes": [],
+                        "logIndex": 0,
+                        "rootHash": hex::encode(leaf.finalize()),
+                        "treeSize": 1
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn rekor_upload_converts_the_first_intoto_entry_of_a_shard() {
+        let entry = tlog_entry_from_rekor_response(&first_entry_in_a_shard().to_string()).unwrap();
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(
+            json["kindVersion"],
+            serde_json::json!({"kind": "intoto", "version": "0.0.2"})
+        );
+        assert_eq!(json["inclusionProof"]["hashes"], serde_json::json!([]));
+        assert_eq!(json["inclusionProof"]["logIndex"], "0");
+        assert_eq!(json["inclusionProof"]["treeSize"], "1");
+    }
+
     #[test]
     fn a_rekor_response_that_would_not_make_a_verifiable_bundle_is_refused() {
         type Change = fn(&mut serde_json::Value);
         let remove = |value: &mut serde_json::Value, field: &str| {
             value.as_object_mut().unwrap().remove(field);
         };
-        let cases: [(&str, Change, &str); 10] = [
+        let cases: [(&str, Change, &str); 19] = [
+            (
+                "no index across the log",
+                |entry| {
+                    entry.as_object_mut().unwrap().remove("logIndex");
+                },
+                "incomplete or malformed",
+            ),
+            (
+                "no integrated time",
+                |entry| {
+                    entry.as_object_mut().unwrap().remove("integratedTime");
+                },
+                "incomplete or malformed",
+            ),
+            (
+                "no log ID",
+                |entry| {
+                    entry.as_object_mut().unwrap().remove("logID");
+                },
+                "incomplete or malformed",
+            ),
+            (
+                "no body",
+                |entry| {
+                    entry.as_object_mut().unwrap().remove("body");
+                },
+                "incomplete or malformed",
+            ),
+            (
+                "a negative index",
+                |entry| entry["logIndex"] = serde_json::json!(-1),
+                "incomplete or malformed",
+            ),
+            (
+                "an integrated time in the year 10000",
+                |entry| entry["integratedTime"] = serde_json::json!(253_402_300_800_i64),
+                "integrated time is out of range",
+            ),
+            (
+                "a SET that isn't base64",
+                |entry| {
+                    entry["verification"]["signedEntryTimestamp"] = serde_json::json!("not!base64")
+                },
+                "no signed entry timestamp",
+            ),
+            (
+                "a hash too short",
+                |entry| {
+                    entry["verification"]["inclusionProof"]["hashes"][0] = serde_json::json!("aa")
+                },
+                "not a hex SHA-256 hash",
+            ),
+            (
+                "an index outside the tree",
+                |entry| {
+                    let size = entry["verification"]["inclusionProof"]["treeSize"].clone();
+                    entry["verification"]["inclusionProof"]["logIndex"] = size;
+                },
+                "doesn't fit its tree",
+            ),
             (
                 "no SET",
                 |entry| {
@@ -1952,7 +2062,7 @@ mod tests {
                         .unwrap()
                         .pop();
                 },
-                "inclusion proof is incomplete",
+                "doesn't fit its tree",
             ),
             (
                 "a changed hash",

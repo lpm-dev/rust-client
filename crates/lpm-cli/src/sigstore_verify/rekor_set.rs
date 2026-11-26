@@ -135,8 +135,8 @@ fn integrated_time_secs(t: &SystemTime) -> i64 {
 /// Decode a TlogEntry `logId.keyId` field into raw SHA-256 bytes.
 ///
 /// Two wire encodings appear in the wild:
-/// - **Hex** (Rekor's REST API canonical form). LPM's publish path
-///   captures this verbatim — see [`crate::sigstore::TlogEntry`] note.
+/// - **Hex** (Rekor's REST API canonical form), in an entry copied from
+///   Rekor's response verbatim.
 /// - **Base64** (Sigstore Bundle v0.3 spec; protobuf JSON encodes
 ///   `bytes` fields as standard base64).
 ///

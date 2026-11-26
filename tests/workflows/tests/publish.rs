@@ -7,7 +7,7 @@ mod support;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD};
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use support::assertions::parse_json_output;
@@ -190,17 +190,43 @@ async fn mount_sigstore_publish_mocks(server: &MockServer) {
 
     Mock::given(method("POST"))
         .and(path("/api/v1/log/entries"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(real_rekor_response()))
+        .respond_with(RekorLoggingTheUpload)
         .expect(1)
         .mount(server)
         .await;
 }
 
-/// A real entry as Rekor v1's API returns it: LPM's v0.84.0 release.
-fn real_rekor_response() -> serde_json::Value {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../crates/lpm-cli/tests/fixtures/rekor_api/v1-entry-lpm-release-v0.84.0.json");
-    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+/// Rekor's log ID, as its API gives it.
+const REKOR_LOG_ID_HEX: &str = "c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d";
+
+/// Rekor answering an upload by logging the entry it was sent, as the
+/// first entry of a new shard, so the bundle's entry is the upload's.
+struct RekorLoggingTheUpload;
+
+impl wiremock::Respond for RekorLoggingTheUpload {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let mut leaf = Sha256::new();
+        leaf.update([0x00]);
+        leaf.update(&request.body);
+        ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "uuid": {
+                "body": BASE64.encode(&request.body),
+                "integratedTime": 1_700_000_000_u64,
+                "logID": REKOR_LOG_ID_HEX,
+                "logIndex": 123,
+                "verification": {
+                    "signedEntryTimestamp": BASE64.encode(b"workflow-test-set"),
+                    "inclusionProof": {
+                        "checkpoint": "rekor.sigstore.dev - 1\n1\nroot=\n\n",
+                        "hashes": [],
+                        "logIndex": 0,
+                        "rootHash": hex::encode(leaf.finalize()),
+                        "treeSize": 1
+                    }
+                }
+            }
+        }))
+    }
 }
 
 // ─── Dry Run ─────────────────────────────────────────────────────
@@ -4821,35 +4847,51 @@ async fn publish_npm_generated_provenance_attaches_sigstore_bundle_to_registry_p
     // hex IDs and hashes and a bare checkpoint; the bundle carries them on
     // the entry in protobuf JSON, as Sigstore's clients read it.
     let tlog_entry = &bundle["verificationMaterial"]["tlogEntries"][0];
-    let rekor_response = real_rekor_response();
-    let (_, rekor_entry) = rekor_response.as_object().unwrap().iter().next().unwrap();
-    assert_eq!(tlog_entry["logIndex"], "3637620348");
+    assert_eq!(tlog_entry["logIndex"], "123");
+    assert_eq!(tlog_entry["integratedTime"], "1700000000");
     assert_eq!(
-        tlog_entry["logId"]["keyId"],
-        "wNI9atQGlz+VWfO6LRygH4QUfY/8W4RFwiT5i5WRgB0="
+        BASE64
+            .decode(tlog_entry["logId"]["keyId"].as_str().unwrap())
+            .unwrap(),
+        hex::decode(REKOR_LOG_ID_HEX).unwrap()
     );
     assert_eq!(
         tlog_entry["kindVersion"],
-        serde_json::json!({"kind": "dsse", "version": "0.0.1"})
+        serde_json::json!({"kind": "intoto", "version": "0.0.2"})
     );
     assert_eq!(
         tlog_entry["inclusionPromise"]["signedEntryTimestamp"],
-        rekor_entry["verification"]["signedEntryTimestamp"]
+        BASE64.encode(b"workflow-test-set")
     );
     let proof = &tlog_entry["inclusionProof"];
-    assert_eq!(proof["treeSize"], "3995884690");
+    assert_eq!(proof["logIndex"], "0");
+    assert_eq!(proof["treeSize"], "1");
+    assert_eq!(proof["hashes"], serde_json::json!([]));
+    assert!(proof["checkpoint"]["envelope"].is_string());
+    // The entry LPM uploaded records this envelope: its payload's hash and
+    // its signature, which an intoto entry encodes once more.
+    let logged: serde_json::Value = serde_json::from_slice(
+        &BASE64
+            .decode(tlog_entry["canonicalizedBody"].as_str().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(
-        proof["checkpoint"]["envelope"],
-        rekor_entry["verification"]["inclusionProof"]["checkpoint"]
+        logged["spec"]["content"]["payloadHash"]["value"],
+        hex::encode(Sha256::digest(&statement_bytes))
     );
     assert_eq!(
-        BASE64.decode(proof["rootHash"].as_str().unwrap()).unwrap(),
-        hex::decode(
-            rekor_entry["verification"]["inclusionProof"]["rootHash"]
-                .as_str()
-                .unwrap()
-        )
-        .unwrap()
+        BASE64
+            .decode(
+                logged["spec"]["content"]["envelope"]["signatures"][0]["sig"]
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap(),
+        bundle["dsseEnvelope"]["signatures"][0]["sig"]
+            .as_str()
+            .unwrap()
+            .as_bytes()
     );
     assert!(
         tlog_entry.get("verification").is_none(),
