@@ -379,6 +379,22 @@ impl TestAuthority {
             .to_vec()
     }
 
+    /// The authority as a trust root listing `chain`.
+    fn trusted_as(&self, chain: Vec<Vec<u8>>) -> TimestampAuthority {
+        TimestampAuthority {
+            cert_chain_der: chain,
+            ..self.trusted()
+        }
+    }
+
+    /// Another self-signed certificate for the root's name and key, as
+    /// `customize` changes it.
+    fn root_copy(&self, customize: impl FnOnce(&mut CertificateParams)) -> Vec<u8> {
+        let mut params = ca_params("test-tsa-root", 1);
+        customize(&mut params);
+        params.self_signed(&self.root_key).unwrap().der().to_vec()
+    }
+
     /// Another certificate for the leaf's key, from the same issuer.
     fn reissued_leaf(&self, serial: u64) -> Vec<u8> {
         let issuer =
@@ -401,6 +417,9 @@ enum Ess {
     V1,
     /// `SigningCertificateV2` naming this certificate instead.
     V2Naming(Vec<u8>),
+    /// `SigningCertificateV2` with the signer's hash and this certificate's
+    /// issuer and serial number.
+    V2IssuerSerialOf(Vec<u8>),
 }
 
 /// What a synthesized token says; [`Token::default`] is a valid token
@@ -481,18 +500,19 @@ fn issuer_serial(cert: &[u8]) -> Vec<u8> {
 fn ess_attribute(ess: &Ess, signer: &[u8]) -> Option<Vec<u8>> {
     let (oid_contents, cert_id) = match ess {
         Ess::None => return None,
-        Ess::V2 | Ess::V2Naming(_) => {
-            let named = match ess {
-                Ess::V2Naming(other) => other.as_slice(),
-                _ => signer,
+        Ess::V2 | Ess::V2Naming(_) | Ess::V2IssuerSerialOf(_) => {
+            let (hashed, identified) = match ess {
+                Ess::V2Naming(other) => (other.as_slice(), other.as_slice()),
+                Ess::V2IssuerSerialOf(other) => (signer, other.as_slice()),
+                _ => (signer, signer),
             };
             (
                 OID_SIGNING_CERTIFICATE_V2,
                 tlv(
                     der::TAG_SEQUENCE,
                     &[
-                        &tlv(der::TAG_OCTET_STRING, &[&Sha256::digest(named)]),
-                        &issuer_serial(named),
+                        &tlv(der::TAG_OCTET_STRING, &[&Sha256::digest(hashed)]),
+                        &issuer_serial(identified),
                     ],
                 ),
             )
@@ -1144,4 +1164,271 @@ fn every_candidate_intermediate_is_tried_whatever_their_order() {
         other => panic!("expected a timestamp refusal, got {other:?}"),
     };
     assert!(why.contains("does not contain the signing time"), "{why}");
+}
+
+/// A critical extension the verifier doesn't process.
+fn unhandled_critical_extension() -> CustomExtension {
+    let mut extension = CustomExtension::from_oid_content(&[1, 2, 3, 4], vec![0x05, 0x00]);
+    extension.set_criticality(true);
+    extension
+}
+
+/// An authority whose leaf sits `depth` intermediates below its root, and
+/// those intermediates from the leaf's issuer up.
+fn authority_with_intermediates(depth: u8) -> (TestAuthority, Vec<Vec<u8>>) {
+    let root_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+    let root = ca_params("test-tsa-root", depth)
+        .self_signed(&root_key)
+        .unwrap();
+    let mut issuer_cert = root.clone();
+    let mut issuer_key = KeyPair::try_from(root_key.serialize_der().as_slice()).unwrap();
+    let mut intermediates = Vec::new();
+    for level in 0..depth {
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let issuer = rcgen::Issuer::from_ca_cert_der(issuer_cert.der(), &issuer_key).unwrap();
+        let cert = ca_params(&format!("test-tsa-intermediate-{level}"), depth - level - 1)
+            .signed_by(&key, &issuer)
+            .unwrap();
+        intermediates.insert(0, cert.der().to_vec());
+        issuer_cert = cert;
+        issuer_key = key;
+    }
+    let leaf_keypair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+    let issuer = rcgen::Issuer::from_ca_cert_der(issuer_cert.der(), &issuer_key).unwrap();
+    let leaf = timestamping_leaf_params(None)
+        .signed_by(&leaf_keypair, &issuer)
+        .unwrap();
+    let authority = TestAuthority {
+        root_der: root.der().to_vec(),
+        intermediate_der: None,
+        leaf_der: leaf.der().to_vec(),
+        leaf_key: p384::ecdsa::SigningKey::from_pkcs8_der(&leaf_keypair.serialize_der()).unwrap(),
+        leaf_keypair,
+        issuer_cert,
+        issuer_key,
+        root_cert: root,
+        root_key,
+    };
+    (authority, intermediates)
+}
+
+#[test]
+fn an_issuer_the_trust_root_holds_that_has_since_expired_needs_newer_trust_material() {
+    // The authority reissued its root, or an intermediate, under the same
+    // name and key; a stale trust root still holds the expired copy.
+    let authority = authority_with(true, |_| {});
+    let expired_root = authority.root_copy(|params| {
+        params.not_after = rcgen::date_time_ymd(2025, 1, 1);
+    });
+    let carrying_leaf_and_intermediate = Token {
+        embed_leaf: true,
+        embed_intermediate: true,
+        ..Token::default()
+    };
+    let refused = verify_signed_timestamp(
+        &carrying_leaf_and_intermediate.signed_by(&authority),
+        SIGNATURE,
+        &[authority.trusted_as(vec![expired_root])],
+    )
+    .unwrap_err();
+    assert!(refused.is_missing_trust_material(), "{refused:?}");
+
+    let carrying_leaf = Token {
+        embed_leaf: true,
+        ..Token::default()
+    };
+    let stale_intermediate = authority.trusted_as(vec![
+        authority.expired_intermediate_copy(),
+        authority.root_der.clone(),
+    ]);
+    let refused = verify_signed_timestamp(
+        &carrying_leaf.signed_by(&authority),
+        SIGNATURE,
+        std::slice::from_ref(&stale_intermediate),
+    )
+    .unwrap_err();
+    assert!(refused.is_missing_trust_material(), "{refused:?}");
+
+    // A current copy the token carries completes the path instead.
+    verify_signed_timestamp(
+        &carrying_leaf_and_intermediate.signed_by(&authority),
+        SIGNATURE,
+        &[stale_intermediate],
+    )
+    .unwrap();
+}
+
+#[test]
+fn another_authoritys_certificates_decide_nothing() {
+    // A token from an authority the trust root doesn't hold carries its own
+    // leaf, which this verifier would refuse, and its self-signed root.
+    let held = authority_with(true, |_| {});
+    let other = test_authority(|params| {
+        params
+            .custom_extensions
+            .push(unhandled_critical_extension())
+    });
+    let token = Token {
+        embed_leaf: true,
+        extra_embedded: vec![other.root_der.clone()],
+        ..Token::default()
+    };
+    let refused = verify_signed_timestamp(
+        &token.signed_by(&other),
+        SIGNATURE,
+        &[held.trusted_root_only()],
+    )
+    .unwrap_err();
+    assert!(refused.is_missing_trust_material(), "{refused:?}");
+}
+
+#[test]
+fn a_token_carrying_too_many_candidate_issuers_is_refused() {
+    // Each certificate under the leaf issuer's name costs a signature check
+    // before it can be ruled out; none of these signed the leaf.
+    let authority = test_authority(|_| {});
+    let impostors: Vec<Vec<u8>> = (0..140)
+        .map(|_| {
+            let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+            ca_params("test-tsa-root", 1)
+                .self_signed(&key)
+                .unwrap()
+                .der()
+                .to_vec()
+        })
+        .collect();
+    let token = Token {
+        embed_leaf: true,
+        extra_embedded: impostors[1..].to_vec(),
+        ..Token::default()
+    };
+    let why = match verify_signed_timestamp(
+        &token.signed_by(&authority),
+        SIGNATURE,
+        &[authority.trusted_as(vec![impostors[0].clone()])],
+    ) {
+        Err(VerifyError::Timestamp(why)) => why,
+        other => panic!("expected a timestamp refusal, got {other:?}"),
+    };
+    assert!(why.contains("signature checks"), "{why}");
+}
+
+#[test]
+fn a_signing_certificate_more_than_three_intermediates_below_its_root_is_not_placed() {
+    let (three_deep, intermediates) = authority_with_intermediates(3);
+    let token = Token {
+        embed_leaf: true,
+        extra_embedded: intermediates,
+        ..Token::default()
+    };
+    verify_signed_timestamp(
+        &token.signed_by(&three_deep),
+        SIGNATURE,
+        &[three_deep.trusted_root_only()],
+    )
+    .unwrap();
+
+    let (four_deep, intermediates) = authority_with_intermediates(4);
+    let token = Token {
+        embed_leaf: true,
+        extra_embedded: intermediates,
+        ..Token::default()
+    };
+    let refused = verify_signed_timestamp(
+        &token.signed_by(&four_deep),
+        SIGNATURE,
+        &[four_deep.trusted_root_only()],
+    )
+    .unwrap_err();
+    assert!(refused.is_missing_trust_material(), "{refused:?}");
+}
+
+#[test]
+fn an_authority_that_only_dates_the_timestamp_out_outranks_one_that_refuses_it() {
+    let authority = test_authority(|_| {});
+    // The same root, reissued as an end-entity certificate: it can't issue.
+    let not_a_ca = authority.root_copy(|params| {
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    });
+    let refusing = || authority.trusted_as(vec![authority.leaf_der.clone(), not_a_ca.clone()]);
+    let unrelated = test_authority(|_| {}).trusted_root_only();
+    let token = Token::default().signed_by(&authority);
+
+    match verify_signed_timestamp(&token, SIGNATURE, &[unrelated, refusing()]) {
+        Err(VerifyError::Timestamp(why)) => assert!(why.contains("cA is FALSE"), "{why}"),
+        other => panic!("expected a timestamp refusal, got {other:?}"),
+    }
+
+    let dated_out = TimestampAuthority {
+        valid_for: ValidityWindow {
+            start: Timestamp::parse_rfc3339("2027-01-01T00:00:00Z").unwrap(),
+            end: None,
+        },
+        ..authority.trusted()
+    };
+    let refused = verify_signed_timestamp(&token, SIGNATURE, &[refusing(), dated_out]).unwrap_err();
+    assert!(refused.is_missing_trust_material(), "{refused:?}");
+}
+
+#[test]
+fn the_signing_certificate_attribute_must_name_the_signers_issuer_and_serial() {
+    let authority = test_authority(|_| {});
+    let token = Token {
+        ess: Ess::V2IssuerSerialOf(authority.reissued_leaf(42)),
+        ..Token::default()
+    };
+    assert!(refusal(&token, &authority).contains("issuer and serial number"));
+}
+
+#[test]
+fn an_intermediate_with_an_unhandled_critical_extension_is_refused() {
+    let authority = authority_with_intermediate(
+        Some(|params: &mut CertificateParams| {
+            params
+                .custom_extensions
+                .push(unhandled_critical_extension());
+        }),
+        |_| {},
+    );
+    assert!(refusal(&Token::default(), &authority).contains("critical extension"));
+}
+
+#[test]
+fn a_trust_anchors_critical_extensions_are_its_trust_roots_business() {
+    let authority = test_authority(|_| {});
+    let anchor = authority.root_copy(|params| {
+        params
+            .custom_extensions
+            .push(unhandled_critical_extension());
+    });
+    let token = Token {
+        embed_leaf: true,
+        ..Token::default()
+    };
+    verify_signed_timestamp(
+        &token.signed_by(&authority),
+        SIGNATURE,
+        &[authority.trusted_as(vec![anchor])],
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_pinned_signing_certificate_with_an_unhandled_critical_extension_is_refused() {
+    // A trust root that lists only the leaf pins it as the anchor too.
+    let authority = test_authority(|params| {
+        params
+            .custom_extensions
+            .push(unhandled_critical_extension())
+    });
+    let why = match verify_signed_timestamp(
+        &Token::default().signed_by(&authority),
+        SIGNATURE,
+        &[authority.trusted_as(vec![authority.leaf_der.clone()])],
+    ) {
+        Err(VerifyError::Timestamp(why)) => why,
+        other => panic!("expected a timestamp refusal, got {other:?}"),
+    };
+    assert!(why.contains("critical extension"), "{why}");
 }

@@ -6,6 +6,7 @@
 //! existed, and the time the signing certificate must have been valid at.
 
 use sha2::{Digest, Sha256, Sha384, Sha512};
+use std::cell::Cell;
 use std::time::{Duration, SystemTime};
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::{FromDer, X509Certificate};
@@ -61,8 +62,9 @@ pub(super) fn verify_signed_timestamps(
     authorities: &[TimestampAuthority],
 ) -> Vec<VerifiedTimestamp> {
     let mut verified = Vec::with_capacity(signed_timestamps.len());
+    let budget = LinkBudget::new();
     for signed_timestamp in signed_timestamps {
-        match verify_signed_timestamp(signed_timestamp, signature, authorities) {
+        match verify_with_budget(signed_timestamp, signature, authorities, &budget) {
             Ok(timestamp) => verified.push(timestamp),
             Err(error) => tracing::debug!(
                 target: "lpm_cli::sigstore_verify",
@@ -74,17 +76,29 @@ pub(super) fn verify_signed_timestamps(
     verified
 }
 
-/// Verify one `signedTimestamp`, a DER `TimeStampResp`, over `signature`.
+/// [`verify_with_budget`] for a bundle with this one timestamp.
+#[cfg(test)]
+pub(super) fn verify_signed_timestamp(
+    signed_timestamp: &[u8],
+    signature: &[u8],
+    authorities: &[TimestampAuthority],
+) -> Result<VerifiedTimestamp, VerifyError> {
+    verify_with_budget(signed_timestamp, signature, authorities, &LinkBudget::new())
+}
+
+/// Verify one `signedTimestamp`, a DER `TimeStampResp`, over `signature`,
+/// spending from the bundle's `budget` of signature checks.
 ///
 /// It verifies when a trusted authority's certificate signed it, that
 /// certificate is a timestamping-only end-entity certificate chaining to
 /// the authority's trust anchor, every certificate on that path and the
 /// authority's own validity window contain the signed time, and the
 /// timestamp's message imprint is the hash of `signature`.
-pub(super) fn verify_signed_timestamp(
+fn verify_with_budget(
     signed_timestamp: &[u8],
     signature: &[u8],
     authorities: &[TimestampAuthority],
+    budget: &LinkBudget,
 ) -> Result<VerifiedTimestamp, VerifyError> {
     let token = parse_response(signed_timestamp).map_err(VerifyError::Timestamp)?;
     let info = parse_tst_info(token.tst_info).map_err(VerifyError::Timestamp)?;
@@ -97,7 +111,7 @@ pub(super) fn verify_signed_timestamp(
     let mut failures = Vec::new();
     let mut outdated = Vec::new();
     for authority in authorities {
-        match verify_with_authority(&token, &info, authority) {
+        match verify_with_authority(&token, &info, authority, budget) {
             Ok(()) => {
                 return Ok(VerifiedTimestamp {
                     time: info.gen_time,
@@ -113,7 +127,10 @@ pub(super) fn verify_signed_timestamp(
             }
         }
     }
-    if !failures.is_empty() {
+    // An authority that verified everything but what a newer trust root
+    // may change outranks one that refused the timestamp, so the trust
+    // root is refreshed.
+    if outdated.is_empty() && !failures.is_empty() {
         return Err(VerifyError::Timestamp(failures.join("; ")));
     }
     Err(VerifyError::MissingTrustMaterial {
@@ -134,19 +151,41 @@ fn authority_label(authority: &TimestampAuthority) -> &str {
     }
 }
 
+/// Why an authority didn't verify a timestamp, most telling last: a
+/// rejection only replaces one that tells less.
 enum AuthorityRejection {
-    /// The authority holds no certificate matching the timestamp's signer.
+    /// The authority holds no certificate matching the timestamp's signer,
+    /// or none of its certificates completes the signer's path.
     NotTheSigner,
-    /// The trust root's window for the authority excludes the signed time,
-    /// as it does for the other roles' keys: a newer trust root may move it.
-    OutsideWindow(String),
     Failed(String),
+    /// Everything verified except what a newer trust root may change: the
+    /// trust root's window for the authority, as for the other roles'
+    /// keys, or the lifetime of an issuer certificate it supplies, which
+    /// the authority may have reissued under the same name and key.
+    OutsideWindow(String),
+}
+
+impl AuthorityRejection {
+    fn rank(&self) -> u8 {
+        match self {
+            Self::NotTheSigner => 0,
+            Self::Failed(_) => 1,
+            Self::OutsideWindow(_) => 2,
+        }
+    }
+
+    fn keep_most_telling(&mut self, other: Self) {
+        if other.rank() > self.rank() {
+            *self = other;
+        }
+    }
 }
 
 fn verify_with_authority(
     token: &TimestampToken<'_>,
     info: &TstInfo,
     authority: &TimestampAuthority,
+    budget: &LinkBudget,
 ) -> Result<(), AuthorityRejection> {
     let mut chain = Vec::with_capacity(authority.cert_chain_der.len());
     for (index, der) in authority.cert_chain_der.iter().enumerate() {
@@ -179,19 +218,40 @@ fn verify_with_authority(
         return Err(AuthorityRejection::NotTheSigner);
     };
 
-    // Intermediates may come from the trust root or the token; only the
-    // trust root's anchor is trusted on its own.
-    let intermediates: Vec<&X509Certificate<'_>> = chain[..chain.len() - 1]
+    // Intermediates may come from the trust root or the token, each
+    // certificate once; only the trust root's anchor is trusted on its own.
+    let trust_root_intermediates = chain[..chain.len() - 1]
         .iter()
-        .chain(embedded.iter())
-        .filter(|cert| is_ca(cert))
-        .collect();
+        .map(|cert| Candidate::from_trust_root(cert, true));
+    let carried = embedded
+        .iter()
+        .map(|cert| Candidate::from_trust_root(cert, false));
+    let mut intermediates: Vec<Candidate<'_, '_>> =
+        Vec::with_capacity(chain.len() + embedded.len());
+    for candidate in trust_root_intermediates.chain(carried) {
+        let der = candidate.cert.as_ref();
+        if is_ca(candidate.cert)
+            && der != anchor.as_ref()
+            && der != signer.as_ref()
+            && !intermediates.iter().any(|seen| seen.cert.as_ref() == der)
+        {
+            intermediates.push(candidate);
+        }
+    }
+
     let at_time = lpm_common::Timestamp::from(info.gen_time);
-    verify_path(signer, &intermediates, anchor, at_time)?;
+    let stale_trust_root = match verify_path(signer, &intermediates, anchor, at_time, budget) {
+        Ok(()) => None,
+        Err(AuthorityRejection::OutsideWindow(why)) => Some(why),
+        Err(rejection) => return Err(rejection),
+    };
 
     enforce_timestamping_leaf(signer).map_err(AuthorityRejection::Failed)?;
     verify_signer_signature(token, signer).map_err(AuthorityRejection::Failed)?;
     check_signing_certificate(token, signer).map_err(AuthorityRejection::Failed)?;
+    if let Some(why) = stale_trust_root {
+        return Err(AuthorityRejection::OutsideWindow(why));
+    }
     if !authority.valid_for.contains(info.gen_time) {
         return Err(AuthorityRejection::OutsideWindow(format!(
             "its time {} is outside the authority's validity window in the trust root",
@@ -205,90 +265,185 @@ fn verify_with_authority(
 /// anchor.
 const MAX_INTERMEDIATES: usize = 3;
 
-/// Walk from the signing certificate up to `anchor`, each certificate valid
-/// at `at_time` and signed by the next. Every candidate issuer is tried, so
-/// the order certificates arrive in doesn't decide the outcome. When no
-/// path reaches the anchor, an issuer that neither `intermediates` nor the
-/// anchor provides, by name and key, is missing trust material: a newer
-/// trust root may hold it.
-fn verify_path(
-    signer: &X509Certificate<'_>,
-    intermediates: &[&X509Certificate<'_>],
-    anchor: &X509Certificate<'_>,
-    at_time: lpm_common::Timestamp,
-) -> Result<(), AuthorityRejection> {
-    let failed = |error: VerifyError| AuthorityRejection::Failed(error.to_string());
-    check_cert_validity_at(signer, at_time, "timestamp signing certificate").map_err(failed)?;
-    if signer.as_ref() == anchor.as_ref() {
-        return Ok(());
+/// The most certificate signatures checked while building timestamp
+/// authority paths for one bundle. A real bundle needs a few per authority;
+/// without a bound, a timestamp carrying many certificates under one name
+/// would make the search expensive, which Go's verifier bounds the same way.
+const MAX_LINK_CHECKS: u32 = 128;
+
+/// What's left of [`MAX_LINK_CHECKS`] for one bundle.
+struct LinkBudget(Cell<u32>);
+
+impl LinkBudget {
+    fn new() -> Self {
+        Self(Cell::new(MAX_LINK_CHECKS))
     }
-    refuse_unhandled_critical_extensions(signer, "its signing certificate")
-        .map_err(AuthorityRejection::Failed)?;
-    let mut used = Vec::with_capacity(MAX_INTERMEDIATES);
-    extend_path(signer, intermediates, anchor, at_time, &mut used)
+
+    fn spend(&self) -> Result<(), AuthorityRejection> {
+        let remaining = self.0.get();
+        if remaining == 0 {
+            return Err(AuthorityRejection::Failed(format!(
+                "its certificates need more than {MAX_LINK_CHECKS} signature checks to place"
+            )));
+        }
+        self.0.set(remaining - 1);
+        Ok(())
+    }
 }
 
-/// Continue a path from `child`, whose path so far uses the intermediates
-/// at the indexes in `used`. A path that found its issuers but failed a
-/// check outranks one that ran out of issuers.
-fn extend_path(
-    child: &X509Certificate<'_>,
-    intermediates: &[&X509Certificate<'_>],
+/// An intermediate certificate on offer, and whether the trust root
+/// supplies it: a newer trust root may replace an expired one.
+#[derive(Clone, Copy)]
+struct Candidate<'c, 'd> {
+    cert: &'c X509Certificate<'d>,
+    from_trust_root: bool,
+}
+
+impl<'c, 'd> Candidate<'c, 'd> {
+    fn from_trust_root(cert: &'c X509Certificate<'d>, from_trust_root: bool) -> Self {
+        Self {
+            cert,
+            from_trust_root,
+        }
+    }
+}
+
+/// Find a path from the signing certificate up to `anchor` on which every
+/// certificate is valid at `at_time` and signed by the next. Paths are
+/// found by name and signature first, and only a path that reaches the
+/// anchor is checked further, so a certificate that leads elsewhere
+/// decides nothing, and the order certificates arrive in doesn't decide
+/// the outcome. When no path reaches the anchor, an issuer neither
+/// `intermediates` nor the anchor provides is missing trust material: a
+/// newer trust root may hold it.
+fn verify_path(
+    signer: &X509Certificate<'_>,
+    intermediates: &[Candidate<'_, '_>],
     anchor: &X509Certificate<'_>,
     at_time: lpm_common::Timestamp,
-    used: &mut Vec<usize>,
+    budget: &LinkBudget,
 ) -> Result<(), AuthorityRejection> {
-    let depth = used.len();
-    let mut outcome = AuthorityRejection::NotTheSigner;
-    let mut record = |rejection: AuthorityRejection| {
-        if !matches!(outcome, AuthorityRejection::Failed(_)) {
-            outcome = rejection;
-        }
+    let mut search = PathSearch {
+        signer,
+        intermediates,
+        anchor,
+        at_time,
+        budget,
+        path: Vec::with_capacity(MAX_INTERMEDIATES),
+        outcome: AuthorityRejection::NotTheSigner,
     };
+    if signer.as_ref() == anchor.as_ref() {
+        return search.check_signer();
+    }
+    if search.extend(signer)? {
+        return Ok(());
+    }
+    Err(search.outcome)
+}
 
-    let label = "timestamp authority trust anchor";
-    if child.tbs_certificate.issuer.as_raw() == anchor.tbs_certificate.subject.as_raw()
-        && verify_chain_link(child, anchor, label).is_ok()
-    {
-        match check_cert_validity_at(anchor, at_time, label)
-            .and_then(|()| enforce_issuer_constraints(anchor, depth, label))
-        {
-            Ok(()) => return Ok(()),
-            Err(error) => record(AuthorityRejection::Failed(error.to_string())),
+struct PathSearch<'s, 'c, 'd> {
+    signer: &'c X509Certificate<'d>,
+    intermediates: &'s [Candidate<'c, 'd>],
+    anchor: &'c X509Certificate<'d>,
+    at_time: lpm_common::Timestamp,
+    budget: &'s LinkBudget,
+    /// Indexes into `intermediates` of the path so far, from the signer up.
+    path: Vec<usize>,
+    outcome: AuthorityRejection,
+}
+
+impl<'c, 'd> PathSearch<'_, 'c, 'd> {
+    /// Continue the path from `child`. True once a path checks out; an
+    /// error only when the signature check budget runs out.
+    fn extend(&mut self, child: &X509Certificate<'_>) -> Result<bool, AuthorityRejection> {
+        if self.links(child, self.anchor)? {
+            match self.check_path() {
+                Ok(()) => return Ok(true),
+                Err(rejection) => self.outcome.keep_most_telling(rejection),
+            }
         }
-    }
-    if depth == MAX_INTERMEDIATES {
-        return Err(outcome);
+        if self.path.len() == MAX_INTERMEDIATES {
+            return Ok(false);
+        }
+        for index in 0..self.intermediates.len() {
+            let issuer = self.intermediates[index].cert;
+            if self.path.contains(&index) || !self.links(child, issuer)? {
+                continue;
+            }
+            self.path.push(index);
+            let found = self.extend(issuer)?;
+            self.path.pop();
+            if found {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
-    let label = format!("timestamp authority intermediate {depth}");
-    for (index, issuer) in intermediates.iter().enumerate() {
-        if used.contains(&index)
-            || issuer.tbs_certificate.subject.as_raw() != child.tbs_certificate.issuer.as_raw()
-            || verify_chain_link(child, issuer, &label).is_err()
-        {
-            continue;
+    /// Whether `issuer` signed `child`, by name and signature.
+    fn links(
+        &self,
+        child: &X509Certificate<'_>,
+        issuer: &X509Certificate<'_>,
+    ) -> Result<bool, AuthorityRejection> {
+        if issuer.tbs_certificate.subject.as_raw() != child.tbs_certificate.issuer.as_raw() {
+            return Ok(false);
         }
-        let checked = check_cert_validity_at(issuer, at_time, &label)
-            .and_then(|()| enforce_issuer_constraints(issuer, depth, &label))
-            .map_err(|error| error.to_string())
-            .and_then(|()| enforce_timestamping_intermediate(issuer))
-            .and_then(|()| {
-                refuse_unhandled_critical_extensions(issuer, "an intermediate certificate")
-            });
-        if let Err(why) = checked {
-            record(AuthorityRejection::Failed(why));
-            continue;
-        }
-        used.push(index);
-        let extended = extend_path(issuer, intermediates, anchor, at_time, used);
-        used.pop();
-        match extended {
-            Ok(()) => return Ok(()),
-            Err(rejection) => record(rejection),
-        }
+        self.budget.spend()?;
+        Ok(verify_chain_link(child, issuer, "timestamp authority certificate").is_ok())
     }
-    Err(outcome)
+
+    fn check_signer(&self) -> Result<(), AuthorityRejection> {
+        let failed = |why: String| AuthorityRejection::Failed(why);
+        check_cert_validity_at(self.signer, self.at_time, "timestamp signing certificate")
+            .map_err(|error| failed(error.to_string()))?;
+        refuse_unhandled_critical_extensions(self.signer, "its signing certificate").map_err(failed)
+    }
+
+    /// Check the path from the signer through `path` to the anchor.
+    fn check_path(&self) -> Result<(), AuthorityRejection> {
+        self.check_signer()?;
+        for (depth, &index) in self.path.iter().enumerate() {
+            let candidate = self.intermediates[index];
+            let label = format!("timestamp authority intermediate {depth}");
+            check_issuer_lifetime(candidate, self.at_time, &label)?;
+            enforce_issuer_constraints(candidate.cert, depth, &label)
+                .map_err(|error| AuthorityRejection::Failed(error.to_string()))?;
+            enforce_timestamping_intermediate(candidate.cert)
+                .and_then(|()| {
+                    refuse_unhandled_critical_extensions(
+                        candidate.cert,
+                        "an intermediate certificate",
+                    )
+                })
+                .map_err(AuthorityRejection::Failed)?;
+        }
+        let label = "timestamp authority trust anchor";
+        check_issuer_lifetime(
+            Candidate::from_trust_root(self.anchor, true),
+            self.at_time,
+            label,
+        )?;
+        enforce_issuer_constraints(self.anchor, self.path.len(), label)
+            .map_err(|error| AuthorityRejection::Failed(error.to_string()))
+    }
+}
+
+/// An issuer's lifetime must contain the signed time. One the trust root
+/// supplies may have been reissued under the same name and key since, so
+/// a newer trust root may hold a certificate that does.
+fn check_issuer_lifetime(
+    candidate: Candidate<'_, '_>,
+    at_time: lpm_common::Timestamp,
+    label: &str,
+) -> Result<(), AuthorityRejection> {
+    check_cert_validity_at(candidate.cert, at_time, label).map_err(|error| {
+        if candidate.from_trust_root {
+            AuthorityRejection::OutsideWindow(error.to_string())
+        } else {
+            AuthorityRejection::Failed(error.to_string())
+        }
+    })
 }
 
 /// Extensions a timestamp authority certificate may mark critical: those
