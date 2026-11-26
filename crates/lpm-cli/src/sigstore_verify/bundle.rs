@@ -248,7 +248,12 @@ pub(super) fn verify_sigstore_bundle_with(
     // earliest RFC 3161 timestamp. An inclusion proof shows the entry is in
     // the log, not when it got there, and Rekor v2 records no time at all.
     let integrated_time = match entry_version {
-        RekorEntryVersion::V1 if components.tlog_entry.resolved_inclusion_promise().is_some() => {
+        RekorEntryVersion::V1
+            if components
+                .tlog_entry
+                .resolved_signed_entry_timestamp()
+                .is_some() =>
+        {
             let _span = tracing::debug_span!("provenance.verify.set").entered();
             Some(verify_rekor_set(
                 &components.tlog_entry,
@@ -379,7 +384,7 @@ fn verify_rekor_v1_inclusion(
     // `Either` requires a SET or an inclusion proof; the SET check
     // already passed over an absent SET.
     if policy == RekorInclusionProofPolicy::Either
-        && tlog_entry.resolved_inclusion_promise().is_none()
+        && tlog_entry.resolved_signed_entry_timestamp().is_none()
         && !has_inclusion_proof
     {
         return Err(VerifyError::RekorSetMissing);

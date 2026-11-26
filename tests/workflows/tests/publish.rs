@@ -197,9 +197,7 @@ async fn mount_sigstore_publish_mocks(server: &MockServer) {
                 "logID": "workflow-test-log",
                 "body": BASE64.encode(b"workflow-test-canonicalized-body"),
                 "verification": {
-                    "inclusionPromise": {
-                        "signedEntryTimestamp": BASE64.encode(b"workflow-test-set")
-                    },
+                    "signedEntryTimestamp": BASE64.encode(b"workflow-test-set"),
                     "inclusionProof": {
                         "checkpoint": "rekor.sigstore.dev - 1\n124\nabc=\n\n",
                         "hashes": ["aa", "bb"],
@@ -4829,9 +4827,18 @@ async fn publish_npm_generated_provenance_attaches_sigstore_bundle_to_registry_p
         format!("pkg:npm/{package}@1.0.0")
     );
     assert_eq!(statement["subject"][0]["digest"]["sha512"], tarball_sha512);
+    let tlog_entry = &bundle["verificationMaterial"]["tlogEntries"][0];
+    assert_eq!(tlog_entry["logIndex"], "123");
+    // Rekor's API nests these under `verification`; the bundle carries
+    // them on the entry, and without the SET it would have no signed time.
     assert_eq!(
-        bundle["verificationMaterial"]["tlogEntries"][0]["logIndex"],
-        "123"
+        tlog_entry["inclusionPromise"]["signedEntryTimestamp"],
+        BASE64.encode(b"workflow-test-set")
+    );
+    assert_eq!(tlog_entry["inclusionProof"]["treeSize"], 124);
+    assert!(
+        tlog_entry.get("verification").is_none(),
+        "the bundle must not carry Rekor's API envelope: {tlog_entry:#}"
     );
     assert_eq!(
         payload["versions"]["1.0.0"]["_npmProvenanceAttestations"]["dsseEnvelope"]["payload"],

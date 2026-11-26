@@ -349,8 +349,8 @@ pub struct TlogEntry {
     /// Sigstore Bundle v0.3 spec: top-level inclusion promise carrying
     /// the Signed Entry Timestamp (SET). Populated when deserializing a
     /// spec-compliant bundle from npm, GitHub `attest-build-provenance`,
-    /// or LPM's own publish path (which lifts Rekor's nested
-    /// `verification.inclusionPromise` into this field).
+    /// or LPM's own publish path (which moves Rekor's
+    /// `verification.signedEntryTimestamp` into this field).
     #[serde(
         rename = "inclusionPromise",
         default,
@@ -368,18 +368,16 @@ pub struct TlogEntry {
     pub inclusion_proof: Option<RekorInclusionProof>,
 
     /// Rekor API response shape (`POST /api/v1/log/entries`), kept as a
-    /// deserialization fallback. Real Rekor responses nest inclusion
-    /// material under a `verification` envelope two levels deep:
-    /// `verification.inclusionPromise.signedEntryTimestamp` and
-    /// `verification.inclusionProof`. The Sigstore Bundle v0.3 spec
-    /// flattens those onto the TlogEntry directly, but in-the-wild
-    /// LPM bundles published before this schema change captured Rekor's
-    /// response verbatim. Verifier reads via the
-    /// [`Self::resolved_inclusion_promise`] /
+    /// deserialization fallback for an entry copied from Rekor's response
+    /// verbatim. Rekor nests the inclusion material under `verification`:
+    /// `verification.signedEntryTimestamp` and
+    /// `verification.inclusionProof`. The Sigstore bundle carries them on
+    /// the TlogEntry directly. Verifier reads via the
+    /// [`Self::resolved_signed_entry_timestamp`] /
     /// [`Self::resolved_inclusion_proof`] accessors which prefer the
     /// spec-compliant top-level fields and fall back through this
-    /// envelope. New LPM bundles never write to this field — the
-    /// publish path lifts the nested values into the top-level fields.
+    /// envelope. LPM bundles never write to this field — the publish
+    /// path moves the nested values into the top-level fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<RekorVerification>,
 
@@ -395,16 +393,19 @@ pub struct TlogEntry {
 // the M2 SPKI pin slots — declared up front, consumed in a follow-up.
 #[allow(dead_code)]
 impl TlogEntry {
-    /// Inclusion promise (carrying the SET) preferring the
-    /// Sigstore Bundle v0.3 spec-compliant top-level field, falling
-    /// back through the legacy Rekor `verification` envelope. See the
-    /// doc-comment on [`Self::verification`] for why both paths exist.
-    pub fn resolved_inclusion_promise(&self) -> Option<&RekorInclusionPromise> {
-        self.inclusion_promise.as_ref().or_else(|| {
-            self.verification
-                .as_ref()
-                .and_then(|v| v.inclusion_promise.as_ref())
-        })
+    /// The SET (base64), preferring the Sigstore bundle's top-level
+    /// inclusion promise, falling back through Rekor's `verification`
+    /// envelope. See the doc-comment on [`Self::verification`] for why
+    /// both paths exist.
+    pub fn resolved_signed_entry_timestamp(&self) -> Option<&str> {
+        self.inclusion_promise
+            .as_ref()
+            .map(|promise| promise.signed_entry_timestamp.as_str())
+            .or_else(|| {
+                self.verification
+                    .as_ref()
+                    .and_then(|v| v.signed_entry_timestamp.as_deref())
+            })
     }
 
     /// Inclusion proof + checkpoint preferring the spec-compliant
@@ -435,19 +436,19 @@ pub struct LogId {
 
 /// Rekor's `verification` envelope as returned by
 /// `POST /api/v1/log/entries`. This shape is NOT part of the Sigstore
-/// Bundle v0.3 spec (the spec flattens these onto TlogEntry directly),
-/// but it appears in legacy LPM-published bundles. New publish flow
-/// lifts the fields into [`TlogEntry::inclusion_promise`] /
-/// [`TlogEntry::inclusion_proof`]; this type exists only so the
-/// verifier can still read older bundles.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// bundle (which carries these on the TlogEntry directly). The publish
+/// flow reads Rekor's response through it and moves the fields into
+/// [`TlogEntry::inclusion_promise`] / [`TlogEntry::inclusion_proof`];
+/// the verifier reads it from an entry copied from Rekor verbatim.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RekorVerification {
+    /// The SET, base64-encoded.
     #[serde(
-        rename = "inclusionPromise",
+        rename = "signedEntryTimestamp",
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    pub inclusion_promise: Option<RekorInclusionPromise>,
+    pub signed_entry_timestamp: Option<String>,
 
     #[serde(
         rename = "inclusionProof",
@@ -898,30 +899,33 @@ async fn rekor_upload(
         .unwrap_or("")
         .to_string();
 
-    // Lift Rekor's `verification.inclusionPromise` / `inclusionProof`
-    // into top-level `TlogEntry` fields so the persisted bundle matches
-    // the Sigstore Bundle v0.3 spec shape (top-level
-    // inclusionPromise/inclusionProof on TransparencyLogEntry). The
-    // `verification` envelope is Rekor's API response wrapping — it is
-    // not part of the bundle wire format. Bundles produced before this
-    // change captured the envelope verbatim; the verifier's
-    // `TlogEntry::resolved_inclusion_*` accessors fall back through
-    // that legacy shape so old bundles still verify.
-    let verification_obj = entry.get("verification");
-    let inclusion_promise = verification_obj
-        .and_then(|v| v.get("inclusionPromise"))
-        .and_then(|v| serde_json::from_value::<RekorInclusionPromise>(v.clone()).ok());
-    let inclusion_proof = verification_obj
-        .and_then(|v| v.get("inclusionProof"))
-        .and_then(|v| serde_json::from_value::<RekorInclusionProof>(v.clone()).ok());
+    // Rekor's API nests the SET and the inclusion proof under
+    // `verification`; the bundle carries them on the entry itself. The
+    // bundle's version requires the proof, and LPM adds no RFC 3161
+    // timestamp, so the SET is the only signed time the bundle has: a
+    // response missing either can't make a bundle that verifies.
+    let verification: RekorVerification = match entry.get("verification") {
+        Some(verification) => serde_json::from_value(verification.clone()).map_err(|e| {
+            LpmError::Registry(format!("Rekor response `verification` is malformed: {e}"))
+        })?,
+        None => RekorVerification::default(),
+    };
+    let signed_entry_timestamp = verification.signed_entry_timestamp.ok_or_else(|| {
+        LpmError::Registry("Rekor's response carries no signed entry timestamp".into())
+    })?;
+    let inclusion_proof = verification
+        .inclusion_proof
+        .ok_or_else(|| LpmError::Registry("Rekor's response carries no inclusion proof".into()))?;
 
     Ok(TlogEntry {
         log_index,
         log_id: LogId { key_id: log_id },
         integrated_time,
         kind_version: None,
-        inclusion_promise,
-        inclusion_proof,
+        inclusion_promise: Some(RekorInclusionPromise {
+            signed_entry_timestamp,
+        }),
+        inclusion_proof: Some(inclusion_proof),
         verification: None,
         canonicalized_body: body_b64,
     })
@@ -1666,6 +1670,8 @@ mod tests {
 
     #[tokio::test]
     async fn rekor_parses_full_entry_and_lifts_set_to_top_level_inclusion_promise() {
+        // Rekor's API carries the SET beside the proof, as
+        // `verification.signedEntryTimestamp`.
         let server = MockServer::start().await;
         let body = serde_json::json!({
             "uuid-deadbeef": {
@@ -1674,9 +1680,7 @@ mod tests {
                 "logID": "log-abc",
                 "body": "base64-body",
                 "verification": {
-                    "inclusionPromise": {
-                        "signedEntryTimestamp": "MEUCIQDexample=="
-                    },
+                    "signedEntryTimestamp": "MEUCIQDexample==",
                     "inclusionProof": {
                         "checkpoint": "rekor.sigstore.dev - 1\n100\nabc=\n\n",
                         "hashes": ["aa", "bb"],
@@ -1726,30 +1730,61 @@ mod tests {
         );
     }
 
+    /// Rekor's `verification` envelope, as its API returns it.
+    fn rekor_api_verification() -> serde_json::Value {
+        serde_json::json!({
+            "signedEntryTimestamp": "MEUCIQDset==",
+            "inclusionProof": {
+                "checkpoint": "rekor.sigstore.dev - 1\n8\nabc=\n\n",
+                "hashes": ["aa"],
+                "logIndex": 7,
+                "rootHash": "rootabc",
+                "treeSize": 8
+            }
+        })
+    }
+
     #[tokio::test]
-    async fn rekor_omits_inclusion_material_when_verification_missing() {
-        let server = MockServer::start().await;
-        let body = serde_json::json!({
-            "uuid": {
+    async fn rekor_upload_refuses_a_response_without_the_set_or_the_inclusion_proof() {
+        // A bundle needs both: its version requires the proof, and the SET
+        // is the only signed time LPM's bundles carry.
+        let without = |field: &str| {
+            let mut verification = rekor_api_verification();
+            verification.as_object_mut().unwrap().remove(field);
+            Some(verification)
+        };
+        let mut malformed_proof = rekor_api_verification();
+        malformed_proof["inclusionProof"]["treeSize"] = serde_json::json!("eight");
+        for (verification, expected) in [
+            (None, "no signed entry timestamp"),
+            (without("signedEntryTimestamp"), "no signed entry timestamp"),
+            (without("inclusionProof"), "no inclusion proof"),
+            (Some(malformed_proof), "`verification` is malformed"),
+        ] {
+            let server = MockServer::start().await;
+            let mut entry = serde_json::json!({
                 "logIndex": 7,
                 "integratedTime": 1700000000_i64,
                 "logID": "log",
                 "body": "b"
+            });
+            if let Some(verification) = verification {
+                entry["verification"] = verification;
             }
-        });
-        Mock::given(method("POST"))
-            .and(match_path("/api/v1/log/entries"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(body))
-            .mount(&server)
-            .await;
+            Mock::given(method("POST"))
+                .and(match_path("/api/v1/log/entries"))
+                .respond_with(
+                    ResponseTemplate::new(201).set_body_json(serde_json::json!({ "uuid": entry })),
+                )
+                .mount(&server)
+                .await;
 
-        let envelope = dsse_fixture();
-        let entry = rekor_upload(&server.uri(), &envelope, "cert")
-            .await
-            .unwrap();
-        assert!(entry.inclusion_promise.is_none());
-        assert!(entry.inclusion_proof.is_none());
-        assert!(entry.verification.is_none());
+            let err = rekor_upload(&server.uri(), &dsse_fixture(), "cert")
+                .await
+                .expect_err("a bundle without a SET and a proof would not verify");
+            let msg = err.to_string();
+            assert!(msg.contains(expected), "expected {expected:?}, got: {msg}");
+        }
     }
 
     #[tokio::test]
@@ -1763,7 +1798,8 @@ mod tests {
             "uuid": {
                 "integratedTime": 1700000000_i64,
                 "logID": "log",
-                "body": "b"
+                "body": "b",
+                "verification": rekor_api_verification()
             }
         });
         Mock::given(method("POST"))
@@ -1798,39 +1834,38 @@ mod tests {
         });
         let entry: TlogEntry = serde_json::from_value(json).expect("spec-shape must deserialize");
         assert!(entry.verification.is_none());
-        let promise = entry
-            .resolved_inclusion_promise()
-            .expect("resolved accessor must return the top-level SET");
-        assert_eq!(promise.signed_entry_timestamp, "MEUCIQDspec==");
+        assert_eq!(
+            entry.resolved_signed_entry_timestamp(),
+            Some("MEUCIQDspec=="),
+            "resolved accessor must return the top-level SET"
+        );
     }
 
     #[test]
-    fn tlog_entry_deserializes_set_from_nested_verification_envelope_for_legacy_bundles() {
-        // Legacy LPM bundles (published before the publish-side fix
-        // that lifts Rekor's response into top-level fields) carry the
-        // SET nested under `verification.inclusionPromise`. The
-        // resolved accessor must transparently fall back through that
-        // envelope so old bundles still verify.
+    fn tlog_entry_reads_the_set_from_rekors_verification_envelope() {
+        // An entry copied from Rekor's API response carries the SET as
+        // `verification.signedEntryTimestamp`. The resolved accessor must
+        // fall back through that envelope.
         let json = serde_json::json!({
             "logIndex": "10",
             "logId": {"keyId": "kid"},
             "integratedTime": "1700000000",
             "verification": {
-                "inclusionPromise": {
-                    "signedEntryTimestamp": "MEUCIQDlegacy=="
-                }
+                "signedEntryTimestamp": "MEUCIQDlegacy=="
             },
             "canonicalizedBody": "body"
         });
-        let entry: TlogEntry = serde_json::from_value(json).expect("legacy shape must deserialize");
+        let entry: TlogEntry =
+            serde_json::from_value(json).expect("Rekor's shape must deserialize");
         assert!(
             entry.inclusion_promise.is_none(),
-            "top-level field should be absent on legacy bundles"
+            "top-level field should be absent on an entry copied from Rekor"
         );
-        let promise = entry
-            .resolved_inclusion_promise()
-            .expect("resolved accessor must fall back through legacy `verification` envelope");
-        assert_eq!(promise.signed_entry_timestamp, "MEUCIQDlegacy==");
+        assert_eq!(
+            entry.resolved_signed_entry_timestamp(),
+            Some("MEUCIQDlegacy=="),
+            "resolved accessor must fall back through Rekor's `verification` envelope"
+        );
     }
 
     #[test]
@@ -1848,16 +1883,14 @@ mod tests {
                 "signedEntryTimestamp": "MEUCIQDtop=="
             },
             "verification": {
-                "inclusionPromise": {
-                    "signedEntryTimestamp": "MEUCIQDnested=="
-                }
+                "signedEntryTimestamp": "MEUCIQDnested=="
             },
             "canonicalizedBody": "body"
         });
         let entry: TlogEntry = serde_json::from_value(json).unwrap();
-        let promise = entry.resolved_inclusion_promise().unwrap();
         assert_eq!(
-            promise.signed_entry_timestamp, "MEUCIQDtop==",
+            entry.resolved_signed_entry_timestamp(),
+            Some("MEUCIQDtop=="),
             "top-level (spec-compliant) field must win when both shapes are present"
         );
     }
@@ -1913,9 +1946,7 @@ mod tests {
                 "logID": "log",
                 "body": "b",
                 "verification": {
-                    "inclusionPromise": {
-                        "signedEntryTimestamp": "MEUCIQDend=="
-                    },
+                    "signedEntryTimestamp": "MEUCIQDend==",
                     "inclusionProof": {
                         "checkpoint": "ckpt",
                         "hashes": ["a"],
@@ -2146,7 +2177,8 @@ mod tests {
                     "logIndex": 99,
                     "integratedTime": 1700000000_i64,
                     "logID": "log",
-                    "body": "b"
+                    "body": "b",
+                    "verification": rekor_api_verification()
                 }
             })))
             .mount(&rekor)
