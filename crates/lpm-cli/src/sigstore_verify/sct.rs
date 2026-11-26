@@ -1,7 +1,7 @@
 use ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use x509_parser::prelude::*;
 
 use super::{CtLogKey, VerifyError};
@@ -32,9 +32,9 @@ pub(super) const MIN_SCT_LEN: usize = 1 + CT_LOG_ID_LEN + 8 + 2 + 4;
 /// leaf's immediate issuer (the Fulcio intermediate or root that
 /// signed it). The SCT signed-input includes
 /// `sha256(issuer_spki_der)` to bind the SCT to a specific issuer.
-/// `ctlog_keys`: trust root's CT log keys, filtered by validity at
-/// `at_time` inside this function.
-/// `at_time`: typically the Rekor `integratedTime`.
+/// `ctlog_keys`: trust root's CT log keys. Each SCT is checked under the
+/// key valid at the SCT's own signed timestamp, as Sigstore's verifiers
+/// do: Fulcio gets the SCT just before the signature exists.
 ///
 /// Returns `Ok(())` when ≥1 SCT in the leaf's extension verifies
 /// under one of the pinned CT log keys. A cert with no SCT
@@ -45,7 +45,6 @@ pub fn verify_embedded_sct(
     leaf_cert_der: &[u8],
     issuer_spki_der: &[u8],
     ctlog_keys: &[CtLogKey],
-    at_time: SystemTime,
 ) -> Result<(), VerifyError> {
     let (_, leaf) = X509Certificate::from_der(leaf_cert_der)
         .map_err(|e| VerifyError::Sct(format!("leaf cert is not valid DER: {e}")))?;
@@ -114,13 +113,26 @@ pub fn verify_embedded_sct(
                 continue;
             }
         };
+        // Past the year 9999 validity windows can't place the time, and
+        // Windows' clock can't hold it some way further on; such an SCT is
+        // refused on every platform alike.
+        let sct_time = i64::try_from(parsed.timestamp_ms)
+            .ok()
+            .and_then(lpm_common::Timestamp::from_unix_milliseconds)
+            .and_then(|_| {
+                SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(parsed.timestamp_ms))
+            });
+        let Some(sct_time) = sct_time else {
+            last_err = Some(format!("sct[{i}]: its timestamp is out of range"));
+            continue;
+        };
         let Some(key) = ctlog_keys
             .iter()
-            .find(|k| k.log_id == parsed.log_id && k.valid_for.contains(at_time))
+            .find(|k| k.log_id == parsed.log_id && k.valid_for.contains(sct_time))
         else {
             saw_unknown_log = true;
             last_err = Some(format!(
-                "sct[{i}]: no pinned CT log key matches logId={} valid at integratedTime",
+                "sct[{i}]: no pinned CT log key matches logId={} valid at the SCT's time",
                 hex::encode(&parsed.log_id)
             ));
             continue;

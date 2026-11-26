@@ -73,25 +73,10 @@ pub fn verify_dsse(envelope: &DsseEnvelope, cert: &X509Certificate<'_>) -> Resul
             .decode(sig.sig.as_bytes())
             .map_err(|e| VerifyError::DsseSignature(format!("signature not valid base64: {e}")))?;
 
-        let candidates = parse_signature_candidates(&sig_bytes);
-        if candidates.der.is_none() && candidates.raw.is_none() {
-            parse_errors.push(candidates.parse_error);
-            continue;
-        }
-
-        if candidates
-            .der
-            .as_ref()
-            .is_some_and(|signature| verifying_key.verify(&pae_bytes, signature).is_ok())
-        {
-            return Ok(());
-        }
-        if candidates
-            .raw
-            .as_ref()
-            .is_some_and(|signature| verifying_key.verify(&pae_bytes, signature).is_ok())
-        {
-            return Ok(());
+        match signature_verifies(&verifying_key, &pae_bytes, &sig_bytes) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(parse_error) => parse_errors.push(parse_error),
         }
     }
 
@@ -108,6 +93,48 @@ pub fn verify_dsse(envelope: &DsseEnvelope, cert: &X509Certificate<'_>) -> Resul
             parse_errors.join("; ")
         )))
     }
+}
+
+/// Verify one particular signature from the envelope, as an RFC 3161
+/// timestamp or a Rekor v2 entry names it, against the leaf cert's key.
+pub(super) fn verify_dsse_signature(
+    envelope: &DsseEnvelope,
+    cert: &X509Certificate<'_>,
+    signature: &[u8],
+) -> Result<(), VerifyError> {
+    let verifying_key = extract_p256_verifying_key(cert)?;
+    let raw_payload = BASE64
+        .decode(envelope.payload.as_bytes())
+        .map_err(|e| VerifyError::DsseSignature(format!("payload not valid base64: {e}")))?;
+    let pae_bytes = pae(&envelope.payload_type, &raw_payload);
+    match signature_verifies(&verifying_key, &pae_bytes, signature) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(VerifyError::DsseSignature(
+            "the envelope's first signature, which the bundle logs and timestamps, did not \
+             verify against the leaf cert's signing key"
+                .into(),
+        )),
+        Err(parse_error) => Err(VerifyError::DsseSignature(format!(
+            "the envelope's first signature did not parse: {parse_error}"
+        ))),
+    }
+}
+
+/// Whether `sig_bytes`, DER or raw R||S, verifies over `pae_bytes`; an
+/// error when it parses as neither.
+fn signature_verifies(
+    verifying_key: &VerifyingKey,
+    pae_bytes: &[u8],
+    sig_bytes: &[u8],
+) -> Result<bool, String> {
+    let candidates = parse_signature_candidates(sig_bytes);
+    if candidates.der.is_none() && candidates.raw.is_none() {
+        return Err(candidates.parse_error);
+    }
+    Ok([candidates.der, candidates.raw]
+        .iter()
+        .flatten()
+        .any(|signature| verifying_key.verify(pae_bytes, signature).is_ok()))
 }
 
 struct SignatureCandidates {

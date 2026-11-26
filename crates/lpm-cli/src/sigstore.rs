@@ -314,17 +314,37 @@ pub struct Certificate {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TlogEntry {
-    /// Log index in the transparency log.
-    #[serde(rename = "logIndex")]
+    /// Log index in the transparency log. Protobuf JSON writes int64 as a
+    /// string and leaves out a zero, the first entry of a new log.
+    #[serde(
+        rename = "logIndex",
+        default = "zero_string",
+        deserialize_with = "de_string_from_str_or_num"
+    )]
     pub log_index: String,
 
-    /// Log ID (Rekor instance identifier).
-    #[serde(rename = "logId")]
+    /// Log ID (Rekor instance identifier). Empty when the bundle leaves it
+    /// out, as Rekor v2 means to.
+    #[serde(rename = "logId", default)]
     pub log_id: LogId,
 
-    /// RFC 3339 timestamp of inclusion.
-    #[serde(rename = "integratedTime")]
+    /// Seconds since the epoch when Rekor v1 integrated the entry. Rekor
+    /// v2 has no integrated time, and its bundles leave the field out.
+    #[serde(
+        rename = "integratedTime",
+        default,
+        deserialize_with = "de_string_from_str_or_num"
+    )]
     pub integrated_time: String,
+
+    /// The entry's kind and version, which its body repeats. Bundles
+    /// before v0.2 leave it out.
+    #[serde(
+        rename = "kindVersion",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub kind_version: Option<KindVersion>,
 
     /// Sigstore Bundle v0.3 spec: top-level inclusion promise carrying
     /// the Signed Entry Timestamp (SET). Populated when deserializing a
@@ -399,10 +419,17 @@ impl TlogEntry {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KindVersion {
+    pub kind: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct LogId {
-    /// Hex-encoded key ID of the Rekor log.
-    #[serde(rename = "keyId")]
+    /// Hex-encoded key ID of the Rekor log. Protobuf JSON leaves an empty
+    /// one out, as `"logId": {}`.
+    #[serde(rename = "keyId", default)]
     pub key_id: String,
 }
 
@@ -451,20 +478,56 @@ pub struct RekorInclusionProof {
     /// rather than relying on a fixed struct.
     pub checkpoint: serde_json::Value,
 
-    /// Sibling hashes along the Merkle path from leaf to root.
+    /// Sibling hashes along the Merkle path from leaf to root. Protobuf
+    /// JSON leaves the list out when it's empty, for a one-entry tree.
+    #[serde(default)]
     pub hashes: Vec<String>,
 
     // Sigstore Bundle v0.3 protobuf JSON encodes int64 as JSON
     // strings (JS-interop convention); LPM's own publish path emits
-    // bare numbers. Accept both via `de_i64_from_str_or_num`.
-    #[serde(rename = "logIndex", deserialize_with = "de_i64_from_str_or_num")]
+    // bare numbers. Accept both via `de_i64_from_str_or_num`. Rekor v2
+    // verifiers ignore this field, the root hash and the tree size, which
+    // repeat values the entry and its signed checkpoint give, so a bundle
+    // may leave them out.
+    #[serde(
+        rename = "logIndex",
+        default,
+        deserialize_with = "de_i64_from_str_or_num"
+    )]
     pub log_index: i64,
 
-    #[serde(rename = "rootHash")]
+    #[serde(rename = "rootHash", default)]
     pub root_hash: String,
 
-    #[serde(rename = "treeSize", deserialize_with = "de_i64_from_str_or_num")]
+    #[serde(
+        rename = "treeSize",
+        default,
+        deserialize_with = "de_i64_from_str_or_num"
+    )]
     pub tree_size: i64,
+}
+
+fn zero_string() -> String {
+    "0".into()
+}
+
+/// An int64 field kept as its decimal string, from a JSON string or a bare
+/// number: protobuf JSON writes the former, other producers the latter.
+fn de_string_from_str_or_num<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StrOrNum {
+        Num(i64),
+        Str(String),
+    }
+    Ok(match StrOrNum::deserialize(deserializer)? {
+        StrOrNum::Num(n) => n.to_string(),
+        StrOrNum::Str(s) => s,
+    })
 }
 
 /// Accept i64 as either a bare JSON number (LPM publish path) or a
@@ -856,6 +919,7 @@ async fn rekor_upload(
         log_index,
         log_id: LogId { key_id: log_id },
         integrated_time,
+        kind_version: None,
         inclusion_promise,
         inclusion_proof,
         verification: None,

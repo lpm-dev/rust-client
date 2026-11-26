@@ -5,18 +5,24 @@ use sha2::{Digest, Sha256};
 use std::time::SystemTime;
 use x509_parser::prelude::*;
 
-use super::rekor_set::{parse_integrated_time, parse_log_index};
+use super::checkpoint::logs_signing;
+use super::dsse::verify_dsse_signature;
+use super::inclusion::{extract_checkpoint_envelope, verify_rekor_v2_inclusion_proof};
+use super::rekor_body::{RekorEntryVersion, rekor_entry_version, verify_hashedrekord_v002};
+use super::rekor_set::{decode_log_id, parse_log_index};
 use super::sct::der_decode_length;
 use super::timestamp::{MAX_SIGNED_TIMESTAMPS, verify_signed_timestamps};
 use super::{
-    FulcioRoot, RekorInclusionProofPolicy, TrustRoot, VerifyError, trust_root, verify_cert_chain,
-    verify_dsse, verify_embedded_sct, verify_inclusion_proof, verify_rekor_body, verify_rekor_set,
+    RekorInclusionProofPolicy, TrustRoot, VerifyError, trust_root, verify_cert_chain, verify_dsse,
+    verify_embedded_sct, verify_inclusion_proof, verify_rekor_body, verify_rekor_set,
 };
 
 // The composed verifier runs each cryptographic phase to completion
 // before trusting output from that phase. All downstream validity-window
-// checks use Rekor `integratedTime`, not wall-clock time, so historical
-// bundles verify against the Fulcio and CT keys active at integration.
+// checks use signed times (Rekor v1's `integratedTime` under a SET, an RFC
+// 3161 timestamp, or an SCT's own time), not wall-clock time, so
+// historical bundles verify against the Fulcio and CT keys active when
+// they were signed.
 /// Verifier-time options. Currently carries the
 /// [`RekorInclusionProofPolicy`] only; future knobs can live here
 /// without breaking the public API.
@@ -87,7 +93,7 @@ impl IdentityExpectations {
 
 /// The structured result of a successful bundle verification.
 /// `snapshot` carries the per-package identity for the drift gate;
-/// the trail of `integrated_time`, `leaf_cert_sha256`, `log_id`,
+/// the trail of `signed_at`, `leaf_cert_sha256`, `log_id`,
 /// and `log_index` becomes verified lockfile evidence. The cache
 /// stores the raw bundle so every hit can re-run these checks.
 #[allow(dead_code)]
@@ -96,7 +102,10 @@ pub struct VerifiedProvenance {
     pub snapshot: lpm_workspace::ProvenanceSnapshot,
     pub build: CertificateBuildClaims,
     pub statement: serde_json::Value,
-    pub integrated_time: SystemTime,
+    /// When the signature was made, as far as signed evidence shows: the
+    /// integrated time Rekor v1 signed in the entry's SET, or else the
+    /// earliest RFC 3161 timestamp that verifies.
+    pub signed_at: SystemTime,
     pub leaf_cert_sha256: String,
     pub log_id: String,
     pub log_index: i64,
@@ -219,30 +228,56 @@ pub(super) fn verify_sigstore_bundle_with(
     };
     trust.check_expiry(SystemTime::now())?;
 
-    let at_time = parse_integrated_time(&components.tlog_entry.integrated_time)?;
     let log_index = parse_log_index(&components.tlog_entry.log_index)?;
+    let entry_version = rekor_entry_version(&components.tlog_entry)?;
+    let signature = first_dsse_signature(&components.dsse_envelope)?;
 
-    // SET first — its successful run also doubles as a sanity check
-    // that the trust root carries an active Rekor key for the log
-    // this bundle references. Under `Either` policy with SET absent,
-    // this is a no-op and returns the parsed integratedTime.
-    {
-        let _span = tracing::debug_span!("provenance.verify.set").entered();
-        verify_rekor_set(
-            &components.tlog_entry,
-            &trust.rekor_keys,
-            options.rekor_inclusion_policy,
-        )?;
-    }
+    // Every RFC 3161 timestamp that verifies is a signed time the
+    // signature existed at.
+    let timestamps = {
+        let _span = tracing::debug_span!("provenance.verify.timestamps").entered();
+        verify_signed_timestamps(
+            &components.signed_timestamps,
+            &signature,
+            &trust.timestamp_authorities,
+        )?
+    };
 
-    // Chain validation at the resolved `at_time`. Trust anchors are
-    // pre-filtered to those active at the same time so a retired
-    // root doesn't accidentally anchor a fresh bundle.
-    let active_fulcio: Vec<&FulcioRoot> = trust.fulcio_roots_at(at_time);
+    // The time the certificate is checked at. For Rekor v1, the integrated
+    // time its SET signs (the bundle's unsigned value under `Either`
+    // without a SET). Rekor v2 records no time, so its entries need a
+    // timestamp, and the earliest one counts.
+    let signed_at = match entry_version {
+        RekorEntryVersion::V1 => {
+            let _span = tracing::debug_span!("provenance.verify.set").entered();
+            verify_rekor_set(
+                &components.tlog_entry,
+                &trust.rekor_keys,
+                options.rekor_inclusion_policy,
+            )?
+        }
+        RekorEntryVersion::V2 => match timestamps.earliest() {
+            Some(earliest) => earliest,
+            None => return Err(timestamps.into_error()),
+        },
+    };
+
+    // The certificate must have been valid at every signed time. Trust
+    // anchors are filtered to those active at each time so a retired root
+    // doesn't anchor a fresh bundle.
     let chain_refs: Vec<&[u8]> = components.chain_der.iter().map(|d| d.as_slice()).collect();
     {
         let _span = tracing::debug_span!("provenance.verify.chain").entered();
-        verify_cert_chain(&chain_refs, &active_fulcio, at_time)?;
+        verify_cert_chain(&chain_refs, &trust.fulcio_roots_at(signed_at), signed_at)?;
+        for timestamp in &timestamps.verified {
+            if timestamp.time != signed_at {
+                verify_cert_chain(
+                    &chain_refs,
+                    &trust.fulcio_roots_at(timestamp.time),
+                    timestamp.time,
+                )?;
+            }
+        }
     }
 
     // Parse the leaf cert once for downstream consumers (DSSE,
@@ -254,26 +289,12 @@ pub(super) fn verify_sigstore_bundle_with(
 
     {
         let _span = tracing::debug_span!("provenance.verify.dsse").entered();
-        verify_dsse(&components.dsse_envelope, &leaf_parsed)?;
-    }
-
-    // Every RFC 3161 timestamp that verifies is a signed time the
-    // signature existed at, so the certificate must have been valid then
-    // too. A timestamp that doesn't verify proves nothing and is skipped.
-    if !components.signed_timestamps.is_empty() {
-        let _span = tracing::debug_span!("provenance.verify.timestamps").entered();
-        let signature = first_dsse_signature(&components.dsse_envelope)?;
-        let timestamps = verify_signed_timestamps(
-            &components.signed_timestamps,
-            &signature,
-            &trust.timestamp_authorities,
-        )?;
-        for timestamp in &timestamps {
-            verify_cert_chain(
-                &chain_refs,
-                &trust.fulcio_roots_at(timestamp.time),
-                timestamp.time,
-            )?;
+        match entry_version {
+            RekorEntryVersion::V1 => verify_dsse(&components.dsse_envelope, &leaf_parsed)?,
+            // A Rekor v2 entry logs one signature; that one must be valid.
+            RekorEntryVersion::V2 => {
+                verify_dsse_signature(&components.dsse_envelope, &leaf_parsed, &signature)?
+            }
         }
     }
 
@@ -282,51 +303,46 @@ pub(super) fn verify_sigstore_bundle_with(
     // fall back to the active trust anchors. Chain validation has
     // already cleared the path, so a match is guaranteed.
     let issuer_spki_der =
-        find_leaf_issuer_spki(&leaf_parsed, &components.chain_der, trust, at_time)?;
+        find_leaf_issuer_spki(&leaf_parsed, &components.chain_der, trust, signed_at)?;
     {
         let _span = tracing::debug_span!("provenance.verify.sct").entered();
         verify_embedded_sct(
             &components.leaf_cert_der,
             &issuer_spki_der,
             &trust.ctlog_keys,
-            at_time,
         )?;
     }
 
     {
         let _span = tracing::debug_span!("provenance.verify.rekor_body").entered();
-        verify_rekor_body(
-            &components.tlog_entry,
-            &components.dsse_envelope,
-            &components.leaf_cert_der,
-        )?;
+        match entry_version {
+            RekorEntryVersion::V1 => verify_rekor_body(
+                &components.tlog_entry,
+                &components.dsse_envelope,
+                &components.leaf_cert_der,
+            )?,
+            RekorEntryVersion::V2 => verify_hashedrekord_v002(
+                &components.tlog_entry,
+                &components.dsse_envelope,
+                &components.leaf_cert_der,
+                &signature,
+            )?,
+        }
     }
 
-    // Inclusion proof — policy-conditional. Verify whenever present
-    // (defense in depth); failure-on-absence per policy.
-    let has_inclusion_proof = components.tlog_entry.resolved_inclusion_proof().is_some();
-    match options.rekor_inclusion_policy {
-        RekorInclusionProofPolicy::RequireInclusionProof
-        | RekorInclusionProofPolicy::RequireBoth => {
-            let _span = tracing::debug_span!("provenance.verify.inclusion_proof").entered();
-            verify_inclusion_proof(&components.tlog_entry, &trust.rekor_keys)?;
-        }
-        RekorInclusionProofPolicy::Either | RekorInclusionProofPolicy::RequireSet => {
-            if has_inclusion_proof {
-                let _span = tracing::debug_span!("provenance.verify.inclusion_proof").entered();
-                verify_inclusion_proof(&components.tlog_entry, &trust.rekor_keys)?;
+    let mut log_id = components.tlog_entry.log_id.key_id.clone();
+    {
+        let _span = tracing::debug_span!("provenance.verify.inclusion_proof").entered();
+        match entry_version {
+            RekorEntryVersion::V1 => verify_rekor_v1_inclusion(
+                &components.tlog_entry,
+                trust,
+                options.rekor_inclusion_policy,
+            )?,
+            RekorEntryVersion::V2 => {
+                log_id = verify_rekor_v2_inclusion(&components.tlog_entry, trust)?;
             }
         }
-    }
-
-    // `Either` requires SET OR inclusion proof. SET was already
-    // checked above (no-op on absence under `Either`); if neither
-    // is present, reject here.
-    if options.rekor_inclusion_policy == RekorInclusionProofPolicy::Either
-        && components.tlog_entry.resolved_inclusion_promise().is_none()
-        && !has_inclusion_proof
-    {
-        return Err(VerifyError::RekorSetMissing);
     }
 
     if !expectations.is_empty() {
@@ -344,11 +360,83 @@ pub(super) fn verify_sigstore_bundle_with(
         snapshot,
         build,
         statement: components.statement,
-        integrated_time: at_time,
+        signed_at,
         leaf_cert_sha256,
-        log_id: components.tlog_entry.log_id.key_id.clone(),
+        log_id,
         log_index,
     })
+}
+
+/// A Rekor v1 entry's inclusion proof, as `policy` requires it. One that
+/// is present is verified whatever the policy.
+fn verify_rekor_v1_inclusion(
+    tlog_entry: &crate::sigstore::TlogEntry,
+    trust: &TrustRoot,
+    policy: RekorInclusionProofPolicy,
+) -> Result<(), VerifyError> {
+    let has_inclusion_proof = tlog_entry.resolved_inclusion_proof().is_some();
+    if has_inclusion_proof || policy.requires_inclusion_proof() {
+        verify_inclusion_proof(tlog_entry, &trust.rekor_keys)?;
+    }
+    // `Either` requires a SET or an inclusion proof; the SET check
+    // already passed over an absent SET.
+    if policy == RekorInclusionProofPolicy::Either
+        && tlog_entry.resolved_inclusion_promise().is_none()
+        && !has_inclusion_proof
+    {
+        return Err(VerifyError::RekorSetMissing);
+    }
+    Ok(())
+}
+
+/// A Rekor v2 entry's inclusion proof, which every policy requires: the
+/// entry carries no SET. Returns the ID the trust root gives the log,
+/// base64-encoded as bundles carry it, however the bundle spells it.
+///
+/// The log is found by the entry's `logId`, or, since Rekor means to stop
+/// sending one, by the checkpoint signature naming a log in the trust
+/// root. A checkpoint carries no time to check the log's key against, so
+/// the log's window in the trust root isn't consulted, as Sigstore's
+/// verifiers don't.
+fn verify_rekor_v2_inclusion(
+    tlog_entry: &crate::sigstore::TlogEntry,
+    trust: &TrustRoot,
+) -> Result<String, VerifyError> {
+    let missing = |detail: String| VerifyError::MissingTrustMaterial {
+        check: "Rekor inclusion proof",
+        detail,
+    };
+    if !tlog_entry.log_id.key_id.is_empty() {
+        let log_id =
+            decode_log_id(&tlog_entry.log_id.key_id).map_err(VerifyError::InclusionProof)?;
+        let log = trust.rekor_log(&log_id).ok_or_else(|| {
+            missing(format!(
+                "no Rekor log for logId={}",
+                tlog_entry.log_id.key_id
+            ))
+        })?;
+        verify_rekor_v2_inclusion_proof(tlog_entry, log)?;
+        return Ok(BASE64.encode(&log.log_id));
+    }
+
+    // A log in the trust root may also co-sign another log's checkpoints,
+    // so every log the checkpoint names is tried.
+    let proof = tlog_entry
+        .resolved_inclusion_proof()
+        .ok_or(VerifyError::InclusionProofMissing)?;
+    let envelope = extract_checkpoint_envelope(&proof.checkpoint)?;
+    let named = logs_signing(&envelope, &trust.rekor_keys).map_err(VerifyError::InclusionProof)?;
+    let mut refused = None;
+    for log in named {
+        match verify_rekor_v2_inclusion_proof(tlog_entry, log) {
+            Ok(()) => return Ok(BASE64.encode(&log.log_id)),
+            Err(error) => {
+                refused.get_or_insert(error);
+            }
+        }
+    }
+    Err(refused
+        .unwrap_or_else(|| missing("no Rekor log in the trust root signed its checkpoint".into())))
 }
 
 /// Parsed bundle components, with the heavy DER + DSSE work done

@@ -14,6 +14,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
+mod conformance;
+mod rekor_v2;
 mod timestamp;
 
 const PAYLOAD_TYPE: &str = "application/vnd.in-toto+json";
@@ -125,6 +127,33 @@ fn verifies_when_at_least_one_of_multiple_signatures_matches() {
     let (_, cert) = X509Certificate::from_der(&cert_der).unwrap();
     verify_dsse(&envelope, &cert)
         .expect("verifier must accept the envelope when one signature verifies");
+}
+
+#[test]
+fn the_signature_a_bundle_logs_must_itself_verify() {
+    // `verify_dsse` accepts an envelope one of whose signatures verifies;
+    // the one a Rekor v2 entry logs and a timestamp covers must be valid
+    // on its own.
+    let (cert_der, signing_key) = p256_cert_and_signing_key();
+    let mut envelope = dsse_envelope_signed_with(&signing_key, PAYLOAD);
+    let garbage = [7u8; 64];
+    envelope.signatures.insert(
+        0,
+        DsseSignature {
+            keyid: String::new(),
+            sig: BASE64.encode(garbage),
+        },
+    );
+    let (_, cert) = X509Certificate::from_der(&cert_der).unwrap();
+    verify_dsse(&envelope, &cert).unwrap();
+
+    let valid = BASE64.decode(&envelope.signatures[1].sig).unwrap();
+    dsse::verify_dsse_signature(&envelope, &cert, &valid).unwrap();
+    let refused = dsse::verify_dsse_signature(&envelope, &cert, &garbage).unwrap_err();
+    assert!(
+        matches!(&refused, VerifyError::DsseSignature(why) if why.contains("did not verify")),
+        "{refused:?}"
+    );
 }
 
 // ── verify_dsse() failure cases ───────────────────────────────
@@ -381,6 +410,7 @@ fn tlog_entry_with_body(body: &serde_json::Value) -> TlogEntry {
             key_id: String::new(),
         },
         integrated_time: "0".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -450,6 +480,7 @@ fn accepts_rekor_body_with_field_reordered_or_extra_whitespace() {
             key_id: String::new(),
         },
         integrated_time: "0".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -552,6 +583,7 @@ fn rejects_bundle_with_canonicalized_body_not_base64() {
             key_id: String::new(),
         },
         integrated_time: "0".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -576,6 +608,7 @@ fn rejects_bundle_with_canonicalized_body_not_json() {
             key_id: String::new(),
         },
         integrated_time: "0".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -1150,6 +1183,7 @@ fn synth_tlog_entry_with_set(
             key_id: log_id_hex.to_string(),
         },
         integrated_time: integrated_time_secs.to_string(),
+        kind_version: None,
         inclusion_promise: Some(crate::sigstore::RekorInclusionPromise {
             signed_entry_timestamp,
         }),
@@ -1169,7 +1203,7 @@ fn rekor_key_active_around(log_id: Vec<u8>, spki_der: Vec<u8>, around_secs: i64)
             start,
             end: Some(end),
         },
-        base_url: "https://rekor.test.example".into(),
+        base_url: "https://rekor.sigstore.dev".into(),
         checkpoint_key_id: None,
     }
 }
@@ -1409,6 +1443,7 @@ fn rejects_missing_set_under_require_set_policy() {
             key_id: String::new(),
         },
         integrated_time: "1700000000".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -1428,6 +1463,7 @@ fn rejects_missing_set_under_require_both_policy() {
             key_id: String::new(),
         },
         integrated_time: "1700000000".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -1451,6 +1487,7 @@ fn accepts_missing_set_under_either_policy_and_returns_integrated_time() {
             key_id: String::new(),
         },
         integrated_time: "1700000000".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -1475,6 +1512,7 @@ fn accepts_missing_set_under_require_inclusion_proof_policy() {
             key_id: String::new(),
         },
         integrated_time: "1700000000".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -1500,6 +1538,7 @@ fn either_policy_rejects_bundle_with_neither_set_nor_inclusion_proof() {
             key_id: String::new(),
         },
         integrated_time: "1700000000".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -1536,6 +1575,7 @@ fn either_policy_accepts_inclusion_proof_only_bundle_via_primitive_seam() {
             key_id: String::new(),
         },
         integrated_time: "1700000000".into(),
+        kind_version: None,
         inclusion_promise: None, // SET absent
         inclusion_proof: Some(crate::sigstore::RekorInclusionProof {
             checkpoint: serde_json::json!({}),
@@ -1571,6 +1611,7 @@ fn either_policy_accepts_set_only_bundle_via_primitive_seam() {
         log_index: "7".into(),
         log_id: crate::sigstore::LogId { key_id: log_id_hex },
         integrated_time: integrated_time.to_string(),
+        kind_version: None,
         inclusion_promise: Some(crate::sigstore::RekorInclusionPromise {
             signed_entry_timestamp: set_b64,
         }),
@@ -1604,6 +1645,7 @@ fn require_both_policy_rejects_when_inclusion_proof_is_absent() {
             key_id: String::new(),
         },
         integrated_time: "1700000000".into(),
+        kind_version: None,
         // SET present, but IP absent (real-world: an npm bundle
         // that ships SET only — fine under Either, refused under
         // RequireBoth).
@@ -1632,6 +1674,7 @@ fn require_inclusion_proof_policy_rejects_when_inclusion_proof_is_absent() {
             key_id: String::new(),
         },
         integrated_time: "1700000000".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -1660,13 +1703,8 @@ fn rfc3161_timestamp_only_bundle_rejects_because_no_embedded_sct_is_present() {
     let leaf_der = build_leaf_with_optional_sct(&leaf_kp, &issuer, None);
     let issuer_spki = issuer_spki_from_cert(&issuer.cert);
     let (_, ct_log_key) = synth_ct_log_key(2025);
-    let err = verify_embedded_sct(
-        &leaf_der,
-        &issuer_spki,
-        std::slice::from_ref(&ct_log_key),
-        ts_year(2025),
-    )
-    .expect_err("RFC-3161-only bundle (no embedded SCT) must reject");
+    let err = verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key))
+        .expect_err("RFC-3161-only bundle (no embedded SCT) must reject");
     match err {
         VerifyError::Sct(msg) => assert!(
             msg.contains("no embedded SCT"),
@@ -1700,6 +1738,7 @@ fn verifies_set_via_legacy_verification_envelope_fallback() {
         log_index: "42".into(),
         log_id: crate::sigstore::LogId { key_id: log_id_hex },
         integrated_time: integrated_time.to_string(),
+        kind_version: None,
         inclusion_promise: None, // top-level absent
         inclusion_proof: None,
         verification: Some(crate::sigstore::RekorVerification {
@@ -1727,6 +1766,7 @@ fn rejects_set_with_malformed_integrated_time_string() {
             key_id: String::new(),
         },
         integrated_time: "not-a-number".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -1837,8 +1877,22 @@ fn rfc6962_inclusion_walk_rejects_leaf_index_out_of_range() {
 /// The signature line uses the origin's first whitespace-delimited
 /// token as the signer name — matches Rekor's actual format
 /// (origin "rekor.sigstore.dev - 12345" → sig name "rekor.sigstore.dev").
+/// A checkpoint Rekor v1 would sign: the key name is the log's host and
+/// the key ID the first four bytes of the SHA-256 of `signing_key`'s SPKI.
 fn build_signed_checkpoint(
     signing_key: &SigningKey,
+    origin: &str,
+    tree_size: i64,
+    root_hash: &[u8],
+) -> String {
+    let spki = VerifyingKey::from(signing_key).to_public_key_der().unwrap();
+    let key_id = Sha256::digest(spki.as_bytes());
+    build_signed_checkpoint_with_key_id(signing_key, &key_id[..4], origin, tree_size, root_hash)
+}
+
+fn build_signed_checkpoint_with_key_id(
+    signing_key: &SigningKey,
+    key_id: &[u8],
     origin: &str,
     tree_size: i64,
     root_hash: &[u8],
@@ -1846,10 +1900,9 @@ fn build_signed_checkpoint(
     let body = format!("{origin}\n{tree_size}\n{}\n", BASE64.encode(root_hash));
     let digest = Sha256::digest(body.as_bytes());
     let sig: Signature = signing_key.sign_prehash(&digest).expect("sign_prehash");
-    // 4-byte key-hint prefix (informational; we don't verify it).
-    let mut key_hint_plus_sig = vec![0u8; 4];
-    key_hint_plus_sig.extend_from_slice(sig.to_der().as_bytes());
-    let sig_b64 = BASE64.encode(&key_hint_plus_sig);
+    let mut key_id_plus_sig = key_id.to_vec();
+    key_id_plus_sig.extend_from_slice(sig.to_der().as_bytes());
+    let sig_b64 = BASE64.encode(&key_id_plus_sig);
     let sig_name = origin.split_whitespace().next().unwrap_or(origin);
     format!("{body}\n\u{2014} {sig_name} {sig_b64}\n")
 }
@@ -1871,6 +1924,7 @@ fn synth_tlog_entry_with_inclusion_proof(
             key_id: log_id_hex.to_string(),
         },
         integrated_time: integrated_time_secs.to_string(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: Some(crate::sigstore::RekorInclusionProof {
             checkpoint: serde_json::Value::String(checkpoint_envelope),
@@ -1946,10 +2000,15 @@ fn rejects_inclusion_proof_with_forged_checkpoint_signature() {
     let log_id_hex = hex::encode(&log_id_bytes);
     let integrated_time = 1700000000_i64;
     let ([_h0, h1, _h2, _h3], (_h01, h23), root, leaves) = four_leaf_tree();
-    // Sign with a DIFFERENT key than the pinned one.
+    // Sign with a DIFFERENT key than the pinned one, claiming its key ID.
     let (signing_key_forge, _, _) = p256_rekor_signing_key();
-    let checkpoint =
-        build_signed_checkpoint(&signing_key_forge, "rekor.sigstore.dev - 1", 4, &root);
+    let checkpoint = build_signed_checkpoint_with_key_id(
+        &signing_key_forge,
+        &log_id_bytes[..4],
+        "rekor.sigstore.dev - 1",
+        4,
+        &root,
+    );
     let tlog = synth_tlog_entry_with_inclusion_proof(
         &log_id_hex,
         0,
@@ -2070,6 +2129,7 @@ fn rejects_missing_inclusion_proof_with_inclusion_proof_missing_variant() {
             key_id: String::new(),
         },
         integrated_time: "1700000000".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -2095,6 +2155,7 @@ fn verifies_inclusion_proof_when_checkpoint_is_object_with_envelope_field() {
         log_index: "0".into(),
         log_id: crate::sigstore::LogId { key_id: log_id_hex },
         integrated_time: integrated_time.to_string(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: Some(crate::sigstore::RekorInclusionProof {
             checkpoint: serde_json::json!({"envelope": envelope}),
@@ -2145,6 +2206,7 @@ fn verifies_inclusion_proof_via_legacy_verification_envelope_fallback() {
         log_index: "0".into(),
         log_id: crate::sigstore::LogId { key_id: log_id_hex },
         integrated_time: integrated_time.to_string(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None, // top-level absent
         verification: Some(crate::sigstore::RekorVerification {
@@ -2180,7 +2242,7 @@ fn rejects_inclusion_proof_with_malformed_checkpoint_envelope() {
         .expect_err("malformed checkpoint envelope must reject");
     match err {
         VerifyError::InclusionProof(msg) => assert!(
-            msg.contains("separator") || msg.contains("envelope"),
+            msg.contains("no blank line between its text and its signatures"),
             "expected envelope-parse diagnostic, got: {msg}"
         ),
         other => panic!("expected InclusionProof, got: {other:?}"),
@@ -2797,6 +2859,68 @@ fn synth_ct_log_key(at_year: i32) -> (SigningKey, CtLogKey) {
 
 #[test]
 fn verifies_valid_embedded_sct_against_pinned_ct_log_key() {
+    let (leaf_with_sct_der, issuer_spki, ct_log_key) = leaf_with_sct_at(1_700_000_000_000);
+    verify_embedded_sct(
+        &leaf_with_sct_der,
+        &issuer_spki,
+        std::slice::from_ref(&ct_log_key),
+    )
+    .expect("synthetic SCT must verify under the pinned CT log key");
+}
+
+#[test]
+fn an_sct_is_checked_under_the_ct_log_key_valid_at_its_own_time() {
+    // The key retired shortly after the log signed the SCT, before an
+    // artifact signed with the certificate might be timestamped; what
+    // matters is when the log signed the SCT.
+    let (leaf_der, issuer_spki, mut ct_log_key) = leaf_with_sct_at(1_700_000_000_000);
+    ct_log_key.valid_for = ValidityWindow {
+        start: Timestamp::parse_rfc3339("2023-11-01T00:00:00Z").unwrap(),
+        end: Some(Timestamp::parse_rfc3339("2023-11-15T00:00:00Z").unwrap()),
+    };
+    verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key)).unwrap();
+
+    ct_log_key.valid_for = ValidityWindow {
+        start: Timestamp::parse_rfc3339("2023-11-15T00:00:00Z").unwrap(),
+        end: None,
+    };
+    let refused = verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key))
+        .unwrap_err();
+    assert!(refused.is_missing_trust_material(), "{refused:?}");
+}
+
+#[test]
+fn an_sct_timestamp_past_the_year_9999_is_refused_on_every_platform() {
+    // A validity window would read such a time as the end of the year 9999:
+    // inside a key's open-ended window. The verifier refuses any SCT time it
+    // can't place before the year 10000, whether or not the platform's
+    // clock could hold it. Either way the SCT itself verifies under the key.
+    for timestamp_ms in [YEAR_10000_MS, u64::MAX] {
+        let (leaf_der, issuer_spki, mut ct_log_key) = leaf_with_sct_at(timestamp_ms);
+        ct_log_key.valid_for.end = None;
+        let refused =
+            verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key))
+                .unwrap_err();
+        assert!(
+            matches!(&refused, VerifyError::Sct(why) if why.contains("out of range")),
+            "{timestamp_ms}: {refused:?}"
+        );
+    }
+}
+
+#[test]
+fn an_sct_from_the_last_millisecond_of_the_year_9999_verifies() {
+    let (leaf_der, issuer_spki, mut ct_log_key) = leaf_with_sct_at(YEAR_10000_MS - 1);
+    ct_log_key.valid_for.end = None;
+    verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key)).unwrap();
+}
+
+/// The first millisecond of the year 10000.
+const YEAR_10000_MS: u64 = 253_402_300_800_000;
+
+/// A leaf whose embedded SCT a fresh CT log key signed at `timestamp_ms`,
+/// with the leaf's issuer SPKI and that key.
+fn leaf_with_sct_at(timestamp_ms: u64) -> (Vec<u8>, Vec<u8>, CtLogKey) {
     // The full positive path with a SHARED leaf keypair across
     // both rcgen builds — that's what makes the two TBSes
     // byte-equal except for the SCT extension entry.
@@ -2806,9 +2930,7 @@ fn verifies_valid_embedded_sct_against_pinned_ct_log_key() {
     let issuer_key_hash = Sha256::digest(&issuer_spki).to_vec();
 
     let (ct_signing_key, ct_log_key) = synth_ct_log_key(2025);
-    let timestamp_ms = 1_700_000_000_000u64;
     let sct_extensions: &[u8] = &[];
-
     // Build leaf v1 WITHOUT SCT and extract its TBS — that's the
     // precert TBS the CT log signs over.
     let leaf_without_sct_der = build_leaf_with_optional_sct(&leaf_kp, &issuer, None);
@@ -2859,13 +2981,7 @@ fn verifies_valid_embedded_sct_against_pinned_ct_log_key() {
              (shared leaf keypair pins SerialNumber + SPKI)"
     );
 
-    verify_embedded_sct(
-        &leaf_with_sct_der,
-        &issuer_spki,
-        std::slice::from_ref(&ct_log_key),
-        ts_year(2025),
-    )
-    .expect("synthetic SCT must verify under the pinned CT log key");
+    (leaf_with_sct_der, issuer_spki, ct_log_key)
 }
 
 #[test]
@@ -2875,13 +2991,8 @@ fn rejects_leaf_with_no_embedded_sct_extension() {
     let leaf_der = build_leaf_with_optional_sct(&leaf_kp, &issuer, None);
     let issuer_spki = issuer_spki_from_cert(&issuer.cert);
     let (_, ct_log_key) = synth_ct_log_key(2025);
-    let err = verify_embedded_sct(
-        &leaf_der,
-        &issuer_spki,
-        std::slice::from_ref(&ct_log_key),
-        ts_year(2025),
-    )
-    .expect_err("leaf without SCT extension must reject");
+    let err = verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key))
+        .expect_err("leaf without SCT extension must reject");
     match err {
         VerifyError::Sct(msg) => assert!(msg.contains("no embedded SCT"), "got: {msg}"),
         other => panic!("expected VerifyError::Sct, got: {other:?}"),
@@ -2911,7 +3022,6 @@ fn rejects_sct_with_unknown_log_id() {
         &leaf_der,
         &issuer_spki,
         std::slice::from_ref(&pinned_unrelated_key),
-        ts_year(2025),
     )
     .expect_err("unknown logId must reject");
     match err {
@@ -2945,13 +3055,8 @@ fn rejects_sct_with_forged_signature_under_pinned_key() {
     );
     let sct_list = encode_sct_list(&[&serialized]);
     let leaf_der = build_leaf_with_optional_sct(&leaf_kp, &issuer, Some(&sct_list));
-    let err = verify_embedded_sct(
-        &leaf_der,
-        &issuer_spki,
-        std::slice::from_ref(&ct_log_key),
-        ts_year(2025),
-    )
-    .expect_err("forged-key SCT must reject");
+    let err = verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key))
+        .expect_err("forged-key SCT must reject");
     match err {
         VerifyError::Sct(msg) => assert!(
             msg.contains("no SCT in the leaf cert's extension verified"),
@@ -2979,13 +3084,8 @@ fn rejects_sct_with_unsupported_signature_algorithm() {
     );
     let sct_list = encode_sct_list(&[&serialized]);
     let leaf_der = build_leaf_with_optional_sct(&leaf_kp, &issuer, Some(&sct_list));
-    let err = verify_embedded_sct(
-        &leaf_der,
-        &issuer_spki,
-        std::slice::from_ref(&ct_log_key),
-        ts_year(2025),
-    )
-    .expect_err("non-sha256/ecdsa SCT must reject");
+    let err = verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key))
+        .expect_err("non-sha256/ecdsa SCT must reject");
     match err {
         VerifyError::Sct(msg) => assert!(
             msg.contains("no SCT in the leaf cert's extension verified"),
@@ -3008,13 +3108,8 @@ fn rejects_sct_extension_with_malformed_tls_list() {
 
     let issuer_spki = issuer_spki_from_cert(&issuer.cert);
     let (_, ct_log_key) = synth_ct_log_key(2025);
-    let err = verify_embedded_sct(
-        &leaf_der,
-        &issuer_spki,
-        std::slice::from_ref(&ct_log_key),
-        ts_year(2025),
-    )
-    .expect_err("malformed SCT list must reject");
+    let err = verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key))
+        .expect_err("malformed SCT list must reject");
     match err {
         VerifyError::Sct(msg) => assert!(
             msg.contains("SCT list TLS encoding is malformed"),
@@ -3610,6 +3705,32 @@ fn verifies_real_npm_attestation_for_axios_1_14_0() {
 }
 
 #[test]
+fn a_rekor_v1_entry_naming_no_log_is_malformed_not_from_an_unknown_log() {
+    // An unknown log would send the verifier for newer trust material.
+    let body = load_fixture_bundle(REAL_NPM_FIXTURE);
+    let mut root: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    for attestation in root["attestations"].as_array_mut().unwrap() {
+        if let Some(entries) =
+            attestation["bundle"]["verificationMaterial"]["tlogEntries"].as_array_mut()
+        {
+            for entry in entries {
+                entry["logId"] = serde_json::json!({});
+            }
+        }
+    }
+    let error = verify_sigstore_bundle(
+        &serde_json::to_vec(&root).unwrap(),
+        &IdentityExpectations::none(),
+        VerifyOptions::npm_attestation(),
+    )
+    .expect_err("an entry naming no log can't be checked");
+    assert!(
+        matches!(&error, VerifyError::RekorSet(why) if why.contains("names no log")),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn rejects_proof_only_bundle_with_malformed_outer_log_index() {
     let body = load_fixture_bundle(REAL_NPM_FIXTURE);
     let mut root: serde_json::Value =
@@ -3799,6 +3920,7 @@ fn microbench_per_step_primitive_timings() {
             log_index: "42".into(),
             log_id: crate::sigstore::LogId { key_id: log_id_hex },
             integrated_time: integrated_time.to_string(),
+            kind_version: None,
             inclusion_promise: Some(crate::sigstore::RekorInclusionPromise {
                 signed_entry_timestamp: set_b64,
             }),
@@ -3821,13 +3943,8 @@ fn microbench_per_step_primitive_timings() {
         let _ = leaf_parsed; // shape sanity
         let keys = std::slice::from_ref(&bundle.ct_log_key);
         measure("verify_embedded_sct", || {
-            verify_embedded_sct(
-                &bundle.leaf_with_sct_der,
-                &bundle.issuer_spki,
-                keys,
-                ts_year(2025),
-            )
-            .expect("embedded SCT must verify under bench setup");
+            verify_embedded_sct(&bundle.leaf_with_sct_der, &bundle.issuer_spki, keys)
+                .expect("embedded SCT must verify under bench setup");
         });
     }
 

@@ -368,3 +368,187 @@ pub(super) fn json_value_kind(v: &serde_json::Value) -> &'static str {
         serde_json::Value::Object(_) => "object",
     }
 }
+
+/// Which Rekor wrote a transparency log entry, judged from its body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RekorEntryVersion {
+    /// An `intoto` or `dsse` entry from Rekor v1.
+    V1,
+    /// A `hashedrekord` 0.0.2 entry, the only kind Rekor v2 writes.
+    V2,
+}
+
+#[derive(serde::Deserialize)]
+struct EntryHeader {
+    kind: String,
+    #[serde(rename = "apiVersion")]
+    api_version: String,
+}
+
+/// The entry's Rekor version. When the bundle names the entry's kind and
+/// version, its body must agree.
+pub(super) fn rekor_entry_version(
+    tlog_entry: &crate::sigstore::TlogEntry,
+) -> Result<RekorEntryVersion, VerifyError> {
+    let body_bytes = BASE64
+        .decode(tlog_entry.canonicalized_body.as_bytes())
+        .map_err(|e| {
+            VerifyError::RekorBodyMalformed(format!("canonicalizedBody not valid base64: {e}"))
+        })?;
+    let header: EntryHeader = serde_json::from_slice(&body_bytes).map_err(|e| {
+        VerifyError::RekorBodyMalformed(format!(
+            "canonicalizedBody does not name its kind and apiVersion: {e}"
+        ))
+    })?;
+    if let Some(named) = &tlog_entry.kind_version
+        && (named.kind != header.kind || named.version != header.api_version)
+    {
+        return Err(VerifyError::RekorBodyMalformed(format!(
+            "the bundle names the entry {} {} but its body is {} {}",
+            named.kind, named.version, header.kind, header.api_version
+        )));
+    }
+    Ok(
+        if header.kind == "hashedrekord" && header.api_version == "0.0.2" {
+            RekorEntryVersion::V2
+        } else {
+            RekorEntryVersion::V1
+        },
+    )
+}
+
+/// The key details and hash a Sigstore leaf certificate's P-256 key
+/// signs with, as Rekor v2 records them.
+const P256_KEY_DETAILS: &str = "PKIX_ECDSA_P256_SHA_256";
+const SHA2_256: &str = "SHA2_256";
+
+#[derive(serde::Deserialize)]
+struct HashedRekordV002Entry {
+    spec: HashedRekordV002Spec,
+}
+
+#[derive(serde::Deserialize)]
+struct HashedRekordV002Spec {
+    #[serde(rename = "hashedRekordV002")]
+    hashed_rekord: HashedRekordV002,
+}
+
+#[derive(serde::Deserialize)]
+struct HashedRekordV002 {
+    data: HashOutput,
+    signature: HashedRekordSignature,
+}
+
+#[derive(serde::Deserialize)]
+struct HashOutput {
+    algorithm: String,
+    digest: String,
+}
+
+#[derive(serde::Deserialize)]
+struct HashedRekordSignature {
+    content: String,
+    verifier: HashedRekordVerifier,
+}
+
+#[derive(serde::Deserialize)]
+struct HashedRekordVerifier {
+    #[serde(rename = "keyDetails")]
+    key_details: String,
+    #[serde(rename = "x509Certificate")]
+    x509_certificate: Option<RawBytes>,
+    #[serde(rename = "publicKey")]
+    public_key: Option<RawBytes>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawBytes {
+    #[serde(rename = "rawBytes")]
+    raw_bytes: String,
+}
+
+/// Verify that a Rekor v2 `hashedrekord` 0.0.2 entry records this bundle:
+/// the SHA-256 of the DSSE envelope's pre-authentication encoding, the
+/// bundle's signature over it, and the bundle's leaf certificate.
+///
+/// Rekor v2 has no DSSE entry type; a DSSE signature is logged as a
+/// `hashedrekord` over the encoding the signature covers.
+pub(super) fn verify_hashedrekord_v002(
+    tlog_entry: &crate::sigstore::TlogEntry,
+    envelope: &DsseEnvelope,
+    leaf_cert_der: &[u8],
+    signature: &[u8],
+) -> Result<(), VerifyError> {
+    let body_bytes = BASE64
+        .decode(tlog_entry.canonicalized_body.as_bytes())
+        .map_err(|e| {
+            VerifyError::RekorBodyMalformed(format!("canonicalizedBody not valid base64: {e}"))
+        })?;
+    let entry: HashedRekordV002Entry = serde_json::from_slice(&body_bytes).map_err(|e| {
+        VerifyError::RekorBodyMalformed(format!("hashedrekord 0.0.2 body shape: {e}"))
+    })?;
+    let record = entry.spec.hashed_rekord;
+    let decode = |field: &str, value: &str| {
+        BASE64.decode(value.as_bytes()).map_err(|e| {
+            VerifyError::RekorBodyMalformed(format!(
+                "hashedrekord 0.0.2 `{field}` is not base64: {e}"
+            ))
+        })
+    };
+
+    if record.signature.verifier.key_details != P256_KEY_DETAILS {
+        return Err(VerifyError::RekorBodyMalformed(format!(
+            "hashedrekord 0.0.2 records a `{}` key where the leaf certificate's is `{P256_KEY_DETAILS}`",
+            record.signature.verifier.key_details
+        )));
+    }
+    if record.data.algorithm != SHA2_256 {
+        return Err(VerifyError::RekorBodyMalformed(format!(
+            "hashedrekord 0.0.2 records a `{}` digest where a P-256 signature's is `{SHA2_256}`",
+            record.data.algorithm
+        )));
+    }
+    let raw_payload = BASE64.decode(envelope.payload.as_bytes()).map_err(|e| {
+        VerifyError::RekorBodyMalformed(format!("DSSE envelope.payload is not valid base64: {e}"))
+    })?;
+    let pae_digest = Sha256::digest(super::pae(&envelope.payload_type, &raw_payload));
+    check_recorded_bytes(
+        "digest",
+        &decode("data.digest", &record.data.digest)?,
+        &pae_digest,
+    )?;
+    check_recorded_bytes(
+        "signature",
+        &decode("signature.content", &record.signature.content)?,
+        signature,
+    )?;
+
+    if record.signature.verifier.public_key.is_some() {
+        return Err(VerifyError::RekorBodyMalformed(
+            "hashedrekord 0.0.2 records a bare public key, not the leaf certificate".into(),
+        ));
+    }
+    let certificate = record.signature.verifier.x509_certificate.ok_or_else(|| {
+        VerifyError::RekorBodyMalformed("hashedrekord 0.0.2 records no signing certificate".into())
+    })?;
+    check_recorded_bytes(
+        "x509Certificate",
+        &decode("x509Certificate", &certificate.raw_bytes)?,
+        leaf_cert_der,
+    )
+}
+
+fn check_recorded_bytes(
+    field: &'static str,
+    recorded: &[u8],
+    bundle: &[u8],
+) -> Result<(), VerifyError> {
+    if recorded == bundle {
+        return Ok(());
+    }
+    Err(VerifyError::RekorBodyMismatch {
+        field,
+        expected_sha256: hex::encode(Sha256::digest(bundle)),
+        actual_sha256: hex::encode(Sha256::digest(recorded)),
+    })
+}

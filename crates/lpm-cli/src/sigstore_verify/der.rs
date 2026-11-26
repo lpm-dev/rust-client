@@ -6,6 +6,7 @@
 
 pub(super) const TAG_BOOLEAN: u8 = 0x01;
 pub(super) const TAG_INTEGER: u8 = 0x02;
+pub(super) const TAG_BIT_STRING: u8 = 0x03;
 pub(super) const TAG_OCTET_STRING: u8 = 0x04;
 pub(super) const TAG_NULL: u8 = 0x05;
 pub(super) const TAG_OID: u8 = 0x06;

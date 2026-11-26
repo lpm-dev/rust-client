@@ -7,12 +7,13 @@
 //! - Sigstore trust root: built into the binary, refreshed from
 //!   Sigstore's TUF repository when a signature needs newer keys.
 //! - DSSE envelope verification against the leaf cert.
-//! - X.509 chain validation at `integratedTime`, and again at the time of
+//! - X.509 chain validation at the signing time, and again at the time of
 //!   every RFC 3161 signed timestamp that verifies.
 //! - embedded SCT verification.
-//! - semantic Rekor body match.
+//! - semantic Rekor body match: an `intoto` or `dsse` entry from Rekor
+//!   v1, or a `hashedrekord` 0.0.2 entry from Rekor v2.
 //! - Rekor SET verification.
-//! - Merkle inclusion proof verification.
+//! - C2SP signed-note checkpoints and Merkle inclusion proof verification.
 //! - composed `verify_sigstore_bundle` entry point.
 //!
 //! PAE is re-encoded from the envelope's `payload_type` and raw decoded
@@ -23,6 +24,7 @@
 
 mod bundle;
 mod chain;
+mod checkpoint;
 mod der;
 mod dsse;
 mod error;

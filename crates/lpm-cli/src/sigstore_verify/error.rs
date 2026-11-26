@@ -37,8 +37,8 @@ pub enum VerifyError {
 
     /// Rekor body could not be parsed at all: `canonicalizedBody`
     /// wasn't base64, the decoded bytes weren't JSON, top-level
-    /// `kind` wasn't `intoto`, or required fields were missing /
-    /// of the wrong shape. Distinct from [`Self::RekorBodyMismatch`]
+    /// `kind` wasn't one the verifier reads, or required fields were
+    /// missing / of the wrong shape. Distinct from [`Self::RekorBodyMismatch`]
     /// which is reserved for "we parsed the body but its claims
     /// disagree with the bundle."
     #[error("Rekor body is malformed: {0}")]
@@ -56,7 +56,7 @@ pub enum VerifyError {
     ///
     /// Trust roots intentionally carry retired entries alongside
     /// active ones so that bundles signed during retired windows
-    /// can still verify against the integratedTime they declare
+    /// can still verify against the time they were signed at
     /// — so a single past `validFor.end` is NOT expiry; the
     /// artifact is expired when an entire role has gone retired-
     /// only.
@@ -65,7 +65,7 @@ pub enum VerifyError {
 
     /// The bundle names a Fulcio certificate authority, Rekor log or
     /// CT log that the trust root in use doesn't hold, or holds only
-    /// for other times than the bundle's `integratedTime`. Sigstore's
+    /// for other times than the bundle's signing time. Sigstore's
     /// current trust root may hold it. `check` names the verification
     /// step that needed it.
     #[error("{check} verification failed: {detail}")]
@@ -122,7 +122,7 @@ pub enum VerifyError {
     InclusionProofMissing,
 
     /// X.509 chain validation failed: a cert's notBefore/notAfter
-    /// window did not contain `integratedTime`, an issuer/subject
+    /// window did not contain the signing time, an issuer/subject
     /// pair didn't line up, a link's signature didn't verify under
     /// its parent, or the chain used an unsupported signature
     /// algorithm. A chain no trusted Fulcio root anchors is
@@ -195,6 +195,10 @@ impl VerifyError {
 /// offline anchors. The variant is the *single* authority on what's required;
 /// there is intentionally no parallel `require_inclusion_proof: bool`
 /// (adding one re-creates a dual-authority bug).
+///
+/// The policy governs Rekor v1 entries. A Rekor v2 entry has no SET, so
+/// under every policy it needs an inclusion proof and an RFC 3161
+/// timestamp, which takes the SET's place as the signed time.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RekorInclusionProofPolicy {

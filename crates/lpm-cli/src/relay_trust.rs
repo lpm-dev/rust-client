@@ -106,7 +106,7 @@ fn validate_approved_pins(
         ));
     }
     let manifest: RelayTrustManifest = serde_json::from_slice(bytes).map_err(trust_error)?;
-    let signed_at = lpm_common::Timestamp::from(verified.integrated_time).unix_seconds();
+    let signed_at = lpm_common::Timestamp::from(verified.signed_at).unix_seconds();
     // Short-lived authorization limits replay without trusting HTTP timestamps or unsigned metadata.
     if manifest.schema_version != 1 || manifest.host != lpm_tunnel::relay::DEFAULT_RELAY_HOST {
         return Err(trust_error(
@@ -168,7 +168,7 @@ mod tests {
             build: Default::default(),
             statement: serde_json::json!({"subject": [{"name": "relay-trust.json",
                 "digest": {"sha256": hex::encode(Sha256::digest(bytes))}}]}),
-            integrated_time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(NOW as u64),
+            signed_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(NOW as u64),
             leaf_cert_sha256: String::new(),
             log_id: String::new(),
             log_index: 0,
@@ -232,7 +232,7 @@ mod tests {
         assert!(validate_approved_pins(&bytes, &verified, NOW).is_err());
         for signed_at in [NOW - 301, NOW + 301, NOW + 901] {
             let mut verified = authenticated(&bytes);
-            verified.integrated_time =
+            verified.signed_at =
                 std::time::UNIX_EPOCH + std::time::Duration::from_secs(signed_at as u64);
             assert!(validate_approved_pins(&bytes, &verified, NOW).is_err());
         }

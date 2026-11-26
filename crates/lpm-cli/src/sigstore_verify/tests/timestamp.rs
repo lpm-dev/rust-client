@@ -185,6 +185,31 @@ fn a_bundle_timestamped_outside_its_certificates_lifetime_is_refused() {
     );
 }
 
+#[test]
+fn a_proof_only_rekor_v1_entry_naming_no_log_is_malformed() {
+    let case = "intoto-with-custom-trust-root";
+    let trust = TrustRoot::parse(&conformance_file(case, "trusted_root.json")).unwrap();
+    let mut bundle: serde_json::Value =
+        serde_json::from_slice(&conformance_file(case, "bundle.sigstore.json")).unwrap();
+    let entry = bundle["verificationMaterial"]["tlogEntries"][0]
+        .as_object_mut()
+        .unwrap();
+    entry.remove("inclusionPromise");
+    entry.insert("logId".into(), serde_json::json!({}));
+    let refused = verify_sigstore_bundle_with(
+        &serde_json::to_vec(&bundle).unwrap(),
+        &IdentityExpectations::none(),
+        VerifyOptions::npm_attestation(),
+        &trust,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&refused, VerifyError::InclusionProof(why)
+            if why.contains("names no log") && !why.contains("SET")),
+        "{refused:?}"
+    );
+}
+
 // ─── Synthesized timestamp tokens ────────────────────────────────
 
 const OID_SIGNED_DATA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02];
@@ -1427,6 +1452,7 @@ fn a_bundle_whose_timestamps_need_too_many_signature_checks_is_refused_in_any_or
         assert_eq!(
             verify_signed_timestamps(std::slice::from_ref(&valid), SIGNATURE, &authorities)
                 .unwrap()
+                .verified
                 .len(),
             1
         );
