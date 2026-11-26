@@ -3,9 +3,10 @@
 Reads Sigstore's TUF repository and writes `signing_config_rekor_v2.v0.2.json`
 while Sigstore stages Rekor v2 in it, else the main `signing_config.v0.2.json`.
 Only TUF's target hashes are checked, not its signatures, so the config is
-refused unless every service it names is an HTTPS URL on sigstore.dev:
-cosign sends the job's OIDC token to the certificate authority it names.
-LPM verifies what gets signed against its own trust root.
+rebuilt from its checked fields, and refused unless every service it names
+is an HTTPS URL on sigstore.dev: cosign sends the job's OIDC token to the
+certificate authority it names. LPM verifies what gets signed against its
+own trust root.
 
 usage: sigstore-rekor-v2-signing-config.py <output>
 """
@@ -18,17 +19,67 @@ import urllib.request
 
 REPOSITORY = "https://tuf-repo-cdn.sigstore.dev"
 CONFIGS = ("signing_config_rekor_v2.v0.2.json", "signing_config.v0.2.json")
+
+# Protobuf JSON accepts each field under its JSON name or its proto name,
+# and cosign parses the config that way.
+CONFIG_FIELDS = {
+    "mediaType": ("mediaType", "media_type"),
+    "caUrls": ("caUrls", "ca_urls"),
+    "oidcUrls": ("oidcUrls", "oidc_urls"),
+    "rekorTlogUrls": ("rekorTlogUrls", "rekor_tlog_urls"),
+    "tsaUrls": ("tsaUrls", "tsa_urls"),
+    "rekorTlogConfig": ("rekorTlogConfig", "rekor_tlog_config"),
+    "tsaConfig": ("tsaConfig", "tsa_config"),
+}
 SERVICE_LISTS = ("caUrls", "oidcUrls", "rekorTlogUrls", "tsaUrls")
+SERVICE_FIELDS = {
+    "url": ("url",),
+    "majorApiVersion": ("majorApiVersion", "major_api_version"),
+    "validFor": ("validFor", "valid_for"),
+    "operator": ("operator",),
+}
+VALID_FOR_FIELDS = {"start": ("start",), "end": ("end",)}
+SELECTOR_FIELDS = {"selector": ("selector",), "count": ("count",)}
 
 
-def check_services(config):
-    """Every service the config names must be HTTPS on sigstore.dev."""
-    for field in SERVICE_LISTS:
-        for service in json.loads(config).get(field) or []:
-            url = urllib.parse.urlsplit(service.get("url", ""))
+def canonical_fields(value, fields, what):
+    """`value` with every field under its JSON name; unknown fields, and a
+    field given under both names, are refused as cosign would read them."""
+    if not isinstance(value, dict):
+        sys.exit(f"the signing config's {what} is not an object")
+    spelling = {name: canonical for canonical, names in fields.items() for name in names}
+    result = {}
+    for name, field in value.items():
+        canonical = spelling.get(name)
+        if canonical is None:
+            sys.exit(f"the signing config's {what} has an unknown field `{name}`")
+        if canonical in result:
+            sys.exit(f"the signing config's {what} gives `{canonical}` twice")
+        result[canonical] = field
+    return result
+
+
+def checked_config(config):
+    """The config rebuilt from its checked fields only. Every service it
+    names must be an HTTPS URL on sigstore.dev: cosign sends the job's OIDC
+    token to the certificate authority it names."""
+    fields = canonical_fields(json.loads(config), CONFIG_FIELDS, "top level")
+    for name in SERVICE_LISTS:
+        services = []
+        for service in fields.get(name) or []:
+            service = canonical_fields(service, SERVICE_FIELDS, name)
+            url = urllib.parse.urlsplit(service.get("url") or "")
             host = url.hostname or ""
             if url.scheme != "https" or not (host == "sigstore.dev" or host.endswith(".sigstore.dev")):
                 sys.exit(f"the signing config names a service outside sigstore.dev: {service.get('url')}")
+            if "validFor" in service:
+                service["validFor"] = canonical_fields(service["validFor"], VALID_FOR_FIELDS, "validFor")
+            services.append(service)
+        fields[name] = services
+    for name in ("rekorTlogConfig", "tsaConfig"):
+        if name in fields:
+            fields[name] = canonical_fields(fields[name], SELECTOR_FIELDS, name)
+    return json.dumps(fields, indent=2).encode()
 
 
 def fetch(path):
@@ -52,9 +103,8 @@ def main(argv):
         config = fetch(f"targets/{digest}.{name}")
         if hashlib.sha256(config).hexdigest() != digest:
             sys.exit(f"{name} does not match the hash Sigstore's targets list")
-        check_services(config)
         with open(argv[1], "wb") as file:
-            file.write(config)
+            file.write(checked_config(config))
         print(name)
         return
     sys.exit("Sigstore's TUF repository lists no v0.2 signing config")

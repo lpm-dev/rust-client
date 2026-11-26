@@ -69,6 +69,12 @@ class SigstoreSignedTimeTests(unittest.TestCase):
         self.assertEqual(int(earliest), 1754506296)
         self.assertEqual(int(latest), 1778700213)
 
+    def test_only_the_first_entry_counts_as_the_updater_reads_it(self):
+        rekor_v2 = bundle(FIXTURES / 'sigstore_conformance' / 'rekor2-dsse-happy-path' / 'bundle.sigstore.json')
+        release = bundle(FIXTURES / 'sigstore_bundles' / '21-real-lpm-release-v0.84.0.json')
+        rekor_v2['verificationMaterial']['tlogEntries'].append(release['verificationMaterial']['tlogEntries'][0])
+        self.assertEqual(run(rekor_v2), '2026-05-13T19:23:33Z')
+
     def test_null_fields_read_as_absent(self):
         rekor_v2 = bundle(FIXTURES / 'sigstore_conformance' / 'rekor2-dsse-happy-path' / 'bundle.sigstore.json')
         rekor_v2['verificationMaterial']['tlogEntries'] = None

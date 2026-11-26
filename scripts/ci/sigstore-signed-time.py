@@ -56,9 +56,12 @@ def timestamp_time(response):
 
 
 def candidate_times(bundle):
-    """The integrated time a SET signs, else every timestamp's time."""
+    """The integrated time the first entry's SET signs, else every
+    timestamp's time: the entry and the times the updater reads."""
     material = bundle.get("verificationMaterial") or {}
-    for entry in material.get("tlogEntries") or []:
+    entries = material.get("tlogEntries") or []
+    if entries:
+        entry = entries[0] or {}
         integrated = int(entry.get("integratedTime") or 0)
         promise = entry.get("inclusionPromise") or (entry.get("verification") or {}).get(
             "inclusionPromise"
