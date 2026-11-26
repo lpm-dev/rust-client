@@ -1897,11 +1897,16 @@ async fn a_global_update_that_fails_for_one_tool_ends_naming_it_not_as_a_script_
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("Upgraded working-tool"), "{stderr}");
     assert!(
+        stderr.contains("broken-tool: selected artifact broken-tool@1.1.0 is unavailable"),
+        "{stderr}"
+    );
+    assert!(
         stderr
             .trim_end()
             .ends_with("Couldn't update 1 of 2 global packages: broken-tool"),
         "{stderr}"
     );
+    assert_eq!(stderr.matches("Couldn't update").count(), 1, "{stderr}");
     assert!(!stderr.contains("Script error"), "{stderr}");
     assert!(!stderr.contains("package.json scripts"), "{stderr}");
 }
@@ -1921,9 +1926,14 @@ async fn a_lone_global_update_that_fails_ends_naming_the_tool() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(
+        stderr.contains("broken-tool: selected artifact broken-tool@1.1.0 is unavailable"),
+        "{stderr}"
+    );
+    assert!(
         stderr.trim_end().ends_with("Couldn't update broken-tool"),
         "{stderr}"
     );
+    assert_eq!(stderr.matches("Couldn't update").count(), 1, "{stderr}");
     assert!(!stderr.contains("Script error"), "{stderr}");
 }
 

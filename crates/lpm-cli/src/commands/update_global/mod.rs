@@ -1436,6 +1436,22 @@ fn execute_saved_spec_rewrite(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_failed_update_summary_names_the_lone_package_or_each_failed_one_of_the_run() {
+        assert_eq!(
+            failed_updates_summary(&["broken-tool"], 1),
+            "Couldn't update broken-tool"
+        );
+        assert_eq!(
+            failed_updates_summary(&["broken-tool"], 2),
+            "Couldn't update 1 of 2 global packages: broken-tool"
+        );
+        assert_eq!(
+            failed_updates_summary(&["a-tool", "b-tool"], 3),
+            "Couldn't update 2 of 3 global packages: a-tool, b-tool"
+        );
+    }
+
     fn firewall_block(source: lpm_common::NpmFirewallBlockSource) -> LpmError {
         LpmError::NpmFirewallBlocked(Box::new(lpm_common::NpmFirewallBlockedErrorContext {
             source,
