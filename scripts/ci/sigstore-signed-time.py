@@ -16,6 +16,7 @@ usage: sigstore-signed-time.py [--epoch | --epoch-range] <bundle>
 
 import base64
 import datetime
+import decimal
 import fractions
 import json
 import math
@@ -49,13 +50,17 @@ def generalized_time_epoch(text):
     """Seconds since the epoch, exactly, of a DER GeneralizedTime such as
     20260513192333Z or 20260513192333.25Z, however many digits its
     fraction has."""
-    whole, _, fraction = text.rstrip("Z").partition(".")
+    whole, dot, fraction = text.rstrip("Z").partition(".")
+    if dot and not (fraction.isascii() and fraction.isdigit()):
+        raise ValueError(f"the GeneralizedTime {text!r} has a malformed fraction")
     seconds = datetime.datetime.strptime(whole, "%Y%m%d%H%M%S").replace(
         tzinfo=datetime.timezone.utc
     )
     elapsed = fractions.Fraction(int((seconds - EPOCH).total_seconds()))
     if fraction:
-        elapsed += fractions.Fraction(int(fraction), 10 ** len(fraction))
+        # Parsed as a decimal, not an int: Python refuses ints over 4,300
+        # digits from text.
+        elapsed += fractions.Fraction(decimal.Decimal(f"0.{fraction}"))
     return elapsed
 
 

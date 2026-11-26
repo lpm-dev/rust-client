@@ -80,6 +80,15 @@ class SigstoreSignedTimeTests(unittest.TestCase):
         long_fraction = signed_time.generalized_time_epoch('20260513192333.' + '9' * 20 + 'Z')
         self.assertLess(long_fraction, whole + 1)
         self.assertEqual(math.floor(long_fraction), whole)
+        # Longer than Python reads as an int from text.
+        longest = signed_time.generalized_time_epoch('20260513192333.' + '9' * 4300 + '1Z')
+        self.assertLess(longest, whole + 1)
+        self.assertGreater(longest, whole + Fraction(999, 1000))
+
+    def test_a_fraction_that_isnt_digits_is_refused(self):
+        for fraction in ('1_0', '-5', ' 5', '', '٣'):
+            with self.assertRaises(ValueError, msg=fraction):
+                signed_time.generalized_time_epoch(f'20260513192333.{fraction}Z')
 
     def test_the_range_rounds_outward_so_a_fraction_past_its_end_is_caught(self):
         original = signed_time.candidate_times
