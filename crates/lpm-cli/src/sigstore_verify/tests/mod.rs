@@ -501,6 +501,83 @@ fn rejects_bundle_with_rekor_body_payload_hash_mismatch() {
 }
 
 #[test]
+fn rejects_rekor_body_logging_another_signature_by_the_same_signer() {
+    let (cert_der, signing_key) = p256_cert_and_signing_key();
+    let envelope = dsse_envelope_signed_with(&signing_key, PAYLOAD);
+    let logged = dsse_envelope_signed_with(&signing_key, b"another payload");
+    let mut body = build_rekor_body_0_0_2(&envelope, &cert_der);
+    body["spec"]["content"]["envelope"]["signatures"][0]["sig"] =
+        serde_json::Value::String(BASE64.encode(logged.signatures[0].sig.as_bytes()));
+    let tlog = tlog_entry_with_body(&body);
+    let err = verify_rekor_body(&tlog, &envelope, &cert_der)
+        .expect_err("an entry logging another signature must reject");
+    expect_rekor_body_mismatch(err, "signature");
+}
+
+#[test]
+fn rejects_intoto_0_0_2_body_logging_the_signature_encoded_once() {
+    // An intoto 0.0.2 entry base64-encodes the envelope's base64
+    // signature again; the signature encoded once isn't what it logs.
+    let (cert_der, signing_key) = p256_cert_and_signing_key();
+    let envelope = dsse_envelope_signed_with(&signing_key, PAYLOAD);
+    let mut body = build_rekor_body_0_0_2(&envelope, &cert_der);
+    body["spec"]["content"]["envelope"]["signatures"][0]["sig"] =
+        serde_json::Value::String(envelope.signatures[0].sig.clone());
+    let tlog = tlog_entry_with_body(&body);
+    let err = verify_rekor_body(&tlog, &envelope, &cert_der)
+        .expect_err("a 0.0.2 signature encoded once must reject");
+    expect_rekor_body_mismatch(err, "signature");
+}
+
+/// [`build_rekor_body_0_0_1`] with the inner envelope's signature set
+/// to `logged_sig`, as an intoto 0.0.1 entry stores the submitted
+/// envelope.
+fn rekor_body_0_0_1_logging(
+    envelope: &DsseEnvelope,
+    leaf_cert_der: &[u8],
+    logged_sig: &str,
+) -> serde_json::Value {
+    let mut body = build_rekor_body_0_0_1(envelope, leaf_cert_der);
+    let encoded = body["spec"]["content"]["envelope"].as_str().unwrap();
+    let mut inner: serde_json::Value =
+        serde_json::from_slice(&BASE64.decode(encoded).unwrap()).unwrap();
+    inner["signatures"][0]["sig"] = serde_json::Value::String(logged_sig.to_string());
+    body["spec"]["content"]["envelope"] =
+        serde_json::Value::String(BASE64.encode(serde_json::to_vec(&inner).unwrap()));
+    body
+}
+
+#[test]
+fn accepts_intoto_0_0_1_body_logging_the_signature_encoded_once() {
+    // Sigstore's clients submitted 0.0.1 envelopes with the signature
+    // as DSSE encodes it; LPM's encoded it again. Both are the
+    // envelope's signature.
+    let (cert_der, signing_key) = p256_cert_and_signing_key();
+    let envelope = dsse_envelope_signed_with(&signing_key, PAYLOAD);
+    let body = rekor_body_0_0_1_logging(&envelope, &cert_der, &envelope.signatures[0].sig);
+    let tlog = tlog_entry_with_body(&body);
+    verify_rekor_body(&tlog, &envelope, &cert_der)
+        .expect("a 0.0.1 body logging the signature encoded once must verify");
+}
+
+#[test]
+fn rejects_intoto_0_0_1_body_logging_another_signature_by_the_same_signer() {
+    let (cert_der, signing_key) = p256_cert_and_signing_key();
+    let envelope = dsse_envelope_signed_with(&signing_key, PAYLOAD);
+    let logged = dsse_envelope_signed_with(&signing_key, b"another payload");
+    for logged_sig in [
+        logged.signatures[0].sig.clone(),
+        BASE64.encode(logged.signatures[0].sig.as_bytes()),
+    ] {
+        let body = rekor_body_0_0_1_logging(&envelope, &cert_der, &logged_sig);
+        let tlog = tlog_entry_with_body(&body);
+        let err = verify_rekor_body(&tlog, &envelope, &cert_der)
+            .expect_err("a 0.0.1 entry logging another signature must reject");
+        expect_rekor_body_mismatch(err, "signature");
+    }
+}
+
+#[test]
 fn rejects_bundle_with_rekor_body_cert_mismatch() {
     // Build the body referencing cert A, but pass cert B as the
     // leaf to verify_rekor_body. The verifier must reject with a
@@ -3739,6 +3816,83 @@ fn rejects_proof_only_bundle_with_malformed_outer_log_index() {
             assert!(message.contains("logIndex"), "unexpected error: {message}");
         }
         other => panic!("expected a Rekor log-index error, got {other:?}"),
+    }
+}
+
+/// The real npm attestation relabelled `media_type` (or unlabelled), with
+/// its inclusion proofs removed so it relies on its SET alone. A v0.1
+/// label also moves the leaf into the chain field that version carries.
+fn real_npm_bundle_with_set_only(media_type: Option<&str>) -> Vec<u8> {
+    let body = load_fixture_bundle(REAL_NPM_FIXTURE);
+    let mut root: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let mut changed_entries = 0;
+    for attestation in root["attestations"].as_array_mut().unwrap() {
+        let bundle = attestation["bundle"].as_object_mut().unwrap();
+        match media_type {
+            Some(media_type) => {
+                bundle.insert("mediaType".into(), media_type.into());
+            }
+            None => {
+                bundle.remove("mediaType");
+            }
+        }
+        let material = bundle
+            .get_mut("verificationMaterial")
+            .and_then(|m| m.as_object_mut())
+            .unwrap();
+        if media_type.is_some_and(|m| m.contains("0.1"))
+            && let Some(leaf) = material.remove("certificate")
+        {
+            material.insert(
+                "x509CertificateChain".into(),
+                serde_json::json!({ "certificates": [leaf] }),
+            );
+        }
+        for entry in material["tlogEntries"].as_array_mut().unwrap() {
+            entry.as_object_mut().unwrap().remove("inclusionProof");
+            changed_entries += 1;
+        }
+    }
+    assert!(changed_entries > 0, "fixture must contain tlog entries");
+    serde_json::to_vec(&root).unwrap()
+}
+
+#[test]
+fn npm_policy_accepts_a_v0_1_bundle_relying_on_its_set() {
+    for media_type in [
+        "application/vnd.dev.sigstore.bundle+json;version=0.1",
+        "application/vnd.dev.sigstore.bundle.v0.1+json",
+    ] {
+        verify_sigstore_bundle(
+            &real_npm_bundle_with_set_only(Some(media_type)),
+            &IdentityExpectations::none(),
+            VerifyOptions::npm_attestation(),
+        )
+        .unwrap_or_else(|e| panic!("a {media_type} bundle may rely on its SET: {e:?}"));
+    }
+}
+
+#[test]
+fn npm_policy_refuses_a_bundle_after_v0_1_without_an_inclusion_proof() {
+    // Every bundle version after 0.1 requires the proof, so one whose
+    // version isn't known to be 0.1 is held to that rule too.
+    for media_type in [
+        Some("application/vnd.dev.sigstore.bundle+json;version=0.2"),
+        Some("application/vnd.dev.sigstore.bundle.v0.3+json"),
+        Some("application/vnd.dev.sigstore.bundle.v0.4+json"),
+        Some("application/json"),
+        None,
+    ] {
+        let error = verify_sigstore_bundle(
+            &real_npm_bundle_with_set_only(media_type),
+            &IdentityExpectations::none(),
+            VerifyOptions::npm_attestation(),
+        )
+        .expect_err("a bundle after v0.1 must carry an inclusion proof");
+        assert!(
+            matches!(error, VerifyError::InclusionProofMissing),
+            "{media_type:?}: expected InclusionProofMissing, got {error:?}"
+        );
     }
 }
 

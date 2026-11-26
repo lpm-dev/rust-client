@@ -35,7 +35,12 @@ fn expected_refusal(case: &str) -> Option<fn(&VerifyError) -> bool> {
         }
         "dsse-mismatch-envelope_fail" => |error| body_mismatch(error, "payloadHash"),
         "rekor2-dsse-mismatch-envelope_fail" => |error| body_mismatch(error, "digest"),
-        "rekor2-dsse-mismatch-sig_fail" => |error| body_mismatch(error, "signature"),
+        "rekor2-dsse-mismatch-sig_fail"
+        | "dsse-mismatch-sig_fail"
+        | "intoto-log-entry-mismatch_fail" => |error| body_mismatch(error, "signature"),
+        "intoto-missing-inclusion-proof_fail" => {
+            |error| matches!(error, VerifyError::InclusionProofMissing)
+        }
         "intoto-expired-certificate_fail"
         | "intoto-set-outside-signing-cert-validity_fail"
         | "intoto-tsa-timestamp-outside-cert-validity_fail" => {

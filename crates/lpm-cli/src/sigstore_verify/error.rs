@@ -192,9 +192,13 @@ impl VerifyError {
 /// (some npm cohorts ship SET-only, others inclusion-proof-only,
 /// some both). `RequireBoth` is the self-update default because binary
 /// replacement is the highest-trust operation, so it requires both
-/// offline anchors. The variant is the *single* authority on what's required;
-/// there is intentionally no parallel `require_inclusion_proof: bool`
-/// (adding one re-creates a dual-authority bug).
+/// offline anchors. The variant is the *single* caller authority on what's
+/// required; there is intentionally no parallel `require_inclusion_proof:
+/// bool` (adding one re-creates a dual-authority bug).
+///
+/// The bundle format adds one rule of its own under every policy: only a
+/// version 0.1 bundle may go without an inclusion proof, so SET-only
+/// bundles are v0.1 bundles.
 ///
 /// Whatever the policy, the time the certificate is checked at must be
 /// signed: by the SET, or by an RFC 3161 timestamp in its place. A bundle
@@ -210,7 +214,8 @@ pub enum RekorInclusionProofPolicy {
     /// RFC 3161 timestamp must sign the time.
     Either,
     /// SET must be present and verify. Inclusion proof is verified
-    /// only when present (advisory).
+    /// when present, and required only when the bundle's version
+    /// requires it.
     RequireSet,
     /// Inclusion proof must be present and verify. SET is verified
     /// only when present; without it, an RFC 3161 timestamp must sign the

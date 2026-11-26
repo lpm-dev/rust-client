@@ -13,6 +13,7 @@ use super::VerifyError;
 // Policy:
 //   - hard-fail: cert identity match (Rekor body's publicKey and leaf cert)
 //   - hard-fail: payload-hash match
+//   - hard-fail: signature match (the logged signature is the envelope's)
 //   - advisory: envelope-hash observation, debug-log only, never rejects
 #[derive(Debug, serde::Deserialize)]
 struct RekorHashRef {
@@ -113,7 +114,12 @@ pub fn verify_rekor_body(
         ));
     }
 
-    // Advisory observation #3: envelope hash. Never rejects.
+    // Hard-fail check #3: the entry logs the envelope's own signature, as
+    // Sigstore's verifiers require: the same signer may sign the same
+    // payload again, and a different signature wasn't logged.
+    check_rekor_body_signature_matches_envelope(&view.signature, envelope)?;
+
+    // Advisory observation: envelope hash. Never rejects.
     observe_rekor_body_envelope_hash(view.envelope_hash.as_ref(), envelope);
 
     Ok(())
@@ -131,11 +137,29 @@ struct RekorBodyView {
     payload_hash: Option<RekorHashRef>,
     /// Optional sha256 of canonical envelope JSON — advisory only.
     envelope_hash: Option<RekorHashRef>,
+    /// The first signature the entry logs.
+    signature: LoggedSignature,
 }
 
+/// A logged signature as the entry kind encodes it.
+struct LoggedSignature {
+    encoded: String,
+    encoding: SignatureEncoding,
+}
+
+#[derive(Clone, Copy)]
+enum SignatureEncoding {
+    /// Base64 of the signature: a `dsse` entry.
+    Once,
+    /// Base64 of the envelope's base64 signature: an `intoto` 0.0.2 entry.
+    Twice,
+    /// An `intoto` 0.0.1 entry, whose envelope is the one submitted:
+    /// Sigstore's clients encoded its signature once, LPM's twice.
+    OnceOrTwice,
+}
 fn extract_intoto_view(
     spec: &serde_json::Map<String, serde_json::Value>,
-    _api_version: &str,
+    api_version: &str,
 ) -> Result<RekorBodyView, VerifyError> {
     let content = spec
         .get("content")
@@ -151,19 +175,31 @@ fn extract_intoto_view(
         )
     })?;
     let inner = extract_intoto_inner_envelope(envelope)?;
-    let public_key_b64 = inner
+    let first_signature = inner
         .get("signatures")
         .and_then(|v| v.as_array())
         .and_then(|arr| arr.first())
-        .and_then(|v| v.as_object())
-        .and_then(|s| s.get("publicKey"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            VerifyError::RekorBodyMalformed(
-                "intoto Rekor body inner envelope has no `signatures[0].publicKey`".into(),
-            )
-        })?
-        .to_string();
+        .and_then(|v| v.as_object());
+    let field = |name: &str| {
+        first_signature
+            .and_then(|s| s.get(name))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                VerifyError::RekorBodyMalformed(format!(
+                    "intoto Rekor body inner envelope has no `signatures[0].{name}`"
+                ))
+            })
+    };
+    let public_key_b64 = field("publicKey")?;
+    let signature = LoggedSignature {
+        encoded: field("sig")?,
+        encoding: if api_version == "0.0.1" {
+            SignatureEncoding::OnceOrTwice
+        } else {
+            SignatureEncoding::Twice
+        },
+    };
     let payload_hash = content
         .get("payloadHash")
         .and_then(|v| serde_json::from_value::<RekorHashRef>(v.clone()).ok());
@@ -174,6 +210,7 @@ fn extract_intoto_view(
         public_key_b64,
         payload_hash,
         envelope_hash,
+        signature,
     })
 }
 
@@ -181,19 +218,27 @@ fn extract_dsse_view(
     spec: &serde_json::Map<String, serde_json::Value>,
     _api_version: &str,
 ) -> Result<RekorBodyView, VerifyError> {
-    let public_key_b64 = spec
+    let first_signature = spec
         .get("signatures")
         .and_then(|v| v.as_array())
         .and_then(|arr| arr.first())
-        .and_then(|v| v.as_object())
-        .and_then(|s| s.get("verifier"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            VerifyError::RekorBodyMalformed(
-                "dsse Rekor body has no `spec.signatures[0].verifier`".into(),
-            )
-        })?
-        .to_string();
+        .and_then(|v| v.as_object());
+    let field = |name: &str| {
+        first_signature
+            .and_then(|s| s.get(name))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                VerifyError::RekorBodyMalformed(format!(
+                    "dsse Rekor body has no `spec.signatures[0].{name}`"
+                ))
+            })
+    };
+    let public_key_b64 = field("verifier")?;
+    let signature = LoggedSignature {
+        encoded: field("signature")?,
+        encoding: SignatureEncoding::Once,
+    };
     let payload_hash = spec
         .get("payloadHash")
         .and_then(|v| serde_json::from_value::<RekorHashRef>(v.clone()).ok());
@@ -204,6 +249,7 @@ fn extract_dsse_view(
         public_key_b64,
         payload_hash,
         envelope_hash,
+        signature,
     })
 }
 
@@ -305,6 +351,39 @@ fn check_rekor_body_payload_hash_matches_envelope(
         });
     }
     Ok(())
+}
+
+/// Verify the entry logs the envelope's first signature, decoded as the
+/// entry kind encodes it.
+fn check_rekor_body_signature_matches_envelope(
+    logged: &LoggedSignature,
+    envelope: &DsseEnvelope,
+) -> Result<(), VerifyError> {
+    let envelope_signature = envelope
+        .signatures
+        .first()
+        .and_then(|sig| BASE64.decode(sig.sig.as_bytes()).ok())
+        .ok_or_else(|| {
+            VerifyError::RekorBodyMalformed("DSSE envelope has no base64 signature".into())
+        })?;
+    let once = BASE64.decode(logged.encoded.as_bytes()).ok();
+    let twice = || once.as_ref().and_then(|b| BASE64.decode(b).ok());
+    let matches = match logged.encoding {
+        SignatureEncoding::Once => once.as_deref() == Some(envelope_signature.as_slice()),
+        SignatureEncoding::Twice => twice().as_deref() == Some(envelope_signature.as_slice()),
+        SignatureEncoding::OnceOrTwice => {
+            once.as_deref() == Some(envelope_signature.as_slice())
+                || twice().as_deref() == Some(envelope_signature.as_slice())
+        }
+    };
+    if matches {
+        return Ok(());
+    }
+    Err(VerifyError::RekorBodyMismatch {
+        field: "signature",
+        expected_sha256: hex::encode(Sha256::digest(&envelope_signature)),
+        actual_sha256: hex::encode(Sha256::digest(logged.encoded.as_bytes())),
+    })
 }
 
 /// Advisory observation on the body's envelope hash. Never rejects.

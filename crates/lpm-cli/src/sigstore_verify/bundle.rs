@@ -41,10 +41,10 @@ impl VerifyOptions {
         }
     }
 
-    /// `Either` — accept SET-only OR inclusion-proof-only bundles; the
-    /// latter, like any bundle without a SET, needs an RFC 3161 timestamp.
-    /// Used for npm attestations because npm cohorts ship either form
-    /// in the wild.
+    /// `Either` — accept SET-only (v0.1) OR inclusion-proof-only bundles;
+    /// the latter, like any bundle without a SET, needs an RFC 3161
+    /// timestamp. Used for npm attestations because npm cohorts ship
+    /// either form in the wild.
     #[allow(dead_code)]
     pub fn npm_attestation() -> Self {
         Self {
@@ -341,6 +341,7 @@ pub(super) fn verify_sigstore_bundle_with(
                 &components.tlog_entry,
                 trust,
                 options.rekor_inclusion_policy,
+                components.inclusion_proof_required,
             )?,
             RekorEntryVersion::V2 => {
                 log_id = verify_rekor_v2_inclusion(&components.tlog_entry, trust)?;
@@ -370,15 +371,17 @@ pub(super) fn verify_sigstore_bundle_with(
     })
 }
 
-/// A Rekor v1 entry's inclusion proof, as `policy` requires it. One that
-/// is present is verified whatever the policy.
+/// A Rekor v1 entry's inclusion proof, as `policy` or the bundle's
+/// version requires it. One that is present is verified whatever the
+/// policy.
 fn verify_rekor_v1_inclusion(
     tlog_entry: &crate::sigstore::TlogEntry,
     trust: &TrustRoot,
     policy: RekorInclusionProofPolicy,
+    bundle_requires_proof: bool,
 ) -> Result<(), VerifyError> {
     let has_inclusion_proof = tlog_entry.resolved_inclusion_proof().is_some();
-    if has_inclusion_proof || policy.requires_inclusion_proof() {
+    if has_inclusion_proof || bundle_requires_proof || policy.requires_inclusion_proof() {
         verify_inclusion_proof(tlog_entry, &trust.rekor_keys)?;
     }
     // `Either` requires a SET or an inclusion proof; the SET check
@@ -453,6 +456,9 @@ pub(super) struct BundleComponents {
     pub(super) tlog_entry: crate::sigstore::TlogEntry,
     /// DER `TimeStampResp`s from `timestampVerificationData`.
     pub(super) signed_timestamps: Vec<Vec<u8>>,
+    /// Whether the bundle's version requires its log entry to carry an
+    /// inclusion proof, whatever the caller's policy.
+    pub(super) inclusion_proof_required: bool,
 }
 
 /// Parse a Sigstore bundle body into [`BundleComponents`]. Handles
@@ -580,6 +586,8 @@ fn parse_inner_bundle(bundle: &serde_json::Value) -> Result<BundleComponents, Ve
     let tlog_entry: crate::sigstore::TlogEntry = serde_json::from_value(tlog_value.clone())
         .map_err(|e| VerifyError::BundleParse(format!("tlogEntries[0] shape: {e}")))?;
     let signed_timestamps = parse_signed_timestamps(verification_material)?;
+    let inclusion_proof_required =
+        media_type_requires_inclusion_proof(bundle.get("mediaType").and_then(|v| v.as_str()));
 
     Ok(BundleComponents {
         dsse_envelope,
@@ -588,7 +596,22 @@ fn parse_inner_bundle(bundle: &serde_json::Value) -> Result<BundleComponents, Ve
         chain_der,
         tlog_entry,
         signed_timestamps,
+        inclusion_proof_required,
     })
+}
+
+/// Whether a bundle of this media type must carry an inclusion proof.
+/// Version 0.1 bundles may rely on a SET alone; every later version
+/// requires the proof, so an unknown or absent media type is held to the
+/// later rule.
+fn media_type_requires_inclusion_proof(media_type: Option<&str>) -> bool {
+    !matches!(
+        media_type,
+        Some(
+            "application/vnd.dev.sigstore.bundle+json;version=0.1"
+                | "application/vnd.dev.sigstore.bundle.v0.1+json"
+        )
+    )
 }
 
 fn parse_signed_timestamps(
