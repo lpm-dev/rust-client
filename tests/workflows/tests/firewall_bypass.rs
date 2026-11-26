@@ -323,6 +323,15 @@ async fn install_with_a_failing_verdict_request(
     lifted_after: std::time::Duration,
     failure_after: std::time::Duration,
 ) -> (MockRegistry, std::process::Output) {
+    install_with_a_failing_verdict_request_in(lifted_after, failure_after, false).await
+}
+
+/// As [`install_with_a_failing_verdict_request`], in JSON when `json` is set.
+async fn install_with_a_failing_verdict_request_in(
+    lifted_after: std::time::Duration,
+    failure_after: std::time::Duration,
+    json: bool,
+) -> (MockRegistry, std::process::Output) {
     let mock = MockRegistry::start().await;
     mock.with_package("agent-tool", "1.0.0", &make_tarball("agent-tool", "1.0.0"))
         .await;
@@ -352,8 +361,12 @@ async fn install_with_a_failing_verdict_request(
         &[stored_rule("agent-tool", serde_json::json!({}))],
     );
 
-    let output = lpm_with_registry(&project, &mock.url())
-        .env("LPM_EXPERIMENT_NPM_FIREWALL_CHUNK_SIZE", "1")
+    let mut command = lpm_with_registry(&project, &mock.url());
+    command.env("LPM_EXPERIMENT_NPM_FIREWALL_CHUNK_SIZE", "1");
+    if json {
+        command.arg("--json");
+    }
+    let output = command
         .args([
             "--color",
             "never",
@@ -1711,48 +1724,27 @@ async fn a_command_that_fails_after_its_install_still_reports_what_a_rule_let_th
     );
 }
 
+fn json_envelope(output: &std::process::Output) -> serde_json::Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{error}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
 #[tokio::test]
 async fn an_install_whose_later_verdict_request_fails_still_reports_what_a_rule_let_through() {
-    let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
-    mock.with_package(
-        "unchecked-tool",
-        "1.0.0",
-        &make_tarball("unchecked-tool", "1.0.0"),
+    let (_mock, output) = install_with_a_failing_verdict_request_in(
+        std::time::Duration::ZERO,
+        std::time::Duration::from_millis(1500),
+        true,
     )
     .await;
-    Mock::given(method("POST"))
-        .and(path(VERDICTS_PATH))
-        .and(body_string_contains("\"name\":\"unchecked-tool\""))
-        .respond_with(ResponseTemplate::new(400))
-        .mount(mock.server())
-        .await;
-    let project = enforcing_project();
-    write_signed_firewall_bypass(
-        &project,
-        &[stored_rule("agent-tool", serde_json::json!({}))],
-    );
-
-    let output = lpm_with_registry(&project, &mock.url())
-        .env("LPM_EXPERIMENT_NPM_FIREWALL_CHUNK_SIZE", "1")
-        .args([
-            "--json",
-            "install",
-            "--no-skills",
-            "agent-tool@1.0.0",
-            "unchecked-tool@1.0.0",
-        ])
-        .output()
-        .unwrap();
 
     assert!(!output.status.success());
-    let envelope: serde_json::Value =
-        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
-            panic!(
-                "{error}\nstdout: {}\nstderr: {}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            )
-        });
+    let envelope = json_envelope(&output);
     assert_eq!(envelope["success"], false, "{envelope:#}");
     assert_eq!(
         envelope["security"]["firewall"]["bypassed"][0]["name"], "agent-tool",
@@ -1761,8 +1753,38 @@ async fn an_install_whose_later_verdict_request_fails_still_reports_what_a_rule_
 }
 
 #[tokio::test]
-async fn a_wrapper_reports_what_a_rule_let_through_before_a_verdict_request_failed() {
-    let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
+async fn an_install_whose_verdict_request_fails_first_reports_no_held_back_version() {
+    let (_mock, output) = install_with_a_failing_verdict_request_in(
+        std::time::Duration::from_millis(1500),
+        std::time::Duration::ZERO,
+        true,
+    )
+    .await;
+
+    assert!(!output.status.success());
+    let envelope = json_envelope(&output);
+    assert_eq!(envelope["success"], false, "{envelope:#}");
+    assert!(envelope.get("security").is_none(), "{envelope:#}");
+}
+
+/// `lpm doctor --fix` in JSON and then in a terminal, over a project whose
+/// install checks `agent-tool`, which a rule lifts, and `unchecked-tool`,
+/// whose verdict request fails, each answered after its delay.
+async fn doctor_with_a_failing_verdict_request(
+    lifted_after: std::time::Duration,
+    failure_after: std::time::Duration,
+) -> (std::process::Output, std::process::Output) {
+    let mock = MockRegistry::start().await;
+    mock.with_package("agent-tool", "1.0.0", &make_tarball("agent-tool", "1.0.0"))
+        .await;
+    mount_block_verdicts_after(
+        &mock,
+        &["agent-tool"],
+        "suspicious",
+        "lpm_ai_agent_control_surface",
+        lifted_after,
+    )
+    .await;
     mock.with_package(
         "unchecked-tool",
         "1.0.0",
@@ -1772,7 +1794,7 @@ async fn a_wrapper_reports_what_a_rule_let_through_before_a_verdict_request_fail
     Mock::given(method("POST"))
         .and(path(VERDICTS_PATH))
         .and(body_string_contains("\"name\":\"unchecked-tool\""))
-        .respond_with(ResponseTemplate::new(400))
+        .respond_with(ResponseTemplate::new(400).set_delay(failure_after))
         .mount(mock.server())
         .await;
     let project = TempProject::empty(
@@ -1793,9 +1815,16 @@ async fn a_wrapper_reports_what_a_rule_let_through_before_a_verdict_request_fail
         }
         command.args(["doctor", "--fix", "--yes"]).output().unwrap()
     };
+    (doctor(true), doctor(false))
+}
 
-    let json = doctor(true);
-    let terminal = doctor(false);
+#[tokio::test]
+async fn a_wrapper_reports_what_a_rule_let_through_before_a_verdict_request_failed() {
+    let (json, terminal) = doctor_with_a_failing_verdict_request(
+        std::time::Duration::ZERO,
+        std::time::Duration::from_millis(1500),
+    )
+    .await;
 
     let envelope: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     assert_eq!(
@@ -1807,9 +1836,117 @@ async fn a_wrapper_reports_what_a_rule_let_through_before_a_verdict_request_fail
         "{envelope:#}"
     );
     let stderr = String::from_utf8_lossy(&terminal.stderr);
+    assert!(stderr.contains(AGENT_TOOL_ALLOWED), "{stderr}");
+}
+
+#[tokio::test]
+async fn a_wrapper_reports_no_lifted_version_held_back_after_a_verdict_request_failed() {
+    let (json, terminal) = doctor_with_a_failing_verdict_request(
+        std::time::Duration::from_millis(1500),
+        std::time::Duration::ZERO,
+    )
+    .await;
+
+    let envelope: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(
+        envelope["fixes_failed"][0]["action"], "lpm install",
+        "{envelope:#}"
+    );
+    assert!(envelope.get("security").is_none(), "{envelope:#}");
+    let stderr = String::from_utf8_lossy(&terminal.stderr);
+    assert!(!stderr.contains("LPM Firewall allowed"), "{stderr}");
+}
+
+/// A registry where `agent-tool`, which a rule lifts, resolves at once and
+/// `missing-tool` is reported missing only after a delay, so an install of
+/// both fails resolving after `agent-tool` was released to download.
+async fn registry_failing_resolution_after_a_lifted_release() -> MockRegistry {
+    let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
+    for metadata_path in ["/missing-tool", "/api/registry/missing-tool"] {
+        Mock::given(method("GET"))
+            .and(path(metadata_path))
+            .respond_with(
+                ResponseTemplate::new(404).set_delay(std::time::Duration::from_millis(1500)),
+            )
+            .mount(mock.server())
+            .await;
+    }
+    mock
+}
+
+#[tokio::test]
+async fn an_install_that_fails_after_releasing_a_lifted_version_still_reports_it() {
+    let mock = registry_failing_resolution_after_a_lifted_release().await;
+    let project = enforcing_project();
+    write_signed_firewall_bypass(
+        &project,
+        &[stored_rule("agent-tool", serde_json::json!({}))],
+    );
+    let install = |json: bool| {
+        let mut command = lpm_with_registry(&project, &mock.url());
+        command.env("LPM_EXPERIMENT_NPM_FIREWALL_CHUNK_SIZE", "1");
+        if json {
+            command.arg("--json");
+        } else {
+            command.args(["--color", "never"]);
+        }
+        command
+            .args([
+                "install",
+                "--no-skills",
+                "agent-tool@1.0.0",
+                "missing-tool@1.0.0",
+            ])
+            .output()
+            .unwrap()
+    };
+
+    let terminal = install(false);
+    let json = install(true);
+
+    let stderr = String::from_utf8_lossy(&terminal.stderr);
+    assert!(!terminal.status.success(), "{stderr}");
+    let notice = stderr.find(AGENT_TOOL_ALLOWED).expect(&stderr);
+    let error = stderr.find("missing-tool").expect(&stderr);
     assert!(
-        stderr.contains("! LPM Firewall allowed 1 blocked package because of your bypass rules:\n"),
-        "{stderr}"
+        notice < error,
+        "the notice must come before the error: {stderr}"
+    );
+    assert!(!json.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(envelope["success"], false, "{envelope:#}");
+    assert_eq!(
+        envelope["security"]["firewall"]["bypassed"][0]["name"], "agent-tool",
+        "{envelope:#}"
+    );
+}
+
+#[tokio::test]
+async fn a_wrapper_reports_a_lifted_version_its_failed_install_released() {
+    let mock = registry_failing_resolution_after_a_lifted_release().await;
+    let project = TempProject::empty(
+        r#"{"name":"consumer","version":"1.0.0","dependencies":{"agent-tool":"1.0.0","missing-tool":"1.0.0"}}"#,
+    );
+    write_npm_firewall_global_config(&project, "enforce");
+    write_signed_firewall_bypass(
+        &project,
+        &[stored_rule("agent-tool", serde_json::json!({}))],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_EXPERIMENT_NPM_FIREWALL_CHUNK_SIZE", "1")
+        .args(["--json", "doctor", "--fix", "--yes"])
+        .output()
+        .unwrap();
+
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["fixes_failed"][0]["action"], "lpm install",
+        "{envelope:#}"
+    );
+    assert_eq!(
+        envelope["security"]["firewall"]["bypassed"][0]["name"], "agent-tool",
+        "{envelope:#}"
     );
 }
 

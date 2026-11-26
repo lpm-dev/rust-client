@@ -519,17 +519,31 @@ pub(crate) fn process_firewall_bypasses_security_json() -> Option<serde_json::Va
 
 impl FirewallBypassReport {
     fn record(&self, stats: &NpmFirewallPreflightStats) {
-        if stats.bypassed.is_empty() {
+        self.record_verdicts(stats.mode, &stats.bypassed);
+    }
+
+    fn record_all(&self, other: &FirewallBypassRecord) {
+        if let Some(mode) = other.mode {
+            self.record_verdicts(mode, &other.bypassed);
+        }
+    }
+
+    fn record_verdicts(
+        &self,
+        mode: crate::npm_firewall_config::NpmFirewallMode,
+        verdicts: &[firewall::BypassedVerdict],
+    ) {
+        if verdicts.is_empty() {
             return;
         }
         let mut record = self
             .record
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        record.mode = Some(stats.mode);
+        record.mode = Some(mode);
         // A command can run several installs over one project, each
         // checking the same versions again.
-        for bypassed in &stats.bypassed {
+        for bypassed in verdicts {
             if !record.bypassed.iter().any(|recorded| {
                 recorded.decision.name == bypassed.decision.name
                     && recorded.decision.version == bypassed.decision.version
@@ -695,6 +709,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
     // the tokio reactor; the held handle lives for the lifetime of
     // the inner future and releases when the future returns.
     let store_lock_path = lpm_root.store_lock();
+    let released_firewall_bypasses = Arc::new(FirewallBypassReport::default());
     let install = lpm_common::with_shared_lock_async(
         store_lock_path,
         assert_send_install_future(run_with_options_under_store_lock(
@@ -702,6 +717,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
             project_dir,
             policy_project_dir,
             &expectations,
+            &released_firewall_bypasses,
             json_output,
             offline,
             frozen_lockfile,
@@ -736,11 +752,39 @@ pub(crate) async fn run_with_options_with_lpm_root(
             &lpm_root,
         )),
     );
-    crate::trust_snapshot::scope_install(workspace_lockfile::scope_member_install(
+    let result = crate::trust_snapshot::scope_install(workspace_lockfile::scope_member_install(
         project_dir,
         install,
     ))
-    .await
+    .await;
+    if result.is_err() {
+        report_unsettled_firewall_bypasses(
+            &released_firewall_bypasses.take(),
+            expectations.firewall_bypass_report.as_deref(),
+            json_output,
+        );
+    }
+    result
+}
+
+/// Reports what the streaming firewall check released to download past a
+/// block when the install failed before that check reported it, as when
+/// resolution or an access check fails while verdicts are still arriving.
+fn report_unsettled_firewall_bypasses(
+    released: &FirewallBypassRecord,
+    command_report: Option<&FirewallBypassReport>,
+    json_output: bool,
+) {
+    if released.bypassed.is_empty() {
+        return;
+    }
+    if !json_output {
+        released.print();
+    }
+    PROCESS_FIREWALL_BYPASSES.record_all(released);
+    if let Some(report) = command_report {
+        report.record_all(released);
+    }
 }
 
 fn assert_send_install_future<F>(future: F) -> F
@@ -765,6 +809,7 @@ async fn run_with_options_under_store_lock(
     project_dir: &Path,
     policy_project_dir: &Path,
     expectations: &InstallExpectations,
+    released_firewall_bypasses: &Arc<FirewallBypassReport>,
     json_output: bool,
     offline: bool,
     frozen_lockfile: FrozenLockfileMode,
@@ -1596,6 +1641,7 @@ async fn run_with_options_under_store_lock(
         npm_firewall_policy_profile,
         npm_firewall_bypass: npm_firewall_bypass.clone(),
         npm_firewall_chunk_size,
+        npm_firewall_released_bypasses: Arc::clone(released_firewall_bypasses),
         locked_integrities: expectations.locked_integrities.as_deref(),
         tarball_prefetch_held: expectations.hold_tarball_prefetch(&policy_extension_configs),
         force,
@@ -1695,11 +1741,16 @@ async fn run_with_options_under_store_lock(
     let monitor_only = matches!(npm_firewall_mode, NpmFirewallMode::Monitor);
     let npm_firewall = match npm_firewall_preflight_join.take() {
         Some(join) if monitor_only => NpmFirewallOutcome::Pending(join),
-        Some(join) => NpmFirewallOutcome::Settled(Box::new(finish_npm_firewall_preflight_into(
-            join.drain().await?,
-            json_output,
-            expectations.firewall_bypass_report.as_deref(),
-        )?)),
+        Some(join) => {
+            let result = join.drain().await?;
+            // The check reports what it released from here on.
+            released_firewall_bypasses.take();
+            NpmFirewallOutcome::Settled(Box::new(finish_npm_firewall_preflight_into(
+                result,
+                json_output,
+                expectations.firewall_bypass_report.as_deref(),
+            )?))
+        }
         None => {
             let request = NpmFirewallPreflightRequest {
                 mode: npm_firewall_mode,

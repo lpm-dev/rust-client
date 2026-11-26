@@ -699,6 +699,10 @@ pub(super) struct NpmFirewallChunkedPreflightConfig {
     pub(super) offline: bool,
     pub(super) chunk_size: usize,
     pub(super) bypass: FirewallBypassRules,
+    /// Where each version a rule lifts is kept once its chunk is released to
+    /// download, so the install can report it if it fails before this check
+    /// reports.
+    pub(super) released_bypasses: Arc<super::FirewallBypassReport>,
 }
 
 pub(super) fn spawn_chunked_npm_firewall_preflight(
@@ -716,6 +720,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
             offline,
             chunk_size,
             bypass,
+            released_bypasses,
         } = config;
 
         if !mode.is_enabled() {
@@ -772,6 +777,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
             mode,
             policy_profile,
             bypass: &bypass,
+            released_bypasses: &released_bypasses,
         };
         let mut chunk = FirewallSelectedChunk::with_capacity(chunk_size);
         let mut receiver_closed = false;
@@ -913,6 +919,7 @@ struct FirewallChunkDispatch<'a> {
     mode: NpmFirewallMode,
     policy_profile: NpmFirewallPolicyProfile,
     bypass: &'a FirewallBypassRules,
+    released_bypasses: &'a super::FirewallBypassReport,
 }
 
 async fn spawn_or_release_firewall_chunk(
@@ -928,6 +935,7 @@ async fn spawn_or_release_firewall_chunk(
         mode,
         policy_profile,
         bypass: _,
+        released_bypasses: _,
     } = *dispatch;
     if chunk.is_empty() {
         return;
@@ -1110,6 +1118,10 @@ async fn apply_firewall_chunk_result(
     let release = !(enforce && (chunk_has_block || earlier_block));
     if !release {
         held_bypassed.append(&mut classified.bypassed);
+    } else if enforce {
+        dispatch
+            .released_bypasses
+            .record_verdicts(mode, &classified.bypassed);
     }
     decisions.extend(stats.record_classified(classified));
     if release {
