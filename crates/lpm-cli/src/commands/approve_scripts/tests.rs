@@ -6,7 +6,6 @@ use lpm_workspace::TrustedDependencyBinding;
 use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use tempfile::tempdir;
 
 // ── snapshot_for_binding_with_mode (rollout knob) ───
@@ -17,57 +16,57 @@ const TEST_SECURITY_SECRET_ENV: &str = "LPM_TEST_SECURITY_SECRET_HEX";
 const TEST_SECURITY_SECRET: &str =
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-fn security_test_dir() -> &'static PathBuf {
-    static SECURITY_DIR: OnceLock<PathBuf> = OnceLock::new();
-    SECURITY_DIR.get_or_init(|| {
-        let dir = tempfile::tempdir().expect("security backend tempdir");
-        let path = dir.path().to_path_buf();
-        std::mem::forget(dir);
-        path
+/// A security backend for one test: a folder of its own, holding the
+/// security store, the LPM home and an npm configuration that names no
+/// registry and holds no credential, so an approval's requests go where the
+/// test's client sends them and not where this machine's `.npmrc` would. The
+/// environment that points approvals at it is restored, and the folder
+/// removed, when the backend is dropped.
+struct SecurityTestBackend {
+    _env: crate::test_env::ScopedEnv,
+    _folder: tempfile::TempDir,
+}
+
+impl SecurityTestBackend {
+    fn new(adjust: impl FnOnce(&mut [(&'static str, Option<OsString>)])) -> Self {
+        let folder = tempdir().expect("security backend tempdir");
+        let npmrc = folder.path().join("empty.npmrc");
+        fs::write(&npmrc, "").expect("write empty npmrc");
+        let mut vars = [
+            (
+                "LPM_HOME",
+                Some(folder.path().join("home").into_os_string()),
+            ),
+            (
+                TEST_SECURITY_DIR_ENV,
+                Some(folder.path().as_os_str().to_owned()),
+            ),
+            (TEST_SECURITY_SECRET_ENV, Some(TEST_SECURITY_SECRET.into())),
+            (TEST_SECURITY_AUTH_RESULT_ENV, Some("approve".into())),
+            ("NPM_CONFIG_USERCONFIG", Some(npmrc.as_os_str().to_owned())),
+            ("NPM_CONFIG_GLOBALCONFIG", Some(npmrc.into_os_string())),
+            ("LPM_NPM_ROUTE", Some("direct".into())),
+        ];
+        adjust(&mut vars);
+        Self {
+            _env: crate::test_env::ScopedEnv::update(vars),
+            _folder: folder,
+        }
+    }
+}
+
+fn ensure_security_test_backend() -> SecurityTestBackend {
+    SecurityTestBackend::new(|_| {})
+}
+
+fn scoped_lpm_home_with_security(path: &Path) -> SecurityTestBackend {
+    SecurityTestBackend::new(|vars| {
+        for (key, value) in vars {
+            if *key == "LPM_HOME" {
+                *value = Some(path.as_os_str().to_owned());
+            }
+        }
     })
-}
-
-/// An npm configuration that names no registry and holds no credential, so
-/// an approval's requests go where the test's client sends them and not
-/// where this machine's `.npmrc` would.
-fn empty_npmrc() -> &'static PathBuf {
-    static NPMRC: OnceLock<PathBuf> = OnceLock::new();
-    NPMRC.get_or_init(|| {
-        let path = security_test_dir().join("empty.npmrc");
-        fs::write(&path, "").expect("write empty npmrc");
-        path
-    })
-}
-
-fn approval_test_env_vars() -> [(&'static str, OsString); 7] {
-    [
-        ("LPM_HOME", security_test_dir().join("home").into()),
-        (
-            TEST_SECURITY_DIR_ENV,
-            security_test_dir().as_os_str().to_owned(),
-        ),
-        (TEST_SECURITY_SECRET_ENV, TEST_SECURITY_SECRET.into()),
-        (TEST_SECURITY_AUTH_RESULT_ENV, "approve".into()),
-        (
-            "NPM_CONFIG_USERCONFIG",
-            empty_npmrc().as_os_str().to_owned(),
-        ),
-        (
-            "NPM_CONFIG_GLOBALCONFIG",
-            empty_npmrc().as_os_str().to_owned(),
-        ),
-        ("LPM_NPM_ROUTE", "direct".into()),
-    ]
-}
-
-fn ensure_security_test_backend() -> crate::test_env::ScopedEnv {
-    crate::test_env::ScopedEnv::set(approval_test_env_vars())
-}
-
-fn scoped_lpm_home_with_security(path: &Path) -> crate::test_env::ScopedEnv {
-    let mut vars = approval_test_env_vars().to_vec();
-    vars.push(("LPM_HOME", path.as_os_str().to_owned()));
-    crate::test_env::ScopedEnv::set(vars)
 }
 
 /// A client whose registries refuse the connection, for an approval that
@@ -106,11 +105,14 @@ async fn run(
 
 /// The security test backend without its automatic approval, so a guarded
 /// mutation asks for one.
-fn security_test_backend_without_auto_approval() -> crate::test_env::ScopedEnv {
-    crate::test_env::ScopedEnv::update(approval_test_env_vars().map(|(key, value)| {
-        let value = (key != TEST_SECURITY_AUTH_RESULT_ENV).then_some(value);
-        (key, value)
-    }))
+fn security_test_backend_without_auto_approval() -> SecurityTestBackend {
+    SecurityTestBackend::new(|vars| {
+        for (key, value) in vars {
+            if *key == TEST_SECURITY_AUTH_RESULT_ENV {
+                *value = None;
+            }
+        }
+    })
 }
 
 #[test]
@@ -134,6 +136,18 @@ fn ensure_security_test_backend_restores_auto_approval_env() {
     }
 
     assert!(std::env::var_os(TEST_SECURITY_AUTH_RESULT_ENV).is_none());
+}
+
+#[test]
+fn the_security_test_backend_removes_its_folder_when_it_ends() {
+    let folder = {
+        let _security_backend = ensure_security_test_backend();
+        let folder = PathBuf::from(std::env::var_os(TEST_SECURITY_DIR_ENV).unwrap());
+        assert!(folder.is_dir(), "{}", folder.display());
+        folder
+    };
+
+    assert!(!folder.exists(), "{} was left behind", folder.display());
 }
 
 fn trusted_esbuild_binding() -> TrustedDependencies {
