@@ -548,17 +548,23 @@ fn project_root_of(rules: &[FirewallBypassRule]) -> Option<String> {
 /// Records an `add` that saved nothing: refused before any prompt, such as
 /// under a managed policy or for a malware verdict without `--allow-malware`,
 /// or approved and then discarded.
-pub(crate) fn record_firewall_bypass_refusal(specs: Vec<String>, reason: &str) {
-    record_audit_event(
-        AuditRecord::new(
-            "firewall-bypass-added",
-            false,
-            vec![FIREWALL_BYPASS_AUDIT_SCOPE.to_string()],
-        )
-        .packages(specs)
-        .source(ApprovalSource::SecurityCommand)
-        .detail(reason),
-    );
+pub(crate) fn record_firewall_bypass_refusal(
+    specs: Vec<String>,
+    project_root: Option<&str>,
+    reason: &str,
+) {
+    let mut record = AuditRecord::new(
+        "firewall-bypass-added",
+        false,
+        vec![FIREWALL_BYPASS_AUDIT_SCOPE.to_string()],
+    )
+    .packages(specs)
+    .source(ApprovalSource::SecurityCommand)
+    .detail(reason);
+    if let Some(root) = project_root {
+        record = record.project_root(root.to_string());
+    }
+    record_audit_event(record);
 }
 
 /// Linux's polkit dialog can't show LPM's text, so the person confirms the

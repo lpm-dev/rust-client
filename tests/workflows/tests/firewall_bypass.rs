@@ -831,3 +831,46 @@ fn bypass_add_that_only_shortens_a_rule_reads_no_preview_settings() {
     );
     assert!(saved_rules(&project)[0]["expires_at"].is_string());
 }
+
+#[tokio::test]
+async fn global_update_names_a_version_refused_while_planning_once() {
+    let mock = MockRegistry::start().await;
+    // Only lpm.dev can answer with LPM Firewall's refusal, and global update
+    // plans an @lpm.dev package through it.
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path_regex(r"plan-tool$"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": "blocked_by_lpm_firewall",
+            "package": "@lpm.dev/acme.plan-tool@1.1.0",
+            "verdict": "malicious",
+            "reason": "the registry policy refused this download",
+            "display": { "reportUrl": "https://firewall.lpm.dev/npm/plan-tool/v/1.1.0" }
+        })))
+        .mount(mock.server())
+        .await;
+    let project = enforcing_project();
+    installed_globally(&project, &["@lpm.dev/acme.plan-tool"]);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--color", "never", "global", "update"])
+        .output()
+        .unwrap();
+
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{text}");
+    assert_eq!(
+        text.matches("blocked @lpm.dev/acme.plan-tool@1.1.0")
+            .count(),
+        1,
+        "{text}"
+    );
+    assert!(text.contains("verdict: malicious"), "{text}");
+    assert!(
+        text.contains("https://firewall.lpm.dev/npm/plan-tool/v/1.1.0"),
+        "{text}"
+    );
+}

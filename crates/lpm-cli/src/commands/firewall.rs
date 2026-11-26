@@ -584,9 +584,14 @@ fn invalid_ttl(raw: &str) -> LpmError {
 }
 
 /// Refuses before any prompt, and records the refusal in the audit log.
-fn refuse_add(specs: &[FirewallBypassSpec], error: LpmError) -> LpmError {
+fn refuse_add(
+    specs: &[FirewallBypassSpec],
+    project_root: Option<&str>,
+    error: LpmError,
+) -> LpmError {
     security_approval::record_firewall_bypass_refusal(
         specs.iter().map(ToString::to_string).collect(),
+        project_root,
         &error.to_string(),
     );
     error
@@ -599,11 +604,14 @@ async fn add(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let specs = parse_specs(request.specs)?;
+    let scope = RuleScope::resolve(cwd, request.project)?;
+    let project_root = scope.project_root.as_deref();
     if request.allow_malware
         && let Some(spec) = specs.iter().find(|spec| spec.kind() != BypassKind::Exact)
     {
         return Err(refuse_add(
             &specs,
+            project_root,
             LpmError::InvalidPackageName(format!(
                 "`--allow-malware` applies only to exact versions such as `name@1.2.3`; `{spec}` names more"
             )),
@@ -612,15 +620,19 @@ async fn add(
     let ttl_secs = parse_ttl(request.ttl)?;
     let now = Timestamp::now();
     let expires_at = expiry_after(now, ttl_secs, request.ttl.unwrap_or_default())?;
-    let scope = RuleScope::resolve(cwd, request.project)?;
     let global = crate::commands::config::GlobalConfig::load_checked()?;
     let effective = security_approval::load_effective_authorized_posture()?;
     if let Some(reason) = security_approval::local_firewall_bypass_inactive_reason(&effective) {
-        return Err(refuse_add(&specs, LpmError::SecurityFloor(reason)));
+        return Err(refuse_add(
+            &specs,
+            project_root,
+            LpmError::SecurityFloor(reason),
+        ));
     }
     if forced_floor_refuses_additions(&global, &effective)? {
         return Err(refuse_add(
             &specs,
+            project_root,
             LpmError::SecurityFloor(
                 "`force-security-floor = true` keeps the npm firewall at enforce, so new bypass rules are refused; lower the floor intentionally in ~/.lpm/config.toml first".to_string(),
             ),
@@ -645,7 +657,7 @@ async fn add(
         })
         .collect();
     let sorted = security_approval::sort_firewall_bypass_requests(rules)
-        .map_err(|error| refuse_add(&specs, error))?;
+        .map_err(|error| refuse_add(&specs, project_root, error))?;
     let outcome = approve_and_save(
         client,
         &PlannedAdd {
@@ -712,11 +724,34 @@ async fn approve_and_save(
     sorted: security_approval::FirewallBypassRequests,
     mut approve: impl FnMut(&security_approval::FirewallBypassApproval<'_>) -> Result<(), LpmError>,
 ) -> Result<security_approval::FirewallBypassAdded, LpmError> {
+    let mut approved_prompts = Vec::new();
+    let saved =
+        approve_and_save_attempts(client, plan, sorted, &mut approve, &mut approved_prompts).await;
+    // Whatever ends a request after a person approved part of it, what they
+    // approved stays on record, as declines and refusals do.
+    if let Err(error) = &saved
+        && !approved_prompts.is_empty()
+    {
+        security_approval::record_firewall_bypass_refusal(
+            plan.specs.iter().map(ToString::to_string).collect(),
+            plan.scope.project_root.as_deref(),
+            &format!("{error}; approved: {}", approved_prompts.join("; ")),
+        );
+    }
+    saved
+}
+
+async fn approve_and_save_attempts(
+    client: &RegistryClient,
+    plan: &PlannedAdd<'_>,
+    sorted: security_approval::FirewallBypassRequests,
+    approve: &mut impl FnMut(&security_approval::FirewallBypassApproval<'_>) -> Result<(), LpmError>,
+    approved_prompts: &mut Vec<String>,
+) -> Result<security_approval::FirewallBypassAdded, LpmError> {
     let mut pending = sorted.needs_approval;
     let mut narrowing = sorted.narrowed;
     let mut unchanged = sorted.unchanged;
     let mut approved: Vec<FirewallBypassRule> = Vec::with_capacity(pending.len());
-    let mut approved_prompts: Vec<String> = Vec::new();
     let mut preview_profile = None;
     let prompt_for = |batch: &[&FirewallBypassSpec]| {
         approval_prompt(batch, plan.scope, plan.ttl_secs, plan.allow_malware)
@@ -743,7 +778,11 @@ async fn approve_and_save(
                 };
                 let previews = preview_exact_specs(client, &pending_specs, profile).await;
                 if let Err(error) = check_previews(&pending_specs, &previews, plan.allow_malware) {
-                    return Err(refuse_add(plan.specs, error));
+                    return Err(refuse_add(
+                        plan.specs,
+                        plan.scope.project_root.as_deref(),
+                        error,
+                    ));
                 }
                 print_add_request(&pending_specs, &previews, plan.scope);
                 for rule in &mut pending {
@@ -776,12 +815,10 @@ async fn approve_and_save(
         )? {
             security_approval::FirewallBypassCommit::Saved(outcome) => return Ok(outcome),
             security_approval::FirewallBypassCommit::Expired => {
-                let error = security_approval::bypass_expired_before_save_error(
+                return Err(security_approval::bypass_expired_before_save_error(
                     command_hint,
                     plan.scope.project_root.clone(),
-                );
-                record_discarded_approvals(plan.specs, &approved_prompts, &error);
-                return Err(error);
+                ));
             }
             // A rule removed, expired or shortened since it was judged a
             // narrowing or already saved now adds or extends one, so it is
@@ -797,22 +834,10 @@ async fn approve_and_save(
             }
         }
     }
-    let error =
-        security_approval::rules_kept_changing_error(command_hint, plan.scope.project_root.clone());
-    record_discarded_approvals(plan.specs, &approved_prompts, &error);
-    Err(error)
-}
-
-/// Keeps approvals a person gave on record when the request is then saved
-/// nowhere, as declines and refusals are.
-fn record_discarded_approvals(specs: &[FirewallBypassSpec], prompts: &[String], error: &LpmError) {
-    if prompts.is_empty() {
-        return;
-    }
-    security_approval::record_firewall_bypass_refusal(
-        specs.iter().map(ToString::to_string).collect(),
-        &format!("{error}; approved: {}", prompts.join("; ")),
-    );
+    Err(security_approval::rules_kept_changing_error(
+        command_hint,
+        plan.scope.project_root.clone(),
+    ))
 }
 
 fn describe_expiry(rule: &FirewallBypassRule) -> String {
@@ -1802,6 +1827,102 @@ mod tests {
             assert!(
                 detail.contains("approved: Allow late@1.0.0 past LPM Firewall in every project"),
                 "{detail}"
+            );
+        });
+    }
+
+    fn project_rule(spec: &FirewallBypassSpec, root: &str) -> FirewallBypassRule {
+        FirewallBypassRule::new(
+            spec,
+            FirewallBypassScope::Project,
+            Some(root.to_string()),
+            false,
+            Timestamp::now(),
+        )
+    }
+
+    #[test]
+    fn add_keeps_approvals_a_later_decline_discards_on_record_with_the_project() {
+        let temp = tempfile::tempdir().unwrap();
+        security_approval::test_support::with_test_env(temp.path(), || {
+            let specs = specs(&[
+                "a@1.0.0", "b@1.0.0", "c@1.0.0", "d@1.0.0", "e@1.0.0", "f@1.0.0",
+            ]);
+            let scope = project("/work/app");
+            let requested = specs
+                .iter()
+                .map(|spec| project_rule(spec, "/work/app"))
+                .collect();
+            let mut prompts = Vec::new();
+
+            run_add(&plan(&specs, &scope, None, false), requested, |approval| {
+                prompts.push(approval.prompt.to_string());
+                if prompts.len() == 1 {
+                    Ok(())
+                } else {
+                    Err(LpmError::SecurityApprovalStore("declined".to_string()))
+                }
+            })
+            .unwrap_err();
+
+            let records = security_approval::test_support::audit_records("firewall-bypass-added");
+            assert_eq!(records.len(), 1, "{records:?}");
+            assert!(!records[0].allowed);
+            assert_eq!(records[0].project_root.as_deref(), Some("/work/app"));
+            let detail = records[0].detail.as_deref().unwrap_or_default();
+            assert!(
+                detail.ends_with(&format!("approved: {}", prompts[0])),
+                "{detail}"
+            );
+        });
+    }
+
+    #[test]
+    fn add_keeps_approvals_on_record_when_the_rules_keep_changing() {
+        let temp = tempfile::tempdir().unwrap();
+        security_approval::test_support::with_test_env(temp.path(), || {
+            let specs = specs(&[
+                "held-a@1.0.0",
+                "held-b@1.0.0",
+                "held-c@1.0.0",
+                "fresh@1.0.0",
+            ]);
+            save(&[
+                rule(&specs[0], None),
+                rule(&specs[1], None),
+                rule(&specs[2], None),
+            ]);
+            let scope = global();
+            let requested = specs.iter().map(|spec| rule(spec, Some(1_800))).collect();
+            let mut approvals = 0;
+
+            let error = run_add(&plan(&specs, &scope, Some(1_800), false), requested, |_| {
+                let removed = specs[approvals].to_string();
+                approvals += 1;
+                security_approval::remove_firewall_bypass_rules(
+                    |rule| rule.spec == removed,
+                    "firewall-bypass-removed",
+                )
+                .unwrap();
+                Ok(())
+            })
+            .unwrap_err();
+
+            assert_eq!(error.error_code(), "security_approval_required");
+            assert!(error.to_string().contains("kept changing"), "{error}");
+            let records: Vec<_> =
+                security_approval::test_support::audit_records("firewall-bypass-added")
+                    .into_iter()
+                    .filter(|record| !record.allowed)
+                    .collect();
+            assert_eq!(records.len(), 1, "{records:?}");
+            assert!(
+                records[0]
+                    .detail
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("approved: Allow fresh@1.0.0"),
+                "{records:?}"
             );
         });
     }
