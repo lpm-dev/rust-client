@@ -30,6 +30,17 @@ async fn mount_block_verdict(mock: &MockRegistry, name: &str, verdict: &str, gro
 /// LPM Firewall blocks every one of `names` at 1.0.0 in a request that asks
 /// about them all.
 async fn mount_block_verdicts(mock: &MockRegistry, names: &[&str], verdict: &str, group: &str) {
+    mount_block_verdicts_after(mock, names, verdict, group, std::time::Duration::ZERO).await;
+}
+
+/// As [`mount_block_verdicts`], answering only after `delay`.
+async fn mount_block_verdicts_after(
+    mock: &MockRegistry,
+    names: &[&str],
+    verdict: &str,
+    group: &str,
+    delay: std::time::Duration,
+) {
     let decisions: Vec<serde_json::Value> = names
         .iter()
         .map(|name| {
@@ -56,19 +67,23 @@ async fn mount_block_verdicts(mock: &MockRegistry, names: &[&str], verdict: &str
         request = request.and(body_string_contains(format!("\"name\":\"{name}\"")));
     }
     request
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "requestId": "bypass-test",
-            "policyMode": "enforce",
-            "summary": {
-                "total": names.len(),
-                "allow": 0,
-                "warn": 0,
-                "block": names.len(),
-                "unknown": 0,
-                "matched": names.len()
-            },
-            "decisions": decisions
-        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "requestId": "bypass-test",
+                    "policyMode": "enforce",
+                    "summary": {
+                        "total": names.len(),
+                        "allow": 0,
+                        "warn": 0,
+                        "block": names.len(),
+                        "unknown": 0,
+                        "matched": names.len()
+                    },
+                    "decisions": decisions
+                }))
+                .set_delay(delay),
+        )
         .mount(mock.server())
         .await;
 }
@@ -301,9 +316,24 @@ async fn monitor_reports_what_a_rule_would_allow_when_a_later_verdict_batch_fail
     );
 }
 
-#[tokio::test]
-async fn an_install_whose_later_verdict_request_fails_prints_what_a_rule_let_through() {
-    let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
+/// An enforce-mode install of `agent-tool`, which a rule lifts, and
+/// `unchecked-tool`, whose verdict request fails, each answered after its
+/// delay, so the test controls which arrives first.
+async fn install_with_a_failing_verdict_request(
+    lifted_after: std::time::Duration,
+    failure_after: std::time::Duration,
+) -> (MockRegistry, std::process::Output) {
+    let mock = MockRegistry::start().await;
+    mock.with_package("agent-tool", "1.0.0", &make_tarball("agent-tool", "1.0.0"))
+        .await;
+    mount_block_verdicts_after(
+        &mock,
+        &["agent-tool"],
+        "suspicious",
+        "lpm_ai_agent_control_surface",
+        lifted_after,
+    )
+    .await;
     mock.with_package(
         "unchecked-tool",
         "1.0.0",
@@ -313,7 +343,7 @@ async fn an_install_whose_later_verdict_request_fails_prints_what_a_rule_let_thr
     Mock::given(method("POST"))
         .and(path(VERDICTS_PATH))
         .and(body_string_contains("\"name\":\"unchecked-tool\""))
-        .respond_with(ResponseTemplate::new(400))
+        .respond_with(ResponseTemplate::new(400).set_delay(failure_after))
         .mount(mock.server())
         .await;
     let project = enforcing_project();
@@ -334,17 +364,47 @@ async fn an_install_whose_later_verdict_request_fails_prints_what_a_rule_let_thr
         ])
         .output()
         .unwrap();
+    (mock, output)
+}
+
+const AGENT_TOOL_ALLOWED: &str =
+    "! LPM Firewall allowed 1 blocked package because of your bypass rules:\n";
+
+#[tokio::test]
+async fn an_install_prints_a_lifted_version_it_downloaded_before_a_verdict_request_failed() {
+    let (mock, output) = install_with_a_failing_verdict_request(
+        std::time::Duration::ZERO,
+        std::time::Duration::from_millis(1500),
+    )
+    .await;
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "{stderr}");
+    let notice = stderr.find(AGENT_TOOL_ALLOWED).expect(&stderr);
     assert!(
-        stderr.contains("! LPM Firewall allowed 1 blocked package because of your bypass rules:\n"),
+        stderr[notice..].contains("    rule: agent-tool (every project)\n"),
         "{stderr}"
     );
+    let error = stderr.find("npm firewall").expect(&stderr);
     assert!(
-        stderr.contains("    rule: agent-tool (every project)\n"),
-        "{stderr}"
+        notice < error,
+        "the notice must come before the error: {stderr}"
     );
+    assert_eq!(mock.tarball_request_count("agent-tool", "1.0.0").await, 1);
+}
+
+#[tokio::test]
+async fn an_install_reports_no_lifted_version_held_back_after_a_verdict_request_failed() {
+    let (mock, output) = install_with_a_failing_verdict_request(
+        std::time::Duration::from_millis(1500),
+        std::time::Duration::ZERO,
+    )
+    .await;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(!stderr.contains("LPM Firewall allowed"), "{stderr}");
+    assert_eq!(mock.tarball_request_count("agent-tool", "1.0.0").await, 0);
 }
 
 #[tokio::test]

@@ -227,7 +227,8 @@ pub(super) struct NpmFirewallPreflightStats {
     /// command fails on the block either way; this keeps the failure that
     /// names it from being replaced by the later request error.
     pub(super) unchecked_reason: Option<String>,
-    /// Blocked versions that bypass rules let through.
+    /// Blocked versions that bypass rules lifted; once a verdict request
+    /// fails, only those already released to download.
     pub(super) bypassed: Vec<BypassedVerdict>,
     /// Why the bypass rules couldn't be read, when a block needed them.
     pub(super) bypass_error: Option<String>,
@@ -780,6 +781,8 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
         // nothing more downloads.
         let mut blocked = false;
         let mut failure: Option<LpmError> = None;
+        // What rules lifted in chunks held back from download.
+        let mut held_bypassed = Vec::new();
 
         loop {
             tokio::select! {
@@ -837,6 +840,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                         blocked || failure.is_some(),
                         &mut stats,
                         &mut decisions,
+                        &mut held_bypassed,
                         &mut report_error,
                     )
                     .await;
@@ -856,6 +860,11 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
             }
             failure => failure,
         };
+        // A block names every version a rule lifted; a failed request lets
+        // through only what downloaded before it.
+        if failure.is_none() {
+            stats.bypassed.append(&mut held_bypassed);
+        }
         stats.batch_ms = total_started.elapsed().as_millis();
         Ok(NpmFirewallPreflightResult {
             stats,
@@ -1060,6 +1069,7 @@ async fn apply_firewall_chunk_result(
     earlier_block: bool,
     stats: &mut NpmFirewallPreflightStats,
     decisions: &mut Vec<NpmFirewallDecision>,
+    held_bypassed: &mut Vec<BypassedVerdict>,
     report_error: &mut Option<String>,
 ) -> bool {
     let fetch_tx = dispatch.fetch_tx;
@@ -1093,12 +1103,16 @@ async fn apply_firewall_chunk_result(
         policy_mode = %response.policy_mode,
         "npm firewall verdict chunk completed",
     );
-    let classified =
+    let mut classified =
         classify_verdicts(response, &chunk_result.verdict_packages, dispatch.bypass).await;
     let chunk_has_block = classified.blocks();
-    decisions.extend(stats.record_classified(classified));
     let enforce = matches!(mode, NpmFirewallMode::Enforce);
-    if !(enforce && (chunk_has_block || earlier_block)) {
+    let release = !(enforce && (chunk_has_block || earlier_block));
+    if !release {
+        held_bypassed.append(&mut classified.bypassed);
+    }
+    decisions.extend(stats.record_classified(classified));
+    if release {
         release_firewall_events(fetch_tx, chunk_result.events).await;
     }
     enforce && chunk_has_block
@@ -1766,6 +1780,9 @@ pub(super) async fn request_npm_firewall_preflight_with_bypass(
     }
     if let Some(error) = first_failure.map(npm_firewall_preflight_enforce_error) {
         if !stats_have_block(&stats, &all_decisions) {
+            // Nothing downloads until every batch settles, so a failed one
+            // lets nothing through.
+            stats.bypassed.clear();
             stats.batch_ms = started.elapsed().as_millis();
             return Ok(NpmFirewallPreflightResult {
                 stats,
@@ -1879,7 +1896,7 @@ pub(super) fn finish_npm_firewall_preflight(
         ))
     });
     if let Some(failure) = result.failure {
-        // A chunk a rule lifted was released to download before the failure.
+        // Only versions released to download before the failure remain.
         if !json_output {
             print_bypassed_verdicts(&stats.bypassed, false);
         }

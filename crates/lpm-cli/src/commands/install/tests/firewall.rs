@@ -2727,3 +2727,180 @@ async fn an_excess_row_never_hides_a_versions_hardest_block() {
     };
     assert_eq!(blocked.packages[0].block_class.as_deref(), Some("malware"));
 }
+
+/// A verdict server where `broken` fails after `failure_delay_ms` and each of
+/// `lifted` (name, delay ms) returns a block that a rule lifts, plus any
+/// `blocked` name returning a block no rule lifts after `block_delay_ms`.
+async fn ordered_failure_server(
+    broken: &str,
+    failure_delay_ms: u64,
+    lifted: &[(&str, u64)],
+    blocked: Option<(&str, u64)>,
+) -> wiremock::MockServer {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .and(body_string_contains(format!("\"name\":\"{broken}\"")))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_delay(std::time::Duration::from_millis(failure_delay_ms)),
+        )
+        .mount(&server)
+        .await;
+    let responses = lifted
+        .iter()
+        .map(|(name, delay)| {
+            (
+                *name,
+                *delay,
+                grouped_block(name, "suspicious", "lpm_ai_telemetry"),
+            )
+        })
+        .chain(blocked.map(|(name, delay)| (name, delay, verdict_decision(name, "block"))));
+    for (name, delay, decision) in responses {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/npm-firewall/verdicts"))
+            .and(body_string_contains(format!("\"name\":\"{name}\"")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(verdict_response(1, vec![decision]))
+                    .set_delay(std::time::Duration::from_millis(delay)),
+            )
+            .mount(&server)
+            .await;
+    }
+    server
+}
+
+fn bypassed_names(stats: &NpmFirewallPreflightStats) -> Vec<&str> {
+    stats
+        .bypassed
+        .iter()
+        .map(|bypassed| bypassed.decision.name.as_str())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_request_failure_reports_only_the_lifted_versions_it_released() {
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let server =
+        ordered_failure_server("broken-a", 150, &[("released-b", 0), ("held-c", 450)], None).await;
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("firewall-token"),
+    );
+    let (selected_tx, selected_rx) = mpsc::channel(4);
+    let (fetch_tx, mut fetch_rx) = mpsc::channel(4);
+    let mut config = chunked_config(NpmFirewallMode::Enforce);
+    config.bypass = FirewallBypassRules::preloaded(
+        &[global_rule("released-b"), global_rule("held-c")],
+        Vec::new(),
+        None,
+        true,
+    );
+    let join = spawn_chunked_npm_firewall_preflight(selected_rx, fetch_tx, client, config);
+
+    for name in ["released-b", "broken-a", "held-c"] {
+        selected_tx.send(selected_event(name)).await.unwrap();
+    }
+    drop(selected_tx);
+    let drained = join.drain().await.unwrap();
+
+    assert!(drained.failure.is_some());
+    assert_eq!(bypassed_names(&drained.stats), ["released-b"]);
+    assert_eq!(fetch_rx.recv().await.unwrap().name, "released-b");
+    assert!(fetch_rx.recv().await.is_none(), "held-c must stay held");
+    assert!(finish_npm_firewall_preflight(drained, true).is_err());
+}
+
+#[tokio::test]
+async fn a_block_after_a_request_failure_lists_every_version_a_rule_lifted() {
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let server = ordered_failure_server(
+        "broken-a",
+        150,
+        &[("released-b", 0), ("held-c", 450)],
+        Some(("evil-d", 450)),
+    )
+    .await;
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("firewall-token"),
+    );
+    let (selected_tx, selected_rx) = mpsc::channel(4);
+    let (fetch_tx, mut fetch_rx) = mpsc::channel(4);
+    let mut config = chunked_config(NpmFirewallMode::Enforce);
+    config.bypass = FirewallBypassRules::preloaded(
+        &[global_rule("released-b"), global_rule("held-c")],
+        Vec::new(),
+        None,
+        true,
+    );
+    let join = spawn_chunked_npm_firewall_preflight(selected_rx, fetch_tx, client, config);
+
+    for name in ["released-b", "broken-a", "held-c", "evil-d"] {
+        selected_tx.send(selected_event(name)).await.unwrap();
+    }
+    drop(selected_tx);
+    let drained = join.drain().await.unwrap();
+
+    assert_eq!(fetch_rx.recv().await.unwrap().name, "released-b");
+    assert!(fetch_rx.recv().await.is_none());
+    let LpmError::NpmFirewallBlocked(blocked) =
+        finish_npm_firewall_preflight(drained, true).unwrap_err()
+    else {
+        panic!("expected the firewall block");
+    };
+    let mut lifted: Vec<&str> = blocked
+        .bypassed
+        .iter()
+        .map(|bypassed| bypassed.name.as_str())
+        .collect();
+    lifted.sort_unstable();
+    assert_eq!(lifted, ["held-c", "released-b"]);
+}
+
+#[tokio::test]
+async fn a_failed_batch_reports_no_lifted_version_since_nothing_downloaded() {
+    let server = ordered_failure_server("p-0", 0, &[("p-512", 0)], None).await;
+    let client = std::sync::Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("firewall-token"),
+    );
+    let packages = (0..=512)
+        .map(|index| lpm_registry::client::NpmFirewallBatchPackage {
+            name: format!("p-{index}"),
+            version: "1.0.0".into(),
+            integrity: None,
+            published_at: None,
+        })
+        .collect();
+
+    let result = request_npm_firewall_preflight_with_bypass(
+        PreflightSettings {
+            mode: NpmFirewallMode::Enforce,
+            lookup_mode: NpmFirewallLookupMode::PackageOnly,
+            policy_profile: lpm_registry::client::NpmFirewallPolicyProfile::default(),
+            offline: false,
+            force: false,
+            bypass: FirewallBypassRules::preloaded(&[global_rule("p-512")], Vec::new(), None, true),
+        },
+        client,
+        packages,
+    )
+    .await
+    .unwrap();
+
+    assert!(result.failure.is_some());
+    assert!(bypassed_names(&result.stats).is_empty());
+}

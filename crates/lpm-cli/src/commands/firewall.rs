@@ -809,6 +809,18 @@ async fn approve_and_save(
     })
 }
 
+/// Refuses once a managed policy turns local rules off, which it can do
+/// while a prompt is open, so `add` checks before each prompt and again
+/// before it saves.
+fn refuse_once_local_rules_stop_applying() -> Result<(), AddRefusal> {
+    let effective = security_approval::load_effective_authorized_posture()
+        .map_err(AddRefusal::settings_unreadable)?;
+    match security_approval::local_firewall_bypass_inactive_reason(&effective) {
+        Some(reason) => Err(LpmError::SecurityFloor(reason).into()),
+        None => Ok(()),
+    }
+}
+
 async fn approve_and_save_attempts(
     client: &RegistryClient,
     plan: &PlannedAdd<'_>,
@@ -861,15 +873,7 @@ async fn approve_and_save_attempts(
                         pending.iter().find(|rule| rule.spec == coordinate).cloned()
                     })
                     .collect();
-                // Read again before each prompt, since a managed policy that
-                // turns local rules off can appear while one is open.
-                let effective = security_approval::load_effective_authorized_posture()
-                    .map_err(AddRefusal::settings_unreadable)?;
-                if let Some(reason) =
-                    security_approval::local_firewall_bypass_inactive_reason(&effective)
-                {
-                    return Err(LpmError::SecurityFloor(reason).into());
-                }
+                refuse_once_local_rules_stop_applying()?;
                 approve(&security_approval::FirewallBypassApproval {
                     rules,
                     prompt: &prompt,
@@ -880,6 +884,7 @@ async fn approve_and_save_attempts(
             }
             approved.append(&mut pending);
         }
+        refuse_once_local_rules_stop_applying()?;
         match security_approval::commit_firewall_bypass_rules(
             &approved,
             narrowing.iter().chain(&unchanged),
@@ -2149,6 +2154,78 @@ mod tests {
                     error.error_code()
                 ))]
             );
+        });
+    }
+
+    /// Runs `add` for `raw` specs, writing a managed policy that owns the
+    /// firewall while the first prompt is open, and returns the error and how
+    /// many prompts opened.
+    fn add_while_a_managed_policy_takes_over(
+        dir: &std::path::Path,
+        raw: &[&str],
+    ) -> (LpmError, usize) {
+        let specs = specs(raw);
+        let scope = global();
+        let requested = specs.iter().map(|spec| rule(spec, None)).collect();
+        let mut prompts = 0;
+        let error = run_add(&plan(&specs, &scope, None, false), requested, |_| {
+            prompts += 1;
+            std::fs::write(
+                dir.join("managed-security-policy.toml"),
+                "[firewall]\nmode = \"enforce\"\n",
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap_err();
+        (error, prompts)
+    }
+
+    #[test]
+    fn add_opens_no_further_prompt_once_a_managed_policy_turns_local_rules_off() {
+        let temp = tempfile::tempdir().unwrap();
+        security_approval::test_support::with_test_env(temp.path(), || {
+            let (error, prompts) = add_while_a_managed_policy_takes_over(
+                temp.path(),
+                &[
+                    "tool-a@1.0.0",
+                    "tool-b@1.0.0",
+                    "tool-c@1.0.0",
+                    "tool-d@1.0.0",
+                    "tool-e@1.0.0",
+                    "tool-f@1.0.0",
+                ],
+            );
+
+            assert!(
+                error.to_string().contains("manages the npm firewall"),
+                "{error}"
+            );
+            assert_eq!(prompts, 1);
+            assert!(saved_specs().is_empty());
+            let details = security_approval::test_support::audit_details("firewall-bypass-added");
+            assert_eq!(details.len(), 1, "{details:?}");
+            let detail = details[0].as_deref().unwrap_or_default();
+            assert!(
+                detail.contains("manages the npm firewall") && detail.contains("; approved: "),
+                "{detail}"
+            );
+        });
+    }
+
+    #[test]
+    fn add_saves_nothing_once_a_managed_policy_turns_local_rules_off_during_the_last_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        security_approval::test_support::with_test_env(temp.path(), || {
+            let (error, prompts) =
+                add_while_a_managed_policy_takes_over(temp.path(), &["fresh@1.0.0"]);
+
+            assert!(
+                error.to_string().contains("manages the npm firewall"),
+                "{error}"
+            );
+            assert_eq!(prompts, 1);
+            assert!(saved_specs().is_empty());
         });
     }
 
