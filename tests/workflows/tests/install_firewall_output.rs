@@ -139,6 +139,93 @@ async fn firewall_monitor_output_reports_would_block_and_continues() {
     assert!(!stderr.contains("LPM Firewall blocked"), "{stderr}");
 }
 
+/// More packages than one verdict request carries, so monitor mode asks in
+/// two batches; the first batch, which holds `aaa-would-block` and
+/// `aab-warned` (packages are asked in name order), answers and the second
+/// fails.
+#[tokio::test]
+async fn firewall_monitor_still_names_what_it_checked_when_another_verdict_batch_fails() {
+    let mock = MockRegistry::start().await;
+    let names: Vec<String> = ["aaa-would-block".to_string(), "aab-warned".to_string()]
+        .into_iter()
+        .chain((0..511).map(|index| format!("filler-{index:03}")))
+        .collect();
+    for name in &names {
+        mock.with_package(name, "1.0.0", &make_tarball(name, "1.0.0"))
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .and(body_string_contains("\"name\":\"aaa-would-block\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "requestId": "firewall-output",
+            "policyMode": "monitor",
+            "summary": { "total": 2, "allow": 0, "warn": 1, "block": 1, "unknown": 0, "matched": 2 },
+            "decisions": [{
+                "decisionId": "aaa-would-block",
+                "name": "aaa-would-block",
+                "version": "1.0.0",
+                "action": "block",
+                "verdict": "malicious",
+                "reason": "Local policy reason",
+                "matchSource": "package",
+                "policyMode": "monitor",
+                "enqueueScan": false,
+                "display": { "summary": "Package source requires review." }
+            }, {
+                "decisionId": "aab-warned",
+                "name": "aab-warned",
+                "version": "1.0.0",
+                "action": "warn",
+                "verdict": "suspicious",
+                "reason": "Local policy reason",
+                "matchSource": "package",
+                "policyMode": "monitor",
+                "enqueueScan": false,
+                "display": { "summary": "Package source looks unusual." }
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(mock.server())
+        .await;
+    let dependencies: serde_json::Map<String, serde_json::Value> = names
+        .iter()
+        .map(|name| (name.clone(), serde_json::json!("1.0.0")))
+        .collect();
+    let project = TempProject::empty(
+        &serde_json::json!({ "name": "consumer", "version": "1.0.0", "dependencies": dependencies })
+            .to_string(),
+    );
+    write_npm_firewall_global_config(&project, "monitor");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--color", "never", "install", "--no-skills"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("! npm firewall verdict preflight failed in monitor mode:"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("! LPM Firewall monitor: 1 would-block, 1 warned; command continues because monitor mode is active."), "{stderr}");
+    assert!(
+        stderr.contains("  › aaa-would-block@1.0.0 - block: Package source requires review."),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("  › aab-warned@1.0.0 - warn: Package source looks unusual."),
+        "{stderr}"
+    );
+}
+
 #[tokio::test]
 async fn firewall_headings_use_plural_packages_for_multiple_verdicts() {
     for (action, heading) in [("block", "blocked"), ("warn", "warned for")] {

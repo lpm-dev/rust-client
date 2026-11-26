@@ -1624,11 +1624,12 @@ pub(super) fn finish_npm_firewall_preflight(
     json_output: bool,
 ) -> Result<NpmFirewallPreflightStats, LpmError> {
     let stats = result.stats;
-    if let Some(error) = result.report_error {
-        if !json_output {
-            output::warn(&lpm_common::sanitize_terminal_inline(&error));
-        }
-        return Ok(stats);
+    // A failed request in monitor mode still leaves what the requests before
+    // it found, which is reported below.
+    if let Some(error) = &result.report_error
+        && !json_output
+    {
+        output::warn(&lpm_common::sanitize_terminal_inline(error));
     }
 
     let blocked = distinct_decisions(&result.decisions, NpmFirewallAction::Block);
