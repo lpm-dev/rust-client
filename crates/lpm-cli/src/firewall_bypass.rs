@@ -174,7 +174,7 @@ fn parse_versions(text: &str) -> Result<SpecVersions, String> {
             "`{normalized}` has build metadata; name the version without it"
         ));
     }
-    if normalized.len() > MAX_VERSION_CHARS {
+    if has_exact_version_shape(&normalized) && normalized.chars().count() > MAX_VERSION_CHARS {
         return Err(format!(
             "the version is longer than the {MAX_VERSION_CHARS} characters npm allows"
         ));
@@ -216,15 +216,21 @@ fn parse_versions(text: &str) -> Result<SpecVersions, String> {
 
 /// `text` as an exact version when it is written the canonical way: three
 /// numeric parts and an optional prerelease, as in `1.2.3` or `1.0.0-rc.x`.
-fn canonical_version(text: &str) -> Option<lpm_semver::Version> {
+/// Whether `text` starts with the three numeric parts of an exact version.
+fn has_exact_version_shape(text: &str) -> bool {
     let core = text.split_once('-').map_or(text, |(core, _)| core);
     let mut parts = core.split('.');
     let numeric = |part: Option<&str>| {
         part.is_some_and(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
     };
-    if !(numeric(parts.next()) && numeric(parts.next()) && numeric(parts.next()))
-        || parts.next().is_some()
-    {
+    numeric(parts.next())
+        && numeric(parts.next())
+        && numeric(parts.next())
+        && parts.next().is_none()
+}
+
+fn canonical_version(text: &str) -> Option<lpm_semver::Version> {
+    if !has_exact_version_shape(text) {
         return None;
     }
     let version = lpm_semver::Version::parse(text).ok()?;
@@ -1034,6 +1040,14 @@ mod tests {
         );
 
         assert_eq!(parsed.kind(), BypassKind::Exact);
+    }
+
+    #[test]
+    fn a_range_longer_than_npm_allows_keeps_the_range_message() {
+        let range = format!(">=1.0.0{}", " || 1.2.3".repeat(40));
+        let error = FirewallBypassSpec::parse(&format!("foldrun@{range}")).unwrap_err();
+
+        assert!(error.contains("80 characters"), "{error}");
     }
 
     #[test]

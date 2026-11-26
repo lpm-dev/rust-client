@@ -411,8 +411,9 @@ fn add_command_hint(
         command.push_str(" --allow-malware");
     }
     if let Some(reason) = reason.filter(|reason| reason_shell_safe(reason)) {
-        // Joined with `=` so a note starting with `-` stays the value.
-        command.push_str(" --reason=\"");
+        // One quoted word: `=` keeps a note starting with `-` the value, and
+        // PowerShell only reads quotes that open a word.
+        command.push_str(" \"--reason=");
         command.push_str(reason);
         command.push('"');
     }
@@ -1390,16 +1391,16 @@ mod tests {
         assert_eq!(
             hint("reviewed the report, ticket SEC-12").as_deref(),
             Some(
-                "lpm firewall bypass add \"foldrun@32.8.2\" --reason=\"reviewed the report, ticket SEC-12\""
+                "lpm firewall bypass add \"foldrun@32.8.2\" \"--reason=reviewed the report, ticket SEC-12\""
             )
         );
         assert_eq!(
             hint("-reviewed").as_deref(),
-            Some("lpm firewall bypass add \"foldrun@32.8.2\" --reason=\"-reviewed\"")
+            Some("lpm firewall bypass add \"foldrun@32.8.2\" \"--reason=-reviewed\"")
         );
         assert_eq!(
             hint("").as_deref(),
-            Some("lpm firewall bypass add \"foldrun@32.8.2\" --reason=\"\"")
+            Some("lpm firewall bypass add \"foldrun@32.8.2\" \"--reason=\"")
         );
         for unsafe_note in [
             "costs $5",
@@ -1414,8 +1415,26 @@ mod tests {
         }
     }
 
+    /// The words a POSIX shell splits `hint` into after `lpm firewall`.
+    #[cfg(unix)]
+    fn words_a_shell_reads(hint: &str) -> Vec<String> {
+        let arguments = hint.strip_prefix("lpm firewall ").unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("printf '%s\\0' {arguments}"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .split_terminator('\0')
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn a_hinted_note_reads_back_as_the_same_note() {
+    fn a_hinted_note_reads_back_through_a_shell_as_the_same_note() {
         use clap::Parser;
 
         #[derive(Parser)]
@@ -1424,22 +1443,34 @@ mod tests {
             command: FirewallCmd,
         }
 
-        for note in ["-reviewed", ""] {
-            let cli = Cli::try_parse_from([
-                "lpm",
-                "bypass",
-                "add",
-                "foldrun@32.8.2",
-                &format!("--reason={note}"),
-            ])
+        for note in [
+            "reviewed the report, ticket SEC-12",
+            "-reviewed",
+            "",
+            "a; b | c & d (e) {f} <g> 'quoted' x.y",
+            "na\u{ef}ve \u{fc}nicode",
+        ] {
+            let hint = add_command_hint(
+                &refs(&specs(&["foldrun@32.8.2"])),
+                &global(),
+                None,
+                false,
+                Some(note),
+            )
             .unwrap();
+            let mut argv = vec!["lpm".to_string()];
+            argv.extend(words_a_shell_reads(&hint));
+
+            let cli = Cli::try_parse_from(&argv).unwrap_or_else(|error| panic!("{hint}: {error}"));
+
             let FirewallCmd::Bypass {
-                action: BypassCmd::Add { reason, .. },
+                action: BypassCmd::Add { specs, reason, .. },
             } = cli.command
             else {
-                panic!("expected `bypass add`");
+                panic!("expected `bypass add` from {hint}");
             };
-            assert_eq!(reason.as_deref(), Some(note));
+            assert_eq!(specs, ["foldrun@32.8.2"], "{hint}");
+            assert_eq!(reason.as_deref(), Some(note), "{hint}");
         }
     }
 
