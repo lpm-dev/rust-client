@@ -666,17 +666,7 @@ fn plan_add(
         .map_err(AddRefusal::settings_unreadable)?;
     let effective = security_approval::load_effective_authorized_posture()
         .map_err(AddRefusal::settings_unreadable)?;
-    if let Some(reason) = security_approval::local_firewall_bypass_inactive_reason(&effective) {
-        return Err(LpmError::SecurityFloor(reason).into());
-    }
-    if forced_floor_refuses_additions(&global, &effective)
-        .map_err(AddRefusal::settings_unreadable)?
-    {
-        return Err(LpmError::SecurityFloor(
-            "`force-security-floor = true` keeps the npm firewall at enforce, so new bypass rules are refused; lower the floor intentionally in ~/.lpm/config.toml first".to_string(),
-        )
-        .into());
-    }
+    refuse_where_additions_are_off(&global, &effective)?;
 
     let rules: Vec<FirewallBypassRule> = specs
         .iter()
@@ -809,16 +799,33 @@ async fn approve_and_save(
     })
 }
 
-/// Refuses once a managed policy turns local rules off, which it can do
-/// while a prompt is open, so `add` checks before each prompt and again
-/// before it saves.
-fn refuse_once_local_rules_stop_applying() -> Result<(), AddRefusal> {
+/// Refuses where a new local rule wouldn't apply or isn't allowed: a managed
+/// policy owns the firewall, or `force-security-floor` holds it at enforce.
+fn refuse_where_additions_are_off(
+    global: &crate::commands::config::GlobalConfig,
+    effective: &security_approval::EffectiveAuthorizedPosture,
+) -> Result<(), AddRefusal> {
+    if let Some(reason) = security_approval::local_firewall_bypass_inactive_reason(effective) {
+        return Err(LpmError::SecurityFloor(reason).into());
+    }
+    if forced_floor_refuses_additions(global, effective).map_err(AddRefusal::settings_unreadable)? {
+        return Err(LpmError::SecurityFloor(
+            "`force-security-floor = true` keeps the npm firewall at enforce, so new bypass rules are refused; lower the floor intentionally in ~/.lpm/config.toml first".to_string(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// [`refuse_where_additions_are_off`] with the settings read again, since
+/// either can change while a prompt is open: `add` checks before each prompt
+/// and under the store's lock before it saves.
+fn refuse_once_additions_are_off() -> Result<(), AddRefusal> {
+    let global = crate::commands::config::GlobalConfig::load_checked()
+        .map_err(AddRefusal::settings_unreadable)?;
     let effective = security_approval::load_effective_authorized_posture()
         .map_err(AddRefusal::settings_unreadable)?;
-    match security_approval::local_firewall_bypass_inactive_reason(&effective) {
-        Some(reason) => Err(LpmError::SecurityFloor(reason).into()),
-        None => Ok(()),
-    }
+    refuse_where_additions_are_off(&global, &effective)
 }
 
 async fn approve_and_save_attempts(
@@ -873,7 +880,7 @@ async fn approve_and_save_attempts(
                         pending.iter().find(|rule| rule.spec == coordinate).cloned()
                     })
                     .collect();
-                refuse_once_local_rules_stop_applying()?;
+                refuse_once_additions_are_off()?;
                 approve(&security_approval::FirewallBypassApproval {
                     rules,
                     prompt: &prompt,
@@ -884,8 +891,8 @@ async fn approve_and_save_attempts(
             }
             approved.append(&mut pending);
         }
-        refuse_once_local_rules_stop_applying()?;
-        match security_approval::commit_firewall_bypass_rules(
+        match security_approval::commit_firewall_bypass_rules_if(
+            refuse_once_additions_are_off,
             &approved,
             narrowing.iter().chain(&unchanged),
             &format!("approved: {}", approved_prompts.join("; ")),
@@ -2222,6 +2229,40 @@ mod tests {
 
             assert!(
                 error.to_string().contains("manages the npm firewall"),
+                "{error}"
+            );
+            assert_eq!(prompts, 1);
+            assert!(saved_specs().is_empty());
+        });
+    }
+
+    #[test]
+    fn add_saves_nothing_once_the_forced_floor_reaches_enforce_during_the_last_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        security_approval::test_support::with_test_env(temp.path(), || {
+            let specs = specs(&["fresh@1.0.0"]);
+            let scope = global();
+            let mut prompts = 0;
+
+            let error = run_add(
+                &plan(&specs, &scope, None, false),
+                vec![rule(&specs[0], None)],
+                |_| {
+                    prompts += 1;
+                    let lpm_home = temp.path().join("lpm-home");
+                    std::fs::create_dir_all(&lpm_home).unwrap();
+                    std::fs::write(
+                        lpm_home.join("config.toml"),
+                        "force-security-floor = true\n\n[firewall]\nmode = \"enforce\"\n",
+                    )
+                    .unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+            assert!(
+                error.to_string().contains("force-security-floor"),
                 "{error}"
             );
             assert_eq!(prompts, 1);

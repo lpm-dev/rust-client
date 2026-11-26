@@ -403,8 +403,24 @@ async fn an_install_reports_no_lifted_version_held_back_after_a_verdict_request_
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("npm firewall verdict preflight failed"),
+        "{stderr}"
+    );
+    assert_eq!(verdict_request_count(&mock).await, 2);
     assert!(!stderr.contains("LPM Firewall allowed"), "{stderr}");
     assert_eq!(mock.tarball_request_count("agent-tool", "1.0.0").await, 0);
+}
+
+/// How many verdict requests the registry received.
+async fn verdict_request_count(mock: &MockRegistry) -> usize {
+    mock.server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available")
+        .iter()
+        .filter(|request| request.url.path() == VERDICTS_PATH)
+        .count()
 }
 
 #[tokio::test]

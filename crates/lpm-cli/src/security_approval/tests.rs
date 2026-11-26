@@ -3418,6 +3418,40 @@ fn a_request_whose_expiry_passed_before_the_save_saves_nothing() {
 }
 
 #[test]
+fn a_save_writes_nothing_its_check_under_the_store_lock_refuses() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        let mut checked_under_lock = false;
+        let Err(error) = commit_firewall_bypass_rules_if(
+            || {
+                checked_under_lock = lpm_common::try_with_exclusive_lock(
+                    firewall_bypass_lock_path().unwrap(),
+                    || Ok(()),
+                )
+                .unwrap()
+                .is_none();
+                Err(LpmError::SecurityFloor("no longer allowed".into()))
+            },
+            &[bypass_rule("foldrun@32.8.2")],
+            [],
+            "approved: foldrun",
+        ) else {
+            panic!("a refused check must save nothing");
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "security floor refused: no longer allowed"
+        );
+        assert!(
+            checked_under_lock,
+            "the check must run while the store lock is held"
+        );
+        assert!(load_local_firewall_bypass_rules().unwrap().is_empty());
+    });
+}
+
+#[test]
 fn a_rule_sharing_an_id_with_a_saved_one_is_judged_a_new_rule() {
     let temp = tempdir().unwrap();
     with_test_env(temp.path(), || {

@@ -2730,7 +2730,9 @@ async fn an_excess_row_never_hides_a_versions_hardest_block() {
 
 /// A verdict server where `broken` fails after `failure_delay_ms` and each of
 /// `lifted` (name, delay ms) returns a block that a rule lifts, plus any
-/// `blocked` name returning a block no rule lifts after `block_delay_ms`.
+/// `blocked` (name, delay ms) returning a block no rule lifts. Each is asked
+/// exactly once; callers keep the delays a second apart so a loaded runner
+/// keeps their order.
 async fn ordered_failure_server(
     broken: &str,
     failure_delay_ms: u64,
@@ -2748,6 +2750,7 @@ async fn ordered_failure_server(
             ResponseTemplate::new(400)
                 .set_delay(std::time::Duration::from_millis(failure_delay_ms)),
         )
+        .expect(1)
         .mount(&server)
         .await;
     let responses = lifted
@@ -2769,6 +2772,7 @@ async fn ordered_failure_server(
                     .set_body_json(verdict_response(1, vec![decision]))
                     .set_delay(std::time::Duration::from_millis(delay)),
             )
+            .expect(1)
             .mount(&server)
             .await;
     }
@@ -2788,8 +2792,13 @@ async fn a_request_failure_reports_only_the_lifted_versions_it_released() {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    let server =
-        ordered_failure_server("broken-a", 150, &[("released-b", 0), ("held-c", 450)], None).await;
+    let server = ordered_failure_server(
+        "broken-a",
+        1000,
+        &[("released-b", 0), ("held-c", 2000)],
+        None,
+    )
+    .await;
     let client = Arc::new(
         lpm_registry::RegistryClient::new()
             .with_base_url(server.uri())
@@ -2813,6 +2822,10 @@ async fn a_request_failure_reports_only_the_lifted_versions_it_released() {
     let drained = join.drain().await.unwrap();
 
     assert!(drained.failure.is_some());
+    assert_eq!(
+        drained.stats.block_count, 2,
+        "both lifted verdicts were classified"
+    );
     assert_eq!(bypassed_names(&drained.stats), ["released-b"]);
     assert_eq!(fetch_rx.recv().await.unwrap().name, "released-b");
     assert!(fetch_rx.recv().await.is_none(), "held-c must stay held");
@@ -2826,9 +2839,9 @@ async fn a_block_after_a_request_failure_lists_every_version_a_rule_lifted() {
 
     let server = ordered_failure_server(
         "broken-a",
-        150,
-        &[("released-b", 0), ("held-c", 450)],
-        Some(("evil-d", 450)),
+        1000,
+        &[("released-b", 0), ("held-c", 2000)],
+        Some(("evil-d", 2000)),
     )
     .await;
     let client = Arc::new(
@@ -2871,7 +2884,7 @@ async fn a_block_after_a_request_failure_lists_every_version_a_rule_lifted() {
 
 #[tokio::test]
 async fn a_failed_batch_reports_no_lifted_version_since_nothing_downloaded() {
-    let server = ordered_failure_server("p-0", 0, &[("p-512", 0)], None).await;
+    let server = ordered_failure_server("p-512", 0, &[("p-0", 0)], None).await;
     let client = std::sync::Arc::new(
         lpm_registry::RegistryClient::new()
             .with_base_url(server.uri())
@@ -2893,7 +2906,7 @@ async fn a_failed_batch_reports_no_lifted_version_since_nothing_downloaded() {
             policy_profile: lpm_registry::client::NpmFirewallPolicyProfile::default(),
             offline: false,
             force: false,
-            bypass: FirewallBypassRules::preloaded(&[global_rule("p-512")], Vec::new(), None, true),
+            bypass: FirewallBypassRules::preloaded(&[global_rule("p-0")], Vec::new(), None, true),
         },
         client,
         packages,
@@ -2902,5 +2915,9 @@ async fn a_failed_batch_reports_no_lifted_version_since_nothing_downloaded() {
     .unwrap();
 
     assert!(result.failure.is_some());
+    assert_eq!(
+        result.stats.block_count, 1,
+        "the first batch's lifted verdict was classified"
+    );
     assert!(bypassed_names(&result.stats).is_empty());
 }

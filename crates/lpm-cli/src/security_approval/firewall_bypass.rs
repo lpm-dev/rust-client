@@ -96,15 +96,27 @@ pub(super) fn firewall_bypass_store_quarantine_reason(value: serde_json::Value) 
 pub(super) fn update_local_firewall_bypass_rules<T>(
     change: impl FnOnce(&mut Vec<FirewallBypassRule>, Timestamp) -> T,
 ) -> Result<(T, usize), LpmError> {
-    std::fs::create_dir_all(security_dir()?)?;
+    update_local_firewall_bypass_rules_if(|| Ok::<(), LpmError>(()), change)
+}
+
+/// As [`update_local_firewall_bypass_rules`], once `still_allowed` passes
+/// under the store's lock, so nothing it refuses by then is written.
+fn update_local_firewall_bypass_rules_if<T, E: From<LpmError>>(
+    still_allowed: impl FnOnce() -> Result<(), E>,
+    change: impl FnOnce(&mut Vec<FirewallBypassRule>, Timestamp) -> T,
+) -> Result<(T, usize), E> {
+    std::fs::create_dir_all(security_dir()?).map_err(LpmError::from)?;
     lpm_common::with_exclusive_lock(firewall_bypass_lock_path()?, || {
+        if let Err(refusal) = still_allowed() {
+            return Ok(Err(refusal));
+        }
         let mut rules = load_local_firewall_bypass_rules()?;
         let before = rules.clone();
         let now = Timestamp::now();
         let result = change(&mut rules, now);
         if rules == before {
             let unexpired = rules.iter().filter(|rule| !rule.is_expired(now)).count();
-            return Ok((result, unexpired));
+            return Ok(Ok((result, unexpired)));
         }
         rules.retain(|rule| !rule.is_expired(now));
         let rules_kept = rules.len();
@@ -125,8 +137,8 @@ pub(super) fn update_local_firewall_bypass_rules<T>(
                 },
             )?;
         }
-        Ok((result, rules_kept))
-    })
+        Ok(Ok((result, rules_kept)))
+    })?
 }
 
 /// Why rules added here don't apply, when a managed policy owns the firewall.
@@ -325,13 +337,32 @@ pub(crate) enum FirewallBypassCommit {
 /// one, the store is left as it was and those rules come back for approval,
 /// so a concurrent `remove` or a newer expiry is never undone without it.
 /// A request with a rule whose expiry has already passed saves nothing.
+#[cfg(test)]
 pub(crate) fn commit_firewall_bypass_rules<'a>(
     approved: &[FirewallBypassRule],
     unapproved: impl IntoIterator<Item = &'a FirewallBypassRule>,
     approval_note: &str,
 ) -> Result<FirewallBypassCommit, LpmError> {
+    commit_firewall_bypass_rules_if(
+        || Ok::<(), LpmError>(()),
+        approved,
+        unapproved,
+        approval_note,
+    )
+}
+
+/// As [`commit_firewall_bypass_rules`], once `still_allowed` passes under the
+/// store's lock, right before the write: what it checks, such as a managed
+/// policy or the forced floor, may have changed while a prompt was open or
+/// the lock was held elsewhere.
+pub(crate) fn commit_firewall_bypass_rules_if<'a, E: From<LpmError>>(
+    still_allowed: impl FnOnce() -> Result<(), E>,
+    approved: &[FirewallBypassRule],
+    unapproved: impl IntoIterator<Item = &'a FirewallBypassRule>,
+    approval_note: &str,
+) -> Result<FirewallBypassCommit, E> {
     let ((commit, approved_narrowing), rules_total) =
-        update_local_firewall_bypass_rules(|saved, now| {
+        update_local_firewall_bypass_rules_if(still_allowed, |saved, now| {
             let original = saved.clone();
             let mut outcome = FirewallBypassAdded::default();
             let mut needs_approval = Vec::new();

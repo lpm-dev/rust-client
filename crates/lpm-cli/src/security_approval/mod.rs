@@ -52,15 +52,15 @@ pub use approval::{
     record_project_scope_candidate_narrowing, reject_firewall_policies_a_managed_policy_holds,
     tighten_persistent_npm_firewall_policies,
 };
-#[cfg(test)]
-pub(crate) use firewall_bypass::add_firewall_bypass_rules;
 pub(crate) use firewall_bypass::{
     FirewallBypassAdded, FirewallBypassApproval, FirewallBypassCommit, FirewallBypassRequests,
-    approve_firewall_bypass_rules, bypass_expired_before_save_error, commit_firewall_bypass_rules,
-    firewall_bypass_file_exists, load_local_firewall_bypass_rules,
+    approve_firewall_bypass_rules, bypass_expired_before_save_error,
+    commit_firewall_bypass_rules_if, firewall_bypass_file_exists, load_local_firewall_bypass_rules,
     local_firewall_bypass_inactive_reason, record_firewall_bypass_refusal,
     remove_firewall_bypass_rules, rules_kept_changing_error, sort_firewall_bypass_requests,
 };
+#[cfg(test)]
+pub(crate) use firewall_bypass::{add_firewall_bypass_rules, commit_firewall_bypass_rules};
 pub use helpers::format_unlock_duration;
 pub(crate) use helpers::project_dir_is_global_install;
 pub(crate) use managed_policy::{
