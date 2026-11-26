@@ -225,8 +225,9 @@ pub(crate) struct PolicyTableBase {
     /// What installs run for a group the table leaves out.
     pub(crate) tableless: NpmFirewallPolicyProfile,
     /// The approved telemetry action, which telemetry following
-    /// `lpm_ai_suspicious` never goes below, or `None` where the approved
-    /// firewall is off and so binds no action.
+    /// `lpm_ai_suspicious` never goes below, or `None` where a local approved
+    /// firewall is off and so binds no action. A managed profile binds
+    /// whenever the firewall runs, so it always holds telemetry.
     pub(crate) approved_telemetry: Option<NpmFirewallPolicyAction>,
 }
 
@@ -240,7 +241,7 @@ impl PolicyTableBase {
     ) -> Self {
         Self {
             tableless: tableless_policy_profile(approved, managed),
-            approved_telemetry: (approved_mode != NpmFirewallMode::Off)
+            approved_telemetry: (managed || approved_mode != NpmFirewallMode::Off)
                 .then_some(approved.lpm_ai_telemetry),
         }
     }
@@ -1305,6 +1306,21 @@ mod tests {
             approved_at(NpmFirewallPolicyAction::Allow),
             NpmFirewallPolicyAction::Allow
         );
+    }
+
+    #[test]
+    fn a_managed_profile_holds_telemetry_even_where_its_mode_is_off() {
+        let global = global_with_policies(&[(LPM_AI_SUSPICIOUS_POLICY_KEY, "allow")]);
+        let managed = NpmFirewallPolicyProfile {
+            lpm_ai_suspicious: NpmFirewallPolicyAction::Allow,
+            lpm_ai_telemetry: NpmFirewallPolicyAction::Block,
+            ..NpmFirewallPolicyProfile::default()
+        };
+        let base = PolicyTableBase::of(managed, NpmFirewallMode::Off, true);
+
+        let request = config_policy_request_over(&global, base).unwrap().unwrap();
+
+        assert_eq!(request.lpm_ai_telemetry, NpmFirewallPolicyAction::Block);
     }
 
     #[test]

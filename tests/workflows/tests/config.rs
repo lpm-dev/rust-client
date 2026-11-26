@@ -2975,16 +2975,14 @@ fn deleting_a_policy_key_never_copies_a_managed_action_into_the_local_posture() 
         String::from_utf8_lossy(&output.stderr)
     );
     let posture_path = project.home().join(".lpm/security/approved-posture.json");
-    if posture_path.exists() {
-        let posture: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(posture_path).unwrap()).unwrap();
-        assert!(
-            posture["payload"]["firewall_policies"]
-                .get("lpm_ai_telemetry")
-                .is_none(),
-            "{posture}"
-        );
-    }
+    let posture: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(posture_path).unwrap()).unwrap();
+    assert!(
+        posture["payload"]["firewall_policies"]
+            .get("lpm_ai_telemetry")
+            .is_none(),
+        "{posture}"
+    );
 }
 
 #[test]
