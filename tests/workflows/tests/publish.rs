@@ -190,27 +190,17 @@ async fn mount_sigstore_publish_mocks(server: &MockServer) {
 
     Mock::given(method("POST"))
         .and(path("/api/v1/log/entries"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
-            "uuid": {
-                "logIndex": 123,
-                "integratedTime": 1700000000_i64,
-                "logID": "workflow-test-log",
-                "body": BASE64.encode(b"workflow-test-canonicalized-body"),
-                "verification": {
-                    "signedEntryTimestamp": BASE64.encode(b"workflow-test-set"),
-                    "inclusionProof": {
-                        "checkpoint": "rekor.sigstore.dev - 1\n124\nabc=\n\n",
-                        "hashes": ["aa", "bb"],
-                        "logIndex": 123,
-                        "rootHash": "rootabc",
-                        "treeSize": 124
-                    }
-                }
-            }
-        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(real_rekor_response()))
         .expect(1)
         .mount(server)
         .await;
+}
+
+/// A real entry as Rekor v1's API returns it: LPM's v0.84.0 release.
+fn real_rekor_response() -> serde_json::Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/lpm-cli/tests/fixtures/rekor_api/v1-entry-lpm-release-v0.84.0.json");
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 
 // ─── Dry Run ─────────────────────────────────────────────────────
@@ -4827,15 +4817,40 @@ async fn publish_npm_generated_provenance_attaches_sigstore_bundle_to_registry_p
         format!("pkg:npm/{package}@1.0.0")
     );
     assert_eq!(statement["subject"][0]["digest"]["sha512"], tarball_sha512);
+    // Rekor's API nests the SET and the proof under `verification`, with
+    // hex IDs and hashes and a bare checkpoint; the bundle carries them on
+    // the entry in protobuf JSON, as Sigstore's clients read it.
     let tlog_entry = &bundle["verificationMaterial"]["tlogEntries"][0];
-    assert_eq!(tlog_entry["logIndex"], "123");
-    // Rekor's API nests these under `verification`; the bundle carries
-    // them on the entry, and without the SET it would have no signed time.
+    let rekor_response = real_rekor_response();
+    let (_, rekor_entry) = rekor_response.as_object().unwrap().iter().next().unwrap();
+    assert_eq!(tlog_entry["logIndex"], "3637620348");
+    assert_eq!(
+        tlog_entry["logId"]["keyId"],
+        "wNI9atQGlz+VWfO6LRygH4QUfY/8W4RFwiT5i5WRgB0="
+    );
+    assert_eq!(
+        tlog_entry["kindVersion"],
+        serde_json::json!({"kind": "dsse", "version": "0.0.1"})
+    );
     assert_eq!(
         tlog_entry["inclusionPromise"]["signedEntryTimestamp"],
-        BASE64.encode(b"workflow-test-set")
+        rekor_entry["verification"]["signedEntryTimestamp"]
     );
-    assert_eq!(tlog_entry["inclusionProof"]["treeSize"], 124);
+    let proof = &tlog_entry["inclusionProof"];
+    assert_eq!(proof["treeSize"], "3995884690");
+    assert_eq!(
+        proof["checkpoint"]["envelope"],
+        rekor_entry["verification"]["inclusionProof"]["checkpoint"]
+    );
+    assert_eq!(
+        BASE64.decode(proof["rootHash"].as_str().unwrap()).unwrap(),
+        hex::decode(
+            rekor_entry["verification"]["inclusionProof"]["rootHash"]
+                .as_str()
+                .unwrap()
+        )
+        .unwrap()
+    );
     assert!(
         tlog_entry.get("verification").is_none(),
         "the bundle must not carry Rekor's API envelope: {tlog_entry:#}"
