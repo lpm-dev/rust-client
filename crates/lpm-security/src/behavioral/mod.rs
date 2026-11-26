@@ -61,6 +61,49 @@ const SOURCE_EXTENSIONS: &[&str] = &["js", "mjs", "cjs", "ts", "mts", "cts", "js
 /// Paths a tag's [`TagFiles`] lists; `file_count` counts the rest.
 const MAX_TAG_FILES: usize = 5;
 
+/// Most bytes of package file names code the package runs may name before
+/// any test file counts as one it could run.
+const MAX_RUNTIME_REFERENCE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Most bytes of package file names a package's test files name together.
+/// Past them, a reached test file counts as one whose references aren't
+/// known, whatever order the files were read in.
+const MAX_TEST_REFERENCE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Test files a budget left unread whose paths reachability remembers.
+const MAX_UNREAD_TEST_PATHS: usize = 4096;
+
+/// Source files a budget or file limit left unread, as far as test-file
+/// reachability needs them: code the package runs that could name any test
+/// file, and test files a reference could reach without the analysis
+/// following what they name. Input fingerprints hash it too, since it
+/// changes what reachability concludes.
+#[derive(Debug, Default)]
+struct UnreadFiles {
+    runtime: bool,
+    tests: Vec<String>,
+    unknown_tests: bool,
+}
+
+impl UnreadFiles {
+    fn note_test(&mut self, path: &str) {
+        if self.tests.len() < MAX_UNREAD_TEST_PATHS {
+            self.tests.push(path.to_owned());
+        } else {
+            self.unknown_tests = true;
+        }
+    }
+
+    fn hash_into(&self, hasher: &mut Sha256) {
+        hasher.update(b"unread\0");
+        hasher.update([u8::from(self.runtime), u8::from(self.unknown_tests)]);
+        for path in &self.tests {
+            hasher.update(path.as_bytes());
+            hasher.update(b"\0");
+        }
+    }
+}
+
 /// How much of a package a [`PackageAnalyzer`] reads.
 ///
 /// The files the package runs and its test files are read within budgets of
@@ -215,6 +258,7 @@ struct SourceFiles {
     runtime: FirstFiles,
     tests: FirstFiles,
     found: usize,
+    runtime_found: usize,
 }
 
 impl SourceFiles {
@@ -223,6 +267,7 @@ impl SourceFiles {
             runtime: FirstFiles::new(limits.files),
             tests: FirstFiles::new(limits.test_files),
             found: 0,
+            runtime_found: 0,
         }
     }
 
@@ -233,6 +278,7 @@ impl SourceFiles {
         if file.role.is_test() {
             self.tests.insert(file)
         } else {
+            self.runtime_found += 1;
             self.runtime.insert(file)
         }
     }
@@ -242,6 +288,16 @@ impl SourceFiles {
         let mut files = self.runtime.into_sorted_vec();
         files.extend(self.tests.into_sorted_vec());
         (files, self.found)
+    }
+
+    /// Whether a file limit left out a file of the code the package runs.
+    fn left_out_runtime(&self) -> bool {
+        self.runtime_found > self.runtime.len()
+    }
+
+    /// Whether a file limit left out a test file.
+    fn left_out_tests(&self) -> bool {
+        self.found - self.runtime_found > self.tests.len()
     }
 }
 
@@ -281,6 +337,13 @@ impl FirstFiles {
                 keep_if_earlier(files, candidate);
                 true
             }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match &self.files {
+            FirstFilesState::Collecting(files) => files.len(),
+            FirstFilesState::Limited(files) => files.len(),
         }
     }
 
@@ -441,11 +504,26 @@ pub fn analyze_package_with_timings(
         &mut sources,
         &mut native_artifacts,
     );
+    let mut unread = UnreadFiles {
+        runtime: sources.left_out_runtime(),
+        unknown_tests: sources.left_out_tests(),
+        ..UnreadFiles::default()
+    };
     let (candidates, found) = sources.into_read_order();
     let mut budget = ScanBudget::new(limits);
     let admitted: Vec<SourceFile> = candidates
         .into_iter()
-        .filter(|file| budget.admit(file.role.is_test(), limits.read_bytes(file.size)))
+        .filter(|file| {
+            let admitted = budget.admit(file.role.is_test(), limits.read_bytes(file.size));
+            if !admitted {
+                if file.role.is_test() {
+                    unread.note_test(&path_to_slash(&file.path));
+                } else {
+                    unread.runtime = true;
+                }
+            }
+            admitted
+        })
         .collect();
 
     // Smaller packages don't benefit from thread pool overhead.
@@ -466,8 +544,13 @@ pub fn analyze_package_with_timings(
     };
 
     let mut analyzer = PackageAnalyzer::with_limits(limits);
-    for result in results.into_iter().flatten() {
-        analyzer.merge(result);
+    analyzer.unread = unread;
+    for (file, result) in admitted.iter().zip(results) {
+        match result {
+            Some(result) => analyzer.merge(result),
+            None if file.role.is_test() => analyzer.unread.note_test(&path_to_slash(&file.path)),
+            None => analyzer.unread.runtime = true,
+        }
     }
     analyzer.skip(found - admitted.len());
     native_artifacts.sort_unstable();
@@ -666,6 +749,11 @@ fn analyze_package_from_open_dir_reading(
     )
     .is_ok();
     native_artifacts.sort_unstable();
+    let left_out = UnreadFiles {
+        runtime: sources.left_out_runtime(),
+        unknown_tests: sources.left_out_tests(),
+        ..UnreadFiles::default()
+    };
     let (candidates, found) = sources.into_read_order();
     let candidate_count = candidates.len();
     let (mut analyzer, mut fingerprint, over_budget, directory_changed) =
@@ -675,9 +763,13 @@ fn analyze_package_from_open_dir_reading(
             limits,
             discovery_complete,
             hold_directories,
+            left_out,
         );
     let skipped = found - candidate_count + over_budget;
     analyzer.skip(skipped);
+    if !discovery_complete {
+        analyzer.unread.runtime = true;
+    }
     let limit_reached = discovery_limit_reached || skipped > 0;
     analyzer.limit_reached |= limit_reached;
     if let Some(hasher) = fingerprint.as_mut() {
@@ -702,6 +794,11 @@ fn analyze_package_from_open_dir_reading(
         }
         Ok(None) | Err(_) => None,
     };
+    let unread_for_fingerprint = UnreadFiles {
+        runtime: analyzer.unread.runtime,
+        tests: analyzer.unread.tests.clone(),
+        unknown_tests: analyzer.unread.unknown_tests,
+    };
     let mut analysis = analyzer.finish(manifest.as_deref());
     if analysis.meta.input_incomplete {
         fingerprint = None;
@@ -710,6 +807,7 @@ fn analyze_package_from_open_dir_reading(
     let fingerprint = fingerprint.map(|mut hasher| {
         hasher.update(b"limits\0");
         hasher.update([u8::from(limit_reached)]);
+        unread_for_fingerprint.hash_into(&mut hasher);
         format!("sha256-{}", hex::encode(hasher.finalize()))
     });
     (analysis, fingerprint, directory_changed)
@@ -740,6 +838,11 @@ pub fn package_input_fingerprint_from_open_dir(
         &mut discovery_limit_reached,
     )?;
     native_artifacts.sort_unstable();
+    let mut unread = UnreadFiles {
+        runtime: sources.left_out_runtime(),
+        unknown_tests: sources.left_out_tests(),
+        ..UnreadFiles::default()
+    };
     let (candidates, found) = sources.into_read_order();
 
     let mut hasher = new_fingerprint_hasher();
@@ -750,6 +853,11 @@ pub fn package_input_fingerprint_from_open_dir(
         let (file, size) = directories.open_file(&source_file.path)?;
         if !budget.admit(source_file.role.is_test(), limits.read_bytes(size)) {
             over_budget += 1;
+            if source_file.role.is_test() {
+                unread.note_test(&path_to_slash(&source_file.path));
+            } else {
+                unread.runtime = true;
+            }
             continue;
         }
         let (bytes_read, content_digest) = digest_cap_source_file(file, size, limits)?;
@@ -774,6 +882,7 @@ pub fn package_input_fingerprint_from_open_dir(
     let skipped = found - candidates.len() + over_budget;
     hasher.update(b"limits\0");
     hasher.update([u8::from(discovery_limit_reached || skipped > 0)]);
+    unread.hash_into(&mut hasher);
 
     Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
 }
@@ -1191,14 +1300,16 @@ struct ScannedCapSourceFile {
     size: u64,
     bytes_read: u64,
     content_digest: [u8; 32],
-    analysis: Option<FileAnalysisResult>,
+    analysis: FileAnalysisResult,
 }
 
+/// Reads and analyzes one opened source file; on a failed read, the path of
+/// the file it couldn't read.
 fn analyze_open_cap_source_file(
     source_file: OpenCapSourceFile,
     limits: ScanLimits,
     comment_buf: &mut Vec<u8>,
-) -> std::io::Result<ScannedCapSourceFile> {
+) -> Result<ScannedCapSourceFile, PathBuf> {
     let mut file = source_file.file.into_std();
     let sampled = source_file.size > limits.full_file_bytes;
     let bytes = if sampled {
@@ -1206,33 +1317,22 @@ fn analyze_open_cap_source_file(
             &mut file,
             source_file.size,
             limits.sample_bytes,
-        )?
+        )
+        .ok()
     } else {
         lpm_common::read_file_capped_from_open_file(file, &source_file.path, limits.full_file_bytes)
-            .map_err(std::io::Error::other)?
-            .0
+            .ok()
+            .map(|(bytes, _)| bytes)
     };
-    let analysis = source_file
-        .path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(|_| {
-            if sampled {
-                analyze_oversized_source_sample(
-                    &source_file.path,
-                    source_file.size,
-                    &bytes,
-                    comment_buf,
-                )
-            } else {
-                analyze_bytes_with_scratch(
-                    &path_to_slash(&source_file.path),
-                    &bytes,
-                    comment_buf,
-                    true,
-                )
-            }
-        });
+    let Some(bytes) = bytes else {
+        return Err(source_file.path);
+    };
+    // A name that isn't UTF-8 is read lossily, as the path walk reads it.
+    let analysis = if sampled {
+        analyze_oversized_source_sample(&source_file.path, source_file.size, &bytes, comment_buf)
+    } else {
+        analyze_bytes_with_scratch(&path_to_slash(&source_file.path), &bytes, comment_buf, true)
+    };
     Ok(ScannedCapSourceFile {
         path: source_file.path,
         size: source_file.size,
@@ -1254,10 +1354,12 @@ fn analyze_cap_files_with_fingerprint(
     limits: ScanLimits,
     fingerprint_valid: bool,
     hold_directories: bool,
+    left_out: UnreadFiles,
 ) -> (PackageAnalyzer, Option<Sha256>, usize, bool) {
     use rayon::prelude::*;
 
     let mut analyzer = PackageAnalyzer::with_limits(limits);
+    analyzer.unread = left_out;
     let mut fingerprint = fingerprint_valid.then(new_fingerprint_hasher);
     let mut budget = ScanBudget::new(limits);
     let mut over_budget = 0usize;
@@ -1282,11 +1384,13 @@ fn analyze_cap_files_with_fingerprint(
                 Ok(opened) => opened,
                 Err(_) => {
                     fingerprint = None;
+                    analyzer.note_unread(source_file.role.is_test(), &source_file.path);
                     continue;
                 }
             };
             if !budget.admit(source_file.role.is_test(), limits.read_bytes(size)) {
                 over_budget += 1;
+                analyzer.note_unread(source_file.role.is_test(), &source_file.path);
                 continue;
             }
             opened.push(OpenCapSourceFile {
@@ -1296,7 +1400,7 @@ fn analyze_cap_files_with_fingerprint(
             });
         }
 
-        let results: Vec<std::io::Result<ScannedCapSourceFile>> = if opened.len() >= 20 {
+        let results: Vec<Result<ScannedCapSourceFile, PathBuf>> = if opened.len() >= 20 {
             opened
                 .into_par_iter()
                 .map_init(Vec::new, |comment_buf, source_file| {
@@ -1316,8 +1420,9 @@ fn analyze_cap_files_with_fingerprint(
         for scanned in results {
             let scanned = match scanned {
                 Ok(scanned) => scanned,
-                Err(_) => {
+                Err(path) => {
                     fingerprint = None;
+                    analyzer.note_unread(FileRole::of(&path).is_test(), &path);
                     continue;
                 }
             };
@@ -1330,9 +1435,7 @@ fn analyze_cap_files_with_fingerprint(
                     scanned.content_digest,
                 );
             }
-            if let Some(result) = scanned.analysis {
-                analyzer.merge(result);
-            }
+            analyzer.merge(scanned.analysis);
         }
     }
     let directory_changed = directories.verify_unchanged().is_err();
@@ -1450,6 +1553,11 @@ pub struct FileAnalysisResult {
     pub oversized_source_files: Vec<OversizedSourceFileEvidence>,
     /// Calls that run code from a string, as the eval tag finds them.
     pub eval_calls: usize,
+    /// The package files the file's string literals name, which decide
+    /// whether a test file is code the package runs.
+    pub(crate) references: roles::FileReferences,
+    /// The file starts a script or a worker from a path it computes.
+    pub(crate) loads_computed_code: bool,
 }
 
 /// Analyze one source file a directory walk found. `None` when it can't be
@@ -1525,10 +1633,33 @@ fn analyze_bytes_with_scratch(
     supply_chain::append_evidence(&context, filename, &file_supply_tags, &mut evidence);
     let trivial = supply_chain::analyze_trivial(stripped);
     let eval_calls = source::eval_calls(&context);
+    let references = match &context.path_literals {
+        Some(paths) => roles::FileReferences::resolve(
+            filename,
+            paths.literals.iter().map(String::as_str),
+            paths.complete,
+        ),
+        None => {
+            let in_test_file = roles::is_test_path(filename);
+            let literals: Vec<std::borrow::Cow<'_, str>> = supply_chain::quoted_literals(stripped)
+                .map(roles::decode_string_escapes)
+                .filter(|literal| roles::may_name_package_file(literal, in_test_file))
+                .collect();
+            roles::FileReferences::resolve(filename, literals.iter().map(AsRef::as_ref), true)
+        }
+    };
+    let loads_computed_code = match &context.calls {
+        Some(calls) => calls.computed_script.is_some(),
+        None => computed_script_patterns()
+            .iter()
+            .any(|pattern| context.find_with_context(pattern, false).is_some()),
+    };
 
     FileAnalysisResult {
         path: filename.to_owned(),
         eval_calls,
+        references,
+        loads_computed_code,
         evidence,
         source: file_source_tags,
         supply_chain: file_supply_tags,
@@ -1542,6 +1673,21 @@ fn analyze_bytes_with_scratch(
         bytes_scanned: raw_content.len() as u64,
         oversized_source_files: Vec::new(),
     }
+}
+
+/// What starting a script or a worker from a computed path looks like in
+/// source the parser couldn't read.
+fn computed_script_patterns() -> &'static [regex::Regex] {
+    static INSTANCE: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| {
+        [
+            r#"\bfork\s*\(\s*[^"'`\s)]"#,
+            r#"\bnew\s+Worker\s*\(\s*[^"'`\s)]"#,
+        ]
+        .into_iter()
+        .map(|pattern| regex::Regex::new(pattern).expect("computed script pattern must compile"))
+        .collect()
+    })
 }
 
 fn analyze_oversized_source_file(
@@ -1578,6 +1724,8 @@ fn analyze_oversized_source_sample(
 
     result.files_scanned = 0;
     result.bytes_scanned = sample.len() as u64;
+    // A literal between the two samples could name any file.
+    result.references = roles::FileReferences::unknown();
     for entry in &mut result.evidence {
         entry.sampled = true;
         entry.line = None;
@@ -1860,14 +2008,25 @@ fn parse_deps_map(value: Option<&serde_json::Value>) -> Option<HashMap<String, S
 /// staging directory, runs the manifest-level analysis, and returns a
 /// [`PackageAnalysis`] identical to [`analyze_package`]'s.
 ///
-/// A test file's tags wait for the manifest: they count as the package's own
-/// when its lifecycle scripts or entry points name the file, and are
+/// A test file's tags wait for the manifest and the rest of the package: they
+/// count as the package's own when its lifecycle scripts or entry points name
+/// the file or code it runs reaches it ([`roles::reachable_tests`]), and are
 /// reported as tests-only otherwise.
 #[derive(Debug)]
 pub struct PackageAnalyzer {
     budget: ScanBudget,
     runtime: TagTotals,
     tests: Vec<FileAnalysisResult>,
+    /// The package files code the package runs names, for
+    /// [`roles::reachable_tests`].
+    runtime_references: Vec<String>,
+    runtime_reference_bytes: usize,
+    /// Code the package runs loads code from a path it computes, or some of
+    /// it wasn't read whole, so any test file could be code it runs.
+    runtime_is_opaque: bool,
+    /// Source files a budget or file limit left unread.
+    unread: UnreadFiles,
+    test_reference_bytes: usize,
     native_artifacts: Vec<String>,
     oversized_source_files: Vec<OversizedSourceFileEvidence>,
     files_scanned: usize,
@@ -1968,6 +2127,11 @@ impl PackageAnalyzer {
             budget: ScanBudget::new(limits),
             runtime: TagTotals::default(),
             tests: Vec::new(),
+            runtime_references: Vec::new(),
+            runtime_reference_bytes: 0,
+            runtime_is_opaque: false,
+            unread: UnreadFiles::default(),
+            test_reference_bytes: 0,
             native_artifacts: Vec::new(),
             oversized_source_files: Vec::new(),
             files_scanned: 0,
@@ -2061,11 +2225,10 @@ impl PackageAnalyzer {
             return;
         }
         let path = path_to_slash(relative_path);
-        if !self
-            .budget
-            .admit(roles::is_test_path(&path), bytes.len() as u64)
-        {
+        let test = roles::is_test_path(&path);
+        if !self.budget.admit(test, bytes.len() as u64) {
             self.skip(1);
+            self.note_unread(test, relative_path);
             return;
         }
 
@@ -2144,11 +2307,11 @@ impl PackageAnalyzer {
     /// Takes a file at `relative_path` that reads `bytes` from its budget,
     /// or skips it.
     fn admit(&mut self, relative_path: &Path, bytes: u64) -> bool {
-        let admitted = self
-            .budget
-            .admit(roles::is_test_path(&path_to_slash(relative_path)), bytes);
+        let test = roles::is_test_path(&path_to_slash(relative_path));
+        let admitted = self.budget.admit(test, bytes);
         if !admitted {
             self.skip(1);
+            self.note_unread(test, relative_path);
         }
         admitted
     }
@@ -2158,6 +2321,16 @@ impl PackageAnalyzer {
         if files > 0 {
             self.skipped_files += files;
             self.limit_reached = true;
+        }
+    }
+
+    /// Notes a source file the analysis didn't read: unread code the package
+    /// runs could name any test file, and an unread test file could name more.
+    fn note_unread(&mut self, test: bool, relative_path: &Path) {
+        if test {
+            self.unread.note_test(&path_to_slash(relative_path));
+        } else {
+            self.unread.runtime = true;
         }
     }
 
@@ -2178,10 +2351,36 @@ impl PackageAnalyzer {
         self.unparsed_files += result.unparsed_files;
         self.bytes_scanned += result.bytes_scanned;
         if roles::is_test_path(&result.path) {
+            self.test_reference_bytes += result.references.byte_len();
             self.tests.push(result);
         } else {
+            let references = std::mem::take(&mut result.references);
+            let loads_computed_code = result.source.dynamic_require || result.loads_computed_code;
+            self.note_runtime_references(references, loads_computed_code);
             self.runtime.add(result);
         }
+    }
+
+    fn note_runtime_references(
+        &mut self,
+        references: roles::FileReferences,
+        loads_computed_code: bool,
+    ) {
+        if self.runtime_is_opaque {
+            return;
+        }
+        if loads_computed_code || !references.is_complete() {
+            self.runtime_is_opaque = true;
+            self.runtime_references = Vec::new();
+            return;
+        }
+        self.runtime_reference_bytes += references.byte_len();
+        if self.runtime_reference_bytes > MAX_RUNTIME_REFERENCE_BYTES {
+            self.runtime_is_opaque = true;
+            self.runtime_references = Vec::new();
+            return;
+        }
+        self.runtime_references.extend(references.into_paths());
     }
 
     /// Complete the analysis: read the package manifest from disk,
@@ -2215,7 +2414,43 @@ impl PackageAnalyzer {
             .map(|result| result.path.as_str())
             .chain(test_addons.iter().copied())
             .collect();
-        let named = references.names(&queried);
+        let candidates: Vec<roles::TestFile<'_>> = test_results
+            .iter()
+            .map(|result| roles::TestFile {
+                path: &result.path,
+                references: Some(&result.references),
+                loads_computed_code: result.source.dynamic_require || result.loads_computed_code,
+            })
+            .chain(test_addons.iter().map(|path| roles::TestFile {
+                path,
+                references: None,
+                loads_computed_code: false,
+            }))
+            .collect();
+        let unread_tests: Vec<&str> = self.unread.tests.iter().map(String::as_str).collect();
+        let manifest_runs_unread_test = references.names(&unread_tests).contains(&true);
+        // The manifest's strings resolved as paths too: a `cd`, an `npm run`
+        // chain, a normalized or differently cased spelling, a directory.
+        let manifest_paths = references.paths();
+        let manifest_paths_complete = manifest_paths.is_complete();
+        self.runtime_references.extend(manifest_paths.into_paths());
+        let named = roles::reachable_tests(
+            &candidates,
+            roles::Reachability {
+                named_by_manifest: references.names(&queried),
+                runtime_references: &self.runtime_references,
+                runtime_is_opaque: self.runtime_is_opaque
+                    || self.unread.runtime
+                    || references.code().runs_unread_code
+                    || manifest_runs_unread_test
+                    || !manifest_paths_complete,
+                package_name: references.code().name.as_deref(),
+                unread_tests: &self.unread.tests,
+                unknown_tests_left_out: self.unread.unknown_tests,
+                test_references_incomplete: self.test_reference_bytes > MAX_TEST_REFERENCE_BYTES,
+            },
+        );
+        drop(candidates);
         let (named_results, named_addons) = named.split_at(test_results.len());
         let named_addons: HashMap<&str, bool> = test_addons
             .iter()
@@ -2729,6 +2964,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fingerprints_tell_a_left_out_runtime_file_from_a_left_out_test_file() {
+        let analyze = |extra: &str| {
+            let package = tempfile::tempdir().unwrap();
+            let mut files: Vec<(String, &str)> = vec![
+                ("package.json".into(), r#"{"name":"kit","license":"MIT"}"#),
+                ("test/0000.js".into(), "eval(code)"),
+                (extra.into(), "module.exports = 1"),
+            ];
+            files.extend(
+                (0..MAX_FILES_PER_PACKAGE)
+                    .map(|index| (format!("lib/{index:04}.js"), "module.exports = 1")),
+            );
+            files.extend(
+                (1..MAX_FILES_PER_PACKAGE / 4)
+                    .map(|index| (format!("test/{index:04}.js"), "module.exports = 1")),
+            );
+            for (path, content) in &files {
+                let file_path = package.path().join(path);
+                fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+                fs::write(file_path, content).unwrap();
+            }
+            let directory =
+                cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+                    .unwrap();
+            let (analysis, fused) = analyze_package_from_open_dir_with_fingerprint(
+                &directory,
+                PackageDirectory::Published,
+            );
+            let standalone =
+                package_input_fingerprint_from_open_dir(&directory, PackageDirectory::Published)
+                    .unwrap();
+            assert_eq!(fused.as_deref(), Some(standalone.as_str()), "{extra}");
+            (analysis.source.eval, standalone)
+        };
+
+        // The same files are read either way; only the role of the one left out differs.
+        let (runtime_eval, runtime_left_out) = analyze("lib/9999.js");
+        let (test_eval, test_left_out) = analyze("test/9999.js");
+
+        assert!(runtime_eval);
+        assert!(!test_eval);
+        assert_ne!(runtime_left_out, test_left_out);
+    }
+
     fn nested_fingerprint_fixture(root: &Path) {
         let mut files: Vec<(String, String)> = vec![
             (
@@ -2781,7 +3061,7 @@ mod tests {
 
         assert_eq!(
             fingerprint,
-            "sha256-dacd0e090e2d759b20ddab73a589a423b9c7d55d9432f8b566b561be59f783ab"
+            "sha256-b5bec034135c6c51bed7be72c440f035e96a9fdad24520f4508e0c50fb7166aa"
         );
     }
 
@@ -2918,6 +3198,36 @@ mod tests {
             other_thread.chain.is_empty(),
             "once any reader ran out, no reader holds directories"
         );
+    }
+
+    #[test]
+    fn a_test_file_the_open_directory_walk_fails_to_read_is_an_unread_test() {
+        let package = tempfile::tempdir().unwrap();
+        fs::write(
+            package.path().join("package.json"),
+            br#"{"name":"kit","license":"MIT"}"#,
+        )
+        .unwrap();
+        fs::create_dir(package.path().join("tests")).unwrap();
+        fs::write(package.path().join("tests/a.js"), b"module.exports = 1").unwrap();
+        fs::write(package.path().join("tests/b.js"), b"eval(code)").unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+                .unwrap();
+        // The first file opened grows past the full-read limit before it's read.
+        let grown = package.path().join("tests/a.js");
+        AFTER_FIRST_SOURCE_OPEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(&grown, vec![b' '; MAX_FILE_SIZE as usize + 1]).unwrap();
+            }));
+        });
+
+        let analysis = analyze_package_from_open_dir(&directory, PackageDirectory::Published);
+
+        // An unread test leaves the package's code known, so the other test's
+        // eval stays a test's.
+        assert!(!analysis.source.eval);
+        assert!(analysis.meta.test_only_tags.iter().any(|tag| tag == "eval"));
     }
 
     // Windows refuses to rename a directory a handle holds open, so a held
@@ -4819,6 +5129,889 @@ mod tests {
         assert!(!analysis.source.eval);
         assert_eq!(analysis.meta.test_only_tags, ["eval"]);
         assert!(!analysis.meta.tag_files["childProcess"].tests_only);
+    }
+
+    #[test]
+    fn a_test_file_the_package_code_requires_counts_as_runtime() {
+        let analysis = analyze_every_way(&[
+            (
+                "package.json",
+                br#"{"name":"kit","license":"MIT","main":"index.js"}"#,
+            ),
+            ("index.js", br#"module.exports = require("./tests/run.js")"#),
+            (
+                "tests/run.js",
+                br#"require("child_process").exec(command); eval(code)"#,
+            ),
+            ("tests/unrelated.test.js", b"fetch(url)"),
+        ]);
+
+        assert!(analysis.source.child_process);
+        assert!(analysis.source.eval);
+        assert!(!analysis.source.network);
+        assert_eq!(analysis.meta.test_only_tags, ["network"]);
+        assert!(!analysis.meta.tag_files["eval"].tests_only);
+    }
+
+    #[test]
+    fn a_test_file_reached_through_other_test_files_counts_as_runtime() {
+        let analysis = analyze_every_way(&[
+            ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+            (
+                "lib/index.js",
+                br#"import helper from "../test/helper"; export default helper"#,
+            ),
+            (
+                "test/helper.js",
+                br#"module.exports = require("./support")"#,
+            ),
+            ("test/support/index.js", b"eval(code)"),
+        ]);
+
+        assert!(analysis.source.eval);
+        assert!(analysis.meta.test_only_tags.is_empty());
+    }
+
+    #[test]
+    fn a_test_file_the_package_code_starts_as_a_process_counts_as_runtime() {
+        let analysis = analyze_every_way(&[
+            ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+            (
+                "index.js",
+                br#"const path = require("path"); require("child_process").fork(path.join(__dirname, "__tests__/run.js")); require("child_process").execSync("node spec/setup.js")"#,
+            ),
+            ("__tests__/run.js", b"eval(code)"),
+            ("spec/setup.js", b"fetch(url)"),
+        ]);
+
+        assert!(analysis.source.eval);
+        assert!(analysis.source.network);
+        assert!(analysis.meta.test_only_tags.is_empty());
+    }
+
+    #[test]
+    fn a_computed_require_in_package_code_keeps_every_test_file_runtime() {
+        let analysis = analyze_every_way(&[
+            ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+            (
+                "index.js",
+                br#"const path = require("path"); module.exports = name => require(path.join(__dirname, "tests", name))"#,
+            ),
+            ("tests/run.js", b"eval(code)"),
+        ]);
+
+        assert!(analysis.source.eval);
+        assert!(analysis.meta.test_only_tags.is_empty());
+    }
+
+    #[test]
+    fn a_test_file_an_exports_pattern_matches_counts_as_runtime() {
+        let analysis = analyze_every_way(&[
+            (
+                "package.json",
+                br#"{"name":"kit","license":"MIT","exports":{".":"./index.js","./*":"./tests/*.js"}}"#,
+            ),
+            ("index.js", b"module.exports = 1"),
+            ("tests/run.js", b"eval(code)"),
+        ]);
+
+        assert!(analysis.source.eval);
+        assert!(analysis.meta.test_only_tags.is_empty());
+    }
+
+    #[test]
+    fn a_test_file_package_code_that_does_not_parse_requires_counts_as_runtime() {
+        let analysis = analyze_every_way(&[
+            ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+            ("index.js", br#"require('./tests/run.js'); )("#),
+            ("tests/run.js", b"eval(code)"),
+        ]);
+
+        assert!(analysis.source.eval);
+        assert!(analysis.meta.test_only_tags.is_empty());
+    }
+
+    #[test]
+    fn package_code_a_budget_leaves_unread_keeps_every_test_file_runtime() {
+        let mut analyzer = PackageAnalyzer::with_limits(ScanLimits {
+            files: 1,
+            ..ScanLimits::INSTALL
+        });
+        analyzer.feed(Path::new("index.js"), b"module.exports = 1");
+        analyzer.feed(Path::new("lib/unread.js"), br#"require("../test/run")"#);
+        analyzer.feed(Path::new("test/run.js"), b"eval(code)");
+        let analysis = analyzer.finish(Some(br#"{"name":"kit","license":"MIT"}"#));
+
+        assert!(analysis.source.eval);
+        assert!(analysis.meta.test_only_tags.is_empty());
+    }
+
+    #[test]
+    fn sampled_package_code_keeps_every_test_file_runtime() {
+        let mut analyzer = PackageAnalyzer::with_limits(ScanLimits {
+            full_file_bytes: 64,
+            sample_bytes: 16,
+            ..ScanLimits::INSTALL
+        });
+        let bundle = format!("module.exports = 1;{}", " ".repeat(200));
+        analyzer.feed(Path::new("dist/bundle.js"), bundle.as_bytes());
+        analyzer.feed(Path::new("test/run.js"), b"eval(code)");
+        let analysis = analyzer.finish(Some(br#"{"name":"kit","license":"MIT"}"#));
+
+        assert!(analysis.source.eval);
+        assert!(analysis.meta.test_only_tags.is_empty());
+    }
+
+    /// Whether `tests/run.js` (which calls `eval`) counts as package code when
+    /// `index.js` holds `code`, across every scan path.
+    fn reaches_tests_run(code: &str, manifest: &str) -> bool {
+        let analysis = analyze_every_way(&[
+            ("package.json", manifest.as_bytes()),
+            ("index.js", code.as_bytes()),
+            ("tests/run.js", b"eval(code)"),
+        ]);
+        assert_eq!(
+            analysis.source.eval,
+            analysis.meta.test_only_tags.is_empty(),
+            "{code}"
+        );
+        analysis.source.eval
+    }
+
+    #[test]
+    fn package_code_reaches_a_test_file_through_common_path_idioms() {
+        const KIT: &str = r#"{"name":"kit","license":"MIT"}"#;
+        for code in [
+            r#"require("./te" + "sts/run.js")"#,
+            r#"import("./te" + `sts/run.js`)"#,
+            r#"const cp = require("child_process"); cp.fork(__dirname + "/tests/run.js")"#,
+            r#"const cp = require("child_process"); cp.fork(`${__dirname}/tests/run.js`)"#,
+            r#"const path = require("path"); require("child_process").fork(path.join(__dirname, "tests", "run.js"))"#,
+            r#"import "./tests/run.js?v=1""#,
+            r#"import "./tests/run.js#x""#,
+            r#"import "./t%65sts/run.js""#,
+            r#"require("./Tests/run.js")"#,
+            r#"require(".\\tests\\run.js")"#,
+            r#"require("child_process").execSync("node tests/run.js|cat")"#,
+            r#"require("child_process").execSync("node tests/run.js&&true")"#,
+            r#"require("child_process").execSync("cd tests && node run.js")"#,
+            r#"require("child_process").fork("./tests/" + name)"#,
+            r#"require("../kit/tests/run.js")"#,
+            r#"require("kit/tests/run.js")"#,
+        ] {
+            assert!(reaches_tests_run(code, KIT), "{code}");
+        }
+        assert!(reaches_tests_run(
+            r##"require("#t/run")"##,
+            r##"{"name":"kit","license":"MIT","imports":{"#t/*":"./tests/*.js"}}"##
+        ));
+        assert!(reaches_tests_run(
+            "module.exports = 1",
+            r#"{"name":"kit","license":"MIT","scripts":{"postinstall":"node tests/[r]un.js"}}"#
+        ));
+        assert!(reaches_tests_run(
+            "module.exports = 1",
+            r#"{"name":"kit","license":"MIT","scripts":{"postinstall":"node tests/?un.js"}}"#
+        ));
+    }
+
+    #[test]
+    fn a_computed_script_path_in_a_fork_or_worker_keeps_every_test_file_runtime() {
+        const KIT: &str = r#"{"name":"kit","license":"MIT"}"#;
+        for code in [
+            r#"const cp = require("child_process"); cp.fork(pick())"#,
+            r#"const { Worker } = require("worker_threads"); new Worker(pick())"#,
+        ] {
+            assert!(reaches_tests_run(code, KIT), "{code}");
+        }
+    }
+
+    #[test]
+    fn a_script_of_another_language_an_install_script_runs_keeps_every_test_file_runtime() {
+        for manifest in [
+            r#"{"name":"kit","license":"MIT","scripts":{"postinstall":"sh setup.sh"}}"#,
+            r#"{"name":"kit","license":"MIT","scripts":{"postinstall":"sh scripts/setup"}}"#,
+        ] {
+            assert!(
+                reaches_tests_run("module.exports = 1", manifest),
+                "{manifest}"
+            );
+        }
+        // A path fragment a filter compares against names no file.
+        assert!(!reaches_tests_run(
+            r#"module.exports = file => file.includes("/tests/")"#,
+            r#"{"name":"kit","license":"MIT"}"#
+        ));
+        // A browser Web Worker loads a URL, not a package file.
+        assert!(!reaches_tests_run(
+            "const worker = new global.Worker(URL.createObjectURL(blob))",
+            r#"{"name":"kit","license":"MIT"}"#
+        ));
+    }
+
+    #[test]
+    fn a_relative_require_from_a_mixed_case_directory_reaches_a_test_file() {
+        let analysis = analyze_every_way(&[
+            ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+            ("Lib/index.js", br#"require("./tests/run.js")"#),
+            ("Lib/tests/run.js", b"eval(code)"),
+        ]);
+        assert!(analysis.source.eval);
+    }
+
+    #[test]
+    fn only_a_worker_threads_worker_with_a_computed_script_keeps_every_test_file_runtime() {
+        const KIT: &str = r#"{"name":"kit","license":"MIT"}"#;
+        assert!(reaches_tests_run(
+            r#"const W = require("worker_threads").Worker; new W(pick())"#,
+            KIT
+        ));
+        assert!(!reaches_tests_run(
+            r#"class Worker { constructor(options) {} } new Worker(pick())"#,
+            KIT
+        ));
+    }
+
+    #[test]
+    fn an_install_script_runs_a_script_it_hands_to_a_shell_but_not_one_it_echoes() {
+        assert!(!reaches_tests_run(
+            "module.exports = 1",
+            r#"{"name":"kit","license":"MIT","scripts":{"postinstall":"echo setup.sh"}}"#
+        ));
+        assert!(reaches_tests_run(
+            "module.exports = 1",
+            r#"{"name":"kit","license":"MIT","scripts":{"postinstall":"FOO=1 bash -e ./setup.sh"}}"#
+        ));
+    }
+
+    #[test]
+    fn a_cyclic_alias_of_a_constructor_is_analysed_without_unbounded_recursion() {
+        let analysis = analyze_every_way(&[
+            ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+            ("index.js", b"var a = b, b = a; new a(pick()); eval(code)"),
+        ]);
+        assert!(analysis.source.eval);
+        assert!(analysis.meta.unparsed_files == 0);
+    }
+
+    fn padded_exports(extra: &str) -> String {
+        let exports: Vec<String> = (0..300)
+            .map(|index| format!(r#""./feature-{index}":"./lib/feature-{index}.js""#))
+            .collect();
+        format!(
+            r#"{{"name":"kit","license":"MIT","exports":{{{}}}{extra}}}"#,
+            exports.join(",")
+        )
+    }
+
+    #[test]
+    fn a_large_manifest_keeps_its_paths_or_counts_every_test_file() {
+        for extra in [
+            r#","scripts":{"postinstall":"cd tests && node run.js"}"#,
+            r#","main":"./tests/./run.js""#,
+        ] {
+            let manifest = padded_exports(extra);
+            assert!(
+                reaches_tests_run("module.exports = 1", &manifest),
+                "{extra}"
+            );
+        }
+        assert!(!reaches_tests_run(
+            "module.exports = 1",
+            &padded_exports(r#","scripts":{"postinstall":"node lib/setup.js"}"#)
+        ));
+    }
+
+    #[test]
+    fn a_directory_part_of_a_built_path_names_the_test_files_in_it() {
+        const KIT: &str = r#"{"name":"kit","license":"MIT"}"#;
+        for code in [
+            r#"require("child_process").execSync("node " + __dirname + "/tests/" + file)"#,
+            r#"require("child_process").execSync(`node ${__dirname}/tests/${file}`)"#,
+        ] {
+            assert!(reaches_tests_run(code, KIT), "{code}");
+        }
+        assert!(!reaches_tests_run(
+            r#"if (file.includes("/tests/")) skip(file)"#,
+            KIT
+        ));
+    }
+
+    #[test]
+    fn install_scripts_reach_a_test_file_through_wrappers_separators_and_interpreters() {
+        let manifest =
+            |scripts: &str| format!(r#"{{"name":"kit","license":"MIT","scripts":{{{scripts}}}}}"#);
+        for scripts in [
+            r#""postinstall":"true\nsh setup.sh""#,
+            r#""postinstall":"exec ./setup.sh""#,
+            r#""postinstall":"env bash scripts/setup""#,
+            r#""postinstall":"./setup""#,
+            r#""postinstall":"make""#,
+            r#""postinstall":"FOO=1 npm run build","build":"node tests/run.js""#,
+            r#""postinstall":"cross-env A=1 npm run build","build":"node tests/run.js""#,
+            r#""postinstall":"(npm run build)","build":"node tests/run.js""#,
+            r#""postinstall":"npm --prefix . run build","build":"node tests/run.js""#,
+            r#""postinstall":"node -e \"require('./te'+'sts/run.js')\"""#,
+            r#""postinstall":"node $npm_package_config_entry""#,
+            r#""postinstall":"node tests""#,
+        ] {
+            assert!(
+                reaches_tests_run("module.exports = 1", &manifest(scripts)),
+                "{scripts}"
+            );
+        }
+        for scripts in [
+            r#""postinstall":"echo skipping tests""#,
+            r#""postinstall":"node scripts/build.js && echo NODE_ENV=test""#,
+        ] {
+            assert!(
+                !reaches_tests_run("module.exports = 1", &manifest(scripts)),
+                "{scripts}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_threads_workers_however_they_are_bound_keep_every_test_file_runtime() {
+        const KIT: &str = r#"{"name":"kit","license":"MIT"}"#;
+        for code in [
+            r#"import("node:worker_threads").then(({ Worker }) => new Worker(pick()))"#,
+            r#"const { Worker } = require("worker_threads"); class Pool extends Worker {} new Pool(pick())"#,
+            r#"const { Worker } = require("worker_threads"); new Worker("require('./te' + 'sts/run.js')", { eval: true })"#,
+            r#"new (process.getBuiltinModule("worker_threads").Worker)(pick())"#,
+            r#"let W; W = require("worker_threads").Worker; new W(pick())"#,
+        ] {
+            assert!(reaches_tests_run(code, KIT), "{code}");
+        }
+        assert!(!reaches_tests_run(
+            "const worker = new Worker(pick()); worker.postMessage(1)",
+            KIT
+        ));
+    }
+
+    #[test]
+    fn module_loads_through_require_as_a_value_keep_every_test_file_runtime() {
+        const KIT: &str = r#"{"name":"kit","license":"MIT"}"#;
+        for code in [
+            "require.bind(null)(pick())",
+            "Reflect.apply(require, null, [pick()])",
+            "const load = require; load(pick())",
+            "[pick()].map(require)",
+            r#"const cp = require("child_process"); cp.fork.call(null, pick())"#,
+        ] {
+            assert!(reaches_tests_run(code, KIT), "{code}");
+        }
+        for code in [
+            r#"if (typeof require === "function") module.exports = 1"#,
+            "if (require.main === module) main()",
+            "const resolved = require.resolve(pick())",
+        ] {
+            assert!(!reaches_tests_run(code, KIT), "{code}");
+        }
+    }
+
+    #[test]
+    fn code_a_launch_or_a_loader_preloads_from_a_computed_name_keeps_every_test_file_runtime() {
+        const KIT: &str = r#"{"name":"kit","license":"MIT"}"#;
+        for code in [
+            r#"require("child_process").fork("./child.js", [], { execArgv: ["--require", pick()] })"#,
+            r#"require("child_process").fork("./child.js", { execArgv: ["--import", pick()] })"#,
+            r#"require("child_process").fork("./child.js", [], { env: { ...process.env, NODE_OPTIONS: "--require " + pick() } })"#,
+            r#"const options = { execArgv: ["--require", pick()] }; require("child_process").fork(require("path").join(__dirname, "child.js"), [], options)"#,
+            r#"const { Worker } = require("worker_threads"); new Worker("./child.js", { execArgv: ["--require", pick()] })"#,
+            r#"process.getBuiltinModule("module").createRequire(__filename)(pick())"#,
+            r#"require("module").register(pick(), require("url").pathToFileURL(__filename))"#,
+            r#"require("module").prototype.require.call(module, pick())"#,
+            r#"require.extensions[".js"](module, pick())"#,
+            "process.mainModule.constructor._load(pick())",
+            "require.main.constructor._load(pick())",
+            r#"module._compile(require("fs").readFileSync(pick(), "utf8"), "x.js")"#,
+        ] {
+            assert!(reaches_tests_run(code, KIT), "{code}");
+        }
+        // Flags spelled out, or inherited from how the package was started.
+        for code in [
+            r#"require("child_process").fork("./child.js", [], { execArgv: process.execArgv.filter(Boolean), env: { ...process.env, NODE_OPTIONS: "--max-old-space-size=4096" } })"#,
+            r#"const { Worker } = require("worker_threads"); new Worker("./child.js", { execArgv: ["--enable-source-maps"] })"#,
+            r#"const args = ["--verbose"]; require("child_process").fork(require("path").join(__dirname, "child.js"), args)"#,
+        ] {
+            assert!(!reaches_tests_run(code, KIT), "{code}");
+        }
+    }
+
+    #[test]
+    fn a_preload_flag_names_its_file_with_or_without_an_equals_sign() {
+        const KIT: &str = r#"{"name":"kit","license":"MIT"}"#;
+        for code in [
+            r#"require("child_process").fork("./child.js", [], { execArgv: ["--require", "./tests/run.js"] })"#,
+            r#"require("child_process").fork("./child.js", [], { execArgv: ["--require=./tests/run.js"] })"#,
+        ] {
+            assert!(reaches_tests_run(code, KIT), "{code}");
+        }
+    }
+
+    /// Whether `eval` in a test file counts as the package's own, the files given.
+    fn eval_counts_as_package_code(files: &[(&str, &str)]) -> bool {
+        let files: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(path, content)| (*path, content.as_bytes()))
+            .collect();
+        let analysis = analyze_every_way(&files);
+        assert_eq!(
+            analysis.source.eval,
+            analysis.meta.test_only_tags.is_empty(),
+            "{files:?}"
+        );
+        analysis.source.eval
+    }
+
+    #[test]
+    fn package_code_reaches_a_test_file_back_through_its_own_name_or_a_bundled_module() {
+        const KIT: &str = r#"{"name":"kit","license":"MIT"}"#;
+        const SCOPED: &str = r#"{"name":"@scope/kit","license":"MIT"}"#;
+        for files in [
+            [
+                ("package.json", KIT),
+                ("index.js", "require('../../node_modules/kit/tests/run.js')"),
+                ("tests/run.js", "eval(code)"),
+            ]
+            .as_slice(),
+            &[
+                ("package.json", SCOPED),
+                ("index.js", "require('../kit/tests/run.js')"),
+                ("tests/run.js", "eval(code)"),
+            ],
+            &[
+                ("package.json", SCOPED),
+                ("index.js", "require('../../@scope/kit/tests/run.js')"),
+                ("tests/run.js", "eval(code)"),
+            ],
+            &[
+                ("package.json", KIT),
+                ("index.js", "require('test')"),
+                ("node_modules/test/index.js", "eval(code)"),
+            ],
+            &[
+                ("package.json", KIT),
+                ("index.js", "require('./test/a.js')"),
+                ("test/a.js", "require('foo')"),
+                ("test/node_modules/foo/index.js", "eval(code)"),
+            ],
+        ] {
+            assert!(eval_counts_as_package_code(files), "{files:?}");
+        }
+        // A module the package doesn't bundle reaches nothing.
+        assert!(!eval_counts_as_package_code(&[
+            ("package.json", KIT),
+            ("index.js", "require('react'); require('test')"),
+            ("tests/run.js", "eval(code)"),
+        ]));
+    }
+
+    #[test]
+    fn install_scripts_are_read_as_the_shell_reads_them() {
+        let manifest = |script: &str| {
+            format!(
+                r#"{{"name":"kit","license":"MIT","scripts":{{"postinstall":{}}}}}"#,
+                serde_json::to_string(script).unwrap()
+            )
+        };
+        // Quotes and escapes the shell joins.
+        for script in [
+            r#"node te''sts/run.js"#,
+            r#"node te\sts/run.js"#,
+            r#"node "te"sts/run.js"#,
+        ] {
+            assert!(
+                reaches_tests_run("module.exports = 1", &manifest(script)),
+                "{script}"
+            );
+        }
+        // A script whose words a command computes, or that node reads from
+        // its input.
+        for script in [
+            "node `echo te`sts/run.js",
+            "node $(echo tests/run.js)",
+            "node < scripts/data.txt",
+        ] {
+            assert!(
+                reaches_tests_run("module.exports = 1", &manifest(script)),
+                "{script}"
+            );
+        }
+        assert!(!reaches_tests_run(
+            "module.exports = 1",
+            &manifest("node scripts/build.js < scripts/data.txt")
+        ));
+    }
+
+    #[test]
+    fn working_directories_set_away_from_the_launch_still_apply() {
+        const KIT: &str = r#"{"name":"kit","license":"MIT"}"#;
+        for code in [
+            r#"const options = { cwd: "lib" }; require("child_process").fork("boot.test.js", options)"#,
+            r#"const { chdir } = process; chdir("lib"); require("child_process").fork("./boot.test.js")"#,
+        ] {
+            assert!(reaches_lib_boot_test("index.js", code, KIT), "{code}");
+        }
+        for code in [
+            r#"require("child_process").fork("run.js", { cwd: pick() })"#,
+            r#"const options = makeOptions(); require("child_process").fork("run.js", options)"#,
+        ] {
+            assert!(reaches_tests_run(code, KIT), "{code}");
+        }
+    }
+
+    #[test]
+    fn a_script_path_counts_as_static_only_when_built_from_known_path_functions() {
+        const KIT: &str = r#"{"name":"kit","license":"MIT"}"#;
+        for code in [
+            r#"require("child_process").fork(["tests", "run.js"].join("/"))"#,
+            r#"require("child_process").fork(pick().normalize())"#,
+            r#"var __filename = pick(); require("child_process").fork(__filename)"#,
+            r#"function start(__dirname) { require("child_process").fork(__dirname + "/x.js") }"#,
+            r#"require("child_process").fork(...args)"#,
+            r#"const { Worker } = require("worker_threads"); new Worker(...args)"#,
+            "require(...args)",
+        ] {
+            assert!(reaches_tests_run(code, KIT), "{code}");
+        }
+        for code in [
+            r#"const path = require("path"); require("child_process").fork(path.join(__dirname, "lib", "x.js"))"#,
+            r#"const { join } = require("node:path"); require("child_process").fork(join(__dirname, "x.js"))"#,
+            r#"require("child_process").fork(require.resolve("./lib/x.js"))"#,
+        ] {
+            assert!(!reaches_tests_run(code, KIT), "{code}");
+        }
+        let esm = analyze_every_way(&[
+            ("package.json", br#"{"name":"kit","license":"MIT","type":"module"}"#),
+            (
+                "index.mjs",
+                br#"import { fork } from "node:child_process"; import { join } from "node:path"; import { fileURLToPath } from "node:url"; fork(join(import.meta.dirname, "x.js")); fork(fileURLToPath(new URL("./y.js", import.meta.url)))"#,
+            ),
+            ("tests/run.js", b"eval(code)"),
+        ]);
+        assert!(!esm.meta.test_only_tags.is_empty());
+    }
+
+    #[test]
+    fn only_the_worker_binding_of_a_worker_threads_destructuring_is_a_worker() {
+        const KIT: &str = r#"{"name":"kit","license":"MIT"}"#;
+        assert!(!reaches_tests_run(
+            r#"const { Worker, BroadcastChannel } = require("worker_threads"); new BroadcastChannel(pick())"#,
+            KIT
+        ));
+        assert!(reaches_tests_run(
+            r#"const { BroadcastChannel, Worker: W } = require("worker_threads"); new W(pick())"#,
+            KIT
+        ));
+        assert!(reaches_tests_run(
+            r#"const { Worker = Fallback } = require("node:worker_threads"); new Worker(pick())"#,
+            KIT
+        ));
+    }
+
+    #[test]
+    fn only_node_module_load_with_a_computed_name_keeps_every_test_file_runtime() {
+        const KIT: &str = r#"{"name":"kit","license":"MIT"}"#;
+        assert!(!reaches_tests_run(
+            "const loader = makeLoader(); loader._load(pick())",
+            KIT
+        ));
+        for code in [
+            r#"require("module")._load(pick())"#,
+            r#"const Module = require("node:module"); Module._load(pick())"#,
+            r#"const { Module } = require("module"); Module._load(pick())"#,
+            "module.constructor._load(pick())",
+            "const M = module.constructor; M._load(pick())",
+        ] {
+            assert!(reaches_tests_run(code, KIT), "{code}");
+        }
+    }
+
+    /// Whether `lib/boot.test.js` (which calls `eval`) counts as package code
+    /// when `entry` holds `code`, across every scan path.
+    fn reaches_lib_boot_test(entry: &str, code: &str, manifest: &str) -> bool {
+        let analysis = analyze_every_way(&[
+            ("package.json", manifest.as_bytes()),
+            (entry, code.as_bytes()),
+            ("lib/boot.test.js", b"eval(code)"),
+        ]);
+        analysis.source.eval
+    }
+
+    #[test]
+    fn a_working_directory_applies_to_the_paths_run_after_it() {
+        const KIT: &str = r#"{"name":"kit","license":"MIT"}"#;
+        assert!(reaches_lib_boot_test(
+            "index.js",
+            "module.exports = 1",
+            r#"{"name":"kit","license":"MIT","scripts":{"postinstall":"cd lib && node ./boot.test.js"}}"#
+        ));
+        for code in [
+            r#"require("child_process").execSync("cd lib && node boot.test.js")"#,
+            r#"const path = require("path"); require("child_process").fork("boot.test.js", { cwd: path.join(__dirname, "lib") })"#,
+            r#"require("child_process").spawn("node", ["./boot.test.js"], { cwd: "lib" })"#,
+            r#"process.chdir("lib"); require("child_process").fork("./boot.test.js")"#,
+        ] {
+            assert!(reaches_lib_boot_test("index.js", code, KIT), "{code}");
+        }
+    }
+
+    #[test]
+    fn a_script_path_built_from_the_module_url_reaches_a_test_file() {
+        const KIT: &str = r#"{"name":"kit","license":"MIT","type":"module"}"#;
+        for code in [
+            r#"import { fork } from "node:child_process"; import path from "node:path"; fork(path.join(import.meta.dirname, "boot.test.js"))"#,
+            r#"import { fork } from "node:child_process"; import path from "node:path"; fork(path.resolve(import.meta.dirname, "./boot.test.js"))"#,
+            r#"import { fork } from "node:child_process"; import path from "node:path"; import { fileURLToPath } from "node:url"; fork(path.join(path.dirname(fileURLToPath(import.meta.url)), "boot.test.js"))"#,
+            r#"import { fork } from "node:child_process"; fork(new URL("./boot.test.js", import.meta.url))"#,
+            r#"import { fork } from "node:child_process"; import path from "node:path"; fork(path.join(import.meta.filename, "..", "boot.test.js"))"#,
+        ] {
+            assert!(reaches_lib_boot_test("lib/index.mjs", code, KIT), "{code}");
+        }
+        assert!(reaches_lib_boot_test(
+            "lib/index.js",
+            r#"const path = require("path"); require("child_process").fork(path.join(__filename, "..", "boot.test.js"))"#,
+            r#"{"name":"kit","license":"MIT"}"#
+        ));
+    }
+
+    #[test]
+    fn scripts_an_install_script_runs_by_name_bring_their_hooks_and_interpreters() {
+        for manifest in [
+            r#"{"name":"kit","license":"MIT","scripts":{"postinstall":"npm run build","build":"tsc","prebuild":"node tests/run.js"}}"#,
+            r#"{"name":"kit","license":"MIT","scripts":{"postinstall":"npm run build","build":"tsc","postbuild":"node tests/run.js"}}"#,
+            r#"{"name":"kit","license":"MIT","scripts":{"postinstall":"npm run build","build":"bash ./setup.sh"}}"#,
+            r#"{"name":"kit","license":"MIT","scripts":{"postinstall":"npm test","test":"node tests/run.js"}}"#,
+            r#"{"name":"kit","license":"MIT","scripts":{"install":"npm start","start":"node tests/run.js"}}"#,
+        ] {
+            assert!(
+                reaches_tests_run("module.exports = 1", manifest),
+                "{manifest}"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_scripts_and_fields_reach_a_test_file_as_a_shell_and_node_would() {
+        for manifest in [
+            r#"{"name":"kit","license":"MIT","scripts":{"postinstall":"cd tests && node run.js"}}"#,
+            r#"{"name":"kit","license":"MIT","scripts":{"postinstall":"npm run setup","setup":"node tests/run.js"}}"#,
+            r#"{"name":"kit","license":"MIT","scripts":{"postinstall":"node tests/./run.js"}}"#,
+            r#"{"name":"kit","license":"MIT","scripts":{"postinstall":"node Tests/run.js"}}"#,
+            r#"{"name":"kit","license":"MIT","main":"./tests/./run.js"}"#,
+            r#"{"name":"kit","license":"MIT","main":"./tests"}"#,
+        ] {
+            assert!(
+                reaches_tests_run("module.exports = 1", manifest),
+                "{manifest}"
+            );
+        }
+    }
+
+    #[test]
+    fn working_directories_and_names_with_spaces_reach_a_test_file() {
+        const KIT: &str = r#"{"name":"kit","license":"MIT"}"#;
+        for code in [
+            r#"require("child_process").fork("run.js", { cwd: "tests" })"#,
+            r#"const path = require("path"); require("child_process").spawn("node", ["run.js"], { cwd: path.join(__dirname, "tests") })"#,
+            r#"process.chdir("tests")"#,
+            r#"require("child_process").execSync("pushd tests && node run.js")"#,
+            r#"require("child_process").execSync("CD tests && node run.js")"#,
+        ] {
+            assert!(reaches_tests_run(code, KIT), "{code}");
+        }
+        for (code, path) in [
+            (
+                r#"require("child_process").fork("tests/my run.js")"#,
+                "tests/my run.js",
+            ),
+            (
+                r#"require("child_process").fork("tests/(x)/run.js")"#,
+                "tests/(x)/run.js",
+            ),
+            (
+                r#"require("child_process").execSync("node lib/a,b.test.js")"#,
+                "lib/a,b.test.js",
+            ),
+        ] {
+            let analysis = analyze_every_way(&[
+                ("package.json", KIT.as_bytes()),
+                ("index.js", code.as_bytes()),
+                (path, b"eval(code)"),
+            ]);
+            assert!(analysis.source.eval, "{code}");
+        }
+    }
+
+    #[test]
+    fn a_script_path_built_from_constants_and_the_module_location_is_not_computed() {
+        const KIT: &str = r#"{"name":"kit","license":"MIT"}"#;
+        for code in [
+            r#"const { Worker } = require("worker_threads"); new Worker(__filename)"#,
+            r#"new Worker(new URL("./worker.js", import.meta.url))"#,
+            r#"require("child_process").fork(require.resolve("./worker"))"#,
+            r#"const path = require("path"); require("child_process").fork(path.join(__dirname, "worker.js"))"#,
+            r#"const { Worker: W } = require("worker_threads"); new W(`${__dirname}/worker.js`)"#,
+        ] {
+            assert!(!reaches_tests_run(code, KIT), "{code}");
+        }
+        for code in [
+            r#"const { Worker: W } = require("worker_threads"); new W(name)"#,
+            r#"require.call(null, pick())"#,
+            r#"require.apply(null, [pick()])"#,
+            r#"require("module")._load(pick())"#,
+        ] {
+            assert!(reaches_tests_run(code, KIT), "{code}");
+        }
+    }
+
+    #[test]
+    fn a_reached_test_file_runs_a_sibling_through_its_own_directory() {
+        let analysis = analyze_every_way(&[
+            ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+            ("index.js", br#"require("./tests/a.js")"#),
+            (
+                "tests/a.js",
+                br#"require("child_process").execSync("node " + __dirname + "/b.js")"#,
+            ),
+            ("tests/b.js", b"eval(code)"),
+        ]);
+        assert!(analysis.source.eval);
+    }
+
+    #[test]
+    fn a_manifest_entry_in_a_test_file_the_budget_left_unread_keeps_every_test_file_runtime() {
+        let mut analyzer = PackageAnalyzer::with_limits(ScanLimits {
+            test_files: 1,
+            ..ScanLimits::INSTALL
+        });
+        analyzer.feed(Path::new("tests/other.js"), b"eval(code)");
+        analyzer.feed(Path::new("tests/main.js"), br#"require("./other.js")"#);
+        let analysis = analyzer.finish(Some(
+            br#"{"name":"kit","license":"MIT","main":"tests/main.js"}"#,
+        ));
+
+        assert!(analysis.source.eval);
+    }
+
+    #[test]
+    fn literals_that_cannot_name_a_test_file_leave_tests_only_tags_alone() {
+        const KIT: &str = r#"{"name":"kit","license":"MIT"}"#;
+        let urls = (0..1100)
+            .map(|index| format!(r#""https://html.spec.whatwg.org/{index}""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        for code in [
+            format!("module.exports = [{urls}]"),
+            r#"require("./lib")"#.to_owned(),
+            r#"console.log("run the test suite with npm test")"#.to_owned(),
+        ] {
+            assert!(!reaches_tests_run(&code, KIT), "{code}");
+        }
+    }
+
+    #[test]
+    fn a_path_literal_too_long_to_keep_keeps_every_test_file_runtime() {
+        let code = format!(
+            r#"require("child_process").execSync("node tests/run.js{}")"#,
+            " ".repeat(20_000)
+        );
+        assert!(reaches_tests_run(
+            &code,
+            r#"{"name":"kit","license":"MIT"}"#
+        ));
+    }
+
+    #[test]
+    fn a_test_file_the_test_budget_left_unread_passes_reachability_on_conservatively() {
+        let mut analyzer = PackageAnalyzer::with_limits(ScanLimits {
+            test_files: 1,
+            ..ScanLimits::INSTALL
+        });
+        analyzer.feed(Path::new("index.js"), br#"require("./test/z.js")"#);
+        analyzer.feed(Path::new("test/a.js"), b"eval(code)");
+        analyzer.feed(Path::new("test/z.js"), br#"require("./a.js")"#);
+        let analysis = analyzer.finish(Some(br#"{"name":"kit","license":"MIT"}"#));
+
+        assert!(analysis.source.eval);
+        assert!(analysis.meta.test_only_tags.is_empty());
+    }
+
+    #[test]
+    fn many_test_files_past_the_test_limit_leave_unreached_tests_tests_only_in_every_walk() {
+        let mut files: Vec<(String, Vec<u8>)> = vec![
+            (
+                "package.json".into(),
+                br#"{"name":"kit","license":"MIT"}"#.to_vec(),
+            ),
+            ("index.js".into(), b"module.exports = 1".to_vec()),
+            ("test/000.js".into(), b"eval(code)".to_vec()),
+        ];
+        files.extend((1..=MAX_FILES_PER_PACKAGE / 4 + 1).map(|index| {
+            (
+                format!("test/{index:04}.js"),
+                b"module.exports = 1".to_vec(),
+            )
+        }));
+        // Past the test limit the streaming feed reads test files in archive
+        // order, so only the two directory walks read the same ones.
+        let package = tempfile::tempdir().unwrap();
+        for (path, content) in &files {
+            let file_path = package.path().join(path);
+            fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+            fs::write(&file_path, content).unwrap();
+        }
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+                .unwrap();
+        for analysis in [
+            analyze_package(package.path()),
+            analyze_package_from_open_dir(&directory, PackageDirectory::Published),
+        ] {
+            assert!(!analysis.source.eval);
+            assert_eq!(analysis.meta.test_only_tags, ["eval"]);
+        }
+    }
+
+    #[test]
+    fn package_code_past_the_file_limit_keeps_every_test_file_runtime_in_every_walk() {
+        let mut files: Vec<(String, Vec<u8>)> = vec![
+            (
+                "package.json".into(),
+                br#"{"name":"kit","license":"MIT"}"#.to_vec(),
+            ),
+            ("test/run.js".into(), b"eval(code)".to_vec()),
+        ];
+        files.extend(
+            (0..=MAX_FILES_PER_PACKAGE)
+                .map(|index| (format!("lib/{index:04}.js"), b"module.exports = 1".to_vec())),
+        );
+        let files: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_slice()))
+            .collect();
+        let analysis = analyze_every_way(&files);
+
+        assert!(analysis.source.eval);
+        assert!(analysis.meta.test_only_tags.is_empty());
+    }
+
+    #[test]
+    fn test_files_only_tests_reach_stay_tests_only() {
+        let analysis = analyze_every_way(&[
+            ("package.json", br#"{"name":"kit","license":"MIT","main":"index.js"}"#),
+            (
+                "index.js",
+                br#"if (process.env.NODE_ENV === "test") console.log("see test/README and ./tests/missing.js"); module.exports = 1"#,
+            ),
+            ("test/index.js", b"require('./helper')"),
+            ("test/helper.js", b"eval(code)"),
+        ]);
+
+        assert!(!analysis.source.eval);
+        assert_eq!(analysis.meta.test_only_tags, ["eval"]);
     }
 
     #[test]

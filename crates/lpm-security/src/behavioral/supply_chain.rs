@@ -659,61 +659,66 @@ fn media_type_signatures(media_type: &str) -> &'static [&'static str] {
 }
 
 /// Whether source the parser couldn't read has a random-looking string
-/// literal (see [`looks_random`]). It reads every literal quoted on one line,
-/// as a regex retrying from each quote would, in linear time: a quote that
-/// finds no partner before the line ends means no later quote of that kind
-/// on the line can.
+/// literal (see [`looks_random`]), read as [`quoted_literals`] finds them.
 pub fn detect_high_entropy(source: &str) -> bool {
+    quoted_literals(source).any(looks_random)
+}
+
+/// The string literals of source the parser couldn't read: every literal
+/// quoted on one line, as a regex retrying from each quote would find them,
+/// in linear time. A quote that finds no partner before the line ends means
+/// no later quote of that kind on the line can. Escapes are left as written.
+pub(super) fn quoted_literals(source: &str) -> impl Iterator<Item = &str> {
     let bytes = source.as_bytes();
     let mut unpaired = [false; 3];
     let mut index = 0;
-    while index < bytes.len() {
-        let quote = bytes[index];
-        let kind = match quote {
-            b'"' => 0,
-            b'\'' => 1,
-            b'`' => 2,
-            b'\n' => {
-                unpaired = [false; 3];
+    std::iter::from_fn(move || {
+        while index < bytes.len() {
+            let quote = bytes[index];
+            let kind = match quote {
+                b'"' => 0,
+                b'\'' => 1,
+                b'`' => 2,
+                b'\n' => {
+                    unpaired = [false; 3];
+                    index += 1;
+                    continue;
+                }
+                _ => {
+                    index += 1;
+                    continue;
+                }
+            };
+            if unpaired[kind] {
                 index += 1;
                 continue;
             }
-            _ => {
-                index += 1;
-                continue;
-            }
-        };
-        if unpaired[kind] {
-            index += 1;
-            continue;
-        }
-        let start = index + 1;
-        let mut cursor = start;
-        let closing = loop {
-            match bytes.get(cursor) {
-                None | Some(b'\n') => break None,
-                Some(b'\\') if bytes.get(cursor + 1).is_some_and(|&next| next != b'\n') => {
-                    cursor += 2;
+            let start = index + 1;
+            let mut cursor = start;
+            let closing = loop {
+                match bytes.get(cursor) {
+                    None | Some(b'\n') => break None,
+                    Some(b'\\') if bytes.get(cursor + 1).is_some_and(|&next| next != b'\n') => {
+                        cursor += 2;
+                    }
+                    Some(b'\\') => break None,
+                    Some(&byte) if byte == quote => break Some(cursor),
+                    Some(_) => cursor += 1,
                 }
-                Some(b'\\') => break None,
-                Some(&byte) if byte == quote => break Some(cursor),
-                Some(_) => cursor += 1,
-            }
-        };
-        match closing {
-            Some(end) => {
-                if looks_random(&source[start..end]) {
-                    return true;
+            };
+            match closing {
+                Some(end) => {
+                    index = end + 1;
+                    return Some(&source[start..end]);
                 }
-                index = end + 1;
-            }
-            None => {
-                unpaired[kind] = true;
-                index += 1;
+                None => {
+                    unpaired[kind] = true;
+                    index += 1;
+                }
             }
         }
-    }
-    false
+        None
+    })
 }
 
 // ── Minified code detection ───────────────────────────────────
