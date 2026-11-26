@@ -206,9 +206,11 @@ fn verify_with_authority(
 const MAX_INTERMEDIATES: usize = 3;
 
 /// Walk from the signing certificate up to `anchor`, each certificate valid
-/// at `at_time` and signed by the next. An issuer that neither
-/// `intermediates` nor the anchor provides, by name and key, is missing
-/// trust material: a newer trust root may hold it.
+/// at `at_time` and signed by the next. Every candidate issuer is tried, so
+/// the order certificates arrive in doesn't decide the outcome. When no
+/// path reaches the anchor, an issuer that neither `intermediates` nor the
+/// anchor provides, by name and key, is missing trust material: a newer
+/// trust root may hold it.
 fn verify_path(
     signer: &X509Certificate<'_>,
     intermediates: &[&X509Certificate<'_>],
@@ -222,35 +224,71 @@ fn verify_path(
     }
     refuse_unhandled_critical_extensions(signer, "its signing certificate")
         .map_err(AuthorityRejection::Failed)?;
+    let mut used = Vec::with_capacity(MAX_INTERMEDIATES);
+    extend_path(signer, intermediates, anchor, at_time, &mut used)
+}
 
-    let mut child = signer;
-    for depth in 0..=MAX_INTERMEDIATES {
-        let label = "timestamp authority trust anchor";
-        if child.tbs_certificate.issuer.as_raw() == anchor.tbs_certificate.subject.as_raw()
-            && verify_chain_link(child, anchor, label).is_ok()
+/// Continue a path from `child`, whose path so far uses the intermediates
+/// at the indexes in `used`. A path that found its issuers but failed a
+/// check outranks one that ran out of issuers.
+fn extend_path(
+    child: &X509Certificate<'_>,
+    intermediates: &[&X509Certificate<'_>],
+    anchor: &X509Certificate<'_>,
+    at_time: lpm_common::Timestamp,
+    used: &mut Vec<usize>,
+) -> Result<(), AuthorityRejection> {
+    let depth = used.len();
+    let mut outcome = AuthorityRejection::NotTheSigner;
+    let mut record = |rejection: AuthorityRejection| {
+        if !matches!(outcome, AuthorityRejection::Failed(_)) {
+            outcome = rejection;
+        }
+    };
+
+    let label = "timestamp authority trust anchor";
+    if child.tbs_certificate.issuer.as_raw() == anchor.tbs_certificate.subject.as_raw()
+        && verify_chain_link(child, anchor, label).is_ok()
+    {
+        match check_cert_validity_at(anchor, at_time, label)
+            .and_then(|()| enforce_issuer_constraints(anchor, depth, label))
         {
-            check_cert_validity_at(anchor, at_time, label).map_err(failed)?;
-            return enforce_issuer_constraints(anchor, depth, label).map_err(failed);
+            Ok(()) => return Ok(()),
+            Err(error) => record(AuthorityRejection::Failed(error.to_string())),
         }
-        if depth == MAX_INTERMEDIATES {
-            break;
-        }
-        let label = format!("timestamp authority intermediate {depth}");
-        let issuer = intermediates
-            .iter()
-            .find(|cert| {
-                cert.tbs_certificate.subject.as_raw() == child.tbs_certificate.issuer.as_raw()
-                    && verify_chain_link(child, cert, &label).is_ok()
-            })
-            .ok_or(AuthorityRejection::NotTheSigner)?;
-        check_cert_validity_at(issuer, at_time, &label).map_err(failed)?;
-        enforce_issuer_constraints(issuer, depth, &label).map_err(failed)?;
-        enforce_timestamping_intermediate(issuer).map_err(AuthorityRejection::Failed)?;
-        refuse_unhandled_critical_extensions(issuer, "an intermediate certificate")
-            .map_err(AuthorityRejection::Failed)?;
-        child = issuer;
     }
-    Err(AuthorityRejection::NotTheSigner)
+    if depth == MAX_INTERMEDIATES {
+        return Err(outcome);
+    }
+
+    let label = format!("timestamp authority intermediate {depth}");
+    for (index, issuer) in intermediates.iter().enumerate() {
+        if used.contains(&index)
+            || issuer.tbs_certificate.subject.as_raw() != child.tbs_certificate.issuer.as_raw()
+            || verify_chain_link(child, issuer, &label).is_err()
+        {
+            continue;
+        }
+        let checked = check_cert_validity_at(issuer, at_time, &label)
+            .and_then(|()| enforce_issuer_constraints(issuer, depth, &label))
+            .map_err(|error| error.to_string())
+            .and_then(|()| enforce_timestamping_intermediate(issuer))
+            .and_then(|()| {
+                refuse_unhandled_critical_extensions(issuer, "an intermediate certificate")
+            });
+        if let Err(why) = checked {
+            record(AuthorityRejection::Failed(why));
+            continue;
+        }
+        used.push(index);
+        let extended = extend_path(issuer, intermediates, anchor, at_time, used);
+        used.pop();
+        match extended {
+            Ok(()) => return Ok(()),
+            Err(rejection) => record(rejection),
+        }
+    }
+    Err(outcome)
 }
 
 /// Extensions a timestamp authority certificate may mark critical: those

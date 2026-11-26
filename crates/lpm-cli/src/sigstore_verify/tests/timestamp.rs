@@ -249,6 +249,8 @@ struct TestAuthority {
     /// The certificate and key that issued the leaf.
     issuer_cert: rcgen::Certificate,
     issuer_key: KeyPair,
+    root_cert: rcgen::Certificate,
+    root_key: KeyPair,
 }
 
 fn validity(not_before: (i32, u8, u8), not_after: (i32, u8, u8)) -> CertificateParams {
@@ -308,6 +310,8 @@ fn authority_with_intermediate(
         .self_signed(&root_key)
         .unwrap();
     let root_der = root.der().to_vec();
+    let root_key_copy = KeyPair::try_from(root_key.serialize_der().as_slice()).unwrap();
+    let root_cert = root.clone();
     let (intermediate_der, issuer_cert, issuer_key) =
         if let Some(customize) = customize_intermediate {
             let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
@@ -334,6 +338,8 @@ fn authority_with_intermediate(
         leaf_keypair,
         issuer_cert,
         issuer_key,
+        root_cert,
+        root_key: root_key_copy,
     }
 }
 
@@ -358,6 +364,19 @@ impl TestAuthority {
             cert_chain_der: vec![self.root_der.clone()],
             ..self.trusted()
         }
+    }
+
+    /// Another certificate for the intermediate's name and key, from the
+    /// root, that expired before the tokens' time.
+    fn expired_intermediate_copy(&self) -> Vec<u8> {
+        let root = rcgen::Issuer::from_ca_cert_der(self.root_cert.der(), &self.root_key).unwrap();
+        let mut params = ca_params("test-tsa-intermediate", 0);
+        params.not_after = rcgen::date_time_ymd(2025, 1, 1);
+        params
+            .signed_by(&self.issuer_key, &root)
+            .unwrap()
+            .der()
+            .to_vec()
     }
 
     /// Another certificate for the leaf's key, from the same issuer.
@@ -402,6 +421,8 @@ struct Token {
     signer_cert: Option<Vec<u8>>,
     /// A TSTInfo extension, marked critical when set.
     critical_tst_extension: bool,
+    /// Certificates carried after the leaf and before the intermediate.
+    extra_embedded: Vec<Vec<u8>>,
     /// Identify the signer by its subject key identifier.
     signer_key_id: bool,
     signature_algorithm: &'static [u8],
@@ -424,6 +445,7 @@ impl Default for Token {
             ess: Ess::V2,
             signer_cert: None,
             critical_tst_extension: false,
+            extra_embedded: Vec::new(),
             signer_key_id: false,
             signature_algorithm: OID_ECDSA_WITH_SHA256,
             signature_algorithm_parameters: false,
@@ -618,6 +640,7 @@ impl Token {
                 embedded.push(&authority.leaf_der);
             }
         }
+        embedded.extend(self.extra_embedded.iter().map(Vec::as_slice));
         if self.embed_intermediate {
             embedded.extend(authority.intermediate_der.as_deref());
         }
@@ -1087,4 +1110,38 @@ fn a_sha384_message_imprint_verifies() {
         ..Token::default()
     };
     verify_token(&token, &authority).unwrap();
+}
+
+#[test]
+fn every_candidate_intermediate_is_tried_whatever_their_order() {
+    // Two certificates for the intermediate's name and key: the first one
+    // carried expired before the token's time, the second is current.
+    let authority = authority_with(true, |_| {});
+    let token = Token {
+        embed_leaf: true,
+        embed_intermediate: true,
+        extra_embedded: vec![authority.expired_intermediate_copy()],
+        ..Token::default()
+    };
+    verify_signed_timestamp(
+        &token.signed_by(&authority),
+        SIGNATURE,
+        &[authority.trusted_root_only()],
+    )
+    .unwrap();
+
+    let only_expired = Token {
+        embed_leaf: true,
+        extra_embedded: vec![authority.expired_intermediate_copy()],
+        ..Token::default()
+    };
+    let why = match verify_signed_timestamp(
+        &only_expired.signed_by(&authority),
+        SIGNATURE,
+        &[authority.trusted_root_only()],
+    ) {
+        Err(VerifyError::Timestamp(why)) => why,
+        other => panic!("expected a timestamp refusal, got {other:?}"),
+    };
+    assert!(why.contains("does not contain the signing time"), "{why}");
 }
