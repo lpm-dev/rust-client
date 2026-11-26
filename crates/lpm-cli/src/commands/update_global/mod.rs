@@ -757,6 +757,25 @@ impl UpdateFailure {
         self
     }
 
+    /// The reason as printed above [`Self::detail_lines`]: a lone registry
+    /// refusal keeps its reason there and leaves naming the version to them.
+    fn terminal_reason(&self) -> std::borrow::Cow<'_, str> {
+        match self.firewall_block.as_deref() {
+            Some(blocked) if !self.details_shown => {
+                match (blocked.source, blocked.packages.as_slice()) {
+                    (lpm_common::NpmFirewallBlockSource::Registry, [package]) => {
+                        std::borrow::Cow::Owned(format!(
+                            "blocked by LPM Firewall: {}",
+                            package.reason
+                        ))
+                    }
+                    _ => std::borrow::Cow::Borrowed(&self.reason),
+                }
+            }
+            _ => std::borrow::Cow::Borrowed(&self.reason),
+        }
+    }
+
     /// The lines printed under this failure: the blocked versions unless the
     /// install listed them, and the block's notes.
     fn detail_lines(&self) -> Vec<install_ui::TerminalLine> {
@@ -1155,7 +1174,7 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
             }
             UpgradePlan::PlanError { package, failure } => {
                 let package_safe = sanitize_for_terminal(package);
-                let reason_safe = sanitize_for_terminal(&failure.reason);
+                let reason_safe = sanitize_for_terminal(&failure.terminal_reason());
                 eprintln!(
                     "  {} {} {}",
                     package_safe.bold(),
@@ -1277,7 +1296,7 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
             }
             UpgradeResult::Failed { package, failure } => {
                 let package_safe = sanitize_for_terminal(package);
-                let reason_safe = sanitize_for_terminal(&failure.reason);
+                let reason_safe = sanitize_for_terminal(&failure.terminal_reason());
                 output::warn_line(install_ui::terminal_line!(
                     "{}: {}",
                     install_ui::bold(&package_safe),
@@ -1359,7 +1378,7 @@ mod tests {
                 match_source: Some("package".into()),
                 policy_group: Some("lpm_ai_agent_control_surface".into()),
                 summary: None,
-                report_url: None,
+                report_url: Some("https://firewall.lpm.dev/npm/agent-tool/v/2.0.0".into()),
                 block_class: Some("policy".into()),
                 bypassable: true,
             }],
@@ -1396,6 +1415,27 @@ mod tests {
         assert_eq!(
             blocked_rows(lpm_common::NpmFirewallBlockSource::Preflight),
             0
+        );
+    }
+
+    #[test]
+    fn a_lone_update_names_a_refused_version_once_with_its_reason_and_report() {
+        let failure = UpdateFailure::from_error(&firewall_block(
+            lpm_common::NpmFirewallBlockSource::Registry,
+        ))
+        .shown_by_install(true);
+        let mut rendered = vec![failure.terminal_reason().into_owned()];
+        rendered.extend(plain_detail_lines(&failure));
+        let text = rendered.join("\n");
+
+        assert_eq!(text.matches("agent-tool@2.0.0").count(), 1, "{text}");
+        assert!(
+            text.contains("client policy maps lpm_ai_agent_control_surface to block"),
+            "{text}"
+        );
+        assert!(
+            text.contains("https://firewall.lpm.dev/npm/agent-tool/v/2.0.0"),
+            "{text}"
         );
     }
 

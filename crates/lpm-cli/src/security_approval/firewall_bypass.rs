@@ -90,15 +90,18 @@ pub(super) fn firewall_bypass_store_quarantine_reason(value: serde_json::Value) 
 /// changed them, saves the result without the rules that have expired. An
 /// empty store is removed so a command with no rules reads nothing. Returns
 /// `change`'s result and how many unexpired rules the store keeps.
-fn update_local_firewall_bypass_rules<T>(
-    change: impl FnOnce(&mut Vec<FirewallBypassRule>) -> T,
+///
+/// `change` gets the instant the save prunes at, so a rule it judges
+/// unexpired is never pruned behind its back.
+pub(super) fn update_local_firewall_bypass_rules<T>(
+    change: impl FnOnce(&mut Vec<FirewallBypassRule>, Timestamp) -> T,
 ) -> Result<(T, usize), LpmError> {
     std::fs::create_dir_all(security_dir()?)?;
     lpm_common::with_exclusive_lock(firewall_bypass_lock_path()?, || {
         let mut rules = load_local_firewall_bypass_rules()?;
         let before = rules.clone();
-        let result = change(&mut rules);
         let now = Timestamp::now();
+        let result = change(&mut rules, now);
         if rules == before {
             let unexpired = rules.iter().filter(|rule| !rule.is_expired(now)).count();
             return Ok((result, unexpired));
@@ -327,9 +330,8 @@ pub(crate) fn commit_firewall_bypass_rules<'a>(
     unapproved: impl IntoIterator<Item = &'a FirewallBypassRule>,
     approval_note: &str,
 ) -> Result<FirewallBypassCommit, LpmError> {
-    let (commit, rules_total) = update_local_firewall_bypass_rules(|saved| {
+    let (commit, rules_total) = update_local_firewall_bypass_rules(|saved, now| {
         let original = saved.clone();
-        let now = Timestamp::now();
         let mut outcome = FirewallBypassAdded::default();
         let mut needs_approval = Vec::new();
         let requested: Vec<(&FirewallBypassRule, bool)> = approved
@@ -462,17 +464,31 @@ pub(crate) fn approve_firewall_bypass_rules(
     Ok(())
 }
 
-/// For a request whose `--ttl` ran out while it waited for approval.
-pub(crate) fn bypass_expired_before_save_error() -> LpmError {
-    LpmError::SecurityApprovalStore(
-        "the `--ttl` ran out before the LPM Firewall bypass rules were saved, so nothing was saved; run the command again".to_string(),
+/// For a request whose `--ttl` ran out while it waited for approval: it
+/// needs a fresh approval, so the error names the command that asks again.
+pub(crate) fn bypass_expired_before_save_error(
+    command_hint: Option<String>,
+    project_root: Option<String>,
+) -> LpmError {
+    approval_required_error(
+        "The `--ttl` ran out before the LPM Firewall bypass rules were saved, so nothing was saved.",
+        vec![FIREWALL_BYPASS_AUDIT_SCOPE.to_string()],
+        project_root,
+        command_hint,
     )
 }
 
-pub(crate) fn rules_kept_changing_error() -> LpmError {
-    LpmError::SecurityApprovalStore(
-        "the LPM Firewall bypass rules kept changing while this command ran; run it again"
-            .to_string(),
+/// For a request whose rules other commands kept changing while it waited
+/// for approval; running it again judges them afresh.
+pub(crate) fn rules_kept_changing_error(
+    command_hint: Option<String>,
+    project_root: Option<String>,
+) -> LpmError {
+    approval_required_error(
+        "The LPM Firewall bypass rules kept changing while this command ran, so nothing was saved.",
+        vec![FIREWALL_BYPASS_AUDIT_SCOPE.to_string()],
+        project_root,
+        command_hint,
     )
 }
 
@@ -493,7 +509,12 @@ pub(crate) fn add_firewall_bypass_rules(
     for _ in 0..3 {
         match commit_firewall_bypass_rules(&approved, &unapproved, approval.prompt)? {
             FirewallBypassCommit::Saved(outcome) => return Ok(outcome),
-            FirewallBypassCommit::Expired => return Err(bypass_expired_before_save_error()),
+            FirewallBypassCommit::Expired => {
+                return Err(bypass_expired_before_save_error(
+                    approval.command_hint.map(str::to_string),
+                    project_root_of(&approval.rules),
+                ));
+            }
             FirewallBypassCommit::NeedsApproval(pending) => {
                 approve_firewall_bypass_rules(&FirewallBypassApproval {
                     rules: pending.clone(),
@@ -505,7 +526,15 @@ pub(crate) fn add_firewall_bypass_rules(
             }
         }
     }
-    Err(rules_kept_changing_error())
+    Err(rules_kept_changing_error(
+        approval.command_hint.map(str::to_string),
+        project_root_of(&approval.rules),
+    ))
+}
+
+#[cfg(test)]
+fn project_root_of(rules: &[FirewallBypassRule]) -> Option<String> {
+    rules.iter().find_map(|rule| rule.project_root.clone())
 }
 
 /// Records an `add` refused before any prompt, such as under a managed policy
@@ -555,7 +584,7 @@ pub(crate) fn remove_firewall_bypass_rules(
     selected: impl Fn(&FirewallBypassRule) -> bool,
     event: &str,
 ) -> Result<(Vec<FirewallBypassRule>, usize), LpmError> {
-    let (removed, rules_total) = update_local_firewall_bypass_rules(|rules| {
+    let (removed, rules_total) = update_local_firewall_bypass_rules(|rules, _| {
         let mut removed = Vec::new();
         rules.retain(|rule| {
             if selected(rule) {

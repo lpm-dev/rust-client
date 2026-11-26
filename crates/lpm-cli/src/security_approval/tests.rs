@@ -3355,6 +3355,23 @@ fn forced_floor_holds_an_approved_group_a_partial_table_leaves_out() {
 }
 
 #[test]
+fn the_bypass_store_keeps_what_a_change_judged_unexpired_at_its_instant() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        let (kept, _) = super::firewall_bypass::update_local_firewall_bypass_rules(|rules, now| {
+            let mut rule = bypass_rule("foldrun@32.8.2");
+            rule.expires_at = now.checked_add(lpm_common::timestamp::Duration::milliseconds(1));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            rules.push(rule.clone());
+            rule
+        })
+        .unwrap();
+
+        assert_eq!(load_local_firewall_bypass_rules().unwrap(), vec![kept]);
+    });
+}
+
+#[test]
 fn a_request_whose_expiry_passed_before_the_save_saves_nothing() {
     let temp = tempdir().unwrap();
     with_test_env(temp.path(), || {

@@ -717,6 +717,16 @@ async fn approve_and_save(
     let prompt_for = |batch: &[&FirewallBypassSpec]| {
         approval_prompt(batch, plan.scope, plan.ttl_secs, plan.allow_malware)
     };
+    // The whole request: nothing is saved before every approval is in, and a
+    // rule already saved may be removed while a prompt is open, so rerunning
+    // all of it is what finishes it.
+    let command_hint = add_command_hint(
+        &plan.specs.iter().collect::<Vec<_>>(),
+        plan.scope,
+        plan.ttl_secs,
+        plan.allow_malware,
+        plan.reason,
+    );
     for _ in 0..MAX_ADD_ATTEMPTS {
         if !pending.is_empty() {
             let pending_specs = specs_named_by(plan.specs, &pending);
@@ -736,18 +746,6 @@ async fn approve_and_save(
                     rule.added_verdict = added_verdict(previews.get(&rule.spec));
                 }
             }
-            // Nothing is saved before every approval is in, so the hint
-            // names every rule the request would still change.
-            let command_hint = add_command_hint(
-                &specs_named_by(
-                    plan.specs,
-                    approved.iter().chain(&pending).chain(&narrowing),
-                ),
-                plan.scope,
-                plan.ttl_secs,
-                plan.allow_malware,
-                plan.reason,
-            );
             for batch in approval_batches(&pending_specs, prompt_for) {
                 let prompt = prompt_for(&batch);
                 let rules = batch
@@ -774,7 +772,10 @@ async fn approve_and_save(
         )? {
             security_approval::FirewallBypassCommit::Saved(outcome) => return Ok(outcome),
             security_approval::FirewallBypassCommit::Expired => {
-                return Err(security_approval::bypass_expired_before_save_error());
+                return Err(security_approval::bypass_expired_before_save_error(
+                    command_hint,
+                    plan.scope.project_root.clone(),
+                ));
             }
             // A rule removed, expired or shortened since it was judged a
             // narrowing or already saved now adds or extends one, so it is
@@ -790,7 +791,10 @@ async fn approve_and_save(
             }
         }
     }
-    Err(security_approval::rules_kept_changing_error())
+    Err(security_approval::rules_kept_changing_error(
+        command_hint,
+        plan.scope.project_root.clone(),
+    ))
 }
 
 fn describe_expiry(rule: &FirewallBypassRule) -> String {
@@ -1551,7 +1555,7 @@ mod tests {
     }
 
     #[test]
-    fn add_hint_names_every_unsaved_rule_when_a_later_approval_is_declined() {
+    fn add_hint_repeats_the_whole_request_when_a_later_approval_is_declined() {
         let temp = tempfile::tempdir().unwrap();
         security_approval::test_support::with_test_env(temp.path(), || {
             let specs = specs(&[
@@ -1588,7 +1592,7 @@ mod tests {
             assert!(
                 matches!(error, LpmError::SecurityApprovalStore(message) if message == "declined")
             );
-            let whole = "lpm firewall bypass add \"a@1.0.0\" \"b@1.0.0\" \"c@1.0.0\" \"d@1.0.0\" \"e@1.0.0\" \"f@1.0.0\" \"held@1.0.0\" --ttl 30m";
+            let whole = "lpm firewall bypass add \"a@1.0.0\" \"b@1.0.0\" \"c@1.0.0\" \"d@1.0.0\" \"e@1.0.0\" \"f@1.0.0\" \"held@1.0.0\" \"same@1.0.0\" --ttl 30m";
             assert_eq!(hints, [Some(whole.to_string()), Some(whole.to_string())]);
             assert_eq!(saved_specs(), ["held@1.0.0", "same@1.0.0"]);
             assert!(
@@ -1655,6 +1659,14 @@ mod tests {
             .unwrap_err();
 
             assert!(error.to_string().contains("--ttl"), "{error}");
+            assert_eq!(error.error_code(), "security_approval_required");
+            let LpmError::SecurityApprovalRequired(approval) = &error else {
+                unreachable!("checked by the error code");
+            };
+            assert_eq!(
+                approval.suggested_command.as_deref(),
+                Some("lpm firewall bypass add \"late@1.0.0\" --ttl 1")
+            );
             assert!(
                 security_approval::load_local_firewall_bypass_rules()
                     .unwrap()
@@ -1670,22 +1682,41 @@ mod tests {
     fn add_records_each_approved_prompt_in_the_audit_log() {
         let temp = tempfile::tempdir().unwrap();
         security_approval::test_support::with_test_env(temp.path(), || {
-            let specs = specs(&["flagged@1.0.0"]);
+            let specs = specs(&[
+                "flagged-a@1.0.0",
+                "flagged-b@1.0.0",
+                "flagged-c@1.0.0",
+                "flagged-d@1.0.0",
+                "flagged-e@1.0.0",
+                "flagged-f@1.0.0",
+            ]);
             let scope = global();
+            let requested = specs
+                .iter()
+                .map(|spec| rule_covering(spec, Some(1_800), true))
+                .collect();
 
-            run_add(
-                &plan(&specs, &scope, Some(1_800), true),
-                vec![rule_covering(&specs[0], Some(1_800), true)],
-                |_| Ok(()),
-            )
+            run_add(&plan(&specs, &scope, Some(1_800), true), requested, |_| {
+                Ok(())
+            })
             .unwrap();
 
+            let prompts: Vec<String> = approval_batches(&refs(&specs), |batch| {
+                approval_prompt(batch, &scope, Some(1_800), true)
+            })
+            .iter()
+            .map(|batch| approval_prompt(batch, &scope, Some(1_800), true))
+            .collect();
+            assert_eq!(prompts.len(), 2);
+            assert!(
+                prompts[0].contains("including a malware verdict"),
+                "{}",
+                prompts[0]
+            );
+            assert!(prompts[0].contains("for 30m"), "{}", prompts[0]);
             assert_eq!(
                 security_approval::test_support::audit_details("firewall-bypass-added"),
-                [Some(
-                    "approved: Allow flagged@1.0.0, including a malware verdict, past LPM Firewall in every project for 30m"
-                        .to_string()
-                )]
+                [Some(format!("approved: {}", prompts.join("; ")))]
             );
         });
     }
