@@ -446,6 +446,10 @@ pub(super) struct NpmFirewallPreflightResult {
     pub(super) stats: NpmFirewallPreflightStats,
     pub(super) decisions: Vec<NpmFirewallDecision>,
     pub(super) report_error: Option<String>,
+    /// An enforce-mode verdict request that failed with nothing blocked,
+    /// which ends the install once what the other requests found is
+    /// reported.
+    pub(super) failure: Option<LpmError>,
 }
 
 impl NpmFirewallPreflightResult {
@@ -454,6 +458,7 @@ impl NpmFirewallPreflightResult {
             stats: NpmFirewallPreflightStats::for_mode(mode, lookup_mode),
             decisions: Vec::new(),
             report_error: None,
+            failure: None,
         }
     }
 }
@@ -579,6 +584,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
             ));
             stats.batch_ms = total_started.elapsed().as_millis();
             return Ok(NpmFirewallPreflightResult {
+                failure: None,
                 stats,
                 decisions,
                 report_error,
@@ -670,17 +676,19 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
             }
         }
 
-        if let Some(error) = failure {
-            if !blocked {
-                return Err(error);
+        let failure = match failure {
+            Some(error) if blocked => {
+                stats.unchecked_reason = Some(error.to_string());
+                None
             }
-            stats.unchecked_reason = Some(error.to_string());
-        }
+            failure => failure,
+        };
         stats.batch_ms = total_started.elapsed().as_millis();
         Ok(NpmFirewallPreflightResult {
             stats,
             decisions,
             report_error,
+            failure,
         })
     });
     NpmFirewallPreflightJoin {
@@ -1371,6 +1379,7 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
     stats.checked_count = verdict_packages.len() as u64;
     if verdict_packages.is_empty() {
         return Ok(NpmFirewallPreflightResult {
+            failure: None,
             stats,
             decisions: Vec::new(),
             report_error: None,
@@ -1382,6 +1391,7 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
         let message = NPM_FIREWALL_OFFLINE_HINT.to_string();
         if matches!(mode, NpmFirewallMode::Monitor) {
             return Ok(NpmFirewallPreflightResult {
+                failure: None,
                 stats,
                 decisions: Vec::new(),
                 report_error: Some(format!(
@@ -1400,6 +1410,7 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
             stats.batch_ms = started.elapsed().as_millis();
             stats.rpc_failed = true;
             return Ok(NpmFirewallPreflightResult {
+                failure: None,
                 stats,
                 decisions: Vec::new(),
                 report_error: Some(npm_firewall_preflight_report_error(error)),
@@ -1462,6 +1473,7 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
     if packages_to_check.is_empty() {
         stats.batch_ms = started.elapsed().as_millis();
         return Ok(NpmFirewallPreflightResult {
+            failure: None,
             stats,
             decisions: Vec::new(),
             report_error: None,
@@ -1496,6 +1508,7 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
                 stats.batch_ms = started.elapsed().as_millis();
                 stats.rpc_failed = true;
                 return Ok(NpmFirewallPreflightResult {
+                    failure: None,
                     stats,
                     decisions: all_decisions,
                     report_error: Some(npm_firewall_preflight_report_error(error)),
@@ -1530,7 +1543,13 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
     }
     if let Some(error) = first_failure.map(npm_firewall_preflight_enforce_error) {
         if !stats_have_block(&stats, &all_decisions) {
-            return Err(error);
+            stats.batch_ms = started.elapsed().as_millis();
+            return Ok(NpmFirewallPreflightResult {
+                stats,
+                decisions: all_decisions,
+                report_error: None,
+                failure: Some(error),
+            });
         }
         stats.unchecked_reason = Some(error.to_string());
     }
@@ -1563,6 +1582,7 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
         "npm firewall verdict preflight completed",
     );
     Ok(NpmFirewallPreflightResult {
+        failure: None,
         stats,
         decisions: all_decisions,
         report_error: None,
@@ -1624,6 +1644,9 @@ pub(super) fn finish_npm_firewall_preflight(
     json_output: bool,
 ) -> Result<NpmFirewallPreflightStats, LpmError> {
     let stats = result.stats;
+    if let Some(failure) = result.failure {
+        return Err(failure);
+    }
     // A failed request in monitor mode still leaves what the requests before
     // it found, which is reported below.
     if let Some(error) = &result.report_error

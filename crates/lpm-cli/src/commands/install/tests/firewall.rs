@@ -159,7 +159,8 @@ async fn enforce_firewall_preflight_maps_legacy_entitlement_denial_to_firewall_e
         }],
         false,
     )
-    .await;
+    .await
+    .and_then(|result| finish_npm_firewall_preflight(result, true));
 
     match result {
         Err(lpm_common::LpmError::NpmFirewallEntitlementRequired {
@@ -1749,6 +1750,7 @@ fn firewall_block_counted_only_in_the_summary_still_blocks() {
         ..NpmFirewallPreflightStats::default()
     };
     let result = NpmFirewallPreflightResult {
+        failure: None,
         stats,
         decisions: vec![decision("named-block", "block")],
         report_error: None,
@@ -1817,6 +1819,7 @@ fn firewall_block_error_names_each_blocked_version_once() {
         ..NpmFirewallPreflightStats::default()
     };
     let result = NpmFirewallPreflightResult {
+        failure: None,
         stats,
         decisions: vec![decision("twice", "block"), decision("twice", "block")],
         report_error: None,
@@ -2131,11 +2134,13 @@ async fn chunked_enforce_releases_nothing_an_allowed_chunk_clears_after_a_failur
     selected_tx.send(selected_event("broken-a")).await.unwrap();
     drop(selected_tx);
 
-    assert!(join.drain().await.is_err());
+    let drained = join.drain().await.unwrap();
+    assert!(drained.failure.is_some());
     assert!(
         started.elapsed() >= std::time::Duration::from_millis(300),
         "drain returned before the allowed chunk's verdict arrived"
     );
+    assert!(finish_npm_firewall_preflight(drained, true).is_err());
     assert!(fetch_rx.recv().await.is_none());
     server.verify().await;
 }
