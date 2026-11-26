@@ -702,6 +702,43 @@ fn an_ed25519_log_signs_under_the_name_its_key_id_commits_to() {
     assert!(why.contains("no signature from the log"), "{why}");
 }
 
+#[test]
+fn a_bundle_signed_through_sigstores_production_rekor_v2_log_verifies() {
+    // Signed by the daily release trust check through log2025-1 and
+    // timestamp.sigstore.dev, verified against the trust root built in.
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/sigstore_bundles/24-real-rekor-v2-release-trust.json");
+    let bundle = std::fs::read(path).unwrap();
+    let trust = TrustRoot::parse(super::super::trust_root::EMBEDDED_TRUST_ROOT_JSON).unwrap();
+    let identity = IdentityExpectations {
+        expected_issuer: Some("https://token.actions.githubusercontent.com".into()),
+        expected_san_uri_prefix: Some("https://github.com/lpm-dev/rust-client/".into()),
+        expected_workflow_path: Some(".github/workflows/release-trust.yml".into()),
+    };
+    for options in [VerifyOptions::strict(), VerifyOptions::npm_attestation()] {
+        let verified = verify_sigstore_bundle_with(&bundle, &identity, options, &trust).unwrap();
+        assert_eq!(
+            Timestamp::from(verified.signed_at).to_rfc3339_seconds(),
+            "2026-11-26T01:57:14Z"
+        );
+        assert_eq!(verified.log_index, 216_692_112);
+        assert_eq!(
+            verified.log_id,
+            "zxGZFVvd0FEmjR8WrFwMdcAJ9vtaY/QXf44Y1wUeP6A="
+        );
+        let (_, digest) = super::super::extract_subject_digest_from_statement(
+            &verified.statement,
+            "sha256",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            digest,
+            "43912a4100b192322045a8589474bfb19621ed8d546892f5edb84a4e2d1cb4c5"
+        );
+    }
+}
+
 /// Run by the daily release trust check on a bundle it has just signed
 /// through Sigstore's production Rekor v2 log with its GitHub Actions
 /// identity. `LPM_LIVE_REKOR_V2_BUNDLE` names the bundle and
