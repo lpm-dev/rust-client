@@ -1,0 +1,20 @@
+---
+source: tests/workflows/tests/global_dependency_skills.rs
+expression: "installed[\"dependency_skills\"]"
+---
+{
+  "linked": [
+    {
+      "skill": "browser-tool",
+      "package": "browser-tool",
+      "version": "1.0.0",
+      "targets": [
+        "~/.agents/skills"
+      ]
+    }
+  ],
+  "updated": [],
+  "removed": [],
+  "held": [],
+  "unchanged": 0
+}

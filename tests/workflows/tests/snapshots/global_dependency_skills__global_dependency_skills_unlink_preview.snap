@@ -1,0 +1,34 @@
+---
+source: tests/workflows/tests/global_dependency_skills.rs
+expression: unlink_preview
+---
+{
+  "success": true,
+  "dry_run": true,
+  "action": "unlink",
+  "skills": [
+    {
+      "skill": "browser-tool",
+      "package": "browser-tool",
+      "version": "1.0.0",
+      "status": "not_allowed",
+      "change": "unlink",
+      "reason": null,
+      "detail": null,
+      "description": "Guidance for driving the browser-tool tool.",
+      "hidden": false,
+      "allowed_tools": [],
+      "permission": "none",
+      "warnings": 0,
+      "review_warning": null,
+      "suggested_selector": "#browser-tool",
+      "links": [
+        "~/.agents/skills/browser-tool"
+      ]
+    }
+  ],
+  "removed": [
+    "#browser-tool"
+  ],
+  "denied": []
+}

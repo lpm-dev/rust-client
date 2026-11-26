@@ -1,0 +1,19 @@
+---
+source: tests/workflows/tests/global_dependency_skills.rs
+expression: preview
+---
+{
+  "success": true,
+  "dry_run": true,
+  "action": "link",
+  "skills": [],
+  "fetches": [
+    {
+      "package": "@lpm.dev/acme.cli",
+      "version": "1.0.0"
+    }
+  ],
+  "added": [
+    "#@lpm.dev/acme.cli"
+  ]
+}

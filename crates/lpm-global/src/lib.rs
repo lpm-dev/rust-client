@@ -32,8 +32,8 @@ pub use recover::{ReconciledTx, ReconciliationOutcome, RecoveryReport, UnknownOp
 
 pub use manifest::{
     AliasEntry, CommandCollision, CommandOwner, GlobalManifest, MANIFEST_FILENAME, PackageEntry,
-    PackageSource, PendingEntry, SCHEMA_VERSION, find_command_collisions, read_for, read_manifest,
-    write_for, write_manifest,
+    PackageSource, PendingEntry, SCHEMA_VERSION, find_command_collisions, parse_manifest, read_for,
+    read_manifest, write_for, write_manifest,
 };
 pub use shim::{
     EmittedShim, Shim, ShimError, artifacts_complete, emit_shim, expected_artifacts, remove_shim,

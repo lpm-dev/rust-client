@@ -51,6 +51,21 @@ pub(crate) struct ParsedPolicy {
     pub(crate) problems: Vec<String>,
 }
 
+impl ParsedPolicy {
+    /// A policy LPM couldn't read at all, for `problem`: it links nothing.
+    pub(crate) fn unreadable(problem: String) -> Self {
+        Self {
+            policy: Some(SkillsPolicy {
+                allow: Vec::new(),
+                deny: Vec::new(),
+                targets: Targets::Auto,
+                deny_unreadable: true,
+            }),
+            problems: vec![problem],
+        }
+    }
+}
+
 impl SkillsPolicy {
     /// Whether the policy can link anything: it allows at least one
     /// selector, and every `deny` entry could be read.
@@ -87,45 +102,78 @@ impl SkillsPolicy {
     }
 }
 
+/// Where a skills policy lives, so its problems name the right keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PolicySource {
+    /// `package.json > lpm > skills`.
+    Manifest,
+    /// The policy of the user's global packages.
+    Global,
+}
+
+impl PolicySource {
+    /// How messages name the key at `path` (`""`, `.allow`, `.allow[2]`).
+    pub(crate) fn key(self, path: &str) -> String {
+        match self {
+            Self::Manifest => format!("`lpm.{POLICY_KEY}{path}`"),
+            Self::Global => match path.strip_prefix('.') {
+                Some(key) => format!("`{key}` in the global skills policy"),
+                None => "the global skills policy".to_string(),
+            },
+        }
+    }
+
+    /// What `targets` entries name.
+    fn target_folders(self) -> &'static str {
+        match self {
+            Self::Manifest => "project directories",
+            Self::Global => "directories in your home folder",
+        }
+    }
+}
+
 /// Reads the policy from a parsed `package.json`.
 pub(crate) fn read_policy(manifest: &serde_json::Value) -> ParsedPolicy {
-    let Some(value) = manifest
-        .get("lpm")
-        .and_then(|lpm| lpm.get(POLICY_KEY))
-        .filter(|value| !value.is_null())
-    else {
+    parse_policy(
+        manifest.get("lpm").and_then(|lpm| lpm.get(POLICY_KEY)),
+        PolicySource::Manifest,
+    )
+}
+
+/// Reads the global policy from its parsed document, the policy object
+/// itself.
+pub(crate) fn read_global_policy(document: &serde_json::Value) -> ParsedPolicy {
+    parse_policy(Some(document), PolicySource::Global)
+}
+
+fn parse_policy(value: Option<&serde_json::Value>, source: PolicySource) -> ParsedPolicy {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
         return ParsedPolicy::default();
     };
     let mut problems = Vec::new();
     let Some(object) = value.as_object() else {
-        problems.push(format!(
-            "`lpm.{POLICY_KEY}` must be an object with `allow`, `deny` and `targets`, so no dependency skills are linked until it is fixed"
+        return ParsedPolicy::unreadable(format!(
+            "{} must be an object with `allow`, `deny` and `targets`, so no dependency skills are linked until it is fixed",
+            source.key("")
         ));
-        return ParsedPolicy {
-            policy: Some(SkillsPolicy {
-                allow: Vec::new(),
-                deny: Vec::new(),
-                targets: Targets::Auto,
-                deny_unreadable: true,
-            }),
-            problems,
-        };
     };
     let mut keys_known = true;
     for key in object.keys() {
         if !matches!(key.as_str(), "allow" | "deny" | "targets") {
             problems.push(format!(
-                "`lpm.{POLICY_KEY}.{key}` is not a known key; use `allow`, `deny` or `targets`"
+                "{} is not a known key; use `allow`, `deny` or `targets`",
+                source.key(&format!(".{key}"))
             ));
             keys_known = false;
         }
     }
-    let (deny, deny_complete) = read_entries(object.get("deny"), "deny", &mut problems);
-    let (allow, _) = read_entries(object.get("allow"), "allow", &mut problems);
-    let targets = read_targets(object.get("targets"), &mut problems);
+    let (deny, deny_complete) = read_entries(object.get("deny"), "deny", source, &mut problems);
+    let (allow, _) = read_entries(object.get("allow"), "allow", source, &mut problems);
+    let targets = read_targets(object.get("targets"), source, &mut problems);
     if !deny_complete || !keys_known {
         problems.push(format!(
-            "`lpm.{POLICY_KEY}` holds entries LPM can't read, so no dependency skills are linked until they are fixed"
+            "{} holds entries LPM can't read, so no dependency skills are linked until they are fixed",
+            source.key("")
         ));
     }
     ParsedPolicy {
@@ -156,6 +204,7 @@ pub(crate) fn policy_digest(policy: Option<&SkillsPolicy>) -> String {
 fn read_entries(
     value: Option<&serde_json::Value>,
     field: &str,
+    source: PolicySource,
     problems: &mut Vec<String>,
 ) -> (Vec<PolicyEntry>, bool) {
     let Some(value) = value.filter(|value| !value.is_null()) else {
@@ -163,7 +212,8 @@ fn read_entries(
     };
     let Some(items) = value.as_array() else {
         problems.push(format!(
-            "`lpm.{POLICY_KEY}.{field}` must be an array of selectors"
+            "{} must be an array of selectors",
+            source.key(&format!(".{field}"))
         ));
         return (Vec::new(), false);
     };
@@ -171,10 +221,11 @@ fn read_entries(
     let mut complete = true;
     let mut seen = BTreeSet::new();
     for (index, item) in items.iter().enumerate() {
-        let location = format!("`lpm.{POLICY_KEY}.{field}[{index}]`");
+        let location = source.key(&format!(".{field}[{index}]"));
         if index == MAX_POLICY_ENTRIES {
             problems.push(format!(
-                "`lpm.{POLICY_KEY}.{field}` holds more than {MAX_POLICY_ENTRIES} selectors; {location} and later entries are ignored"
+                "{} holds more than {MAX_POLICY_ENTRIES} selectors; {location} and later entries are ignored",
+                source.key(&format!(".{field}"))
             ));
             complete = false;
             break;
@@ -217,7 +268,11 @@ fn read_entries(
     (entries, complete)
 }
 
-fn read_targets(value: Option<&serde_json::Value>, problems: &mut Vec<String>) -> Targets {
+fn read_targets(
+    value: Option<&serde_json::Value>,
+    source: PolicySource,
+    problems: &mut Vec<String>,
+) -> Targets {
     let Some(value) = value.filter(|value| !value.is_null()) else {
         return Targets::Auto;
     };
@@ -226,17 +281,20 @@ fn read_targets(value: Option<&serde_json::Value>, problems: &mut Vec<String>) -
     }
     let Some(items) = value.as_array() else {
         problems.push(format!(
-            "`lpm.{POLICY_KEY}.targets` must be \"auto\" or an array of project directories"
+            "{} must be \"auto\" or an array of {}",
+            source.key(".targets"),
+            source.target_folders()
         ));
         return Targets::Explicit(Vec::new());
     };
     let mut targets: Vec<String> = Vec::with_capacity(items.len().min(MAX_TARGETS));
     let mut seen = BTreeSet::new();
     for (index, item) in items.iter().enumerate() {
-        let location = format!("`lpm.{POLICY_KEY}.targets[{index}]`");
+        let location = source.key(&format!(".targets[{index}]"));
         if targets.len() == MAX_TARGETS {
             problems.push(format!(
-                "`lpm.{POLICY_KEY}.targets` holds more than {MAX_TARGETS} directories; {location} and later entries are ignored"
+                "{} holds more than {MAX_TARGETS} directories; {location} and later entries are ignored",
+                source.key(".targets")
             ));
             break;
         }

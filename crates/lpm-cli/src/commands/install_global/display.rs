@@ -9,6 +9,7 @@ pub(super) fn print_success(
     out: &CommitOutput,
     hint: &crate::path_onboarding::PathHintReport,
     firewall_bypassed: &crate::commands::install::FirewallBypassRecord,
+    skills: &crate::dependency_skills::ReconcileReport,
     json_output: bool,
 ) {
     if json_output {
@@ -35,6 +36,7 @@ pub(super) fn print_success(
         if let Some(security) = firewall_bypassed.security_json() {
             body["security"] = security;
         }
+        crate::commands::install::attach_dependency_skills(&mut body, skills);
         println!("{}", serde_json::to_string_pretty(&body).unwrap());
         return;
     }
@@ -47,21 +49,19 @@ pub(super) fn print_success(
         install_ui::dim(&version_safe),
         install_ui::dim(&saved_spec_safe)
     ));
-    if out.commands.is_empty() {
-        // Shouldn't happen — we error out earlier when bin entries are
-        // empty — but guard the message just in case.
-        return;
+    if !out.commands.is_empty() {
+        let commands_safe: Vec<String> = out
+            .commands
+            .iter()
+            .map(|c| sanitize_for_terminal(c))
+            .collect();
+        output::info(&format!(
+            "Exposed command{} on PATH: {}",
+            if out.commands.len() == 1 { "" } else { "s" },
+            commands_safe.join(", ")
+        ));
     }
-    let commands_safe: Vec<String> = out
-        .commands
-        .iter()
-        .map(|c| sanitize_for_terminal(c))
-        .collect();
-    output::info(&format!(
-        "Exposed command{} on PATH: {}",
-        if out.commands.len() == 1 { "" } else { "s" },
-        commands_safe.join(", ")
-    ));
+    crate::dependency_skills::print_report(skills);
     // The banner (if any) was printed by `maybe_show_path_hint` BEFORE
     // we got here. We don't re-emit anything in human mode; the hint
     // is its own block of output. Leaving this comment so future

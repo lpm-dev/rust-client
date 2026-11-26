@@ -4,12 +4,12 @@ use super::plan::{Candidate, CandidateStatus, HoldReason, Plan, Prepared};
 use super::policy::Targets;
 use super::snapshot::{snapshot_digest, sweep, write_snapshot};
 use super::state::{
-    FileStamp, LinkKind, LinkRecord, LinkState, LinkedSkillRecord, StoredState,
+    FileStamp, LinkKind, LinkRecord, LinkState, LinkedSkillRecord, Site, StoredState,
     remove_root_if_empty, remove_state, write_state,
 };
 use lpm_common::LpmError;
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::{Path, PathBuf};
 
 /// A skill whose links changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,7 +92,7 @@ pub(crate) enum Desired<'a> {
 /// skill linked fresh claims its name before any earlier copy another
 /// package keeps.
 pub(crate) fn desired_skills<'a>(
-    project_dir: &Path,
+    site: &Site,
     plan: &'a Plan,
     previous: &'a LinkState,
     policy: &str,
@@ -118,7 +118,7 @@ pub(crate) fn desired_skills<'a>(
             continue;
         };
         let kept = held_copy(
-            project_dir,
+            site,
             candidate,
             *reason,
             previous,
@@ -151,7 +151,7 @@ pub(crate) fn desired_skills<'a>(
         else {
             continue;
         };
-        let kept = keeps_unlisted_copy(project_dir, skill, record, previous, policy, targets)
+        let kept = keeps_unlisted_copy(site, skill, record, previous, policy, targets)
             && clean(record)
             && verdicts.is_none_or(|verdicts| installed_release_allows(verdicts, plan, record));
         held.push(HeldSkill {
@@ -174,7 +174,7 @@ pub(crate) fn desired_skills<'a>(
 /// when another skill already `taken` its name, or when none of its links
 /// in `targets` is still intact.
 fn held_copy<'a>(
-    project_dir: &Path,
+    site: &Site,
     candidate: &Candidate,
     reason: HoldReason,
     previous: &'a LinkState,
@@ -184,15 +184,15 @@ fn held_copy<'a>(
 ) -> Option<&'a LinkedSkillRecord> {
     let record = previous.skills.get(&candidate.skill)?;
     (!taken(&candidate.skill)
-        && keeps_earlier_copy(project_dir, candidate, reason, record, previous, policy)
-        && has_intact_link(project_dir, &candidate.skill, record, targets))
+        && keeps_earlier_copy(site, candidate, reason, record, previous, policy)
+        && has_intact_link(site, &candidate.skill, record, targets))
     .then_some(record)
 }
 
 /// Whether one of the links `record` recorded for `skill` in `targets` is
 /// still there and LPM's: a kept copy stays only where it is linked.
 fn has_intact_link(
-    project_dir: &Path,
+    site: &Site,
     skill: &str,
     record: &LinkedSkillRecord,
     targets: &[String],
@@ -202,7 +202,7 @@ fn has_intact_link(
             name == skill
                 && targets.iter().any(|wanted| wanted == target)
                 && kept_link_intact(
-                    project_dir,
+                    site,
                     target,
                     skill,
                     Recorded {
@@ -245,7 +245,7 @@ fn unlisted_hold<'a>(
 /// the policy is unchanged, the copy is intact, and one of its links in
 /// `targets` is.
 fn keeps_unlisted_copy(
-    project_dir: &Path,
+    site: &Site,
     skill: &str,
     record: &LinkedSkillRecord,
     previous: &LinkState,
@@ -254,8 +254,8 @@ fn keeps_unlisted_copy(
 ) -> bool {
     previous.policy == policy
         && reviewed_here(record)
-        && snapshot_digest(project_dir, skill).as_deref() == Some(record.digest.as_str())
-        && has_intact_link(project_dir, skill, record, targets)
+        && snapshot_digest(site, skill).as_deref() == Some(record.digest.as_str())
+        && has_intact_link(site, skill, record, targets)
 }
 
 /// Whether the security provider's last verdict on the npm release `record`
@@ -350,13 +350,13 @@ fn checked_as(current: Option<&str>, record: &LinkedSkillRecord) -> bool {
 /// rechecked like the releases installed now. A copy no verdict can keep,
 /// such as one linked under another release check, is never asked about.
 pub(crate) fn retained_releases(
-    project_dir: &Path,
+    site: &Site,
     plan: &Plan,
     previous: &LinkState,
     policy: &str,
     current: Option<&str>,
 ) -> BTreeSet<(String, String)> {
-    let targets = link_targets(project_dir, plan);
+    let targets = link_targets(site, plan);
     let fresh: BTreeSet<&str> = plan
         .candidates
         .iter()
@@ -377,22 +377,15 @@ pub(crate) fn retained_releases(
     };
     for candidate in &plan.candidates {
         if let CandidateStatus::Held { reason, .. } = &candidate.status
-            && let Some(record) = held_copy(
-                project_dir,
-                candidate,
-                *reason,
-                previous,
-                policy,
-                &targets,
-                taken,
-            )
+            && let Some(record) =
+                held_copy(site, candidate, *reason, previous, policy, &targets, taken)
         {
             retain(record, plan.unlisted.contains_key(&record.package));
         }
     }
     for (skill, record) in &previous.skills {
         if unlisted_hold(plan, skill, record, taken).is_some()
-            && keeps_unlisted_copy(project_dir, skill, record, previous, policy, &targets)
+            && keeps_unlisted_copy(site, skill, record, previous, policy, &targets)
         {
             retain(record, true);
         }
@@ -472,41 +465,68 @@ fn revoked(plan: &Plan, skill: &str, package: &str) -> bool {
 /// commands it would pre-approve now run the release Socket hasn't
 /// cleared.
 fn keeps_earlier_copy(
-    project_dir: &Path,
+    site: &Site,
     candidate: &Candidate,
     reason: HoldReason,
     record: &LinkedSkillRecord,
     previous: &LinkState,
     policy: &str,
 ) -> bool {
-    let approved = match reason {
+    let approved = policy_keeps_copy(
+        reason,
+        record,
+        HeldCandidate {
+            same_policy: previous.policy == policy,
+            same_release: record.version == candidate.version
+                && record.integrity == candidate.integrity,
+            undecided: candidate.undecided,
+            naming: candidate.naming,
+            possible_naming: candidate.possible_naming,
+        },
+    );
+    approved
+        && record.package == candidate.package
+        && reviewed_here(record)
+        && snapshot_digest(site, &candidate.skill).as_deref() == Some(record.digest.as_str())
+}
+
+/// What [`policy_keeps_copy`] reads of the held skill and the policy.
+#[derive(Clone, Copy)]
+struct HeldCandidate {
+    same_policy: bool,
+    /// The copy is of the very release installed now.
+    same_release: bool,
+    undecided: bool,
+    naming: super::plan::Naming,
+    possible_naming: super::plan::Naming,
+}
+
+/// The policy's part of [`keeps_earlier_copy`]. Under an unchanged policy
+/// the entries still have to name the skill as specifically as the copy
+/// needs: a record written before a grant needed the skill named asks for
+/// more than the entries that linked it gave.
+fn policy_keeps_copy(reason: HoldReason, record: &LinkedSkillRecord, held: HeldCandidate) -> bool {
+    match reason {
         HoldReason::NeedsData | HoldReason::NotReviewed | HoldReason::Unreadable => {
-            previous.policy == policy
+            held.same_policy && held.possible_naming >= record.requires
         }
-        HoldReason::AwaitingCheck
-            if record.version == candidate.version && record.integrity == candidate.integrity =>
-        {
-            previous.policy == policy
-                || (!candidate.undecided && candidate.naming >= record.requires)
+        HoldReason::AwaitingCheck if held.same_release => {
+            (held.same_policy && held.possible_naming >= record.requires)
+                || (!held.undecided && held.naming >= record.requires)
         }
         HoldReason::AwaitingCheck => {
-            previous.policy == policy
+            held.same_policy
+                && held.possible_naming >= record.requires
                 && record.permission == lpm_skill::SkillPermission::None.as_str()
         }
-        HoldReason::NeedsPackageName | HoldReason::NeedsSkillName => {
-            candidate.naming >= record.requires
-        }
+        HoldReason::NeedsPackageName | HoldReason::NeedsSkillName => held.naming >= record.requires,
         HoldReason::Invalid
         | HoldReason::Blocked
         | HoldReason::Hooks
         | HoldReason::NameConflict
         | HoldReason::Malware
         | HoldReason::NotCheckable => false,
-    };
-    approved
-        && record.package == candidate.package
-        && reviewed_here(record)
-        && snapshot_digest(project_dir, &candidate.skill).as_deref() == Some(record.digest.as_str())
+    }
 }
 
 /// Whether `record`'s copy may stay under the registry LPM uses now: an
@@ -521,13 +541,13 @@ fn reviewed_here(record: &LinkedSkillRecord) -> bool {
 /// LPM's: a copy kept while its skill is held stays only where it is
 /// linked, and is never linked anywhere new, not even where its link went
 /// missing.
-fn kept_link_intact(project_dir: &Path, target: &str, skill: &str, recorded: Recorded<'_>) -> bool {
-    TargetDir::open(project_dir, target)
+fn kept_link_intact(site: &Site, target: &str, skill: &str, recorded: Recorded<'_>) -> bool {
+    TargetDir::open(site, target)
         .ok()
         .flatten()
         .is_some_and(|directory| {
             directory
-                .inspect(project_dir, skill)
+                .inspect(site, skill)
                 .is_intact(recorded.kind, recorded.digest)
         })
 }
@@ -538,13 +558,13 @@ pub(crate) fn newer_state_warning(reason: &str) -> String {
     format!("{reason}, so this LPM leaves dependency skill links alone; update LPM to manage them")
 }
 
-/// Applies `plan` to the project: writes changed copies, links them into
-/// every target, removes what LPM linked earlier that the plan no longer
-/// wants, keeps the links out of Git, and records the result. `stored` is
-/// the state as read under the project's link lock, which the caller holds
-/// from before it read the policy.
+/// Applies `plan` to `site`: writes changed copies, links them into every
+/// target, removes what LPM linked earlier that the plan no longer wants,
+/// keeps the links out of Git, and records the result. `stored` is the
+/// state as read under the site's link lock, which the caller holds from
+/// before it read the policy.
 pub(crate) fn apply(
-    project_dir: &Path,
+    site: &Site,
     plan: &Plan,
     stored: StoredState,
     inputs: Inputs,
@@ -568,20 +588,21 @@ pub(crate) fn apply(
             return Ok(report);
         }
     };
-    let targets = link_targets(project_dir, plan);
+    let targets = link_targets(site, plan);
     if plan.considered {
         let wanted = plan
             .policy
             .as_ref()
             .map_or(&Targets::Auto, |policy| &policy.targets);
-        for target in unreachable_targets(project_dir, wanted, &targets) {
+        for target in unreachable_targets(site, wanted, &targets) {
             report.warnings.push(format!(
-                "{target} passes through a link, so LPM doesn't link skills into it"
+                "{} passes through a link, so LPM doesn't link skills into it",
+                site.label(&target)
             ));
         }
     }
     let (desired, held) = desired_skills(
-        project_dir,
+        site,
         plan,
         &previous,
         &inputs.policy,
@@ -631,9 +652,9 @@ pub(crate) fn apply(
             Desired::Kept(record) => (record.clone(), None),
             Desired::Fresh(candidate, prepared) => {
                 let digest = &prepared.checked.digest;
-                let copy = snapshot_digest(project_dir, skill);
+                let copy = snapshot_digest(site, skill);
                 if copy.as_deref() != Some(digest.as_str())
-                    && let Err(error) = write_snapshot(project_dir, skill, &prepared.entries)
+                    && let Err(error) = write_snapshot(site, skill, &prepared.entries)
                 {
                     complete = false;
                     report.warnings.push(format!(
@@ -689,7 +710,7 @@ pub(crate) fn apply(
             });
             if kept {
                 if let Some(recorded) = recorded
-                    && kept_link_intact(project_dir, target, skill, recorded)
+                    && kept_link_intact(site, target, skill, recorded)
                 {
                     record.links.push(LinkRecord {
                         path,
@@ -701,9 +722,9 @@ pub(crate) fn apply(
                 continue;
             }
             let outcome = directories
-                .create(project_dir, target, &mut next.created_directories)
+                .create(site, target, &mut next.created_directories)
                 .and_then(|directory| {
-                    link_entry(project_dir, directory, skill, &record.digest, recorded)
+                    link_entry(site, directory, skill, &record.digest, recorded)
                         .map_err(|error| error.to_string())
                 });
             match outcome {
@@ -713,17 +734,19 @@ pub(crate) fn apply(
                         kind,
                         digest: None,
                     });
-                    linked_targets.push(target.clone());
+                    linked_targets.push(site.label(target).into_owned());
                 }
                 Ok(None) => {
                     report.warnings.push(format!(
-                        "{path} already holds a skill LPM didn't link; it was left alone"
+                        "{} already holds a skill LPM didn't link; it was left alone",
+                        site.label(&path)
                     ));
                     record.blocked.push(path);
                 }
                 Err(error) => {
                     report.warnings.push(format!(
-                        "skill `{skill}` could not be linked into {target}: {error}"
+                        "skill `{skill}` could not be linked into {}: {error}",
+                        site.label(target)
                     ));
                     record.blocked.push(path);
                     complete = false;
@@ -750,22 +773,23 @@ pub(crate) fn apply(
     }
 
     remove_stale(
-        project_dir,
+        site,
         &previous,
         &mut next,
         &targets,
         &mut directories,
         &mut report,
     );
-    remove_unused_directories(project_dir, &mut next);
-    sweep(project_dir, |name| next.skills.contains_key(name));
+    remove_unused_directories(site, &mut next);
+    sweep(site, |name| next.skills.contains_key(name));
 
     let entries: Vec<String> = next
         .skills
         .values()
         .flat_map(|record| record.links.iter().map(|link| link.path.clone()))
         .collect();
-    if let ExcludeOutcome::Failed(reason) = sync_exclude_block(project_dir, &entries)
+    if !site.is_global()
+        && let ExcludeOutcome::Failed(reason) = sync_exclude_block(site.base(), &entries)
         && !entries.is_empty()
     {
         report.warnings.push(format!(
@@ -782,10 +806,10 @@ pub(crate) fn apply(
         || !next.stale.is_empty()
         || !next.created_directories.is_empty()
     {
-        write_state(project_dir, &next)?;
+        write_state(site, &next)?;
     } else {
-        remove_state(project_dir)?;
-        remove_root_if_empty(project_dir);
+        remove_state(site)?;
+        remove_root_if_empty(site);
     }
     Ok(report)
 }
@@ -807,29 +831,27 @@ struct TargetDirs {
 impl TargetDirs {
     fn create(
         &mut self,
-        project_dir: &Path,
+        site: &Site,
         target: &str,
         created_directories: &mut Vec<String>,
     ) -> Result<&TargetDir, String> {
         self.created
             .entry(target.to_string())
             .or_insert_with(|| {
-                TargetDir::create(project_dir, target, created_directories)
+                TargetDir::create(site, target, created_directories)
                     .map_err(|error| error.to_string())
             })
             .as_ref()
             .map_err(Clone::clone)
     }
 
-    fn open(&mut self, project_dir: &Path, target: &str) -> Result<Option<&TargetDir>, String> {
+    fn open(&mut self, site: &Site, target: &str) -> Result<Option<&TargetDir>, String> {
         if let Some(Ok(directory)) = self.created.get(target) {
             return Ok(Some(directory));
         }
         self.opened
             .entry(target.to_string())
-            .or_insert_with(|| {
-                TargetDir::open(project_dir, target).map_err(|error| error.to_string())
-            })
+            .or_insert_with(|| TargetDir::open(site, target).map_err(|error| error.to_string()))
             .as_ref()
             .map(Option::as_ref)
             .map_err(Clone::clone)
@@ -844,15 +866,15 @@ impl TargetDirs {
 /// is there, including a marked copy LPM has no record of: matching files
 /// prove nothing about who put them there.
 fn link_entry(
-    project_dir: &Path,
+    site: &Site,
     directory: &TargetDir,
     skill: &str,
     digest: &str,
     recorded: Option<Recorded<'_>>,
 ) -> Result<Option<LinkKind>, LpmError> {
     let recorded_kind = recorded.map(|recorded| recorded.kind);
-    let replaceable = match directory.inspect(project_dir, skill) {
-        TargetEntry::Missing => return directory.link(project_dir, skill, digest).map(Some),
+    let replaceable = match directory.inspect(site, skill) {
+        TargetEntry::Missing => return directory.link(site, skill, digest).map(Some),
         TargetEntry::Link => return Ok(Some(LinkKind::Link)),
         TargetEntry::Copy(found) if found == digest && recorded_kind == Some(LinkKind::Copy) => {
             return Ok(Some(LinkKind::Copy));
@@ -860,22 +882,22 @@ fn link_entry(
         TargetEntry::Placeholder => true,
         TargetEntry::Copy(_) => recorded_kind == Some(LinkKind::Copy),
         TargetEntry::Occupied => {
-            recorded_kind == Some(LinkKind::Link) && directory.is_moved_link(skill)
+            recorded_kind == Some(LinkKind::Link) && directory.is_moved_link(site, skill)
         }
     };
-    if replaceable && directory.remove(project_dir, skill, recorded)? {
-        directory.link(project_dir, skill, digest).map(Some)
+    if replaceable && directory.remove(site, skill, recorded)? {
+        directory.link(site, skill, digest).map(Some)
     } else {
         Ok(None)
     }
 }
 
-/// The target folders reconciling `plan` links into: none when nothing
-/// could link.
-pub(crate) fn link_targets(project_dir: &Path, plan: &Plan) -> Vec<String> {
+/// The target folders reconciling `plan` links into at `site`: none when
+/// nothing could link.
+pub(crate) fn link_targets(site: &Site, plan: &Plan) -> Vec<String> {
     if plan.considered {
         resolve_targets(
-            project_dir,
+            site,
             plan.policy
                 .as_ref()
                 .map_or(&Targets::Auto, |policy| &policy.targets),
@@ -885,27 +907,57 @@ pub(crate) fn link_targets(project_dir: &Path, plan: &Plan) -> Vec<String> {
     }
 }
 
-/// The project-relative directories `targets` names now: `.agents/skills`,
-/// plus `.claude/skills` when the project has a `.claude` directory, or the
-/// explicit list; without any that passes through a link. A skills folder
-/// linked to another one, as projects sharing one folder between agents
-/// do, already shows what LPM links into the folder it points at, and
-/// LPM never writes through links.
-pub(crate) fn resolve_targets(project_dir: &Path, targets: &Targets) -> Vec<String> {
-    target_candidates(project_dir, targets)
+/// The directories relative to `site`'s base that `targets` names now:
+/// `.agents/skills`, plus `.claude/skills` when the base has a `.claude`
+/// directory, or the explicit list. A skills folder linked to another one,
+/// as setups sharing one folder between agents have, already shows what
+/// LPM links into the folder it points at: a project leaves out every
+/// target that passes through a link, as LPM never writes through links a
+/// checkout carries; the home folder, whose links the user made, leaves out
+/// a target that leads where one before it does.
+pub(crate) fn resolve_targets(site: &Site, targets: &Targets) -> Vec<String> {
+    let base = site.base();
+    let candidates = target_candidates(site, targets);
+    if !site.is_global() {
+        return candidates
+            .into_iter()
+            .filter(|target| !passes_through_link(base, target))
+            .collect();
+    }
+    let mut seen = Vec::with_capacity(candidates.len());
+    candidates
         .into_iter()
-        .filter(|target| !passes_through_link(project_dir, target))
+        .filter(|target| {
+            let resolved = home_folder(base, target);
+            if seen.contains(&resolved) {
+                return false;
+            }
+            seen.push(resolved);
+            true
+        })
         .collect()
 }
 
-fn target_candidates(project_dir: &Path, targets: &Targets) -> Vec<String> {
+/// Where `target`, relative to the home folder `base`, leads once the
+/// links the user made on the way are followed, before LPM creates it.
+fn home_folder(base: &Path, target: &str) -> PathBuf {
+    crate::project_fs::resolve_links_with_missing_tail(&super::links::project_path(base, target))
+}
+
+fn target_candidates(site: &Site, targets: &Targets) -> Vec<String> {
     match targets {
         Targets::Explicit(targets) => targets.clone(),
         Targets::Auto => {
             let mut candidates = vec![".agents/skills".to_string()];
-            if std::fs::symlink_metadata(project_dir.join(".claude")).is_ok_and(|metadata| {
-                metadata.is_dir() && !lpm_common::is_symlink_or_junction(&metadata)
-            }) {
+            let claude = site.base().join(".claude");
+            let has_claude = if site.is_global() {
+                std::fs::metadata(claude).is_ok_and(|metadata| metadata.is_dir())
+            } else {
+                std::fs::symlink_metadata(claude).is_ok_and(|metadata| {
+                    metadata.is_dir() && !lpm_common::is_symlink_or_junction(&metadata)
+                })
+            };
+            if has_claude {
                 candidates.push(".claude/skills".to_string());
             }
             candidates
@@ -915,22 +967,22 @@ fn target_candidates(project_dir: &Path, targets: &Targets) -> Vec<String> {
 
 /// The targets [`resolve_targets`] leaves out that don't lead to one it
 /// keeps, so agents reading them don't see what LPM links.
-fn unreachable_targets(project_dir: &Path, targets: &Targets, resolved: &[String]) -> Vec<String> {
-    let mut candidates = target_candidates(project_dir, targets);
+fn unreachable_targets(site: &Site, targets: &Targets, resolved: &[String]) -> Vec<String> {
+    if site.is_global() {
+        return Vec::new();
+    }
+    let base = site.base();
+    let mut candidates = target_candidates(site, targets);
     candidates.retain(|target| !resolved.contains(target));
     if candidates.is_empty() {
         return candidates;
     }
     let kept: Vec<std::path::PathBuf> = resolved
         .iter()
-        .filter_map(|target| {
-            super::links::project_path(project_dir, target)
-                .canonicalize()
-                .ok()
-        })
+        .filter_map(|target| super::links::project_path(base, target).canonicalize().ok())
         .collect();
     candidates.retain(|target| {
-        super::links::project_path(project_dir, target)
+        super::links::project_path(base, target)
             .canonicalize()
             .map_or(true, |path| !kept.contains(&path))
     });
@@ -942,9 +994,12 @@ fn unreachable_targets(project_dir: &Path, targets: &Targets, resolved: &[String
 /// before; a removal that fails again stays recorded for the next
 /// reconcile. Then removes any link in a target directory that points at
 /// an LPM copy of a skill it doesn't hold. Copies are only removed where
-/// recorded, and nothing is reached through a linked directory.
+/// recorded. In a project nothing is reached through a linked directory;
+/// in the home folder, an entry a dropped target reaches through the
+/// user's links that is one `next` holds through a kept target stays, and
+/// only its record goes.
 fn remove_stale(
-    project_dir: &Path,
+    site: &Site,
     previous: &LinkState,
     next: &mut LinkState,
     targets: &[String],
@@ -956,6 +1011,17 @@ fn remove_stale(
         .values()
         .flat_map(|record| record.links.iter().map(|link| link.path.clone()))
         .collect();
+    let held_entry = |path: &str| {
+        let (folder, skill) = path.rsplit_once('/')?;
+        let mut entry = home_folder(site.base(), folder);
+        entry.push(skill);
+        Some(entry)
+    };
+    let held: HashSet<PathBuf> = if site.is_global() {
+        current.iter().filter_map(|path| held_entry(path)).collect()
+    } else {
+        HashSet::new()
+    };
     let mut scanned: BTreeSet<String> = targets.iter().cloned().collect();
     let recorded = previous
         .skills
@@ -971,6 +1037,10 @@ fn remove_stale(
             if current.contains(&link.path) {
                 continue;
             }
+            if !held.is_empty() && held_entry(&link.path).is_some_and(|entry| held.contains(&entry))
+            {
+                continue;
+            }
             let Some((target, _)) = link.path.rsplit_once('/') else {
                 continue;
             };
@@ -982,11 +1052,11 @@ fn remove_stale(
                 digest: digest.map(str::to_string),
                 ..link.clone()
             };
-            let removal = match directories.open(project_dir, target) {
+            let removal = match directories.open(site, target) {
                 Ok(None) => Ok(true),
                 Ok(Some(directory)) => directory
                     .remove(
-                        project_dir,
+                        site,
                         skill,
                         Some(Recorded {
                             kind: link.kind,
@@ -995,23 +1065,25 @@ fn remove_stale(
                     )
                     .map_err(|error| error.to_string()),
                 Err(reason) => {
-                    report
-                        .warnings
-                        .push(format!("{} was left alone for now: {reason}", link.path));
+                    report.warnings.push(format!(
+                        "{} was left alone for now: {reason}",
+                        site.label(&link.path)
+                    ));
                     next.stale.entry(skill.clone()).or_default().push(pending());
                     continue;
                 }
             };
             match removal {
-                Ok(true) => removed_targets.push(target.to_string()),
+                Ok(true) => removed_targets.push(site.label(target).into_owned()),
                 Ok(false) => report.warnings.push(format!(
                     "{} no longer holds LPM's copy of `{skill}`; it was left alone",
-                    link.path
+                    site.label(&link.path)
                 )),
                 Err(error) => {
-                    report
-                        .warnings
-                        .push(format!("{} could not be removed: {error}", link.path));
+                    report.warnings.push(format!(
+                        "{} could not be removed: {error}",
+                        site.label(&link.path)
+                    ));
                     next.stale.entry(skill.clone()).or_default().push(pending());
                 }
             }
@@ -1028,7 +1100,7 @@ fn remove_stale(
         }
     }
     for target in scanned {
-        let Ok(Some(directory)) = directories.open(project_dir, &target) else {
+        let Ok(Some(directory)) = directories.open(site, &target) else {
             continue;
         };
         for name in directory.skill_names() {
@@ -1036,10 +1108,10 @@ fn remove_stale(
                 continue;
             }
             if matches!(
-                directory.inspect(project_dir, &name),
+                directory.inspect(site, &name),
                 TargetEntry::Link | TargetEntry::Placeholder
             ) {
-                let _ = directory.remove(project_dir, &name, None);
+                let _ = directory.remove(site, &name, None);
             }
         }
     }
@@ -1047,7 +1119,7 @@ fn remove_stale(
 
 /// Removes the directories LPM created that no link uses any more, deepest
 /// first, when they are empty.
-fn remove_unused_directories(project_dir: &Path, next: &mut LinkState) {
+fn remove_unused_directories(site: &Site, next: &mut LinkState) {
     let in_use: Vec<&str> = next
         .skills
         .values()
@@ -1060,7 +1132,7 @@ fn remove_unused_directories(project_dir: &Path, next: &mut LinkState) {
     for directory in directories {
         let prefix = format!("{directory}/");
         let used = in_use.iter().any(|path| path.starts_with(&prefix));
-        if used || !remove_if_empty(project_dir, &directory) {
+        if used || !remove_if_empty(site, &directory) {
             kept.push(directory);
         }
     }
@@ -1125,6 +1197,41 @@ mod tests {
             installs: BTreeMap::from([("tool".to_string(), installs)]),
             ..Plan::default()
         }
+    }
+
+    #[test]
+    fn a_held_grant_recorded_before_it_needed_its_skill_named_stays_only_once_the_policy_names_it()
+    {
+        let mut migrated = record(lpm_skill::SkillPermission::Broad);
+        migrated.requires = Naming::Skill;
+        let held = |naming| HeldCandidate {
+            same_policy: true,
+            same_release: false,
+            undecided: false,
+            naming,
+            possible_naming: naming,
+        };
+        for reason in [
+            HoldReason::NotReviewed,
+            HoldReason::NeedsData,
+            HoldReason::Unreadable,
+            HoldReason::AwaitingCheck,
+        ] {
+            assert!(
+                !policy_keeps_copy(reason, &migrated, held(Naming::Package)),
+                "{reason:?}"
+            );
+        }
+        assert!(policy_keeps_copy(
+            HoldReason::NotReviewed,
+            &migrated,
+            held(Naming::Skill)
+        ));
+        assert!(policy_keeps_copy(
+            HoldReason::NotReviewed,
+            &record(lpm_skill::SkillPermission::None),
+            held(Naming::Package)
+        ));
     }
 
     #[test]
@@ -1268,14 +1375,24 @@ mod tests {
             serde_json::json!({ "skill": "deploy", "digest": incoming }).to_string(),
         )
         .unwrap();
-        let directory =
-            TargetDir::create(project.path(), ".agents/skills", &mut Vec::new()).unwrap();
+        let directory = TargetDir::create(
+            &Site::project(project.path()),
+            ".agents/skills",
+            &mut Vec::new(),
+        )
+        .unwrap();
         let older = Recorded {
             kind: LinkKind::Copy,
             digest: "sha256:the-copy-lpm-linked-before",
         };
 
-        let linked = link_entry(project.path(), &directory, "deploy", &incoming, Some(older));
+        let linked = link_entry(
+            &Site::project(project.path()),
+            &directory,
+            "deploy",
+            &incoming,
+            Some(older),
+        );
 
         assert!(matches!(linked, Ok(Some(LinkKind::Copy))), "{linked:?}");
         assert_eq!(

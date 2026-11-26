@@ -184,6 +184,12 @@ pub async fn run(
         // next run.
         crate::commands::global::run_opportunistic_sweep(&root);
 
+        let skills = if overrides.no_skills {
+            crate::dependency_skills::ReconcileReport::default()
+        } else {
+            crate::dependency_skills::reconcile_after_global_change(Some(&registry)).await
+        };
+
         // ─── Step 5: PATH onboarding hint ──────────────────────
         // Idempotent: at most one banner per host. The helper handles
         // marker stickiness and JSON-mode silence internally; we just
@@ -192,7 +198,7 @@ pub async fn run(
         let hint = crate::path_onboarding::maybe_show_path_hint(&root, json_output);
 
         // ─── Output ────────────────────────────────────────────────────
-        print_success(&active, &hint, &firewall_bypassed, json_output);
+        print_success(&active, &hint, &firewall_bypassed, &skills, json_output);
 
         // ─── Step 6: post-install blocked-scripts warning ──────
         // Mirrors the project-level post-install security summary

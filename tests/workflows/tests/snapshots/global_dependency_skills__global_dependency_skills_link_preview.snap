@@ -1,0 +1,31 @@
+---
+source: tests/workflows/tests/global_dependency_skills.rs
+expression: link_preview
+---
+{
+  "success": true,
+  "dry_run": true,
+  "action": "link",
+  "skills": [
+    {
+      "skill": "browser-tool",
+      "package": "browser-tool",
+      "version": "1.0.0",
+      "status": "allowed",
+      "change": "link",
+      "reason": null,
+      "detail": null,
+      "description": "Guidance for driving the browser-tool tool.",
+      "hidden": false,
+      "allowed_tools": [],
+      "permission": "none",
+      "warnings": 0,
+      "review_warning": null,
+      "suggested_selector": "#browser-tool",
+      "links": []
+    }
+  ],
+  "added": [
+    "#browser-tool"
+  ]
+}

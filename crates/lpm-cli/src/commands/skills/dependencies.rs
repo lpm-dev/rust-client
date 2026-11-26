@@ -1,10 +1,11 @@
 //! `lpm skills deps`, `link`, `unlink` and `sync`: the skills installed
-//! dependencies ship, and the project policy that links them for agents.
+//! dependencies ship, and the policy that links them for agents: the
+//! project's, or with `--global` the one for the user's global packages.
 
 use super::{plural, require_confirmation};
 use crate::dependency_skills::{
-    InspectedSkill, Inspection, InstanceRuling, ManifestEdit, PlannedChange, PolicyList,
-    ReconcileReport, Settings, SkillDetails, SkillStatus,
+    InspectedSkill, Inspection, InstanceRuling, PlannedChange, PolicyList, ReconcileReport, Scope,
+    Settings, SkillDetails, SkillStatus,
 };
 use crate::install_ui;
 use crate::lpm_skills_config::LpmSkillsPreference;
@@ -18,6 +19,10 @@ pub struct DepsArgs {
     /// Show only the skills of this package, or the skills with this name.
     #[arg(value_name = "NAME")]
     pub name: Option<String>,
+    /// The skills of your global packages, under the global skills policy,
+    /// linked into the agent folders in your home folder.
+    #[arg(short = 'g', long)]
+    pub global: bool,
 }
 
 #[derive(Debug, Args, Default)]
@@ -33,6 +38,10 @@ pub struct LinkArgs {
     /// Confirm a non-interactive change.
     #[arg(short = 'y', long)]
     pub yes: bool,
+    /// The skills of your global packages, under the global skills policy,
+    /// linked into the agent folders in your home folder.
+    #[arg(short = 'g', long)]
+    pub global: bool,
 }
 
 #[derive(Debug, Args, Default)]
@@ -52,6 +61,10 @@ pub struct UnlinkArgs {
     /// Confirm a non-interactive change.
     #[arg(short = 'y', long)]
     pub yes: bool,
+    /// The skills of your global packages, under the global skills policy,
+    /// linked into the agent folders in your home folder.
+    #[arg(short = 'g', long)]
+    pub global: bool,
 }
 
 #[derive(Debug, Args, Default)]
@@ -60,6 +73,10 @@ pub struct SyncArgs {
     /// without changing files.
     #[arg(long)]
     pub check: bool,
+    /// The skills of your global packages, under the global skills policy,
+    /// linked into the agent folders in your home folder.
+    #[arg(short = 'g', long)]
+    pub global: bool,
 }
 
 fn settings() -> Result<Settings, LpmError> {
@@ -75,10 +92,11 @@ fn settings() -> Result<Settings, LpmError> {
 }
 
 pub(super) fn deps(project_dir: &Path, args: &DepsArgs, json_output: bool) -> Result<(), LpmError> {
-    let root = crate::dependency_skills::skills_root(project_dir);
+    let scope = Scope::resolve(project_dir, args.global)?;
     let settings = settings()?;
-    let manifest = crate::dependency_skills::read_manifest(&root)?;
-    let mut inspection = crate::dependency_skills::inspect_project(&root, &manifest, settings)?;
+    let mut inspection = scope
+        .inspector(settings)
+        .under(&scope.document()?, settings)?;
     if let Some(name) = &args.name {
         inspection
             .skills
@@ -87,33 +105,55 @@ pub(super) fn deps(project_dir: &Path, args: &DepsArgs, json_output: bool) -> Re
     if json_output {
         println!(
             "{}",
-            serde_json::to_string_pretty(&inspection_json(&root, &inspection)).unwrap()
+            serde_json::to_string_pretty(&inspection_json(&scope, &inspection)).unwrap()
         );
         return Ok(());
     }
-    print_inspection(&inspection);
+    print_inspection(&scope, &inspection);
     Ok(())
 }
 
-fn inspection_json(root: &Path, inspection: &Inspection) -> serde_json::Value {
-    serde_json::json!({
-        "success": true,
-        "project": root.display().to_string(),
-        "enabled": inspection.other_packages,
-        "policy": {
+fn inspection_json(scope: &Scope, inspection: &Inspection) -> serde_json::Value {
+    let mut report = serde_json::Map::with_capacity(9);
+    report.insert("success".into(), serde_json::json!(true));
+    match scope {
+        Scope::Project(root) => {
+            report.insert(
+                "project".into(),
+                serde_json::json!(root.display().to_string()),
+            );
+        }
+        Scope::Global(_) => {
+            report.insert("global".into(), serde_json::json!(true));
+        }
+    }
+    report.insert(
+        "enabled".into(),
+        serde_json::json!(inspection.other_packages),
+    );
+    report.insert(
+        "policy".into(),
+        serde_json::json!({
             "allow": inspection.allow,
             "deny": inspection.deny,
             "targets": inspection.targets,
-        },
-        "problems": inspection.problems,
-        "unlisted": inspection
+        }),
+    );
+    report.insert("problems".into(), serde_json::json!(inspection.problems));
+    report.insert(
+        "unlisted".into(),
+        inspection
             .unlisted
             .iter()
             .map(|(package, detail)| serde_json::json!({ "package": package, "detail": detail }))
-            .collect::<Vec<_>>(),
-        "count": inspection.skills.len(),
-        "skills": inspection.skills.iter().map(skill_json).collect::<Vec<_>>(),
-    })
+            .collect(),
+    );
+    report.insert("count".into(), serde_json::json!(inspection.skills.len()));
+    report.insert(
+        "skills".into(),
+        inspection.skills.iter().map(skill_json).collect(),
+    );
+    serde_json::Value::Object(report)
 }
 
 fn skill_json(skill: &InspectedSkill) -> serde_json::Value {
@@ -142,9 +182,13 @@ fn skill_json(skill: &InspectedSkill) -> serde_json::Value {
     })
 }
 
-fn print_inspection(inspection: &Inspection) {
+fn print_inspection(scope: &Scope, inspection: &Inspection) {
     if inspection.skills.is_empty() {
-        crate::output::info("No installed dependency ships a skills/<name>/SKILL.md directory");
+        crate::output::info(if scope.is_global() {
+            "No global package ships a skills/<name>/SKILL.md directory"
+        } else {
+            "No installed dependency ships a skills/<name>/SKILL.md directory"
+        });
     } else {
         let mut table = install_ui::Table::new();
         for skill in &inspection.skills {
@@ -188,7 +232,8 @@ fn print_inspection(inspection: &Inspection) {
     }) {
         let selector = &skill.details.as_ref().expect("checked above").suggested;
         install_ui::detail_line(crate::install_ui::terminal_line!(
-            "  Link one with: lpm skills link '{}'",
+            "  Link one with: lpm skills link{} '{}'",
+            scope.flag(),
             selector
         ));
     }
@@ -248,46 +293,55 @@ fn permission_summary(permission: SkillPermission, tools: &[String]) -> String {
 }
 
 pub(super) async fn link(
+    client: &lpm_registry::RegistryClient,
     project_dir: &Path,
     args: LinkArgs,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let root = crate::dependency_skills::skills_root(project_dir);
+    let scope = Scope::resolve(project_dir, args.global)?;
     let settings = settings()?;
-    crate::dependency_skills::ensure_links_are_ours(&root)?;
+    scope.ensure_links_are_ours()?;
     let mut selectors = args
         .selectors
         .iter()
         .map(|text| crate::dependency_skills::validate_selector(text).map_err(LpmError::Registry))
         .collect::<Result<Vec<_>, _>>()?;
     if selectors.is_empty() {
-        selectors = pick_selectors(&root, settings, json_output)?;
+        selectors = pick_selectors(&scope, settings, json_output)?;
         if selectors.is_empty() {
             return Ok(());
         }
     }
 
-    let mut edit = ManifestEdit::read(&root)?;
+    let mut edit = scope.edit()?;
     let before = edit.value.clone();
     let added = edit.add(PolicyList::Allow, &selectors)?;
-    let inspector = crate::dependency_skills::Inspector::new(&root, settings);
-    let preview = inspector.project(&edit.value, settings)?;
+    let fetches = scope.lpm_dev_sets_to_fetch(&edit.value, settings);
+    let inspector = scope.inspector(settings);
+    let preview = inspector.under(&edit.value, settings)?;
     let changes = previewed_changes(&preview);
+    let previewed = PolicyPreview {
+        action: "link",
+        removed_or_added: &added,
+        denied: &[],
+        changes: &changes,
+        fetches: &fetches,
+    };
     if args.dry_run {
-        print_policy_preview(json_output, "link", &added, &[], &changes);
+        print_policy_preview(json_output, &previewed);
         return Ok(());
     }
     if !json_output {
-        print_policy_preview(false, "link", &added, &[], &changes);
+        print_policy_preview(false, &previewed);
     }
     if !added.is_empty() {
         let grants = if args.yes || !super::is_interactive(json_output) {
             0
         } else {
-            new_grants(&inspector.project(&before, settings)?, &preview)
+            new_grants(&inspector.under(&before, settings)?, &preview)
         };
         let prompt = if grants == 0 {
-            "Allow these skills for agents in package.json?".to_string()
+            format!("Allow these skills for agents in {}?", scope.policy_file())
         } else {
             grants_prompt(grants)
         };
@@ -295,12 +349,14 @@ pub(super) async fn link(
             args.yes,
             json_output,
             "lpm skills link",
-            format!("allow {} in package.json", added.join(", ")),
+            format!("allow {} in {}", added.join(", "), scope.policy_file()),
             &prompt,
         )?;
     }
-    let report = write_and_reconcile(&root, &edit, !added.is_empty(), settings).await?;
-    print_mutation_result(json_output, &added, &[], &report, settings);
+    let report = scope
+        .write_and_reconcile(&edit, !added.is_empty(), settings, Some(client))
+        .await?;
+    print_mutation_result(&scope, json_output, &added, &[], &report, settings);
     Ok(())
 }
 
@@ -340,48 +396,29 @@ fn new_grants(before: &Inspection, after: &Inspection) -> usize {
         .count()
 }
 
-/// Writes `edit` when `changed`, and reconciles the links, inside the
-/// project's install transaction: the write refuses a manifest that changed
-/// since the edit read it, and nothing else writes it until the links match.
-async fn write_and_reconcile(
-    root: &Path,
-    edit: &ManifestEdit,
-    changed: bool,
-    settings: Settings,
-) -> Result<ReconcileReport, LpmError> {
-    crate::commands::trust::scope_project_policy_mutation(root, async {
-        crate::dependency_skills::ensure_links_are_ours(root)?;
-        if changed {
-            edit.write()?;
-        }
-        crate::dependency_skills::reconcile_now(root, settings)
-    })
-    .await
-}
-
 pub(super) async fn unlink(
     project_dir: &Path,
     args: UnlinkArgs,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let root = crate::dependency_skills::skills_root(project_dir);
+    let scope = Scope::resolve(project_dir, args.global)?;
     let settings = settings()?;
-    crate::dependency_skills::ensure_links_are_ours(&root)?;
+    scope.ensure_links_are_ours()?;
     let selectors = args
         .selectors
         .iter()
         .map(|text| crate::dependency_skills::validate_selector(text).map_err(LpmError::Registry))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut edit = ManifestEdit::read(&root)?;
+    let mut edit = scope.edit()?;
     let shared = Settings {
         lpm_dev_packages: true,
         other_packages: true,
         ..settings
     };
-    let inspector = crate::dependency_skills::Inspector::new(&root, settings);
+    let inspector = scope.inspector(settings);
     let (removed, denied) = if args.all {
         let removed = edit.clear(PolicyList::Allow);
-        let remaining = inspector.project(&edit.value, shared)?;
+        let remaining = inspector.under(&edit.value, shared)?;
         let still_linked: Vec<String> = linked_after(&remaining)
             .into_iter()
             .map(|outcome| format!("#{}", outcome.package))
@@ -400,7 +437,7 @@ pub(super) async fn unlink(
             .iter()
             .filter_map(|text| crate::dependency_skills::validate_selector(text).ok())
             .collect();
-        let remaining = inspector.project(&edit.value, shared)?;
+        let remaining = inspector.under(&edit.value, shared)?;
         let linked = linked_after(&remaining);
         let mut deny = Vec::with_capacity(selectors.len());
         for selector in selectors {
@@ -409,7 +446,7 @@ pub(super) async fn unlink(
                 || {
                     let mut trial = edit.clone();
                     trial.add(PolicyList::Deny, std::slice::from_ref(&selector))?;
-                    linked_after(&inspector.project(&trial.value, shared)?) != linked
+                    linked_after(&inspector.under(&trial.value, shared)?) != linked
                 }
             {
                 deny.push(selector);
@@ -418,14 +455,21 @@ pub(super) async fn unlink(
         let denied = edit.add(PolicyList::Deny, &deny)?;
         (removed, denied)
     };
-    let preview = inspector.project(&edit.value, settings)?;
+    let preview = inspector.under(&edit.value, settings)?;
     let changes = previewed_changes(&preview);
+    let previewed = PolicyPreview {
+        action: "unlink",
+        removed_or_added: &removed,
+        denied: &denied,
+        changes: &changes,
+        fetches: &[],
+    };
     if args.dry_run {
-        print_policy_preview(json_output, "unlink", &removed, &denied, &changes);
+        print_policy_preview(json_output, &previewed);
         return Ok(());
     }
     if !json_output {
-        print_policy_preview(false, "unlink", &removed, &denied, &changes);
+        print_policy_preview(false, &previewed);
     }
     let changed = !removed.is_empty() || !denied.is_empty();
     if changed {
@@ -433,20 +477,27 @@ pub(super) async fn unlink(
             args.yes,
             json_output,
             "lpm skills unlink",
-            "change the skills policy in package.json".into(),
+            format!("change the skills policy in {}", scope.policy_file()),
             "Stop linking these skills for agents?",
         )?;
     }
-    let report = write_and_reconcile(&root, &edit, changed, settings).await?;
-    print_mutation_result(json_output, &removed, &denied, &report, settings);
+    let report = scope
+        .write_and_reconcile(&edit, changed, settings, None)
+        .await?;
+    print_mutation_result(&scope, json_output, &removed, &denied, &report, settings);
     Ok(())
 }
 
-pub(super) fn sync(project_dir: &Path, args: &SyncArgs, json_output: bool) -> Result<(), LpmError> {
-    let root = crate::dependency_skills::skills_root(project_dir);
+pub(super) async fn sync(
+    client: &lpm_registry::RegistryClient,
+    project_dir: &Path,
+    args: &SyncArgs,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let scope = Scope::resolve(project_dir, args.global)?;
     let settings = settings()?;
     if args.check {
-        let differences = crate::dependency_skills::drift(&root, settings)?;
+        let differences = scope.drift(settings)?;
         if json_output {
             println!(
                 "{}",
@@ -464,20 +515,25 @@ pub(super) fn sync(project_dir: &Path, args: &SyncArgs, json_output: bool) -> Re
             };
         }
         if differences.is_empty() {
-            install_ui::done("Dependency skill links match the project's policy");
+            install_ui::done(if scope.is_global() {
+                "Dependency skill links match the global skills policy"
+            } else {
+                "Dependency skill links match the project's policy"
+            });
             return Ok(());
         }
         for difference in &differences {
             install_ui::warn_untrusted(difference);
         }
         return Err(LpmError::Script(format!(
-            "{} dependency skill {} out of date; run `lpm skills sync`",
+            "{} dependency skill {} out of date; run `lpm skills sync{}`",
             differences.len(),
-            plural(differences.len(), "link is", "links are")
+            plural(differences.len(), "link is", "links are"),
+            scope.flag()
         )));
     }
-    let report = crate::dependency_skills::reconcile_now(&root, settings)?;
-    print_mutation_result(json_output, &[], &[], &report, settings);
+    let report = scope.sync(settings, client).await?;
+    print_mutation_result(&scope, json_output, &[], &[], &report, settings);
     Ok(())
 }
 
@@ -485,17 +541,19 @@ pub(super) fn sync(project_dir: &Path, args: &SyncArgs, json_output: bool) -> Re
 /// doesn't link yet; returns `#<package>:skill(<name>)` for each, so a pick
 /// links that skill and none the package adds later.
 fn pick_selectors(
-    root: &Path,
+    scope: &Scope,
     settings: Settings,
     json_output: bool,
 ) -> Result<Vec<String>, LpmError> {
     if !super::is_interactive(json_output) {
-        return Err(LpmError::Registry(
-            "pass a selector, such as `lpm skills link '#agent-browser'`; `lpm skills deps` lists the skills installed packages ship".into(),
-        ));
+        let flag = scope.flag();
+        return Err(LpmError::Registry(format!(
+            "pass a selector, such as `lpm skills link{flag} '#agent-browser'`; `lpm skills deps{flag}` lists the skills installed packages ship"
+        )));
     }
-    let manifest = crate::dependency_skills::read_manifest(root)?;
-    let inspection = crate::dependency_skills::inspect_project(root, &manifest, settings)?;
+    let inspection = scope
+        .inspector(settings)
+        .under(&scope.document()?, settings)?;
     print_problems(&inspection);
     let choices = pickable(&inspection.skills);
     for skill in inspection
@@ -511,10 +569,13 @@ fn pick_selectors(
             skill.detail.as_deref().unwrap_or_default()
         ));
     }
-    if choices.is_empty() {
-        crate::output::info(
-            "No direct dependency ships a skill this project could link and doesn't yet; name others with `lpm skills link '#<package>'`",
-        );
+    let unfetched = scope.lpm_dev_packages_without_sets(settings);
+    if choices.is_empty() && unfetched.is_empty() {
+        crate::output::info(if scope.is_global() {
+            "No global package ships a skill LPM could link and doesn't yet; name others with `lpm skills link --global '#<package>'`"
+        } else {
+            "No direct dependency ships a skill this project could link and doesn't yet; name others with `lpm skills link '#<package>'`"
+        });
         return Ok(Vec::new());
     }
     let mut prompt =
@@ -534,10 +595,23 @@ fn pick_selectors(
             )),
         );
     }
+    for (offset, (package, version)) in unfetched.iter().enumerate() {
+        prompt = prompt.item(
+            choices.len() + offset,
+            crate::prompt::untrusted(format!("#{package}  ({package}@{version})")),
+            crate::prompt::untrusted(
+                "LPM.dev reviewed skills, fetched once you confirm; links each that needs no more specific entry"
+                    .to_string(),
+            ),
+        );
+    }
     let picked: Vec<usize> = prompt.interact().map_err(crate::prompt::prompt_err)?;
     let mut selectors: Vec<String> = Vec::with_capacity(picked.len());
     for index in picked {
-        let selector = skill_selector(&choices[index].package, &choices[index].skill);
+        let selector = match choices.get(index) {
+            Some(choice) => skill_selector(&choice.package, &choice.skill),
+            None => format!("#{}", unfetched[index - choices.len()].0),
+        };
         if !selectors.contains(&selector) {
             selectors.push(selector);
         }
@@ -617,13 +691,26 @@ fn previewed_changes(preview: &Inspection) -> Vec<InspectedSkill> {
         .collect()
 }
 
-fn print_policy_preview(
-    json_output: bool,
-    action: &str,
-    removed_or_added: &[String],
-    denied: &[String],
-    changes: &[InspectedSkill],
-) {
+/// What a policy change would do, as a dry run or the confirmation
+/// prompt shows it.
+struct PolicyPreview<'a> {
+    action: &'static str,
+    removed_or_added: &'a [String],
+    denied: &'a [String],
+    changes: &'a [InspectedSkill],
+    /// The LPM.dev packages, by name and version, whose reviewed skills
+    /// applying fetches before deciding what links from them.
+    fetches: &'a [(String, String)],
+}
+
+fn print_policy_preview(json_output: bool, preview: &PolicyPreview<'_>) {
+    let PolicyPreview {
+        action,
+        removed_or_added,
+        denied,
+        changes,
+        fetches,
+    } = *preview;
     if json_output {
         let mut report = serde_json::json!({
             "success": true,
@@ -631,6 +718,12 @@ fn print_policy_preview(
             "action": action,
             "skills": changes.iter().map(skill_json).collect::<Vec<_>>(),
         });
+        if !fetches.is_empty() {
+            report["fetches"] = fetches
+                .iter()
+                .map(|(package, version)| serde_json::json!({ "package": package, "version": version }))
+                .collect();
+        }
         if action == "link" {
             report["added"] = serde_json::json!(removed_or_added);
         } else {
@@ -649,6 +742,13 @@ fn print_policy_preview(
     }
     for entry in denied {
         install_ui::detail_line(crate::install_ui::terminal_line!("  deny {}", entry));
+    }
+    for (package, version) in fetches {
+        install_ui::detail_line(crate::install_ui::terminal_line!(
+            "  fetch the reviewed skills of {}@{} from LPM.dev, then link what the policy allows from them",
+            package,
+            version
+        ));
     }
     for skill in changes {
         let Some(change) = skill.change else {
@@ -692,6 +792,7 @@ fn print_policy_preview(
 }
 
 fn print_mutation_result(
+    scope: &Scope,
     json_output: bool,
     changed: &[String],
     denied: &[String],
@@ -717,7 +818,11 @@ fn print_mutation_result(
             "npm and other package skills are turned off for you, so their entries link nothing until you turn them on with `lpm config npm-skills --set true`",
         );
     } else if report.is_quiet() {
-        install_ui::done("Dependency skill links already match the project's policy");
+        install_ui::done(if scope.is_global() {
+            "Dependency skill links already match the global skills policy"
+        } else {
+            "Dependency skill links already match the project's policy"
+        });
     }
 }
 

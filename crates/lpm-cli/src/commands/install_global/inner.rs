@@ -29,6 +29,8 @@ pub struct InstallGlobalOverrides {
     pub advisor_override: Option<String>,
     pub strict_sandbox: bool,
     pub no_sandbox: bool,
+    /// Leave the global packages' dependency-skill links alone this run.
+    pub no_skills: bool,
 }
 
 pub(super) async fn do_install(

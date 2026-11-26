@@ -128,6 +128,56 @@ impl GlobalInstallsDirectory {
     }
 }
 
+/// Opens LPM's global folder, `global` in the LPM home, as global installs
+/// open it: never through a link in place of the home or the folder.
+/// `Ok(None)` when either doesn't exist yet.
+pub fn open_global_directory(root: &LpmRoot) -> Result<Option<cap_std::fs::Dir>, LpmError> {
+    match std::fs::symlink_metadata(root.root()) {
+        Ok(metadata) if crate::is_symlink_or_junction(&metadata) || !metadata.is_dir() => {
+            return Err(LpmError::Io(std::io::Error::other(format!(
+                "refusing LPM home directory that is not a real directory: {}",
+                root.root().display()
+            ))));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(contextual_io_error(
+                error,
+                "LPM home directory",
+                root.root(),
+                "inspect",
+            ));
+        }
+    }
+    let home = cap_std::fs::Dir::open_ambient_dir(root.root(), cap_std::ambient_authority())
+        .map_err(|error| contextual_io_error(error, "LPM home directory", root.root(), "open"))?;
+    match home.open_dir_nofollow(Path::new("global")) {
+        Ok(global) => Ok(Some(global)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(contextual_io_error(
+            error,
+            "global install directory",
+            &root.global_root(),
+            "open without following filesystem links",
+        )),
+    }
+}
+
+/// [`open_global_directory`], creating the LPM home and its global folder
+/// when missing.
+pub fn open_or_create_global_directory(root: &LpmRoot) -> Result<cap_std::fs::Dir, LpmError> {
+    ensure_real_lpm_home(root)?;
+    let home = cap_std::fs::Dir::open_ambient_dir(root.root(), cap_std::ambient_authority())
+        .map_err(|error| contextual_io_error(error, "LPM home directory", root.root(), "open"))?;
+    open_or_create_directory(
+        &home,
+        OsStr::new("global"),
+        &root.global_root(),
+        "global install directory",
+    )
+}
+
 fn ensure_real_lpm_home(root: &LpmRoot) -> Result<(), LpmError> {
     match std::fs::symlink_metadata(root.root()) {
         Ok(metadata) if crate::is_symlink_or_junction(&metadata) || !metadata.is_dir() => {
@@ -265,6 +315,38 @@ mod tests {
     use super::GlobalStateDirectories;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn the_global_folder_opens_only_once_it_exists() {
+        let parent = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(parent.path().join("lpm-home"));
+
+        assert!(super::open_global_directory(&root).unwrap().is_none());
+        super::open_or_create_global_directory(&root).unwrap();
+        assert!(root.global_root().is_dir());
+        assert!(super::open_global_directory(&root).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_global_folder_never_opens_through_a_link() {
+        let home = TempDir::new().unwrap();
+        let victim = TempDir::new().unwrap();
+        symlink(victim.path(), home.path().join("global")).unwrap();
+        let root = LpmRoot::from_dir(home.path());
+
+        let opened = super::open_global_directory(&root).unwrap_err();
+        let created = super::open_or_create_global_directory(&root).unwrap_err();
+
+        for error in [opened, created] {
+            assert!(
+                error
+                    .to_string()
+                    .contains("open without following filesystem links"),
+                "{error}"
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[test]

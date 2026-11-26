@@ -3155,6 +3155,24 @@ impl MockRegistry {
             .count()
     }
 
+    /// How many times the package-published skills of LPM.dev package
+    /// `name` were requested.
+    pub async fn package_skills_request_count(&self, name: &str) -> usize {
+        self.server()
+            .received_requests()
+            .await
+            .expect("wiremock request log must be available")
+            .into_iter()
+            .filter(|request| {
+                request.url.path() == "/api/registry/skills"
+                    && request
+                        .url
+                        .query_pairs()
+                        .any(|(key, value)| key == "name" && value == name)
+            })
+            .count()
+    }
+
     pub fn register_tarball_bytes(&self, name: &str, version: &str, tarball_bytes: &[u8]) {
         self.register_tarball_integrity(name, version, compute_integrity(tarball_bytes));
     }

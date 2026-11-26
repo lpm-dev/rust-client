@@ -158,40 +158,8 @@ async fn install_skills_for_packages(
     project_dir: &Path,
     json_output: bool,
 ) -> Vec<String> {
-    let fetched = futures::future::join_all(packages.iter().map(|(package, version)| {
-        let short_name = package.strip_prefix("@lpm.dev/").unwrap_or(package);
-        async move {
-            let skills = fetch_package_skills(client, short_name, version).await;
-            (short_name, *version, skills)
-        }
-    }))
-    .await;
-
-    let mut total_installed = 0usize;
-    let mut warnings = Vec::new();
-    for (short_name, version, skills) in fetched {
-        let label = format!("@lpm.dev/{short_name}@{version}");
-        let installed = skills.and_then(|response| {
-            crate::commands::skills::package::materialize(
-                project_dir,
-                short_name,
-                Some(version),
-                &response.skills,
-                &response.skill_directories,
-            )
-            .map_err(|error| {
-                format!(
-                    "package skills for {label} could not be written: {}",
-                    crate::commands::skills::warning_detail(&error)
-                )
-            })
-        });
-        match installed {
-            Ok(result) => total_installed += result.installed,
-            Err(warning) => warnings.push(warning),
-        }
-    }
-
+    let (total_installed, warnings) =
+        materialize_package_skills(client, packages, project_dir).await;
     if !json_output {
         if total_installed > 0 || warnings.is_empty() {
             output::info(&format!(
@@ -205,36 +173,149 @@ async fn install_skills_for_packages(
     warnings
 }
 
+/// Fetches and writes the package-published skills of `packages`, by full
+/// name and version, into `project_dir`'s `.lpm/skills`, printing nothing.
+/// Returns how many skills were written and a warning for each package
+/// whose skills couldn't be fetched, aren't offered, or couldn't be
+/// written; that package keeps the skills it had.
+async fn materialize_package_skills(
+    client: &RegistryClient,
+    packages: &[(&str, &str)],
+    project_dir: &Path,
+) -> (usize, Vec<String>) {
+    let mut total_installed = 0usize;
+    let mut warnings = Vec::new();
+    for fetched in fetch_published_skills(client, packages).await {
+        match fetched.write(project_dir) {
+            Ok(installed) => total_installed += installed,
+            Err(warning) => warnings.push(warning),
+        }
+    }
+    (total_installed, warnings)
+}
+
+/// One LPM.dev package's published skills as the registry answered for
+/// its version, checked but not written yet, or why there are none to
+/// write.
+pub(crate) struct FetchedPackageSkills {
+    short_name: String,
+    version: String,
+    response: Result<lpm_registry::SkillsResponse, String>,
+    /// Why the registry said it offers no skills for this version, when it
+    /// answered so.
+    refusal: Option<crate::commands::skills::package::SkillsUnavailable>,
+}
+
+impl FetchedPackageSkills {
+    /// Records the registry's answer that it offers no skills for this
+    /// version, when it gave one, so later runs needn't ask again yet.
+    pub(crate) fn record_refusal(&self) -> Result<(), LpmError> {
+        match self.refusal {
+            Some(refusal) => crate::commands::skills::reviews::write_refusal(
+                &self.short_name,
+                &self.version,
+                refusal == crate::commands::skills::package::SkillsUnavailable::UnderReview,
+            ),
+            None => Ok(()),
+        }
+    }
+
+    /// Writes the skills into `project_dir`'s `.lpm/skills` and returns how
+    /// many were written, or the warning that says why the package keeps
+    /// the skills it had.
+    pub(crate) fn write(self, project_dir: &Path) -> Result<usize, String> {
+        let response = self.response?;
+        crate::commands::skills::package::materialize(
+            project_dir,
+            &self.short_name,
+            Some(&self.version),
+            &response.skills,
+            &response.skill_directories,
+        )
+        .map(|result| result.installed)
+        .map_err(|error| {
+            format!(
+                "package skills for @lpm.dev/{}@{} could not be written: {}",
+                self.short_name,
+                self.version,
+                crate::commands::skills::warning_detail(&error)
+            )
+        })
+    }
+}
+
+/// Fetches the package-published skills of `packages`, by full name and
+/// version, concurrently and in their order, writing nothing.
+pub(crate) async fn fetch_published_skills(
+    client: &RegistryClient,
+    packages: &[(&str, &str)],
+) -> Vec<FetchedPackageSkills> {
+    futures::future::join_all(packages.iter().map(|(package, version)| {
+        let short_name = package.strip_prefix("@lpm.dev/").unwrap_or(package);
+        async move {
+            let (response, refusal) = match fetch_package_skills(client, short_name, version).await
+            {
+                Ok(response) => (Ok(response), None),
+                Err((warning, refusal)) => (Err(warning), refusal),
+            };
+            FetchedPackageSkills {
+                short_name: short_name.to_owned(),
+                version: (*version).to_owned(),
+                response,
+                refusal,
+            }
+        }
+    }))
+    .await
+}
+
+/// One package's published skills, or the warning that says why there are
+/// none to write, with the registry's reason when it said it offers none.
 async fn fetch_package_skills(
     client: &RegistryClient,
     short_name: &str,
     version: &str,
-) -> Result<lpm_registry::SkillsResponse, String> {
+) -> Result<
+    lpm_registry::SkillsResponse,
+    (
+        String,
+        Option<crate::commands::skills::package::SkillsUnavailable>,
+    ),
+> {
     let label = format!("@lpm.dev/{short_name}@{version}");
     let response = client
         .get_skills(short_name, Some(version))
         .await
         .map_err(|error| {
-            format!(
-                "package skills for {label} could not be fetched: {}; existing skills were kept",
-                crate::commands::skills::warning_detail(&error)
+            (
+                format!(
+                    "package skills for {label} could not be fetched: {}; existing skills were kept",
+                    crate::commands::skills::warning_detail(&error)
+                ),
+                None,
             )
         })?;
     crate::commands::skills::package::answers_for(&response, short_name, Some(version)).map_err(
         |error| {
-            format!(
-                "package skills for {label} were refused: {}; existing skills were kept",
-                crate::commands::skills::warning_detail(&error)
+            (
+                format!(
+                    "package skills for {label} were refused: {}; existing skills were kept",
+                    crate::commands::skills::warning_detail(&error)
+                ),
+                None,
             )
         },
     )?;
     if let Some(reason) = crate::commands::skills::package::unavailable_reason(&response) {
-        return Err(reason.message(&label));
+        return Err((reason.message(&label), Some(reason)));
     }
     crate::commands::skills::package::validate(&response.skills).map_err(|error| {
-        format!(
-            "package skills for {label} were refused: {}; existing skills were kept",
-            crate::commands::skills::warning_detail(&error)
+        (
+            format!(
+                "package skills for {label} were refused: {}; existing skills were kept",
+                crate::commands::skills::warning_detail(&error)
+            ),
+            None,
         )
     })?;
     Ok(response)
