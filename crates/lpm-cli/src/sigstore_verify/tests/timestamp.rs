@@ -1473,7 +1473,10 @@ fn a_trust_root_issuer_not_yet_valid_at_the_signed_time_is_refused() {
         &[authority.trusted_as(vec![future_anchor])],
     )
     .unwrap_err();
-    assert!(matches!(refused, VerifyError::Timestamp(_)), "{refused:?}");
+    assert!(
+        matches!(&refused, VerifyError::Timestamp(why) if why.contains("does not contain the signing time")),
+        "{refused:?}"
+    );
 }
 
 #[test]

@@ -56,6 +56,7 @@ pub(super) struct VerifiedTimestamp {
 /// Verify each of a bundle's signed timestamps over `signature`, the
 /// bundle's signature bytes, against `authorities`.
 /// Returns those that verified; the others prove nothing and are skipped.
+///
 /// A bundle whose timestamps need more signature checks than
 /// [`MAX_LINK_CHECKS`] to place is refused outright, so the outcome never
 /// depends on which timestamps were judged before the budget ran out.
