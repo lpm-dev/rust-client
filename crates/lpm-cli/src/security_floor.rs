@@ -17,6 +17,7 @@ use crate::provenance_fetch::EnforceMode;
 use crate::release_age_config::{DEFAULT_MIN_RELEASE_AGE_SECS, ReleaseAgePolicy};
 use crate::sandbox_config::ResolvedSandboxMode;
 use crate::script_policy_config::ScriptPolicy;
+use crate::security_approval::PersistentSecuritySetting;
 use lpm_common::LpmError;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -263,76 +264,187 @@ pub fn current_sigstore_floor(global: &GlobalConfig) -> EnforceMode {
     mode
 }
 
-pub fn reject_looser_script_policy_write(
+/// Refuses saving `settings` together while `force-security-floor = true` is
+/// active. Every setting is first put to a managed security policy, all of
+/// them before any floor, so a floor refusal never stands in for the
+/// policy's; then each is held to the machine floor `config.toml` sets.
+pub fn reject_looser_writes(
     global: &GlobalConfig,
-    requested: ScriptPolicy,
+    settings: &[PersistentSecuritySetting],
 ) -> Result<(), LpmError> {
     if !force_security_floor_enabled(global) {
         return Ok(());
     }
-    let floor = current_script_policy_floor(global);
-    if requested.loosens(floor) {
-        return Err(security_floor_write_error(
-            "script-policy",
-            requested.as_str(),
-            floor.as_str(),
-        ));
-    }
-    Ok(())
+    crate::security_approval::reject_saves_a_managed_policy_holds(settings)?;
+    settings
+        .iter()
+        .try_for_each(|setting| reject_below_floor(global, *setting))
+}
+
+/// Refuses `setting` when it loosens the machine floor `config.toml` sets.
+fn reject_below_floor(
+    global: &GlobalConfig,
+    setting: PersistentSecuritySetting,
+) -> Result<(), LpmError> {
+    use PersistentSecuritySetting as Setting;
+    let (knob, requested, floor) = match setting {
+        Setting::ScriptPolicy(requested) => {
+            let floor = current_script_policy_floor(global);
+            if !requested.loosens(floor) {
+                return Ok(());
+            }
+            (
+                "script-policy",
+                requested.as_str(),
+                floor.as_str().to_owned(),
+            )
+        }
+        Setting::MinimumReleaseAgeSecs(requested) => {
+            let floor = current_release_age_floor_secs(global);
+            if requested >= floor {
+                return Ok(());
+            }
+            return Err(security_floor_write_error(
+                "minimum-release-age-secs",
+                requested.to_string(),
+                floor.to_string(),
+            ));
+        }
+        Setting::ReleaseAgePolicy(requested) => {
+            let floor = current_release_age_policy_floor(global);
+            if !requested.loosens(floor) {
+                return Ok(());
+            }
+            (
+                crate::release_age_config::GLOBAL_POLICY_KEY,
+                requested.as_str(),
+                floor.as_str().to_owned(),
+            )
+        }
+        Setting::SandboxMode(requested) => {
+            let floor = current_sandbox_floor_mode(global);
+            if !requested.loosens(floor) {
+                return Ok(());
+            }
+            (
+                "[sandbox].mode",
+                requested.as_str(),
+                floor.as_str().to_owned(),
+            )
+        }
+        Setting::SigstoreVerify(requested) => {
+            let floor = current_sigstore_floor(global);
+            if !sigstore_loosens(requested, floor) {
+                return Ok(());
+            }
+            (
+                "[sigstore].verify",
+                sigstore_mode_name(requested),
+                sigstore_mode_name(floor).to_owned(),
+            )
+        }
+        Setting::TyposquatGuard(requested) => {
+            let floor = global
+                .get_typosquat_guard_mode()
+                .unwrap_or(crate::commands::config::TyposquatGuardSelection::Default);
+            if !requested.loosens(floor) {
+                return Ok(());
+            }
+            (
+                crate::commands::config::TYPOSQUAT_GUARD_KEY,
+                requested.as_str(),
+                floor.as_str().to_owned(),
+            )
+        }
+        Setting::FirewallMode(requested) => {
+            let floor = current_firewall_floor(global)?;
+            if !requested.loosens(floor) {
+                return Ok(());
+            }
+            (
+                crate::npm_firewall_config::FIREWALL_CONFIG_PATH,
+                requested.as_str(),
+                floor.as_str().to_owned(),
+            )
+        }
+        Setting::InstallTimeSourceAnalysis(requested) => {
+            if requested
+                || !crate::source_analysis_config::read_install_time_source_analysis(global)?
+            {
+                return Ok(());
+            }
+            (
+                crate::source_analysis_config::INSTALL_TIME_SOURCE_ANALYSIS_KEY,
+                "false",
+                "true".to_owned(),
+            )
+        }
+    };
+    Err(security_floor_write_error(knob, requested, floor))
+}
+
+pub fn reject_looser_typosquat_guard_write(
+    global: &GlobalConfig,
+    requested: crate::commands::config::TyposquatGuardSelection,
+) -> Result<(), LpmError> {
+    reject_looser_writes(
+        global,
+        &[PersistentSecuritySetting::TyposquatGuard(requested)],
+    )
+}
+
+pub fn reject_looser_script_policy_write(
+    global: &GlobalConfig,
+    requested: ScriptPolicy,
+) -> Result<(), LpmError> {
+    reject_looser_writes(
+        global,
+        &[PersistentSecuritySetting::ScriptPolicy(requested)],
+    )
 }
 
 pub fn reject_looser_release_age_write(
     global: &GlobalConfig,
     requested_secs: u64,
 ) -> Result<(), LpmError> {
-    if !force_security_floor_enabled(global) {
-        return Ok(());
-    }
-    let floor = current_release_age_floor_secs(global);
-    if requested_secs < floor {
-        return Err(security_floor_write_error(
-            "minimum-release-age-secs",
-            requested_secs.to_string(),
-            floor.to_string(),
-        ));
-    }
-    Ok(())
+    reject_looser_writes(
+        global,
+        &[PersistentSecuritySetting::MinimumReleaseAgeSecs(
+            requested_secs,
+        )],
+    )
 }
 
 pub fn reject_looser_release_age_policy_write(
     global: &GlobalConfig,
     requested: ReleaseAgePolicy,
 ) -> Result<(), LpmError> {
-    if !force_security_floor_enabled(global) {
-        return Ok(());
-    }
-    let floor = current_release_age_policy_floor(global);
-    if requested.loosens(floor) {
-        return Err(security_floor_write_error(
-            crate::release_age_config::GLOBAL_POLICY_KEY,
-            requested.as_str(),
-            floor.as_str(),
-        ));
-    }
-    Ok(())
+    reject_looser_writes(
+        global,
+        &[PersistentSecuritySetting::ReleaseAgePolicy(requested)],
+    )
 }
 
 pub fn reject_looser_sigstore_write(
     global: &GlobalConfig,
     requested: EnforceMode,
 ) -> Result<(), LpmError> {
-    if !force_security_floor_enabled(global) {
-        return Ok(());
-    }
-    let floor = current_sigstore_floor(global);
-    if sigstore_loosens(requested, floor) {
-        return Err(security_floor_write_error(
-            "[sigstore].verify",
-            sigstore_mode_name(requested),
-            sigstore_mode_name(floor),
-        ));
-    }
-    Ok(())
+    reject_looser_writes(
+        global,
+        &[PersistentSecuritySetting::SigstoreVerify(requested)],
+    )
+}
+
+pub fn reject_looser_install_time_source_analysis_write(
+    global: &GlobalConfig,
+    requested: bool,
+) -> Result<(), LpmError> {
+    reject_looser_writes(
+        global,
+        &[PersistentSecuritySetting::InstallTimeSourceAnalysis(
+            requested,
+        )],
+    )
 }
 
 pub fn current_firewall_floor(
@@ -345,18 +457,10 @@ pub fn reject_looser_firewall_mode_write(
     global: &GlobalConfig,
     requested: crate::npm_firewall_config::NpmFirewallMode,
 ) -> Result<(), LpmError> {
-    if !force_security_floor_enabled(global) {
-        return Ok(());
-    }
-    let floor = current_firewall_floor(global)?;
-    if requested.loosens(floor) {
-        return Err(security_floor_write_error(
-            crate::npm_firewall_config::FIREWALL_CONFIG_PATH,
-            requested.as_str(),
-            floor.as_str(),
-        ));
-    }
-    Ok(())
+    reject_looser_writes(
+        global,
+        &[PersistentSecuritySetting::FirewallMode(requested)],
+    )
 }
 
 /// Refuses an editor save of `requested` that a managed security policy or
@@ -559,18 +663,7 @@ pub fn reject_looser_sandbox_mode_write(
     global: &GlobalConfig,
     requested: ResolvedSandboxMode,
 ) -> Result<(), LpmError> {
-    if !force_security_floor_enabled(global) {
-        return Ok(());
-    }
-    let floor = current_sandbox_floor_mode(global);
-    if requested.loosens(floor) {
-        return Err(security_floor_write_error(
-            "[sandbox].mode",
-            requested.as_str(),
-            floor.as_str(),
-        ));
-    }
-    Ok(())
+    reject_looser_writes(global, &[PersistentSecuritySetting::SandboxMode(requested)])
 }
 
 pub fn security_floor_write_error(
@@ -643,16 +736,43 @@ mod tests {
 
     #[test]
     fn reject_looser_release_age_write_blocks_lower_value_when_force_enabled() {
-        let cfg = global_cfg(None, Some("259200"), true);
-        let err = reject_looser_release_age_write(&cfg, 0).unwrap_err();
-        assert_eq!(err.error_code(), "security_floor");
-        assert!(err.to_string().contains("minimum-release-age-secs"));
+        let temp = tempfile::tempdir().unwrap();
+        crate::security_approval::test_support::with_test_env(temp.path(), || {
+            let cfg = global_cfg(None, Some("259200"), true);
+            let err = reject_looser_release_age_write(&cfg, 0).unwrap_err();
+            assert_eq!(err.error_code(), "security_floor");
+            assert!(err.to_string().contains("minimum-release-age-secs"));
+        });
+    }
+
+    #[test]
+    fn a_floor_check_without_a_managed_policy_leaves_the_signed_posture_unread() {
+        let temp = tempfile::tempdir().unwrap();
+        crate::security_approval::test_support::with_test_env(temp.path(), || {
+            std::fs::write(
+                temp.path().join("approved-posture.json"),
+                "not a signed posture",
+            )
+            .unwrap();
+            let cfg = global_cfg(None, Some("259200"), true);
+
+            let err = reject_looser_release_age_write(&cfg, 0).unwrap_err();
+
+            assert!(
+                err.to_string()
+                    .contains("would loosen the current machine floor `259200`"),
+                "{err}"
+            );
+        });
     }
 
     #[test]
     fn reject_looser_script_policy_write_allows_tightening() {
-        let cfg = global_cfg(Some("allow"), None, true);
-        reject_looser_script_policy_write(&cfg, ScriptPolicy::Triage).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        crate::security_approval::test_support::with_test_env(temp.path(), || {
+            let cfg = global_cfg(Some("allow"), None, true);
+            reject_looser_script_policy_write(&cfg, ScriptPolicy::Triage).unwrap();
+        });
     }
 
     #[test]

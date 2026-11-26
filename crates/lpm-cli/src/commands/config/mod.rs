@@ -43,12 +43,11 @@ use wizards::{
     format_current_lpm_skills, format_current_release_age, format_current_typosquat_guard,
     parse_config_bool, parse_firewall_mode_selection, parse_integrity_policy_selection,
     parse_sigstore_assignment, parse_typosquat_guard_selection, read_string_value,
-    reject_looser_typosquat_guard_write, run_firewall_wizard, run_integrity_wizard,
-    run_lpm_dev_wizard, run_lpm_insights_wizard, run_lpm_skills_wizard,
-    run_release_age_configuration_wizard, run_release_age_policy_wizard, run_release_age_wizard,
-    run_sandbox_wizard, run_scripts_wizard, run_signatures_wizard, run_sigstore_wizard,
-    run_source_analysis_wizard, run_triage_wizard, run_trust_policy_wizard, run_typosquat_wizard,
-    validate_trust_policy_value,
+    run_firewall_wizard, run_integrity_wizard, run_lpm_dev_wizard, run_lpm_insights_wizard,
+    run_lpm_skills_wizard, run_release_age_configuration_wizard, run_release_age_policy_wizard,
+    run_release_age_wizard, run_sandbox_wizard, run_scripts_wizard, run_signatures_wizard,
+    run_sigstore_wizard, run_source_analysis_wizard, run_triage_wizard, run_trust_policy_wizard,
+    run_typosquat_wizard, validate_trust_policy_value,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -339,9 +338,6 @@ pub async fn run(
                     RELEASE_AGE_POLICY_KEY => {
                         let requested =
                             crate::release_age_config::ReleaseAgePolicy::parse(key, value)?;
-                        crate::security_floor::reject_looser_release_age_policy_write(
-                            config, requested,
-                        )?;
                         crate::security_approval::authorize_persistent_release_age_policy(
                             requested,
                             json_output,
@@ -369,7 +365,6 @@ pub async fn run(
                     }
                     TYPOSQUAT_GUARD_KEY => {
                         let requested = parse_typosquat_guard_selection(value)?;
-                        reject_looser_typosquat_guard_write(config, requested)?;
                         crate::security_approval::authorize_persistent_typosquat_guard(
                             requested,
                             json_output,
@@ -482,10 +477,6 @@ pub async fn run(
                         &format!("lpm config delete {key}"),
                     )?,
                     RELEASE_AGE_POLICY_KEY => {
-                        crate::security_floor::reject_looser_release_age_policy_write(
-                            config,
-                            crate::release_age_config::ReleaseAgePolicy::Direct,
-                        )?;
                         crate::security_approval::authorize_persistent_release_age_policy(
                             crate::release_age_config::ReleaseAgePolicy::Direct,
                             json_output,
@@ -514,10 +505,6 @@ pub async fn run(
                         )?;
                     }
                     FIREWALL_CONFIG_SECTION | "firewall.mode" => {
-                        crate::security_floor::reject_looser_firewall_mode_write(
-                            config,
-                            NpmFirewallMode::Off,
-                        )?;
                         crate::security_approval::authorize_persistent_npm_firewall_mode(
                             NpmFirewallMode::Off,
                             json_output,

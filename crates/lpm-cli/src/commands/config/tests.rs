@@ -854,6 +854,43 @@ async fn release_age_wizard_preserves_unrelated_keys() {
     );
 }
 
+/// A save of both release-age settings asks the managed policy about each
+/// before the forced floor about either, so a floor refusal of the minimum
+/// age never stands in for the policy's refusal of the scope.
+#[tokio::test]
+async fn a_grouped_release_age_save_meets_a_managed_policy_on_either_setting_before_the_floor() {
+    let (dir, path, _env) = tmp_config();
+    std::fs::write(
+        dir.path().join("absent-managed-security-policy.toml"),
+        "release-age-policy = \"strict\"\n",
+    )
+    .unwrap();
+    let config = "force-security-floor = true\nminimum-release-age-secs = \"259200\"\nrelease-age-policy = \"strict\"\n";
+    std::fs::write(&path, config).unwrap();
+
+    let message = persist_release_age_selection(
+        &path,
+        ReleaseAgeSelection::Seconds(0),
+        Some(crate::release_age_config::ReleaseAgePolicy::Direct),
+        true,
+        "lpm config release-age --set 0",
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+
+    assert!(
+        message.contains("managed security policy")
+            && message.contains("keeps `release-age-policy` at `strict`"),
+        "{message}"
+    );
+    assert_eq!(
+        crate::security_approval::test_support::guarded_attempts(),
+        1
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), config);
+}
+
 #[tokio::test]
 async fn grouped_release_age_save_persists_scope_and_minimum_age_together() {
     let (_dir, path, _env) = tmp_config();
@@ -1235,6 +1272,7 @@ fn guard_generic_set_rejects_disabling_force_floor_when_enabled() {
 
 #[test]
 fn guard_generic_set_rejects_case_insensitive_source_analysis_disable_under_force_floor() {
+    let (_dir, _path, _env) = tmp_config();
     let config =
         global_config("force-security-floor = true\ninstall-time-source-analysis = true\n");
     let err =
@@ -1247,6 +1285,7 @@ fn guard_generic_set_rejects_case_insensitive_source_analysis_disable_under_forc
 
 #[test]
 fn guard_generic_delete_rejects_lowering_release_age_to_default() {
+    let (_dir, _path, _env) = tmp_config();
     let config =
         global_config("force-security-floor = true\nminimum-release-age-secs = \"259200\"\n");
     let err = guard_generic_delete_against_force_floor(&config, RELEASE_AGE_KEY).unwrap_err();
@@ -1264,6 +1303,7 @@ fn guard_generic_delete_rejects_unsetting_force_floor_when_enabled() {
 
 #[test]
 fn guard_generic_delete_rejects_unsetting_enabled_typosquat_guard_under_force_floor() {
+    let (_dir, _path, _env) = tmp_config();
     let config = global_config("force-security-floor = true\ntyposquat-guard = \"on\"\n");
 
     let err = guard_generic_delete_against_force_floor(&config, TYPOSQUAT_GUARD_KEY).unwrap_err();
@@ -1274,6 +1314,7 @@ fn guard_generic_delete_rejects_unsetting_enabled_typosquat_guard_under_force_fl
 
 #[test]
 fn guard_generic_delete_allows_removing_disabled_typosquat_guard_under_force_floor() {
+    let (_dir, _path, _env) = tmp_config();
     let config = global_config("force-security-floor = true\ntyposquat-guard = \"off\"\n");
 
     guard_generic_delete_against_force_floor(&config, TYPOSQUAT_GUARD_KEY).unwrap();

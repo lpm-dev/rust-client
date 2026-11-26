@@ -444,14 +444,22 @@ pub(in crate::commands::config) async fn persist_release_age_selection(
 ) -> Result<Option<u64>, LpmError> {
     let requested_secs = release_age_requested_secs(selection);
     update_config(config_path, |config| {
-        crate::security_floor::reject_looser_release_age_write(config, requested_secs)?;
+        let mut settings = vec![
+            crate::security_approval::PersistentSecuritySetting::MinimumReleaseAgeSecs(
+                requested_secs,
+            ),
+        ];
+        settings.extend(
+            requested_policy
+                .map(crate::security_approval::PersistentSecuritySetting::ReleaseAgePolicy),
+        );
+        crate::security_floor::reject_looser_writes(config, &settings)?;
         crate::security_approval::authorize_persistent_release_age(
             requested_secs,
             json_output,
             command_hint,
         )?;
         if let Some(policy) = requested_policy {
-            crate::security_floor::reject_looser_release_age_policy_write(config, policy)?;
             crate::security_approval::authorize_persistent_release_age_policy(
                 policy,
                 json_output,

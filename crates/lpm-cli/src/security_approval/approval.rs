@@ -14,6 +14,156 @@ fn managed_policy_write_error(
     ))
 }
 
+/// A machine security setting a save persists, with the value it asks for.
+#[derive(Clone, Copy, Debug)]
+pub enum PersistentSecuritySetting {
+    ScriptPolicy(ScriptPolicy),
+    MinimumReleaseAgeSecs(u64),
+    ReleaseAgePolicy(ReleaseAgePolicy),
+    SandboxMode(ResolvedSandboxMode),
+    SigstoreVerify(EnforceMode),
+    TyposquatGuard(crate::commands::config::TyposquatGuardSelection),
+    FirewallMode(crate::npm_firewall_config::NpmFirewallMode),
+    InstallTimeSourceAnalysis(bool),
+}
+
+impl PersistentSecuritySetting {
+    /// Whether the save loosens what `effective` holds there, and where that
+    /// value comes from.
+    fn loosening(self, effective: &EffectiveAuthorizedPosture) -> (bool, PostureSourceKind) {
+        let posture = &effective.posture;
+        let sources = &effective.sources;
+        match self {
+            Self::ScriptPolicy(requested) => (
+                requested.loosens(posture.script_policy()),
+                sources.script_policy,
+            ),
+            Self::MinimumReleaseAgeSecs(requested) => (
+                requested < posture.minimum_release_age_secs(),
+                sources.minimum_release_age_secs,
+            ),
+            Self::ReleaseAgePolicy(requested) => (
+                requested.loosens(posture.release_age_policy()),
+                sources.release_age_policy,
+            ),
+            Self::SandboxMode(requested) => (
+                requested.loosens(posture.sandbox_mode()),
+                sources.sandbox_mode,
+            ),
+            Self::SigstoreVerify(requested) => (
+                crate::security_floor::sigstore_loosens(requested, posture.sigstore_verify()),
+                sources.sigstore_verify,
+            ),
+            Self::TyposquatGuard(requested) => (
+                requested.loosens(posture.typosquat_guard()),
+                sources.typosquat_guard,
+            ),
+            Self::FirewallMode(requested) => (
+                requested.loosens(posture.firewall_mode()),
+                sources.firewall_mode,
+            ),
+            Self::InstallTimeSourceAnalysis(requested) => (
+                !requested && posture.install_time_source_analysis(),
+                sources.install_time_source_analysis,
+            ),
+        }
+    }
+
+    fn approval_scope(self) -> ApprovalScope {
+        match self {
+            Self::ScriptPolicy(requested) => approval_scope_for_script_policy(requested),
+            Self::MinimumReleaseAgeSecs(_) => ApprovalScope::CooldownBypass,
+            Self::ReleaseAgePolicy(_) => ApprovalScope::CooldownWindow,
+            Self::SandboxMode(requested) => approval_scope_for_sandbox_mode(requested),
+            Self::SigstoreVerify(_) => ApprovalScope::ProvenanceUnverified,
+            Self::TyposquatGuard(_) => ApprovalScope::TyposquatDisable,
+            Self::FirewallMode(_) => ApprovalScope::FirewallDisable,
+            Self::InstallTimeSourceAnalysis(_) => ApprovalScope::SourceAnalysisDisable,
+        }
+    }
+
+    /// The setting's name, the value the save asks for and the value
+    /// `posture` holds, as a refusal names them.
+    fn named_values(self, posture: &AuthorizedPosture) -> (&'static str, String, String) {
+        match self {
+            Self::ScriptPolicy(requested) => (
+                "script-policy",
+                requested.as_str().to_owned(),
+                posture.script_policy().as_str().to_owned(),
+            ),
+            Self::MinimumReleaseAgeSecs(requested) => (
+                "minimum-release-age-secs",
+                requested.to_string(),
+                posture.minimum_release_age_secs().to_string(),
+            ),
+            Self::ReleaseAgePolicy(requested) => (
+                crate::release_age_config::GLOBAL_POLICY_KEY,
+                requested.as_str().to_owned(),
+                posture.release_age_policy().as_str().to_owned(),
+            ),
+            Self::SandboxMode(requested) => (
+                "[sandbox].mode",
+                requested.as_str().to_owned(),
+                posture.sandbox_mode().as_str().to_owned(),
+            ),
+            Self::SigstoreVerify(requested) => (
+                "[sigstore].verify",
+                crate::security_floor::sigstore_mode_name(requested).to_owned(),
+                crate::security_floor::sigstore_mode_name(posture.sigstore_verify()).to_owned(),
+            ),
+            Self::TyposquatGuard(requested) => (
+                crate::commands::config::TYPOSQUAT_GUARD_KEY,
+                requested.as_str().to_owned(),
+                posture.typosquat_guard().as_str().to_owned(),
+            ),
+            Self::FirewallMode(requested) => (
+                crate::npm_firewall_config::FIREWALL_CONFIG_PATH,
+                requested.as_str().to_owned(),
+                posture.firewall_mode().as_str().to_owned(),
+            ),
+            Self::InstallTimeSourceAnalysis(requested) => (
+                crate::source_analysis_config::INSTALL_TIME_SOURCE_ANALYSIS_KEY,
+                requested.to_string(),
+                posture.install_time_source_analysis().to_string(),
+            ),
+        }
+    }
+
+    /// Refuses the save, naming the policy and recording the attempt, when
+    /// it loosens a value a managed security policy holds.
+    fn refuse_where_managed(self, effective: &EffectiveAuthorizedPosture) -> Result<(), LpmError> {
+        let (loosens, source) = self.loosening(effective);
+        if !loosens || source != PostureSourceKind::ManagedPolicy {
+            return Ok(());
+        }
+        let managed_policy = effective
+            .managed_policy
+            .as_ref()
+            .expect("managed policy source must include status metadata");
+        let (knob, requested, held) = self.named_values(&effective.posture);
+        let err = managed_policy_write_error(managed_policy, knob, requested, held);
+        record_persistent_guarded_attempt(self.approval_scope(), false, &err.to_string());
+        Err(err)
+    }
+}
+
+/// Refuses a save of `settings` when one loosens what a managed security
+/// policy holds, recording the attempt, so a check that runs before the
+/// save's approval, such as the forced floor's, never answers for the policy.
+pub fn reject_saves_a_managed_policy_holds(
+    settings: &[PersistentSecuritySetting],
+) -> Result<(), LpmError> {
+    // Without a managed policy nothing is held, so the signed posture, and
+    // the key that verifies it, stay unread.
+    if load_managed_policy()?.is_none() {
+        return Ok(());
+    }
+    let effective = load_effective_authorized_posture()?;
+    settings
+        .iter()
+        .try_for_each(|setting| setting.refuse_where_managed(&effective))
+}
+
 fn managed_policy_scope_error(
     managed_policy: &ManagedPolicyStatus,
     scope: ApprovalScope,
@@ -495,29 +645,7 @@ pub fn authorize_persistent_script_policy(
     let effective = load_effective_authorized_posture()?;
     let current = effective.posture.script_policy();
     let weakens_current = requested.loosens(current);
-    if requested.loosens(current)
-        && matches!(
-            effective.sources.script_policy,
-            PostureSourceKind::ManagedPolicy
-        )
-    {
-        let managed_policy = effective
-            .managed_policy
-            .as_ref()
-            .expect("managed policy source must include status metadata");
-        let err = managed_policy_write_error(
-            managed_policy,
-            "script-policy",
-            requested.as_str(),
-            current.as_str(),
-        );
-        record_persistent_guarded_attempt(
-            approval_scope_for_script_policy(requested),
-            false,
-            &err.to_string(),
-        );
-        return Err(err);
-    }
+    PersistentSecuritySetting::ScriptPolicy(requested).refuse_where_managed(&effective)?;
 
     let mut posture = load_authorized_posture()?;
     if weakens_current {
@@ -553,25 +681,8 @@ pub fn authorize_persistent_release_age(
     let effective = load_effective_authorized_posture()?;
     let current = effective.posture.minimum_release_age_secs();
     let weakens_current = requested_secs < current;
-    if requested_secs < current
-        && matches!(
-            effective.sources.minimum_release_age_secs,
-            PostureSourceKind::ManagedPolicy
-        )
-    {
-        let managed_policy = effective
-            .managed_policy
-            .as_ref()
-            .expect("managed policy source must include status metadata");
-        let err = managed_policy_write_error(
-            managed_policy,
-            "minimum-release-age-secs",
-            requested_secs.to_string(),
-            current.to_string(),
-        );
-        record_persistent_guarded_attempt(ApprovalScope::CooldownBypass, false, &err.to_string());
-        return Err(err);
-    }
+    PersistentSecuritySetting::MinimumReleaseAgeSecs(requested_secs)
+        .refuse_where_managed(&effective)?;
 
     let mut posture = load_authorized_posture()?;
     if weakens_current {
@@ -650,25 +761,7 @@ pub fn authorize_persistent_release_age_policy(
     let effective = load_effective_authorized_posture()?;
     let current = effective.posture.release_age_policy();
     let weakens_current = requested.loosens(current);
-    if weakens_current
-        && matches!(
-            effective.sources.release_age_policy,
-            PostureSourceKind::ManagedPolicy
-        )
-    {
-        let managed_policy = effective
-            .managed_policy
-            .as_ref()
-            .expect("managed policy source must include status metadata");
-        let err = managed_policy_write_error(
-            managed_policy,
-            crate::release_age_config::GLOBAL_POLICY_KEY,
-            requested.as_str(),
-            current.as_str(),
-        );
-        record_persistent_guarded_attempt(ApprovalScope::CooldownWindow, false, &err.to_string());
-        return Err(err);
-    }
+    PersistentSecuritySetting::ReleaseAgePolicy(requested).refuse_where_managed(&effective)?;
 
     let mut posture = load_authorized_posture()?;
     if weakens_current {
@@ -705,29 +798,7 @@ pub fn authorize_persistent_sandbox_mode(
     let effective = load_effective_authorized_posture()?;
     let current = effective.posture.sandbox_mode();
     let weakens_current = requested.loosens(current);
-    if requested.loosens(current)
-        && matches!(
-            effective.sources.sandbox_mode,
-            PostureSourceKind::ManagedPolicy
-        )
-    {
-        let managed_policy = effective
-            .managed_policy
-            .as_ref()
-            .expect("managed policy source must include status metadata");
-        let err = managed_policy_write_error(
-            managed_policy,
-            "[sandbox].mode",
-            requested.as_str(),
-            current.as_str(),
-        );
-        record_persistent_guarded_attempt(
-            approval_scope_for_sandbox_mode(requested),
-            false,
-            &err.to_string(),
-        );
-        return Err(err);
-    }
+    PersistentSecuritySetting::SandboxMode(requested).refuse_where_managed(&effective)?;
 
     let mut posture = load_authorized_posture()?;
     if weakens_current {
@@ -763,29 +834,7 @@ pub fn authorize_persistent_sigstore(
     let effective = load_effective_authorized_posture()?;
     let current = effective.posture.sigstore_verify();
     let weakens_current = crate::security_floor::sigstore_loosens(requested, current);
-    if weakens_current
-        && matches!(
-            effective.sources.sigstore_verify,
-            PostureSourceKind::ManagedPolicy
-        )
-    {
-        let managed_policy = effective
-            .managed_policy
-            .as_ref()
-            .expect("managed policy source must include status metadata");
-        let err = managed_policy_write_error(
-            managed_policy,
-            "[sigstore].verify",
-            crate::security_floor::sigstore_mode_name(requested),
-            crate::security_floor::sigstore_mode_name(current),
-        );
-        record_persistent_guarded_attempt(
-            ApprovalScope::ProvenanceUnverified,
-            false,
-            &err.to_string(),
-        );
-        return Err(err);
-    }
+    PersistentSecuritySetting::SigstoreVerify(requested).refuse_where_managed(&effective)?;
 
     let mut posture = load_authorized_posture()?;
     if weakens_current {
@@ -821,25 +870,7 @@ pub fn authorize_persistent_typosquat_guard(
     let effective = load_effective_authorized_posture()?;
     let current = effective.posture.typosquat_guard();
     let weakens_current = requested.loosens(current);
-    if weakens_current
-        && matches!(
-            effective.sources.typosquat_guard,
-            PostureSourceKind::ManagedPolicy
-        )
-    {
-        let managed_policy = effective
-            .managed_policy
-            .as_ref()
-            .expect("managed policy source must include status metadata");
-        let err = managed_policy_write_error(
-            managed_policy,
-            crate::commands::config::TYPOSQUAT_GUARD_KEY,
-            requested.as_str(),
-            current.as_str(),
-        );
-        record_persistent_guarded_attempt(ApprovalScope::TyposquatDisable, false, &err.to_string());
-        return Err(err);
-    }
+    PersistentSecuritySetting::TyposquatGuard(requested).refuse_where_managed(&effective)?;
 
     let mut posture = load_authorized_posture()?;
     if weakens_current {
@@ -876,25 +907,7 @@ pub fn authorize_persistent_npm_firewall_mode(
     let effective = load_effective_authorized_posture()?;
     let current = effective.posture.firewall_mode();
     let weakens_current = requested.loosens(current);
-    if weakens_current
-        && matches!(
-            effective.sources.firewall_mode,
-            PostureSourceKind::ManagedPolicy
-        )
-    {
-        let managed_policy = effective
-            .managed_policy
-            .as_ref()
-            .expect("managed policy source must include status metadata");
-        let err = managed_policy_write_error(
-            managed_policy,
-            crate::npm_firewall_config::FIREWALL_CONFIG_PATH,
-            requested.as_str(),
-            current.as_str(),
-        );
-        record_persistent_guarded_attempt(ApprovalScope::FirewallDisable, false, &err.to_string());
-        return Err(err);
-    }
+    PersistentSecuritySetting::FirewallMode(requested).refuse_where_managed(&effective)?;
 
     let mut posture = load_authorized_posture()?;
     if weakens_current {
@@ -1069,29 +1082,8 @@ pub fn authorize_persistent_install_time_source_analysis(
     let effective = load_effective_authorized_posture()?;
     let current = effective.posture.install_time_source_analysis();
     let weakens_current = !requested && current;
-    if weakens_current
-        && matches!(
-            effective.sources.install_time_source_analysis,
-            PostureSourceKind::ManagedPolicy
-        )
-    {
-        let managed_policy = effective
-            .managed_policy
-            .as_ref()
-            .expect("managed policy source must include status metadata");
-        let err = managed_policy_write_error(
-            managed_policy,
-            crate::source_analysis_config::INSTALL_TIME_SOURCE_ANALYSIS_KEY,
-            requested.to_string(),
-            current.to_string(),
-        );
-        record_persistent_guarded_attempt(
-            ApprovalScope::SourceAnalysisDisable,
-            false,
-            &err.to_string(),
-        );
-        return Err(err);
-    }
+    PersistentSecuritySetting::InstallTimeSourceAnalysis(requested)
+        .refuse_where_managed(&effective)?;
 
     let mut posture = load_authorized_posture()?;
     if weakens_current {
