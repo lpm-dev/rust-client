@@ -67,4 +67,5 @@ pub(super) async fn do_install(
         },
     )
     .await
+    .into_result()
 }

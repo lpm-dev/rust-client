@@ -885,23 +885,18 @@ async fn registry_lifting_a_tarball_that_fails_its_check() -> MockRegistry {
 
 /// Runs a quiet install's command where the install fails after a rule let a
 /// blocked version through.
-async fn run_through_a_failing_lifted_install(args: &[&str]) -> String {
+async fn run_through_a_failing_lifted_install(args: &[&str]) -> std::process::Output {
     let mock = registry_lifting_a_tarball_that_fails_its_check().await;
     let project = project_depending_on_a_blocked_tool();
     write_signed_firewall_bypass(
         &project,
         &[stored_rule("agent-tool", serde_json::json!({}))],
     );
-    let output = lpm_with_registry(&project, &mock.url())
+    lpm_with_registry(&project, &mock.url())
         .args(["--color", "never"])
         .args(args)
         .output()
-        .unwrap();
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
+        .unwrap()
 }
 
 #[tokio::test]
@@ -911,17 +906,20 @@ async fn quiet_installs_that_fail_after_a_rule_lifted_a_block_still_print_it() {
         &["dev", "--no-open", "--no-dashboard"][..],
         &["--json", "dlx", "agent-tool@1.0.0"][..],
     ] {
-        let text = run_through_a_failing_lifted_install(args).await;
+        let output = run_through_a_failing_lifted_install(args).await;
 
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let text = format!("{}{stderr}", String::from_utf8_lossy(&output.stdout));
+        assert!(!output.status.success(), "{args:?}: {text}");
         assert!(text.contains("integrity"), "{args:?}: {text}");
         assert!(
-            text.contains(
+            stderr.contains(
                 "! LPM Firewall allowed 1 blocked package because of your bypass rules:\n"
             ),
             "{args:?}: {text}"
         );
         assert!(
-            text.contains("    rule: agent-tool (every project)\n"),
+            stderr.contains("    rule: agent-tool (every project)\n"),
             "{args:?}: {text}"
         );
     }
@@ -1375,6 +1373,60 @@ async fn batch_update_with_one_tool_allowed(
     }
     let output = command.args(["global", "update"]).output().unwrap();
     (output, project)
+}
+
+#[tokio::test]
+async fn global_update_reports_what_a_rule_let_through_for_a_tool_whose_update_then_failed() {
+    for json in [true, false] {
+        let mock = MockRegistry::start().await;
+        mount_blocked_global_update(&mock, "update-tool").await;
+        mount_global_update(&mock, "other-tool", "allow").await;
+        Mock::given(method("GET"))
+            .and(path("/tarballs/update-tool/-/update-tool-1.1.0.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(make_tarball("other-tool", "9.9.9")),
+            )
+            .with_priority(1)
+            .mount(mock.server())
+            .await;
+        let project = enforcing_project();
+        installed_globally(&project, &["update-tool", "other-tool"]);
+        write_signed_firewall_bypass(
+            &project,
+            &[stored_rule("update-tool", serde_json::json!({}))],
+        );
+
+        let mut command = lpm_with_registry(&project, &mock.url());
+        command.args(["--color", "never"]);
+        if json {
+            command.arg("--json");
+        }
+        let output = command.args(["global", "update"]).output().unwrap();
+
+        assert!(!output.status.success());
+        if json {
+            let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let failed = envelope["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|result| result["package"] == "update-tool")
+                .unwrap();
+            assert_eq!(failed["action"], "failed", "{envelope:#}");
+            assert_eq!(
+                failed["security"]["firewall"]["bypassed"][0]["name"], "update-tool",
+                "{envelope:#}"
+            );
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let failure = stderr.find("update-tool:").expect(&stderr);
+            let notice = stderr
+                .find("LPM Firewall allowed 1 blocked package because of your bypass rules")
+                .expect(&stderr);
+            assert!(failure < notice, "{stderr}");
+            assert!(stderr.contains("rule: update-tool"), "{stderr}");
+        }
+    }
 }
 
 #[tokio::test]

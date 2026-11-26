@@ -336,11 +336,19 @@ pub async fn run_with_options(
     .await
 }
 
-/// A quiet install's outcome, with what LPM Firewall bypass rules let through,
-/// which the command reports whether or not the install finished.
-pub(crate) struct QuietInstall {
+/// An install's outcome, with what LPM Firewall bypass rules let through,
+/// which the command that ran it reports whether or not the install finished.
+pub(crate) struct InstallOutcome {
     pub(crate) result: Result<(), LpmError>,
     pub(crate) firewall_bypassed: FirewallBypassRecord,
+}
+
+impl InstallOutcome {
+    /// The record of a finished install, for a command that reports nothing
+    /// of a failed one beyond its error.
+    pub(crate) fn into_result(self) -> Result<FirewallBypassRecord, LpmError> {
+        self.result.map(|()| self.firewall_bypassed)
+    }
 }
 
 /// Installs `project_dir` without output for a command that reports in its
@@ -348,11 +356,11 @@ pub(crate) struct QuietInstall {
 pub(crate) async fn run_silent_for_audit_fix(
     client: &RegistryClient,
     project_dir: &Path,
-) -> QuietInstall {
+) -> InstallOutcome {
     let lpm_root = match lpm_common::LpmRoot::from_env() {
         Ok(lpm_root) => lpm_root,
         Err(error) => {
-            return QuietInstall {
+            return InstallOutcome {
                 result: Err(error),
                 firewall_bypassed: FirewallBypassRecord::default(),
             };
@@ -398,7 +406,7 @@ pub(crate) async fn run_silent_for_audit_fix(
         lpm_root,
     )
     .await;
-    QuietInstall {
+    InstallOutcome {
         result,
         firewall_bypassed: firewall_bypass_report.take(),
     }

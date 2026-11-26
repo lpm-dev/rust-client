@@ -6,6 +6,6 @@ use lpm_registry::RegistryClient;
 pub(super) async fn run_doctor_install(
     client: &RegistryClient,
     project_dir: &Path,
-) -> crate::commands::install::QuietInstall {
+) -> crate::commands::install::InstallOutcome {
     crate::commands::install::run_silent_for_audit_fix(client, project_dir).await
 }

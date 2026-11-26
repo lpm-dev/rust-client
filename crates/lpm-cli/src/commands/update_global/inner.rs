@@ -2,7 +2,7 @@ use super::super::global_util::{
     InnerGlobalInstallOptions, SyntheticProjectJsonFormat, run_inner_global_install,
 };
 use super::prepare::{StagedUpgrade, UpgradePrep};
-use lpm_common::{LpmError, LpmRoot};
+use lpm_common::LpmRoot;
 use lpm_registry::RegistryClient;
 
 pub(super) async fn do_install_upgrade(
@@ -11,7 +11,7 @@ pub(super) async fn do_install_upgrade(
     prep: &UpgradePrep,
     staged: &StagedUpgrade,
     suppress_nested_output: bool,
-) -> Result<crate::commands::install::FirewallBypassRecord, LpmError> {
+) -> crate::commands::install::InstallOutcome {
     let new_version = prep.new_version.to_string();
     run_inner_global_install(
         registry,

@@ -47,12 +47,26 @@ pub(super) struct InnerGlobalInstallOptions<'a> {
     pub(super) verify_policy: VerifyPolicy,
 }
 
-/// Installs a global package into its own root and returns what LPM Firewall
-/// bypass rules let through, which the global command reports itself.
+/// Installs a global package into its own root, with what LPM Firewall bypass
+/// rules let through, which the global command reports itself.
 pub(super) async fn run_inner_global_install(
     registry: &RegistryClient,
     options: InnerGlobalInstallOptions<'_>,
-) -> Result<crate::commands::install::FirewallBypassRecord, LpmError> {
+) -> crate::commands::install::InstallOutcome {
+    let firewall_bypass_report =
+        std::sync::Arc::new(crate::commands::install::FirewallBypassReport::default());
+    let result = install_into_global_root(registry, options, &firewall_bypass_report).await;
+    crate::commands::install::InstallOutcome {
+        result,
+        firewall_bypassed: firewall_bypass_report.take(),
+    }
+}
+
+async fn install_into_global_root(
+    registry: &RegistryClient,
+    options: InnerGlobalInstallOptions<'_>,
+    firewall_bypass_report: &std::sync::Arc<crate::commands::install::FirewallBypassReport>,
+) -> Result<(), LpmError> {
     let install_leaf = options.install_root.file_name().ok_or_else(|| {
         LpmError::Script(format!(
             "global install root has no final path component: {}",
@@ -79,8 +93,6 @@ pub(super) async fn run_inner_global_install(
     let _stdout_gag =
         crate::output::suppress_stdout(options.suppress_nested_output).map_err(LpmError::Script)?;
 
-    let firewall_bypass_report =
-        std::sync::Arc::new(crate::commands::install::FirewallBypassReport::default());
     crate::commands::install::run_with_options_with_lpm_root(
         registry,
         options.install_root,
@@ -116,13 +128,12 @@ pub(super) async fn run_inner_global_install(
         false,
         Some(
             crate::commands::install::InstallCallerContext::reporting_firewall_bypasses(
-                std::sync::Arc::clone(&firewall_bypass_report),
+                std::sync::Arc::clone(firewall_bypass_report),
             ),
         ),
         lpm_common::LpmRoot::from_env()?,
     )
-    .await?;
-    Ok(firewall_bypass_report.take())
+    .await
 }
 
 #[cfg(test)]
