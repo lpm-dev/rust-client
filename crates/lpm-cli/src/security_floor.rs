@@ -359,6 +359,18 @@ pub fn reject_looser_firewall_mode_write(
     Ok(())
 }
 
+/// Refuses an editor save of `requested` that a managed security policy or
+/// the forced floor doesn't allow. The managed check comes first, so a save
+/// that loosens what the policy holds is refused naming the policy and is
+/// recorded, and the floor's advice then always passes the policy.
+pub fn reject_firewall_policy_save(
+    global: &GlobalConfig,
+    requested: &lpm_registry::client::NpmFirewallPolicyProfile,
+) -> Result<(), LpmError> {
+    crate::security_approval::reject_firewall_policies_a_managed_policy_holds(requested)?;
+    reject_looser_firewall_policy_write(global, requested)
+}
+
 /// Refuses a `[firewall.npm.policies]` profile the firewall editor saves, and
 /// signs into the approved posture, when it handles any policy group more
 /// leniently than installs enforce now, or than the local posture it rewrites,
@@ -379,46 +391,21 @@ pub fn reject_looser_firewall_policy_write(
     let installs_mode = installs_firewall_mode(global, &effective)?;
     let local = crate::security_approval::load_authorized_posture()?;
     let local_profile = local.firewall_policy_profile();
-    let mut floors = vec![
-        PolicyFloor {
-            mode: installs_mode,
-            profile: &enforced,
-            source: PolicyFloorSource::Enforced,
-        },
-        PolicyFloor {
-            mode: local.firewall_mode(),
-            profile: &local_profile,
-            source: PolicyFloorSource::ApprovedPosture,
-        },
-    ];
-    // The save's managed check refuses what this floor names, so the advice
-    // is one that check also accepts: a managed profile binds at the
-    // `enforce` the save sets, and a managed mode alone at its own mode.
-    let policies_managed = matches!(
-        effective.sources.firewall_policies,
-        crate::security_approval::PostureSourceKind::ManagedPolicy
-    );
-    let managed_profile = effective.posture.firewall_policy_profile();
-    if policies_managed
-        || matches!(
-            effective.sources.firewall_mode,
-            crate::security_approval::PostureSourceKind::ManagedPolicy
-        )
-    {
-        floors.push(PolicyFloor {
-            mode: if policies_managed {
-                crate::npm_firewall_config::NpmFirewallMode::Enforce
-            } else {
-                effective.posture.firewall_mode()
-            },
-            profile: &managed_profile,
-            source: PolicyFloorSource::ManagedPolicy,
-        });
-    }
     reject_policy_below_floors(
         crate::npm_firewall_config::NpmFirewallMode::Enforce,
         requested,
-        &floors,
+        &[
+            PolicyFloor {
+                mode: installs_mode,
+                profile: &enforced,
+                source: PolicyFloorSource::Enforced,
+            },
+            PolicyFloor {
+                mode: local.firewall_mode(),
+                profile: &local_profile,
+                source: PolicyFloorSource::ApprovedPosture,
+            },
+        ],
     )
 }
 
@@ -485,8 +472,6 @@ enum PolicyFloorSource {
     Enforced,
     /// The local approved posture a save rewrites.
     ApprovedPosture,
-    /// The managed security policy, which a save may not loosen.
-    ManagedPolicy,
 }
 
 impl PolicyFloorSource {
@@ -494,7 +479,6 @@ impl PolicyFloorSource {
         match self {
             Self::Enforced => "LPM CLI enforces",
             Self::ApprovedPosture => "your approved posture holds",
-            Self::ManagedPolicy => "the managed security policy holds",
         }
     }
 }

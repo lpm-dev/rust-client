@@ -2355,40 +2355,87 @@ fn forced_floor_names_one_action_that_passes_every_floor_an_editor_save_meets() 
     });
 }
 
-#[test]
-fn forced_floor_advice_includes_what_a_managed_profile_holds_at_the_saved_mode() {
+fn guarded_attempts() -> usize {
+    std::fs::read_to_string(audit_log_path().unwrap())
+        .unwrap_or_default()
+        .matches("\"event\":\"persistent-guarded-attempt\"")
+        .count()
+}
+
+/// An editor save under `managed_policy` and `force-security-floor = true` at
+/// `config_mode`, loosening telemetry to each of `requested_actions`, is
+/// refused by the managed check, which names `refused_group` and records each
+/// try.
+fn assert_managed_check_refuses_first(
+    managed_policy: &str,
+    config_mode: &str,
+    extra: lpm_registry::client::NpmFirewallPolicyProfile,
+    requested_actions: &[lpm_registry::client::NpmFirewallPolicyAction],
+    refused_group: &str,
+) {
     let temp = tempdir().unwrap();
     with_test_env(temp.path(), || {
-        write_managed_policy(
-            temp.path(),
-            "[firewall]\nmode = \"monitor\"\n\n[firewall.npm.policies]\nlpm_ai_telemetry = \"block\"\n",
-        );
-        let config = forced_floor_config("monitor");
+        write_managed_policy(temp.path(), managed_policy);
+        let config = forced_floor_config(config_mode);
 
-        for requested_action in [
-            lpm_registry::client::NpmFirewallPolicyAction::Allow,
-            lpm_registry::client::NpmFirewallPolicyAction::Warn,
-        ] {
+        for requested_action in requested_actions {
             let requested = lpm_registry::client::NpmFirewallPolicyProfile {
-                lpm_ai_telemetry: requested_action,
-                ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+                lpm_ai_telemetry: *requested_action,
+                ..extra
             };
 
-            let message =
-                crate::security_floor::reject_looser_firewall_policy_write(&config, &requested)
-                    .unwrap_err()
-                    .to_string();
+            let message = crate::security_floor::reject_firewall_policy_save(&config, &requested)
+                .unwrap_err()
+                .to_string();
 
             assert!(
-                message.contains("would loosen the `block` the managed security policy holds"),
+                message.contains(&format!(
+                    "keeps `[firewall.npm.policies].{refused_group}` at `block`"
+                )),
                 "{message}"
             );
-            assert!(
-                message.contains("Keep it at `block` or stricter"),
-                "{message}"
-            );
+            assert!(!message.contains("force-security-floor"), "{message}");
         }
+        assert_eq!(guarded_attempts(), requested_actions.len());
     });
+}
+
+#[test]
+fn an_editor_save_meets_the_managed_check_before_the_forced_floor() {
+    let telemetry_block =
+        "[firewall]\nmode = \"{mode}\"\n\n[firewall.npm.policies]\nlpm_ai_telemetry = \"block\"\n";
+    let looser = [
+        lpm_registry::client::NpmFirewallPolicyAction::Allow,
+        lpm_registry::client::NpmFirewallPolicyAction::Warn,
+    ];
+    // Installs run at monitor, where the managed `block` alone holds the group.
+    assert_managed_check_refuses_first(
+        &telemetry_block.replace("{mode}", "monitor"),
+        "monitor",
+        lpm_registry::client::NpmFirewallPolicyProfile::default(),
+        &looser,
+        "lpm_ai_telemetry",
+    );
+    // Installs run at enforce, where what they enforce ties the managed floor.
+    assert_managed_check_refuses_first(
+        &telemetry_block.replace("{mode}", "enforce"),
+        "enforce",
+        lpm_registry::client::NpmFirewallPolicyProfile::default(),
+        &looser,
+        "lpm_ai_telemetry",
+    );
+    // A save that loosens several groups the policy holds is refused on the
+    // first, still by the managed check.
+    assert_managed_check_refuses_first(
+        &telemetry_block.replace("{mode}", "enforce"),
+        "enforce",
+        lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_confirmed_malware: lpm_registry::client::NpmFirewallPolicyAction::Warn,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        },
+        &[lpm_registry::client::NpmFirewallPolicyAction::Allow],
+        "lpm_ai_confirmed_malware",
+    );
 }
 
 #[test]

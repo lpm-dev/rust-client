@@ -151,7 +151,7 @@ async fn apply_firewall_selection(
         crate::security_floor::reject_looser_firewall_mode_write(config, mode)?;
         match selection.policy_profile() {
             Some(profile) => {
-                crate::security_floor::reject_looser_firewall_policy_write(config, &profile)?;
+                crate::security_floor::reject_firewall_policy_save(config, &profile)?;
                 crate::security_approval::authorize_persistent_npm_firewall_policies(
                     &profile,
                     json_output,

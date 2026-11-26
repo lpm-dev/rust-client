@@ -924,15 +924,15 @@ pub fn authorize_persistent_npm_firewall_mode(
     persist_authorized_posture(&posture)
 }
 
-/// Approves `requested` as the machine's npm firewall policy profile, with the
-/// firewall in enforce mode, as `lpm config firewall` saves a custom profile.
-pub fn authorize_persistent_npm_firewall_policies(
+/// The groups an editor save of `requested` loosens against the effective
+/// approved profile, as a save at `enforce` meets it. Where a managed security
+/// policy holds one, the save is refused, naming the policy, and the attempt
+/// is recorded.
+fn loosenings_a_managed_policy_allows(
     requested: &lpm_registry::client::NpmFirewallPolicyProfile,
-    json_output: bool,
-    command_hint: &str,
-) -> Result<(), LpmError> {
+    effective: &EffectiveAuthorizedPosture,
+) -> Result<Vec<crate::npm_firewall_config::LoosenedFirewallPolicy>, LpmError> {
     let enforce = crate::npm_firewall_config::NpmFirewallMode::Enforce;
-    let effective = load_effective_authorized_posture()?;
     let policies_managed = matches!(
         effective.sources.firewall_policies,
         PostureSourceKind::ManagedPolicy
@@ -948,13 +948,11 @@ pub fn authorize_persistent_npm_firewall_policies(
         &effective.posture.firewall_policy_profile(),
     );
     if let Some(first) = weakened.first()
-        && (matches!(
-            effective.sources.firewall_policies,
-            PostureSourceKind::ManagedPolicy
-        ) || matches!(
-            effective.sources.firewall_mode,
-            PostureSourceKind::ManagedPolicy
-        ))
+        && (policies_managed
+            || matches!(
+                effective.sources.firewall_mode,
+                PostureSourceKind::ManagedPolicy
+            ))
     {
         let managed_policy = effective
             .managed_policy
@@ -973,10 +971,31 @@ pub fn authorize_persistent_npm_firewall_policies(
         record_persistent_guarded_attempt(ApprovalScope::FirewallDisable, false, &err.to_string());
         return Err(err);
     }
+    Ok(weakened)
+}
+
+/// Refuses an editor save of `requested` that loosens what a managed security
+/// policy holds, recording the attempt, before any other check can stop it.
+pub fn reject_firewall_policies_a_managed_policy_holds(
+    requested: &lpm_registry::client::NpmFirewallPolicyProfile,
+) -> Result<(), LpmError> {
+    let effective = load_effective_authorized_posture()?;
+    loosenings_a_managed_policy_allows(requested, &effective).map(drop)
+}
+
+/// Approves `requested` as the machine's npm firewall policy profile, with the
+/// firewall in enforce mode, as `lpm config firewall` saves a custom profile.
+pub fn authorize_persistent_npm_firewall_policies(
+    requested: &lpm_registry::client::NpmFirewallPolicyProfile,
+    json_output: bool,
+    command_hint: &str,
+) -> Result<(), LpmError> {
+    let enforce = crate::npm_firewall_config::NpmFirewallMode::Enforce;
+    let effective = load_effective_authorized_posture()?;
+    let mut weakened = loosenings_a_managed_policy_allows(requested, &effective)?;
     // The save rewrites the local posture, which binds again once a managed
     // policy goes away, so a group it loosens there needs approval too.
     let mut posture = load_authorized_posture()?;
-    let mut weakened = weakened;
     for entry in crate::npm_firewall_config::loosened_firewall_policies(
         enforce,
         requested,
