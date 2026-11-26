@@ -522,12 +522,35 @@ pub(crate) fn policy_action_loosens(
     enforced_rank(requested_mode, requested_action) < enforced_rank(approved_mode, approved_action)
 }
 
-fn enforced_rank(mode: NpmFirewallMode, action: NpmFirewallPolicyAction) -> u8 {
-    let action_rank = match action {
+/// The loosest action that, run at `requested_mode`, stops or reports as much
+/// as `approved_action` does under `approved_mode`.
+pub(crate) fn loosest_action_meeting(
+    requested_mode: NpmFirewallMode,
+    approved_mode: NpmFirewallMode,
+    approved_action: NpmFirewallPolicyAction,
+) -> NpmFirewallPolicyAction {
+    [
+        NpmFirewallPolicyAction::Allow,
+        NpmFirewallPolicyAction::Warn,
+    ]
+    .into_iter()
+    .find(|candidate| {
+        !policy_action_loosens(requested_mode, *candidate, approved_mode, approved_action)
+    })
+    .unwrap_or(NpmFirewallPolicyAction::Block)
+}
+
+#[inline]
+pub(crate) fn action_strictness(action: NpmFirewallPolicyAction) -> u8 {
+    match action {
         NpmFirewallPolicyAction::Allow => 0,
         NpmFirewallPolicyAction::Warn => 1,
         NpmFirewallPolicyAction::Block => 2,
-    };
+    }
+}
+
+fn enforced_rank(mode: NpmFirewallMode, action: NpmFirewallPolicyAction) -> u8 {
+    let action_rank = action_strictness(action);
     match mode {
         NpmFirewallMode::Off => 0,
         NpmFirewallMode::Monitor => action_rank.min(1),

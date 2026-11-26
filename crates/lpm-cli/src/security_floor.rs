@@ -501,29 +501,27 @@ fn reject_policy_below_floors(
     requested: &lpm_registry::client::NpmFirewallPolicyProfile,
     floors: &[PolicyFloor<'_>],
 ) -> Result<(), LpmError> {
-    use crate::npm_firewall_config::{policy_action, policy_action_loosens};
+    use crate::npm_firewall_config::{
+        action_strictness, loosest_action_meeting, policy_action, policy_action_loosens,
+    };
     use lpm_registry::client::NpmFirewallPolicyAction;
-    const BY_STRICTNESS: [NpmFirewallPolicyAction; 3] = [
-        NpmFirewallPolicyAction::Allow,
-        NpmFirewallPolicyAction::Warn,
-        NpmFirewallPolicyAction::Block,
-    ];
     for key in crate::npm_firewall_config::POLICY_KEYS {
         let Some(requested_action) = policy_action(requested, key) else {
             continue;
         };
-        let mut binding: Option<(&PolicyFloor<'_>, NpmFirewallPolicyAction, usize)> = None;
+        let mut binding: Option<(
+            &PolicyFloor<'_>,
+            NpmFirewallPolicyAction,
+            NpmFirewallPolicyAction,
+        )> = None;
         for floor in floors {
             let Some(floor_action) = policy_action(floor.profile, key) else {
                 continue;
             };
-            let passing = BY_STRICTNESS
-                .iter()
-                .position(|candidate| {
-                    !policy_action_loosens(requested_mode, *candidate, floor.mode, floor_action)
-                })
-                .unwrap_or(BY_STRICTNESS.len() - 1);
-            if binding.is_none_or(|(_, _, strictest)| passing > strictest) {
+            let passing = loosest_action_meeting(requested_mode, floor.mode, floor_action);
+            if binding.is_none_or(|(_, _, strictest)| {
+                action_strictness(passing) > action_strictness(strictest)
+            }) {
                 binding = Some((floor, floor_action, passing));
             }
         }
@@ -542,7 +540,7 @@ fn reject_policy_below_floors(
             requested_action.as_str(),
             floor_action.as_str(),
             floor.source.describe(),
-            BY_STRICTNESS[passing].as_str(),
+            passing.as_str(),
         )));
     }
     Ok(())

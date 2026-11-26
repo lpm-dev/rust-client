@@ -880,6 +880,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_custom_profile_save_meets_the_managed_policy_before_the_forced_floor() {
+        let temp = tempfile::tempdir().unwrap();
+        crate::security_approval::test_support::with_test_env(temp.path(), || {
+            std::fs::write(
+                temp.path().join("managed-security-policy.toml"),
+                "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_telemetry = \"block\"\n",
+            )
+            .unwrap();
+            let config_path = temp.path().join("config.toml");
+            let config = "force-security-floor = true\n\n[firewall]\nmode = \"enforce\"\n";
+            std::fs::write(&config_path, config).unwrap();
+            let looser_telemetry = NpmFirewallPolicyProfile {
+                lpm_ai_telemetry: NpmFirewallPolicyAction::Warn,
+                ..NpmFirewallPolicyProfile::default()
+            };
+
+            let message = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(apply_firewall_selection(
+                    &config_path,
+                    FirewallWizardSelection::CustomEnforce(looser_telemetry),
+                    true,
+                    "lpm config firewall",
+                ))
+                .unwrap_err()
+                .to_string();
+
+            assert!(
+                message.contains("managed security policy")
+                    && message
+                        .contains("keeps `[firewall.npm.policies].lpm_ai_telemetry` at `block`"),
+                "{message}"
+            );
+            assert!(!message.contains("force-security-floor"), "{message}");
+            assert_eq!(
+                crate::security_approval::test_support::guarded_attempts(),
+                1
+            );
+            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), config);
+        });
+    }
+
     fn offered_suspicious_actions(
         config: &str,
         local: &[(&str, &str)],

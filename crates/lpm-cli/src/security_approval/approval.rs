@@ -947,27 +947,44 @@ fn loosenings_a_managed_policy_allows(
         },
         &effective.posture.firewall_policy_profile(),
     );
+    let mode_managed = matches!(
+        effective.sources.firewall_mode,
+        PostureSourceKind::ManagedPolicy
+    );
     if let Some(first) = weakened.first()
-        && (policies_managed
-            || matches!(
-                effective.sources.firewall_mode,
-                PostureSourceKind::ManagedPolicy
-            ))
+        && (policies_managed || mode_managed)
     {
         let managed_policy = effective
             .managed_policy
             .as_ref()
             .expect("managed policy source must include status metadata");
-        let err = managed_policy_write_error(
-            managed_policy,
-            &format!(
-                "{}.{}",
-                crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_PATH,
-                first.key
-            ),
-            first.requested.as_str(),
-            first.approved.as_str(),
+        let knob = format!(
+            "{}.{}",
+            crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_PATH,
+            first.key
         );
+        let err = if policies_managed {
+            managed_policy_write_error(
+                managed_policy,
+                &knob,
+                first.requested.as_str(),
+                first.approved.as_str(),
+            )
+        } else {
+            // The policy holds only the mode, under which a looser action
+            // than the approved one can still stop or report as much.
+            let mode = effective.posture.firewall_mode();
+            LpmError::SecurityFloor(format!(
+                "managed security policy `{}` keeps the npm firewall in `{}` mode, where `{knob}` \
+                 can't be looser than `{}`. Update that higher-authority policy before setting \
+                 `{knob}` to `{}` here.",
+                managed_policy.path,
+                mode.as_str(),
+                crate::npm_firewall_config::loosest_action_meeting(enforce, mode, first.approved)
+                    .as_str(),
+                first.requested.as_str(),
+            ))
+        };
         record_persistent_guarded_attempt(ApprovalScope::FirewallDisable, false, &err.to_string());
         return Err(err);
     }

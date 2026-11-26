@@ -30,3 +30,11 @@ pub(crate) fn with_test_env<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
     ]);
     f()
 }
+
+/// How many `persistent-guarded-attempt` entries the audit log holds.
+pub(crate) fn guarded_attempts() -> usize {
+    std::fs::read_to_string(super::paths::audit_log_path().unwrap())
+        .unwrap_or_default()
+        .matches("\"event\":\"persistent-guarded-attempt\"")
+        .count()
+}

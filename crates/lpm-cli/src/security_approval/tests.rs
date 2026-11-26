@@ -1,5 +1,5 @@
 use super::prelude::*;
-use super::test_support::with_test_env;
+use super::test_support::{guarded_attempts, with_test_env};
 use super::*;
 use tempfile::tempdir;
 
@@ -2355,13 +2355,6 @@ fn forced_floor_names_one_action_that_passes_every_floor_an_editor_save_meets() 
     });
 }
 
-fn guarded_attempts() -> usize {
-    std::fs::read_to_string(audit_log_path().unwrap())
-        .unwrap_or_default()
-        .matches("\"event\":\"persistent-guarded-attempt\"")
-        .count()
-}
-
 /// An editor save under `managed_policy` and `force-security-floor = true` at
 /// `config_mode`, loosening telemetry to each of `requested_actions`, is
 /// refused by the managed check, which names `refused_group` and records each
@@ -2436,6 +2429,47 @@ fn an_editor_save_meets_the_managed_check_before_the_forced_floor() {
         &[lpm_registry::client::NpmFirewallPolicyAction::Allow],
         "lpm_ai_confirmed_malware",
     );
+}
+
+#[test]
+fn a_managed_mode_alone_names_the_loosest_action_its_mode_accepts() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_managed_policy(temp.path(), "[firewall]\nmode = \"monitor\"\n");
+        let config = forced_floor_config("monitor");
+        let dependency_scripts = |action| lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_dependency_script_policy: action,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        let message = crate::security_floor::reject_firewall_policy_save(
+            &config,
+            &dependency_scripts(lpm_registry::client::NpmFirewallPolicyAction::Allow),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            message.contains("keeps the npm firewall in `monitor` mode"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "`[firewall.npm.policies].{}` can't be looser than `warn`",
+                crate::npm_firewall_config::LPM_AI_DEPENDENCY_SCRIPT_POLICY_KEY
+            )),
+            "{message}"
+        );
+        assert!(!message.contains("`block`"), "{message}");
+        assert_eq!(guarded_attempts(), 1);
+        // Monitor reports `warn` and `block` alike, so the action it names passes.
+        crate::security_floor::reject_firewall_policy_save(
+            &config,
+            &dependency_scripts(lpm_registry::client::NpmFirewallPolicyAction::Warn),
+        )
+        .unwrap();
+        assert_eq!(guarded_attempts(), 1);
+    });
 }
 
 #[test]
