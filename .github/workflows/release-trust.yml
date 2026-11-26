@@ -149,7 +149,9 @@ jobs:
   sigstore:
     name: Sigstore's live trust root and Rekor v2 log work with LPM
     needs: rekor-v2-signing
-    if: ${{ !cancelled() && !github.event.pull_request.draft }}
+    # Runs whatever the signing job did, which pull requests skip; only the
+    # steps that check its bundle need it to have succeeded.
+    if: ${{ always() && !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
