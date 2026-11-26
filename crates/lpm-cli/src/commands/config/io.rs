@@ -50,6 +50,18 @@ pub(crate) async fn update_config<R>(
     Ok(result)
 }
 
+/// Runs `body` holding the transaction lock every config write takes, so
+/// neither `config.toml` nor a posture change made through it lands until
+/// `body` returns.
+pub(crate) async fn with_config_transaction_lock<R, E: From<LpmError>>(
+    body: impl FnOnce() -> Result<R, E>,
+) -> Result<R, E> {
+    let path = lpm_common::LpmRoot::from_env()?.root().join("config.toml");
+    ensure_config_parent(&path)?;
+    let _lock = acquire_config_lock(&path.with_file_name(".config.lock")).await?;
+    body()
+}
+
 fn ensure_config_parent(path: &std::path::Path) -> Result<(), LpmError> {
     let Some(parent) = path.parent() else {
         return Ok(());

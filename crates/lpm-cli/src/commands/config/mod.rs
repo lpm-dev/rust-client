@@ -30,7 +30,7 @@ use io::{
     guard_generic_set_against_force_floor, local_policy_table_base, read_config,
     remove_config_value_at_path,
 };
-pub(crate) use io::{redact_config_json_value, update_config};
+pub(crate) use io::{redact_config_json_value, update_config, with_config_transaction_lock};
 use wizards::{
     FIREWALL_GUIDED_MENU_LABEL, INTEGRITY_GUIDED_MENU_LABEL, INTEGRITY_KEY,
     RELEASE_AGE_GUIDED_MENU_LABEL, RELEASE_AGE_KEY, RELEASE_AGE_POLICY_KEY, SANDBOX_MODE_VALUES,

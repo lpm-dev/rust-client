@@ -2824,7 +2824,7 @@ async fn a_request_failure_reports_only_the_lifted_versions_it_released() {
     assert!(drained.failure.is_some());
     assert_eq!(
         drained.stats.block_count, 2,
-        "both lifted verdicts were classified"
+        "both lifted verdict responses arrived"
     );
     assert_eq!(bypassed_names(&drained.stats), ["released-b"]);
     assert_eq!(fetch_rx.recv().await.unwrap().name, "released-b");
@@ -2917,7 +2917,7 @@ async fn a_failed_batch_reports_no_lifted_version_since_nothing_downloaded() {
     assert!(result.failure.is_some());
     assert_eq!(
         result.stats.block_count, 1,
-        "the first batch's lifted verdict was classified"
+        "the first batch's lifted verdict arrived"
     );
     assert!(bypassed_names(&result.stats).is_empty());
 }

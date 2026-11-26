@@ -819,7 +819,7 @@ fn refuse_where_additions_are_off(
 
 /// [`refuse_where_additions_are_off`] with the settings read again, since
 /// either can change while a prompt is open: `add` checks before each prompt
-/// and under the store's lock before it saves.
+/// and, holding the config and store locks, right before it saves.
 fn refuse_once_additions_are_off() -> Result<(), AddRefusal> {
     let global = crate::commands::config::GlobalConfig::load_checked()
         .map_err(AddRefusal::settings_unreadable)?;
@@ -891,12 +891,19 @@ async fn approve_and_save_attempts(
             }
             approved.append(&mut pending);
         }
-        match security_approval::commit_firewall_bypass_rules_if(
-            refuse_once_additions_are_off,
-            &approved,
-            narrowing.iter().chain(&unchanged),
-            &format!("approved: {}", approved_prompts.join("; ")),
-        )? {
+        let approval_note = format!("approved: {}", approved_prompts.join("; "));
+        // The config lock keeps `force-security-floor` and the approved mode
+        // from changing between the last check and the write.
+        let commit = crate::commands::config::with_config_transaction_lock(|| {
+            security_approval::commit_firewall_bypass_rules_if(
+                refuse_once_additions_are_off,
+                &approved,
+                narrowing.iter().chain(&unchanged),
+                &approval_note,
+            )
+        })
+        .await?;
+        match commit {
             security_approval::FirewallBypassCommit::Saved(outcome) => return Ok(outcome),
             security_approval::FirewallBypassCommit::Expired => {
                 return Err(security_approval::bypass_expired_before_save_error(
@@ -2266,6 +2273,46 @@ mod tests {
                 "{error}"
             );
             assert_eq!(prompts, 1);
+            assert!(saved_specs().is_empty());
+        });
+    }
+
+    #[test]
+    fn add_waits_for_a_config_write_in_progress_and_then_meets_its_forced_floor() {
+        let temp = tempfile::tempdir().unwrap();
+        security_approval::test_support::with_test_env(temp.path(), || {
+            let lpm_home = temp.path().join("lpm-home");
+            std::fs::create_dir_all(&lpm_home).unwrap();
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                let lock = lpm_common::try_acquire_exclusive_lock(lpm_home.join(".config.lock"))
+                    .unwrap()
+                    .expect("nothing else holds the config lock");
+                locked_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                std::fs::write(
+                    lpm_home.join("config.toml"),
+                    "force-security-floor = true\n\n[firewall]\nmode = \"enforce\"\n",
+                )
+                .unwrap();
+                drop(lock);
+            });
+            locked_rx.recv().unwrap();
+            let specs = specs(&["fresh@1.0.0"]);
+            let scope = global();
+
+            let error = run_add(
+                &plan(&specs, &scope, None, false),
+                vec![rule(&specs[0], None)],
+                |_| Ok(()),
+            )
+            .unwrap_err();
+            writer.join().unwrap();
+
+            assert!(
+                error.to_string().contains("force-security-floor"),
+                "{error}"
+            );
             assert!(saved_specs().is_empty());
         });
     }
