@@ -597,25 +597,28 @@ fn refuse_add(
     error
 }
 
-async fn add(
-    client: &RegistryClient,
-    cwd: &Path,
+/// What `add` settles before any prompt.
+struct AddSetup {
+    ttl_secs: Option<u64>,
+    now: Timestamp,
+    global: crate::commands::config::GlobalConfig,
+    effective: security_approval::EffectiveAuthorizedPosture,
+    sorted: security_approval::FirewallBypassRequests,
+}
+
+/// Checks a request whose specs and scope parsed, and sorts its rules by
+/// what saving them needs.
+fn plan_add(
     request: &AddRequest<'_>,
-    json_output: bool,
-) -> Result<(), LpmError> {
-    let specs = parse_specs(request.specs)?;
-    let scope = RuleScope::resolve(cwd, request.project)?;
-    let project_root = scope.project_root.as_deref();
+    specs: &[FirewallBypassSpec],
+    scope: &RuleScope,
+) -> Result<AddSetup, LpmError> {
     if request.allow_malware
         && let Some(spec) = specs.iter().find(|spec| spec.kind() != BypassKind::Exact)
     {
-        return Err(refuse_add(
-            &specs,
-            project_root,
-            LpmError::InvalidPackageName(format!(
-                "`--allow-malware` applies only to exact versions such as `name@1.2.3`; `{spec}` names more"
-            )),
-        ));
+        return Err(LpmError::InvalidPackageName(format!(
+            "`--allow-malware` applies only to exact versions such as `name@1.2.3`; `{spec}` names more"
+        )));
     }
     let ttl_secs = parse_ttl(request.ttl)?;
     let now = Timestamp::now();
@@ -623,19 +626,11 @@ async fn add(
     let global = crate::commands::config::GlobalConfig::load_checked()?;
     let effective = security_approval::load_effective_authorized_posture()?;
     if let Some(reason) = security_approval::local_firewall_bypass_inactive_reason(&effective) {
-        return Err(refuse_add(
-            &specs,
-            project_root,
-            LpmError::SecurityFloor(reason),
-        ));
+        return Err(LpmError::SecurityFloor(reason));
     }
     if forced_floor_refuses_additions(&global, &effective)? {
-        return Err(refuse_add(
-            &specs,
-            project_root,
-            LpmError::SecurityFloor(
-                "`force-security-floor = true` keeps the npm firewall at enforce, so new bypass rules are refused; lower the floor intentionally in ~/.lpm/config.toml first".to_string(),
-            ),
+        return Err(LpmError::SecurityFloor(
+            "`force-security-floor = true` keeps the npm firewall at enforce, so new bypass rules are refused; lower the floor intentionally in ~/.lpm/config.toml first".to_string(),
         ));
     }
 
@@ -656,8 +651,32 @@ async fn add(
             rule
         })
         .collect();
-    let sorted = security_approval::sort_firewall_bypass_requests(rules)
-        .map_err(|error| refuse_add(&specs, project_root, error))?;
+    let sorted = security_approval::sort_firewall_bypass_requests(rules)?;
+    Ok(AddSetup {
+        ttl_secs,
+        now,
+        global,
+        effective,
+        sorted,
+    })
+}
+
+async fn add(
+    client: &RegistryClient,
+    cwd: &Path,
+    request: &AddRequest<'_>,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let specs = parse_specs(request.specs)?;
+    let scope = RuleScope::resolve(cwd, request.project)?;
+    let AddSetup {
+        ttl_secs,
+        now,
+        global,
+        effective,
+        sorted,
+    } = plan_add(request, &specs, &scope)
+        .map_err(|error| refuse_add(&specs, scope.project_root.as_deref(), error))?;
     let outcome = approve_and_save(
         client,
         &PlannedAdd {
@@ -1886,8 +1905,11 @@ mod tests {
             let requested = specs.iter().map(|spec| rule(spec, None)).collect();
             let mut approvals = 0;
 
-            run_add(&plan(&specs, &scope, None, false), requested, |approval| {
+            let mut prompts = Vec::new();
+
+            let error = run_add(&plan(&specs, &scope, None, false), requested, |approval| {
                 approvals += 1;
+                prompts.push(approval.prompt.to_string());
                 if approvals == 2 {
                     // SAFETY: the test environment holds the process-wide
                     // environment lock and restores the variable afterwards.
@@ -1897,9 +1919,58 @@ mod tests {
             })
             .unwrap_err();
 
+            assert_eq!(approvals, 2);
             let records = security_approval::test_support::audit_records("firewall-bypass-added");
             assert_eq!(records.len(), 1, "{records:?}");
             assert!(!records[0].allowed);
+            assert_eq!(
+                records[0].detail,
+                Some(format!("{error}; approved: {}", prompts[0]))
+            );
+            assert!(error.to_string().contains("not approved"), "{error}");
+        });
+    }
+
+    #[test]
+    fn add_records_a_refusal_for_a_setup_error_once_its_specs_are_known() {
+        let temp = tempfile::tempdir().unwrap();
+        security_approval::test_support::with_test_env(temp.path(), || {
+            let specs = vec!["left-pad@1.3.0".to_string()];
+            let run_add_command = |ttl: Option<&str>| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(add(
+                        &RegistryClient::new(),
+                        temp.path(),
+                        &AddRequest {
+                            specs: &specs,
+                            project: None,
+                            ttl,
+                            reason: None,
+                            allow_malware: false,
+                        },
+                        true,
+                    ))
+                    .unwrap_err()
+            };
+
+            let invalid_ttl = run_add_command(Some("soon"));
+            let lpm_home = temp.path().join("lpm-home");
+            std::fs::create_dir_all(&lpm_home).unwrap();
+            std::fs::write(
+                lpm_home.join("config.toml"),
+                "force-security-floor = true\n[firewall]\nmode = \"sometimes\"\n",
+            )
+            .unwrap();
+            let invalid_config = run_add_command(None);
+
+            let records = security_approval::test_support::audit_records("firewall-bypass-added");
+            assert_eq!(records.len(), 2, "{records:?}");
+            assert!(records.iter().all(|record| !record.allowed), "{records:?}");
+            assert_eq!(records[0].detail, Some(invalid_ttl.to_string()));
+            assert_eq!(records[1].detail, Some(invalid_config.to_string()));
         });
     }
 

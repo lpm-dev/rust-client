@@ -197,6 +197,84 @@ async fn bypassed_version_is_listed_in_the_install_json_security_report() {
     }
 }
 
+/// More packages than one verdict request carries, so monitor mode asks in
+/// two batches: the first, which holds `aaa-agent-tool` (packages are asked
+/// in name order), answers and the second fails.
+#[tokio::test]
+async fn monitor_reports_what_a_rule_would_allow_when_a_later_verdict_batch_fails() {
+    let mock = MockRegistry::start().await;
+    let names: Vec<String> = std::iter::once("aaa-agent-tool".to_string())
+        .chain((0..512).map(|index| format!("filler-{index:03}")))
+        .collect();
+    for name in &names {
+        mock.with_package(name, "1.0.0", &make_tarball(name, "1.0.0"))
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path(VERDICTS_PATH))
+        .and(body_string_contains("\"name\":\"aaa-agent-tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "requestId": "bypass-test",
+            "policyMode": "monitor",
+            "summary": { "total": 1, "allow": 0, "warn": 0, "block": 1, "unknown": 0, "matched": 1 },
+            "decisions": [{
+                "decisionId": "bypass-test:aaa-agent-tool",
+                "name": "aaa-agent-tool",
+                "version": "1.0.0",
+                "action": "block",
+                "verdict": "suspicious",
+                "reason": "client policy maps lpm_ai_agent_control_surface to block",
+                "matchSource": "package",
+                "policyMode": "monitor",
+                "enqueueScan": false,
+                "policy": { "group": "lpm_ai_agent_control_surface" }
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path(VERDICTS_PATH))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(mock.server())
+        .await;
+    let dependencies: serde_json::Map<String, serde_json::Value> = names
+        .iter()
+        .map(|name| (name.clone(), serde_json::json!("1.0.0")))
+        .collect();
+    let project = TempProject::empty(
+        &serde_json::json!({ "name": "consumer", "version": "1.0.0", "dependencies": dependencies })
+            .to_string(),
+    );
+    write_npm_firewall_global_config(&project, "monitor");
+    write_signed_firewall_bypass(
+        &project,
+        &[stored_rule("aaa-agent-tool", serde_json::json!({}))],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--color", "never", "install", "--no-skills"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("! npm firewall verdict preflight failed in monitor mode:"),
+        "{stderr}"
+    );
+    assert!(
+        stderr
+            .contains("! LPM Firewall monitor: your bypass rules would allow 1 blocked package:\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("    rule: aaa-agent-tool (every project)\n"),
+        "{stderr}"
+    );
+}
+
 #[tokio::test]
 async fn name_rule_never_lets_a_malware_version_through() {
     let mock = registry_blocking("hijacked", "malicious", "lpm_ai_confirmed_malware").await;
@@ -490,6 +568,36 @@ async fn global_install_block_names_a_rule_for_every_project() {
     let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
     let project = enforcing_project();
     let root = cli_project_root(project.path());
+    write_signed_firewall_bypass(
+        &project,
+        &[stored_rule(
+            "agent-tool",
+            serde_json::json!({ "scope": "project", "project_root": root }),
+        )],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--color", "never", "install", "-g", "agent-tool@1.0.0"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains(AGENT_TOOL_HINT), "{stderr}");
+}
+
+#[tokio::test]
+async fn global_install_ignores_a_project_rule_for_a_workspace_that_holds_lpm_home() {
+    let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
+    let project = enforcing_project();
+    // The workspace claims every directory under `LPM_HOME`'s global tree,
+    // so the global install root resolves to this project.
+    std::fs::write(
+        project.home().join("package.json"),
+        r#"{"name":"home-workspace","private":true,"workspaces":[".lpm/global/**"]}"#,
+    )
+    .unwrap();
+    let root = cli_project_root(project.home());
     write_signed_firewall_bypass(
         &project,
         &[stored_rule(
