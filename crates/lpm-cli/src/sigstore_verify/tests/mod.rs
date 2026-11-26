@@ -2892,10 +2892,9 @@ fn an_sct_is_checked_under_the_ct_log_key_valid_at_its_own_time() {
 #[test]
 fn an_sct_timestamp_past_the_year_9999_is_refused_on_every_platform() {
     // A validity window would read such a time as the end of the year 9999:
-    // inside a key's open-ended window. The first millisecond of the year
-    // 10000 fits every platform's clock; the largest timestamp fits none.
-    // Either way the SCT itself verifies under the key.
-    const YEAR_10000_MS: u64 = 253_402_300_800_000;
+    // inside a key's open-ended window. The verifier refuses any SCT time it
+    // can't place before the year 10000, whether or not the platform's
+    // clock could hold it. Either way the SCT itself verifies under the key.
     for timestamp_ms in [YEAR_10000_MS, u64::MAX] {
         let (leaf_der, issuer_spki, mut ct_log_key) = leaf_with_sct_at(timestamp_ms);
         ct_log_key.valid_for.end = None;
@@ -2907,12 +2906,17 @@ fn an_sct_timestamp_past_the_year_9999_is_refused_on_every_platform() {
             "{timestamp_ms}: {refused:?}"
         );
     }
+}
 
-    // The last millisecond of the year 9999 is still a time to judge.
+#[test]
+fn an_sct_from_the_last_millisecond_of_the_year_9999_verifies() {
     let (leaf_der, issuer_spki, mut ct_log_key) = leaf_with_sct_at(YEAR_10000_MS - 1);
     ct_log_key.valid_for.end = None;
     verify_embedded_sct(&leaf_der, &issuer_spki, std::slice::from_ref(&ct_log_key)).unwrap();
 }
+
+/// The first millisecond of the year 10000.
+const YEAR_10000_MS: u64 = 253_402_300_800_000;
 
 /// A leaf whose embedded SCT a fresh CT log key signed at `timestamp_ms`,
 /// with the leaf's issuer SPKI and that key.
