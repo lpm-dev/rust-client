@@ -53,9 +53,47 @@ pub(super) struct VerifiedTimestamp {
     pub(super) authority: String,
 }
 
+/// A bundle's timestamps, sorted into those that verified and why the
+/// others didn't. A timestamp that doesn't verify proves nothing.
+#[derive(Debug, Default)]
+pub(super) struct TimestampOutcome {
+    pub(super) verified: Vec<VerifiedTimestamp>,
+    rejected: Vec<VerifyError>,
+}
+
+impl TimestampOutcome {
+    /// The earliest verified time: the latest the signature can have
+    /// been made.
+    pub(super) fn earliest(&self) -> Option<SystemTime> {
+        self.verified.iter().map(|timestamp| timestamp.time).min()
+    }
+
+    /// Why no timestamp verified, preferring a reason a newer trust root
+    /// could fix so the caller fetches one.
+    pub(super) fn into_error(mut self) -> VerifyError {
+        if let Some(index) = self
+            .rejected
+            .iter()
+            .position(VerifyError::is_missing_trust_material)
+        {
+            return self.rejected.swap_remove(index);
+        }
+        match self.rejected.len() {
+            0 => VerifyError::Timestamp("the bundle carries no RFC 3161 timestamp".into()),
+            1 => self.rejected.remove(0),
+            _ => VerifyError::Timestamp(
+                self.rejected
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+        }
+    }
+}
+
 /// Verify each of a bundle's signed timestamps over `signature`, the
 /// bundle's signature bytes, against `authorities`.
-/// Returns those that verified; the others prove nothing and are skipped.
 ///
 /// A bundle whose timestamps need more signature checks than
 /// [`MAX_LINK_CHECKS`] to place is refused outright, so the outcome never
@@ -64,21 +102,24 @@ pub(super) fn verify_signed_timestamps(
     signed_timestamps: &[Vec<u8>],
     signature: &[u8],
     authorities: &[TimestampAuthority],
-) -> Result<Vec<VerifiedTimestamp>, VerifyError> {
-    let mut verified = Vec::with_capacity(signed_timestamps.len());
+) -> Result<TimestampOutcome, VerifyError> {
+    let mut outcome = TimestampOutcome::default();
     let budget = LinkBudget::new();
     for signed_timestamp in signed_timestamps {
         match verify_with_budget(signed_timestamp, signature, authorities, &budget) {
-            Ok(timestamp) => verified.push(timestamp),
-            Err(error) => tracing::debug!(
-                target: "lpm_cli::sigstore_verify",
-                %error,
-                "an RFC 3161 timestamp in the bundle did not verify",
-            ),
+            Ok(timestamp) => outcome.verified.push(timestamp),
+            Err(error) => {
+                tracing::debug!(
+                    target: "lpm_cli::sigstore_verify",
+                    %error,
+                    "an RFC 3161 timestamp in the bundle did not verify",
+                );
+                outcome.rejected.push(error);
+            }
         }
         budget.check()?;
     }
-    Ok(verified)
+    Ok(outcome)
 }
 
 /// [`verify_with_budget`] for a bundle with this one timestamp.

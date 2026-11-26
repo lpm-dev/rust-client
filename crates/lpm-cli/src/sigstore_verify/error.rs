@@ -195,6 +195,10 @@ impl VerifyError {
 /// offline anchors. The variant is the *single* authority on what's required;
 /// there is intentionally no parallel `require_inclusion_proof: bool`
 /// (adding one re-creates a dual-authority bug).
+///
+/// The policy governs Rekor v1 entries. A Rekor v2 entry has no SET, so
+/// under every policy it needs an inclusion proof and an RFC 3161
+/// timestamp, which takes the SET's place as the signed time.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RekorInclusionProofPolicy {

@@ -1427,6 +1427,7 @@ fn a_bundle_whose_timestamps_need_too_many_signature_checks_is_refused_in_any_or
         assert_eq!(
             verify_signed_timestamps(std::slice::from_ref(&valid), SIGNATURE, &authorities)
                 .unwrap()
+                .verified
                 .len(),
             1
         );

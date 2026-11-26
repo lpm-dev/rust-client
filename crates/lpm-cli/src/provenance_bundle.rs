@@ -602,11 +602,11 @@ fn npm_provenance_from(
                 )));
             }
             let integrated_time_secs = verified
-                .integrated_time
+                .signed_at
                 .duration_since(UNIX_EPOCH)
                 .map_err(|error| {
                     LpmError::ProvenanceVerification(format!(
-                        "attestation integrated time predates the Unix epoch: {error}"
+                        "attestation signing time predates the Unix epoch: {error}"
                     ))
                 })?
                 .as_secs();

@@ -14,6 +14,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
+mod conformance;
+mod rekor_v2;
 mod timestamp;
 
 const PAYLOAD_TYPE: &str = "application/vnd.in-toto+json";
@@ -125,6 +127,33 @@ fn verifies_when_at_least_one_of_multiple_signatures_matches() {
     let (_, cert) = X509Certificate::from_der(&cert_der).unwrap();
     verify_dsse(&envelope, &cert)
         .expect("verifier must accept the envelope when one signature verifies");
+}
+
+#[test]
+fn the_signature_a_bundle_logs_must_itself_verify() {
+    // `verify_dsse` accepts an envelope one of whose signatures verifies;
+    // the one a Rekor v2 entry logs and a timestamp covers must be valid
+    // on its own.
+    let (cert_der, signing_key) = p256_cert_and_signing_key();
+    let mut envelope = dsse_envelope_signed_with(&signing_key, PAYLOAD);
+    let garbage = [7u8; 64];
+    envelope.signatures.insert(
+        0,
+        DsseSignature {
+            keyid: String::new(),
+            sig: BASE64.encode(garbage),
+        },
+    );
+    let (_, cert) = X509Certificate::from_der(&cert_der).unwrap();
+    verify_dsse(&envelope, &cert).unwrap();
+
+    let valid = BASE64.decode(&envelope.signatures[1].sig).unwrap();
+    dsse::verify_dsse_signature(&envelope, &cert, &valid).unwrap();
+    let refused = dsse::verify_dsse_signature(&envelope, &cert, &garbage).unwrap_err();
+    assert!(
+        matches!(&refused, VerifyError::DsseSignature(why) if why.contains("did not verify")),
+        "{refused:?}"
+    );
 }
 
 // ── verify_dsse() failure cases ───────────────────────────────
@@ -381,6 +410,7 @@ fn tlog_entry_with_body(body: &serde_json::Value) -> TlogEntry {
             key_id: String::new(),
         },
         integrated_time: "0".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -450,6 +480,7 @@ fn accepts_rekor_body_with_field_reordered_or_extra_whitespace() {
             key_id: String::new(),
         },
         integrated_time: "0".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -552,6 +583,7 @@ fn rejects_bundle_with_canonicalized_body_not_base64() {
             key_id: String::new(),
         },
         integrated_time: "0".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -576,6 +608,7 @@ fn rejects_bundle_with_canonicalized_body_not_json() {
             key_id: String::new(),
         },
         integrated_time: "0".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -1150,6 +1183,7 @@ fn synth_tlog_entry_with_set(
             key_id: log_id_hex.to_string(),
         },
         integrated_time: integrated_time_secs.to_string(),
+        kind_version: None,
         inclusion_promise: Some(crate::sigstore::RekorInclusionPromise {
             signed_entry_timestamp,
         }),
@@ -1169,7 +1203,7 @@ fn rekor_key_active_around(log_id: Vec<u8>, spki_der: Vec<u8>, around_secs: i64)
             start,
             end: Some(end),
         },
-        base_url: "https://rekor.test.example".into(),
+        base_url: "https://rekor.sigstore.dev".into(),
         checkpoint_key_id: None,
     }
 }
@@ -1409,6 +1443,7 @@ fn rejects_missing_set_under_require_set_policy() {
             key_id: String::new(),
         },
         integrated_time: "1700000000".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -1428,6 +1463,7 @@ fn rejects_missing_set_under_require_both_policy() {
             key_id: String::new(),
         },
         integrated_time: "1700000000".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -1451,6 +1487,7 @@ fn accepts_missing_set_under_either_policy_and_returns_integrated_time() {
             key_id: String::new(),
         },
         integrated_time: "1700000000".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -1475,6 +1512,7 @@ fn accepts_missing_set_under_require_inclusion_proof_policy() {
             key_id: String::new(),
         },
         integrated_time: "1700000000".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -1500,6 +1538,7 @@ fn either_policy_rejects_bundle_with_neither_set_nor_inclusion_proof() {
             key_id: String::new(),
         },
         integrated_time: "1700000000".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -1536,6 +1575,7 @@ fn either_policy_accepts_inclusion_proof_only_bundle_via_primitive_seam() {
             key_id: String::new(),
         },
         integrated_time: "1700000000".into(),
+        kind_version: None,
         inclusion_promise: None, // SET absent
         inclusion_proof: Some(crate::sigstore::RekorInclusionProof {
             checkpoint: serde_json::json!({}),
@@ -1571,6 +1611,7 @@ fn either_policy_accepts_set_only_bundle_via_primitive_seam() {
         log_index: "7".into(),
         log_id: crate::sigstore::LogId { key_id: log_id_hex },
         integrated_time: integrated_time.to_string(),
+        kind_version: None,
         inclusion_promise: Some(crate::sigstore::RekorInclusionPromise {
             signed_entry_timestamp: set_b64,
         }),
@@ -1604,6 +1645,7 @@ fn require_both_policy_rejects_when_inclusion_proof_is_absent() {
             key_id: String::new(),
         },
         integrated_time: "1700000000".into(),
+        kind_version: None,
         // SET present, but IP absent (real-world: an npm bundle
         // that ships SET only — fine under Either, refused under
         // RequireBoth).
@@ -1632,6 +1674,7 @@ fn require_inclusion_proof_policy_rejects_when_inclusion_proof_is_absent() {
             key_id: String::new(),
         },
         integrated_time: "1700000000".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -1700,6 +1743,7 @@ fn verifies_set_via_legacy_verification_envelope_fallback() {
         log_index: "42".into(),
         log_id: crate::sigstore::LogId { key_id: log_id_hex },
         integrated_time: integrated_time.to_string(),
+        kind_version: None,
         inclusion_promise: None, // top-level absent
         inclusion_proof: None,
         verification: Some(crate::sigstore::RekorVerification {
@@ -1727,6 +1771,7 @@ fn rejects_set_with_malformed_integrated_time_string() {
             key_id: String::new(),
         },
         integrated_time: "not-a-number".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -1837,8 +1882,22 @@ fn rfc6962_inclusion_walk_rejects_leaf_index_out_of_range() {
 /// The signature line uses the origin's first whitespace-delimited
 /// token as the signer name — matches Rekor's actual format
 /// (origin "rekor.sigstore.dev - 12345" → sig name "rekor.sigstore.dev").
+/// A checkpoint Rekor v1 would sign: the key name is the log's host and
+/// the key ID the first four bytes of the SHA-256 of `signing_key`'s SPKI.
 fn build_signed_checkpoint(
     signing_key: &SigningKey,
+    origin: &str,
+    tree_size: i64,
+    root_hash: &[u8],
+) -> String {
+    let spki = VerifyingKey::from(signing_key).to_public_key_der().unwrap();
+    let key_id = Sha256::digest(spki.as_bytes());
+    build_signed_checkpoint_with_key_id(signing_key, &key_id[..4], origin, tree_size, root_hash)
+}
+
+fn build_signed_checkpoint_with_key_id(
+    signing_key: &SigningKey,
+    key_id: &[u8],
     origin: &str,
     tree_size: i64,
     root_hash: &[u8],
@@ -1846,10 +1905,9 @@ fn build_signed_checkpoint(
     let body = format!("{origin}\n{tree_size}\n{}\n", BASE64.encode(root_hash));
     let digest = Sha256::digest(body.as_bytes());
     let sig: Signature = signing_key.sign_prehash(&digest).expect("sign_prehash");
-    // 4-byte key-hint prefix (informational; we don't verify it).
-    let mut key_hint_plus_sig = vec![0u8; 4];
-    key_hint_plus_sig.extend_from_slice(sig.to_der().as_bytes());
-    let sig_b64 = BASE64.encode(&key_hint_plus_sig);
+    let mut key_id_plus_sig = key_id.to_vec();
+    key_id_plus_sig.extend_from_slice(sig.to_der().as_bytes());
+    let sig_b64 = BASE64.encode(&key_id_plus_sig);
     let sig_name = origin.split_whitespace().next().unwrap_or(origin);
     format!("{body}\n\u{2014} {sig_name} {sig_b64}\n")
 }
@@ -1871,6 +1929,7 @@ fn synth_tlog_entry_with_inclusion_proof(
             key_id: log_id_hex.to_string(),
         },
         integrated_time: integrated_time_secs.to_string(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: Some(crate::sigstore::RekorInclusionProof {
             checkpoint: serde_json::Value::String(checkpoint_envelope),
@@ -1946,10 +2005,15 @@ fn rejects_inclusion_proof_with_forged_checkpoint_signature() {
     let log_id_hex = hex::encode(&log_id_bytes);
     let integrated_time = 1700000000_i64;
     let ([_h0, h1, _h2, _h3], (_h01, h23), root, leaves) = four_leaf_tree();
-    // Sign with a DIFFERENT key than the pinned one.
+    // Sign with a DIFFERENT key than the pinned one, claiming its key ID.
     let (signing_key_forge, _, _) = p256_rekor_signing_key();
-    let checkpoint =
-        build_signed_checkpoint(&signing_key_forge, "rekor.sigstore.dev - 1", 4, &root);
+    let checkpoint = build_signed_checkpoint_with_key_id(
+        &signing_key_forge,
+        &log_id_bytes[..4],
+        "rekor.sigstore.dev - 1",
+        4,
+        &root,
+    );
     let tlog = synth_tlog_entry_with_inclusion_proof(
         &log_id_hex,
         0,
@@ -2070,6 +2134,7 @@ fn rejects_missing_inclusion_proof_with_inclusion_proof_missing_variant() {
             key_id: String::new(),
         },
         integrated_time: "1700000000".into(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None,
         verification: None,
@@ -2095,6 +2160,7 @@ fn verifies_inclusion_proof_when_checkpoint_is_object_with_envelope_field() {
         log_index: "0".into(),
         log_id: crate::sigstore::LogId { key_id: log_id_hex },
         integrated_time: integrated_time.to_string(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: Some(crate::sigstore::RekorInclusionProof {
             checkpoint: serde_json::json!({"envelope": envelope}),
@@ -2145,6 +2211,7 @@ fn verifies_inclusion_proof_via_legacy_verification_envelope_fallback() {
         log_index: "0".into(),
         log_id: crate::sigstore::LogId { key_id: log_id_hex },
         integrated_time: integrated_time.to_string(),
+        kind_version: None,
         inclusion_promise: None,
         inclusion_proof: None, // top-level absent
         verification: Some(crate::sigstore::RekorVerification {
@@ -2180,7 +2247,7 @@ fn rejects_inclusion_proof_with_malformed_checkpoint_envelope() {
         .expect_err("malformed checkpoint envelope must reject");
     match err {
         VerifyError::InclusionProof(msg) => assert!(
-            msg.contains("separator") || msg.contains("envelope"),
+            msg.contains("no blank line between its text and its signatures"),
             "expected envelope-parse diagnostic, got: {msg}"
         ),
         other => panic!("expected InclusionProof, got: {other:?}"),
@@ -3799,6 +3866,7 @@ fn microbench_per_step_primitive_timings() {
             log_index: "42".into(),
             log_id: crate::sigstore::LogId { key_id: log_id_hex },
             integrated_time: integrated_time.to_string(),
+            kind_version: None,
             inclusion_promise: Some(crate::sigstore::RekorInclusionPromise {
                 signed_entry_timestamp: set_b64,
             }),

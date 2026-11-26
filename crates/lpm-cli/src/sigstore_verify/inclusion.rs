@@ -1,11 +1,10 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use ecdsa::signature::hazmat::PrehashVerifier;
-use p256::ecdsa::Signature;
 use sha2::{Digest, Sha256};
 
+use super::checkpoint::{Checkpoint, LogStyle, verify_checkpoint};
 use super::rekor_body::json_value_kind;
-use super::rekor_set::{decode_log_id, p256_verifying_key_from_spki, parse_integrated_time};
+use super::rekor_set::{decode_log_id, parse_integrated_time, parse_log_index};
 use super::{RekorKey, VerifyError};
 
 /// Verify the Rekor Merkle inclusion proof attached to `tlog_entry`.
@@ -47,17 +46,18 @@ pub fn verify_inclusion_proof(
         })?;
 
     let checkpoint_envelope = extract_checkpoint_envelope(&proof.checkpoint)?;
-    let trusted = verify_checkpoint_signature(&checkpoint_envelope, rekor_key)?;
+    let trusted = verify_checkpoint(&checkpoint_envelope, rekor_key, LogStyle::RekorV1)
+        .map_err(VerifyError::InclusionProof)?;
 
     // Consistency: bundle's inclusion-proof fields agree with the
     // signed checkpoint. A bundle that says tree_size=N + root=R but
     // whose signed checkpoint commits to a different tree state is
     // structurally inconsistent — reject before walking the Merkle
     // path so the diagnostic names the mismatch directly.
-    if trusted.tree_size != proof.tree_size {
+    if u64::try_from(proof.tree_size).ok() != Some(trusted.size) {
         return Err(VerifyError::InclusionProof(format!(
             "inclusion proof tree_size={} disagrees with signed checkpoint tree_size={}",
-            proof.tree_size, trusted.tree_size,
+            proof.tree_size, trusted.size,
         )));
     }
     let proof_root_bytes = decode_root_hash_hex_or_base64(&proof.root_hash).map_err(|e| {
@@ -92,6 +92,43 @@ pub fn verify_inclusion_proof(
         )));
     }
 
+    verify_leaf_inclusion(tlog_entry, &proof.hashes, proof.log_index as u64, &trusted)
+}
+
+/// Verify the inclusion proof of a Rekor v2 entry against the log `log`.
+///
+/// The checkpoint's origin is the log's name, and the top-level
+/// `logIndex` is the leaf's index: Rekor v2 has no shards, and the
+/// proof's own index, tree size and root hash repeat values the signed
+/// checkpoint and the entry already give.
+pub(super) fn verify_rekor_v2_inclusion_proof(
+    tlog_entry: &crate::sigstore::TlogEntry,
+    log: &RekorKey,
+) -> Result<(), VerifyError> {
+    let proof = tlog_entry
+        .resolved_inclusion_proof()
+        .ok_or(VerifyError::InclusionProofMissing)?;
+    let checkpoint_envelope = extract_checkpoint_envelope(&proof.checkpoint)?;
+    let trusted = verify_checkpoint(&checkpoint_envelope, log, LogStyle::RekorV2)
+        .map_err(VerifyError::InclusionProof)?;
+    let log_index = parse_log_index(&tlog_entry.log_index)
+        .map_err(|e| VerifyError::InclusionProof(e.to_string()))?;
+    verify_leaf_inclusion(tlog_entry, &proof.hashes, log_index as u64, &trusted)
+}
+
+/// Walk the entry's leaf up to the signed checkpoint's root.
+fn verify_leaf_inclusion(
+    tlog_entry: &crate::sigstore::TlogEntry,
+    hashes: &[String],
+    leaf_index: u64,
+    trusted: &Checkpoint,
+) -> Result<(), VerifyError> {
+    if leaf_index >= trusted.size {
+        return Err(VerifyError::InclusionProof(format!(
+            "the entry's index {leaf_index} is not inside the signed checkpoint's tree of size {}",
+            trusted.size
+        )));
+    }
     let body_bytes = BASE64
         .decode(tlog_entry.canonicalized_body.as_bytes())
         .map_err(|e| {
@@ -101,8 +138,7 @@ pub fn verify_inclusion_proof(
         })?;
     let leaf_hash = rfc6962_leaf_hash(&body_bytes);
 
-    let sibling_hashes = proof
-        .hashes
+    let sibling_hashes = hashes
         .iter()
         .map(|h| {
             decode_root_hash_hex_or_base64(h).map_err(|e| {
@@ -121,12 +157,8 @@ pub fn verify_inclusion_proof(
         }
     }
 
-    let computed_root = rfc6962_verify_inclusion(
-        proof.log_index as u64,
-        proof.tree_size as u64,
-        &leaf_hash,
-        &sibling_hashes,
-    )?;
+    let computed_root =
+        rfc6962_verify_inclusion(leaf_index, trusted.size, &leaf_hash, &sibling_hashes)?;
     if computed_root != trusted.root_hash {
         return Err(VerifyError::InclusionProof(format!(
             "Merkle walk root does not match signed checkpoint root: \
@@ -160,130 +192,6 @@ fn extract_checkpoint_envelope(value: &serde_json::Value) -> Result<String, Veri
             json_value_kind(other)
         ))),
     }
-}
-
-/// Parsed and signature-verified checkpoint body. Trusted = the
-/// fields below were committed to by the Rekor signing key.
-struct TrustedCheckpoint {
-    tree_size: i64,
-    root_hash: Vec<u8>,
-}
-
-/// Verify a C2SP signed-note checkpoint against the pinned Rekor key.
-///
-/// Format (canonical signed-note):
-/// ```text
-/// <origin>
-/// <tree_size>
-/// <root_hash_base64>
-/// <... optional extra body lines ...>
-///
-/// — <name> <base64(key_hint || signature)>
-/// ```
-///
-/// The signed bytes are the body (lines before the empty separator),
-/// terminated by `\n`. The signature is DER-encoded ECDSA over
-/// `sha256(body_bytes)`. The 4-byte key_hint prefix is informational
-/// — we look up the Rekor key by `logId` instead, so a wrong hint
-/// doesn't cause a false reject (a wrong signature still does).
-fn verify_checkpoint_signature(
-    envelope: &str,
-    rekor_key: &RekorKey,
-) -> Result<TrustedCheckpoint, VerifyError> {
-    let (text, sig_block) = envelope.split_once("\n\n").ok_or_else(|| {
-        VerifyError::InclusionProof(
-            "checkpoint envelope is missing the empty-line separator between body and signatures"
-                .into(),
-        )
-    })?;
-    let signed_bytes = format!("{text}\n");
-
-    let mut body_lines = text.lines();
-    let _origin = body_lines
-        .next()
-        .ok_or_else(|| VerifyError::InclusionProof("checkpoint body has no origin line".into()))?;
-    let tree_size_str = body_lines.next().ok_or_else(|| {
-        VerifyError::InclusionProof("checkpoint body has no tree-size line".into())
-    })?;
-    let root_hash_b64 = body_lines.next().ok_or_else(|| {
-        VerifyError::InclusionProof("checkpoint body has no root-hash line".into())
-    })?;
-
-    let tree_size: i64 = tree_size_str.trim().parse().map_err(|e| {
-        VerifyError::InclusionProof(format!(
-            "checkpoint body tree-size line `{tree_size_str}` is not a valid i64: {e}"
-        ))
-    })?;
-    let root_hash = BASE64
-        .decode(root_hash_b64.trim().as_bytes())
-        .map_err(|e| {
-            VerifyError::InclusionProof(format!(
-                "checkpoint body root-hash line `{root_hash_b64}` is not valid base64: {e}"
-            ))
-        })?;
-    if root_hash.len() != 32 {
-        return Err(VerifyError::InclusionProof(format!(
-            "checkpoint root hash is {} bytes (expected 32 for sha256)",
-            root_hash.len()
-        )));
-    }
-
-    let mut sig_lines = sig_block.lines().filter(|l| !l.is_empty());
-    let sig_line = sig_lines.next().ok_or_else(|| {
-        VerifyError::InclusionProof("checkpoint envelope has no signature line".into())
-    })?;
-
-    // Per C2SP signed-note: "— <name> <base64>" where the em-dash is
-    // U+2014 (UTF-8: E2 80 94). Strip prefix; the name doesn't gate
-    // verification (we look the key up by logId), but the base64
-    // value is what we need.
-    let rest = sig_line
-        .strip_prefix("\u{2014} ")
-        .or_else(|| sig_line.strip_prefix("- "))
-        .ok_or_else(|| {
-            VerifyError::InclusionProof(format!(
-                "checkpoint signature line does not start with `— ` (em-dash + space): `{sig_line}`"
-            ))
-        })?;
-    let (_name, b64) = rest.split_once(' ').ok_or_else(|| {
-        VerifyError::InclusionProof(format!(
-            "checkpoint signature line is missing the base64 signature component: `{sig_line}`"
-        ))
-    })?;
-    let key_hint_plus_sig = BASE64.decode(b64.trim().as_bytes()).map_err(|e| {
-        VerifyError::InclusionProof(format!("checkpoint signature base64 did not decode: {e}"))
-    })?;
-    if key_hint_plus_sig.len() < 4 {
-        return Err(VerifyError::InclusionProof(format!(
-            "checkpoint signature is {} bytes (expected at least 4 for the key-hint prefix)",
-            key_hint_plus_sig.len()
-        )));
-    }
-    let sig_bytes = &key_hint_plus_sig[4..];
-    let signature = Signature::from_der(sig_bytes).map_err(|e| {
-        VerifyError::InclusionProof(format!("checkpoint signature is not valid DER ECDSA: {e}"))
-    })?;
-
-    let verifying_key = p256_verifying_key_from_spki(&rekor_key.spki_der).map_err(|e| {
-        VerifyError::InclusionProof(format!(
-            "pinned Rekor key did not decode as ECDSA P-256 SPKI: {e}"
-        ))
-    })?;
-    let digest = Sha256::digest(signed_bytes.as_bytes());
-    // Same prehash semantic as the SET verifier — Rekor signs the
-    // checkpoint digest via Go's ecdsa.SignASN1 prehash protocol.
-    verifying_key
-        .verify_prehash(digest.as_slice(), &signature)
-        .map_err(|e| {
-            VerifyError::InclusionProof(format!(
-                "checkpoint signature did not verify under the pinned Rekor key: {e}"
-            ))
-        })?;
-
-    Ok(TrustedCheckpoint {
-        tree_size,
-        root_hash,
-    })
 }
 
 /// Decode a 32-byte sha256 from either hex (Rekor canonical) or

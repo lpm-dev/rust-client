@@ -303,6 +303,16 @@ impl TrustRoot {
             .find(|k| k.log_id == log_id && k.valid_for.contains(t))
     }
 
+    /// The Rekor log a bundle's `logId` names, valid at `t`. A Rekor v2
+    /// entry's `logId` is the log's checkpoint key ID, which the trust root
+    /// may give separately.
+    pub fn rekor_log_at(&self, log_id: &[u8], t: SystemTime) -> Option<&RekorKey> {
+        self.rekor_keys.iter().find(|k| {
+            (k.log_id == log_id || k.checkpoint_key_id.as_deref() == Some(log_id))
+                && k.valid_for.contains(t)
+        })
+    }
+
     /// CT log key for an SCT's `logID`, valid at `t`.
     pub fn ctlog_key_at(&self, log_id: &[u8], t: SystemTime) -> Option<&CtLogKey> {
         self.ctlog_keys

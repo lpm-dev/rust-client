@@ -2258,7 +2258,7 @@ fn check_release_manifest(
         snapshot,
         build,
         statement,
-        integrated_time,
+        signed_at,
         leaf_cert_sha256,
         log_id,
         log_index,
@@ -2273,7 +2273,7 @@ fn check_release_manifest(
     )?;
 
     let published_at = release.published_at;
-    let integrated_time_utc: lpm_common::Timestamp = integrated_time.into();
+    let signed_at_utc: lpm_common::Timestamp = signed_at.into();
     let (Some(earliest), Some(latest)) = (
         published_at.checked_sub(REPLAY_PRE_WINDOW),
         published_at.checked_add(REPLAY_POST_WINDOW),
@@ -2283,12 +2283,12 @@ fn check_release_manifest(
             published_at.to_plain_utc()
         )));
     };
-    if integrated_time_utc < earliest || integrated_time_utc > latest {
+    if signed_at_utc < earliest || signed_at_utc > latest {
         return Err(LpmError::SelfUpdate(format!(
-            "Sigstore bundle integratedTime ({}) is outside the replay window \
+            "Sigstore bundle signing time ({}) is outside the replay window \
              [{}, {}] for release v{version} (published_at = {}). \
              The bundle may be a replayed attestation from a different release.",
-            integrated_time_utc.to_plain_utc(),
+            signed_at_utc.to_plain_utc(),
             earliest.to_plain_utc(),
             latest.to_plain_utc(),
             published_at.to_plain_utc()
@@ -2323,7 +2323,7 @@ fn check_release_manifest(
         publisher: snapshot.publisher,
         workflow_path: snapshot.workflow_path,
         workflow_ref: snapshot.workflow_ref,
-        integrated_time: integrated_time_utc,
+        integrated_time: signed_at_utc,
         log_index,
         log_id,
         leaf_cert_sha256,

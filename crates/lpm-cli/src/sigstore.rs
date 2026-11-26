@@ -322,9 +322,19 @@ pub struct TlogEntry {
     #[serde(rename = "logId")]
     pub log_id: LogId,
 
-    /// RFC 3339 timestamp of inclusion.
-    #[serde(rename = "integratedTime")]
+    /// Seconds since the epoch when Rekor v1 integrated the entry. Rekor
+    /// v2 has no integrated time, and its bundles leave the field out.
+    #[serde(rename = "integratedTime", default)]
     pub integrated_time: String,
+
+    /// The entry's kind and version, which its body repeats. Bundles
+    /// before v0.2 leave it out.
+    #[serde(
+        rename = "kindVersion",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub kind_version: Option<KindVersion>,
 
     /// Sigstore Bundle v0.3 spec: top-level inclusion promise carrying
     /// the Signed Entry Timestamp (SET). Populated when deserializing a
@@ -397,6 +407,12 @@ impl TlogEntry {
                 .and_then(|v| v.inclusion_proof.as_ref())
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KindVersion {
+    pub kind: String,
+    pub version: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -856,6 +872,7 @@ async fn rekor_upload(
         log_index,
         log_id: LogId { key_id: log_id },
         integrated_time,
+        kind_version: None,
         inclusion_promise,
         inclusion_proof,
         verification: None,
