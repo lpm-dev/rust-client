@@ -2450,12 +2450,12 @@ fn a_managed_mode_alone_names_the_loosest_action_its_mode_accepts() {
         .to_string();
 
         assert!(
-            message.contains("keeps the npm firewall in `monitor` mode"),
+            message.contains("holds the npm firewall at `monitor` mode or stricter"),
             "{message}"
         );
         assert!(
             message.contains(&format!(
-                "`[firewall.npm.policies].{}` can't be looser than `warn`",
+                "at `monitor` `[firewall.npm.policies].{}` can't be looser than `warn`",
                 crate::npm_firewall_config::LPM_AI_DEPENDENCY_SCRIPT_POLICY_KEY
             )),
             "{message}"

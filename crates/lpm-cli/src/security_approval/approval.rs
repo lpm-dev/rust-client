@@ -971,18 +971,18 @@ fn loosenings_a_managed_policy_allows(
                 first.approved.as_str(),
             )
         } else {
-            // The policy holds only the mode, under which a looser action
-            // than the approved one can still stop or report as much.
+            // The policy holds only a minimum mode, under which a looser
+            // action than the approved one can still stop or report as much.
             let mode = effective.posture.firewall_mode();
             LpmError::SecurityFloor(format!(
-                "managed security policy `{}` keeps the npm firewall in `{}` mode, where `{knob}` \
-                 can't be looser than `{}`. Update that higher-authority policy before setting \
-                 `{knob}` to `{}` here.",
+                "managed security policy `{}` holds the npm firewall at `{mode}` mode or \
+                 stricter, and at `{mode}` `{knob}` can't be looser than `{}`. Update that \
+                 higher-authority policy before setting `{knob}` to `{}` here.",
                 managed_policy.path,
-                mode.as_str(),
                 crate::npm_firewall_config::loosest_action_meeting(enforce, mode, first.approved)
                     .as_str(),
                 first.requested.as_str(),
+                mode = mode.as_str(),
             ))
         };
         record_persistent_guarded_attempt(ApprovalScope::FirewallDisable, false, &err.to_string());
