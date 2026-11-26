@@ -672,6 +672,23 @@ fn trust_root_reads_a_logs_checkpoint_key_id() {
 }
 
 #[test]
+fn a_log_the_trust_root_identifies_only_by_its_checkpoint_key_id_is_read() {
+    let mut json = synth_trust_root_json(
+        serde_json::json!({"start": "2020-01-01T00:00:00Z"}),
+        serde_json::json!({"start": "2020-01-01T00:00:00Z"}),
+        serde_json::json!({"start": "2020-01-01T00:00:00Z"}),
+    );
+    let log = json["tlogs"][0].as_object_mut().unwrap();
+    log.remove("logId");
+    log.insert(
+        "checkpointKeyId".into(),
+        serde_json::json!({"keyId": BASE64.encode([9u8; 32])}),
+    );
+    let root = TrustRoot::parse(&serde_json::to_vec(&json).unwrap()).unwrap();
+    assert_eq!(root.rekor_keys[0].log_id, vec![9u8; 32]);
+}
+
+#[test]
 fn an_unreadable_timestamp_authority_is_skipped_and_named() {
     let mut json = synth_trust_root_json(
         serde_json::json!({"start": "2020-01-01T00:00:00Z"}),

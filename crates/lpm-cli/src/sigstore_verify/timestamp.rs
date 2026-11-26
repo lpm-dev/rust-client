@@ -11,7 +11,8 @@ use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 use super::chain::{
-    check_cert_validity_at, enforce_issuer_constraints, verify_chain_link, verify_ecdsa_prehash,
+    check_cert_validity_at, enforce_issuer_constraints, oid_components_match, verify_chain_link,
+    verify_ecdsa_prehash,
 };
 use super::der::{self, Element, Reader};
 use super::{TimestampAuthority, VerifyError};
@@ -27,6 +28,12 @@ const OID_TST_INFO: &[u8] = &[
 ];
 const OID_CONTENT_TYPE: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x03];
 const OID_MESSAGE_DIGEST: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04];
+const OID_SIGNING_CERTIFICATE: &[u8] = &[
+    0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x0C,
+];
+const OID_SIGNING_CERTIFICATE_V2: &[u8] = &[
+    0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x2F,
+];
 const OID_SHA1: &[u8] = &[0x2B, 0x0E, 0x03, 0x02, 0x1A];
 const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
 const OID_SHA384: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02];
@@ -88,6 +95,7 @@ pub(super) fn verify_signed_timestamp(
     }
 
     let mut failures = Vec::new();
+    let mut outdated = Vec::new();
     for authority in authorities {
         match verify_with_authority(&token, &info, authority) {
             Ok(()) => {
@@ -97,21 +105,25 @@ pub(super) fn verify_signed_timestamp(
                 });
             }
             Err(AuthorityRejection::NotTheSigner) => {}
+            Err(AuthorityRejection::OutsideWindow(why)) => {
+                outdated.push(format!("{}: {why}", authority_label(authority)));
+            }
             Err(AuthorityRejection::Failed(why)) => {
                 failures.push(format!("{}: {why}", authority_label(authority)));
             }
         }
     }
-    if failures.is_empty() {
-        Err(VerifyError::MissingTrustMaterial {
-            check: CHECK,
-            detail: "no timestamp authority in the trust root holds the certificate that \
-                     signed it"
-                .into(),
-        })
-    } else {
-        Err(VerifyError::Timestamp(failures.join("; ")))
+    if !failures.is_empty() {
+        return Err(VerifyError::Timestamp(failures.join("; ")));
     }
+    Err(VerifyError::MissingTrustMaterial {
+        check: CHECK,
+        detail: if outdated.is_empty() {
+            "no timestamp authority in the trust root holds the certificate that signed it".into()
+        } else {
+            outdated.join("; ")
+        },
+    })
 }
 
 fn authority_label(authority: &TimestampAuthority) -> &str {
@@ -125,6 +137,9 @@ fn authority_label(authority: &TimestampAuthority) -> &str {
 enum AuthorityRejection {
     /// The authority holds no certificate matching the timestamp's signer.
     NotTheSigner,
+    /// The trust root's window for the authority excludes the signed time,
+    /// as it does for the other roles' keys: a newer trust root may move it.
+    OutsideWindow(String),
     Failed(String),
 }
 
@@ -142,53 +157,127 @@ fn verify_with_authority(
         })?;
         chain.push(cert);
     }
-    let Some(first) = chain.first() else {
+    let (Some(first), Some(anchor)) = (chain.first(), chain.last()) else {
         return Err(AuthorityRejection::NotTheSigner);
     };
+    let embedded: Vec<X509Certificate<'_>> = token
+        .certificates
+        .iter()
+        .filter_map(|der| X509Certificate::from_der(der).ok().map(|(_, cert)| cert))
+        .collect();
 
     // A chain that starts with an end-entity certificate pins the signing
     // certificate; otherwise the timestamp must carry it.
-    let embedded: Vec<X509Certificate<'_>>;
-    let (signer, issuers) = if is_ca(first) {
-        embedded = token
-            .certificates
-            .iter()
-            .filter_map(|der| X509Certificate::from_der(der).ok().map(|(_, cert)| cert))
-            .collect();
-        let signer = embedded
+    let signer = if is_ca(first) {
+        embedded
             .iter()
             .find(|cert| token.signer.id.matches(cert))
-            .ok_or(AuthorityRejection::NotTheSigner)?;
-        (signer, chain.as_slice())
+            .ok_or(AuthorityRejection::NotTheSigner)?
     } else if token.signer.id.matches(first) {
-        (first, &chain[1..])
+        first
     } else {
         return Err(AuthorityRejection::NotTheSigner);
     };
 
-    verify_signer_signature(token, signer).map_err(AuthorityRejection::Failed)?;
-    enforce_timestamping_leaf(signer).map_err(AuthorityRejection::Failed)?;
+    // Intermediates may come from the trust root or the token; only the
+    // trust root's anchor is trusted on its own.
+    let intermediates: Vec<&X509Certificate<'_>> = chain[..chain.len() - 1]
+        .iter()
+        .chain(embedded.iter())
+        .filter(|cert| is_ca(cert))
+        .collect();
+    let at_time = lpm_common::Timestamp::from(info.gen_time);
+    verify_path(signer, &intermediates, anchor, at_time)?;
 
+    enforce_timestamping_leaf(signer).map_err(AuthorityRejection::Failed)?;
+    verify_signer_signature(token, signer).map_err(AuthorityRejection::Failed)?;
+    check_signing_certificate(token, signer).map_err(AuthorityRejection::Failed)?;
     if !authority.valid_for.contains(info.gen_time) {
-        return Err(AuthorityRejection::Failed(format!(
+        return Err(AuthorityRejection::OutsideWindow(format!(
             "its time {} is outside the authority's validity window in the trust root",
-            lpm_common::Timestamp::from(info.gen_time).to_rfc3339()
+            at_time.to_rfc3339()
         )));
     }
+    Ok(())
+}
 
-    let at_time = lpm_common::Timestamp::from(info.gen_time);
+/// The most intermediates between a signing certificate and its trust
+/// anchor.
+const MAX_INTERMEDIATES: usize = 3;
+
+/// Walk from the signing certificate up to `anchor`, each certificate valid
+/// at `at_time` and signed by the next. An issuer that neither
+/// `intermediates` nor the anchor provides, by name and key, is missing
+/// trust material: a newer trust root may hold it.
+fn verify_path(
+    signer: &X509Certificate<'_>,
+    intermediates: &[&X509Certificate<'_>],
+    anchor: &X509Certificate<'_>,
+    at_time: lpm_common::Timestamp,
+) -> Result<(), AuthorityRejection> {
     let failed = |error: VerifyError| AuthorityRejection::Failed(error.to_string());
     check_cert_validity_at(signer, at_time, "timestamp signing certificate").map_err(failed)?;
+    if signer.as_ref() == anchor.as_ref() {
+        return Ok(());
+    }
+    refuse_unhandled_critical_extensions(signer, "its signing certificate")
+        .map_err(AuthorityRejection::Failed)?;
+
     let mut child = signer;
-    for (index, issuer) in issuers.iter().enumerate() {
-        let label = format!("timestamp authority certificate {index}");
-        check_cert_validity_at(issuer, at_time, &label).map_err(failed)?;
-        enforce_issuer_constraints(issuer, index, &label).map_err(failed)?;
-        if index + 1 < issuers.len() {
-            enforce_timestamping_intermediate(issuer).map_err(AuthorityRejection::Failed)?;
+    for depth in 0..=MAX_INTERMEDIATES {
+        let label = "timestamp authority trust anchor";
+        if child.tbs_certificate.issuer.as_raw() == anchor.tbs_certificate.subject.as_raw()
+            && verify_chain_link(child, anchor, label).is_ok()
+        {
+            check_cert_validity_at(anchor, at_time, label).map_err(failed)?;
+            return enforce_issuer_constraints(anchor, depth, label).map_err(failed);
         }
-        verify_chain_link(child, issuer, &label).map_err(failed)?;
+        if depth == MAX_INTERMEDIATES {
+            break;
+        }
+        let label = format!("timestamp authority intermediate {depth}");
+        let issuer = intermediates
+            .iter()
+            .find(|cert| {
+                cert.tbs_certificate.subject.as_raw() == child.tbs_certificate.issuer.as_raw()
+                    && verify_chain_link(child, cert, &label).is_ok()
+            })
+            .ok_or(AuthorityRejection::NotTheSigner)?;
+        check_cert_validity_at(issuer, at_time, &label).map_err(failed)?;
+        enforce_issuer_constraints(issuer, depth, &label).map_err(failed)?;
+        enforce_timestamping_intermediate(issuer).map_err(AuthorityRejection::Failed)?;
+        refuse_unhandled_critical_extensions(issuer, "an intermediate certificate")
+            .map_err(AuthorityRejection::Failed)?;
         child = issuer;
+    }
+    Err(AuthorityRejection::NotTheSigner)
+}
+
+/// Extensions a timestamp authority certificate may mark critical: those
+/// this verifier enforces, and the subject alternative name.
+const HANDLED_CRITICAL_EXTENSIONS: [&[u64]; 4] = [
+    &[2, 5, 29, 15],
+    &[2, 5, 29, 17],
+    &[2, 5, 29, 19],
+    &[2, 5, 29, 37],
+];
+
+/// RFC 5280 §4.2: a certificate with a critical extension the verifier
+/// doesn't process must be refused.
+fn refuse_unhandled_critical_extensions(
+    cert: &X509Certificate<'_>,
+    what: &str,
+) -> Result<(), String> {
+    for extension in cert.extensions().iter().filter(|e| e.critical) {
+        if !HANDLED_CRITICAL_EXTENSIONS
+            .iter()
+            .any(|oid| oid_components_match(&extension.oid, oid))
+        {
+            return Err(format!(
+                "{what} carries the critical extension {}, which LPM doesn't process",
+                extension.oid
+            ));
+        }
     }
     Ok(())
 }
@@ -358,7 +447,18 @@ struct SignerInfo<'a> {
     signed_attributes: &'a [u8],
     /// The value of the message digest signed attribute.
     message_digest: &'a [u8],
+    /// The values of the ESS signing certificate attributes.
+    signing_certificates: Vec<SigningCertificate<'a>>,
     signature: &'a [u8],
+}
+
+/// An ESS signing certificate attribute's value (RFC 2634 §5.4, RFC 5035).
+#[derive(Clone, Copy)]
+enum SigningCertificate<'a> {
+    /// `SigningCertificate`, naming certificates by SHA-1.
+    V1(&'a [u8]),
+    /// `SigningCertificateV2`, naming certificates by any SHA-2 hash.
+    V2(&'a [u8]),
 }
 
 /// Judged once a trusted certificate matches the signer, so a timestamp
@@ -548,13 +648,14 @@ fn parse_signer_info(contents: &[u8]) -> Result<SignerInfo<'_>, String> {
     signer.optional(der::context_constructed(1))?;
     signer.finish("the SignerInfo")?;
 
-    let message_digest = signed_message_digest(signed_attributes)?;
+    let attributes = parse_signed_attributes(signed_attributes)?;
     Ok(SignerInfo {
         id,
         digest,
         signature_algorithm,
         signed_attributes,
-        message_digest,
+        message_digest: attributes.message_digest,
+        signing_certificates: attributes.signing_certificates,
         signature,
     })
 }
@@ -563,23 +664,34 @@ fn signature_algorithm(
     element: &Element<'_>,
     digest: HashAlgorithm,
 ) -> Result<SignatureAlgorithm, String> {
-    let identifier = algorithm_identifier(element, "the signer's signature algorithm")?;
-    Ok(match identifier.oid {
-        OID_ECDSA_WITH_SHA256 => SignatureAlgorithm::Ecdsa(HashAlgorithm::Sha256),
-        OID_ECDSA_WITH_SHA384 => SignatureAlgorithm::Ecdsa(HashAlgorithm::Sha384),
-        OID_ECDSA_WITH_SHA512 => SignatureAlgorithm::Ecdsa(HashAlgorithm::Sha512),
-        OID_EC_PUBLIC_KEY => SignatureAlgorithm::Ecdsa(digest),
-        _ => SignatureAlgorithm::Other,
-    })
+    const WHAT: &str = "the signer's signature algorithm";
+    let identifier = algorithm_identifier(element, WHAT)?;
+    let hash = match identifier.oid {
+        OID_ECDSA_WITH_SHA256 => HashAlgorithm::Sha256,
+        OID_ECDSA_WITH_SHA384 => HashAlgorithm::Sha384,
+        OID_ECDSA_WITH_SHA512 => HashAlgorithm::Sha512,
+        OID_EC_PUBLIC_KEY => return Ok(SignatureAlgorithm::Ecdsa(digest)),
+        _ => return Ok(SignatureAlgorithm::Other),
+    };
+    // RFC 5758 §3.2: ecdsa-with-SHA2 identifiers carry no parameters.
+    identifier.parameters.finish(WHAT)?;
+    Ok(SignatureAlgorithm::Ecdsa(hash))
+}
+
+struct SignedAttributes<'a> {
+    message_digest: &'a [u8],
+    signing_certificates: Vec<SigningCertificate<'a>>,
 }
 
 /// The content type and message digest attributes RFC 5652 §5.3 requires,
 /// each present once with one value, with the content type naming a
-/// TSTInfo. Returns the message digest.
-fn signed_message_digest(contents: &[u8]) -> Result<&[u8], String> {
+/// TSTInfo; and the ESS signing certificate attributes RFC 3161 §2.4.1
+/// asks a timestamp authority to include.
+fn parse_signed_attributes(contents: &[u8]) -> Result<SignedAttributes<'_>, String> {
     let mut attributes = Reader::new(contents);
     let mut content_type: Option<&[u8]> = None;
     let mut message_digest: Option<&[u8]> = None;
+    let mut signing_certificates = Vec::new();
     while !attributes.is_empty() {
         let mut attribute = attributes.nested(der::TAG_SEQUENCE, "a signed attribute")?;
         let oid = attribute
@@ -590,6 +702,18 @@ fn signed_message_digest(contents: &[u8]) -> Result<&[u8], String> {
         let (slot, tag, name) = match oid {
             OID_CONTENT_TYPE => (&mut content_type, der::TAG_OID, "content type"),
             OID_MESSAGE_DIGEST => (&mut message_digest, der::TAG_OCTET_STRING, "message digest"),
+            OID_SIGNING_CERTIFICATE | OID_SIGNING_CERTIFICATE_V2 => {
+                let value = values
+                    .expect(der::TAG_SEQUENCE, "the signing certificate attribute")?
+                    .contents;
+                values.finish("the signing certificate attribute")?;
+                signing_certificates.push(if oid == OID_SIGNING_CERTIFICATE {
+                    SigningCertificate::V1(value)
+                } else {
+                    SigningCertificate::V2(value)
+                });
+                continue;
+            }
             _ => continue,
         };
         let value = values.expect(tag, name)?.contents;
@@ -603,7 +727,71 @@ fn signed_message_digest(contents: &[u8]) -> Result<&[u8], String> {
     if content_type.ok_or("the signed attributes carry no content type")? != OID_TST_INFO {
         return Err("the signed content type is not a TSTInfo".into());
     }
-    message_digest.ok_or_else(|| "the signed attributes carry no message digest".into())
+    Ok(SignedAttributes {
+        message_digest: message_digest.ok_or("the signed attributes carry no message digest")?,
+        signing_certificates,
+    })
+}
+
+/// The signer identifier isn't covered by the signature, so a token whose
+/// signed attributes name its signing certificate must name the one the
+/// identifier selected: the first certificate each ESS attribute lists,
+/// by hash and, when given, by issuer and serial number.
+fn check_signing_certificate(
+    token: &TimestampToken<'_>,
+    signer: &X509Certificate<'_>,
+) -> Result<(), String> {
+    const WHAT: &str = "the signing certificate attribute";
+    for attribute in &token.signer.signing_certificates {
+        let (contents, version_two) = match *attribute {
+            SigningCertificate::V1(contents) => (contents, false),
+            SigningCertificate::V2(contents) => (contents, true),
+        };
+        let mut certificates = Reader::new(contents).nested(der::TAG_SEQUENCE, WHAT)?;
+        let mut cert_id = certificates.nested(der::TAG_SEQUENCE, WHAT)?;
+        let named_hash = if version_two {
+            let hash = if cert_id.peek_tag() == Some(der::TAG_SEQUENCE) {
+                HashAlgorithm::from_algorithm_identifier(&cert_id.element()?, WHAT)?
+            } else {
+                HashAlgorithm::Sha256
+            };
+            let named = cert_id.expect(der::TAG_OCTET_STRING, WHAT)?.contents;
+            hash.digest(signer.as_ref()) == named
+        } else {
+            let named = cert_id.expect(der::TAG_OCTET_STRING, WHAT)?.contents;
+            sha1::Sha1::digest(signer.as_ref()).as_slice() == named
+        };
+        if !named_hash {
+            return Err(format!("{WHAT} names another certificate than its signer"));
+        }
+        if let Some(issuer_serial) = cert_id.optional(der::TAG_SEQUENCE)? {
+            check_issuer_serial(issuer_serial.contents, signer)
+                .map_err(|why| format!("{WHAT} {why}"))?;
+        }
+        cert_id.finish(WHAT)?;
+    }
+    Ok(())
+}
+
+/// `IssuerSerial`: the signer's issuer among its general names, and its
+/// serial number.
+fn check_issuer_serial(contents: &[u8], signer: &X509Certificate<'_>) -> Result<(), String> {
+    const DIRECTORY_NAME: u8 = der::context_constructed(4);
+    let mut issuer_serial = Reader::new(contents);
+    let mut names = issuer_serial.nested(der::TAG_SEQUENCE, "its issuer")?;
+    let mut issuer_named = false;
+    while !names.is_empty() {
+        let name = names.element()?;
+        if name.tag == DIRECTORY_NAME {
+            issuer_named |= name.contents == signer.tbs_certificate.issuer.as_raw();
+        }
+    }
+    let serial = der::integer_contents(&issuer_serial.element()?, "its serial number")?;
+    issuer_serial.finish("its issuer and serial number")?;
+    if !issuer_named || serial != signer.tbs_certificate.raw_serial() {
+        return Err("names another issuer and serial number than its signer's".into());
+    }
+    Ok(())
 }
 
 struct TstInfo {
@@ -645,7 +833,9 @@ fn parse_tst_info(bytes: &[u8]) -> Result<TstInfo, String> {
     info.optional(der::TAG_BOOLEAN)?;
     info.optional(der::TAG_INTEGER)?;
     info.optional(der::context_constructed(0))?;
-    info.optional(der::context_constructed(1))?;
+    if let Some(extensions) = info.optional(der::context_constructed(1))? {
+        refuse_critical_tst_info_extensions(extensions.contents)?;
+    }
     info.finish("the TSTInfo")?;
 
     Ok(TstInfo {
@@ -653,6 +843,25 @@ fn parse_tst_info(bytes: &[u8]) -> Result<TstInfo, String> {
         hashed_message,
         gen_time,
     })
+}
+
+/// No TSTInfo extension is defined that this verifier processes, so a
+/// critical one refuses the timestamp.
+fn refuse_critical_tst_info_extensions(contents: &[u8]) -> Result<(), String> {
+    const WHAT: &str = "a TSTInfo extension";
+    let mut extensions = Reader::new(contents);
+    while !extensions.is_empty() {
+        let mut extension = extensions.nested(der::TAG_SEQUENCE, WHAT)?;
+        extension.expect(der::TAG_OID, WHAT)?;
+        if let Some(critical) = extension.optional(der::TAG_BOOLEAN)?
+            && critical.contents != [0x00]
+        {
+            return Err("the TSTInfo carries a critical extension LPM doesn't process".into());
+        }
+        extension.expect(der::TAG_OCTET_STRING, WHAT)?;
+        extension.finish(WHAT)?;
+    }
+    Ok(())
 }
 
 /// A DER `GeneralizedTime`: `YYYYMMDDHHMMSS`, an optional fraction of a

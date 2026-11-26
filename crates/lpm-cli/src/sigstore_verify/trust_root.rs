@@ -173,8 +173,8 @@ struct TrustedRootCertEntry {
 struct TrustedRootLog {
     #[serde(rename = "baseUrl", default)]
     base_url: String,
-    #[serde(rename = "logId")]
-    log_id: TrustedRootLogId,
+    #[serde(rename = "logId", default)]
+    log_id: Option<TrustedRootLogId>,
     #[serde(rename = "checkpointKeyId", default)]
     checkpoint_key_id: Option<TrustedRootLogId>,
     #[serde(rename = "publicKey")]
@@ -315,8 +315,8 @@ impl TrustRoot {
     /// Wall-clock invocation lives in [`trust_root`].
     ///
     /// "Currently active at `now`" = `valid_for.contains(now)` — both
-    /// `start <= now` and (`end is None` OR `end > now`). Retired
-    /// entries (end <= now) don't count.
+    /// `start <= now` and (`end is None` OR `end >= now`). Retired
+    /// entries (end < now) don't count.
     pub fn check_expiry(&self, now: SystemTime) -> Result<(), VerifyError> {
         let missing = self.roles_without_active_key(now);
         if missing.is_empty() {
@@ -448,15 +448,22 @@ struct ParsedLog {
     checkpoint_key_id: Option<Vec<u8>>,
 }
 
+/// A log's `logId` is due to give way to `checkpointKeyId`, so a log that
+/// gives only the latter is identified by it.
 fn parse_log_key(raw: TrustedRootLog) -> Result<ParsedLog, VerifyError> {
-    let log_id = BASE64
-        .decode(raw.log_id.key_id.as_bytes())
-        .map_err(|e| VerifyError::TrustRoot(format!("logId.keyId not base64: {e}")))?;
     let checkpoint_key_id = raw
         .checkpoint_key_id
         .map(|id| BASE64.decode(id.key_id.as_bytes()))
         .transpose()
         .map_err(|e| VerifyError::TrustRoot(format!("checkpointKeyId.keyId not base64: {e}")))?;
+    let log_id = match raw.log_id {
+        Some(id) => BASE64
+            .decode(id.key_id.as_bytes())
+            .map_err(|e| VerifyError::TrustRoot(format!("logId.keyId not base64: {e}")))?,
+        None => checkpoint_key_id.clone().ok_or_else(|| {
+            VerifyError::TrustRoot("log has neither a logId nor a checkpointKeyId".into())
+        })?,
+    };
     let spki_der = BASE64
         .decode(raw.public_key.raw_bytes.as_bytes())
         .map_err(|e| VerifyError::TrustRoot(format!("log publicKey.rawBytes not base64: {e}")))?;

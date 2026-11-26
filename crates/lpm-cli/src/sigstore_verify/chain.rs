@@ -7,9 +7,9 @@ use super::{FulcioRoot, VerifyError};
 
 // AIA fetch is intentionally not implemented. A Sigstore bundle that's
 // missing intermediates fails instead of fetching a URL from inside the
-// certificate. `at_time` must be Rekor `integratedTime`, not wall-clock,
-// so historical bundles verify against the Fulcio chain active when the
-// log entry was integrated.
+// certificate. `at_time` must be a signed time (Rekor's `integratedTime` or
+// an RFC 3161 timestamp), not wall-clock, so historical bundles verify
+// against the Fulcio chain active when they were signed.
 /// Sigstore profile limits cert chains to 3 (leaf + intermediate +
 /// root). Caps the depth so a forged chain with attacker-injected
 /// "intermediates" can't grow unbounded under-the-radar even if a
@@ -69,7 +69,7 @@ pub fn verify_cert_chain(
     if fulcio_roots.is_empty() {
         return Err(VerifyError::MissingTrustMaterial {
             check: "X.509 chain",
-            detail: "no Fulcio roots active at integratedTime — cannot anchor any chain".into(),
+            detail: "no Fulcio roots active at the signing time — cannot anchor any chain".into(),
         });
     }
 
@@ -88,7 +88,7 @@ pub fn verify_cert_chain(
     }
 
     // Step 1: every chain cert must be valid at `at_time`. This is
-    // the load-bearing "at_time = integratedTime" check that lets
+    // the load-bearing "at_time = signing time" check that lets
     // old bundles still verify against retired Fulcio chains.
     for (i, cert) in parsed.iter().enumerate() {
         check_cert_validity_at(cert, at_time_dt, &format!("chain[{i}]"))?;
@@ -167,7 +167,7 @@ pub fn verify_cert_chain(
         detail: format!(
             "bundle chain's top cert does not match any trusted Fulcio root and \
              is not signed by any trusted Fulcio root \
-             ({} candidate root(s) active at integratedTime)",
+             ({} candidate root(s) active at the signing time)",
             fulcio_roots.len()
         ),
     })

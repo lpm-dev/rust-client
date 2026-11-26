@@ -110,11 +110,16 @@ fn a_timestamp_at_the_end_of_its_authoritys_validity_window_verifies() {
 }
 
 #[test]
-fn a_timestamp_after_its_authoritys_validity_window_is_refused() {
+fn a_timestamp_after_its_authoritys_validity_window_needs_newer_trust_material() {
+    // As for the other roles' keys, a newer trust root may move the window.
     let refused = verify_conformance_case("rekor2-timestamp-outside-trust-root-tsa-validity_fail")
         .unwrap_err();
     assert!(
-        matches!(&refused, VerifyError::Timestamp(why) if why.contains("validity window in the trust root")),
+        matches!(
+            &refused,
+            VerifyError::MissingTrustMaterial { check: "RFC 3161 timestamp", detail }
+                if detail.contains("validity window in the trust root")
+        ),
         "{refused:?}"
     );
 }
@@ -188,6 +193,10 @@ const OID_CONTENT_TYPE: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09
 const OID_MESSAGE_DIGEST: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04];
 const OID_SHA1: &[u8] = &[0x2B, 0x0E, 0x03, 0x02, 0x1A];
 const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+const OID_SHA384: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02];
+const OID_EC_PUBLIC_KEY: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
+const OID_ECDSA_WITH_SHA384: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03];
+const OID_RSA_WITH_SHA256: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B];
 const OID_ECDSA_WITH_SHA256: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02];
 const OID_SIGSTORE_TSA_POLICY: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x83, 0xBF, 0x30, 0x02];
 const OID_TIME_STAMPING: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 3, 8];
@@ -233,8 +242,13 @@ fn extended_key_usage(purposes: &[&[u64]], critical: bool) -> CustomExtension {
 
 struct TestAuthority {
     root_der: Vec<u8>,
+    intermediate_der: Option<Vec<u8>>,
     leaf_der: Vec<u8>,
     leaf_key: p384::ecdsa::SigningKey,
+    leaf_keypair: KeyPair,
+    /// The certificate and key that issued the leaf.
+    issuer_cert: rcgen::Certificate,
+    issuer_key: KeyPair,
 }
 
 fn validity(not_before: (i32, u8, u8), not_after: (i32, u8, u8)) -> CertificateParams {
@@ -244,48 +258,130 @@ fn validity(not_before: (i32, u8, u8), not_after: (i32, u8, u8)) -> CertificateP
     params
 }
 
+fn ca_params(name: &str, path_len: u8) -> CertificateParams {
+    let mut params = validity((2020, 1, 1), (2040, 1, 1));
+    params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Constrained(path_len));
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, name);
+    params
+}
+
+/// A timestamping leaf; without `serial`, rcgen derives one from the key.
+fn timestamping_leaf_params(serial: Option<u64>) -> CertificateParams {
+    let mut params = validity((2021, 1, 1), (2039, 1, 1));
+    params.is_ca = IsCa::ExplicitNoCa;
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.custom_extensions = vec![extended_key_usage(&[OID_TIME_STAMPING], true)];
+    params.serial_number = serial.map(rcgen::SerialNumber::from);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "test-tsa");
+    params
+}
+
 /// A timestamp authority with a P-384 root and a leaf whose profile
 /// `customize_leaf` may change from a valid timestamping certificate.
 fn test_authority(customize_leaf: impl FnOnce(&mut CertificateParams)) -> TestAuthority {
+    authority_with(false, customize_leaf)
+}
+
+/// [`test_authority`], with an intermediate between the root and the leaf
+/// when `intermediate` is set.
+fn authority_with(
+    intermediate: bool,
+    customize_leaf: impl FnOnce(&mut CertificateParams),
+) -> TestAuthority {
+    authority_with_intermediate(
+        intermediate.then_some(|_: &mut CertificateParams| {}),
+        customize_leaf,
+    )
+}
+
+fn authority_with_intermediate(
+    customize_intermediate: Option<impl FnOnce(&mut CertificateParams)>,
+    customize_leaf: impl FnOnce(&mut CertificateParams),
+) -> TestAuthority {
     let root_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
-    let mut root_params = validity((2020, 1, 1), (2040, 1, 1));
-    root_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
-    root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
-    root_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "test-tsa-root");
-    let root = root_params.self_signed(&root_key).unwrap();
+    let root = ca_params("test-tsa-root", 1)
+        .self_signed(&root_key)
+        .unwrap();
+    let root_der = root.der().to_vec();
+    let (intermediate_der, issuer_cert, issuer_key) =
+        if let Some(customize) = customize_intermediate {
+            let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+            let root_issuer = rcgen::Issuer::from_ca_cert_der(root.der(), &root_key).unwrap();
+            let mut params = ca_params("test-tsa-intermediate", 0);
+            customize(&mut params);
+            let cert = params.signed_by(&key, &root_issuer).unwrap();
+            (Some(cert.der().to_vec()), cert, key)
+        } else {
+            (None, root, root_key)
+        };
 
     let leaf_keypair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
-    let mut leaf_params = validity((2021, 1, 1), (2039, 1, 1));
-    leaf_params.is_ca = IsCa::ExplicitNoCa;
-    leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-    leaf_params.custom_extensions = vec![extended_key_usage(&[OID_TIME_STAMPING], true)];
-    leaf_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "test-tsa");
+    let mut leaf_params = timestamping_leaf_params(None);
     customize_leaf(&mut leaf_params);
-    let issuer = rcgen::Issuer::from_ca_cert_der(root.der(), &root_key).unwrap();
+    let issuer = rcgen::Issuer::from_ca_cert_der(issuer_cert.der(), &issuer_key).unwrap();
     let leaf = leaf_params.signed_by(&leaf_keypair, &issuer).unwrap();
 
     TestAuthority {
-        root_der: root.der().to_vec(),
+        root_der,
+        intermediate_der,
         leaf_der: leaf.der().to_vec(),
         leaf_key: p384::ecdsa::SigningKey::from_pkcs8_der(&leaf_keypair.serialize_der()).unwrap(),
+        leaf_keypair,
+        issuer_cert,
+        issuer_key,
     }
 }
 
 impl TestAuthority {
     fn trusted(&self) -> TimestampAuthority {
+        let mut cert_chain_der = vec![self.leaf_der.clone()];
+        cert_chain_der.extend(self.intermediate_der.clone());
+        cert_chain_der.push(self.root_der.clone());
         TimestampAuthority {
             uri: "https://tsa.test.example".into(),
-            cert_chain_der: vec![self.leaf_der.clone(), self.root_der.clone()],
+            cert_chain_der,
             valid_for: ValidityWindow {
                 start: Timestamp::parse_rfc3339("2022-01-01T00:00:00Z").unwrap(),
                 end: None,
             },
         }
     }
+
+    /// The authority as a trust root that lists only its root.
+    fn trusted_root_only(&self) -> TimestampAuthority {
+        TimestampAuthority {
+            cert_chain_der: vec![self.root_der.clone()],
+            ..self.trusted()
+        }
+    }
+
+    /// Another certificate for the leaf's key, from the same issuer.
+    fn reissued_leaf(&self, serial: u64) -> Vec<u8> {
+        let issuer =
+            rcgen::Issuer::from_ca_cert_der(self.issuer_cert.der(), &self.issuer_key).unwrap();
+        timestamping_leaf_params(Some(serial))
+            .signed_by(&self.leaf_keypair, &issuer)
+            .unwrap()
+            .der()
+            .to_vec()
+    }
+}
+
+/// The signing-certificate attribute a token carries.
+#[derive(Clone)]
+enum Ess {
+    None,
+    /// `SigningCertificateV2` naming the signer by its SHA-256 hash.
+    V2,
+    /// `SigningCertificate` naming the signer by its SHA-1 hash.
+    V1,
+    /// `SigningCertificateV2` naming this certificate instead.
+    V2Naming(Vec<u8>),
 }
 
 /// What a synthesized token says; [`Token::default`] is a valid token
@@ -300,6 +396,17 @@ struct Token {
     message_digest: Option<Vec<u8>>,
     signers: usize,
     embed_leaf: bool,
+    embed_intermediate: bool,
+    ess: Ess,
+    /// The certificate the signer identifier names, in place of the leaf.
+    signer_cert: Option<Vec<u8>>,
+    /// A TSTInfo extension, marked critical when set.
+    critical_tst_extension: bool,
+    /// Identify the signer by its subject key identifier.
+    signer_key_id: bool,
+    signature_algorithm: &'static [u8],
+    /// NULL parameters on the signature algorithm.
+    signature_algorithm_parameters: bool,
 }
 
 impl Default for Token {
@@ -313,12 +420,104 @@ impl Default for Token {
             message_digest: None,
             signers: 1,
             embed_leaf: false,
+            embed_intermediate: false,
+            ess: Ess::V2,
+            signer_cert: None,
+            critical_tst_extension: false,
+            signer_key_id: false,
+            signature_algorithm: OID_ECDSA_WITH_SHA256,
+            signature_algorithm_parameters: false,
         }
     }
 }
 
+const OID_SIGNING_CERTIFICATE: &[u8] = &[
+    0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x0C,
+];
+const OID_SIGNING_CERTIFICATE_V2: &[u8] = &[
+    0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x2F,
+];
+
+/// `IssuerSerial` for `cert`: its issuer as a directory name, and serial.
+fn issuer_serial(cert: &[u8]) -> Vec<u8> {
+    let (_, parsed) = X509Certificate::from_der(cert).unwrap();
+    tlv(
+        der::TAG_SEQUENCE,
+        &[
+            &tlv(
+                der::TAG_SEQUENCE,
+                &[&tlv(
+                    der::context_constructed(4),
+                    &[parsed.tbs_certificate.issuer.as_raw()],
+                )],
+            ),
+            &tlv(der::TAG_INTEGER, &[parsed.tbs_certificate.raw_serial()]),
+        ],
+    )
+}
+
+fn ess_attribute(ess: &Ess, signer: &[u8]) -> Option<Vec<u8>> {
+    let (oid_contents, cert_id) = match ess {
+        Ess::None => return None,
+        Ess::V2 | Ess::V2Naming(_) => {
+            let named = match ess {
+                Ess::V2Naming(other) => other.as_slice(),
+                _ => signer,
+            };
+            (
+                OID_SIGNING_CERTIFICATE_V2,
+                tlv(
+                    der::TAG_SEQUENCE,
+                    &[
+                        &tlv(der::TAG_OCTET_STRING, &[&Sha256::digest(named)]),
+                        &issuer_serial(named),
+                    ],
+                ),
+            )
+        }
+        Ess::V1 => (
+            OID_SIGNING_CERTIFICATE,
+            tlv(
+                der::TAG_SEQUENCE,
+                &[
+                    &tlv(der::TAG_OCTET_STRING, &[&sha1::Sha1::digest(signer)]),
+                    &issuer_serial(signer),
+                ],
+            ),
+        ),
+    };
+    Some(tlv(
+        der::TAG_SEQUENCE,
+        &[
+            &oid(oid_contents),
+            &tlv(
+                der::TAG_SET,
+                &[&tlv(
+                    der::TAG_SEQUENCE,
+                    &[&tlv(der::TAG_SEQUENCE, &[&cert_id])],
+                )],
+            ),
+        ],
+    ))
+}
+
 impl Token {
     fn signed_by(&self, authority: &TestAuthority) -> Vec<u8> {
+        let extensions = if self.critical_tst_extension {
+            tlv(
+                der::context_constructed(1),
+                &[&tlv(
+                    der::TAG_SEQUENCE,
+                    &[
+                        &oid(&[0x2A, 0x03, 0x04]),
+                        &tlv(der::TAG_BOOLEAN, &[&[0xFF]]),
+                        &tlv(der::TAG_OCTET_STRING, &[&[0x05, 0x00]]),
+                    ],
+                )],
+            )
+        } else {
+            Vec::new()
+        };
         let tst_info = tlv(
             der::TAG_SEQUENCE,
             &[
@@ -333,9 +532,11 @@ impl Token {
                 ),
                 &integer(7),
                 &tlv(der::TAG_GENERALIZED_TIME, &[self.gen_time.as_bytes()]),
+                &extensions,
             ],
         );
 
+        let signer_cert = self.signer_cert.as_ref().unwrap_or(&authority.leaf_der);
         let digest = self
             .message_digest
             .clone()
@@ -357,36 +558,73 @@ impl Token {
                 &tlv(der::TAG_SET, &[&tlv(der::TAG_OCTET_STRING, &[&digest])]),
             ],
         ));
+        attributes.extend(ess_attribute(&self.ess, &authority.leaf_der).unwrap_or_default());
         let signature: p384::ecdsa::Signature = authority
             .leaf_key
             .sign_prehash(&Sha256::digest(der::encode_set(&attributes)))
             .unwrap();
 
-        let (_, leaf) = X509Certificate::from_der(&authority.leaf_der).unwrap();
+        let (_, named) = X509Certificate::from_der(signer_cert).unwrap();
+        let (version, signer_id) = if self.signer_key_id {
+            let key_id = named
+                .extensions()
+                .iter()
+                .find_map(|extension| match extension.parsed_extension() {
+                    x509_parser::extensions::ParsedExtension::SubjectKeyIdentifier(id) => {
+                        Some(id.0.to_vec())
+                    }
+                    _ => None,
+                })
+                .expect("the leaf has a subject key identifier");
+            (3, tlv(der::context_primitive(0), &[&key_id]))
+        } else {
+            (
+                1,
+                tlv(
+                    der::TAG_SEQUENCE,
+                    &[
+                        named.tbs_certificate.issuer.as_raw(),
+                        &tlv(der::TAG_INTEGER, &[named.tbs_certificate.raw_serial()]),
+                    ],
+                ),
+            )
+        };
+        let signature_algorithm = if self.signature_algorithm_parameters {
+            tlv(
+                der::TAG_SEQUENCE,
+                &[&oid(self.signature_algorithm), &tlv(der::TAG_NULL, &[])],
+            )
+        } else {
+            algorithm(self.signature_algorithm)
+        };
         let signer_info = tlv(
             der::TAG_SEQUENCE,
             &[
-                &integer(1),
-                &tlv(
-                    der::TAG_SEQUENCE,
-                    &[
-                        leaf.tbs_certificate.issuer.as_raw(),
-                        &tlv(der::TAG_INTEGER, &[leaf.tbs_certificate.raw_serial()]),
-                    ],
-                ),
+                &integer(version),
+                &signer_id,
                 &algorithm(OID_SHA256),
                 &tlv(der::context_constructed(0), &[&attributes]),
-                &algorithm(OID_ECDSA_WITH_SHA256),
+                &signature_algorithm,
                 &tlv(der::TAG_OCTET_STRING, &[signature.to_der().as_bytes()]),
             ],
         );
         let signer_infos: Vec<&[u8]> =
             std::iter::repeat_n(signer_info.as_slice(), self.signers).collect();
 
-        let certificates = if self.embed_leaf {
-            tlv(der::context_constructed(0), &[&authority.leaf_der])
-        } else {
+        let mut embedded: Vec<&[u8]> = Vec::new();
+        if self.embed_leaf {
+            embedded.push(signer_cert);
+            if signer_cert != &authority.leaf_der {
+                embedded.push(&authority.leaf_der);
+            }
+        }
+        if self.embed_intermediate {
+            embedded.extend(authority.intermediate_der.as_deref());
+        }
+        let certificates = if embedded.is_empty() {
             Vec::new()
+        } else {
+            tlv(der::context_constructed(0), &embedded)
         };
         let signed_data = tlv(
             der::TAG_SEQUENCE,
@@ -547,11 +785,9 @@ fn a_token_with_two_signers_is_refused() {
 #[test]
 fn a_signature_by_another_key_is_refused() {
     let authority = test_authority(|_| {});
-    let impostor = TestAuthority {
-        leaf_key: test_authority(|_| {}).leaf_key,
-        root_der: authority.root_der.clone(),
-        leaf_der: authority.leaf_der.clone(),
-    };
+    let mut impostor = test_authority(|_| {});
+    impostor.root_der = authority.root_der.clone();
+    impostor.leaf_der = authority.leaf_der.clone();
     let refused = verify_signed_timestamp(
         &Token::default().signed_by(&impostor),
         SIGNATURE,
@@ -677,4 +913,178 @@ fn generalized_times_follow_the_der_profile() {
         rfc3339(verify_token(&leap_day, &authority).unwrap().time),
         "2028-02-29T12:00:00Z"
     );
+}
+
+#[test]
+fn a_token_may_carry_the_intermediate_between_its_signer_and_a_trusted_root() {
+    let authority = authority_with(true, |_| {});
+    let token = Token {
+        embed_leaf: true,
+        embed_intermediate: true,
+        ..Token::default()
+    };
+    verify_signed_timestamp(
+        &token.signed_by(&authority),
+        SIGNATURE,
+        &[authority.trusted_root_only()],
+    )
+    .unwrap();
+
+    let without_intermediate = Token {
+        embed_leaf: true,
+        ..Token::default()
+    };
+    let refused = verify_signed_timestamp(
+        &without_intermediate.signed_by(&authority),
+        SIGNATURE,
+        &[authority.trusted_root_only()],
+    )
+    .unwrap_err();
+    assert!(refused.is_missing_trust_material(), "{refused:?}");
+}
+
+#[test]
+fn a_signer_from_another_authority_needs_newer_trust_material() {
+    // A stale trust root that lists only an older authority's root: the
+    // token's own signing certificate chains to a root it doesn't hold.
+    let held = test_authority(|_| {});
+    let other = test_authority(|_| {});
+    let token = Token {
+        embed_leaf: true,
+        ..Token::default()
+    };
+    let refused = verify_signed_timestamp(
+        &token.signed_by(&other),
+        SIGNATURE,
+        &[held.trusted_root_only()],
+    )
+    .unwrap_err();
+    assert!(refused.is_missing_trust_material(), "{refused:?}");
+}
+
+#[test]
+fn a_signing_certificate_with_an_unhandled_critical_extension_is_refused() {
+    let authority = test_authority(|params| {
+        let mut extension = CustomExtension::from_oid_content(&[1, 2, 3, 4], vec![0x05, 0x00]);
+        extension.set_criticality(true);
+        params.custom_extensions.push(extension);
+    });
+    assert!(refusal(&Token::default(), &authority).contains("critical extension"));
+}
+
+#[test]
+fn the_signing_certificate_attribute_must_name_the_signer() {
+    let authority = test_authority(|_| {});
+    for ess in [Ess::V2, Ess::V1, Ess::None] {
+        let token = Token {
+            ess,
+            ..Token::default()
+        };
+        verify_token(&token, &authority).unwrap();
+    }
+
+    // Two certificates for one key: the signer identifier, which the
+    // signature doesn't cover, names a reissued certificate while the
+    // signed attribute names the original.
+    let reissued = authority.reissued_leaf(42);
+    let swapped = Token {
+        embed_leaf: true,
+        signer_cert: Some(reissued.clone()),
+        ..Token::default()
+    };
+    let why = match verify_signed_timestamp(
+        &swapped.signed_by(&authority),
+        SIGNATURE,
+        &[authority.trusted_root_only()],
+    ) {
+        Err(VerifyError::Timestamp(why)) => why,
+        other => panic!("expected a timestamp refusal, got {other:?}"),
+    };
+    assert!(why.contains("signing certificate attribute"), "{why}");
+
+    let wrong = Token {
+        ess: Ess::V2Naming(reissued),
+        ..Token::default()
+    };
+    assert!(refusal(&wrong, &authority).contains("signing certificate attribute"));
+}
+
+#[test]
+fn a_critical_tstinfo_extension_is_refused() {
+    let authority = test_authority(|_| {});
+    let token = Token {
+        critical_tst_extension: true,
+        ..Token::default()
+    };
+    assert!(refusal(&token, &authority).contains("critical extension"));
+}
+
+#[test]
+fn a_signer_identified_by_its_subject_key_identifier_verifies() {
+    let authority = test_authority(|_| {});
+    let token = Token {
+        signer_key_id: true,
+        ..Token::default()
+    };
+    verify_token(&token, &authority).unwrap();
+}
+
+#[test]
+fn an_intermediate_that_does_not_allow_timestamping_is_refused() {
+    let authority = authority_with_intermediate(
+        Some(|params: &mut CertificateParams| {
+            params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::CodeSigning];
+        }),
+        |_| {},
+    );
+    assert!(refusal(&Token::default(), &authority).contains("does not allow timestamping"));
+}
+
+#[test]
+fn the_signature_algorithm_must_be_ecdsa_over_the_signers_digest() {
+    let authority = test_authority(|_| {});
+    let ec_public_key = Token {
+        signature_algorithm: OID_EC_PUBLIC_KEY,
+        ..Token::default()
+    };
+    verify_token(&ec_public_key, &authority).unwrap();
+
+    let cases = [
+        (
+            Token {
+                signature_algorithm: OID_ECDSA_WITH_SHA384,
+                ..Token::default()
+            },
+            "different algorithm than its digest",
+        ),
+        (
+            Token {
+                signature_algorithm: OID_RSA_WITH_SHA256,
+                ..Token::default()
+            },
+            "not signed with ECDSA",
+        ),
+        (
+            Token {
+                signature_algorithm_parameters: true,
+                ..Token::default()
+            },
+            "trailing",
+        ),
+    ];
+    for (token, expected) in cases {
+        let why = refusal(&token, &authority);
+        assert!(why.contains(expected), "{expected}: {why}");
+    }
+}
+
+#[test]
+fn a_sha384_message_imprint_verifies() {
+    let authority = test_authority(|_| {});
+    let token = Token {
+        imprint_algorithm: OID_SHA384,
+        imprint: sha2::Sha384::digest(SIGNATURE).to_vec(),
+        ..Token::default()
+    };
+    verify_token(&token, &authority).unwrap();
 }
