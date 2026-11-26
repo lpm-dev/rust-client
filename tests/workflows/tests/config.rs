@@ -3014,84 +3014,169 @@ fn a_save_a_managed_policy_holds_names_the_policy_before_the_forced_floor() {
         args: &'static [&'static str],
         knob: &'static str,
         scope: &'static str,
+        /// More of `config.toml`, past what the managed policy holds.
+        also_configured: &'static str,
     }
     let cases = [
         Case {
             held: "script-policy = \"deny\"\n",
             args: &["config", "set", "script-policy", "allow"],
             knob: "script-policy",
+            also_configured: "",
             scope: "scripts-allow",
         },
         Case {
             held: "script-policy = \"deny\"\n",
             args: &["config", "scripts", "--set", "allow"],
             knob: "script-policy",
+            also_configured: "",
             scope: "scripts-allow",
         },
         Case {
             held: "minimum-release-age-secs = 259200\n",
             args: &["config", "set", "minimum-release-age-secs", "0"],
             knob: "minimum-release-age-secs",
+            also_configured: "",
             scope: "cooldown-bypass",
         },
         Case {
             held: "minimum-release-age-secs = 259200\n",
             args: &["config", "delete", "minimum-release-age-secs"],
             knob: "minimum-release-age-secs",
+            also_configured: "",
             scope: "cooldown-bypass",
         },
         Case {
             held: "release-age-policy = \"strict\"\n",
             args: &["config", "set", "release-age-policy", "direct"],
             knob: "release-age-policy",
+            also_configured: "",
             scope: "cooldown-window",
         },
         Case {
             held: "[sandbox]\nmode = \"strict\"\n",
             args: &["config", "set", "sandbox", "none"],
             knob: "[sandbox].mode",
+            also_configured: "",
             scope: "sandbox-none",
         },
         Case {
             held: "[sandbox]\nmode = \"strict\"\n",
             args: &["config", "sandbox", "--set", "none"],
             knob: "[sandbox].mode",
+            also_configured: "",
             scope: "sandbox-none",
         },
         Case {
             held: "[sigstore]\nverify = \"deny\"\n",
             args: &["config", "set", "sigstore", "verify=off"],
             knob: "[sigstore].verify",
+            also_configured: "",
             scope: "provenance-unverified",
         },
         Case {
             held: "typosquat-guard = \"on\"\n",
             args: &["config", "set", "typosquat-guard", "off"],
             knob: "typosquat-guard",
+            also_configured: "",
             scope: "typosquat-disable",
         },
         Case {
             held: "typosquat-guard = \"on\"\n",
             args: &["config", "typosquat", "--set", "off"],
             knob: "typosquat-guard",
+            also_configured: "",
             scope: "typosquat-disable",
         },
         Case {
             held: "[firewall]\nmode = \"enforce\"\n",
             args: &["config", "set", "firewall", "off"],
             knob: "[firewall].mode",
+            also_configured: "",
             scope: "firewall-disable",
         },
         Case {
             held: "[firewall]\nmode = \"enforce\"\n",
             args: &["config", "delete", "firewall.mode"],
             knob: "[firewall].mode",
+            also_configured: "",
             scope: "firewall-disable",
         },
         Case {
             held: "install-time-source-analysis = true\n",
             args: &["config", "set", "install-time-source-analysis", "false"],
             knob: "install-time-source-analysis",
+            also_configured: "",
+            scope: "source-analysis-disable",
+        },
+        Case {
+            held: "[firewall]\nmode = \"enforce\"\n",
+            args: &["config", "delete", "firewall"],
+            knob: "[firewall].mode",
+            also_configured: "",
+            scope: "firewall-disable",
+        },
+        Case {
+            held: "[firewall]\nmode = \"enforce\"\n",
+            args: &["config", "delete", "firewall"],
+            knob: "[firewall].mode",
+            also_configured: "[firewall.npm.policies]\nlpm_ai_agent_control_surface = \"block\"\n",
+            scope: "firewall-disable",
+        },
+        Case {
+            held: "[firewall]\nmode = \"enforce\"\n",
+            args: &["config", "firewall", "--set", "off"],
+            knob: "[firewall].mode",
+            also_configured: "",
+            scope: "firewall-disable",
+        },
+        Case {
+            held: "minimum-release-age-secs = 259200\n",
+            args: &["config", "release-age", "--set", "0"],
+            knob: "minimum-release-age-secs",
+            also_configured: "",
+            scope: "cooldown-bypass",
+        },
+        Case {
+            held: "release-age-policy = \"strict\"\n",
+            args: &["config", "release-age-policy", "--set", "direct"],
+            knob: "release-age-policy",
+            also_configured: "",
+            scope: "cooldown-window",
+        },
+        Case {
+            held: "release-age-policy = \"strict\"\n",
+            args: &["config", "delete", "release-age-policy"],
+            knob: "release-age-policy",
+            also_configured: "",
+            scope: "cooldown-window",
+        },
+        Case {
+            held: "[sandbox]\nmode = \"strict\"\n",
+            args: &["config", "delete", "sandbox"],
+            knob: "[sandbox].mode",
+            also_configured: "",
+            scope: "sandbox-default",
+        },
+        Case {
+            held: "[sigstore]\nverify = \"deny\"\n",
+            args: &["config", "sigstore", "--set", "off"],
+            knob: "[sigstore].verify",
+            also_configured: "",
+            scope: "provenance-unverified",
+        },
+        Case {
+            held: "typosquat-guard = \"on\"\n",
+            args: &["config", "delete", "typosquat-guard"],
+            knob: "typosquat-guard",
+            also_configured: "",
+            scope: "typosquat-disable",
+        },
+        Case {
+            held: "install-time-source-analysis = true\n",
+            args: &["config", "source-analysis", "--set", "false"],
+            knob: "install-time-source-analysis",
+            also_configured: "",
             scope: "source-analysis-disable",
         },
     ];
@@ -3102,7 +3187,10 @@ fn a_save_a_managed_policy_holds_names_the_policy_before_the_forced_floor() {
         let policy_path = project.home().join(".lpm/security-policy.toml");
         std::fs::create_dir_all(policy_path.parent().unwrap()).unwrap();
         std::fs::write(&policy_path, case.held).unwrap();
-        let config = format!("force-security-floor = true\n{}", case.held);
+        let config = format!(
+            "force-security-floor = true\n{}{}",
+            case.held, case.also_configured
+        );
         seed_config(&project, &config);
 
         let output = lpm(&project)
@@ -3128,21 +3216,24 @@ fn a_save_a_managed_policy_holds_names_the_policy_before_the_forced_floor() {
                 policy_path.display(),
                 case.knob
             ));
-        let refusals = std::fs::read_to_string(project.home().join(".lpm/security/audit.jsonl"))
-            .unwrap_or_default()
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["payload"].clone())
-            .filter(|payload| {
-                payload["event"] == "persistent-guarded-attempt"
-                    && payload["allowed"] == false
-                    && payload["scopes"] == serde_json::json!([case.scope])
-            })
-            .count();
+        let attempts: Vec<serde_json::Value> =
+            std::fs::read_to_string(project.home().join(".lpm/security/audit.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()["payload"].clone()
+                })
+                .filter(|payload| payload["event"] == "persistent-guarded-attempt")
+                .collect();
+        let one_refusal = matches!(
+            attempts.as_slice(),
+            [only] if only["allowed"] == false && only["scopes"] == serde_json::json!([case.scope])
+        );
         let config_kept = std::fs::read_to_string(config_path(&project)).unwrap() == config;
-        if output.status.success() || !names_the_policy || refusals != 1 || !config_kept {
+        if output.status.success() || !names_the_policy || !one_refusal || !config_kept {
             failures.push(format!(
-                "{:?}: refusals recorded {refusals}, config kept {config_kept}: {envelope}",
-                case.args
+                "{:?} with {:?}: attempts recorded {attempts:?}, config kept {config_kept}: {envelope}",
+                case.args, case.also_configured
             ));
         }
     }

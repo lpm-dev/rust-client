@@ -106,7 +106,7 @@ pub(in crate::commands::config) async fn run_typosquat_wizard(
     }
 
     update_config(config_path, |config| {
-        reject_looser_typosquat_guard_write(config, selection)?;
+        crate::security_floor::reject_looser_typosquat_guard_write(config, selection)?;
         crate::security_approval::authorize_persistent_typosquat_guard(
             selection,
             json_output,
@@ -148,29 +148,6 @@ pub(in crate::commands::config) fn read_typosquat_guard_override(
         _ => return Ok(None),
     };
     Ok(GlobalConfig { table }.get_typosquat_guard_mode())
-}
-
-pub(in crate::commands::config) fn reject_looser_typosquat_guard_write(
-    global: &GlobalConfig,
-    requested: TyposquatGuardSelection,
-) -> Result<(), LpmError> {
-    if !crate::security_floor::force_security_floor_enabled(global) {
-        return Ok(());
-    }
-    crate::security_approval::reject_a_save_a_managed_policy_holds(
-        crate::security_approval::PersistentSecuritySetting::TyposquatGuard(requested),
-    )?;
-    let floor = global
-        .get_typosquat_guard_mode()
-        .unwrap_or(TyposquatGuardSelection::Default);
-    if !requested.loosens(floor) {
-        return Ok(());
-    }
-    Err(crate::security_floor::security_floor_write_error(
-        TYPOSQUAT_GUARD_KEY,
-        requested.as_str(),
-        floor.as_str(),
-    ))
 }
 
 pub(in crate::commands::config) fn format_current_typosquat_guard(

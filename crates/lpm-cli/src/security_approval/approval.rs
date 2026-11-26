@@ -147,18 +147,21 @@ impl PersistentSecuritySetting {
     }
 }
 
-/// Refuses a save of `setting` that loosens what a managed security policy
-/// holds, recording the attempt, so a check that runs before the save's
-/// approval, such as the forced floor's, never answers for the policy.
-pub fn reject_a_save_a_managed_policy_holds(
-    setting: PersistentSecuritySetting,
+/// Refuses a save of `settings` when one loosens what a managed security
+/// policy holds, recording the attempt, so a check that runs before the
+/// save's approval, such as the forced floor's, never answers for the policy.
+pub fn reject_saves_a_managed_policy_holds(
+    settings: &[PersistentSecuritySetting],
 ) -> Result<(), LpmError> {
     // Without a managed policy nothing is held, so the signed posture, and
     // the key that verifies it, stay unread.
-    if super::managed_policy::load_managed_policy()?.is_none() {
+    if load_managed_policy()?.is_none() {
         return Ok(());
     }
-    setting.refuse_where_managed(&load_effective_authorized_posture()?)
+    let effective = load_effective_authorized_posture()?;
+    settings
+        .iter()
+        .try_for_each(|setting| setting.refuse_where_managed(&effective))
 }
 
 fn managed_policy_scope_error(

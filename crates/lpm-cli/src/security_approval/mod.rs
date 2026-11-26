@@ -50,8 +50,8 @@ pub use approval::{
     ensure_project_trust_candidate_authorized,
     ensure_runtime_install_time_source_analysis_authorized, ensure_runtime_sigstore_posture,
     ensure_runtime_sigstore_posture_for_global, ensure_runtime_typosquat_guard_config_authorized,
-    record_project_scope_candidate_narrowing, reject_a_save_a_managed_policy_holds,
-    reject_firewall_policies_a_managed_policy_holds, tighten_persistent_npm_firewall_policies,
+    record_project_scope_candidate_narrowing, reject_firewall_policies_a_managed_policy_holds,
+    reject_saves_a_managed_policy_holds, tighten_persistent_npm_firewall_policies,
 };
 pub(crate) use firewall_bypass::{
     FirewallBypassAdded, FirewallBypassApproval, FirewallBypassCommit, FirewallBypassRequests,

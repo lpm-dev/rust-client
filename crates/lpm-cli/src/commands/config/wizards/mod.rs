@@ -105,6 +105,5 @@ pub(in crate::commands::config) use trust_policy::{
 pub(in crate::commands::config) use typosquat::read_typosquat_guard_override;
 pub(crate) use typosquat::{TYPOSQUAT_GUARD_KEY, TyposquatGuardSelection};
 pub(in crate::commands::config) use typosquat::{
-    format_current_typosquat_guard, parse_typosquat_guard_selection,
-    reject_looser_typosquat_guard_write, run_typosquat_wizard,
+    format_current_typosquat_guard, parse_typosquat_guard_selection, run_typosquat_wizard,
 };
