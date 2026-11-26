@@ -160,9 +160,13 @@ async fn enforce_firewall_preflight_maps_legacy_entitlement_denial_to_firewall_e
         false,
     )
     .await
-    .and_then(|result| finish_npm_firewall_preflight(result, true));
+    .expect("a failed enforce request is carried on the result, not returned early");
+    assert!(
+        result.failure.is_some(),
+        "the request failure must be carried as `failure`"
+    );
 
-    match result {
+    match finish_npm_firewall_preflight(result, true) {
         Err(lpm_common::LpmError::NpmFirewallEntitlementRequired {
             message,
             reason,
