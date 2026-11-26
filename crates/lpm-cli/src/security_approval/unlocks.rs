@@ -216,11 +216,18 @@ fn revoke_unlocks(
         let revoked_scopes = normalized_scopes(&revoked_scopes);
         let remaining_scopes = normalized_scopes(&remaining_scopes);
 
+        // A grant saved with the verbatim root is recorded, and kept, under
+        // the root as it is written now.
+        let grant_root = match (&project_root, entry.grant.target) {
+            (Some(root), UnlockTargetKind::Project) => Some(root.as_str().to_owned()),
+            _ => entry.grant.project_root.clone(),
+        };
         if remaining_scopes.is_empty() {
             std::fs::remove_file(&entry.path)?;
         } else {
             let mut updated = entry.grant.clone();
             updated.scopes = remaining_scopes.clone();
+            updated.project_root.clone_from(&grant_root);
             write_signed_json(&entry.path, &updated)?;
         }
 
@@ -228,7 +235,7 @@ fn revoke_unlocks(
             .packages(entry.grant.packages.clone())
             .source(source)
             .unlock_id(entry.grant.id.clone());
-        if let Some(root) = entry.grant.project_root.clone() {
+        if let Some(root) = grant_root.clone() {
             audit = audit.project_root(root);
         }
         let detail = if remaining_scopes.is_empty() {
@@ -244,7 +251,7 @@ fn revoke_unlocks(
         revocations.push(UnlockRevocation {
             id: entry.grant.id,
             target: entry.grant.target,
-            project_root: entry.grant.project_root,
+            project_root: grant_root,
             revoked_scopes,
             remaining_scopes,
             packages: entry.grant.packages,

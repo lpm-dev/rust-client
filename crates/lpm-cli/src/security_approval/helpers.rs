@@ -17,7 +17,8 @@ pub(super) fn is_automation(json_output: bool) -> bool {
 /// it. Windows resolves a directory to a verbatim path (`\\?\C:\work\app`);
 /// the root is written the way people and shells write it (`C:\work\app`)
 /// when that means the same, as firewall bypass rules write it. Records saved
-/// before kept the verbatim form, which [`ProjectRoot::names`] still accepts.
+/// before kept the verbatim form, which [`ProjectRoot::names`] still accepts,
+/// and approval state stays filed under it ([`ProjectRoot::storage_key`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ProjectRoot {
     written: String,
@@ -26,6 +27,10 @@ pub(super) struct ProjectRoot {
 
 impl ProjectRoot {
     pub(super) fn of(project_dir: &Path) -> Self {
+        #[cfg(test)]
+        if let Some(resolved) = super::test_support::resolved_on_windows(project_dir) {
+            return Self::from_resolved(resolved, true);
+        }
         let resolved = std::fs::canonicalize(project_dir)
             .unwrap_or_else(|_| project_dir.to_path_buf())
             .display()
@@ -60,6 +65,13 @@ impl ProjectRoot {
     /// differs from how the root is written now.
     pub(super) fn verbatim(&self) -> Option<&str> {
         self.verbatim.as_deref()
+    }
+
+    /// The root as the file system resolved it, which keys the project's
+    /// approval state: the key it always had, so no state moves and every
+    /// version finds the same file.
+    pub(super) fn storage_key(&self) -> &str {
+        self.verbatim().unwrap_or(&self.written)
     }
 
     /// Whether `saved`, a root a record holds, names this project.

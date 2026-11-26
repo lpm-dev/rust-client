@@ -114,10 +114,20 @@ fn security_status_json_defaults_to_project_target() {
     );
 
     let envelope = json_output(&output, "lpm --json security status");
-    let expected_root = std::fs::canonicalize(project.path())
+    let canonical = std::fs::canonicalize(project.path())
         .expect("canonicalize temp project")
         .to_string_lossy()
         .to_string();
+    // Windows resolves the temp folder to a verbatim drive path, which the
+    // status writes as typed.
+    let expected_root = if cfg!(windows) {
+        canonical
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&canonical)
+            .to_owned()
+    } else {
+        canonical
+    };
     assert_eq!(envelope["success"], serde_json::json!(true));
     assert_eq!(envelope["status"]["target"], serde_json::json!("project"));
     assert_eq!(
