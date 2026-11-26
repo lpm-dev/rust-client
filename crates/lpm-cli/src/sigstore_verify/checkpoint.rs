@@ -124,11 +124,15 @@ pub(super) fn logs_signing<'a>(
 }
 
 /// The tree size and root hash a checkpoint's text states, without
-/// verifying its signatures: for checking a log's response is consistent
-/// before LPM writes it into a bundle that will be verified.
+/// verifying its signatures, though they must be well formed: for checking
+/// a log's response is consistent before LPM writes it into a bundle that
+/// will be verified.
 pub(crate) fn unverified_tree_head(envelope: &str) -> Result<(u64, Vec<u8>), String> {
-    let (text, _) = split_note(envelope)?;
+    let (text, signatures) = split_note(envelope)?;
     let checkpoint = parse_checkpoint_text(text)?;
+    for line in signature_lines(signatures)? {
+        line?;
+    }
     Ok((checkpoint.size, checkpoint.root_hash))
 }
 

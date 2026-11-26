@@ -199,19 +199,23 @@ async fn mount_sigstore_publish_mocks(server: &MockServer) {
 /// Rekor's log ID, as its API gives it.
 const REKOR_LOG_ID_HEX: &str = "c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d";
 
-/// Rekor answering an upload by logging the entry it was sent, as the
+/// Rekor answering an upload by logging the entry it would log, as the
 /// first entry of a new shard, so the bundle's entry is the upload's.
 struct RekorLoggingTheUpload;
 
 impl wiremock::Respond for RekorLoggingTheUpload {
     fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let logged = match rekor_logged_intoto(&request.body) {
+            Ok(logged) => logged,
+            Err(why) => return ResponseTemplate::new(400).set_body_string(why),
+        };
         let mut leaf = Sha256::new();
         leaf.update([0x00]);
-        leaf.update(&request.body);
+        leaf.update(&logged);
         let leaf = leaf.finalize();
         ResponseTemplate::new(201).set_body_json(serde_json::json!({
             "uuid": {
-                "body": BASE64.encode(&request.body),
+                "body": BASE64.encode(&logged),
                 "integratedTime": 1_700_000_000_u64,
                 "logID": REKOR_LOG_ID_HEX,
                 "logIndex": 123,
@@ -219,7 +223,7 @@ impl wiremock::Respond for RekorLoggingTheUpload {
                     "signedEntryTimestamp": BASE64.encode(b"workflow-test-set"),
                     "inclusionProof": {
                         "checkpoint": format!(
-                            "rekor.sigstore.dev - 1\n1\n{}\n\n\u{2014} rekor.sigstore.dev wNI9ag==\n",
+                            "rekor.sigstore.dev - 1\n1\n{}\n\n\u{2014} rekor.sigstore.dev wNI9agE=\n",
                             BASE64.encode(leaf)
                         ),
                         "hashes": [],
@@ -231,6 +235,36 @@ impl wiremock::Respond for RekorLoggingTheUpload {
             }
         }))
     }
+}
+
+/// The entry Rekor logs for an `intoto` 0.0.2 upload: the envelope without
+/// its payload, and the payload's hash, which Rekor computes. An upload
+/// without the payload, or stating another hash, is refused, as Rekor
+/// refuses it.
+fn rekor_logged_intoto(upload: &[u8]) -> Result<Vec<u8>, String> {
+    let mut entry: serde_json::Value =
+        serde_json::from_slice(upload).map_err(|e| format!("not JSON: {e}"))?;
+    if entry["kind"] != "intoto" || entry["apiVersion"] != "0.0.2" {
+        return Err("not an intoto 0.0.2 entry".into());
+    }
+    let content = &mut entry["spec"]["content"];
+    let payload = content["envelope"]
+        .as_object_mut()
+        .and_then(|envelope| envelope.remove("payload"))
+        .and_then(|payload| payload.as_str().map(str::to_string))
+        .ok_or("the envelope has no payload")?;
+    // The upload encodes the DSSE payload, itself base64, once more.
+    let statement = BASE64
+        .decode(payload)
+        .ok()
+        .and_then(|dsse_payload| BASE64.decode(dsse_payload).ok())
+        .ok_or("the payload isn't base64 of base64")?;
+    let payload_hash = hex::encode(Sha256::digest(&statement));
+    if content["payloadHash"]["value"] != payload_hash.as_str() {
+        return Err("the stated payload hash isn't the payload's".into());
+    }
+    content["payloadHash"] = serde_json::json!({"algorithm": "sha256", "value": payload_hash});
+    Ok(serde_json::to_vec(&entry).unwrap())
 }
 
 // ─── Dry Run ─────────────────────────────────────────────────────
@@ -4871,15 +4905,33 @@ async fn publish_npm_generated_provenance_attaches_sigstore_bundle_to_registry_p
     assert_eq!(proof["logIndex"], "0");
     assert_eq!(proof["treeSize"], "1");
     assert_eq!(proof["hashes"], serde_json::json!([]));
-    assert!(proof["checkpoint"]["envelope"].is_string());
-    // The entry LPM uploaded records this envelope: its payload's hash and
-    // its signature, which an intoto entry encodes once more.
-    let logged: serde_json::Value = serde_json::from_slice(
-        &BASE64
-            .decode(tlog_entry["canonicalizedBody"].as_str().unwrap())
-            .unwrap(),
-    )
-    .unwrap();
+    let logged_bytes = BASE64
+        .decode(tlog_entry["canonicalizedBody"].as_str().unwrap())
+        .unwrap();
+    let mut leaf = Sha256::new();
+    leaf.update([0x00]);
+    leaf.update(&logged_bytes);
+    let leaf = leaf.finalize();
+    assert_eq!(
+        BASE64.decode(proof["rootHash"].as_str().unwrap()).unwrap(),
+        leaf.as_slice()
+    );
+    assert!(
+        proof["checkpoint"]["envelope"]
+            .as_str()
+            .unwrap()
+            .contains(&BASE64.encode(leaf))
+    );
+    // The bundle carries the entry Rekor logged, without the payload LPM
+    // uploaded, and it records this envelope: its payload's hash and its
+    // signature, which an intoto entry encodes once more.
+    let logged: serde_json::Value = serde_json::from_slice(&logged_bytes).unwrap();
+    assert!(
+        logged["spec"]["content"]["envelope"]
+            .get("payload")
+            .is_none(),
+        "the bundle must carry Rekor's logged entry, not LPM's upload: {logged:#}"
+    );
     assert_eq!(
         logged["spec"]["content"]["payloadHash"]["value"],
         hex::encode(Sha256::digest(&statement_bytes))

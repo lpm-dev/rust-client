@@ -921,9 +921,11 @@ struct RekorApiInclusionProof {
 /// The bundle's transparency log entry for Rekor's response to an upload,
 /// in the Sigstore bundle's encoding, as Sigstore's clients convert it.
 ///
-/// The response must be whole and consistent: the SET present, the log ID
-/// and every hash the right length, and the audit path leading from the
-/// logged body to the proof's root. A bundle built from less wouldn't
+/// The response must be whole and consistent, as the verifier will read it:
+/// the SET present; the log ID and every hash the right length; the log
+/// index and integrated time within the verifier's bounds; the audit path
+/// leading from the logged body to the proof's root; and a well-formed
+/// checkpoint stating the proof's tree. A bundle built from less wouldn't
 /// verify, so the publish stops here instead.
 fn tlog_entry_from_rekor_response(response: &str) -> Result<TlogEntry, String> {
     let entries: std::collections::BTreeMap<String, serde_json::Value> =
@@ -1922,7 +1924,7 @@ mod tests {
                     "signedEntryTimestamp": BASE64.encode(b"set"),
                     "inclusionProof": {
                         "checkpoint": format!(
-                            "rekor.sigstore.dev - 1\n1\n{}\n\n\u{2014} rekor.sigstore.dev wNI9ag==\n",
+                            "rekor.sigstore.dev - 1\n1\n{}\n\n\u{2014} rekor.sigstore.dev wNI9agE=\n",
                             BASE64.encode(leaf)
                         ),
                         "hashes": [],
@@ -1954,7 +1956,42 @@ mod tests {
         let remove = |value: &mut serde_json::Value, field: &str| {
             value.as_object_mut().unwrap().remove(field);
         };
-        let cases: [(&str, Change, &str); 20] = [
+        let cases: [(&str, Change, &str); 23] = [
+            (
+                "a checkpoint for a tree of another root",
+                |entry| {
+                    let proof = &entry["verification"]["inclusionProof"];
+                    let root = hex::decode(proof["rootHash"].as_str().unwrap()).unwrap();
+                    let other = [0x55_u8; 32];
+                    let checkpoint = proof["checkpoint"].as_str().unwrap().replacen(
+                        &BASE64.encode(root),
+                        &BASE64.encode(other),
+                        1,
+                    );
+                    entry["verification"]["inclusionProof"]["checkpoint"] =
+                        serde_json::json!(checkpoint);
+                },
+                "for another tree",
+            ),
+            (
+                "a checkpoint with a malformed signature line",
+                |entry| {
+                    let checkpoint = format!(
+                        "{}\u{2014} witness.example wNI9ag==\n",
+                        entry["verification"]["inclusionProof"]["checkpoint"]
+                            .as_str()
+                            .unwrap()
+                    );
+                    entry["verification"]["inclusionProof"]["checkpoint"] =
+                        serde_json::json!(checkpoint);
+                },
+                "checkpoint is malformed",
+            ),
+            (
+                "an index past int64",
+                |entry| entry["logIndex"] = serde_json::json!(9_223_372_036_854_775_808_u64),
+                "log index is out of range",
+            ),
             (
                 "a checkpoint for another tree",
                 |entry| {
