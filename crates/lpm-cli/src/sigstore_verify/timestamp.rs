@@ -79,7 +79,10 @@ impl TimestampOutcome {
             return self.rejected.swap_remove(index);
         }
         match self.rejected.len() {
-            0 => VerifyError::Timestamp("the bundle carries no RFC 3161 timestamp".into()),
+            0 => VerifyError::Timestamp(
+                "the bundle has no signed time: neither a Rekor SET nor an RFC 3161 timestamp"
+                    .into(),
+            ),
             1 => self.rejected.remove(0),
             _ => VerifyError::Timestamp(
                 self.rejected

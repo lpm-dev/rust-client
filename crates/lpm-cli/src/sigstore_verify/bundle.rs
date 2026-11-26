@@ -42,7 +42,8 @@ impl VerifyOptions {
         }
     }
 
-    /// `Either` — accept SET-only OR inclusion-proof-only bundles.
+    /// `Either` — accept SET-only OR inclusion-proof-only bundles; the
+    /// latter, like any bundle without a SET, needs an RFC 3161 timestamp.
     /// Used for npm attestations because npm cohorts ship either form
     /// in the wild.
     #[allow(dead_code)]
@@ -243,23 +244,28 @@ pub(super) fn verify_sigstore_bundle_with(
         )?
     };
 
-    // The time the certificate is checked at. For Rekor v1, the integrated
-    // time its SET signs (the bundle's unsigned value under `Either`
-    // without a SET). Rekor v2 records no time, so its entries need a
-    // timestamp, and the earliest one counts.
-    let signed_at = match entry_version {
+    // The time the certificate is checked at, which something must have
+    // signed: the integrated time in a Rekor v1 entry's SET, else the
+    // earliest RFC 3161 timestamp. An inclusion proof shows the entry is in
+    // the log, not when it got there, and Rekor v2 records no time at all.
+    let integrated_time = match entry_version {
         RekorEntryVersion::V1 => {
             let _span = tracing::debug_span!("provenance.verify.set").entered();
-            verify_rekor_set(
+            let integrated_time = verify_rekor_set(
                 &components.tlog_entry,
                 &trust.rekor_keys,
                 options.rekor_inclusion_policy,
-            )?
+            )?;
+            components
+                .tlog_entry
+                .resolved_inclusion_promise()
+                .map(|_| integrated_time)
         }
-        RekorEntryVersion::V2 => match timestamps.earliest() {
-            Some(earliest) => earliest,
-            None => return Err(timestamps.into_error()),
-        },
+        RekorEntryVersion::V2 => None,
+    };
+    let signed_at = match integrated_time.or_else(|| timestamps.earliest()) {
+        Some(signed_at) => signed_at,
+        None => return Err(timestamps.into_error()),
     };
 
     // The certificate must have been valid at every signed time. Trust

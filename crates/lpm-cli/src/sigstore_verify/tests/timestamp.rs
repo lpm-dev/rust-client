@@ -1228,6 +1228,41 @@ fn a_sha384_message_imprint_verifies() {
 }
 
 #[test]
+fn a_timestamp_signs_the_time_of_a_rekor_v1_bundle_without_a_set() {
+    let case = "intoto-with-custom-trust-root";
+    let trust = TrustRoot::parse(&conformance_file(case, "trusted_root.json")).unwrap();
+    let mut bundle: serde_json::Value =
+        serde_json::from_slice(&conformance_file(case, "bundle.sigstore.json")).unwrap();
+    let verify = |bundle: &serde_json::Value| {
+        verify_sigstore_bundle_with(
+            &serde_json::to_vec(bundle).unwrap(),
+            &IdentityExpectations::none(),
+            VerifyOptions::npm_attestation(),
+            &trust,
+        )
+    };
+    let with_set = verify(&bundle).unwrap();
+    assert_eq!(rfc3339(with_set.signed_at), "2023-02-01T00:00:00Z");
+
+    // The unsigned integrated time no longer counts; the timestamp does.
+    let entry = &mut bundle["verificationMaterial"]["tlogEntries"][0];
+    entry.as_object_mut().unwrap().remove("inclusionPromise");
+    entry["integratedTime"] = serde_json::json!("1700000000");
+    let without_set = verify(&bundle).unwrap();
+    assert_eq!(rfc3339(without_set.signed_at), "2023-02-01T00:00:00Z");
+
+    bundle["verificationMaterial"]
+        .as_object_mut()
+        .unwrap()
+        .remove("timestampVerificationData");
+    let refused = verify(&bundle).unwrap_err();
+    assert!(
+        matches!(&refused, VerifyError::Timestamp(why) if why.contains("no signed time")),
+        "{refused:?}"
+    );
+}
+
+#[test]
 fn every_candidate_intermediate_is_tried_whatever_their_order() {
     // Two certificates for the intermediate's name and key: the first one
     // carried expired before the token's time, the second is current.

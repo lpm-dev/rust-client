@@ -3771,6 +3771,39 @@ fn rejects_proof_only_bundle_with_malformed_outer_log_index() {
     }
 }
 
+#[test]
+fn a_rekor_v1_bundle_without_a_set_needs_a_timestamp_to_sign_its_time() {
+    // An inclusion proof proves the entry is in the log, not when it was
+    // logged: without the SET, the bundle's `integratedTime` is a claim
+    // nobody signed, and the certificate can't be checked against it.
+    let body = load_fixture_bundle(REAL_NPM_FIXTURE);
+    let mut root: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    for attestation in root["attestations"].as_array_mut().unwrap() {
+        if let Some(entries) =
+            attestation["bundle"]["verificationMaterial"]["tlogEntries"].as_array_mut()
+        {
+            for entry in entries {
+                entry.as_object_mut().unwrap().remove("inclusionPromise");
+            }
+        }
+    }
+    let body = serde_json::to_vec(&root).unwrap();
+
+    for options in [
+        VerifyOptions::npm_attestation(),
+        VerifyOptions {
+            rekor_inclusion_policy: RekorInclusionProofPolicy::RequireInclusionProof,
+        },
+    ] {
+        let refused = verify_sigstore_bundle(&body, &IdentityExpectations::none(), options)
+            .expect_err("a proof-only bundle has no signed time");
+        assert!(
+            matches!(&refused, VerifyError::Timestamp(why) if why.contains("no signed time")),
+            "{refused:?}"
+        );
+    }
+}
+
 /// Same fixture, but assert the bundle exercises the v0.3
 /// single-cert wire shape inside the npm wrapper. npm currently
 /// ships its SLSA provenance attestation in this shape; if it
