@@ -2427,6 +2427,42 @@ fn forced_floor_refuses_an_editor_save_that_would_sign_a_group_left_loose_by_han
 }
 
 #[test]
+fn forced_floor_measures_a_delete_at_the_mode_installs_run() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        approve_firewall_mode(crate::npm_firewall_config::NpmFirewallMode::Monitor);
+        let mut config = firewall_policy_global_config(
+            "monitor",
+            &[(
+                crate::npm_firewall_config::LPM_AI_SUSPICIOUS_POLICY_KEY,
+                "block",
+            )],
+        );
+        config.table_mut().insert(
+            "force-security-floor".to_string(),
+            toml::Value::Boolean(true),
+        );
+        let after_delete = |action| lpm_registry::client::NpmFirewallPolicyProfile {
+            lpm_ai_suspicious: action,
+            lpm_ai_telemetry: action,
+            ..lpm_registry::client::NpmFirewallPolicyProfile::default()
+        };
+
+        let reports_as_much = crate::security_floor::reject_looser_firewall_policy_delete(
+            &config,
+            &after_delete(lpm_registry::client::NpmFirewallPolicyAction::Warn),
+        );
+        let reports_less = crate::security_floor::reject_looser_firewall_policy_delete(
+            &config,
+            &after_delete(lpm_registry::client::NpmFirewallPolicyAction::Allow),
+        );
+
+        assert!(reports_as_much.is_ok(), "{reports_as_much:?}");
+        assert_eq!(reports_less.unwrap_err().error_code(), "security_floor");
+    });
+}
+
+#[test]
 fn forced_floor_judges_a_delete_only_by_the_groups_it_changes() {
     let temp = tempdir().unwrap();
     with_test_env(temp.path(), || {

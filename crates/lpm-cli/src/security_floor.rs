@@ -376,12 +376,7 @@ pub fn reject_looser_firewall_policy_write(
     let enforced = crate::npm_firewall_config::enforced_policy_profile(global, &effective)?;
     // An editor save also sets `enforce`, so its profile takes effect at once
     // and is measured against what installs do now, at the mode they run.
-    let installs_mode = crate::npm_firewall_config::runtime_request_mode(global)?
-        .map_or_else(
-            || effective.posture.firewall_mode(),
-            |request| request.mode(),
-        )
-        .stricter(effective.posture.firewall_mode());
+    let installs_mode = installs_firewall_mode(global, &effective)?;
     let local = crate::security_approval::load_authorized_posture()?;
     let local_profile = local.firewall_policy_profile();
     let mut floors = vec![
@@ -445,6 +440,7 @@ pub fn reject_looser_firewall_policy_delete(
         &effective,
     );
     let floor = crate::npm_firewall_config::enforced_policy_profile(global, &effective)?;
+    let installs_mode = installs_firewall_mode(global, &effective)?;
     let mut changed = floor;
     for key in crate::npm_firewall_config::POLICY_KEYS {
         let after_action = crate::npm_firewall_config::policy_action(after, key);
@@ -458,14 +454,28 @@ pub fn reject_looser_firewall_policy_delete(
         }
     }
     reject_policy_below_floors(
-        crate::npm_firewall_config::NpmFirewallMode::Enforce,
+        installs_mode,
         &changed,
         &[PolicyFloor {
-            mode: crate::npm_firewall_config::NpmFirewallMode::Enforce,
+            mode: installs_mode,
             profile: &floor,
             source: PolicyFloorSource::Enforced,
         }],
     )
+}
+
+/// The firewall mode installs run at now: the config or environment request,
+/// never below the effective approved mode.
+fn installs_firewall_mode(
+    global: &GlobalConfig,
+    effective: &crate::security_approval::EffectiveAuthorizedPosture,
+) -> Result<crate::npm_firewall_config::NpmFirewallMode, LpmError> {
+    Ok(crate::npm_firewall_config::runtime_request_mode(global)?
+        .map_or_else(
+            || effective.posture.firewall_mode(),
+            |request| request.mode(),
+        )
+        .stricter(effective.posture.firewall_mode()))
 }
 
 /// Where a policy floor comes from, as its error names it.
