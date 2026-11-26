@@ -1,22 +1,27 @@
 """Print when a Sigstore bundle says its signature was made.
 
-That is Rekor v1's integrated time when the entry carries a SET, else the
+That is the integrated time a Rekor v1 entry's SET signs, else the
 earliest RFC 3161 timestamp, which is all a Rekor v2 bundle has. Nothing is
 verified here: release checks use the time to stand in for a publication
 time that the updater under test then checks against what it verifies.
 
 With --epoch-range, prints the earliest and latest candidate times in
 seconds since the epoch: every timestamp, since the updater uses the
-earliest one that verifies, which may not be the earliest one present. A
-window holding both holds whichever the updater uses.
+earliest one that verifies, which may not be the earliest one present.
+The earliest is rounded down and the latest up, so a window holding both
+holds whichever the updater uses, to the fraction of a second it reads.
 
 usage: sigstore-signed-time.py [--epoch | --epoch-range] <bundle>
 """
 
 import base64
 import datetime
+import decimal
 import json
+import math
 import sys
+
+EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 
 
 def read_element(data, offset):
@@ -40,8 +45,19 @@ def children(contents):
         yield tag, value
 
 
+def generalized_time_epoch(text):
+    """Seconds since the epoch, exactly, of a DER GeneralizedTime such as
+    20260513192333Z or 20260513192333.25Z."""
+    whole, _, fraction = text.rstrip("Z").partition(".")
+    seconds = datetime.datetime.strptime(whole, "%Y%m%d%H%M%S").replace(
+        tzinfo=datetime.timezone.utc
+    )
+    return int((seconds - EPOCH).total_seconds()) + decimal.Decimal(f"0.{fraction or 0}")
+
+
 def timestamp_time(response):
-    """The genTime of a DER TimeStampResp (RFC 3161), as a UTC datetime."""
+    """The genTime of a DER TimeStampResp (RFC 3161), in seconds since the
+    epoch."""
     _, fields, _ = read_element(response, 0)
     _, content_info = list(children(fields))[1]
     _, explicit = list(children(content_info))[1]
@@ -51,23 +67,39 @@ def timestamp_time(response):
     _, tst_info = list(children(content))[0]
     _, info = list(children(tst_info))[0]
     _, gen_time = list(children(info))[4]
-    text = gen_time.decode("ascii").rstrip("Z").split(".")[0]
-    return datetime.datetime.strptime(text, "%Y%m%d%H%M%S").replace(tzinfo=datetime.timezone.utc)
+    return generalized_time_epoch(gen_time.decode("ascii"))
+
+
+def is_rekor_v2_entry(entry):
+    """Whether the entry's body is the hashedrekord 0.0.2 entry Rekor v2
+    writes, which has no SET."""
+    try:
+        body = json.loads(base64.b64decode(entry.get("canonicalizedBody") or ""))
+    except ValueError:
+        return False
+    return (
+        isinstance(body, dict)
+        and body.get("kind") == "hashedrekord"
+        and body.get("apiVersion") == "0.0.2"
+    )
 
 
 def candidate_times(bundle):
     """The integrated time the first entry's SET signs, else every
-    timestamp's time: the entry and the times the updater reads."""
+    timestamp's time, in seconds since the epoch: the entry and the times
+    the updater reads."""
     material = bundle.get("verificationMaterial") or {}
     entries = material.get("tlogEntries") or []
     if entries:
         entry = entries[0] or {}
         integrated = int(entry.get("integratedTime") or 0)
-        promise = entry.get("inclusionPromise") or (entry.get("verification") or {}).get(
-            "inclusionPromise"
-        )
-        if integrated and promise:
-            return [datetime.datetime.fromtimestamp(integrated, datetime.timezone.utc)]
+        # A bundle carries the SET as its inclusion promise; an entry copied
+        # from Rekor's API carries it under `verification`.
+        signed = (entry.get("inclusionPromise") or {}).get("signedEntryTimestamp") or (
+            entry.get("verification") or {}
+        ).get("signedEntryTimestamp")
+        if integrated and signed and not is_rekor_v2_entry(entry):
+            return [decimal.Decimal(integrated)]
     timestamps = (material.get("timestampVerificationData") or {}).get("rfc3161Timestamps") or []
     times = [timestamp_time(base64.b64decode(t["signedTimestamp"])) for t in timestamps]
     if not times:
@@ -83,12 +115,13 @@ def main(argv):
         sys.exit(usage)
     with open(paths[0], encoding="utf-8") as file:
         times = candidate_times(json.load(file))
+    earliest = math.floor(min(times))
     if mode == "--epoch-range":
-        print(int(min(times).timestamp()), int(max(times).timestamp()))
+        print(earliest, math.ceil(max(times)))
     elif mode == "--epoch":
-        print(int(min(times).timestamp()))
+        print(earliest)
     else:
-        print(min(times).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        print((EPOCH + datetime.timedelta(seconds=earliest)).strftime("%Y-%m-%dT%H:%M:%SZ"))
 
 
 if __name__ == "__main__":

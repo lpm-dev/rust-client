@@ -45,10 +45,22 @@ class SigningConfigTests(unittest.TestCase):
             config[field] = [{'url': 'https://fulcio.example'}]
             with self.assertRaises(SystemExit, msg=field):
                 checked(config)
-        for url in ('http://fulcio.sigstore.dev', 'https://fulcio.sigstore.dev.example'):
-            config = dict(STAGED, caUrls=[{'url': url}])
-            with self.assertRaises(SystemExit, msg=url):
-                checked(config)
+        for url in (
+            'http://fulcio.sigstore.dev',
+            'https://fulcio.sigstore.dev.example',
+            'https://evilsigstore.dev',
+            'https://sigstore.dev@evil.example',
+            'https://evil.example/fulcio.sigstore.dev',
+            'https://evil.example#.sigstore.dev',
+            '',
+        ):
+            for field in signing_config.SERVICE_LISTS:
+                config = dict(STAGED, **{field: [{'url': url}]})
+                with self.assertRaises(SystemExit, msg=f'{field}: {url!r}'):
+                    checked(config)
+        without_url = dict(STAGED, tsaUrls=[{'majorApiVersion': 1}])
+        with self.assertRaises(SystemExit):
+            checked(without_url)
 
     def test_unknown_or_repeated_fields_are_refused(self):
         with self.assertRaises(SystemExit):

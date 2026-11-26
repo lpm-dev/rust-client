@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from decimal import Decimal
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location(
@@ -53,12 +54,35 @@ class SigstoreSignedTimeTests(unittest.TestCase):
             run(rekor_v2)
 
 
-    def test_a_set_nested_the_way_rekors_api_returned_it_counts(self):
+    def test_a_set_where_rekors_api_returned_it_counts(self):
         release = bundle(FIXTURES / 'sigstore_bundles' / '21-real-lpm-release-v0.84.0.json')
         entry = release['verificationMaterial']['tlogEntries'][0]
         integrated = int(entry['integratedTime'])
-        entry['verification'] = {'inclusionPromise': entry.pop('inclusionPromise')}
+        entry['verification'] = entry.pop('inclusionPromise')
         self.assertEqual(run(release, '--epoch'), str(integrated))
+
+    def test_a_rekor_v2_entry_has_no_set_to_count(self):
+        rekor_v2 = bundle(FIXTURES / 'sigstore_conformance' / 'rekor2-dsse-happy-path' / 'bundle.sigstore.json')
+        entry = rekor_v2['verificationMaterial']['tlogEntries'][0]
+        entry['integratedTime'] = '1700000000'
+        entry['inclusionPromise'] = {'signedEntryTimestamp': 'MEUCIQD='}
+        self.assertEqual(run(rekor_v2), '2026-05-13T19:23:33Z')
+
+    def test_fractional_seconds_are_read_exactly(self):
+        self.assertEqual(
+            signed_time.generalized_time_epoch('20260513192333.25Z'),
+            signed_time.generalized_time_epoch('20260513192333Z') + Decimal('0.25'),
+        )
+        self.assertEqual(signed_time.generalized_time_epoch('19700101000001Z'), 1)
+
+    def test_the_range_rounds_outward_so_a_fraction_past_its_end_is_caught(self):
+        original = signed_time.candidate_times
+        signed_time.candidate_times = lambda _bundle: [Decimal('100.5'), Decimal('200.25')]
+        try:
+            self.assertEqual(run({}, '--epoch-range'), '100 201')
+            self.assertEqual(run({}, '--epoch'), '100')
+        finally:
+            signed_time.candidate_times = original
 
     def test_the_range_covers_every_timestamp(self):
         rekor_v2 = bundle(FIXTURES / 'sigstore_conformance' / 'rekor2-dsse-happy-path' / 'bundle.sigstore.json')
