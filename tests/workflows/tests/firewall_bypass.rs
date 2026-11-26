@@ -1231,3 +1231,209 @@ async fn global_update_names_a_version_refused_while_planning_once() {
         "{text}"
     );
 }
+
+#[tokio::test]
+async fn global_install_json_reports_the_version_a_bypass_rule_let_through() {
+    let mock = MockRegistry::start().await;
+    mount_blocked_global_update(&mock, "update-tool").await;
+    let project = enforcing_project();
+    write_signed_firewall_bypass(
+        &project,
+        &[stored_rule("update-tool", serde_json::json!({}))],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "install", "-g", "update-tool"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let firewall = &envelope["security"]["firewall"];
+    assert_eq!(firewall["mode"], "enforce", "{envelope:#}");
+    assert_eq!(
+        firewall["bypassed"][0]["name"], "update-tool",
+        "{envelope:#}"
+    );
+    assert_eq!(firewall["bypassed"][0]["version"], "1.1.0", "{envelope:#}");
+    assert_eq!(
+        firewall["bypassed"][0]["rule"]["spec"], "update-tool",
+        "{envelope:#}"
+    );
+}
+
+async fn batch_update_with_one_tool_allowed(json: bool) -> (std::process::Output, TempProject) {
+    let mock = MockRegistry::start().await;
+    mount_blocked_global_update(&mock, "update-tool").await;
+    mount_blocked_global_update(&mock, "other-tool").await;
+    let project = enforcing_project();
+    installed_globally(&project, &["update-tool", "other-tool"]);
+    write_signed_firewall_bypass(
+        &project,
+        &[stored_rule("update-tool", serde_json::json!({}))],
+    );
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    command.args(["--color", "never"]);
+    if json {
+        command.arg("--json");
+    }
+    let output = command.args(["global", "update"]).output().unwrap();
+    (output, project)
+}
+
+#[tokio::test]
+async fn batch_global_update_prints_what_a_bypass_rule_let_through_under_its_tool() {
+    let (output, _project) = batch_update_with_one_tool_allowed(false).await;
+
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        text.matches("LPM Firewall allowed 1 blocked package because of your bypass rules")
+            .count(),
+        1,
+        "{text}"
+    );
+    assert!(text.contains("rule: update-tool"), "{text}");
+}
+
+#[tokio::test]
+async fn batch_global_update_json_reports_what_a_bypass_rule_let_through_per_tool() {
+    let (output, _project) = batch_update_with_one_tool_allowed(true).await;
+
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let results = envelope["results"].as_array().unwrap();
+    let updated = results
+        .iter()
+        .find(|result| result["package"] == "update-tool")
+        .unwrap();
+    assert_eq!(updated["action"], "upgraded", "{envelope:#}");
+    let firewall = &updated["security"]["firewall"];
+    assert_eq!(
+        firewall["bypassed"][0]["name"], "update-tool",
+        "{envelope:#}"
+    );
+    assert_eq!(
+        firewall["bypassed"][0]["rule"]["spec"], "update-tool",
+        "{envelope:#}"
+    );
+    let held = results
+        .iter()
+        .find(|result| result["package"] == "other-tool")
+        .unwrap();
+    assert!(held.get("security").is_none(), "{envelope:#}");
+}
+
+#[tokio::test]
+async fn upgrade_json_reports_the_version_a_bypass_rule_let_through() {
+    let project = TempProject::empty(
+        r#"{"name":"upgrade-bypass","version":"1.0.0","dependencies":{"agent-tool":"^1.0.0"}}"#,
+    );
+    write_npm_firewall_global_config(&project, "enforce");
+    project.write_file(
+        "lpm.lock",
+        "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n\n\
+         [[packages]]\nname = \"agent-tool\"\nversion = \"1.0.0\"\n\
+         source = \"registry+https://registry.npmjs.org\"\n",
+    );
+    let mock = MockRegistry::start().await;
+    mock.with_full_package_metadata(
+        "agent-tool",
+        "1.1.0",
+        &[
+            (
+                "1.0.0",
+                serde_json::json!({}),
+                Some(make_tarball("agent-tool", "1.0.0")),
+            ),
+            (
+                "1.1.0",
+                serde_json::json!({}),
+                Some(make_tarball("agent-tool", "1.1.0")),
+            ),
+        ],
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path(VERDICTS_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "requestId": "upgrade-bypass",
+            "policyMode": "enforce",
+            "summary": { "total": 1, "allow": 0, "warn": 0, "block": 1, "unknown": 0, "matched": 1 },
+            "decisions": [{
+                "decisionId": "upgrade-bypass:agent-tool",
+                "name": "agent-tool",
+                "version": "1.1.0",
+                "action": "block",
+                "verdict": "suspicious",
+                "reason": "client policy maps lpm_ai_agent_control_surface to block",
+                "matchSource": "package",
+                "policyMode": "enforce",
+                "enqueueScan": false,
+                "policy": { "group": "lpm_ai_agent_control_surface" }
+            }]
+        })))
+        .mount(mock.server())
+        .await;
+    write_signed_firewall_bypass(
+        &project,
+        &[stored_rule("agent-tool", serde_json::json!({}))],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["upgrade", "-y", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let firewall = &envelope["security"]["firewall"];
+    assert_eq!(firewall["mode"], "enforce", "{envelope:#}");
+    assert_eq!(
+        firewall["bypassed"][0]["name"], "agent-tool",
+        "{envelope:#}"
+    );
+    assert_eq!(firewall["bypassed"][0]["version"], "1.1.0", "{envelope:#}");
+}
+
+#[tokio::test]
+async fn lone_global_update_prints_what_a_bypass_rule_let_through_once() {
+    let mock = MockRegistry::start().await;
+    mount_blocked_global_update(&mock, "update-tool").await;
+    let project = enforcing_project();
+    installed_globally(&project, &["update-tool"]);
+    write_signed_firewall_bypass(
+        &project,
+        &[stored_rule("update-tool", serde_json::json!({}))],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--color", "never", "global", "update"])
+        .output()
+        .unwrap();
+
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{text}");
+    assert_eq!(
+        text.matches("LPM Firewall allowed 1 blocked package because of your bypass rules")
+            .count(),
+        1,
+        "{text}"
+    );
+}

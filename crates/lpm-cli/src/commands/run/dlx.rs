@@ -283,7 +283,7 @@ async fn install_dlx_target(
         !options.reserve_stdout,                                 // emit_install_report
         options.reserve_stdout,
         Some(crate::commands::install::InstallCallerContext {
-            route_table: caller_routes.clone(),
+            route_table: Some(caller_routes.clone()),
             policy_project_dir: Some(project_dir),
             expected_root: target.expected_identity.as_ref().map(|identity| {
                 crate::commands::install::ExpectedInstallRoot {
@@ -295,6 +295,7 @@ async fn install_dlx_target(
             }),
             locked_integrities: None,
             firewall_bypass_root: None,
+            firewall_bypass_report: None,
         }),
         lpm_common::LpmRoot::from_env()?,
     )

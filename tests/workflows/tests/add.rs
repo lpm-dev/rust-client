@@ -5912,3 +5912,62 @@ async fn lpm_add_reports_a_firewall_blocked_source_dependency_as_a_firewall_bloc
     );
     assert_eq!(project.read_file("package.json"), original_manifest);
 }
+
+#[tokio::test]
+async fn lpm_add_json_reports_a_source_dependency_a_bypass_rule_let_through() {
+    let mock = MockRegistry::start().await;
+    mount_release_age_source_package(&mock, "firewall-source-pkg", "blocked-source-dep@1.0.0")
+        .await;
+    let dependency_tarball = make_tarball_from_pkg_json(
+        json!({ "name": "blocked-source-dep", "version": "1.0.0" }),
+        &[],
+    );
+    mock.with_package("blocked-source-dep", "1.0.0", &dependency_tarball)
+        .await;
+    mock.with_npm_firewall_allow("firewall-source-pkg", "1.0.0")
+        .await;
+    mock.with_npm_firewall_block("blocked-source-dep", "1.0.0")
+        .await;
+    let project =
+        TempProject::empty(r#"{"name":"add-firewall-dep","version":"1.0.0","dependencies":{}}"#);
+    write_npm_firewall_global_config(&project, "enforce");
+    support::write_signed_firewall_bypass(
+        &project,
+        &[json!({
+            "id": "fwb_blocked",
+            "spec": "blocked-source-dep@1.0.0",
+            "scope": "global",
+            "covers_malware": true,
+            "added_at": "2026-11-25T10:00:00Z",
+        })],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            "firewall-source-pkg?withDependency=true",
+            "--yes",
+            "--json",
+            "--no-skills",
+        ])
+        .output()
+        .expect("failed to run lpm add");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let firewall = &envelope["security"]["firewall"];
+    assert_eq!(firewall["mode"], "enforce", "{envelope:#}");
+    assert_eq!(
+        firewall["bypassed"][0]["name"], "blocked-source-dep",
+        "{envelope:#}"
+    );
+    assert_eq!(
+        firewall["bypassed"][0]["rule"]["spec"], "blocked-source-dep@1.0.0",
+        "{envelope:#}"
+    );
+}

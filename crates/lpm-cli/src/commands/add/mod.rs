@@ -92,6 +92,10 @@ struct AddJsonOutput<'a> {
     errors: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     firewall: Option<serde_json::Value>,
+    /// What LPM Firewall bypass rules let through in the dependency install,
+    /// in the `security.firewall` shape other commands report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    security: Option<serde_json::Value>,
 }
 
 /// Splits the bare specifiers a plain copy uses into the package names they
@@ -1505,6 +1509,8 @@ async fn run_locked(
     // (no `lpm.config.json`) keeps the download-manager contract:
     // copy bytes, surface external imports, let the user install deps
     // themselves.
+    let firewall_bypass_report =
+        std::sync::Arc::new(crate::commands::install::FirewallBypassReport::default());
     let dependency_outcome = if !no_install_deps && lpm_config.is_some() {
         handle_dependencies(
             client,
@@ -1519,6 +1525,7 @@ async fn run_locked(
             !no_skills,
             &effective_pm,
             &mut tx,
+            &firewall_bypass_report,
         )
         .await?
     } else if !no_install_deps && lpm_config.is_none() {
@@ -1548,6 +1555,7 @@ async fn run_locked(
             no_engine_strict,
             !no_skills,
             &effective_pm,
+            &firewall_bypass_report,
         )
         .await?;
     }
@@ -1787,6 +1795,7 @@ async fn run_locked(
             warnings: swift_traversal.warnings(),
             errors: &[],
             firewall: firewall_json,
+            security: firewall_bypass_report.take().security_json(),
         };
         let stdout = std::io::stdout();
         let mut stdout = stdout.lock();

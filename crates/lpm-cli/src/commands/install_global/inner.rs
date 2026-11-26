@@ -37,7 +37,7 @@ pub(super) async fn do_install(
     prep: &PrepResult,
     suppress_nested_output: bool,
     overrides: &InstallGlobalOverrides,
-) -> Result<(), LpmError> {
+) -> Result<crate::commands::install::FirewallBypassRecord, LpmError> {
     let version = prep.version.to_string();
     run_inner_global_install(
         registry,

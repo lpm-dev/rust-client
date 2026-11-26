@@ -972,7 +972,7 @@ async fn execute_upgrade_batch(
 
     let installs = bounded_install_stream(ready.into_iter().map(|upgrade| async move {
         let install_result = async {
-            do_install_upgrade(
+            let firewall_bypassed = do_install_upgrade(
                 root,
                 registry,
                 &upgrade.prep,
@@ -991,7 +991,7 @@ async fn execute_upgrade_batch(
                 &upgrade.staged.install_root,
                 &InstallReadyMarker::new(commands),
             )?;
-            Ok(())
+            Ok(firewall_bypassed)
         }
         .await;
         (upgrade, install_result)
@@ -1000,7 +1000,7 @@ async fn execute_upgrade_batch(
     let mut commit_ready = Vec::with_capacity(upgrade_count);
     while let Some((upgrade, install_result)) = installs.next().await {
         match install_result {
-            Ok(()) => commit_ready.push(upgrade),
+            Ok(firewall_bypassed) => commit_ready.push((upgrade, firewall_bypassed)),
             Err(error) => results.push((
                 upgrade.index,
                 UpgradeResult::Failed {
@@ -1012,18 +1012,24 @@ async fn execute_upgrade_batch(
     }
 
     if !commit_ready.is_empty() {
-        commit_ready.sort_by_key(|upgrade| upgrade.index);
+        commit_ready.sort_by_key(|(upgrade, _)| upgrade.index);
         let commit_inputs = commit_ready
             .iter()
-            .map(|upgrade| (upgrade.prep.as_ref(), &upgrade.staged))
+            .map(|(upgrade, _)| (upgrade.prep.as_ref(), &upgrade.staged))
             .collect::<Vec<_>>();
         match with_exclusive_lock(root.global_tx_lock(), || {
             commit_upgrade_batch_locked(root, &commit_inputs)
         }) {
             Ok(commit_results) => {
-                for (upgrade, commit_result) in commit_ready.into_iter().zip(commit_results) {
+                for ((upgrade, firewall_bypassed), commit_result) in
+                    commit_ready.into_iter().zip(commit_results)
+                {
                     let result = match commit_result {
-                        Ok(output) => UpgradeResult::Upgraded(output),
+                        Ok(output) => UpgradeResult::Upgraded(UpgradeOutput {
+                            firewall_bypassed,
+                            firewall_bypassed_shown: !suppress_nested_output,
+                            ..output
+                        }),
                         Err(error) => UpgradeResult::Failed {
                             package: upgrade.prep.name.clone(),
                             failure: UpdateFailure::from_error(&error),
@@ -1034,7 +1040,7 @@ async fn execute_upgrade_batch(
             }
             Err(error) => {
                 let failure = UpdateFailure::from_error(&error);
-                results.extend(commit_ready.into_iter().map(|upgrade| {
+                results.extend(commit_ready.into_iter().map(|(upgrade, _)| {
                     (
                         upgrade.index,
                         UpgradeResult::Failed {
@@ -1064,7 +1070,8 @@ async fn execute_upgrade(
             prepare_upgrade_locked(root, &prep, tx_id)
         })?;
 
-        do_install_upgrade(root, registry, &prep, &staged, suppress_nested_output).await?;
+        let firewall_bypassed =
+            do_install_upgrade(root, registry, &prep, &staged, suppress_nested_output).await?;
         let commands = discover_bin_commands(&staged.install_root, &prep.name)?;
         if commands.is_empty() {
             return Err(LpmError::Script(format!(
@@ -1077,6 +1084,11 @@ async fn execute_upgrade(
 
         with_exclusive_lock(root.global_tx_lock(), || {
             commit_upgrade_locked(root, &prep, &staged)
+        })
+        .map(|output| UpgradeOutput {
+            firewall_bypassed,
+            firewall_bypassed_shown: !suppress_nested_output,
+            ..output
         })
     })
     .await
@@ -1218,14 +1230,20 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
         let entries: Vec<_> = results
             .iter()
             .map(|r| match r {
-                UpgradeResult::Upgraded(out) => serde_json::json!({
-                    "package": out.name,
-                    "action": "upgraded",
-                    "from": out.from_version,
-                    "to": out.to_version,
-                    "saved_spec": out.saved_spec,
-                    "commands": out.commands,
-                }),
+                UpgradeResult::Upgraded(out) => {
+                    let mut entry = serde_json::json!({
+                        "package": out.name,
+                        "action": "upgraded",
+                        "from": out.from_version,
+                        "to": out.to_version,
+                        "saved_spec": out.saved_spec,
+                        "commands": out.commands,
+                    });
+                    if let Some(security) = out.firewall_bypassed.security_json() {
+                        entry["security"] = security;
+                    }
+                    entry
+                }
                 UpgradeResult::SaveSpecRewritten {
                     package,
                     version,
@@ -1272,6 +1290,9 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
                     install_ui::dim(&from_safe),
                     install_ui::green(&to_safe),
                 ));
+                if !out.firewall_bypassed_shown {
+                    out.firewall_bypassed.print();
+                }
             }
             UpgradeResult::SaveSpecRewritten {
                 package,

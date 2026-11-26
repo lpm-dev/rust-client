@@ -301,14 +301,15 @@ pub async fn run(
         !json_output, // JSON belongs to the single deploy summary
         false,        // reserve_stdout: deploy owns no stdio protocol channel
         Some(crate::commands::install::InstallCallerContext {
-            route_table: crate::commands::install::load_install_route_table(
+            route_table: Some(crate::commands::install::load_install_route_table(
                 &plan.output_dir,
                 client,
-            )?,
+            )?),
             policy_project_dir: None,
             expected_root: None,
             locked_integrities: None,
             firewall_bypass_root: Some(cwd),
+            firewall_bypass_report: None,
         }),
         lpm_common::LpmRoot::from_dir(plan.output_dir.join(".lpm")),
     )

@@ -474,6 +474,7 @@ pub async fn run(
                 fetch_errors,
                 &skipped_private,
                 &skipped_non_registry,
+                &crate::commands::install::FirewallBypassRecord::default(),
             )?;
         } else {
             if !dry_run {
@@ -523,6 +524,7 @@ pub async fn run(
                 fetch_errors,
                 &skipped_private,
                 &skipped_non_registry,
+                &crate::commands::install::FirewallBypassRecord::default(),
             )?;
             return Ok(());
         }
@@ -633,6 +635,8 @@ pub async fn run(
         .map_err(|e| LpmError::Script(format!("failed to serialize package.json: {e}")))?;
     updated_content.push('\n');
     let project_dirs = [project_dir.to_path_buf()];
+    let firewall_bypass_report =
+        std::sync::Arc::new(crate::commands::install::FirewallBypassReport::default());
     let install_result =
         crate::commands::install::workspace_lockfile::scope_workspace_mutation_if_present(
             project_dir,
@@ -720,7 +724,11 @@ pub async fn run(
                     &[],
                     !json_output,
                     false,
-                    None,
+                    Some(
+                        crate::commands::install::InstallCallerContext::reporting_firewall_bypasses(
+                            std::sync::Arc::clone(&firewall_bypass_report),
+                        ),
+                    ),
                     lpm_root,
                 );
                 let install_result = crate::commands::install::root_versions::scope(
@@ -753,6 +761,7 @@ pub async fn run(
             fetch_errors,
             &skipped_private,
             &skipped_non_registry,
+            &firewall_bypass_report.take(),
         )?;
     } else {
         install_ui::done("Updated package.json, lpm.lock, node_modules");
@@ -1049,12 +1058,15 @@ fn plan_upgrade_dependency(
     Ok(planned)
 }
 
+/// `firewall_bypassed` is what LPM Firewall bypass rules let through in the
+/// install; in a terminal the install prints it itself.
 fn emit_upgrade_json(
     candidates: &[EnrichedCandidate],
     dry_run: bool,
     fetch_errors: usize,
     skipped_private: &[String],
     skipped_non_registry: &[String],
+    firewall_bypassed: &crate::commands::install::FirewallBypassRecord,
 ) -> Result<(), LpmError> {
     let packages: Vec<_> = candidates.iter().map(candidate_to_json).collect();
     let mut json = serde_json::json!({
@@ -1072,6 +1084,9 @@ fn emit_upgrade_json(
                 "skipped_non_registry".to_string(),
                 serde_json::json!(skipped_non_registry),
             );
+    }
+    if let Some(security) = firewall_bypassed.security_json() {
+        json["security"] = security;
     }
     let encoded = serde_json::to_string_pretty(&json).map_err(|error| {
         LpmError::Script(format!("failed to serialize upgrade result: {error}"))

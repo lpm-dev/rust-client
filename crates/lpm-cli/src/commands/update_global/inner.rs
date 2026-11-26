@@ -11,7 +11,7 @@ pub(super) async fn do_install_upgrade(
     prep: &UpgradePrep,
     staged: &StagedUpgrade,
     suppress_nested_output: bool,
-) -> Result<(), LpmError> {
+) -> Result<crate::commands::install::FirewallBypassRecord, LpmError> {
     let new_version = prep.new_version.to_string();
     run_inner_global_install(
         registry,

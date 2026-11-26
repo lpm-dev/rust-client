@@ -371,7 +371,7 @@ pub(super) struct BypassedVerdict {
 }
 
 impl BypassedVerdict {
-    fn to_json(&self) -> serde_json::Value {
+    pub(super) fn to_json(&self) -> serde_json::Value {
         let mut json = npm_firewall_decision_json(&self.decision);
         json["rule"] = self.rule.to_json();
         json
@@ -2103,7 +2103,7 @@ fn blocked_package(
 }
 
 /// Prints the blocked versions bypass rules let through, each with its rule.
-fn print_bypassed_verdicts(bypassed: &[BypassedVerdict], monitor: bool) {
+pub(super) fn print_bypassed_verdicts(bypassed: &[BypassedVerdict], monitor: bool) {
     if bypassed.is_empty() {
         return;
     }

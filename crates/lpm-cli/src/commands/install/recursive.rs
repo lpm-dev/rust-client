@@ -792,13 +792,14 @@ async fn run_workspace_target_install(
     let caller_context = locked_integrities
         .map(|locked| {
             Ok::<_, LpmError>(super::InstallCallerContext {
-                route_table: super::source_resolution::load_install_route_table(
+                route_table: Some(super::source_resolution::load_install_route_table(
                     &plan.path, &client,
-                )?,
+                )?),
                 policy_project_dir: None,
                 expected_root: None,
                 locked_integrities: Some(locked),
                 firewall_bypass_root: None,
+                firewall_bypass_report: None,
             })
         })
         .transpose()?;

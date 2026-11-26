@@ -389,6 +389,7 @@ pub(crate) struct InstallExpectations {
     /// The project whose LPM Firewall bypass rules apply, when the install
     /// runs elsewhere on its behalf, as `lpm deploy` does.
     firewall_bypass_root: Option<PathBuf>,
+    firewall_bypass_report: Option<Arc<FirewallBypassReport>>,
 }
 
 impl InstallExpectations {
@@ -416,22 +417,112 @@ pub(crate) use locked_integrity::LockedIntegrities;
 pub(crate) use source_resolution::load_install_route_table;
 
 pub(crate) struct InstallCallerContext<'a> {
-    pub(crate) route_table: RouteTable,
+    /// The routes the caller already loaded, or `None` to load them here.
+    pub(crate) route_table: Option<RouteTable>,
     pub(crate) policy_project_dir: Option<&'a Path>,
     pub(crate) expected_root: Option<ExpectedInstallRoot>,
     pub(crate) locked_integrities: Option<Arc<LockedIntegrities>>,
     pub(crate) firewall_bypass_root: Option<&'a Path>,
+    /// Where the install hands what LPM Firewall bypass rules let through.
+    pub(crate) firewall_bypass_report: Option<Arc<FirewallBypassReport>>,
 }
 
 impl From<RouteTable> for InstallCallerContext<'_> {
     fn from(route_table: RouteTable) -> Self {
         Self {
-            route_table,
+            route_table: Some(route_table),
             policy_project_dir: None,
             expected_root: None,
             locked_integrities: None,
             firewall_bypass_root: None,
+            firewall_bypass_report: None,
         }
+    }
+}
+
+impl InstallCallerContext<'_> {
+    /// A context that only collects what LPM Firewall bypass rules let
+    /// through, for a command that runs an install of its own.
+    pub(crate) fn reporting_firewall_bypasses(report: Arc<FirewallBypassReport>) -> Self {
+        Self {
+            route_table: None,
+            policy_project_dir: None,
+            expected_root: None,
+            locked_integrities: None,
+            firewall_bypass_root: None,
+            firewall_bypass_report: Some(report),
+        }
+    }
+}
+
+/// What LPM Firewall bypass rules let through during an install, collected
+/// for a command that runs the install and reports in its own words, as
+/// `lpm install -g`, `lpm global update`, `lpm upgrade` and `lpm add` do.
+#[derive(Debug, Default)]
+pub(crate) struct FirewallBypassReport {
+    record: std::sync::Mutex<FirewallBypassRecord>,
+}
+
+impl FirewallBypassReport {
+    fn record(&self, stats: &NpmFirewallPreflightStats) {
+        if stats.bypassed.is_empty() {
+            return;
+        }
+        let mut record = self
+            .record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        record.mode = Some(stats.mode);
+        record.bypassed.extend(stats.bypassed.iter().cloned());
+    }
+
+    pub(crate) fn take(&self) -> FirewallBypassRecord {
+        std::mem::take(
+            &mut *self
+                .record
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
+/// The blocked versions bypass rules let through, and the firewall mode they
+/// were checked in; in monitor mode nothing was blocked, so they are what the
+/// rules would have let through.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FirewallBypassRecord {
+    mode: Option<crate::npm_firewall_config::NpmFirewallMode>,
+    bypassed: Vec<firewall::BypassedVerdict>,
+}
+
+impl FirewallBypassRecord {
+    /// Each version as `security.firewall.bypassed` reports it.
+    pub(crate) fn bypassed_json(&self) -> Vec<serde_json::Value> {
+        self.bypassed
+            .iter()
+            .map(firewall::BypassedVerdict::to_json)
+            .collect()
+    }
+
+    /// The `security` object a command adds to its JSON, or `None` when no
+    /// rule let anything through.
+    pub(crate) fn security_json(&self) -> Option<serde_json::Value> {
+        let mode = self.mode?;
+        Some(serde_json::json!({
+            "firewall": {
+                "mode": mode.as_str(),
+                "bypassed": self.bypassed_json(),
+            }
+        }))
+    }
+
+    /// Prints the versions as an install does, for a command whose install
+    /// ran without output.
+    pub(crate) fn print(&self) {
+        firewall::print_bypassed_verdicts(
+            &self.bypassed,
+            self.mode == Some(crate::npm_firewall_config::NpmFirewallMode::Monitor),
+        );
     }
 }
 
@@ -482,11 +573,12 @@ pub(crate) async fn run_with_options_with_lpm_root(
     let (preloaded_route_table, mut expectations) = caller_context
         .map(|context| {
             (
-                Some(context.route_table),
+                context.route_table,
                 InstallExpectations {
                     root: context.expected_root,
                     locked_integrities: context.locked_integrities,
                     firewall_bypass_root: context.firewall_bypass_root.map(Path::to_path_buf),
+                    firewall_bypass_report: context.firewall_bypass_report,
                 },
             )
         })
@@ -1135,6 +1227,7 @@ async fn run_with_options_under_store_lock(
             dependency_engine_policy: dependency_engine_policy.as_ref(),
             emit_install_report,
             current_importer_snapshot: &current_importer_snapshot,
+            firewall_bypass_report: expectations.firewall_bypass_report.as_deref(),
         })
         .await;
     }
@@ -1774,6 +1867,9 @@ async fn run_with_options_under_store_lock(
     let wf_link_compatibility_ms = link_phase.compatibility_ms;
     let wf_link_bin_shims_ms = link_phase.bin_shims_ms;
     let npm_firewall_stats = npm_firewall.settle(json_output).await?;
+    if let Some(report) = &expectations.firewall_bypass_report {
+        report.record(&npm_firewall_stats);
+    }
     // `link_ms` lands in the verbose footer and the JSON timing object;
     // no dedicated "Linked in Xms" line.
 

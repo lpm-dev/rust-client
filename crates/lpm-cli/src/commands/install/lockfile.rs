@@ -1144,6 +1144,7 @@ pub(super) struct OfflineInstallInput<'a> {
     pub(super) dependency_engine_policy: &'a crate::engine_check::DependencyEnginePolicy,
     pub(super) emit_install_report: bool,
     pub(super) current_importer_snapshot: &'a lpm_lockfile::ImporterSnapshot,
+    pub(super) firewall_bypass_report: Option<&'a super::FirewallBypassReport>,
 }
 
 pub(super) async fn run_offline_install_phase(
@@ -1198,6 +1199,7 @@ pub(super) async fn run_offline_install_phase(
         dependency_engine_policy,
         emit_install_report,
         current_importer_snapshot,
+        firewall_bypass_report,
     } = input;
 
     if override_drift.changed() {
@@ -1403,6 +1405,9 @@ pub(super) async fn run_offline_install_phase(
         json_output,
     })
     .await?;
+    if let Some(report) = firewall_bypass_report {
+        report.record(&npm_firewall_stats);
+    }
     let policy_extension_stats =
         run_policy_extensions(policy_extension_configs, project_dir, &locked, json_output).await?;
     let mut ephemeral_packages = v2_workspace_root_pre_resolve.install_pkgs.clone();

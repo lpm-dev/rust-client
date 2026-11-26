@@ -47,10 +47,12 @@ pub(super) struct InnerGlobalInstallOptions<'a> {
     pub(super) verify_policy: VerifyPolicy,
 }
 
+/// Installs a global package into its own root and returns what LPM Firewall
+/// bypass rules let through, which the global command reports itself.
 pub(super) async fn run_inner_global_install(
     registry: &RegistryClient,
     options: InnerGlobalInstallOptions<'_>,
-) -> Result<(), LpmError> {
+) -> Result<crate::commands::install::FirewallBypassRecord, LpmError> {
     let install_leaf = options.install_root.file_name().ok_or_else(|| {
         LpmError::Script(format!(
             "global install root has no final path component: {}",
@@ -77,7 +79,9 @@ pub(super) async fn run_inner_global_install(
     let _stdout_gag =
         crate::output::suppress_stdout(options.suppress_nested_output).map_err(LpmError::Script)?;
 
-    crate::commands::install::run_with_options(
+    let firewall_bypass_report =
+        std::sync::Arc::new(crate::commands::install::FirewallBypassReport::default());
+    crate::commands::install::run_with_options_with_lpm_root(
         registry,
         options.install_root,
         options.suppress_nested_output,
@@ -108,8 +112,17 @@ pub(super) async fn run_inner_global_install(
         false,
         false,
         &[],
+        true,
+        false,
+        Some(
+            crate::commands::install::InstallCallerContext::reporting_firewall_bypasses(
+                std::sync::Arc::clone(&firewall_bypass_report),
+            ),
+        ),
+        lpm_common::LpmRoot::from_env()?,
     )
-    .await
+    .await?;
+    Ok(firewall_bypass_report.take())
 }
 
 #[cfg(test)]
