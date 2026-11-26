@@ -267,7 +267,7 @@ pub(super) fn verify_sigstore_bundle_with(
             &components.signed_timestamps,
             &signature,
             &trust.timestamp_authorities,
-        );
+        )?;
         for timestamp in &timestamps {
             verify_cert_chain(
                 &chain_refs,

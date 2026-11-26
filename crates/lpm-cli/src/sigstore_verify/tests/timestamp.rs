@@ -3,7 +3,9 @@
 //! the refusals those cases don't reach.
 
 use super::super::der;
-use super::super::timestamp::{VerifiedTimestamp, verify_signed_timestamp};
+use super::super::timestamp::{
+    VerifiedTimestamp, verify_signed_timestamp, verify_signed_timestamps,
+};
 use super::super::trust_root::ValidityWindow;
 use super::super::{
     IdentityExpectations, TimestampAuthority, TrustRoot, VerifyError, VerifyOptions,
@@ -393,6 +395,36 @@ impl TestAuthority {
         let mut params = ca_params("test-tsa-root", 1);
         customize(&mut params);
         params.self_signed(&self.root_key).unwrap().der().to_vec()
+    }
+
+    /// Another certificate for the leaf's key, from the same issuer, as
+    /// `customize` changes it.
+    fn reissued_leaf_with(
+        &self,
+        serial: u64,
+        customize: impl FnOnce(&mut CertificateParams),
+    ) -> Vec<u8> {
+        let issuer =
+            rcgen::Issuer::from_ca_cert_der(self.issuer_cert.der(), &self.issuer_key).unwrap();
+        let mut params = timestamping_leaf_params(Some(serial));
+        customize(&mut params);
+        params
+            .signed_by(&self.leaf_keypair, &issuer)
+            .unwrap()
+            .der()
+            .to_vec()
+    }
+
+    /// Copies of the root under its name and key, each with its own serial
+    /// number, so each signs every other.
+    fn root_copies(&self, count: u64) -> Vec<Vec<u8>> {
+        (1..=count)
+            .map(|serial| {
+                self.root_copy(|params| {
+                    params.serial_number = Some(rcgen::SerialNumber::from(serial));
+                })
+            })
+            .collect()
     }
 
     /// Another certificate for the leaf's key, from the same issuer.
@@ -1202,6 +1234,21 @@ fn every_candidate_intermediate_is_tried_whatever_their_order() {
         other => panic!("expected a timestamp refusal, got {other:?}"),
     };
     assert!(why.contains("does not contain the signing time"), "{why}");
+
+    let current_first = Token {
+        embed_leaf: true,
+        extra_embedded: vec![
+            authority.intermediate_der.clone().unwrap(),
+            authority.expired_intermediate_copy(),
+        ],
+        ..Token::default()
+    };
+    verify_signed_timestamp(
+        &current_first.signed_by(&authority),
+        SIGNATURE,
+        &[authority.trusted_root_only()],
+    )
+    .unwrap();
 }
 
 /// A critical extension the verifier doesn't process.
@@ -1321,34 +1368,127 @@ fn another_authoritys_certificates_decide_nothing() {
 }
 
 #[test]
-fn a_token_carrying_too_many_candidate_issuers_is_refused() {
-    // Each certificate under the leaf issuer's name costs a signature check
-    // before it can be ruled out; none of these signed the leaf.
+fn a_token_carrying_more_certificates_than_an_authority_sends_is_refused() {
     let authority = test_authority(|_| {});
-    let impostors: Vec<Vec<u8>> = (0..140)
-        .map(|_| {
-            let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-            ca_params("test-tsa-root", 1)
-                .self_signed(&key)
-                .unwrap()
-                .der()
-                .to_vec()
-        })
-        .collect();
     let token = Token {
         embed_leaf: true,
-        extra_embedded: impostors[1..].to_vec(),
+        extra_embedded: authority.root_copies(16),
         ..Token::default()
     };
     let why = match verify_signed_timestamp(
         &token.signed_by(&authority),
         SIGNATURE,
-        &[authority.trusted_as(vec![impostors[0].clone()])],
+        &[authority.trusted_root_only()],
     ) {
         Err(VerifyError::Timestamp(why)) => why,
         other => panic!("expected a timestamp refusal, got {other:?}"),
     };
-    assert!(why.contains("signature checks"), "{why}");
+    assert!(why.contains("more than 16 certificates"), "{why}");
+}
+
+#[test]
+fn a_bundle_whose_timestamps_need_too_many_signature_checks_is_refused_in_any_order() {
+    // Copies of the root under its name and key each sign every other, so
+    // against an anchor that signed none of them, every ordering of them is
+    // a path to try.
+    let authority = test_authority(|_| {});
+    let impostor_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+    let impostor_anchor = ca_params("test-tsa-root", 3)
+        .self_signed(&impostor_key)
+        .unwrap()
+        .der()
+        .to_vec();
+    let hostile = Token {
+        embed_leaf: true,
+        extra_embedded: authority.root_copies(15),
+        ..Token::default()
+    }
+    .signed_by(&authority);
+    let valid = Token::default().signed_by(&authority);
+    let authorities = [
+        authority.trusted_as(vec![impostor_anchor]),
+        authority.trusted(),
+    ];
+
+    for timestamps in [
+        vec![hostile.clone(), valid.clone()],
+        vec![valid.clone(), hostile],
+    ] {
+        match verify_signed_timestamps(&timestamps, SIGNATURE, &authorities) {
+            Err(VerifyError::Timestamp(why)) => assert!(why.contains("signature checks"), "{why}"),
+            other => panic!("expected the bundle refused, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        verify_signed_timestamps(std::slice::from_ref(&valid), SIGNATURE, &authorities)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn an_expired_trust_root_issuer_does_not_hide_a_refusal_further_up_its_path() {
+    // The trust root's intermediate expired, which a newer trust root could
+    // mend, but its anchor may not issue that deep, which it couldn't.
+    let authority = authority_with(true, |_| {});
+    let shallow_anchor = authority.root_copy(|params| {
+        params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+    });
+    let token = Token {
+        embed_leaf: true,
+        ..Token::default()
+    };
+    let why = match verify_signed_timestamp(
+        &token.signed_by(&authority),
+        SIGNATURE,
+        &[authority.trusted_as(vec![authority.expired_intermediate_copy(), shallow_anchor])],
+    ) {
+        Err(VerifyError::Timestamp(why)) => why,
+        other => panic!("expected a timestamp refusal, got {other:?}"),
+    };
+    assert!(why.contains("pathLenConstraint"), "{why}");
+}
+
+#[test]
+fn a_trust_root_issuer_not_yet_valid_at_the_signed_time_is_refused() {
+    // Only an issuer that expired may have been reissued since.
+    let authority = test_authority(|_| {});
+    let future_anchor = authority.root_copy(|params| {
+        params.not_before = rcgen::date_time_ymd(2027, 1, 1);
+    });
+    let token = Token {
+        embed_leaf: true,
+        ..Token::default()
+    };
+    let refused = verify_signed_timestamp(
+        &token.signed_by(&authority),
+        SIGNATURE,
+        &[authority.trusted_as(vec![future_anchor])],
+    )
+    .unwrap_err();
+    assert!(matches!(refused, VerifyError::Timestamp(_)), "{refused:?}");
+}
+
+#[test]
+fn every_carried_certificate_matching_the_signer_is_tried() {
+    // Two certificates for the leaf's key, so its key identifier names
+    // both: the first expired before the token's time.
+    let authority = test_authority(|_| {});
+    let expired = authority.reissued_leaf_with(42, |params| {
+        params.not_after = rcgen::date_time_ymd(2025, 1, 1);
+    });
+    let token = Token {
+        signer_key_id: true,
+        extra_embedded: vec![expired, authority.leaf_der.clone()],
+        ..Token::default()
+    };
+    verify_signed_timestamp(
+        &token.signed_by(&authority),
+        SIGNATURE,
+        &[authority.trusted_root_only()],
+    )
+    .unwrap();
 }
 
 #[test]
