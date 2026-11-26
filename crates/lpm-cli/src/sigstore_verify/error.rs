@@ -95,6 +95,15 @@ pub enum VerifyError {
     #[error("Rekor SET is required by policy but missing from the bundle")]
     RekorSetMissing,
 
+    /// An RFC 3161 signed timestamp in the bundle did not verify: it
+    /// was malformed, its message imprint was not the hash of the bundle's
+    /// signature, its CMS signature or its signing certificate's chain did
+    /// not verify, or its time fell outside a certificate's or the timestamp
+    /// authority's validity window. A timestamp no trusted authority signed
+    /// is [`Self::MissingTrustMaterial`].
+    #[error("RFC 3161 timestamp verification failed: {0}")]
+    Timestamp(String),
+
     /// Rekor Merkle inclusion proof verification failed: signed
     /// checkpoint did not verify under the pinned Rekor key, the
     /// walked Merkle root did not match the checkpoint's signed

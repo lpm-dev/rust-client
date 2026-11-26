@@ -14,6 +14,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
+mod timestamp;
+
 const PAYLOAD_TYPE: &str = "application/vnd.in-toto+json";
 const PAYLOAD: &[u8] = br#"{"_type":"https://in-toto.io/Statement/v0.1"}"#;
 
@@ -630,6 +632,83 @@ fn vendored_trust_root_parses_cleanly() {
 }
 
 #[test]
+fn vendored_trust_root_carries_sigstores_timestamp_authority_and_rekor_v2_log() {
+    let root = TrustRoot::parse(EMBEDDED_TRUST_ROOT_JSON).unwrap();
+    let authority = root
+        .timestamp_authorities
+        .iter()
+        .find(|authority| authority.uri == "https://timestamp.sigstore.dev/api/v1/timestamp")
+        .expect("the vendored trust root lists Sigstore's timestamp authority");
+    assert_eq!(
+        authority.cert_chain_der.len(),
+        2,
+        "signing certificate and root"
+    );
+    for der in &authority.cert_chain_der {
+        X509Certificate::from_der(der).expect("timestamp authority certificates parse");
+    }
+
+    let log = root
+        .rekor_keys
+        .iter()
+        .find(|key| key.base_url == "https://log2025-1.rekor.sigstore.dev")
+        .expect("the vendored trust root lists the Rekor v2 log");
+    assert_eq!(log.log_id.len(), 32);
+    assert_eq!(log.checkpoint_key_id, None);
+}
+
+#[test]
+fn trust_root_reads_a_logs_checkpoint_key_id() {
+    let mut json = synth_trust_root_json(
+        serde_json::json!({"start": "2020-01-01T00:00:00Z"}),
+        serde_json::json!({"start": "2020-01-01T00:00:00Z"}),
+        serde_json::json!({"start": "2020-01-01T00:00:00Z"}),
+    );
+    json["tlogs"][0]["baseUrl"] = serde_json::json!("https://log.test.example");
+    json["tlogs"][0]["checkpointKeyId"] = serde_json::json!({"keyId": BASE64.encode([7u8; 4])});
+    let root = TrustRoot::parse(&serde_json::to_vec(&json).unwrap()).unwrap();
+    assert_eq!(root.rekor_keys[0].base_url, "https://log.test.example");
+    assert_eq!(root.rekor_keys[0].checkpoint_key_id, Some(vec![7u8; 4]));
+}
+
+#[test]
+fn a_log_the_trust_root_identifies_only_by_its_checkpoint_key_id_is_read() {
+    let mut json = synth_trust_root_json(
+        serde_json::json!({"start": "2020-01-01T00:00:00Z"}),
+        serde_json::json!({"start": "2020-01-01T00:00:00Z"}),
+        serde_json::json!({"start": "2020-01-01T00:00:00Z"}),
+    );
+    let log = json["tlogs"][0].as_object_mut().unwrap();
+    log.remove("logId");
+    log.insert(
+        "checkpointKeyId".into(),
+        serde_json::json!({"keyId": BASE64.encode([9u8; 32])}),
+    );
+    let root = TrustRoot::parse(&serde_json::to_vec(&json).unwrap()).unwrap();
+    assert_eq!(root.rekor_keys[0].log_id, vec![9u8; 32]);
+}
+
+#[test]
+fn an_unreadable_timestamp_authority_is_skipped_and_named() {
+    let mut json = synth_trust_root_json(
+        serde_json::json!({"start": "2020-01-01T00:00:00Z"}),
+        serde_json::json!({"start": "2020-01-01T00:00:00Z"}),
+        serde_json::json!({"start": "2020-01-01T00:00:00Z"}),
+    );
+    json["timestampAuthorities"] = serde_json::json!([
+        {"uri": "https://tsa.test.example", "validFor": {"start": "2020-01-01T00:00:00Z"}},
+    ]);
+    let bytes = serde_json::to_vec(&json).unwrap();
+
+    assert!(TrustRoot::parse(&bytes).is_err());
+    let (root, skipped) = TrustRoot::parse_skipping_unreadable(&bytes).unwrap();
+    assert!(root.timestamp_authorities.is_empty());
+    assert_eq!(skipped, ["timestamp authority"]);
+    root.check_expiry(ts("2030-01-01T00:00:00Z"))
+        .expect("timestamp authorities are not a role every trust root needs");
+}
+
+#[test]
 fn trust_root_oncelock_returns_arc_to_same_parse_result() {
     // The OnceLock-cached production accessor must hand back the
     // same underlying allocation across calls (cheap Arc clone),
@@ -1013,17 +1092,15 @@ fn validity_window_open_ended_contains_anything_after_start() {
 }
 
 #[test]
-fn validity_window_closed_excludes_end_exclusively() {
+fn validity_window_includes_both_of_its_bounds() {
     let window = ValidityWindow {
         start: Timestamp::parse_rfc3339("2020-01-01T00:00:00Z").unwrap(),
         end: Some(Timestamp::parse_rfc3339("2024-01-01T00:00:00Z").unwrap()),
     };
+    assert!(!window.contains(ts("2019-12-31T23:59:59Z")));
     assert!(window.contains(ts("2020-01-01T00:00:00Z")));
-    assert!(window.contains(ts("2023-12-31T23:59:59Z")));
-    assert!(
-        !window.contains(ts("2024-01-01T00:00:00Z")),
-        "end is exclusive: a key valid until midnight Jan 1 must NOT be picked at midnight Jan 1"
-    );
+    assert!(window.contains(ts("2024-01-01T00:00:00Z")));
+    assert!(!window.contains(ts("2024-01-01T00:00:01Z")));
 }
 
 // ── verify_rekor_set — ──────────────────────────────
@@ -1092,6 +1169,8 @@ fn rekor_key_active_around(log_id: Vec<u8>, spki_der: Vec<u8>, around_secs: i64)
             start,
             end: Some(end),
         },
+        base_url: "https://rekor.test.example".into(),
+        checkpoint_key_id: None,
     }
 }
 
@@ -1183,11 +1262,10 @@ fn verifies_cert_signatures_with_a_high_s() {
     let p256_key = SigningKey::generate();
     let p256_spki = VerifyingKey::from(&p256_key).to_public_key_der().unwrap();
     let p256_signature: Signature = p256_key.sign(tbs);
-    verify_ecdsa_p256_sha256(
+    chain::verify_ecdsa_prehash(
         p256_spki.as_bytes(),
-        tbs,
+        &Sha256::digest(tbs),
         with_high_s(p256_signature).to_der().as_bytes(),
-        "leaf",
     )
     .expect("a P-256 cert signature with a high S must verify");
 
@@ -1196,11 +1274,10 @@ fn verifies_cert_signatures_with_a_high_s() {
         .to_public_key_der()
         .unwrap();
     let p384_signature: p384::ecdsa::Signature = p384_key.sign(tbs);
-    verify_ecdsa_p384_sha384(
+    chain::verify_ecdsa_prehash(
         p384_spki.as_bytes(),
-        tbs,
+        &sha2::Sha384::digest(tbs),
         with_high_s(p384_signature).to_der().as_bytes(),
-        "root",
     )
     .expect("a P-384 cert signature with a high S must verify");
 }
@@ -1300,6 +1377,8 @@ fn rejects_bundle_with_rekor_key_outside_validity_at_integrated_time() {
             start: Timestamp::parse_rfc3339("2010-01-01T00:00:00Z").unwrap(),
             end: Some(Timestamp::parse_rfc3339("2015-01-01T00:00:00Z").unwrap()),
         },
+        base_url: "https://rekor.test.example".into(),
+        checkpoint_key_id: None,
     };
     let err = verify_rekor_set(
         &tlog,
@@ -2279,7 +2358,7 @@ fn rejects_chain_with_leaf_out_of_validity_at_integrated_time() {
         .expect_err("integratedTime past leaf's notAfter must reject");
     match err {
         VerifyError::Chain(msg) => assert!(
-            msg.contains("does not contain integratedTime"),
+            msg.contains("does not contain the signing time"),
             "expected validity-window diagnostic, got: {msg}"
         ),
         other => panic!("expected Chain, got: {other:?}"),
