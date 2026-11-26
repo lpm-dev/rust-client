@@ -1835,6 +1835,118 @@ async fn a_blocked_install_lists_what_it_downloaded_in_the_block_alone() {
     assert!(envelope.get("security").is_none(), "{envelope:#}");
 }
 
+/// A registry where `helper-tool`, which a rule lifts, is answered at once
+/// and `agent-tool` is blocked a moment later, so an install of both
+/// downloads `helper-tool` before its check blocks.
+async fn registry_blocking_after_a_lifted_download() -> MockRegistry {
+    let mock = MockRegistry::start().await;
+    mock.with_package(
+        "helper-tool",
+        "1.0.0",
+        &make_tarball("helper-tool", "1.0.0"),
+    )
+    .await;
+    mount_block_verdict(
+        &mock,
+        "helper-tool",
+        "suspicious",
+        "lpm_ai_agent_control_surface",
+    )
+    .await;
+    mock.with_package("agent-tool", "1.0.0", &make_tarball("agent-tool", "1.0.0"))
+        .await;
+    mount_block_verdicts_after(
+        &mock,
+        &["agent-tool"],
+        "suspicious",
+        "lpm_ai_agent_control_surface",
+        std::time::Duration::from_millis(1500),
+    )
+    .await;
+    mock
+}
+
+#[tokio::test]
+async fn doctor_lists_a_version_its_blocked_install_downloaded_once() {
+    let mock = registry_blocking_after_a_lifted_download().await;
+    let project = TempProject::empty(
+        r#"{"name":"consumer","version":"1.0.0","dependencies":{"helper-tool":"1.0.0","agent-tool":"1.0.0"}}"#,
+    );
+    write_npm_firewall_global_config(&project, "enforce");
+    write_signed_firewall_bypass(
+        &project,
+        &[stored_rule("helper-tool", serde_json::json!({}))],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_EXPERIMENT_NPM_FIREWALL_CHUNK_SIZE", "1")
+        .args(["--color", "never", "doctor", "--fix", "--yes"])
+        .output()
+        .unwrap();
+
+    assert_eq!(mock.tarball_request_count("helper-tool", "1.0.0").await, 1);
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        printed.contains("allowed helper-tool@1.0.0 by your bypass rule helper-tool"),
+        "{printed}"
+    );
+    assert_eq!(printed.matches("helper-tool@1.0.0").count(), 1, "{printed}");
+}
+
+#[tokio::test]
+async fn a_workspace_error_names_what_a_blocked_member_downloaded() {
+    let mock = registry_blocking_after_a_lifted_download().await;
+    let project =
+        TempProject::empty(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#);
+    project.write_file(
+        "packages/blocked/package.json",
+        r#"{"name":"blocked","version":"1.0.0","dependencies":{"helper-tool":"1.0.0","agent-tool":"1.0.0"}}"#,
+    );
+    // Filtering out the root and a lifecycle script here keep the members out
+    // of a shared resolution, so each runs on its own, the blocked one
+    // streaming its check, and the first error doesn't stop the other.
+    project.write_file(
+        "packages/broken/package.json",
+        r#"{"name":"broken","version":"1.0.0","scripts":{"postinstall":"node -e 0"},"dependencies":{"missing-tool":"1.0.0"}}"#,
+    );
+    write_npm_firewall_global_config(&project, "enforce");
+    write_signed_firewall_bypass(
+        &project,
+        &[stored_rule("helper-tool", serde_json::json!({}))],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_EXPERIMENT_NPM_FIREWALL_CHUNK_SIZE", "1")
+        .env("LPM_WORKSPACE_CONCURRENCY", "2")
+        .args([
+            "--json",
+            "install",
+            "--no-skills",
+            "--filter",
+            "blocked",
+            "--filter",
+            "broken",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(mock.tarball_request_count("helper-tool", "1.0.0").await, 1);
+    let envelope = json_envelope(&output);
+    assert_ne!(
+        envelope["error_code"], "npm_firewall_blocked",
+        "{envelope:#}"
+    );
+    assert_eq!(
+        envelope["security"]["firewall"]["bypassed"][0]["name"], "helper-tool",
+        "{envelope:#}"
+    );
+}
+
 /// `lpm doctor --fix` in JSON and then in a terminal, over a project whose
 /// install checks `agent-tool`, which a rule lifts, and `unchecked-tool`,
 /// whose verdict request fails, each answered after its delay.

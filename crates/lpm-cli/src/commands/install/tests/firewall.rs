@@ -3294,12 +3294,33 @@ async fn a_check_settles_its_record_unless_an_exit_closed_it_first() {
         &fetch_tx,
     ));
 
-    assert!(settled.settle_into(&process));
-    assert_eq!(record_names(&process.take()), ["member-tool"]);
+    let stats = NpmFirewallPreflightStats {
+        mode: NpmFirewallMode::Enforce,
+        bypassed: vec![lifted_verdict("checked-tool").await],
+        ..NpmFirewallPreflightStats::default()
+    };
+
+    assert!(settled.settle_into(&process, &stats));
+    let mut names = record_names(&process.take())
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, ["checked-tool", "member-tool"]);
+    // Settling closes it: no second settle, and nothing more handed off.
+    assert!(!settled.settle_into(&process, &stats));
+    assert!(!settled.hand_off(
+        NpmFirewallMode::Enforce,
+        [&lifted_verdict("late-tool").await],
+        fetch_tx.reserve().await.unwrap(),
+        selected_event("late-tool"),
+        &fetch_tx,
+    ));
 
     let taken_by_exit = super::super::ReleasedFirewallBypasses::default();
     taken_by_exit.close();
-    assert!(!taken_by_exit.settle_into(&process));
+    assert!(!taken_by_exit.settle_into(&process, &stats));
+    assert!(process.take().bypassed.is_empty());
 }
 
 #[tokio::test]
@@ -3323,18 +3344,36 @@ async fn a_second_closer_waits_until_the_first_has_added_the_record() {
         let (released, process) = (Arc::clone(&released), Arc::clone(&process));
         std::thread::spawn(move || released.close_into(&process))
     };
-    while released.state.try_lock().is_ok() {
-        std::thread::yield_now();
+    // The first closer holds the record while it waits to add; one that let
+    // go of it first shows a closed record here, and the test then fails.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match released.state.try_lock() {
+            Err(_) => break,
+            Ok(state) if state.closed => break,
+            Ok(_) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the first closer never started"
+                );
+                std::thread::yield_now();
+            }
+        }
     }
     let second_done = Arc::new(AtomicBool::new(false));
+    let (starting_tx, starting_rx) = std::sync::mpsc::channel();
     let second = {
         let (released, second_done) = (Arc::clone(&released), Arc::clone(&second_done));
         std::thread::spawn(move || {
+            starting_tx.send(()).unwrap();
             let record = released.close();
             second_done.store(true, Ordering::SeqCst);
             record
         })
     };
+    starting_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));
     assert!(
         !second_done.load(Ordering::SeqCst),
@@ -3368,6 +3407,7 @@ async fn an_exit_waits_for_a_notice_being_written_and_does_not_repeat_it() {
     writing_rx.recv().unwrap();
     let exit_done = Arc::new(AtomicBool::new(false));
     let exit_wrote = Arc::new(AtomicBool::new(false));
+    let (starting_tx, starting_rx) = std::sync::mpsc::channel();
     let exit = {
         let (notices, exit_done, exit_wrote) = (
             Arc::clone(&notices),
@@ -3375,6 +3415,7 @@ async fn an_exit_waits_for_a_notice_being_written_and_does_not_repeat_it() {
             Arc::clone(&exit_wrote),
         );
         std::thread::spawn(move || {
+            starting_tx.send(()).unwrap();
             notices.close_for_exit(
                 &super::super::FirewallBypassRecord {
                     mode: Some(NpmFirewallMode::Enforce),
@@ -3385,6 +3426,9 @@ async fn an_exit_waits_for_a_notice_being_written_and_does_not_repeat_it() {
             exit_done.store(true, Ordering::SeqCst);
         })
     };
+    starting_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));
     assert!(
         !exit_done.load(Ordering::SeqCst),
@@ -3437,4 +3481,84 @@ async fn a_block_reports_what_its_check_lifted_itself() {
         )),
         ["listed-tool", "elsewhere-tool"]
     );
+}
+
+#[tokio::test]
+async fn an_exit_names_a_blocked_checks_downloads_unless_that_block_is_reported() {
+    let earlier = lifted_verdict("earlier-tool").await;
+    let downloaded = lifted_verdict("downloaded-tool").await;
+    let record = |bypassed: Vec<BypassedVerdict>| super::super::FirewallBypassRecord {
+        mode: Some(NpmFirewallMode::Enforce),
+        bypassed,
+    };
+    // An earlier check let `earlier-tool` through; a later one downloaded
+    // `downloaded-tool`, then blocked, listing both.
+    let let_through = record(vec![earlier]);
+    let blocked_downloads = record(vec![downloaded]);
+    let block =
+        LpmError::NpmFirewallBlocked(Box::new(lpm_common::NpmFirewallBlockedErrorContext {
+            source: lpm_common::NpmFirewallBlockSource::Preflight,
+            packages: Vec::new(),
+            unattributed_count: 0,
+            unchecked_reason: None,
+            bypassed: ["earlier-tool", "downloaded-tool"]
+                .into_iter()
+                .map(|name| lpm_common::NpmFirewallBypassedPackage {
+                    name: name.into(),
+                    version: "1.0.0".into(),
+                    rule: name.into(),
+                })
+                .collect(),
+            bypass_command: None,
+            bypass_unavailable_reason: None,
+        }));
+
+    assert_eq!(
+        record_names(&super::super::exit_record(
+            let_through.clone(),
+            blocked_downloads.clone(),
+            &block
+        )),
+        ["earlier-tool"]
+    );
+    assert_eq!(
+        record_names(&super::super::exit_record(
+            let_through,
+            blocked_downloads,
+            &LpmError::Registry("another member failed".into())
+        )),
+        ["earlier-tool", "downloaded-tool"]
+    );
+}
+
+#[tokio::test]
+async fn a_lifted_version_the_downloader_never_took_fails_the_check() {
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let server = verdict_server(verdict_response(
+        1,
+        vec![grouped_block("lifted-b", "suspicious", "lpm_ai_telemetry")],
+    ))
+    .await;
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("firewall-token"),
+    );
+    let (selected_tx, selected_rx) = mpsc::channel(4);
+    let (fetch_tx, fetch_rx) = mpsc::channel(4);
+    drop(fetch_rx);
+    let mut config = chunked_config(NpmFirewallMode::Enforce);
+    config.bypass =
+        FirewallBypassRules::preloaded(&[global_rule("lifted-b")], Vec::new(), None, true);
+    let join = spawn_chunked_npm_firewall_preflight(selected_rx, fetch_tx, client, config);
+    selected_tx.send(selected_event("lifted-b")).await.unwrap();
+    drop(selected_tx);
+
+    let drained = join.drain().await.unwrap();
+
+    assert!(drained.failure.is_some(), "the install can't go on past it");
+    assert!(bypassed_names(&drained.stats).is_empty());
+    assert!(!npm_firewall_preflight_lets_through(&drained));
 }

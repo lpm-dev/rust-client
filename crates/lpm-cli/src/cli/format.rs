@@ -1293,6 +1293,7 @@ fn push_bypassed_lines(
     lines: &mut Vec<SlimErrorLine>,
     blocked: &lpm_common::NpmFirewallBlockedErrorContext,
 ) {
+    crate::commands::install::note_firewall_bypasses_listed(&blocked.bypassed);
     for bypassed in &blocked.bypassed {
         push_untrusted_detail(
             lines,

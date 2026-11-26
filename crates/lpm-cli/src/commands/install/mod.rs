@@ -75,8 +75,8 @@ use firewall::{
     NpmFirewallChunkedPreflightConfig, NpmFirewallLookupMode, NpmFirewallMode, NpmFirewallOutcome,
     NpmFirewallPreflightJoin, NpmFirewallPreflightRequest, NpmFirewallPreflightStats,
     finish_npm_firewall_preflight_into, npm_firewall_chunk_size_from_env,
-    npm_firewall_has_packages, run_npm_firewall_preflight, spawn_chunked_npm_firewall_preflight,
-    spawn_npm_firewall_preflight,
+    npm_firewall_has_packages, npm_firewall_preflight_lets_through, run_npm_firewall_preflight,
+    spawn_chunked_npm_firewall_preflight, spawn_npm_firewall_preflight,
 };
 pub(crate) use firewall::{
     NpmFirewallMaterializationPackage, begin_prepared_npm_firewall_materialization_preflight,
@@ -566,6 +566,17 @@ impl OpenReleases {
 
 static OPEN_RELEASES: OpenReleases = OpenReleases::new();
 
+/// What checks that ended in a block had already handed to the downloader.
+/// Kept apart so a command that reports one of those blocks, which lists
+/// them in `error.bypassed`, doesn't repeat them, while any other error
+/// still names them.
+static BLOCKED_FIREWALL_DOWNLOADS: FirewallBypassReport = FirewallBypassReport {
+    record: std::sync::Mutex::new(FirewallBypassRecord {
+        mode: None,
+        bypassed: Vec::new(),
+    }),
+};
+
 /// The notices this process printed for versions a rule let through, written
 /// one at a time, so a command exiting on an error prints what its terminal
 /// never showed before the error, and no install prints after it.
@@ -604,6 +615,16 @@ impl FirewallBypassNotices {
         }
         write(verdicts);
         state.shown.extend(verdicts.iter().map(notice_key));
+    }
+
+    /// Notes `listed` as shown: a command printed them itself, as a block's
+    /// `allowed` lines.
+    fn note_listed(&self, listed: impl IntoIterator<Item = (String, String)>) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shown
+            .extend(listed);
     }
 
     /// Writes, with `write`, a notice for each of `recorded` never shown, and
@@ -656,12 +677,16 @@ pub(crate) fn settle_firewall_bypasses_before_exit(
     error: &LpmError,
 ) -> FirewallBypassRecord {
     OPEN_RELEASES.close_all_into(&PROCESS_FIREWALL_BYPASSES);
-    let recorded = without_versions_the_error_lists(
-        PROCESS_FIREWALL_BYPASSES
+    let snapshot = |report: &FirewallBypassReport| {
+        report
             .record
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone(),
+            .clone()
+    };
+    let recorded = exit_record(
+        snapshot(&PROCESS_FIREWALL_BYPASSES),
+        snapshot(&BLOCKED_FIREWALL_DOWNLOADS),
         error,
     );
     FIREWALL_BYPASS_NOTICES.close_for_exit(&recorded, |unshown| {
@@ -670,6 +695,31 @@ pub(crate) fn settle_firewall_bypasses_before_exit(
         }
     });
     recorded
+}
+
+/// What a command exiting with `error` reports as let through: everything
+/// `let_through` holds, and what blocked checks downloaded unless `error`
+/// lists it itself.
+fn exit_record(
+    mut let_through: FirewallBypassRecord,
+    blocked_downloads: FirewallBypassRecord,
+    error: &LpmError,
+) -> FirewallBypassRecord {
+    let unlisted = without_versions_the_error_lists(blocked_downloads, error);
+    if let Some(mode) = unlisted.mode {
+        let_through.add(mode, &unlisted.bypassed);
+    }
+    let_through
+}
+
+/// Notes the versions a block's `allowed` lines name, which a command prints
+/// itself, so an exit doesn't print them again.
+pub(crate) fn note_firewall_bypasses_listed(listed: &[lpm_common::NpmFirewallBypassedPackage]) {
+    FIREWALL_BYPASS_NOTICES.note_listed(
+        listed
+            .iter()
+            .map(|package| (package.name.clone(), package.version.clone())),
+    );
 }
 
 /// `recorded` without the versions `error` reports itself: a block lists every
@@ -1002,10 +1052,15 @@ impl ReleasedFirewallBypasses {
         std::mem::take(&mut state.record)
     }
 
-    /// Closes the record once the install's check has reported, adding what
-    /// was handed off to `into`, unless an exiting command closed it first.
-    /// Returns whether the install may go on to download.
-    fn settle_into(&self, into: &FirewallBypassReport) -> bool {
+    /// Closes the record once the install's check has a clean result, adding
+    /// what was handed off and what `settled` let through to `into`, unless
+    /// an exiting command closed it first. Returns whether the install may go
+    /// on to report and download.
+    fn settle_into(
+        &self,
+        into: &FirewallBypassReport,
+        settled: &NpmFirewallPreflightStats,
+    ) -> bool {
         let mut state = self
             .state
             .lock()
@@ -1015,6 +1070,7 @@ impl ReleasedFirewallBypasses {
         }
         state.closed = true;
         into.record_all(&std::mem::take(&mut state.record));
+        into.record(settled);
         true
     }
 
@@ -1033,12 +1089,15 @@ impl ReleasedFirewallBypasses {
     }
 }
 
-/// Settles the install's record once its check has reported. A command that
-/// started exiting first, as when another workspace member failed, has
-/// already reported what this install let through, so it downloads nothing
-/// more.
-fn settle_released_firewall_bypasses(released: &ReleasedFirewallBypasses) -> Result<(), LpmError> {
-    if released.settle_into(&PROCESS_FIREWALL_BYPASSES) {
+/// Settles the install's record once its check has a clean result, before
+/// the check reports it. A command that started exiting first, as when
+/// another workspace member failed, has already reported what this install
+/// let through, so it reports and downloads nothing more.
+fn settle_released_firewall_bypasses(
+    released: &ReleasedFirewallBypasses,
+    settled: &NpmFirewallPreflightStats,
+) -> Result<(), LpmError> {
+    if released.settle_into(&PROCESS_FIREWALL_BYPASSES, settled) {
         Ok(())
     } else {
         Err(LpmError::Io(std::io::Error::new(
@@ -2030,19 +2089,25 @@ async fn run_with_options_under_store_lock(
         Some(join) if monitor_only => NpmFirewallOutcome::Pending(join),
         Some(join) => {
             let result = join.drain().await?;
+            if npm_firewall_preflight_lets_through(&result) {
+                settle_released_firewall_bypasses(released_firewall_bypasses, &result.stats)?;
+            }
             match finish_npm_firewall_preflight_into(
                 result,
                 json_output,
                 expectations.firewall_bypass_report.as_deref(),
             ) {
-                Ok(stats) => {
-                    settle_released_firewall_bypasses(released_firewall_bypasses)?;
-                    NpmFirewallOutcome::Settled(Box::new(stats))
-                }
+                Ok(stats) => NpmFirewallOutcome::Settled(Box::new(stats)),
                 Err(error) => {
                     // What reached the downloader stays reported whichever
-                    // error the command ends with; a block also lists it.
-                    released_firewall_bypasses.close_into(&PROCESS_FIREWALL_BYPASSES);
+                    // error the command ends with; a block lists it itself.
+                    released_firewall_bypasses.close_into(
+                        if matches!(error, LpmError::NpmFirewallBlocked(_)) {
+                            &BLOCKED_FIREWALL_DOWNLOADS
+                        } else {
+                            &PROCESS_FIREWALL_BYPASSES
+                        },
+                    );
                     return Err(error);
                 }
             }
@@ -2060,13 +2125,12 @@ async fn run_with_options_under_store_lock(
                 force,
                 json_output,
                 firewall_bypass_report: expectations.firewall_bypass_report.as_deref(),
+                released_bypasses: Some(released_firewall_bypasses),
             };
             if monitor_only {
                 NpmFirewallOutcome::Pending(spawn_npm_firewall_preflight(request))
             } else {
-                let stats = run_npm_firewall_preflight(request).await?;
-                settle_released_firewall_bypasses(released_firewall_bypasses)?;
-                NpmFirewallOutcome::Settled(Box::new(stats))
+                NpmFirewallOutcome::Settled(Box::new(run_npm_firewall_preflight(request).await?))
             }
         }
     };

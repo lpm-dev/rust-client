@@ -840,7 +840,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                             continue;
                         }
                     };
-                    blocked |= apply_firewall_chunk_result(
+                    let applied = apply_firewall_chunk_result(
                         chunk_result,
                         &dispatch,
                         blocked || failure.is_some(),
@@ -850,6 +850,14 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                         &mut report_error,
                     )
                     .await;
+                    blocked |= applied.blocks;
+                    if applied.lifted_version_not_handed_off {
+                        failure.get_or_insert_with(|| {
+                            LpmError::Registry(
+                                "npm firewall preflight couldn't hand a version a bypass rule let through to the download, which has stopped".into(),
+                            )
+                        });
+                    }
                 }
                 else => {
                     if receiver_closed && tasks.is_empty() {
@@ -1071,6 +1079,16 @@ fn normalize_npm_firewall_preflight_error(error: LpmError) -> LpmError {
 /// Records a finished chunk and releases its events for download unless the
 /// chunk, or an earlier one, blocks in enforce mode. Returns whether this
 /// chunk blocks.
+/// What applying one chunk's verdicts found.
+#[derive(Default)]
+struct AppliedChunk {
+    /// An enforced block the install fails on.
+    blocks: bool,
+    /// A version a rule lifted whose events never reached the downloader:
+    /// the install can't go on to download it unreported, so the check fails.
+    lifted_version_not_handed_off: bool,
+}
+
 async fn apply_firewall_chunk_result(
     chunk_result: FirewallChunkResult,
     dispatch: &FirewallChunkDispatch<'_>,
@@ -1079,7 +1097,7 @@ async fn apply_firewall_chunk_result(
     decisions: &mut Vec<NpmFirewallDecision>,
     held_bypassed: &mut Vec<BypassedVerdict>,
     report_error: &mut Option<String>,
-) -> bool {
+) -> AppliedChunk {
     let fetch_tx = dispatch.fetch_tx;
     let mode = dispatch.mode;
     if let Some(error) = chunk_result.report_error {
@@ -1091,12 +1109,12 @@ async fn apply_firewall_chunk_result(
             *report_error = Some(error);
         }
         release_firewall_events(fetch_tx, chunk_result.events).await;
-        return false;
+        return AppliedChunk::default();
     }
 
     let Some(response) = chunk_result.response else {
         release_firewall_events(fetch_tx, chunk_result.events).await;
-        return false;
+        return AppliedChunk::default();
     };
 
     stats.record_response(&response, chunk_result.elapsed_ms);
@@ -1116,6 +1134,7 @@ async fn apply_firewall_chunk_result(
     let chunk_has_block = classified.blocks();
     let enforce = matches!(mode, NpmFirewallMode::Enforce);
     let release = !(enforce && (chunk_has_block || earlier_block));
+    let mut lifted_version_not_handed_off = false;
     if !release {
         held_bypassed.append(&mut classified.bypassed);
     } else if enforce {
@@ -1134,6 +1153,7 @@ async fn apply_firewall_chunk_result(
             if delivered {
                 classified.bypassed.push(verdict);
             } else {
+                lifted_version_not_handed_off = true;
                 held_bypassed.push(verdict);
             }
         }
@@ -1141,7 +1161,10 @@ async fn apply_firewall_chunk_result(
         release_firewall_events(fetch_tx, chunk_result.events).await;
     }
     decisions.extend(stats.record_classified(classified));
-    enforce && chunk_has_block
+    AppliedChunk {
+        blocks: enforce && chunk_has_block,
+        lifted_version_not_handed_off,
+    }
 }
 
 /// Sends each of `events` to the downloader together with the lifted
@@ -1931,6 +1954,7 @@ pub(super) fn spawn_npm_firewall_preflight(
         force,
         json_output: _,
         firewall_bypass_report: _,
+        released_bypasses: _,
     } = request;
     let verdict_packages =
         npm_firewall_packages(packages, route_table, client.as_ref(), lookup_mode);
@@ -2251,6 +2275,7 @@ pub(super) async fn run_npm_firewall_preflight(
         force,
         json_output,
         firewall_bypass_report,
+        released_bypasses,
     } = request;
     let verdict_packages =
         npm_firewall_packages(packages, route_table, client.as_ref(), lookup_mode);
@@ -2267,6 +2292,11 @@ pub(super) async fn run_npm_firewall_preflight(
         verdict_packages,
     )
     .await?;
+    if let Some(released) = released_bypasses
+        && npm_firewall_preflight_lets_through(&result)
+    {
+        super::settle_released_firewall_bypasses(released, &result.stats)?;
+    }
     finish_npm_firewall_preflight_into(result, json_output, firewall_bypass_report)
 }
 
@@ -2283,6 +2313,16 @@ pub(super) struct NpmFirewallPreflightRequest<'a> {
     pub(super) json_output: bool,
     /// Where the command keeps what bypass rules let through.
     pub(super) firewall_bypass_report: Option<&'a super::FirewallBypassReport>,
+    /// The install's record of what it let through, settled before the check
+    /// reports a clean result, so an exiting command stops the install first.
+    pub(super) released_bypasses: Option<&'a super::ReleasedFirewallBypasses>,
+}
+
+/// Whether `result` lets the install go on to download: no request failed and
+/// nothing is blocked, or monitor mode, which blocks nothing.
+pub(super) fn npm_firewall_preflight_lets_through(result: &NpmFirewallPreflightResult) -> bool {
+    matches!(result.stats.mode, NpmFirewallMode::Monitor)
+        || (result.failure.is_none() && !stats_have_block(&result.stats, &result.decisions))
 }
 
 pub(super) fn npm_firewall_packages(
