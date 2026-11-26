@@ -209,6 +209,18 @@ fn decode_root_hash_hex_or_base64(s: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("not hex; not base64 ({e})"))
 }
 
+/// The root of the tree an RFC 6962 inclusion proof places `leaf_data`
+/// in, at `leaf_index` among `tree_size` leaves, with `hashes` (each 32
+/// bytes) as its audit path. Refuses an audit path of the wrong length.
+pub(crate) fn inclusion_proof_root(
+    leaf_data: &[u8],
+    leaf_index: u64,
+    tree_size: u64,
+    hashes: &[Vec<u8>],
+) -> Result<Vec<u8>, VerifyError> {
+    rfc6962_verify_inclusion(leaf_index, tree_size, &rfc6962_leaf_hash(leaf_data), hashes)
+}
+
 /// `MTH({d(0)}) = SHA-256(0x00 || d(0))` per RFC 6962 §2.1.
 pub(super) fn rfc6962_leaf_hash(leaf_data: &[u8]) -> Vec<u8> {
     let mut hasher = Sha256::new();

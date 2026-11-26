@@ -129,33 +129,6 @@ fn verifies_when_at_least_one_of_multiple_signatures_matches() {
         .expect("verifier must accept the envelope when one signature verifies");
 }
 
-#[test]
-fn the_signature_a_bundle_logs_must_itself_verify() {
-    // `verify_dsse` accepts an envelope one of whose signatures verifies;
-    // the one a Rekor v2 entry logs and a timestamp covers must be valid
-    // on its own.
-    let (cert_der, signing_key) = p256_cert_and_signing_key();
-    let mut envelope = dsse_envelope_signed_with(&signing_key, PAYLOAD);
-    let garbage = [7u8; 64];
-    envelope.signatures.insert(
-        0,
-        DsseSignature {
-            keyid: String::new(),
-            sig: BASE64.encode(garbage),
-        },
-    );
-    let (_, cert) = X509Certificate::from_der(&cert_der).unwrap();
-    verify_dsse(&envelope, &cert).unwrap();
-
-    let valid = BASE64.decode(&envelope.signatures[1].sig).unwrap();
-    dsse::verify_dsse_signature(&envelope, &cert, &valid).unwrap();
-    let refused = dsse::verify_dsse_signature(&envelope, &cert, &garbage).unwrap_err();
-    assert!(
-        matches!(&refused, VerifyError::DsseSignature(why) if why.contains("did not verify")),
-        "{refused:?}"
-    );
-}
-
 // ── verify_dsse() failure cases ───────────────────────────────
 
 #[test]
@@ -1526,7 +1499,7 @@ fn accepts_missing_set_under_require_inclusion_proof_policy() {
 fn either_policy_rejects_bundle_with_neither_set_nor_inclusion_proof() {
     // The composed verify_sigstore_bundle entry point enforces
     // "Either ⇒ at least one of SET, IP". That rule depends on the
-    // resolved_inclusion_promise() and resolved_inclusion_proof()
+    // resolved_signed_entry_timestamp() and resolved_inclusion_proof()
     // helpers both surfacing None for an empty tlog entry. Pin
     // those helpers here so a refactor that accidentally widens
     // either accessor (e.g., synthesizes a default value) breaks
@@ -1545,8 +1518,8 @@ fn either_policy_rejects_bundle_with_neither_set_nor_inclusion_proof() {
         canonicalized_body: String::new(),
     };
     assert!(
-        tlog.resolved_inclusion_promise().is_none(),
-        "empty tlog entry must surface None for resolved_inclusion_promise",
+        tlog.resolved_signed_entry_timestamp().is_none(),
+        "empty tlog entry must surface None for resolved_signed_entry_timestamp",
     );
     assert!(
         tlog.resolved_inclusion_proof().is_none(),
@@ -1719,9 +1692,9 @@ fn rfc3161_timestamp_only_bundle_rejects_because_no_embedded_sct_is_present() {
 
 #[test]
 fn verifies_set_via_legacy_verification_envelope_fallback() {
-    // A bundle that captured Rekor's API response verbatim under
-    // `verification.inclusionPromise` (the schema's
-    // fallback path) must still verify — `resolved_inclusion_promise`
+    // An entry copied from Rekor's API response verbatim carries the SET
+    // as `verification.signedEntryTimestamp` (the schema's fallback
+    // path); it must still verify — `resolved_signed_entry_timestamp`
     // walks through.
     let (signing_key, spki_der, log_id_bytes) = p256_rekor_signing_key();
     let log_id_hex = hex::encode(&log_id_bytes);
@@ -1742,9 +1715,7 @@ fn verifies_set_via_legacy_verification_envelope_fallback() {
         inclusion_promise: None, // top-level absent
         inclusion_proof: None,
         verification: Some(crate::sigstore::RekorVerification {
-            inclusion_promise: Some(crate::sigstore::RekorInclusionPromise {
-                signed_entry_timestamp: set_b64,
-            }),
+            signed_entry_timestamp: Some(set_b64),
             inclusion_proof: None,
         }),
         canonicalized_body: canonicalized_body.to_string(),
@@ -2210,7 +2181,7 @@ fn verifies_inclusion_proof_via_legacy_verification_envelope_fallback() {
         inclusion_promise: None,
         inclusion_proof: None, // top-level absent
         verification: Some(crate::sigstore::RekorVerification {
-            inclusion_promise: None,
+            signed_entry_timestamp: None,
             inclusion_proof: Some(proof),
         }),
         canonicalized_body: BASE64.encode(leaves[0]),
@@ -3768,6 +3739,39 @@ fn rejects_proof_only_bundle_with_malformed_outer_log_index() {
             assert!(message.contains("logIndex"), "unexpected error: {message}");
         }
         other => panic!("expected a Rekor log-index error, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_rekor_v1_bundle_without_a_set_needs_a_timestamp_to_sign_its_time() {
+    // An inclusion proof proves the entry is in the log, not when it was
+    // logged: without the SET, the bundle's `integratedTime` is a claim
+    // nobody signed, and the certificate can't be checked against it.
+    let body = load_fixture_bundle(REAL_NPM_FIXTURE);
+    let mut root: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    for attestation in root["attestations"].as_array_mut().unwrap() {
+        if let Some(entries) =
+            attestation["bundle"]["verificationMaterial"]["tlogEntries"].as_array_mut()
+        {
+            for entry in entries {
+                entry.as_object_mut().unwrap().remove("inclusionPromise");
+            }
+        }
+    }
+    let body = serde_json::to_vec(&root).unwrap();
+
+    for options in [
+        VerifyOptions::npm_attestation(),
+        VerifyOptions {
+            rekor_inclusion_policy: RekorInclusionProofPolicy::RequireInclusionProof,
+        },
+    ] {
+        let refused = verify_sigstore_bundle(&body, &IdentityExpectations::none(), options)
+            .expect_err("a proof-only bundle has no signed time");
+        assert!(
+            matches!(&refused, VerifyError::Timestamp(why) if why.contains("no signed time")),
+            "{refused:?}"
+        );
     }
 }
 

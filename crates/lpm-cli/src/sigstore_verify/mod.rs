@@ -45,10 +45,13 @@ pub use self::bundle::{
 };
 pub(crate) use self::bundle::{extract_npm_subject_sha512, extract_subject_digest_from_statement};
 pub use self::chain::verify_cert_chain;
+pub(crate) use self::checkpoint::unverified_tree_head;
 pub(crate) use self::dsse::pae;
 pub use self::dsse::verify_dsse;
 pub use self::error::{RekorInclusionProofPolicy, VerifyError};
+pub(crate) use self::inclusion::inclusion_proof_root;
 pub use self::inclusion::verify_inclusion_proof;
+pub(crate) use self::rekor_body::EntryHeader;
 pub use self::rekor_body::verify_rekor_body;
 pub use self::rekor_set::verify_rekor_set;
 pub use self::sct::verify_embedded_sct;

@@ -6,7 +6,6 @@ use std::time::SystemTime;
 use x509_parser::prelude::*;
 
 use super::checkpoint::logs_signing;
-use super::dsse::verify_dsse_signature;
 use super::inclusion::{extract_checkpoint_envelope, verify_rekor_v2_inclusion_proof};
 use super::rekor_body::{RekorEntryVersion, rekor_entry_version, verify_hashedrekord_v002};
 use super::rekor_set::{decode_log_id, parse_log_index};
@@ -42,7 +41,8 @@ impl VerifyOptions {
         }
     }
 
-    /// `Either` — accept SET-only OR inclusion-proof-only bundles.
+    /// `Either` — accept SET-only OR inclusion-proof-only bundles; the
+    /// latter, like any bundle without a SET, needs an RFC 3161 timestamp.
     /// Used for npm attestations because npm cohorts ship either form
     /// in the wild.
     #[allow(dead_code)]
@@ -230,7 +230,7 @@ pub(super) fn verify_sigstore_bundle_with(
 
     let log_index = parse_log_index(&components.tlog_entry.log_index)?;
     let entry_version = rekor_entry_version(&components.tlog_entry)?;
-    let signature = first_dsse_signature(&components.dsse_envelope)?;
+    let signature = dsse_signature(&components.dsse_envelope)?;
 
     // Every RFC 3161 timestamp that verifies is a signed time the
     // signature existed at.
@@ -243,23 +243,32 @@ pub(super) fn verify_sigstore_bundle_with(
         )?
     };
 
-    // The time the certificate is checked at. For Rekor v1, the integrated
-    // time its SET signs (the bundle's unsigned value under `Either`
-    // without a SET). Rekor v2 records no time, so its entries need a
-    // timestamp, and the earliest one counts.
-    let signed_at = match entry_version {
-        RekorEntryVersion::V1 => {
+    // The time the certificate is checked at, which something must have
+    // signed: the integrated time in a Rekor v1 entry's SET, else the
+    // earliest RFC 3161 timestamp. An inclusion proof shows the entry is in
+    // the log, not when it got there, and Rekor v2 records no time at all.
+    let integrated_time = match entry_version {
+        RekorEntryVersion::V1
+            if components
+                .tlog_entry
+                .resolved_signed_entry_timestamp()
+                .is_some() =>
+        {
             let _span = tracing::debug_span!("provenance.verify.set").entered();
-            verify_rekor_set(
+            Some(verify_rekor_set(
                 &components.tlog_entry,
                 &trust.rekor_keys,
                 options.rekor_inclusion_policy,
-            )?
+            )?)
         }
-        RekorEntryVersion::V2 => match timestamps.earliest() {
-            Some(earliest) => earliest,
-            None => return Err(timestamps.into_error()),
-        },
+        RekorEntryVersion::V1 if options.rekor_inclusion_policy.requires_set() => {
+            return Err(VerifyError::RekorSetMissing);
+        }
+        RekorEntryVersion::V1 | RekorEntryVersion::V2 => None,
+    };
+    let signed_at = match integrated_time.or_else(|| timestamps.earliest()) {
+        Some(signed_at) => signed_at,
+        None => return Err(timestamps.into_error()),
     };
 
     // The certificate must have been valid at every signed time. Trust
@@ -289,13 +298,7 @@ pub(super) fn verify_sigstore_bundle_with(
 
     {
         let _span = tracing::debug_span!("provenance.verify.dsse").entered();
-        match entry_version {
-            RekorEntryVersion::V1 => verify_dsse(&components.dsse_envelope, &leaf_parsed)?,
-            // A Rekor v2 entry logs one signature; that one must be valid.
-            RekorEntryVersion::V2 => {
-                verify_dsse_signature(&components.dsse_envelope, &leaf_parsed, &signature)?
-            }
-        }
+        verify_dsse(&components.dsse_envelope, &leaf_parsed)?;
     }
 
     // SCT verify — need the immediate issuer's SPKI for the precert
@@ -381,7 +384,7 @@ fn verify_rekor_v1_inclusion(
     // `Either` requires a SET or an inclusion proof; the SET check
     // already passed over an absent SET.
     if policy == RekorInclusionProofPolicy::Either
-        && tlog_entry.resolved_inclusion_promise().is_none()
+        && tlog_entry.resolved_signed_entry_timestamp().is_none()
         && !has_inclusion_proof
     {
         return Err(VerifyError::RekorSetMissing);
@@ -630,13 +633,17 @@ fn parse_signed_timestamps(
         .collect()
 }
 
-/// The bundle's signature as RFC 3161 timestamps and Rekor v2 entries
-/// name it: the DSSE envelope's first signature, decoded.
-pub(super) fn first_dsse_signature(envelope: &DsseEnvelope) -> Result<Vec<u8>, VerifyError> {
-    let signature = envelope
-        .signatures
-        .first()
-        .ok_or_else(|| VerifyError::DsseSignature("envelope carries no signatures".into()))?;
+/// The bundle's signature, decoded: the one its RFC 3161 timestamps and a
+/// Rekor v2 entry name. A Sigstore bundle's envelope carries exactly one,
+/// as Sigstore's verifiers require; with a second, a timestamp could date
+/// a signature it never saw.
+pub(super) fn dsse_signature(envelope: &DsseEnvelope) -> Result<Vec<u8>, VerifyError> {
+    let [signature] = envelope.signatures.as_slice() else {
+        return Err(VerifyError::DsseSignature(format!(
+            "the envelope carries {} signatures where a Sigstore bundle's carries exactly one",
+            envelope.signatures.len()
+        )));
+    };
     BASE64
         .decode(signature.sig.as_bytes())
         .map_err(|e| VerifyError::DsseSignature(format!("signature not valid base64: {e}")))

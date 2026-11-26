@@ -146,7 +146,7 @@ fn a_rekor_v2_bundle_needs_a_timestamp() {
     )
     .unwrap_err();
     assert!(
-        matches!(&refused, VerifyError::Timestamp(why) if why.contains("no RFC 3161 timestamp")),
+        matches!(&refused, VerifyError::Timestamp(why) if why.contains("no signed time")),
         "{refused:?}"
     );
 }

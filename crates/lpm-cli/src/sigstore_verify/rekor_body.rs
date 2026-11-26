@@ -378,11 +378,12 @@ pub(super) enum RekorEntryVersion {
     V2,
 }
 
+/// The kind and version a Rekor entry's body names.
 #[derive(serde::Deserialize)]
-struct EntryHeader {
-    kind: String,
+pub(crate) struct EntryHeader {
+    pub(crate) kind: String,
     #[serde(rename = "apiVersion")]
-    api_version: String,
+    pub(crate) api_version: String,
 }
 
 /// The entry's Rekor version. When the bundle names the entry's kind and

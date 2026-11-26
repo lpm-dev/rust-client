@@ -196,21 +196,25 @@ impl VerifyError {
 /// there is intentionally no parallel `require_inclusion_proof: bool`
 /// (adding one re-creates a dual-authority bug).
 ///
-/// The policy governs Rekor v1 entries. A Rekor v2 entry has no SET, so
-/// under every policy it needs an inclusion proof and an RFC 3161
-/// timestamp, which takes the SET's place as the signed time.
+/// Whatever the policy, the time the certificate is checked at must be
+/// signed: by the SET, or by an RFC 3161 timestamp in its place. A bundle
+/// with an inclusion proof and no SET needs a timestamp. The policy
+/// governs Rekor v1 entries; a Rekor v2 entry has no SET, so under every
+/// policy it needs an inclusion proof and a timestamp.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RekorInclusionProofPolicy {
     /// Accept the bundle if at least one of SET, inclusion proof is
     /// present and verifies. Verify the other if it's also present
-    /// (defense in depth). Reject if both are absent.
+    /// (defense in depth). Reject if both are absent. Without a SET, an
+    /// RFC 3161 timestamp must sign the time.
     Either,
     /// SET must be present and verify. Inclusion proof is verified
     /// only when present (advisory).
     RequireSet,
     /// Inclusion proof must be present and verify. SET is verified
-    /// only when present (advisory).
+    /// only when present; without it, an RFC 3161 timestamp must sign the
+    /// time.
     RequireInclusionProof,
     /// Both SET and inclusion proof must be present and both must
     /// verify. The strongest claim.

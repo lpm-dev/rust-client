@@ -24,7 +24,7 @@ pub fn verify_rekor_set(
 ) -> Result<SystemTime, VerifyError> {
     let integrated_time = parse_integrated_time(&tlog_entry.integrated_time)?;
 
-    let Some(promise) = tlog_entry.resolved_inclusion_promise() else {
+    let Some(signed_entry_timestamp) = tlog_entry.resolved_signed_entry_timestamp() else {
         return if policy.requires_set() {
             Err(VerifyError::RekorSetMissing)
         } else {
@@ -53,7 +53,7 @@ pub fn verify_rekor_set(
     })?;
 
     let signature_bytes = BASE64
-        .decode(promise.signed_entry_timestamp.as_bytes())
+        .decode(signed_entry_timestamp.as_bytes())
         .map_err(|e| VerifyError::RekorSet(format!("signedEntryTimestamp not base64: {e}")))?;
     // Rekor SETs are DER-encoded ECDSA signatures per the Sigstore
     // reference implementation (sigstore/rekor `pkg/util/checkpoint.go`).
@@ -135,8 +135,8 @@ fn integrated_time_secs(t: &SystemTime) -> i64 {
 /// Decode a TlogEntry `logId.keyId` field into raw SHA-256 bytes.
 ///
 /// Two wire encodings appear in the wild:
-/// - **Hex** (Rekor's REST API canonical form). LPM's publish path
-///   captures this verbatim — see [`crate::sigstore::TlogEntry`] note.
+/// - **Hex** (Rekor's REST API canonical form), in an entry copied from
+///   Rekor's response verbatim.
 /// - **Base64** (Sigstore Bundle v0.3 spec; protobuf JSON encodes
 ///   `bytes` fields as standard base64).
 ///
