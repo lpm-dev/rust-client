@@ -423,25 +423,19 @@ pub(crate) struct FirewallBypassApproval<'a> {
 }
 
 /// Asks the person at the terminal to approve `approval.rules` with a fresh
-/// native approval; saves nothing. Nothing else, such as a FloorEdit unlock,
+/// native approval; saves and records nothing, so the caller records one
+/// refusal for the whole request. Nothing else, such as a FloorEdit unlock,
 /// stands in for the prompt, and `--json` never prompts.
 pub(crate) fn approve_firewall_bypass_rules(
     approval: &FirewallBypassApproval<'_>,
 ) -> Result<(), LpmError> {
     let effective = load_effective_authorized_posture()?;
     if let Some(reason) = local_firewall_bypass_inactive_reason(&effective) {
-        bypass_audit("firewall-bypass-added", false, &approval.rules, &reason);
         return Err(LpmError::SecurityFloor(reason));
     }
     // `--json` is checked on its own so it never prompts, even where tests
     // stand in for the person at a terminal.
     if approval.json_output || is_automation(approval.json_output) {
-        bypass_audit(
-            "firewall-bypass-added",
-            false,
-            &approval.rules,
-            "refused without an interactive approval terminal",
-        );
         return Err(approval_required_error(
             "Allowing packages past LPM Firewall needs your approval at an interactive terminal.",
             vec![FIREWALL_BYPASS_AUDIT_SCOPE.to_string()],
@@ -453,12 +447,6 @@ pub(crate) fn approve_firewall_bypass_rules(
         ));
     }
     if !confirm_by_typing(approval.prompt)? || !request_native_approval(approval.prompt)? {
-        bypass_audit(
-            "firewall-bypass-added",
-            false,
-            &approval.rules,
-            "the person at the terminal declined",
-        );
         return Err(approval_required_error(
             "The LPM Firewall bypass was not approved, so nothing was saved.",
             vec![FIREWALL_BYPASS_AUDIT_SCOPE.to_string()],

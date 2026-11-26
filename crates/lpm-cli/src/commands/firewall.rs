@@ -727,15 +727,19 @@ async fn approve_and_save(
     let mut approved_prompts = Vec::new();
     let saved =
         approve_and_save_attempts(client, plan, sorted, &mut approve, &mut approved_prompts).await;
-    // Whatever ends a request after a person approved part of it, what they
-    // approved stays on record, as declines and refusals do.
-    if let Err(error) = &saved
-        && !approved_prompts.is_empty()
-    {
+    // One record for a request that saved nothing, whatever ended it: a
+    // decline, a refusal, a store error, an expired `--ttl` or rules that
+    // kept changing, with what the person approved before it.
+    if let Err(error) = &saved {
+        let detail = if approved_prompts.is_empty() {
+            error.to_string()
+        } else {
+            format!("{error}; approved: {}", approved_prompts.join("; "))
+        };
         security_approval::record_firewall_bypass_refusal(
             plan.specs.iter().map(ToString::to_string).collect(),
             plan.scope.project_root.as_deref(),
-            &format!("{error}; approved: {}", approved_prompts.join("; ")),
+            &detail,
         );
     }
     saved
@@ -777,13 +781,7 @@ async fn approve_and_save_attempts(
                     ),
                 };
                 let previews = preview_exact_specs(client, &pending_specs, profile).await;
-                if let Err(error) = check_previews(&pending_specs, &previews, plan.allow_malware) {
-                    return Err(refuse_add(
-                        plan.specs,
-                        plan.scope.project_root.as_deref(),
-                        error,
-                    ));
-                }
+                check_previews(&pending_specs, &previews, plan.allow_malware)?;
                 print_add_request(&pending_specs, &previews, plan.scope);
                 for rule in &mut pending {
                     rule.added_verdict = added_verdict(previews.get(&rule.spec));
@@ -1878,6 +1876,34 @@ mod tests {
     }
 
     #[test]
+    fn a_declined_later_approval_leaves_one_refusal_on_record() {
+        let temp = tempfile::tempdir().unwrap();
+        security_approval::test_support::with_test_env(temp.path(), || {
+            let specs = specs(&[
+                "a@1.0.0", "b@1.0.0", "c@1.0.0", "d@1.0.0", "e@1.0.0", "f@1.0.0",
+            ]);
+            let scope = global();
+            let requested = specs.iter().map(|spec| rule(spec, None)).collect();
+            let mut approvals = 0;
+
+            run_add(&plan(&specs, &scope, None, false), requested, |approval| {
+                approvals += 1;
+                if approvals == 2 {
+                    // SAFETY: the test environment holds the process-wide
+                    // environment lock and restores the variable afterwards.
+                    unsafe { std::env::set_var("LPM_TEST_SECURITY_AUTH_RESULT", "deny") };
+                }
+                security_approval::approve_firewall_bypass_rules(approval)
+            })
+            .unwrap_err();
+
+            let records = security_approval::test_support::audit_records("firewall-bypass-added");
+            assert_eq!(records.len(), 1, "{records:?}");
+            assert!(!records[0].allowed);
+        });
+    }
+
+    #[test]
     fn add_keeps_approvals_on_record_when_the_rules_keep_changing() {
         let temp = tempfile::tempdir().unwrap();
         security_approval::test_support::with_test_env(temp.path(), || {
@@ -1894,18 +1920,22 @@ mod tests {
             ]);
             let scope = global();
             let requested = specs.iter().map(|spec| rule(spec, Some(1_800))).collect();
-            let mut approvals = 0;
+            let mut prompts: Vec<String> = Vec::new();
 
-            let error = run_add(&plan(&specs, &scope, Some(1_800), false), requested, |_| {
-                let removed = specs[approvals].to_string();
-                approvals += 1;
-                security_approval::remove_firewall_bypass_rules(
-                    |rule| rule.spec == removed,
-                    "firewall-bypass-removed",
-                )
-                .unwrap();
-                Ok(())
-            })
+            let error = run_add(
+                &plan(&specs, &scope, Some(1_800), false),
+                requested,
+                |approval| {
+                    let removed = specs[prompts.len()].to_string();
+                    prompts.push(approval.prompt.to_string());
+                    security_approval::remove_firewall_bypass_rules(
+                        |rule| rule.spec == removed,
+                        "firewall-bypass-removed",
+                    )
+                    .unwrap();
+                    Ok(())
+                },
+            )
             .unwrap_err();
 
             assert_eq!(error.error_code(), "security_approval_required");
@@ -1916,13 +1946,11 @@ mod tests {
                     .filter(|record| !record.allowed)
                     .collect();
             assert_eq!(records.len(), 1, "{records:?}");
+            assert_eq!(prompts.len(), 3);
+            let detail = records[0].detail.as_deref().unwrap_or_default();
             assert!(
-                records[0]
-                    .detail
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("approved: Allow fresh@1.0.0"),
-                "{records:?}"
+                detail.ends_with(&format!("approved: {}", prompts.join("; "))),
+                "{detail}"
             );
         });
     }
