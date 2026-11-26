@@ -1368,7 +1368,7 @@ fn another_authoritys_certificates_decide_nothing() {
 }
 
 #[test]
-fn a_token_carrying_more_certificates_than_an_authority_sends_is_refused() {
+fn a_timestamp_carrying_more_than_16_certificates_is_refused() {
     let authority = test_authority(|_| {});
     let token = Token {
         embed_leaf: true,
@@ -1405,26 +1405,32 @@ fn a_bundle_whose_timestamps_need_too_many_signature_checks_is_refused_in_any_or
     }
     .signed_by(&authority);
     let valid = Token::default().signed_by(&authority);
-    let authorities = [
-        authority.trusted_as(vec![impostor_anchor]),
-        authority.trusted(),
-    ];
+    let impostor = || authority.trusted_as(vec![impostor_anchor.clone()]);
 
-    for timestamps in [
-        vec![hostile.clone(), valid.clone()],
-        vec![valid.clone(), hostile],
+    // The authority that verifies the hostile timestamp's signature may be
+    // listed first or last: every authority is consulted either way.
+    for authorities in [
+        [impostor(), authority.trusted()],
+        [authority.trusted(), impostor()],
     ] {
-        match verify_signed_timestamps(&timestamps, SIGNATURE, &authorities) {
-            Err(VerifyError::Timestamp(why)) => assert!(why.contains("signature checks"), "{why}"),
-            other => panic!("expected the bundle refused, got {other:?}"),
+        for timestamps in [
+            vec![hostile.clone(), valid.clone()],
+            vec![valid.clone(), hostile.clone()],
+        ] {
+            match verify_signed_timestamps(&timestamps, SIGNATURE, &authorities) {
+                Err(VerifyError::Timestamp(why)) => {
+                    assert!(why.contains("signature checks"), "{why}")
+                }
+                other => panic!("expected the bundle refused, got {other:?}"),
+            }
         }
+        assert_eq!(
+            verify_signed_timestamps(std::slice::from_ref(&valid), SIGNATURE, &authorities)
+                .unwrap()
+                .len(),
+            1
+        );
     }
-    assert_eq!(
-        verify_signed_timestamps(std::slice::from_ref(&valid), SIGNATURE, &authorities)
-            .unwrap()
-            .len(),
-        1
-    );
 }
 
 #[test]

@@ -112,6 +112,11 @@ fn verify_with_budget(
         ));
     }
 
+    // Every authority is consulted, even once one verifies, so what the
+    // timestamp costs in signature checks, and with it whether the bundle's
+    // budget runs out, doesn't depend on the order the trust root lists
+    // authorities in.
+    let mut verified_by = None;
     let mut failures = Vec::new();
     let mut outdated = Vec::new();
     for authority in authorities {
@@ -119,10 +124,7 @@ fn verify_with_budget(
         budget.check()?;
         match outcome {
             Ok(()) => {
-                return Ok(VerifiedTimestamp {
-                    time: info.gen_time,
-                    authority: authority.uri.clone(),
-                });
+                verified_by.get_or_insert(authority);
             }
             Err(AuthorityRejection::NotTheSigner) => {}
             Err(AuthorityRejection::OutsideWindow(why)) => {
@@ -132,6 +134,12 @@ fn verify_with_budget(
                 failures.push(format!("{}: {why}", authority_label(authority)));
             }
         }
+    }
+    if let Some(authority) = verified_by {
+        return Ok(VerifiedTimestamp {
+            time: info.gen_time,
+            authority: authority.uri.clone(),
+        });
     }
     // An authority that verified everything but what a newer trust root
     // may change outranks one that refused the timestamp, so the trust
