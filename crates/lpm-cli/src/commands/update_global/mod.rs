@@ -331,10 +331,10 @@ pub async fn run(
 
     emit_results(&results, json_output);
 
-    // Exit non-zero on any failure so shell automation can detect partial
-    // or total bulk-update failures. In JSON mode, `emit_results` already
-    // wrote the structured envelope, so return `ExitCode` to avoid a second
-    // top-level JSON document.
+    // `emit_results` listed each failure with its own reason, so the run
+    // ends with a summary and an exit status rather than an error whose kind
+    // and hint would claim one cause for all of them, and JSON keeps its one
+    // document.
     let failed: Vec<&str> = results
         .iter()
         .filter_map(|r| match r {
@@ -343,16 +343,25 @@ pub async fn run(
         })
         .collect();
     if !failed.is_empty() {
-        if json_output {
-            return Err(LpmError::ExitCode(1));
+        if !json_output {
+            install_ui::failed_untrusted(&failed_updates_summary(&failed, results.len()));
         }
-        return Err(LpmError::Script(format!(
-            "{} package(s) failed to update: {}",
-            failed.len(),
-            failed.join(", ")
-        )));
+        return Err(LpmError::ExitCode(1));
     }
     Ok(())
+}
+
+/// The line a terminal update ends with when the `failed` packages of the
+/// `total` it updated didn't update.
+fn failed_updates_summary(failed: &[&str], total: usize) -> String {
+    match failed {
+        [only] if total == 1 => format!("Couldn't update {only}"),
+        _ => format!(
+            "Couldn't update {} of {total} global packages: {}",
+            failed.len(),
+            failed.join(", ")
+        ),
+    }
 }
 
 // ─── Target parsing ──────────────────────────────────────────────────

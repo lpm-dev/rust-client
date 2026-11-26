@@ -1810,6 +1810,123 @@ fn global_update_unknown_package_fails_with_helpful_message() {
     );
 }
 
+/// `package` 1.1.0, with a binary, as the registry lists it; its tarball is
+/// served only when `serve_tarball` is set, so the update of a package
+/// listed without one fails while installing.
+async fn mount_global_update_target(mock: &MockRegistry, package: &str, serve_tarball: bool) {
+    let bin_path = format!("bin/{package}.js");
+    let tarball = support::mock_registry::make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": package,
+            "version": "1.1.0",
+            "bin": { package: bin_path }
+        }),
+        &[(bin_path.as_str(), b"#!/usr/bin/env node\n" as &[u8])],
+    );
+    let tarball_path = format!("/tarballs/{package}/-/{package}-1.1.0.tgz");
+    Mock::given(method("GET"))
+        .and(wm_path(format!("/{package}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": package,
+            "dist-tags": { "latest": "1.1.0" },
+            "versions": {
+                "1.0.0": { "name": package, "version": "1.0.0" },
+                "1.1.0": {
+                    "name": package,
+                    "version": "1.1.0",
+                    "bin": { package: bin_path },
+                    "dist": {
+                        "tarball": format!("{}{tarball_path}", mock.url()),
+                        "integrity": compute_integrity(&tarball)
+                    }
+                }
+            },
+            "time": {
+                "1.0.0": "2025-01-01T00:00:00.000Z",
+                "1.1.0": "2025-01-01T00:00:00.000Z"
+            }
+        })))
+        .mount(mock.server())
+        .await;
+    let tarball_response = if serve_tarball {
+        ResponseTemplate::new(200).set_body_bytes(tarball)
+    } else {
+        ResponseTemplate::new(404)
+    };
+    Mock::given(method("GET"))
+        .and(wm_path(tarball_path))
+        .respond_with(tarball_response)
+        .mount(mock.server())
+        .await;
+}
+
+fn seed_global_packages(project: &TempProject, packages: &[&str]) {
+    let mut manifest = GlobalManifest::default();
+    for package in packages {
+        manifest.packages.insert(
+            (*package).to_string(),
+            PackageEntry {
+                saved_spec: "^1".to_string(),
+                resolved: "1.0.0".to_string(),
+                integrity: "sha512-old".to_string(),
+                source: PackageSource::UpstreamNpm,
+                installed_at: Timestamp::now(),
+                root: format!("installs/{package}@1.0.0"),
+                commands: vec![(*package).to_string()],
+            },
+        );
+    }
+    lpm_global::write_for(&isolated_lpm_root(project), &manifest)
+        .expect("write global manifest fixture");
+}
+
+#[tokio::test]
+async fn a_global_update_that_fails_for_one_tool_ends_naming_it_not_as_a_script_error() {
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mount_global_update_target(&mock, "working-tool", true).await;
+    mount_global_update_target(&mock, "broken-tool", false).await;
+    seed_global_packages(&project, &["working-tool", "broken-tool"]);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--color", "never", "global", "update"])
+        .output()
+        .expect("run lpm global update");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("Upgraded working-tool"), "{stderr}");
+    assert!(
+        stderr
+            .trim_end()
+            .ends_with("Couldn't update 1 of 2 global packages: broken-tool"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Script error"), "{stderr}");
+    assert!(!stderr.contains("package.json scripts"), "{stderr}");
+}
+
+#[tokio::test]
+async fn a_lone_global_update_that_fails_ends_naming_the_tool() {
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mount_global_update_target(&mock, "broken-tool", false).await;
+    seed_global_packages(&project, &["broken-tool"]);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--color", "never", "global", "update", "broken-tool"])
+        .output()
+        .expect("run lpm global update broken-tool");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.trim_end().ends_with("Couldn't update broken-tool"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Script error"), "{stderr}");
+}
+
 // ─── install -g (clap-level arg validation) ───────────────────────────
 
 #[test]

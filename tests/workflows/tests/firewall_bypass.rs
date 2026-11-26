@@ -1054,11 +1054,16 @@ async fn global_update_block_names_the_bypass_command() {
         .unwrap();
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success(), "{stderr}");
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(
         stderr.contains("  allow lpm firewall bypass add \"update-tool@1.1.0\"\n"),
         "{stderr}"
     );
+    assert!(
+        stderr.trim_end().ends_with("Couldn't update update-tool"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("package.json scripts"), "{stderr}");
 }
 
 #[tokio::test]
