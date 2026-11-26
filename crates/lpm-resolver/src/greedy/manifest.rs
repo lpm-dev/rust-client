@@ -781,11 +781,7 @@ async fn fetch_exact_metadata_with_source(
                 },
             );
         }
-        ResolveError::DependencyFetch {
-            package: canonical.to_string(),
-            version: version.to_string(),
-            detail: failure.error.to_string(),
-        }
+        registry_fetch_error_for(canonical, version, failure.error)
     })?;
     if raw.timings.selected_from_history {
         timings.route = "npm_direct_selected_history";
@@ -860,6 +856,9 @@ pub(super) fn exact_metadata_fast_path_eligible(
 pub(super) enum ExactMetadataFetchOutcome {
     Hit(FetchedMetadata),
     Fallback,
+    /// LPM Firewall refused the version; the packument would only be refused
+    /// or name nothing better, so the refusal is the answer.
+    Refused(ResolveError),
 }
 
 pub(super) async fn try_fetch_exact_metadata_for_resolver(
@@ -906,6 +905,12 @@ pub(super) async fn try_fetch_exact_metadata_for_resolver(
                 "npm version document for {canonical}@{version} omitted install distribution fields; falling back to the packument"
             );
         }
+        Err(
+            error @ ResolveError::Registry {
+                failure: crate::RegistryFetchFailure::FirewallBlocked(_),
+                ..
+            },
+        ) => return ExactMetadataFetchOutcome::Refused(error),
         Err(error) => {
             lpm_registry::timing::record_exact_document_fallback(
                 lpm_registry::timing::ExactDocumentFallbackReason::FetchError,
@@ -1517,11 +1522,7 @@ async fn fetch_release_times_raw_for_policy(
                 suffix_hint,
             )
             .await
-            .map_err(|e| ResolveError::DependencyFetch {
-                package: canonical.to_string(),
-                version: "*".to_string(),
-                detail: e.to_string(),
-            })?;
+            .map_err(|error| registry_fetch_error(canonical, error))?;
         let detail = ReleaseTimeFetchDetail {
             total_ms: start.elapsed().as_millis(),
             timings: timed.timings,
@@ -1537,11 +1538,7 @@ async fn fetch_release_times_raw_for_policy(
                 suffix_hint,
             )
             .await
-            .map_err(|e| ResolveError::DependencyFetch {
-                package: canonical.to_string(),
-                version: "*".to_string(),
-                detail: e.to_string(),
-            })?;
+            .map_err(|error| registry_fetch_error(canonical, error))?;
         Ok((release_times, None))
     }
 }
@@ -1633,11 +1630,7 @@ async fn fetch_platform_metadata_from_route(
                     info.modified.as_deref(),
                 )
                 .await
-                .map_err(|error| ResolveError::DependencyFetch {
-                    package: canonical.to_string(),
-                    version: "*".to_string(),
-                    detail: error.to_string(),
-                })?;
+                .map_err(|error| registry_fetch_error(canonical, error))?;
             let detail = ReleaseTimeFetchDetail {
                 total_ms: start.elapsed().as_millis(),
                 timings: timed.timings,
@@ -1653,11 +1646,7 @@ async fn fetch_platform_metadata_from_route(
             let metadata = client
                 .get_npm_platform_metadata_routed_full(name, route, info.modified.as_deref())
                 .await
-                .map_err(|error| ResolveError::DependencyFetch {
-                    package: canonical.to_string(),
-                    version: "*".to_string(),
-                    detail: error.to_string(),
-                })?;
+                .map_err(|error| registry_fetch_error(canonical, error))?;
             merge_release_times_into_cache_info(info, &metadata);
             Ok(None)
         }
@@ -1706,11 +1695,7 @@ async fn fetch_full_metadata_for_policy(
     let direct_full = client
         .refetch_npm_metadata_direct_full(name)
         .await
-        .map_err(|e| ResolveError::DependencyFetch {
-            package: canonical.to_string(),
-            version: "*".to_string(),
-            detail: e.to_string(),
-        })?;
+        .map_err(|error| registry_fetch_error(canonical, error))?;
     Ok(parse_full_fetched_metadata(
         direct_full,
         include_speculation,
@@ -1853,12 +1838,39 @@ pub(super) fn complete_metadata_fetch(
         }
         Err(error) => {
             if let Some(edges) = completion.parked.remove(&request) {
+                // A firewall refusal of one exact version answers only the
+                // edges that pin it; a range that waited on the same request
+                // fetches the packument instead.
+                let refused_version = request.exact_version.as_deref().filter(|_| {
+                    matches!(
+                        error,
+                        ResolveError::Registry {
+                            failure: crate::RegistryFetchFailure::FirewallBlocked(_),
+                            ..
+                        }
+                    )
+                });
+                let mut waiting_ranges = Vec::new();
                 for edge in edges {
+                    if let Some(version) = refused_version
+                        && edge
+                            .range
+                            .exact_version()
+                            .is_none_or(|pinned| pinned.to_string() != version)
+                    {
+                        waiting_ranges.push(edge);
+                        continue;
+                    }
                     propagate_fetch_error(&edge, &error, completion.state)?;
                     completion
                         .pending_root_constraints
                         .complete_root_edge(&edge, &mut completion.state.task_queue);
                 }
+                waiting_ranges.sort_by(|left, right| {
+                    (left.parent, left.local_name.as_str())
+                        .cmp(&(right.parent, right.local_name.as_str()))
+                });
+                completion.state.task_queue.extend(waiting_ranges);
             }
             Ok(false)
         }
@@ -1918,6 +1930,21 @@ fn metadata_fetch_error(canonical: &CanonicalKey, error: lpm_common::LpmError) -
             },
         };
     }
+    registry_fetch_error(canonical, error)
+}
+
+/// A fetch for a package whose metadata the resolver already holds: a
+/// registry refusal, such as an LPM Firewall block, keeps its kind.
+fn registry_fetch_error(canonical: &CanonicalKey, error: lpm_common::LpmError) -> ResolveError {
+    registry_fetch_error_for(canonical, "*", error)
+}
+
+/// [`registry_fetch_error`] for a fetch of one `version`.
+fn registry_fetch_error_for(
+    canonical: &CanonicalKey,
+    version: &str,
+    error: lpm_common::LpmError,
+) -> ResolveError {
     if let Some(failure) = crate::RegistryFetchFailure::from_lpm_error(&error) {
         return ResolveError::Registry {
             package: canonical.to_string(),
@@ -1926,7 +1953,7 @@ fn metadata_fetch_error(canonical: &CanonicalKey, error: lpm_common::LpmError) -
     }
     ResolveError::DependencyFetch {
         package: canonical.to_string(),
-        version: "*".to_string(),
+        version: version.to_string(),
         detail: error.to_string(),
     }
 }
@@ -2064,4 +2091,65 @@ pub(super) fn propagate_fetch_error(
     Err(ResolveError::Resolution(Box::new(
         state.edge_resolution_context(edge, ResolutionFailureKind::FetchFailed, detail, None, None),
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn firewall_block() -> lpm_common::LpmError {
+        lpm_common::LpmError::NpmFirewallBlocked(Box::new(
+            lpm_common::NpmFirewallBlockedErrorContext::registry(
+                lpm_common::NpmFirewallBlockedPackage {
+                    name: "foldrun".to_string(),
+                    version: Some("32.8.2".to_string()),
+                    verdict: "malicious".to_string(),
+                    reason: "the registry policy refused this download".to_string(),
+                    decision_id: None,
+                    match_source: None,
+                    policy_group: None,
+                    summary: None,
+                    report_url: None,
+                },
+            ),
+        ))
+    }
+
+    #[test]
+    fn a_firewall_block_on_a_metadata_fetch_keeps_its_typed_error() {
+        let canonical = CanonicalKey::from_dep_name("foldrun");
+
+        let ResolveError::Registry { package, failure } =
+            metadata_fetch_error(&canonical, firewall_block())
+        else {
+            panic!("a firewall block must stay a registry refusal");
+        };
+
+        assert!(matches!(
+            failure.into_lpm_error(&package),
+            lpm_common::LpmError::NpmFirewallBlocked(blocked)
+                if blocked.packages[0].coordinate() == "foldrun@32.8.2"
+        ));
+    }
+
+    #[test]
+    fn a_firewall_block_on_a_version_fetch_keeps_its_typed_error() {
+        let canonical = CanonicalKey::from_dep_name("foldrun");
+
+        assert!(matches!(
+            registry_fetch_error_for(&canonical, "32.8.2", firewall_block()),
+            ResolveError::Registry {
+                failure: crate::RegistryFetchFailure::FirewallBlocked(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            registry_fetch_error_for(
+                &canonical,
+                "32.8.2",
+                lpm_common::LpmError::Registry("connection reset".into())
+            ),
+            ResolveError::DependencyFetch { version, .. } if version == "32.8.2"
+        ));
+    }
 }

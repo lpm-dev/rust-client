@@ -218,6 +218,13 @@ pub(super) struct NpmFirewallPreflightStats {
     pub(super) allow_count: u64,
     pub(super) warn_count: u64,
     pub(super) block_count: u64,
+    /// Blocks a verdict summary counted beyond the decision rows it returned,
+    /// so no package can be named for them.
+    pub(super) unattributed_block_count: u64,
+    /// Why some packages went unchecked after a block was already found. The
+    /// command fails on the block either way; this keeps the failure that
+    /// names it from being replaced by the later request error.
+    pub(super) unchecked_reason: Option<String>,
     pub(super) unknown_count: u64,
     pub(super) matched_count: u64,
     pub(super) cache_hit_count: u64,
@@ -266,13 +273,23 @@ impl NpmFirewallPreflightStats {
         self.client_timing = timing;
     }
 
-    fn record_response(&mut self, response: &NpmFirewallBatchResponse, elapsed_ms: u128) {
+    /// Adds one verdict response and returns whether it blocks anything.
+    fn record_response(&mut self, response: &NpmFirewallBatchResponse, elapsed_ms: u128) -> bool {
         self.chunk_count = self.chunk_count.saturating_add(1);
         self.chunk_sum_ms = self.chunk_sum_ms.saturating_add(elapsed_ms);
         self.chunk_max_ms = self.chunk_max_ms.max(elapsed_ms);
         self.add_summary(response.summary);
+        let block_rows = response
+            .decisions
+            .iter()
+            .filter(|decision| decision.action == NpmFirewallAction::Block)
+            .count() as u64;
+        self.unattributed_block_count = self
+            .unattributed_block_count
+            .saturating_add(response.summary.block.saturating_sub(block_rows));
         add_worker_diagnostics(&mut self.worker_diagnostics, response.diagnostics.clone());
         add_client_timing(&mut self.client_timing, response.client_timing);
+        block_rows > 0 || response.summary.block > 0
     }
 
     pub(super) fn to_json(&self) -> serde_json::Value {
@@ -295,6 +312,9 @@ impl NpmFirewallPreflightStats {
         });
         if self.mode.is_enabled() || self.cache_hit_count > 0 {
             json["cache_hit_count"] = serde_json::json!(self.cache_hit_count);
+        }
+        if self.mode.is_enabled() {
+            json["unattributed_block_count"] = serde_json::json!(self.unattributed_block_count);
         }
         if let Some(diagnostics) = &self.worker_diagnostics {
             json["worker"] = serde_json::to_value(diagnostics).unwrap_or(serde_json::Value::Null);
@@ -426,6 +446,10 @@ pub(super) struct NpmFirewallPreflightResult {
     pub(super) stats: NpmFirewallPreflightStats,
     pub(super) decisions: Vec<NpmFirewallDecision>,
     pub(super) report_error: Option<String>,
+    /// An enforce-mode verdict request that failed with nothing blocked,
+    /// which ends the install once what the other requests found is
+    /// reported.
+    pub(super) failure: Option<LpmError>,
 }
 
 impl NpmFirewallPreflightResult {
@@ -434,6 +458,7 @@ impl NpmFirewallPreflightResult {
             stats: NpmFirewallPreflightStats::for_mode(mode, lookup_mode),
             decisions: Vec::new(),
             report_error: None,
+            failure: None,
         }
     }
 }
@@ -559,6 +584,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
             ));
             stats.batch_ms = total_started.elapsed().as_millis();
             return Ok(NpmFirewallPreflightResult {
+                failure: None,
                 stats,
                 decisions,
                 report_error,
@@ -566,9 +592,20 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
         }
 
         let preflight_client = NpmFirewallPreflightClient::new(Arc::clone(&client));
+        let dispatch = FirewallChunkDispatch {
+            fetch_tx: &fetch_tx,
+            client: &preflight_client,
+            mode,
+            policy_profile,
+        };
         let mut chunk = FirewallSelectedChunk::with_capacity(chunk_size);
         let mut receiver_closed = false;
         let mut tasks = tokio::task::JoinSet::new();
+        // After an enforced block, or a failed request, the install fails, so
+        // later chunks are still checked to name every blocked package, but
+        // nothing more downloads.
+        let mut blocked = false;
+        let mut failure: Option<LpmError> = None;
 
         loop {
             tokio::select! {
@@ -588,10 +625,8 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                             if chunk.len() >= chunk_size {
                                 spawn_or_release_firewall_chunk(
                                     &mut chunk,
-                                    &fetch_tx,
-                                    &preflight_client,
-                                    mode,
-                                    policy_profile,
+                                    &dispatch,
+                                    blocked || failure.is_some(),
                                     &mut stats,
                                     &mut tasks,
                                 )
@@ -602,10 +637,8 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                             receiver_closed = true;
                             spawn_or_release_firewall_chunk(
                                 &mut chunk,
-                                &fetch_tx,
-                                &preflight_client,
-                                mode,
-                                policy_profile,
+                                &dispatch,
+                                blocked || failure.is_some(),
                                 &mut stats,
                                 &mut tasks,
                             )
@@ -614,27 +647,26 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                     }
                 }
                 joined = tasks.join_next(), if !tasks.is_empty() => {
-                    let chunk_result = joined
+                    let chunk_result = match joined
                         .ok_or_else(|| LpmError::Registry("npm firewall chunk task ended unexpectedly".into()))?
-                        .map_err(|error| LpmError::Registry(format!("npm firewall chunk task panicked: {error}")))??;
-                    apply_firewall_chunk_result(
+                        .map_err(|error| LpmError::Registry(format!("npm firewall chunk task panicked: {error}")))?
+                    {
+                        Ok(chunk_result) => chunk_result,
+                        Err(error) => {
+                            failure.get_or_insert(error);
+                            continue;
+                        }
+                    };
+                    blocked |= apply_firewall_chunk_result(
                         chunk_result,
                         &fetch_tx,
                         mode,
+                        blocked || failure.is_some(),
                         &mut stats,
                         &mut decisions,
                         &mut report_error,
                     )
                     .await;
-                    if matches!(mode, NpmFirewallMode::Enforce) && stats.block_count > 0 {
-                        tasks.abort_all();
-                        stats.batch_ms = total_started.elapsed().as_millis();
-                        return Ok(NpmFirewallPreflightResult {
-                            stats,
-                            decisions,
-                            report_error,
-                        });
-                    }
                 }
                 else => {
                     if receiver_closed && tasks.is_empty() {
@@ -644,11 +676,19 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
             }
         }
 
+        let failure = match failure {
+            Some(error) if blocked => {
+                stats.unchecked_reason = Some(error.to_string());
+                None
+            }
+            failure => failure,
+        };
         stats.batch_ms = total_started.elapsed().as_millis();
         Ok(NpmFirewallPreflightResult {
             stats,
             decisions,
             report_error,
+            failure,
         })
     });
     NpmFirewallPreflightJoin {
@@ -669,6 +709,10 @@ fn push_firewall_chunk_event(
 ) -> Option<lpm_resolver::SelectedPackageEvent> {
     if let Some(verdict_package) =
         npm_firewall_package_from_selected_event(&event, route_table, client, lookup_mode)
+        && !chunk
+            .verdict_packages
+            .iter()
+            .any(|requested| same_verdict_request(requested, &verdict_package))
     {
         chunk.verdict_packages.push(verdict_package);
     }
@@ -680,20 +724,34 @@ fn push_firewall_chunk_event(
     }
 }
 
-async fn spawn_or_release_firewall_chunk(
-    chunk: &mut FirewallSelectedChunk,
-    fetch_tx: &tokio::sync::mpsc::Sender<lpm_resolver::SelectedPackageEvent>,
-    client: &NpmFirewallPreflightClient,
+/// What every chunk of one streaming preflight shares.
+struct FirewallChunkDispatch<'a> {
+    fetch_tx: &'a tokio::sync::mpsc::Sender<lpm_resolver::SelectedPackageEvent>,
+    client: &'a NpmFirewallPreflightClient,
     mode: NpmFirewallMode,
     policy_profile: NpmFirewallPolicyProfile,
+}
+
+async fn spawn_or_release_firewall_chunk(
+    chunk: &mut FirewallSelectedChunk,
+    dispatch: &FirewallChunkDispatch<'_>,
+    blocked: bool,
     stats: &mut NpmFirewallPreflightStats,
     tasks: &mut tokio::task::JoinSet<Result<FirewallChunkResult, LpmError>>,
 ) {
+    let FirewallChunkDispatch {
+        fetch_tx,
+        client,
+        mode,
+        policy_profile,
+    } = *dispatch;
     if chunk.is_empty() {
         return;
     }
     if chunk.verdict_packages.is_empty() {
-        release_firewall_events(fetch_tx, chunk.events.drain(..)).await;
+        if !blocked {
+            release_firewall_events(fetch_tx, chunk.events.drain(..)).await;
+        }
         chunk.clear();
         return;
     }
@@ -816,14 +874,18 @@ fn normalize_npm_firewall_preflight_error(error: LpmError) -> LpmError {
     }
 }
 
+/// Records a finished chunk and releases its events for download unless the
+/// chunk, or an earlier one, blocks in enforce mode. Returns whether this
+/// chunk blocks.
 async fn apply_firewall_chunk_result(
     chunk_result: FirewallChunkResult,
     fetch_tx: &tokio::sync::mpsc::Sender<lpm_resolver::SelectedPackageEvent>,
     mode: NpmFirewallMode,
+    earlier_block: bool,
     stats: &mut NpmFirewallPreflightStats,
     decisions: &mut Vec<NpmFirewallDecision>,
     report_error: &mut Option<String>,
-) {
+) -> bool {
     if let Some(error) = chunk_result.report_error {
         stats.rpc_failed = true;
         stats.chunk_count = stats.chunk_count.saturating_add(1);
@@ -833,15 +895,15 @@ async fn apply_firewall_chunk_result(
             *report_error = Some(error);
         }
         release_firewall_events(fetch_tx, chunk_result.events).await;
-        return;
+        return false;
     }
 
     let Some(response) = chunk_result.response else {
         release_firewall_events(fetch_tx, chunk_result.events).await;
-        return;
+        return false;
     };
 
-    stats.record_response(&response, chunk_result.elapsed_ms);
+    let chunk_has_block = stats.record_response(&response, chunk_result.elapsed_ms);
     tracing::debug!(
         target = "lpm::firewall",
         package_count = response.summary.total,
@@ -853,16 +915,12 @@ async fn apply_firewall_chunk_result(
         policy_mode = %response.policy_mode,
         "npm firewall verdict chunk completed",
     );
-
-    let chunk_has_block = response.summary.block > 0
-        || response
-            .decisions
-            .iter()
-            .any(|decision| decision.action == NpmFirewallAction::Block);
     decisions.extend(response.decisions);
-    if matches!(mode, NpmFirewallMode::Monitor) || !chunk_has_block {
+    let enforce = matches!(mode, NpmFirewallMode::Enforce);
+    if !(enforce && (chunk_has_block || earlier_block)) {
         release_firewall_events(fetch_tx, chunk_result.events).await;
     }
+    enforce && chunk_has_block
 }
 
 async fn release_firewall_events(
@@ -1321,6 +1379,7 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
     stats.checked_count = verdict_packages.len() as u64;
     if verdict_packages.is_empty() {
         return Ok(NpmFirewallPreflightResult {
+            failure: None,
             stats,
             decisions: Vec::new(),
             report_error: None,
@@ -1332,6 +1391,7 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
         let message = NPM_FIREWALL_OFFLINE_HINT.to_string();
         if matches!(mode, NpmFirewallMode::Monitor) {
             return Ok(NpmFirewallPreflightResult {
+                failure: None,
                 stats,
                 decisions: Vec::new(),
                 report_error: Some(format!(
@@ -1350,6 +1410,7 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
             stats.batch_ms = started.elapsed().as_millis();
             stats.rpc_failed = true;
             return Ok(NpmFirewallPreflightResult {
+                failure: None,
                 stats,
                 decisions: Vec::new(),
                 report_error: Some(npm_firewall_preflight_report_error(error)),
@@ -1412,6 +1473,7 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
     if packages_to_check.is_empty() {
         stats.batch_ms = started.elapsed().as_millis();
         return Ok(NpmFirewallPreflightResult {
+            failure: None,
             stats,
             decisions: Vec::new(),
             report_error: None,
@@ -1427,6 +1489,9 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
     let mut total_block_live = 0u64;
     let mut last_request_id = String::new();
     let mut last_policy_mode = String::new();
+    // In enforce mode a failed batch doesn't stop the others: a block they
+    // find is what the install reports, with this failure as unchecked.
+    let mut first_failure = None;
 
     for chunk in packages_to_check.chunks(MAX_FIREWALL_BATCH_PACKAGES) {
         let chunk_started = Instant::now();
@@ -1443,13 +1508,15 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
                 stats.batch_ms = started.elapsed().as_millis();
                 stats.rpc_failed = true;
                 return Ok(NpmFirewallPreflightResult {
+                    failure: None,
                     stats,
                     decisions: all_decisions,
                     report_error: Some(npm_firewall_preflight_report_error(error)),
                 });
             }
             Err(error) => {
-                return Err(npm_firewall_preflight_enforce_error(error));
+                first_failure.get_or_insert(error);
+                continue;
             }
         };
         let chunk_ms = chunk_started.elapsed().as_millis();
@@ -1473,6 +1540,18 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
             );
         }
         all_decisions.extend(response.decisions);
+    }
+    if let Some(error) = first_failure.map(npm_firewall_preflight_enforce_error) {
+        if !stats_have_block(&stats, &all_decisions) {
+            stats.batch_ms = started.elapsed().as_millis();
+            return Ok(NpmFirewallPreflightResult {
+                stats,
+                decisions: all_decisions,
+                report_error: None,
+                failure: Some(error),
+            });
+        }
+        stats.unchecked_reason = Some(error.to_string());
     }
     stats.batch_ms = started.elapsed().as_millis();
 
@@ -1503,6 +1582,7 @@ pub(super) async fn request_npm_firewall_preflight_with_force(
         "npm firewall verdict preflight completed",
     );
     Ok(NpmFirewallPreflightResult {
+        failure: None,
         stats,
         decisions: all_decisions,
         report_error: None,
@@ -1564,24 +1644,22 @@ pub(super) fn finish_npm_firewall_preflight(
     json_output: bool,
 ) -> Result<NpmFirewallPreflightStats, LpmError> {
     let stats = result.stats;
-    if let Some(error) = result.report_error {
-        if !json_output {
-            output::warn(&lpm_common::sanitize_terminal_inline(&error));
-        }
-        return Ok(stats);
+    if let Some(failure) = result.failure {
+        return Err(failure);
+    }
+    // A failed request in monitor mode still leaves what the requests before
+    // it found, which is reported below.
+    if let Some(error) = &result.report_error
+        && !json_output
+    {
+        output::warn(&lpm_common::sanitize_terminal_inline(error));
     }
 
-    let blocked: Vec<_> = result
-        .decisions
-        .iter()
-        .filter(|decision| decision.action == NpmFirewallAction::Block)
-        .collect();
-    let warned: Vec<_> = result
-        .decisions
-        .iter()
-        .filter(|decision| decision.action == NpmFirewallAction::Warn)
-        .collect();
-    let blocked_count = blocked.len().max(stats.block_count as usize);
+    let blocked = distinct_decisions(&result.decisions, NpmFirewallAction::Block);
+    let warned = distinct_decisions(&result.decisions, NpmFirewallAction::Warn);
+    let blocked_count = blocked
+        .len()
+        .saturating_add(usize::try_from(stats.unattributed_block_count).unwrap_or(usize::MAX));
     let warned_count = warned.len().max(stats.warn_count as usize);
 
     if matches!(stats.mode, NpmFirewallMode::Monitor) {
@@ -1617,11 +1695,60 @@ pub(super) fn finish_npm_firewall_preflight(
         ));
         print_firewall_decisions(&blocked);
     }
-    Err(LpmError::Registry(format!(
-        "{} {} blocked by LPM Firewall",
-        blocked_count,
-        install_ui::packages_word(blocked_count),
+    Err(LpmError::NpmFirewallBlocked(Box::new(
+        lpm_common::NpmFirewallBlockedErrorContext {
+            source: lpm_common::NpmFirewallBlockSource::Preflight,
+            packages: blocked
+                .iter()
+                .map(|decision| blocked_package(decision))
+                .collect(),
+            unattributed_count: stats.unattributed_block_count,
+            unchecked_reason: stats.unchecked_reason,
+        },
     )))
+}
+
+/// Whether the verdicts gathered so far already block the command.
+fn stats_have_block(stats: &NpmFirewallPreflightStats, decisions: &[NpmFirewallDecision]) -> bool {
+    stats.unattributed_block_count > 0
+        || decisions
+            .iter()
+            .any(|decision| decision.action == NpmFirewallAction::Block)
+}
+
+/// The decisions with `action`, once per package version: peer-context
+/// instances of one version can each come back from a separate chunk.
+fn distinct_decisions(
+    decisions: &[NpmFirewallDecision],
+    action: NpmFirewallAction,
+) -> Vec<&NpmFirewallDecision> {
+    let mut seen = HashSet::with_capacity(decisions.len());
+    decisions
+        .iter()
+        .filter(|decision| {
+            decision.action == action
+                && seen.insert((decision.name.as_str(), decision.version.as_str()))
+        })
+        .collect()
+}
+
+fn blocked_package(decision: &NpmFirewallDecision) -> lpm_common::NpmFirewallBlockedPackage {
+    let display = decision.display.as_ref();
+    lpm_common::NpmFirewallBlockedPackage {
+        name: decision.name.clone(),
+        version: Some(decision.version.clone()),
+        verdict: decision.verdict.clone(),
+        reason: decision.reason.clone(),
+        decision_id: Some(decision.decision_id.clone()),
+        match_source: Some(decision.match_source.clone()),
+        policy_group: decision.policy.as_ref().map(|policy| policy.group.clone()),
+        summary: display
+            .and_then(|display| non_empty_display_text(display.summary.as_deref()))
+            .map(str::to_string),
+        report_url: display
+            .and_then(|display| non_empty_display_text(display.report_url.as_deref()))
+            .map(str::to_string),
+    }
 }
 
 pub(super) async fn run_npm_firewall_preflight(
@@ -1672,14 +1799,33 @@ pub(super) fn npm_firewall_packages(
     lookup_mode: NpmFirewallLookupMode,
 ) -> Vec<NpmFirewallBatchPackage> {
     let mut verdict_packages = Vec::with_capacity(packages.len());
+    let mut requested = HashSet::with_capacity(packages.len());
     for package in packages {
+        let key = (
+            package.name.as_str(),
+            package.version.as_str(),
+            lookup_mode
+                .include_integrity()
+                .then_some(package.integrity.as_deref())
+                .flatten(),
+        );
+        if requested.contains(&key) {
+            continue;
+        }
         if let Some(verdict_package) =
             npm_firewall_package(package, route_table, client, lookup_mode)
         {
+            requested.insert(key);
             verdict_packages.push(verdict_package);
         }
     }
     verdict_packages
+}
+
+/// Peer-context instances of one package share a coordinate, and one verdict
+/// answers for all of them.
+fn same_verdict_request(left: &NpmFirewallBatchPackage, right: &NpmFirewallBatchPackage) -> bool {
+    left.name == right.name && left.version == right.version && left.integrity == right.integrity
 }
 
 pub(super) fn npm_firewall_has_packages(

@@ -75,9 +75,10 @@ async fn firewall_block_output_uses_product_name_and_indented_package_marker() {
         "{stderr}",
     );
     assert!(
-        stderr.contains("1 package blocked by LPM Firewall"),
+        stderr.contains("✗ Blocked by LPM Firewall\n  reason 1 package blocked by LPM Firewall\n"),
         "{stderr}"
     );
+    assert!(!stderr.contains("Registry error"), "{stderr}");
     assert!(
         !stderr.contains('\x1b'),
         "plain output must contain no terminal escapes: {stderr:?}"
@@ -136,6 +137,93 @@ async fn firewall_monitor_output_reports_would_block_and_continues() {
         "{stderr}"
     );
     assert!(!stderr.contains("LPM Firewall blocked"), "{stderr}");
+}
+
+/// More packages than one verdict request carries, so monitor mode asks in
+/// two batches; the first batch, which holds `aaa-would-block` and
+/// `aab-warned` (packages are asked in name order), answers and the second
+/// fails.
+#[tokio::test]
+async fn firewall_monitor_still_names_what_it_checked_when_another_verdict_batch_fails() {
+    let mock = MockRegistry::start().await;
+    let names: Vec<String> = ["aaa-would-block".to_string(), "aab-warned".to_string()]
+        .into_iter()
+        .chain((0..511).map(|index| format!("filler-{index:03}")))
+        .collect();
+    for name in &names {
+        mock.with_package(name, "1.0.0", &make_tarball(name, "1.0.0"))
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .and(body_string_contains("\"name\":\"aaa-would-block\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "requestId": "firewall-output",
+            "policyMode": "monitor",
+            "summary": { "total": 2, "allow": 0, "warn": 1, "block": 1, "unknown": 0, "matched": 2 },
+            "decisions": [{
+                "decisionId": "aaa-would-block",
+                "name": "aaa-would-block",
+                "version": "1.0.0",
+                "action": "block",
+                "verdict": "malicious",
+                "reason": "Local policy reason",
+                "matchSource": "package",
+                "policyMode": "monitor",
+                "enqueueScan": false,
+                "display": { "summary": "Package source requires review." }
+            }, {
+                "decisionId": "aab-warned",
+                "name": "aab-warned",
+                "version": "1.0.0",
+                "action": "warn",
+                "verdict": "suspicious",
+                "reason": "Local policy reason",
+                "matchSource": "package",
+                "policyMode": "monitor",
+                "enqueueScan": false,
+                "display": { "summary": "Package source looks unusual." }
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(mock.server())
+        .await;
+    let dependencies: serde_json::Map<String, serde_json::Value> = names
+        .iter()
+        .map(|name| (name.clone(), serde_json::json!("1.0.0")))
+        .collect();
+    let project = TempProject::empty(
+        &serde_json::json!({ "name": "consumer", "version": "1.0.0", "dependencies": dependencies })
+            .to_string(),
+    );
+    write_npm_firewall_global_config(&project, "monitor");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--color", "never", "install", "--no-skills"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("! npm firewall verdict preflight failed in monitor mode:"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("! LPM Firewall monitor: 1 would-block, 1 warned; command continues because monitor mode is active."), "{stderr}");
+    assert!(
+        stderr.contains("  › aaa-would-block@1.0.0 - block: Package source requires review."),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("  › aab-warned@1.0.0 - warn: Package source looks unusual."),
+        "{stderr}"
+    );
 }
 
 #[tokio::test]
@@ -294,4 +382,60 @@ async fn firewall_install_sends_inherited_telemetry_policy_and_names_its_group()
         ),
         "{stderr}"
     );
+}
+
+#[tokio::test]
+async fn firewall_block_json_envelope_names_every_blocked_package() {
+    let mock = MockRegistry::start().await;
+    let names = ["blocked-one", "blocked-two"];
+    let mut decisions = Vec::with_capacity(names.len());
+    for name in names {
+        mock.with_package(name, "1.0.0", &make_tarball(name, "1.0.0"))
+            .await;
+        decisions.push(serde_json::json!({
+            "decisionId": format!("firewall-json:{name}"),
+            "name": name,
+            "version": "1.0.0",
+            "action": "block",
+            "verdict": "malicious",
+            "reason": "client policy maps lpm_ai_confirmed_malware to block",
+            "matchSource": "package",
+            "policyMode": "enforce",
+            "enqueueScan": false,
+            "policy": { "group": "lpm_ai_confirmed_malware" },
+            "display": {
+                "summary": "Package steals credentials.",
+                "reportUrl": format!("https://firewall.lpm.dev/npm/{name}/v/1.0.0")
+            }
+        }));
+    }
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .and(body_string_contains("\"name\":\"blocked-one\""))
+        .and(body_string_contains("\"name\":\"blocked-two\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "requestId": "firewall-json",
+            "policyMode": "enforce",
+            "summary": { "total": 2, "allow": 0, "warn": 0, "block": 2, "unknown": 0, "matched": 2 },
+            "decisions": decisions
+        })))
+        .mount(mock.server())
+        .await;
+    let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
+    write_npm_firewall_global_config(&project, "enforce");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["install", "--json", "--no-skills"])
+        .args(names.iter().map(|name| format!("{name}@1.0.0")))
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&output.stdout)));
+    let mut packages = envelope["error"]["packages"].as_array().unwrap().clone();
+    packages.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    let mut envelope = envelope;
+    envelope["error"]["packages"] = serde_json::Value::Array(packages);
+    insta::assert_json_snapshot!("install_firewall_block_json_envelope", envelope);
 }

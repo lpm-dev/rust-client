@@ -332,16 +332,35 @@ pub(super) fn parse_lpm_worker_error_body(body: &str) -> Option<LpmError> {
     };
 
     match error {
-        "blocked_by_lpm_firewall" => Some(LpmError::NpmFirewallBlocked(Box::new(
-            lpm_common::NpmFirewallBlockedErrorContext {
-                package: text("package", 214).unwrap_or_else(|| "requested package".to_owned()),
-                verdict: text("verdict", 64).unwrap_or_else(|| "unknown".to_owned()),
-                reason: text("reason", 600)
-                    .unwrap_or_else(|| "the registry policy refused this download".to_owned()),
-                decision_id: text("decisionId", 120),
-                match_source: text("matchSource", 120),
-            },
-        ))),
+        "blocked_by_lpm_firewall" => {
+            let display_text = |key: &str, max_chars: usize| {
+                value
+                    .get("display")
+                    .and_then(|display| json_string_field(display, key))
+                    .map(|text| lpm_common::sanitize_server_text(text, max_chars))
+                    .filter(|text| !text.is_empty())
+            };
+            let (name, version) = split_package_coordinate(
+                text("package", 214).unwrap_or_else(|| "requested package".to_owned()),
+            );
+            Some(LpmError::NpmFirewallBlocked(Box::new(
+                lpm_common::NpmFirewallBlockedErrorContext::registry(
+                    lpm_common::NpmFirewallBlockedPackage {
+                        name,
+                        version,
+                        verdict: text("verdict", 64).unwrap_or_else(|| "unknown".to_owned()),
+                        reason: text("reason", 600).unwrap_or_else(|| {
+                            "the registry policy refused this download".to_owned()
+                        }),
+                        decision_id: text("decisionId", 120),
+                        match_source: text("matchSource", 120),
+                        policy_group: None,
+                        summary: display_text("summary", 600),
+                        report_url: display_text("reportUrl", 600),
+                    },
+                ),
+            )))
+        }
         "upstream_proxy_entitlement_required" => Some(LpmError::UpstreamProxyEntitlementRequired {
             message: message(),
             reason: text("reason", 600),
@@ -353,6 +372,19 @@ pub(super) fn parse_lpm_worker_error_body(body: &str) -> Option<LpmError> {
             entitlement_source: text("entitlementSource", 120),
         }),
         _ => None,
+    }
+}
+
+/// Splits `name@version`, keeping a scoped name's leading `@`.
+fn split_package_coordinate(coordinate: String) -> (String, Option<String>) {
+    match coordinate.rfind('@') {
+        Some(at) if at > 0 && at + 1 < coordinate.len() => {
+            let version = coordinate[at + 1..].to_owned();
+            let mut name = coordinate;
+            name.truncate(at);
+            (name, Some(version))
+        }
+        _ => (coordinate, None),
     }
 }
 
@@ -403,5 +435,36 @@ mod tests {
             .unwrap();
         drop(permit);
         assert_eq!(limiter.available_permits(), 1);
+    }
+
+    #[test]
+    fn firewall_refusal_keeps_a_scoped_name_and_reads_the_report_link() {
+        let body = r#"{"error":"blocked_by_lpm_firewall","package":"@scope/pkg@1.2.3","verdict":"malicious","reason":"r","display":{"summary":"s","reportUrl":"https://firewall.lpm.dev/npm/@scope/pkg/v/1.2.3"}}"#;
+
+        let Some(LpmError::NpmFirewallBlocked(blocked)) = parse_lpm_worker_error_body(body) else {
+            panic!("expected a firewall block");
+        };
+
+        let package = &blocked.packages[0];
+        assert_eq!(package.name, "@scope/pkg");
+        assert_eq!(package.version.as_deref(), Some("1.2.3"));
+        assert_eq!(package.summary.as_deref(), Some("s"));
+        assert_eq!(
+            package.report_url.as_deref(),
+            Some("https://firewall.lpm.dev/npm/@scope/pkg/v/1.2.3")
+        );
+        assert_eq!(blocked.source, lpm_common::NpmFirewallBlockSource::Registry);
+    }
+
+    #[test]
+    fn firewall_refusal_without_a_version_keeps_the_whole_name() {
+        assert_eq!(
+            split_package_coordinate("@scope/pkg".to_owned()),
+            ("@scope/pkg".to_owned(), None)
+        );
+        assert_eq!(
+            split_package_coordinate("pkg@".to_owned()),
+            ("pkg@".to_owned(), None)
+        );
     }
 }

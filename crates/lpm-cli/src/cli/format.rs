@@ -437,6 +437,24 @@ pub(crate) fn json_error_value(error: &lpm_common::LpmError) -> serde_json::Valu
                 "suggested_command": approval.suggested_command,
             }
         }),
+        lpm_common::LpmError::NpmFirewallBlocked(blocked) => serde_json::json!({
+            "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
+            "success": false,
+            "error_code": "npm_firewall_blocked",
+            "error": {
+                "code": "NPM_FIREWALL_BLOCKED",
+                "message": blocked.to_string(),
+                "source": blocked.source.as_str(),
+                "blocked_count": blocked.blocked_count(),
+                "unattributed_count": blocked.unattributed_count,
+                "unchecked_reason": blocked.unchecked_reason,
+                "packages": blocked
+                    .packages
+                    .iter()
+                    .map(npm_firewall_blocked_package_json)
+                    .collect::<Vec<_>>(),
+            }
+        }),
         lpm_common::LpmError::PoolAttributionUnconfirmed { reason } => serde_json::json!({
             "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
             "success": false,
@@ -505,6 +523,29 @@ pub(crate) fn json_error_value(error: &lpm_common::LpmError) -> serde_json::Valu
     };
     if let Some(next_steps) = next_steps_for_error(error) {
         json["next_steps"] = next_steps;
+    }
+    json
+}
+
+fn npm_firewall_blocked_package_json(
+    package: &lpm_common::NpmFirewallBlockedPackage,
+) -> serde_json::Value {
+    let mut json = serde_json::json!({
+        "name": package.name,
+        "version": package.version,
+        "verdict": package.verdict,
+        "reason": package.reason,
+        "decision_id": package.decision_id,
+        "match_source": package.match_source,
+    });
+    if let Some(group) = &package.policy_group {
+        json["policy"] = serde_json::json!({ "group": group });
+    }
+    if package.summary.is_some() || package.report_url.is_some() {
+        json["display"] = serde_json::json!({
+            "summary": package.summary,
+            "report_url": package.report_url,
+        });
     }
     json
 }
@@ -842,51 +883,7 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         lpm_common::LpmError::Forbidden(reason) => {
             diagnostic_lines("Forbidden", Some(reason), error)
         }
-        lpm_common::LpmError::NpmFirewallBlocked(blocked) => {
-            let lpm_common::NpmFirewallBlockedErrorContext {
-                package,
-                verdict,
-                reason,
-                decision_id,
-                match_source,
-            } = blocked.as_ref();
-            let mut lines = vec![
-                SlimErrorLine::Failed(install_ui::terminal_line!(
-                    "Firewall blocked {}",
-                    install_ui::yellow(package),
-                )),
-                SlimErrorLine::Detail(install_ui::terminal_line!(
-                    "  {} {}",
-                    install_ui::dim("verdict"),
-                    install_ui::yellow(verdict),
-                )),
-                SlimErrorLine::Detail(install_ui::terminal_line!(
-                    "  {} {}",
-                    install_ui::dim("reason"),
-                    reason,
-                )),
-            ];
-            if let Some(decision_id) = decision_id {
-                lines.push(SlimErrorLine::Detail(install_ui::terminal_line!(
-                    "  {} {}",
-                    install_ui::dim("decision"),
-                    install_ui::cyan(decision_id),
-                )));
-            }
-            if let Some(match_source) = match_source {
-                lines.push(SlimErrorLine::Detail(install_ui::terminal_line!(
-                    "  {} {}",
-                    install_ui::dim("match"),
-                    install_ui::cyan(match_source),
-                )));
-            }
-            lines.push(SlimErrorLine::Detail(install_ui::terminal_line!(
-                "  {} {}",
-                install_ui::dim("hint"),
-                install_ui::dim("The package was not downloaded."),
-            )));
-            lines
-        }
+        lpm_common::LpmError::NpmFirewallBlocked(blocked) => npm_firewall_blocked_lines(blocked),
         lpm_common::LpmError::NpmFirewallEntitlementRequired {
             message,
             reason,
@@ -1222,6 +1219,88 @@ fn registry_http_lines(answer: &lpm_common::RegistryHttpError) -> Vec<SlimErrorL
     if let Some(hint) = answer.hint() {
         push_dimmed_multiline_detail(&mut lines, "hint", &hint);
     }
+    lines
+}
+
+fn npm_firewall_blocked_lines(
+    blocked: &lpm_common::NpmFirewallBlockedErrorContext,
+) -> Vec<SlimErrorLine> {
+    match (blocked.source, blocked.packages.as_slice()) {
+        (lpm_common::NpmFirewallBlockSource::Registry, [package]) => {
+            npm_firewall_registry_refusal_lines(package)
+        }
+        _ => {
+            let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
+                "Blocked by LPM Firewall",
+            ))];
+            push_untrusted_detail(&mut lines, "reason", &blocked.to_string());
+            if blocked.unattributed_count > 0 {
+                push_detail(
+                    &mut lines,
+                    "unnamed",
+                    install_ui::yellow(&format!(
+                        "{} of them blocked without a package name in the verdict response",
+                        blocked.unattributed_count
+                    )),
+                );
+            }
+            if let Some(reason) = &blocked.unchecked_reason {
+                push_untrusted_detail(
+                    &mut lines,
+                    "unchecked",
+                    &format!("some packages weren't checked: {reason}"),
+                );
+            }
+            lines
+        }
+    }
+}
+
+fn npm_firewall_registry_refusal_lines(
+    package: &lpm_common::NpmFirewallBlockedPackage,
+) -> Vec<SlimErrorLine> {
+    let mut lines = vec![
+        SlimErrorLine::Failed(install_ui::terminal_line!(
+            "Firewall blocked {}",
+            install_ui::yellow(&package.coordinate()),
+        )),
+        SlimErrorLine::Detail(install_ui::terminal_line!(
+            "  {} {}",
+            install_ui::dim("verdict"),
+            install_ui::yellow(&package.verdict),
+        )),
+        SlimErrorLine::Detail(install_ui::terminal_line!(
+            "  {} {}",
+            install_ui::dim("reason"),
+            package.reason.as_str(),
+        )),
+    ];
+    if let Some(decision_id) = &package.decision_id {
+        lines.push(SlimErrorLine::Detail(install_ui::terminal_line!(
+            "  {} {}",
+            install_ui::dim("decision"),
+            install_ui::cyan(decision_id),
+        )));
+    }
+    if let Some(match_source) = &package.match_source {
+        lines.push(SlimErrorLine::Detail(install_ui::terminal_line!(
+            "  {} {}",
+            install_ui::dim("match"),
+            install_ui::cyan(match_source),
+        )));
+    }
+    if let Some(report_url) = &package.report_url {
+        lines.push(SlimErrorLine::Detail(install_ui::terminal_line!(
+            "  {} {}",
+            install_ui::dim("report"),
+            install_ui::hyperlink(report_url),
+        )));
+    }
+    lines.push(SlimErrorLine::Detail(install_ui::terminal_line!(
+        "  {} {}",
+        install_ui::dim("hint"),
+        install_ui::dim("The package was not downloaded."),
+    )));
     lines
 }
 
@@ -1570,13 +1649,19 @@ mod tests {
     #[test]
     fn slim_error_lines_render_firewall_block_as_contract_rows() {
         let error = lpm_common::LpmError::NpmFirewallBlocked(Box::new(
-            lpm_common::NpmFirewallBlockedErrorContext {
-                package: "is-number@7.0.0".into(),
-                verdict: "malicious".into(),
-                reason: "product_default policy maps malicious to block".into(),
-                decision_id: Some("decision-1".into()),
-                match_source: Some("package".into()),
-            },
+            lpm_common::NpmFirewallBlockedErrorContext::registry(
+                lpm_common::NpmFirewallBlockedPackage {
+                    name: "is-number".into(),
+                    version: Some("7.0.0".into()),
+                    verdict: "malicious".into(),
+                    reason: "product_default policy maps malicious to block".into(),
+                    decision_id: Some("decision-1".into()),
+                    match_source: Some("package".into()),
+                    policy_group: None,
+                    summary: None,
+                    report_url: None,
+                },
+            ),
         ));
 
         let lines = slim_error_lines(&error);
@@ -1591,6 +1676,77 @@ mod tests {
         assert_eq!(plain[3], "  decision decision-1");
         assert_eq!(plain[4], "  match package");
         assert_eq!(plain[5], "  hint The package was not downloaded.");
+    }
+
+    fn preflight_block(unattributed_count: u64) -> lpm_common::LpmError {
+        lpm_common::LpmError::NpmFirewallBlocked(Box::new(
+            lpm_common::NpmFirewallBlockedErrorContext {
+                source: lpm_common::NpmFirewallBlockSource::Preflight,
+                packages: vec![lpm_common::NpmFirewallBlockedPackage {
+                    name: "foldrun".into(),
+                    version: Some("32.8.2".into()),
+                    verdict: "malicious".into(),
+                    reason: "client policy maps lpm_ai_agent_control_surface to block".into(),
+                    decision_id: Some("req:1".into()),
+                    match_source: Some("package".into()),
+                    policy_group: Some("lpm_ai_agent_control_surface".into()),
+                    summary: Some("`foldrun talk` can send a credential to a gateway.".into()),
+                    report_url: Some("https://firewall.lpm.dev/npm/foldrun/v/32.8.2".into()),
+                }],
+                unattributed_count,
+                unchecked_reason: None,
+            },
+        ))
+    }
+
+    #[test]
+    fn slim_error_lines_title_a_preflight_block_as_blocked_by_lpm_firewall() {
+        let lines = slim_error_lines(&preflight_block(0));
+        let plain: Vec<_> = lines.iter().map(plain_slim_line).collect();
+
+        assert_eq!(
+            plain,
+            [
+                "Blocked by LPM Firewall",
+                "  reason 1 package blocked by LPM Firewall",
+            ]
+        );
+    }
+
+    #[test]
+    fn slim_error_lines_count_preflight_blocks_without_a_package_name() {
+        let lines = slim_error_lines(&preflight_block(2));
+        let plain: Vec<_> = lines.iter().map(plain_slim_line).collect();
+
+        assert_eq!(plain[1], "  reason 3 packages blocked by LPM Firewall");
+        assert_eq!(
+            plain[2],
+            "  unnamed 2 of them blocked without a package name in the verdict response"
+        );
+    }
+
+    #[test]
+    fn json_error_envelope_lists_every_package_the_firewall_blocked() {
+        let json = json_error_value(&preflight_block(1));
+
+        assert_eq!(json["success"], false);
+        assert_eq!(json["error_code"], "npm_firewall_blocked");
+        assert_eq!(json["error"]["code"], "NPM_FIREWALL_BLOCKED");
+        assert_eq!(json["error"]["source"], "preflight");
+        assert_eq!(json["error"]["blocked_count"], 2);
+        assert_eq!(json["error"]["unattributed_count"], 1);
+        assert_eq!(
+            json["error"]["message"],
+            "2 packages blocked by LPM Firewall"
+        );
+        let package = &json["error"]["packages"][0];
+        assert_eq!(package["name"], "foldrun");
+        assert_eq!(package["version"], "32.8.2");
+        assert_eq!(package["policy"]["group"], "lpm_ai_agent_control_surface");
+        assert_eq!(
+            package["display"]["report_url"],
+            "https://firewall.lpm.dev/npm/foldrun/v/32.8.2"
+        );
     }
 
     #[test]

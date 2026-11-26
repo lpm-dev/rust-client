@@ -738,9 +738,10 @@ async fn npm_proxy_firewall_block_does_not_fallback_to_direct_npm_registry() {
     assert!(matches!(
         result,
         Err(LpmError::NpmFirewallBlocked(blocked))
-            if blocked.package == npm_name
-                && blocked.verdict == "malicious"
-                && blocked.reason == "test policy block"
+            if blocked.packages[0].name == npm_name
+                && blocked.packages[0].version.is_none()
+                && blocked.packages[0].verdict == "malicious"
+                && blocked.packages[0].reason == "test policy block"
     ));
 }
 
@@ -4088,4 +4089,39 @@ async fn duplicate_batch_cache_persists_raw_metadata_without_synthetic_hint_auth
     assert!(cached.versions.contains_key("3.0.0"));
     assert_eq!(cached.latest_version_tag(), None);
     assert_eq!(cached.latest_version_hint(), None);
+}
+
+#[tokio::test]
+async fn selected_history_returns_a_firewall_refusal_without_trying_the_exact_document() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/pkg"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": "blocked_by_lpm_firewall",
+            "package": "pkg@1.0.0",
+            "verdict": "malicious",
+            "reason": "the registry policy refused this download"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/pkg/1.0.0"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let client = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_npm_registry_url(server.uri())
+        .with_cache_dir(None);
+
+    let error = client
+        .get_npm_version_from_history_with_timings("pkg", "1.0.0")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, LpmError::NpmFirewallBlocked(_)), "{error}");
 }
