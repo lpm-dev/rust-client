@@ -2284,12 +2284,15 @@ mod tests {
             let lpm_home = temp.path().join("lpm-home");
             std::fs::create_dir_all(&lpm_home).unwrap();
             let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            let (approved_tx, approved_rx) = std::sync::mpsc::channel::<()>();
+            // Holds the config lock from before `add` starts and writes the
+            // forced floor only once `add` is past its approval prompt.
             let writer = std::thread::spawn(move || {
                 let lock = lpm_common::try_acquire_exclusive_lock(lpm_home.join(".config.lock"))
                     .unwrap()
                     .expect("nothing else holds the config lock");
                 locked_tx.send(()).unwrap();
-                std::thread::sleep(std::time::Duration::from_millis(300));
+                approved_rx.recv().unwrap();
                 std::fs::write(
                     lpm_home.join("config.toml"),
                     "force-security-floor = true\n\n[firewall]\nmode = \"enforce\"\n",
@@ -2300,11 +2303,16 @@ mod tests {
             locked_rx.recv().unwrap();
             let specs = specs(&["fresh@1.0.0"]);
             let scope = global();
+            let mut prompts = 0;
 
             let error = run_add(
                 &plan(&specs, &scope, None, false),
                 vec![rule(&specs[0], None)],
-                |_| Ok(()),
+                |_| {
+                    prompts += 1;
+                    approved_tx.send(()).unwrap();
+                    Ok(())
+                },
             )
             .unwrap_err();
             writer.join().unwrap();
@@ -2313,6 +2321,7 @@ mod tests {
                 error.to_string().contains("force-security-floor"),
                 "{error}"
             );
+            assert_eq!(prompts, 1);
             assert!(saved_specs().is_empty());
         });
     }

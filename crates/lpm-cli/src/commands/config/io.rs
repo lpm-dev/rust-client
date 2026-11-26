@@ -95,7 +95,9 @@ async fn acquire_config_lock_with_timeout(
         }
         if started.elapsed() >= timeout {
             return Err(LpmError::Registry(format!(
-                "timed out after {} seconds waiting for the config transaction lock {}",
+                "timed out after {} seconds waiting for the config transaction lock {}. Another \
+                 LPM command is changing your settings, possibly waiting at an approval prompt; \
+                 finish or cancel it, then retry.",
                 timeout.as_secs_f64(),
                 path.display()
             )));
@@ -827,6 +829,12 @@ mod tests {
 
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert!(error.to_string().contains("timed out"), "got: {error}");
+        assert!(
+            error
+                .to_string()
+                .contains("finish or cancel it, then retry"),
+            "got: {error}"
+        );
     }
 
     #[test]
