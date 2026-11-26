@@ -1800,6 +1800,20 @@ fn read_manifest(content: &[u8]) -> Option<(ManifestTags, roles::EntryReferences
 
     let dependencies = parse_deps_map(parsed.get("dependencies"));
     let optional_dependencies = parse_deps_map(parsed.get("optionalDependencies"));
+    let mut peer_dependencies = parse_deps_map(parsed.get("peerDependencies"));
+    if let (Some(peers), Some(meta)) = (
+        peer_dependencies.as_mut(),
+        parsed
+            .get("peerDependenciesMeta")
+            .and_then(|meta| meta.as_object()),
+    ) {
+        peers.retain(|name, _| {
+            !meta
+                .get(name)
+                .and_then(|entry| entry.get("optional"))
+                .is_some_and(is_truthy)
+        });
+    }
 
     Some((
         manifest::analyze_manifest_with_privacy(
@@ -1807,9 +1821,21 @@ fn read_manifest(content: &[u8]) -> Option<(ManifestTags, roles::EntryReferences
             private_package,
             dependencies.as_ref(),
             optional_dependencies.as_ref(),
+            peer_dependencies.as_ref(),
         ),
         references,
     ))
+}
+
+/// Whether JavaScript reads `value` as true, as npm reads `peerDependenciesMeta`.
+fn is_truthy(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(value) => *value,
+        serde_json::Value::Number(number) => number.as_f64().is_some_and(|number| number != 0.0),
+        serde_json::Value::String(text) => !text.is_empty(),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => true,
+    }
 }
 
 /// Parse a JSON value into a HashMap<String, String> for dependency maps.
@@ -4149,6 +4175,52 @@ mod tests {
 
         assert!(!analysis.source.eval);
         assert_eq!(analysis.meta.files_scanned, 1);
+    }
+
+    #[test]
+    fn a_peer_dependency_an_install_adds_sets_the_git_and_http_tags() {
+        let analysis = analyze_every_way(&[
+            (
+                "package.json",
+                br#"{"name":"kit","license":"MIT",
+                    "peerDependencies":{"helper":"github:owner/helper","mirror":"http://example.com/m.tgz"}}"#,
+            ),
+            ("index.js", b"module.exports = 1"),
+        ]);
+
+        assert!(analysis.manifest.git_dependency);
+        assert!(analysis.manifest.http_dependency);
+    }
+
+    #[test]
+    fn a_peer_npm_reads_as_optional_by_any_true_value_sets_no_dependency_tag() {
+        let analysis = analyze_every_way(&[
+            (
+                "package.json",
+                br#"{"name":"plugin","license":"MIT",
+                    "peerDependencies":{"a":"github:owner/a","b":"github:owner/b"},
+                    "peerDependenciesMeta":{"a":{"optional":1},"b":{"optional":"yes"}}}"#,
+            ),
+            ("index.js", b"module.exports = 1"),
+        ]);
+
+        assert!(!analysis.manifest.git_dependency);
+    }
+
+    #[test]
+    fn optional_peers_and_any_version_peer_ranges_set_no_dependency_tag() {
+        let analysis = analyze_every_way(&[
+            (
+                "package.json",
+                br#"{"name":"plugin","license":"MIT",
+                    "peerDependencies":{"eslint":"*","react":"","helper":"github:owner/helper"},
+                    "peerDependenciesMeta":{"helper":{"optional":true}}}"#,
+            ),
+            ("index.js", b"module.exports = 1"),
+        ]);
+
+        assert!(!analysis.manifest.wildcard_dependency);
+        assert!(!analysis.manifest.git_dependency);
     }
 
     #[test]
