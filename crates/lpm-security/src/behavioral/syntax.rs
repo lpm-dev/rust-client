@@ -841,6 +841,8 @@ impl<'a> Visit<'a> for LiteralSpans<'_> {
 struct Parsed {
     executable: Vec<u8>,
     complete: bool,
+    /// The parser reported a syntax error.
+    syntax_error: bool,
     calls: Option<super::bindings::CallFacts>,
     random_literal: Option<bool>,
     path_literals: Option<PathLiterals>,
@@ -956,6 +958,7 @@ fn parse_above(
     Ok(Parsed {
         executable,
         complete,
+        syntax_error: parsed.fatal_error || parsed.diagnostics.has_errors(),
         calls,
         random_literal,
         path_literals,
@@ -1021,6 +1024,59 @@ fn parse(
         .ok()
     })
     .flatten()
+}
+
+/// [`parse`], and for JavaScript that has a syntax error and may close a JSX
+/// element ([`may_close_jsx_element`]), parsing again with JSX: React and
+/// React Native packages ship JSX in `.js` files.
+/// The JSX parse is kept when it has no syntax error; otherwise the first
+/// parse is.
+fn parse_javascript_or_jsx(
+    source: &str,
+    source_type: SourceType,
+    stripped: &mut Vec<u8>,
+    complete_input: bool,
+    in_test_file: bool,
+) -> Option<Parsed> {
+    let parsed = parse(source, source_type, stripped, complete_input, in_test_file)?;
+    if !parsed.syntax_error
+        || !source_type.is_javascript()
+        || source_type.is_jsx()
+        || !may_close_jsx_element(source.as_bytes())
+    {
+        return Some(parsed);
+    }
+    let masked = std::mem::replace(stripped, source.as_bytes().to_vec());
+    match parse(
+        source,
+        source_type.with_jsx(true),
+        stripped,
+        complete_input,
+        in_test_file,
+    ) {
+        Some(jsx) if !jsx.syntax_error => Some(jsx),
+        _ => {
+            *stripped = masked;
+            Some(parsed)
+        }
+    }
+}
+
+/// Whether `source` has a `/` right after a `<` or right before a `>`, with
+/// only whitespace between them, as every JSX element's closing tag or
+/// self-closing end has (`</a>`, `<a />`, `< /a>`, `<a / >`). Each
+/// whitespace run is crossed at most twice, so the check is linear.
+fn may_close_jsx_element(source: &[u8]) -> bool {
+    memchr::memchr_iter(b'/', source).any(|slash| {
+        let before = source[..slash]
+            .iter()
+            .rev()
+            .find(|byte| !byte.is_ascii_whitespace());
+        let after = source[slash + 1..]
+            .iter()
+            .find(|byte| !byte.is_ascii_whitespace());
+        before == Some(&b'<') || after == Some(&b'>')
+    })
 }
 
 /// Parses `source` as `source_type` and gives `inspect` the program and
@@ -1102,7 +1158,7 @@ impl<'s> SourceContext<'s> {
         let parsed = SourceType::from_path(filename)
             .ok()
             .and_then(|source_type| {
-                parse(source, source_type, stripped, complete_input, in_test_file)
+                parse_javascript_or_jsx(source, source_type, stripped, complete_input, in_test_file)
             });
         let Parsed {
             executable,
@@ -1110,9 +1166,11 @@ impl<'s> SourceContext<'s> {
             calls,
             random_literal,
             path_literals,
+            ..
         } = parsed.unwrap_or_else(|| Parsed {
             executable: source.as_bytes().to_vec(),
             complete: false,
+            syntax_error: true,
             calls: None,
             random_literal: None,
             path_literals: None,

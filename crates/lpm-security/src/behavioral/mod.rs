@@ -6015,6 +6015,61 @@ mod tests {
     }
 
     #[test]
+    fn javascript_files_written_with_jsx_parse_as_jsx() {
+        let analysis = analyze_every_way(&[
+            ("package.json", br#"{"name":"widgets","license":"MIT"}"#),
+            (
+                "index.js",
+                br#"import Widget from "./Widget"; export const App = () => <Widget onClick={() => eval(code)} />;"#,
+            ),
+            ("plain.js", b"module.exports = a < b ? c : d;"),
+        ]);
+
+        assert_eq!(analysis.meta.unparsed_files, 0);
+        assert!(analysis.source.eval);
+        assert_eq!(analysis.meta.eval_calls, 1);
+    }
+
+    #[test]
+    fn jsx_whose_closing_tags_are_spaced_out_parses_as_jsx() {
+        for source in [
+            "export const App = () => <Widget onClick={() => eval(code)} / >;",
+            "export const App = () => <div>{eval(code)}< /div>;",
+        ] {
+            let analysis = analyze_every_way(&[
+                ("package.json", br#"{"name":"widgets","license":"MIT"}"#),
+                ("index.js", source.as_bytes()),
+            ]);
+            assert_eq!(analysis.meta.unparsed_files, 0, "{source}");
+            assert_eq!(analysis.meta.eval_calls, 1, "{source}");
+        }
+    }
+
+    #[test]
+    fn a_rejected_jsx_parse_leaves_the_first_parse_s_comments_masked() {
+        // As JSX, the quote inside the tag opens a string that swallows the comment;
+        // the JSX parse fails, and the first parse's reading, with the comment
+        // masked as code, must be the one kept.
+        let analysis = analyze_every_way(&[
+            ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+            ("index.js", br#"const s = <a>'</a>; /* eval(code) */ '; )"#),
+        ]);
+
+        assert_eq!(analysis.meta.unparsed_files, 1);
+        assert!(analysis.source.eval);
+    }
+
+    #[test]
+    fn javascript_that_fails_with_and_without_jsx_stays_unparsed() {
+        let analysis = analyze_every_way(&[
+            ("package.json", br#"{"name":"broken","license":"MIT"}"#),
+            ("index.js", b"const value = ; eval(code)"),
+        ]);
+
+        assert_eq!(analysis.meta.unparsed_files, 1);
+    }
+
+    #[test]
     fn counts_the_eval_calls_of_runtime_files() {
         let analysis = analyze_every_way(&[
             ("package.json", br#"{"name":"kit","license":"MIT"}"#),
