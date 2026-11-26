@@ -702,7 +702,7 @@ pub(super) struct NpmFirewallChunkedPreflightConfig {
     /// Where each version a rule lifts is kept once its chunk is released to
     /// download, so the install can report it if it fails before this check
     /// reports.
-    pub(super) released_bypasses: Arc<super::FirewallBypassReport>,
+    pub(super) released_bypasses: Arc<super::ReleasedFirewallBypasses>,
 }
 
 pub(super) fn spawn_chunked_npm_firewall_preflight(
@@ -919,7 +919,7 @@ struct FirewallChunkDispatch<'a> {
     mode: NpmFirewallMode,
     policy_profile: NpmFirewallPolicyProfile,
     bypass: &'a FirewallBypassRules,
-    released_bypasses: &'a super::FirewallBypassReport,
+    released_bypasses: &'a super::ReleasedFirewallBypasses,
 }
 
 async fn spawn_or_release_firewall_chunk(
@@ -1119,15 +1119,49 @@ async fn apply_firewall_chunk_result(
     if !release {
         held_bypassed.append(&mut classified.bypassed);
     } else if enforce {
-        dispatch
-            .released_bypasses
-            .record_verdicts(mode, &classified.bypassed);
-    }
-    decisions.extend(stats.record_classified(classified));
-    if release {
+        hand_off_firewall_events(
+            fetch_tx,
+            chunk_result.events,
+            &classified.bypassed,
+            mode,
+            dispatch.released_bypasses,
+        )
+        .await;
+    } else {
         release_firewall_events(fetch_tx, chunk_result.events).await;
     }
+    decisions.extend(stats.record_classified(classified));
     enforce && chunk_has_block
+}
+
+/// Sends each of `events` to the downloader together with the lifted
+/// versions it carries, so the install's record of `released` names exactly
+/// what reached the downloader, and stops once the install closes it.
+async fn hand_off_firewall_events(
+    fetch_tx: &tokio::sync::mpsc::Sender<lpm_resolver::SelectedPackageEvent>,
+    events: Vec<lpm_resolver::SelectedPackageEvent>,
+    lifted: &[BypassedVerdict],
+    mode: NpmFirewallMode,
+    released: &super::ReleasedFirewallBypasses,
+) {
+    for event in events {
+        let Ok(permit) = fetch_tx.reserve().await else {
+            break;
+        };
+        let carried: Vec<&BypassedVerdict> = if lifted.is_empty() {
+            Vec::new()
+        } else {
+            lifted
+                .iter()
+                .filter(|verdict| {
+                    verdict.decision.name == event.name && verdict.decision.version == event.version
+                })
+                .collect()
+        };
+        if !released.hand_off(mode, carried, permit, event) {
+            break;
+        }
+    }
 }
 
 async fn release_firewall_events(

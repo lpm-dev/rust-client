@@ -2949,13 +2949,38 @@ async fn a_failed_batch_reports_no_lifted_version_since_nothing_downloaded() {
     assert!(bypassed_names(&result.stats).is_empty());
 }
 
+/// Waits until `server` has received `count` requests.
+async fn wait_for_requests(server: &wiremock::MockServer, count: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while server.received_requests().await.unwrap_or_default().len() < count {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the server never received {count} requests"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+fn record_names(record: &super::super::FirewallBypassRecord) -> Vec<&str> {
+    record
+        .bypassed
+        .iter()
+        .map(|bypassed| bypassed.decision.name.as_str())
+        .collect()
+}
+
 #[tokio::test]
 async fn a_lifted_version_is_kept_for_the_install_once_its_chunk_is_released() {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    let server =
-        ordered_failure_server("broken-a", 150, &[("released-b", 0), ("held-c", 450)], None).await;
+    let server = ordered_failure_server(
+        "broken-a",
+        1000,
+        &[("released-b", 0), ("held-c", 2000)],
+        None,
+    )
+    .await;
     let client = Arc::new(
         lpm_registry::RegistryClient::new()
             .with_base_url(server.uri())
@@ -2963,7 +2988,7 @@ async fn a_lifted_version_is_kept_for_the_install_once_its_chunk_is_released() {
     );
     let (selected_tx, selected_rx) = mpsc::channel(4);
     let (fetch_tx, mut fetch_rx) = mpsc::channel(4);
-    let released = Arc::new(super::super::FirewallBypassReport::default());
+    let released = Arc::new(super::super::ReleasedFirewallBypasses::default());
     let mut config = chunked_config(NpmFirewallMode::Enforce);
     config.bypass = FirewallBypassRules::preloaded(
         &[global_rule("released-b"), global_rule("held-c")],
@@ -2979,16 +3004,12 @@ async fn a_lifted_version_is_kept_for_the_install_once_its_chunk_is_released() {
     drop(selected_tx);
 
     assert_eq!(fetch_rx.recv().await.unwrap().name, "released-b");
+    wait_for_requests(&server, 3).await;
     // An install that fails now drops the check unfinished.
     drop(join);
-    let kept = released.take();
+    let kept = released.close();
 
-    let names: Vec<&str> = kept
-        .bypassed
-        .iter()
-        .map(|bypassed| bypassed.decision.name.as_str())
-        .collect();
-    assert_eq!(names, ["released-b"]);
+    assert_eq!(record_names(&kept), ["released-b"]);
     assert_eq!(kept.mode, Some(NpmFirewallMode::Enforce));
 }
 
@@ -2997,7 +3018,7 @@ async fn a_lifted_version_held_back_is_never_kept_as_released() {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    let server = ordered_failure_server("broken-a", 0, &[("held-c", 300)], None).await;
+    let server = ordered_failure_server("broken-a", 0, &[("held-c", 1000)], None).await;
     let client = Arc::new(
         lpm_registry::RegistryClient::new()
             .with_base_url(server.uri())
@@ -3005,7 +3026,7 @@ async fn a_lifted_version_held_back_is_never_kept_as_released() {
     );
     let (selected_tx, selected_rx) = mpsc::channel(4);
     let (fetch_tx, mut fetch_rx) = mpsc::channel(4);
-    let released = Arc::new(super::super::FirewallBypassReport::default());
+    let released = Arc::new(super::super::ReleasedFirewallBypasses::default());
     let mut config = chunked_config(NpmFirewallMode::Enforce);
     config.bypass =
         FirewallBypassRules::preloaded(&[global_rule("held-c")], Vec::new(), None, true);
@@ -3016,7 +3037,81 @@ async fn a_lifted_version_held_back_is_never_kept_as_released() {
     }
     drop(selected_tx);
 
-    assert!(join.drain().await.unwrap().failure.is_some());
+    let drained = join.drain().await.unwrap();
+    assert!(drained.failure.is_some());
+    assert_eq!(
+        drained.stats.block_count, 1,
+        "the held verdict was classified"
+    );
     assert!(fetch_rx.recv().await.is_none());
-    assert!(released.take().bypassed.is_empty());
+    assert!(released.close().bypassed.is_empty());
+}
+
+#[tokio::test]
+async fn a_lifted_version_still_waiting_for_room_to_download_is_not_kept() {
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let server = verdict_server(verdict_response(
+        2,
+        vec![
+            grouped_block("lifted-a", "suspicious", "lpm_ai_telemetry"),
+            grouped_block("lifted-b", "suspicious", "lpm_ai_telemetry"),
+        ],
+    ))
+    .await;
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("firewall-token"),
+    );
+    let (selected_tx, selected_rx) = mpsc::channel(4);
+    // Room for one download, so the chunk's second event waits.
+    let (fetch_tx, _fetch_rx) = mpsc::channel(1);
+    let probe = fetch_tx.clone();
+    let released = Arc::new(super::super::ReleasedFirewallBypasses::default());
+    let mut config = chunked_config(NpmFirewallMode::Enforce);
+    config.chunk_size = 2;
+    config.bypass = FirewallBypassRules::preloaded(
+        &[global_rule("lifted-a"), global_rule("lifted-b")],
+        Vec::new(),
+        None,
+        true,
+    );
+    config.released_bypasses = Arc::clone(&released);
+    let join = spawn_chunked_npm_firewall_preflight(selected_rx, fetch_tx, client, config);
+    for name in ["lifted-a", "lifted-b"] {
+        selected_tx.send(selected_event(name)).await.unwrap();
+    }
+    drop(selected_tx);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while probe.capacity() > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "nothing was handed off"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // Give the second event time to be recorded if it wrongly would be.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    drop(join);
+
+    assert_eq!(record_names(&released.close()), ["lifted-a"]);
+}
+
+#[tokio::test]
+async fn nothing_is_handed_off_once_the_install_closes_the_record() {
+    let released = super::super::ReleasedFirewallBypasses::default();
+    let (fetch_tx, mut fetch_rx) = tokio::sync::mpsc::channel(1);
+    let permit = fetch_tx.reserve().await.unwrap();
+
+    assert!(released.close().bypassed.is_empty());
+    assert!(!released.hand_off(
+        NpmFirewallMode::Enforce,
+        std::iter::empty(),
+        permit,
+        selected_event("late"),
+    ));
+    assert!(fetch_rx.try_recv().is_err());
 }

@@ -536,21 +536,10 @@ impl FirewallBypassReport {
         if verdicts.is_empty() {
             return;
         }
-        let mut record = self
-            .record
+        self.record
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        record.mode = Some(mode);
-        // A command can run several installs over one project, each
-        // checking the same versions again.
-        for bypassed in verdicts {
-            if !record.bypassed.iter().any(|recorded| {
-                recorded.decision.name == bypassed.decision.name
-                    && recorded.decision.version == bypassed.decision.version
-            }) {
-                record.bypassed.push(bypassed.clone());
-            }
-        }
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .add(mode, verdicts);
     }
 
     pub(crate) fn take(&self) -> FirewallBypassRecord {
@@ -573,6 +562,24 @@ pub(crate) struct FirewallBypassRecord {
 }
 
 impl FirewallBypassRecord {
+    /// Adds `verdicts`, each version once: a command can run several
+    /// installs over one project, each checking the same versions again.
+    fn add<'a>(
+        &mut self,
+        mode: crate::npm_firewall_config::NpmFirewallMode,
+        verdicts: impl IntoIterator<Item = &'a firewall::BypassedVerdict>,
+    ) {
+        for bypassed in verdicts {
+            self.mode = Some(mode);
+            if !self.bypassed.iter().any(|recorded| {
+                recorded.decision.name == bypassed.decision.name
+                    && recorded.decision.version == bypassed.decision.version
+            }) {
+                self.bypassed.push(bypassed.clone());
+            }
+        }
+    }
+
     /// Each version as `security.firewall.bypassed` reports it.
     pub(crate) fn bypassed_json(&self) -> Vec<serde_json::Value> {
         self.bypassed
@@ -709,7 +716,14 @@ pub(crate) async fn run_with_options_with_lpm_root(
     // the tokio reactor; the held handle lives for the lifetime of
     // the inner future and releases when the future returns.
     let store_lock_path = lpm_root.store_lock();
-    let released_firewall_bypasses = Arc::new(FirewallBypassReport::default());
+    let released_firewall_bypasses = Arc::new(ReleasedFirewallBypasses::default());
+    // Declared before the install so it reports after the install, and the
+    // streaming check it owns, are dropped.
+    let _unsettled_notice = UnsettledFirewallBypassNotice {
+        released: &released_firewall_bypasses,
+        command_report: expectations.firewall_bypass_report.as_deref(),
+        json_output,
+    };
     let install = lpm_common::with_shared_lock_async(
         store_lock_path,
         assert_send_install_future(run_with_options_under_store_lock(
@@ -752,38 +766,86 @@ pub(crate) async fn run_with_options_with_lpm_root(
             &lpm_root,
         )),
     );
-    let result = crate::trust_snapshot::scope_install(workspace_lockfile::scope_member_install(
+    crate::trust_snapshot::scope_install(workspace_lockfile::scope_member_install(
         project_dir,
         install,
     ))
-    .await;
-    if result.is_err() {
-        report_unsettled_firewall_bypasses(
-            &released_firewall_bypasses.take(),
-            expectations.firewall_bypass_report.as_deref(),
-            json_output,
-        );
-    }
-    result
+    .await
 }
 
-/// Reports what the streaming firewall check released to download past a
-/// block when the install failed before that check reported it, as when
-/// resolution or an access check fails while verdicts are still arriving.
-fn report_unsettled_firewall_bypasses(
-    released: &FirewallBypassRecord,
-    command_report: Option<&FirewallBypassReport>,
+/// The versions past a block that an install's streaming firewall check has
+/// handed to the downloader, kept until the check reports them itself. Once
+/// the install closes it, nothing more is handed off, so what the install
+/// reports is exactly what reached the downloader.
+#[derive(Debug, Default)]
+pub(crate) struct ReleasedFirewallBypasses {
+    state: std::sync::Mutex<ReleasedFirewallBypassState>,
+}
+
+#[derive(Debug, Default)]
+struct ReleasedFirewallBypassState {
+    closed: bool,
+    record: FirewallBypassRecord,
+}
+
+impl ReleasedFirewallBypasses {
+    /// Records `lifted` and sends `event` through `permit` as one step,
+    /// unless the install has closed the record. Returns whether `event` was
+    /// sent.
+    fn hand_off<'a>(
+        &self,
+        mode: crate::npm_firewall_config::NpmFirewallMode,
+        lifted: impl IntoIterator<Item = &'a firewall::BypassedVerdict>,
+        permit: tokio::sync::mpsc::Permit<'_, lpm_resolver::SelectedPackageEvent>,
+        event: lpm_resolver::SelectedPackageEvent,
+    ) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed {
+            return false;
+        }
+        state.record.add(mode, lifted);
+        permit.send(event);
+        true
+    }
+
+    /// Stops any further hand-off and returns what was handed off.
+    fn close(&self) -> FirewallBypassRecord {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.closed = true;
+        std::mem::take(&mut state.record)
+    }
+}
+
+/// Reports what the streaming firewall check handed to the downloader past a
+/// block when the install ends before that check reports it: on an error,
+/// such as a failed resolution or access check while verdicts are still
+/// arriving, or when the install is cancelled, as Ctrl-C does. A terminal
+/// prints it; a JSON error and the command's report carry it.
+struct UnsettledFirewallBypassNotice<'a> {
+    released: &'a ReleasedFirewallBypasses,
+    command_report: Option<&'a FirewallBypassReport>,
     json_output: bool,
-) {
-    if released.bypassed.is_empty() {
-        return;
-    }
-    if !json_output {
-        released.print();
-    }
-    PROCESS_FIREWALL_BYPASSES.record_all(released);
-    if let Some(report) = command_report {
-        report.record_all(released);
+}
+
+impl Drop for UnsettledFirewallBypassNotice<'_> {
+    fn drop(&mut self) {
+        let released = self.released.close();
+        if released.bypassed.is_empty() {
+            return;
+        }
+        if !self.json_output {
+            released.print();
+        }
+        PROCESS_FIREWALL_BYPASSES.record_all(&released);
+        if let Some(report) = self.command_report {
+            report.record_all(&released);
+        }
     }
 }
 
@@ -809,7 +871,7 @@ async fn run_with_options_under_store_lock(
     project_dir: &Path,
     policy_project_dir: &Path,
     expectations: &InstallExpectations,
-    released_firewall_bypasses: &Arc<FirewallBypassReport>,
+    released_firewall_bypasses: &Arc<ReleasedFirewallBypasses>,
     json_output: bool,
     offline: bool,
     frozen_lockfile: FrozenLockfileMode,
@@ -1744,7 +1806,7 @@ async fn run_with_options_under_store_lock(
         Some(join) => {
             let result = join.drain().await?;
             // The check reports what it released from here on.
-            released_firewall_bypasses.take();
+            released_firewall_bypasses.close();
             NpmFirewallOutcome::Settled(Box::new(finish_npm_firewall_preflight_into(
                 result,
                 json_output,

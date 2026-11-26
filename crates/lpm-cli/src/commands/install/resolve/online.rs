@@ -33,7 +33,7 @@ pub(in crate::commands::install) struct OnlineResolutionPhaseInput<'a> {
     pub(in crate::commands::install) npm_firewall_chunk_size: usize,
     /// Where the streaming firewall check keeps each version a rule lifts
     /// once it releases it to download.
-    pub(in crate::commands::install) npm_firewall_released_bypasses: Arc<FirewallBypassReport>,
+    pub(in crate::commands::install) npm_firewall_released_bypasses: Arc<ReleasedFirewallBypasses>,
     /// The integrities a migrated lockfile recorded, which a tarball-URL
     /// dependency is held to before it's extracted.
     pub(in crate::commands::install) locked_integrities: Option<&'a LockedIntegrities>,

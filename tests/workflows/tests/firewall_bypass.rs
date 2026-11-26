@@ -4,6 +4,8 @@
 
 mod support;
 
+#[cfg(unix)]
+use support::lpm_spawnable_with_registry;
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
 use support::{
     TempProject, lpm, lpm_with_registry, write_npm_firewall_global_config,
@@ -1754,7 +1756,7 @@ async fn an_install_whose_later_verdict_request_fails_still_reports_what_a_rule_
 
 #[tokio::test]
 async fn an_install_whose_verdict_request_fails_first_reports_no_held_back_version() {
-    let (_mock, output) = install_with_a_failing_verdict_request_in(
+    let (mock, output) = install_with_a_failing_verdict_request_in(
         std::time::Duration::from_millis(1500),
         std::time::Duration::ZERO,
         true,
@@ -1764,6 +1766,13 @@ async fn an_install_whose_verdict_request_fails_first_reports_no_held_back_versi
     assert!(!output.status.success());
     let envelope = json_envelope(&output);
     assert_eq!(envelope["success"], false, "{envelope:#}");
+    assert!(
+        envelope
+            .to_string()
+            .contains("npm firewall verdict preflight failed"),
+        "{envelope:#}"
+    );
+    assert_eq!(verdict_request_count(&mock).await, 2);
     assert!(envelope.get("security").is_none(), "{envelope:#}");
 }
 
@@ -1773,7 +1782,7 @@ async fn an_install_whose_verdict_request_fails_first_reports_no_held_back_versi
 async fn doctor_with_a_failing_verdict_request(
     lifted_after: std::time::Duration,
     failure_after: std::time::Duration,
-) -> (std::process::Output, std::process::Output) {
+) -> (MockRegistry, std::process::Output, std::process::Output) {
     let mock = MockRegistry::start().await;
     mock.with_package("agent-tool", "1.0.0", &make_tarball("agent-tool", "1.0.0"))
         .await;
@@ -1815,12 +1824,14 @@ async fn doctor_with_a_failing_verdict_request(
         }
         command.args(["doctor", "--fix", "--yes"]).output().unwrap()
     };
-    (doctor(true), doctor(false))
+    let json = doctor(true);
+    let terminal = doctor(false);
+    (mock, json, terminal)
 }
 
 #[tokio::test]
 async fn a_wrapper_reports_what_a_rule_let_through_before_a_verdict_request_failed() {
-    let (json, terminal) = doctor_with_a_failing_verdict_request(
+    let (_mock, json, terminal) = doctor_with_a_failing_verdict_request(
         std::time::Duration::ZERO,
         std::time::Duration::from_millis(1500),
     )
@@ -1841,7 +1852,7 @@ async fn a_wrapper_reports_what_a_rule_let_through_before_a_verdict_request_fail
 
 #[tokio::test]
 async fn a_wrapper_reports_no_lifted_version_held_back_after_a_verdict_request_failed() {
-    let (json, terminal) = doctor_with_a_failing_verdict_request(
+    let (mock, json, terminal) = doctor_with_a_failing_verdict_request(
         std::time::Duration::from_millis(1500),
         std::time::Duration::ZERO,
     )
@@ -1852,22 +1863,31 @@ async fn a_wrapper_reports_no_lifted_version_held_back_after_a_verdict_request_f
         envelope["fixes_failed"][0]["action"], "lpm install",
         "{envelope:#}"
     );
+    assert!(
+        envelope["fixes_failed"][0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("npm firewall verdict preflight failed")),
+        "{envelope:#}"
+    );
+    // Each of the two runs asks about both versions.
+    assert_eq!(verdict_request_count(&mock).await, 4);
     assert!(envelope.get("security").is_none(), "{envelope:#}");
     let stderr = String::from_utf8_lossy(&terminal.stderr);
     assert!(!stderr.contains("LPM Firewall allowed"), "{stderr}");
 }
 
 /// A registry where `agent-tool`, which a rule lifts, resolves at once and
-/// `missing-tool` is reported missing only after a delay, so an install of
-/// both fails resolving after `agent-tool` was released to download.
-async fn registry_failing_resolution_after_a_lifted_release() -> MockRegistry {
+/// `missing-tool` is reported missing only after `delay`, so an install of
+/// both is still resolving, or fails resolving, after `agent-tool` was
+/// released to download.
+async fn registry_failing_resolution_after_a_lifted_release(
+    delay: std::time::Duration,
+) -> MockRegistry {
     let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
     for metadata_path in ["/missing-tool", "/api/registry/missing-tool"] {
         Mock::given(method("GET"))
             .and(path(metadata_path))
-            .respond_with(
-                ResponseTemplate::new(404).set_delay(std::time::Duration::from_millis(1500)),
-            )
+            .respond_with(ResponseTemplate::new(404).set_delay(delay))
             .mount(mock.server())
             .await;
     }
@@ -1876,7 +1896,9 @@ async fn registry_failing_resolution_after_a_lifted_release() -> MockRegistry {
 
 #[tokio::test]
 async fn an_install_that_fails_after_releasing_a_lifted_version_still_reports_it() {
-    let mock = registry_failing_resolution_after_a_lifted_release().await;
+    let mock =
+        registry_failing_resolution_after_a_lifted_release(std::time::Duration::from_millis(1500))
+            .await;
     let project = enforcing_project();
     write_signed_firewall_bypass(
         &project,
@@ -1923,7 +1945,9 @@ async fn an_install_that_fails_after_releasing_a_lifted_version_still_reports_it
 
 #[tokio::test]
 async fn a_wrapper_reports_a_lifted_version_its_failed_install_released() {
-    let mock = registry_failing_resolution_after_a_lifted_release().await;
+    let mock =
+        registry_failing_resolution_after_a_lifted_release(std::time::Duration::from_millis(1500))
+            .await;
     let project = TempProject::empty(
         r#"{"name":"consumer","version":"1.0.0","dependencies":{"agent-tool":"1.0.0","missing-tool":"1.0.0"}}"#,
     );
@@ -2251,4 +2275,77 @@ async fn lone_global_update_prints_what_a_bypass_rule_let_through_once() {
         1,
         "{text}"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_interrupted_install_reports_a_lifted_version_it_released() {
+    for json in [false, true] {
+        let mock =
+            registry_failing_resolution_after_a_lifted_release(std::time::Duration::from_secs(30))
+                .await;
+        let project = enforcing_project();
+        write_signed_firewall_bypass(
+            &project,
+            &[stored_rule("agent-tool", serde_json::json!({}))],
+        );
+        let mut command = lpm_spawnable_with_registry(&project, &mock.url());
+        command.env("LPM_EXPERIMENT_NPM_FIREWALL_CHUNK_SIZE", "1");
+        if json {
+            command.arg("--json");
+        }
+        let mut child = command
+            .args([
+                "--color",
+                "never",
+                "install",
+                "--no-skills",
+                "agent-tool@1.0.0",
+                "missing-tool@1.0.0",
+            ])
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while mock.tarball_request_count("agent-tool", "1.0.0").await == 0 {
+            if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "the install never downloaded the lifted version: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-INT", &child.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let output = child.wait_with_output().unwrap();
+
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if json {
+            let envelope = json_envelope(&output);
+            assert!(
+                envelope.to_string().contains("Install interrupted"),
+                "{envelope:#}"
+            );
+            assert_eq!(
+                envelope["security"]["firewall"]["bypassed"][0]["name"], "agent-tool",
+                "{envelope:#}"
+            );
+        } else {
+            let notice = stderr.find(AGENT_TOOL_ALLOWED).expect(&stderr);
+            let error = stderr.find("Install interrupted").expect(&stderr);
+            assert!(
+                notice < error,
+                "the notice must come before the error: {stderr}"
+            );
+        }
+    }
 }
