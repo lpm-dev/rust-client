@@ -254,7 +254,7 @@ async fn install_dlx_target(
     let firewall_bypass_report = options
         .reserve_stdout
         .then(|| std::sync::Arc::new(crate::commands::install::FirewallBypassReport::default()));
-    crate::commands::install::run_with_options_with_lpm_root(
+    let installed = crate::commands::install::run_with_options_with_lpm_root(
         client,
         install.root(),
         options.reserve_stdout, // json_output
@@ -304,11 +304,12 @@ async fn install_dlx_target(
         }),
         lpm_common::LpmRoot::from_env()?,
     )
-    .await?;
+    .await;
+    // A failed install can have let a version through before it failed.
     if let Some(report) = firewall_bypass_report {
         report.take().print();
     }
-    Ok(())
+    installed
 }
 
 /// The cache entry's key: the target, and the receipt of the caller policy

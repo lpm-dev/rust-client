@@ -229,10 +229,12 @@ async fn apply_one(
         }
         DoctorFix::InstallProject => {
             phase(json_output, "fixing: lpm install");
-            *firewall_bypassed = run_doctor_install(client, project_dir).await?;
+            let install = run_doctor_install(client, project_dir).await;
+            *firewall_bypassed = install.firewall_bypassed;
             if !json_output {
                 firewall_bypassed.print();
             }
+            install.result?;
             Ok(Some("lpm install".into()))
         }
         DoctorFix::RemoveObsoleteBinaryLockfile => {

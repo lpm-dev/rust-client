@@ -865,6 +865,68 @@ async fn doctor_fix_names_what_a_block_stopped_in_its_failed_install() {
     );
 }
 
+/// A registry where a rule lets `agent-tool@1.0.0` past its block and its
+/// download then fails the integrity check, so the install fails after LPM
+/// Firewall let the version through.
+async fn registry_lifting_a_tarball_that_fails_its_check() -> MockRegistry {
+    let mock = registry_blocking("agent-tool", "suspicious", "lpm_ai_agent_control_surface").await;
+    let tarball_url = mock.tarball_url("agent-tool", "1.0.0");
+    let tarball_path = tarball_url.strip_prefix(&mock.url()).unwrap().to_string();
+    Mock::given(method("GET"))
+        .and(path(tarball_path))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(make_tarball("other-tool", "9.9.9")),
+        )
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    mock
+}
+
+/// Runs a quiet install's command where the install fails after a rule let a
+/// blocked version through.
+async fn run_through_a_failing_lifted_install(args: &[&str]) -> String {
+    let mock = registry_lifting_a_tarball_that_fails_its_check().await;
+    let project = project_depending_on_a_blocked_tool();
+    write_signed_firewall_bypass(
+        &project,
+        &[stored_rule("agent-tool", serde_json::json!({}))],
+    );
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--color", "never"])
+        .args(args)
+        .output()
+        .unwrap();
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+#[tokio::test]
+async fn quiet_installs_that_fail_after_a_rule_lifted_a_block_still_print_it() {
+    for args in [
+        &["doctor", "--fix", "--yes"][..],
+        &["dev", "--no-open", "--no-dashboard"][..],
+        &["--json", "dlx", "agent-tool@1.0.0"][..],
+    ] {
+        let text = run_through_a_failing_lifted_install(args).await;
+
+        assert!(text.contains("integrity"), "{args:?}: {text}");
+        assert!(
+            text.contains(
+                "! LPM Firewall allowed 1 blocked package because of your bypass rules:\n"
+            ),
+            "{args:?}: {text}"
+        );
+        assert!(
+            text.contains("    rule: agent-tool (every project)\n"),
+            "{args:?}: {text}"
+        );
+    }
+}
+
 async fn mount_blocked_global_update(mock: &MockRegistry, name: &str) {
     mount_global_update(mock, name, "block").await;
 }

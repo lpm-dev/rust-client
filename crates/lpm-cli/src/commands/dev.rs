@@ -3864,9 +3864,10 @@ async fn auto_install_if_stale(
         .await
     };
 
+    // A failed install can have let a version through before it failed.
+    firewall_bypass_report.take().print();
     match nested_install_result {
         Ok(()) => {
-            firewall_bypass_report.take().print();
             let elapsed = start.elapsed();
             Ok(format!("installed in {}", format_duration(elapsed)))
         }

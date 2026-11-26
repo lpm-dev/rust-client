@@ -5976,37 +5976,44 @@ async fn lpm_add_json_reports_a_source_dependency_a_bypass_rule_let_through() {
 async fn lpm_add_json_lists_a_source_package_a_bypass_rule_let_through_with_the_command_s_other_bypasses()
  {
     let mock = MockRegistry::start().await;
-    let source_tarball = make_tarball_from_pkg_json(
-        json!({ "name": "bypassed-source", "version": "1.0.0" }),
-        &[],
-    );
-    mock.with_package("bypassed-source", "1.0.0", &source_tarball)
+    mount_release_age_source_package(&mock, "bypassed-source", "bypassed-dep@1.0.0").await;
+    let dependency_tarball =
+        make_tarball_from_pkg_json(json!({ "name": "bypassed-dep", "version": "1.0.0" }), &[]);
+    mock.with_package("bypassed-dep", "1.0.0", &dependency_tarball)
         .await;
-    mock.with_npm_firewall_block("bypassed-source", "1.0.0")
-        .await;
+    for name in ["bypassed-source", "bypassed-dep"] {
+        mock.with_npm_firewall_block(name, "1.0.0").await;
+    }
     let project =
         TempProject::empty(r#"{"name":"add-firewall","version":"1.0.0","dependencies":{}}"#);
     write_lpm_proxy_npmrc(&project, &mock.url());
     write_npm_firewall_global_config(&project, "enforce");
     support::write_signed_firewall_bypass(
         &project,
-        &[json!({
-            "id": "fwb_source",
-            "spec": "bypassed-source@1.0.0",
-            "scope": "global",
-            "covers_malware": true,
-            "added_at": "2026-11-25T10:00:00Z",
-        })],
+        &[
+            json!({
+                "id": "fwb_source",
+                "spec": "bypassed-source@1.0.0",
+                "scope": "global",
+                "covers_malware": true,
+                "added_at": "2026-11-25T10:00:00Z",
+            }),
+            json!({
+                "id": "fwb_dep",
+                "spec": "bypassed-dep@1.0.0",
+                "scope": "global",
+                "covers_malware": true,
+                "added_at": "2026-11-25T10:00:00Z",
+            }),
+        ],
     );
 
     let output = lpm_with_registry(&project, &mock.url())
         .args([
             "add",
-            "bypassed-source",
+            "bypassed-source?withDependency=true",
             "--yes",
             "--json",
-            "--path",
-            "components",
             "--no-skills",
         ])
         .output()
@@ -6025,15 +6032,13 @@ async fn lpm_add_json_lists_a_source_package_a_bypass_rule_let_through_with_the_
     );
     let security = &envelope["security"]["firewall"];
     assert_eq!(security["mode"], "enforce", "{envelope:#}");
-    assert_eq!(
-        security["bypassed"].as_array().map(Vec::len),
-        Some(1),
-        "{envelope:#}"
-    );
-    assert_eq!(
-        security["bypassed"][0]["rule"]["spec"], "bypassed-source@1.0.0",
-        "{envelope:#}"
-    );
+    let names: Vec<&str> = security["bypassed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["name"].as_str())
+        .collect();
+    assert_eq!(names, ["bypassed-source", "bypassed-dep"], "{envelope:#}");
 }
 
 #[tokio::test]

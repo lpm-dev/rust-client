@@ -381,23 +381,18 @@ async fn run_fix_inner(
                     audit_fix_remove_optional_file(&lockfile_binary_path)?;
                 }
 
-                let firewall_bypassed =
-                    match crate::commands::install::run_silent_for_audit_fix(client, project_dir)
-                        .await
-                    {
-                        Ok(firewall_bypassed) => {
-                            if !json_output {
-                                firewall_bypassed.print();
-                            }
-                            firewall_bypassed
-                        }
-                        Err(error) => {
-                            if !json_output {
-                                install_ui::warn("install failed — restored original package.json");
-                            }
-                            return Err(error);
-                        }
-                    };
+                let install =
+                    crate::commands::install::run_silent_for_audit_fix(client, project_dir).await;
+                if !json_output {
+                    install.firewall_bypassed.print();
+                }
+                if let Err(error) = install.result {
+                    if !json_output {
+                        install_ui::warn("install failed — restored original package.json");
+                    }
+                    return Err(error);
+                }
+                let firewall_bypassed = install.firewall_bypassed;
                 verify_audit_fixes(client, project_dir, &planned).await?;
                 crate::commands::install::workspace_lockfile::commit_manifest_transaction(
                     transaction,

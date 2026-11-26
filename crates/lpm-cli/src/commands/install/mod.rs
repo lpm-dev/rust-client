@@ -336,16 +336,30 @@ pub async fn run_with_options(
     .await
 }
 
+/// A quiet install's outcome, with what LPM Firewall bypass rules let through,
+/// which the command reports whether or not the install finished.
+pub(crate) struct QuietInstall {
+    pub(crate) result: Result<(), LpmError>,
+    pub(crate) firewall_bypassed: FirewallBypassRecord,
+}
+
 /// Installs `project_dir` without output for a command that reports in its
-/// own words, as `lpm audit fix` and `lpm doctor --fix` do, and returns what
-/// LPM Firewall bypass rules let through for that command to report.
+/// own words, as `lpm audit fix` and `lpm doctor --fix` do.
 pub(crate) async fn run_silent_for_audit_fix(
     client: &RegistryClient,
     project_dir: &Path,
-) -> Result<FirewallBypassRecord, LpmError> {
-    let lpm_root = lpm_common::LpmRoot::from_env()?;
+) -> QuietInstall {
+    let lpm_root = match lpm_common::LpmRoot::from_env() {
+        Ok(lpm_root) => lpm_root,
+        Err(error) => {
+            return QuietInstall {
+                result: Err(error),
+                firewall_bypassed: FirewallBypassRecord::default(),
+            };
+        }
+    };
     let firewall_bypass_report = Arc::new(FirewallBypassReport::default());
-    run_with_options_with_lpm_root(
+    let result = run_with_options_with_lpm_root(
         client,
         project_dir,
         true,
@@ -383,8 +397,11 @@ pub(crate) async fn run_silent_for_audit_fix(
         )),
         lpm_root,
     )
-    .await?;
-    Ok(firewall_bypass_report.take())
+    .await;
+    QuietInstall {
+        result,
+        firewall_bypassed: firewall_bypass_report.take(),
+    }
 }
 
 /// What a caller requires of the packages an install resolves, checked
@@ -1693,6 +1710,13 @@ async fn run_with_options_under_store_lock(
             }
         }
     };
+    // What enforce mode let through downloads from here on, so it is reported
+    // even when a later step fails.
+    if let (NpmFirewallOutcome::Settled(stats), Some(report)) =
+        (&npm_firewall, &expectations.firewall_bypass_report)
+    {
+        report.record(stats);
+    }
     if post_firewall_fetch_overlap_allowed
         && fetch_overlap_join.is_none()
         && !packages.is_empty()
