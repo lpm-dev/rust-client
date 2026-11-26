@@ -91,7 +91,14 @@ async fn run_fix_inner(
     }
 
     if discovery.packages.is_empty() {
-        emit_audit_fix_report(&[], &[], dry_run, json_output, started_at.elapsed());
+        emit_audit_fix_report(
+            &[],
+            &[],
+            dry_run,
+            json_output,
+            started_at.elapsed(),
+            &crate::commands::install::FirewallBypassRecord::default(),
+        );
         return Ok(());
     }
 
@@ -325,6 +332,7 @@ async fn run_fix_inner(
             dry_run,
             json_output,
             started_at.elapsed(),
+            &crate::commands::install::FirewallBypassRecord::default(),
         );
         return audit_fix_completion(&skipped);
     }
@@ -373,24 +381,35 @@ async fn run_fix_inner(
                     audit_fix_remove_optional_file(&lockfile_binary_path)?;
                 }
 
-                if let Err(error) =
-                    crate::commands::install::run_silent_for_audit_fix(client, project_dir).await
-                {
+                let install =
+                    crate::commands::install::run_silent_for_audit_fix(client, project_dir).await;
+                if !json_output {
+                    install.firewall_bypassed.print();
+                }
+                if let Err(error) = install.result {
                     if !json_output {
+                        // The quiet install showed nothing of a block; its
+                        // error explains the rest.
+                        if let LpmError::NpmFirewallBlocked(blocked) = &error {
+                            for line in crate::cli::npm_firewall_block_package_lines(blocked) {
+                                install_ui::detail_line(line);
+                            }
+                        }
                         install_ui::warn("install failed — restored original package.json");
                     }
                     return Err(error);
                 }
+                let firewall_bypassed = install.firewall_bypassed;
                 verify_audit_fixes(client, project_dir, &planned).await?;
                 crate::commands::install::workspace_lockfile::commit_manifest_transaction(
                     transaction,
                 );
-                Ok(())
+                Ok(firewall_bypassed)
             },
         )
         .await;
 
-    fix_result?;
+    let firewall_bypassed = fix_result?;
 
     emit_audit_fix_report(
         &planned,
@@ -398,6 +417,7 @@ async fn run_fix_inner(
         dry_run,
         json_output,
         started_at.elapsed(),
+        &firewall_bypassed,
     );
     audit_fix_completion(&skipped)
 }
@@ -1241,6 +1261,7 @@ fn emit_audit_fix_report(
     dry_run: bool,
     json_output: bool,
     elapsed: std::time::Duration,
+    firewall_bypassed: &crate::commands::install::FirewallBypassRecord,
 ) {
     if json_output {
         let packages: Vec<_> = fixes
@@ -1262,19 +1283,19 @@ fn emit_audit_fix_report(
             .iter()
             .map(|skip| serde_json::json!({"name": skip.name, "reason": skip.reason}))
             .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "success": skipped.is_empty(),
-                "dry_run": dry_run,
-                "fixed": if dry_run { 0 } else { fixes.len() },
-                "planned": fixes.len(),
-                "packages": packages,
-                "skipped": skipped_json,
-                "elapsed_ms": elapsed.as_millis(),
-            }))
-            .unwrap()
-        );
+        let mut report = serde_json::json!({
+            "success": skipped.is_empty(),
+            "dry_run": dry_run,
+            "fixed": if dry_run { 0 } else { fixes.len() },
+            "planned": fixes.len(),
+            "packages": packages,
+            "skipped": skipped_json,
+            "elapsed_ms": elapsed.as_millis(),
+        });
+        if let Some(security) = firewall_bypassed.security_json() {
+            report["security"] = security;
+        }
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
         return;
     }
 

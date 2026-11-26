@@ -173,10 +173,14 @@ fn exit_with_clap_error(error: clap::Error, json_output: bool, help_hint: Option
 }
 
 pub(super) fn exit_with_lpm_error(error: &lpm_common::LpmError, json_output: bool) -> ! {
+    // The process exits without dropping an install still running in another
+    // task, so what it let through is reported here, before the error.
+    let firewall_bypassed =
+        crate::commands::install::settle_firewall_bypasses_before_exit(json_output, error);
     super::install_timeline::finish("error");
     super::dispatch::keep_state_ignored_at_exit();
     if json_output && !matches!(error, lpm_common::LpmError::ExitCode(_)) {
-        print_json_error(error);
+        print_json_error(error, &firewall_bypassed);
     } else if !json_output && !matches!(error, lpm_common::LpmError::ExitCode(_)) {
         render_slim_error(error);
     }
@@ -235,11 +239,17 @@ pub(crate) fn print_json_clap_error(error: &clap::Error, help_hint: Option<&str>
     );
 }
 
-fn print_json_error(error: &lpm_common::LpmError) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json_error_value(error)).unwrap()
-    );
+fn print_json_error(
+    error: &lpm_common::LpmError,
+    firewall_bypassed: &crate::commands::install::FirewallBypassRecord,
+) {
+    let mut json = json_error_value(error);
+    // A command can fail after an install let a blocked version through, as
+    // when `lpm migrate` verification fails, and the version stays installed.
+    if let Some(security) = firewall_bypassed.security_json() {
+        json["security"] = security;
+    }
+    println!("{}", serde_json::to_string_pretty(&json).unwrap());
 }
 
 /// The shared JSON error envelope for `error`, as the CLI prints it.
@@ -1283,6 +1293,7 @@ fn push_bypassed_lines(
     lines: &mut Vec<SlimErrorLine>,
     blocked: &lpm_common::NpmFirewallBlockedErrorContext,
 ) {
+    crate::commands::install::note_firewall_bypasses_listed(&blocked.bypassed);
     for bypassed in &blocked.bypassed {
         push_untrusted_detail(
             lines,

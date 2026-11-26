@@ -250,6 +250,8 @@ pub async fn run(
     output.verify()?;
 
     let target_set: Vec<String> = vec![plan.output_dir.display().to_string()];
+    let firewall_bypass_report =
+        std::sync::Arc::new(crate::commands::install::FirewallBypassReport::default());
 
     crate::commands::install::run_with_options_with_lpm_root(
         client,
@@ -301,18 +303,20 @@ pub async fn run(
         !json_output, // JSON belongs to the single deploy summary
         false,        // reserve_stdout: deploy owns no stdio protocol channel
         Some(crate::commands::install::InstallCallerContext {
-            route_table: crate::commands::install::load_install_route_table(
+            route_table: Some(crate::commands::install::load_install_route_table(
                 &plan.output_dir,
                 client,
-            )?,
+            )?),
             policy_project_dir: None,
             expected_root: None,
             locked_integrities: None,
             firewall_bypass_root: Some(cwd),
+            firewall_bypass_report: Some(std::sync::Arc::clone(&firewall_bypass_report)),
         }),
         lpm_common::LpmRoot::from_dir(plan.output_dir.join(".lpm")),
     )
     .await?;
+    let firewall_bypassed = firewall_bypass_report.take();
 
     output.verify()?;
     let internal_symlinks_retargeted = retarget_internal_node_modules_symlinks(&plan.output_dir)?;
@@ -355,7 +359,7 @@ pub async fn run(
 
     // The install pipeline reserves JSON stdout for this final result.
     if json_output {
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "success": true,
             "dry_run": false,
             "deployed": {
@@ -387,6 +391,9 @@ pub async fn run(
             "dependency_ignore_files": dependency_ignore_files,
             "duration_ms": elapsed.as_millis() as u64,
         });
+        if let Some(security) = firewall_bypassed.security_json() {
+            payload["security"] = security;
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&payload).unwrap_or_default()

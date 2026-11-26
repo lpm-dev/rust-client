@@ -81,6 +81,9 @@ pub(crate) struct RecursiveInstallOptions {
     pub(crate) audit_after_install: bool,
     pub(crate) timing: bool,
     pub(crate) workspace_concurrency: Option<NonZeroUsize>,
+    /// Where every member's install hands what LPM Firewall bypass rules let
+    /// through, for a command that reports instead of the summary.
+    pub(crate) firewall_bypass_report: Option<Arc<super::FirewallBypassReport>>,
 }
 
 struct WorkspaceInstallTarget {
@@ -789,19 +792,21 @@ async fn run_workspace_target_install(
     };
 
     let capture = options.json_output.then(report_capture::new_capture);
-    let caller_context = locked_integrities
-        .map(|locked| {
-            Ok::<_, LpmError>(super::InstallCallerContext {
-                route_table: super::source_resolution::load_install_route_table(
-                    &plan.path, &client,
-                )?,
-                policy_project_dir: None,
-                expected_root: None,
-                locked_integrities: Some(locked),
-                firewall_bypass_root: None,
-            })
+    let caller_context = if locked_integrities.is_some() || options.firewall_bypass_report.is_some()
+    {
+        Some(super::InstallCallerContext {
+            route_table: Some(super::source_resolution::load_install_route_table(
+                &plan.path, &client,
+            )?),
+            policy_project_dir: None,
+            expected_root: None,
+            locked_integrities,
+            firewall_bypass_root: None,
+            firewall_bypass_report: options.firewall_bypass_report.clone(),
         })
-        .transpose()?;
+    } else {
+        None
+    };
     let install = assert_send(run_with_options_with_lpm_root(
         &client,
         &plan.path,

@@ -3812,11 +3812,13 @@ async fn auto_install_if_stale(
     //
     // Use the injected client so nested installs preserve the caller's
     // registry, authentication, and test configuration.
+    let firewall_bypass_report =
+        std::sync::Arc::new(crate::commands::install::FirewallBypassReport::default());
     let nested_install_result = {
         let _stdout_suppressed = crate::output::suppress_stdout(true).map_err(LpmError::Script)?;
         let _stderr_suppressed = crate::output::suppress_stderr(true).map_err(LpmError::Script)?;
 
-        crate::commands::install::run_with_options(
+        crate::commands::install::run_with_options_with_lpm_root(
             client,
             project_dir,
             false, // json_output
@@ -3850,10 +3852,20 @@ async fn auto_install_if_stale(
             false, // audit_after_install: internal pipeline never runs audit
             false, // timing: dev auto-install does not expose install's --timing flag
             compatibility_bin_names,
+            true,
+            false,
+            Some(
+                crate::commands::install::InstallCallerContext::reporting_firewall_bypasses(
+                    std::sync::Arc::clone(&firewall_bypass_report),
+                ),
+            ),
+            lpm_common::LpmRoot::from_env()?,
         )
         .await
     };
 
+    // A failed install can have let a version through before it failed.
+    firewall_bypass_report.take().print();
     match nested_install_result {
         Ok(()) => {
             let elapsed = start.elapsed();

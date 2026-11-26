@@ -1533,6 +1533,7 @@ mod tests {
             audit_after_install: false,
             timing: false,
             workspace_concurrency: None,
+            firewall_bypass_report: None,
         };
         let target_inputs = [
             super::WorkspaceSyncNoopTargetInput {
@@ -1747,6 +1748,7 @@ mod tests {
             audit_after_install: false,
             timing: false,
             workspace_concurrency: None,
+            firewall_bypass_report: None,
         };
         let target_inputs = [
             super::WorkspaceSyncNoopTargetInput {

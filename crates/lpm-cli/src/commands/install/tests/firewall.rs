@@ -381,6 +381,7 @@ async fn chunked_enforce_firewall_preflight_exchanges_ci_oidc_token_once() {
             offline: false,
             chunk_size: 1,
             bypass: crate::firewall_bypass::FirewallBypassRules::none(),
+            released_bypasses: Arc::default(),
         },
     );
 
@@ -483,6 +484,7 @@ fn chunked_config(mode: NpmFirewallMode) -> NpmFirewallChunkedPreflightConfig {
         offline: false,
         chunk_size: 1,
         bypass: crate::firewall_bypass::FirewallBypassRules::none(),
+        released_bypasses: std::sync::Arc::default(),
     }
 }
 
@@ -2420,6 +2422,31 @@ fn one_version_bypassed_in_two_chunks_is_reported_once() {
     assert_eq!(stats.bypassed.len(), 1);
 }
 
+#[test]
+fn a_command_report_lists_a_version_its_installs_each_let_through_once() {
+    let bypassed = BypassedVerdict {
+        decision: decision("rechecked", "block"),
+        rule: crate::firewall_bypass::AppliedRule {
+            spec: "rechecked".into(),
+            id: Some("fwb_1".into()),
+            scope: crate::firewall_bypass::FirewallBypassScope::Global,
+            project_root: None,
+            source: "local",
+        },
+    };
+    let stats = NpmFirewallPreflightStats {
+        mode: NpmFirewallMode::Enforce,
+        bypassed: vec![bypassed],
+        ..NpmFirewallPreflightStats::default()
+    };
+    let report = crate::commands::install::FirewallBypassReport::default();
+
+    report.record(&stats);
+    report.record(&stats);
+
+    assert_eq!(report.take().bypassed_json().len(), 1);
+}
+
 #[tokio::test]
 async fn a_review_hold_under_a_managed_policy_names_no_rule_to_add() {
     let result = enforce_with_rules(
@@ -2920,4 +2947,618 @@ async fn a_failed_batch_reports_no_lifted_version_since_nothing_downloaded() {
         "the first batch's lifted verdict arrived"
     );
     assert!(bypassed_names(&result.stats).is_empty());
+}
+
+/// Waits until `server` has received `count` requests.
+async fn wait_for_requests(server: &wiremock::MockServer, count: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while server.received_requests().await.unwrap_or_default().len() < count {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the server never received {count} requests"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+fn record_names(record: &super::super::FirewallBypassRecord) -> Vec<&str> {
+    record
+        .bypassed
+        .iter()
+        .map(|bypassed| bypassed.decision.name.as_str())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_lifted_version_is_kept_for_the_install_once_its_chunk_is_released() {
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let server = ordered_failure_server(
+        "broken-a",
+        1000,
+        &[("released-b", 0), ("held-c", 2000)],
+        None,
+    )
+    .await;
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("firewall-token"),
+    );
+    let (selected_tx, selected_rx) = mpsc::channel(4);
+    let (fetch_tx, mut fetch_rx) = mpsc::channel(4);
+    let released = Arc::new(super::super::ReleasedFirewallBypasses::default());
+    let mut config = chunked_config(NpmFirewallMode::Enforce);
+    config.bypass = FirewallBypassRules::preloaded(
+        &[global_rule("released-b"), global_rule("held-c")],
+        Vec::new(),
+        None,
+        true,
+    );
+    config.released_bypasses = Arc::clone(&released);
+    let join = spawn_chunked_npm_firewall_preflight(selected_rx, fetch_tx, client, config);
+    for name in ["released-b", "broken-a", "held-c"] {
+        selected_tx.send(selected_event(name)).await.unwrap();
+    }
+    drop(selected_tx);
+
+    assert_eq!(fetch_rx.recv().await.unwrap().name, "released-b");
+    wait_for_requests(&server, 3).await;
+    // An install that fails now drops the check unfinished.
+    drop(join);
+    let kept = released.close();
+
+    assert_eq!(record_names(&kept), ["released-b"]);
+    assert_eq!(kept.mode, Some(NpmFirewallMode::Enforce));
+}
+
+#[tokio::test]
+async fn a_lifted_version_held_back_is_never_kept_as_released() {
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let server = ordered_failure_server("broken-a", 0, &[("held-c", 1000)], None).await;
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("firewall-token"),
+    );
+    let (selected_tx, selected_rx) = mpsc::channel(4);
+    let (fetch_tx, mut fetch_rx) = mpsc::channel(4);
+    let released = Arc::new(super::super::ReleasedFirewallBypasses::default());
+    let mut config = chunked_config(NpmFirewallMode::Enforce);
+    config.bypass =
+        FirewallBypassRules::preloaded(&[global_rule("held-c")], Vec::new(), None, true);
+    config.released_bypasses = Arc::clone(&released);
+    let join = spawn_chunked_npm_firewall_preflight(selected_rx, fetch_tx, client, config);
+    for name in ["broken-a", "held-c"] {
+        selected_tx.send(selected_event(name)).await.unwrap();
+    }
+    drop(selected_tx);
+
+    let drained = join.drain().await.unwrap();
+    assert!(drained.failure.is_some());
+    assert_eq!(
+        drained.stats.block_count, 1,
+        "the held verdict was classified"
+    );
+    assert!(fetch_rx.recv().await.is_none());
+    assert!(released.close().bypassed.is_empty());
+}
+
+#[tokio::test]
+async fn a_lifted_version_still_waiting_for_room_to_download_is_not_kept() {
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let server = verdict_server(verdict_response(
+        2,
+        vec![
+            grouped_block("lifted-a", "suspicious", "lpm_ai_telemetry"),
+            grouped_block("lifted-b", "suspicious", "lpm_ai_telemetry"),
+        ],
+    ))
+    .await;
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("firewall-token"),
+    );
+    let (selected_tx, selected_rx) = mpsc::channel(4);
+    // Room for one download, so the chunk's second event waits.
+    let (fetch_tx, _fetch_rx) = mpsc::channel(1);
+    let probe = fetch_tx.clone();
+    let released = Arc::new(super::super::ReleasedFirewallBypasses::default());
+    let mut config = chunked_config(NpmFirewallMode::Enforce);
+    config.chunk_size = 2;
+    config.bypass = FirewallBypassRules::preloaded(
+        &[global_rule("lifted-a"), global_rule("lifted-b")],
+        Vec::new(),
+        None,
+        true,
+    );
+    config.released_bypasses = Arc::clone(&released);
+    let join = spawn_chunked_npm_firewall_preflight(selected_rx, fetch_tx, client, config);
+    for name in ["lifted-a", "lifted-b"] {
+        selected_tx.send(selected_event(name)).await.unwrap();
+    }
+    drop(selected_tx);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while probe.capacity() > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "nothing was handed off"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // Give the second event time to be recorded if it wrongly would be.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    drop(join);
+
+    assert_eq!(record_names(&released.close()), ["lifted-a"]);
+}
+
+/// A version a rule lifted, as the check records it.
+async fn lifted_verdict(name: &str) -> BypassedVerdict {
+    enforce_with_rules(
+        verdict_response(
+            1,
+            vec![grouped_block(name, "suspicious", "lpm_ai_telemetry")],
+        ),
+        &[name],
+        FirewallBypassRules::preloaded(&[global_rule(name)], Vec::new(), None, true),
+    )
+    .await
+    .stats
+    .bypassed
+    .remove(0)
+}
+
+#[tokio::test]
+async fn nothing_is_handed_off_once_the_install_closes_the_record() {
+    let released = super::super::ReleasedFirewallBypasses::default();
+    let lifted = lifted_verdict("late").await;
+    let (fetch_tx, mut fetch_rx) = tokio::sync::mpsc::channel(1);
+    let permit = fetch_tx.reserve().await.unwrap();
+
+    assert!(released.close().bypassed.is_empty());
+    assert!(!released.hand_off(
+        NpmFirewallMode::Enforce,
+        [&lifted],
+        permit,
+        selected_event("late"),
+        &fetch_tx,
+    ));
+    assert!(fetch_rx.try_recv().is_err());
+    assert!(released.close().bypassed.is_empty());
+}
+
+#[tokio::test]
+async fn nothing_is_handed_off_once_the_downloader_stops() {
+    let released = super::super::ReleasedFirewallBypasses::default();
+    let lifted = lifted_verdict("orphan").await;
+    let (fetch_tx, fetch_rx) = tokio::sync::mpsc::channel(1);
+    let permit = fetch_tx.reserve().await.unwrap();
+    drop(fetch_rx);
+
+    assert!(!released.hand_off(
+        NpmFirewallMode::Enforce,
+        [&lifted],
+        permit,
+        selected_event("orphan"),
+        &fetch_tx,
+    ));
+    assert!(released.close().bypassed.is_empty());
+}
+
+#[tokio::test]
+async fn an_error_exit_closes_every_record_an_install_still_holds() {
+    let registry = super::super::OpenReleases::new();
+    let process = super::super::FirewallBypassReport::default();
+    let first = registry.open();
+    let second = registry.open();
+    drop(registry.open());
+    let (fetch_tx, mut fetch_rx) = tokio::sync::mpsc::channel(4);
+    for (record, name) in [(&first, "first-tool"), (&second, "second-tool")] {
+        assert!(record.hand_off(
+            NpmFirewallMode::Enforce,
+            [&lifted_verdict(name).await],
+            fetch_tx.reserve().await.unwrap(),
+            selected_event(name),
+            &fetch_tx,
+        ));
+    }
+
+    registry.close_all_into(&process);
+
+    let mut names = record_names(&process.take())
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, ["first-tool", "second-tool"]);
+    // A member still running, or one starting after the exit began, hands off
+    // nothing more.
+    let late = lifted_verdict("late-tool").await;
+    for record in [&first, &registry.open()] {
+        assert!(!record.hand_off(
+            NpmFirewallMode::Enforce,
+            [&late],
+            fetch_tx.reserve().await.unwrap(),
+            selected_event("late-tool"),
+            &fetch_tx,
+        ));
+    }
+    assert_eq!(fetch_rx.recv().await.unwrap().name, "first-tool");
+    assert_eq!(fetch_rx.recv().await.unwrap().name, "second-tool");
+    assert!(fetch_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn closing_a_record_into_the_process_record_happens_as_one_step() {
+    let released = super::super::ReleasedFirewallBypasses::default();
+    let process = super::super::FirewallBypassReport::default();
+    let (fetch_tx, _fetch_rx) = tokio::sync::mpsc::channel(1);
+    assert!(released.hand_off(
+        NpmFirewallMode::Enforce,
+        [&lifted_verdict("member-tool").await],
+        fetch_tx.reserve().await.unwrap(),
+        selected_event("member-tool"),
+        &fetch_tx,
+    ));
+
+    let closed = released.close_into(&process);
+
+    assert_eq!(record_names(&closed), ["member-tool"]);
+    assert_eq!(record_names(&process.take()), ["member-tool"]);
+    // Whoever closes it second finds it empty, and already in the process
+    // record.
+    assert!(released.close().bypassed.is_empty());
+}
+
+#[tokio::test]
+async fn an_exit_prints_only_what_was_never_shown_and_nothing_after() {
+    let notices = super::super::FirewallBypassNotices::new();
+    let shown = lifted_verdict("shown-tool").await;
+    let unshown = lifted_verdict("unshown-tool").await;
+    let mut written: Vec<Vec<String>> = Vec::new();
+    let names = |verdicts: &[BypassedVerdict]| {
+        verdicts
+            .iter()
+            .map(|verdict| verdict.decision.name.clone())
+            .collect::<Vec<_>>()
+    };
+
+    notices.show(std::slice::from_ref(&shown), |verdicts| {
+        written.push(names(verdicts));
+    });
+    notices.close_for_exit(
+        &super::super::FirewallBypassRecord {
+            mode: Some(NpmFirewallMode::Enforce),
+            bypassed: vec![shown.clone(), unshown.clone()],
+        },
+        |record| written.push(names(&record.bypassed)),
+    );
+    notices.show(std::slice::from_ref(&unshown), |verdicts| {
+        written.push(names(verdicts));
+    });
+
+    assert_eq!(written, [vec!["shown-tool"], vec!["unshown-tool"]]);
+}
+
+#[tokio::test]
+async fn a_request_failure_reports_no_lifted_version_the_downloader_never_took() {
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let server = ordered_failure_server("broken-a", 1000, &[("lifted-b", 0)], None).await;
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("firewall-token"),
+    );
+    let (selected_tx, selected_rx) = mpsc::channel(4);
+    let (fetch_tx, fetch_rx) = mpsc::channel(4);
+    // The downloader has already stopped, as when the install is ending.
+    drop(fetch_rx);
+    let released = Arc::new(super::super::ReleasedFirewallBypasses::default());
+    let mut config = chunked_config(NpmFirewallMode::Enforce);
+    config.bypass =
+        FirewallBypassRules::preloaded(&[global_rule("lifted-b")], Vec::new(), None, true);
+    config.released_bypasses = Arc::clone(&released);
+    let join = spawn_chunked_npm_firewall_preflight(selected_rx, fetch_tx, client, config);
+    for name in ["lifted-b", "broken-a"] {
+        selected_tx.send(selected_event(name)).await.unwrap();
+    }
+    drop(selected_tx);
+
+    let drained = join.drain().await.unwrap();
+
+    assert!(drained.failure.is_some());
+    assert!(bypassed_names(&drained.stats).is_empty());
+    assert!(released.close().bypassed.is_empty());
+}
+
+#[tokio::test]
+async fn a_check_settles_its_record_unless_an_exit_closed_it_first() {
+    let process = super::super::FirewallBypassReport::default();
+    let (fetch_tx, _fetch_rx) = tokio::sync::mpsc::channel(2);
+    let settled = super::super::ReleasedFirewallBypasses::default();
+    assert!(settled.hand_off(
+        NpmFirewallMode::Enforce,
+        [&lifted_verdict("member-tool").await],
+        fetch_tx.reserve().await.unwrap(),
+        selected_event("member-tool"),
+        &fetch_tx,
+    ));
+
+    let stats = NpmFirewallPreflightStats {
+        mode: NpmFirewallMode::Enforce,
+        bypassed: vec![lifted_verdict("checked-tool").await],
+        ..NpmFirewallPreflightStats::default()
+    };
+
+    assert!(settled.settle_into(&process, &stats));
+    let mut names = record_names(&process.take())
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, ["checked-tool", "member-tool"]);
+    // Settling closes it: no second settle, and nothing more handed off.
+    assert!(!settled.settle_into(&process, &stats));
+    assert!(!settled.hand_off(
+        NpmFirewallMode::Enforce,
+        [&lifted_verdict("late-tool").await],
+        fetch_tx.reserve().await.unwrap(),
+        selected_event("late-tool"),
+        &fetch_tx,
+    ));
+
+    let taken_by_exit = super::super::ReleasedFirewallBypasses::default();
+    taken_by_exit.close();
+    assert!(!taken_by_exit.settle_into(&process, &stats));
+    assert!(process.take().bypassed.is_empty());
+}
+
+#[tokio::test]
+async fn a_second_closer_waits_until_the_first_has_added_the_record() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let released = Arc::new(super::super::ReleasedFirewallBypasses::default());
+    let process = Arc::new(super::super::FirewallBypassReport::default());
+    let (fetch_tx, _fetch_rx) = tokio::sync::mpsc::channel(1);
+    assert!(released.hand_off(
+        NpmFirewallMode::Enforce,
+        [&lifted_verdict("member-tool").await],
+        fetch_tx.reserve().await.unwrap(),
+        selected_event("member-tool"),
+        &fetch_tx,
+    ));
+    // Holding the process record pauses the first closer while it adds.
+    let held = process.record.lock().unwrap();
+    let first = {
+        let (released, process) = (Arc::clone(&released), Arc::clone(&process));
+        std::thread::spawn(move || released.close_into(&process))
+    };
+    // The first closer holds the record while it waits to add; one that let
+    // go of it first shows a closed record here, and the test then fails.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match released.state.try_lock() {
+            Err(_) => break,
+            Ok(state) if state.closed => break,
+            Ok(_) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the first closer never started"
+                );
+                std::thread::yield_now();
+            }
+        }
+    }
+    let second_done = Arc::new(AtomicBool::new(false));
+    let (starting_tx, starting_rx) = std::sync::mpsc::channel();
+    let second = {
+        let (released, second_done) = (Arc::clone(&released), Arc::clone(&second_done));
+        std::thread::spawn(move || {
+            starting_tx.send(()).unwrap();
+            let record = released.close();
+            second_done.store(true, Ordering::SeqCst);
+            record
+        })
+    };
+    starting_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        !second_done.load(Ordering::SeqCst),
+        "the second closer must wait while the first adds the record"
+    );
+    drop(held);
+
+    assert_eq!(record_names(&first.join().unwrap()), ["member-tool"]);
+    assert!(second.join().unwrap().bypassed.is_empty());
+    assert_eq!(record_names(&process.take()), ["member-tool"]);
+}
+
+#[tokio::test]
+async fn an_exit_waits_for_a_notice_being_written_and_does_not_repeat_it() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let notices = Arc::new(super::super::FirewallBypassNotices::new());
+    let lifted = lifted_verdict("member-tool").await;
+    let (writing_tx, writing_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let member = {
+        let (notices, lifted) = (Arc::clone(&notices), lifted.clone());
+        std::thread::spawn(move || {
+            notices.show(std::slice::from_ref(&lifted), |_| {
+                writing_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+            });
+        })
+    };
+    writing_rx.recv().unwrap();
+    let exit_done = Arc::new(AtomicBool::new(false));
+    let exit_wrote = Arc::new(AtomicBool::new(false));
+    let (starting_tx, starting_rx) = std::sync::mpsc::channel();
+    let exit = {
+        let (notices, exit_done, exit_wrote) = (
+            Arc::clone(&notices),
+            Arc::clone(&exit_done),
+            Arc::clone(&exit_wrote),
+        );
+        std::thread::spawn(move || {
+            starting_tx.send(()).unwrap();
+            notices.close_for_exit(
+                &super::super::FirewallBypassRecord {
+                    mode: Some(NpmFirewallMode::Enforce),
+                    bypassed: vec![lifted],
+                },
+                |_| exit_wrote.store(true, Ordering::SeqCst),
+            );
+            exit_done.store(true, Ordering::SeqCst);
+        })
+    };
+    starting_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        !exit_done.load(Ordering::SeqCst),
+        "the exit must wait for the notice being written"
+    );
+    go_tx.send(()).unwrap();
+
+    member.join().unwrap();
+    exit.join().unwrap();
+    assert!(
+        !exit_wrote.load(Ordering::SeqCst),
+        "the notice printed once"
+    );
+}
+
+#[tokio::test]
+async fn a_block_reports_what_its_check_lifted_itself() {
+    let listed = lifted_verdict("listed-tool").await;
+    let elsewhere = lifted_verdict("elsewhere-tool").await;
+    let recorded = || super::super::FirewallBypassRecord {
+        mode: Some(NpmFirewallMode::Enforce),
+        bypassed: vec![listed.clone(), elsewhere.clone()],
+    };
+    let block =
+        LpmError::NpmFirewallBlocked(Box::new(lpm_common::NpmFirewallBlockedErrorContext {
+            source: lpm_common::NpmFirewallBlockSource::Preflight,
+            packages: Vec::new(),
+            unattributed_count: 0,
+            unchecked_reason: None,
+            bypassed: vec![lpm_common::NpmFirewallBypassedPackage {
+                name: "listed-tool".into(),
+                version: "1.0.0".into(),
+                rule: "listed-tool".into(),
+            }],
+            bypass_command: None,
+            bypass_unavailable_reason: None,
+        }));
+
+    assert_eq!(
+        record_names(&super::super::without_versions_the_error_lists(
+            recorded(),
+            &block
+        )),
+        ["elsewhere-tool"]
+    );
+    assert_eq!(
+        record_names(&super::super::without_versions_the_error_lists(
+            recorded(),
+            &LpmError::Registry("another member failed".into())
+        )),
+        ["listed-tool", "elsewhere-tool"]
+    );
+}
+
+#[tokio::test]
+async fn an_exit_names_a_blocked_checks_downloads_unless_that_block_is_reported() {
+    let earlier = lifted_verdict("earlier-tool").await;
+    let downloaded = lifted_verdict("downloaded-tool").await;
+    let record = |bypassed: Vec<BypassedVerdict>| super::super::FirewallBypassRecord {
+        mode: Some(NpmFirewallMode::Enforce),
+        bypassed,
+    };
+    // An earlier check let `earlier-tool` through; a later one downloaded
+    // `downloaded-tool`, then blocked, listing both.
+    let let_through = record(vec![earlier]);
+    let blocked_downloads = record(vec![downloaded]);
+    let block =
+        LpmError::NpmFirewallBlocked(Box::new(lpm_common::NpmFirewallBlockedErrorContext {
+            source: lpm_common::NpmFirewallBlockSource::Preflight,
+            packages: Vec::new(),
+            unattributed_count: 0,
+            unchecked_reason: None,
+            bypassed: ["earlier-tool", "downloaded-tool"]
+                .into_iter()
+                .map(|name| lpm_common::NpmFirewallBypassedPackage {
+                    name: name.into(),
+                    version: "1.0.0".into(),
+                    rule: name.into(),
+                })
+                .collect(),
+            bypass_command: None,
+            bypass_unavailable_reason: None,
+        }));
+
+    assert_eq!(
+        record_names(&super::super::exit_record(
+            let_through.clone(),
+            blocked_downloads.clone(),
+            &block
+        )),
+        ["earlier-tool"]
+    );
+    assert_eq!(
+        record_names(&super::super::exit_record(
+            let_through,
+            blocked_downloads,
+            &LpmError::Registry("another member failed".into())
+        )),
+        ["earlier-tool", "downloaded-tool"]
+    );
+}
+
+#[tokio::test]
+async fn a_lifted_version_the_downloader_never_took_fails_the_check() {
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let server = verdict_server(verdict_response(
+        1,
+        vec![grouped_block("lifted-b", "suspicious", "lpm_ai_telemetry")],
+    ))
+    .await;
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("firewall-token"),
+    );
+    let (selected_tx, selected_rx) = mpsc::channel(4);
+    let (fetch_tx, fetch_rx) = mpsc::channel(4);
+    drop(fetch_rx);
+    let mut config = chunked_config(NpmFirewallMode::Enforce);
+    config.bypass =
+        FirewallBypassRules::preloaded(&[global_rule("lifted-b")], Vec::new(), None, true);
+    let join = spawn_chunked_npm_firewall_preflight(selected_rx, fetch_tx, client, config);
+    selected_tx.send(selected_event("lifted-b")).await.unwrap();
+    drop(selected_tx);
+
+    let drained = join.drain().await.unwrap();
+
+    assert!(drained.failure.is_some(), "the install can't go on past it");
+    assert!(bypassed_names(&drained.stats).is_empty());
+    assert!(!npm_firewall_preflight_lets_through(&drained));
 }

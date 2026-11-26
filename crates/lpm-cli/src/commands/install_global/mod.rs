@@ -121,7 +121,8 @@ pub async fn run(
         // validate_install_root returns MissingMarker, and roll-back
         // removes the pending row + cleans the install root. Single
         // cleanup code path, called from one place.
-        do_install(&root, &registry, &prep, json_output, &overrides).await?;
+        let firewall_bypassed =
+            do_install(&root, &registry, &prep, json_output, &overrides).await?;
         let commands = match discover_materialized_bin_commands(&prep.install_root, &prep.name) {
             Ok(commands) => commands,
             Err(e) => {
@@ -191,7 +192,7 @@ pub async fn run(
         let hint = crate::path_onboarding::maybe_show_path_hint(&root, json_output);
 
         // ─── Output ────────────────────────────────────────────────────
-        print_success(&active, &hint, json_output);
+        print_success(&active, &hint, &firewall_bypassed, json_output);
 
         // ─── Step 6: post-install blocked-scripts warning ──────
         // Mirrors the project-level post-install security summary

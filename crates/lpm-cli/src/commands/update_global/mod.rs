@@ -296,10 +296,7 @@ pub async fn run(
         ordered_results[index] = Some(
             match execute_upgrade(&root, &install_registry, prep, json_output).await {
                 Ok(output) => UpgradeResult::Upgraded(output),
-                Err((package, error)) => UpgradeResult::Failed {
-                    package,
-                    failure: UpdateFailure::from_error(&error).shown_by_install(!json_output),
-                },
+                Err((package, failure)) => UpgradeResult::Failed { package, failure },
             },
         );
     } else {
@@ -728,6 +725,10 @@ struct UpdateFailure {
     firewall_block: Option<Box<lpm_common::NpmFirewallBlockedErrorContext>>,
     /// The nested install already listed the blocked versions.
     details_shown: bool,
+    /// What bypass rules let through before the update failed.
+    firewall_bypassed: crate::commands::install::FirewallBypassRecord,
+    /// The nested install already printed `firewall_bypassed`.
+    firewall_bypassed_shown: bool,
 }
 
 impl UpdateFailure {
@@ -744,7 +745,21 @@ impl UpdateFailure {
             reason: reason.to_string(),
             firewall_block: None,
             details_shown: false,
+            firewall_bypassed: crate::commands::install::FirewallBypassRecord::default(),
+            firewall_bypassed_shown: false,
         }
+    }
+
+    /// Keeps what bypass rules let through before the update failed, and
+    /// whether its install already printed it.
+    fn with_firewall_bypassed(
+        mut self,
+        firewall_bypassed: crate::commands::install::FirewallBypassRecord,
+        shown: bool,
+    ) -> Self {
+        self.firewall_bypassed = firewall_bypassed;
+        self.firewall_bypassed_shown = shown;
+        self
     }
 
     /// For a failure whose install printed its own output: it lists blocked
@@ -802,6 +817,8 @@ impl UpdateFailure {
             reason,
             firewall_block,
             details_shown: false,
+            firewall_bypassed: crate::commands::install::FirewallBypassRecord::default(),
+            firewall_bypassed_shown: false,
         }
     }
 
@@ -816,6 +833,9 @@ impl UpdateFailure {
                 crate::cli::json_error_value(&LpmError::NpmFirewallBlocked(blocked.clone()));
             json["error_code"] = envelope["error_code"].clone();
             json["error"] = envelope["error"].clone();
+        }
+        if let Some(security) = self.firewall_bypassed.security_json() {
+            json["security"] = security;
         }
         json
     }
@@ -971,62 +991,58 @@ async fn execute_upgrade_batch(
     }
 
     let installs = bounded_install_stream(ready.into_iter().map(|upgrade| async move {
-        let install_result = async {
-            do_install_upgrade(
-                root,
-                registry,
-                &upgrade.prep,
-                &upgrade.staged,
-                suppress_nested_output,
-            )
-            .await?;
-            let commands = discover_bin_commands(&upgrade.staged.install_root, &upgrade.prep.name)?;
-            if commands.is_empty() {
-                return Err(LpmError::Script(format!(
-                    "package '{}' exposes no bin entries — refusing to upgrade",
-                    upgrade.prep.name
-                )));
-            }
-            write_marker(
-                &upgrade.staged.install_root,
-                &InstallReadyMarker::new(commands),
-            )?;
-            Ok(())
-        }
+        let installed = do_install_upgrade(
+            root,
+            registry,
+            &upgrade.prep,
+            &upgrade.staged,
+            suppress_nested_output,
+        )
         .await;
-        (upgrade, install_result)
+        let result = installed
+            .result
+            .and_then(|()| mark_upgrade_ready(&upgrade.staged, &upgrade.prep.name));
+        (upgrade, result, installed.firewall_bypassed)
     }));
     futures::pin_mut!(installs);
     let mut commit_ready = Vec::with_capacity(upgrade_count);
-    while let Some((upgrade, install_result)) = installs.next().await {
+    while let Some((upgrade, install_result, firewall_bypassed)) = installs.next().await {
         match install_result {
-            Ok(()) => commit_ready.push(upgrade),
+            Ok(()) => commit_ready.push((upgrade, firewall_bypassed)),
             Err(error) => results.push((
                 upgrade.index,
                 UpgradeResult::Failed {
                     package: upgrade.prep.name.clone(),
-                    failure: UpdateFailure::from_error(&error),
+                    failure: UpdateFailure::from_error(&error)
+                        .with_firewall_bypassed(firewall_bypassed, !suppress_nested_output),
                 },
             )),
         }
     }
 
     if !commit_ready.is_empty() {
-        commit_ready.sort_by_key(|upgrade| upgrade.index);
+        commit_ready.sort_by_key(|(upgrade, _)| upgrade.index);
         let commit_inputs = commit_ready
             .iter()
-            .map(|upgrade| (upgrade.prep.as_ref(), &upgrade.staged))
+            .map(|(upgrade, _)| (upgrade.prep.as_ref(), &upgrade.staged))
             .collect::<Vec<_>>();
         match with_exclusive_lock(root.global_tx_lock(), || {
             commit_upgrade_batch_locked(root, &commit_inputs)
         }) {
             Ok(commit_results) => {
-                for (upgrade, commit_result) in commit_ready.into_iter().zip(commit_results) {
+                for ((upgrade, firewall_bypassed), commit_result) in
+                    commit_ready.into_iter().zip(commit_results)
+                {
                     let result = match commit_result {
-                        Ok(output) => UpgradeResult::Upgraded(output),
+                        Ok(output) => UpgradeResult::Upgraded(UpgradeOutput {
+                            firewall_bypassed,
+                            firewall_bypassed_shown: !suppress_nested_output,
+                            ..output
+                        }),
                         Err(error) => UpgradeResult::Failed {
                             package: upgrade.prep.name.clone(),
-                            failure: UpdateFailure::from_error(&error),
+                            failure: UpdateFailure::from_error(&error)
+                                .with_firewall_bypassed(firewall_bypassed, !suppress_nested_output),
                         },
                     };
                     results.push((upgrade.index, result));
@@ -1034,15 +1050,22 @@ async fn execute_upgrade_batch(
             }
             Err(error) => {
                 let failure = UpdateFailure::from_error(&error);
-                results.extend(commit_ready.into_iter().map(|upgrade| {
-                    (
-                        upgrade.index,
-                        UpgradeResult::Failed {
-                            package: upgrade.prep.name.clone(),
-                            failure: failure.clone(),
-                        },
-                    )
-                }));
+                results.extend(
+                    commit_ready
+                        .into_iter()
+                        .map(|(upgrade, firewall_bypassed)| {
+                            (
+                                upgrade.index,
+                                UpgradeResult::Failed {
+                                    package: upgrade.prep.name.clone(),
+                                    failure: failure.clone().with_firewall_bypassed(
+                                        firewall_bypassed,
+                                        !suppress_nested_output,
+                                    ),
+                                },
+                            )
+                        }),
+                );
             }
         }
     }
@@ -1055,32 +1078,52 @@ async fn execute_upgrade(
     registry: &RegistryClient,
     prep: Box<UpgradePrep>,
     suppress_nested_output: bool,
-) -> Result<UpgradeOutput, (String, LpmError)> {
+) -> Result<UpgradeOutput, (String, UpdateFailure)> {
     let package_name = prep.name.clone();
     let tx_id = mk_tx_id();
     let inflight_lock = lpm_global::inflight_tx_lock(root, &tx_id);
+    let mut firewall_bypassed = crate::commands::install::FirewallBypassRecord::default();
     with_exclusive_lock_async(inflight_lock, async {
         let staged = with_exclusive_lock(root.global_tx_lock(), || {
             prepare_upgrade_locked(root, &prep, tx_id)
         })?;
 
-        do_install_upgrade(root, registry, &prep, &staged, suppress_nested_output).await?;
-        let commands = discover_bin_commands(&staged.install_root, &prep.name)?;
-        if commands.is_empty() {
-            return Err(LpmError::Script(format!(
-                "package '{}' exposes no bin entries — refusing to upgrade",
-                prep.name
-            )));
-        }
-        let marker = InstallReadyMarker::new(commands);
-        write_marker(&staged.install_root, &marker)?;
+        let installed =
+            do_install_upgrade(root, registry, &prep, &staged, suppress_nested_output).await;
+        firewall_bypassed = installed.firewall_bypassed;
+        installed.result?;
+        mark_upgrade_ready(&staged, &prep.name)?;
 
         with_exclusive_lock(root.global_tx_lock(), || {
             commit_upgrade_locked(root, &prep, &staged)
         })
+        .map(|output| UpgradeOutput {
+            firewall_bypassed: firewall_bypassed.clone(),
+            firewall_bypassed_shown: !suppress_nested_output,
+            ..output
+        })
     })
     .await
-    .map_err(|e| (package_name, e))
+    .map_err(|error| {
+        (
+            package_name,
+            UpdateFailure::from_error(&error)
+                .shown_by_install(!suppress_nested_output)
+                .with_firewall_bypassed(firewall_bypassed, !suppress_nested_output),
+        )
+    })
+}
+
+/// Marks a staged upgrade ready to commit once it exposes the commands a
+/// global package must.
+fn mark_upgrade_ready(staged: &StagedUpgrade, package: &str) -> Result<(), LpmError> {
+    let commands = discover_bin_commands(&staged.install_root, package)?;
+    if commands.is_empty() {
+        return Err(LpmError::Script(format!(
+            "package '{package}' exposes no bin entries — refusing to upgrade"
+        )));
+    }
+    write_marker(&staged.install_root, &InstallReadyMarker::new(commands))
 }
 
 // ─── Output ──────────────────────────────────────────────────────────
@@ -1218,14 +1261,20 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
         let entries: Vec<_> = results
             .iter()
             .map(|r| match r {
-                UpgradeResult::Upgraded(out) => serde_json::json!({
-                    "package": out.name,
-                    "action": "upgraded",
-                    "from": out.from_version,
-                    "to": out.to_version,
-                    "saved_spec": out.saved_spec,
-                    "commands": out.commands,
-                }),
+                UpgradeResult::Upgraded(out) => {
+                    let mut entry = serde_json::json!({
+                        "package": out.name,
+                        "action": "upgraded",
+                        "from": out.from_version,
+                        "to": out.to_version,
+                        "saved_spec": out.saved_spec,
+                        "commands": out.commands,
+                    });
+                    if let Some(security) = out.firewall_bypassed.security_json() {
+                        entry["security"] = security;
+                    }
+                    entry
+                }
                 UpgradeResult::SaveSpecRewritten {
                     package,
                     version,
@@ -1272,6 +1321,9 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
                     install_ui::dim(&from_safe),
                     install_ui::green(&to_safe),
                 ));
+                if !out.firewall_bypassed_shown {
+                    out.firewall_bypassed.print();
+                }
             }
             UpgradeResult::SaveSpecRewritten {
                 package,
@@ -1310,6 +1362,9 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
                 ));
                 for line in failure.detail_lines() {
                     install_ui::detail_line(line);
+                }
+                if !failure.firewall_bypassed_shown {
+                    failure.firewall_bypassed.print();
                 }
             }
         }

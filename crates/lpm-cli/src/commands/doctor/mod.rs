@@ -85,6 +85,10 @@ struct DoctorOutputJson<'a> {
     warnings: usize,
     fixes_applied: &'a [String],
     fixes_failed: &'a [self::fix::FixFailure],
+    /// What LPM Firewall bypass rules let through in a fix's install, in the
+    /// `security.firewall` shape other commands report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    security: Option<serde_json::Value>,
 }
 
 /// Render the canonical catalog inventory.
@@ -998,6 +1002,7 @@ async fn run_inner(
             warnings: warning_count,
             fixes_applied: &fix_report.applied,
             fixes_failed: &fix_report.failed,
+            security: fix_report.firewall_bypassed.security_json(),
         };
         let estimated_detail_bytes = checks
             .iter()

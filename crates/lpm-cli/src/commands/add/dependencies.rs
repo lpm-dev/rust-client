@@ -332,6 +332,7 @@ pub(super) async fn handle_dependencies(
     install_lpm_skills: bool,
     effective_pm: &str,
     transaction: &mut crate::manifest_tx::ManifestTransaction,
+    firewall_bypass_report: &std::sync::Arc<crate::commands::install::FirewallBypassReport>,
 ) -> Result<DependencyOutcome, LpmError> {
     if entries.is_empty() {
         return Ok(DependencyOutcome {
@@ -538,6 +539,7 @@ pub(super) async fn handle_dependencies(
         no_engine_strict,
         install_lpm_skills,
         effective_pm,
+        firewall_bypass_report,
     )
     .await?;
 
@@ -547,6 +549,8 @@ pub(super) async fn handle_dependencies(
     })
 }
 
+/// `firewall_bypass_report` collects what LPM Firewall bypass rules let
+/// through when LPM runs the install.
 pub(super) async fn refresh_dependency_install(
     client: &RegistryClient,
     project_dir: &Path,
@@ -554,6 +558,7 @@ pub(super) async fn refresh_dependency_install(
     no_engine_strict: bool,
     install_lpm_skills: bool,
     effective_pm: &str,
+    firewall_bypass_report: &std::sync::Arc<crate::commands::install::FirewallBypassReport>,
 ) -> Result<(), LpmError> {
     match effective_pm {
         "lpm" => {
@@ -601,7 +606,11 @@ pub(super) async fn refresh_dependency_install(
                 &[],
                 false, // the enclosing add command owns stdout reporting
                 json_output,
-                None,
+                Some(
+                    crate::commands::install::InstallCallerContext::reporting_firewall_bypasses(
+                        std::sync::Arc::clone(firewall_bypass_report),
+                    ),
+                ),
                 lpm_root,
             )
             .await

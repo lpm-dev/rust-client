@@ -1624,6 +1624,203 @@ async fn audit_fix_updates_vulnerable_direct_dependency_and_reinstalls_lockfile(
     assert_eq!(pkg.version, "1.0.1");
 }
 
+/// Runs `lpm audit fix` where the version it moves to is blocked by LPM
+/// Firewall and an exact rule lets it through.
+async fn audit_fix_through_a_bypass_rule(json: bool) -> std::process::Output {
+    let project = TempProject::empty(
+        r#"{"name":"audit-fix-bypass","version":"1.0.0","dependencies":{"vuln-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    install_vulnerable_direct_dep_with_fixed_version(&project, &mock).await;
+    mock.with_osv_querybatch(vec![vec![osv_fixed_vuln(
+        "GHSA-test-bypass",
+        "vuln-pkg",
+        "1.0.1",
+    )]])
+    .await;
+    mock.with_npm_firewall_block("vuln-pkg", "1.0.1").await;
+    support::write_npm_firewall_global_config(&project, "enforce");
+    support::write_signed_firewall_bypass(
+        &project,
+        &[serde_json::json!({
+            "id": "fwb_fixed",
+            "spec": "vuln-pkg@1.0.1",
+            "scope": "global",
+            "covers_malware": true,
+            "added_at": "2026-11-25T10:00:00Z",
+        })],
+    );
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    command.env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()));
+    if json {
+        command.arg("--json");
+    } else {
+        command.args(["--color", "never"]);
+    }
+    command.args(["audit", "fix"]).output().unwrap()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_interrupted_audit_fix_prints_the_version_a_bypass_rule_let_through() {
+    let project = TempProject::empty(
+        r#"{"name":"audit-fix-interrupted","version":"1.0.0","dependencies":{"vuln-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    install_vulnerable_direct_dep_with_fixed_version(&project, &mock).await;
+    mock.with_osv_querybatch(vec![vec![osv_fixed_vuln(
+        "GHSA-test-interrupt",
+        "vuln-pkg",
+        "1.0.1",
+    )]])
+    .await;
+    mock.with_npm_firewall_block("vuln-pkg", "1.0.1").await;
+    // A dependency the reinstall is still downloading when Ctrl-C arrives,
+    // after LPM Firewall let `vuln-pkg@1.0.1` through.
+    let slow = make_tarball("slow-pkg", "1.0.0");
+    mock.with_package("slow-pkg", "1.0.0", &slow).await;
+    Mock::given(method("GET"))
+        .and(path(MockRegistry::tarball_path("slow-pkg", "1.0.0")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(slow)
+                .set_delay(std::time::Duration::from_secs(30)),
+        )
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "requestId": "slow-pkg-allowed",
+            "policyMode": "enforce",
+            "summary": { "total": 1, "allow": 1, "warn": 0, "block": 0, "unknown": 0, "matched": 0 },
+            "decisions": []
+        })))
+        .with_priority(10)
+        .mount(mock.server())
+        .await;
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    manifest["dependencies"]["slow-pkg"] = serde_json::json!("1.0.0");
+    project.write_file("package.json", &manifest.to_string());
+    support::write_npm_firewall_global_config(&project, "enforce");
+    support::write_signed_firewall_bypass(
+        &project,
+        &[serde_json::json!({
+            "id": "fwb_fixed",
+            "spec": "vuln-pkg@1.0.1",
+            "scope": "global",
+            "covers_malware": true,
+            "added_at": "2026-11-25T10:00:00Z",
+        })],
+    );
+    let mut child = lpm_spawnable_with_registry(&project, &mock.url())
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args(["--color", "never", "audit", "fix"])
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while mock.tarball_request_count("vuln-pkg", "1.0.1").await == 0 {
+        if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "audit fix never downloaded vuln-pkg@1.0.1: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let output = child.wait_with_output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    let notice_text = "! LPM Firewall allowed 1 blocked package because of your bypass rules:\n";
+    let notice = stderr.find(notice_text).expect(&stderr);
+    let error = stderr.find("Install interrupted").expect(&stderr);
+    assert!(
+        notice < error,
+        "the notice must come before the error: {stderr}"
+    );
+    assert!(
+        stderr[notice..error].contains("› vuln-pkg@1.0.1 - "),
+        "the notice names the version before the error: {stderr}"
+    );
+    assert_eq!(stderr.matches(notice_text).count(), 1, "{stderr}");
+}
+
+#[tokio::test]
+async fn audit_fix_names_the_version_a_firewall_block_stopped() {
+    let project = TempProject::empty(
+        r#"{"name":"audit-fix-blocked","version":"1.0.0","dependencies":{"vuln-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    install_vulnerable_direct_dep_with_fixed_version(&project, &mock).await;
+    mock.with_osv_querybatch(vec![vec![osv_fixed_vuln(
+        "GHSA-test-blocked",
+        "vuln-pkg",
+        "1.0.1",
+    )]])
+    .await;
+    mock.with_npm_firewall_block("vuln-pkg", "1.0.1").await;
+    support::write_npm_firewall_global_config(&project, "enforce");
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args(["--color", "never", "audit", "fix"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("blocked vuln-pkg@1.0.1"), "{stderr}");
+    assert!(stderr.contains("✗ Blocked by LPM Firewall"), "{stderr}");
+}
+
+#[tokio::test]
+async fn audit_fix_json_reports_the_version_a_bypass_rule_let_through() {
+    let out = audit_fix_through_a_bypass_rule(true).await;
+
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(envelope["fixed"], 1, "{envelope:#}");
+    let firewall = &envelope["security"]["firewall"];
+    assert_eq!(firewall["mode"], "enforce", "{envelope:#}");
+    assert_eq!(firewall["bypassed"][0]["name"], "vuln-pkg", "{envelope:#}");
+    assert_eq!(firewall["bypassed"][0]["version"], "1.0.1", "{envelope:#}");
+}
+
+#[tokio::test]
+async fn audit_fix_prints_the_version_a_bypass_rule_let_through() {
+    let out = audit_fix_through_a_bypass_rule(false).await;
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("! LPM Firewall allowed 1 blocked package because of your bypass rules:\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("    rule: vuln-pkg@1.0.1 (every project)\n"),
+        "{stderr}"
+    );
+}
+
 #[tokio::test]
 async fn workspace_member_audit_fix_preserves_the_sibling_root_lockfile_projection() {
     let project = TempProject::empty(

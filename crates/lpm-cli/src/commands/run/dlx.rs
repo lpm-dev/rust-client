@@ -249,7 +249,12 @@ async fn install_dlx_target(
         client.invalidate_routed_metadata_cache(&route, &target.package_name, expected_version);
     }
 
-    crate::commands::install::run_with_options_with_lpm_root(
+    // With stdout reserved for the tool, the install is quiet, and what
+    // bypass rules let through is reported here, on stderr.
+    let firewall_bypass_report = options
+        .reserve_stdout
+        .then(|| std::sync::Arc::new(crate::commands::install::FirewallBypassReport::default()));
+    let installed = crate::commands::install::run_with_options_with_lpm_root(
         client,
         install.root(),
         options.reserve_stdout, // json_output
@@ -283,7 +288,7 @@ async fn install_dlx_target(
         !options.reserve_stdout,                                 // emit_install_report
         options.reserve_stdout,
         Some(crate::commands::install::InstallCallerContext {
-            route_table: caller_routes.clone(),
+            route_table: Some(caller_routes.clone()),
             policy_project_dir: Some(project_dir),
             expected_root: target.expected_identity.as_ref().map(|identity| {
                 crate::commands::install::ExpectedInstallRoot {
@@ -295,10 +300,16 @@ async fn install_dlx_target(
             }),
             locked_integrities: None,
             firewall_bypass_root: None,
+            firewall_bypass_report: firewall_bypass_report.clone(),
         }),
         lpm_common::LpmRoot::from_env()?,
     )
-    .await
+    .await;
+    // A failed install can have let a version through before it failed.
+    if let Some(report) = firewall_bypass_report {
+        report.take().print();
+    }
+    installed
 }
 
 /// The cache entry's key: the target, and the receipt of the caller policy

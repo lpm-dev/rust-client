@@ -16,6 +16,11 @@ pub(super) struct UpgradeOutput {
     pub(super) to_version: String,
     pub(super) saved_spec: String,
     pub(super) commands: Vec<String>,
+    /// What LPM Firewall bypass rules let through in the upgrade's install.
+    pub(super) firewall_bypassed: crate::commands::install::FirewallBypassRecord,
+    /// Whether the install printed `firewall_bypassed` itself, as a lone
+    /// upgrade's does; a batch installs quietly.
+    pub(super) firewall_bypassed_shown: bool,
 }
 
 struct UpgradeCommitError {
@@ -329,6 +334,8 @@ fn apply_upgrade_commit(
             to_version: prep.new_version.to_string(),
             saved_spec: prep.new_saved_spec.clone(),
             commands: final_commands,
+            firewall_bypassed: crate::commands::install::FirewallBypassRecord::default(),
+            firewall_bypassed_shown: false,
         },
         record,
     ))

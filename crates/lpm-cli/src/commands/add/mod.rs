@@ -92,6 +92,10 @@ struct AddJsonOutput<'a> {
     errors: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     firewall: Option<serde_json::Value>,
+    /// What LPM Firewall bypass rules let through in the dependency install,
+    /// in the `security.firewall` shape other commands report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    security: Option<serde_json::Value>,
 }
 
 /// Splits the bare specifiers a plain copy uses into the package names they
@@ -698,6 +702,7 @@ async fn run_locked(
         ));
     }
 
+    let firewall_bypass_report = swift_traversal.firewall_bypass_report();
     let firewall_verdict = begin_prepared_npm_firewall_materialization_preflight(
         client,
         firewall_preflight,
@@ -720,7 +725,9 @@ async fn run_locked(
     let downloaded = client
         .download_tarball_routed(&route_table, &target.route_name(), tarball_url)
         .await?;
-    let firewall_json = firewall_verdict.settle(json_output).await?;
+    let firewall_json = firewall_verdict
+        .settle_into(json_output, &firewall_bypass_report)
+        .await?;
 
     // Verify integrity. Fast path: SRI compare against the
     // SHA-512 hash already computed during download. Slow path: stream-
@@ -1109,7 +1116,12 @@ async fn run_locked(
         }
         if emit_output {
             swift_traversal.preview.ensure_unchanged()?;
-            display::print_dry_run(&mut swift_traversal.preview.packages, json_output)?;
+            display::print_dry_run(
+                &mut swift_traversal.preview.packages,
+                json_output,
+                firewall_json,
+                firewall_bypass_report.take().security_json(),
+            )?;
         }
         return Ok(());
     }
@@ -1519,6 +1531,7 @@ async fn run_locked(
             !no_skills,
             &effective_pm,
             &mut tx,
+            &firewall_bypass_report,
         )
         .await?
     } else if !no_install_deps && lpm_config.is_none() {
@@ -1548,6 +1561,7 @@ async fn run_locked(
             no_engine_strict,
             !no_skills,
             &effective_pm,
+            &firewall_bypass_report,
         )
         .await?;
     }
@@ -1787,6 +1801,7 @@ async fn run_locked(
             warnings: swift_traversal.warnings(),
             errors: &[],
             firewall: firewall_json,
+            security: firewall_bypass_report.take().security_json(),
         };
         let stdout = std::io::stdout();
         let mut stdout = stdout.lock();

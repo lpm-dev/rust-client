@@ -3,9 +3,12 @@ use super::prepare::PrepResult;
 use crate::{install_ui, output};
 use lpm_common::{LpmRoot, sanitize_for_terminal};
 
+/// `firewall_bypassed` reaches only the JSON: in a terminal the install
+/// already printed what bypass rules let through.
 pub(super) fn print_success(
     out: &CommitOutput,
     hint: &crate::path_onboarding::PathHintReport,
+    firewall_bypassed: &crate::commands::install::FirewallBypassRecord,
     json_output: bool,
 ) {
     if json_output {
@@ -14,7 +17,7 @@ pub(super) fn print_success(
         // PATH" without scraping stderr/stdout. The four fields
         // mirror PathHintReport so consumers can treat it as a
         // pass-through.
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "success": true,
             "package": out.name,
             "version": out.version,
@@ -29,6 +32,9 @@ pub(super) fn print_success(
                 "banner_printed": hint.banner_printed,
             },
         });
+        if let Some(security) = firewall_bypassed.security_json() {
+            body["security"] = security;
+        }
         println!("{}", serde_json::to_string_pretty(&body).unwrap());
         return;
     }

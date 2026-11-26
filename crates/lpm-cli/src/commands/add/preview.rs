@@ -27,6 +27,13 @@ pub(super) struct PackagePreview {
     pub dependencies_removed: Vec<plan::RemovedDependency>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub source_dependencies: Vec<PackagePreview>,
+    /// The added package's own LPM Firewall check, as `lpm add --json`
+    /// reports it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub firewall: Option<serde_json::Value>,
+    /// What LPM Firewall bypass rules let through while previewing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security: Option<serde_json::Value>,
 }
 
 #[derive(Default)]
@@ -443,6 +450,8 @@ pub(super) fn plan_package(
         },
         stale_files,
         dependencies_removed: removed,
+        firewall: None,
+        security: None,
         source_dependencies: Vec::new(),
     });
     Ok(())

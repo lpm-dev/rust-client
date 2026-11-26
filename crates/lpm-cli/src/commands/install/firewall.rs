@@ -371,7 +371,7 @@ pub(super) struct BypassedVerdict {
 }
 
 impl BypassedVerdict {
-    fn to_json(&self) -> serde_json::Value {
+    pub(super) fn to_json(&self) -> serde_json::Value {
         let mut json = npm_firewall_decision_json(&self.decision);
         json["rule"] = self.rule.to_json();
         json
@@ -699,6 +699,10 @@ pub(super) struct NpmFirewallChunkedPreflightConfig {
     pub(super) offline: bool,
     pub(super) chunk_size: usize,
     pub(super) bypass: FirewallBypassRules,
+    /// Where each version a rule lifts is kept once its chunk is released to
+    /// download, so the install can report it if it fails before this check
+    /// reports.
+    pub(super) released_bypasses: Arc<super::ReleasedFirewallBypasses>,
 }
 
 pub(super) fn spawn_chunked_npm_firewall_preflight(
@@ -716,6 +720,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
             offline,
             chunk_size,
             bypass,
+            released_bypasses,
         } = config;
 
         if !mode.is_enabled() {
@@ -772,6 +777,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
             mode,
             policy_profile,
             bypass: &bypass,
+            released_bypasses: &released_bypasses,
         };
         let mut chunk = FirewallSelectedChunk::with_capacity(chunk_size);
         let mut receiver_closed = false;
@@ -834,7 +840,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                             continue;
                         }
                     };
-                    blocked |= apply_firewall_chunk_result(
+                    let applied = apply_firewall_chunk_result(
                         chunk_result,
                         &dispatch,
                         blocked || failure.is_some(),
@@ -844,6 +850,14 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                         &mut report_error,
                     )
                     .await;
+                    blocked |= applied.blocks;
+                    if applied.lifted_version_not_handed_off {
+                        failure.get_or_insert_with(|| {
+                            LpmError::Registry(
+                                "npm firewall preflight couldn't hand a version a bypass rule let through to the download, which has stopped".into(),
+                            )
+                        });
+                    }
                 }
                 else => {
                     if receiver_closed && tasks.is_empty() {
@@ -913,6 +927,7 @@ struct FirewallChunkDispatch<'a> {
     mode: NpmFirewallMode,
     policy_profile: NpmFirewallPolicyProfile,
     bypass: &'a FirewallBypassRules,
+    released_bypasses: &'a super::ReleasedFirewallBypasses,
 }
 
 async fn spawn_or_release_firewall_chunk(
@@ -928,6 +943,7 @@ async fn spawn_or_release_firewall_chunk(
         mode,
         policy_profile,
         bypass: _,
+        released_bypasses: _,
     } = *dispatch;
     if chunk.is_empty() {
         return;
@@ -1063,6 +1079,16 @@ fn normalize_npm_firewall_preflight_error(error: LpmError) -> LpmError {
 /// Records a finished chunk and releases its events for download unless the
 /// chunk, or an earlier one, blocks in enforce mode. Returns whether this
 /// chunk blocks.
+/// What applying one chunk's verdicts found.
+#[derive(Default)]
+struct AppliedChunk {
+    /// An enforced block the install fails on.
+    blocks: bool,
+    /// A version a rule lifted whose events never reached the downloader:
+    /// the install can't go on to download it unreported, so the check fails.
+    lifted_version_not_handed_off: bool,
+}
+
 async fn apply_firewall_chunk_result(
     chunk_result: FirewallChunkResult,
     dispatch: &FirewallChunkDispatch<'_>,
@@ -1071,7 +1097,7 @@ async fn apply_firewall_chunk_result(
     decisions: &mut Vec<NpmFirewallDecision>,
     held_bypassed: &mut Vec<BypassedVerdict>,
     report_error: &mut Option<String>,
-) -> bool {
+) -> AppliedChunk {
     let fetch_tx = dispatch.fetch_tx;
     let mode = dispatch.mode;
     if let Some(error) = chunk_result.report_error {
@@ -1083,12 +1109,12 @@ async fn apply_firewall_chunk_result(
             *report_error = Some(error);
         }
         release_firewall_events(fetch_tx, chunk_result.events).await;
-        return false;
+        return AppliedChunk::default();
     }
 
     let Some(response) = chunk_result.response else {
         release_firewall_events(fetch_tx, chunk_result.events).await;
-        return false;
+        return AppliedChunk::default();
     };
 
     stats.record_response(&response, chunk_result.elapsed_ms);
@@ -1108,14 +1134,78 @@ async fn apply_firewall_chunk_result(
     let chunk_has_block = classified.blocks();
     let enforce = matches!(mode, NpmFirewallMode::Enforce);
     let release = !(enforce && (chunk_has_block || earlier_block));
+    let mut lifted_version_not_handed_off = false;
     if !release {
         held_bypassed.append(&mut classified.bypassed);
-    }
-    decisions.extend(stats.record_classified(classified));
-    if release {
+    } else if enforce {
+        let delivered = hand_off_firewall_events(
+            fetch_tx,
+            chunk_result.events,
+            &classified.bypassed,
+            mode,
+            dispatch.released_bypasses,
+        )
+        .await;
+        // A version none of whose events reached the downloader was let
+        // through by nothing, so it stays with the held ones.
+        let lifted = std::mem::take(&mut classified.bypassed);
+        for (verdict, delivered) in lifted.into_iter().zip(delivered) {
+            if delivered {
+                classified.bypassed.push(verdict);
+            } else {
+                lifted_version_not_handed_off = true;
+                held_bypassed.push(verdict);
+            }
+        }
+    } else {
         release_firewall_events(fetch_tx, chunk_result.events).await;
     }
-    enforce && chunk_has_block
+    decisions.extend(stats.record_classified(classified));
+    AppliedChunk {
+        blocks: enforce && chunk_has_block,
+        lifted_version_not_handed_off,
+    }
+}
+
+/// Sends each of `events` to the downloader together with the lifted
+/// versions it carries, so the install's record of `released` names exactly
+/// what reached the downloader, and stops once the install closes it or the
+/// downloader stops. Returns, for each of `lifted`, whether an event carrying
+/// it was sent.
+async fn hand_off_firewall_events(
+    fetch_tx: &tokio::sync::mpsc::Sender<lpm_resolver::SelectedPackageEvent>,
+    events: Vec<lpm_resolver::SelectedPackageEvent>,
+    lifted: &[BypassedVerdict],
+    mode: NpmFirewallMode,
+    released: &super::ReleasedFirewallBypasses,
+) -> Vec<bool> {
+    let mut delivered = vec![false; lifted.len()];
+    for event in events {
+        let Ok(permit) = fetch_tx.reserve().await else {
+            break;
+        };
+        let carried: Vec<usize> = lifted
+            .iter()
+            .enumerate()
+            .filter(|(_, verdict)| {
+                verdict.decision.name == event.name && verdict.decision.version == event.version
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if !released.hand_off(
+            mode,
+            carried.iter().map(|&index| &lifted[index]),
+            permit,
+            event,
+            fetch_tx,
+        ) {
+            break;
+        }
+        for index in carried {
+            delivered[index] = true;
+        }
+    }
+    delivered
 }
 
 async fn release_firewall_events(
@@ -1863,6 +1953,8 @@ pub(super) fn spawn_npm_firewall_preflight(
         offline,
         force,
         json_output: _,
+        firewall_bypass_report: _,
+        released_bypasses: _,
     } = request;
     let verdict_packages =
         npm_firewall_packages(packages, route_table, client.as_ref(), lookup_mode);
@@ -1883,7 +1975,32 @@ pub(super) fn spawn_npm_firewall_preflight(
     }
 }
 
+/// Settles `result` for an install whose command keeps `report`. A request
+/// failure ends the install as an error, so what a rule let through before it
+/// is handed to the report first.
+pub(super) fn finish_npm_firewall_preflight_into(
+    result: NpmFirewallPreflightResult,
+    json_output: bool,
+    report: Option<&super::FirewallBypassReport>,
+) -> Result<NpmFirewallPreflightStats, LpmError> {
+    if result.failure.is_some()
+        && let Some(report) = report
+    {
+        report.record(&result.stats);
+    }
+    finish_npm_firewall_preflight(result, json_output)
+}
+
 pub(super) fn finish_npm_firewall_preflight(
+    result: NpmFirewallPreflightResult,
+    json_output: bool,
+) -> Result<NpmFirewallPreflightStats, LpmError> {
+    let stats = report_npm_firewall_preflight(result, json_output)?;
+    super::PROCESS_FIREWALL_BYPASSES.record(&stats);
+    Ok(stats)
+}
+
+fn report_npm_firewall_preflight(
     result: NpmFirewallPreflightResult,
     json_output: bool,
 ) -> Result<NpmFirewallPreflightStats, LpmError> {
@@ -1900,6 +2017,7 @@ pub(super) fn finish_npm_firewall_preflight(
         if !json_output {
             print_bypassed_verdicts(&stats.bypassed, false);
         }
+        super::PROCESS_FIREWALL_BYPASSES.record(&stats);
         return Err(failure);
     }
     // A failed request in monitor mode still leaves what the requests before
@@ -2103,7 +2221,17 @@ fn blocked_package(
 }
 
 /// Prints the blocked versions bypass rules let through, each with its rule.
-fn print_bypassed_verdicts(bypassed: &[BypassedVerdict], monitor: bool) {
+pub(super) fn print_bypassed_verdicts(bypassed: &[BypassedVerdict], monitor: bool) {
+    if bypassed.is_empty() {
+        return;
+    }
+    super::FIREWALL_BYPASS_NOTICES.show(bypassed, |bypassed| {
+        write_bypassed_verdicts(bypassed, monitor);
+    });
+}
+
+/// Writes the notice [`print_bypassed_verdicts`] prints.
+pub(super) fn write_bypassed_verdicts(bypassed: &[BypassedVerdict], monitor: bool) {
     if bypassed.is_empty() {
         return;
     }
@@ -2146,6 +2274,8 @@ pub(super) async fn run_npm_firewall_preflight(
         offline,
         force,
         json_output,
+        firewall_bypass_report,
+        released_bypasses,
     } = request;
     let verdict_packages =
         npm_firewall_packages(packages, route_table, client.as_ref(), lookup_mode);
@@ -2162,7 +2292,12 @@ pub(super) async fn run_npm_firewall_preflight(
         verdict_packages,
     )
     .await?;
-    finish_npm_firewall_preflight(result, json_output)
+    if let Some(released) = released_bypasses
+        && npm_firewall_preflight_lets_through(&result)
+    {
+        super::settle_released_firewall_bypasses(released, &result.stats)?;
+    }
+    finish_npm_firewall_preflight_into(result, json_output, firewall_bypass_report)
 }
 
 pub(super) struct NpmFirewallPreflightRequest<'a> {
@@ -2176,6 +2311,18 @@ pub(super) struct NpmFirewallPreflightRequest<'a> {
     pub(super) offline: bool,
     pub(super) force: bool,
     pub(super) json_output: bool,
+    /// Where the command keeps what bypass rules let through.
+    pub(super) firewall_bypass_report: Option<&'a super::FirewallBypassReport>,
+    /// The install's record of what it let through, settled before the check
+    /// reports a clean result, so an exiting command stops the install first.
+    pub(super) released_bypasses: Option<&'a super::ReleasedFirewallBypasses>,
+}
+
+/// Whether `result` lets the install go on to download: no request failed and
+/// nothing is blocked, or monitor mode, which blocks nothing.
+pub(super) fn npm_firewall_preflight_lets_through(result: &NpmFirewallPreflightResult) -> bool {
+    matches!(result.stats.mode, NpmFirewallMode::Monitor)
+        || (result.failure.is_none() && !stats_have_block(&result.stats, &result.decisions))
 }
 
 pub(super) fn npm_firewall_packages(
@@ -2371,8 +2518,13 @@ pub(crate) fn prepare_npm_firewall_materialization_preflight(
 pub(crate) struct NpmFirewallMaterializationVerdict(MaterializationVerdictState);
 
 enum MaterializationVerdictState {
-    Settled(NpmFirewallMaterializationJson),
+    Settled(Box<SettledMaterialization>),
     Pending(NpmFirewallPreflightJoin),
+}
+
+struct SettledMaterialization {
+    json: NpmFirewallMaterializationJson,
+    stats: NpmFirewallPreflightStats,
 }
 
 impl NpmFirewallMaterializationVerdict {
@@ -2381,8 +2533,25 @@ impl NpmFirewallMaterializationVerdict {
         self,
         json_output: bool,
     ) -> Result<NpmFirewallMaterializationJson, LpmError> {
+        Ok(self.settled(json_output).await?.json)
+    }
+
+    /// [`Self::settle`], also handing what bypass rules let through to the
+    /// command's `report`, as `lpm add` reports its source package with the
+    /// installs it runs.
+    pub(crate) async fn settle_into(
+        self,
+        json_output: bool,
+        report: &super::FirewallBypassReport,
+    ) -> Result<NpmFirewallMaterializationJson, LpmError> {
+        let settled = self.settled(json_output).await?;
+        report.record(&settled.stats);
+        Ok(settled.json)
+    }
+
+    async fn settled(self, json_output: bool) -> Result<SettledMaterialization, LpmError> {
         match self.0 {
-            MaterializationVerdictState::Settled(json) => Ok(json),
+            MaterializationVerdictState::Settled(settled) => Ok(*settled),
             MaterializationVerdictState::Pending(join) => {
                 finish_npm_firewall_materialization(join.drain().await?, json_output)
             }
@@ -2415,10 +2584,10 @@ pub(crate) async fn begin_prepared_npm_firewall_materialization_preflight(
             handle: Some(tokio::spawn(request)),
         })
     } else {
-        MaterializationVerdictState::Settled(finish_npm_firewall_materialization(
+        MaterializationVerdictState::Settled(Box::new(finish_npm_firewall_materialization(
             request.await?,
             json_output,
-        )?)
+        )?))
     };
     Ok(NpmFirewallMaterializationVerdict(state))
 }
@@ -2426,9 +2595,10 @@ pub(crate) async fn begin_prepared_npm_firewall_materialization_preflight(
 fn finish_npm_firewall_materialization(
     result: NpmFirewallPreflightResult,
     json_output: bool,
-) -> Result<NpmFirewallMaterializationJson, LpmError> {
-    let firewall_json = npm_firewall_materialization_json(&result);
-    finish_npm_firewall_preflight(result, json_output).map(|_| firewall_json)
+) -> Result<SettledMaterialization, LpmError> {
+    let json = npm_firewall_materialization_json(&result);
+    finish_npm_firewall_preflight(result, json_output)
+        .map(|stats| SettledMaterialization { json, stats })
 }
 
 fn npm_firewall_materialization_json(

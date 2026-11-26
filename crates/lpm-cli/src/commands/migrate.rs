@@ -42,6 +42,8 @@ pub async fn run(
     let workspace = migration_workspace(cwd)?;
     // Refused before any lock, so that a refusal leaves no `.lpm` behind.
     refuse_existing_lockfile(cwd, force, dry_run)?;
+    let firewall_bypass_report =
+        std::sync::Arc::new(super::install::FirewallBypassReport::default());
     let migration = migrate_and_install(
         client,
         cwd,
@@ -53,6 +55,7 @@ pub async fn run(
             force,
             json,
             workspace_root: workspace.is_some(),
+            firewall_bypass_report: std::sync::Arc::clone(&firewall_bypass_report),
         },
     );
     let migrated = if dry_run || workspace.is_none() {
@@ -96,7 +99,7 @@ pub async fn run(
 
     // Summary
     if json {
-        let output = serde_json::json!({
+        let mut output = serde_json::json!({
             "success": true,
             "source": format!("{}", result.source.kind),
             "source_version": result.source.version,
@@ -107,6 +110,9 @@ pub async fn run(
             "workspace_members": result.workspace_members,
             "registry_changes": registry_changes_json(&registry_changes),
         });
+        if let Some(security) = firewall_bypass_report.take().security_json() {
+            output["security"] = security;
+        }
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         if !result.skipped.is_empty() {
@@ -158,6 +164,7 @@ struct MigrationInstallOptions {
     force: bool,
     json: bool,
     workspace_root: bool,
+    firewall_bypass_report: std::sync::Arc<super::install::FirewallBypassReport>,
 }
 
 async fn migrate_and_install(
@@ -180,6 +187,7 @@ async fn migrate_and_install(
         force,
         json,
         workspace_root,
+        firewall_bypass_report,
     } = options;
     let workspace = migration_workspace(cwd)?;
     if workspace.is_some() != workspace_root {
@@ -537,6 +545,9 @@ async fn migrate_and_install(
                         audit_after_install: false,
                         timing: false,
                         workspace_concurrency: None,
+                        firewall_bypass_report: Some(std::sync::Arc::clone(
+                            &firewall_bypass_report,
+                        )),
                     },
                 )
                 .await
@@ -580,7 +591,9 @@ async fn migrate_and_install(
                     &[],
                     !json,
                     json,
-                    None,
+                    Some(super::install::InstallCallerContext::reporting_firewall_bypasses(
+                        std::sync::Arc::clone(&firewall_bypass_report),
+                    )),
                     lpm_common::LpmRoot::from_env()?,
                 )
                 .await

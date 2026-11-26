@@ -31,6 +31,9 @@ pub(in crate::commands::install) struct OnlineResolutionPhaseInput<'a> {
     pub(in crate::commands::install) npm_firewall_bypass:
         crate::firewall_bypass::FirewallBypassRules,
     pub(in crate::commands::install) npm_firewall_chunk_size: usize,
+    /// Where the streaming firewall check keeps each version a rule lifts
+    /// once it releases it to download.
+    pub(in crate::commands::install) npm_firewall_released_bypasses: Arc<ReleasedFirewallBypasses>,
     /// The integrities a migrated lockfile recorded, which a tarball-URL
     /// dependency is held to before it's extracted.
     pub(in crate::commands::install) locked_integrities: Option<&'a LockedIntegrities>,
@@ -122,6 +125,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         npm_firewall_policy_profile,
         npm_firewall_bypass,
         npm_firewall_chunk_size,
+        npm_firewall_released_bypasses,
         locked_integrities,
         tarball_prefetch_held,
         force,
@@ -390,6 +394,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                                         bypass: npm_firewall_bypass.clone(),
                                         offline,
                                         chunk_size: npm_firewall_chunk_size,
+                                        released_bypasses: npm_firewall_released_bypasses.clone(),
                                     },
                                 ));
                             Some(selected_tx)
