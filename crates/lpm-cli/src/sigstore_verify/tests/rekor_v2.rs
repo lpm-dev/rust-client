@@ -703,6 +703,87 @@ fn an_ed25519_log_signs_under_the_name_its_key_id_commits_to() {
 }
 
 #[test]
+fn a_bundle_signed_through_sigstores_production_rekor_v2_log_verifies() {
+    // The release trust workflow's identity signed this bundle through
+    // log2025-1 and timestamp.sigstore.dev, so it verifies against the
+    // trust root built in, under that identity.
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/sigstore_bundles/24-real-rekor-v2-release-trust.json");
+    let bundle = std::fs::read(path).unwrap();
+    let trust = TrustRoot::parse(super::super::trust_root::EMBEDDED_TRUST_ROOT_JSON).unwrap();
+    let identity = IdentityExpectations {
+        expected_issuer: Some("https://token.actions.githubusercontent.com".into()),
+        expected_san_uri_prefix: Some("https://github.com/lpm-dev/rust-client/".into()),
+        expected_workflow_path: Some(".github/workflows/release-trust.yml".into()),
+    };
+    for options in [VerifyOptions::strict(), VerifyOptions::npm_attestation()] {
+        let verified = verify_sigstore_bundle_with(&bundle, &identity, options, &trust).unwrap();
+        assert_eq!(
+            Timestamp::from(verified.signed_at).to_rfc3339_seconds(),
+            "2026-11-26T01:57:14Z"
+        );
+        assert_eq!(verified.log_index, 216_692_112);
+        assert_eq!(
+            verified.log_id,
+            "zxGZFVvd0FEmjR8WrFwMdcAJ9vtaY/QXf44Y1wUeP6A="
+        );
+        let (_, digest) = super::super::extract_subject_digest_from_statement(
+            &verified.statement,
+            "sha256",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            digest,
+            "43912a4100b192322045a8589474bfb19621ed8d546892f5edb84a4e2d1cb4c5"
+        );
+    }
+}
+
+/// Run by the daily release trust check on a bundle it has just signed
+/// through Sigstore's production Rekor v2 log with its GitHub Actions
+/// identity. `LPM_LIVE_REKOR_V2_BUNDLE` names the bundle and
+/// `LPM_LIVE_REKOR_V2_SUBJECT_SHA256` the digest it attests.
+#[test]
+#[ignore = "needs a bundle signed through Sigstore's production Rekor v2 log"]
+fn a_bundle_signed_through_sigstores_live_rekor_v2_log_verifies() {
+    let path = std::env::var("LPM_LIVE_REKOR_V2_BUNDLE").expect("LPM_LIVE_REKOR_V2_BUNDLE");
+    let subject_sha256 = std::env::var("LPM_LIVE_REKOR_V2_SUBJECT_SHA256")
+        .expect("LPM_LIVE_REKOR_V2_SUBJECT_SHA256");
+    let bundle = std::fs::read(path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bundle).unwrap();
+    assert_eq!(
+        parsed["verificationMaterial"]["tlogEntries"][0]["kindVersion"],
+        serde_json::json!({"kind": "hashedrekord", "version": "0.0.2"}),
+        "the bundle is not a Rekor v2 entry"
+    );
+
+    let trust = TrustRoot::parse(super::super::trust_root::EMBEDDED_TRUST_ROOT_JSON).unwrap();
+    let identity = IdentityExpectations {
+        expected_issuer: Some("https://token.actions.githubusercontent.com".into()),
+        expected_san_uri_prefix: Some("https://github.com/lpm-dev/rust-client/".into()),
+        expected_workflow_path: Some(".github/workflows/release-trust.yml".into()),
+    };
+    let verified =
+        verify_sigstore_bundle_with(&bundle, &identity, VerifyOptions::strict(), &trust).unwrap();
+
+    // The runner's clock and the timestamp authority's may disagree by a
+    // little.
+    let now = std::time::SystemTime::now();
+    let skew = std::time::Duration::from_secs(60);
+    assert!(
+        verified.signed_at <= now + skew
+            && verified.signed_at + std::time::Duration::from_secs(3600) >= now,
+        "the timestamp {:?} isn't from the last hour",
+        verified.signed_at
+    );
+    let (_, digest) =
+        super::super::extract_subject_digest_from_statement(&verified.statement, "sha256", true)
+            .unwrap();
+    assert_eq!(digest, subject_sha256);
+}
+
+#[test]
 fn a_rekor_v2_entry_without_a_log_id_is_matched_past_a_log_that_only_cosigned() {
     // Another log in the trust root co-signed the checkpoint, and is listed
     // first: its signature names it, but the checkpoint isn't its own.

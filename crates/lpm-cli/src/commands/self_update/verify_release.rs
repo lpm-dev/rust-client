@@ -44,10 +44,10 @@ pub(crate) fn run(
         );
         output::field("source commit", &verified.source_commit);
         output::field(
-            "integrated",
+            "signed",
             &format!(
                 "{} (Rekor log index {})",
-                verified.integrated_time.to_rfc3339(),
+                verified.signed_at.to_rfc3339(),
                 verified.log_index
             ),
         );
@@ -91,7 +91,7 @@ fn verification_json(version: &str, verified: &VerifiedReleaseManifest) -> serde
         "workflow_path": verified.workflow_path,
         "workflow_ref": verified.workflow_ref,
         "source_commit": verified.source_commit,
-        "integrated_time": verified.integrated_time.to_rfc3339(),
+        "integrated_time": verified.signed_at.to_rfc3339(),
         "log_index": verified.log_index,
         "log_id": verified.log_id,
         "leaf_cert_sha256": verified.leaf_cert_sha256,

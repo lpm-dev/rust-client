@@ -966,7 +966,7 @@ mod tests {
             publisher: None,
             workflow_path: None,
             workflow_ref: None,
-            integrated_time: lpm_common::Timestamp::now(),
+            signed_at: lpm_common::Timestamp::now(),
             log_index: 0,
             log_id: String::new(),
             leaf_cert_sha256: String::new(),
