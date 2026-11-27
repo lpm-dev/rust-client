@@ -818,9 +818,13 @@ pub async fn read_body_capped_into(
     cap: usize,
     body: &mut Vec<u8>,
 ) -> Result<(), ResponseBodyError> {
-    read_body_capped_with_budget(response, cap, body, (), |(), _, _, _| {
-        std::future::ready(())
-    })
+    read_body_capped_with_budget(
+        response,
+        cap,
+        body,
+        (),
+        |(), _, _, _| std::future::ready(()),
+    )
     .await
     .0
 }

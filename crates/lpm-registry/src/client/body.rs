@@ -219,9 +219,7 @@ async fn read_metadata_body_with_budget_and_overflow(
                         let target_units = budget_units_for_bytes(cap).max(needed);
                         if target_units > existing.reserved_units {
                             let delta = target_units - existing.reserved_units;
-                            if let Ok(extra) =
-                                Arc::clone(&budget).acquire_many_owned(delta).await
-                            {
+                            if let Ok(extra) = Arc::clone(&budget).acquire_many_owned(delta).await {
                                 if let Some(permit) = existing.byte_budget_permit.as_mut() {
                                     permit.merge(extra);
                                 } else {
@@ -1449,7 +1447,11 @@ mod tests {
             let budget = Arc::clone(&budget);
             let overflow = Arc::clone(&overflow);
             tasks.push(tokio::spawn(async move {
-                let response = client.get(format!("http://{addr}/{path}")).send().await.unwrap();
+                let response = client
+                    .get(format!("http://{addr}/{path}"))
+                    .send()
+                    .await
+                    .unwrap();
                 let mut body = Vec::new();
                 let (read, guard) = read_metadata_body_with_budget_and_overflow(
                     response,
@@ -1485,13 +1487,10 @@ mod tests {
         let budget = Arc::new(tokio::sync::Semaphore::new(METADATA_MEMORY_BUDGET_UNITS));
         let buf_len = 33 * 1024 * 1024;
         let capacity = 64 * 1024 * 1024;
-        let preacquired = acquire_large_metadata_guard_units(
-            &limiter,
-            &budget,
-            budget_units_for_bytes(capacity),
-        )
-        .await
-        .expect("capacity-sized guard");
+        let preacquired =
+            acquire_large_metadata_guard_units(&limiter, &budget, budget_units_for_bytes(capacity))
+                .await
+                .expect("capacity-sized guard");
 
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();

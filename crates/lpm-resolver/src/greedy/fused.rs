@@ -4608,13 +4608,9 @@ mod metadata_timeline_bound_tests {
         );
         let canonical = CanonicalKey::npm("pkg");
         let range = NpmRange::parse("^1.0.0").unwrap();
-        assert!(scheduler.enqueue_prefetch(
-            &dispatch,
-            canonical.clone(),
-            None,
-            Some(range),
-            false,
-        ));
+        assert!(
+            scheduler.enqueue_prefetch(&dispatch, canonical.clone(), None, Some(range), false,)
+        );
         assert!(scheduler.prefetch_inflight.contains(&canonical));
 
         // Promote a plain packument demand while the preferred-range prefetch is in flight.

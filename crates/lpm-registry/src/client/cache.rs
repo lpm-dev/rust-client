@@ -867,15 +867,23 @@ impl RegistryClient {
         }
     }
 
+    pub(super) fn metadata_cache_mutation_in(
+        mutations: &std::sync::Mutex<
+            super::state::WeakEntryMap<std::path::PathBuf, MetadataCacheMutation>,
+        >,
+        path: &std::path::Path,
+    ) -> Arc<MetadataCacheMutation> {
+        let mut guard = mutations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.get_or_insert(path, || Arc::new(MetadataCacheMutation::new()))
+    }
+
     pub(super) fn metadata_cache_mutation(
         &self,
         path: &std::path::Path,
     ) -> Arc<MetadataCacheMutation> {
-        let mut mutations = self
-            .metadata_cache_mutations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        mutations.get_or_insert(path, || Arc::new(MetadataCacheMutation::new()))
+        Self::metadata_cache_mutation_in(&self.metadata_cache_mutations, path)
     }
 
     fn invalidate_metadata_cache_path(&self, path: &std::path::Path) {

@@ -353,18 +353,12 @@ impl RegistryClient {
             };
         }
 
-        let preferred_mutation = preferred_path
-            .as_deref()
-            .map(|path| self.metadata_cache_mutation(path));
-        let complete_mutation = complete_path
-            .as_deref()
-            .map(|path| self.metadata_cache_mutation(path));
+        let mutations = Arc::clone(&self.metadata_cache_mutations);
         let target_name = name.to_owned();
         tokio::task::spawn_blocking(move || {
             let mut has_stale_history_validator = false;
-            if let Some(path) = preferred_path
-                && let Some(mutation) = preferred_mutation
-            {
+            if let Some(path) = preferred_path {
+                let mutation = RegistryClient::metadata_cache_mutation_in(&mutations, &path);
                 let content_revision = mutation
                     .content_revision
                     .load(std::sync::atomic::Ordering::Acquire);
@@ -400,9 +394,8 @@ impl RegistryClient {
                     has_stale_history_validator |= entry_has_etag;
                 }
             }
-            if let Some(path) = complete_path
-                && let Some(mutation) = complete_mutation
-            {
+            if let Some(path) = complete_path {
+                let mutation = RegistryClient::metadata_cache_mutation_in(&mutations, &path);
                 let content_revision = mutation
                     .content_revision
                     .load(std::sync::atomic::Ordering::Acquire);

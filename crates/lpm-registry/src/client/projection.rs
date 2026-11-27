@@ -371,7 +371,8 @@ impl RegistryClient {
                 .completed_content_revision
                 .load(std::sync::atomic::Ordering::Acquire)
                 < content_revision
-                || !slot.entry.is_file()
+                || !cache::open_metadata_cache_entry(&slot.entry)
+                    .is_some_and(|entry| entry.header.content_id == slot.content_id)
             {
                 return;
             }
@@ -725,6 +726,91 @@ mod tests {
             client.pending_cache_write_bytes.available_permits(),
             permits_before,
             "cancelled parked projection must release its pending-write budget permit"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cache_read_slot_from_old_document_cannot_overwrite_newer_packument_projection() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let mut client = RegistryClient::new()
+            .with_cache_dir(Some(cache_dir.path().to_path_buf()))
+            .with_synchronous_cache_writes(true);
+
+        client
+            .write_metadata_cache_entry_async(
+                "read-race",
+                serde_json::json!({"name": "read-race", "version": "1.0.0"}),
+                None,
+                cache::MetadataCacheDirective::Unspecified,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Pause V2's write after `prepare_metadata_cache_write` increments `content_revision`
+        // but before V2 replaces V1 on disk.
+        client.synchronous_cache_writes = false;
+        let (v2_paused_tx, v2_paused_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_v2_tx, release_v2_rx) = std::sync::mpsc::sync_channel(1);
+        let (_m2, w2) = client
+            .write_metadata_cache_entry_async_with_hook(
+                "read-race",
+                serde_json::json!({"name": "read-race", "version": "2.0.0"}),
+                None,
+                cache::MetadataCacheDirective::Unspecified,
+                None,
+                move || {
+                    let _ = v2_paused_tx.send(());
+                    let _ = release_v2_rx.recv();
+                },
+            )
+            .await
+            .unwrap();
+
+        v2_paused_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("v2 writer must pause before publishing");
+
+        // Reader samples V2's incremented `content_revision` while V1 is still on disk.
+        let cached = client
+            .read_metadata_cache_resolution_async::<serde_json::Value, RawBody>("read-race")
+            .await
+            .expect("v1 entry must still be readable before v2 publishes");
+        let stale_read_slot = match cached.value {
+            cache::CachedResolution::Document { source, .. } => source
+                .expect("v1 read source")
+                .slot::<RawBody>(ProjectionFacts {
+                    versions_complete: true,
+                    latest: Some("1.0.0".to_string()),
+                })
+                .expect("v1 read slot"),
+            cache::CachedResolution::Projected { .. } => panic!("expected unprojected document"),
+        };
+
+        // Now V2 finishes publishing and stores its projection.
+        release_v2_tx.send(()).unwrap();
+        client.flush_pending_cache_writes().await;
+
+        let v2_source = w2.and_then(|w| w.source).expect("v2 source");
+        let v2_entry = v2_source.entry.clone();
+        let v2_content_id = v2_source.content_id;
+        let v2_slot = v2_source
+            .slot::<RawBody>(ProjectionFacts {
+                versions_complete: true,
+                latest: Some("2.0.0".to_string()),
+            })
+            .expect("v2 slot");
+        client.synchronous_cache_writes = true;
+        client.store_metadata_projection(v2_slot, b"v2-body".to_vec());
+
+        // The delayed V1 read slot must not clobber V2's projection sidecar.
+        client.store_metadata_projection(stale_read_slot, b"stale-v1-read-body".to_vec());
+
+        let projected = read_projection::<RawBody>(&v2_entry, v2_content_id);
+        assert_eq!(
+            projected.map(|(body, _)| body),
+            Some(RawBody(b"v2-body".to_vec())),
+            "delayed cache-read slot from older document must not overwrite newer projection"
         );
     }
 }

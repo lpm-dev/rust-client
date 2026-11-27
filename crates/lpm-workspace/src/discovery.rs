@@ -3956,11 +3956,9 @@ overrides:
                 "root patterns must never enroll root as a member (named={named_root}, pnpm={use_pnpm_yaml})"
             );
 
-            let open_root = cap_std::fs::Dir::open_ambient_dir(
-                dir.path(),
-                cap_std::ambient_authority(),
-            )
-            .unwrap();
+            let open_root =
+                cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority())
+                    .unwrap();
             let ws_open = discover_workspace_from_open_root(dir.path(), &open_root, dir.path())
                 .unwrap()
                 .unwrap();
