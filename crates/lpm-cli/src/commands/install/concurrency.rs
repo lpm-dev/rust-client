@@ -303,12 +303,13 @@ pub(super) async fn prevalidate_v2_reusable_objects(
         let store_v2 = Arc::clone(&store_v2);
         let validation_batch = validation_batch.clone();
         let (batch_results, overflow) = tokio::task::spawn_blocking(move || {
+            let inline_started = std::time::Instant::now();
             let mut batch_results = Vec::with_capacity(unique_candidates.len());
             let mut iter = unique_candidates.into_iter();
             while let Some(sri) = iter.next() {
                 let (hit, timings) =
                     store_v2.reusable_object_with_timings_in_batch(&sri, &validation_batch)?;
-                let slow = timings.total_ms >= INLINE_SLOW_CHECK_THRESHOLD_MS;
+                let slow = inline_started.elapsed().as_millis() >= INLINE_SLOW_CHECK_THRESHOLD_MS;
                 batch_results.push((sri, hit, timings));
                 if slow {
                     let overflow: Vec<String> = iter.collect();

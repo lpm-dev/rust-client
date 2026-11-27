@@ -724,8 +724,14 @@ fn decompress_gzip_libdeflate_with_limits_and_budget<'a>(
     };
 
     // Keep input and output reserved together until decoding succeeds. An owned
-    // input can then be dropped and its share released before tar walking.
-    let mut budget = extract_budget.acquire(capacity.saturating_add(compressed.len()) as u64);
+    // input can then be dropped and its share released before tar walking. If
+    // the required reservation exceeds the container budget, fall back to
+    // streaming before attempting the oversized allocation.
+    let Some(mut budget) =
+        extract_budget.try_acquire(capacity.saturating_add(compressed.len()) as u64)
+    else {
+        return Ok(BufferedGzipDecode::NeedsStreaming);
+    };
     let mut decompressor = libdeflater::Decompressor::new();
     loop {
         let mut output = system_buffer::SystemBuffer::zeroed(capacity);
@@ -748,7 +754,12 @@ fn decompress_gzip_libdeflate_with_limits_and_budget<'a>(
                 drop(output);
                 capacity = capacity.saturating_mul(2).min(max_buffered);
                 drop(budget);
-                budget = extract_budget.acquire(capacity.saturating_add(compressed.len()) as u64);
+                let Some(grown_budget) =
+                    extract_budget.try_acquire(capacity.saturating_add(compressed.len()) as u64)
+                else {
+                    return Ok(BufferedGzipDecode::NeedsStreaming);
+                };
+                budget = grown_budget;
             }
             Err(e) => {
                 return Err(LpmError::Registry(format!(
@@ -804,6 +815,26 @@ impl AllocBudget {
         }
     }
 
+    /// Reserve `bytes` within the configured budget, waiting until enough
+    /// headroom is free. Returns `None` without waiting or reserving when a
+    /// single request exceeds the total budget so callers can route oversized
+    /// payloads to streaming instead of exceeding container memory limits.
+    fn try_acquire(&self, bytes: u64) -> Option<AllocBudgetGuard<'_>> {
+        if bytes > self.budget_bytes {
+            return None;
+        }
+        let mut guard = self.lock_available();
+        while *guard < bytes {
+            guard = self.wait_available(guard);
+        }
+        *guard -= bytes;
+        Some(AllocBudgetGuard {
+            budget: self,
+            bytes,
+        })
+    }
+
+    #[cfg(test)]
     fn acquire(&self, bytes: u64) -> AllocBudgetGuard<'_> {
         // Reservations larger than the whole budget would deadlock
         // (no path to make `available >= bytes` true). Cap at the
@@ -4674,10 +4705,91 @@ mod tests {
     }
 
     #[test]
+    fn buffered_decode_routes_to_streaming_when_initial_or_growth_exceeds_container_budget() {
+        use std::io::Write as _;
+
+        // Payload decompresses to 48 KiB (ISIZE = 48 KiB), exceeding the 16 KiB container budget.
+        let original = vec![b'a'; 48 * 1024];
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let tiny_budget = AllocBudget::new(16 * 1024);
+        let limits = ExtractionLimits {
+            max_buffered_compressed_size: 256 * 1024,
+            max_buffered_decompressed_size: 256 * 1024,
+            max_extraction_size: 256 * 1024,
+            max_file_size: 256 * 1024,
+            max_file_count: 16,
+            max_path_ledger_bytes: MAX_PATH_LEDGER_BYTES,
+        };
+        let outcome =
+            decompress_gzip_libdeflate_with_limits_and_budget(&compressed, limits, &tiny_budget)
+                .unwrap();
+        assert!(
+            matches!(outcome, BufferedGzipDecode::NeedsStreaming),
+            "initial decode exceeding container budget must route to streaming"
+        );
+        assert_eq!(*tiny_budget.lock_available(), 16 * 1024);
+
+        // Growth path: forge a small ISIZE (4 KiB, fits within 16 KiB budget) on a
+        // 48 KiB multi-member/concatenated payload (or truncated hint via 4 GiB wrap);
+        // Wait: libdeflate validates ISIZE against decompressed length, so instead test
+        // a small 8 KiB compressed + 12 KiB decoded payload under a 16 KiB budget where
+        // compressed.len() + capacity > budget_bytes.
+        let mut noisy = Vec::with_capacity(12 * 1024);
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        for _ in 0..(12 * 1024) {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            noisy.push((state >> 56) as u8);
+        }
+        let mut enc2 = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
+        enc2.write_all(&noisy).unwrap();
+        let noisy_gz = enc2.finish().unwrap();
+        assert!(noisy_gz.len() + noisy.len() > 16 * 1024);
+        let outcome2 =
+            decompress_gzip_libdeflate_with_limits_and_budget(&noisy_gz, limits, &tiny_budget)
+                .unwrap();
+        assert!(
+            matches!(outcome2, BufferedGzipDecode::NeedsStreaming),
+            "compressed+decompressed size exceeding container budget must route to streaming"
+        );
+
+        // Growth path: two concatenated gzip members where the trailing ISIZE
+        // is only 4 KiB (admitted initially), while total decoded output is 24 KiB (> 16 KiB).
+        let mut enc_part1 =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc_part1.write_all(&vec![b'p'; 20 * 1024]).unwrap();
+        let mut concat_gz = enc_part1.finish().unwrap();
+        let mut enc_part2 =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc_part2.write_all(&vec![b'q'; 4 * 1024]).unwrap();
+        concat_gz.extend_from_slice(&enc_part2.finish().unwrap());
+        let outcome3 =
+            decompress_gzip_libdeflate_with_limits_and_budget(&concat_gz, limits, &tiny_budget)
+                .unwrap();
+        assert!(
+            matches!(outcome3, BufferedGzipDecode::NeedsStreaming),
+            "growth exceeding container budget must route to streaming without oversized allocation"
+        );
+        assert_eq!(*tiny_budget.lock_available(), 16 * 1024);
+    }
+
+    #[test]
     fn windows_reserved_device_name_classification_covers_ports_and_case() {
         for reserved in [
-            "CON", "con", "Con.txt", "prn ", "aux.", "NUL.js", "CLOCK$", "clock$.bin", "COM1",
-            "com9.ts", "LPT1", "lpt5.json",
+            "CON",
+            "con",
+            "Con.txt",
+            "prn ",
+            "aux.",
+            "NUL.js",
+            "CLOCK$",
+            "clock$.bin",
+            "COM1",
+            "com9.ts",
+            "LPT1",
+            "lpt5.json",
         ] {
             assert!(
                 is_windows_reserved_device_name(OsStr::new(reserved)),

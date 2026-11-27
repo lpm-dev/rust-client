@@ -24,8 +24,10 @@ const MAX_CGROUP_WALK_DEPTH: usize = 64;
 const CGROUP_SCALAR_READ_CAP_BYTES: u64 = 128;
 #[cfg(any(target_os = "linux", test))]
 const CGROUP_STAT_READ_CAP_BYTES: u64 = 64 * 1024;
-#[cfg(target_os = "linux")]
-const PROC_READ_CAP_BYTES: u64 = 256 * 1024;
+#[cfg(any(target_os = "linux", test))]
+const PROC_LINE_CAP_BYTES: usize = 16 * 1024;
+#[cfg(any(target_os = "linux", test))]
+const MAX_PROC_LINES: usize = 65_536;
 
 /// Effective logical CPU count available to this process.
 ///
@@ -64,7 +66,7 @@ pub fn large_metadata_parse_permits(cpus: usize, memory_limit: Option<u64>) -> u
     if memory_limit.is_some_and(|bytes| bytes <= 768 * MIB) {
         return 1;
     }
-    (cpus / 4).clamp(1, 4)
+    (cpus / 4).clamp(2, 4)
 }
 
 /// Default bounded fetch/extract concurrency permits for the current OS.
@@ -79,17 +81,16 @@ pub fn default_fetch_extract_permits_for_os(
     memory_limit: Option<u64>,
     is_macos: bool,
 ) -> usize {
+    if memory_limit.is_some_and(|bytes| bytes <= GIB) {
+        return cpus.clamp(1, 2);
+    }
     // APFS metadata serialization caps macOS extract scaling at 4 writers;
-    // Linux and Windows scale up to 8 when CPU and RAM allow.
-    let base = if is_macos {
+    // Linux and Windows keep a 4-permit floor for network/disk overlap and
+    // scale up to 8 when CPU and RAM allow.
+    if is_macos {
         cpus.clamp(1, 4)
     } else {
-        cpus.clamp(1, 8)
-    };
-    if memory_limit.is_some_and(|bytes| bytes <= GIB) {
-        base.min(2)
-    } else {
-        base
+        cpus.clamp(4, 8)
     }
 }
 
@@ -120,15 +121,12 @@ pub fn default_tree_walk_helper_cap(cpus: usize) -> usize {
 fn detect_effective_memory_limit_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        let cgroup =
-            crate::read_text_file_capped(Path::new("/proc/self/cgroup"), PROC_READ_CAP_BYTES)
-                .unwrap_or_default();
-        let mountinfo =
-            crate::read_text_file_capped(Path::new("/proc/self/mountinfo"), PROC_READ_CAP_BYTES)
-                .unwrap_or_default();
-        let meminfo = crate::read_text_file_capped(Path::new("/proc/meminfo"), PROC_READ_CAP_BYTES)
-            .unwrap_or_default();
-        detect_linux_memory_limit_in(Path::new("/"), &cgroup, &mountinfo, &meminfo)
+        detect_linux_memory_limit_from_proc_files(
+            Path::new("/"),
+            Path::new("/proc/self/cgroup"),
+            Path::new("/proc/self/mountinfo"),
+            Path::new("/proc/meminfo"),
+        )
     }
     #[cfg(target_os = "macos")]
     {
@@ -276,40 +274,100 @@ fn parse_proc_cgroup_paths(content: &str) -> (Option<&str>, Option<&str>) {
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[derive(Default)]
 struct CgroupMounts {
-    v2: Option<(String, String)>,
-    v1_memory: Option<(String, String)>,
+    v2: Vec<(String, String)>,
+    v1_memory: Vec<(String, String)>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn push_cgroup_mount_line(mounts: &mut CgroupMounts, line: &str) {
+    let Some((left, right)) = line.split_once(" - ") else {
+        return;
+    };
+    let left_fields: Vec<&str> = left.split_whitespace().collect();
+    let right_fields: Vec<&str> = right.split_whitespace().collect();
+    if left_fields.len() < 5 || right_fields.len() < 3 {
+        return;
+    }
+    let fs_type = right_fields[0];
+    let super_opts = right_fields[2];
+    if fs_type == "cgroup2" {
+        let mount_root = unescape_mountinfo_field(left_fields[3]).into_owned();
+        let mount_point = unescape_mountinfo_field(left_fields[4]).into_owned();
+        mounts.v2.push((mount_root, mount_point));
+    } else if fs_type == "cgroup" && super_opts.split(',').any(|opt| opt == "memory") {
+        let mount_root = unescape_mountinfo_field(left_fields[3]).into_owned();
+        let mount_point = unescape_mountinfo_field(left_fields[4]).into_owned();
+        mounts.v1_memory.push((mount_root, mount_point));
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
 fn parse_cgroup_mounts(mountinfo: &str) -> CgroupMounts {
-    let mut mounts = CgroupMounts {
-        v2: None,
-        v1_memory: None,
-    };
+    let mut mounts = CgroupMounts::default();
     for line in mountinfo.lines() {
-        let Some((left, right)) = line.split_once(" - ") else {
-            continue;
-        };
-        let left_fields: Vec<&str> = left.split_whitespace().collect();
-        let right_fields: Vec<&str> = right.split_whitespace().collect();
-        if left_fields.len() < 5 || right_fields.len() < 3 {
-            continue;
-        }
-        let mount_root = unescape_mountinfo_field(left_fields[3]).into_owned();
-        let mount_point = unescape_mountinfo_field(left_fields[4]).into_owned();
-        let fs_type = right_fields[0];
-        let super_opts = right_fields[2];
-        if fs_type == "cgroup2" && mounts.v2.is_none() {
-            mounts.v2 = Some((mount_root, mount_point));
-        } else if fs_type == "cgroup"
-            && mounts.v1_memory.is_none()
-            && super_opts.split(',').any(|opt| opt == "memory")
-        {
-            mounts.v1_memory = Some((mount_root, mount_point));
-        }
+        push_cgroup_mount_line(&mut mounts, line);
     }
     mounts
+}
+
+/// Stream a potentially large `/proc` pseudo-file line-by-line so containers
+/// with hundreds of mounts (e.g. Docker-in-Docker or snap hosts where
+/// `/proc/self/mountinfo` exceeds 256 KiB) never drop cgroup entries.
+#[cfg(any(target_os = "linux", test))]
+fn for_each_proc_line(path: &Path, mut visit: impl FnMut(&str) -> bool) {
+    use std::io::BufRead as _;
+
+    let Ok(file) = std::fs::File::open(path) else {
+        return;
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf = Vec::with_capacity(512);
+    for _ in 0..MAX_PROC_LINES {
+        buf.clear();
+        let mut line_truncated = false;
+        loop {
+            let Ok(available) = reader.fill_buf() else {
+                return;
+            };
+            if available.is_empty() {
+                break;
+            }
+            if let Some(nl) = available.iter().position(|&b| b == b'\n') {
+                let take = (nl + 1).min(PROC_LINE_CAP_BYTES.saturating_sub(buf.len()));
+                if !line_truncated && take > 0 {
+                    buf.extend_from_slice(&available[..take]);
+                }
+                if nl + 1 > take {
+                    line_truncated = true;
+                }
+                reader.consume(nl + 1);
+                break;
+            }
+            let avail_len = available.len();
+            let remaining = PROC_LINE_CAP_BYTES.saturating_sub(buf.len());
+            let take = avail_len.min(remaining);
+            if !line_truncated && take > 0 {
+                buf.extend_from_slice(&available[..take]);
+            }
+            if avail_len > take {
+                line_truncated = true;
+            }
+            reader.consume(avail_len);
+        }
+        if buf.is_empty() {
+            break;
+        }
+        if line_truncated {
+            continue;
+        }
+        if let Ok(line) = std::str::from_utf8(&buf)
+            && !visit(line.trim_end_matches(['\r', '\n']))
+        {
+            break;
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -323,38 +381,97 @@ fn join_rooted_path(fs_root: &Path, abs_path: &str) -> PathBuf {
 }
 
 #[cfg(any(target_os = "linux", test))]
+enum ResolvedCgroupDir {
+    /// `mount_root` is an exact ancestor of `cgroup_path`.
+    Direct {
+        mount_dir: PathBuf,
+        cgroup_dir: PathBuf,
+    },
+    /// `mount_root` does not prefix `cgroup_path` (e.g. a cgroup namespace
+    /// where `/proc/self/cgroup` reports `/` relative to the namespace root).
+    Namespaced {
+        mount_dir: PathBuf,
+        cgroup_dir: PathBuf,
+    },
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn resolve_cgroup_dir(
     fs_root: &Path,
     mount_root: &str,
     mount_point: &str,
     cgroup_path: &str,
-) -> (PathBuf, PathBuf) {
+) -> Option<ResolvedCgroupDir> {
     let mount_dir = join_rooted_path(fs_root, mount_point);
     let norm_root = mount_root.trim_end_matches('/');
     let norm_cgroup = cgroup_path.trim_end_matches('/');
-    let relative = if norm_root.is_empty() {
-        norm_cgroup.trim_start_matches('/')
+    let (is_direct, relative) = if norm_root.is_empty() {
+        (true, norm_cgroup.trim_start_matches('/'))
     } else if norm_cgroup == norm_root {
-        ""
-    } else if let Some(rest) = norm_cgroup.strip_prefix(norm_root) {
-        if let Some(sub) = rest.strip_prefix('/') {
-            sub
-        } else {
-            norm_cgroup.trim_start_matches('/')
-        }
+        (true, "")
+    } else if let Some(rest) = norm_cgroup.strip_prefix(norm_root)
+        && let Some(sub) = rest.strip_prefix('/')
+    {
+        (true, sub)
     } else {
-        // Inside a cgroup namespace `/proc/self/cgroup` reports `/` relative to
-        // the namespace root even though `mountinfo` shows the host mount_root.
-        norm_cgroup.trim_start_matches('/')
+        (false, norm_cgroup.trim_start_matches('/'))
     };
     let mut target = mount_dir.clone();
     for segment in relative.split('/').filter(|s| !s.is_empty()) {
         if segment == "." || segment == ".." {
-            return (mount_dir.clone(), mount_dir);
+            return None;
         }
         target.push(segment);
     }
-    (mount_dir, target)
+    if !target.is_dir() {
+        return None;
+    }
+    Some(if is_direct {
+        ResolvedCgroupDir::Direct {
+            mount_dir,
+            cgroup_dir: target,
+        }
+    } else {
+        ResolvedCgroupDir::Namespaced {
+            mount_dir,
+            cgroup_dir: target,
+        }
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn resolve_hierarchy_memory_limit(
+    fs_root: &Path,
+    mounts: &[(String, String)],
+    cgroup_path: &str,
+    walk: fn(&Path, &Path) -> Option<u64>,
+) -> Option<u64> {
+    let mut direct_limit = None;
+    let mut saw_direct_mount = false;
+    let mut namespaced_limit = None;
+    for (mount_root, mount_point) in mounts {
+        match resolve_cgroup_dir(fs_root, mount_root, mount_point, cgroup_path) {
+            Some(ResolvedCgroupDir::Direct {
+                mount_dir,
+                cgroup_dir,
+            }) => {
+                saw_direct_mount = true;
+                direct_limit = min_opt(direct_limit, walk(&mount_dir, &cgroup_dir));
+            }
+            Some(ResolvedCgroupDir::Namespaced {
+                mount_dir,
+                cgroup_dir,
+            }) => {
+                namespaced_limit = min_opt(namespaced_limit, walk(&mount_dir, &cgroup_dir));
+            }
+            None => {}
+        }
+    }
+    if saw_direct_mount {
+        direct_limit
+    } else {
+        namespaced_limit
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -418,6 +535,85 @@ fn walk_cgroup_v1_memory_limit(mount_dir: &Path, cgroup_dir: &Path) -> Option<u6
 }
 
 #[cfg(any(target_os = "linux", test))]
+fn detect_linux_memory_limit_with_parsed(
+    fs_root: &Path,
+    v2_path: Option<&str>,
+    v1_memory_path: Option<&str>,
+    mounts: &CgroupMounts,
+    mem_total: Option<u64>,
+) -> Option<u64> {
+    let mut limit = mem_total;
+    if let Some(cgroup_path) = v2_path {
+        limit = min_opt(
+            limit,
+            resolve_hierarchy_memory_limit(
+                fs_root,
+                &mounts.v2,
+                cgroup_path,
+                walk_cgroup_v2_memory_limit,
+            ),
+        );
+    }
+    if let Some(cgroup_path) = v1_memory_path {
+        limit = min_opt(
+            limit,
+            resolve_hierarchy_memory_limit(
+                fs_root,
+                &mounts.v1_memory,
+                cgroup_path,
+                walk_cgroup_v1_memory_limit,
+            ),
+        );
+    }
+    limit
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn detect_linux_memory_limit_from_proc_files(
+    fs_root: &Path,
+    cgroup_file: &Path,
+    mountinfo_file: &Path,
+    meminfo_file: &Path,
+) -> Option<u64> {
+    let mut mem_total = None;
+    for_each_proc_line(meminfo_file, |line| {
+        if let Some(total) = parse_proc_meminfo_total_bytes(line) {
+            mem_total = Some(total);
+            return false;
+        }
+        true
+    });
+    let mut v2_path: Option<String> = None;
+    let mut v1_memory_path: Option<String> = None;
+    for_each_proc_line(cgroup_file, |line| {
+        let (v2, v1) = parse_proc_cgroup_paths(line);
+        if v2_path.is_none()
+            && let Some(path) = v2
+        {
+            v2_path = Some(path.to_owned());
+        }
+        if v1_memory_path.is_none()
+            && let Some(path) = v1
+        {
+            v1_memory_path = Some(path.to_owned());
+        }
+        v2_path.is_none() || v1_memory_path.is_none()
+    });
+    let mut mounts = CgroupMounts::default();
+    for_each_proc_line(mountinfo_file, |line| {
+        push_cgroup_mount_line(&mut mounts, line);
+        true
+    });
+    detect_linux_memory_limit_with_parsed(
+        fs_root,
+        v2_path.as_deref(),
+        v1_memory_path.as_deref(),
+        &mounts,
+        mem_total,
+    )
+}
+
+#[cfg(test)]
 fn detect_linux_memory_limit_in(
     fs_root: &Path,
     cgroup_content: &str,
@@ -427,20 +623,7 @@ fn detect_linux_memory_limit_in(
     let mem_total = parse_proc_meminfo_total_bytes(meminfo);
     let (v2_path, v1_memory_path) = parse_proc_cgroup_paths(cgroup_content);
     let mounts = parse_cgroup_mounts(mountinfo);
-    let mut limit = mem_total;
-    if let (Some(cgroup_path), Some((mount_root, mount_point))) = (v2_path, mounts.v2.as_ref()) {
-        let (mount_dir, cgroup_dir) =
-            resolve_cgroup_dir(fs_root, mount_root, mount_point, cgroup_path);
-        limit = min_opt(limit, walk_cgroup_v2_memory_limit(&mount_dir, &cgroup_dir));
-    }
-    if let (Some(cgroup_path), Some((mount_root, mount_point))) =
-        (v1_memory_path, mounts.v1_memory.as_ref())
-    {
-        let (mount_dir, cgroup_dir) =
-            resolve_cgroup_dir(fs_root, mount_root, mount_point, cgroup_path);
-        limit = min_opt(limit, walk_cgroup_v1_memory_limit(&mount_dir, &cgroup_dir));
-    }
-    limit
+    detect_linux_memory_limit_with_parsed(fs_root, v2_path, v1_memory_path, &mounts, mem_total)
 }
 
 #[cfg(test)]
@@ -549,6 +732,14 @@ mod tests {
         assert_eq!(default_max_blocking_threads(8, Some(GIB)), 12);
         assert_eq!(default_tree_walk_helper_cap(1), 0);
 
+        // 2-vCPU and 4-vCPU CI runners with ample memory preserve full I/O & HTTP/1.1 floors.
+        assert_eq!(
+            default_fetch_extract_permits_for_os(2, Some(4 * GIB), false),
+            4
+        );
+        assert_eq!(large_metadata_parse_permits(4, Some(4 * GIB)), 2);
+        assert_eq!(large_metadata_parse_permits(2, Some(4 * GIB)), 2);
+
         // Large host (16 vCPU, 32 GiB)
         assert_eq!(extract_memory_budget_bytes(Some(32 * GIB)), GIB);
         assert_eq!(extract_memory_budget_bytes(None), GIB);
@@ -572,5 +763,99 @@ mod tests {
             unescape_mountinfo_field("/mnt/my\\040cgroup\\134v2"),
             "/mnt/my cgroup\\v2"
         );
+    }
+
+    #[test]
+    fn cgroup_mount_selection_skips_unrelated_first_bind_mount_and_picks_applicable_subtree() {
+        let root = tempfile::tempdir().unwrap();
+        let unrelated_v2 = root.path().join("mnt/unrelated-v2");
+        let real_v2 = root.path().join("sys/fs/cgroup");
+        std::fs::create_dir_all(&unrelated_v2).unwrap();
+        std::fs::create_dir_all(real_v2.join("worker")).unwrap();
+        std::fs::write(unrelated_v2.join("memory.max"), format!("{}\n", 8 * GIB)).unwrap();
+        std::fs::write(
+            real_v2.join("worker/memory.max"),
+            format!("{}\n", 256 * MIB),
+        )
+        .unwrap();
+
+        let cgroup_v2 = "0::/app/worker\n";
+        let mountinfo_v2 = "\
+10 1 0:25 /sibling /mnt/unrelated-v2 rw - cgroup2 cgroup2 rw\n\
+28 1 0:25 /app /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n";
+        let meminfo = "MemTotal:       16384000 kB\n";
+
+        assert_eq!(
+            detect_linux_memory_limit_in(root.path(), cgroup_v2, mountinfo_v2, meminfo),
+            Some(256 * MIB),
+            "v2 mount selection must skip unrelated sibling bind mount and use process's subtree"
+        );
+
+        let unrelated_v1 = root.path().join("mnt/unrelated-v1");
+        let real_v1 = root.path().join("sys/fs/cgroup/memory");
+        std::fs::create_dir_all(&unrelated_v1).unwrap();
+        std::fs::create_dir_all(real_v1.join("worker")).unwrap();
+        std::fs::write(
+            unrelated_v1.join("memory.limit_in_bytes"),
+            format!("{}\n", 8 * GIB),
+        )
+        .unwrap();
+        std::fs::write(
+            real_v1.join("worker/memory.limit_in_bytes"),
+            format!("{}\n", 384 * MIB),
+        )
+        .unwrap();
+
+        let cgroup_v1 = "4:memory:/app/worker\n";
+        let mountinfo_v1 = "\
+11 1 0:29 /sibling /mnt/unrelated-v1 rw - cgroup cgroup rw,memory\n\
+33 1 0:29 /app /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n";
+        assert_eq!(
+            detect_linux_memory_limit_in(root.path(), cgroup_v1, mountinfo_v1, meminfo),
+            Some(384 * MIB),
+            "v1 mount selection must skip unrelated sibling bind mount and use process's subtree"
+        );
+    }
+
+    #[test]
+    fn large_mountinfo_exceeding_256kib_still_detects_cgroup_limit() {
+        use std::io::Write as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let cg_root = root.path().join("sys/fs/cgroup");
+        std::fs::create_dir_all(&cg_root).unwrap();
+        std::fs::write(cg_root.join("memory.max"), format!("{}\n", 512 * MIB)).unwrap();
+
+        let proc_dir = root.path().join("proc_mock");
+        std::fs::create_dir_all(&proc_dir).unwrap();
+        let cgroup_file = proc_dir.join("cgroup");
+        let mountinfo_file = proc_dir.join("mountinfo");
+        let meminfo_file = proc_dir.join("meminfo");
+        std::fs::write(&cgroup_file, "0::/\n").unwrap();
+        std::fs::write(&meminfo_file, "MemTotal:       16384000 kB\n").unwrap();
+
+        // Write > 300 KiB of unrelated mounts before the cgroup2 entry.
+        let mut f = std::fs::File::create(&mountinfo_file).unwrap();
+        for idx in 0..3500 {
+            writeln!(
+                f,
+                "{idx} 1 0:99 / /snap/package-{idx:04}/12345 ro,nodev,relatime - squashfs /dev/loop{idx} ro,errors=continue"
+            )
+            .unwrap();
+        }
+        writeln!(f, "9999 1 0:25 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw").unwrap();
+        drop(f);
+        assert!(
+            std::fs::metadata(&mountinfo_file).unwrap().len() > 256 * 1024,
+            "mountinfo fixture must exceed the old 256 KiB read cap"
+        );
+
+        let detected = detect_linux_memory_limit_from_proc_files(
+            root.path(),
+            &cgroup_file,
+            &mountinfo_file,
+            &meminfo_file,
+        );
+        assert_eq!(detected, Some(512 * MIB));
     }
 }

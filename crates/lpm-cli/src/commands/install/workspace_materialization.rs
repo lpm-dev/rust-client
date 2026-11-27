@@ -534,6 +534,7 @@ impl WorkspaceMaterializationCoordinator {
                             let store = Arc::clone(&store);
                             let validation_batch = validation_batch.clone();
                             tokio::task::spawn_blocking(move || {
+                                let inline_started = std::time::Instant::now();
                                 let mut batch_results = Vec::with_capacity(check_source_sris.len());
                                 let mut iter = check_source_sris.into_iter();
                                 while let Some(source_sri) = iter.next() {
@@ -542,7 +543,8 @@ impl WorkspaceMaterializationCoordinator {
                                             &source_sri,
                                             &validation_batch,
                                         )?;
-                                    let slow = timings.total_ms >= INLINE_SLOW_CHECK_THRESHOLD_MS;
+                                    let slow = inline_started.elapsed().as_millis()
+                                        >= INLINE_SLOW_CHECK_THRESHOLD_MS;
                                     batch_results
                                         .push((source_sri, ObjectValidation { reusable, timings }));
                                     if slow {

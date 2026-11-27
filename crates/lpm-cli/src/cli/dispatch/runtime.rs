@@ -74,7 +74,6 @@ pub(super) fn run_async_main() -> Result<()> {
     const ASYNC_STACK_BYTES: usize = 32 * 1024 * 1024;
 
     let cpus = lpm_common::resources::effective_cpu_count();
-    let memory_limit = lpm_common::resources::effective_memory_limit_bytes();
     let workers = runtime_worker_threads(
         cli.command.as_ref(),
         std::env::var_os("TOKIO_WORKER_THREADS").is_some(),
@@ -91,14 +90,13 @@ pub(super) fn run_async_main() -> Result<()> {
             if let Some(workers) = workers {
                 runtime_builder.worker_threads(workers);
             }
-            let max_blocking_threads = std::env::var("LPM_MAX_BLOCKING_THREADS")
+            if let Some(max_blocking_threads) = std::env::var("LPM_MAX_BLOCKING_THREADS")
                 .ok()
                 .and_then(|s| s.parse::<std::num::NonZeroUsize>().ok())
-                .map_or_else(
-                    || lpm_common::resources::default_max_blocking_threads(cpus, memory_limit),
-                    std::num::NonZeroUsize::get,
-                );
-            runtime_builder.max_blocking_threads(max_blocking_threads);
+                .map(std::num::NonZeroUsize::get)
+            {
+                runtime_builder.max_blocking_threads(max_blocking_threads);
+            }
             let result = runtime_builder
                 .build()
                 .expect("failed to create tokio runtime")
