@@ -26,6 +26,7 @@ pub struct NpmRange {
     raw: String,
     parsed: node_semver::Range,
     dist_tag: Option<String>,
+    exact_version: Option<NpmVersion>,
 }
 
 impl NpmRange {
@@ -36,6 +37,7 @@ impl NpmRange {
                 raw: "*".to_string(),
                 parsed: node_semver::Range::any(),
                 dist_tag: None,
+                exact_version: None,
             });
         }
         if trimmed == "latest" {
@@ -43,14 +45,18 @@ impl NpmRange {
                 raw: "latest".to_string(),
                 parsed: node_semver::Range::any(),
                 dist_tag: Some("latest".to_string()),
+                exact_version: None,
             });
         }
         let parsed = lpm_semver::parse_node_semver_range(trimmed)
             .map_err(|error| format!("invalid range '{input}': {error}"))?;
+        let exact_raw = trimmed.strip_prefix('=').unwrap_or(trimmed);
+        let exact_version = NpmVersion::parse_exact_candidate(exact_raw);
         Ok(NpmRange {
             raw: trimmed.to_string(),
             parsed,
             dist_tag: None,
+            exact_version,
         })
     }
 
@@ -61,6 +67,7 @@ impl NpmRange {
                 raw: input.trim().to_string(),
                 parsed: node_semver::Range::any(),
                 dist_tag: Some(input.trim().to_string()),
+                exact_version: None,
             }),
             Err(error) => Err(error),
         }
@@ -136,14 +143,8 @@ impl NpmRange {
             return Ranges::full();
         }
 
-        // Use min_version as a lower bound heuristic
         if let Some(min) = self.parsed.min_version() {
-            // For caret ranges like ^1.2.3, the upper bound is < next major
-            // For tilde ranges like ~1.2.3, the upper bound is < next minor
-            // We use a broad range and rely on `satisfies` for exact filtering
-            Ranges::higher_than(
-                NpmVersion::parse(&min.to_string()).unwrap_or(NpmVersion::new(0, 0, 0)),
-            )
+            Ranges::higher_than(NpmVersion::from_inner(min))
         } else {
             Ranges::full()
         }
@@ -161,12 +162,14 @@ impl NpmRange {
         self.dist_tag.as_deref()
     }
 
+    #[inline]
     pub fn exact_version(&self) -> Option<NpmVersion> {
-        if self.dist_tag.is_some() {
-            return None;
-        }
-        let raw = self.raw.strip_prefix('=').unwrap_or(&self.raw);
-        NpmVersion::parse(raw).ok()
+        self.exact_version.clone()
+    }
+
+    #[inline]
+    pub fn exact_version_ref(&self) -> Option<&NpmVersion> {
+        self.exact_version.as_ref()
     }
 }
 

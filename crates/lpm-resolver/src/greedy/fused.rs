@@ -5,9 +5,9 @@ use super::manifest::{
     ensure_policy_metadata_for_cached_manifest, exact_metadata_fast_path_eligible,
     fetch_metadata_for_resolver_with_permit, fetch_metadata_for_resolver_with_permit_and_exact,
     fetch_metadata_for_resolver_with_trace_detail, fetch_preferred_metadata_for_resolver,
-    hydrate_cached_manifest_for_edge, parse_cached_metadata_for_resolver, parse_fetched_metadata,
-    parse_partial_fetched_metadata, publish_direct_base_fact, reads_public_npm,
-    try_fetch_exact_metadata_for_resolver,
+    hydrate_cached_manifest_for_edge, parse_borrowed_fetched_metadata,
+    parse_cached_metadata_for_resolver, parse_fetched_metadata, parse_partial_fetched_metadata,
+    publish_direct_base_fact, reads_public_npm, try_fetch_exact_metadata_for_resolver,
 };
 use super::peer::{drain_peer_requirements_one_pass, pick_peer_prefetch_candidates};
 use super::prelude::*;
@@ -2305,8 +2305,8 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             continue;
         };
         let canonical = CanonicalKey::from_dep_name(&name);
-        let fetched = parse_fetched_metadata(
-            metadata.as_ref().clone(),
+        let fetched = parse_borrowed_fetched_metadata(
+            metadata.as_ref(),
             spec_tx.is_some(),
             trace_metadata_fetches,
         );

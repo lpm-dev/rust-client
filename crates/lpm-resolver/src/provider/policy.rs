@@ -42,6 +42,9 @@ pub(crate) fn release_age_status_for_version(
     version: &NpmVersion,
     policy: &ResolverPolicy,
 ) -> ReleaseTimeStatus {
+    if !policy.release_age_applies_to_package(package) {
+        return ReleaseTimeStatus::Allowed;
+    }
     let start = std::time::Instant::now();
     let status = release_age_status_for_version_unprofiled(package, info, version, policy);
     crate::profile::record_release_age_check(
@@ -58,7 +61,16 @@ pub(crate) fn release_age_status_for_version_unprofiled(
     version: &NpmVersion,
     policy: &ResolverPolicy,
 ) -> ReleaseTimeStatus {
-    let published_unix = info.published_at_unix(&version.to_string());
+    if !policy.release_age_applies_to_package(package)
+        || policy.release_age_version_excluded(package, version)
+    {
+        return ReleaseTimeStatus::Allowed;
+    }
+    let published_unix = if info.release_records_empty() {
+        None
+    } else {
+        info.published_at_unix_for(version)
+    };
     if published_unix.is_none()
         && policy.metadata_modified_before_or_at_cutoff_for_package(
             package,
@@ -85,36 +97,31 @@ pub(crate) fn trust_downgrade_violation_unprofiled(
     info: &CachedPackageInfo,
     version: &NpmVersion,
 ) -> Option<String> {
-    let version_str = version.to_string();
-    let published_unix = info.published_at_unix(&version_str)?;
-    let current_evidence = info.trust_evidence(&version_str);
-    let exclude_prerelease = !version.is_prerelease();
-
-    let mut strongest_prior: Option<TrustEvidence> = None;
-    for candidate in info.versions.iter() {
-        if exclude_prerelease && candidate.is_prerelease() {
-            continue;
-        }
-        let candidate_str = candidate.to_string();
-        if candidate_str == version_str {
-            continue;
-        }
-        let Some(candidate_published) = info.published_at_unix(&candidate_str) else {
-            continue;
-        };
-        if candidate_published >= published_unix {
-            continue;
-        }
-        let Some(evidence) = info.trust_evidence(&candidate_str) else {
-            continue;
-        };
-        if strongest_prior.is_none_or(|prior| evidence > prior) {
-            strongest_prior = Some(evidence);
-            if evidence == TrustEvidence::StagedPublish {
-                break;
-            }
-        }
+    if info.trust_is_empty() {
+        return None;
     }
+    let published_unix = info.published_at_unix_for(version)?;
+    let current_evidence = info.trust_evidence_for(version);
+    if current_evidence == Some(TrustEvidence::StagedPublish) {
+        return None;
+    }
+
+    let timeline = info.trust_timeline();
+    let (earliest_staged, earliest_trusted) = if version.is_prerelease() {
+        (timeline.earliest_staged_any, timeline.earliest_trusted_any)
+    } else {
+        (
+            timeline.earliest_staged_stable,
+            timeline.earliest_trusted_stable,
+        )
+    };
+    let strongest_prior = if earliest_staged.is_some_and(|ts| ts < published_unix) {
+        Some(TrustEvidence::StagedPublish)
+    } else if earliest_trusted.is_some_and(|ts| ts < published_unix) {
+        Some(TrustEvidence::TrustedPublisher)
+    } else {
+        None
+    };
 
     let prior = strongest_prior?;
     if current_evidence.is_some_and(|current| current >= prior) {
@@ -122,7 +129,7 @@ pub(crate) fn trust_downgrade_violation_unprofiled(
     }
     let current_label = current_evidence.map_or("no trust evidence", TrustEvidence::label);
     Some(format!(
-        "{version_str} has {current_label}; an earlier published version had {}",
+        "{version} has {current_label}; an earlier published version had {}",
         prior.label()
     ))
 }
@@ -166,7 +173,7 @@ pub(crate) fn select_override_target(
         }
         if info.has_platform_metadata()
             && info
-                .platform_is_compatible(&version.to_string())
+                .platform_is_compatible_for(version)
                 .is_some_and(|compatible| !compatible)
         {
             return Some(OverrideTargetRejection::PlatformIncompatible);

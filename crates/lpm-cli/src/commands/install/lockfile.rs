@@ -4037,7 +4037,7 @@ fn resolved_to_unfinalized_install_packages(
                 .get(&canonical)
                 .map(|info| {
                     (
-                        info.signatures(&version).to_vec(),
+                        info.signatures(&version),
                         info.published_at(&version).map(str::to_owned),
                         info.unpacked_size(&version),
                     )

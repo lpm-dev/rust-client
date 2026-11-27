@@ -58,6 +58,9 @@ impl VersionReq {
 /// Parse an npm semver range through LPM's defensive wrapper around `node-semver`.
 pub fn parse_node_semver_range(input: &str) -> Result<node_semver::Range, LpmError> {
     let trimmed = input.trim();
+    if is_canonical_single_comparator(trimmed) {
+        return parse_normalized_node_semver_range(input, trimmed);
+    }
     if !contains_only_range_characters(trimmed) {
         return Err(LpmError::InvalidVersionRange(format!(
             "{input}: contains unsupported semver range characters"
@@ -68,18 +71,77 @@ pub fn parse_node_semver_range(input: &str) -> Result<node_semver::Range, LpmErr
             "{input}: invalid range token"
         )));
     }
-    if has_malformed_wildcard_range_operator(trimmed) {
-        return Err(LpmError::InvalidVersionRange(format!(
-            "{input}: invalid wildcard range"
-        )));
-    }
-    if has_malformed_wildcard_comparator(trimmed) {
-        return Err(LpmError::InvalidVersionRange(format!(
-            "{input}: invalid wildcard comparator"
-        )));
+    let has_wildcard_char = trimmed
+        .bytes()
+        .any(|byte| matches!(byte, b'*' | b'x' | b'X'));
+    if has_wildcard_char {
+        if has_malformed_wildcard_range_operator(trimmed) {
+            return Err(LpmError::InvalidVersionRange(format!(
+                "{input}: invalid wildcard range"
+            )));
+        }
+        if has_malformed_wildcard_comparator(trimmed) {
+            return Err(LpmError::InvalidVersionRange(format!(
+                "{input}: invalid wildcard comparator"
+            )));
+        }
     }
     let parse_input = normalize_range_input(trimmed);
     parse_normalized_node_semver_range(input, parse_input.as_ref())
+}
+
+/// Fast-path recognizer for single-token canonical comparators like `^1.2.3`,
+/// `~1.2.3`, `1.2.3`, `=1.2.3`, `>=1.2.3`, `<=1.2.3`, `>1.2.3`, `<1.2.3`
+/// where all three numeric components are plain ASCII integers within
+/// `node_semver::MAX_SAFE_INTEGER`. These never require wildcard/hyphen
+/// normalization and cannot contain malformed tokens.
+fn is_canonical_single_comparator(trimmed: &str) -> bool {
+    if trimmed.is_empty() || trimmed.len() > node_semver::MAX_LENGTH {
+        return false;
+    }
+    let bytes = trimmed.as_bytes();
+    let rest = match bytes {
+        [b'>', b'=', tail @ ..] | [b'<', b'=', tail @ ..] => tail,
+        [b'^' | b'~' | b'=' | b'>' | b'<', tail @ ..] => tail,
+        _ => bytes,
+    };
+    let mut parts = rest.split(|byte| *byte == b'.');
+    let Some(major) = parts.next() else {
+        return false;
+    };
+    let Some(minor) = parts.next() else {
+        return false;
+    };
+    let Some(patch) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    is_valid_ascii_semver_int(major)
+        && is_valid_ascii_semver_int(minor)
+        && is_valid_ascii_semver_int(patch)
+}
+
+fn is_valid_ascii_semver_int(digits: &[u8]) -> bool {
+    if digits.is_empty() {
+        return false;
+    }
+    let mut value = 0u64;
+    for &byte in digits {
+        let digit = byte.wrapping_sub(b'0');
+        if digit > 9 {
+            return false;
+        }
+        let Some(next) = value
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(u64::from(digit)))
+        else {
+            return false;
+        };
+        value = next;
+    }
+    value <= node_semver::MAX_SAFE_INTEGER
 }
 
 fn parse_normalized_node_semver_range(
@@ -336,16 +398,29 @@ fn has_malformed_wildcard_range_operator(input: &str) -> bool {
 
 fn normalize_wildcard_range_operators(input: &str) -> Option<String> {
     let mut changed = false;
-    let mut disjuncts = Vec::new();
-    for disjunct in input.split("||") {
-        disjuncts.push(normalize_wildcard_operator_disjunct(
-            disjunct.trim(),
-            &mut changed,
-        ));
+    let mut disjuncts: Option<Vec<Cow<'_, str>>> = None;
+    for (index, raw_disjunct) in input.split("||").enumerate() {
+        let trimmed = raw_disjunct.trim();
+        let mut local_changed = false;
+        let normalized = normalize_wildcard_operator_disjunct(trimmed, &mut local_changed);
+        if local_changed {
+            changed = true;
+            let vec = disjuncts.get_or_insert_with(|| {
+                input
+                    .split("||")
+                    .take(index)
+                    .map(|prev| Cow::Borrowed(prev.trim()))
+                    .collect()
+            });
+            vec.push(normalized);
+        } else if let Some(vec) = disjuncts.as_mut() {
+            vec.push(normalized);
+        }
     }
     if !changed {
         return None;
     }
+    let disjuncts = disjuncts?;
     if disjuncts.iter().any(|disjunct| disjunct == "*") {
         Some("*".to_string())
     } else {
@@ -353,13 +428,13 @@ fn normalize_wildcard_range_operators(input: &str) -> Option<String> {
     }
 }
 
-fn normalize_wildcard_operator_disjunct(disjunct: &str, changed: &mut bool) -> String {
+fn normalize_wildcard_operator_disjunct<'a>(disjunct: &'a str, changed: &mut bool) -> Cow<'a, str> {
     if let Some(range) = normalize_wildcard_hyphen(disjunct) {
         *changed = true;
-        return range;
+        return Cow::Owned(range);
     }
     let mut local_changed = false;
-    let mut normalized = Vec::new();
+    let mut normalized: Vec<Cow<'a, str>> = Vec::new();
     let mut tokens = disjunct.split_whitespace().peekable();
     while let Some(token) = tokens.next() {
         let range_operator = token.trim_end_matches('=');
@@ -374,9 +449,9 @@ fn normalize_wildcard_operator_disjunct(disjunct: &str, changed: &mut bool) -> S
                 local_changed = true;
                 let operand = operand.trim_start_matches('=');
                 normalized.push(if is_valid_wildcard_operand(operand) {
-                    "*".to_string()
+                    Cow::Borrowed("*")
                 } else {
-                    format!("{range_operator}{operand}")
+                    Cow::Owned(format!("{range_operator}{operand}"))
                 });
                 continue;
             }
@@ -395,37 +470,41 @@ fn normalize_wildcard_operator_disjunct(disjunct: &str, changed: &mut bool) -> S
                 tokens.next();
             }
             local_changed = true;
-            normalized.push(range);
+            normalized.push(Cow::Owned(range));
             continue;
         }
         if let Some(operand) = range_operator_operand(token) {
             if is_valid_wildcard_operand(operand) {
                 local_changed = true;
-                normalized.push("*".to_string());
+                normalized.push(Cow::Borrowed("*"));
                 continue;
             }
             if token.contains('=') {
                 local_changed = true;
                 let operator = if token.starts_with('^') { "^" } else { "~" };
-                normalized.push(format!("{operator}{operand}"));
+                normalized.push(Cow::Owned(format!("{operator}{operand}")));
                 continue;
             }
         }
-        normalized.push(token.to_string());
+        if token == "<0.0.0-0" {
+            *changed = true;
+            return Cow::Borrowed("<0.0.0-0");
+        }
+        normalized.push(Cow::Borrowed(token));
     }
     if normalized.iter().any(|token| token == "<0.0.0-0") {
         *changed = true;
-        return "<0.0.0-0".to_string();
+        return Cow::Borrowed("<0.0.0-0");
     }
     if !local_changed {
-        return disjunct.to_string();
+        return Cow::Borrowed(disjunct);
     }
     *changed = true;
     normalized.retain(|token| token != "*");
     if normalized.is_empty() {
-        "*".to_string()
+        Cow::Borrowed("*")
     } else {
-        normalized.join(" ")
+        Cow::Owned(normalized.join(" "))
     }
 }
 
@@ -1210,5 +1289,55 @@ mod tests {
         let json = serde_json::to_string(&range).unwrap();
         let parsed: VersionReq = serde_json::from_str(&json).unwrap();
         assert_eq!(range.original(), parsed.original());
+    }
+
+    #[test]
+    fn canonical_single_comparator_fast_path_matches_node_semver() {
+        let cases = [
+            "^1.2.3",
+            "^0.2.3",
+            "^0.0.3",
+            "~1.2.3",
+            "1.2.3",
+            "=1.2.3",
+            ">=1.2.3",
+            "<=1.2.3",
+            ">1.2.3",
+            "<1.2.3",
+            ">=1.0.0 <2.0.0",
+            "^1.0.0 || ^2.0.0",
+        ];
+        let versions = [
+            v("0.0.2"),
+            v("0.0.3"),
+            v("0.0.4"),
+            v("0.2.3"),
+            v("0.2.9"),
+            v("0.3.0"),
+            v("1.0.0"),
+            v("1.2.2"),
+            v("1.2.3"),
+            v("1.2.4"),
+            v("1.9.9"),
+            v("2.0.0"),
+            v("2.1.0"),
+        ];
+        for input in cases {
+            let parsed = parse_node_semver_range(input).unwrap();
+            let reference = node_semver::Range::parse(input).unwrap();
+            for ver in &versions {
+                assert_eq!(
+                    parsed.satisfies(ver.as_inner()),
+                    reference.satisfies(ver.as_inner()),
+                    "mismatch for {input} on {ver}"
+                );
+            }
+        }
+        assert!(is_canonical_single_comparator("^1.2.3"));
+        assert!(!is_canonical_single_comparator("^1.2"));
+        assert!(!is_canonical_single_comparator("^1.2.x"));
+        assert!(!is_canonical_single_comparator(">=1.0.0 <2.0.0"));
+        assert!(!is_canonical_single_comparator("^1.2.3-alpha.1"));
+        assert!(normalize_wildcard_range_operators("^1.0.0 || ^2.0.0").is_none());
     }
 }

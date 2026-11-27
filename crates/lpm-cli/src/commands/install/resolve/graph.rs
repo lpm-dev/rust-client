@@ -386,7 +386,7 @@ pub(super) fn merge_node_into_packages(
                 peers: Vec::new(),
                 integrity: node.info.integrity(&version).map(str::to_owned),
                 unpacked_size: node.info.unpacked_size(&version),
-                registry_signatures: node.info.signatures(&version).to_vec(),
+                registry_signatures: node.info.signatures(&version),
                 registry_published_at: node.info.published_at(&version).map(str::to_owned),
                 platform: node.platform.clone(),
                 node_engine: node.info.node_engine(&version).map(str::to_owned),

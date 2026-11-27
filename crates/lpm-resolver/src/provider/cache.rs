@@ -1,4 +1,3 @@
-use super::manifest_core::ManifestVersion;
 use super::prelude::*;
 use super::types::{CachedAvailableVersions, CachedRange, PubGrubSolution};
 
@@ -96,40 +95,49 @@ pub(crate) fn merge_cached_package_info(
         && (incoming.release_metadata_complete || !incoming_adds_versions))
         || (incoming.release_metadata_complete && !existing_adds_versions);
 
-    if !incoming_adds_versions
-        && incoming
-            .modified
-            .as_ref()
-            .is_none_or(|value| existing.modified.as_ref() == Some(value))
-        && incoming
-            .latest_version
-            .as_ref()
-            .is_none_or(|value| existing.latest_version.as_ref() == Some(value))
-        && incoming
-            .dist_tags()
-            .iter()
-            .all(|(tag, version)| existing.dist_tags().get(tag) == Some(version))
-        && incoming.versions.iter().all(|version| {
-            let current = existing.manifest_version_owned_for(version);
-            let updated = merge_manifest_version(
-                current.as_ref(),
-                incoming.manifest_version_owned_for(version),
-                existing.workspace_versions.contains(version),
-            );
-            current == updated
-        })
-    {
-        let mut merged = existing.clone();
-        merged.covered_ranges = covered_ranges;
-        merged.workspace_versions = workspace_versions;
-        merged.versions_complete = versions_complete;
-        merged.trust_metadata_complete = trust_metadata_complete;
-        merged.platform_metadata_complete = platform_metadata_complete;
-        merged.platform_hydrated_versions = platform_hydrated_versions;
-        merged.release_metadata_complete = release_metadata_complete;
-        merged.latest_version_hint = latest_version_hint;
-        merged.preferred_latest = merged_preferred_latest(existing, incoming, &merged);
-        return merged;
+    if !incoming_adds_versions {
+        let diff = existing.analyze_subset_merge(incoming);
+        if !diff.core_changed {
+            let mut merged = existing.clone();
+            if let Some(value) = incoming.modified.as_ref()
+                && existing.modified.as_ref() != Some(value)
+            {
+                merged.modified = Some(value.clone());
+                merged.modified_unix = incoming.modified_unix;
+            }
+            if let Some(value) = incoming.latest_version.as_ref()
+                && existing.latest_version.as_ref() != Some(value)
+            {
+                merged.latest_version = Some(value.clone());
+            }
+            if !incoming
+                .dist_tags()
+                .iter()
+                .all(|(tag, version)| existing.dist_tags().get(tag) == Some(version))
+            {
+                let mut dist_tags = existing.dist_tags().clone();
+                dist_tags.extend(
+                    incoming
+                        .dist_tags()
+                        .iter()
+                        .map(|(tag, version)| (tag.clone(), version.clone())),
+                );
+                merged.set_dist_tags(dist_tags);
+            }
+            if diff.release_changed || diff.platform_changed || diff.trust_changed {
+                merged.merge_overlays_from(incoming, diff);
+            }
+            merged.covered_ranges = covered_ranges;
+            merged.workspace_versions = workspace_versions;
+            merged.versions_complete = versions_complete;
+            merged.trust_metadata_complete = trust_metadata_complete;
+            merged.platform_metadata_complete = platform_metadata_complete;
+            merged.platform_hydrated_versions = platform_hydrated_versions;
+            merged.release_metadata_complete = release_metadata_complete;
+            merged.latest_version_hint = latest_version_hint;
+            merged.preferred_latest = merged_preferred_latest(existing, incoming, &merged);
+            return merged;
+        }
     }
 
     let modified = incoming
@@ -147,11 +155,7 @@ pub(crate) fn merge_cached_package_info(
             .iter()
             .map(|(tag, version)| (tag.clone(), version.clone())),
     );
-    let mut versions = Vec::with_capacity(existing.versions.len() + incoming.versions.len());
-    versions.extend(existing.versions.iter().cloned());
-    versions.extend(incoming.versions.iter().cloned());
-    versions.sort_unstable_by(|left, right| right.cmp(left));
-    versions.dedup();
+    let max_versions = existing.versions.len() + incoming.versions.len();
     let mut builder = CachedPackageInfo::builder(
         modified,
         trust_metadata_complete,
@@ -160,20 +164,47 @@ pub(crate) fn merge_cached_package_info(
         workspace_versions,
         platform_metadata_complete,
         latest_version,
-        versions.len(),
+        max_versions,
     );
     builder.set_dist_tags(dist_tags);
-    for version in versions {
-        let existing_manifest = existing.manifest_version_owned_for(&version);
-        let incoming_manifest = incoming.manifest_version_owned_for(&version);
-        let manifest =
-            if existing.workspace_versions.contains(&version) || incoming_manifest.is_none() {
-                existing_manifest
-            } else {
-                merge_manifest_version(existing_manifest.as_ref(), incoming_manifest, false)
-            };
-        if let Some(manifest) = manifest {
-            builder.push(manifest);
+    let mut ex_idx = 0usize;
+    let mut inc_idx = 0usize;
+    let ex_len = existing.versions.len();
+    let inc_len = incoming.versions.len();
+    while ex_idx < ex_len || inc_idx < inc_len {
+        match (
+            existing.versions.get(ex_idx),
+            incoming.versions.get(inc_idx),
+        ) {
+            (Some(ex_v), Some(inc_v)) => match ex_v.cmp(inc_v) {
+                std::cmp::Ordering::Greater => {
+                    builder.push_merged_from_cache(Some((existing, ex_idx)), None, false);
+                    ex_idx += 1;
+                }
+                std::cmp::Ordering::Less => {
+                    builder.push_merged_from_cache(None, Some((incoming, inc_idx)), false);
+                    inc_idx += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    let preserve_existing = existing.workspace_versions.contains(ex_v);
+                    builder.push_merged_from_cache(
+                        Some((existing, ex_idx)),
+                        Some((incoming, inc_idx)),
+                        preserve_existing,
+                    );
+                    ex_idx += 1;
+                    inc_idx += 1;
+                }
+            },
+            (Some(_), None) => {
+                builder.push_merged_from_cache(Some((existing, ex_idx)), None, false);
+                ex_idx += 1;
+            }
+            (None, Some(_)) => {
+                builder.push_merged_from_cache(None, Some((incoming, inc_idx)), false);
+                inc_idx += 1;
+            }
+            (None, None) => break,
         }
     }
     let mut merged = builder.finish();
@@ -198,77 +229,6 @@ fn merged_preferred_latest(
         .or(existing.preferred_latest.as_ref())
         .filter(|latest| Some(*latest) == merged.latest_version.as_ref())
         .cloned()
-}
-
-fn merge_manifest_version(
-    existing: Option<&ManifestVersion>,
-    incoming: Option<ManifestVersion>,
-    preserve_existing: bool,
-) -> Option<ManifestVersion> {
-    if preserve_existing {
-        return existing.cloned();
-    }
-    match (existing, incoming) {
-        (Some(existing), Some(mut incoming)) => {
-            if incoming.dependencies.is_empty() {
-                incoming.dependencies.clone_from(&existing.dependencies);
-            }
-            if incoming.peer_dependencies.is_empty() {
-                incoming
-                    .peer_dependencies
-                    .clone_from(&existing.peer_dependencies);
-            }
-            if incoming.node_engine.is_none() {
-                incoming.node_engine.clone_from(&existing.node_engine);
-            }
-            match (&existing.platform, &mut incoming.platform) {
-                (Some(existing_platform), Some(incoming_platform)) => {
-                    if incoming_platform.os.is_empty() {
-                        incoming_platform.os.clone_from(&existing_platform.os);
-                    }
-                    if incoming_platform.cpu.is_empty() {
-                        incoming_platform.cpu.clone_from(&existing_platform.cpu);
-                    }
-                    if incoming_platform.libc.is_empty() {
-                        incoming_platform.libc.clone_from(&existing_platform.libc);
-                    }
-                }
-                (Some(existing_platform), None) => {
-                    incoming.platform = Some(existing_platform.clone());
-                }
-                (None, _) => {}
-            }
-            incoming.dist = merge_cached_dist_info(&existing.dist, &incoming.dist);
-            Some(incoming)
-        }
-        (Some(existing), None) => Some(existing.clone()),
-        (None, incoming) => incoming,
-    }
-}
-
-fn merge_cached_dist_info(existing: &CachedDistInfo, incoming: &CachedDistInfo) -> CachedDistInfo {
-    CachedDistInfo {
-        tarball_url: incoming
-            .tarball_url
-            .clone()
-            .or_else(|| existing.tarball_url.clone()),
-        integrity: incoming
-            .integrity
-            .clone()
-            .or_else(|| existing.integrity.clone()),
-        unpacked_size: incoming.unpacked_size.or(existing.unpacked_size),
-        signatures: if incoming.signatures.is_empty() {
-            existing.signatures.clone()
-        } else {
-            incoming.signatures.clone()
-        },
-        published_at: incoming
-            .published_at
-            .clone()
-            .or_else(|| existing.published_at.clone()),
-        published_at_unix: incoming.published_at_unix.or(existing.published_at_unix),
-        trust_evidence: incoming.trust_evidence.or(existing.trust_evidence),
-    }
 }
 
 impl StreamingBfsMetrics {

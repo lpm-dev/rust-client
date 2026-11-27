@@ -1026,6 +1026,29 @@ pub(super) fn parse_fetched_metadata(
     )
 }
 
+pub(super) fn parse_borrowed_fetched_metadata(
+    metadata: &lpm_registry::PackageMetadata,
+    include_speculation: bool,
+    include_latest_version: bool,
+) -> FetchedMetadata {
+    let latest_version = include_latest_version
+        .then(|| latest_version_from_metadata(metadata))
+        .flatten();
+    let info = Arc::new(parse_metadata_to_cache_info(metadata));
+    let speculation = include_speculation.then(|| {
+        SpeculativePackageMetadata::from_dist_tags_and_info(
+            metadata.dist_tags.clone(),
+            info.clone(),
+        )
+    });
+    FetchedMetadata {
+        speculation,
+        shared_fact: Some(Arc::clone(&info)),
+        info,
+        latest_version,
+    }
+}
+
 pub(super) fn parse_partial_fetched_metadata(
     metadata: lpm_registry::PackageMetadata,
     include_speculation: bool,
