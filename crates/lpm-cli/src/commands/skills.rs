@@ -558,6 +558,7 @@ fn reconcile_package_skill_links(project_dir: &Path) -> crate::dependency_skills
         project_dir,
         crate::lpm_skills_config::LpmSkillsPreference::Config,
         crate::commands::install::InstallOmitPolicy::default(),
+        false,
     )
 }
 

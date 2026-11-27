@@ -1,7 +1,8 @@
 use super::prelude::*;
 use crate::lpm_skills_config::{
     LPM_DEV_PACKAGES_SETTING, LpmSkillsPreference, OTHER_PACKAGES_SETTING,
-    other_package_skills_enabled, write_skill_settings,
+    SECURITY_PROVIDER_SETTING, SecurityProvider, other_package_skills_enabled, security_provider,
+    write_security_provider, write_skill_settings,
 };
 use console::Term;
 
@@ -13,6 +14,7 @@ const SKILLS_EDITOR_HELP: &str = "Use ↑/↓ to move, ←/→ to change, Enter 
 pub(in crate::commands::config) struct SkillSettings {
     pub(in crate::commands::config) lpm_dev_packages: bool,
     pub(in crate::commands::config) other_packages: bool,
+    pub(in crate::commands::config) security_provider: SecurityProvider,
 }
 
 pub(in crate::commands::config) async fn run_skills_wizard(
@@ -44,15 +46,49 @@ pub(in crate::commands::config) async fn run_skills_wizard(
     let selected = SkillSettings {
         lpm_dev_packages: toggles[0].enabled,
         other_packages: toggles[1].enabled,
+        security_provider: if toggles[2].enabled {
+            SecurityProvider::Socket
+        } else {
+            SecurityProvider::None
+        },
     };
-    persist_skill_settings(
-        config_path,
-        Some(selected.lpm_dev_packages),
-        Some(selected.other_packages),
-    )
+    update_config(config_path, |config| {
+        write_skill_settings(
+            config.table_mut(),
+            Some(selected.lpm_dev_packages),
+            Some(selected.other_packages),
+        )?;
+        write_security_provider(config.table_mut(), selected.security_provider)?;
+        Ok(((), true))
+    })
     .await?;
     install_ui::done("Saved skill settings");
+    if selected.security_provider == SecurityProvider::Socket
+        && lpm_auth::resolve_socket_credential().is_none()
+    {
+        install_ui::warn(
+            "Socket checks need a Socket API token: run `lpm login --socket`, or set SOCKET_CLI_API_TOKEN",
+        );
+    }
     Ok(())
+}
+
+/// `lpm config set skills.security-provider <none|socket>`.
+pub(in crate::commands::config) async fn persist_security_provider(
+    config_path: &std::path::Path,
+    value: &str,
+) -> Result<SecurityProvider, LpmError> {
+    let provider = SecurityProvider::parse(value).ok_or_else(|| {
+        LpmError::Registry(format!(
+            "`{SECURITY_PROVIDER_SETTING}` must be \"none\" or \"socket\""
+        ))
+    })?;
+    update_config(config_path, |config| {
+        write_security_provider(config.table_mut(), provider)?;
+        Ok(((), true))
+    })
+    .await?;
+    Ok(provider)
 }
 
 pub(in crate::commands::config) async fn run_npm_skills_wizard(
@@ -104,6 +140,7 @@ pub(in crate::commands::config) fn read_skill_settings(
     Ok(SkillSettings {
         lpm_dev_packages: LpmSkillsPreference::Config.resolve(&global)?,
         other_packages: other_package_skills_enabled(&global)?,
+        security_provider: security_provider(&global)?,
     })
 }
 
@@ -123,9 +160,10 @@ pub(in crate::commands::config) fn format_current_skill_settings(
     settings: SkillSettings,
 ) -> String {
     format!(
-        "lpm.dev={}, npm={}",
+        "lpm.dev={}, npm={}, check={}",
         format_bool_enabled(settings.lpm_dev_packages),
-        format_bool_enabled(settings.other_packages)
+        format_bool_enabled(settings.other_packages),
+        settings.security_provider.as_str()
     )
 }
 
@@ -145,6 +183,11 @@ fn toggles(settings: SkillSettings) -> Vec<super::editor::Toggle> {
             detail: "Link the skills of npm and other dependencies that a project's package.json allows.",
             enabled: settings.other_packages,
         },
+        super::editor::Toggle {
+            title: "Socket security check",
+            detail: "Before linking them, check those skills' packages with Socket (needs `lpm login --socket`).",
+            enabled: settings.security_provider == SecurityProvider::Socket,
+        },
     ]
 }
 
@@ -153,13 +196,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_editor_frame_shows_both_skill_settings() {
+    fn the_editor_frame_shows_every_skill_setting() {
         let frame = super::super::editor::format_toggle_frame(
             SKILLS_EDITOR_PROMPT,
             SKILLS_EDITOR_HELP,
             &toggles(SkillSettings {
                 lpm_dev_packages: true,
                 other_packages: false,
+                security_provider: SecurityProvider::None,
             }),
             1,
         );
@@ -167,6 +211,7 @@ mod tests {
         assert!(plain.contains("Skill settings"));
         assert!(plain.contains("LPM.dev package skills"));
         assert!(plain.contains("npm and other package skills"));
+        assert!(plain.contains("Socket security check"));
         assert!(plain.contains("● Enabled"));
         assert!(plain.contains("● Disabled"));
     }
@@ -191,10 +236,37 @@ mod tests {
             SkillSettings {
                 lpm_dev_packages: false,
                 other_packages: false,
+                security_provider: SecurityProvider::None,
             }
         );
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.contains("auto-install-lpm-skills"), "{written}");
         assert!(written.contains("registry = \"https://example.test\""));
+    }
+
+    #[tokio::test]
+    async fn the_security_provider_is_saved_by_name_and_unknown_names_are_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+
+        assert_eq!(
+            persist_security_provider(&path, "Socket").await.unwrap(),
+            SecurityProvider::Socket
+        );
+        assert_eq!(
+            read_skill_settings(&path).unwrap().security_provider,
+            SecurityProvider::Socket
+        );
+        assert!(
+            persist_security_provider(&path, "virustotal")
+                .await
+                .is_err()
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("security-provider = \"socket\"")
+        );
     }
 }

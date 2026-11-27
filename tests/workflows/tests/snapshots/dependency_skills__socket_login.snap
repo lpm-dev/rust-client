@@ -1,0 +1,11 @@
+---
+source: tests/workflows/tests/dependency_skills.rs
+expression: report
+---
+{
+  "success": true,
+  "provider": "socket",
+  "organization": "acme",
+  "storage_backend": "[backend]",
+  "storage_degraded": "[degraded]"
+}

@@ -14,9 +14,41 @@ pub(crate) const LPM_DEV_PACKAGES_KEY: &str = "lpm-dev-packages";
 /// `[skills] other-packages`: link the skills of npm and other non-LPM.dev
 /// dependencies that a project allows.
 pub(crate) const OTHER_PACKAGES_KEY: &str = "other-packages";
-/// The dotted names `lpm config` uses for the two settings.
+/// `[skills] security-provider`: the service that checks the skills of npm
+/// and other packages before they link, `none` by default.
+pub(crate) const SECURITY_PROVIDER_KEY: &str = "security-provider";
+/// The dotted names `lpm config` uses for the settings.
 pub(crate) const LPM_DEV_PACKAGES_SETTING: &str = "skills.lpm-dev-packages";
 pub(crate) const OTHER_PACKAGES_SETTING: &str = "skills.other-packages";
+pub(crate) const SECURITY_PROVIDER_SETTING: &str = "skills.security-provider";
+
+/// Who checks the skills of npm and other packages before LPM links them,
+/// besides LPM's own checks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SecurityProvider {
+    /// No remote check.
+    #[default]
+    None,
+    /// Socket's package verdicts, with the user's Socket API token.
+    Socket,
+}
+
+impl SecurityProvider {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "socket" => Some(Self::Socket),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Socket => "socket",
+        }
+    }
+}
 
 /// Where the LPM.dev package-skills setting came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +121,41 @@ pub(crate) fn other_package_skills_enabled(config: &GlobalConfig) -> Result<bool
     }
 }
 
+/// The security provider `config` names: `[skills] security-provider`.
+pub(crate) fn security_provider(config: &GlobalConfig) -> Result<SecurityProvider, LpmError> {
+    match skills_table(config)?.and_then(|table| table.get(SECURITY_PROVIDER_KEY)) {
+        None => Ok(SecurityProvider::None),
+        Some(value) => value
+            .as_str()
+            .and_then(SecurityProvider::parse)
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "invalid `{SECURITY_PROVIDER_SETTING}` in ~/.lpm/config.toml; must be \"none\" or \"socket\""
+                ))
+            }),
+    }
+}
+
+/// Whether `config` sets `[skills] security-provider` itself.
+pub(crate) fn security_provider_configured(config: &GlobalConfig) -> bool {
+    skills_table(config)
+        .ok()
+        .flatten()
+        .is_some_and(|table| table.contains_key(SECURITY_PROVIDER_KEY))
+}
+
+/// Writes `[skills] security-provider` into `table`, the whole user config.
+pub(crate) fn write_security_provider(
+    table: &mut toml::map::Map<String, toml::Value>,
+    provider: SecurityProvider,
+) -> Result<(), LpmError> {
+    skills_table_mut(table)?.insert(
+        SECURITY_PROVIDER_KEY.into(),
+        toml::Value::String(provider.as_str().into()),
+    );
+    Ok(())
+}
+
 /// Where the LPM.dev package-skills setting comes from in `config`.
 pub(crate) fn lpm_dev_skills_source(config: &GlobalConfig) -> LpmDevSkillsSource {
     if skills_table(config)
@@ -113,15 +180,7 @@ pub(crate) fn write_skill_settings(
     lpm_dev_packages: Option<bool>,
     other_packages: Option<bool>,
 ) -> Result<(), LpmError> {
-    let skills = table
-        .entry(SKILLS_TABLE)
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
-        .as_table_mut()
-        .ok_or_else(|| {
-            LpmError::Registry(format!(
-                "`{SKILLS_TABLE}` in ~/.lpm/config.toml is not a table; fix it before changing skill settings"
-            ))
-        })?;
+    let skills = skills_table_mut(table)?;
     if let Some(enabled) = lpm_dev_packages {
         skills.insert(LPM_DEV_PACKAGES_KEY.into(), toml::Value::Boolean(enabled));
     }
@@ -133,6 +192,20 @@ pub(crate) fn write_skill_settings(
         table.remove(LEGACY_NO_SKILLS_KEY);
     }
     Ok(())
+}
+
+fn skills_table_mut(
+    table: &mut toml::map::Map<String, toml::Value>,
+) -> Result<&mut toml::map::Map<String, toml::Value>, LpmError> {
+    table
+        .entry(SKILLS_TABLE)
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| {
+            LpmError::Registry(format!(
+                "`{SKILLS_TABLE}` in ~/.lpm/config.toml is not a table; fix it before changing skill settings"
+            ))
+        })
 }
 
 fn skills_table(config: &GlobalConfig) -> Result<Option<&toml::value::Table>, LpmError> {

@@ -11,6 +11,7 @@
 //! and records what it linked in `.lpm/linked-skills/state.json`.
 
 mod apply;
+mod checks;
 mod discovery;
 mod edit;
 mod git_exclude;
@@ -20,15 +21,17 @@ mod lpm_dev;
 mod plan;
 mod policy;
 mod snapshot;
+mod socket;
 mod state;
 #[cfg(test)]
 mod tests;
 
 pub(crate) use apply::{ReconcileReport, SkillChange};
+pub(crate) use checks::credentials_changed as socket_credentials_changed;
 pub(crate) use discovery::{read_skill_directory, skill_directory_names};
 pub(crate) use edit::{ManifestEdit, PolicyList};
 pub(crate) use inspect::{
-    InspectedSkill, Inspection, PlannedChange, SkillStatus, drift, inspect_project,
+    InspectedSkill, Inspection, Inspector, PlannedChange, SkillStatus, drift, inspect_project,
 };
 pub(crate) use lpm_dev::review_warning_note;
 pub(crate) use plan::read_manifest;
@@ -36,6 +39,7 @@ pub(crate) use plan::read_manifest;
 pub(crate) use plan::{HoldReason, Naming};
 pub(crate) use plan::{InstanceRuling, SkillDetails, may_match_any};
 pub(crate) use policy::validate_selector;
+pub(crate) use socket::login_organization as socket_organization;
 pub(crate) use state::{LinkKind, LinkedSkillRecord};
 
 use crate::lpm_skills_config::LpmSkillsPreference;
@@ -58,6 +62,11 @@ pub(crate) struct Settings {
     /// "npm and other package skills": follow the project's allow-list.
     /// Off, the links LPM made are removed.
     pub(crate) other_packages: bool,
+    /// Who checks the packages behind those skills before they link.
+    pub(crate) security_provider: crate::lpm_skills_config::SecurityProvider,
+    /// Whether the run is offline: the security provider isn't asked, and
+    /// verdicts coming due don't count against the links.
+    pub(crate) offline: bool,
     /// The dependency kinds the install left out, as `--prod` does. The
     /// same lockfile then installs fewer packages, so links reconciled
     /// under other omissions are reconciled again.
@@ -70,11 +79,16 @@ impl Settings {
     pub(crate) fn resolve(preference: LpmSkillsPreference) -> Result<Option<Self>, LpmError> {
         match preference {
             LpmSkillsPreference::Disabled => Ok(None),
-            LpmSkillsPreference::Enabled => Ok(Some(Self {
-                lpm_dev_packages: true,
-                other_packages: true,
-                omitted: Default::default(),
-            })),
+            LpmSkillsPreference::Enabled => {
+                let config = crate::commands::config::GlobalConfig::load_checked()?;
+                Ok(Some(Self {
+                    lpm_dev_packages: true,
+                    other_packages: true,
+                    security_provider: crate::lpm_skills_config::security_provider(&config)?,
+                    offline: false,
+                    omitted: Default::default(),
+                }))
+            }
             LpmSkillsPreference::Config => Ok(Some(Self::from_config(
                 &crate::commands::config::GlobalConfig::load_checked()?,
             )?)),
@@ -88,6 +102,8 @@ impl Settings {
         Ok(Self {
             lpm_dev_packages: LpmSkillsPreference::Config.resolve(config)?,
             other_packages: crate::lpm_skills_config::other_package_skills_enabled(config)?,
+            security_provider: crate::lpm_skills_config::security_provider(config)?,
+            offline: false,
             omitted: Default::default(),
         })
     }
@@ -96,12 +112,26 @@ impl Settings {
         plan::Sources {
             lpm_dev: self.lpm_dev_packages,
             other: self.other_packages,
+            provider: self.security_provider,
+            offline: self.offline,
         }
     }
 
     /// These settings for an install that left out `omitted`.
     pub(crate) fn omitting(self, omitted: crate::commands::install::InstallOmitPolicy) -> Self {
         Self { omitted, ..self }
+    }
+
+    /// The security provider's verdicts LPM keeps, when Socket checks npm
+    /// packages.
+    pub(crate) fn verdicts(self) -> Option<checks::Book> {
+        (self.security_provider == crate::lpm_skills_config::SecurityProvider::Socket)
+            .then(checks::Book::load)
+    }
+
+    /// These settings for a run that is `offline` or not.
+    pub(crate) fn offline(self, offline: bool) -> Self {
+        Self { offline, ..self }
     }
 }
 
@@ -167,6 +197,7 @@ fn readiness(
                         &importers,
                     )
                 && recorded.stale.is_empty()
+                && !recheck_due(&recorded, settings)
                 && links_intact(project_dir, &recorded);
             if ready
                 && let Some(stamp) = lockfile
@@ -183,6 +214,28 @@ fn readiness(
     } else {
         Readiness::Stale
     }
+}
+
+/// Whether the links are due to be reconciled for the security verdicts
+/// they rest on: one expired, taking the copies it kept with it; the
+/// verdict cache changed since they read it, as when another project
+/// recorded a verdict or a failure that kept Socket from answering cleared;
+/// or, online, one came due to be asked again.
+fn recheck_due(recorded: &state::LinkState, settings: Settings) -> bool {
+    if settings.security_provider != crate::lpm_skills_config::SecurityProvider::Socket {
+        return false;
+    }
+    let now = checks::now_secs();
+    if recorded.expires_at.is_some_and(|at| now >= at) {
+        return true;
+    }
+    if recorded.recheck_at.is_some() && checks::cache_stamp() != Ok(recorded.verdicts_stamp) {
+        return true;
+    }
+    if settings.offline {
+        return false;
+    }
+    recorded.recheck_at.is_some_and(|at| now >= at)
 }
 
 /// Whether `policy` and `settings` could link anything in `importers`:
@@ -554,7 +607,7 @@ pub(crate) fn reconcile_now(
 ) -> Result<ReconcileReport, LpmError> {
     let lock = state::acquire_lock(project_dir)?;
     let manifest = plan::read_manifest(project_dir)?;
-    reconcile_locked(project_dir, &manifest, settings, &lock)
+    reconcile_locked(project_dir, manifest, settings, lock, checks::Asking::Now)
 }
 
 fn try_reconcile(project_dir: &Path, settings: Settings) -> Result<ReconcileReport, LpmError> {
@@ -572,7 +625,13 @@ fn try_reconcile(project_dir: &Path, settings: Settings) -> Result<ReconcileRepo
         return Ok(ReconcileReport::default());
     };
     match readiness(project_dir, &work.manifest, settings, &work.importers) {
-        Readiness::Stale => reconcile_locked(project_dir, &work.manifest, settings, &lock),
+        Readiness::Stale => reconcile_locked(
+            project_dir,
+            work.manifest,
+            settings,
+            lock,
+            checks::Asking::WhenDue,
+        ),
         Readiness::Ready => Ok(ReconcileReport::default()),
         Readiness::RecordedByNewer(reason) => Ok(left_to_newer(&reason)),
     }
@@ -665,22 +724,144 @@ fn skill_work(project_dir: &Path, settings: Settings) -> Result<Option<SkillWork
 }
 
 /// Plans and applies the links `manifest` asks for; the caller holds the
-/// project's link lock from before it read `manifest`.
+/// project's link `lock` from before it read `manifest`. When the plan
+/// rests on security verdicts `asking` wants asked for, the lock is let go
+/// while Socket answers, and the plan is made again from the manifest as it
+/// is then.
 fn reconcile_locked(
+    project_dir: &Path,
+    manifest: serde_json::Value,
+    settings: Settings,
+    lock: lpm_common::ExclusiveLockHandle,
+    asking: checks::Asking,
+) -> Result<ReconcileReport, LpmError> {
+    let socket = settings.security_provider == crate::lpm_skills_config::SecurityProvider::Socket;
+    let mut lock = lock;
+    let mut manifest = manifest;
+    let mut book = if socket {
+        checks::Book::load()
+    } else {
+        checks::Book::default()
+    };
+    let mut rounds = 0;
+    let mut asked = std::collections::BTreeSet::new();
+    let mut unsaved = None;
+    let mut refreshed = 0;
+    let checked_as = socket.then(checks::release_check).flatten();
+    loop {
+        let (plan, inputs, stored) = plan_locked(project_dir, &manifest, settings, &book)?;
+        let mut releases = plan.relied.clone();
+        if socket && let state::StoredState::Present(previous) = &stored {
+            releases.extend(apply::retained_releases(
+                project_dir,
+                &plan,
+                previous,
+                &inputs.policy,
+                checked_as.as_deref(),
+            ));
+        }
+        if socket && !settings.offline && rounds < MAX_ASK_ROUNDS {
+            let packages: Vec<(String, String)> = checks::to_ask(&book, &releases, asking)
+                .into_iter()
+                .filter(|release| !asked.contains(release))
+                .collect();
+            if !packages.is_empty() {
+                drop(lock);
+                let (answers, error) = checks::ask(&packages);
+                book.absorb(&answers);
+                unsaved = unsaved.or(error);
+                rounds += 1;
+                asked.extend(packages);
+                lock = state::acquire_lock(project_dir)?;
+                manifest = plan::read_manifest(project_dir)?;
+                continue;
+            }
+        }
+        if socket && refreshed < MAX_VERDICT_REFRESHES && !releases.is_empty() {
+            let current = checks::Book::load();
+            if current.read_failed() && !book.refresh_failed() {
+                book.note_refresh_failed();
+                refreshed += 1;
+                continue;
+            }
+            if book.differs_for(&current, &releases) {
+                book = book.merged_with(current);
+                refreshed += 1;
+                continue;
+            }
+            book.caught_up_with(&current);
+        }
+        let recheck = checks::recheck(&book, &releases);
+        let stale = if socket {
+            checks::stale(&book, &releases)
+        } else {
+            0
+        };
+        let failure = book.failure().map(str::to_string);
+        let mut inputs = apply::Inputs {
+            recheck,
+            verdicts: socket.then_some(book),
+            checked_as,
+            ..inputs
+        };
+        if inputs
+            .verdicts
+            .as_ref()
+            .is_some_and(checks::Book::refresh_failed)
+        {
+            inputs.fingerprint.clear();
+        }
+        record_pending_reviews(&plan.pending_reviews);
+        let mut report = apply::apply(project_dir, &plan, stored, inputs, &lock)?;
+        if stale > 0 {
+            report.warnings.push(format!(
+                "Socket's verdicts for {stale} {} are more than a day old and LPM couldn't ask again ({}); their skills stay as they were and no new one links until Socket answers",
+                if stale == 1 { "package" } else { "packages" },
+                if settings.offline {
+                    "the install runs offline"
+                } else {
+                    failure
+                        .as_deref()
+                        .unwrap_or("they came up after this run asked Socket; the next run asks")
+                }
+            ));
+        }
+        if let Some(error) = unsaved {
+            report.warnings.push(format!(
+                "Socket's answers couldn't be saved, so other projects ask again: {error}"
+            ));
+        }
+        return Ok(report);
+    }
+}
+
+/// How many times one reconcile plans again because another project
+/// recorded a newer verdict it relies on, before it applies what it has.
+const MAX_VERDICT_REFRESHES: usize = 2;
+
+/// How many rounds one reconcile asks Socket: a second asks only about
+/// releases the first round's answers brought into play, such as the other
+/// installed versions of a package whose skill turned out to pre-approve
+/// its command.
+const MAX_ASK_ROUNDS: usize = 2;
+
+/// The plan for `manifest`, what it is reconciled from, and the state as
+/// read under the link lock.
+fn plan_locked(
     project_dir: &Path,
     manifest: &serde_json::Value,
     settings: Settings,
-    lock: &lpm_common::ExclusiveLockHandle,
-) -> Result<ReconcileReport, LpmError> {
+    book: &checks::Book,
+) -> Result<(plan::Plan, apply::Inputs, state::StoredState), LpmError> {
     let parsed = policy::read_policy(manifest);
-    let (recorded, recorded_skills) = match state::read_state(project_dir) {
+    let stored = state::read_state(project_dir);
+    let (recorded, recorded_skills) = match &stored {
         state::StoredState::Present(recorded) => {
-            let skills = recorded.recorded_skills();
-            (recorded.lockfile, skills)
+            (recorded.lockfile.as_ref(), recorded.recorded_skills())
         }
         _ => (None, plan::RecordedSkills::new()),
     };
-    let lockfile = lockfile_stamp(project_dir, recorded.as_ref());
+    let lockfile = lockfile_stamp(project_dir, recorded);
     let members: Vec<String> = plan::importer_directories(project_dir)
         .iter()
         .skip(1)
@@ -697,6 +878,9 @@ fn reconcile_locked(
         policy: policy::policy_digest(parsed.policy.as_ref()),
         lockfile,
         members,
+        recheck: checks::Recheck::default(),
+        verdicts: None,
+        checked_as: None,
     };
     let plan = plan::plan_project(
         project_dir,
@@ -704,11 +888,13 @@ fn reconcile_locked(
         manifest,
         plan::PlanMode::Apply,
         settings.sources(),
+        plan::History {
+            verdicts: Some(book),
+            recorded: &recorded_skills,
+        },
         None,
-        &recorded_skills,
     )?;
-    record_pending_reviews(&plan.pending_reviews);
-    apply::apply(project_dir, &plan, inputs, lock)
+    Ok((plan, inputs, stored))
 }
 
 /// Marks each review record that leaves one of its package's skill
@@ -762,6 +948,20 @@ fn fingerprint(
         u8::from(settings.omitted.dev),
         u8::from(settings.omitted.optional),
     ]);
+    hasher.update(settings.security_provider.as_str());
+    hasher.update([0]);
+    if settings.security_provider == crate::lpm_skills_config::SecurityProvider::Socket {
+        hasher.update(
+            socket::cache_scope()
+                .as_deref()
+                .unwrap_or("unusable endpoint"),
+        );
+        hasher.update([0]);
+        hasher.update(checks::mirror().as_deref().unwrap_or_default());
+        hasher.update([0]);
+        hasher.update(checks::credential_key());
+        hasher.update([0]);
+    }
     match policy {
         Some(policy) => hasher.update(policy.fingerprint_text()),
         None => hasher.update("no-policy"),

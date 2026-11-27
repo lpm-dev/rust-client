@@ -4,7 +4,7 @@ use super::plan::{Candidate, CandidateStatus, HoldReason, Plan, Prepared};
 use super::policy::Targets;
 use super::snapshot::{snapshot_digest, sweep, write_snapshot};
 use super::state::{
-    FileStamp, LinkKind, LinkRecord, LinkState, LinkedSkillRecord, StoredState, read_state,
+    FileStamp, LinkKind, LinkRecord, LinkState, LinkedSkillRecord, StoredState,
     remove_root_if_empty, remove_state, write_state,
 };
 use lpm_common::LpmError;
@@ -60,6 +60,21 @@ pub(crate) struct Inputs {
     pub(crate) policy: String,
     pub(crate) lockfile: Option<FileStamp>,
     pub(crate) members: Vec<String>,
+    pub(crate) recheck: super::checks::Recheck,
+    /// The security provider's verdicts, when one checks npm packages: an
+    /// earlier copy of an npm package stays only while its own release is
+    /// clean.
+    pub(crate) verdicts: Option<super::checks::Book>,
+    /// The release check copies linked now pass, when the provider checks.
+    pub(crate) checked_as: Option<String>,
+}
+
+/// The security provider's verdicts and the release check they answer
+/// for, when one checks npm packages.
+#[derive(Clone, Copy)]
+pub(crate) struct Verdicts<'a> {
+    pub(crate) book: &'a super::checks::Book,
+    pub(crate) checked_as: Option<&'a str>,
 }
 
 /// What the links should hold for one skill.
@@ -68,74 +83,77 @@ pub(crate) enum Desired<'a> {
     Fresh(&'a Candidate, &'a Prepared),
     /// The copy linked earlier, which stays while the version installed now
     /// waits for data or a more specific approval.
-    Kept(LinkedSkillRecord),
+    Kept(&'a LinkedSkillRecord),
 }
 
 /// What reconciling `plan` leaves linked, given `previous`, and the allowed
-/// skills it holds back. `policy` is the digest of the plan's policy.
+/// skills it holds back. `policy` is the digest of the plan's policy, and
+/// `verdicts` the security provider's, when one checks npm packages. A
+/// skill linked fresh claims its name before any earlier copy another
+/// package keeps.
 pub(crate) fn desired_skills<'a>(
     project_dir: &Path,
     plan: &'a Plan,
     previous: &'a LinkState,
     policy: &str,
+    targets: &[String],
+    verdicts: Option<Verdicts<'_>>,
 ) -> (BTreeMap<&'a str, Desired<'a>>, Vec<HeldSkill>) {
     let mut desired = BTreeMap::new();
     let mut held = Vec::new();
     for candidate in &plan.candidates {
-        match &candidate.status {
-            CandidateStatus::Linkable(prepared) => {
-                let replaced = desired.insert(
-                    candidate.skill.as_str(),
-                    Desired::Fresh(candidate, prepared),
-                );
-                debug_assert!(replaced.is_none(), "planning resolves name conflicts");
-            }
-            CandidateStatus::Held { reason, detail } => {
-                let kept = previous
-                    .skills
-                    .get(&candidate.skill)
-                    .filter(|record| {
-                        keeps_earlier_copy(
-                            project_dir,
-                            candidate,
-                            *reason,
-                            record,
-                            previous,
-                            policy,
-                        )
-                    })
-                    .cloned();
-                held.push(HeldSkill {
-                    skill: candidate.skill.clone(),
-                    package: candidate.package.clone(),
-                    version: candidate.version.clone(),
-                    reason: *reason,
-                    detail: detail.clone(),
-                    kept_version: kept.as_ref().map(|record| record.version.clone()),
-                });
-                if let Some(record) = kept {
-                    desired.insert(candidate.skill.as_str(), Desired::Kept(record));
-                }
-            }
-            CandidateStatus::NotAllowed | CandidateStatus::Denied => {}
+        if let CandidateStatus::Linkable(prepared) = &candidate.status {
+            let replaced = desired.insert(
+                candidate.skill.as_str(),
+                Desired::Fresh(candidate, prepared),
+            );
+            debug_assert!(replaced.is_none(), "planning resolves name conflicts");
+        }
+    }
+    let clean = |record: &LinkedSkillRecord| {
+        verdicts.is_none_or(|verdicts| release_is_clean(verdicts, record))
+    };
+    for candidate in &plan.candidates {
+        let CandidateStatus::Held { reason, detail } = &candidate.status else {
+            continue;
+        };
+        let kept = held_copy(
+            project_dir,
+            candidate,
+            *reason,
+            previous,
+            policy,
+            targets,
+            |skill| desired.contains_key(skill),
+        )
+        .filter(|record| {
+            clean(record)
+                && verdicts.is_none_or(|verdicts| {
+                    (!plan.unlisted.contains_key(&record.package)
+                        || installed_release_allows(verdicts, plan, record))
+                        && instances_allow_commands(verdicts, plan, record)
+                })
+        });
+        held.push(HeldSkill {
+            skill: candidate.skill.clone(),
+            package: candidate.package.clone(),
+            version: candidate.version.clone(),
+            reason: *reason,
+            detail: detail.clone(),
+            kept_version: kept.as_ref().map(|record| record.version.clone()),
+        });
+        if let Some(record) = kept {
+            desired.insert(candidate.skill.as_str(), Desired::Kept(record));
         }
     }
     for (skill, record) in &previous.skills {
-        let Some(detail) = plan.unlisted.get(&record.package) else {
+        let Some(detail) = unlisted_hold(plan, skill, record, |skill| desired.contains_key(skill))
+        else {
             continue;
         };
-        if desired.contains_key(skill.as_str())
-            || revoked(plan, skill, &record.package)
-            || !plan
-                .unlisted_allows
-                .get(&record.package)
-                .is_some_and(|skills| skills.contains(skill))
-        {
-            continue;
-        }
-        let kept = previous.policy == policy
-            && reviewed_here(record)
-            && snapshot_digest(project_dir, skill).as_deref() == Some(record.digest.as_str());
+        let kept = keeps_unlisted_copy(project_dir, skill, record, previous, policy, targets)
+            && clean(record)
+            && verdicts.is_none_or(|verdicts| installed_release_allows(verdicts, plan, record));
         held.push(HeldSkill {
             skill: skill.clone(),
             package: record.package.clone(),
@@ -145,10 +163,274 @@ pub(crate) fn desired_skills<'a>(
             kept_version: kept.then(|| record.version.clone()),
         });
         if kept {
-            desired.insert(skill.as_str(), Desired::Kept(record.clone()));
+            desired.insert(skill.as_str(), Desired::Kept(record));
         }
     }
     (desired, held)
+}
+
+/// The copy linked earlier that stays while `candidate` is held for
+/// `reason`, before the security provider's verdict on it weighs in: none
+/// when another skill already `taken` its name, or when none of its links
+/// in `targets` is still intact.
+fn held_copy<'a>(
+    project_dir: &Path,
+    candidate: &Candidate,
+    reason: HoldReason,
+    previous: &'a LinkState,
+    policy: &str,
+    targets: &[String],
+    taken: impl Fn(&str) -> bool,
+) -> Option<&'a LinkedSkillRecord> {
+    let record = previous.skills.get(&candidate.skill)?;
+    (!taken(&candidate.skill)
+        && keeps_earlier_copy(project_dir, candidate, reason, record, previous, policy)
+        && has_intact_link(project_dir, &candidate.skill, record, targets))
+    .then_some(record)
+}
+
+/// Whether one of the links `record` recorded for `skill` in `targets` is
+/// still there and LPM's: a kept copy stays only where it is linked.
+fn has_intact_link(
+    project_dir: &Path,
+    skill: &str,
+    record: &LinkedSkillRecord,
+    targets: &[String],
+) -> bool {
+    record.links.iter().any(|link| {
+        link.path.rsplit_once('/').is_some_and(|(target, name)| {
+            name == skill
+                && targets.iter().any(|wanted| wanted == target)
+                && kept_link_intact(
+                    project_dir,
+                    target,
+                    skill,
+                    Recorded {
+                        kind: link.kind,
+                        digest: &record.digest,
+                    },
+                )
+        })
+    })
+}
+
+/// Why `skill`'s copy, linked earlier from `record`'s package, is held
+/// because that package's skills couldn't be listed, unless the policy
+/// couldn't allow them whatever they are, another skill already `taken` its
+/// name, the plan decided against it outright, or an instance of the
+/// package that could be listed ships the skill, which then decides the
+/// copy.
+fn unlisted_hold<'a>(
+    plan: &'a Plan,
+    skill: &str,
+    record: &LinkedSkillRecord,
+    taken: impl Fn(&str) -> bool,
+) -> Option<&'a String> {
+    let detail = plan.unlisted.get(&record.package)?;
+    (plan
+        .unlisted_allows
+        .get(&record.package)
+        .is_some_and(|skills| skills.contains(skill))
+        && !taken(skill)
+        && !revoked(plan, skill, &record.package)
+        && !plan.candidates.iter().any(|candidate| {
+            candidate.skill == skill
+                && candidate.package == record.package
+                && !matches!(candidate.status, CandidateStatus::NotAllowed)
+        }))
+    .then_some(detail)
+}
+
+/// Whether a copy whose package's skills couldn't be listed stays: while
+/// the policy is unchanged, the copy is intact, and one of its links in
+/// `targets` is.
+fn keeps_unlisted_copy(
+    project_dir: &Path,
+    skill: &str,
+    record: &LinkedSkillRecord,
+    previous: &LinkState,
+    policy: &str,
+    targets: &[String],
+) -> bool {
+    previous.policy == policy
+        && reviewed_here(record)
+        && snapshot_digest(project_dir, skill).as_deref() == Some(record.digest.as_str())
+        && has_intact_link(project_dir, skill, record, targets)
+}
+
+/// Whether the security provider's last verdict on the npm release `record`
+/// linked is clean, however old, under the release check the copy passed
+/// when it linked: a copy stays only while its own release is. An LPM.dev
+/// package's copy answers to LPM.dev review instead.
+fn release_is_clean(verdicts: Verdicts<'_>, record: &LinkedSkillRecord) -> bool {
+    super::plan::is_lpm_dev(&record.package)
+        || (checked_as(verdicts.checked_as, record)
+            && verdicts
+                .book
+                .entry(&record.package, &record.version)
+                .is_some_and(|entry| entry.verdict == super::socket::Verdict::Clean))
+}
+
+/// Whether, under the security provider, every instance of `record`'s
+/// package installed now lets its copy stay while one of them can't be
+/// listed: each must be an npm release a verdict covers, as a listed one
+/// must be to keep a copy, none may be flagged, and a copy that pre-approves
+/// anything stays only while every instance is its own release, since its
+/// commands run what is installed. An LPM.dev package's copy answers to
+/// LPM.dev review instead.
+fn installed_release_allows(
+    verdicts: Verdicts<'_>,
+    plan: &Plan,
+    record: &LinkedSkillRecord,
+) -> bool {
+    if super::plan::is_lpm_dev(&record.package) {
+        return true;
+    }
+    let Some(installs) = plan.installs.get(&record.package) else {
+        return false;
+    };
+    let grants = record.permission != lpm_skill::SkillPermission::None.as_str();
+    installs.iter().all(|install| {
+        let Some((name, version)) = &install.release else {
+            return false;
+        };
+        let flagged = verdicts
+            .book
+            .entry(name, version)
+            .is_some_and(|entry| matches!(entry.verdict, super::socket::Verdict::Malware { .. }));
+        !flagged
+            && (!grants
+                || verdicts.book.vouches_now(name, version)
+                    && (*name == record.package
+                        && *version == record.version
+                        && install.version == record.version
+                        && install.integrity == record.integrity))
+    })
+}
+
+/// Whether, under the security provider, the copy `record` keeps may keep
+/// pre-approving its package's command: a copy that pre-approves nothing
+/// may; one that does only while every installed instance of the package,
+/// any of which the command may run, is an npm release whose last verdict,
+/// however old, is clean. With no instance recorded, nothing vouches for
+/// what the command runs.
+fn instances_allow_commands(
+    verdicts: Verdicts<'_>,
+    plan: &Plan,
+    record: &LinkedSkillRecord,
+) -> bool {
+    if record.permission == lpm_skill::SkillPermission::None.as_str()
+        || super::plan::is_lpm_dev(&record.package)
+    {
+        return true;
+    }
+    let Some(installs) = plan.installs.get(&record.package) else {
+        return false;
+    };
+    installs.iter().all(|install| {
+        install.release.as_ref().is_some_and(|(name, version)| {
+            verdicts.book.vouches_now(name, version)
+                && verdicts
+                    .book
+                    .entry(name, version)
+                    .is_some_and(|entry| entry.verdict == super::socket::Verdict::Clean)
+        })
+    })
+}
+
+/// Whether `record`'s copy passed the release check `current` names.
+fn checked_as(current: Option<&str>, record: &LinkedSkillRecord) -> bool {
+    current.is_some() && record.checked_as.as_deref() == current
+}
+
+/// The npm releases of the copies linked earlier that `plan` would keep,
+/// if their verdicts allow, and, for a package one of whose instances
+/// can't be listed, the releases of every instance installed now: those
+/// verdicts decide whether the copies stay, so they are asked about and
+/// rechecked like the releases installed now. A copy no verdict can keep,
+/// such as one linked under another release check, is never asked about.
+pub(crate) fn retained_releases(
+    project_dir: &Path,
+    plan: &Plan,
+    previous: &LinkState,
+    policy: &str,
+    current: Option<&str>,
+) -> BTreeSet<(String, String)> {
+    let targets = link_targets(project_dir, plan);
+    let fresh: BTreeSet<&str> = plan
+        .candidates
+        .iter()
+        .filter(|candidate| matches!(candidate.status, CandidateStatus::Linkable(_)))
+        .map(|candidate| candidate.skill.as_str())
+        .collect();
+    let taken = |skill: &str| fresh.contains(skill);
+    let mut releases = BTreeSet::new();
+    let mut retain = |record: &LinkedSkillRecord, unlisted: bool| {
+        if super::plan::is_lpm_dev(&record.package) || !checked_as(current, record) {
+            return;
+        }
+        let Some(installed) = deciding_installs(plan, record, unlisted) else {
+            return;
+        };
+        releases.insert((record.package.clone(), record.version.clone()));
+        releases.extend(installed);
+    };
+    for candidate in &plan.candidates {
+        if let CandidateStatus::Held { reason, .. } = &candidate.status
+            && let Some(record) = held_copy(
+                project_dir,
+                candidate,
+                *reason,
+                previous,
+                policy,
+                &targets,
+                taken,
+            )
+        {
+            retain(record, plan.unlisted.contains_key(&record.package));
+        }
+    }
+    for (skill, record) in &previous.skills {
+        if unlisted_hold(plan, skill, record, taken).is_some()
+            && keeps_unlisted_copy(project_dir, skill, record, previous, policy, &targets)
+        {
+            retain(record, true);
+        }
+    }
+    releases
+}
+
+/// The releases of `record`'s package installed now whose verdicts decide
+/// whether its copy stays, besides its own, or `None` when no verdict
+/// could keep it: what [`installed_release_allows`] and
+/// [`instances_allow_commands`] check before reading any verdict, for a
+/// package one of whose instances couldn't be listed (`unlisted`) or a copy
+/// that pre-approves commands.
+fn deciding_installs(
+    plan: &Plan,
+    record: &LinkedSkillRecord,
+    unlisted: bool,
+) -> Option<Vec<(String, String)>> {
+    let grants = record.permission != lpm_skill::SkillPermission::None.as_str();
+    if !unlisted && !grants {
+        return Some(Vec::new());
+    }
+    let installs = plan.installs.get(&record.package)?;
+    let mut releases = Vec::with_capacity(installs.len());
+    for install in installs {
+        let release = install.release.as_ref()?;
+        if unlisted
+            && grants
+            && !(release.0 == record.package
+                && release.1 == record.version
+                && install.version == record.version
+                && install.integrity == record.integrity)
+        {
+            return None;
+        }
+        releases.push(release.clone());
+    }
+    Some(releases)
 }
 
 /// Whether the plan decided against `package`'s `skill` outright: a deny,
@@ -165,7 +447,11 @@ fn revoked(plan: &Plan, skill: &str, package: &str) -> bool {
                 } => true,
                 CandidateStatus::Denied
                 | CandidateStatus::Held {
-                    reason: HoldReason::Invalid | HoldReason::Blocked | HoldReason::Hooks,
+                    reason:
+                        HoldReason::Invalid
+                        | HoldReason::Blocked
+                        | HoldReason::Hooks
+                        | HoldReason::Malware,
                     ..
                 } => candidate.package == package,
                 _ => false,
@@ -176,10 +462,15 @@ fn revoked(plan: &Plan, skill: &str, package: &str) -> bool {
 /// Whether the copy `record` linked earlier stays while `candidate`, the
 /// version installed now, is held for `reason`: the policy must still
 /// approve that copy as it approved it then, and the copy must be intact.
-/// Waiting for data, for LPM.dev review, or for the installed skill to
-/// become readable, that means the same policy; waiting for a more
-/// specific approval, an allowing entry that names the skill as
-/// specifically as the earlier copy's own grants needed.
+/// Waiting for data, LPM.dev review, a security check, or the installed
+/// skill to become readable, that means the same policy; waiting for a
+/// more specific approval, an allowing entry that names the skill as
+/// specifically as the earlier copy's own grants needed. A copy of the
+/// very release installed now, waiting for a security check, also stays
+/// under an edited policy that still names it that specifically; a copy of
+/// another release stays then only if it pre-approves nothing, since the
+/// commands it would pre-approve now run the release Socket hasn't
+/// cleared.
 fn keeps_earlier_copy(
     project_dir: &Path,
     candidate: &Candidate,
@@ -192,13 +483,25 @@ fn keeps_earlier_copy(
         HoldReason::NeedsData | HoldReason::NotReviewed | HoldReason::Unreadable => {
             previous.policy == policy
         }
+        HoldReason::AwaitingCheck
+            if record.version == candidate.version && record.integrity == candidate.integrity =>
+        {
+            previous.policy == policy
+                || (!candidate.undecided && candidate.naming >= record.requires)
+        }
+        HoldReason::AwaitingCheck => {
+            previous.policy == policy
+                && record.permission == lpm_skill::SkillPermission::None.as_str()
+        }
         HoldReason::NeedsPackageName | HoldReason::NeedsSkillName => {
             candidate.naming >= record.requires
         }
         HoldReason::Invalid
         | HoldReason::Blocked
         | HoldReason::Hooks
-        | HoldReason::NameConflict => false,
+        | HoldReason::NameConflict
+        | HoldReason::Malware
+        | HoldReason::NotCheckable => false,
     };
     approved
         && record.package == candidate.package
@@ -214,6 +517,21 @@ fn reviewed_here(record: &LinkedSkillRecord) -> bool {
             == Some(crate::commands::skills::reviews::issuing_registry())
 }
 
+/// Whether the link a kept copy recorded at `target` is still there and
+/// LPM's: a copy kept while its skill is held stays only where it is
+/// linked, and is never linked anywhere new, not even where its link went
+/// missing.
+fn kept_link_intact(project_dir: &Path, target: &str, skill: &str, recorded: Recorded<'_>) -> bool {
+    TargetDir::open(project_dir, target)
+        .ok()
+        .flatten()
+        .is_some_and(|directory| {
+            directory
+                .inspect(project_dir, skill)
+                .is_intact(recorded.kind, recorded.digest)
+        })
+}
+
 /// Why a run leaves dependency-skill links alone after a newer LPM
 /// recorded them.
 pub(crate) fn newer_state_warning(reason: &str) -> String {
@@ -222,11 +540,13 @@ pub(crate) fn newer_state_warning(reason: &str) -> String {
 
 /// Applies `plan` to the project: writes changed copies, links them into
 /// every target, removes what LPM linked earlier that the plan no longer
-/// wants, keeps the links out of Git, and records the result. The caller
-/// holds the project's link lock from before it read the policy.
+/// wants, keeps the links out of Git, and records the result. `stored` is
+/// the state as read under the project's link lock, which the caller holds
+/// from before it read the policy.
 pub(crate) fn apply(
     project_dir: &Path,
     plan: &Plan,
+    stored: StoredState,
     inputs: Inputs,
     _lock: &lpm_common::ExclusiveLockHandle,
 ) -> Result<ReconcileReport, LpmError> {
@@ -234,8 +554,8 @@ pub(crate) fn apply(
         warnings: plan.problems.clone(),
         ..ReconcileReport::default()
     };
-    let previous = match read_state(project_dir) {
-        StoredState::Present(state) => state,
+    let previous = match stored {
+        StoredState::Present(state) => *state,
         StoredState::Missing => LinkState::default(),
         StoredState::Unusable(reason) => {
             report.warnings.push(format!(
@@ -248,22 +568,34 @@ pub(crate) fn apply(
             return Ok(report);
         }
     };
-    let targets = if plan.considered {
+    let targets = link_targets(project_dir, plan);
+    if plan.considered {
         let wanted = plan
             .policy
             .as_ref()
             .map_or(&Targets::Auto, |policy| &policy.targets);
-        let resolved = resolve_targets(project_dir, wanted);
-        for target in unreachable_targets(project_dir, wanted, &resolved) {
+        for target in unreachable_targets(project_dir, wanted, &targets) {
             report.warnings.push(format!(
                 "{target} passes through a link, so LPM doesn't link skills into it"
             ));
         }
-        resolved
-    } else {
-        Vec::new()
-    };
-    let (desired, held) = desired_skills(project_dir, plan, &previous, &inputs.policy);
+    }
+    let (desired, held) = desired_skills(
+        project_dir,
+        plan,
+        &previous,
+        &inputs.policy,
+        &targets,
+        inputs.verdicts.as_ref().map(|book| Verdicts {
+            book,
+            checked_as: inputs.checked_as.as_deref(),
+        }),
+    );
+    let checked_as = inputs
+        .verdicts
+        .is_some()
+        .then_some(inputs.checked_as)
+        .flatten();
     let unreadable = !plan.unlisted.is_empty()
         || plan.incomplete
         || held
@@ -282,14 +614,21 @@ pub(crate) fn apply(
         lockfile: inputs.lockfile,
         members: inputs.members,
         created_directories: previous.created_directories.clone(),
+        recheck_at: inputs.recheck.at,
+        expires_at: inputs.recheck.expires_at,
+        verdicts_stamp: inputs
+            .verdicts
+            .as_ref()
+            .and_then(super::checks::Book::stamp),
         ..LinkState::default()
     };
     let mut complete = !unreadable;
     let mut directories = TargetDirs::default();
     for (skill, wanted) in desired {
         let earlier = previous.skills.get(skill);
+        let kept = matches!(wanted, Desired::Kept(_));
         let (mut record, change) = match wanted {
-            Desired::Kept(record) => (record, None),
+            Desired::Kept(record) => (record.clone(), None),
             Desired::Fresh(candidate, prepared) => {
                 let digest = &prepared.checked.digest;
                 let copy = snapshot_digest(project_dir, skill);
@@ -323,6 +662,9 @@ pub(crate) fn apply(
                         reviewed_by: super::plan::is_lpm_dev(&candidate.package).then(|| {
                             crate::commands::skills::reviews::issuing_registry().to_string()
                         }),
+                        checked_as: checked_as
+                            .clone()
+                            .filter(|_| !super::plan::is_lpm_dev(&candidate.package)),
                         links: Vec::new(),
                         blocked: Vec::new(),
                     },
@@ -345,6 +687,19 @@ pub(crate) fn apply(
                         digest: &earlier.digest,
                     })
             });
+            if kept {
+                if let Some(recorded) = recorded
+                    && kept_link_intact(project_dir, target, skill, recorded)
+                {
+                    record.links.push(LinkRecord {
+                        path,
+                        kind: recorded.kind,
+                        digest: None,
+                    });
+                    linked_targets.push(target.clone());
+                }
+                continue;
+            }
             let outcome = directories
                 .create(project_dir, target, &mut next.created_directories)
                 .and_then(|directory| {
@@ -512,6 +867,21 @@ fn link_entry(
         directory.link(project_dir, skill, digest).map(Some)
     } else {
         Ok(None)
+    }
+}
+
+/// The target folders reconciling `plan` links into: none when nothing
+/// could link.
+pub(crate) fn link_targets(project_dir: &Path, plan: &Plan) -> Vec<String> {
+    if plan.considered {
+        resolve_targets(
+            project_dir,
+            plan.policy
+                .as_ref()
+                .map_or(&Targets::Auto, |policy| &policy.targets),
+        )
+    } else {
+        Vec::new()
     }
 }
 
@@ -700,7 +1070,191 @@ fn remove_unused_directories(project_dir: &Path, next: &mut LinkState) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::plan::{Naming, PackageInstall};
     use super::*;
+
+    fn record(permission: lpm_skill::SkillPermission) -> LinkedSkillRecord {
+        LinkedSkillRecord {
+            package: "tool".into(),
+            version: "1.0.0".into(),
+            integrity: Some("sha512-one".into()),
+            digest: "sha256:copy".into(),
+            permission: permission.as_str().into(),
+            requires: Naming::Package,
+            reviewed_by: None,
+            checked_as: None,
+            links: Vec::new(),
+            blocked: Vec::new(),
+        }
+    }
+
+    fn install(version: &str, integrity: &str, release: Option<&str>) -> PackageInstall {
+        PackageInstall {
+            version: version.into(),
+            integrity: Some(integrity.into()),
+            release: release.map(|version| ("tool".to_string(), version.to_string())),
+        }
+    }
+
+    /// Verdicts: `tool@1.0.0` clean, `tool@3.0.0` flagged, `tool@2.0.0`
+    /// never answered.
+    fn tool_verdicts() -> super::super::checks::Book {
+        let observed = |verdict| super::super::socket::Observed { verdict, at_ms: 1 };
+        let mut book = super::super::checks::Book::default();
+        book.absorb(&super::super::socket::Answers {
+            verdicts: std::collections::HashMap::from([
+                (
+                    ("tool".to_string(), "1.0.0".to_string()),
+                    observed(super::super::socket::Verdict::Clean),
+                ),
+                (
+                    ("tool".to_string(), "3.0.0".to_string()),
+                    observed(super::super::socket::Verdict::Malware {
+                        alert: "malware".into(),
+                    }),
+                ),
+            ]),
+            failure: None,
+            at_ms: 1,
+        });
+        book
+    }
+
+    fn installed(installs: Vec<PackageInstall>) -> Plan {
+        Plan {
+            installs: BTreeMap::from([("tool".to_string(), installs)]),
+            ..Plan::default()
+        }
+    }
+
+    #[test]
+    fn a_copy_stays_beside_an_unlisted_instance_only_while_every_instance_is_checkable_and_clean() {
+        let granting = record(lpm_skill::SkillPermission::Broad);
+        let plain = record(lpm_skill::SkillPermission::None);
+        let own = install("1.0.0", "sha512-one", Some("1.0.0"));
+        let book = tool_verdicts();
+        let verdicts = Verdicts {
+            book: &book,
+            checked_as: None,
+        };
+        let allows = |installs: Vec<PackageInstall>, record: &LinkedSkillRecord| {
+            installed_release_allows(verdicts, &installed(installs), record)
+        };
+
+        assert!(allows(vec![own.clone()], &granting));
+        assert!(
+            !allows(vec![install("1.0.0", "sha512-one", None)], &granting),
+            "a patched or otherwise uncheckable install keeps no copy"
+        );
+        assert!(!allows(vec![install("1.0.0", "sha512-one", None)], &plain));
+        let newer = install("2.0.0", "sha512-two", Some("2.0.0"));
+        assert!(
+            !allows(vec![own.clone(), newer.clone()], &granting),
+            "another installed version runs the command the copy pre-approves"
+        );
+        assert!(allows(vec![own.clone(), newer], &plain));
+        let flagged = install("3.0.0", "sha512-three", Some("3.0.0"));
+        assert!(!allows(vec![own, flagged], &plain));
+        assert!(
+            !installed_release_allows(verdicts, &Plan::default(), &plain),
+            "a package with nothing recorded as installed keeps no copy"
+        );
+    }
+
+    #[test]
+    fn a_command_granting_copy_stays_only_while_every_installed_instance_has_a_clean_verdict() {
+        let granting = record(lpm_skill::SkillPermission::Broad);
+        let plain = record(lpm_skill::SkillPermission::None);
+        let own = install("1.0.0", "sha512-one", Some("1.0.0"));
+        let book = tool_verdicts();
+        let verdicts = Verdicts {
+            book: &book,
+            checked_as: None,
+        };
+        let allows = |installs: Vec<PackageInstall>| {
+            instances_allow_commands(verdicts, &installed(installs), &granting)
+        };
+
+        assert!(allows(vec![own.clone()]));
+        assert!(!allows(vec![
+            own.clone(),
+            install("3.0.0", "sha512-three", Some("3.0.0"))
+        ]));
+        assert!(
+            !allows(vec![
+                own.clone(),
+                install("2.0.0", "sha512-two", Some("2.0.0"))
+            ]),
+            "a version Socket hasn't answered for may run the command"
+        );
+        assert!(!allows(vec![own, install("1.0.0", "sha512-one", None)]));
+        assert!(
+            !instances_allow_commands(verdicts, &Plan::default(), &granting),
+            "with no instance recorded, nothing vouches for what the command runs"
+        );
+        assert!(instances_allow_commands(verdicts, &Plan::default(), &plain));
+        let mut unverified = super::super::checks::Book::default().merged_with(tool_verdicts());
+        unverified.note_refresh_failed();
+        assert!(
+            !instances_allow_commands(
+                Verdicts {
+                    book: &unverified,
+                    checked_as: None,
+                },
+                &installed(vec![install("1.0.0", "sha512-one", Some("1.0.0"))]),
+                &granting
+            ),
+            "a verdict the shared cache couldn't be read to confirm keeps no command grant"
+        );
+    }
+
+    #[test]
+    fn the_releases_deciding_a_kept_copy_are_every_instance_its_verdicts_must_cover() {
+        let granting = record(lpm_skill::SkillPermission::Broad);
+        let plain = record(lpm_skill::SkillPermission::None);
+        let own = install("1.0.0", "sha512-one", Some("1.0.0"));
+        let newer = install("2.0.0", "sha512-two", Some("2.0.0"));
+        let release = |version: &str| ("tool".to_string(), version.to_string());
+        let both = installed(vec![own.clone(), newer]);
+
+        assert_eq!(deciding_installs(&both, &plain, false), Some(Vec::new()));
+        assert_eq!(
+            deciding_installs(&both, &granting, false),
+            Some(vec![release("1.0.0"), release("2.0.0")])
+        );
+        assert_eq!(
+            deciding_installs(&both, &plain, true),
+            Some(vec![release("1.0.0"), release("2.0.0")])
+        );
+        assert_eq!(
+            deciding_installs(&both, &granting, true),
+            None,
+            "beside an unlisted instance, a granting copy needs every instance to be its own"
+        );
+        assert_eq!(
+            deciding_installs(&installed(vec![own.clone()]), &granting, true),
+            Some(vec![release("1.0.0")])
+        );
+        assert_eq!(
+            deciding_installs(
+                &installed(vec![own, install("1.0.0", "sha512-one", None)]),
+                &granting,
+                false
+            ),
+            None
+        );
+        for unlisted in [false, true] {
+            assert_eq!(
+                deciding_installs(&Plan::default(), &granting, unlisted),
+                None,
+                "no recorded instance, no verdict that could keep it"
+            );
+        }
+        assert_eq!(
+            deciding_installs(&Plan::default(), &plain, false),
+            Some(Vec::new())
+        );
+    }
 
     #[test]
     fn a_copy_an_interrupted_update_left_where_lpm_recorded_its_older_copy_is_taken_over() {

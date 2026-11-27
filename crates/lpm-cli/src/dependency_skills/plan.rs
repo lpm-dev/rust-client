@@ -2,6 +2,8 @@ use super::discovery::{read_skill_directory, skill_directory_listing};
 use super::policy::{ParsedPolicy, SkillsPolicy};
 use crate::commands::audit::discovery::{DiscoveredPackage, ManagerKind};
 use crate::commands::audit::inventory::PackageInventory;
+use crate::commands::query::selector_uses_pseudo_class;
+use crate::lpm_skills_config::SecurityProvider;
 use lpm_common::LpmError;
 use lpm_registry::SkillReviewIssue;
 use lpm_security::query::{
@@ -31,6 +33,14 @@ pub(crate) enum HoldReason {
     Hooks,
     /// Another allowed package ships a skill with the same name.
     NameConflict,
+    /// The security provider reports the package version as malware.
+    Malware,
+    /// The security provider hasn't decided the package version: it is
+    /// still analyzing it, doesn't know it, or couldn't be asked.
+    AwaitingCheck,
+    /// No verdict of the security provider covers the package's files: it
+    /// wasn't fetched from the npm registry, or the project patches it.
+    NotCheckable,
     /// The skill directory couldn't be read.
     Unreadable,
     /// An LPM.dev package's skill directory that LPM.dev review hasn't
@@ -41,15 +51,21 @@ pub(crate) enum HoldReason {
 impl HoldReason {
     /// Whether the hold can clear without a new version of the package or
     /// a change to the policy: data arriving, a conflict ending, a folder
-    /// becoming readable.
+    /// becoming readable, the security provider deciding.
     pub(crate) fn clears_on_its_own(self) -> bool {
         match self {
-            Self::NeedsData | Self::NameConflict | Self::Unreadable | Self::NotReviewed => true,
+            Self::NeedsData
+            | Self::NameConflict
+            | Self::AwaitingCheck
+            | Self::Unreadable
+            | Self::NotReviewed => true,
             Self::Invalid
             | Self::Blocked
             | Self::NeedsPackageName
             | Self::NeedsSkillName
-            | Self::Hooks => false,
+            | Self::Hooks
+            | Self::Malware
+            | Self::NotCheckable => false,
         }
     }
 
@@ -62,6 +78,9 @@ impl HoldReason {
             Self::NeedsSkillName => "needs_skill_name",
             Self::Hooks => "hooks",
             Self::NameConflict => "name_conflict",
+            Self::Malware => "malware",
+            Self::AwaitingCheck => "awaiting_check",
+            Self::NotCheckable => "not_checkable",
             Self::Unreadable => "unreadable",
             Self::NotReviewed => "not_reviewed",
         }
@@ -173,6 +192,11 @@ pub(crate) struct Plan {
     /// such as a parent whose install can't be confirmed, so the next run
     /// plans again.
     pub(crate) incomplete: bool,
+    /// Every installed instance of each package that ships skills or whose
+    /// skills couldn't be listed, when a security provider checks npm
+    /// packages: a skill that pre-approves its package's command answers to
+    /// every release that command may run.
+    pub(crate) installs: BTreeMap<String, Vec<PackageInstall>>,
     /// Whether anything could link: the policy allows packages and npm and
     /// other package skills are on, or LPM.dev package skills are on and
     /// an install materialized some.
@@ -183,6 +207,19 @@ pub(crate) struct Plan {
     /// The LPM.dev packages among [`Self::unlisted`] that link without an
     /// entry: declared by an importer, or delivered by `lpm add`.
     pub(crate) automatic_unlisted: BTreeSet<String>,
+    /// The npm releases, as names and versions, whose security verdicts
+    /// the plan's decisions rest on: the package of every skill it allows
+    /// or can't decide, when a security provider checks them.
+    pub(crate) relied: BTreeSet<(String, String)>,
+}
+
+/// One installed instance of a package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PackageInstall {
+    pub(crate) version: String,
+    pub(crate) integrity: Option<String>,
+    /// The npm release a verdict on it would cover, when one would.
+    pub(crate) release: Option<(String, String)>,
 }
 
 /// A skill directory an LPM.dev package ships that its review record
@@ -233,6 +270,10 @@ pub(crate) struct Sources {
     pub(crate) lpm_dev: bool,
     /// The skills of npm and other registries' packages the policy allows.
     pub(crate) other: bool,
+    /// Who checks the packages behind the second kind before they link.
+    pub(crate) provider: SecurityProvider,
+    /// Whether the run is offline, so the provider can't be asked.
+    pub(crate) offline: bool,
 }
 
 /// The project directories whose installs a plan reads: `project_dir`, and
@@ -252,19 +293,32 @@ pub(crate) fn importer_directories(project_dir: &Path) -> Vec<PathBuf> {
 /// couldn't be listed.
 pub(crate) type RecordedSkills = BTreeMap<String, Vec<(String, Naming)>>;
 
+/// What a plan reads from earlier runs: the security verdicts LPM keeps,
+/// when a provider checks npm packages, and the skills earlier links
+/// recorded.
+#[derive(Clone, Copy)]
+pub(crate) struct History<'a> {
+    pub(crate) verdicts: Option<&'a super::checks::Book>,
+    pub(crate) recorded: &'a RecordedSkills,
+}
+
 /// Plans `project_dir`'s dependency skills under `policy`, linking the
-/// kinds `sources` turns on. In a workspace root the plan covers the root
-/// and every member. With nothing to link, nothing is read. `packages`
-/// limits the plan to the skills those packages ship.
+/// kinds `sources` turns on, with what `history` holds. In a workspace root
+/// the plan covers the root and every member. With nothing to link, nothing
+/// is read. `packages` limits the plan to the skills those packages ship.
 pub(crate) fn plan_project(
     project_dir: &Path,
     parsed: ParsedPolicy,
     manifest: &serde_json::Value,
     mode: PlanMode,
     sources: Sources,
+    history: History<'_>,
     packages: Option<&HashSet<String>>,
-    recorded: &RecordedSkills,
 ) -> Result<Plan, LpmError> {
+    let History {
+        verdicts: checks,
+        recorded,
+    } = history;
     let ParsedPolicy { policy, problems } = parsed;
     let mut plan = Plan {
         policy,
@@ -300,6 +354,7 @@ pub(crate) fn plan_project(
     let kinds = Sources {
         lpm_dev: sources.lpm_dev && sets.iter().any(|sets| !sets.is_empty()),
         other: sources.other && !policy.allow.is_empty(),
+        ..sources
     };
     plan.considered = kinds.lpm_dev || kinds.other;
     if mode == PlanMode::Apply && !plan.considered {
@@ -348,6 +403,22 @@ pub(crate) fn plan_project(
     let is_lpm_project = discoveries
         .iter()
         .any(|(discovery, _, _, _)| discovery.manager == ManagerKind::Lpm);
+    if sources.provider == SecurityProvider::None
+        && (sources.other || mode == PlanMode::Inspect)
+        && policy.allow.iter().chain(&policy.deny).any(|entry| {
+            selector_uses_pseudo_class(&entry.selector, |class| class == PseudoClass::Malware)
+        })
+    {
+        plan.problems.push(format!(
+            "a skills selector uses `:malware`, which reads Socket's verdicts, and no security provider is on, so skills it decides wait as needs_data; `lpm config set {} socket` turns Socket on",
+            crate::lpm_skills_config::SECURITY_PROVIDER_SETTING
+        ));
+    }
+    let book = checks.filter(|_| sources.provider == SecurityProvider::Socket);
+    let reads_malware = book.is_some()
+        && policy.allow.iter().chain(&policy.deny).any(|entry| {
+            selector_uses_pseudo_class(&entry.selector, |class| class == PseudoClass::Malware)
+        });
     let scope = Scope {
         policy,
         mode,
@@ -356,6 +427,7 @@ pub(crate) fn plan_project(
             Sources {
                 lpm_dev: true,
                 other: true,
+                ..sources
             }
         } else {
             kinds
@@ -367,6 +439,8 @@ pub(crate) fn plan_project(
         only: packages,
         reads_others,
         recorded,
+        book,
+        reads_malware,
     };
     let build = |lpm_root: Option<&lpm_common::LpmRoot>| -> Result<Found, LpmError> {
         let store_version = lpm_store::StoreVersion::from_env();
@@ -413,10 +487,12 @@ pub(crate) fn plan_project(
     plan.candidates = found.candidates;
     plan.unlisted = found.unlisted;
     plan.unlisted_allows = found.unlisted_allows;
+    plan.installs = found.installs;
     plan.problems.extend(found.problems);
     plan.incomplete = found.incomplete;
     plan.pending_reviews = found.pending_reviews;
     plan.automatic_unlisted = found.automatic_unlisted;
+    plan.relied = found.relied;
     Ok(plan)
 }
 
@@ -440,6 +516,11 @@ struct Scope<'a> {
     /// The skills earlier links recorded, judged for packages whose skills
     /// couldn't be listed.
     recorded: &'a RecordedSkills,
+    /// The security provider's verdicts, when one checks npm packages.
+    book: Option<&'a super::checks::Book>,
+    /// Whether a selector reads `:malware`, so every candidate's verdict
+    /// can change a decision, denied ones included.
+    reads_malware: bool,
 }
 
 impl Scope<'_> {
@@ -701,25 +782,10 @@ struct Decided {
     direct: bool,
 }
 
-/// The skills the importers' installed packages ship, and the packages
-/// whose skills couldn't be listed, with why.
+/// What deciding the importers finds besides the decisions themselves.
 #[derive(Default)]
-struct Found {
-    candidates: Vec<Candidate>,
-    unlisted: BTreeMap<String, String>,
-    unlisted_allows: BTreeMap<String, BTreeSet<String>>,
-    /// Packages whose skills break a rule the same way every run.
-    problems: Vec<String>,
-    incomplete: bool,
-    pending_reviews: Vec<PendingReview>,
-    automatic_unlisted: BTreeSet<String>,
-}
-
-/// Every policy decision across the importers, in the order made.
-#[derive(Default)]
-struct Decisions {
-    decided: Vec<Decided>,
-    unlisted: BTreeMap<String, String>,
+struct Judged {
+    /// [`Plan::unlisted_allows`].
     unlisted_allows: BTreeMap<String, BTreeSet<String>>,
     /// The packages, as `name@version`, whose installs can't be confirmed
     /// and that a candidate or an unlisted package reaches through its
@@ -730,9 +796,22 @@ struct Decisions {
     /// package reaches through its parents, when a selector reads what
     /// parents ship.
     unreviewed: BTreeSet<String>,
-    automatic_unlisted: BTreeSet<String>,
+}
+
+/// The skills the importers' installed packages ship, the packages whose
+/// skills couldn't be listed, with why, and the npm releases whose
+/// security verdicts the decisions rest on.
+struct Found {
+    candidates: Vec<Candidate>,
+    unlisted: BTreeMap<String, String>,
+    unlisted_allows: BTreeMap<String, BTreeSet<String>>,
+    installs: BTreeMap<String, Vec<PackageInstall>>,
+    /// Packages whose skills break a rule the same way every run.
     problems: Vec<String>,
     incomplete: bool,
+    pending_reviews: Vec<PendingReview>,
+    automatic_unlisted: BTreeSet<String>,
+    relied: BTreeSet<(String, String)>,
 }
 
 /// A decided skill's package: name, version and integrity.
@@ -755,88 +834,261 @@ fn identity<'a>(importers: &'a [Importer], entry: &Decided) -> (&'a str, &'a str
     }
 }
 
+/// The candidates of every importer, and the npm releases whose security
+/// verdicts decide them.
 fn candidates_from_importers(
     importers: &[Importer],
     lpm_root: Option<&lpm_common::LpmRoot>,
     scope: &Scope<'_>,
 ) -> Found {
-    let project_roots: Vec<Option<cap_std::fs::Dir>> = importers
+    let mut scanned: Vec<Scanned> = importers
         .iter()
         .map(|importer| {
-            crate::commands::audit::inventory::open_project_root(
+            let project_root = crate::commands::audit::inventory::open_project_root(
                 &importer.inventory.discovery.project_root,
             )
-            .ok()
+            .ok();
+            scan_importer(importer, project_root.as_ref(), lpm_root, scope)
         })
         .collect();
+    let watched: HashSet<String> = if scope.book.is_some() {
+        importers
+            .iter()
+            .zip(&scanned)
+            .flat_map(|(importer, scanned)| {
+                let packages = &importer.inventory.discovery.packages;
+                scanned
+                    .unlisted
+                    .iter()
+                    .map(|(name, _, _)| name.clone())
+                    .chain(
+                        scanned
+                            .skills
+                            .iter()
+                            .zip(packages)
+                            .filter(|(skills, _)| !skills.is_empty())
+                            .map(|(_, package)| package.name.clone()),
+                    )
+                    .filter(|name| !is_lpm_dev(name))
+            })
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    for (importer, scanned) in importers.iter().zip(scanned.iter_mut()) {
+        let packages = &importer.inventory.discovery.packages;
+        scanned.releases = npm_releases(
+            importer,
+            |index| watched.contains(&packages[index].name),
+            scope,
+        );
+    }
     let root = RootDependencies::of(importers.first());
-    let mut decisions = Decisions::default();
-    let mut directories = Vec::with_capacity(importers.len());
-    for (index, importer) in importers.iter().enumerate() {
-        directories.push(decide_importer(
+    let mut decided = Vec::new();
+    let mut judged = Judged::default();
+    for (index, (importer, scanned)) in importers.iter().zip(&scanned).enumerate() {
+        decide_importer(
             importer,
             index,
-            project_roots[index].as_ref(),
-            lpm_root,
+            scanned,
             scope,
             &root,
-            &mut decisions,
-        ));
+            &mut decided,
+            &mut judged,
+        );
     }
-    if let Some(problem) = unconfirmed_parents(&decisions.unconfirmed) {
-        decisions.incomplete = true;
-        decisions.problems.push(problem);
-    }
-    if let Some(problem) = unreviewed_parents(&decisions.unreviewed) {
-        decisions.problems.push(problem);
-    }
-    let Decisions {
-        decided,
-        unlisted,
+    let Judged {
         unlisted_allows,
-        automatic_unlisted,
-        problems,
-        incomplete,
-        ..
-    } = decisions;
+        unconfirmed,
+        unreviewed,
+    } = judged;
+    let unlisted: BTreeMap<String, String> = scanned
+        .iter()
+        .flat_map(|scanned| {
+            scanned
+                .unlisted
+                .iter()
+                .map(|(package, detail, _)| (package.clone(), detail.clone()))
+        })
+        .collect();
+    let mut installs: BTreeMap<String, Vec<PackageInstall>> = BTreeMap::new();
+    if !watched.is_empty() {
+        for (importer, scanned) in importers.iter().zip(&scanned) {
+            for (index, package) in importer.inventory.discovery.packages.iter().enumerate() {
+                if !watched.contains(&package.name) {
+                    continue;
+                }
+                installs
+                    .entry(package.name.clone())
+                    .or_default()
+                    .push(PackageInstall {
+                        version: package.version.clone(),
+                        integrity: package.integrity.clone(),
+                        release: scanned.releases[index]
+                            .as_ref()
+                            .and_then(|release| release.as_ref().ok().cloned()),
+                    });
+            }
+        }
+    }
+    let mut problems: Vec<String> = Vec::new();
+    for problem in scanned.iter().flat_map(|scanned| &scanned.problems) {
+        if !problems.contains(problem) {
+            problems.push(problem.clone());
+        }
+    }
+    let mut incomplete = scanned.iter().any(|scanned| scanned.incomplete);
+    if let Some(problem) = unconfirmed_parents(&unconfirmed) {
+        incomplete = true;
+        problems.push(problem);
+    }
+    if let Some(problem) = unreviewed_parents(&unreviewed) {
+        problems.push(problem);
+    }
+    let automatic_unlisted: BTreeSet<String> = importers
+        .iter()
+        .zip(&scanned)
+        .flat_map(|(importer, scanned)| {
+            let declared = importer.declared_instances();
+            let packages = &importer.inventory.discovery.packages;
+            scanned
+                .unlisted
+                .iter()
+                .filter(|(name, _, index)| {
+                    is_lpm_dev(name)
+                        && scanned.sets[*index].is_some_and(|set| {
+                            importer.declares(&packages[*index], &declared)
+                                || importer.delivered_by_add(set)
+                        })
+                })
+                .map(|(name, _, _)| name.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect();
     if decided.is_empty() {
         return Found {
             candidates: Vec::new(),
             unlisted,
             unlisted_allows,
+            installs,
             problems,
             incomplete,
             pending_reviews: Vec::new(),
             automatic_unlisted,
+            relied: BTreeSet::new(),
         };
     }
-
+    let directories: Vec<&[Option<cap_std::fs::Dir>]> = scanned
+        .iter()
+        .map(|scanned| scanned.directories.as_slice())
+        .collect();
     let identity_of = |entry: &Decided| {
         let (name, version, _) = identity(importers, entry);
         (name, version)
     };
     let preferred = preferred_instances(&decided, &identity_of);
-    let conflicts = name_conflicts(&decided, &preferred, &identity_of);
-    let mut rulings: HashMap<(&str, String), Vec<InstanceRuling>> = HashMap::new();
-    let mut inspected: Vec<Option<(CandidateStatus, Option<SkillDetails>)>> = Vec::new();
-    if scope.mode == PlanMode::Inspect {
-        inspected.reserve_exact(decided.len());
+    let eligible = |position: usize, entry: &Decided| {
+        preferred.contains(&position)
+            && matches!(entry.decision, Decision::Allowed(_) | Decision::Unknown)
+    };
+    // The skills that may link are read before anything else, so only those
+    // that can link contest a name, and what they pre-approve is known before
+    // the provider is asked about the releases their commands may run.
+    // Inspection reads every instance for its own ruling.
+    let mut full: Vec<Option<(CandidateStatus, Option<SkillDetails>)>> =
+        Vec::with_capacity(decided.len());
+    let mut may_link: Vec<bool> = Vec::with_capacity(decided.len());
+    {
         for (position, entry) in decided.iter().enumerate() {
-            let (name, version, _) = identity(importers, entry);
+            if scope.mode != PlanMode::Inspect && !eligible(position, entry) {
+                full.push(None);
+                may_link.push(false);
+                continue;
+            }
+            let (name, _, _) = identity(importers, entry);
             let directory = entry
                 .package
                 .and_then(|package| directories[entry.importer][package].as_ref());
             let (status, details) =
                 prepare_fully(directory, name, &entry.skill, review_of(importers, entry));
-            let may_link = matches!(entry.decision, Decision::Allowed(_) | Decision::Unknown)
-                && match &status {
-                    CandidateStatus::Linkable(_) => true,
-                    CandidateStatus::Held { reason, .. } => reason.clears_on_its_own(),
-                    CandidateStatus::NotAllowed | CandidateStatus::Denied => false,
+            may_link.push(
+                matches!(entry.decision, Decision::Allowed(_) | Decision::Unknown)
+                    && match &status {
+                        CandidateStatus::Linkable(_) => true,
+                        CandidateStatus::Held { reason, .. } => reason.clears_on_its_own(),
+                        CandidateStatus::NotAllowed | CandidateStatus::Denied => false,
+                    }
+                    && details
+                        .as_ref()
+                        .is_none_or(|details| details.requires <= entry.possible_naming),
+            );
+            full.push(preferred.contains(&position).then_some((status, details)));
+        }
+    }
+    let grants_commands = |position: usize| {
+        full.get(position)
+            .and_then(Option::as_ref)
+            .and_then(|(_, details)| details.as_ref())
+            .is_some_and(|details| details.permission != SkillPermission::None)
+    };
+    let mut relied = BTreeSet::new();
+    let mut command_holds: Vec<Option<(HoldReason, String)>> = vec![None; decided.len()];
+    let (provider_holds, contesting): (Vec<Option<(HoldReason, String)>>, Vec<bool>) = decided
+        .iter()
+        .enumerate()
+        .map(|(position, entry)| {
+            let eligible = eligible(position, entry);
+            let linkable = eligible && may_link[position];
+            let mut hold = None;
+            let mut contests = linkable;
+            if let Some(release) = entry
+                .package
+                .and_then(|package| scanned[entry.importer].releases[package].as_ref())
+            {
+                if let Ok(release) = release
+                    && (linkable || scope.reads_malware)
+                {
+                    relied.insert(release.clone());
                 }
-                && details
-                    .as_ref()
-                    .is_none_or(|details| details.requires <= entry.possible_naming);
+                hold = eligible
+                    .then(|| provider_hold(scope, release))
+                    .flatten()
+                    .filter(|(reason, _)| linkable || *reason == HoldReason::Malware);
+                contests = linkable && (hold.is_none() || has_clean_verdict(scope, release));
+            }
+            let (name, _, _) = identity(importers, entry);
+            let held_for_good = matches!(
+                hold,
+                Some((HoldReason::Malware | HoldReason::NotCheckable, _))
+            );
+            if linkable
+                && !held_for_good
+                && grants_commands(position)
+                && let Some(package_installs) = installs.get(name)
+            {
+                relied.extend(
+                    package_installs
+                        .iter()
+                        .filter_map(|install| install.release.clone()),
+                );
+                if let Some(command) = command_hold(scope, name, package_installs) {
+                    contests &= package_installs.iter().all(|install| {
+                        install
+                            .release
+                            .as_ref()
+                            .is_some_and(|(name, version)| verdict_is_clean(scope, name, version))
+                    });
+                    command_holds[position] = Some(command);
+                }
+            }
+            (hold, contests)
+        })
+        .unzip();
+    let conflicts = name_conflicts(&decided, &preferred, &contesting, &identity_of);
+    let mut rulings: HashMap<(&str, String), Vec<InstanceRuling>> = HashMap::new();
+    if scope.mode == PlanMode::Inspect {
+        for (position, entry) in decided.iter().enumerate() {
+            let (name, version, _) = identity(importers, entry);
             rulings
                 .entry((name, entry.skill.clone()))
                 .or_default()
@@ -844,9 +1096,8 @@ fn candidates_from_importers(
                     version: version.to_string(),
                     ruling: entry.decision.kind(),
                     open_denials: entry.open_denials,
-                    may_link,
+                    may_link: may_link[position],
                 });
-            inspected.push(preferred.contains(&position).then_some((status, details)));
         }
         for instances in rulings.values_mut() {
             instances.sort();
@@ -871,7 +1122,7 @@ fn candidates_from_importers(
         let set = entry.set.map(|set| &importer.sets[set]);
         let review = review_of(importers, entry);
         let check = |naming: Naming| prepare(directory, package, skill, naming, review);
-        let full = inspected.get_mut(position).and_then(Option::take);
+        let full = full.get_mut(position).and_then(Option::take);
         let inspect =
             |status: CandidateStatus, full: Option<(CandidateStatus, Option<SkillDetails>)>| {
                 match full {
@@ -888,6 +1139,11 @@ fn candidates_from_importers(
         let (status, details, blocker) = match entry.decision {
             Decision::NotAllowed => inspect(CandidateStatus::NotAllowed, full),
             Decision::Denied => inspect(CandidateStatus::Denied, full),
+            Decision::Allowed(_) | Decision::Unknown
+                if let Some((HoldReason::Malware, detail)) = &provider_holds[position] =>
+            {
+                inspect(held(HoldReason::Malware, detail.clone()), full)
+            }
             Decision::Allowed(_) | Decision::Unknown if conflicts.contains_key(skill) => inspect(
                 held(
                     HoldReason::NameConflict,
@@ -903,6 +1159,11 @@ fn candidates_from_importers(
                 ),
                 full,
             ),
+            Decision::Allowed(_) | Decision::Unknown
+                if let Some((reason, detail)) = &provider_holds[position] =>
+            {
+                inspect(held(*reason, detail.clone()), full)
+            }
             Decision::Unknown => inspect(held(HoldReason::NeedsData, UNDECIDED), full),
             Decision::Allowed(naming) => {
                 let (status, details) = match full {
@@ -942,6 +1203,16 @@ fn candidates_from_importers(
                 directory: skill.to_string(),
             });
         }
+        let status = match (status, command_holds[position].take()) {
+            (CandidateStatus::Linkable(_), Some((reason, detail))) => held(reason, detail),
+            (CandidateStatus::Held { reason, .. }, Some((command, detail)))
+                if reason.clears_on_its_own()
+                    && matches!(command, HoldReason::Malware | HoldReason::NotCheckable) =>
+            {
+                held(command, detail)
+            }
+            (status, _) => status,
+        };
         candidates.push(Candidate {
             package: package.to_string(),
             version: version.to_string(),
@@ -974,11 +1245,419 @@ fn candidates_from_importers(
         candidates,
         unlisted,
         unlisted_allows,
+        installs,
         problems,
         incomplete,
         pending_reviews,
         automatic_unlisted,
+        relied,
     }
+}
+
+/// Why a skill that pre-approves `package`'s command waits, when one of
+/// the package's installed instances, any of which the command may run, has
+/// no verdict that lets it link: a flagged one first, then one no verdict
+/// can vouch for, then one waiting for an answer.
+fn command_hold(
+    scope: &Scope<'_>,
+    package: &str,
+    installs: &[PackageInstall],
+) -> Option<(HoldReason, String)> {
+    let mut found: Option<(HoldReason, String)> = None;
+    for install in installs {
+        let hold = match &install.release {
+            Some((name, version))
+                if scope
+                    .book
+                    .is_some_and(|book| !book.vouches_now(name, version)) =>
+            {
+                (
+                    HoldReason::AwaitingCheck,
+                    format!(
+                        "LPM couldn't read the shared verdict cache to confirm that {package}@{}, which the command it pre-approves may run, wasn't flagged since",
+                        install.version
+                    ),
+                )
+            }
+            None => (
+                HoldReason::NotCheckable,
+                format!(
+                    "the command it pre-approves may run {package}@{}, a copy Socket's verdicts can't vouch for",
+                    install.version
+                ),
+            ),
+            Some(release) => match provider_hold(scope, &Ok(release.clone())) {
+                None => continue,
+                Some((reason, detail)) => (
+                    reason,
+                    format!(
+                        "the command it pre-approves may run {package}@{}: {detail}",
+                        install.version
+                    ),
+                ),
+            },
+        };
+        let rank = |reason: HoldReason| match reason {
+            HoldReason::Malware => 0,
+            HoldReason::NotCheckable => 1,
+            _ => 2,
+        };
+        if found
+            .as_ref()
+            .is_none_or(|(current, _)| rank(hold.0) < rank(*current))
+        {
+            found = Some(hold);
+        }
+    }
+    found
+}
+
+/// Whether the security provider's latest verdict on `release` is clean,
+/// however old.
+fn has_clean_verdict(scope: &Scope<'_>, release: &Result<(String, String), String>) -> bool {
+    release
+        .as_ref()
+        .is_ok_and(|(name, version)| verdict_is_clean(scope, name, version))
+}
+
+/// Whether the security provider's latest verdict on `name@version` is
+/// clean, however old.
+fn verdict_is_clean(scope: &Scope<'_>, name: &str, version: &str) -> bool {
+    scope
+        .book
+        .and_then(|book| book.entry(name, version))
+        .is_some_and(|entry| entry.verdict == super::socket::Verdict::Clean)
+}
+
+/// Why the security provider holds a skill of the package whose npm
+/// release is `release`, or `None` when its verdict lets the skill link.
+/// Without a verdict LPM keeps, the skill waits for Socket to be asked.
+fn provider_hold(
+    scope: &Scope<'_>,
+    release: &Result<(String, String), String>,
+) -> Option<(HoldReason, String)> {
+    use super::socket::Verdict;
+
+    let book = scope.book?;
+    let (name, version) = match release {
+        Ok(release) => release,
+        Err(why) => {
+            return Some((
+                HoldReason::NotCheckable,
+                format!("Socket's verdicts can't vouch for this copy: {why}"),
+            ));
+        }
+    };
+    let entry = book.entry(name, version);
+    let detail = match entry.map(|entry| &entry.verdict) {
+        Some(Verdict::Clean) if !entry.is_some_and(|entry| book.is_due(entry)) => return None,
+        Some(Verdict::Clean) => format!(
+            "Socket's clean verdict for this version is more than a day old and LPM couldn't ask again: {}",
+            unasked_reason(scope, book)
+        ),
+        Some(Verdict::Malware { alert }) => {
+            let kind = if alert == "gptMalware" {
+                "possible malware, found by AI analysis"
+            } else {
+                "known malware"
+            };
+            return Some((
+                HoldReason::Malware,
+                format!("Socket flags {name}@{version} as {kind}"),
+            ));
+        }
+        Some(Verdict::Pending) => "Socket hasn't finished analyzing this version".to_string(),
+        Some(Verdict::Unknown) => "Socket has no record of this version".to_string(),
+        None => format!(
+            "LPM couldn't ask Socket about this version: {}",
+            unasked_reason(scope, book)
+        ),
+    };
+    Some((HoldReason::AwaitingCheck, detail))
+}
+
+/// Why the provider wasn't asked about a version in this plan.
+fn unasked_reason(scope: &Scope<'_>, book: &super::checks::Book) -> String {
+    if scope.enabled.offline {
+        return "the install runs offline".to_string();
+    }
+    match book.failure() {
+        Some(reason) => reason.to_string(),
+        None if scope.mode == PlanMode::Inspect => {
+            "listing never asks; the next install, `lpm skills link` or `lpm skills sync` asks"
+                .to_string()
+        }
+        None => "it wasn't asked yet".to_string(),
+    }
+}
+
+/// What one importer's packages ship, before any decision.
+struct Scanned {
+    /// The directory of each package that ships skills, opened once.
+    directories: Vec<Option<cap_std::fs::Dir>>,
+    skills: Vec<PackageSkills>,
+    /// What each package's selector facts know of the skills it ships.
+    shipped: Vec<Shipped>,
+    /// Each package's reviewed set in the importer.
+    sets: Vec<Option<usize>>,
+    /// The reviewed sets whose packages the importer didn't install.
+    orphans: Vec<usize>,
+    /// The packages whose `skills` folder couldn't be listed, with why and
+    /// their index.
+    unlisted: Vec<(String, String, usize)>,
+    /// Packages whose skills break a rule the same way every run.
+    problems: Vec<String>,
+    /// Whether a package read for the selectors alone couldn't be read now.
+    incomplete: bool,
+    /// For each npm package that ships skills, or that shares a name with a
+    /// package whose skills couldn't be listed, when a security provider
+    /// checks them: the npm release it is a copy of, or why no verdict
+    /// covers its files. Filled once every importer is scanned.
+    releases: Vec<Option<Result<(String, String), String>>>,
+}
+
+fn scan_importer(
+    importer: &Importer,
+    project_root: Option<&cap_std::fs::Dir>,
+    lpm_root: Option<&lpm_common::LpmRoot>,
+    scope: &Scope<'_>,
+) -> Scanned {
+    use rayon::prelude::*;
+
+    let packages = &importer.inventory.discovery.packages;
+    let sets: Vec<Option<usize>> = packages
+        .iter()
+        .map(|package| importer.set_of(&package.name, &package.version))
+        .collect();
+    type Listed = (
+        Option<cap_std::fs::Dir>,
+        PackageSkills,
+        Option<ListFailure>,
+        Shipped,
+        bool,
+    );
+    let listed: Vec<Listed> = packages
+        .par_iter()
+        .zip(&sets)
+        .map(|(package, set)| {
+            let reads = scope.reads(&package.name);
+            if !reads && !scope.reads_facts(&package.name) {
+                return (None, Vec::new(), None, Shipped::Unknown, false);
+            }
+            let uncertain =
+                package.installed == Some(crate::commands::audit::discovery::Installation::Unknown);
+            let lpm_dev = is_lpm_dev(&package.name);
+            let reviewed = set.filter(|set| importer.sets[*set].recorded);
+            if !reads && (uncertain || lpm_dev && reviewed.is_none()) {
+                return (None, Vec::new(), None, Shipped::Unknown, false);
+            }
+            let mut skills: PackageSkills = set
+                .map(|set| {
+                    importer.sets[set]
+                        .skills
+                        .iter()
+                        .enumerate()
+                        .map(|(index, skill)| (skill.name.clone(), Origin::Reviewed(index)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut failure = None;
+            let directory = match importer.open(package, project_root, lpm_root) {
+                Ok(directory) => Some(directory),
+                Err(error)
+                    if is_absent(&error, project_root, package, importer.opens_in_project()) =>
+                {
+                    None
+                }
+                Err(error) => {
+                    failure = Some(ListFailure::Unreadable(error));
+                    None
+                }
+            };
+            let mut unconfirmed = false;
+            if let Some(directory) = directory.as_ref() {
+                match skill_directory_listing(directory) {
+                    Ok(listing) => {
+                        unconfirmed = listing.unconfirmed;
+                        skills.extend(
+                            listing
+                                .names
+                                .into_iter()
+                                .map(|name| (name, Origin::Directory)),
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                        failure = Some(ListFailure::Refused(error));
+                    }
+                    Err(error) => failure = Some(ListFailure::Unreadable(error)),
+                }
+            }
+            // A reviewed LPM.dev skill comes from the registry, so what the
+            // package ships is known only from LPM's record of the review for
+            // the installed version.
+            let names_known = failure.is_none() && !unconfirmed && (!lpm_dev || reviewed.is_some());
+            let fact_names = |skills: &PackageSkills| -> Vec<String> {
+                match reviewed {
+                    Some(set) => importer.sets[set]
+                        .approved
+                        .iter()
+                        .cloned()
+                        .chain(
+                            skills
+                                .iter()
+                                .filter(|(_, origin)| matches!(origin, Origin::Directory))
+                                .map(|(name, _)| name.clone()),
+                        )
+                        .collect(),
+                    None => skills.iter().map(|(name, _)| name.clone()).collect(),
+                }
+            };
+            if !reads {
+                let facts = if names_known {
+                    Shipped::Names(fact_names(&skills))
+                } else {
+                    Shipped::Unknown
+                };
+                return (
+                    None,
+                    Vec::new(),
+                    failure.map(ListFailure::for_facts),
+                    facts,
+                    unconfirmed,
+                );
+            }
+            if uncertain {
+                let failure =
+                    failure.or_else(|| (!skills.is_empty()).then_some(ListFailure::Uncertain));
+                return (None, Vec::new(), failure, Shipped::Unknown, false);
+            }
+            let facts = if !names_known {
+                Shipped::Unknown
+            } else if lpm_dev {
+                Shipped::Names(fact_names(&skills))
+            } else {
+                Shipped::Listed
+            };
+            if skills.is_empty() {
+                (None, skills, failure, facts, unconfirmed)
+            } else {
+                (directory, skills, failure, facts, unconfirmed)
+            }
+        })
+        .collect();
+    let mut directories = Vec::with_capacity(listed.len());
+    let mut skills = Vec::with_capacity(listed.len());
+    let mut shipped = Vec::with_capacity(listed.len());
+    let mut unlisted = Vec::new();
+    let mut problems = Vec::new();
+    let mut incomplete = false;
+    for (index, (package, (directory, package_skills, failure, facts, unconfirmed))) in
+        packages.iter().zip(listed).enumerate()
+    {
+        incomplete |= unconfirmed;
+        match failure {
+            Some(ListFailure::Uncertain) => {
+                unlisted.push((package.name.clone(), UNCERTAIN_INSTALL.to_string(), index));
+            }
+            Some(ListFailure::Unreadable(error)) => {
+                unlisted.push((
+                    package.name.clone(),
+                    format!("its skills folder could not be read: {error}"),
+                    index,
+                ));
+            }
+            Some(ListFailure::Refused(error)) => {
+                problems.push(format!(
+                    "{}@{}: {error}, so none of its skills are linked",
+                    package.name, package.version
+                ));
+            }
+            Some(ListFailure::FactsUnreadable(error)) => {
+                incomplete = true;
+                problems.push(format!(
+                    "{}@{}: its skills folder could not be read ({error}), so selectors that look at the skills it ships stay undecided until it can be",
+                    package.name, package.version
+                ));
+            }
+            Some(ListFailure::FactsRefused(error)) => {
+                problems.push(format!(
+                    "{}@{}: {error}, so selectors that look at the skills it ships stay undecided",
+                    package.name, package.version
+                ));
+            }
+            None => {}
+        }
+        directories.push(directory);
+        skills.push(package_skills);
+        shipped.push(facts);
+    }
+    let orphans = (0..importer.sets.len())
+        .filter(|set| !sets.contains(&Some(*set)) && importer.delivered_by_add(*set))
+        .collect();
+    Scanned {
+        directories,
+        skills,
+        shipped,
+        sets,
+        orphans,
+        unlisted,
+        problems,
+        incomplete,
+        releases: Vec::new(),
+    }
+}
+
+/// The npm release of each package of `importer` that is `wanted`, or why
+/// no verdict covers it, when a security provider checks npm packages.
+fn npm_releases(
+    importer: &Importer,
+    wanted: impl Fn(usize) -> bool,
+    scope: &Scope<'_>,
+) -> Vec<Option<Result<(String, String), String>>> {
+    let packages = &importer.inventory.discovery.packages;
+    let checked =
+        |index: usize| scope.book.is_some() && !is_lpm_dev(&packages[index].name) && wanted(index);
+    if !(0..packages.len()).any(checked) {
+        return vec![None; packages.len()];
+    }
+    let lockfile = importer.inventory.discovery.retained_lpm_lockfile();
+    let mut by_instance: HashMap<lpm_common::PackageInstanceId, &lpm_lockfile::LockedPackage> =
+        HashMap::new();
+    let mut by_release: HashMap<(&str, &str), Vec<&lpm_lockfile::LockedPackage>> = HashMap::new();
+    let matches_by_release =
+        (0..packages.len()).any(|index| checked(index) && packages[index].instance_id.is_none());
+    for locked in lockfile.iter().flat_map(|lockfile| &lockfile.packages) {
+        if let Some(instance) = locked.instance_id {
+            by_instance.insert(instance, locked);
+        }
+        if matches_by_release {
+            by_release
+                .entry((locked.name.as_str(), locked.version.as_str()))
+                .or_default()
+                .push(locked);
+        }
+    }
+    packages
+        .iter()
+        .enumerate()
+        .map(|(index, package)| {
+            checked(index).then(|| {
+                let locked: Vec<&lpm_lockfile::LockedPackage> = match package.instance_id {
+                    Some(instance) => by_instance.get(&instance).copied().into_iter().collect(),
+                    None => by_release
+                        .get(&(package.name.as_str(), package.version.as_str()))
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .filter(|locked| {
+                            package.integrity.is_none() || locked.integrity == package.integrity
+                        })
+                        .collect(),
+                };
+                super::checks::npm_release(package, &locked)
+            })
+        })
+        .collect()
 }
 
 /// The workspace root's direct dependencies, which `:workspace-root >`
@@ -1154,215 +1833,29 @@ fn unreviewed_parents(unreviewed: &BTreeSet<String>) -> Option<String> {
 
 /// Decides every skill one importer's installed packages ship, and the
 /// reviewed sets whose packages it didn't install, against that importer's
-/// dependency graph. Returns the directory of each package that ships
-/// skills, opened once for reading them.
+/// dependency graph and the security verdicts LPM keeps.
 fn decide_importer(
     importer: &Importer,
     importer_index: usize,
-    project_root: Option<&cap_std::fs::Dir>,
-    lpm_root: Option<&lpm_common::LpmRoot>,
+    scanned: &Scanned,
     scope: &Scope<'_>,
     root: &RootDependencies,
-    decisions: &mut Decisions,
-) -> Vec<Option<cap_std::fs::Dir>> {
-    use rayon::prelude::*;
-
+    decided: &mut Vec<Decided>,
+    judged: &mut Judged,
+) {
     let inventory = &importer.inventory;
     let packages = &inventory.discovery.packages;
-    let sets: Vec<Option<usize>> = packages
-        .iter()
-        .map(|package| importer.set_of(&package.name, &package.version))
-        .collect();
     let declared = importer.declared_instances();
-    type Listed = (
-        Option<cap_std::fs::Dir>,
-        PackageSkills,
-        Option<ListFailure>,
-        Shipped,
-        bool,
-    );
-    let listed: Vec<Listed> = packages
-        .par_iter()
-        .zip(&sets)
-        .map(|(package, set)| {
-            let reads = scope.reads(&package.name);
-            if !reads && !scope.reads_facts(&package.name) {
-                return (None, Vec::new(), None, Shipped::Unknown, false);
-            }
-            let uncertain =
-                package.installed == Some(crate::commands::audit::discovery::Installation::Unknown);
-            let lpm_dev = is_lpm_dev(&package.name);
-            let reviewed = set.filter(|set| importer.sets[*set].recorded);
-            if !reads && (uncertain || lpm_dev && reviewed.is_none()) {
-                return (None, Vec::new(), None, Shipped::Unknown, false);
-            }
-            let mut skills: PackageSkills = set
-                .map(|set| {
-                    importer.sets[set]
-                        .skills
-                        .iter()
-                        .enumerate()
-                        .map(|(index, skill)| (skill.name.clone(), Origin::Reviewed(index)))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let mut failure = None;
-            let directory = match importer.open(package, project_root, lpm_root) {
-                Ok(directory) => Some(directory),
-                Err(error)
-                    if is_absent(&error, project_root, package, importer.opens_in_project()) =>
-                {
-                    None
-                }
-                Err(error) => {
-                    failure = Some(ListFailure::Unreadable(error));
-                    None
-                }
-            };
-            let mut unconfirmed = false;
-            if let Some(directory) = directory.as_ref() {
-                match skill_directory_listing(directory) {
-                    Ok(listing) => {
-                        unconfirmed = listing.unconfirmed;
-                        skills.extend(
-                            listing
-                                .names
-                                .into_iter()
-                                .map(|name| (name, Origin::Directory)),
-                        );
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-                        failure = Some(ListFailure::Refused(error));
-                    }
-                    Err(error) => failure = Some(ListFailure::Unreadable(error)),
-                }
-            }
-            // A reviewed LPM.dev skill comes from the registry, so what the
-            // package ships is known only from LPM's record of the review for
-            // the installed version.
-            let names_known = failure.is_none() && !unconfirmed && (!lpm_dev || reviewed.is_some());
-            let fact_names = |skills: &PackageSkills| -> Vec<String> {
-                match reviewed {
-                    Some(set) => importer.sets[set]
-                        .approved
-                        .iter()
-                        .cloned()
-                        .chain(
-                            skills
-                                .iter()
-                                .filter(|(_, origin)| matches!(origin, Origin::Directory))
-                                .map(|(name, _)| name.clone()),
-                        )
-                        .collect(),
-                    None => skills.iter().map(|(name, _)| name.clone()).collect(),
-                }
-            };
-            if !reads {
-                let facts = if names_known {
-                    Shipped::Names(fact_names(&skills))
-                } else {
-                    Shipped::Unknown
-                };
-                return (
-                    None,
-                    Vec::new(),
-                    failure.map(ListFailure::for_facts),
-                    facts,
-                    unconfirmed,
-                );
-            }
-            if uncertain {
-                let failure =
-                    failure.or_else(|| (!skills.is_empty()).then_some(ListFailure::Uncertain));
-                return (None, Vec::new(), failure, Shipped::Unknown, false);
-            }
-            let facts = if !names_known {
-                Shipped::Unknown
-            } else if lpm_dev {
-                Shipped::Names(fact_names(&skills))
-            } else {
-                Shipped::Listed
-            };
-            if skills.is_empty() {
-                (None, skills, failure, facts, unconfirmed)
-            } else {
-                (directory, skills, failure, facts, unconfirmed)
-            }
-        })
-        .collect();
-    let mut directories = Vec::with_capacity(listed.len());
-    let mut skills = Vec::with_capacity(listed.len());
-    let mut shipped = Vec::with_capacity(listed.len());
-    let mut unlisted = Vec::new();
-    for (index, (package, (directory, package_skills, failure, facts, unconfirmed))) in
-        packages.iter().zip(listed).enumerate()
-    {
-        decisions.incomplete |= unconfirmed;
-        if matches!(
-            failure,
-            Some(ListFailure::Uncertain | ListFailure::Unreadable(_))
-        ) {
-            unlisted.push(index);
-            if is_lpm_dev(&package.name)
-                && sets[index].is_some_and(|set| {
-                    importer.declares(package, &declared) || importer.delivered_by_add(set)
-                })
-            {
-                decisions.automatic_unlisted.insert(package.name.clone());
-            }
-        }
-        match failure {
-            Some(ListFailure::Uncertain) => {
-                decisions
-                    .unlisted
-                    .entry(package.name.clone())
-                    .or_insert_with(|| UNCERTAIN_INSTALL.to_string());
-            }
-            Some(ListFailure::Unreadable(error)) => {
-                decisions
-                    .unlisted
-                    .entry(package.name.clone())
-                    .or_insert_with(|| format!("its skills folder could not be read: {error}"));
-            }
-            Some(ListFailure::Refused(error)) => {
-                let problem = format!(
-                    "{}@{}: {error}, so none of its skills are linked",
-                    package.name, package.version
-                );
-                if !decisions.problems.contains(&problem) {
-                    decisions.problems.push(problem);
-                }
-            }
-            Some(ListFailure::FactsUnreadable(error)) => {
-                decisions.incomplete = true;
-                let problem = format!(
-                    "{}@{}: its skills folder could not be read ({error}), so selectors that look at the skills it ships stay undecided until it can be",
-                    package.name, package.version
-                );
-                if !decisions.problems.contains(&problem) {
-                    decisions.problems.push(problem);
-                }
-            }
-            Some(ListFailure::FactsRefused(error)) => {
-                let problem = format!(
-                    "{}@{}: {error}, so selectors that look at the skills it ships stay undecided",
-                    package.name, package.version
-                );
-                if !decisions.problems.contains(&problem) {
-                    decisions.problems.push(problem);
-                }
-            }
-            None => {}
-        }
-        directories.push(directory);
-        skills.push(package_skills);
-        shipped.push(facts);
-    }
-    let orphans: Vec<usize> = (0..importer.sets.len())
-        .filter(|set| !sets.contains(&Some(*set)) && importer.delivered_by_add(*set))
-        .collect();
-    if skills.iter().all(Vec::is_empty) && orphans.is_empty() && unlisted.is_empty() {
-        return directories;
+    let Scanned {
+        skills,
+        shipped,
+        sets,
+        orphans,
+        releases,
+        ..
+    } = scanned;
+    if skills.iter().all(Vec::is_empty) && orphans.is_empty() && scanned.unlisted.is_empty() {
+        return;
     }
     let skill_names: Vec<Vec<String>> = skills
         .iter()
@@ -1438,7 +1931,11 @@ fn decide_importer(
                 Shipped::Unknown => None,
             },
             skill: None,
-            malware: is_lpm_dev(&package.name).then_some(false),
+            malware: if is_lpm_dev(&package.name) {
+                Some(false)
+            } else {
+                malware_verdict(scope, releases[index].as_ref())
+            },
         })
         .collect();
     let all_packages: HashMap<&str, PackageContext<'_>> = graph_keys
@@ -1466,7 +1963,7 @@ fn decide_importer(
             .enumerate()
             .filter(|(_, names)| !names.is_empty())
             .map(|(index, _)| index)
-            .chain(unlisted.iter().copied())
+            .chain(scanned.unlisted.iter().map(|&(_, _, index)| index))
             .map(|index| graph_keys[index]);
         for key in ancestors(&graph, reached) {
             let Some(&index) = index_of.get(key) else {
@@ -1475,16 +1972,16 @@ fn decide_importer(
             let package = &packages[index];
             let release = format!("{}@{}", package.name, package.version);
             if package.installed == Some(crate::commands::audit::discovery::Installation::Unknown) {
-                decisions.unconfirmed.insert(release);
+                judged.unconfirmed.insert(release);
             } else if scope.reads_others
                 && is_lpm_dev(&package.name)
                 && !sets[index].is_some_and(|set| importer.sets[set].recorded)
             {
-                decisions.unreviewed.insert(release);
+                judged.unreviewed.insert(release);
             }
         }
     }
-    for &index in &unlisted {
+    for &(_, _, index) in &scanned.unlisted {
         let package = &packages[index];
         let lpm_dev = is_lpm_dev(&package.name);
         let enabled = if lpm_dev {
@@ -1517,7 +2014,7 @@ fn decide_importer(
                 Decision::NotAllowed | Decision::Denied => false,
             };
             if allows {
-                decisions
+                judged
                     .unlisted_allows
                     .entry(package.name.clone())
                     .or_default()
@@ -1552,7 +2049,7 @@ fn decide_importer(
             } else {
                 Ruling::NOT_ALLOWED
             };
-            decisions.decided.push(Decided {
+            decided.push(Decided {
                 importer: importer_index,
                 package: Some(index),
                 set: sets[index],
@@ -1565,7 +2062,7 @@ fn decide_importer(
             });
         }
     }
-    for set_index in orphans {
+    for &set_index in orphans {
         let set = &importer.sets[set_index];
         let names: Vec<String> = set.skills.iter().map(|skill| skill.name.clone()).collect();
         let context = PackageContext {
@@ -1598,7 +2095,7 @@ fn decide_importer(
             } else {
                 Ruling::NOT_ALLOWED
             };
-            decisions.decided.push(Decided {
+            decided.push(Decided {
                 importer: importer_index,
                 package: None,
                 set: Some(set_index),
@@ -1611,7 +2108,21 @@ fn decide_importer(
             });
         }
     }
-    directories
+}
+
+/// What the security provider's verdict says to a `:malware` selector
+/// about the package whose npm release is `release`: `None` without a
+/// decided verdict for exactly that release.
+fn malware_verdict(
+    scope: &Scope<'_>,
+    release: Option<&Result<(String, String), String>>,
+) -> Option<bool> {
+    let (name, version) = release?.as_ref().ok()?;
+    match scope.book?.entry(name, version)?.verdict {
+        super::socket::Verdict::Clean => Some(false),
+        super::socket::Verdict::Malware { .. } => Some(true),
+        super::socket::Verdict::Pending | super::socket::Verdict::Unknown => None,
+    }
 }
 
 /// Why the skills of a package behind an entry LPM couldn't inspect aren't
@@ -1880,16 +2391,21 @@ fn preferred_instances<'a>(
     best.into_values().collect()
 }
 
-/// Skill names that more than one package the policy allows, or may allow
-/// once data arrives, ships, with the packages.
+/// Skill names that more than one `contesting` package the policy allows,
+/// or may allow once data arrives, ships, with the packages. A package the
+/// security provider holds back doesn't contest, since its skill doesn't
+/// link, unless only its clean verdict's age holds it: which package links
+/// a name never depends on how old a verdict is.
 fn name_conflicts<'a>(
     decided: &[Decided],
     preferred: &HashSet<usize>,
+    contesting: &[bool],
     identity_of: &impl Fn(&Decided) -> (&'a str, &'a str),
 ) -> HashMap<String, Vec<String>> {
     let mut providers: HashMap<&str, Vec<&str>> = HashMap::new();
     for (position, entry) in decided.iter().enumerate() {
         if preferred.contains(&position)
+            && contesting[position]
             && matches!(entry.decision, Decision::Allowed(_) | Decision::Unknown)
         {
             let names = providers.entry(entry.skill.as_str()).or_default();
@@ -2226,6 +2742,102 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_command_hold_names_a_flagged_instance_first_then_an_uncheckable_one_then_a_waiting_one() {
+        let now_ms = super::super::checks::now_ms();
+        let observed = |verdict| super::super::socket::Observed {
+            verdict,
+            at_ms: now_ms,
+        };
+        let mut book = super::super::checks::Book::default();
+        book.absorb(&super::super::socket::Answers {
+            verdicts: HashMap::from([
+                (
+                    ("tool".to_string(), "1.0.0".to_string()),
+                    observed(super::super::socket::Verdict::Clean),
+                ),
+                (
+                    ("tool".to_string(), "3.0.0".to_string()),
+                    observed(super::super::socket::Verdict::Malware {
+                        alert: "malware".into(),
+                    }),
+                ),
+            ]),
+            failure: None,
+            at_ms: now_ms,
+        });
+        let policy = SkillsPolicy {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            targets: super::super::policy::Targets::Auto,
+            deny_unreadable: false,
+        };
+        let scope = Scope {
+            policy: &policy,
+            mode: PlanMode::Apply,
+            enabled: Sources {
+                lpm_dev: true,
+                other: true,
+                provider: SecurityProvider::Socket,
+                offline: false,
+            },
+            read: Sources {
+                lpm_dev: true,
+                other: true,
+                provider: SecurityProvider::Socket,
+                offline: false,
+            },
+            named: None,
+            only: None,
+            reads_others: false,
+            recorded: &RecordedSkills::new(),
+            book: Some(&book),
+            reads_malware: false,
+        };
+        let install = |version: &str, checkable: bool| PackageInstall {
+            version: version.to_string(),
+            integrity: None,
+            release: checkable.then(|| ("tool".to_string(), version.to_string())),
+        };
+        let reason = |installs: &[PackageInstall]| {
+            command_hold(&scope, "tool", installs).map(|(reason, _)| reason)
+        };
+
+        let clean = install("1.0.0", true);
+        let unanswered = install("2.0.0", true);
+        let flagged = install("3.0.0", true);
+        let patched = install("4.0.0", false);
+        assert_eq!(reason(std::slice::from_ref(&clean)), None);
+        assert_eq!(
+            reason(&[clean.clone(), unanswered.clone()]),
+            Some(HoldReason::AwaitingCheck)
+        );
+        assert_eq!(
+            reason(&[unanswered.clone(), patched.clone()]),
+            Some(HoldReason::NotCheckable)
+        );
+        assert_eq!(
+            reason(&[unanswered, patched, flagged, clean.clone()]),
+            Some(HoldReason::Malware)
+        );
+
+        let mut unverified = super::super::checks::Book::default().merged_with(book.clone());
+        unverified.note_refresh_failed();
+        assert!(
+            command_hold(&scope, "tool", std::slice::from_ref(&clean)).is_none(),
+            "Socket answered for it during this run"
+        );
+        let scope = Scope {
+            book: Some(&unverified),
+            ..scope
+        };
+        assert_eq!(
+            command_hold(&scope, "tool", std::slice::from_ref(&clean)).map(|(reason, _)| reason),
+            Some(HoldReason::AwaitingCheck),
+            "a verdict the shared cache couldn't be read to confirm no longer vouches for a command"
+        );
+    }
+
+    #[test]
     fn a_legacy_root_release_counts_under_every_name_the_root_installs_it_under() {
         let root = |package: &str| lpm_lockfile::LockedRootResolution {
             package: package.to_string(),
@@ -2491,14 +3103,17 @@ mod tests {
             },
         ];
         let preferred: HashSet<usize> = [0, 1].into_iter().collect();
-        let conflicts = name_conflicts(&decided, &preferred, &|entry: &Decided| {
+        let identity_of = |entry: &Decided| {
             let package = &packages[entry.package.unwrap()];
             (package.name.as_str(), package.version.as_str())
-        });
+        };
+        let conflicts = name_conflicts(&decided, &preferred, &[true, true], &identity_of);
         assert_eq!(
             conflicts.get("guide").map(Vec::as_slice),
             Some(["a".to_string(), "b".to_string()].as_slice())
         );
+
+        assert!(name_conflicts(&decided, &preferred, &[true, false], &identity_of).is_empty());
     }
 
     #[test]

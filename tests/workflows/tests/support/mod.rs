@@ -984,6 +984,9 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     cmd.remove_env("GITHUB_TOKEN");
     cmd.remove_env("GITLAB_TOKEN");
     cmd.remove_env("CI_JOB_TOKEN");
+    cmd.remove_env("SOCKET_CLI_API_TOKEN");
+    cmd.remove_env("SOCKET_SECURITY_API_TOKEN");
+    cmd.remove_env("LPM_SOCKET_API_URL");
     cmd.remove_env("LPM_TEST_VAULT_WRAPPING_KEY_ERROR");
     cmd.remove_env("LPM_VAULT_ID");
     cmd.remove_env("LPM_OIDC_POLICY_ID");

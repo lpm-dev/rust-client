@@ -1,6 +1,8 @@
 use super::apply::{Desired, desired_skills};
 use super::links::TargetDir;
-use super::plan::{CandidateStatus, HoldReason, Plan, PlanMode, SkillDetails, plan_project};
+use super::plan::{
+    CandidateStatus, History, HoldReason, Plan, PlanMode, SkillDetails, plan_project,
+};
 use super::policy::{Targets, policy_digest, read_policy};
 use super::state::{LinkState, StoredState, read_state};
 use super::{Settings, apply, snapshot, still_blocked};
@@ -147,7 +149,7 @@ pub(crate) fn inspect_project(
     manifest: &serde_json::Value,
     settings: Settings,
 ) -> Result<Inspection, LpmError> {
-    inspect(project_dir, manifest, settings, None)
+    Inspector::new(project_dir, settings).project(manifest, settings)
 }
 
 /// [`inspect_project`] for the skills `packages` ship, reading no other
@@ -158,7 +160,58 @@ pub(crate) fn inspect_packages(
     settings: Settings,
     packages: &HashSet<String>,
 ) -> Result<Inspection, LpmError> {
-    inspect(project_dir, manifest, settings, Some(packages))
+    Inspector::new(project_dir, settings).inspect(manifest, settings, Some(packages))
+}
+
+/// Inspects one project's dependency skills, as often as a command needs
+/// over edited manifests, reading the security provider's verdicts once.
+pub(crate) struct Inspector<'a> {
+    project_dir: &'a Path,
+    provider: crate::lpm_skills_config::SecurityProvider,
+    verdicts: Option<super::checks::Book>,
+    checked_as: Option<String>,
+}
+
+impl<'a> Inspector<'a> {
+    pub(crate) fn new(project_dir: &'a Path, settings: Settings) -> Self {
+        let verdicts = settings.verdicts();
+        let checked_as = verdicts
+            .as_ref()
+            .and_then(|_| super::checks::release_check());
+        Self {
+            project_dir,
+            provider: settings.security_provider,
+            verdicts,
+            checked_as,
+        }
+    }
+
+    /// The project's skills as `manifest` decides them under `settings`,
+    /// whose security provider must be the one this inspector was made
+    /// for.
+    pub(crate) fn project(
+        &self,
+        manifest: &serde_json::Value,
+        settings: Settings,
+    ) -> Result<Inspection, LpmError> {
+        self.inspect(manifest, settings, None)
+    }
+
+    fn inspect(
+        &self,
+        manifest: &serde_json::Value,
+        settings: Settings,
+        packages: Option<&HashSet<String>>,
+    ) -> Result<Inspection, LpmError> {
+        debug_assert_eq!(settings.security_provider, self.provider);
+        inspect(
+            self.project_dir,
+            manifest,
+            settings,
+            packages,
+            provider_verdicts(self.verdicts.as_ref(), self.checked_as.as_deref()),
+        )
+    }
 }
 
 fn inspect(
@@ -166,6 +219,7 @@ fn inspect(
     manifest: &serde_json::Value,
     settings: Settings,
     packages: Option<&HashSet<String>>,
+    verdicts: Option<apply::Verdicts<'_>>,
 ) -> Result<Inspection, LpmError> {
     let parsed = read_policy(manifest);
     let allow = parsed
@@ -193,7 +247,7 @@ fn inspect(
     );
     let policy = policy_digest(parsed.policy.as_ref());
     let state = match read_state(project_dir) {
-        StoredState::Present(state) => state,
+        StoredState::Present(state) => *state,
         _ => LinkState::default(),
     };
     let plan = plan_project(
@@ -202,8 +256,11 @@ fn inspect(
         manifest,
         PlanMode::Inspect,
         settings.sources(),
+        History {
+            verdicts: verdicts.map(|verdicts| verdicts.book),
+            recorded: &state.recorded_skills(),
+        },
         packages,
-        &state.recorded_skills(),
     )?;
     Ok(Inspection {
         allow,
@@ -218,7 +275,7 @@ fn inspect(
         automatic_unlisted: plan.automatic_unlisted.clone(),
         other_packages: settings.other_packages,
         lpm_dev_packages: settings.lpm_dev_packages,
-        skills: inspected_skills(project_dir, &plan, &state, &policy),
+        skills: inspected_skills(project_dir, &plan, &state, &policy, verdicts),
     })
 }
 
@@ -227,8 +284,10 @@ fn inspected_skills(
     plan: &Plan,
     state: &LinkState,
     policy: &str,
+    verdicts: Option<apply::Verdicts<'_>>,
 ) -> Vec<InspectedSkill> {
-    let (desired, _) = desired_skills(project_dir, plan, state, policy);
+    let targets = apply::link_targets(project_dir, plan);
+    let (desired, _) = desired_skills(project_dir, plan, state, policy, &targets, verdicts);
     plan.candidates
         .iter()
         .map(|candidate| {
@@ -300,6 +359,13 @@ fn inspected_skills(
         .collect()
 }
 
+fn provider_verdicts<'a>(
+    book: Option<&'a super::checks::Book>,
+    checked_as: Option<&'a str>,
+) -> Option<apply::Verdicts<'a>> {
+    book.map(|book| apply::Verdicts { book, checked_as })
+}
+
 /// The digest of the files a desired skill links.
 fn digest_of<'a>(wanted: &'a Desired<'_>) -> &'a str {
     match wanted {
@@ -327,32 +393,37 @@ pub(crate) fn drift(project_dir: &Path, settings: Settings) -> Result<Vec<String
     };
     let parsed = read_policy(&manifest);
     let state = match read_state(project_dir) {
-        StoredState::Present(state) => state,
+        StoredState::Present(state) => *state,
         StoredState::Missing => LinkState::default(),
         StoredState::Unusable(reason) => return Ok(vec![reason]),
         StoredState::Newer(reason) => return Ok(vec![apply::newer_state_warning(&reason)]),
     };
     let policy = policy_digest(parsed.policy.as_ref());
+    let verdicts = settings.verdicts();
+    let checked_as = verdicts
+        .as_ref()
+        .and_then(|_| super::checks::release_check());
     let plan = plan_project(
         project_dir,
         parsed,
         &manifest,
         PlanMode::Apply,
         settings.sources(),
+        History {
+            verdicts: verdicts.as_ref(),
+            recorded: &state.recorded_skills(),
+        },
         None,
-        &state.recorded_skills(),
     )?;
-    let targets = if plan.considered {
-        apply::resolve_targets(
-            project_dir,
-            plan.policy
-                .as_ref()
-                .map_or(&Targets::Auto, |policy| &policy.targets),
-        )
-    } else {
-        Vec::new()
-    };
-    let (desired, _) = desired_skills(project_dir, &plan, &state, &policy);
+    let targets = apply::link_targets(project_dir, &plan);
+    let (desired, _) = desired_skills(
+        project_dir,
+        &plan,
+        &state,
+        &policy,
+        &targets,
+        provider_verdicts(verdicts.as_ref(), checked_as.as_deref()),
+    );
     let mut differences = Vec::new();
     for (skill, wanted) in &desired {
         let (package, version) = source_of(wanted);
@@ -371,8 +442,12 @@ pub(crate) fn drift(project_dir: &Path, settings: Settings) -> Result<Vec<String
         {
             differences.push(format!("LPM's copy of {skill} is missing or changed"));
         }
+        let kept = matches!(wanted, Desired::Kept(_));
         for target in &targets {
             let path = format!("{target}/{skill}");
+            if kept && !record.links.iter().any(|link| link.path == path) {
+                continue;
+            }
             if record.blocked.contains(&path) {
                 if !still_blocked(project_dir, skill, &path) {
                     differences.push(format!(

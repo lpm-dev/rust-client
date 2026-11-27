@@ -1773,6 +1773,7 @@ async fn run_locked(
             project_dir,
             skills,
             crate::commands::install::InstallOmitPolicy::default(),
+            false,
         )
     });
     if json_output && let Some(reconciled) = &dependency_skills {

@@ -9,6 +9,7 @@ pub(crate) struct LogoutTargets<'a> {
     pub npm: bool,
     pub github: bool,
     pub gitlab: bool,
+    pub socket: bool,
     pub custom_registry: Option<&'a str>,
     pub all_custom_registries: bool,
 }
@@ -184,6 +185,34 @@ pub async fn run(
             );
         }
     }
+    if targets.socket {
+        let credential_cleared = record_local_clear(
+            auth::clear_socket_token(),
+            "Socket local credential clearing",
+            &mut local_cleared,
+            &mut errors,
+        );
+        crate::dependency_skills::socket_credentials_changed();
+        let checking = socket_check_may_be_on();
+        let provider_cleared = !checking
+            || record_local_clear(
+                crate::commands::config::set_skill_security_provider(
+                    crate::lpm_skills_config::SecurityProvider::None,
+                )
+                .await
+                .map_err(|error| error.to_string()),
+                "Socket security check setting",
+                &mut local_cleared,
+                &mut errors,
+            );
+        if credential_cleared && provider_cleared && !json_output {
+            output::success(if checking {
+                "Logged out from Socket; installs no longer check dependency skills with Socket"
+            } else {
+                "Logged out from Socket"
+            });
+        }
+    }
     if let Some(url) = targets.custom_registry {
         let cleared = record_local_clear(
             auth::clear_custom_registry_token(url),
@@ -271,6 +300,16 @@ async fn revoke_pairings(client: &RegistryClient) -> Result<(), LpmError> {
         }
     })
     .await
+}
+
+/// Whether the user config may turn the Socket check of dependency skills
+/// on: it names Socket, or a value LPM can't read. Logging out writes the
+/// setting only then, so a config that never mentioned it stays as it was.
+fn socket_check_may_be_on() -> bool {
+    crate::commands::config::GlobalConfig::load_checked()
+        .ok()
+        .and_then(|config| crate::lpm_skills_config::security_provider(&config).ok())
+        != Some(crate::lpm_skills_config::SecurityProvider::None)
 }
 
 fn record_local_clear(

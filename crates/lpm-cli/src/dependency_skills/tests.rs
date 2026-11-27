@@ -13,6 +13,8 @@ fn settings() -> Settings {
     Settings {
         lpm_dev_packages: true,
         other_packages: true,
+        security_provider: Default::default(),
+        offline: false,
         omitted: Default::default(),
     }
 }
@@ -22,7 +24,7 @@ fn settings() -> Settings {
 fn force_reconcile(project_dir: &Path, settings: Settings) -> Result<ReconcileReport, LpmError> {
     let lock = state::acquire_lock(project_dir)?;
     let manifest = plan::read_manifest(project_dir)?;
-    reconcile_locked(project_dir, &manifest, settings, &lock)
+    reconcile_locked(project_dir, manifest, settings, lock, checks::Asking::Now)
 }
 
 struct Project {
@@ -130,11 +132,11 @@ fn walk(path: &Path) -> Vec<PathBuf> {
 /// Holds `path` at a mode until dropped, then makes it `0o755` again, so a
 /// failing assertion still leaves a tree its temporary directory can remove.
 #[cfg(unix)]
-struct ModeGuard(PathBuf);
+pub(super) struct ModeGuard(PathBuf);
 
 #[cfg(unix)]
 impl ModeGuard {
-    fn set(path: &Path, mode: u32) -> Self {
+    pub(super) fn set(path: &Path, mode: u32) -> Self {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
         Self(path.to_path_buf())
@@ -1326,6 +1328,59 @@ fn a_workspaces_key_spelled_with_escapes_still_marks_a_possible_workspace_root()
         r#"{"work\u0073paces":["packages/*"]}"#
     ));
     assert!(!may_be_workspace_root(project.path(), r#"{"name":"app"}"#));
+}
+
+#[test]
+fn links_resting_on_verdicts_come_due_once_the_verdict_cache_changes_online_or_offline() {
+    let _home = crate::test_env::isolated_lpm_home();
+    let online = Settings {
+        security_provider: crate::lpm_skills_config::SecurityProvider::Socket,
+        ..settings()
+    };
+    let offline = Settings {
+        offline: true,
+        ..online
+    };
+    checks::credentials_changed();
+    let mut recorded = state::LinkState {
+        recheck_at: Some(checks::now_secs() + 3600),
+        verdicts_stamp: checks::cache_stamp().unwrap(),
+        ..state::LinkState::default()
+    };
+    assert!(recorded.verdicts_stamp.is_some());
+    assert!(!recheck_due(&recorded, online));
+    assert!(!recheck_due(&recorded, offline));
+
+    checks::credentials_changed();
+
+    assert!(recheck_due(&recorded, online));
+    assert!(recheck_due(&recorded, offline));
+    #[cfg(unix)]
+    {
+        recorded.verdicts_stamp = None;
+        let cache = std::fs::read_dir(_home.0.path().join("cache/skill-checks"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .unwrap();
+        let mode = ModeGuard::set(&cache, 0o000);
+        if std::fs::File::open(&cache).is_err() {
+            assert!(
+                recheck_due(&recorded, online),
+                "a verdict cache that can't be opened may hold anything, though the links never read it"
+            );
+        }
+        drop(mode);
+    }
+    recorded.recheck_at = None;
+    assert!(
+        !recheck_due(&recorded, online),
+        "links that rest on no verdict never come due"
+    );
 }
 
 #[cfg(unix)]

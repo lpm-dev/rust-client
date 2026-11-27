@@ -1221,6 +1221,7 @@ fn reconcile_dependency_skills(
             root,
             crate::lpm_skills_config::LpmSkillsPreference::Config,
             crate::commands::install::InstallOmitPolicy::default(),
+            false,
         ),
         None => crate::dependency_skills::ReconcileReport::default(),
     }
