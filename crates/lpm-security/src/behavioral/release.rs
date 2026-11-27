@@ -180,6 +180,20 @@ pub fn analyze_release_tarball<R: Read>(
                 .map_err(LpmError::Io)?;
             return Ok(());
         }
+        if super::is_nested_manifest(relative) {
+            if size <= lpm_common::CONFIG_FILE_SIZE_CAP_BYTES {
+                let content = read_whole(&mut entry, size).map_err(LpmError::Io)?;
+                analyzer.note_nested_manifest(relative, &content);
+                if let (Some(quality), Some(bytes)) = (quality.as_mut(), quality_bytes) {
+                    let end = usize::try_from(bytes)
+                        .map_or(content.len(), |bytes| bytes.min(content.len()));
+                    quality.add_content(path, &content[..end]);
+                }
+            } else {
+                analyzer.note_nested_manifest_left_out();
+            }
+            return Ok(());
+        }
         // A file whose extension says nothing is source when its shebang line
         // runs a JavaScript runtime: its first bytes tell, and are read again
         // with the rest.
@@ -866,6 +880,21 @@ mod tests {
             serde_json::to_value(&alone).unwrap(),
             serde_json::to_value(&quality).unwrap()
         );
+    }
+
+    #[test]
+    fn reads_what_a_directory_s_own_manifest_names() {
+        let signals = analyze(&[
+            (
+                "package.json",
+                br#"{"name":"kit","license":"MIT","main":"index.js"}"#,
+            ),
+            ("index.js", br#"require("./lib")"#),
+            ("lib/package.json", br#"{"main":"../tests/run.js"}"#),
+            ("tests/run.js", b"eval(code)"),
+        ]);
+        assert!(signals.tags["eval"]);
+        assert!(!signals.test_only_tags.iter().any(|tag| tag == "eval"));
     }
 
     #[test]

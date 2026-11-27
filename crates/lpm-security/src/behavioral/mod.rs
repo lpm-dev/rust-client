@@ -58,6 +58,53 @@ const MAX_OVERSIZED_SOURCE_FILE_EVIDENCE: usize = 20;
 /// Source file extensions that should be scanned.
 const SOURCE_EXTENSIONS: &[&str] = &["js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx"];
 
+/// `package.json` files below a package's root an analysis reads. Past this,
+/// what the rest name isn't known, and every test file counts.
+const MAX_NESTED_MANIFESTS: usize = 1024;
+
+/// Whether a package-relative path is a `package.json` below the root, in
+/// any case: on a case-insensitive file system Node finds `PACKAGE.JSON`.
+fn is_nested_manifest(relative_path: &Path) -> bool {
+    relative_path.file_name().is_some_and(|name| {
+        name.as_encoded_bytes()
+            .eq_ignore_ascii_case(b"package.json")
+    }) && relative_path
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty())
+}
+
+/// How deep serde reads JSON: arrays and objects nested deeper fail to parse.
+const MAX_JSON_NESTING: usize = 127;
+
+/// Whether `json` nests arrays and objects deeper than `limit`, scanning it
+/// once and skipping strings. It needn't be valid JSON.
+fn json_nests_deeper_than(json: &[u8], limit: usize) -> bool {
+    let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+    for &byte in json {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                if depth > limit {
+                    return true;
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Bytes of a file read to find its shebang line: the most any kernel reads
 /// for one (Linux reads 256, macOS 512).
 const SHEBANG_BYTES: usize = 512;
@@ -745,11 +792,13 @@ pub fn analyze_package_with_timings(
     let limits = ScanLimits::INSTALL;
     let mut sources = SourceFiles::new(limits);
     let mut native_artifacts = Vec::new();
+    let mut manifests = Vec::new();
     collect_source_files_recursive(
         package_dir,
         Path::new(""),
         &mut sources,
         &mut native_artifacts,
+        &mut manifests,
     );
     let mut unread = UnreadFiles {
         runtime: sources.left_out_runtime(),
@@ -807,6 +856,17 @@ pub fn analyze_package_with_timings(
     }
     for artifact in &native_artifacts {
         analyzer.note_entry(artifact);
+    }
+    manifests.sort_unstable();
+    analyzer.nested_manifests_left_out |= manifests.len() > MAX_NESTED_MANIFESTS;
+    for relative in manifests.iter().take(MAX_NESTED_MANIFESTS) {
+        match lpm_common::read_file_capped(
+            &package_dir.join(relative),
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) {
+            Ok(bytes) => analyzer.note_nested_manifest(relative, &bytes),
+            Err(_) => analyzer.note_nested_manifest_left_out(),
+        }
     }
     let source_scan_ns = source_scan_start.elapsed().as_nanos();
     let manifest = read_package_manifest(package_dir);
@@ -984,6 +1044,7 @@ fn analyze_package_from_open_dir_reading(
     let limits = ScanLimits::INSTALL;
     let mut sources = SourceFiles::new(limits);
     let mut native_artifacts = Vec::new();
+    let mut manifests = Vec::new();
     let mut discovery_limit_reached = false;
     let rules = WalkRules::new(package_dir, contents);
     let discovery_complete = collect_cap_fingerprint_files(
@@ -992,6 +1053,7 @@ fn analyze_package_from_open_dir_reading(
         &rules,
         &mut sources,
         &mut native_artifacts,
+        &mut manifests,
         &mut discovery_limit_reached,
     )
     .is_ok();
@@ -1024,6 +1086,21 @@ fn analyze_package_from_open_dir_reading(
     }
     for artifact in &native_artifacts {
         analyzer.note_entry(artifact);
+    }
+    match read_nested_manifests_from_open_dir(package_dir, &mut manifests, fingerprint.as_mut()) {
+        Ok(read) => {
+            analyzer.nested_manifests_left_out |= manifests.len() > MAX_NESTED_MANIFESTS;
+            for (relative, bytes) in &read {
+                match bytes {
+                    Some(bytes) => analyzer.note_nested_manifest(relative, bytes),
+                    None => analyzer.note_nested_manifest_left_out(),
+                }
+            }
+        }
+        Err(_) => {
+            fingerprint = None;
+            analyzer.nested_manifests_left_out = true;
+        }
     }
 
     let manifest = match read_package_manifest_from_open_dir(package_dir) {
@@ -1074,6 +1151,7 @@ pub fn package_input_fingerprint_from_open_dir(
     let limits = ScanLimits::INSTALL;
     let mut sources = SourceFiles::new(limits);
     let mut native_artifacts = Vec::new();
+    let mut manifests = Vec::new();
     let mut discovery_limit_reached = false;
     let rules = WalkRules::new(package_dir, contents);
     collect_cap_fingerprint_files(
@@ -1082,6 +1160,7 @@ pub fn package_input_fingerprint_from_open_dir(
         &rules,
         &mut sources,
         &mut native_artifacts,
+        &mut manifests,
         &mut discovery_limit_reached,
     )?;
     native_artifacts.sort_unstable();
@@ -1118,6 +1197,7 @@ pub fn package_input_fingerprint_from_open_dir(
     }
     directories.verify_unchanged()?;
     hash_native_artifacts(&mut hasher, &native_artifacts);
+    read_nested_manifests_from_open_dir(package_dir, &mut manifests, Some(&mut hasher))?;
 
     match digest_package_manifest_from_open_dir(package_dir)? {
         Some((size, bytes_read, digest)) => {
@@ -1159,6 +1239,7 @@ fn collect_cap_fingerprint_files(
     rules: &WalkRules<'_>,
     files: &mut SourceFiles,
     native_artifacts: &mut Vec<std::path::PathBuf>,
+    manifests: &mut Vec<std::path::PathBuf>,
     limit_reached: &mut bool,
 ) -> std::io::Result<()> {
     use cap_fs_ext::DirExt as _;
@@ -1188,6 +1269,7 @@ fn collect_cap_fingerprint_files(
                 rules,
                 files,
                 native_artifacts,
+                manifests,
                 limit_reached,
             )?;
         } else if file_type.is_file() {
@@ -1206,6 +1288,8 @@ fn collect_cap_fingerprint_files(
                 } else {
                     *limit_reached = true;
                 }
+            } else if is_nested_manifest(&relative) {
+                manifests.push(relative);
             }
         }
     }
@@ -1777,6 +1861,58 @@ fn digest_package_manifest_from_open_dir(
     Ok(Some((size, bytes_read, hasher.finalize().into())))
 }
 
+/// The `package.json` files below the root a walk found, read from the open
+/// package directory in path order and hashed into `hasher` as inputs of the
+/// analysis. Past [`MAX_NESTED_MANIFESTS`] the rest are left unread, which the
+/// analysis counts as left out and the hash records.
+/// The first [`MAX_NESTED_MANIFESTS`] `package.json` files below the root,
+/// in order, each with its content, or `None` when it's past the
+/// configuration file cap.
+fn read_nested_manifests_from_open_dir(
+    package_dir: &cap_std::fs::Dir,
+    manifests: &mut [PathBuf],
+    mut hasher: Option<&mut Sha256>,
+) -> std::io::Result<Vec<(PathBuf, Option<Vec<u8>>)>> {
+    manifests.sort_unstable();
+    let mut read = Vec::with_capacity(manifests.len().min(MAX_NESTED_MANIFESTS));
+    for relative in manifests.iter().take(MAX_NESTED_MANIFESTS) {
+        let (file, size) = open_cap_source_file(package_dir, relative)?;
+        if size > lpm_common::CONFIG_FILE_SIZE_CAP_BYTES {
+            if let Some(hasher) = hasher.as_deref_mut() {
+                hasher.update(b"manifest\0left out\0");
+                hasher.update(relative.as_os_str().as_encoded_bytes());
+                hasher.update(b"\0");
+                hasher.update(size.to_le_bytes());
+            }
+            read.push((relative.clone(), None));
+            continue;
+        }
+        let content = lpm_common::read_file_capped_from_open_file(
+            file.into_std(),
+            relative,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        )
+        .map_err(std::io::Error::other)?
+        .0;
+        if let Some(hasher) = hasher.as_deref_mut() {
+            hash_fingerprint_record_digest(
+                hasher,
+                relative.as_os_str().as_encoded_bytes(),
+                size,
+                content.len() as u64,
+                Sha256::digest(&content).into(),
+            );
+        }
+        read.push((relative.clone(), Some(content)));
+    }
+    if manifests.len() > MAX_NESTED_MANIFESTS
+        && let Some(hasher) = hasher
+    {
+        hasher.update(b"manifests\0left out\0");
+    }
+    Ok(read)
+}
+
 fn read_package_manifest_from_open_dir(
     package_dir: &cap_std::fs::Dir,
 ) -> std::io::Result<Option<(u64, Vec<u8>)>> {
@@ -2166,6 +2302,7 @@ fn collect_source_files_recursive(
     relative_dir: &Path,
     files: &mut SourceFiles,
     native_artifacts: &mut Vec<std::path::PathBuf>,
+    manifests: &mut Vec<std::path::PathBuf>,
 ) {
     let Ok(entries) = std::fs::read_dir(package_dir.join(relative_dir)) else {
         return;
@@ -2181,7 +2318,13 @@ fn collect_source_files_recursive(
         }
         let relative = relative_dir.join(&name);
         if metadata.is_dir() {
-            collect_source_files_recursive(package_dir, &relative, files, native_artifacts);
+            collect_source_files_recursive(
+                package_dir,
+                &relative,
+                files,
+                native_artifacts,
+                manifests,
+            );
         } else if !metadata.is_file() {
             continue;
         } else if PackageAnalyzer::reads_as_source(&relative, &entry.path()) {
@@ -2192,6 +2335,8 @@ fn collect_source_files_recursive(
             });
         } else if PackageAnalyzer::is_native_artifact(&relative) {
             native_artifacts.push(relative);
+        } else if is_nested_manifest(&relative) {
+            manifests.push(relative);
         }
     }
 }
@@ -2317,6 +2462,13 @@ pub struct PackageAnalyzer {
     unparsed_files: usize,
     /// Of `unparsed_files`, those of files that aren't tests.
     runtime_unparsed_files: usize,
+    /// The package's `package.json` files below its root, and whether more
+    /// were found than are kept.
+    nested_manifests: Vec<roles::NestedManifest>,
+    /// `package.json` files below the root handed over, read or not.
+    nested_manifests_seen: usize,
+    nested_manifests_left_out: bool,
+    nested_manifest_budget: roles::NestedManifestBudget,
     bytes_scanned: u64,
     sampled_files: usize,
     skipped_files: usize,
@@ -2423,6 +2575,10 @@ impl PackageAnalyzer {
             files_scanned: 0,
             unparsed_files: 0,
             runtime_unparsed_files: 0,
+            nested_manifests: Vec::new(),
+            nested_manifests_seen: 0,
+            nested_manifests_left_out: false,
+            nested_manifest_budget: roles::NestedManifestBudget::default(),
             bytes_scanned: 0,
             sampled_files: 0,
             skipped_files: 0,
@@ -2554,6 +2710,54 @@ impl PackageAnalyzer {
         self.note_scan_time(scan_start);
     }
 
+    /// Notes a `package.json` below the package root: requiring its directory
+    /// loads what it names, which can be a test file. The root manifest goes
+    /// to [`Self::finish`] instead, and a manifest that isn't JSON names
+    /// nothing, as Node can't load through it.
+    pub fn note_nested_manifest(&mut self, relative_path: &Path, bytes: &[u8]) {
+        let path = path_to_slash(relative_path);
+        let Some((directory, name)) = path.rsplit_once('/') else {
+            return;
+        };
+        if !name.eq_ignore_ascii_case("package.json") || !self.count_nested_manifest() {
+            return;
+        }
+        // Node reads a manifest past a byte order mark. One serde can't read,
+        // nested deeper than it reads or holding a number or an escape only
+        // JavaScript takes, names what isn't known.
+        let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+        let manifest = (!json_nests_deeper_than(bytes, MAX_JSON_NESTING))
+            .then(|| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+            .flatten();
+        self.nested_manifests.push(match manifest {
+            Some(manifest) => roles::NestedManifest::from_manifest(
+                directory,
+                &manifest,
+                &mut self.nested_manifest_budget,
+            ),
+            None => roles::NestedManifest::unknown(directory),
+        });
+    }
+
+    /// Notes that a `package.json` below the root couldn't be read, so what it
+    /// names isn't known.
+    pub(crate) fn note_nested_manifest_left_out(&mut self) {
+        self.count_nested_manifest();
+        self.nested_manifests_left_out = true;
+    }
+
+    /// Counts a `package.json` below the root toward [`MAX_NESTED_MANIFESTS`],
+    /// whether or not it can be read, as the directory walks count them.
+    /// `false` once past it.
+    fn count_nested_manifest(&mut self) -> bool {
+        self.nested_manifests_seen += 1;
+        if self.nested_manifests_seen > MAX_NESTED_MANIFESTS {
+            self.nested_manifests_left_out = true;
+            return false;
+        }
+        true
+    }
+
     /// Read a source file a caller extracted without buffering it, from disk:
     /// an oversized one by its sample, and a file whose extension says nothing,
     /// such as `bin/cli`, which [`Self::should_buffer_source`] never buffers,
@@ -2566,6 +2770,17 @@ impl PackageAnalyzer {
         size: u64,
     ) {
         let limits = self.budget.limits;
+        if is_nested_manifest(relative_path) {
+            if self.nested_manifests_seen >= MAX_NESTED_MANIFESTS {
+                self.note_nested_manifest_left_out();
+                return;
+            }
+            match lpm_common::read_file_capped(full_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
+                Ok(bytes) => self.note_nested_manifest(relative_path, &bytes),
+                Err(_) => self.note_nested_manifest_left_out(),
+            }
+            return;
+        }
         if may_be_shebang_script(relative_path) {
             // Whether such a file is a script only its first line says, so a
             // caller buffering by name buffers none.
@@ -2751,6 +2966,15 @@ impl PackageAnalyzer {
         let manifest_paths = references.paths();
         let manifest_paths_complete = manifest_paths.is_complete();
         self.runtime_references.extend(manifest_paths.into_paths());
+        // A manifest below the root outside test directories is how the
+        // package's code loads its directory, so what it names must be known;
+        // a fixture's matters once a reference reaches it.
+        let nested_manifests = std::mem::take(&mut self.nested_manifests);
+        let nested_manifests_known = !self.nested_manifests_left_out
+            && nested_manifests
+                .iter()
+                .all(|manifest| manifest.is_in_a_test_directory() || manifest.is_complete());
+        let manifest_paths_complete = manifest_paths_complete && nested_manifests_known;
         let named = roles::reachable_tests(
             &candidates,
             roles::Reachability {
@@ -2765,6 +2989,7 @@ impl PackageAnalyzer {
                 unread_tests: &self.unread.tests,
                 unknown_tests_left_out: self.unread.unknown_tests,
                 test_references_incomplete: self.test_reference_bytes > MAX_TEST_REFERENCE_BYTES,
+                nested_manifests: &nested_manifests,
             },
         );
         drop(candidates);
@@ -3813,6 +4038,7 @@ mod tests {
             &WalkRules::new(&directory, PackageDirectory::Published),
             &mut files,
             &mut native_artifacts,
+            &mut Vec::new(),
             &mut limit_reached,
         )
         .unwrap();
@@ -6803,5 +7029,218 @@ const usage = "eval(x)" /* eval(y) */"#,
         // analyze_package_cached should re-analyze and return valid result
         let analysis = analyze_package_cached(dir.path());
         assert_eq!(analysis.version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_directory_required_through_its_own_manifest_reaches_what_it_names() {
+        let reached = |files: &[(&str, &[u8])]| analyze_every_way(files).source.eval;
+        assert!(reached(&[
+            ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+            ("index.js", br#"require("./lib")"#),
+            ("lib/package.json", br#"{"main":"../tests/run.js"}"#),
+            ("tests/run.js", b"eval(code)"),
+        ]));
+        assert!(reached(&[
+            ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+            ("index.js", br#"require("./lib")"#),
+            (
+                "lib/package.json",
+                br##"{"imports":{"#run":"../tests/run.js"}}"##
+            ),
+            ("lib/index.js", br##"require("#run")"##),
+            ("tests/run.js", b"eval(code)"),
+        ]));
+        // A fixture's manifest names what it does once the fixture is reached.
+        assert!(reached(&[
+            ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+            ("index.js", br#"require("./tests/fixtures/pkg")"#),
+            (
+                "tests/fixtures/pkg/package.json",
+                br#"{"main":"../../run.js"}"#
+            ),
+            ("tests/run.js", b"eval(code)"),
+        ]));
+        // A fixture's manifest names its own files only when the fixture is reached.
+        assert!(!reached(&[
+            ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+            ("index.js", b"module.exports = 1"),
+            ("tests/fixtures/pkg/package.json", br#"{"main":"index.js"}"#),
+            ("tests/fixtures/pkg/index.js", b"eval(code)"),
+        ]));
+    }
+
+    #[test]
+    fn a_directory_manifest_is_read_as_node_reads_it_with_a_bom_in_any_case_or_nested_deep() {
+        let mut with_bom = b"\xEF\xBB\xBF".to_vec();
+        with_bom.extend_from_slice(br#"{"main":"../tests/run.js"}"#);
+        let nested_deep = format!(
+            r#"{{"main":"../tests/run.js","x":{}0{}}}"#,
+            "[".repeat(200),
+            "]".repeat(200)
+        );
+        for (name, manifest) in [
+            ("lib/package.json", with_bom.as_slice()),
+            (
+                "lib/PACKAGE.JSON",
+                br#"{"main":"../tests/run.js"}"#.as_slice(),
+            ),
+            ("lib/package.json", nested_deep.as_bytes()),
+        ] {
+            let analysis = analyze_every_way(&[
+                ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+                ("index.js", br#"require("./lib")"#),
+                (name, manifest),
+                ("tests/run.js", b"eval(code)"),
+            ]);
+            assert!(analysis.source.eval, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_directory_manifest_serde_rejects_but_node_reads_counts_as_unknown() {
+        for manifest in [
+            r#"{"main":"../tests/run.js","x":1e999}"#,
+            r#"{"main":"../tests/run.js","x":"\ud800"}"#,
+        ] {
+            assert!(
+                eval_counts_as_package_code(&[
+                    ("package.json", r#"{"name":"kit","license":"MIT"}"#),
+                    ("index.js", r#"require("./lib")"#),
+                    ("lib/package.json", manifest),
+                    ("tests/run.js", "eval(code)"),
+                ]),
+                "{manifest}"
+            );
+        }
+        // A broken fixture nothing reaches changes nothing.
+        assert!(!eval_counts_as_package_code(&[
+            ("package.json", r#"{"name":"kit","license":"MIT"}"#),
+            ("index.js", "module.exports = 1"),
+            ("tests/fixtures/broken/package.json", "{ not json"),
+            ("tests/run.js", "eval(code)"),
+        ]));
+    }
+
+    #[test]
+    fn a_directory_manifest_s_subpath_patterns_and_name_reach_what_they_map_to() {
+        const KIT: &str = r#"{"name":"kit","license":"MIT"}"#;
+        for files in [
+            [
+                ("package.json", KIT),
+                ("index.js", r#"require("./lib")"#),
+                (
+                    "lib/package.json",
+                    r##"{"imports":{"#t/*":"./tests/*.js"}}"##,
+                ),
+                ("lib/index.js", r##"require("#t/run")"##),
+                ("lib/tests/run.js", "eval(code)"),
+            ]
+            .as_slice(),
+            &[
+                ("package.json", KIT),
+                ("index.js", r#"require("dep/run")"#),
+                (
+                    "node_modules/dep/package.json",
+                    r#"{"name":"dep","exports":{"./*":"./test/*.js"}}"#,
+                ),
+                ("node_modules/dep/test/run.js", "eval(code)"),
+            ],
+            // A fixture loading itself by the name its manifest gives it.
+            &[
+                ("package.json", KIT),
+                ("index.js", r#"require("./test/fx/a.js")"#),
+                (
+                    "test/fx/package.json",
+                    r#"{"name":"fx","exports":"./b.js"}"#,
+                ),
+                ("test/fx/a.js", r#"require("fx")"#),
+                ("test/fx/b.js", "eval(code)"),
+            ],
+        ] {
+            assert!(eval_counts_as_package_code(files), "{files:?}");
+        }
+    }
+
+    #[test]
+    fn directory_manifests_share_one_reference_budget() {
+        let exports: Vec<String> = (0..10_000)
+            .map(|index| format!(r#""./{index}":"./f{index}.js""#))
+            .collect();
+        let manifest = format!(r#"{{"exports":{{{}}}}}"#, exports.join(","));
+        let names: Vec<String> = (0..8)
+            .map(|index| format!("lib{index}/package.json"))
+            .collect();
+        let package = |manifests: usize| {
+            let mut files: Vec<(&str, &[u8])> = vec![
+                ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+                ("index.js", b"module.exports = 1"),
+                ("tests/run.js", b"eval(code)"),
+            ];
+            files.extend(
+                names[..manifests]
+                    .iter()
+                    .map(|name| (name.as_str(), manifest.as_bytes())),
+            );
+            analyze_every_way(&files)
+        };
+        // One names fewer files than a manifest may; eight together name more
+        // than all of them may, so what they name isn't known.
+        assert!(!package(1).source.eval);
+        assert!(package(8).source.eval);
+    }
+
+    #[test]
+    fn every_directory_manifest_counts_toward_the_limit_whether_or_not_it_parses() {
+        let names: Vec<String> = (0..=MAX_NESTED_MANIFESTS)
+            .map(|index| format!("tests/fixture{index}/package.json"))
+            .collect();
+        let mut files: Vec<(&str, &[u8])> = vec![
+            ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+            ("index.js", b"module.exports = 1"),
+            ("tests/run.js", b"eval(code)"),
+        ];
+        files.extend(
+            names
+                .iter()
+                .map(|name| (name.as_str(), b"not json".as_slice())),
+        );
+        assert!(analyze_every_way(&files).source.eval);
+    }
+
+    #[test]
+    fn a_directory_manifest_past_the_size_cap_is_left_out_without_failing_the_fingerprint() {
+        let oversized = vec![b' '; lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize + 1];
+        let analysis = analyze_every_way(&[
+            ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+            ("index.js", b"module.exports = 1"),
+            ("lib/package.json", &oversized),
+            ("tests/run.js", b"eval(code)"),
+        ]);
+        assert!(analysis.source.eval);
+        assert!(!analysis.meta.input_incomplete);
+    }
+
+    #[test]
+    fn deep_manifest_paths_stay_linear_beside_directory_manifests() {
+        let main = format!("{}x", "a/".repeat(100_000));
+        let manifest = format!(r#"{{"name":"kit","license":"MIT","main":"{main}"}}"#);
+        let time = |fixture: bool| {
+            let package = tempfile::tempdir().unwrap();
+            fs::write(package.path().join("package.json"), &manifest).unwrap();
+            fs::create_dir_all(package.path().join("test/fixture")).unwrap();
+            fs::write(package.path().join("test/run.js"), "eval(code)").unwrap();
+            if fixture {
+                fs::write(package.path().join("test/fixture/package.json"), "{}").unwrap();
+            }
+            let started = std::time::Instant::now();
+            analyze_package(package.path());
+            started.elapsed()
+        };
+        let without = time(false);
+        let with = time(true);
+        assert!(
+            with < without * 5 + std::time::Duration::from_millis(200),
+            "with a fixture manifest {with:?}, without {without:?}"
+        );
     }
 }

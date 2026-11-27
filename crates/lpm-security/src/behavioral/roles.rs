@@ -793,7 +793,7 @@ const MAX_FILE_REFERENCES: usize = 256;
 
 /// How many paths, and how many bytes of them, one resolution may keep before
 /// its references count as unknown.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct ReferenceBudget {
     paths: usize,
     bytes: usize,
@@ -1109,6 +1109,12 @@ impl FileReferences {
                         None => Some(""),
                     };
                 }
+                // The package whose manifest scopes the file, by its name.
+                let scoped = format!("{MODULE_SPECIFIER}{directory}{MODULE_SPECIFIER}{specifier}")
+                    .to_ascii_lowercase();
+                if !add(scoped, &mut references) {
+                    return Self::unknown();
+                }
                 continue;
             }
             let mut after_cd = false;
@@ -1414,6 +1420,169 @@ pub(super) struct TestFile<'a> {
     pub loads_computed_code: bool,
 }
 
+/// A `package.json` inside the package, below its root: requiring its
+/// directory loads the file its `main` (or `exports`) names, and code under
+/// it resolves its `imports`.
+#[derive(Debug)]
+pub(super) struct NestedManifest {
+    /// Its directory, in lower case.
+    directory: String,
+    /// Its `name`, in lower case, by which code in its directory loads it.
+    name: Option<String>,
+    /// What `main`, `module`, `browser` and `exports` name, from its directory.
+    entries: FileReferences,
+    /// What `imports` names, from its directory.
+    imports: FileReferences,
+    /// The subpath patterns its entries and imports map to (`./tests/*.js`),
+    /// from the package root, with runs of `*` collapsed.
+    entry_patterns: Vec<Vec<u8>>,
+    import_patterns: Vec<Vec<u8>>,
+}
+
+impl NestedManifest {
+    /// Whether its directory is in a test directory, as a fixture's is: what
+    /// it names counts only once a reference reaches the directory. A
+    /// manifest anywhere else is part of how the package's code loads, and
+    /// what it names counts as referenced.
+    pub(super) fn is_in_a_test_directory(&self) -> bool {
+        is_test_path(&format!("{}/package.json", self.directory))
+    }
+
+    /// Whether what it names is known: it was read, and within the budget.
+    pub(super) fn is_complete(&self) -> bool {
+        self.entries.is_complete() && self.imports.is_complete()
+    }
+
+    /// Whether a path below its directory loads through its `exports`: it is
+    /// a package's directory in a `node_modules`, which a specifier such as
+    /// `dep/run` names.
+    fn maps_subpaths(&self) -> bool {
+        let mut segments = self.directory.rsplit('/');
+        let name = segments.next();
+        match (name, segments.next(), segments.next()) {
+            (Some(_), Some("node_modules"), _) => true,
+            (Some(_), Some(scope), Some("node_modules")) => scope.starts_with('@'),
+            _ => false,
+        }
+    }
+
+    /// A manifest in `directory` whose content isn't known: one Node reads
+    /// that serde can't.
+    pub(super) fn unknown(directory: &str) -> Self {
+        Self {
+            directory: directory.to_ascii_lowercase(),
+            name: None,
+            entries: FileReferences::unknown(),
+            imports: FileReferences::unknown(),
+            entry_patterns: Vec::new(),
+            import_patterns: Vec::new(),
+        }
+    }
+
+    /// What `manifest`, in `directory`, names, within what's left of
+    /// `budget`.
+    pub(super) fn from_manifest(
+        directory: &str,
+        manifest: &serde_json::Value,
+        budget: &mut NestedManifestBudget,
+    ) -> Self {
+        let strings = |fields: &[&str]| {
+            let mut strings = Vec::new();
+            let mut pending: Vec<&serde_json::Value> = fields
+                .iter()
+                .filter_map(|field| manifest.get(field))
+                .collect();
+            while let Some(value) = pending.pop() {
+                match value {
+                    serde_json::Value::String(text) => strings.push(text.replace('\\', "/")),
+                    serde_json::Value::Array(items) => pending.extend(items),
+                    serde_json::Value::Object(entries) => pending.extend(entries.values()),
+                    _ => {}
+                }
+            }
+            strings
+        };
+        let mut resolve = |fields: &[&str]| {
+            let (patterns, strings): (Vec<String>, Vec<String>) = strings(fields)
+                .into_iter()
+                .partition(|string| string.contains('*'));
+            let mut references = FileReferences::resolve_from(
+                directory,
+                strings.iter().map(String::as_str),
+                true,
+                true,
+                budget.0,
+            );
+            let patterns: Vec<Vec<u8>> = patterns
+                .iter()
+                .filter_map(|pattern| join_package_path(directory, pattern))
+                .map(|pattern| collapse_stars(&pattern.to_ascii_lowercase()))
+                .collect();
+            budget.spend(&references);
+            if !budget.spend_bytes(patterns.iter().map(Vec::len).sum()) {
+                references = FileReferences::unknown();
+            }
+            (references, patterns)
+        };
+        let (entries, entry_patterns) = resolve(&["main", "module", "browser", "exports"]);
+        let (imports, import_patterns) = resolve(&["imports"]);
+        Self {
+            directory: directory.to_ascii_lowercase(),
+            name: manifest
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_ascii_lowercase),
+            entries,
+            imports,
+            entry_patterns,
+            import_patterns,
+        }
+    }
+}
+
+/// What a package's manifests below its root may name together: a crafted
+/// package holds up to [`MAX_NESTED_MANIFESTS`](super::MAX_NESTED_MANIFESTS)
+/// of them, each as large as its root manifest.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct NestedManifestBudget(ReferenceBudget);
+
+impl Default for NestedManifestBudget {
+    fn default() -> Self {
+        Self(ReferenceBudget::MANIFEST)
+    }
+}
+
+impl NestedManifestBudget {
+    /// Takes `bytes` of patterns from the budget; `false`, leaving nothing,
+    /// past it.
+    fn spend_bytes(&mut self, bytes: usize) -> bool {
+        match self.0.bytes.checked_sub(bytes) {
+            Some(left) => {
+                self.0.bytes = left;
+                true
+            }
+            None => {
+                self.0 = ReferenceBudget { paths: 0, bytes: 0 };
+                false
+            }
+        }
+    }
+
+    /// Takes what `references` name from the budget. References past it name
+    /// nothing, and leave nothing for the manifests after them.
+    fn spend(&mut self, references: &FileReferences) {
+        if !references.is_complete() {
+            self.0 = ReferenceBudget { paths: 0, bytes: 0 };
+            return;
+        }
+        self.0.paths = self.0.paths.saturating_sub(references.paths.len());
+        self.0.bytes = self
+            .0
+            .bytes
+            .saturating_sub(references.paths.iter().map(String::len).sum());
+    }
+}
+
 /// What a package's code and manifest say about its test files, for
 /// [`reachable_tests`].
 pub(super) struct Reachability<'a> {
@@ -1433,6 +1602,117 @@ pub(super) struct Reachability<'a> {
     /// The test files named more paths together than are kept, so a reached
     /// test file's references aren't known.
     pub test_references_incomplete: bool,
+    /// The package's `package.json` files below its root: what one outside
+    /// test directories names counts from the start, what a fixture's names
+    /// once a reference reaches it.
+    pub nested_manifests: &'a [NestedManifest],
+}
+
+/// The directories that hold a manifest below the root, as a tree of path
+/// segments, so a path's ancestors among them are found in one pass over
+/// the path, which stops where it leaves every such directory.
+struct ManifestDirectories<'m> {
+    children: std::collections::HashMap<(usize, &'m str), usize>,
+    /// The manifests of each node; node 0 is the package root.
+    manifests: Vec<Vec<usize>>,
+}
+
+impl<'m> ManifestDirectories<'m> {
+    fn new(nested: &'m [NestedManifest]) -> Self {
+        let mut tree = Self {
+            children: std::collections::HashMap::new(),
+            manifests: vec![Vec::new()],
+        };
+        for (index, manifest) in nested.iter().enumerate() {
+            let mut node = 0;
+            for segment in manifest.directory.split('/') {
+                let next = tree.manifests.len();
+                node = *tree.children.entry((node, segment)).or_insert(next);
+                if node == next {
+                    tree.manifests.push(Vec::new());
+                }
+            }
+            tree.manifests[node].push(index);
+        }
+        tree
+    }
+
+    /// The manifests in `path` or a directory above it, each with whether
+    /// its directory is `path` itself.
+    fn along<'p>(&'p self, path: &'p str) -> impl Iterator<Item = (usize, bool)> + 'p {
+        let mut segments = path.split('/').peekable();
+        let mut node = (self.manifests.len() > 1).then_some(0);
+        std::iter::from_fn(move || {
+            let segment = segments.next()?;
+            node = node.and_then(|node| self.children.get(&(node, segment)).copied());
+            let current = node?;
+            Some((current, segments.peek().is_none()))
+        })
+        .flat_map(move |(node, is_path)| {
+            self.manifests[node]
+                .iter()
+                .map(move |&index| (index, is_path))
+        })
+    }
+
+    /// The manifests of the nearest directory at or above `directory` that
+    /// holds one, the scope Node resolves a package's own name in.
+    fn nearest(&self, directory: &str) -> &[usize] {
+        let mut node = 0;
+        let mut nearest: &[usize] = &[];
+        for segment in directory.split('/') {
+            let Some(&next) = self.children.get(&(node, segment)) else {
+                break;
+            };
+            node = next;
+            if !self.manifests[node].is_empty() {
+                nearest = &self.manifests[node];
+            }
+        }
+        nearest
+    }
+}
+
+/// A package specifier split into its package name and the subpath after
+/// it: `@scope/name/sub` into `@scope/name` and `sub`.
+fn split_specifier(specifier: &str) -> (&str, &str) {
+    let mut separators = specifier.match_indices('/').map(|(index, _)| index);
+    let end = if specifier.starts_with('@') {
+        separators.nth(1)
+    } else {
+        separators.next()
+    };
+    match end {
+        Some(end) => (&specifier[..end], &specifier[end + 1..]),
+        None => (specifier, ""),
+    }
+}
+
+/// Marks the test files `patterns` match, as reached. `false` once matching
+/// takes more than `steps`.
+fn match_patterns(
+    patterns: &[Vec<u8>],
+    paths: &[String],
+    named: &mut [bool],
+    reached: &mut Vec<usize>,
+    steps: &mut usize,
+) -> bool {
+    for pattern in patterns {
+        for (index, path) in paths.iter().enumerate() {
+            if named[index] {
+                continue;
+            }
+            match wildcard_matches(pattern, path.as_bytes(), steps) {
+                Some(true) => {
+                    named[index] = true;
+                    reached.push(index);
+                }
+                Some(false) => {}
+                None => return false,
+            }
+        }
+    }
+    true
 }
 
 /// Which test files the package runs: those the manifest names, those code
@@ -1441,6 +1721,8 @@ pub(super) struct Reachability<'a> {
 /// is opaque, a test file it runs computes what it loads or names more than
 /// was kept, or a reference reaches a test file a budget left unread.
 pub(super) fn reachable_tests(tests: &[TestFile<'_>], facts: Reachability<'_>) -> Vec<bool> {
+    use std::borrow::Cow;
+
     let everything = vec![true; tests.len()];
     if facts.runtime_is_opaque {
         return everything;
@@ -1483,17 +1765,112 @@ pub(super) fn reachable_tests(tests: &[TestFile<'_>], facts: Reachability<'_>) -
         .enumerate()
         .filter_map(|(index, named)| named.then_some(index))
         .collect();
-    let mut pending: Vec<&str> = facts
+    let mut pending: Vec<Cow<'_, str>> = facts
         .runtime_references
         .iter()
-        .map(String::as_str)
+        .map(|reference| Cow::Borrowed(reference.as_str()))
         .collect();
+    let manifests = facts.nested_manifests;
+    let nested = ManifestDirectories::new(manifests);
+    let pattern_bytes: usize = manifests
+        .iter()
+        .flat_map(|manifest| {
+            manifest
+                .entry_patterns
+                .iter()
+                .chain(&manifest.import_patterns)
+        })
+        .map(Vec::len)
+        .sum();
+    let mut steps = pattern_bytes
+        .saturating_mul(MATCHES_PER_REFERENCE_BYTE)
+        .max(MATCHES_FLOOR);
+    let mut entries_followed = vec![false; manifests.len()];
+    let mut imports_followed = vec![false; manifests.len()];
+    // What a manifest outside test directories names is how the package's
+    // code loads, so it counts from the start.
+    for (index, manifest) in manifests.iter().enumerate() {
+        if manifest.is_in_a_test_directory() {
+            continue;
+        }
+        if !manifest.is_complete() {
+            return everything;
+        }
+        entries_followed[index] = true;
+        imports_followed[index] = true;
+        for references in [&manifest.entries, &manifest.imports] {
+            pending.extend(
+                references
+                    .paths()
+                    .iter()
+                    .map(|reference| Cow::Borrowed(reference.as_str())),
+            );
+        }
+        for patterns in [&manifest.entry_patterns, &manifest.import_patterns] {
+            if !match_patterns(patterns, &paths, &mut named, &mut reached, &mut steps) {
+                return everything;
+            }
+        }
+    }
     loop {
         while let Some(reference) = pending.pop() {
+            // A bare specifier a file loads names the package whose manifest
+            // scopes the file, by that manifest's name.
+            if let Some(module) = reference.strip_prefix(MODULE_SPECIFIER) {
+                if let Some((directory, specifier)) = module.split_once(MODULE_SPECIFIER) {
+                    let (package, subpath) = split_specifier(specifier);
+                    for &index in nested.nearest(directory) {
+                        let manifest = &manifests[index];
+                        if manifest.name.as_deref() == Some(package) {
+                            pending.push(Cow::Owned(if subpath.is_empty() {
+                                manifest.directory.clone()
+                            } else {
+                                format!("{}/{subpath}", manifest.directory)
+                            }));
+                        }
+                    }
+                }
+                continue;
+            }
+            let reference: &str = &reference;
             let own = own_name
                 .as_deref()
                 .and_then(|name| own_path(reference, name));
             for reference in std::iter::once(reference).chain(own) {
+                // A reference to a directory with its own manifest loads what
+                // that names; code under it resolves its imports, and a path
+                // under a package's directory its exports.
+                for (index, is_reference) in nested.along(reference) {
+                    let manifest = &manifests[index];
+                    let entries = (is_reference || manifest.maps_subpaths())
+                        && !std::mem::replace(&mut entries_followed[index], true);
+                    let imports = !std::mem::replace(&mut imports_followed[index], true);
+                    for (follow, references, patterns) in [
+                        (entries, &manifest.entries, &manifest.entry_patterns),
+                        (imports, &manifest.imports, &manifest.import_patterns),
+                    ] {
+                        if !follow {
+                            continue;
+                        }
+                        if !references.is_complete()
+                            || !match_patterns(
+                                patterns,
+                                &paths,
+                                &mut named,
+                                &mut reached,
+                                &mut steps,
+                            )
+                        {
+                            return everything;
+                        }
+                        pending.extend(
+                            references
+                                .paths()
+                                .iter()
+                                .map(|reference| Cow::Borrowed(reference.as_str())),
+                        );
+                    }
+                }
                 // Each key's files are taken the first time it is reached.
                 let found = by_key.get_mut(reference).map(std::mem::take);
                 if unread.contains(reference)
@@ -1522,7 +1899,12 @@ pub(super) fn reachable_tests(tests: &[TestFile<'_>], facts: Reachability<'_>) -
             {
                 return everything;
             }
-            pending.extend(references.paths().iter().map(String::as_str));
+            pending.extend(
+                references
+                    .paths()
+                    .iter()
+                    .map(|reference| Cow::Borrowed(reference.as_str())),
+            );
         }
     }
 }
@@ -1898,6 +2280,7 @@ mod tests {
                 unread_tests: &[],
                 unknown_tests_left_out: false,
                 test_references_incomplete: false,
+                nested_manifests: &[],
             },
         );
         assert!(
@@ -1946,6 +2329,7 @@ mod tests {
                     unread_tests: &[],
                     unknown_tests_left_out: false,
                     test_references_incomplete: false,
+                    nested_manifests: &[],
                 },
             )
         };
