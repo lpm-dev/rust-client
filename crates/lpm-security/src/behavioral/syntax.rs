@@ -1157,6 +1157,14 @@ impl<'s> SourceContext<'s> {
         let in_test_file = super::roles::is_test_path(filename);
         let parsed = SourceType::from_path(filename)
             .ok()
+            .or_else(|| {
+                // A script whose extension says nothing is parsed as its
+                // shebang line's runtime runs it.
+                super::may_be_shebang_script(std::path::Path::new(filename))
+                    .then(|| super::shebang_script_extension(source.as_bytes()))
+                    .flatten()
+                    .and_then(|extension| SourceType::from_extension(extension).ok())
+            })
             .and_then(|source_type| {
                 parse_javascript_or_jsx(source, source_type, stripped, complete_input, in_test_file)
             });

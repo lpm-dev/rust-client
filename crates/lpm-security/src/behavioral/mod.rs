@@ -58,6 +58,240 @@ const MAX_OVERSIZED_SOURCE_FILE_EVIDENCE: usize = 20;
 /// Source file extensions that should be scanned.
 const SOURCE_EXTENSIONS: &[&str] = &["js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx"];
 
+/// Bytes of a file read to find its shebang line: the most any kernel reads
+/// for one (Linux reads 256, macOS 512).
+const SHEBANG_BYTES: usize = 512;
+
+/// Extensions of files that hold data, documents, styles, media, native code
+/// or another language's source and build files, never a script Node runs,
+/// whatever their first line says.
+const NON_SCRIPT_EXTENSIONS: &[&str] = &[
+    "json",
+    "map",
+    "md",
+    "markdown",
+    "mdx",
+    "txt",
+    "rst",
+    "adoc",
+    "css",
+    "scss",
+    "sass",
+    "less",
+    "styl",
+    "html",
+    "htm",
+    "xml",
+    "svg",
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "webp",
+    "avif",
+    "ico",
+    "bmp",
+    "tif",
+    "tiff",
+    "woff",
+    "woff2",
+    "ttf",
+    "otf",
+    "eot",
+    "mp3",
+    "mp4",
+    "wav",
+    "ogg",
+    "webm",
+    "mov",
+    "wasm",
+    "node",
+    "so",
+    "dylib",
+    "dll",
+    "exe",
+    "a",
+    "lib",
+    "o",
+    "obj",
+    "pdb",
+    "zip",
+    "gz",
+    "tgz",
+    "tar",
+    "br",
+    "zst",
+    "xz",
+    "bz2",
+    "7z",
+    "jar",
+    "aar",
+    "pdf",
+    "yml",
+    "yaml",
+    "toml",
+    "ini",
+    "csv",
+    "tsv",
+    "lock",
+    "log",
+    "flow",
+    "snap",
+    "proto",
+    "graphql",
+    "gql",
+    "po",
+    "mo",
+    "pot",
+    "properties",
+    "pem",
+    "crt",
+    "md5",
+    "sha1",
+    "sha256",
+    "sha512",
+    "h",
+    "hpp",
+    "c",
+    "cc",
+    "cpp",
+    "cxx",
+    "m",
+    "mm",
+    "s",
+    "asm",
+    "swift",
+    "kt",
+    "kts",
+    "java",
+    "gradle",
+    "pom",
+    "podspec",
+    "plist",
+    "pbxproj",
+    "xcconfig",
+    "xcscheme",
+    "xcprivacy",
+    "strings",
+    "modulemap",
+    "storyboard",
+    "xib",
+    "pch",
+    "entitlements",
+    "gyp",
+    "gypi",
+    "cmake",
+    "mk",
+    "rb",
+    "py",
+    "pl",
+    "go",
+    "rs",
+    "cs",
+];
+
+/// Whether only a file's first line says whether a JavaScript runtime runs
+/// it: it has no extension, an empty one, or one that is neither source nor
+/// one of [`NON_SCRIPT_EXTENSIONS`]. A `bin` target such as `bin/cli` or
+/// `bin/cli.sh` is run by its shebang line, and Node runs a file of any
+/// other extension as CommonJS.
+fn may_be_shebang_script(relative_path: &Path) -> bool {
+    if relative_path.file_name().is_none() {
+        return false;
+    }
+    let Some(extension) = relative_path.extension() else {
+        return true;
+    };
+    let extension = extension.as_encoded_bytes();
+    let listed = |extensions: &[&str]| {
+        extensions
+            .iter()
+            .any(|listed| listed.as_bytes().eq_ignore_ascii_case(extension))
+    };
+    extension.is_empty() || !(listed(SOURCE_EXTENSIONS) || listed(NON_SCRIPT_EXTENSIONS))
+}
+
+/// Opens a package file to read its first line, without following a symlink
+/// or waiting on a FIFO: only a regular file comes back.
+fn open_regular_file(path: &Path) -> Option<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
+/// The extension to parse a script as, when `head`, its first bytes,
+/// opens with a shebang line that runs a JavaScript runtime directly or
+/// through `env` (`#!/usr/bin/env node`, `#!/usr/bin/node`,
+/// `#!/usr/bin/env -S node --flag`): `js` for Node.js and Bun, `ts` for Deno,
+/// tsx and ts-node, which run TypeScript.
+pub fn shebang_script_extension(head: &[u8]) -> Option<&'static str> {
+    let head = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
+    let line = head.strip_prefix(b"#!")?;
+    let line = line.split(|&byte| byte == b'\n').next().unwrap_or(line);
+    let line = String::from_utf8_lossy(line);
+    let mut words = line.split_ascii_whitespace();
+    let mut program = shebang_program_name(words.next()?);
+    // Past env's options, the ones that take a value too, and the variables
+    // it sets; then past a package runner's options.
+    if program == "env" {
+        program = next_shebang_program(&mut words, &["-u", "--unset", "-C", "--chdir"])?;
+    }
+    if matches!(program.as_str(), "npx" | "pnpx" | "bunx") {
+        program = next_shebang_program(&mut words, &["-p", "--package"])?;
+    }
+    match program.as_str() {
+        "node" | "nodejs" | "bun" | "zx" => Some("js"),
+        "deno" | "tsx" | "ts-node" => Some("ts"),
+        _ => None,
+    }
+}
+
+/// A shebang program's name: the last part of its path, in lower case,
+/// without `.exe` or a version (`node20`, `node-18`).
+fn shebang_program_name(word: &str) -> String {
+    let name = word
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(word)
+        .to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    name.trim_end_matches(|character: char| {
+        character.is_ascii_digit() || matches!(character, '.' | '-' | '_')
+    })
+    .to_owned()
+}
+
+/// The program `words` go on to run, past options (skipping the value of
+/// one of `valued`) and variable assignments.
+fn next_shebang_program<'w>(
+    words: &mut impl Iterator<Item = &'w str>,
+    valued: &[&str],
+) -> Option<String> {
+    while let Some(word) = words.next() {
+        if word.starts_with('-') {
+            if valued.contains(&word) {
+                words.next();
+            }
+        } else if !word.contains('=') {
+            return Some(shebang_program_name(word));
+        }
+    }
+    None
+}
+
+/// [`shebang_script_extension`] for a file read from `reader`, by its first
+/// [`SHEBANG_BYTES`].
+fn reads_as_shebang_script(reader: impl std::io::Read) -> bool {
+    lpm_common::read_stream_prefix(reader, SHEBANG_BYTES as u64)
+        .is_ok_and(|head| shebang_script_extension(&head).is_some())
+}
+
 /// Paths a tag's [`TagFiles`] lists; `file_count` counts the rest.
 const MAX_TAG_FILES: usize = 5;
 
@@ -900,6 +1134,18 @@ pub fn package_input_fingerprint_from_open_dir(
     Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
 }
 
+/// Whether the regular file `name` in `directory` is a script a JavaScript
+/// runtime runs, by its shebang line, opened as the walk's reads open a file.
+fn opens_as_shebang_script(directory: &cap_std::fs::Dir, name: &std::ffi::OsStr) -> bool {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _};
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No).nonblock(true);
+    directory
+        .open_with(name, &options)
+        .is_ok_and(reads_as_shebang_script)
+}
+
 fn new_fingerprint_hasher() -> Sha256 {
     let mut hasher = Sha256::new();
     hasher.update(b"lpm-behavioral-input-v2\0");
@@ -945,7 +1191,9 @@ fn collect_cap_fingerprint_files(
                 limit_reached,
             )?;
         } else if file_type.is_file() {
-            if PackageAnalyzer::should_scan(&relative, 0) {
+            if PackageAnalyzer::should_scan(&relative, 0)
+                || (may_be_shebang_script(&relative) && opens_as_shebang_script(directory, &name))
+            {
                 let candidate = SourceFile {
                     role: FileRole::of(&relative),
                     path: relative,
@@ -1936,7 +2184,7 @@ fn collect_source_files_recursive(
             collect_source_files_recursive(package_dir, &relative, files, native_artifacts);
         } else if !metadata.is_file() {
             continue;
-        } else if PackageAnalyzer::should_scan(&relative, metadata.len()) {
+        } else if PackageAnalyzer::reads_as_source(&relative, &entry.path()) {
             files.insert(SourceFile {
                 role: FileRole::of(&relative),
                 path: relative,
@@ -2229,6 +2477,19 @@ impl PackageAnalyzer {
             .is_some_and(|name| roles::is_native_artifact_name(name.as_encoded_bytes()))
     }
 
+    /// Whether the analysis reads the file at `full_path`, whose path in the
+    /// package is `relative_path`, as source: by its extension, as
+    /// [`Self::should_scan`] decides, or, for a file whose extension doesn't
+    /// say, by a shebang line that runs a JavaScript runtime, read from the
+    /// file. That read follows no symlink and doesn't wait on a FIFO: anything
+    /// but a regular file isn't source. A caller with its own source walk can
+    /// read the same files with it.
+    pub fn reads_as_source(relative_path: &Path, full_path: &Path) -> bool {
+        Self::should_scan(relative_path, 0)
+            || (may_be_shebang_script(relative_path)
+                && open_regular_file(full_path).is_some_and(reads_as_shebang_script))
+    }
+
     /// Should the extractor buffer this source entry for full byte-level scanning?
     pub fn should_buffer_source(relative_path: &Path, size: u64) -> bool {
         Self::should_scan(relative_path, size) && size <= MAX_FILE_SIZE
@@ -2293,7 +2554,11 @@ impl PackageAnalyzer {
         self.note_scan_time(scan_start);
     }
 
-    /// Sample an oversized source file from disk after extraction.
+    /// Read a source file a caller extracted without buffering it, from disk:
+    /// an oversized one by its sample, and a file whose extension says nothing,
+    /// such as `bin/cli`, which [`Self::should_buffer_source`] never buffers,
+    /// when its shebang line runs a JavaScript runtime. Any other file is left alone, so a caller can hand
+    /// over every file it didn't buffer.
     pub fn feed_oversized_source_file(
         &mut self,
         relative_path: &Path,
@@ -2301,10 +2566,22 @@ impl PackageAnalyzer {
         size: u64,
     ) {
         let limits = self.budget.limits;
-        if !Self::should_scan(relative_path, size)
-            || size <= limits.full_file_bytes
-            || !self.admit(relative_path, limits.read_bytes(size))
-        {
+        if may_be_shebang_script(relative_path) {
+            // Whether such a file is a script only its first line says, so a
+            // caller buffering by name buffers none.
+            if size == 0 || !open_regular_file(full_path).is_some_and(reads_as_shebang_script) {
+                return;
+            }
+            if size <= limits.full_file_bytes {
+                if let Ok(bytes) = lpm_common::read_file_capped(full_path, limits.full_file_bytes) {
+                    self.feed(relative_path, &bytes);
+                }
+                return;
+            }
+        } else if !Self::should_scan(relative_path, size) {
+            return;
+        }
+        if size <= limits.full_file_bytes || !self.admit(relative_path, limits.read_bytes(size)) {
             return;
         }
         let scan_start = std::time::Instant::now();
@@ -5092,12 +5369,20 @@ mod tests {
             cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
                 .unwrap();
         let by_capability = analyze_package_from_open_dir(&directory, PackageDirectory::Published);
+        // As lpm-store feeds an extraction: each buffered file's bytes, and
+        // every other file from disk.
         let mut streaming = PackageAnalyzer::new();
         for (path, content) in files.iter().rev() {
             let path = Path::new(path);
             streaming.note_entry(path);
             if PackageAnalyzer::should_buffer_source(path, content.len() as u64) {
                 streaming.feed(path, content);
+            } else {
+                streaming.feed_oversized_source_file(
+                    path,
+                    &package.path().join(path),
+                    content.len() as u64,
+                );
             }
         }
         let streamed = streaming.finalize(package.path());
@@ -5533,6 +5818,149 @@ mod tests {
             "module.exports = 1",
             r#"{"name":"kit","license":"MIT","scripts":{"postinstall":"FOO=1 bash -e ./setup.sh"}}"#
         ));
+    }
+
+    #[test]
+    fn a_shebang_line_says_which_runtime_runs_a_script_without_an_extension() {
+        for (head, extension) in [
+            (&b"#!/usr/bin/env node\nmain()"[..], Some("js")),
+            (b"#!/usr/bin/node", Some("js")),
+            (b"#! /usr/local/bin/node --harmony\r\n", Some("js")),
+            (
+                b"#!/usr/bin/env -S node --experimental-vm-modules\n",
+                Some("js"),
+            ),
+            (b"#!/usr/bin/env NODE_ENV=production node\n", Some("js")),
+            (b"#!/usr/bin/env nodejs\n", Some("js")),
+            (b"#!/usr/bin/env bun\n", Some("js")),
+            (b"#!/usr/bin/env -S deno run --allow-all\n", Some("ts")),
+            (b"#!/usr/bin/env tsx\n", Some("ts")),
+            (b"#!/usr/bin/env ts-node\n", Some("ts")),
+            (b"#!/usr/bin/env -S -u DEBUG node\n", Some("js")),
+            (b"#!/usr/bin/env --chdir /tmp node\n", Some("js")),
+            (b"#!/usr/bin/env npx tsx\n", Some("ts")),
+            (b"#!/usr/bin/env npx --yes ts-node\n", Some("ts")),
+            (b"#!/usr/bin/env bunx tsx\n", Some("ts")),
+            (b"#!/usr/local/bin/node20\n", Some("js")),
+            (b"#!/usr/bin/env node-18\n", Some("js")),
+            (b"#!C:/nodejs/node.exe\n", Some("js")),
+            (b"#!/usr/bin/env node.exe\n", Some("js")),
+            (b"#!/usr/bin/env zx\n", Some("js")),
+            (b"\xEF\xBB\xBF#!/usr/bin/env node\n", Some("js")),
+            (b"#!/usr/bin/env npx cowsay\n", None),
+            (b"#!/bin/sh\nnode cli.js", None),
+            (b"#!/usr/bin/env python3\n", None),
+            (b"// #!/usr/bin/env node\n", None),
+            (b"MIT License", None),
+            (b"", None),
+        ] {
+            assert_eq!(
+                shebang_script_extension(head),
+                extension,
+                "{}",
+                String::from_utf8_lossy(head)
+            );
+        }
+    }
+
+    #[test]
+    fn a_script_without_an_extension_is_read_as_source_when_its_shebang_line_runs_node() {
+        let analysis = analyze_every_way(&[
+            (
+                "package.json",
+                br#"{"name":"kit","license":"MIT","bin":{"kit":"bin/cli"}}"#,
+            ),
+            ("bin/cli", b"#!/usr/bin/env node\neval(process.argv[2]);\n"),
+            (
+                "LICENSE",
+                b"Permission is granted to require('child_process').exec(anything).",
+            ),
+            (
+                "scripts/fetch",
+                b"#!/bin/sh\nfetch('https://example.com')\n",
+            ),
+            ("bin/run", b"#!/usr/bin/env tsx\nconst port: number = 1;\n"),
+        ]);
+        assert!(analysis.source.eval);
+        assert!(!analysis.source.child_process);
+        assert!(!analysis.source.network);
+        assert_eq!(analysis.meta.unparsed_files, 0);
+    }
+
+    #[test]
+    fn a_script_with_an_unknown_or_empty_extension_is_read_when_its_shebang_line_runs_node() {
+        let mut files: Vec<(&str, &[u8])> = vec![
+            (
+                "package.json",
+                br#"{"name":"kit","license":"MIT","bin":{"kit":"bin/cli.sh","run":"bin/run."}}"#,
+            ),
+            (
+                "bin/cli.sh",
+                b"#!/usr/bin/env node\neval(process.argv[2]);\n",
+            ),
+            (
+                "docs/usage.md",
+                b"#!/usr/bin/env node\nrequire('child_process').exec(anything);\n",
+            ),
+        ];
+        // Windows drops a trailing dot from a file name, so no such file exists there.
+        if cfg!(not(windows)) {
+            files.push((
+                "bin/run.",
+                b"#!/usr/bin/env node\nfetch('https://example.com');\n",
+            ));
+        }
+        let analysis = analyze_every_way(&files);
+        assert!(analysis.source.eval);
+        assert_eq!(analysis.source.network, cfg!(not(windows)));
+        assert!(!analysis.source.child_process);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reads_as_source_turns_down_a_fifo_without_waiting_for_a_writer() {
+        let package = tempfile::tempdir().unwrap();
+        let fifo = package.path().join("cli");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `path` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(PackageAnalyzer::reads_as_source(Path::new("cli"), &fifo));
+        });
+        assert_eq!(
+            receiver.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn a_test_file_a_bin_script_without_an_extension_reaches_counts_as_runtime() {
+        let analysis = analyze_every_way(&[
+            (
+                "package.json",
+                br#"{"name":"kit","license":"MIT","bin":{"kit":"bin/cli"}}"#,
+            ),
+            (
+                "bin/cli",
+                b"#!/usr/bin/env node\nrequire('../test/helper.js');\n",
+            ),
+            ("test/helper.js", b"eval(code)"),
+        ]);
+        assert!(analysis.source.eval);
+        assert!(analysis.meta.test_only_tags.is_empty());
+    }
+
+    #[test]
+    fn an_oversized_script_without_an_extension_is_sampled_in_every_walk() {
+        let mut script = b"#!/usr/bin/env node\neval(process.argv[2]);\n".to_vec();
+        script.resize(MAX_FILE_SIZE as usize + 1, b' ');
+        let analysis = analyze_every_way(&[
+            ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+            ("bin/cli", &script),
+        ]);
+        assert!(analysis.source.eval);
+        assert_eq!(analysis.meta.oversized_source_files.len(), 1);
     }
 
     #[test]
