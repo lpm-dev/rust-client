@@ -823,7 +823,7 @@ struct MetadataFetchScheduler {
     exact_document_semaphore: Arc<tokio::sync::Semaphore>,
     policy_semaphore: Arc<tokio::sync::Semaphore>,
     jobs: tokio::task::JoinSet<(MetadataFetchKey, FetchResult)>,
-    prefetch_jobs: tokio::task::JoinSet<(CanonicalKey, FetchResult)>,
+    prefetch_jobs: tokio::task::JoinSet<(CanonicalKey, FetchResult, bool)>,
     prefetch_inflight: AHashSet<CanonicalKey>,
     prefetch_pending: VecDeque<PendingPrefetch>,
     prefetch_queued: AHashSet<CanonicalKey>,
@@ -898,6 +898,8 @@ impl MetadataFetchScheduler {
     ) {
         self.prefetch_inflight.insert(pending.canonical.clone());
         let policy_semaphore = Arc::clone(&self.policy_semaphore);
+        let is_plain_packument_prefetch =
+            pending.exact_version.is_none() && pending.preferred_range.is_none();
         self.prefetch_jobs.spawn(async move {
             let _active_fetch = pending.telemetry.enter();
             let result = if pending.exact_version.is_none()
@@ -929,7 +931,7 @@ impl MetadataFetchScheduler {
                 )
                 .await
             };
-            (pending.canonical, result)
+            (pending.canonical, result, is_plain_packument_prefetch)
         });
     }
 
@@ -1444,15 +1446,16 @@ impl MetadataFetchScheduler {
                 Some(joined) = self.prefetch_jobs.join_next(), if !self.prefetch_jobs.is_empty() => {
                     self.fill_available();
                     match joined {
-                        Ok((canonical, result)) => {
+                        Ok((canonical, result, is_plain_packument_prefetch)) => {
                             self.prefetch_inflight.remove(&canonical);
                             if let Some(promoted) = self.promoted_prefetches.remove(&canonical) {
                                 let mut first_ready = None;
                                 for item in promoted {
-                                    // Plain packument demands share the same failure as the
-                                    // speculative packument fetch and can receive it directly;
-                                    // exact/range-preferred demands fall back to their dedicated
-                                    // fetch path (e.g. exact version document endpoint).
+                                    // Deliver a failed speculative prefetch directly ONLY when
+                                    // the prefetch itself ran the plain packument endpoint AND
+                                    // the promoted demand is also a plain packument demand;
+                                    // otherwise fall back to the demand's own fetch path so a
+                                    // failing `/latest` or exact prefetch never fails resolution.
                                     let can_deliver = if result.is_ok() {
                                         prefetched_result_usable(
                                             &result,
@@ -1460,7 +1463,8 @@ impl MetadataFetchScheduler {
                                             item.pending.preferred_range.as_ref(),
                                         )
                                     } else {
-                                        item.pending.exact_version.is_none()
+                                        is_plain_packument_prefetch
+                                            && item.pending.exact_version.is_none()
                                             && item.pending.preferred_range.is_none()
                                     };
                                     if can_deliver {
@@ -4543,5 +4547,85 @@ mod metadata_timeline_bound_tests {
                 .iter()
                 .any(|pkg| pkg.package.canonical_name() == "peer-b")
         );
+    }
+
+    #[tokio::test]
+    async fn failed_preferred_range_prefetch_falls_back_for_promoted_plain_demand() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // `/pkg/latest` fails with a firewall-blocked/500-style hard error after a short
+        // delay so the plain demand promotes onto the in-flight preferred-range prefetch;
+        // the full packument `/pkg` succeeds.
+        Mock::given(method("GET"))
+            .and(path("/pkg/latest"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_delay(Duration::from_millis(60))
+                    .set_body_string("latest endpoint broken"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "pkg",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "pkg",
+                        "version": "1.0.0",
+                        "dependencies": {}
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        );
+        let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+        let policy = ResolverPolicy::default();
+        let telemetry = Arc::new(MetadataFetchTelemetry::default());
+        let dispatch = MetadataFetchDispatch {
+            client: &client,
+            route_table: &route_table,
+            policy: &policy,
+            trace_metadata_fetches: false,
+            telemetry: &telemetry,
+            timeline: None,
+        };
+        let mut scheduler = MetadataFetchScheduler::new(
+            Arc::new(tokio::sync::Semaphore::new(4)),
+            Arc::new(tokio::sync::Semaphore::new(4)),
+        );
+        let canonical = CanonicalKey::npm("pkg");
+        let range = NpmRange::parse("^1.0.0").unwrap();
+        assert!(scheduler.enqueue_prefetch(
+            &dispatch,
+            canonical.clone(),
+            None,
+            Some(range),
+            false,
+        ));
+        assert!(scheduler.prefetch_inflight.contains(&canonical));
+
+        // Promote a plain packument demand while the preferred-range prefetch is in flight.
+        scheduler.enqueue(&dispatch, canonical.clone(), None, false);
+        assert!(scheduler.promoted_prefetches.contains_key(&canonical));
+
+        let (_, result) = scheduler
+            .join_next()
+            .await
+            .expect("promoted demand must complete")
+            .expect("worker task must not panic");
+        let fetched = result.expect(
+            "promoted plain demand must fall back to full packument instead of inheriting /latest prefetch failure",
+        );
+        assert!(fetched.info.version_view("1.0.0").is_some());
     }
 }

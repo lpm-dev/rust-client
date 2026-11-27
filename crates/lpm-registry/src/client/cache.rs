@@ -882,21 +882,11 @@ impl RegistryClient {
         use std::sync::atomic::Ordering;
 
         let mutation = self.metadata_cache_mutation(path);
-        mutation.revision.fetch_add(1, Ordering::AcqRel);
-        let _operation = mutation
-            .operation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for path in [path.to_path_buf(), projection_path(path)] {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => tracing::debug!(%error, "failed to invalidate metadata cache entry"),
-            }
-        }
+        let revision = mutation.revision.fetch_add(1, Ordering::AcqRel) + 1;
+        remove_metadata_cache_files_locked(path, &mutation, revision);
     }
 
-    pub(super) fn invalidate_metadata_cache_key(&self, key: &str) {
+    fn invalidate_metadata_cache_key_in_memory(&self, key: &str) {
         if let Some(policies) = &self.metadata_command_cache_policies {
             policies
                 .lock()
@@ -907,6 +897,10 @@ impl RegistryClient {
         let direct_memory_key = self.direct_metadata_memory_cache_key(key);
         self.invalidate_metadata_memory_cache(&direct_memory_key);
         self.invalidate_metadata_memory_cache(&format!("custom:{key}"));
+    }
+
+    pub(super) fn invalidate_metadata_cache_key(&self, key: &str) {
+        self.invalidate_metadata_cache_key_in_memory(key);
         if let Some(path) = self.cache_path(key) {
             self.invalidate_metadata_cache_path(&path);
         }
@@ -1430,13 +1424,13 @@ impl RegistryClient {
         etag: Option<&str>,
         directive: MetadataCacheDirective,
         history_generation: Option<u64>,
-    ) -> Option<(PreparedMetadataCacheWrite, MetadataCacheWrite)> {
+    ) -> PreparedMetadataCacheAction {
         use std::sync::atomic::Ordering;
 
         if history_generation
             .is_some_and(|generation| !self.history_cache.is_generation(generation))
         {
-            return None;
+            return PreparedMetadataCacheAction::Skip;
         }
         let fresh_for = match directive.local_freshness() {
             Some(fresh_for) => {
@@ -1451,7 +1445,7 @@ impl RegistryClient {
                 if let Some(generation) = history_generation {
                     self.history_cache.with_generation(generation, record);
                     if !self.history_cache.is_generation(generation) {
-                        return None;
+                        return PreparedMetadataCacheAction::Skip;
                     }
                 } else {
                     record();
@@ -1459,9 +1453,18 @@ impl RegistryClient {
                 fresh_for
             }
             None => {
-                let record_no_store = || {
-                    self.invalidate_metadata_cache_key(key);
+                let mut disk_invalidation = None;
+                let mut record_no_store = || {
+                    self.invalidate_metadata_cache_key_in_memory(key);
                     self.remember_command_cache_policy(key, MetadataCommandCachePolicy::NoStore);
+                    if let Some(path) = self.cache_path(key) {
+                        let mutation = self.metadata_cache_mutation(&path);
+                        // Advance revision before releasing the generation lock so any
+                        // in-flight write for this key observes the invalidation, and a
+                        // subsequent newer write is never clobbered by a queued removal.
+                        let revision = mutation.revision.fetch_add(1, Ordering::AcqRel) + 1;
+                        disk_invalidation = Some((path, mutation, revision));
+                    }
                 };
                 if let Some(generation) = history_generation {
                     self.history_cache
@@ -1469,13 +1472,22 @@ impl RegistryClient {
                 } else {
                     record_no_store();
                 }
-                return None;
+                return match disk_invalidation {
+                    Some((path, mutation, revision)) => PreparedMetadataCacheAction::NoStore {
+                        path,
+                        mutation,
+                        revision,
+                    },
+                    None => PreparedMetadataCacheAction::Skip,
+                };
             }
         };
         // Freshness counts from the response, however long the write waits.
         let now = std::time::SystemTime::now();
         let expires_at = now.checked_add(fresh_for).unwrap_or(now);
-        let path = self.cache_path(key)?;
+        let Some(path) = self.cache_path(key) else {
+            return PreparedMetadataCacheAction::Skip;
+        };
         let mutation = self.metadata_cache_mutation(&path);
         let revision = mutation.revision.fetch_add(1, Ordering::AcqRel) + 1;
 
@@ -1493,8 +1505,8 @@ impl RegistryClient {
         let history_guard =
             history_generation.map(|generation| (Arc::clone(&self.history_cache), generation));
 
-        Some((
-            PreparedMetadataCacheWrite {
+        PreparedMetadataCacheAction::Write {
+            prepared: PreparedMetadataCacheWrite {
                 fresh_for,
                 expires_at,
                 path,
@@ -1506,7 +1518,7 @@ impl RegistryClient {
                 history_guard,
             },
             written,
-        ))
+        }
     }
 
     pub(super) fn write_metadata_cache_entry_at_generation<T: serde::Serialize + 'static>(
@@ -1517,8 +1529,23 @@ impl RegistryClient {
         directive: MetadataCacheDirective,
         history_generation: Option<u64>,
     ) -> Option<MetadataCacheWrite> {
-        let (prepared, written) =
-            self.prepare_metadata_cache_write(key, etag, directive, history_generation)?;
+        let (prepared, written) = match self.prepare_metadata_cache_write(
+            key,
+            etag,
+            directive,
+            history_generation,
+        ) {
+            PreparedMetadataCacheAction::Skip => return None,
+            PreparedMetadataCacheAction::NoStore {
+                path,
+                mutation,
+                revision,
+            } => {
+                remove_metadata_cache_files_locked(&path, &mutation, revision);
+                return None;
+            }
+            PreparedMetadataCacheAction::Write { prepared, written } => (prepared, written),
+        };
         let (content, prefix_len, used_json_fallback) = match encode_metadata_cache_buffer(
             &self.pending_cache_write_bytes,
             key,
@@ -1588,13 +1615,35 @@ impl RegistryClient {
         directive: MetadataCacheDirective,
         history_generation: Option<u64>,
     ) -> Result<(T, Option<MetadataCacheWrite>), LpmError> {
-        let Some((prepared, written)) =
-            self.prepare_metadata_cache_write(key, etag, directive, history_generation)
-        else {
-            return Ok((metadata, None));
+        let runtime_handle = tokio::runtime::Handle::try_current();
+        let (prepared, written) = match self.prepare_metadata_cache_write(
+            key,
+            etag,
+            directive,
+            history_generation,
+        ) {
+            PreparedMetadataCacheAction::Skip => return Ok((metadata, None)),
+            PreparedMetadataCacheAction::NoStore {
+                path,
+                mutation,
+                revision,
+            } => {
+                if !self.synchronous_cache_writes
+                    && let Ok(handle) = runtime_handle
+                {
+                    let pending_guard = self.pending_cache_writes.enter();
+                    handle.spawn_blocking(move || {
+                        let _pending_guard = pending_guard;
+                        remove_metadata_cache_files_locked(&path, &mutation, revision);
+                    });
+                } else {
+                    remove_metadata_cache_files_locked(&path, &mutation, revision);
+                }
+                return Ok((metadata, None));
+            }
+            PreparedMetadataCacheAction::Write { prepared, written } => (prepared, written),
         };
 
-        let runtime_handle = tokio::runtime::Handle::try_current();
         if self.synchronous_cache_writes || runtime_handle.is_err() {
             let encoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 encode_metadata_cache_buffer(
@@ -1608,15 +1657,24 @@ impl RegistryClient {
             }));
             let written = match encoded {
                 Ok(Ok((content, prefix_len, used_json_fallback))) => {
-                    finish_metadata_cache_write(
-                        key,
-                        content,
-                        prefix_len,
-                        used_json_fallback,
-                        &self.pending_cache_write_bytes,
-                        &prepared,
-                    );
-                    Some(written)
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        finish_metadata_cache_write(
+                            key,
+                            content,
+                            prefix_len,
+                            used_json_fallback,
+                            &self.pending_cache_write_bytes,
+                            &prepared,
+                        );
+                    }))
+                    .is_err()
+                    {
+                        let key_for_log = sanitize_cache_key_for_log(key);
+                        tracing::warn!("metadata cache write panicked for {key_for_log}");
+                        None
+                    } else {
+                        Some(written)
+                    }
                 }
                 Ok(Err(Some(BufferLimit::Budget))) => {
                     tracing::debug!(
@@ -2182,6 +2240,42 @@ fn compress_metadata_cache_buffer(
         }
     }
     content
+}
+
+enum PreparedMetadataCacheAction {
+    Skip,
+    NoStore {
+        path: std::path::PathBuf,
+        mutation: Arc<MetadataCacheMutation>,
+        revision: u64,
+    },
+    Write {
+        prepared: PreparedMetadataCacheWrite,
+        written: MetadataCacheWrite,
+    },
+}
+
+fn remove_metadata_cache_files_locked(
+    path: &std::path::Path,
+    mutation: &MetadataCacheMutation,
+    revision: u64,
+) {
+    use std::sync::atomic::Ordering;
+
+    let _operation = mutation
+        .operation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if mutation.revision.load(Ordering::Acquire) != revision {
+        return;
+    }
+    for path in [path.to_path_buf(), projection_path(path)] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::debug!(%error, "failed to invalidate metadata cache entry"),
+        }
+    }
 }
 
 struct PreparedMetadataCacheWrite {
@@ -3641,5 +3735,43 @@ mod timeline_tests {
         assert_eq!(from_legacy.name, "sparse-pkg");
         assert_eq!(from_legacy.versions.len(), 80);
         assert_eq!(from_legacy.ecosystem.as_deref(), Some("npm"));
+    }
+
+    #[tokio::test]
+    async fn async_no_store_directive_invalidates_cached_entry_off_worker_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = RegistryClient::new().with_cache_dir(Some(dir.path().to_owned()));
+        let (_, written) = client
+            .write_metadata_cache_entry_async(
+                "no-store-pkg",
+                serde_json::json!({"name": "no-store-pkg"}),
+                None,
+                MetadataCacheDirective::Unspecified,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(written.is_some());
+        client.flush_pending_cache_writes().await;
+        let path = client.cache_path("no-store-pkg").unwrap();
+        assert!(path.exists());
+
+        let (returned, no_store_written) = client
+            .write_metadata_cache_entry_async(
+                "no-store-pkg",
+                serde_json::json!({"name": "no-store-pkg", "fresh": true}),
+                None,
+                MetadataCacheDirective::NoStore,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(returned["fresh"], true);
+        assert!(no_store_written.is_none());
+        client.flush_pending_cache_writes().await;
+        assert!(
+            !path.exists(),
+            "NoStore directive must remove existing cache file via pending blocking flush"
+        );
     }
 }

@@ -181,11 +181,16 @@ impl ParseCache {
                 }
                 Err(flight) => {
                     let mut state = flight.state.lock().unwrap_or_else(PoisonError::into_inner);
+                    #[cfg(test)]
+                    let mut counted_waiter = false;
                     loop {
                         match &*state {
                             InFlightState::Pending => {
                                 #[cfg(test)]
-                                flight.waiters.fetch_add(1, Ordering::SeqCst);
+                                if !counted_waiter {
+                                    flight.waiters.fetch_add(1, Ordering::SeqCst);
+                                    counted_waiter = true;
+                                }
                                 state = flight
                                     .ready
                                     .wait(state)
