@@ -239,6 +239,44 @@ pub(super) fn extract(
     )
 }
 
+pub(super) fn extract_with_inspector<P, I>(
+    reader: impl Read + Send,
+    target_dir: &Path,
+    limits: ExtractionLimits,
+    buffer_predicate: P,
+    inspector: I,
+    cancel_input: impl FnOnce(),
+) -> Result<Vec<ExtractedFileDigest>, LpmError>
+where
+    P: Fn(&Path, u64) -> bool,
+    I: for<'a> FnMut(super::EntryInfo<'a>),
+{
+    with_decoder(
+        reader,
+        StreamFormat::Gzip,
+        limits,
+        cancel_input,
+        |decoded| {
+            extract_tar_archive_until(
+                decoded,
+                target_dir,
+                limits,
+                true,
+                buffer_predicate,
+                inspector,
+                InspectionMode::WithCallback,
+                |mut reader| {
+                    io::copy(&mut reader, &mut io::sink())
+                        .map(|_| ())
+                        .map_err(LpmError::Io)
+                },
+                crate::writers::WriterSetup::Disabled,
+                ArchiveEnd::FirstZeroBlock,
+            )
+        },
+    )
+}
+
 pub(super) fn extract_stream<E: ExtractionRecord>(
     reader: impl Read + Send,
     target_dir: &Path,
@@ -1025,5 +1063,41 @@ mod tests {
             .is_err()
         );
         assert!(cancelled.get());
+    }
+
+    #[test]
+    fn pipelined_inspector_invokes_callback_in_order_and_computes_digests() {
+        let archive = create_test_tarball_with_entries(&[
+            ("a.js", b"console.log('a');"),
+            ("nested/b.txt", b"not-buffered"),
+            ("nested/c.js", b"console.log('c');"),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let mut seen = Vec::new();
+        let files = crate::extract_tarball_from_reader_pipelined_with_entry_digests(
+            archive.as_slice(),
+            root.path(),
+            |path, _| path.extension().and_then(|ext| ext.to_str()) == Some("js"),
+            |entry| {
+                seen.push((
+                    entry.relative_path.to_path_buf(),
+                    entry.bytes.map(<[u8]>::to_vec),
+                    entry.blake3_digest,
+                ));
+            },
+            || {},
+        )
+        .unwrap();
+        assert_eq!(files.len(), 3);
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0].0, Path::new("a.js"));
+        assert_eq!(seen[0].1.as_deref(), Some(b"console.log('a');".as_slice()));
+        assert_eq!(seen[1].0, Path::new("nested/b.txt"));
+        assert!(seen[1].1.is_none());
+        assert_eq!(seen[2].0, Path::new("nested/c.js"));
+        assert_eq!(seen[2].1.as_deref(), Some(b"console.log('c');".as_slice()));
+        for (file, (_, _, digest)) in files.iter().zip(&seen) {
+            assert_eq!(Some(file.blake3_digest), *digest);
+        }
     }
 }

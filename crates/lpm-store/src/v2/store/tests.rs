@@ -6292,7 +6292,7 @@ fn opened_regular_files_stream_only_above_the_hybrid_buffer_limit() {
     ] {
         reader.get_ref().set_len(size).unwrap();
         assert_eq!(
-            file_exceeds_hybrid_buffer(&reader),
+            file_takes_pipelined_decoder(&reader),
             size > lpm_extractor::MAX_HYBRID_BUFFERED_COMPRESSED_SIZE
         );
     }
@@ -6316,10 +6316,6 @@ fn small_files_that_decode_past_the_buffer_take_the_pipelined_decoder() {
             file_takes_pipelined_decoder(&reader),
             pipelined,
             "{decoded}"
-        );
-        assert!(
-            !file_exceeds_hybrid_buffer(&reader),
-            "inspecting extraction keeps buffering what it can't pipeline"
         );
         let mut cursor = reader.get_ref();
         assert_eq!(
@@ -6351,7 +6347,7 @@ fn nonregular_file_handles_retain_the_hybrid_reader() {
     let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
     let fd: std::os::fd::OwnedFd = socket.into();
     let reader = std::io::BufReader::new(std::fs::File::from(fd));
-    assert!(!file_exceeds_hybrid_buffer(&reader));
+    assert!(!file_takes_pipelined_decoder(&reader));
 }
 
 fn large_uncompressed_tarball() -> Vec<u8> {

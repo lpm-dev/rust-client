@@ -10,6 +10,8 @@ use std::thread::JoinHandle;
 pub(super) const MAX_ENTRY_BYTES: usize = 512 * 1024;
 pub(super) const MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
 pub(super) const MAX_PENDING_ENTRIES: usize = 64;
+const JOB_BATCH_MAX_FILES: usize = 16;
+const JOB_BATCH_MAX_BYTES: usize = 128 * 1024;
 const MAX_WRITER_POOLS: usize = 4;
 static ACTIVE_WRITER_POOLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -88,10 +90,11 @@ pub(super) enum WriterSetup {
 
 impl WriterSetup {
     pub(super) fn configured() -> Self {
+        let default_count = lpm_common::resources::effective_cpu_count().clamp(1, 2);
         let count = std::env::var("LPM_INTERNAL_EXTRACT_WRITERS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(2)
+            .unwrap_or(default_count)
             .min(8);
         if count == 0 {
             Self::Disabled
@@ -277,7 +280,7 @@ impl PendingEntries {
     /// Accept the completed entries at the front without waiting.
     pub(super) fn accept_ready<E: crate::ExtractionRecord>(
         &mut self,
-        pool: &WriterPool,
+        pool: &mut WriterPool,
         records: &mut Vec<E>,
         identities: &mut Vec<Identity>,
     ) -> Result<(), LpmError> {
@@ -290,7 +293,7 @@ impl PendingEntries {
     /// Wait until `bytes` more fit, accepting the oldest entries as they complete.
     pub(super) fn make_room<E: crate::ExtractionRecord>(
         &mut self,
-        pool: &WriterPool,
+        pool: &mut WriterPool,
         bytes: usize,
         records: &mut Vec<E>,
         identities: &mut Vec<Identity>,
@@ -299,6 +302,7 @@ impl PendingEntries {
         if self.has_capacity(bytes) {
             return Ok(());
         }
+        pool.flush()?;
         #[cfg(test)]
         self.observe(TestEvent::DrainStarted);
         while !self.has_capacity(bytes) && !self.slots.is_empty() {
@@ -311,10 +315,11 @@ impl PendingEntries {
     /// Wait for every entry and accept them in archive order.
     pub(super) fn drain<E: crate::ExtractionRecord>(
         &mut self,
-        pool: &WriterPool,
+        pool: &mut WriterPool,
         records: &mut Vec<E>,
         identities: &mut Vec<Identity>,
     ) -> Result<(), LpmError> {
+        pool.flush()?;
         #[cfg(test)]
         self.observe(TestEvent::DrainStarted);
         while self.slots.iter().any(|slot| slot.result.is_none()) {
@@ -369,8 +374,11 @@ impl PendingEntries {
 }
 
 pub(super) struct WriterPool {
-    sender: Option<mpsc::Sender<Job>>,
-    ready: mpsc::Receiver<Completion>,
+    sender: Option<mpsc::Sender<Vec<Job>>>,
+    pending_batch: Vec<Job>,
+    pending_batch_bytes: usize,
+    ready: mpsc::Receiver<Vec<Completion>>,
+    buffered_completions: VecDeque<Completion>,
     workers: Vec<JoinHandle<()>>,
     #[cfg(test)]
     hooks: TestHooks,
@@ -400,12 +408,15 @@ impl WriterPool {
         #[cfg(test)] hooks: TestHooks,
         failure: Option<Arc<FailureSignal>>,
     ) -> Result<Self, LpmError> {
-        let (sender, receiver) = mpsc::channel::<Job>();
+        let (sender, receiver) = mpsc::channel::<Vec<Job>>();
         let receiver = Arc::new(Mutex::new(receiver));
-        let (completed, ready) = mpsc::channel();
+        let (completed, ready) = mpsc::channel::<Vec<Completion>>();
         let mut pool = Self {
             sender: Some(sender),
+            pending_batch: Vec::with_capacity(JOB_BATCH_MAX_FILES),
+            pending_batch_bytes: 0,
             ready,
+            buffered_completions: VecDeque::with_capacity(JOB_BATCH_MAX_FILES),
             workers: Vec::with_capacity(count),
             #[cfg(test)]
             hooks,
@@ -428,48 +439,52 @@ impl WriterPool {
                         #[cfg(test)]
                         let _exit = TestExit(hooks.on_exit.clone());
                         loop {
-                            let job = match jobs.lock() {
+                            let batch = match jobs.lock() {
                                 Ok(receiver) => receiver.recv(),
                                 Err(_) => return,
                             };
-                            let Ok(job) = job else { return };
-                            let sequence = job.sequence;
-                            let result =
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    #[cfg(test)]
-                                    if let Some(before_open) = &hooks.before_open {
-                                        before_open(&job)?;
-                                    }
-                                    let job = job.open()?;
-                                    #[cfg(test)]
-                                    let job = {
-                                        let mut job = job;
-                                        if let Some(before_write) = &hooks.before_write {
-                                            before_write(&mut job)?;
+                            let Ok(batch) = batch else { return };
+                            let mut completions = Vec::with_capacity(batch.len());
+                            for job in batch {
+                                let sequence = job.sequence;
+                                let result =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        #[cfg(test)]
+                                        if let Some(before_open) = &hooks.before_open {
+                                            before_open(&job)?;
                                         }
-                                        job
-                                    };
-                                    let written = write(job)?;
-                                    #[cfg(test)]
-                                    if let Some(after_write) = &hooks.after_write {
-                                        after_write(&written)?;
-                                    }
-                                    Ok(written)
-                                }))
-                                .unwrap_or_else(|_| {
-                                    Err(io::Error::other("tarball file writer panicked").into())
-                                });
-                            if result.is_err()
-                                && let Some(failure) = &failure
-                            {
-                                failure.failed.store(true, Ordering::Release);
+                                        let job = job.open()?;
+                                        #[cfg(test)]
+                                        let job = {
+                                            let mut job = job;
+                                            if let Some(before_write) = &hooks.before_write {
+                                                before_write(&mut job)?;
+                                            }
+                                            job
+                                        };
+                                        let written = write(job)?;
+                                        #[cfg(test)]
+                                        if let Some(after_write) = &hooks.after_write {
+                                            after_write(&written)?;
+                                        }
+                                        Ok(written)
+                                    }))
+                                    .unwrap_or_else(|_| {
+                                        Err(io::Error::other("tarball file writer panicked").into())
+                                    });
+                                if result.is_err()
+                                    && let Some(failure) = &failure
+                                {
+                                    failure.failed.store(true, Ordering::Release);
+                                }
+                                completions.push(Completion { sequence, result });
+                                #[cfg(test)]
+                                if let Some(observer) = &hooks.observer {
+                                    observer(TestEvent::Completed { sequence });
+                                }
                             }
-                            if results.send(Completion { sequence, result }).is_err() {
+                            if results.send(completions).is_err() {
                                 return;
-                            }
-                            #[cfg(test)]
-                            if let Some(observer) = &hooks.observer {
-                                observer(TestEvent::Completed { sequence });
                             }
                         }
                     })?,
@@ -481,26 +496,91 @@ impl WriterPool {
         Ok(pool)
     }
 
-    pub(super) fn submit(&self, job: Job) -> Result<(), LpmError> {
+    #[cfg(test)]
+    fn has_test_hooks(&self) -> bool {
+        self.hooks.before_open.is_some()
+            || self.hooks.before_write.is_some()
+            || self.hooks.after_write.is_some()
+            || self.hooks.observer.is_some()
+    }
+
+    pub(super) fn submit(&mut self, job: Job) -> Result<(), LpmError> {
+        #[cfg(test)]
+        if self.has_test_hooks() {
+            return self
+                .sender
+                .as_ref()
+                .ok_or_else(|| io::Error::other("tarball file writers already stopped"))?
+                .send(vec![job])
+                .map_err(|_| io::Error::other("tarball file writers disconnected").into());
+        }
+        let job_bytes = job.bytes.len();
+        if !self.pending_batch.is_empty()
+            && self.pending_batch_bytes.saturating_add(job_bytes) > JOB_BATCH_MAX_BYTES
+        {
+            self.flush()?;
+        }
+        self.pending_batch.push(job);
+        self.pending_batch_bytes = self.pending_batch_bytes.saturating_add(job_bytes);
+        if self.pending_batch.len() >= JOB_BATCH_MAX_FILES
+            || self.pending_batch_bytes >= JOB_BATCH_MAX_BYTES
+        {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn flush(&mut self) -> Result<(), LpmError> {
+        if self.pending_batch.is_empty() {
+            return Ok(());
+        }
+        let batch = std::mem::replace(
+            &mut self.pending_batch,
+            Vec::with_capacity(JOB_BATCH_MAX_FILES),
+        );
+        self.pending_batch_bytes = 0;
         self.sender
             .as_ref()
             .ok_or_else(|| io::Error::other("tarball file writers already stopped"))?
-            .send(job)
+            .send(batch)
             .map_err(|_| io::Error::other("tarball file writers disconnected").into())
     }
 
-    pub(super) fn receive(&self) -> Result<Completion, LpmError> {
-        self.ready
-            .recv()
-            .map_err(|_| io::Error::other("tarball file writers stopped before completion").into())
+    pub(super) fn receive(&mut self) -> Result<Completion, LpmError> {
+        if let Some(completion) = self.buffered_completions.pop_front() {
+            return Ok(completion);
+        }
+        self.flush()?;
+        loop {
+            let batch = self
+                .ready
+                .recv()
+                .map_err(|_| io::Error::other("tarball file writers stopped before completion"))?;
+            self.buffered_completions.extend(batch);
+            if let Some(completion) = self.buffered_completions.pop_front() {
+                return Ok(completion);
+            }
+        }
     }
 
-    fn try_receive(&self) -> Result<Option<Completion>, LpmError> {
-        match self.ready.try_recv() {
-            Ok(completion) => Ok(Some(completion)),
-            Err(mpsc::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                Err(io::Error::other("tarball file writers stopped before completion").into())
+    fn try_receive(&mut self) -> Result<Option<Completion>, LpmError> {
+        if let Some(completion) = self.buffered_completions.pop_front() {
+            return Ok(Some(completion));
+        }
+        loop {
+            match self.ready.try_recv() {
+                Ok(batch) => {
+                    self.buffered_completions.extend(batch);
+                    if let Some(completion) = self.buffered_completions.pop_front() {
+                        return Ok(Some(completion));
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => return Ok(None),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(
+                        io::Error::other("tarball file writers stopped before completion").into(),
+                    );
+                }
             }
         }
     }
@@ -510,6 +590,7 @@ impl WriterPool {
     }
 
     fn join(&mut self) -> Result<(), LpmError> {
+        let _ = self.flush();
         self.sender.take();
         let mut failed = false;
         for worker in self.workers.drain(..) {

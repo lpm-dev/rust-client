@@ -1211,6 +1211,29 @@ pub fn extract_tarball_from_reader_pipelined_digests(
     pipeline::extract(reader, target_dir, DEFAULT_EXTRACTION_LIMITS, cancel_input)
 }
 
+/// Decode gzip ahead of file extraction while still running an ordered
+/// per-entry inspector callback on the consuming thread.
+pub fn extract_tarball_from_reader_pipelined_with_entry_digests<P, I>(
+    reader: impl Read + Send,
+    target_dir: &Path,
+    buffer_predicate: P,
+    inspector: I,
+    cancel_input: impl FnOnce(),
+) -> Result<Vec<ExtractedFileDigest>, LpmError>
+where
+    P: Fn(&Path, u64) -> bool,
+    I: for<'a> FnMut(EntryInfo<'a>),
+{
+    pipeline::extract_with_inspector(
+        reader,
+        target_dir,
+        DEFAULT_EXTRACTION_LIMITS,
+        buffer_predicate,
+        inspector,
+        cancel_input,
+    )
+}
+
 /// Extract an uncompressed tar stream, reading it on a separate thread so the
 /// caller's reader (a download, with its hashing and decompression) runs
 /// alongside the tar walk and the file writes. At most 1 MiB of the stream is
@@ -1786,8 +1809,7 @@ where
             )));
         }
 
-        let original_path = entry.path().to_path_buf();
-        let Some(relative_path) = sanitize_entry_path(&original_path)? else {
+        let Some(relative_path) = sanitize_entry_path(entry.path())? else {
             return Ok(ControlFlow::<()>::Continue(()));
         };
 
@@ -1855,15 +1877,23 @@ where
                         &mut extracted_files,
                         &mut accepted_identities,
                     )?;
-                    let mut bytes = vec![0; length];
-                    pending.make_room(
-                        pool,
-                        bytes.capacity(),
-                        &mut extracted_files,
-                        &mut accepted_identities,
-                    )?;
-                    entry.read_exact(&mut bytes)?;
+                    let mut bytes = Vec::with_capacity(length);
+                    let mut remaining = length;
+                    while remaining > 0 {
+                        let chunk = remaining.min(copy_buffer.len());
+                        entry.read_exact(&mut copy_buffer[..chunk])?;
+                        bytes.extend_from_slice(&copy_buffer[..chunk]);
+                        remaining -= chunk;
+                    }
                     let capacity = bytes.capacity();
+                    if capacity > length {
+                        pending.make_room(
+                            pool,
+                            capacity,
+                            &mut extracted_files,
+                            &mut accepted_identities,
+                        )?;
+                    }
                     pool.submit(writers::Job {
                         sequence: pending.next_sequence(),
                         target: output.new_file(&relative_path)?,
@@ -1956,8 +1986,8 @@ where
         ArchiveEnd::EndOfInput => visit_tar_archive_to_end(reader, tar_limits, visitor),
     };
 
-    let writers_result = if let Some((pool, mut pending)) = parallel {
-        let drained = pending.drain(&pool, &mut extracted_files, &mut accepted_identities);
+    let writers_result = if let Some((mut pool, mut pending)) = parallel {
+        let drained = pending.drain(&mut pool, &mut extracted_files, &mut accepted_identities);
         let joined = pool.finish();
         drained.and(joined)
     } else {
@@ -2418,19 +2448,21 @@ fn is_windows_reserved_device_name(component: &OsStr) -> bool {
     let component = component.to_string_lossy();
     let trimmed = component.trim_end_matches([' ', '.']);
     let stem = trimmed.split('.').next().unwrap_or(trimmed);
-    let upper = stem.to_ascii_uppercase();
-
-    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$")
-        || is_reserved_windows_port_name(&upper, "COM")
-        || is_reserved_windows_port_name(&upper, "LPT")
-}
-
-fn is_reserved_windows_port_name(upper: &str, prefix: &str) -> bool {
-    let Some(number) = upper.strip_prefix(prefix) else {
-        return false;
-    };
-
-    matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+    let bytes = stem.as_bytes();
+    match bytes.len() {
+        3 => {
+            stem.eq_ignore_ascii_case("CON")
+                || stem.eq_ignore_ascii_case("PRN")
+                || stem.eq_ignore_ascii_case("AUX")
+                || stem.eq_ignore_ascii_case("NUL")
+        }
+        4 => {
+            matches!(bytes[3], b'1'..=b'9')
+                && (stem[..3].eq_ignore_ascii_case("COM") || stem[..3].eq_ignore_ascii_case("LPT"))
+        }
+        6 => stem.eq_ignore_ascii_case("CLOCK$"),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -4639,5 +4671,26 @@ mod tests {
         assert_eq!(*budget.lock_available(), 0);
         drop(guard);
         assert_eq!(*budget.lock_available(), container_budget);
+    }
+
+    #[test]
+    fn windows_reserved_device_name_classification_covers_ports_and_case() {
+        for reserved in [
+            "CON", "con", "Con.txt", "prn ", "aux.", "NUL.js", "CLOCK$", "clock$.bin", "COM1",
+            "com9.ts", "LPT1", "lpt5.json",
+        ] {
+            assert!(
+                is_windows_reserved_device_name(OsStr::new(reserved)),
+                "expected reserved: {reserved}"
+            );
+        }
+        for allowed in [
+            "COM0", "COM10", "LPT0", "LPT10", "CONSOL", "CLOCK", "CLOCK$1", "index.js", "nu",
+        ] {
+            assert!(
+                !is_windows_reserved_device_name(OsStr::new(allowed)),
+                "expected allowed: {allowed}"
+            );
+        }
     }
 }

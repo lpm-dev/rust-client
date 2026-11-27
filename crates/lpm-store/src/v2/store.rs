@@ -114,12 +114,6 @@ struct FileCasFinishContext<'a> {
     validation_batch: Option<&'a ReusableObjectValidationBatch>,
 }
 
-fn file_exceeds_hybrid_buffer(reader: &std::io::BufReader<std::fs::File>) -> bool {
-    reader.get_ref().metadata().is_ok_and(|metadata| {
-        metadata.is_file() && metadata.len() > lpm_extractor::MAX_HYBRID_BUFFERED_COMPRESSED_SIZE
-    })
-}
-
 /// Whether a downloaded file is too large, compressed or as its gzip
 /// trailer declares it decoded, to buffer where the pipelined decoder can
 /// take it instead and write its files in parallel.
@@ -1615,7 +1609,7 @@ impl Store {
                 ),
             }
         } else {
-            let stream_file = matches!(&tarball_input, TarballInput::File(reader) if file_exceeds_hybrid_buffer(reader));
+            let pipeline_file = matches!(&tarball_input, TarballInput::File(reader) if file_takes_pipelined_decoder(reader));
             match &mut tarball_input {
                 TarballInput::Bytes(bytes) => lpm_extractor::extract_tarball_with_entry_digests(
                     bytes,
@@ -1623,12 +1617,13 @@ impl Store {
                     buffer_predicate,
                     inspect_entry,
                 ),
-                TarballInput::File(reader) if stream_file => {
-                    lpm_extractor::extract_tarball_from_reader_streaming_with_entry_digests(
+                TarballInput::File(reader) if pipeline_file => {
+                    lpm_extractor::extract_tarball_from_reader_pipelined_with_entry_digests(
                         reader,
                         tmp_dir,
                         buffer_predicate,
                         inspect_entry,
+                        || {},
                     )
                 }
                 TarballInput::File(reader) => {
@@ -1647,14 +1642,17 @@ impl Store {
                         inspect_entry,
                     )
                 }
-                TarballInput::PipelinedStreaming { reader, .. } => {
-                    lpm_extractor::extract_tarball_from_reader_streaming_with_entry_digests(
-                        &mut **reader,
-                        tmp_dir,
-                        buffer_predicate,
-                        inspect_entry,
-                    )
-                }
+                TarballInput::PipelinedStreaming {
+                    reader,
+                    cancel_input,
+                    ..
+                } => lpm_extractor::extract_tarball_from_reader_pipelined_with_entry_digests(
+                    &mut **reader,
+                    tmp_dir,
+                    buffer_predicate,
+                    inspect_entry,
+                    cancel_input,
+                ),
             }
         };
         let extracted_files = extract_result?;

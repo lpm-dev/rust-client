@@ -39,7 +39,127 @@ struct Parent {
     identity: Identity,
 }
 
-const MAX_CACHED_PARENTS: usize = 16;
+const MIN_CACHED_PARENTS: usize = 16;
+const MID_CACHED_PARENTS: usize = 32;
+const MAX_CACHED_PARENTS: usize = 64;
+
+fn parent_cache_capacity() -> usize {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: getrlimit initializes this valid out pointer on success.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        return MIN_CACHED_PARENTS;
+    }
+    // SAFETY: getrlimit succeeded.
+    let soft = unsafe { limit.assume_init() }.rlim_cur;
+    if soft >= 512 {
+        MAX_CACHED_PARENTS
+    } else if soft >= 256 {
+        MID_CACHED_PARENTS
+    } else {
+        MIN_CACHED_PARENTS
+    }
+}
+
+struct LruNode {
+    parent: Parent,
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
+struct ParentCache {
+    nodes: Vec<Option<LruNode>>,
+    free_slots: Vec<usize>,
+    index: HashMap<PathBuf, usize>,
+    head: Option<usize>,
+    tail: Option<usize>,
+    capacity: usize,
+}
+
+impl ParentCache {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            nodes: Vec::with_capacity(capacity),
+            free_slots: Vec::new(),
+            index: HashMap::with_capacity(capacity),
+            head: None,
+            tail: None,
+            capacity,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.nodes.clear();
+        self.free_slots.clear();
+        self.index.clear();
+        self.head = None;
+        self.tail = None;
+    }
+
+    fn unlink(&mut self, slot: usize) -> Parent {
+        let node = self.nodes[slot].take().expect("LRU slot must be occupied");
+        match node.prev {
+            Some(prev) => {
+                if let Some(prev_node) = self.nodes[prev].as_mut() {
+                    prev_node.next = node.next;
+                }
+            }
+            None => self.head = node.next,
+        }
+        match node.next {
+            Some(next) => {
+                if let Some(next_node) = self.nodes[next].as_mut() {
+                    next_node.prev = node.prev;
+                }
+            }
+            None => self.tail = node.prev,
+        }
+        self.free_slots.push(slot);
+        node.parent
+    }
+
+    fn take(&mut self, path: &Path) -> Option<Parent> {
+        let slot = self.index.remove(path)?;
+        Some(self.unlink(slot))
+    }
+
+    fn insert(&mut self, parent: Parent) {
+        if self.capacity == 0 {
+            return;
+        }
+        if let Some(existing) = self.index.remove(&parent.path) {
+            let _ = self.unlink(existing);
+        } else if self.index.len() >= self.capacity
+            && let Some(lru_slot) = self.tail
+        {
+            let evicted = self.unlink(lru_slot);
+            self.index.remove(&evicted.path);
+        }
+        let path_key = parent.path.clone();
+        let old_head = self.head;
+        let node = LruNode {
+            parent,
+            prev: None,
+            next: old_head,
+        };
+        let slot = if let Some(slot) = self.free_slots.pop() {
+            self.nodes[slot] = Some(node);
+            slot
+        } else {
+            let slot = self.nodes.len();
+            self.nodes.push(Some(node));
+            slot
+        };
+        if let Some(head_slot) = old_head
+            && let Some(head_node) = self.nodes[head_slot].as_mut()
+        {
+            head_node.prev = Some(slot);
+        } else {
+            self.tail = Some(slot);
+        }
+        self.head = Some(slot);
+        self.index.insert(path_key, slot);
+    }
+}
 
 pub(crate) struct OutputTree {
     root_path: PathBuf,
@@ -48,7 +168,7 @@ pub(crate) struct OutputTree {
     root_identity: Identity,
     directories: HashMap<PathBuf, DirectoryRecord>,
     parent: Option<Parent>,
-    recent_parents: Vec<Parent>,
+    recent_parents: ParentCache,
 }
 
 impl OutputTree {
@@ -62,7 +182,7 @@ impl OutputTree {
             root_identity,
             directories: HashMap::with_capacity(64),
             parent: None,
-            recent_parents: Vec::with_capacity(MAX_CACHED_PARENTS),
+            recent_parents: ParentCache::with_capacity(parent_cache_capacity()),
         })
     }
 
@@ -70,16 +190,7 @@ impl OutputTree {
         let Some(previous) = self.parent.take() else {
             return;
         };
-        if let Some(pos) = self
-            .recent_parents
-            .iter()
-            .position(|cached| cached.path == previous.path)
-        {
-            self.recent_parents.remove(pos);
-        } else if self.recent_parents.len() >= MAX_CACHED_PARENTS {
-            self.recent_parents.remove(0);
-        }
-        self.recent_parents.push(previous);
+        self.recent_parents.insert(previous);
     }
 
     pub(crate) fn prepare_parent(
@@ -100,20 +211,14 @@ impl OutputTree {
             return Ok(());
         }
         self.park_current_parent();
-        if let Some(pos) = self
-            .recent_parents
-            .iter()
-            .position(|cached| cached.path == parent)
-        {
-            let cached = self.recent_parents.remove(pos);
-            if self
+        if let Some(cached) = self.recent_parents.take(parent)
+            && self
                 .directories
                 .get(parent)
                 .is_some_and(|record| record.identity == cached.identity)
-            {
-                self.parent = Some(cached);
-                return Ok(());
-            }
+        {
+            self.parent = Some(cached);
+            return Ok(());
         }
         if let Some(record) = self.directories.get(parent)
             && let Some((directory, name)) = open_known_parent(&self.root, parent)?
@@ -696,5 +801,40 @@ mod tests {
         ] {
             assert!(!confined_open_unavailable(error), "{error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod parent_cache_tests {
+    use super::*;
+
+    fn dummy_parent(file: &Arc<File>, name: &str, inode: i128) -> Parent {
+        Parent {
+            path: PathBuf::from(name),
+            name: CString::new(name).unwrap(),
+            file: Arc::clone(file),
+            identity: Identity { device: 1, inode },
+        }
+    }
+
+    #[test]
+    fn parent_cache_evicts_least_recently_used_entry_in_constant_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = Arc::new(File::open(dir.path()).unwrap());
+        let mut cache = ParentCache::with_capacity(3);
+        cache.insert(dummy_parent(&file, "a", 1));
+        cache.insert(dummy_parent(&file, "b", 2));
+        cache.insert(dummy_parent(&file, "c", 3));
+
+        // Promote `a` by taking and re-inserting it, then insert `d` so `b` is evicted.
+        let promoted = cache.take(Path::new("a")).unwrap();
+        assert_eq!(promoted.identity.inode, 1);
+        cache.insert(promoted);
+        cache.insert(dummy_parent(&file, "d", 4));
+
+        assert!(cache.take(Path::new("b")).is_none());
+        assert_eq!(cache.take(Path::new("a")).unwrap().identity.inode, 1);
+        assert_eq!(cache.take(Path::new("c")).unwrap().identity.inode, 3);
+        assert_eq!(cache.take(Path::new("d")).unwrap().identity.inode, 4);
     }
 }
