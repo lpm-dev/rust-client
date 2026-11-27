@@ -57,12 +57,39 @@ impl ResolutionMetadata<NoProjection> {
 }
 
 /// Identifies the cached document a projection is derived from.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProjectionSlot {
     entry: std::path::PathBuf,
     content_id: u128,
+    mutation: Arc<MetadataCacheMutation>,
+    content_revision: u64,
+    write_revision: Option<u64>,
     format: &'static str,
     facts: ProjectionFacts,
+}
+
+impl std::fmt::Debug for ProjectionSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProjectionSlot")
+            .field("entry", &self.entry)
+            .field("content_id", &self.content_id)
+            .field("content_revision", &self.content_revision)
+            .field("write_revision", &self.write_revision)
+            .field("format", &self.format)
+            .field("facts", &self.facts)
+            .finish()
+    }
+}
+
+/// Projection payload parked while its cold packument write is still in flight.
+pub(super) struct PendingProjection {
+    pub(super) packument_revision: u64,
+    pub(super) content_revision: u64,
+    pub(super) projection_revision: u64,
+    pub(super) entry: std::path::PathBuf,
+    pub(super) header: Vec<u8>,
+    pub(super) body: Vec<u8>,
+    pub(super) _reservation: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// What the registry needs from a document to choose it without decoding it.
@@ -73,10 +100,13 @@ pub(super) struct ProjectionFacts {
 }
 
 /// The entry that holds a decoded document, for binding its projection.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(super) struct ProjectionSource {
     pub(super) entry: std::path::PathBuf,
     pub(super) content_id: u128,
+    pub(super) mutation: Arc<MetadataCacheMutation>,
+    pub(super) content_revision: u64,
+    pub(super) write_revision: Option<u64>,
 }
 
 impl ProjectionSource {
@@ -87,6 +117,9 @@ impl ProjectionSource {
         (!P::FORMAT.is_empty()).then_some(ProjectionSlot {
             entry: self.entry,
             content_id: self.content_id,
+            mutation: self.mutation,
+            content_revision: self.content_revision,
+            write_revision: self.write_revision,
             format: P::FORMAT,
             facts,
         })
@@ -216,7 +249,7 @@ fn projection_header(slot: &ProjectionSlot) -> Option<Vec<u8>> {
     Some(header)
 }
 
-fn write_projection_file(
+pub(super) fn write_projection_file(
     entry: &std::path::Path,
     header: &[u8],
     body: &[u8],
@@ -276,20 +309,25 @@ impl RegistryClient {
             return;
         };
         // Share the packument's mutation coordinator so awaited `no-store` /
-        // invalidation removals serialize against in-flight projection writes
-        // and stale projections never survive removal as orphaned files.
-        let mutation = self.metadata_cache_mutation(&slot.entry);
-        let packument_revision = mutation
-            .revision
-            .load(std::sync::atomic::Ordering::Acquire);
+        // invalidation removals serialize against in-flight projection writes,
+        // cold packument writes pick up projections that arrive before
+        // publication, and delayed slots from superseded documents are dropped.
+        let mutation = slot.mutation;
+        let content_revision = slot.content_revision;
+        if mutation
+            .content_revision
+            .load(std::sync::atomic::Ordering::Acquire)
+            != content_revision
+        {
+            return;
+        }
         let projection_revision = mutation
             .projection_revision
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
             + 1;
         let write = move || {
-            let _reservation = reservation;
             before_lock();
-            let _operation = mutation
+            let mut state = mutation
                 .operation
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -298,13 +336,46 @@ impl RegistryClient {
                 .load(std::sync::atomic::Ordering::Acquire)
                 != projection_revision
                 || mutation
-                    .revision
+                    .content_revision
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != content_revision
+            {
+                return;
+            }
+            if let Some(packument_revision) = slot.write_revision {
+                if mutation
+                    .completed_revision
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    < packument_revision
+                {
+                    state.pending_projection = Some(PendingProjection {
+                        packument_revision,
+                        content_revision,
+                        projection_revision,
+                        entry: slot.entry,
+                        header,
+                        body,
+                        _reservation: reservation,
+                    });
+                    return;
+                }
+                if mutation
+                    .published_revision
                     .load(std::sync::atomic::Ordering::Acquire)
                     != packument_revision
+                    || !slot.entry.is_file()
+                {
+                    return;
+                }
+            } else if mutation
+                .completed_content_revision
+                .load(std::sync::atomic::Ordering::Acquire)
+                < content_revision
                 || !slot.entry.is_file()
             {
                 return;
             }
+            let _reservation = reservation;
             if let Err(error) = write_projection_file(&slot.entry, &header, &body) {
                 tracing::debug!(%error, "failed to write metadata projection");
             }
@@ -330,6 +401,9 @@ mod tests {
         ProjectionSlot {
             entry: std::path::PathBuf::from("entry"),
             content_id: 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210,
+            mutation: Arc::new(MetadataCacheMutation::new()),
+            content_revision: 0,
+            write_revision: None,
             format: "format/1",
             facts: ProjectionFacts {
                 versions_complete: latest.is_none(),
@@ -374,10 +448,17 @@ mod tests {
 
         let entry_path = client.cache_path("proj-race").expect("cache path");
         let proj_path = projection_path(&entry_path);
+        let mutation = client.metadata_cache_mutation(&entry_path);
+        let content_revision = mutation
+            .content_revision
+            .load(std::sync::atomic::Ordering::Acquire);
         let opened = cache::open_metadata_cache_entry(&entry_path).expect("seeded packument");
         let slot = ProjectionSlot {
             entry: entry_path.clone(),
             content_id: opened.header.content_id,
+            mutation,
+            content_revision,
+            write_revision: None,
             format: "test/1",
             facts: ProjectionFacts {
                 versions_complete: true,
@@ -439,5 +520,211 @@ mod tests {
         std::fs::write(projection_path(&entry), bytes).unwrap();
 
         assert!(read_projection::<PanicOnDecode>(&entry, slot.content_id + 1).is_none());
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RawBody(Vec<u8>);
+
+    impl MetadataProjection for RawBody {
+        const FORMAT: &'static str = "raw-body/1";
+
+        fn decode(bytes: &[u8]) -> Option<Self> {
+            Some(Self(bytes.to_vec()))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_async_cache_write_keeps_projection_when_projection_runs_before_packument_publish()
+    {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let mut client = RegistryClient::new().with_cache_dir(Some(cache_dir.path().to_path_buf()));
+
+        let (packument_paused_tx, packument_paused_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_packument_tx, release_packument_rx) = std::sync::mpsc::sync_channel(1);
+
+        let (_meta, written) = client
+            .write_metadata_cache_entry_async_with_hook(
+                "cold-proj-race",
+                serde_json::json!({"name": "cold-proj-race"}),
+                None,
+                cache::MetadataCacheDirective::Unspecified,
+                None,
+                move || {
+                    let _ = packument_paused_tx.send(());
+                    let _ = release_packument_rx.recv();
+                },
+            )
+            .await
+            .unwrap();
+
+        packument_paused_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("packument writer must pause before publishing");
+
+        let source = written
+            .and_then(|w| w.source)
+            .expect("cold write must yield a projection source");
+        let entry_path = source.entry.clone();
+        let content_id = source.content_id;
+        let slot = source
+            .slot::<RawBody>(ProjectionFacts {
+                versions_complete: true,
+                latest: None,
+            })
+            .expect("projection slot");
+
+        // Run the projection write while the cold packument file has not yet been published.
+        client.synchronous_cache_writes = true;
+        client.store_metadata_projection(slot, b"cold-derived-body".to_vec());
+        client.synchronous_cache_writes = false;
+
+        release_packument_tx.send(()).unwrap();
+        client.flush_pending_cache_writes().await;
+
+        assert!(
+            entry_path.is_file(),
+            "packument cache file must be published"
+        );
+        let projected = read_projection::<RawBody>(&entry_path, content_id);
+        assert_eq!(
+            projected.map(|(body, _)| body),
+            Some(RawBody(b"cold-derived-body".to_vec())),
+            "cold fetch must not drop its projection when the projection runs before packument publication"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delayed_projection_slot_cannot_overwrite_newer_packument_projection() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let client = RegistryClient::new()
+            .with_cache_dir(Some(cache_dir.path().to_path_buf()))
+            .with_synchronous_cache_writes(true);
+
+        let (_m1, w1) = client
+            .write_metadata_cache_entry_async(
+                "delayed-proj",
+                serde_json::json!({"name": "delayed-proj", "version": "1.0.0"}),
+                None,
+                cache::MetadataCacheDirective::Unspecified,
+                None,
+            )
+            .await
+            .unwrap();
+        let stale_slot = w1
+            .and_then(|w| w.source)
+            .and_then(|source| {
+                source.slot::<RawBody>(ProjectionFacts {
+                    versions_complete: true,
+                    latest: Some("1.0.0".to_string()),
+                })
+            })
+            .expect("v1 slot");
+
+        // A newer packument replaces v1 and writes its own projection.
+        let (_m2, w2) = client
+            .write_metadata_cache_entry_async(
+                "delayed-proj",
+                serde_json::json!({"name": "delayed-proj", "version": "2.0.0"}),
+                None,
+                cache::MetadataCacheDirective::Unspecified,
+                None,
+            )
+            .await
+            .unwrap();
+        let v2_source = w2.and_then(|w| w.source).expect("v2 source");
+        let v2_entry = v2_source.entry.clone();
+        let v2_content_id = v2_source.content_id;
+        let v2_slot = v2_source
+            .slot::<RawBody>(ProjectionFacts {
+                versions_complete: true,
+                latest: Some("2.0.0".to_string()),
+            })
+            .expect("v2 slot");
+        client.store_metadata_projection(v2_slot, b"v2-body".to_vec());
+
+        // Now the stale v1 slot is submitted late — it must not clobber v2's projection.
+        client.store_metadata_projection(stale_slot, b"stale-v1-body".to_vec());
+
+        let projected = read_projection::<RawBody>(&v2_entry, v2_content_id);
+        assert_eq!(
+            projected.map(|(body, _)| body),
+            Some(RawBody(b"v2-body".to_vec())),
+            "delayed projection slot from superseded packument must not overwrite newer projection"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parked_cold_projection_is_cancelled_when_no_store_arrives_before_packument_publish() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let mut client = RegistryClient::new().with_cache_dir(Some(cache_dir.path().to_path_buf()));
+        let permits_before = client.pending_cache_write_bytes.available_permits();
+
+        let (packument_paused_tx, packument_paused_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_packument_tx, release_packument_rx) = std::sync::mpsc::sync_channel(1);
+
+        let (_meta, written) = client
+            .write_metadata_cache_entry_async_with_hook(
+                "parked-no-store",
+                serde_json::json!({"name": "parked-no-store"}),
+                None,
+                cache::MetadataCacheDirective::Unspecified,
+                None,
+                move || {
+                    let _ = packument_paused_tx.send(());
+                    let _ = release_packument_rx.recv();
+                },
+            )
+            .await
+            .unwrap();
+
+        packument_paused_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("packument writer must pause before publishing");
+
+        let source = written
+            .and_then(|w| w.source)
+            .expect("cold write must yield a projection source");
+        let entry_path = source.entry.clone();
+        let proj_path = projection_path(&entry_path);
+        let slot = source
+            .slot::<RawBody>(ProjectionFacts {
+                versions_complete: true,
+                latest: None,
+            })
+            .expect("projection slot");
+
+        // Park the projection while the cold packument write is still in flight.
+        client.synchronous_cache_writes = true;
+        client.store_metadata_projection(slot, b"parked-body".to_vec());
+        client.synchronous_cache_writes = false;
+
+        // Now `no-store` arrives before the packument publishes.
+        let _ = client
+            .write_metadata_cache_entry_async(
+                "parked-no-store",
+                serde_json::json!({"name": "parked-no-store"}),
+                None,
+                cache::MetadataCacheDirective::NoStore,
+                None,
+            )
+            .await
+            .unwrap();
+
+        release_packument_tx.send(()).unwrap();
+        client.flush_pending_cache_writes().await;
+
+        assert!(
+            !entry_path.exists(),
+            "superseded cold packument must not be written after no-store"
+        );
+        assert!(
+            !proj_path.exists(),
+            "parked cold projection must not be written after no-store"
+        );
+        assert_eq!(
+            client.pending_cache_write_bytes.available_permits(),
+            permits_before,
+            "cancelled parked projection must release its pending-write budget permit"
+        );
     }
 }

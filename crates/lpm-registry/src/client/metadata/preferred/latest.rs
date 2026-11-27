@@ -353,62 +353,86 @@ impl RegistryClient {
             };
         }
 
+        let preferred_mutation = preferred_path
+            .as_deref()
+            .map(|path| self.metadata_cache_mutation(path));
+        let complete_mutation = complete_path
+            .as_deref()
+            .map(|path| self.metadata_cache_mutation(path));
         let target_name = name.to_owned();
         tokio::task::spawn_blocking(move || {
             let mut has_stale_history_validator = false;
             if let Some(path) = preferred_path
-                && let Some(entry) = crate::client::cache::open_metadata_cache_entry(&path)
+                && let Some(mutation) = preferred_mutation
             {
-                let entry_has_etag = entry.header.etag.is_some();
-                if entry.remaining_freshness().is_some()
-                    && let Some(resolution) = entry.resolve::<ResolverPreferred, P>(&path)
-                {
-                    match resolution {
-                        CachedResolution::Projected { value, facts, .. } => {
-                            return PreferenceProbe::Hit(Preference::History(Box::new(
-                                CachedHistory::projected(value, facts),
-                            )));
-                        }
-                        CachedResolution::Document { value, source } => {
-                            let preferred = PreferredMetadata::from(value);
-                            if preferred.is_valid(&target_name) {
+                let content_revision = mutation
+                    .content_revision
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if let Some(entry) = crate::client::cache::open_metadata_cache_entry(&path) {
+                    let entry_has_etag = entry.header.etag.is_some();
+                    if entry.remaining_freshness().is_some()
+                        && let Some(resolution) = entry.resolve::<ResolverPreferred, P>(
+                            &path,
+                            Arc::clone(&mutation),
+                            content_revision,
+                        )
+                    {
+                        match resolution {
+                            CachedResolution::Projected { value, facts, .. } => {
                                 return PreferenceProbe::Hit(Preference::History(Box::new(
-                                    CachedHistory::document(
-                                        preferred.metadata,
-                                        preferred.versions_complete,
-                                        source,
-                                    ),
+                                    CachedHistory::projected(value, facts),
                                 )));
+                            }
+                            CachedResolution::Document { value, source } => {
+                                let preferred = PreferredMetadata::from(value);
+                                if preferred.is_valid(&target_name) {
+                                    return PreferenceProbe::Hit(Preference::History(Box::new(
+                                        CachedHistory::document(
+                                            preferred.metadata,
+                                            preferred.versions_complete,
+                                            source,
+                                        ),
+                                    )));
+                                }
                             }
                         }
                     }
+                    has_stale_history_validator |= entry_has_etag;
                 }
-                has_stale_history_validator |= entry_has_etag;
             }
             if let Some(path) = complete_path
-                && let Some(entry) = crate::client::cache::open_metadata_cache_entry(&path)
+                && let Some(mutation) = complete_mutation
             {
-                let entry_has_etag = entry.header.etag.is_some();
-                if entry.remaining_freshness().is_some()
-                    && let Some(resolution) =
-                        entry.resolve::<resolver_cache::ResolverMetadata, P>(&path)
-                {
-                    match resolution {
-                        CachedResolution::Projected { value, facts, .. } => {
-                            return PreferenceProbe::Hit(Preference::History(Box::new(
-                                CachedHistory::projected(value, facts),
-                            )));
-                        }
-                        CachedResolution::Document { value, source } => {
-                            if batch_metadata_entry_matches_name(&target_name, &value.0) {
+                let content_revision = mutation
+                    .content_revision
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if let Some(entry) = crate::client::cache::open_metadata_cache_entry(&path) {
+                    let entry_has_etag = entry.header.etag.is_some();
+                    if entry.remaining_freshness().is_some()
+                        && let Some(resolution) = entry
+                            .resolve::<resolver_cache::ResolverMetadata, P>(
+                                &path,
+                                Arc::clone(&mutation),
+                                content_revision,
+                            )
+                    {
+                        match resolution {
+                            CachedResolution::Projected { value, facts, .. } => {
                                 return PreferenceProbe::Hit(Preference::History(Box::new(
-                                    CachedHistory::document(value.0, true, source),
+                                    CachedHistory::projected(value, facts),
                                 )));
+                            }
+                            CachedResolution::Document { value, source } => {
+                                if batch_metadata_entry_matches_name(&target_name, &value.0) {
+                                    return PreferenceProbe::Hit(Preference::History(Box::new(
+                                        CachedHistory::document(value.0, true, source),
+                                    )));
+                                }
                             }
                         }
                     }
+                    has_stale_history_validator |= entry_has_etag;
                 }
-                has_stale_history_validator |= entry_has_etag;
             }
             if let Some(body) = mem_latest_body
                 && let Ok(manifest) = serde_json::from_slice::<VersionMetadata>(

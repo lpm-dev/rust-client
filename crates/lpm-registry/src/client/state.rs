@@ -421,11 +421,33 @@ pub(super) struct MetadataCacheEntry<T> {
     pub(super) remaining_freshness: std::time::Duration,
 }
 
+#[derive(Default)]
+pub(super) struct MetadataCacheOperationState {
+    pub(super) pending_projection: Option<super::projection::PendingProjection>,
+}
+
 pub(super) struct MetadataCacheMutation {
     pub(super) revision: std::sync::atomic::AtomicU64,
+    pub(super) content_revision: std::sync::atomic::AtomicU64,
+    pub(super) completed_revision: std::sync::atomic::AtomicU64,
+    pub(super) completed_content_revision: std::sync::atomic::AtomicU64,
     pub(super) published_revision: std::sync::atomic::AtomicU64,
     pub(super) projection_revision: std::sync::atomic::AtomicU64,
-    pub(super) operation: std::sync::Mutex<()>,
+    pub(super) operation: std::sync::Mutex<MetadataCacheOperationState>,
+}
+
+impl MetadataCacheMutation {
+    pub(super) fn new() -> Self {
+        Self {
+            revision: std::sync::atomic::AtomicU64::new(0),
+            content_revision: std::sync::atomic::AtomicU64::new(0),
+            completed_revision: std::sync::atomic::AtomicU64::new(0),
+            completed_content_revision: std::sync::atomic::AtomicU64::new(0),
+            published_revision: std::sync::atomic::AtomicU64::new(0),
+            projection_revision: std::sync::atomic::AtomicU64::new(0),
+            operation: std::sync::Mutex::new(MetadataCacheOperationState::default()),
+        }
+    }
 }
 
 /// Observability for [`RegistryClient::parallel_fetch_npm_manifests`].

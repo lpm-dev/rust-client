@@ -1127,7 +1127,11 @@ impl RegistryClient {
             },
         }
 
+        let mutation = self.metadata_cache_mutation(&path);
         let outcome = tokio::task::spawn_blocking(move || {
+            let content_revision = mutation
+                .content_revision
+                .load(std::sync::atomic::Ordering::Acquire);
             let mut entry = super::cache::open_metadata_cache_entry(&path)?;
             if entry.header.etag.as_deref() != Some(validator_etag.as_str()) {
                 return None;
@@ -1148,21 +1152,24 @@ impl RegistryClient {
                         && etags_weak_match(effective_etag, cached_etag.as_deref())
             );
             if can_refresh_in_place {
-                let value = match entry.resolve::<R, P>(&path)? {
-                    CachedResolution::Projected {
-                        value,
-                        facts,
-                        source,
-                    } => CachedResolution::Projected {
-                        value,
-                        facts,
-                        source,
-                    },
-                    CachedResolution::Document { value, source } => CachedResolution::Document {
-                        value: into_document(value),
-                        source,
-                    },
-                };
+                let value =
+                    match entry.resolve::<R, P>(&path, Arc::clone(&mutation), content_revision)? {
+                        CachedResolution::Projected {
+                            value,
+                            facts,
+                            source,
+                        } => CachedResolution::Projected {
+                            value,
+                            facts,
+                            source,
+                        },
+                        CachedResolution::Document { value, source } => {
+                            CachedResolution::Document {
+                                value: into_document(value),
+                                source,
+                            }
+                        }
+                    };
                 Some(Stale304Outcome::InPlace {
                     value,
                     cached_etag,

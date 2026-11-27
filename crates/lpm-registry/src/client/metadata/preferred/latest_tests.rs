@@ -395,7 +395,7 @@ async fn latest_failed_parse_bytes_are_counted_when_history_recovers() {
 )]
 async fn latest_document_is_reused_while_disk_publication_is_pending() {
     use crate::client::state::MetadataCacheMutation;
-    use std::sync::{Arc, Mutex, atomic::AtomicU64};
+    use std::sync::Arc;
     let server = MockServer::start().await;
     let body = downloadable_history(&server);
     Mock::given(method("GET"))
@@ -413,12 +413,7 @@ async fn latest_document_is_reused_while_disk_publication_is_pending() {
         .await
         .with_synchronous_cache_writes(false);
     let key = client.npm_latest_metadata_cache_key("pkg", PublicNpmAccess::ANONYMOUS);
-    let mutation = Arc::new(MetadataCacheMutation {
-        revision: AtomicU64::new(0),
-        published_revision: AtomicU64::new(0),
-        projection_revision: AtomicU64::new(0),
-        operation: Mutex::new(()),
-    });
+    let mutation = Arc::new(MetadataCacheMutation::new());
     client
         .metadata_cache_mutations
         .lock()
