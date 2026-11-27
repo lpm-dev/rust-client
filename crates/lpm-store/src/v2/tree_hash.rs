@@ -240,7 +240,7 @@ impl TreeMetadataBuilder {
         self.refresh(index, path, payload)
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     pub(crate) fn record_with_metadata(
         &mut self,
         root: &Path,

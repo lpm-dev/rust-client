@@ -33,6 +33,109 @@ struct Parent {
     identity: Identity,
 }
 
+const MAX_CACHED_PARENTS: usize = 64;
+
+struct LruNode {
+    parent: Parent,
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
+struct ParentCache {
+    nodes: Vec<Option<LruNode>>,
+    free_slots: Vec<usize>,
+    index: HashMap<PathBuf, usize>,
+    head: Option<usize>,
+    tail: Option<usize>,
+    capacity: usize,
+}
+
+impl ParentCache {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            nodes: Vec::with_capacity(capacity),
+            free_slots: Vec::new(),
+            index: HashMap::with_capacity(capacity),
+            head: None,
+            tail: None,
+            capacity,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.nodes.clear();
+        self.free_slots.clear();
+        self.index.clear();
+        self.head = None;
+        self.tail = None;
+    }
+
+    fn unlink(&mut self, slot: usize) -> Parent {
+        let node = self.nodes[slot].take().expect("LRU slot must be occupied");
+        match node.prev {
+            Some(prev) => {
+                if let Some(prev_node) = self.nodes[prev].as_mut() {
+                    prev_node.next = node.next;
+                }
+            }
+            None => self.head = node.next,
+        }
+        match node.next {
+            Some(next) => {
+                if let Some(next_node) = self.nodes[next].as_mut() {
+                    next_node.prev = node.prev;
+                }
+            }
+            None => self.tail = node.prev,
+        }
+        self.free_slots.push(slot);
+        node.parent
+    }
+
+    fn take(&mut self, path: &Path) -> Option<Parent> {
+        let slot = self.index.remove(path)?;
+        Some(self.unlink(slot))
+    }
+
+    fn insert(&mut self, parent: Parent) {
+        if self.capacity == 0 {
+            return;
+        }
+        if let Some(existing) = self.index.remove(&parent.path) {
+            let _ = self.unlink(existing);
+        } else if self.index.len() >= self.capacity
+            && let Some(lru_slot) = self.tail
+        {
+            let evicted = self.unlink(lru_slot);
+            self.index.remove(&evicted.path);
+        }
+        let path_key = parent.path.clone();
+        let old_head = self.head;
+        let node = LruNode {
+            parent,
+            prev: None,
+            next: old_head,
+        };
+        let slot = if let Some(slot) = self.free_slots.pop() {
+            self.nodes[slot] = Some(node);
+            slot
+        } else {
+            let slot = self.nodes.len();
+            self.nodes.push(Some(node));
+            slot
+        };
+        if let Some(head_slot) = old_head
+            && let Some(head_node) = self.nodes[head_slot].as_mut()
+        {
+            head_node.prev = Some(slot);
+        } else {
+            self.tail = Some(slot);
+        }
+        self.head = Some(slot);
+        self.index.insert(path_key, slot);
+    }
+}
+
 pub(crate) struct OutputTree {
     root_path: PathBuf,
     visible_root_path: PathBuf,
@@ -40,6 +143,7 @@ pub(crate) struct OutputTree {
     root_identity: Identity,
     directories: HashMap<PathBuf, DirectoryRecord>,
     parent: Option<Parent>,
+    recent_parents: ParentCache,
 }
 
 impl OutputTree {
@@ -53,7 +157,15 @@ impl OutputTree {
             root_identity,
             directories: HashMap::with_capacity(64),
             parent: None,
+            recent_parents: ParentCache::with_capacity(MAX_CACHED_PARENTS),
         })
+    }
+
+    fn park_current_parent(&mut self) {
+        let Some(previous) = self.parent.take() else {
+            return;
+        };
+        self.recent_parents.insert(previous);
     }
 
     pub(crate) fn prepare_parent(
@@ -63,7 +175,7 @@ impl OutputTree {
     ) -> Result<(), LpmError> {
         let parent = path.parent().unwrap_or(Path::new(""));
         if parent.as_os_str().is_empty() {
-            self.parent = None;
+            self.park_current_parent();
             return Ok(());
         }
         if self
@@ -73,7 +185,16 @@ impl OutputTree {
         {
             return Ok(());
         }
-        self.parent = None;
+        self.park_current_parent();
+        if let Some(cached) = self.recent_parents.take(parent)
+            && self
+                .directories
+                .get(parent)
+                .is_some_and(|record| record.identity == cached.identity)
+        {
+            self.parent = Some(cached);
+            return Ok(());
+        }
 
         let mut current = None::<Dir>;
         let mut prefix = PathBuf::with_capacity(parent.as_os_str().len());
@@ -195,9 +316,53 @@ impl OutputTree {
 
     pub(crate) fn validate(&mut self) -> Result<(), LpmError> {
         self.parent = None;
+        self.recent_parents.clear();
         self.validate_root()?;
-        for path in self.directories.keys() {
-            self.open_recorded_directory(path)?;
+        if self.directories.is_empty() {
+            return Ok(());
+        }
+        // Sort lexicographically so every recorded ancestor precedes its
+        // descendants, allowing each directory to be opened once from an
+        // already-validated parent handle instead of re-walking from root.
+        let mut paths: Vec<&Path> = self.directories.keys().map(PathBuf::as_path).collect();
+        paths.sort_unstable();
+        let mut stack: Vec<(&Path, Dir)> = Vec::new();
+        for path in paths {
+            let record = self
+                .directories
+                .get(path)
+                .ok_or_else(|| changed_directory(path))?;
+            let parent_path = path.parent().unwrap_or(Path::new(""));
+            while stack
+                .last()
+                .is_some_and(|(top_path, _)| *top_path != parent_path)
+            {
+                stack.pop();
+            }
+            let opened = if let Some((_, parent_dir)) = stack.last() {
+                let leaf = path.file_name().ok_or_else(|| changed_directory(path))?;
+                let next = parent_dir
+                    .open_dir_nofollow(Path::new(leaf))
+                    .map_err(|error| path_error(error, path))?;
+                if Identity::from_cap(&next.dir_metadata()?) != record.identity {
+                    return Err(changed_directory(path));
+                }
+                next
+            } else if parent_path.as_os_str().is_empty() {
+                let leaf = path.file_name().ok_or_else(|| changed_directory(path))?;
+                let next = self
+                    .root
+                    .open_dir_nofollow(Path::new(leaf))
+                    .map_err(|error| path_error(error, path))?;
+                if Identity::from_cap(&next.dir_metadata()?) != record.identity {
+                    return Err(changed_directory(path));
+                }
+                next
+            } else {
+                self.open_recorded_directory(path)?
+                    .ok_or_else(|| changed_directory(path))?
+            };
+            stack.push((path, opened));
         }
         Ok(())
     }
@@ -217,6 +382,7 @@ impl OutputTree {
 
     pub(crate) fn cleanup<E: ExtractionRecord>(&mut self, files: &[E], identities: &[Identity]) {
         self.parent = None;
+        self.recent_parents.clear();
         if files.len() != identities.len() {
             return;
         }

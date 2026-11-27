@@ -143,7 +143,7 @@ thread_local! {
     static FAIL_NEXT_REMAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const MAP_THRESHOLD: usize = 256 * 1024;
 
 #[cfg(unix)]
@@ -155,7 +155,12 @@ fn page_size() -> usize {
     })
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+fn page_size() -> usize {
+    4096
+}
+
+#[cfg(any(unix, windows))]
 fn mapped_capacity(size: usize) -> usize {
     let page = page_size();
     size.div_ceil(page)
@@ -163,14 +168,37 @@ fn mapped_capacity(size: usize) -> usize {
         .expect("buffer size overflows usize")
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn is_mapped(capacity: usize) -> bool {
     capacity >= MAP_THRESHOLD
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn is_mapped(_capacity: usize) -> bool {
     false
+}
+
+#[cfg(windows)]
+mod win_mem {
+    pub(super) const MEM_COMMIT: u32 = 0x0000_1000;
+    pub(super) const MEM_RESERVE: u32 = 0x0000_2000;
+    pub(super) const MEM_RELEASE: u32 = 0x0000_8000;
+    pub(super) const PAGE_READWRITE: u32 = 0x04;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub(super) fn VirtualAlloc(
+            lp_address: *const std::ffi::c_void,
+            dw_size: usize,
+            fl_allocation_type: u32,
+            fl_protect: u32,
+        ) -> *mut std::ffi::c_void;
+        pub(super) fn VirtualFree(
+            lp_address: *mut std::ffi::c_void,
+            dw_size: usize,
+            dw_free_type: u32,
+        ) -> i32;
+    }
 }
 
 /// Allocate at least `size` bytes; returns the pointer and the capacity owned.
@@ -195,6 +223,21 @@ fn allocate(size: usize, zeroed: bool) -> (NonNull<u8>, usize) {
         // Fresh anonymous pages are already zero.
         return (allocated(ptr.cast(), layout(capacity)), capacity);
     }
+    #[cfg(windows)]
+    if is_mapped(size) {
+        let capacity = mapped_capacity(size);
+        // SAFETY: `VirtualAlloc` with a null base address commits fresh zeroed
+        // private pages owned exclusively by this buffer.
+        let ptr = unsafe {
+            win_mem::VirtualAlloc(
+                std::ptr::null(),
+                capacity,
+                win_mem::MEM_COMMIT | win_mem::MEM_RESERVE,
+                win_mem::PAGE_READWRITE,
+            )
+        };
+        return (allocated(ptr.cast(), layout(capacity)), capacity);
+    }
     let layout = layout(size);
     // SAFETY: `layout` has a non-zero size.
     let ptr = unsafe {
@@ -213,6 +256,15 @@ unsafe fn release(ptr: NonNull<u8>, capacity: usize) {
     if is_mapped(capacity) {
         // SAFETY: the caller passes a mapping of exactly `capacity` bytes.
         unsafe { libc::munmap(ptr.as_ptr().cast(), capacity) };
+        return;
+    }
+    #[cfg(windows)]
+    if is_mapped(capacity) {
+        // SAFETY: `ptr` was returned by `VirtualAlloc` with `MEM_RESERVE` and is
+        // released in full with `dwSize = 0` and `MEM_RELEASE`.
+        unsafe {
+            win_mem::VirtualFree(ptr.as_ptr().cast(), 0, win_mem::MEM_RELEASE);
+        }
         return;
     }
     // SAFETY: the caller passes a `System` allocation with this layout.

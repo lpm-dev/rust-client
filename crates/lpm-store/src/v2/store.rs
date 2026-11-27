@@ -3399,7 +3399,8 @@ impl Store {
         let mut all_tree_blobs = std::collections::HashSet::new();
         let mut reachable_blob_ids: std::collections::HashSet<crate::v3::CompactBlobKey> =
             std::collections::HashSet::new();
-        let mut tree_manifests = std::collections::HashMap::with_capacity(materialized_digests.len());
+        let mut tree_manifests =
+            std::collections::HashMap::with_capacity(materialized_digests.len());
         for tree_path in &tree_files {
             let (digest, manifest) = match cas.manifest_from_file(tree_path) {
                 Ok(manifest) => manifest,
@@ -4496,6 +4497,9 @@ fn dependency_links_match(
         if actual != expected {
             #[cfg(windows)]
             if actual.is_absolute() {
+                if lpm_common::link_targets_equivalent(&actual, &link, &expected) {
+                    continue;
+                }
                 let parent = link
                     .parent()
                     .ok_or_else(|| LpmError::Store("dependency link has no parent".into()))?;
@@ -4761,8 +4765,9 @@ fn unescape_mountinfo_bytes(raw: &[u8]) -> Vec<u8> {
             && matches!(raw[index + 2], b'0'..=b'7')
             && matches!(raw[index + 3], b'0'..=b'7')
         {
-            let value =
-                ((raw[index + 1] - b'0') << 6) | ((raw[index + 2] - b'0') << 3) | (raw[index + 3] - b'0');
+            let value = ((raw[index + 1] - b'0') << 6)
+                | ((raw[index + 2] - b'0') << 3)
+                | (raw[index + 3] - b'0');
             out.push(value);
             index += 4;
         } else {
@@ -4824,7 +4829,9 @@ fn linux_overlay_upperdir_from_mountinfo(path: &Path, mountinfo: &[u8]) -> Optio
 
 #[cfg(target_os = "linux")]
 fn share_host_root_prefix(upper: &Path, mount_root: &Path) -> bool {
-    let mut upper_components = upper.components().filter(|c| matches!(c, std::path::Component::Normal(_)));
+    let mut upper_components = upper
+        .components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)));
     let mut root_components = mount_root
         .components()
         .filter(|c| matches!(c, std::path::Component::Normal(_)))

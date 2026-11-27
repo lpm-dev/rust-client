@@ -98,7 +98,7 @@ pub fn remove_path_entry_counting_freed_bytes(path: &Path) -> std::io::Result<u6
         return Ok(0);
     }
     if !metadata.is_dir() {
-        let freed = freed_by_unlinking(&metadata);
+        let freed = freed_by_unlinking(path, &metadata);
         std::fs::remove_file(path)?;
         return Ok(freed);
     }
@@ -138,7 +138,7 @@ fn clear_directory_counting_freed_bytes(directory: &cap_std::fs::Dir) -> std::io
             directory.remove_dir(&name)?;
         } else {
             if metadata.is_file() {
-                freed = freed.saturating_add(cap_freed_by_unlinking(&metadata));
+                freed = freed.saturating_add(cap_freed_by_unlinking(directory, &name, &metadata));
             }
             directory.remove_file_or_symlink(&name)?;
         }
@@ -148,7 +148,7 @@ fn clear_directory_counting_freed_bytes(directory: &cap_std::fs::Dir) -> std::io
 
 /// What unlinking a file frees: its bytes, once its last link goes.
 #[cfg(unix)]
-fn freed_by_unlinking(metadata: &std::fs::Metadata) -> u64 {
+fn freed_by_unlinking(_path: &Path, metadata: &std::fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt as _;
     if metadata.nlink() <= 1 {
         metadata.len()
@@ -157,13 +157,37 @@ fn freed_by_unlinking(metadata: &std::fs::Metadata) -> u64 {
     }
 }
 
-#[cfg(not(unix))]
-fn freed_by_unlinking(metadata: &std::fs::Metadata) -> u64 {
+#[cfg(windows)]
+fn freed_by_unlinking(path: &Path, metadata: &std::fs::Metadata) -> u64 {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+
+    let open = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path);
+    match open.and_then(|file| crate::atomic_write::windows_file_information(&file)) {
+        Ok(info) if info.nNumberOfLinks <= 1 => metadata.len(),
+        Ok(_) => 0,
+        Err(_) => metadata.len(),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn freed_by_unlinking(_path: &Path, metadata: &std::fs::Metadata) -> u64 {
     metadata.len()
 }
 
 #[cfg(unix)]
-fn cap_freed_by_unlinking(metadata: &cap_std::fs::Metadata) -> u64 {
+fn cap_freed_by_unlinking(
+    _directory: &cap_std::fs::Dir,
+    _name: &std::ffi::OsStr,
+    metadata: &cap_std::fs::Metadata,
+) -> u64 {
     use cap_std::fs::MetadataExt as _;
     if metadata.nlink() <= 1 {
         metadata.len()
@@ -172,8 +196,39 @@ fn cap_freed_by_unlinking(metadata: &cap_std::fs::Metadata) -> u64 {
     }
 }
 
-#[cfg(not(unix))]
-fn cap_freed_by_unlinking(metadata: &cap_std::fs::Metadata) -> u64 {
+#[cfg(windows)]
+fn cap_freed_by_unlinking(
+    directory: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+    metadata: &cap_std::fs::Metadata,
+) -> u64 {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+    use cap_std::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .follow(FollowSymlinks::No);
+    let open = directory
+        .open_with(name, &options)
+        .map(cap_std::fs::File::into_std);
+    match open.and_then(|file| crate::atomic_write::windows_file_information(&file)) {
+        Ok(info) if info.nNumberOfLinks <= 1 => metadata.len(),
+        Ok(_) => 0,
+        Err(_) => metadata.len(),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn cap_freed_by_unlinking(
+    _directory: &cap_std::fs::Dir,
+    _name: &std::ffi::OsStr,
+    metadata: &cap_std::fs::Metadata,
+) -> u64 {
     metadata.len()
 }
 
@@ -244,12 +299,14 @@ fn create_dir_symlink_or_junction_inner(target: &Path, link: &Path) -> std::io::
     let link = with_backslashes(link);
     let target = with_backslashes(target);
     let abs_target = absolute_windows_link_target(&target, &link)?;
+    let link_for_api = extended_if_long(&link)?;
+    let target_for_api = extended_if_long(&abs_target)?;
 
     if !SYMLINK_DIR_PRIVILEGE_MISSING.load(Ordering::Relaxed) {
         // Try symlink_dir first — works without admin on Windows setups
         // running with Developer Mode or with the SeCreateSymbolicLink
         // privilege granted via group policy.
-        match std::os::windows::fs::symlink_dir(&abs_target, &link) {
+        match std::os::windows::fs::symlink_dir(target_for_api.as_ref(), link_for_api.as_ref()) {
             Ok(()) => return Ok(()),
             Err(error) if error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => {
                 SYMLINK_DIR_PRIVILEGE_MISSING.store(true, Ordering::Relaxed);
@@ -257,7 +314,20 @@ fn create_dir_symlink_or_junction_inner(target: &Path, link: &Path) -> std::io::
             Err(_) => {}
         }
     }
-    create_junction(&abs_target, &link)
+    create_junction(&abs_target, link_for_api.as_ref())
+}
+
+#[cfg(windows)]
+fn extended_if_long(path: &Path) -> std::io::Result<std::borrow::Cow<'_, Path>> {
+    // Win32 directory APIs enforce a 248-character MAX_PATH ceiling without `\\?\`.
+    const WINDOWS_DIR_MAX_PATH: usize = 248;
+    if path.as_os_str().len() >= WINDOWS_DIR_MAX_PATH {
+        Ok(std::borrow::Cow::Owned(crate::absolute_extended_path(
+            path,
+        )?))
+    } else {
+        Ok(std::borrow::Cow::Borrowed(path))
+    }
 }
 
 /// `path` with every `/` as `\`. A scoped package's name puts a `/` in the
@@ -409,24 +479,50 @@ fn absolute_windows_link_target(target: &Path, link: &Path) -> std::io::Result<P
     Ok(lexically_clean(&absolute_parent.join(target)))
 }
 
+/// Resolve a symlink `target` for probing against `link`'s parent directory
+/// rather than the process working directory.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(crate) fn resolve_symlink_probe_path(target: &Path, link: &Path) -> PathBuf {
+    if target.is_absolute() {
+        return lexically_clean(target);
+    }
+    match link
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        Some(parent) => lexically_clean(&parent.join(target)),
+        None => lexically_clean(target),
+    }
+}
+
 #[cfg(windows)]
 fn create_symlink_inner(target: &Path, link: &Path) -> std::io::Result<()> {
-    match std::fs::metadata(target) {
+    let target_bs = with_backslashes(target);
+    let link_bs = with_backslashes(link);
+    let probe = resolve_symlink_probe_path(target_bs.as_ref(), link_bs.as_ref());
+    let probe_for_api = extended_if_long(&probe)?;
+    match std::fs::metadata(probe_for_api.as_ref()) {
         Ok(meta) if meta.is_dir() => create_dir_symlink_or_junction_inner(target, link),
-        Ok(_) => std::os::windows::fs::symlink_file(target, link),
+        Ok(_) => {
+            let link_for_api = extended_if_long(link_bs.as_ref())?;
+            let target_for_api = if target_bs.is_absolute() {
+                extended_if_long(target_bs.as_ref())?
+            } else {
+                std::borrow::Cow::Borrowed(target_bs.as_ref())
+            };
+            std::os::windows::fs::symlink_file(target_for_api.as_ref(), link_for_api.as_ref())
+        }
         Err(e) => Err(e),
     }
 }
 
 /// Lexically simplify `..` and `.` segments in a path without touching
-/// the filesystem. Used by the Windows link path so a junction receives
-/// a canonical absolute target.
+/// the filesystem.
 ///
 /// `a/b/../c` → `a/c`, `./a` → `a`, leading `..` segments are
 /// preserved (we have no parent to pop into). Leading `RootDir` /
 /// `Prefix` components are kept verbatim.
-#[cfg(windows)]
-fn lexically_clean(p: &Path) -> PathBuf {
+pub fn lexically_clean(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in p.components() {
         match component {
@@ -443,6 +539,83 @@ fn lexically_clean(p: &Path) -> PathBuf {
             other => out.push(other.as_os_str()),
         }
     }
+    out
+}
+
+/// Compare an existing symlink/junction target read from `link_path` against
+/// `expected_target`, handling relative `..` segments on every platform and
+/// Windows `\\?\` prefixes, slash differences, and ASCII case folding.
+pub fn link_targets_equivalent(
+    existing_target: &Path,
+    link_path: &Path,
+    expected_target: &Path,
+) -> bool {
+    if existing_target == expected_target {
+        return true;
+    }
+    let resolved_existing = resolve_symlink_probe_path(existing_target, link_path);
+    let resolved_expected = resolve_symlink_probe_path(expected_target, link_path);
+    if resolved_existing == resolved_expected {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        normalize_windows_link_target_str(&resolved_existing.to_string_lossy())
+            == normalize_windows_link_target_str(&resolved_expected.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(crate) fn normalize_windows_link_target_str(raw: &str) -> String {
+    let mut s = raw.replace('/', "\\");
+    if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+        s = format!(r"\\{unc}");
+    } else if let Some(verbatim) = s.strip_prefix(r"\\?\") {
+        s = verbatim.to_string();
+    } else if let Some(nt_unc) = s.strip_prefix(r"\??\UNC\") {
+        s = format!(r"\\{nt_unc}");
+    } else if let Some(nt) = s.strip_prefix(r"\??\") {
+        s = nt.to_string();
+    }
+    // Lexically collapse `\`-separated `.` and `..` segments even when tested on Unix hosts.
+    let (prefix, rest) = if let Some(unc_rest) = s.strip_prefix(r"\\") {
+        (r"\\", unc_rest)
+    } else if s.len() >= 3
+        && s.as_bytes()[0].is_ascii_alphabetic()
+        && s.as_bytes()[1] == b':'
+        && s.as_bytes()[2] == b'\\'
+    {
+        (&s[..3], &s[3..])
+    } else {
+        ("", s.as_str())
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in rest.split('\\') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                if parts.last().is_some_and(|last| *last != "..") {
+                    parts.pop();
+                } else if prefix.is_empty() {
+                    parts.push("..");
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    let mut out = String::with_capacity(s.len());
+    out.push_str(prefix);
+    for (idx, part) in parts.iter().enumerate() {
+        if idx > 0 {
+            out.push('\\');
+        }
+        out.push_str(part);
+    }
+    out.make_ascii_lowercase();
     out
 }
 
@@ -1079,6 +1252,43 @@ mod entry_removal_tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(std::fs::read(real_directory.join("marker")).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn resolve_symlink_probe_path_resolves_relative_targets_against_link_parent() {
+        let probe = super::resolve_symlink_probe_path(
+            Path::new("../shared/pkg"),
+            Path::new("/workspace/project/node_modules/@scope/pkg"),
+        );
+        assert_eq!(
+            probe,
+            Path::new("/workspace/project/node_modules/shared/pkg")
+        );
+
+        let abs = super::resolve_symlink_probe_path(
+            Path::new("/opt/store/pkg"),
+            Path::new("/workspace/project/node_modules/pkg"),
+        );
+        assert_eq!(abs, Path::new("/opt/store/pkg"));
+    }
+
+    #[test]
+    fn normalize_windows_link_target_handles_verbatim_prefixes_slashes_and_case() {
+        let verbatim = super::normalize_windows_link_target_str(
+            r"\\?\C:\Users\Dev\.lpm\store\v2\links\pkg\node_modules\pkg",
+        );
+        let mixed = super::normalize_windows_link_target_str(
+            r"c:/Users/Dev/.lpm/store/v2/links/tmp/../pkg/node_modules/pkg/",
+        );
+        let nt_prefix = super::normalize_windows_link_target_str(
+            r"\??\C:\Users\Dev\.lpm\store\v2\links\pkg\node_modules\pkg",
+        );
+        assert_eq!(verbatim, mixed);
+        assert_eq!(verbatim, nt_prefix);
+
+        let unc_verbatim = super::normalize_windows_link_target_str(r"\\?\UNC\Server\Share\Pkg\");
+        let unc_plain = super::normalize_windows_link_target_str(r"\\server/share/pkg");
+        assert_eq!(unc_verbatim, unc_plain);
     }
 }
 

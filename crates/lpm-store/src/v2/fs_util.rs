@@ -724,7 +724,12 @@ fn materialize_regular_file(
     {
         linux_copy::copy_file_with_metadata(src, dst, warm_source)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        let _ = warm_source;
+        windows_copy_file_with_metadata(src, dst)
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = warm_source;
         std::fs::copy(src, dst).map_err(|copy_err| {
@@ -736,6 +741,117 @@ fn materialize_regular_file(
         })?;
         Ok(None)
     }
+}
+
+/// Copy small regular files (`<= 64 KiB`) on Windows via open handles so we
+/// can read the settled destination metadata directly from the destination
+/// handle without a follow-up path stat; larger files delegate to `CopyFileExW`
+/// via `std::fs::copy`.
+#[cfg(windows)]
+fn windows_copy_file_with_metadata(
+    src: &Path,
+    dst: &Path,
+) -> Result<Option<std::fs::Metadata>, LpmError> {
+    use std::io::{Read as _, Write as _};
+
+    const WINDOWS_SMALL_COPY_MAX_BYTES: u64 = 64 * 1024;
+    let mut source = std::fs::File::open(src).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to open virtual-store source file {} → {}: {e}",
+            src.display(),
+            dst.display()
+        ))
+    })?;
+    let source_meta = source.metadata().map_err(|e| {
+        LpmError::Store(format!(
+            "failed to inspect virtual-store source file {} → {}: {e}",
+            src.display(),
+            dst.display()
+        ))
+    })?;
+    if !source_meta.is_file() || source_meta.len() > WINDOWS_SMALL_COPY_MAX_BYTES {
+        drop(source);
+        std::fs::copy(src, dst).map_err(|copy_err| {
+            LpmError::Store(format!(
+                "failed to copy virtual-store source file {} → {}: {copy_err}",
+                src.display(),
+                dst.display()
+            ))
+        })?;
+        return Ok(None);
+    }
+    let expected_len = source_meta.len() as usize;
+    let readonly = source_meta.permissions().readonly();
+    thread_local! {
+        static SMALL_COPY_BUF: std::cell::RefCell<Vec<u8>> =
+            std::cell::RefCell::new(vec![0u8; WINDOWS_SMALL_COPY_MAX_BYTES as usize + 1]);
+    }
+    SMALL_COPY_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        let mut copied = 0usize;
+        while copied < expected_len {
+            match source.read(&mut buf[copied..=expected_len]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    copied += n;
+                    if copied > expected_len {
+                        return Err(LpmError::Store(format!(
+                            "virtual-store source file changed during copy: {}",
+                            src.display()
+                        )));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(LpmError::Store(format!(
+                        "failed to read virtual-store source file {} → {}: {error}",
+                        src.display(),
+                        dst.display()
+                    )));
+                }
+            }
+        }
+        if copied != expected_len {
+            return Err(LpmError::Store(format!(
+                "virtual-store source file truncated during copy: {}",
+                src.display()
+            )));
+        }
+        let mut destination = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dst)
+            .map_err(|e| {
+                LpmError::Store(format!(
+                    "failed to create virtual-store file {} → {}: {e}",
+                    src.display(),
+                    dst.display()
+                ))
+            })?;
+        let written = (|| -> std::io::Result<std::fs::Metadata> {
+            if copied > 0 {
+                destination.write_all(&buf[..copied])?;
+            }
+            if readonly {
+                let mut perms = destination.metadata()?.permissions();
+                perms.set_readonly(true);
+                destination.set_permissions(perms)?;
+            }
+            destination.metadata()
+        })();
+        match written {
+            Ok(meta) => Ok(Some(meta)),
+            Err(error) => {
+                drop(destination);
+                let _ = std::fs::remove_file(dst);
+                Err(LpmError::Store(format!(
+                    "failed to copy virtual-store source file {} → {}: {error}",
+                    src.display(),
+                    dst.display()
+                )))
+            }
+        }
+    })
 }
 
 #[cfg(unix)]

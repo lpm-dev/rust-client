@@ -268,15 +268,7 @@ pub(super) fn symlink_points_to(link_path: &Path, target_path: &Path) -> bool {
     let Ok(existing_target) = std::fs::read_link(link_path) else {
         return false;
     };
-    if existing_target == target_path {
-        return true;
-    }
-    if existing_target.is_relative()
-        && let Some(parent) = link_path.parent()
-    {
-        return parent.join(existing_target) == target_path;
-    }
-    false
+    lpm_common::link_targets_equivalent(&existing_target, link_path, target_path)
 }
 
 /// Resolve a target's root-symlink filenames. Mirrors v1's contract
@@ -396,4 +388,27 @@ pub(super) fn ensure_link_parent_dir(
 
 pub(super) fn ensure_real_dir(path: &Path, label: &str) -> Result<(), LpmError> {
     ensure_real_dir_with_prefix(path, label, "virtual-store linker: ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symlink_points_to_matches_relative_parent_traversal_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope_dir = dir.path().join("node_modules/@scope");
+        let target_dir = dir.path().join("node_modules/.lpm/compat/pkg");
+        std::fs::create_dir_all(&scope_dir).unwrap();
+        std::fs::create_dir_all(&target_dir).unwrap();
+
+        let link_path = scope_dir.join("pkg");
+        let relative_target = Path::new("../.lpm/compat/pkg");
+        create_dir_symlink_or_junction(relative_target, &link_path).unwrap();
+
+        assert!(
+            symlink_points_to(&link_path, &target_dir),
+            "relative symlink with `..` segments must match its cleaned absolute target"
+        );
+    }
 }

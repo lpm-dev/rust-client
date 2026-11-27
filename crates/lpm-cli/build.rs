@@ -45,6 +45,10 @@ fn main() {
         // not silently fall back to Windows' 1 MiB default stack.
         if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
             println!("cargo:rustc-link-arg-bins=/STACK:8388608");
+            println!("cargo:rustc-link-arg-bins=delayimp.lib");
+            for dll in ["userenv.dll", "mpr.dll", "netapi32.dll", "shell32.dll"] {
+                println!("cargo:rustc-link-arg-bins=/DELAYLOAD:{dll}");
+            }
             println!("cargo:rustc-link-arg-tests=/MANIFEST:EMBED");
         } else {
             println!("cargo:rustc-link-arg-bins=-Wl,--stack,8388608");

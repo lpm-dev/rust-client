@@ -145,6 +145,7 @@ mod windows {
         ///
         /// When Windows can't tell the volume.
         pub fn of(file: &impl AsRawHandle) -> io::Result<Self> {
+            let mut serial = 0_u32;
             let mut flags = 0_u32;
             let mut file_system = [0_u16; 64];
             let capacity = u32::try_from(file_system.len()).map_err(io::Error::other)?;
@@ -155,7 +156,7 @@ mod windows {
                     file.as_raw_handle(),
                     std::ptr::null_mut(),
                     0,
-                    std::ptr::null_mut(),
+                    &mut serial,
                     std::ptr::null_mut(),
                     &mut flags,
                     file_system.as_mut_ptr(),
@@ -169,8 +170,7 @@ mod windows {
                 .iter()
                 .position(|unit| *unit == 0)
                 .unwrap_or(file_system.len());
-            let network =
-                crate::owner_only::final_path(file).is_ok_and(|path| is_network_path(&path));
+            let network = volume_is_network_cached(serial, file);
             Ok(Self {
                 flags,
                 file_system: String::from_utf16_lossy(&file_system[..end]),
@@ -270,6 +270,35 @@ mod windows {
             Some(Component::Prefix(prefix))
                 if matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..))
         )
+    }
+
+    fn volume_is_network_cached(serial: u32, file: &impl AsRawHandle) -> bool {
+        use std::collections::HashMap;
+        use std::sync::{OnceLock, RwLock};
+
+        const MAX_CACHED_VOLUMES: usize = 64;
+        if serial == 0 {
+            return crate::owner_only::final_path(file).is_ok_and(|path| is_network_path(&path));
+        }
+        static CACHE: OnceLock<RwLock<HashMap<u32, bool>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| RwLock::new(HashMap::with_capacity(8)));
+        if let Some(&is_network) = cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&serial)
+        {
+            return is_network;
+        }
+        let is_network =
+            crate::owner_only::final_path(file).is_ok_and(|path| is_network_path(&path));
+        let mut guard = cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.len() >= MAX_CACHED_VOLUMES && !guard.contains_key(&serial) {
+            guard.clear();
+        }
+        guard.insert(serial, is_network);
+        is_network
     }
 
     #[cfg(test)]
