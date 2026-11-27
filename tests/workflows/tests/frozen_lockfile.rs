@@ -26,12 +26,7 @@ async fn install_once(project: &TempProject, mock: &MockRegistry) {
 
 fn install_workspace_once(project: &TempProject) {
     let output = lpm(project)
-        .args([
-            "install",
-            "--no-recursive",
-            "--no-security-summary",
-            "--no-skills",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run initial workspace lpm install");
 
@@ -458,6 +453,11 @@ fn lpm_ci_accepts_workspace_member_trusted_dependencies_without_rewriting_lockfi
     "trustedDependencies": ["esbuild"]
   }
 }"#,
+    );
+    support::write_signed_unlock_for(
+        &project,
+        &project.path().join("packages/foo"),
+        &["trust-bulk-approve"],
     );
 
     install_workspace_once(&project);

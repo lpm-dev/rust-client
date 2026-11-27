@@ -685,8 +685,11 @@ fn store_compat_island_complete(
             return false;
         }
         let package_dir = compatibility_package_dir(store_island, &entry.key);
-        let shallow_eligible = store.source_policy_allows_shallow_guard_for_sri(&entry.target.source_sri)
-            && package_dir.join(".lpm-built").symlink_metadata().is_err();
+        let entry_source_policy =
+            store.source_policy_allows_shallow_guard_for_sri(&entry.target.source_sri);
+        let entry_trust_restored = trust_restored && entry_source_policy;
+        let shallow_eligible =
+            entry_source_policy && package_dir.join(".lpm-built").symlink_metadata().is_err();
         let mut hit_shallow = false;
         if shallow_eligible
             && let Some(captured_at) = captured_at_nanos
@@ -727,7 +730,7 @@ fn store_compat_island_complete(
         let expected_no_ctime = recorded_entries_no_ctime
             .and_then(|map| map.get(entry.key.dir_name()))
             .and_then(serde_json::Value::as_str);
-        if !trust_restored && expected_no_ctime.is_some() {
+        if !entry_trust_restored && expected_no_ctime.is_some() {
             let Ok(actual) = store.compat_island_entry_metadata_integrity(&entry_dir) else {
                 return false;
             };
@@ -746,10 +749,10 @@ fn store_compat_island_complete(
         };
         let matched_strict = actual == expected;
         let matched_restored = !matched_strict
-            && trust_restored
+            && entry_trust_restored
             && expected_no_ctime == Some(actual_no_ctime.as_str());
         if !matched_strict && !matched_restored {
-            if trust_restored {
+            if entry_trust_restored {
                 tracing::debug!(
                     entry = %entry.key.dir_name(),
                     "LPM_TRUST_RESTORED_STORE enabled but compat island ctime-free digest missed"
@@ -1796,6 +1799,7 @@ mod tests {
             ),
             "without LPM_TRUST_RESTORED_STORE, stale strict digest must miss"
         );
+        #[cfg(debug_assertions)]
         {
             let _trust = lpm_store::v2::override_trust_restored_store_for_test(Some(true));
             assert!(
@@ -1807,19 +1811,47 @@ mod tests {
                 ),
                 "with LPM_TRUST_RESTORED_STORE under Source policy, matching ctime-free digest must hit"
             );
+            let after_trust: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&sentinel_path).unwrap()).unwrap();
+            assert_eq!(
+                after_trust["entries"][derived_key.dir_name()].as_str(),
+                Some("sha256-stale-strict-digest"),
+                "trust-restored hit must never overwrite the recorded strict metadata digest"
+            );
+            assert_eq!(
+                after_trust["shallow_guards"][derived_key.dir_name()]["dir_ctime_nanos"].as_str(),
+                Some("0"),
+                "trust-restored hit must never overwrite the recorded strict shallow guard"
+            );
+
+            // Local-source objects enforce Tree integrity even under Source policy,
+            // so `LPM_TRUST_RESTORED_STORE` must NOT accept ctime drift for them.
+            let local_sentinel = store
+                .paths()
+                .objects_root()
+                .join(".lpm-object-meta")
+                .join(
+                    store
+                        .paths()
+                        .object_dir(&entry.target.source_sri)
+                        .unwrap()
+                        .file_name()
+                        .unwrap(),
+                )
+                .join("local-source");
+            std::fs::create_dir_all(local_sentinel.parent().unwrap()).unwrap();
+            std::fs::write(&local_sentinel, b"1").unwrap();
+            assert!(
+                !store_compat_island_complete(
+                    &store_island,
+                    std::slice::from_ref(&entry),
+                    &store,
+                    &key_map,
+                ),
+                "local-source entry using Tree integrity must ignore LPM_TRUST_RESTORED_STORE"
+            );
+            std::fs::remove_file(&local_sentinel).unwrap();
         }
-        let after_trust: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&sentinel_path).unwrap()).unwrap();
-        assert_eq!(
-            after_trust["entries"][derived_key.dir_name()].as_str(),
-            Some("sha256-stale-strict-digest"),
-            "trust-restored hit must never overwrite the recorded strict metadata digest"
-        );
-        assert_eq!(
-            after_trust["shallow_guards"][derived_key.dir_name()]["dir_ctime_nanos"].as_str(),
-            Some("0"),
-            "trust-restored hit must never overwrite the recorded strict shallow guard"
-        );
         assert!(
             !store_compat_island_complete(
                 &store_island,

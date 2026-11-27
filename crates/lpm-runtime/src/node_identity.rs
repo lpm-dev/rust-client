@@ -132,7 +132,7 @@ impl<'a> IdentityContext<'a> {
             runtime,
             self.environment.has_loader_override(),
         );
-        let node_binary = !matches!(binary_match, RuntimeBinaryMatch::NotBinary)
+        let mut node_binary = !matches!(binary_match, RuntimeBinaryMatch::NotBinary)
             && !is_version_manager_shim(
                 executable,
                 &canonical_executable,
@@ -147,8 +147,9 @@ impl<'a> IdentityContext<'a> {
         crate::effective::update_with_file_metadata(&mut hasher.0, &metadata);
         if node_binary
             && let RuntimeBinaryMatch::DynamicLibnode(ref resolved) = binary_match
+            && !hash_resolved_libnode(&mut hasher, resolved)
         {
-            hash_resolved_libnode(&mut hasher, resolved);
+            node_binary = false;
         }
         if managed_node_root.is_some_and(|root| canonical_executable.starts_with(root)) {
             // Each managed runtime is installed under its own version, so no
@@ -156,11 +157,19 @@ impl<'a> IdentityContext<'a> {
             hasher.bytes(b"managed");
         } else {
             if !node_binary {
-                // A launcher can resolve helpers through the script PATH and read
-                // files relative to the working directory.
+                // A launcher can resolve helpers through the script PATH, read
+                // files relative to the working directory, or load libraries
+                // redirected by dynamic-loader environment variables.
                 hasher.bytes(b"launcher");
                 hasher.os(self.cwd.canonicalize().ok()?.as_os_str());
                 hasher.os(self.path);
+                if !self.environment.loader_overrides().is_empty() {
+                    hasher.bytes(b"loader-overrides");
+                    for (name, value) in self.environment.loader_overrides() {
+                        hasher.os(name);
+                        hasher.os(value);
+                    }
+                }
             }
             let selectors = self.selectors.get_or_init(|| {
                 let mut selectors = FieldHasher::new(b"runtime-version-selectors");
@@ -366,7 +375,9 @@ pub(crate) fn hash_dynamic_libnode_for_binary(
         RuntimeBinaryMatch::StaticBinary => true,
         RuntimeBinaryMatch::DynamicLibnode(resolved) => {
             let mut field_hasher = FieldHasher::new(b"lpm-task-dynamic-libnode-v1");
-            hash_resolved_libnode(&mut field_hasher, &resolved);
+            if !hash_resolved_libnode(&mut field_hasher, &resolved) {
+                return false;
+            }
             hasher.update(field_hasher.finish().as_bytes());
             true
         }
@@ -463,7 +474,7 @@ const DYNAMIC_LOADER_OVERRIDE_VARS: &[&str] = &[
     "DYLD_SHARED_CACHE_DIR",
 ];
 
-fn is_dynamic_loader_override_var(name: &OsStr) -> bool {
+pub(crate) fn is_dynamic_loader_override_var(name: &OsStr) -> bool {
     DYNAMIC_LOADER_OVERRIDE_VARS
         .iter()
         .any(|candidate| same_variable(name, OsStr::new(candidate)))
@@ -941,11 +952,16 @@ fn resolve_dynamic_libnode(
             }
             // Per ELF ld.so rules (with LD_LIBRARY_PATH stripped): DT_RUNPATH
             // supersedes DT_RPATH; otherwise DT_RPATH is searched before
-            // ld.so.cache and default system library directories.
+            // ld.so.cache and default system library directories. If a search
+            // directory contains a `glibc-hwcaps` subdirectory, fail closed
+            // because glibc may load a hardware-capability variant instead.
             let active_search = runpath.as_deref().or(rpath.as_deref());
             if let Some(search_list) = active_search {
                 for entry in search_list.split(':') {
                     let dir = expand_elf_rpath_entry(entry, exe_dir)?;
+                    if dir.join("glibc-hwcaps").is_dir() {
+                        return None;
+                    }
                     if let Some(canonical_path) = canonical_regular_file(&dir.join(&soname)) {
                         return Some(ResolvedLibnode {
                             soname,
@@ -955,35 +971,10 @@ fn resolve_dynamic_libnode(
                     }
                 }
             }
-            let system_dirs: &[&str] = if cfg!(target_arch = "aarch64") {
-                &[
-                    "/usr/lib/aarch64-linux-gnu",
-                    "/lib/aarch64-linux-gnu",
-                    "/usr/lib64",
-                    "/lib64",
-                    "/usr/lib",
-                    "/lib",
-                ]
-            } else if cfg!(target_arch = "x86_64") {
-                &[
-                    "/usr/lib/x86_64-linux-gnu",
-                    "/lib/x86_64-linux-gnu",
-                    "/usr/lib64",
-                    "/lib64",
-                    "/usr/lib",
-                    "/lib",
-                ]
-            } else {
-                &["/usr/lib64", "/lib64", "/usr/lib", "/lib"]
-            };
-            for dir in system_dirs {
-                if let Some(canonical_path) = canonical_regular_file(&Path::new(dir).join(&soname))
-                {
-                    return Some(ResolvedLibnode {
-                        soname,
-                        canonical_path,
-                        include_ld_so_cache: true,
-                    });
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(resolved) = resolve_linux_system_libnode(&soname) {
+                    return Some(resolved);
                 }
             }
             None
@@ -1016,6 +1007,183 @@ fn resolve_dynamic_libnode(
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn host_ld_so_cache_arch_flag() -> Option<u32> {
+    if cfg!(target_arch = "x86_64") {
+        Some(0x0300)
+    } else if cfg!(target_arch = "aarch64") {
+        Some(0x0a00)
+    } else if cfg!(target_arch = "x86") {
+        Some(0x0000)
+    } else if cfg!(target_arch = "powerpc64") {
+        Some(0x0500)
+    } else if cfg!(target_arch = "s390x") {
+        Some(0x0400)
+    } else {
+        None
+    }
+}
+
+/// Parse glibc's `glibc-ld.so.cache1.1` binary table (pure new format or
+/// compat old+new format) and return the unique non-hwcap library path matching
+/// `soname` for the host ELF class/architecture. Returns `None` (fail closed)
+/// on any ambiguity, hwcap variant, or unrecognized table format.
+#[cfg(any(target_os = "linux", test))]
+fn lookup_soname_in_glibc_ld_so_cache(bytes: &[u8], soname: &str) -> Option<PathBuf> {
+    const NEW_MAGIC: &[u8] = b"glibc-ld.so.cache1.1";
+    const OLD_MAGIC: &[u8] = b"ld.so-1.7.0";
+    const NEW_HEADER_LEN: usize = 48;
+    const NEW_ENTRY_LEN: usize = 24;
+    const OLD_HEADER_LEN: usize = 16;
+    const OLD_ENTRY_LEN: usize = 12;
+    const MAX_LIBS: usize = 65_536;
+    const FLAG_ELF_MASK: u32 = 0x00ff;
+    const FLAG_ELF: u32 = 0x0001;
+    const FLAG_ARCH_MASK: u32 = 0xff00;
+
+    let expected_arch_flag = host_ld_so_cache_arch_flag()?;
+    let new_header_offset = if bytes.starts_with(NEW_MAGIC) {
+        0usize
+    } else if bytes.starts_with(OLD_MAGIC) && bytes.len() >= OLD_HEADER_LEN {
+        let old_nlibs = usize::try_from(u32::from_ne_bytes(
+            bytes[12..16].try_into().ok()?,
+        ))
+        .ok()?;
+        if old_nlibs > MAX_LIBS {
+            return None;
+        }
+        let after_old = OLD_HEADER_LEN.checked_add(old_nlibs.checked_mul(OLD_ENTRY_LEN)?)?;
+        let aligned = (after_old.checked_add(7)?) & !7;
+        if bytes.get(aligned..)?.starts_with(NEW_MAGIC) {
+            aligned
+        } else if bytes.get(after_old..)?.starts_with(NEW_MAGIC) {
+            after_old
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    let section = bytes.get(new_header_offset..)?;
+    if section.len() < NEW_HEADER_LEN {
+        return None;
+    }
+    let nlibs = usize::try_from(u32::from_ne_bytes(
+        section[20..24].try_into().ok()?,
+    ))
+    .ok()?;
+    if nlibs > MAX_LIBS {
+        return None;
+    }
+    let entries_end = NEW_HEADER_LEN.checked_add(nlibs.checked_mul(NEW_ENTRY_LEN)?)?;
+    if entries_end > section.len() {
+        return None;
+    }
+
+    let read_cstr = |offset: u32| -> Option<&[u8]> {
+        let start = usize::try_from(offset).ok()?;
+        let tail = section.get(start..)?;
+        let nul = tail.iter().position(|&b| b == 0)?;
+        Some(&tail[..nul])
+    };
+
+    let target = soname.as_bytes();
+    let mut matched: Option<PathBuf> = None;
+    for index in 0..nlibs {
+        let base = NEW_HEADER_LEN + index * NEW_ENTRY_LEN;
+        let entry = &section[base..base + NEW_ENTRY_LEN];
+        let flags = u32::from_ne_bytes(entry[0..4].try_into().ok()?);
+        let key_off = u32::from_ne_bytes(entry[4..8].try_into().ok()?);
+        let val_off = u32::from_ne_bytes(entry[8..12].try_into().ok()?);
+        let hwcap = u64::from_ne_bytes(entry[16..24].try_into().ok()?);
+        if (flags & FLAG_ELF_MASK) != FLAG_ELF || (flags & FLAG_ARCH_MASK) != expected_arch_flag {
+            continue;
+        }
+        let key_bytes = read_cstr(key_off)?;
+        if key_bytes != target {
+            continue;
+        }
+        // Any hwcap entry or duplicate soname mapping is ambiguous: fail closed.
+        if hwcap != 0 || matched.is_some() {
+            return None;
+        }
+        let val_bytes = read_cstr(val_off)?;
+        let val_str = std::str::from_utf8(val_bytes).ok()?;
+        if val_str.is_empty() {
+            return None;
+        }
+        matched = Some(PathBuf::from(val_str));
+    }
+    matched
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_system_libnode(soname: &str) -> Option<ResolvedLibnode> {
+    const MAX_LD_SO_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+    let cache_path = Path::new("/etc/ld.so.cache");
+    if let Ok(cache_bytes) = lpm_common::read_file_capped(cache_path, MAX_LD_SO_CACHE_BYTES) {
+        let resolved = lookup_soname_in_glibc_ld_so_cache(&cache_bytes, soname)?;
+        if resolved
+            .parent()
+            .is_some_and(|parent| parent.join("glibc-hwcaps").is_dir())
+        {
+            return None;
+        }
+        let canonical_path = canonical_regular_file(&resolved)?;
+        return Some(ResolvedLibnode {
+            soname: soname.to_owned(),
+            canonical_path,
+            include_ld_so_cache: true,
+        });
+    }
+    // Non-glibc Linux (e.g. Alpine musl without `/etc/ld.so.cache`): read
+    // `/etc/ld-musl-<arch>.path` when present, else standard musl search dirs,
+    // and accept only a single unambiguous match with no `glibc-hwcaps`.
+    let musl_arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        return None;
+    };
+    let musl_path_file = PathBuf::from(format!("/etc/ld-musl-{musl_arch}.path"));
+    let search_dirs: Vec<PathBuf> =
+        if let Ok(raw) = lpm_common::read_text_file_capped(&musl_path_file, 64 * 1024) {
+            raw.split([':', '\n'])
+                .map(str::trim)
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from)
+                .collect()
+        } else {
+            vec![
+                PathBuf::from("/lib"),
+                PathBuf::from("/usr/local/lib"),
+                PathBuf::from("/usr/lib"),
+            ]
+        };
+    let mut found: Option<PathBuf> = None;
+    for dir in search_dirs {
+        if dir.join("glibc-hwcaps").is_dir() {
+            return None;
+        }
+        if let Some(canonical_path) = canonical_regular_file(&dir.join(soname)) {
+            if let Some(prev) = &found {
+                if prev != &canonical_path {
+                    return None;
+                }
+            } else {
+                found = Some(canonical_path);
+            }
+        }
+    }
+    found.map(|canonical_path| ResolvedLibnode {
+        soname: soname.to_owned(),
+        canonical_path,
+        include_ld_so_cache: false,
+    })
+}
+
 fn hash_file_metadata_with_ctime(hasher: &mut FieldHasher, metadata: &Metadata) {
     crate::effective::update_with_file_metadata(&mut hasher.0, metadata);
     #[cfg(unix)]
@@ -1027,20 +1195,26 @@ fn hash_file_metadata_with_ctime(hasher: &mut FieldHasher, metadata: &Metadata) 
     }
 }
 
-fn hash_resolved_libnode(hasher: &mut FieldHasher, resolved: &ResolvedLibnode) {
+fn hash_resolved_libnode(hasher: &mut FieldHasher, resolved: &ResolvedLibnode) -> bool {
+    let Ok(meta) = resolved.canonical_path.metadata() else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
     hasher.bytes(b"dynamic-libnode");
     hasher.bytes(resolved.soname.as_bytes());
     hasher.os(resolved.canonical_path.as_os_str());
-    if let Ok(meta) = resolved.canonical_path.metadata() {
-        hash_file_metadata_with_ctime(hasher, &meta);
-    }
+    hash_file_metadata_with_ctime(hasher, &meta);
     #[cfg(target_os = "linux")]
-    if resolved.include_ld_so_cache
-        && let Ok(meta) = std::fs::metadata("/etc/ld.so.cache")
-    {
+    if resolved.include_ld_so_cache {
+        let Ok(cache_meta) = std::fs::metadata("/etc/ld.so.cache") else {
+            return false;
+        };
         hasher.bytes(b"ld-so-cache");
-        hash_file_metadata_with_ctime(hasher, &meta);
+        hash_file_metadata_with_ctime(hasher, &cache_meta);
     }
+    true
 }
 
 /// Hash each link target from the `PATH` entry to the executable, since a
@@ -1070,6 +1244,8 @@ pub(crate) struct SelectorEnvironment {
     local_data: Option<PathBuf>,
     /// Version-manager variables, sorted by name.
     variables: Vec<(OsString, OsString)>,
+    /// Active dynamic-loader override variables (sorted by name, non-empty).
+    loader_overrides: Vec<(OsString, OsString)>,
     /// Whether any process/script dynamic-loader override or `/etc/ld.so.preload`
     /// is active (forces dynamically-linked small `node` binaries to fail closed).
     has_loader_override: bool,
@@ -1084,16 +1260,20 @@ impl SelectorEnvironment {
         self.has_loader_override
     }
 
+    pub(crate) fn loader_overrides(&self) -> &[(OsString, OsString)] {
+        &self.loader_overrides
+    }
+
     /// The process environment with `script` variables layered over it, as a
     /// script whose project environment sets them sees it.
     pub(crate) fn with_script_variables(
         script: impl IntoIterator<Item = (impl Into<OsString>, impl Into<OsString>)>,
     ) -> Self {
         let mut variables: Vec<(OsString, OsString)> = Vec::new();
-        let mut has_loader_override = has_linux_ld_so_preload();
+        let mut loader_overrides: Vec<(OsString, OsString)> = Vec::new();
         for (name, value) in std::env::vars_os() {
             if is_dynamic_loader_override_var(&name) && !value.is_empty() {
-                has_loader_override = true;
+                loader_overrides.push((name.clone(), value.clone()));
             }
             if is_manager_variable(&name) {
                 variables.push((name, value));
@@ -1102,8 +1282,11 @@ impl SelectorEnvironment {
         for (name, value) in script {
             let name = name.into();
             let value = value.into();
-            if is_dynamic_loader_override_var(&name) && !value.is_empty() {
-                has_loader_override = true;
+            if is_dynamic_loader_override_var(&name) {
+                loader_overrides.retain(|(existing, _)| !same_variable(existing, &name));
+                if !value.is_empty() {
+                    loader_overrides.push((name.clone(), value.clone()));
+                }
             }
             if !is_manager_variable(&name) {
                 continue;
@@ -1112,6 +1295,8 @@ impl SelectorEnvironment {
             variables.push((name, value));
         }
         variables.sort();
+        loader_overrides.sort();
+        let has_loader_override = has_linux_ld_so_preload() || !loader_overrides.is_empty();
         Self {
             home: dirs::home_dir(),
             config_home: std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
@@ -1122,6 +1307,7 @@ impl SelectorEnvironment {
                 None
             },
             variables,
+            loader_overrides,
             has_loader_override,
         }
     }
@@ -1606,6 +1792,7 @@ mod tests {
             data_home: None,
             local_data: None,
             variables: Vec::new(),
+            loader_overrides: Vec::new(),
             has_loader_override: false,
         }
     }
@@ -2364,11 +2551,13 @@ mod tests {
         let home = environment(prefix.path());
 
         // Decoy libnode in bin_dir must NOT be picked up (ld.so never searches bin_dir).
-        fs::write(bin_dir.join("libnode.so.109"), b"decoy").unwrap();
+        // Use an impossible soname so host system libraries can never satisfy it.
+        const TEST_SONAME: &str = "libnode.so.99999";
+        fs::write(bin_dir.join(TEST_SONAME), b"decoy").unwrap();
         let unresolvable = bin_dir.join(NODE);
         fs::write(
             &unresolvable,
-            build_synthetic_elf64_with_needed(&["libc.so.6", "libnode.so.109"], None, None),
+            build_synthetic_elf64_with_needed(&["libc.so.6", TEST_SONAME], None, None),
         )
         .unwrap();
         assert!(
@@ -2381,38 +2570,65 @@ mod tests {
         fs::write(
             &dyn_node,
             build_synthetic_elf64_with_needed(
-                &["libc.so.6", "libnode.so.109"],
+                &["libc.so.6", TEST_SONAME],
                 None,
                 Some("$ORIGIN/../custom"),
             ),
         )
         .unwrap();
-        let libnode = custom_dir.join("libnode.so.109");
+        let libnode = custom_dir.join(TEST_SONAME);
         fs::write(&libnode, b"v20.11.0").unwrap();
         let first = identity(&dyn_node, prefix.path(), OsStr::new(""), &home);
         assert!(
             first.node_binary,
             "ELF with concrete RUNPATH libnode.so must be recognized as real node binary"
         );
-        // Same-length library replacement with preserved mtime must still change fingerprint (ctime).
-        let orig_mtime = fs::metadata(&libnode).unwrap().modified().unwrap();
-        fs::write(&libnode, b"v20.19.0").unwrap();
-        fs::set_times(
-            &libnode,
-            fs::FileTimes::new().set_modified(orig_mtime),
-        )
-        .unwrap();
-        let second = identity(&dyn_node, prefix.path(), OsStr::new(""), &home);
+        #[cfg(unix)]
+        {
+            // Same-length library replacement with preserved mtime must still change fingerprint (ctime).
+            let orig_mtime = fs::metadata(&libnode).unwrap().modified().unwrap();
+            fs::write(&libnode, b"v20.19.0").unwrap();
+            fs::set_times(
+                &libnode,
+                fs::FileTimes::new().set_modified(orig_mtime),
+            )
+            .unwrap();
+            let second = identity(&dyn_node, prefix.path(), OsStr::new(""), &home);
+            assert_ne!(
+                first.fingerprint, second.fingerprint,
+                "same-size preserved-mtime libnode upgrade must invalidate fingerprint via ctime"
+            );
+        }
+
+        // Presence of `glibc-hwcaps` inside the RUNPATH dir must fail closed.
+        let hwcaps_dir = custom_dir.join("glibc-hwcaps");
+        fs::create_dir(&hwcaps_dir).unwrap();
+        assert!(
+            !identity(&dyn_node, prefix.path(), OsStr::new(""), &home).node_binary,
+            "RUNPATH directory containing glibc-hwcaps must fail closed"
+        );
+        fs::remove_dir(&hwcaps_dir).unwrap();
+
+        // Distinct LD_LIBRARY_PATH values must fail closed AND yield distinct fingerprints.
+        let mut env_a = environment(prefix.path());
+        env_a.loader_overrides = vec![(OsString::from("LD_LIBRARY_PATH"), OsString::from("/opt/a"))];
+        env_a.has_loader_override = true;
+        let mut env_b = environment(prefix.path());
+        env_b.loader_overrides = vec![(OsString::from("LD_LIBRARY_PATH"), OsString::from("/opt/b"))];
+        env_b.has_loader_override = true;
+        let id_a = identity(&dyn_node, prefix.path(), OsStr::new(""), &env_a);
+        let id_b = identity(&dyn_node, prefix.path(), OsStr::new(""), &env_b);
+        assert!(!id_a.node_binary && !id_b.node_binary);
         assert_ne!(
-            first.fingerprint, second.fingerprint,
-            "same-size preserved-mtime libnode upgrade must invalidate fingerprint via ctime"
+            id_a.fingerprint, id_b.fingerprint,
+            "different LD_LIBRARY_PATH values must produce distinct launcher fingerprints"
         );
 
         // Relative/empty RUNPATH depends on cwd and must fail closed.
         fs::write(
             &dyn_node,
             build_synthetic_elf64_with_needed(
-                &["libc.so.6", "libnode.so.109"],
+                &["libc.so.6", TEST_SONAME],
                 None,
                 Some(":$ORIGIN/../custom"),
             ),
@@ -2575,6 +2791,94 @@ mod tests {
                 false
             ),
             "missing libnode must fail closed in task binary fingerprint helper"
+        );
+    }
+
+    #[test]
+    fn glibc_ld_so_cache_parser_resolves_unique_entry_and_fails_closed_on_hwcaps_or_ambiguity() {
+        let Some(arch_flag) = host_ld_so_cache_arch_flag() else {
+            return;
+        };
+        let build_new_cache = |entries: &[(&str, &str, u32, u64)]| -> Vec<u8> {
+            let entries_offset = 48usize;
+            let strings_offset = entries_offset + entries.len() * 24;
+            let mut string_table = Vec::new();
+            let mut encoded_entries = Vec::new();
+            for (soname, path, flags, hwcap) in entries {
+                let key_off = (strings_offset + string_table.len()) as u32;
+                string_table.extend_from_slice(soname.as_bytes());
+                string_table.push(0);
+                let val_off = (strings_offset + string_table.len()) as u32;
+                string_table.extend_from_slice(path.as_bytes());
+                string_table.push(0);
+                encoded_entries.extend_from_slice(&flags.to_ne_bytes());
+                encoded_entries.extend_from_slice(&key_off.to_ne_bytes());
+                encoded_entries.extend_from_slice(&val_off.to_ne_bytes());
+                encoded_entries.extend_from_slice(&0u32.to_ne_bytes());
+                encoded_entries.extend_from_slice(&hwcap.to_ne_bytes());
+            }
+            let mut buf = Vec::with_capacity(strings_offset + string_table.len());
+            buf.extend_from_slice(b"glibc-ld.so.cache1.1");
+            buf.extend_from_slice(&(entries.len() as u32).to_ne_bytes());
+            buf.extend_from_slice(&(string_table.len() as u32).to_ne_bytes());
+            buf.resize(48, 0);
+            buf.extend_from_slice(&encoded_entries);
+            buf.extend_from_slice(&string_table);
+            buf
+        };
+
+        let host_flags = 0x0001 | arch_flag;
+        // Unique match selects the exact path from ld.so.cache (e.g. /usr/local/lib).
+        let unique = build_new_cache(&[
+            ("libc.so.6", "/lib/libc.so.6", host_flags, 0),
+            (
+                "libnode.so.109",
+                "/usr/local/lib/libnode.so.109",
+                host_flags,
+                0,
+            ),
+        ]);
+        assert_eq!(
+            lookup_soname_in_glibc_ld_so_cache(&unique, "libnode.so.109"),
+            Some(PathBuf::from("/usr/local/lib/libnode.so.109"))
+        );
+
+        // Compat old+new wrapper (ld.so-1.7.0 prefix before glibc-ld.so.cache1.1).
+        let mut compat = Vec::new();
+        compat.extend_from_slice(b"ld.so-1.7.0\0");
+        compat.extend_from_slice(&1u32.to_ne_bytes()); // 1 old entry (12 bytes) -> offset 28 -> aligned 32
+        compat.extend_from_slice(&[0u8; 16]);
+        compat.extend_from_slice(&unique);
+        assert_eq!(
+            lookup_soname_in_glibc_ld_so_cache(&compat, "libnode.so.109"),
+            Some(PathBuf::from("/usr/local/lib/libnode.so.109"))
+        );
+
+        // Hardware-capability variant (hwcap != 0) must fail closed.
+        let hwcaps = build_new_cache(&[(
+            "libnode.so.109",
+            "/usr/lib/glibc-hwcaps/x86-64-v3/libnode.so.109",
+            host_flags,
+            1 << 62,
+        )]);
+        assert_eq!(
+            lookup_soname_in_glibc_ld_so_cache(&hwcaps, "libnode.so.109"),
+            None
+        );
+
+        // Duplicate entries for the same soname must fail closed.
+        let ambiguous = build_new_cache(&[
+            (
+                "libnode.so.109",
+                "/usr/local/lib/libnode.so.109",
+                host_flags,
+                0,
+            ),
+            ("libnode.so.109", "/usr/lib/libnode.so.109", host_flags, 0),
+        ]);
+        assert_eq!(
+            lookup_soname_in_glibc_ld_so_cache(&ambiguous, "libnode.so.109"),
+            None
         );
     }
 }

@@ -263,15 +263,17 @@ fn workspace_package_link_source(
             package.name.as_deref().unwrap_or("<unnamed>"),
         )));
     }
-    if source_dir.exists() {
-        return source_dir.canonicalize().map_err(|error| {
-            LpmError::Workspace(format!(
-                "failed to resolve publishConfig.directory {}: {error}",
-                source_dir.display()
-            ))
-        });
+    if existing_ancestor == source_dir {
+        return Ok(canonical_ancestor);
     }
-    Ok(source_dir)
+    let pending_tail = source_dir.strip_prefix(existing_ancestor).map_err(|_| {
+        LpmError::Workspace(format!(
+            "failed to resolve publishConfig.directory {} inside {}",
+            source_dir.display(),
+            package_dir.display()
+        ))
+    })?;
+    Ok(canonical_ancestor.join(pending_tail))
 }
 
 pub(super) fn is_declared_workspace_package_source(

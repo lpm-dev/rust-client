@@ -7212,3 +7212,71 @@ fn shallow_package_guard_requires_strict_ctime_and_non_racy_window() {
     racy.captured_at_nanos = Some(1_700_000_000_500_000_000);
     assert!(!base.matches_non_racy(&racy));
 }
+
+#[cfg(unix)]
+#[test]
+fn local_source_object_ignores_trust_restored_store_and_object_snapshot_refuses_symlink_integrity() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_with_object_integrity_policy(dir.path(), ObjectIntegrityPolicy::Source);
+    let tarball = build_test_tarball(&[
+        ("package.json", br#"{"name":"local-src","version":"1.0.0"}"#),
+        ("index.js", b"module.exports = 'orig';\n"),
+    ]);
+    let (object, sri, _) = store
+        .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Source)
+        .unwrap();
+    // Mark the object as local-source (forces Tree integrity even under Source policy).
+    let local_sentinel = crate::v2::integrity::local_source_sentinel_path(&object.path).unwrap();
+    std::fs::create_dir_all(local_sentinel.parent().unwrap()).unwrap();
+    std::fs::write(&local_sentinel, b"1").unwrap();
+
+    let key = arc_key("local-src", "1.0.0");
+    let first = store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&key),
+            source_sri: sri.clone(),
+            object_dir: object.path.clone(),
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+    let pkg_dir = link_entry_package_dir(&first.link_dir, &key);
+    let index_path = pkg_dir.join("index.js");
+    let orig_mtime = std::fs::metadata(&index_path).unwrap().modified().unwrap();
+
+    // Mutate bytes keeping identical length and mtime (shifts ctime only).
+    std::fs::write(&index_path, b"module.exports = 'hack';\n").unwrap();
+    std::fs::set_times(&index_path, std::fs::FileTimes::new().set_modified(orig_mtime)).unwrap();
+
+    let _trust = crate::v2::integrity::override_trust_restored_store_for_test(Some(true));
+    let reused = store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&key),
+            source_sri: sri.clone(),
+            object_dir: object.path.clone(),
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+    assert!(
+        reused.freshly_populated,
+        "local-source link entry uses Tree integrity and must reject ctime-only mutation even with LPM_TRUST_RESTORED_STORE=1"
+    );
+    assert_eq!(
+        std::fs::read(&index_path).unwrap(),
+        b"module.exports = 'orig';\n"
+    );
+
+    // Symlinked `.integrity` marker must be refused by `object_snapshot_matches_live_object`.
+    let obj_snapshot = read_tree_snapshot(&object.path).unwrap();
+    assert!(object_snapshot_matches_live_object(&object.path, &sri, &obj_snapshot).unwrap());
+    let outside_marker = dir.path().join("outside-integrity");
+    std::fs::write(&outside_marker, &sri).unwrap();
+    let integrity_path = object.path.join(".integrity");
+    std::fs::remove_file(&integrity_path).unwrap();
+    std::os::unix::fs::symlink(&outside_marker, &integrity_path).unwrap();
+    assert!(
+        !object_snapshot_matches_live_object(&object.path, &sri, &obj_snapshot).unwrap(),
+        "symlinked .integrity marker must be refused"
+    );
+}

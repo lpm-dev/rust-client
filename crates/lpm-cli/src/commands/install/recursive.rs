@@ -245,6 +245,9 @@ pub(crate) async fn run_recursive_workspace_install(
             )?);
         if options.frozen_lockfile == super::FrozenLockfileMode::Always {
             workspace_lockfile_coordinator.mark_frozen();
+            if filters.is_empty() && filter_prod.is_empty() {
+                workspace_lockfile_coordinator.validate_frozen_preflight()?;
+            }
         }
         let workspace_project_state_coordinator =
             Arc::new(workspace_project_state::WorkspaceProjectStateCoordinator::new(targets.len()));
@@ -598,17 +601,23 @@ pub(crate) async fn run_recursive_workspace_install(
             if first_error.is_none()
                 && let Some((index, path, lifecycle)) = deferred_root_after_install
             {
-                let hook_start = Instant::now();
-                if let Err(error) =
-                    lifecycle.run_after_successful_install(&path, options.json_output)
+                if options.frozen_lockfile == super::FrozenLockfileMode::Always
+                    && let Err(error) = workspace_lockfile_coordinator.validate_frozen_preflight()
                 {
                     first_error = Some(error);
                 } else {
-                    workspace_freshness_cache.invalidate();
-                    if let Some(outcome) = outcomes[index].as_mut() {
-                        outcome.duration_ms = outcome
-                            .duration_ms
-                            .saturating_add(duration_ms(hook_start.elapsed()));
+                    let hook_start = Instant::now();
+                    if let Err(error) =
+                        lifecycle.run_after_successful_install(&path, options.json_output)
+                    {
+                        first_error = Some(error);
+                    } else {
+                        workspace_freshness_cache.invalidate();
+                        if let Some(outcome) = outcomes[index].as_mut() {
+                            outcome.duration_ms = outcome
+                                .duration_ms
+                                .saturating_add(duration_ms(hook_start.elapsed()));
+                        }
                     }
                 }
             }

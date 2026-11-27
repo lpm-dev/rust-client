@@ -769,4 +769,48 @@ async fn ci_treats_empty_workspaces_and_unlisted_pnpm_subdir_as_single_project()
         "unlisted subdir under pnpm-workspace.yaml must not run recursive ci, got {standalone_json}"
     );
     assert!(standalone_dir.join("node_modules/leaf-pkg/package.json").exists());
+
+    // Case 3: a standalone project nested inside a listed pnpm member (`packages/listed/examples/demo`)
+    // is NOT a declared workspace member and must use its own lockfile under both `lpm install` and `lpm ci`.
+    pnpm_parent.write_file(
+        "packages/listed/examples/demo/package.json",
+        r#"{"name":"nested-demo","version":"1.0.0","dependencies":{"leaf-pkg":"1.0.0"}}"#,
+    );
+    let demo_dir = pnpm_parent.path().join("packages/listed/examples/demo");
+    let seed_demo = lpm_with_registry(&pnpm_parent, &registry.url())
+        .current_dir(&demo_dir)
+        .args(["install", "--no-skills", "--no-security-summary"])
+        .output()
+        .unwrap();
+    assert!(
+        seed_demo.status.success(),
+        "seed install in nested standalone demo failed: {}",
+        String::from_utf8_lossy(&seed_demo.stderr)
+    );
+    assert!(
+        demo_dir.join("lpm.lock").exists(),
+        "nested standalone project must write its own lpm.lock"
+    );
+    assert!(
+        !pnpm_parent.path().join("lpm.lock").exists(),
+        "nested standalone project must not write to the outer workspace root lpm.lock"
+    );
+    std::fs::remove_dir_all(demo_dir.join("node_modules")).unwrap();
+    let ci_demo = lpm_with_registry(&pnpm_parent, &registry.url())
+        .current_dir(&demo_dir)
+        .args(["ci", "--json", "--no-skills", "--no-security-summary"])
+        .output()
+        .unwrap();
+    assert!(
+        ci_demo.status.success(),
+        "lpm ci in nested standalone demo failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&ci_demo.stdout),
+        String::from_utf8_lossy(&ci_demo.stderr),
+    );
+    let demo_json: serde_json::Value = serde_json::from_slice(&ci_demo.stdout).unwrap();
+    assert!(
+        demo_json.get("recursive").is_none(),
+        "nested standalone demo must not run recursive ci, got {demo_json}"
+    );
+    assert!(demo_dir.join("node_modules/leaf-pkg/package.json").exists());
 }

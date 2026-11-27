@@ -1102,7 +1102,15 @@ async fn async_main(cli: Cli) -> Result<()> {
                     None => false,
                 };
                 let pnpm_workspace_active = install_state::pnpm_workspace_declares_packages(&cwd)
-                    && !matches!(lpm_workspace::find_workspace_root(&cwd), Ok(None));
+                    && match lpm_workspace::find_workspace_root(&cwd) {
+                        Ok(Some(root)) => {
+                            lpm_workspace::is_same_directory(&root, &cwd)
+                                || lpm_workspace::workspace_declares_member(&root, &cwd)
+                                    .unwrap_or(false)
+                        }
+                        Ok(None) => false,
+                        Err(_) => true,
+                    };
                 let recursive_install = recursive
                     || (!no_recursive && (manifest_declares_workspaces || pnpm_workspace_active));
 

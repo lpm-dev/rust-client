@@ -106,7 +106,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 /// coalesce onto a single probe.
 #[derive(Debug, Default)]
 pub struct PathNodeVersionCache {
-    resolutions: Mutex<HashMap<PathNodeIdentity, Arc<OnceLock<PathNodeResolution>>>>,
+    resolutions: Mutex<HashMap<PathNodeIdentity, Arc<OnceLock<Option<PathNodeResolution>>>>>,
     managed_node_root: OnceLock<Option<PathBuf>>,
     recorded: Option<RecordedNodeVersions>,
     recordings: Mutex<Vec<std::thread::JoinHandle<()>>>,
@@ -306,36 +306,36 @@ impl PathNodeVersionCache {
             };
         };
 
-        let slot = {
-            let mut map = self
-                .resolutions
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            Arc::clone(map.entry(identity.clone()).or_default())
-        };
+        for _attempt in 0..2 {
+            let slot = {
+                let mut map = self
+                    .resolutions
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                Arc::clone(map.entry(identity.clone()).or_default())
+            };
 
-        let mut unstable = false;
-        let resolution = slot
-            .get_or_init(|| {
+            let mut local_unstable_resolution: Option<PathNodeResolution> = None;
+            let cached = slot.get_or_init(|| {
                 if let Some(observed) = observed
                     && identity.script.node_binary
                     && identity.script.fingerprint == observed.runtime_fingerprint
                 {
-                    return PathNodeResolution {
+                    return Some(PathNodeResolution {
                         version: Some(observed.version.clone()),
                         runtime_fingerprint: Some(observed.runtime_fingerprint.clone()),
                         executable: executable_before.clone(),
-                    };
+                    });
                 }
                 if let Some(recorded) = self.recorded.as_ref()
                     && identity.script.node_binary
                     && let Some(version) = recorded.version(&identity.script.fingerprint)
                 {
-                    return PathNodeResolution {
+                    return Some(PathNodeResolution {
                         version: Some(version),
                         runtime_fingerprint: Some(identity.script.fingerprint.clone()),
                         executable: executable_before.clone(),
-                    };
+                    });
                 }
 
                 let version = node_version_on_path(cwd, path, executable_before.as_deref());
@@ -361,26 +361,43 @@ impl PathNodeVersionCache {
                             .unwrap_or_else(PoisonError::into_inner)
                             .push(recording);
                     }
+                    Some(resolution)
                 } else {
-                    unstable = true;
+                    // Never publish an unstable probe result into the shared slot
+                    // for waiting callers; return `None` so waiters retry freshly.
+                    local_unstable_resolution = Some(resolution);
+                    None
                 }
-                resolution
-            })
-            .clone();
+            });
 
-        if unstable {
-            let mut map = self
-                .resolutions
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if map
-                .get(&identity)
-                .is_some_and(|current| Arc::ptr_eq(current, &slot))
+            if let Some(resolution) = cached {
+                return resolution.clone();
+            }
+
             {
-                map.remove(&identity);
+                let mut map = self
+                    .resolutions
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if map
+                    .get(&identity)
+                    .is_some_and(|current| Arc::ptr_eq(current, &slot))
+                {
+                    map.remove(&identity);
+                }
+            }
+
+            if let Some(resolution) = local_unstable_resolution {
+                return resolution;
             }
         }
-        resolution
+
+        let version = node_version_on_path(cwd, path, executable_before.as_deref());
+        PathNodeResolution {
+            version,
+            runtime_fingerprint: None,
+            executable: executable_before,
+        }
     }
 }
 

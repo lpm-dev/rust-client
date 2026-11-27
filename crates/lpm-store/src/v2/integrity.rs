@@ -32,16 +32,20 @@ pub const ENV_TRUST_RESTORED_STORE: &str = "LPM_TRUST_RESTORED_STORE";
 static TRUST_RESTORED_STORE_CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static TRUST_RESTORED_STORE_WARNED: std::sync::Once = std::sync::Once::new();
 
-#[cfg(debug_assertions)]
+#[cfg(any(test, debug_assertions))]
 static TRUST_RESTORED_STORE_TEST_OVERRIDE: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
 
-#[cfg(debug_assertions)]
+#[cfg(any(test, debug_assertions))]
+static TRUST_RESTORED_STORE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(any(test, debug_assertions))]
 pub struct TrustRestoredStoreOverrideGuard {
     previous: u8,
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(test, debug_assertions))]
 impl Drop for TrustRestoredStoreOverrideGuard {
     fn drop(&mut self) {
         TRUST_RESTORED_STORE_TEST_OVERRIDE
@@ -49,10 +53,13 @@ impl Drop for TrustRestoredStoreOverrideGuard {
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(test, debug_assertions))]
 pub fn override_trust_restored_store_for_test(
     value: Option<bool>,
 ) -> TrustRestoredStoreOverrideGuard {
+    let lock = TRUST_RESTORED_STORE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let encoded = match value {
         None => 0,
         Some(false) => 1,
@@ -60,7 +67,10 @@ pub fn override_trust_restored_store_for_test(
     };
     let previous = TRUST_RESTORED_STORE_TEST_OVERRIDE
         .swap(encoded, std::sync::atomic::Ordering::SeqCst);
-    TrustRestoredStoreOverrideGuard { previous }
+    TrustRestoredStoreOverrideGuard {
+        previous,
+        _lock: lock,
+    }
 }
 
 fn parse_trust_restored_store_env() -> bool {
@@ -75,7 +85,7 @@ fn parse_trust_restored_store_env() -> bool {
 }
 
 pub fn trust_restored_store_from_env() -> bool {
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     {
         match TRUST_RESTORED_STORE_TEST_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst) {
             1 => return false,

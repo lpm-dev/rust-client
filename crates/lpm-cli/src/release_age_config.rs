@@ -531,19 +531,15 @@ impl ReleaseAgeResolver {
 pub(crate) fn workspace_root_release_age_config(
     project_dir: &Path,
 ) -> Result<Option<(PathBuf, PackageReleaseAgeConfig)>, LpmError> {
-    if let Some(workspace) = crate::workspace_discovery_cache::active_workspace(project_dir) {
-        if same_directory(&workspace.root, project_dir) {
-            return Ok(None);
-        }
+    if crate::workspace_discovery_cache::active_workspace(project_dir).is_some() {
         // Only declared workspace members inherit the workspace root's cooldown
-        // settings; arbitrary nested directories under the root do not.
-        if !workspace
-            .members
-            .iter()
-            .any(|member| same_directory(&member.path, project_dir))
-        {
+        // settings; arbitrary nested directories under the root (or the root
+        // itself) do not.
+        let Some(workspace) =
+            crate::workspace_discovery_cache::active_workspace_for_declared_member(project_dir)
+        else {
             return Ok(None);
-        }
+        };
         return Ok(
             package_release_age_config_from_package(&workspace.root_package)?
                 .map(|config| (workspace.root.clone(), config)),
@@ -569,6 +565,11 @@ pub(crate) fn workspace_root_release_age_config(
         }
     };
     if same_directory(&workspace_root, project_dir) {
+        return Ok(None);
+    }
+    if !lpm_workspace::workspace_declares_member(&workspace_root, project_dir)
+        .map_err(|error| LpmError::Workspace(error.to_string()))?
+    {
         return Ok(None);
     }
     let root_package =

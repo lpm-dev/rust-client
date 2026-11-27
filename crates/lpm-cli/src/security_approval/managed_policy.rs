@@ -1122,54 +1122,74 @@ fn parse_policy_firewall(
     })
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct ManagedPolicyStamp {
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnixPathAuthorityStamp {
     len: u64,
     modified: Option<std::time::SystemTime>,
-    #[cfg(unix)]
     dev: u64,
-    #[cfg(unix)]
     ino: u64,
-    #[cfg(unix)]
     ctime: i64,
-    #[cfg(unix)]
     ctime_nsec: i64,
-    #[cfg(unix)]
     mode: u32,
-    #[cfg(unix)]
     uid: u32,
 }
 
-impl ManagedPolicyStamp {
+#[cfg(unix)]
+impl UnixPathAuthorityStamp {
     fn from_metadata(meta: &std::fs::Metadata) -> Self {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::MetadataExt;
 
-            Self {
-                len: meta.len(),
-                modified: meta.modified().ok(),
-                dev: meta.dev(),
-                ino: meta.ino(),
-                ctime: meta.ctime(),
-                ctime_nsec: meta.ctime_nsec(),
-                mode: meta.mode(),
-                uid: meta.uid(),
-            }
+        Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+            ctime: meta.ctime(),
+            ctime_nsec: meta.ctime_nsec(),
+            mode: meta.mode(),
+            uid: meta.uid(),
         }
-        #[cfg(not(unix))]
-        {
-            Self {
-                len: meta.len(),
-                modified: meta.modified().ok(),
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedPolicyStamp {
+    file: UnixPathAuthorityStamp,
+    /// Stamps for every ancestor directory from the policy parent up to `/`,
+    /// so parent/ancestor permission or ownership changes invalidate cache hits.
+    ancestors: Vec<UnixPathAuthorityStamp>,
+}
+
+#[cfg(unix)]
+impl ManagedPolicyStamp {
+    fn capture(path: &Path) -> Result<Option<Self>, std::io::Error> {
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let file = UnixPathAuthorityStamp::from_metadata(&meta);
+        let mut ancestors = Vec::new();
+        let mut current = path.parent();
+        while let Some(dir) = current {
+            if dir.as_os_str().is_empty() {
+                break;
             }
+            let dir_meta = std::fs::symlink_metadata(dir)?;
+            ancestors.push(UnixPathAuthorityStamp::from_metadata(&dir_meta));
+            current = dir.parent();
         }
+        Ok(Some(Self { file, ancestors }))
     }
 }
 
 #[derive(Default)]
 pub(crate) struct ManagedPolicyCache {
+    #[cfg(unix)]
     entries: std::sync::Mutex<std::collections::HashMap<PathBuf, (ManagedPolicyStamp, ManagedPolicy)>>,
+    #[cfg(unix)]
     load_lock: std::sync::Mutex<()>,
 }
 
@@ -1199,85 +1219,86 @@ where
 
 pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
     let path = managed_policy_path();
-    let Ok(cache) = SCOPED_MANAGED_POLICY_CACHE.try_with(std::sync::Arc::clone) else {
+    #[cfg(not(unix))]
+    {
         return load_managed_policy_from_disk(path);
-    };
+    }
+    #[cfg(unix)]
+    {
+        let Ok(cache) = SCOPED_MANAGED_POLICY_CACHE.try_with(std::sync::Arc::clone) else {
+            return load_managed_policy_from_disk(path);
+        };
 
-    // Always inspect the current file identity via `symlink_metadata` so
-    // newly-created, atomically-replaced, or chmod'd policy files are never
-    // shadowed by a stale cache entry or cached absence.
-    let current_stamp = match std::fs::symlink_metadata(&path) {
-        Ok(meta) => ManagedPolicyStamp::from_metadata(&meta),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        // Always inspect the policy file and every ancestor directory via
+        // `symlink_metadata` so newly-created, replaced, or chmod/chown'd
+        // policy files or parents are never shadowed by a stale cache entry.
+        let Some(current_stamp) = ManagedPolicyStamp::capture(&path)
+            .map_err(|error| privileged_policy_io_error(&path, "inspect", error))?
+        else {
             cache
                 .entries
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&path);
             return Ok(None);
+        };
+
+        if let Some((cached_stamp, cached_policy)) = cache
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&path)
+            && *cached_stamp == current_stamp
+        {
+            return Ok(Some(cached_policy.clone()));
         }
-        Err(error) => return Err(privileged_policy_io_error(&path, "inspect", error)),
-    };
 
-    if let Some((cached_stamp, cached_policy)) = cache
-        .entries
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&path)
-        && *cached_stamp == current_stamp
-    {
-        return Ok(Some(cached_policy.clone()));
-    }
-
-    // Serialize cache-miss disk reads so concurrent workers share a single
-    // parse and cannot publish an older policy generation over a newer one.
-    let _loading = cache
-        .load_lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let pre_stamp = match std::fs::symlink_metadata(&path) {
-        Ok(meta) => ManagedPolicyStamp::from_metadata(&meta),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        // Serialize cache-miss disk reads so concurrent workers share a single
+        // parse and cannot publish an older policy generation over a newer one.
+        let _loading = cache
+            .load_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(pre_stamp) = ManagedPolicyStamp::capture(&path)
+            .map_err(|error| privileged_policy_io_error(&path, "inspect", error))?
+        else {
             cache
                 .entries
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&path);
             return Ok(None);
+        };
+        if let Some((cached_stamp, cached_policy)) = cache
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&path)
+            && *cached_stamp == pre_stamp
+        {
+            return Ok(Some(cached_policy.clone()));
         }
-        Err(error) => return Err(privileged_policy_io_error(&path, "inspect", error)),
-    };
-    if let Some((cached_stamp, cached_policy)) = cache
-        .entries
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&path)
-        && *cached_stamp == pre_stamp
-    {
-        return Ok(Some(cached_policy.clone()));
-    }
 
-    let policy = load_managed_policy_from_disk(path.clone())?;
-    let post_stamp = std::fs::symlink_metadata(&path)
-        .ok()
-        .map(|meta| ManagedPolicyStamp::from_metadata(&meta));
-    match (policy.as_ref(), post_stamp) {
-        (Some(parsed), Some(stamp)) if stamp == pre_stamp => {
-            cache
-                .entries
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(path, (stamp, parsed.clone()));
+        let policy = load_managed_policy_from_disk(path.clone())?;
+        let post_stamp = ManagedPolicyStamp::capture(&path).ok().flatten();
+        match (policy.as_ref(), post_stamp) {
+            (Some(parsed), Some(stamp)) if stamp == pre_stamp => {
+                cache
+                    .entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(path, (stamp, parsed.clone()));
+            }
+            _ => {
+                cache
+                    .entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&path);
+            }
         }
-        _ => {
-            cache
-                .entries
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&path);
-        }
+        Ok(policy)
     }
-    Ok(policy)
 }
 
 fn load_managed_policy_from_disk(path: PathBuf) -> Result<Option<ManagedPolicy>, LpmError> {
@@ -1922,6 +1943,24 @@ mod access_tests {
                 Some(172800),
                 "atomic policy replacement must invalidate the cached entry"
             );
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                let stamp_before = super::ManagedPolicyStamp::capture(&policy_path)
+                    .unwrap()
+                    .expect("policy stamp must exist");
+                std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                let stamp_after = super::ManagedPolicyStamp::capture(&policy_path)
+                    .unwrap()
+                    .expect("policy stamp must exist after parent chmod");
+                assert_ne!(
+                    stamp_before, stamp_after,
+                    "parent directory permission change must invalidate the managed policy stamp"
+                );
+            }
 
             // Deleting the policy file must immediately drop the cached entry.
             std::fs::remove_file(&policy_path).unwrap();

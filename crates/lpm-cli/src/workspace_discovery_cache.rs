@@ -104,7 +104,24 @@ pub(crate) fn canonicalize_or_original(path: &Path) -> PathBuf {
 struct ActiveWorkspaceContext {
     workspace: Option<Arc<Workspace>>,
     scope_root: PathBuf,
+    member_canonical_paths: Arc<std::collections::HashSet<PathBuf>>,
     freshness_cache: Arc<WorkspaceFreshnessCache>,
+}
+
+fn canonical_member_paths(workspace: Option<&Workspace>) -> Arc<std::collections::HashSet<PathBuf>> {
+    let Some(workspace) = workspace else {
+        return Arc::new(std::collections::HashSet::new());
+    };
+    let mut paths = std::collections::HashSet::with_capacity(workspace.members.len());
+    for member in &workspace.members {
+        paths.insert(
+            member
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| member.path.clone()),
+        );
+    }
+    Arc::new(paths)
 }
 
 tokio::task_local! {
@@ -122,11 +139,13 @@ where
     F: Future,
 {
     let scope_root = workspace.root.clone();
+    let member_canonical_paths = canonical_member_paths(Some(workspace.as_ref()));
     ACTIVE_WORKSPACE
         .scope(
             ActiveWorkspaceContext {
                 workspace: Some(workspace),
                 scope_root,
+                member_canonical_paths,
                 freshness_cache,
             },
             ACTIVE_ROOT_PROVIDER_FINGERPRINT.scope(root_provider_fingerprint, future),
@@ -146,11 +165,13 @@ where
         || start_dir.to_path_buf(),
         |workspace| workspace.root.clone(),
     );
+    let member_canonical_paths = canonical_member_paths(workspace.as_deref());
     ACTIVE_WORKSPACE
         .scope(
             ActiveWorkspaceContext {
                 workspace,
                 scope_root,
+                member_canonical_paths,
                 freshness_cache: Arc::new(WorkspaceFreshnessCache::default()),
             },
             ACTIVE_ROOT_PROVIDER_FINGERPRINT.scope(None, future),
@@ -191,6 +212,22 @@ pub(crate) fn active_workspace(start_dir: &Path) -> Option<Arc<Workspace>> {
         .try_with(|context| {
             start_dir
                 .starts_with(&context.scope_root)
+                .then(|| context.workspace.clone())
+                .flatten()
+        })
+        .ok()
+        .flatten()
+}
+
+/// Return the active scoped workspace if `project_dir` is an exact declared
+/// member (O(1) lookup against the pre-canonicalized member set).
+pub(crate) fn active_workspace_for_declared_member(project_dir: &Path) -> Option<Arc<Workspace>> {
+    let canonical = canonicalize_or_original(project_dir);
+    ACTIVE_WORKSPACE
+        .try_with(|context| {
+            context
+                .member_canonical_paths
+                .contains(&canonical)
                 .then(|| context.workspace.clone())
                 .flatten()
         })

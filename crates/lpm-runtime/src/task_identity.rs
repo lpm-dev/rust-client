@@ -365,6 +365,12 @@ pub fn is_version_manager_variable(name: &str) -> bool {
     crate::node_identity::is_manager_variable(OsStr::new(name))
 }
 
+/// Whether a project environment variable named `name` can override dynamic
+/// library resolution for a dynamically-linked runtime binary.
+pub fn is_dynamic_loader_override_variable(name: &str) -> bool {
+    crate::node_identity::is_dynamic_loader_override_var(OsStr::new(name))
+}
+
 fn managed_runtime_root(runtime: RuntimeKind) -> Option<PathBuf> {
     crate::node::runtimes_dir()
         .ok()?

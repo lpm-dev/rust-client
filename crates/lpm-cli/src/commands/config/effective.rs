@@ -612,8 +612,28 @@ fn add_security_entries(
         &global_excludes,
     )?;
     let inherits_root_age = lpm.and_then(|lpm| lpm.minimum_release_age).is_none();
+    let managed_cooldown = matches!(
+        posture.sources.minimum_release_age_secs,
+        PostureSourceKind::ManagedPolicy
+    ) || matches!(
+        posture.sources.release_age_policy,
+        PostureSourceKind::ManagedPolicy
+    );
     let workspace_excludes = if inherits_root_age {
-        workspace_root_age_config.minimum_release_age_exclude
+        let candidate = workspace_root_age_config.minimum_release_age_exclude;
+        if candidate.is_empty()
+            || !managed_cooldown
+            || crate::security_approval::has_active_project_unlock(
+                crate::security_approval::ApprovalScope::CooldownBypass,
+                project_dir,
+                None,
+                &candidate,
+            )?
+        {
+            candidate
+        } else {
+            Vec::new()
+        }
     } else {
         Vec::new()
     };

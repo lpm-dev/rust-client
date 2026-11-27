@@ -774,21 +774,13 @@ pub struct SingleFileExclusiveLockHandle {
 }
 
 fn open_lock_file(lock_path: &Path) -> std::io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).read(true).write(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-
-        options.mode(0o600);
-    }
-    match options.open(lock_path) {
+    match open_lock_file_nofollow(lock_path) {
         Ok(file) => Ok(file),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if let Some(parent) = lock_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            options.open(lock_path)
+            open_lock_file_nofollow(lock_path)
         }
         Err(error) => Err(error),
     }
@@ -1500,15 +1492,36 @@ impl OpenRealDir {
     /// Open `path` as a pinned directory handle after confirming it is a real
     /// directory (not a symlink or junction).
     pub fn open_ambient(path: &Path) -> std::io::Result<Self> {
-        let metadata = std::fs::symlink_metadata(path)?;
-        if !metadata.is_dir() || crate::is_symlink_or_junction(&metadata) {
-            return Err(std::io::Error::other(format!(
-                "refusing non-directory or symlink root at {}",
-                path.display()
-            )));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)?;
+            let dir = cap_std::fs::Dir::from_std_file(file);
+            Ok(Self { dir })
         }
-        let dir = cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())?;
-        Ok(Self { dir })
+        #[cfg(not(unix))]
+        {
+            let metadata = std::fs::symlink_metadata(path)?;
+            if !metadata.is_dir() || crate::is_symlink_or_junction(&metadata) {
+                return Err(std::io::Error::other(format!(
+                    "refusing non-directory or symlink root at {}",
+                    path.display()
+                )));
+            }
+            let dir = cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())?;
+            let opened_meta = dir.dir_metadata()?;
+            if !opened_meta.is_dir() || capability_metadata_is_link_or_reparse(&opened_meta) {
+                return Err(std::io::Error::other(format!(
+                    "refusing non-directory or symlink root at {}",
+                    path.display()
+                )));
+            }
+            Ok(Self { dir })
+        }
     }
 
     /// Walk `relative_dir` component-by-component without following symlinks or
@@ -1530,37 +1543,57 @@ impl OpenRealDir {
             };
             cursor.push(part);
             let parent = current.as_ref().unwrap_or(&self.dir);
-            let meta = parent.symlink_metadata(part).map_err(|source| {
+            #[cfg(not(unix))]
+            {
+                let meta = parent.symlink_metadata(part).map_err(|source| {
+                    DescendantVerifyError::Io {
+                        path: cursor.clone(),
+                        source,
+                    }
+                })?;
+                if capability_metadata_is_link_or_reparse(&meta) {
+                    return Err(DescendantVerifyError::UnsafeOrLink(cursor));
+                }
+                if !meta.is_dir() {
+                    return Err(DescendantVerifyError::NotDirectory(cursor));
+                }
+            }
+            let next = parent.open_dir_nofollow(part).map_err(|source| {
+                #[cfg(unix)]
+                {
+                    if let Ok(meta) = parent.symlink_metadata(part) {
+                        if capability_metadata_is_link_or_reparse(&meta) {
+                            return DescendantVerifyError::UnsafeOrLink(cursor.clone());
+                        }
+                        if !meta.is_dir() {
+                            return DescendantVerifyError::NotDirectory(cursor.clone());
+                        }
+                    }
+                    if let Some(code) = source.raw_os_error() {
+                        if is_nofollow_link_error(&source, code) {
+                            return DescendantVerifyError::UnsafeOrLink(cursor.clone());
+                        }
+                        if code == libc::ENOTDIR {
+                            return DescendantVerifyError::NotDirectory(cursor.clone());
+                        }
+                    }
+                }
                 DescendantVerifyError::Io {
                     path: cursor.clone(),
                     source,
                 }
             })?;
-            if capability_metadata_is_link_or_reparse(&meta) {
-                return Err(DescendantVerifyError::UnsafeOrLink(cursor));
-            }
-            if !meta.is_dir() {
-                return Err(DescendantVerifyError::NotDirectory(cursor));
-            }
-            let next = parent.open_dir_nofollow(part).map_err(|source| {
-                if matches!(
-                    source.raw_os_error(),
-                    Some(code) if is_nofollow_link_error(&source, code)
-                ) {
-                    DescendantVerifyError::UnsafeOrLink(cursor.clone())
-                } else {
+            #[cfg(not(unix))]
+            {
+                let opened_meta = next.dir_metadata().map_err(|source| {
                     DescendantVerifyError::Io {
                         path: cursor.clone(),
                         source,
                     }
+                })?;
+                if !opened_meta.is_dir() || capability_metadata_is_link_or_reparse(&opened_meta) {
+                    return Err(DescendantVerifyError::UnsafeOrLink(cursor));
                 }
-            })?;
-            let opened_meta = next.dir_metadata().map_err(|source| DescendantVerifyError::Io {
-                path: cursor.clone(),
-                source,
-            })?;
-            if !opened_meta.is_dir() || capability_metadata_is_link_or_reparse(&opened_meta) {
-                return Err(DescendantVerifyError::UnsafeOrLink(cursor));
             }
             current = Some(next);
         }
@@ -1580,16 +1613,9 @@ impl OpenRealDir {
     }
 }
 
-fn is_nofollow_link_error(error: &std::io::Error, code: i32) -> bool {
-    let _ = (error, code);
-    #[cfg(unix)]
-    {
-        code == libc::ELOOP || code == libc::ENOTDIR || code == libc::EMLINK
-    }
-    #[cfg(not(unix))]
-    {
-        false
-    }
+#[cfg(unix)]
+fn is_nofollow_link_error(_error: &std::io::Error, code: i32) -> bool {
+    code == libc::ELOOP || code == libc::EMLINK
 }
 
 pub fn acquire_single_file_shared_lock_from_file(
