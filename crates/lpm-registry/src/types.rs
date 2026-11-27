@@ -43,42 +43,58 @@ pub enum LatestVersionHint {
 pub struct PackageMetadata {
     pub name: String,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
     /// npm abbreviated metadata exposes this package-level timestamp
     /// even when it omits per-version `time`. It is an upper bound on
     /// every version publish time and lets clients avoid a full-packument
     /// fetch when the package has not changed since a release-age cutoff.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified: Option<String>,
 
-    #[serde(default, rename = "dist-tags")]
+    #[serde(
+        default,
+        rename = "dist-tags",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
     pub dist_tags: HashMap<String, String>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub versions: HashMap<String, VersionMetadata>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub time: HashMap<String, String>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub downloads: Option<u64>,
 
-    #[serde(default, rename = "distributionMode")]
+    #[serde(
+        default,
+        rename = "distributionMode",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub distribution_mode: Option<String>,
 
-    #[serde(default, rename = "packageType")]
+    #[serde(
+        default,
+        rename = "packageType",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub package_type: Option<String>,
 
-    #[serde(default, rename = "latestVersion")]
+    #[serde(
+        default,
+        rename = "latestVersion",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub latest_version: Option<String>,
 
     // Merged summaries are never cached; serialization would discard this provenance.
     #[serde(skip)]
     pub latest_hint: LatestVersionHint,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ecosystem: Option<String>,
 }
 
@@ -95,19 +111,27 @@ pub struct VersionMetadata {
     )]
     pub publication_status: Option<String>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deprecated: Option<serde_json::Value>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub dependencies: HashMap<String, String>,
 
-    #[serde(default, rename = "devDependencies")]
+    #[serde(
+        default,
+        rename = "devDependencies",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
     pub dev_dependencies: HashMap<String, String>,
 
-    #[serde(default, rename = "peerDependencies")]
+    #[serde(
+        default,
+        rename = "peerDependencies",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
     pub peer_dependencies: HashMap<String, String>,
 
     /// `peerDependenciesMeta` flags from package.json. The npm spec
@@ -118,6 +142,7 @@ pub struct VersionMetadata {
     #[serde(
         default,
         rename = "peerDependenciesMeta",
+        skip_serializing_if = "HashMap::is_empty",
         deserialize_with = "deserialize_peer_dependencies_meta"
     )]
     pub peer_dependencies_meta: HashMap<String, PeerDependencyMeta>,
@@ -127,23 +152,39 @@ pub struct VersionMetadata {
     /// and `bundledDependencies` spellings. When both occur, the canonical
     /// `bundleDependencies` field takes precedence. Consumers skip these names —
     /// they're already provided by the parent's tarball.
-    #[serde(rename = "bundleDependencies")]
+    #[serde(rename = "bundleDependencies", skip_serializing_if = "Vec::is_empty")]
     pub bundle_dependencies: Vec<String>,
 
-    #[serde(default, rename = "optionalDependencies")]
+    #[serde(
+        default,
+        rename = "optionalDependencies",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
     pub optional_dependencies: HashMap<String, String>,
 
     /// Runtime compatibility constraints declared by this version. Historical
     /// npm packuments that list runtime names without ranges are ignored.
-    #[serde(default, deserialize_with = "deserialize_engine_constraints")]
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        deserialize_with = "deserialize_engine_constraints"
+    )]
     pub engines: HashMap<String, String>,
 
     /// Platform restrictions: `"darwin"` or `["darwin", "linux", "win32"]`.
-    #[serde(default, deserialize_with = "deserialize_string_or_string_list")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_string_or_string_list"
+    )]
     pub os: Vec<String>,
 
     /// CPU restrictions: `"x64"` or `["x64", "arm64"]`.
-    #[serde(default, deserialize_with = "deserialize_string_or_string_list")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_string_or_string_list"
+    )]
     pub cpu: Vec<String>,
 
     /// Linux libc flavor restrictions: `"glibc"`, `["glibc"]`, `["musl"]`, or
@@ -152,29 +193,45 @@ pub struct VersionMetadata {
     /// Native modules (sharp, esbuild, `@next/swc-*`) ship distinct
     /// binaries per libc; the resolver's platform filter consumes this
     /// field alongside `os`/`cpu`.
-    #[serde(default, deserialize_with = "deserialize_string_or_string_list")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_string_or_string_list"
+    )]
     pub libc: Vec<String>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dist: Option<DistInfo>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readme: Option<String>,
 
-    #[serde(default, rename = "lpmConfig")]
+    #[serde(default, rename = "lpmConfig", skip_serializing_if = "Option::is_none")]
     pub lpm_config: Option<serde_json::Value>,
 
-    #[serde(default, rename = "_ecosystem")]
+    #[serde(
+        default,
+        rename = "_ecosystem",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ecosystem: Option<String>,
 
-    #[serde(default, rename = "_swiftMeta")]
+    #[serde(
+        default,
+        rename = "_swiftMeta",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub swift_meta: Option<Box<SwiftMeta>>,
 
-    #[serde(default, rename = "_npmUser")]
+    #[serde(default, rename = "_npmUser", skip_serializing_if = "Option::is_none")]
     pub npm_user: Option<Box<NpmUserMetadata>>,
 
     // Security metadata for post-install warnings
-    #[serde(default, rename = "_behavioralTags")]
+    #[serde(
+        default,
+        rename = "_behavioralTags",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub behavioral_tags: Option<BehavioralTags>,
 
     /// Keys of `behavioral_tags` that only the package's test files showed,
@@ -186,7 +243,11 @@ pub struct VersionMetadata {
     )]
     pub test_only_tags: Option<Vec<String>>,
 
-    #[serde(default, rename = "_lifecycleScripts")]
+    #[serde(
+        default,
+        rename = "_lifecycleScripts",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub lifecycle_scripts: Option<HashMap<String, String>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -199,10 +260,18 @@ pub struct VersionMetadata {
     )]
     pub has_install_script: Option<bool>,
 
-    #[serde(default, rename = "_securityFindings")]
+    #[serde(
+        default,
+        rename = "_securityFindings",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub security_findings: Option<Vec<SecurityFinding>>,
 
-    #[serde(default, rename = "_qualityScore")]
+    #[serde(
+        default,
+        rename = "_qualityScore",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub quality_score: Option<u32>,
 }
 
@@ -381,13 +450,13 @@ pub use swift::*;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DistInfo {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tarball: Option<String>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integrity: Option<String>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shasum: Option<String>,
 
     #[serde(
@@ -2724,6 +2793,38 @@ mod tests {
 
     #[test]
     fn bundle_alias_and_existing_positional_messagepack_remain_readable() {
+        #[derive(Serialize)]
+        struct LegacyPositionalVersionMetadata<'a> {
+            name: &'a str,
+            version: &'a str,
+            publication_status: Option<&'a str>,
+            description: Option<&'a str>,
+            deprecated: Option<&'a serde_json::Value>,
+            dependencies: &'a HashMap<String, String>,
+            dev_dependencies: &'a HashMap<String, String>,
+            peer_dependencies: &'a HashMap<String, String>,
+            peer_dependencies_meta: &'a HashMap<String, PeerDependencyMeta>,
+            bundle_dependencies: &'a [String],
+            optional_dependencies: &'a HashMap<String, String>,
+            engines: &'a HashMap<String, String>,
+            os: &'a [String],
+            cpu: &'a [String],
+            libc: &'a [String],
+            dist: Option<&'a DistInfo>,
+            readme: Option<&'a str>,
+            lpm_config: Option<&'a serde_json::Value>,
+            ecosystem: Option<&'a str>,
+            swift_meta: Option<&'a SwiftMeta>,
+            npm_user: Option<&'a NpmUserMetadata>,
+            behavioral_tags: Option<&'a BehavioralTags>,
+            test_only_tags: Option<&'a [String]>,
+            lifecycle_scripts: Option<&'a HashMap<String, String>>,
+            scripts: Option<&'a HashMap<String, String>>,
+            has_install_script: Option<bool>,
+            security_findings: Option<&'a [SecurityFinding]>,
+            quality_score: Option<u32>,
+        }
+
         let alias: VersionMetadata = serde_json::from_str(
             r#"{"name":"pkg","version":"1.0.0","bundledDependencies":["vendored"]}"#,
         )
@@ -2739,8 +2840,38 @@ mod tests {
             os: vec!["darwin".into()],
             ..alias
         };
+        let legacy_positional = LegacyPositionalVersionMetadata {
+            name: &original.name,
+            version: &original.version,
+            publication_status: original.publication_status.as_deref(),
+            description: original.description.as_deref(),
+            deprecated: original.deprecated.as_ref(),
+            dependencies: &original.dependencies,
+            dev_dependencies: &original.dev_dependencies,
+            peer_dependencies: &original.peer_dependencies,
+            peer_dependencies_meta: &original.peer_dependencies_meta,
+            bundle_dependencies: &original.bundle_dependencies,
+            optional_dependencies: &original.optional_dependencies,
+            engines: &original.engines,
+            os: &original.os,
+            cpu: &original.cpu,
+            libc: &original.libc,
+            dist: original.dist.as_ref(),
+            readme: original.readme.as_deref(),
+            lpm_config: original.lpm_config.as_ref(),
+            ecosystem: original.ecosystem.as_deref(),
+            swift_meta: original.swift_meta.as_deref(),
+            npm_user: original.npm_user.as_deref(),
+            behavioral_tags: original.behavioral_tags.as_ref(),
+            test_only_tags: original.test_only_tags.as_deref(),
+            lifecycle_scripts: original.lifecycle_scripts.as_ref(),
+            scripts: original.scripts.as_ref(),
+            has_install_script: original.has_install_script,
+            security_findings: original.security_findings.as_deref(),
+            quality_score: original.quality_score,
+        };
         let decoded: VersionMetadata =
-            rmp_serde::from_slice(&rmp_serde::to_vec(&original).unwrap()).unwrap();
+            rmp_serde::from_slice(&rmp_serde::to_vec(&legacy_positional).unwrap()).unwrap();
         assert_eq!(
             serde_json::to_value(decoded).unwrap(),
             serde_json::to_value(original).unwrap()

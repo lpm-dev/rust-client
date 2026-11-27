@@ -421,7 +421,7 @@ async fn latest_document_is_reused_while_disk_publication_is_pending() {
         .metadata_cache_mutations
         .lock()
         .unwrap()
-        .insert(client.cache_path(&key).unwrap(), Arc::clone(&mutation));
+        .insert(client.cache_path(&key).unwrap(), Arc::downgrade(&mutation));
     let publication = mutation.operation.lock().unwrap();
     for _ in 0..2 {
         let result = tokio::time::timeout(

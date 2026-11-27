@@ -29,7 +29,7 @@ impl MetadataCacheBuffer {
         Self::with_limit(budget, prefix, METADATA_CACHE_FILE_CAP as usize)
     }
 
-    fn with_limit(
+    pub(super) fn with_limit(
         budget: &Arc<Semaphore>,
         prefix: &[&[u8]],
         file_limit: usize,
@@ -136,6 +136,22 @@ impl MetadataCacheBuffer {
         for chunk in &self.chunks {
             if !chunk.is_empty() {
                 writer.write_all(chunk)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn write_payload_to(&self, skip: usize, writer: &mut impl Write) -> io::Result<()> {
+        let mut remaining_skip = skip;
+        for chunk in &self.chunks {
+            if remaining_skip >= chunk.len() {
+                remaining_skip -= chunk.len();
+                continue;
+            }
+            let slice = &chunk[remaining_skip..];
+            remaining_skip = 0;
+            if !slice.is_empty() {
+                writer.write_all(slice)?;
             }
         }
         Ok(())

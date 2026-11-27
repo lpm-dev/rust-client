@@ -6,6 +6,11 @@ enum Preference<P> {
     Latest(Box<VersionMetadata>),
 }
 
+enum PreferenceProbe<P> {
+    Hit(Preference<P>),
+    Miss { has_stale_history_validator: bool },
+}
+
 /// How one known preference answers a ranged request.
 enum Selection<P> {
     Ready(Box<Selected<P>>),
@@ -140,40 +145,47 @@ impl RegistryClient {
         let mut timings = PackageMetadataFetchTimings::default();
         let latest_key = self.npm_latest_metadata_cache_key(name, access);
         let started = std::time::Instant::now();
-        let cached = self.read_preference_cache(name, access, &latest_key).await;
+        let probe = self
+            .probe_preference_cache::<P>(name, access, &latest_key)
+            .await;
         timings.cache_read_ms += started.elapsed().as_millis();
-        match cached.map(|preference| select_preference(name, preference, &accepts)) {
-            Some(Selection::Ready(selected)) => {
-                timings.cache_hit = true;
-                crate::timing::record_metadata_cache_hit();
-                Ok(selected.with_timings(timings))
-            }
-            Some(Selection::CompleteHistory) => {
-                let mut fetched = self
-                    .get_npm_metadata_direct_inner(name, MetadataCachePolicy::UseFresh, access)
-                    .await?;
-                self.invalidate_metadata_cache_key(
-                    &self.npm_preferred_metadata_cache_key(name, access),
-                );
-                fetched.timings.add_attempt(&timings);
-                Ok(TimedPreferredResolution {
-                    metadata: ResolutionMetadata::Document {
-                        metadata: Box::new(fetched.metadata),
-                        projection: None,
-                    },
-                    timings: fetched.timings,
-                    versions_complete: true,
-                    platform_metadata_complete: false,
-                })
-            }
-            Some(Selection::History) => {
+        match probe {
+            PreferenceProbe::Hit(preference) => match select_preference(name, preference, &accepts)
+            {
+                Selection::Ready(selected) => {
+                    timings.cache_hit = true;
+                    crate::timing::record_metadata_cache_hit();
+                    Ok(selected.with_timings(timings))
+                }
+                Selection::CompleteHistory => {
+                    let mut fetched = self
+                        .get_npm_metadata_direct_inner(name, MetadataCachePolicy::UseFresh, access)
+                        .await?;
+                    self.invalidate_metadata_cache_key(
+                        &self.npm_preferred_metadata_cache_key(name, access),
+                    );
+                    fetched.timings.add_attempt(&timings);
+                    Ok(TimedPreferredResolution {
+                        metadata: ResolutionMetadata::Document {
+                            metadata: Box::new(fetched.metadata),
+                            projection: None,
+                        },
+                        timings: fetched.timings,
+                        versions_complete: true,
+                        platform_metadata_complete: false,
+                    })
+                }
+                Selection::History => {
+                    crate::timing::record_metadata_cache_miss();
+                    self.fetch_npm_preferred_history::<_, true, P>(name, access, accepts, timings)
+                        .await
+                }
+            },
+            PreferenceProbe::Miss {
+                has_stale_history_validator,
+            } => {
                 crate::timing::record_metadata_cache_miss();
-                self.fetch_npm_preferred_history::<_, true, P>(name, access, accepts, timings)
-                    .await
-            }
-            None => {
-                crate::timing::record_metadata_cache_miss();
-                if self.has_stale_preferred_history_validator(name, access) {
+                if has_stale_history_validator {
                     self.fetch_npm_preferred_history::<_, true, P>(name, access, accepts, timings)
                         .await
                 } else {
@@ -202,21 +214,26 @@ impl RegistryClient {
         let mut timings = PackageMetadataFetchTimings::default();
         let latest_key = self.npm_latest_metadata_cache_key(name, access);
         let started = std::time::Instant::now();
-        let cached = self
-            .read_preference_cache::<P>(name, access, &latest_key)
+        let probe = self
+            .probe_preference_cache::<P>(name, access, &latest_key)
             .await;
         timings.cache_read_ms += started.elapsed().as_millis();
-        if let Some(preference) = cached {
-            return Ok(match select_preference(name, preference, &accepts) {
-                Selection::Ready(selected) => {
-                    timings.cache_hit = true;
-                    Some(selected.with_timings(timings))
-                }
-                Selection::CompleteHistory | Selection::History => None,
-            });
-        }
-        if self.has_stale_preferred_history_validator(name, access) {
-            return Ok(None);
+        match probe {
+            PreferenceProbe::Hit(preference) => {
+                return Ok(match select_preference(name, preference, &accepts) {
+                    Selection::Ready(selected) => {
+                        timings.cache_hit = true;
+                        Some(selected.with_timings(timings))
+                    }
+                    Selection::CompleteHistory | Selection::History => None,
+                });
+            }
+            PreferenceProbe::Miss {
+                has_stale_history_validator: true,
+            } => return Ok(None),
+            PreferenceProbe::Miss {
+                has_stale_history_validator: false,
+            } => {}
         }
         let (latest_result, mut latest_timings) =
             self.fetch_latest_leg::<P>(name, access, &latest_key).await;
@@ -295,68 +312,130 @@ impl RegistryClient {
         Ok(fetched)
     }
 
-    fn has_stale_preferred_history_validator(
-        &self,
-        name: &str,
-        access: PublicNpmAccess<'_>,
-    ) -> bool {
-        let preferred_key = self.npm_preferred_metadata_cache_key(name, access);
-        if self
-            .read_cache_validator(&preferred_key)
-            .is_some_and(|v| v.etag.is_some())
-        {
-            return true;
-        }
-        let complete_key = self.npm_direct_metadata_cache_key(name, access);
-        self.read_cache_validator(&complete_key)
-            .is_some_and(|v| v.etag.is_some())
-    }
-
-    async fn read_preference_cache<P: MetadataProjection>(
+    async fn probe_preference_cache<P: MetadataProjection>(
         &self,
         name: &str,
         access: PublicNpmAccess<'_>,
         latest_key: &str,
-    ) -> Option<Preference<P>> {
-        let key = self.npm_preferred_metadata_cache_key(name, access);
-        if let Some(cached) = self
-            .read_preferred_cache_for_use::<true, P>(name, &key)
-            .await
-        {
-            return Some(Preference::History(Box::new(cached)));
-        }
-        let key = self.npm_direct_metadata_cache_key(name, access);
-        if let Some(cached) = self
-            .read_complete_cache_for_use::<true, P>(name, &key)
-            .await
-        {
-            return Some(Preference::History(Box::new(cached)));
-        }
-        if let Some(cached) = self.history_cache.lookup(latest_key).1 {
-            let body = Arc::clone(&cached.body);
-            let parse = move || {
-                serde_json::from_slice::<VersionMetadata>(lpm_common::strip_utf8_bom_bytes(
-                    body.bytes(),
-                ))
-            };
-            let manifest = if cached.body.bytes().len()
-                < crate::client::body::BLOCKING_METADATA_PARSE_THRESHOLD
-            {
-                parse().ok()
-            } else {
-                tokio::task::spawn_blocking(parse)
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-            };
-            if let Some(manifest) = manifest.filter(|manifest| valid_latest(name, manifest)) {
-                return Some(Preference::Latest(Box::new(manifest)));
+    ) -> PreferenceProbe<P> {
+        let mem_latest_body = self
+            .history_cache
+            .lookup(latest_key)
+            .1
+            .map(|entry| Arc::clone(&entry.body));
+        let preferred_path = self.cache_path(&self.npm_preferred_metadata_cache_key(name, access));
+        let complete_path = self.cache_path(&self.npm_direct_metadata_cache_key(name, access));
+        let latest_path = self.cache_path(latest_key);
+
+        if preferred_path.is_none() && complete_path.is_none() && latest_path.is_none() {
+            if let Some(body) = mem_latest_body {
+                let body_len = body.bytes().len();
+                let parse = move || {
+                    serde_json::from_slice::<VersionMetadata>(lpm_common::strip_utf8_bom_bytes(
+                        body.bytes(),
+                    ))
+                };
+                let manifest = if body_len < crate::client::body::BLOCKING_METADATA_PARSE_THRESHOLD
+                {
+                    parse().ok()
+                } else {
+                    tokio::task::spawn_blocking(parse)
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                };
+                if let Some(manifest) = manifest.filter(|manifest| valid_latest(name, manifest)) {
+                    return PreferenceProbe::Hit(Preference::Latest(Box::new(manifest)));
+                }
             }
+            return PreferenceProbe::Miss {
+                has_stale_history_validator: false,
+            };
         }
-        let cached = self
-            .read_metadata_cache_entry_as_async::<VersionMetadata>(latest_key)
-            .await?;
-        valid_latest(name, &cached.value).then_some(Preference::Latest(Box::new(cached.value)))
+
+        let target_name = name.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut has_stale_history_validator = false;
+            if let Some(path) = preferred_path
+                && let Some(entry) = crate::client::cache::open_metadata_cache_entry(&path)
+            {
+                let entry_has_etag = entry.header.etag.is_some();
+                if entry.remaining_freshness().is_some()
+                    && let Some(resolution) = entry.resolve::<ResolverPreferred, P>(&path)
+                {
+                    match resolution {
+                        CachedResolution::Projected { value, facts, .. } => {
+                            return PreferenceProbe::Hit(Preference::History(Box::new(
+                                CachedHistory::projected(value, facts),
+                            )));
+                        }
+                        CachedResolution::Document { value, source } => {
+                            let preferred = PreferredMetadata::from(value);
+                            if preferred.is_valid(&target_name) {
+                                return PreferenceProbe::Hit(Preference::History(Box::new(
+                                    CachedHistory::document(
+                                        preferred.metadata,
+                                        preferred.versions_complete,
+                                        source,
+                                    ),
+                                )));
+                            }
+                        }
+                    }
+                }
+                has_stale_history_validator |= entry_has_etag;
+            }
+            if let Some(path) = complete_path
+                && let Some(entry) = crate::client::cache::open_metadata_cache_entry(&path)
+            {
+                let entry_has_etag = entry.header.etag.is_some();
+                if entry.remaining_freshness().is_some()
+                    && let Some(resolution) =
+                        entry.resolve::<resolver_cache::ResolverMetadata, P>(&path)
+                {
+                    match resolution {
+                        CachedResolution::Projected { value, facts, .. } => {
+                            return PreferenceProbe::Hit(Preference::History(Box::new(
+                                CachedHistory::projected(value, facts),
+                            )));
+                        }
+                        CachedResolution::Document { value, source } => {
+                            if batch_metadata_entry_matches_name(&target_name, &value.0) {
+                                return PreferenceProbe::Hit(Preference::History(Box::new(
+                                    CachedHistory::document(value.0, true, source),
+                                )));
+                            }
+                        }
+                    }
+                }
+                has_stale_history_validator |= entry_has_etag;
+            }
+            if let Some(body) = mem_latest_body
+                && let Ok(manifest) = serde_json::from_slice::<VersionMetadata>(
+                    lpm_common::strip_utf8_bom_bytes(body.bytes()),
+                )
+                && valid_latest(&target_name, &manifest)
+            {
+                return PreferenceProbe::Hit(Preference::Latest(Box::new(manifest)));
+            }
+            if let Some(path) = latest_path
+                && let Some(mut entry) = crate::client::cache::open_metadata_cache_entry(&path)
+                && entry.remaining_freshness().is_some()
+                && let Some(manifest) = crate::client::cache::decode_metadata_cache_payload::<
+                    VersionMetadata,
+                >(&mut entry.reader)
+                && valid_latest(&target_name, &manifest)
+            {
+                return PreferenceProbe::Hit(Preference::Latest(Box::new(manifest)));
+            }
+            PreferenceProbe::Miss {
+                has_stale_history_validator,
+            }
+        })
+        .await
+        .unwrap_or(PreferenceProbe::Miss {
+            has_stale_history_validator: false,
+        })
     }
 
     /// Fetch the latest document after the caller found no usable cache. The flight
@@ -371,9 +450,9 @@ impl RegistryClient {
         let _flight = self.history_cache.flight(key).await;
         let (generation, _) = self.history_cache.lookup(key);
         let started = std::time::Instant::now();
-        let cached = self.read_preference_cache(name, access, key).await;
+        let probe = self.probe_preference_cache(name, access, key).await;
         timings.cache_read_ms += started.elapsed().as_millis();
-        if let Some(cached) = cached {
+        if let PreferenceProbe::Hit(cached) = probe {
             timings.cache_hit = true;
             return (Ok(cached), timings);
         }
@@ -397,7 +476,7 @@ impl RegistryClient {
         timings: &mut PackageMetadataFetchTimings,
     ) -> Result<VersionMetadata, LpmError> {
         let started = std::time::Instant::now();
-        let validator = self.read_cache_validator(key);
+        let validator = self.read_cache_validator_async(key).await;
         timings.validator_read_ms += started.elapsed().as_millis();
         let url = format!("{}/{name}/latest", self.npm_registry_url);
         let request = self
@@ -501,9 +580,15 @@ impl RegistryClient {
             );
         }
         let started = std::time::Instant::now();
-        self.history_cache.with_generation(generation, || {
-            self.write_metadata_cache_with_directive(key, &manifest, etag.as_deref(), directive);
-        });
+        let (manifest, _written) = self
+            .write_metadata_cache_entry_async(
+                key,
+                manifest,
+                etag.as_deref(),
+                directive,
+                Some(generation),
+            )
+            .await?;
         timings.cache_write_dispatch_ms += started.elapsed().as_millis();
         Ok(manifest)
     }

@@ -442,6 +442,53 @@ pub struct FanOutStats {
     pub halve_events: usize,
 }
 
+/// Tracks in-flight asynchronous metadata cache writes without retaining
+/// completed `JoinHandle`s across long-lived clients.
+#[derive(Default)]
+pub(super) struct PendingCacheWrites {
+    active: std::sync::atomic::AtomicUsize,
+    drained: tokio::sync::Notify,
+}
+
+pub(super) struct PendingCacheWriteGuard {
+    tracker: Arc<PendingCacheWrites>,
+}
+
+impl PendingCacheWrites {
+    pub(super) fn enter(self: &Arc<Self>) -> PendingCacheWriteGuard {
+        self.active
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        PendingCacheWriteGuard {
+            tracker: Arc::clone(self),
+        }
+    }
+
+    pub(super) async fn flush(&self) {
+        loop {
+            let notified = self.drained.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.active.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for PendingCacheWriteGuard {
+    fn drop(&mut self) {
+        if self
+            .tracker
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.tracker.drained.notify_waiters();
+        }
+    }
+}
+
 /// Client for communicating with the LPM registry.
 pub struct RegistryClient {
     /// Bundle of HTTP clients keyed by origin. Default client + eager +
@@ -461,20 +508,14 @@ pub struct RegistryClient {
     pub(super) token: Option<SecretString>,
     /// Path to the metadata cache directory. None disables caching.
     pub(super) cache_dir: Option<std::path::PathBuf>,
-    /// Handles for in-flight `spawn_blocking` cache writes. Production
-    /// callers never observe this (the writes are fire-and-forget and the
-    /// handles drop on `RegistryClient::drop`). Tests call
-    /// [`Self::flush_pending_cache_writes`] to deterministically await all
-    /// pending writes before reading the cache back. The push is one
-    /// `Mutex` acquire + `Vec` push per write — sub-µs vs the ms-scale
-    /// `std::fs::write` it tracks.
-    pub(super) pending_cache_writes: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Count + waiter notification for in-flight `spawn_blocking` cache writes.
+    pub(super) pending_cache_writes: Arc<PendingCacheWrites>,
     /// Byte budget held by queued asynchronous metadata-cache buffers.
     /// Cache writes are best-effort and are skipped when a cold metadata
     /// burst would exceed this bound.
     pub(super) pending_cache_write_bytes: Arc<tokio::sync::Semaphore>,
     pub(super) metadata_cache_mutations:
-        Arc<std::sync::Mutex<HashMap<std::path::PathBuf, Arc<MetadataCacheMutation>>>>,
+        Arc<std::sync::Mutex<HashMap<std::path::PathBuf, std::sync::Weak<MetadataCacheMutation>>>>,
     /// Optional command-scoped immutable packument cache. Recursive
     /// workspace installs enable it on client clones so independent
     /// importer resolvers can reuse one parsed registry response without

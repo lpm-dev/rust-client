@@ -98,54 +98,96 @@ pub(super) fn projection_path(entry: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Read the projection bound to `content_id` in `format`.
+///
+/// Validates the bounded header from the open file before allocating or reading
+/// the projection body, so stale or format-mismatched files avoid reading large
+/// sidecar payloads into memory.
 pub(super) fn read_projection<P: MetadataProjection>(
     entry: &std::path::Path,
     content_id: u128,
 ) -> Option<(P, ProjectionFacts)> {
+    use std::io::Read as _;
+
     if P::FORMAT.is_empty() {
         return None;
     }
-    let bytes =
-        lpm_common::read_file_capped(&projection_path(entry), cache::METADATA_CACHE_FILE_CAP)
-            .ok()?;
-    let (facts, body) = parse_projection(&bytes, content_id, P::FORMAT)?;
-    Some((P::decode(body)?, facts))
+    let file = std::fs::File::open(projection_path(entry)).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    if file_len > cache::METADATA_CACHE_FILE_CAP {
+        return None;
+    }
+    let mut reader = std::io::BufReader::new(file.take(cache::METADATA_CACHE_FILE_CAP));
+    let (facts, header_bytes) = read_projection_header(&mut reader, content_id, P::FORMAT)?;
+    let remaining_est = usize::try_from(file_len.saturating_sub(header_bytes as u64))
+        .unwrap_or(0)
+        .min(cache::METADATA_CACHE_FILE_CAP as usize);
+    let mut body = Vec::with_capacity(remaining_est);
+    reader.read_to_end(&mut body).ok()?;
+    Some((P::decode(&body)?, facts))
 }
 
+fn read_projection_header<R: std::io::Read>(
+    reader: &mut R,
+    content_id: u128,
+    format: &str,
+) -> Option<(ProjectionFacts, usize)> {
+    let mut magic = [0u8; PROJECTION_MAGIC.len()];
+    reader.read_exact(&mut magic).ok()?;
+    if magic != *PROJECTION_MAGIC {
+        return None;
+    }
+    let mut stored_id = [0u8; 16];
+    reader.read_exact(&mut stored_id).ok()?;
+    if u128::from_le_bytes(stored_id) != content_id {
+        return None;
+    }
+    let mut flags_buf = [0u8; 1];
+    reader.read_exact(&mut flags_buf).ok()?;
+    let flags = flags_buf[0];
+    if flags & !(VERSIONS_COMPLETE | LATEST_PRESENT) != 0 {
+        return None;
+    }
+    let mut header_bytes = PROJECTION_MAGIC.len() + 16 + 1;
+    let latest = if flags & LATEST_PRESENT != 0 {
+        let (latest, consumed) = read_text(reader)?;
+        header_bytes += consumed;
+        Some(latest)
+    } else {
+        None
+    };
+    let (stored_format, consumed) = read_text(reader)?;
+    header_bytes += consumed;
+    if stored_format != format {
+        return None;
+    }
+    Some((
+        ProjectionFacts {
+            versions_complete: flags & VERSIONS_COMPLETE != 0,
+            latest,
+        },
+        header_bytes,
+    ))
+}
+
+fn read_text<R: std::io::Read>(reader: &mut R) -> Option<(String, usize)> {
+    let mut len_buf = [0u8; 2];
+    reader.read_exact(&mut len_buf).ok()?;
+    let len = usize::from(u16::from_le_bytes(len_buf));
+    let mut bytes = vec![0u8; len];
+    reader.read_exact(&mut bytes).ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    Some((text, 2 + len))
+}
+
+#[cfg(test)]
 fn parse_projection<'a>(
     bytes: &'a [u8],
     content_id: u128,
     format: &str,
 ) -> Option<(ProjectionFacts, &'a [u8])> {
-    let rest = bytes.strip_prefix(PROJECTION_MAGIC)?;
-    let (stored_id, rest) = rest.split_first_chunk::<16>()?;
-    if u128::from_le_bytes(*stored_id) != content_id {
-        return None;
-    }
-    let (&flags, rest) = rest.split_first()?;
-    if flags & !(VERSIONS_COMPLETE | LATEST_PRESENT) != 0 {
-        return None;
-    }
-    let (latest, rest) = if flags & LATEST_PRESENT != 0 {
-        let (latest, rest) = take_text(rest)?;
-        (Some(latest.to_owned()), rest)
-    } else {
-        (None, rest)
-    };
-    let (stored_format, body) = take_text(rest)?;
-    (stored_format == format).then_some((
-        ProjectionFacts {
-            versions_complete: flags & VERSIONS_COMPLETE != 0,
-            latest,
-        },
-        body,
-    ))
-}
-
-fn take_text(bytes: &[u8]) -> Option<(&str, &[u8])> {
-    let (len, rest) = bytes.split_first_chunk::<2>()?;
-    let (text, rest) = rest.split_at_checked(usize::from(u16::from_le_bytes(*len)))?;
-    Some((std::str::from_utf8(text).ok()?, rest))
+    let mut cursor = std::io::Cursor::new(bytes);
+    let (facts, consumed) = read_projection_header(&mut cursor, content_id, format)?;
+    Some((facts, &bytes[consumed..]))
 }
 
 fn projection_header(slot: &ProjectionSlot) -> Option<Vec<u8>> {
@@ -200,17 +242,25 @@ impl RegistryClient {
     ///
     /// The write is best-effort and runs off the calling thread. It is skipped
     /// when the pending cache-write budget is exhausted.
-    pub fn store_metadata_projection(&self, slot: ProjectionSlot, body: Vec<u8>) {
-        let Some(header) = projection_header(&slot) else {
+    pub fn store_metadata_projection(&self, slot: ProjectionSlot, mut body: Vec<u8>) {
+        let Some(mut header) = projection_header(&slot) else {
             return;
         };
-        let bytes = header.len() + body.len();
+        let bytes = header.len().saturating_add(body.len());
         if bytes as u64 > cache::METADATA_CACHE_FILE_CAP {
             return;
         }
-        let Some(reservation) =
-            cache::reserve_pending_metadata_cache_bytes(&self.pending_cache_write_bytes, bytes)
-        else {
+        if body.capacity().saturating_sub(body.len()) > 4096 {
+            body.shrink_to_fit();
+        }
+        if header.capacity().saturating_sub(header.len()) > 256 {
+            header.shrink_to_fit();
+        }
+        let retained_capacity = header.capacity().saturating_add(body.capacity());
+        let Some(reservation) = cache::reserve_pending_metadata_cache_bytes(
+            &self.pending_cache_write_bytes,
+            retained_capacity,
+        ) else {
             tracing::debug!(
                 "skipping metadata projection write because the allocation budget is full"
             );
@@ -236,10 +286,11 @@ impl RegistryClient {
         };
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) if !self.synchronous_cache_writes => {
-                let join = runtime.spawn_blocking(write);
-                if let Ok(mut pending) = self.pending_cache_writes.lock() {
-                    pending.push(join);
-                }
+                let pending_guard = self.pending_cache_writes.enter();
+                drop(runtime.spawn_blocking(move || {
+                    let _pending_guard = pending_guard;
+                    write();
+                }));
             }
             _ => write(),
         }
@@ -287,5 +338,26 @@ mod tests {
                 "{len}"
             );
         }
+    }
+
+    #[test]
+    fn read_projection_rejects_mismatched_content_id_without_decoding_body() {
+        struct PanicOnDecode;
+        impl MetadataProjection for PanicOnDecode {
+            const FORMAT: &'static str = "format/1";
+
+            fn decode(_bytes: &[u8]) -> Option<Self> {
+                panic!("projection body must not be decoded when header content_id mismatches");
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path().join("entry");
+        let slot = slot(Some("2.0.0"));
+        let mut bytes = projection_header(&slot).unwrap();
+        bytes.extend_from_slice(&[0xff; 64]);
+        std::fs::write(projection_path(&entry), bytes).unwrap();
+
+        assert!(read_projection::<PanicOnDecode>(&entry, slot.content_id + 1).is_none());
     }
 }

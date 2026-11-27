@@ -15,6 +15,21 @@ struct PreferredMetadata {
     versions_complete: bool,
 }
 
+#[derive(serde::Deserialize)]
+struct ResolverPreferred {
+    metadata: resolver_cache::ResolverMetadata,
+    versions_complete: bool,
+}
+
+impl From<ResolverPreferred> for PreferredMetadata {
+    fn from(value: ResolverPreferred) -> Self {
+        Self {
+            metadata: value.metadata.0,
+            versions_complete: value.versions_complete,
+        }
+    }
+}
+
 impl PreferredMetadata {
     fn is_valid(&self, name: &str) -> bool {
         batch_metadata_entry_matches_name(name, &self.metadata)
@@ -41,11 +56,25 @@ struct Catalog<'a> {
     #[serde(borrow)]
     name: Cow<'a, str>,
     #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
     modified: Option<String>,
     #[serde(default, rename = "dist-tags")]
     dist_tags: HashMap<String, String>,
     #[serde(borrow, default)]
     versions: Option<&'a RawValue>,
+    #[serde(borrow, default)]
+    time: Option<&'a RawValue>,
+    #[serde(default)]
+    downloads: Option<u64>,
+    #[serde(default, rename = "distributionMode")]
+    distribution_mode: Option<String>,
+    #[serde(default, rename = "packageType")]
+    package_type: Option<String>,
+    #[serde(default, rename = "latestVersion")]
+    latest_version: Option<String>,
+    #[serde(default)]
+    ecosystem: Option<String>,
 }
 
 struct PreferredVersions<'a> {
@@ -83,7 +112,12 @@ impl<'de> Visitor<'de> for PreferredVersions<'_> {
             if version == self.latest {
                 latest = Some(record);
             }
-            if let Ok(parsed) = lpm_semver::Version::parse(&version)
+            let is_prerelease_candidate = version
+                .split_once('+')
+                .map_or(version.as_ref(), |(core, _)| core)
+                .contains('-');
+            if !is_prerelease_candidate
+                && let Ok(parsed) = lpm_semver::Version::parse(&version)
                 && !parsed.is_prerelease()
                 && newest
                     .as_ref()
@@ -110,8 +144,31 @@ fn parse_preferred(
             "package history identity does not match request",
         ));
     }
-    let full = || {
-        let metadata: PackageMetadata = serde_json::from_slice(bytes)?;
+    let full = |catalog: Catalog<'_>| -> Result<PreferredMetadata, serde_json::Error> {
+        let metadata = if let Some(raw_versions) = catalog.versions {
+            let versions: HashMap<String, VersionMetadata> =
+                serde_json::from_str(raw_versions.get())?;
+            let time: HashMap<String, String> = match catalog.time {
+                Some(raw_time) => serde_json::from_str(raw_time.get())?,
+                None => HashMap::new(),
+            };
+            PackageMetadata {
+                name: catalog.name.into_owned(),
+                description: catalog.description,
+                modified: catalog.modified,
+                dist_tags: catalog.dist_tags,
+                versions,
+                time,
+                downloads: catalog.downloads,
+                distribution_mode: catalog.distribution_mode,
+                package_type: catalog.package_type,
+                latest_version: catalog.latest_version,
+                latest_hint: Default::default(),
+                ecosystem: catalog.ecosystem,
+            }
+        } else {
+            serde_json::from_slice(bytes)?
+        };
         if !batch_metadata_entry_matches_name(name, &metadata) {
             return Err(serde_json::Error::custom(
                 "package history identity does not match request",
@@ -126,27 +183,28 @@ fn parse_preferred(
         .dist_tags
         .get("latest")
         .filter(|latest| accepts(latest))
+        .cloned()
     else {
-        return full();
+        return full(catalog);
     };
     let Some(records) = catalog.versions else {
-        return full();
+        return full(catalog);
     };
     let mut deserializer = serde_json::Deserializer::from_str(records.get());
-    let selected = PreferredVersions { latest }.deserialize(&mut deserializer)?;
+    let selected = PreferredVersions { latest: &latest }.deserialize(&mut deserializer)?;
     deserializer.end()?;
     let Some(latest_record) = selected.latest else {
-        return full();
+        return full(catalog);
     };
     let mut versions = HashMap::with_capacity(2);
     for (version, record) in std::iter::once((latest.clone(), latest_record)).chain(
         selected
             .newest_stable
-            .filter(|(version, _)| version != latest),
+            .filter(|(version, _)| version != &latest),
     ) {
         let manifest: VersionMetadata = serde_json::from_str(record.get())?;
         if manifest.name != name || manifest.version != version {
-            return full();
+            return full(catalog);
         }
         versions.insert(version, manifest);
     }
@@ -282,11 +340,6 @@ impl RegistryClient {
                 CachedHistory::document(cached.value.metadata, cached.value.versions_complete, None)
             });
         }
-        #[derive(serde::Deserialize)]
-        struct ResolverPreferred {
-            metadata: resolver_cache::ResolverMetadata,
-            versions_complete: bool,
-        }
         match self
             .read_metadata_cache_resolution_async::<ResolverPreferred, P>(key)
             .await?
@@ -296,10 +349,7 @@ impl RegistryClient {
                 Some(CachedHistory::projected(value, facts))
             }
             CachedResolution::Document { value, source } => {
-                let preferred = PreferredMetadata {
-                    metadata: value.metadata.0,
-                    versions_complete: value.versions_complete,
-                };
+                let preferred = PreferredMetadata::from(value);
                 preferred.is_valid(name).then(|| {
                     CachedHistory::document(preferred.metadata, preferred.versions_complete, source)
                 })
@@ -463,10 +513,20 @@ impl RegistryClient {
         let validator_start = std::time::Instant::now();
         // Both entries hold selections of the same response, so a stale
         // complete history is revalidated when no preferred selection exists.
-        let (validator, revalidates_complete) = match self.read_cache_validator(&cache_key) {
-            Some(validator) => (Some(validator), false),
-            None => (self.read_cache_validator(&complete_key), true),
-        };
+        let (validator, revalidates_complete) =
+            match (self.cache_path(&cache_key), self.cache_path(&complete_key)) {
+                (Some(preferred_path), Some(complete_path)) => {
+                    tokio::task::spawn_blocking(move || {
+                        match Self::read_cache_validator_path(&preferred_path) {
+                            Some(validator) => (Some(validator), false),
+                            None => (Self::read_cache_validator_path(&complete_path), true),
+                        }
+                    })
+                    .await
+                    .unwrap_or((None, true))
+                }
+                _ => (None, true),
+            };
         timings.validator_read_ms = validator_start.elapsed().as_millis();
         let url = format!("{}/{name}", self.npm_registry_url);
         let rpc_start = std::time::Instant::now();
@@ -483,24 +543,50 @@ impl RegistryClient {
             if response.status() == reqwest::StatusCode::NOT_MODIFIED {
                 let cache_start = std::time::Instant::now();
                 let revalidated = if revalidates_complete {
-                    self.cached_resolution_after_304::<PackageMetadata, P>(
-                        &complete_key,
-                        &response,
-                        validator.as_ref(),
-                        |metadata| batch_metadata_entry_matches_name(name, metadata),
-                        |facts| facts.versions_complete,
-                    )
-                    .await
+                    if RESOLVER {
+                        self.cached_resolution_after_304_with_view::<PackageMetadata, resolver_cache::ResolverMetadata, P>(
+                            &complete_key,
+                            &response,
+                            validator.as_ref(),
+                            |view| view.0,
+                            |metadata| batch_metadata_entry_matches_name(name, metadata),
+                            |facts| facts.versions_complete,
+                        )
+                        .await
+                    } else {
+                        self.cached_resolution_after_304_with_view::<PackageMetadata, PackageMetadata, P>(
+                            &complete_key,
+                            &response,
+                            validator.as_ref(),
+                            std::convert::identity,
+                            |metadata| batch_metadata_entry_matches_name(name, metadata),
+                            |facts| facts.versions_complete,
+                        )
+                        .await
+                    }
                     .map(|cached| CachedHistory::from_complete(cached.value))
                 } else {
-                    self.cached_resolution_after_304::<PreferredMetadata, P>(
-                        &cache_key,
-                        &response,
-                        validator.as_ref(),
-                        |cached| cached.is_valid(name) && cached.covers(&accepts),
-                        |facts| facts.covers(&accepts),
-                    )
-                    .await
+                    if RESOLVER {
+                        self.cached_resolution_after_304_with_view::<PreferredMetadata, ResolverPreferred, P>(
+                            &cache_key,
+                            &response,
+                            validator.as_ref(),
+                            PreferredMetadata::from,
+                            |cached| cached.is_valid(name) && cached.covers(&accepts),
+                            |facts| facts.covers(&accepts),
+                        )
+                        .await
+                    } else {
+                        self.cached_resolution_after_304_with_view::<PreferredMetadata, PreferredMetadata, P>(
+                            &cache_key,
+                            &response,
+                            validator.as_ref(),
+                            std::convert::identity,
+                            |cached| cached.is_valid(name) && cached.covers(&accepts),
+                            |facts| facts.covers(&accepts),
+                        )
+                        .await
+                    }
                     .map(|cached| CachedHistory::from_preferred(cached.value))
                 };
                 if let Some(cached) = revalidated {
@@ -541,30 +627,44 @@ impl RegistryClient {
             timings.json_decode_ms = body.json_parse_ms;
             timings.body_bytes = body.body_bytes;
             let write_start = std::time::Instant::now();
-            let written = if directive == super::super::cache::MetadataCacheDirective::NoStore {
-                self.write_metadata_cache_with_directive(&cache_key, &selected, None, directive);
-                self.write_metadata_cache_with_directive(
-                    &complete_key,
-                    &selected.metadata,
-                    None,
-                    directive,
-                );
-                None
-            } else if selected.versions_complete {
-                self.invalidate_metadata_cache_key(&cache_key);
-                self.write_metadata_cache_entry(
-                    &complete_key,
-                    &selected.metadata,
-                    etag.as_deref(),
-                    directive,
-                )
-            } else {
-                self.write_metadata_cache_entry(&cache_key, &selected, etag.as_deref(), directive)
-            };
+            let (metadata, versions_complete, written) =
+                if directive == super::super::cache::MetadataCacheDirective::NoStore {
+                    self.write_metadata_cache_with_directive(&cache_key, &selected, None, directive);
+                    self.write_metadata_cache_with_directive(
+                        &complete_key,
+                        &selected.metadata,
+                        None,
+                        directive,
+                    );
+                    (selected.metadata, selected.versions_complete, None)
+                } else if selected.versions_complete {
+                    self.invalidate_metadata_cache_key(&cache_key);
+                    let (metadata, written) = self
+                        .write_metadata_cache_entry_async(
+                            &complete_key,
+                            selected.metadata,
+                            etag.as_deref(),
+                            directive,
+                            None,
+                        )
+                        .await?;
+                    (metadata, true, written)
+                } else {
+                    let (selected, written) = self
+                        .write_metadata_cache_entry_async(
+                            &cache_key,
+                            selected,
+                            etag.as_deref(),
+                            directive,
+                            None,
+                        )
+                        .await?;
+                    (selected.metadata, selected.versions_complete, written)
+                };
             timings.cache_write_dispatch_ms = write_start.elapsed().as_millis();
             Ok(CachedHistory::<P>::document(
-                selected.metadata,
-                selected.versions_complete,
+                metadata,
+                versions_complete,
                 written.and_then(|write| write.source),
             )
             .with_timings(timings))
@@ -665,7 +765,7 @@ impl RegistryClient {
         }
 
         let validator_start = std::time::Instant::now();
-        let cache_validator = self.read_cache_validator(&cache_key);
+        let cache_validator = self.read_cache_validator_async(&cache_key).await;
         timings.validator_read_ms = validator_start.elapsed().as_millis();
         timings.cache_age_seconds = cache_validator
             .as_ref()
@@ -693,10 +793,11 @@ impl RegistryClient {
             timings.not_modified = true;
             let cache_304_start = std::time::Instant::now();
             if let Some(cached) = self
-                .cached_resolution_after_304::<PackageMetadata, P>(
+                .cached_resolution_after_304_with_view::<PackageMetadata, resolver_cache::ResolverMetadata, P>(
                     &cache_key,
                     &response,
                     cache_validator.as_ref(),
+                    |view| view.0,
                     |metadata| batch_metadata_entry_matches_name(name, metadata),
                     |facts| facts.versions_complete,
                 )
@@ -773,12 +874,19 @@ impl RegistryClient {
         timings.json_decode_ms = body_timings.json_parse_ms;
         timings.body_bytes = body_timings.body_bytes;
         let cache_write_start = std::time::Instant::now();
-        let written = self.write_metadata_cache_entry(
-            &cache_key,
-            &metadata,
-            etag.as_deref(),
-            cache_directive,
-        );
+        let (metadata, written) = match self
+            .write_metadata_cache_entry_async(
+                &cache_key,
+                metadata,
+                etag.as_deref(),
+                cache_directive,
+                None,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => return finish!(Err(error)),
+        };
         timings.cache_write_dispatch_ms = cache_write_start.elapsed().as_millis();
         self.remember_metadata_for_command(
             &memory_cache_key,

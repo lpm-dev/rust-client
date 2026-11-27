@@ -12,8 +12,11 @@ const _: () = assert!(MAX_METADATA_BYTES <= 64 * 1024 * 1024);
 pub(super) const MAX_VERSION_METADATA_BYTES: usize = 4 * 1024 * 1024;
 // Keep small responses inline; large packuments can monopolize an async worker.
 pub(super) const BLOCKING_METADATA_PARSE_THRESHOLD: usize = 64 * 1024;
-// Bound simultaneous multi-MB packument deserializations to keep cold-install peak RSS in check.
+// Bound simultaneous multi-MB packument buffers and deserializations to keep peak RSS in check.
 const LARGE_METADATA_PARSE_THRESHOLD: usize = 512 * 1024;
+const METADATA_MEMORY_BUDGET_QUANTUM: usize = 64 * 1024;
+const METADATA_MEMORY_BUDGET_UNITS: usize = (128 * 1024 * 1024) / METADATA_MEMORY_BUDGET_QUANTUM;
+const CHUNKED_LARGE_BODY_UNITS: u32 = ((16 * 1024 * 1024) / METADATA_MEMORY_BUDGET_QUANTUM) as u32;
 
 fn large_metadata_parse_limiter() -> &'static Arc<tokio::sync::Semaphore> {
     static LIMITER: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
@@ -24,6 +27,105 @@ fn large_metadata_parse_limiter() -> &'static Arc<tokio::sync::Semaphore> {
     })
 }
 
+fn metadata_body_memory_budget() -> &'static Arc<tokio::sync::Semaphore> {
+    static BUDGET: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    BUDGET.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(METADATA_MEMORY_BUDGET_UNITS)))
+}
+
+struct LargeMetadataMemoryGuard {
+    _concurrency_permit: tokio::sync::OwnedSemaphorePermit,
+    _byte_budget_permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+async fn acquire_large_metadata_guard(
+    limiter: &Arc<tokio::sync::Semaphore>,
+    budget: &Arc<tokio::sync::Semaphore>,
+    bytes: usize,
+    is_declared_total: bool,
+) -> Option<LargeMetadataMemoryGuard> {
+    let concurrency_permit = Arc::clone(limiter).acquire_owned().await.ok()?;
+    let units = if is_declared_total {
+        u32::try_from(
+            bytes
+                .div_ceil(METADATA_MEMORY_BUDGET_QUANTUM)
+                .clamp(1, METADATA_MEMORY_BUDGET_UNITS),
+        )
+        .unwrap_or(METADATA_MEMORY_BUDGET_UNITS as u32)
+    } else {
+        CHUNKED_LARGE_BODY_UNITS.min(METADATA_MEMORY_BUDGET_UNITS as u32)
+    };
+    let byte_budget_permit = Arc::clone(budget).acquire_many_owned(units).await.ok()?;
+    Some(LargeMetadataMemoryGuard {
+        _concurrency_permit: concurrency_permit,
+        _byte_budget_permit: byte_budget_permit,
+    })
+}
+
+async fn read_metadata_body_with_budget(
+    response: reqwest::Response,
+    cap: usize,
+    body: &mut Vec<u8>,
+    limiter: &Arc<tokio::sync::Semaphore>,
+    budget: &Arc<tokio::sync::Semaphore>,
+) -> (
+    Result<(), lpm_http::ResponseBodyError>,
+    Option<LargeMetadataMemoryGuard>,
+) {
+    let limiter = Arc::clone(limiter);
+    let budget = Arc::clone(budget);
+    lpm_http::read_body_capped_with_budget(
+        response,
+        cap,
+        body,
+        None::<LargeMetadataMemoryGuard>,
+        move |mut guard, next_len, is_declared_total| {
+            let limiter = Arc::clone(&limiter);
+            let budget = Arc::clone(&budget);
+            async move {
+                if guard.is_none() && next_len >= LARGE_METADATA_PARSE_THRESHOLD {
+                    guard = acquire_large_metadata_guard(
+                        &limiter,
+                        &budget,
+                        next_len,
+                        is_declared_total,
+                    )
+                    .await;
+                }
+                guard
+            }
+        },
+    )
+    .await
+}
+
+async fn run_blocking_metadata_parse_with_guard<T, F>(
+    limiter: &Arc<tokio::sync::Semaphore>,
+    budget: &Arc<tokio::sync::Semaphore>,
+    buf_len: usize,
+    preacquired_guard: Option<LargeMetadataMemoryGuard>,
+    parse: F,
+) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let guard = if let Some(guard) = preacquired_guard {
+        Some(guard)
+    } else if buf_len >= LARGE_METADATA_PARSE_THRESHOLD {
+        acquire_large_metadata_guard(limiter, budget, buf_len, true).await
+    } else {
+        None
+    };
+    tokio::task::spawn_blocking(move || {
+        // Keep permits alive inside the blocking worker so cancelling the outer future
+        // cannot release RSS headroom while deserialization is still running.
+        let _guard = guard;
+        parse()
+    })
+    .await
+}
+
+#[cfg(test)]
 async fn run_blocking_metadata_parse<T, F>(
     limiter: &Arc<tokio::sync::Semaphore>,
     buf_len: usize,
@@ -33,17 +135,13 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    let large_parse_permit = if buf_len >= LARGE_METADATA_PARSE_THRESHOLD {
-        Arc::clone(limiter).acquire_owned().await.ok()
-    } else {
-        None
-    };
-    tokio::task::spawn_blocking(move || {
-        // Keep the permit alive inside the blocking worker so cancelling the outer future
-        // cannot release RSS headroom while deserialization is still running.
-        let _large_parse_permit = large_parse_permit;
-        parse()
-    })
+    run_blocking_metadata_parse_with_guard(
+        limiter,
+        metadata_body_memory_budget(),
+        buf_len,
+        None,
+        parse,
+    )
     .await
 }
 
@@ -85,16 +183,33 @@ pub(super) async fn parse_capped_metadata<T: serde::de::DeserializeOwned + Send 
     response: reqwest::Response,
     context: &str,
 ) -> Result<T, LpmError> {
-    let buf = read_capped_body(response, MAX_METADATA_BYTES, context).await?;
+    let mut buf = Vec::new();
+    let (read, guard) = read_metadata_body_with_budget(
+        response,
+        MAX_METADATA_BYTES,
+        &mut buf,
+        large_metadata_parse_limiter(),
+        metadata_body_memory_budget(),
+    )
+    .await;
+    read.map_err(|error| LpmError::Registry(format!("{context}: {error}")))?;
     if buf.len() < BLOCKING_METADATA_PARSE_THRESHOLD {
         return parse_metadata_buffer(&buf, context);
     }
 
     let buf_len = buf.len();
     let context_owned = context.to_string();
-    run_blocking_metadata_parse(large_metadata_parse_limiter(), buf_len, move || {
-        parse_metadata_buffer(&buf, &context_owned)
-    })
+    run_blocking_metadata_parse_with_guard(
+        large_metadata_parse_limiter(),
+        metadata_body_memory_budget(),
+        buf_len,
+        guard,
+        move || {
+            let parsed = parse_metadata_buffer(&buf, &context_owned);
+            drop(buf);
+            parsed
+        },
+    )
     .await
     .map_err(|e| LpmError::Registry(format!("{context}: JSON parse task failed: {e}")))?
 }
@@ -185,7 +300,14 @@ where
 {
     let body_start = std::time::Instant::now();
     let mut buf = Vec::new();
-    let read = lpm_http::read_body_capped_into(response, cap, &mut buf).await;
+    let (read, guard) = read_metadata_body_with_budget(
+        response,
+        cap,
+        &mut buf,
+        large_metadata_parse_limiter(),
+        metadata_body_memory_budget(),
+    )
+    .await;
     tracing::event!(name: "body_end", target: "lpm_install_timeline", tracing::Level::TRACE, bytes = buf.len() as u64, success = read.is_ok());
     let mut timings = MetadataBodyTimings {
         body_read_ms: body_start.elapsed().as_millis(),
@@ -199,6 +321,8 @@ where
     };
     let read = read.map_err(|error| LpmError::Registry(format!("{context}: {error}")));
     if let Err(error) = read {
+        drop(buf);
+        drop(guard);
         return (Err(error), timings);
     }
     if buf.len() < BLOCKING_METADATA_PARSE_THRESHOLD {
@@ -220,16 +344,22 @@ where
         tracing::trace_span!(target: "lpm_install_timeline", "metadata_parse", blocking = true);
     tracing::event!(name: "enqueue", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, {});
     let worker_span = span.clone();
-    let result = run_blocking_metadata_parse(large_metadata_parse_limiter(), buf_len, move || {
-        let _entered = worker_span.enter();
-        tracing::event!(name: "work_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
-        let parse_start = std::time::Instant::now();
-        let parsed = parse(buf).map_err(|error| {
-            LpmError::Registry(format!("{context_owned}: failed to parse JSON: {error}"))
-        });
-        tracing::event!(name: "work_end", target: "lpm_install_timeline", tracing::Level::TRACE, success = parsed.is_ok());
-        (parsed, parse_start.elapsed().as_millis())
-    })
+    let result = run_blocking_metadata_parse_with_guard(
+        large_metadata_parse_limiter(),
+        metadata_body_memory_budget(),
+        buf_len,
+        guard,
+        move || {
+            let _entered = worker_span.enter();
+            tracing::event!(name: "work_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
+            let parse_start = std::time::Instant::now();
+            let parsed = parse(buf).map_err(|error| {
+                LpmError::Registry(format!("{context_owned}: failed to parse JSON: {error}"))
+            });
+            tracing::event!(name: "work_end", target: "lpm_install_timeline", tracing::Level::TRACE, success = parsed.is_ok());
+            (parsed, parse_start.elapsed().as_millis())
+        },
+    )
     .await;
     tracing::event!(name: "await_resume", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, success = result.is_ok());
     match result {
@@ -468,5 +598,61 @@ mod tests {
             split_package_coordinate("pkg@".to_owned()),
             ("pkg@".to_owned(), None)
         );
+    }
+
+    #[tokio::test]
+    async fn large_metadata_body_read_waits_for_memory_budget_before_completing() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let payload = "a".repeat(LARGE_METADATA_PARSE_THRESHOLD + 4096);
+        Mock::given(method("GET"))
+            .and(path("/large"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(payload.clone()))
+            .mount(&server)
+            .await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{}/large", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let budget = Arc::new(tokio::sync::Semaphore::new(METADATA_MEMORY_BUDGET_UNITS));
+        let held = Arc::clone(&budget)
+            .try_acquire_many_owned(METADATA_MEMORY_BUDGET_UNITS as u32)
+            .unwrap();
+
+        let limiter_for_task = Arc::clone(&limiter);
+        let budget_for_task = Arc::clone(&budget);
+        let mut task = tokio::spawn(async move {
+            let mut body = Vec::new();
+            let (read, guard) = read_metadata_body_with_budget(
+                response,
+                MAX_METADATA_BYTES,
+                &mut body,
+                &limiter_for_task,
+                &budget_for_task,
+            )
+            .await;
+            read.unwrap();
+            (body.len(), guard.is_some())
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(60), &mut task)
+                .await
+                .is_err(),
+            "large body read must wait for memory budget permits before buffering"
+        );
+        drop(held);
+        let (len, acquired_guard) = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("body read must finish once memory budget permits are available")
+            .unwrap();
+        assert_eq!(len, payload.len());
+        assert!(acquired_guard);
+        assert_eq!(budget.available_permits(), METADATA_MEMORY_BUDGET_UNITS);
     }
 }

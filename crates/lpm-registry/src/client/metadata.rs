@@ -4,7 +4,7 @@ mod batch_hint_tests;
 use super::*;
 
 mod preferred;
-mod version_selection;
+pub(super) mod version_selection;
 
 /// Caller-supplied hints from an already-validated abbreviated packument that
 /// allow public npm age-only release-time hydration to fetch just the tail
@@ -33,14 +33,23 @@ enum MetadataCachePolicy {
 /// a cache hit.
 async fn metadata_fetch_flight_guard(cache_key: &str) -> tokio::sync::OwnedMutexGuard<()> {
     static FLIGHTS: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+        std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     > = std::sync::OnceLock::new();
     let flight = {
         let mut flights = FLIGHTS
             .get_or_init(Default::default)
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Arc::clone(flights.entry(cache_key.to_owned()).or_default())
+        if let Some(existing) = flights.get(cache_key).and_then(std::sync::Weak::upgrade) {
+            existing
+        } else {
+            if flights.len() >= 64 {
+                flights.retain(|_, weak| weak.strong_count() > 0);
+            }
+            let flight = Arc::new(tokio::sync::Mutex::new(()));
+            flights.insert(cache_key.to_owned(), Arc::downgrade(&flight));
+            flight
+        }
     };
     flight.lock_owned().await
 }
@@ -956,9 +965,11 @@ impl RegistryClient {
                 name,
                 bearer.as_deref(),
             );
-            let cache_validator = use_validator
-                .then(|| self.read_cache_validator(&cache_key))
-                .flatten();
+            let cache_validator = if use_validator {
+                self.read_cache_validator_async(&cache_key).await
+            } else {
+                None
+            };
             let mut request = self
                 .build_worker_metadata_get_with_bearer(url, bearer.as_deref())
                 .await?;
@@ -1057,25 +1068,28 @@ impl RegistryClient {
                 if fresh_for == cached_fresh_for
                     && etags_weak_match(effective_etag, cached_etag.as_deref())
         );
-        let mut remaining_freshness = Duration::ZERO;
-        let mut publish = || {
-            remaining_freshness = if can_refresh_in_place {
-                self.refresh_metadata_cache_freshness(cache_key, cached_fresh_for)
-            } else {
-                self.write_metadata_cache_with_directive(
+        let (value, remaining_freshness) = if can_refresh_in_place {
+            let remaining = self
+                .refresh_metadata_cache_freshness_at_generation_async(
                     cache_key,
-                    &value,
+                    cached_fresh_for,
+                    generation,
+                )
+                .unwrap_or_default();
+            (value, remaining)
+        } else {
+            let (value, written) = self
+                .write_metadata_cache_entry_async(
+                    cache_key,
+                    value,
                     effective_etag,
                     directive,
+                    generation,
                 )
-            }
-            .unwrap_or_default();
+                .await
+                .ok()?;
+            (value, written.map(|w| w.fresh_for).unwrap_or_default())
         };
-        if let Some(generation) = generation {
-            self.history_cache.with_generation(generation, publish);
-        } else {
-            publish();
-        }
         Some(MetadataCacheEntry {
             value,
             etag: response_etag.or(cached_etag),
@@ -1084,87 +1098,150 @@ impl RegistryClient {
     }
 
     /// Revalidate a cached document, or the stored projection bound to it,
-    /// after a 304. A projection answers only when the entry can be refreshed
-    /// in place; rewriting the entry needs the document.
-    pub(super) async fn cached_resolution_after_304<T, P>(
+    /// after a 304. When the entry can be refreshed in place, a stored
+    /// projection answers directly and non-projected entries decode via `R`
+    /// (allowing resolver callers to skip development dependencies); rewriting
+    /// decodes the full document `T` in the same blocking pass without opening
+    /// the entry twice.
+    pub(super) async fn cached_resolution_after_304_with_view<T, R, P>(
         &self,
         cache_key: &str,
         response: &reqwest::Response,
         validator: Option<&CacheValidator>,
+        into_document: impl FnOnce(R) -> T + Send + 'static,
         document_is_valid: impl FnOnce(&T) -> bool,
         projection_is_valid: impl FnOnce(&ProjectionFacts) -> bool,
     ) -> Option<MetadataCacheEntry<CachedResolution<T, P>>>
     where
         T: serde::de::DeserializeOwned + serde::Serialize + Send + 'static,
+        R: serde::de::DeserializeOwned + Send + 'static,
         P: MetadataProjection,
     {
-        let validator_etag = validator?.etag.as_deref()?;
-        let stale = self
-            .read_stale_metadata_cache_resolution_async::<T, P>(cache_key)
-            .await?;
-        let cached_etag = stale.header.etag;
-        let cached_fresh_for = stale.header.fresh_for;
-        if cached_etag.as_deref() != Some(validator_etag) {
-            return None;
-        }
-        let valid = match &stale.value {
-            CachedResolution::Document { value, .. } => document_is_valid(value),
-            CachedResolution::Projected { facts, .. } => projection_is_valid(facts),
-        };
-        if !valid {
-            self.invalidate_metadata_cache_key(cache_key);
-            return None;
-        }
-        let directive = match Self::metadata_cache_directive(response.headers()) {
-            MetadataCacheDirective::Unspecified => MetadataCacheDirective::Store {
-                fresh_for: cached_fresh_for,
-            },
-            directive => directive,
-        };
+        let validator_etag = validator?.etag.as_deref()?.to_owned();
+        let path = self.cache_path(cache_key)?;
+        let response_directive = Self::metadata_cache_directive(response.headers());
         let response_etag = Self::response_etag(response);
-        let effective_etag = response_etag.as_deref().or(cached_etag.as_deref());
-        let can_refresh_in_place = matches!(
-            directive,
-            MetadataCacheDirective::Store { fresh_for }
-                if fresh_for == cached_fresh_for
-                    && etags_weak_match(effective_etag, cached_etag.as_deref())
-        );
-        if can_refresh_in_place {
-            let remaining_freshness = self
-                .refresh_metadata_cache_freshness(cache_key, cached_fresh_for)
-                .unwrap_or_default();
-            return Some(MetadataCacheEntry {
-                value: stale.value,
-                etag: cached_etag.or(response_etag),
-                remaining_freshness,
-            });
+        let response_etag_for_task = response_etag.clone();
+
+        enum Stale304Outcome<T, P> {
+            InPlace {
+                value: CachedResolution<T, P>,
+                cached_etag: Option<String>,
+                cached_fresh_for: Duration,
+            },
+            Rewrite {
+                document: T,
+                cached_etag: Option<String>,
+                directive: MetadataCacheDirective,
+            },
         }
-        let document = match stale.value {
-            CachedResolution::Document { value, .. } => value,
-            CachedResolution::Projected { .. } => {
-                let path = self.cache_path(cache_key)?;
-                let (value, etag, _) = tokio::task::spawn_blocking(move || {
-                    Self::read_stale_metadata_cache_path_as::<T>(&path)
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            let mut entry = super::cache::open_metadata_cache_entry(&path)?;
+            if entry.header.etag.as_deref() != Some(validator_etag.as_str()) {
+                return None;
+            }
+            let cached_etag = entry.header.etag.clone();
+            let cached_fresh_for = entry.header.fresh_for;
+            let directive = match response_directive {
+                MetadataCacheDirective::Unspecified => MetadataCacheDirective::Store {
+                    fresh_for: cached_fresh_for,
+                },
+                directive => directive,
+            };
+            let effective_etag = response_etag_for_task.as_deref().or(cached_etag.as_deref());
+            let can_refresh_in_place = matches!(
+                directive,
+                MetadataCacheDirective::Store { fresh_for }
+                    if fresh_for == cached_fresh_for
+                        && etags_weak_match(effective_etag, cached_etag.as_deref())
+            );
+            if can_refresh_in_place {
+                let value = match entry.resolve::<R, P>(&path)? {
+                    CachedResolution::Projected {
+                        value,
+                        facts,
+                        source,
+                    } => CachedResolution::Projected {
+                        value,
+                        facts,
+                        source,
+                    },
+                    CachedResolution::Document { value, source } => CachedResolution::Document {
+                        value: into_document(value),
+                        source,
+                    },
+                };
+                Some(Stale304Outcome::InPlace {
+                    value,
+                    cached_etag,
+                    cached_fresh_for,
                 })
-                .await
-                .ok()
-                .flatten()?;
-                if etag != cached_etag {
+            } else {
+                let document = super::cache::decode_metadata_cache_payload::<T>(&mut entry.reader)?;
+                Some(Stale304Outcome::Rewrite {
+                    document,
+                    cached_etag,
+                    directive,
+                })
+            }
+        })
+        .await
+        .ok()
+        .flatten()?;
+
+        match outcome {
+            Stale304Outcome::InPlace {
+                value,
+                cached_etag,
+                cached_fresh_for,
+            } => {
+                let valid = match &value {
+                    CachedResolution::Document { value, .. } => document_is_valid(value),
+                    CachedResolution::Projected { facts, .. } => projection_is_valid(facts),
+                };
+                if !valid {
+                    self.invalidate_metadata_cache_key(cache_key);
                     return None;
                 }
-                value
+                let remaining_freshness =
+                    self.refresh_metadata_cache_freshness_async(cache_key, cached_fresh_for);
+                Some(MetadataCacheEntry {
+                    value,
+                    etag: cached_etag.or(response_etag),
+                    remaining_freshness,
+                })
             }
-        };
-        let written =
-            self.write_metadata_cache_entry(cache_key, &document, effective_etag, directive);
-        Some(MetadataCacheEntry {
-            value: CachedResolution::Document {
-                value: document,
-                source: written.as_ref().and_then(|write| write.source.clone()),
-            },
-            etag: response_etag.or(cached_etag),
-            remaining_freshness: written.map(|write| write.fresh_for).unwrap_or_default(),
-        })
+            Stale304Outcome::Rewrite {
+                document,
+                cached_etag,
+                directive,
+            } => {
+                if !document_is_valid(&document) {
+                    self.invalidate_metadata_cache_key(cache_key);
+                    return None;
+                }
+                let effective_etag = response_etag.as_deref().or(cached_etag.as_deref());
+                let (document, written) = self
+                    .write_metadata_cache_entry_async(
+                        cache_key,
+                        document,
+                        effective_etag,
+                        directive,
+                        None,
+                    )
+                    .await
+                    .ok()?;
+                Some(MetadataCacheEntry {
+                    value: CachedResolution::Document {
+                        value: document,
+                        source: written.as_ref().and_then(|write| write.source.clone()),
+                    },
+                    etag: response_etag.or(cached_etag),
+                    remaining_freshness: written.map(|write| write.fresh_for).unwrap_or_default(),
+                })
+            }
+        }
     }
 
     async fn cached_metadata_after_304<F>(
@@ -1702,9 +1779,11 @@ impl RegistryClient {
                         bearer.as_deref(),
                     );
                     let validator_start = std::time::Instant::now();
-                    let cache_validator = (cache_policy != MetadataCachePolicy::Reload)
-                        .then(|| self.read_cache_validator(&attempt_cache_key))
-                        .flatten();
+                    let cache_validator = if cache_policy != MetadataCachePolicy::Reload {
+                        self.read_cache_validator_async(&attempt_cache_key).await
+                    } else {
+                        None
+                    };
                     timings.validator_read_ms = validator_start.elapsed().as_millis();
                     timings.cache_age_seconds = cache_validator
                         .as_ref()
@@ -1920,7 +1999,7 @@ impl RegistryClient {
             crate::timing::record_metadata_cache_hit();
             return finish!(Ok(cached));
         }
-        let direct_cache_validator = self.read_cache_validator(&direct_cache_key);
+        let direct_cache_validator = self.read_cache_validator_async(&direct_cache_key).await;
         let npm_url = format!("{}/{}", self.npm_registry_url, name);
         tracing::debug!("fetching {name} from npm registry");
         let req = self
@@ -2121,7 +2200,7 @@ impl RegistryClient {
         }
 
         let validator_start = std::time::Instant::now();
-        let cache_validator = self.read_cache_validator(&cache_key);
+        let cache_validator = self.read_cache_validator_async(&cache_key).await;
         timings.validator_read_ms = validator_start.elapsed().as_millis();
         timings.cache_age_seconds = cache_validator
             .as_ref()
@@ -2213,12 +2292,19 @@ impl RegistryClient {
         timings.json_decode_ms = body_timings.json_parse_ms;
         timings.body_bytes = body_timings.body_bytes;
         let cache_write_start = std::time::Instant::now();
-        self.write_metadata_cache_with_directive(
-            &cache_key,
-            &metadata,
-            etag.as_deref(),
-            cache_directive,
-        );
+        let (metadata, _written) = match self
+            .write_metadata_cache_entry_async(
+                &cache_key,
+                metadata,
+                etag.as_deref(),
+                cache_directive,
+                None,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => return finish!(Err(error)),
+        };
         timings.cache_write_dispatch_ms = cache_write_start.elapsed().as_millis();
         self.remember_metadata_for_command(
             &memory_cache_key,
@@ -2368,94 +2454,110 @@ impl RegistryClient {
 
         let result = async {
             let cache_read_start = std::time::Instant::now();
-            if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
-                && batch_metadata_entry_matches_name(name, &cached)
-            {
-                timings.cache_read_ms = cache_read_start.elapsed().as_millis();
-                if package_metadata_matches_version_doc(name, version, &cached) {
+            if let Some(cache_path) = self.cache_path(&cache_key) {
+                let legacy_path = from_history
+                    .then(|| {
+                        self.cache_path(
+                            &self.npm_direct_version_metadata_cache_key(name, version, access),
+                        )
+                    })
+                    .flatten();
+                let full_packument_path =
+                    self.cache_path(&self.npm_direct_metadata_cache_key(name, access));
+                let target_name = name.to_owned();
+                let target_version = version.to_owned();
+                let cached_hit =
+                    tokio::task::spawn_blocking(move || {
+                        let mut stale_version_hit: Option<PackageMetadata> = None;
+                        if let Some(mut entry) =
+                            super::cache::open_metadata_cache_entry(&cache_path)
+                        {
+                            let is_fresh = entry.remaining_freshness().is_some();
+                            if let Some(doc) = super::cache::decode_metadata_cache_payload::<
+                                PackageMetadata,
+                            >(&mut entry.reader)
+                            {
+                                if is_fresh {
+                                    if batch_metadata_entry_matches_name(&target_name, &doc)
+                                        && package_metadata_matches_version_doc(
+                                            &target_name,
+                                            &target_version,
+                                            &doc,
+                                        )
+                                    {
+                                        return Some((doc, from_history));
+                                    }
+                                } else if !from_history
+                                    && version_doc_has_immutable_dist(
+                                        &target_name,
+                                        &target_version,
+                                        &doc,
+                                    )
+                                {
+                                    stale_version_hit = Some(doc);
+                                }
+                            }
+                        }
+                        if let Some(legacy_path) = legacy_path
+                            && let Some(mut entry) =
+                                super::cache::open_metadata_cache_entry(&legacy_path)
+                            && entry.remaining_freshness().is_some()
+                            && let Some(doc) = super::cache::decode_metadata_cache_payload::<
+                                PackageMetadata,
+                            >(&mut entry.reader)
+                            && package_metadata_matches_version_doc(
+                                &target_name,
+                                &target_version,
+                                &doc,
+                            )
+                        {
+                            return Some((doc, false));
+                        }
+                        if let Some(full_path) = full_packument_path
+                            && let Some(mut entry) =
+                                super::cache::open_metadata_cache_entry(&full_path)
+                        {
+                            let is_fresh = entry.remaining_freshness().is_some();
+                            if is_fresh || (!from_history && stale_version_hit.is_none()) {
+                                let seed = version_selection::SingleVersionPackumentSeed {
+                                    expected_name: target_name.clone(),
+                                    target_version: target_version.clone(),
+                                };
+                                if let Some(doc) =
+                                    super::cache::decode_metadata_cache_payload_with_seed(
+                                        &mut entry.reader,
+                                        seed,
+                                    )
+                                {
+                                    if is_fresh {
+                                        return Some((doc, false));
+                                    }
+                                    if doc
+                                        .versions
+                                        .get(&target_version)
+                                        .and_then(|v| v.dist.as_ref())
+                                        .is_some_and(|d| {
+                                            d.integrity.is_some() && d.tarball.is_some()
+                                        })
+                                    {
+                                        return Some((doc, false));
+                                    }
+                                }
+                            }
+                        }
+                        stale_version_hit.map(|doc| (doc, false))
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some((cached, selected_from_history)) = cached_hit {
+                    timings.cache_read_ms = cache_read_start.elapsed().as_millis();
                     timings.cache_hit = true;
+                    timings.selected_from_history = selected_from_history;
                     crate::timing::record_metadata_cache_hit();
                     tracing::debug!("metadata cache hit (direct version): npm:{name}@{version}");
                     return Ok(TimedPackageMetadata {
                         metadata: cached,
-                        timings,
-                    });
-                }
-                tracing::debug!(
-                    "metadata cache mismatch (direct version): npm:{name}@{version}; refetching"
-                );
-            }
-            if from_history {
-                let legacy_key = self.npm_direct_version_metadata_cache_key(name, version, access);
-                if let Some((cached, _)) = self.read_metadata_cache_async(&legacy_key).await
-                    && package_metadata_matches_version_doc(name, version, &cached)
-                {
-                    timings.cache_read_ms = cache_read_start.elapsed().as_millis();
-                    timings.cache_hit = true;
-                    timings.selected_from_history = false;
-                    crate::timing::record_metadata_cache_hit();
-                    return Ok(TimedPackageMetadata {
-                        metadata: cached,
-                        timings,
-                    });
-                }
-            }
-            let full_packument_key = self.npm_direct_metadata_cache_key(name, access);
-            if let Some((mut cached_packument, _)) =
-                self.read_metadata_cache_async(&full_packument_key).await
-                && batch_metadata_entry_matches_name(name, &cached_packument)
-                && cached_packument.versions.contains_key(version)
-            {
-                cached_packument.versions.retain(|v, _| v == version);
-                cached_packument.time.retain(|v, _| v == version);
-                timings.cache_read_ms = cache_read_start.elapsed().as_millis();
-                timings.cache_hit = true;
-                timings.selected_from_history = false;
-                crate::timing::record_metadata_cache_hit();
-                return Ok(TimedPackageMetadata {
-                    metadata: cached_packument,
-                    timings,
-                });
-            }
-            if !from_history {
-                // Published npm versions are immutable and tarball integrity is verified
-                // on fetch, so a stale cached version document with dist integrity and
-                // tarball URL can satisfy exact pins without a network round trip.
-                if let Some(stale) = self
-                    .read_stale_metadata_cache_entry_as_async::<PackageMetadata>(&cache_key)
-                    .await
-                    && version_doc_has_immutable_dist(name, version, &stale.value)
-                {
-                    timings.cache_read_ms = cache_read_start.elapsed().as_millis();
-                    timings.cache_hit = true;
-                    timings.selected_from_history = false;
-                    crate::timing::record_metadata_cache_hit();
-                    return Ok(TimedPackageMetadata {
-                        metadata: stale.value,
-                        timings,
-                    });
-                }
-                if let Some(mut stale_packument) = self
-                    .read_stale_metadata_cache_entry_as_async::<PackageMetadata>(
-                        &full_packument_key,
-                    )
-                    .await
-                    && batch_metadata_entry_matches_name(name, &stale_packument.value)
-                    && stale_packument
-                        .value
-                        .versions
-                        .get(version)
-                        .and_then(|v| v.dist.as_ref())
-                        .is_some_and(|d| d.integrity.is_some() && d.tarball.is_some())
-                {
-                    stale_packument.value.versions.retain(|v, _| v == version);
-                    stale_packument.value.time.retain(|v, _| v == version);
-                    timings.cache_read_ms = cache_read_start.elapsed().as_millis();
-                    timings.cache_hit = true;
-                    timings.selected_from_history = false;
-                    crate::timing::record_metadata_cache_hit();
-                    return Ok(TimedPackageMetadata {
-                        metadata: stale_packument.value,
                         timings,
                     });
                 }
@@ -2485,7 +2587,7 @@ impl RegistryClient {
                 .saturating_add(coalesced_read_start.elapsed().as_millis());
 
             let validator_start = std::time::Instant::now();
-            let cache_validator = self.read_cache_validator(&cache_key);
+            let cache_validator = self.read_cache_validator_async(&cache_key).await;
             timings.validator_read_ms = validator_start.elapsed().as_millis();
 
             let history_key = (from_history
@@ -2529,18 +2631,19 @@ impl RegistryClient {
                     metadata.time.insert(version.to_owned(), published_at);
                 }
                 let write_start = std::time::Instant::now();
-                self.history_cache.with_generation(history_generation, || {
-                    self.write_metadata_cache_with_directive(
+                let (metadata, _written) = self
+                    .write_metadata_cache_entry_async(
                         &cache_key,
-                        &metadata,
+                        metadata,
                         history.etag.as_deref(),
                         MetadataCacheDirective::Store {
                             fresh_for: history
                                 .expires_at
                                 .saturating_duration_since(std::time::Instant::now()),
                         },
-                    );
-                });
+                        Some(history_generation),
+                    )
+                    .await?;
                 timings.cache_write_dispatch_ms = write_start.elapsed().as_millis();
                 timings.cache_hit = true;
                 crate::timing::record_metadata_cache_hit();
@@ -2725,20 +2828,19 @@ impl RegistryClient {
                 );
             }
             let cache_write_start = std::time::Instant::now();
-            let publish = || {
-                self.write_metadata_cache_with_directive(
+            let (metadata, _written) = match self
+                .write_metadata_cache_entry_async(
                     &cache_key,
-                    &metadata,
+                    metadata,
                     etag.as_deref(),
                     cache_directive,
-                );
+                    history_lookup_active.then_some(history_generation),
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => return finish!(Err(error)),
             };
-            if history_lookup_active {
-                self.history_cache
-                    .with_generation(history_generation, publish);
-            } else {
-                publish();
-            }
             timings.cache_write_dispatch_ms = cache_write_start.elapsed().as_millis();
             finish!(Ok(TimedPackageMetadata { metadata, timings }))
         }
@@ -2877,7 +2979,7 @@ impl RegistryClient {
             crate::timing::record_metadata_cache_hit();
             return finish!(Ok(cached));
         }
-        let direct_cache_validator = self.read_cache_validator(&direct_cache_key);
+        let direct_cache_validator = self.read_cache_validator_async(&direct_cache_key).await;
         let npm_url = format!("{}/{}", self.npm_registry_url, name);
         let req = self
             .http
@@ -2991,9 +3093,11 @@ impl RegistryClient {
             }};
         }
 
-        let cache_validator = use_cache
-            .then(|| self.read_cache_validator(&cache_key))
-            .flatten();
+        let cache_validator = if use_cache {
+            self.read_cache_validator_async(&cache_key).await
+        } else {
+            None
+        };
         let npm_url = format!("{}/{}", self.npm_registry_url, name);
         let req = self
             .http
@@ -3688,9 +3792,11 @@ impl RegistryClient {
         }
 
         let validator_start = std::time::Instant::now();
-        let cache_validator = (use_cache && !modified_skew_detected)
-            .then(|| self.read_cache_validator(&cache_key))
-            .flatten();
+        let cache_validator = if use_cache && !modified_skew_detected {
+            self.read_cache_validator_async(&cache_key).await
+        } else {
+            None
+        };
         timings.validator_read_ms = validator_start.elapsed().as_millis();
         let rpc_start = std::time::Instant::now();
         macro_rules! finish {
@@ -3950,12 +4056,19 @@ impl RegistryClient {
             Err(err) => return finish!(Err(err)),
         };
         let cache_write_start = std::time::Instant::now();
-        self.write_metadata_cache_with_directive(
-            &cache_key,
-            &metadata,
-            etag.as_deref(),
-            cache_directive,
-        );
+        let (metadata, _written) = match self
+            .write_metadata_cache_entry_async(
+                &cache_key,
+                metadata,
+                etag.as_deref(),
+                cache_directive,
+                None,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => return finish!(Err(error)),
+        };
         timings.cache_write_dispatch_ms = cache_write_start.elapsed().as_millis();
         let metadata = Arc::new(metadata);
         self.remember_release_times_for_command(
@@ -4057,9 +4170,11 @@ impl RegistryClient {
             return Ok(Arc::unwrap_or_clone(metadata));
         }
 
-        let cache_validator = (!modified_skew_detected)
-            .then(|| self.read_cache_validator(&cache_key))
-            .flatten();
+        let cache_validator = if !modified_skew_detected {
+            self.read_cache_validator_async(&cache_key).await
+        } else {
+            None
+        };
         let rpc_start = std::time::Instant::now();
         macro_rules! finish {
             ($expr:expr) => {{
@@ -4481,7 +4596,7 @@ impl RegistryClient {
             .saturating_add(coalesced_read_start.elapsed().as_millis());
 
         let validator_start = std::time::Instant::now();
-        let cache_validator = self.read_cache_validator(&cache_key);
+        let cache_validator = self.read_cache_validator_async(&cache_key).await;
         timings.validator_read_ms = validator_start.elapsed().as_millis();
         timings.cache_age_seconds = cache_validator
             .as_ref()
@@ -4586,12 +4701,19 @@ impl RegistryClient {
         timings.json_decode_ms = body_timings.json_parse_ms;
         timings.body_bytes = body_timings.body_bytes;
         let cache_write_start = std::time::Instant::now();
-        self.write_metadata_cache_with_directive(
-            &cache_key,
-            &metadata,
-            etag.as_deref(),
-            cache_directive,
-        );
+        let (metadata, _written) = match self
+            .write_metadata_cache_entry_async(
+                &cache_key,
+                metadata,
+                etag.as_deref(),
+                cache_directive,
+                None,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => return finish!(Err(error)),
+        };
         timings.cache_write_dispatch_ms = cache_write_start.elapsed().as_millis();
         self.remember_metadata_for_command(
             &memory_cache_key,
@@ -4626,7 +4748,7 @@ impl RegistryClient {
         }
         crate::timing::record_metadata_cache_miss();
 
-        let cache_validator = self.read_cache_validator(&cache_key);
+        let cache_validator = self.read_cache_validator_async(&cache_key).await;
         let rpc_start = std::time::Instant::now();
         macro_rules! finish {
             ($expr:expr) => {{
