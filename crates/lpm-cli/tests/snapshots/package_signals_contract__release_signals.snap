@@ -5,7 +5,7 @@ expression: document
 {
   "lpmVersion": "[version]",
   "schemaVersion": 1,
-  "rulesVersion": 14,
+  "rulesVersion": 15,
   "tags": {
     "childProcess": true,
     "copyleftLicense": false,

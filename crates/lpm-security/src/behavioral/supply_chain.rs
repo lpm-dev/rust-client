@@ -77,12 +77,12 @@ fn supply_patterns() -> &'static [Regex] {
             r"\b_0x[0-9a-f]{4,}\b",
             r"String\.fromCharCode\s*\(",
             r#"Buffer\.from\s*\([^)]*["']base64["']"#,
-            r#"(?:\bfrom\s+|\b(?:require|import)\s*\(\s*)["'](?:@?segment(?:/analytics-node)?|analytics-node)["']"#,
-            r#"(?:\bfrom\s+|\b(?:require|import)\s*\(\s*)["']mixpanel["']"#,
-            r#"(?:\bfrom\s+|\b(?:require|import)\s*\(\s*)["']posthog-node["']"#,
-            r#"(?:\bfrom\s+|\b(?:require|import)\s*\(\s*)["'](?:@amplitude/node|amplitude)["']"#,
-            r#"(?:\bfrom\s+|\b(?:require|import)\s*\(\s*)["']keen-tracking["']"#,
-            r#"(?:\bfrom\s+|\b(?:require|import)\s*\(\s*)["']countly-sdk-nodejs["']"#,
+            r#"(?:\b(?:from|import)\s*|\b(?:require|import)\s*\(\s*)["'](?:@?segment(?:/analytics-node)?|analytics-node)["']"#,
+            r#"(?:\b(?:from|import)\s*|\b(?:require|import)\s*\(\s*)["']mixpanel["']"#,
+            r#"(?:\b(?:from|import)\s*|\b(?:require|import)\s*\(\s*)["']posthog-node["']"#,
+            r#"(?:\b(?:from|import)\s*|\b(?:require|import)\s*\(\s*)["'](?:@amplitude/node|amplitude)["']"#,
+            r#"(?:\b(?:from|import)\s*|\b(?:require|import)\s*\(\s*)["']keen-tracking["']"#,
+            r#"(?:\b(?:from|import)\s*|\b(?:require|import)\s*\(\s*)["']countly-sdk-nodejs["']"#,
             r"\bnavigator\.sendBeacon\s*\(",
             r#"\bnew\s+Image\s*\(\s*\)\s*\.src\s*=\s*["']https?://"#,
             r"(?:Intl\.DateTimeFormat|resolvedOptions\(\)\.(?:timeZone|locale)|os\.networkInterfaces)[\s\S]{0,200}(?:===?|!==?)[\s\S]{0,100}process\.exit",
@@ -340,44 +340,130 @@ pub fn shannon_entropy(data: &[u8]) -> f64 {
     entropy
 }
 
-/// Shortest literal that can look random: shorter encoded text is too often
-/// an identifier or a short hash.
+/// Shortest run of encoded text that can look random: a shorter one is too
+/// often an identifier or a short hash.
 const MIN_RANDOM_LITERAL_BYTES: usize = 32;
 
 fn is_encoded_text_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'_' | b'-')
 }
 
-fn character_class(byte: u8) -> u8 {
+fn alphanumeric_class(byte: u8) -> Option<u8> {
     match byte {
-        b'a'..=b'z' => 0,
-        b'A'..=b'Z' => 1,
-        b'0'..=b'9' => 2,
-        _ => 3,
+        b'a'..=b'z' => Some(0),
+        b'A'..=b'Z' => Some(1),
+        b'0'..=b'9' => Some(2),
+        _ => None,
     }
 }
 
-/// Whether a string literal looks random: an encoded payload, a token or a
-/// key. It must be one run of base64, base64url or hex characters at least
-/// 32 long, repeat a character (an alphabet or lookup table repeats none),
-/// come close to the most entropy its length allows, and switch between
-/// lower case, upper case and digits as often as random text does, which
-/// identifiers don't. Random base64 of 32 to 200 characters passes over 99%
-/// of the time; generated camelCase identifiers don't. A PEM private key
-/// marker always passes.
+/// Whether a string literal looks random: it holds an encoded payload, a
+/// token or a key. Each run of base64 or base64url characters at least 32
+/// long is read on its own, so a prefix (`v1:`, `Bearer `) or line wrapping
+/// doesn't hide one; in a URL, and in a module or file path of words, each
+/// path segment is read on its own. A run
+/// must repeat a character (an alphabet or lookup table repeats none), come
+/// close to the most entropy its length allows, and switch between lower
+/// case, upper case and digits as often as random text does, which
+/// identifiers and URL paths don't. Random base64 of 32 to 200 characters
+/// passes over 99% of the time; generated camelCase identifiers don't. Hex
+/// can't reach that entropy, so a hex digest never passes, and neither does
+/// a lower-case random host label, whose few digits switch class too rarely.
+/// Public data passes over when its content starts as its label says: an
+/// image, font, audio, video or JSON `data:` URL, and a complete PEM
+/// certificate, public key or parameters block. A PEM private key marker
+/// always passes.
 pub fn looks_random(literal: &str) -> bool {
     if literal.contains("PRIVATE KEY-----") {
         return true;
     }
     let bytes = literal.as_bytes();
-    if bytes.len() < MIN_RANDOM_LITERAL_BYTES
-        || !bytes.iter().all(|&byte| is_encoded_text_byte(byte))
-    {
+    if bytes.len() < MIN_RANDOM_LITERAL_BYTES {
         return false;
     }
+    let urls = url_spans(literal);
+    let mut next_url = 0;
+    let public_blocks = public_pem_blocks(literal);
+    let mut next_block = 0;
+    let mut start = 0;
+    while start < bytes.len() {
+        let mut end = start;
+        while end < bytes.len() && is_encoded_text_byte(bytes[end]) {
+            if bytes[end] == b'/' {
+                while urls.get(next_url).is_some_and(|url| url.end <= end) {
+                    next_url += 1;
+                }
+                if urls.get(next_url).is_some_and(|url| url.start <= end) {
+                    break;
+                }
+            }
+            end += 1;
+        }
+        if end - start >= MIN_RANDOM_LITERAL_BYTES {
+            while public_blocks
+                .get(next_block)
+                .is_some_and(|block| block.end <= start)
+            {
+                next_block += 1;
+            }
+            let in_public_block = public_blocks
+                .get(next_block)
+                .is_some_and(|block| block.start <= start);
+            if !in_public_block
+                && !follows_public_media_data_url(literal, start)
+                && encoded_run_looks_random(&bytes[start..end])
+            {
+                return true;
+            }
+        }
+        start = end + 1;
+    }
+    false
+}
+
+/// Whether a run of encoded text looks random. A run of two or more
+/// `/`-separated words, a module or file path such as
+/// `./2024/IsArrayBufferViewOutOfBounds`, is read a segment at a time, as a
+/// URL's path is: short words and a number switch case and digits as often
+/// as random text does.
+fn encoded_run_looks_random(run: &[u8]) -> bool {
+    if is_path_of_words(run) {
+        return run
+            .split(|&byte| byte == b'/')
+            .any(|segment| segment.len() >= MIN_RANDOM_LITERAL_BYTES && run_looks_random(segment));
+    }
+    run_looks_random(run)
+}
+
+/// Whether `run` is two or more `/`-separated words: a number, letters
+/// with optional trailing digits, or lower-case letters, digits, `-` and
+/// `_`. A random token's segments almost never all are.
+fn is_path_of_words(run: &[u8]) -> bool {
+    let mut words = 0;
+    for segment in run.split(|&byte| byte == b'/') {
+        if segment.is_empty() {
+            continue;
+        }
+        let letters = segment
+            .iter()
+            .rposition(|byte| !byte.is_ascii_digit())
+            .map_or(0, |last| last + 1);
+        let word = segment[..letters].iter().all(u8::is_ascii_alphabetic)
+            || segment.iter().all(|&byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+            });
+        if !word {
+            return false;
+        }
+        words += 1;
+    }
+    words >= 2
+}
+
+fn run_looks_random(run: &[u8]) -> bool {
     let mut counts = [0u32; 128];
     let mut repeats = false;
-    for &byte in bytes {
+    for &byte in run {
         let count = &mut counts[usize::from(byte)];
         *count += 1;
         repeats |= *count == 2;
@@ -385,7 +471,7 @@ pub fn looks_random(literal: &str) -> bool {
     if !repeats {
         return false;
     }
-    let length = bytes.len() as f64;
+    let length = run.len() as f64;
     let entropy: f64 = counts
         .iter()
         .filter(|&&count| count > 0)
@@ -394,11 +480,182 @@ pub fn looks_random(literal: &str) -> bool {
             -share * share.log2()
         })
         .sum();
-    let shifts = bytes
-        .windows(2)
-        .filter(|pair| character_class(pair[0]) != character_class(pair[1]))
-        .count();
-    entropy >= 0.82 * length.min(64.0).log2() && shifts as f64 / (length - 1.0) >= 0.4
+    let (mut pairs, mut shifts) = (0usize, 0usize);
+    for pair in run.windows(2) {
+        if let (Some(left), Some(right)) =
+            (alphanumeric_class(pair[0]), alphanumeric_class(pair[1]))
+        {
+            pairs += 1;
+            shifts += usize::from(left != right);
+        }
+    }
+    pairs != 0 && entropy >= 0.82 * length.min(64.0).log2() && shifts as f64 / pairs as f64 >= 0.4
+}
+
+/// The byte ranges of the URLs in a literal: a scheme, `://`, and what
+/// follows up to whitespace, a quote, a bracket or a comma. In order and
+/// apart.
+fn url_spans(literal: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = literal.as_bytes();
+    let mut spans: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut search = 0;
+    while let Some(found) = literal[search..].find("://") {
+        let separator = search + found;
+        let start = bytes[..separator]
+            .iter()
+            .rposition(|&byte| {
+                !(byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'.' | b'-'))
+            })
+            .map_or(0, |position| position + 1);
+        let end = bytes[separator..]
+            .iter()
+            .position(|&byte| {
+                byte.is_ascii_whitespace()
+                    || matches!(byte, b'"' | b'\'' | b'`' | b'(' | b')' | b'<' | b'>' | b',')
+            })
+            .map_or(bytes.len(), |length| separator + length);
+        let start = spans.last().map_or(start, |last| start.max(last.end));
+        spans.push(start..end);
+        search = end.max(separator + 3);
+    }
+    spans
+}
+
+/// The byte ranges of complete PEM blocks whose contents are public:
+/// certificates, revocation lists, signing requests, public keys and
+/// parameters. A range runs from its BEGIN marker to its END marker, in
+/// order. All of these encode DER, so a body that doesn't start with `M` (a
+/// DER sequence in base64) isn't one, and a block without its END marker
+/// covers nothing.
+fn public_pem_blocks(literal: &str) -> Vec<std::ops::Range<usize>> {
+    const BEGIN: &str = "-----BEGIN ";
+    const PUBLIC_LABELS: &[&str] = &[
+        "CERTIFICATE",
+        "TRUSTED CERTIFICATE",
+        "X509 CRL",
+        "CERTIFICATE REQUEST",
+        "NEW CERTIFICATE REQUEST",
+        "PUBLIC KEY",
+        "RSA PUBLIC KEY",
+        "DH PARAMETERS",
+        "EC PARAMETERS",
+    ];
+    const END: &str = "-----END ";
+    if !literal.contains(BEGIN) {
+        return Vec::new();
+    }
+    // Where each label's END markers start, found in one pass, so a BEGIN
+    // without its END doesn't search the rest of the literal again, with a
+    // cursor per label: BEGIN markers come in order, so each label's END
+    // markers are passed over once.
+    let mut ends: std::collections::HashMap<&str, (Vec<usize>, usize)> =
+        std::collections::HashMap::new();
+    let mut search = 0;
+    while let Some(found) = literal[search..].find(END) {
+        let marker = search + found;
+        let label_start = marker + END.len();
+        let Some(label_length) = literal[label_start..].find("-----") else {
+            break;
+        };
+        ends.entry(&literal[label_start..label_start + label_length])
+            .or_default()
+            .0
+            .push(marker);
+        search = label_start + label_length;
+    }
+    let mut blocks = Vec::new();
+    let mut search = 0;
+    while let Some(found) = literal[search..].find(BEGIN) {
+        let begin = search + found;
+        let label_start = begin + BEGIN.len();
+        let Some(label_length) = literal[label_start..].find("-----") else {
+            break;
+        };
+        let label = &literal[label_start..label_start + label_length];
+        let body_start = label_start + label_length + "-----".len();
+        let body_end = ends.get_mut(label).and_then(|(markers, next)| {
+            while markers
+                .get(*next)
+                .is_some_and(|&marker| marker < body_start)
+            {
+                *next += 1;
+            }
+            markers.get(*next).copied()
+        });
+        let Some(body_end) = body_end else {
+            search = body_start;
+            continue;
+        };
+        if PUBLIC_LABELS.contains(&label)
+            && literal[body_start..body_end].trim_start().starts_with('M')
+        {
+            blocks.push(begin..body_end);
+        }
+        search = body_end + END.len() + label.len() + "-----".len();
+    }
+    blocks
+}
+
+/// Bytes before `;base64,` searched for the `data:` that starts its URL. A
+/// media type and its parameters are short, and the bound keeps the search
+/// from rereading a long literal for each run.
+const MAX_DATA_URL_HEADER_BYTES: usize = 256;
+
+/// Whether the run at `start` is the payload of a `data:` URL for an image,
+/// a font, audio, video or JSON, and starts as that kind of file does.
+fn follows_public_media_data_url(literal: &str, start: usize) -> bool {
+    const MARKER: &str = ";base64,";
+    let Some(header) = literal[..start].strip_suffix(MARKER) else {
+        return false;
+    };
+    let window_start = header.len().saturating_sub(MAX_DATA_URL_HEADER_BYTES);
+    let window_start = (window_start..=header.len())
+        .find(|&index| header.is_char_boundary(index))
+        .unwrap_or(header.len());
+    let Some(scheme) = header[window_start..].rfind("data:") else {
+        return false;
+    };
+    let parameters = &header[window_start + scheme + "data:".len()..];
+    if parameters
+        .bytes()
+        .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'(' | b')' | b'"' | b'\'' | b','))
+    {
+        return false;
+    }
+    let media_type = parameters
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let payload = &literal[start..];
+    media_type_signatures(&media_type)
+        .iter()
+        .any(|signature| payload.starts_with(signature))
+}
+
+/// How the base64 of a file of each public media type starts.
+fn media_type_signatures(media_type: &str) -> &'static [&'static str] {
+    match media_type {
+        "image/png" | "image/apng" => &["iVBORw0KGgo"],
+        "image/jpeg" | "image/jpg" | "image/pjpeg" => &["/9j/"],
+        "image/gif" => &["R0lGOD"],
+        "image/webp" | "audio/wav" | "audio/x-wav" | "audio/wave" => &["UklGR"],
+        "image/svg+xml" => &["PHN2Zy", "PD94bWw", "PCFET0NUWVBF", "PCEtLS"],
+        "image/x-icon" | "image/vnd.microsoft.icon" => &["AAABAA"],
+        "image/bmp" => &["Qk"],
+        "image/avif" | "video/mp4" | "audio/mp4" => &["AAAA"],
+        "font/woff2" | "application/font-woff2" | "application/x-font-woff2" => &["d09GMg"],
+        "font/woff" | "application/font-woff" | "application/x-font-woff" => &["d09GRg"],
+        "font/ttf" | "font/sfnt" | "application/x-font-ttf" | "application/font-sfnt" => {
+            &["AAEAAA"]
+        }
+        "font/otf" | "font/opentype" | "application/x-font-otf" => &["T1RUTw"],
+        "audio/mpeg" | "audio/mp3" => &["SUQz", "//"],
+        "audio/ogg" | "video/ogg" => &["T2dnUw"],
+        "video/webm" | "audio/webm" => &["GkXfo"],
+        "application/json" => &["ey", "W"],
+        _ => &[],
+    }
 }
 
 /// Whether source the parser couldn't read has a random-looking string
@@ -970,16 +1227,165 @@ mod tests {
         analyze_supply_chain(code, code.as_bytes()).high_entropy_strings
     }
 
+    /// Base64 from a fixed xorshift sequence: random-looking and reproducible.
+    fn random_base64(length: usize) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        (0..length)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                char::from(ALPHABET[(state >> 58) as usize])
+            })
+            .collect()
+    }
+
     #[test]
     fn flags_a_random_looking_literal_an_encoded_payload_a_secret_or_a_private_key() {
         for code in [
             format!(r#"const payload = "{PAYLOAD}""#),
-            r#"const key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY""#.to_owned(),
+            format!(r#"const key = "{}""#, random_base64(40)),
             r#"const key = "aK3mP9xR2vT8qL5nB7wF4jD6hG1cE0iaK3m""#.to_owned(),
             "const pem = `-----BEGIN RSA PRIVATE KEY-----\\nMIIEowIBAAKCAQEA\\n-----END RSA PRIVATE KEY-----`".to_owned(),
         ] {
             assert!(high_entropy(&code), "{code}");
         }
+    }
+
+    #[test]
+    fn flags_an_encoded_payload_behind_a_prefix_or_wrapped_over_lines() {
+        let wrapped = random_base64(228);
+        let wrapped = wrapped
+            .as_bytes()
+            .chunks(76)
+            .map(|line| std::str::from_utf8(line).unwrap())
+            .collect::<Vec<_>>()
+            .join("\\n");
+        for code in [
+            format!(r#"const token = "v1:{PAYLOAD}""#),
+            format!(r#"const header = "Bearer {PAYLOAD}""#),
+            format!(r#"const blob = "{wrapped}""#),
+            format!("const blob = `{}`", wrapped.replace("\\n", "\n")),
+        ] {
+            assert!(high_entropy(&code), "{code}");
+        }
+    }
+
+    #[test]
+    fn passes_over_embedded_images_fonts_source_maps_and_public_certificates() {
+        let body = random_base64(88);
+        let certificate =
+            format!("-----BEGIN CERTIFICATE-----\nMII{body}\n{body}\n-----END CERTIFICATE-----");
+        let inline_certificate =
+            format!("-----BEGIN CERTIFICATE-----MII{body}-----END CERTIFICATE-----");
+        for code in [
+            format!(r#"const icon = "data:image/png;base64,iVBORw0KGgo{body}""#),
+            format!(
+                r#"const css = "background: url(data:image/svg+xml;base64,PHN2Zy{body}) no-repeat""#
+            ),
+            format!(r#"const font = "url('data:font/woff2;charset=utf-8;base64,d09GMg{body}')""#),
+            format!(r#"const font = "data:application/x-font-woff;base64,d09GRg{body}""#),
+            format!(
+                r#"const map = "/*# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJ2ZXJzaW9uIjozLC{body} */""#
+            ),
+            format!("const ca = `{certificate}`"),
+            format!(r#"const ca = "{inline_certificate}""#),
+        ] {
+            assert!(!high_entropy(&code), "{code}");
+        }
+    }
+
+    #[test]
+    fn a_payload_labelled_as_public_data_still_counts() {
+        let body = random_base64(88);
+        for code in [
+            format!(r#"import("data:text/javascript;base64,{body}")"#),
+            // Not what the label says: a PNG starts iVBORw0KGgo, DER starts M.
+            format!(r#"const icon = "data:image/png;base64,{body}""#),
+            format!("const ca = `-----BEGIN CERTIFICATE-----\nQ{body}\n-----END CERTIFICATE-----`"),
+            // No END marker: the label covers nothing.
+            format!("const ca = `-----BEGIN PUBLIC KEY-----\nMII{body}`"),
+            format!("const ca = `-----BEGIN PUBLIC KEY-----\nMII\n-----END PUBLIC KEY-----{body}`"),
+        ] {
+            assert!(high_entropy(&code), "{code}");
+        }
+    }
+
+    #[test]
+    fn url_path_segments_are_read_on_their_own() {
+        for literal in [
+            "https://fonts.gstatic.com/s/roboto/v30/KFOmCnqEu92Fr1Mu4mxKKTU1Kg.woff2",
+            "https://cdn.example.com/assets/3a9f/Kf8Qm2Lx/v1/bundle-Hd7Pq.js",
+        ] {
+            let code = format!("const value = {}", serde_json::to_string(literal).unwrap());
+            assert!(!high_entropy(&code), "{literal}");
+        }
+        // A random token that is a whole path segment still counts.
+        assert!(high_entropy(&format!(
+            r#"const hook = "https://discord.com/api/webhooks/1234567890/{}""#,
+            random_base64(68).replace(['+', '/'], "_")
+        )));
+    }
+
+    #[test]
+    fn module_and_file_paths_are_read_a_segment_at_a_time() {
+        for literal in [
+            "./2024/IsArrayBufferViewOutOfBounds",
+            "src/2024/IsArrayBufferViewOutOfBounds.js",
+            "../lib/es2025/GetPrototypeFromConstructor/index",
+            "@scope/pkg-name/dist/esm/v8/createWorkerPool",
+            "packages/core/src/__generated__/schema_v2",
+        ] {
+            let code = format!("const value = {}", serde_json::to_string(literal).unwrap());
+            assert!(!high_entropy(&code), "{literal}");
+        }
+        // A token with a slash in it isn't a path, and a long random name in
+        // a path still counts.
+        let token = random_base64(40);
+        for code in [
+            format!(r#"const key = "{}/{}""#, &token[..20], &token[20..]),
+            format!(r#"const key = "./{}/{}""#, &token[..20], &token[20..]),
+            r#"const file = "src/assets/mpMbXDuCLmHoOsFaQfDPrAJfTquWoGsbeKXgzgsy.bin""#.to_owned(),
+        ] {
+            assert!(high_entropy(&code), "{code}");
+        }
+    }
+
+    #[test]
+    fn exclusion_checks_stay_linear_on_crafted_literals() {
+        let time = |literal: String| {
+            let started = std::time::Instant::now();
+            assert!(!looks_random(&literal));
+            started.elapsed()
+        };
+        let size = 512 * 1024;
+        let benign = time("a ".repeat(size / 2));
+        let media =
+            time(";base64,".to_owned() + &format!("{} ;base64,", "a".repeat(32)).repeat(size / 42));
+        let blocks = "-----BEGIN PUBLIC KEY-----\nM\n-----END PUBLIC KEY-----\n".repeat(size / 100)
+            + &format!("{} ", "b".repeat(32)).repeat(size / 66);
+        let pem = time(blocks);
+        let unterminated = time(
+            "-----BEGIN PUBLIC KEY-----\nM\n".repeat(size / 30)
+                + &format!("{} ", "c".repeat(32)).repeat(size / 66),
+        );
+        let limit = benign * 20 + std::time::Duration::from_millis(250);
+        assert!(media < limit, "media {media:?}, benign {benign:?}");
+        assert!(pem < limit, "pem {pem:?}, benign {benign:?}");
+        assert!(
+            unterminated < limit,
+            "unterminated {unterminated:?}, benign {benign:?}"
+        );
+    }
+
+    #[test]
+    fn a_url_elsewhere_in_a_literal_leaves_an_embedded_image_whole() {
+        let image = format!("/9j/{}", random_base64(240));
+        let code = format!(
+            r#"const css = "@import url(https://fonts.example.com/css); .logo {{ background: url(data:image/jpeg;base64,{image}) }}""#
+        );
+        assert!(!high_entropy(&code), "{code}");
     }
 
     #[test]
@@ -1000,6 +1406,8 @@ mod tests {
             "550E8400-E29B-41D4-A716-446655440000",
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
             "flex items-center justify-between px-4 py-2 text-sm font-medium",
+            "https://stackoverflow.com/questions/12345678/how-to-do-This-In-JavaScript",
+            "https://github.com/Microsoft/TypeScript/wiki/Breaking-Changes",
             "hello world",
         ] {
             let code = format!("const value = {}", serde_json::to_string(literal).unwrap());
@@ -1033,6 +1441,30 @@ mod tests {
             r#"new Image().src = "https://collector.example.com/p.gif?e=load";"#,
         ] {
             assert!(telemetry(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn telemetry_comes_from_a_minified_or_side_effect_import() {
+        for code in [
+            r#"import mixpanel from"mixpanel";"#,
+            r#"import*as m from"mixpanel";"#,
+            r#"export*from"posthog-node";"#,
+            r#"import "@segment/analytics-node";"#,
+            r#"import'keen-tracking';"#,
+        ] {
+            assert!(telemetry(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn an_sdk_name_passed_to_a_from_method_is_not_telemetry() {
+        for code in [
+            r#"const bytes = Buffer.from("mixpanel");"#,
+            r#"const route = { from: "mixpanel", to: "segment" };"#,
+            r#"const sources = Array.from('amplitude');"#,
+        ] {
+            assert!(!telemetry(code), "{code}");
         }
     }
 
