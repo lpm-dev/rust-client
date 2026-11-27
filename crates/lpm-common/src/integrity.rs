@@ -78,25 +78,16 @@ impl Integrity {
 
     /// Compute integrity hash from raw bytes.
     pub fn from_bytes(algorithm: HashAlgorithm, data: &[u8]) -> Self {
-        let hash = match algorithm {
-            HashAlgorithm::Sha1 => {
-                let mut hasher = Sha1::new();
-                hasher.update(data);
-                hasher.finalize().to_vec()
-            }
-            HashAlgorithm::Sha256 => {
-                let mut hasher = Sha256::new();
-                hasher.update(data);
-                hasher.finalize().to_vec()
-            }
-            HashAlgorithm::Sha512 => {
-                let mut hasher = Sha512::new();
-                hasher.update(data);
-                hasher.finalize().to_vec()
-            }
-        };
+        let mut hasher = IntegrityHasher::new(algorithm);
+        hasher.update(data);
+        hasher.finish()
+    }
 
-        Integrity { algorithm, hash }
+    /// Starts hashing a stream with this integrity's algorithm, for
+    /// [`Self::verify_hasher`] once the stream ends.
+    #[inline]
+    pub fn hasher(&self) -> IntegrityHasher {
+        IntegrityHasher::new(self.algorithm)
     }
 
     /// Verify that the given data matches this integrity hash.
@@ -104,20 +95,9 @@ impl Integrity {
     /// Uses [`subtle::ConstantTimeEq`] so a future caller running this
     /// path against attacker-influenced timing (server-side verifier,
     /// network-observable hot loop) doesn't leak per-byte digest
-    /// information through `Vec::eq`'s early-exit short-circuit. The
-    /// length check happens first — both digests are always the same
-    /// length for a given algorithm (32 for SHA-256, 64 for SHA-512)
-    /// but the explicit guard documents the precondition.
+    /// information through `Vec::eq`'s early-exit short-circuit.
     pub fn verify(&self, data: &[u8]) -> Result<(), LpmError> {
-        let computed = Self::from_bytes(self.algorithm, data);
-        if self.hash.len() == computed.hash.len() && self.hash.ct_eq(&computed.hash).into() {
-            Ok(())
-        } else {
-            Err(LpmError::IntegrityMismatch {
-                expected: self.to_string(),
-                actual: computed.to_string(),
-            })
-        }
+        self.verify_digest(Self::from_bytes(self.algorithm, data))
     }
 
     /// Verify a file on disk matches this integrity hash (bounded-memory).
@@ -129,50 +109,31 @@ impl Integrity {
 
         let mut file = std::fs::File::open(path).map_err(LpmError::Io)?;
         let mut buf = [0u8; 64 * 1024];
+        let mut hasher = self.hasher();
+        loop {
+            let n = file.read(&mut buf).map_err(LpmError::Io)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        self.verify_hasher(hasher)
+    }
 
-        let computed_hash = match self.algorithm {
-            HashAlgorithm::Sha1 => {
-                let mut hasher = Sha1::new();
-                loop {
-                    let n = file.read(&mut buf).map_err(LpmError::Io)?;
-                    if n == 0 {
-                        break;
-                    }
-                    hasher.update(&buf[..n]);
-                }
-                hasher.finalize().to_vec()
-            }
-            HashAlgorithm::Sha256 => {
-                let mut hasher = Sha256::new();
-                loop {
-                    let n = file.read(&mut buf).map_err(LpmError::Io)?;
-                    if n == 0 {
-                        break;
-                    }
-                    hasher.update(&buf[..n]);
-                }
-                hasher.finalize().to_vec()
-            }
-            HashAlgorithm::Sha512 => {
-                let mut hasher = Sha512::new();
-                loop {
-                    let n = file.read(&mut buf).map_err(LpmError::Io)?;
-                    if n == 0 {
-                        break;
-                    }
-                    hasher.update(&buf[..n]);
-                }
-                hasher.finalize().to_vec()
-            }
-        };
+    /// Verify the bytes `hasher` was fed against this integrity hash, in
+    /// constant time like [`Self::verify`]. A hasher of another algorithm
+    /// never matches.
+    pub fn verify_hasher(&self, hasher: IntegrityHasher) -> Result<(), LpmError> {
+        self.verify_digest(hasher.finish())
+    }
 
-        if self.hash.len() == computed_hash.len() && self.hash.ct_eq(&computed_hash).into() {
+    fn verify_digest(&self, computed: Integrity) -> Result<(), LpmError> {
+        if computed.algorithm == self.algorithm
+            && self.hash.len() == computed.hash.len()
+            && bool::from(self.hash.ct_eq(&computed.hash))
+        {
             Ok(())
         } else {
-            let computed = Integrity {
-                algorithm: self.algorithm,
-                hash: computed_hash,
-            };
             Err(LpmError::IntegrityMismatch {
                 expected: self.to_string(),
                 actual: computed.to_string(),
@@ -183,6 +144,78 @@ impl Integrity {
     /// Returns the base64-encoded hash string (without algorithm prefix).
     pub fn hash_base64(&self) -> String {
         BASE64.encode(&self.hash)
+    }
+}
+
+/// Hashes bytes as they arrive, so a stream can be checked against an
+/// [`Integrity`] without holding the whole stream or reading it twice.
+#[derive(Clone)]
+pub struct IntegrityHasher(StreamHasher);
+
+#[derive(Clone)]
+enum StreamHasher {
+    Sha1(Sha1),
+    Sha256(Sha256),
+    Sha512(Sha512),
+}
+
+impl IntegrityHasher {
+    pub fn new(algorithm: HashAlgorithm) -> Self {
+        Self(match algorithm {
+            HashAlgorithm::Sha1 => StreamHasher::Sha1(Sha1::new()),
+            HashAlgorithm::Sha256 => StreamHasher::Sha256(Sha256::new()),
+            HashAlgorithm::Sha512 => StreamHasher::Sha512(Sha512::new()),
+        })
+    }
+
+    #[inline]
+    pub fn algorithm(&self) -> HashAlgorithm {
+        match self.0 {
+            StreamHasher::Sha1(_) => HashAlgorithm::Sha1,
+            StreamHasher::Sha256(_) => HashAlgorithm::Sha256,
+            StreamHasher::Sha512(_) => HashAlgorithm::Sha512,
+        }
+    }
+
+    #[inline]
+    pub fn update(&mut self, bytes: &[u8]) {
+        match &mut self.0 {
+            StreamHasher::Sha1(hasher) => hasher.update(bytes),
+            StreamHasher::Sha256(hasher) => hasher.update(bytes),
+            StreamHasher::Sha512(hasher) => hasher.update(bytes),
+        }
+    }
+
+    /// The integrity of every byte fed so far.
+    pub fn finish(self) -> Integrity {
+        let algorithm = self.algorithm();
+        let hash = match self.0 {
+            StreamHasher::Sha1(hasher) => hasher.finalize().to_vec(),
+            StreamHasher::Sha256(hasher) => hasher.finalize().to_vec(),
+            StreamHasher::Sha512(hasher) => hasher.finalize().to_vec(),
+        };
+        Integrity { algorithm, hash }
+    }
+}
+
+impl fmt::Debug for IntegrityHasher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("IntegrityHasher")
+            .field(&self.algorithm())
+            .finish()
+    }
+}
+
+impl std::io::Write for IntegrityHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.update(bytes);
+        Ok(bytes.len())
+    }
+
+    #[inline]
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -456,6 +489,71 @@ mod tests {
         let serialized = original.to_string();
         let parsed = Integrity::parse(&serialized).unwrap();
         assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn hasher_fed_in_pieces_matches_the_one_shot_digest_for_every_algorithm() {
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        for algorithm in [
+            HashAlgorithm::Sha1,
+            HashAlgorithm::Sha256,
+            HashAlgorithm::Sha512,
+        ] {
+            let mut hasher = IntegrityHasher::new(algorithm);
+            for piece in data.chunks(7919) {
+                hasher.update(piece);
+            }
+            assert_eq!(hasher.algorithm(), algorithm);
+            assert_eq!(hasher.finish(), Integrity::from_bytes(algorithm, &data));
+        }
+    }
+
+    #[test]
+    fn verify_hasher_accepts_the_declared_stream_and_rejects_a_changed_byte() {
+        let data = b"streamed tarball bytes";
+        for algorithm in [
+            HashAlgorithm::Sha1,
+            HashAlgorithm::Sha256,
+            HashAlgorithm::Sha512,
+        ] {
+            let declared = Integrity::from_bytes(algorithm, data);
+            let mut hasher = declared.hasher();
+            hasher.update(&data[..5]);
+            hasher.update(&data[5..]);
+            declared.verify_hasher(hasher).unwrap();
+
+            let mut tampered = declared.hasher();
+            tampered.update(b"streamed tarball bytez");
+            assert!(matches!(
+                declared.verify_hasher(tampered),
+                Err(LpmError::IntegrityMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn verify_hasher_rejects_a_hasher_of_another_algorithm() {
+        // The same digest bytes under another algorithm's name: only the algorithm differs.
+        let sha256 = Integrity::from_bytes(HashAlgorithm::Sha256, b"payload");
+        let declared = Integrity {
+            algorithm: HashAlgorithm::Sha512,
+            hash: sha256.hash,
+        };
+        let mut hasher = IntegrityHasher::new(HashAlgorithm::Sha256);
+        hasher.update(b"payload");
+        assert!(matches!(
+            declared.verify_hasher(hasher),
+            Err(LpmError::IntegrityMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn hasher_takes_bytes_through_io_write() {
+        let data = vec![7u8; 300_000];
+        let declared = Integrity::from_bytes(HashAlgorithm::Sha512, &data);
+        let mut hasher = declared.hasher();
+        std::io::copy(&mut data.as_slice(), &mut hasher).unwrap();
+        declared.verify_hasher(hasher).unwrap();
     }
 
     #[test]

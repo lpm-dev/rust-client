@@ -97,14 +97,14 @@ impl Subscriber for WriterProbe {
 }
 
 #[test]
-fn public_digest_routes_preserve_contents_with_supported_writer_activation() {
+fn public_routes_preserve_contents_with_supported_writer_activation() {
     const CHILD: &str = "LPM_TEST_PUBLIC_WRITER_ACTIVATION";
     if std::env::var_os(CHILD).is_none() {
         for writers in [None, Some("0"), Some("1")] {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command.args([
                 "--exact",
-                "tests::public_writer_activation::public_digest_routes_preserve_contents_with_supported_writer_activation",
+                "tests::public_writer_activation::public_routes_preserve_contents_with_supported_writer_activation",
                 "--nocapture",
             ]).env(CHILD, "1");
             if let Some(writers) = writers {
@@ -182,6 +182,39 @@ fn public_digest_routes_preserve_contents_with_supported_writer_activation() {
                     "{route}"
                 );
             }
+        }
+
+        let mut tar = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::GzDecoder::new(archive.as_slice()),
+            &mut tar,
+        )
+        .unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let activations = Arc::new(AtomicUsize::new(0));
+        let files =
+            tracing::subscriber::with_default(WriterProbe(Arc::clone(&activations)), || {
+                crate::extract_tar_from_reader_pipelined(tar.as_slice(), target.path(), || {})
+            })
+            .unwrap();
+        assert_eq!(
+            activations.load(Ordering::Relaxed),
+            usize::from(
+                file_count > 4
+                    && std::env::var("LPM_INTERNAL_EXTRACT_WRITERS").as_deref() != Ok("0")
+                    && crate::writers::writer_pool_capacity() > 0
+            ),
+            "pipelined-tar"
+        );
+        assert_eq!(
+            files,
+            names
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect::<Vec<_>>()
+        );
+        for name in &names {
+            assert_eq!(std::fs::read(target.path().join(name)).unwrap(), b"content");
         }
     }
 }

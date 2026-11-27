@@ -90,7 +90,7 @@ pub use global_fs::{
     GlobalInstallDirectory, GlobalInstallsDirectory, GlobalStateDirectories, open_global_directory,
     open_or_create_global_directory,
 };
-pub use integrity::{Integrity, SriComparison, compare_sri};
+pub use integrity::{Integrity, IntegrityHasher, SriComparison, compare_sri};
 pub use local_target::{LocalScheme, LocalTarget};
 pub use lpm_json::{
     LpmJsonAndLocalState, LpmJsonFileState, LpmJsonMutation, LpmJsonTransactionError,
