@@ -1403,6 +1403,7 @@ mod tests {
     fn fixture_file(path: &str, content: &[u8]) -> ExtractedFileDigest {
         ExtractedFileDigest {
             relative_path: path.into(),
+            size: content.len() as u64,
             blake3_digest: *blake3::hash(content).as_bytes(),
         }
     }
@@ -1602,6 +1603,7 @@ mod tests {
         ];
         files.push(ExtractedFileDigest {
             relative_path: unicode_path,
+            size: b"unicode".len() as u64,
             blake3_digest: *blake3::hash(b"unicode").as_bytes(),
         });
         let actual = finish_with_bulk_walk(root, files, 3).unwrap();

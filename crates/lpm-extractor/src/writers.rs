@@ -247,6 +247,7 @@ impl Job {
 
 pub(super) struct Written {
     pub output: CompletedFile,
+    pub size: u64,
     pub digest: Option<[u8; 32]>,
 }
 
@@ -409,7 +410,7 @@ impl PendingEntries {
             self.front_sequence += 1;
             self.bytes -= bytes;
             let written = result?;
-            let record = E::from_extracted_file(path, written.digest)?;
+            let record = E::from_extracted_file(path, written.size, written.digest)?;
             let identity = written.output.commit()?;
             records.push(record);
             identities.push(identity);
@@ -674,8 +675,10 @@ fn write(mut job: OpenedJob) -> Result<Written, LpmError> {
     }
     #[cfg(not(unix))]
     let _ = job.exec_bits;
+    let size = job.bytes.len() as u64;
     Ok(Written {
         output: job.output.complete()?,
+        size,
         digest,
     })
 }

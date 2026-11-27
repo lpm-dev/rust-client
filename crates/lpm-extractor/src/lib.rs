@@ -969,6 +969,8 @@ enum InspectionMode {
 pub struct ExtractedFileDigest {
     /// Path relative to the extraction root.
     pub relative_path: PathBuf,
+    /// Final byte length written for this archive entry.
+    pub size: u64,
     /// BLAKE3 digest of the final bytes written for this archive entry.
     pub blake3_digest: [u8; 32],
 }
@@ -978,6 +980,7 @@ trait ExtractionRecord: Sized {
 
     fn from_extracted_file(
         relative_path: PathBuf,
+        size: u64,
         blake3_digest: Option<[u8; 32]>,
     ) -> Result<Self, LpmError>;
 
@@ -989,6 +992,7 @@ impl ExtractionRecord for PathBuf {
 
     fn from_extracted_file(
         relative_path: PathBuf,
+        _size: u64,
         _blake3_digest: Option<[u8; 32]>,
     ) -> Result<Self, LpmError> {
         Ok(relative_path)
@@ -1004,6 +1008,7 @@ impl ExtractionRecord for ExtractedFileDigest {
 
     fn from_extracted_file(
         relative_path: PathBuf,
+        size: u64,
         blake3_digest: Option<[u8; 32]>,
     ) -> Result<Self, LpmError> {
         let blake3_digest = blake3_digest.ok_or_else(|| {
@@ -1014,6 +1019,7 @@ impl ExtractionRecord for ExtractedFileDigest {
         })?;
         Ok(Self {
             relative_path,
+            size,
             blake3_digest,
         })
     }
@@ -1891,6 +1897,7 @@ where
                         relative_path,
                         writers::Written {
                             output: file.complete()?,
+                            size,
                             digest,
                         },
                     );
@@ -1958,7 +1965,7 @@ where
                 compute_blake3,
             )?;
 
-            let extracted_file = E::from_extracted_file(relative_path, blake3_digest)?;
+            let extracted_file = E::from_extracted_file(relative_path, size, blake3_digest)?;
             let accepted_identity = match inspection_mode {
                 InspectionMode::WithCallback => {
                     output.validate_parent_for_inspection()?;

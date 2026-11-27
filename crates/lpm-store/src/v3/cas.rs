@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,20 +17,67 @@ use crate::v2::tree_hash::is_object_metadata_sidecar;
 const CAS_SCHEMA_VERSION: u32 = 1;
 const MANIFEST_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const SOURCE_RECORD_MAX_BYTES: u64 = 16 * 1024;
-const SOURCE_VALIDATION_MAX_BYTES: u64 = 1024 * 1024;
+const SOURCE_VALIDATION_HEADER_MAX_BYTES: u64 = 16 * 1024;
+const SOURCE_VALIDATION_TRAILER_MAGIC: &[u8; 4] = b"LPMB";
+const SOURCE_VALIDATION_TRAILER_VERSION: u32 = 1;
+const SOURCE_VALIDATION_MAX_TRAILER_BLOBS: usize = 262_144;
+const SOURCE_VALIDATION_MAX_FILE_BYTES: u64 =
+    SOURCE_VALIDATION_HEADER_MAX_BYTES + 12 + (SOURCE_VALIDATION_MAX_TRAILER_BLOBS as u64 * 16);
+const SOURCE_BLOB_STAT_DOMAIN: &[u8] = b"lpm-v3-source-blob-stat-v3\0";
 const MAX_TREE_DEPTH: usize = 256;
 const MATERIALIZED_COMPLETE_FILENAME: &str = ".complete";
 const MAX_CACHED_MANIFESTS: usize = 256;
 const MAX_CACHED_MANIFEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_VALIDATED_BLOBS: usize = 65_536;
-/// Minimum age before a session-validated blob's mtime is treated as settled
-/// past coarse OS filesystem timestamp granularity (Linux HZ ticks and Windows
-/// 15.6 ms system clock). Blobs newer than this margin rehash on dedup hits so
-/// same-tick in-place tampering cannot bypass repair.
+/// Minimum age before a session-validated blob's mtime and ctime are treated as
+/// settled past coarse OS filesystem timestamp granularity (Linux HZ ticks and
+/// Windows 15.6 ms system clock). Blobs newer than this margin rehash on dedup
+/// hits so same-tick in-place tampering cannot bypass repair.
 const SETTLED_BLOB_MTIME_MARGIN: Duration = Duration::from_millis(50);
 
 /// Allocation-free identity for a CAS blob file `(blake3_digest, normalized_mode)`.
 pub(crate) type CompactBlobKey = ([u8; 32], u32);
+
+/// Allocation-free key for in-memory blob stat and validation maps.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct CompactBlobId {
+    digest: [u8; 32],
+    mode: u32,
+    size: u64,
+}
+
+impl CompactBlobId {
+    fn from_raw(digest: [u8; 32], mode: u32, size: u64) -> Self {
+        Self { digest, mode, size }
+    }
+
+    fn try_from_key(key: &BlobKey) -> Option<Self> {
+        if !valid_hex_digest(&key.digest) {
+            return None;
+        }
+        let mut digest = [0_u8; 32];
+        hex::decode_to_slice(&key.digest, &mut digest).ok()?;
+        Some(Self {
+            digest,
+            mode: key.mode,
+            size: key.size,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct FileIdentity(u64, u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FirstPublishTrust {
+    Verified,
+    DeferUntilFinalized,
+}
+
+struct PublishedBlob {
+    fingerprint: BlobStatFingerprint,
+    deferred_validation: bool,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct FileCas {
@@ -42,7 +89,7 @@ pub(crate) struct FileCas {
     materialized_root: PathBuf,
     secured_directories: Arc<RwLock<HashSet<PathBuf>>>,
     manifest_cache: Arc<Mutex<ManifestCacheState>>,
-    validated_blobs: Arc<RwLock<HashMap<BlobKey, BlobStatFingerprint>>>,
+    validated_blobs: Arc<RwLock<HashMap<CompactBlobId, BlobStatFingerprint>>>,
 }
 
 #[derive(Debug)]
@@ -103,7 +150,7 @@ pub(crate) struct FileCasReuseTimings {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FileCasValidationBatch {
-    blob_stats: Arc<Mutex<HashMap<BlobKey, BlobStatFingerprint>>>,
+    blob_stats: Arc<Mutex<HashMap<CompactBlobId, BlobStatFingerprint>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -111,6 +158,7 @@ pub(crate) struct PreparedSourceRecord {
     object_segment: OsString,
     record: SourceRecord,
     validation: SourceValidationRecord,
+    blob_stat_digests: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,6 +211,7 @@ struct BlobStatFingerprint {
     dev: u64,
     ino: u64,
     mode: u32,
+    nlink: u64,
     mtime: i64,
     mtime_nsec: i64,
     ctime: i64,
@@ -178,6 +227,7 @@ struct BlobStatFingerprint {
     last_write_time: u64,
     change_time: i64,
     file_attributes: u32,
+    nlink: u32,
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -194,14 +244,16 @@ pub(crate) struct RegistryCasIngest {
     source_sri: String,
     entries: Vec<CasManifestEntry>,
     entry_indexes: HashMap<Vec<u8>, usize>,
-    blob_stats: HashMap<BlobKey, BlobStatFingerprint>,
+    seen_identities: HashMap<FileIdentity, Vec<u8>>,
+    blob_stats: HashMap<CompactBlobId, BlobStatFingerprint>,
+    deferred_validated: Vec<(CompactBlobId, BlobStatFingerprint)>,
     hash_buffer: Vec<u8>,
 }
 
 struct TreeIngestContext<'a> {
     object_root: &'a Path,
     entries: &'a mut Vec<CasManifestEntry>,
-    blob_stats: &'a mut HashMap<BlobKey, BlobStatFingerprint>,
+    blob_stats: &'a mut HashMap<CompactBlobId, BlobStatFingerprint>,
     hash_buffer: &'a mut [u8],
     allows_symlinks: bool,
 }
@@ -253,11 +305,39 @@ struct SourceValidationRecord {
     source_sri: String,
     tree_digest: String,
     blob_stat_fingerprint: String,
-    /// Two little-endian `u64` words (128-bit BLAKE3 prefix) per unique blob in
-    /// `unique_manifest_blob_keys(manifest)` order so a single changed blob
-    /// does not force rehashing unchanged siblings.
-    #[serde(default)]
-    blob_stat_digests: Vec<u64>,
+}
+
+struct OpenSourceValidation {
+    record: SourceValidationRecord,
+    reader: BufReader<File>,
+}
+
+impl OpenSourceValidation {
+    fn read_per_blob_digests(mut self, expected_count: usize) -> Option<Vec<u8>> {
+        if expected_count == 0 || expected_count > SOURCE_VALIDATION_MAX_TRAILER_BLOBS {
+            return None;
+        }
+        let mut header = [0_u8; 12];
+        self.reader.read_exact(&mut header).ok()?;
+        if &header[0..4] != SOURCE_VALIDATION_TRAILER_MAGIC {
+            return None;
+        }
+        if u32::from_le_bytes(header[4..8].try_into().ok()?) != SOURCE_VALIDATION_TRAILER_VERSION {
+            return None;
+        }
+        let count = u32::from_le_bytes(header[8..12].try_into().ok()?) as usize;
+        if count != expected_count {
+            return None;
+        }
+        let payload_len = count.checked_mul(16)?;
+        let mut digests = vec![0_u8; payload_len];
+        self.reader.read_exact(&mut digests).ok()?;
+        let mut trailing = [0_u8; 1];
+        if self.reader.read(&mut trailing).ok()? != 0 {
+            return None;
+        }
+        Some(digests)
+    }
 }
 
 impl FileCas {
@@ -340,7 +420,9 @@ impl FileCas {
             source_sri: source_sri.to_string(),
             entries: Vec::with_capacity(128),
             entry_indexes: HashMap::with_capacity(128),
+            seen_identities: HashMap::with_capacity(128),
             blob_stats: HashMap::with_capacity(128),
+            deferred_validated: Vec::with_capacity(128),
             hash_buffer: vec![0_u8; 64 * 1024],
         })
     }
@@ -377,13 +459,36 @@ impl FileCas {
                 source.display()
             )));
         }
+        if let Some(identity) = file_identity_for_path(&source, &metadata)? {
+            if let Some(prior_path) = ingest.seen_identities.get(&identity)
+                && prior_path != &path_bytes
+            {
+                return Err(LpmError::Store(format!(
+                    "extracted v3 CAS entry aliases an already-ingested file identity at {}",
+                    relative_path.display()
+                )));
+            }
+            ingest.seen_identities.insert(identity, path_bytes.clone());
+        }
+        let mode = normalized_mode(&metadata);
+        let compact_id = CompactBlobId::from_raw(digest, mode, file_size);
         let key = BlobKey {
             digest: blake3::Hash::from_bytes(digest).to_hex().to_string(),
-            mode: normalized_mode(&metadata),
+            mode,
             size: file_size,
         };
-        let fingerprint = self.publish_blob(&source, &key, &mut ingest.hash_buffer)?;
-        ingest.blob_stats.insert(key.clone(), fingerprint);
+        let published = self.publish_blob(
+            &source,
+            &key,
+            &mut ingest.hash_buffer,
+            FirstPublishTrust::DeferUntilFinalized,
+        )?;
+        ingest.blob_stats.insert(compact_id, published.fingerprint);
+        if published.deferred_validation {
+            ingest
+                .deferred_validated
+                .push((compact_id, published.fingerprint));
+        }
 
         let mut parent = relative_path.parent();
         while let Some(directory) = parent {
@@ -449,6 +554,9 @@ impl FileCas {
         &self,
         ingest: RegistryCasIngest,
     ) -> Result<PreparedSourceRecord, LpmError> {
+        for (compact_id, fingerprint) in ingest.deferred_validated {
+            self.record_validated_blob_id(compact_id, fingerprint);
+        }
         self.prepare_source_record(
             ingest.object_segment,
             &ingest.source_sri,
@@ -464,7 +572,7 @@ impl FileCas {
         source_sri: &str,
         allows_symlinks: bool,
         mut entries: Vec<CasManifestEntry>,
-        known_blob_stats: Option<&HashMap<BlobKey, BlobStatFingerprint>>,
+        known_blob_stats: Option<&HashMap<CompactBlobId, BlobStatFingerprint>>,
     ) -> Result<PreparedSourceRecord, LpmError> {
         entries.sort_unstable_by(|left, right| left.path.cmp(&right.path));
         let manifest = CasManifest {
@@ -495,8 +603,8 @@ impl FileCas {
                 source_sri: source_sri.to_string(),
                 tree_digest: tree_digest.clone(),
                 blob_stat_fingerprint,
-                blob_stat_digests,
             },
+            blob_stat_digests,
             record: SourceRecord {
                 schema: CAS_SCHEMA_VERSION,
                 source_sri: source_sri.to_string(),
@@ -565,7 +673,7 @@ impl FileCas {
             }
         };
         result?;
-        self.write_source_validation(&prepared.validation)
+        self.write_source_validation(&prepared.validation, &prepared.blob_stat_digests)
     }
 
     fn valid_registry_source_collision(
@@ -657,7 +765,7 @@ impl FileCas {
         let keys = unique_manifest_blob_keys(&manifest);
         let mut observed_stats = Vec::with_capacity(keys.len());
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"lpm-v3-source-blob-stat-v2\0");
+        hasher.update(SOURCE_BLOB_STAT_DOMAIN);
         let mut all_stats_ok = true;
         for key in &keys {
             match self.blob_stat(key, timings, batch) {
@@ -679,7 +787,7 @@ impl FileCas {
             }
         }
         let source_validation_start = std::time::Instant::now();
-        let source_validation = self.read_source_validation(source_sri).ok();
+        let source_validation = self.open_source_validation(source_sri).ok();
         timings.source_validation_read_count =
             timings.source_validation_read_count.saturating_add(1);
         timings.source_validation_read_ms = timings
@@ -687,11 +795,11 @@ impl FileCas {
             .saturating_add(source_validation_start.elapsed().as_millis());
         if all_stats_ok {
             let observed_fingerprint = hasher.finalize().to_hex().to_string();
-            if source_validation.as_ref().is_some_and(|validation| {
-                validation.schema == CAS_SCHEMA_VERSION
-                    && validation.source_sri == source_sri
-                    && validation.tree_digest == record.tree_digest
-                    && validation.blob_stat_fingerprint == observed_fingerprint
+            if source_validation.as_ref().is_some_and(|open| {
+                open.record.schema == CAS_SCHEMA_VERSION
+                    && open.record.source_sri == source_sri
+                    && open.record.tree_digest == record.tree_digest
+                    && open.record.blob_stat_fingerprint == observed_fingerprint
             }) {
                 return Ok(SourceReuseStatus::Reusable);
             }
@@ -700,7 +808,7 @@ impl FileCas {
             &record,
             &keys,
             &observed_stats,
-            source_validation.as_ref(),
+            source_validation,
             timings,
         )
     }
@@ -710,25 +818,32 @@ impl FileCas {
         record: &SourceRecord,
         keys: &[&BlobKey],
         observed_stats: &[Option<BlobStatFingerprint>],
-        prior_validation: Option<&SourceValidationRecord>,
+        prior_validation: Option<OpenSourceValidation>,
         timings: &mut FileCasReuseTimings,
     ) -> Result<SourceReuseStatus, LpmError> {
-        let usable_prior = prior_validation.filter(|validation| {
-            validation.schema == CAS_SCHEMA_VERSION
-                && validation.source_sri == record.source_sri
-                && validation.tree_digest == record.tree_digest
-                && validation.blob_stat_digests.len() == keys.len().saturating_mul(2)
-        });
+        let prior_digests = prior_validation
+            .filter(|open| {
+                open.record.schema == CAS_SCHEMA_VERSION
+                    && open.record.source_sri == record.source_sri
+                    && open.record.tree_digest == record.tree_digest
+            })
+            .and_then(|open| open.read_per_blob_digests(keys.len()));
         let mut hash_buffer = Vec::new();
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"lpm-v3-source-blob-stat-v2\0");
-        let mut per_blob_digests = Vec::with_capacity(keys.len().saturating_mul(2));
+        hasher.update(SOURCE_BLOB_STAT_DOMAIN);
+        let emit_trailer = keys.len() <= SOURCE_VALIDATION_MAX_TRAILER_BLOBS;
+        let mut per_blob_digests = if emit_trailer {
+            Vec::with_capacity(keys.len().saturating_mul(16))
+        } else {
+            Vec::new()
+        };
         for (index, key) in keys.iter().enumerate() {
             let observed = observed_stats.get(index).copied().flatten();
             let trusted = observed.and_then(|fp| {
                 let digest = single_blob_stat_digest(key, fp);
-                let unchanged_since_prior = usable_prior.is_some_and(|prior| {
-                    prior.blob_stat_digests.get(index * 2..index * 2 + 2) == Some(digest.as_slice())
+                let unchanged_since_prior = prior_digests.as_ref().is_some_and(|digests| {
+                    let start = index * 16;
+                    digests.get(start..start + 16) == Some(digest.as_slice())
                 });
                 let validated_in_session =
                     !unchanged_since_prior && self.cached_validated_blob(key) == Some(fp);
@@ -770,16 +885,17 @@ impl FileCas {
             hasher.update(&key.mode.to_le_bytes());
             hasher.update(&key.size.to_le_bytes());
             fingerprint.update_hasher(&mut hasher);
-            per_blob_digests.extend_from_slice(&digest);
+            if emit_trailer {
+                per_blob_digests.extend_from_slice(&digest);
+            }
         }
         let validation = SourceValidationRecord {
             schema: CAS_SCHEMA_VERSION,
             source_sri: record.source_sri.clone(),
             tree_digest: record.tree_digest.clone(),
             blob_stat_fingerprint: hasher.finalize().to_hex().to_string(),
-            blob_stat_digests: per_blob_digests,
         };
-        self.write_source_validation(&validation)?;
+        self.write_source_validation(&validation, &per_blob_digests)?;
         Ok(SourceReuseStatus::Reusable)
     }
 
@@ -788,13 +904,15 @@ impl FileCas {
         keys: &[&BlobKey],
         timings: &mut FileCasReuseTimings,
         batch: Option<&FileCasValidationBatch>,
-        known_blob_stats: Option<&HashMap<BlobKey, BlobStatFingerprint>>,
+        known_blob_stats: Option<&HashMap<CompactBlobId, BlobStatFingerprint>>,
         out_stats: &mut Vec<BlobStatFingerprint>,
     ) -> Result<String, LpmError> {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"lpm-v3-source-blob-stat-v2\0");
+        hasher.update(SOURCE_BLOB_STAT_DOMAIN);
         for key in keys {
-            let fingerprint = if let Some(fp) = known_blob_stats.and_then(|map| map.get(*key)) {
+            let fingerprint = if let Some(fp) = known_blob_stats
+                .and_then(|map| CompactBlobId::try_from_key(key).and_then(|id| map.get(&id)))
+            {
                 *fp
             } else {
                 self.blob_stat(key, timings, batch)?
@@ -814,14 +932,15 @@ impl FileCas {
         timings: &mut FileCasReuseTimings,
         batch: Option<&FileCasValidationBatch>,
     ) -> Result<BlobStatFingerprint, LpmError> {
-        if let Some(fingerprint) = batch.and_then(|batch| {
-            batch
+        let compact_id = CompactBlobId::try_from_key(key);
+        if let (Some(id), Some(batch)) = (compact_id, batch)
+            && let Some(fingerprint) = batch
                 .blob_stats
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(key)
+                .get(&id)
                 .copied()
-        }) {
+        {
             timings.blob_stat_cache_hit_count = timings.blob_stat_cache_hit_count.saturating_add(1);
             return Ok(fingerprint);
         }
@@ -831,12 +950,12 @@ impl FileCas {
         timings.blob_stat_ms = timings
             .blob_stat_ms
             .saturating_add(start.elapsed().as_millis());
-        if let (Ok(fingerprint), Some(batch)) = (result.as_ref(), batch) {
+        if let (Ok(fingerprint), Some(id), Some(batch)) = (result.as_ref(), compact_id, batch) {
             batch
                 .blob_stats
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(key.clone(), *fingerprint);
+                .insert(id, *fingerprint);
         }
         result
     }
@@ -868,7 +987,11 @@ impl FileCas {
         }
     }
 
-    fn write_source_validation(&self, validation: &SourceValidationRecord) -> Result<(), LpmError> {
+    fn write_source_validation(
+        &self,
+        validation: &SourceValidationRecord,
+        per_blob_digests: &[u8],
+    ) -> Result<(), LpmError> {
         let path = self.source_validation_path(&validation.source_sri)?;
         let parent = path.parent().ok_or_else(|| {
             LpmError::Store(format!(
@@ -882,16 +1005,28 @@ impl FileCas {
                 parent.display()
             ))
         })?;
-        let bytes = rmp_serde::to_vec_named(validation).map_err(|error| {
+        let mut bytes = rmp_serde::to_vec_named(validation).map_err(|error| {
             LpmError::Store(format!(
                 "failed to serialize v3 CAS source validation: {error}"
             ))
         })?;
-        if bytes.len() as u64 > SOURCE_VALIDATION_MAX_BYTES {
+        if bytes.len() as u64 > SOURCE_VALIDATION_HEADER_MAX_BYTES {
             return Err(LpmError::Store(format!(
-                "v3 CAS source validation is {} bytes; cap is {SOURCE_VALIDATION_MAX_BYTES}",
+                "v3 CAS source validation header is {} bytes; cap is {SOURCE_VALIDATION_HEADER_MAX_BYTES}",
                 bytes.len()
             )));
+        }
+        if !per_blob_digests.is_empty() && per_blob_digests.len().is_multiple_of(16) {
+            let blob_count = per_blob_digests.len() / 16;
+            if blob_count <= SOURCE_VALIDATION_MAX_TRAILER_BLOBS
+                && let Ok(count_u32) = u32::try_from(blob_count)
+            {
+                bytes.reserve(12 + per_blob_digests.len());
+                bytes.extend_from_slice(SOURCE_VALIDATION_TRAILER_MAGIC);
+                bytes.extend_from_slice(&SOURCE_VALIDATION_TRAILER_VERSION.to_le_bytes());
+                bytes.extend_from_slice(&count_u32.to_le_bytes());
+                bytes.extend_from_slice(per_blob_digests);
+            }
         }
         write_file_atomic(&path, bytes).map_err(|error| {
             LpmError::Store(format!(
@@ -1222,6 +1357,7 @@ impl FileCas {
         destination: &Path,
     ) -> Result<(), LpmError> {
         let mut directory_modes = Vec::new();
+        let mut hash_buffer = Vec::new();
         for entry in &manifest.entries {
             let relative = decode_relative_path(&entry.path)?;
             let path = destination.join(relative);
@@ -1239,7 +1375,21 @@ impl FileCas {
                     let key = entry.blob.as_ref().ok_or_else(|| {
                         LpmError::Store("v3 CAS file entry is missing its blob key".into())
                     })?;
-                    let blob = self.verify_blob(key, false, &mut [])?;
+                    let blob = self.blob_path(key)?;
+                    let live_pre = self.read_blob_stat(key)?;
+                    let prior_validated = self.cached_validated_blob(key);
+                    if let Some(cached) = prior_validated
+                        && live_pre != cached
+                    {
+                        if hash_buffer.is_empty() {
+                            hash_buffer.resize(64 * 1024, 0);
+                        }
+                        if let Err(error) = self.validate_blob(&blob, key, &mut hash_buffer) {
+                            self.evict_validated_blob(key);
+                            self.quarantine_entry(&blob, "blobs")?;
+                            return Err(error);
+                        }
+                    }
                     if let Some(parent) = path.parent() {
                         fs::create_dir_all(parent).map_err(|error| {
                             LpmError::Store(format!(
@@ -1248,7 +1398,6 @@ impl FileCas {
                             ))
                         })?;
                     }
-                    let prior_validated = self.cached_validated_blob(key);
                     fs::hard_link(&blob, &path).map_err(|error| {
                         LpmError::Store(format!(
                             "failed to hardlink v3 CAS blob {} into materialized cache {}: {error}",
@@ -1256,11 +1405,21 @@ impl FileCas {
                             path.display()
                         ))
                     })?;
-                    if let Some(pre_fp) = prior_validated
-                        && let Ok(post_fp) = self.read_blob_stat(key)
-                        && post_fp.same_content_identity(pre_fp)
-                    {
-                        self.record_validated_blob(key, post_fp);
+                    if let Some(cached) = prior_validated {
+                        let post_fp = self.read_blob_stat(key)?;
+                        if !(post_fp == cached && cached.is_settled()) {
+                            if hash_buffer.is_empty() {
+                                hash_buffer.resize(64 * 1024, 0);
+                            }
+                            match self.validate_blob(&blob, key, &mut hash_buffer) {
+                                Ok(validated) => self.record_validated_blob(key, validated),
+                                Err(error) => {
+                                    self.evict_validated_blob(key);
+                                    self.quarantine_entry(&blob, "blobs")?;
+                                    return Err(error);
+                                }
+                            }
+                        }
                     }
                 }
                 CasEntryKind::Symlink => {
@@ -1584,8 +1743,9 @@ impl FileCas {
                 });
                 self.ingest_dir(ingest, &path, relative, depth + 1)?;
             } else if file_type.is_file() {
-                let (blob, fingerprint) = self.ingest_file(&path, &metadata, ingest.hash_buffer)?;
-                ingest.blob_stats.insert(blob.clone(), fingerprint);
+                let (blob, compact_id, fingerprint) =
+                    self.ingest_file(&path, &metadata, ingest.hash_buffer)?;
+                ingest.blob_stats.insert(compact_id, fingerprint);
                 ingest.entries.push(CasManifestEntry {
                     path: relative.clone(),
                     kind: CasEntryKind::File,
@@ -1626,40 +1786,53 @@ impl FileCas {
         source: &Path,
         metadata: &fs::Metadata,
         hash_buffer: &mut [u8],
-    ) -> Result<(BlobKey, BlobStatFingerprint), LpmError> {
-        let digest = hash_file(source, hash_buffer)?;
+    ) -> Result<(BlobKey, CompactBlobId, BlobStatFingerprint), LpmError> {
+        let raw_digest = hash_file_bytes(source, hash_buffer)?;
+        let mode = normalized_mode(metadata);
+        let size = metadata.len();
+        let compact_id = CompactBlobId::from_raw(raw_digest, mode, size);
         let key = BlobKey {
-            digest,
-            mode: normalized_mode(metadata),
-            size: metadata.len(),
+            digest: blake3::Hash::from_bytes(raw_digest).to_hex().to_string(),
+            mode,
+            size,
         };
-        let fingerprint = self.publish_blob(source, &key, hash_buffer)?;
-        Ok((key, fingerprint))
+        let published =
+            self.publish_blob(source, &key, hash_buffer, FirstPublishTrust::Verified)?;
+        Ok((key, compact_id, published.fingerprint))
     }
 
     fn record_validated_blob(&self, key: &BlobKey, fingerprint: BlobStatFingerprint) {
+        if let Some(id) = CompactBlobId::try_from_key(key) {
+            self.record_validated_blob_id(id, fingerprint);
+        }
+    }
+
+    fn record_validated_blob_id(&self, id: CompactBlobId, fingerprint: BlobStatFingerprint) {
         let mut guard = self
             .validated_blobs
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if guard.len() >= MAX_VALIDATED_BLOBS && !guard.contains_key(key) {
+        if guard.len() >= MAX_VALIDATED_BLOBS && !guard.contains_key(&id) {
             guard.clear();
         }
-        guard.insert(key.clone(), fingerprint);
+        guard.insert(id, fingerprint);
     }
 
     fn evict_validated_blob(&self, key: &BlobKey) {
-        self.validated_blobs
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(key);
+        if let Some(id) = CompactBlobId::try_from_key(key) {
+            self.validated_blobs
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+        }
     }
 
     fn cached_validated_blob(&self, key: &BlobKey) -> Option<BlobStatFingerprint> {
+        let id = CompactBlobId::try_from_key(key)?;
         self.validated_blobs
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(key)
+            .get(&id)
             .copied()
     }
 
@@ -1668,7 +1841,8 @@ impl FileCas {
         source: &Path,
         key: &BlobKey,
         hash_buffer: &mut [u8],
-    ) -> Result<BlobStatFingerprint, LpmError> {
+        first_publish_trust: FirstPublishTrust,
+    ) -> Result<PublishedBlob, LpmError> {
         let blob = self.blob_path(key)?;
         let parent = blob.parent().ok_or_else(|| {
             LpmError::Store(format!("v3 CAS blob has no parent: {}", blob.display()))
@@ -1683,8 +1857,15 @@ impl FileCas {
         match fs::hard_link(source, &blob) {
             Ok(()) => {
                 let fingerprint = self.read_blob_stat(key)?;
-                self.record_validated_blob(key, fingerprint);
-                return Ok(fingerprint);
+                let deferred_validation =
+                    first_publish_trust == FirstPublishTrust::DeferUntilFinalized;
+                if !deferred_validation {
+                    self.record_validated_blob(key, fingerprint);
+                }
+                return Ok(PublishedBlob {
+                    fingerprint,
+                    deferred_validation,
+                });
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
@@ -1694,62 +1875,74 @@ impl FileCas {
                 )));
             }
         }
+
+        if paths_share_file_identity(source, &blob) {
+            let validated = self.validate_blob(&blob, key, hash_buffer)?;
+            self.record_validated_blob(key, validated);
+            return Ok(PublishedBlob {
+                fingerprint: validated,
+                deferred_validation: false,
+            });
+        }
+
+        let backup = HardlinkReplaceGuard::stage(&blob, source)?;
+        #[cfg(test)]
+        run_test_after_publish_hardlink_hook(&blob);
         if let Some(cached) = self.cached_validated_blob(key)
             && cached.is_settled()
             && self
                 .read_blob_stat(key)
                 .is_ok_and(|live| live == cached && live.is_settled())
         {
-            replace_with_hardlink(&blob, source)?;
-            return self.refresh_validated_blob_after_hardlink(&blob, key, cached, hash_buffer);
+            backup.commit()?;
+            return Ok(PublishedBlob {
+                fingerprint: cached,
+                deferred_validation: false,
+            });
         }
-        let pre_hardlink = match self.validate_blob(&blob, key, hash_buffer) {
-            Ok(fingerprint) => {
-                self.record_validated_blob(key, fingerprint);
-                fingerprint
+        match self.validate_blob(&blob, key, hash_buffer) {
+            Ok(validated) => {
+                backup.commit()?;
+                self.record_validated_blob(key, validated);
+                Ok(PublishedBlob {
+                    fingerprint: validated,
+                    deferred_validation: false,
+                })
             }
             Err(_) => {
                 self.evict_validated_blob(key);
+                backup.rollback()?;
                 self.quarantine_entry(&blob, "blobs")?;
                 match fs::hard_link(source, &blob) {
                     Ok(()) => {
                         let fingerprint = self.read_blob_stat(key)?;
-                        self.record_validated_blob(key, fingerprint);
-                        return Ok(fingerprint);
+                        let deferred_validation =
+                            first_publish_trust == FirstPublishTrust::DeferUntilFinalized;
+                        if !deferred_validation {
+                            self.record_validated_blob(key, fingerprint);
+                        }
+                        Ok(PublishedBlob {
+                            fingerprint,
+                            deferred_validation,
+                        })
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let retry_backup = HardlinkReplaceGuard::stage(&blob, source)?;
                         let fingerprint = self.validate_blob(&blob, key, hash_buffer)?;
+                        retry_backup.commit()?;
                         self.record_validated_blob(key, fingerprint);
-                        fingerprint
+                        Ok(PublishedBlob {
+                            fingerprint,
+                            deferred_validation: false,
+                        })
                     }
-                    Err(error) => {
-                        return Err(LpmError::Store(format!(
-                            "failed to repair v3 CAS blob {}: {error}",
-                            blob.display()
-                        )));
-                    }
+                    Err(error) => Err(LpmError::Store(format!(
+                        "failed to repair v3 CAS blob {}: {error}",
+                        blob.display()
+                    ))),
                 }
             }
-        };
-        replace_with_hardlink(&blob, source)?;
-        self.refresh_validated_blob_after_hardlink(&blob, key, pre_hardlink, hash_buffer)
-    }
-
-    fn refresh_validated_blob_after_hardlink(
-        &self,
-        blob: &Path,
-        key: &BlobKey,
-        pre_hardlink: BlobStatFingerprint,
-        hash_buffer: &mut [u8],
-    ) -> Result<BlobStatFingerprint, LpmError> {
-        let post_hardlink = self.read_blob_stat(key)?;
-        if post_hardlink.same_content_identity(pre_hardlink) {
-            self.record_validated_blob(key, post_hardlink);
-            return Ok(post_hardlink);
         }
-        let validated = self.validate_blob(blob, key, hash_buffer)?;
-        self.record_validated_blob(key, validated);
-        Ok(validated)
     }
 
     fn ensure_cas_directory(&self, path: &Path) -> std::io::Result<()> {
@@ -1775,48 +1968,85 @@ impl FileCas {
         key: &BlobKey,
         hash_buffer: &mut [u8],
     ) -> Result<BlobStatFingerprint, LpmError> {
-        let (mut file, pre_meta) = open_regular_file_nofollow(blob).map_err(|error| {
+        let (mut file, mut pre_meta) = open_regular_file_nofollow(blob).map_err(|error| {
             LpmError::Store(format!(
                 "failed to inspect existing v3 CAS blob {}: {error}",
                 blob.display()
             ))
         })?;
-        if !pre_meta.file_type().is_file()
-            || pre_meta.len() != key.size
-            || normalized_mode(&pre_meta) != key.mode
-        {
-            return Err(LpmError::Store(format!(
-                "existing v3 CAS blob failed integrity validation at {}",
-                blob.display()
-            )));
-        }
-        let digest = hash_open_file(&mut file, blob, hash_buffer)?;
-        if digest != key.digest {
-            return Err(LpmError::Store(format!(
-                "existing v3 CAS blob failed integrity validation at {}",
-                blob.display()
-            )));
-        }
-        let post_meta = file.metadata().map_err(|error| {
-            LpmError::Store(format!(
-                "failed to re-inspect existing v3 CAS blob {}: {error}",
-                blob.display()
-            ))
-        })?;
-        if !post_meta.file_type().is_file()
-            || post_meta.len() != key.size
-            || normalized_mode(&post_meta) != key.mode
-        {
+        for attempt in 0..2 {
+            if attempt > 0 {
+                file.seek(io::SeekFrom::Start(0)).map_err(|error| {
+                    LpmError::Store(format!(
+                        "failed to rewind existing v3 CAS blob {}: {error}",
+                        blob.display()
+                    ))
+                })?;
+                pre_meta = file.metadata().map_err(|error| {
+                    LpmError::Store(format!(
+                        "failed to re-inspect existing v3 CAS blob {}: {error}",
+                        blob.display()
+                    ))
+                })?;
+            }
+            if !pre_meta.file_type().is_file()
+                || pre_meta.len() != key.size
+                || normalized_mode(&pre_meta) != key.mode
+            {
+                return Err(LpmError::Store(format!(
+                    "existing v3 CAS blob failed integrity validation at {}",
+                    blob.display()
+                )));
+            }
+            #[cfg(windows)]
+            let pre_fp = BlobStatFingerprint::from_open_file(blob, &file)?;
+            #[cfg(not(windows))]
+            let pre_fp = BlobStatFingerprint::from_metadata(&pre_meta);
+
+            let digest = hash_open_file(&mut file, blob, hash_buffer)?;
+            if digest != key.digest {
+                return Err(LpmError::Store(format!(
+                    "existing v3 CAS blob failed integrity validation at {}",
+                    blob.display()
+                )));
+            }
+            #[cfg(test)]
+            run_test_after_validate_hash_hook(blob);
+            let post_meta = file.metadata().map_err(|error| {
+                LpmError::Store(format!(
+                    "failed to re-inspect existing v3 CAS blob {}: {error}",
+                    blob.display()
+                ))
+            })?;
+            if !post_meta.file_type().is_file()
+                || post_meta.len() != key.size
+                || normalized_mode(&post_meta) != key.mode
+            {
+                return Err(LpmError::Store(format!(
+                    "existing v3 CAS blob changed during integrity validation at {}",
+                    blob.display()
+                )));
+            }
+            #[cfg(windows)]
+            let post_fp = BlobStatFingerprint::from_open_file(blob, &file)?;
+            #[cfg(not(windows))]
+            let post_fp = BlobStatFingerprint::from_metadata(&post_meta);
+
+            if post_fp == pre_fp {
+                return Ok(post_fp);
+            }
+            if attempt == 0 && post_fp.is_hardlink_only_transition_from(pre_fp) {
+                continue;
+            }
             return Err(LpmError::Store(format!(
                 "existing v3 CAS blob changed during integrity validation at {}",
                 blob.display()
             )));
         }
-        #[cfg(windows)]
-        let fingerprint = BlobStatFingerprint::from_open_file(blob, &file)?;
-        #[cfg(not(windows))]
-        let fingerprint = BlobStatFingerprint::from_metadata(&post_meta);
-        Ok(fingerprint)
+        Err(LpmError::Store(format!(
+            "existing v3 CAS blob changed during integrity validation at {}",
+            blob.display()
+        )))
     }
 
     fn publish_tree_manifest(&self, digest: &str, bytes: &[u8]) -> Result<(), LpmError> {
@@ -1996,15 +2226,26 @@ impl FileCas {
         rmp_serde::from_slice(&bytes).map_err(std::io::Error::other)
     }
 
-    fn read_source_validation(
+    fn open_source_validation(
         &self,
         source_sri: &str,
-    ) -> Result<SourceValidationRecord, std::io::Error> {
+    ) -> Result<OpenSourceValidation, std::io::Error> {
         let path = self
             .source_validation_path(source_sri)
             .map_err(std::io::Error::other)?;
-        let bytes = read_capped_io(&path, SOURCE_VALIDATION_MAX_BYTES)?;
-        rmp_serde::from_slice(&bytes).map_err(std::io::Error::other)
+        let (file, metadata) = open_regular_file_nofollow(&path)?;
+        if metadata.len() > SOURCE_VALIDATION_MAX_FILE_BYTES {
+            return Err(std::io::Error::other(format!(
+                "CAS source validation is {} bytes; cap is {SOURCE_VALIDATION_MAX_FILE_BYTES}",
+                metadata.len()
+            )));
+        }
+        let mut reader = BufReader::with_capacity(1024, file);
+        let record = {
+            let mut limited = reader.by_ref().take(SOURCE_VALIDATION_HEADER_MAX_BYTES);
+            rmp_serde::decode::from_read(&mut limited).map_err(std::io::Error::other)?
+        };
+        Ok(OpenSourceValidation { record, reader })
     }
 
     pub(crate) fn blob_files(&self) -> Result<Vec<PathBuf>, LpmError> {
@@ -2646,6 +2887,97 @@ impl ManifestStatFingerprint {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Windows implementation, which opens the path to read handle identity"
+)]
+fn file_identity_for_path(
+    _path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<Option<FileIdentity>, LpmError> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(Some(FileIdentity(metadata.dev(), metadata.ino())))
+}
+
+#[cfg(windows)]
+fn file_identity_for_path(
+    path: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<Option<FileIdentity>, LpmError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file = open_attributes_nofollow(path).map_err(|error| {
+        LpmError::Store(format!(
+            "failed to inspect v3 CAS file identity at {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` is open and `info` is valid writable storage for the Win32 struct.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(LpmError::Store(format!(
+            "failed to read v3 CAS file identity at {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    let file_index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Ok(Some(FileIdentity(
+        u64::from(info.dwVolumeSerialNumber),
+        file_index,
+    )))
+}
+
+#[cfg(not(any(unix, windows)))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Windows implementation, which opens the path to read handle identity"
+)]
+fn file_identity_for_path(
+    _path: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<Option<FileIdentity>, LpmError> {
+    Ok(None)
+}
+
+fn paths_share_file_identity(left: &Path, right: &Path) -> bool {
+    let Ok(left_meta) = fs::symlink_metadata(left) else {
+        return false;
+    };
+    let Ok(right_meta) = fs::symlink_metadata(right) else {
+        return false;
+    };
+    matches!(
+        (
+            file_identity_for_path(left, &left_meta),
+            file_identity_for_path(right, &right_meta),
+        ),
+        (Ok(Some(a)), Ok(Some(b))) if a == b
+    )
+}
+
+#[cfg(unix)]
+fn unix_timestamp_is_settled(secs: i64, nanos: i64, now: SystemTime) -> bool {
+    let Ok(secs) = u64::try_from(secs) else {
+        return false;
+    };
+    let Ok(nanos) = u32::try_from(nanos) else {
+        return false;
+    };
+    if nanos >= 1_000_000_000 {
+        return false;
+    }
+    let Some(ts) = UNIX_EPOCH.checked_add(Duration::new(secs, nanos)) else {
+        return false;
+    };
+    now.duration_since(ts)
+        .is_ok_and(|age| age >= SETTLED_BLOB_MTIME_MARGIN)
+}
+
+#[cfg(unix)]
 impl BlobStatFingerprint {
     fn from_metadata(metadata: &fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt;
@@ -2654,6 +2986,7 @@ impl BlobStatFingerprint {
             dev: metadata.dev(),
             ino: metadata.ino(),
             mode: normalized_mode(metadata),
+            nlink: metadata.nlink(),
             mtime: metadata.mtime(),
             mtime_nsec: metadata.mtime_nsec(),
             ctime: metadata.ctime(),
@@ -2672,10 +3005,15 @@ impl BlobStatFingerprint {
             )
     }
 
+    fn is_hardlink_only_transition_from(self, prior: Self) -> bool {
+        self.same_content_identity(prior) && self.nlink > prior.nlink
+    }
+
     fn update_hasher(self, hasher: &mut blake3::Hasher) {
         hasher.update(&self.dev.to_le_bytes());
         hasher.update(&self.ino.to_le_bytes());
         hasher.update(&self.mode.to_le_bytes());
+        hasher.update(&self.nlink.to_le_bytes());
         hasher.update(&self.mtime.to_le_bytes());
         hasher.update(&self.mtime_nsec.to_le_bytes());
         hasher.update(&self.ctime.to_le_bytes());
@@ -2683,22 +3021,28 @@ impl BlobStatFingerprint {
     }
 
     fn is_settled(self) -> bool {
-        let Ok(secs) = u64::try_from(self.mtime) else {
-            return false;
-        };
-        let Ok(nanos) = u32::try_from(self.mtime_nsec) else {
-            return false;
-        };
-        if nanos >= 1_000_000_000 {
-            return false;
-        }
-        let Some(mtime) = UNIX_EPOCH.checked_add(Duration::new(secs, nanos)) else {
-            return false;
-        };
-        SystemTime::now()
-            .duration_since(mtime)
-            .is_ok_and(|age| age >= SETTLED_BLOB_MTIME_MARGIN)
+        self.is_settled_at(SystemTime::now())
     }
+
+    fn is_settled_at(self, now: SystemTime) -> bool {
+        unix_timestamp_is_settled(self.mtime, self.mtime_nsec, now)
+            && unix_timestamp_is_settled(self.ctime, self.ctime_nsec, now)
+    }
+}
+
+#[cfg(windows)]
+fn windows_filetime_is_settled(ticks_100ns: u64, now: SystemTime) -> bool {
+    const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
+    let Some(since_unix_100ns) = ticks_100ns.checked_sub(WINDOWS_TO_UNIX_EPOCH_100NS) else {
+        return false;
+    };
+    let secs = since_unix_100ns / 10_000_000;
+    let nanos = ((since_unix_100ns % 10_000_000) * 100) as u32;
+    let Some(ts) = UNIX_EPOCH.checked_add(Duration::new(secs, nanos)) else {
+        return false;
+    };
+    now.duration_since(ts)
+        .is_ok_and(|age| age >= SETTLED_BLOB_MTIME_MARGIN)
 }
 
 #[cfg(windows)]
@@ -2786,6 +3130,7 @@ impl BlobStatFingerprint {
                 last_write_time,
                 change_time: basic_info.ChangeTime,
                 file_attributes: handle_info.dwFileAttributes,
+                nlink: handle_info.nNumberOfLinks,
             },
             size,
         ))
@@ -2807,6 +3152,10 @@ impl BlobStatFingerprint {
         )
     }
 
+    fn is_hardlink_only_transition_from(self, prior: Self) -> bool {
+        self.same_content_identity(prior) && self.nlink > prior.nlink
+    }
+
     fn update_hasher(self, hasher: &mut blake3::Hasher) {
         hasher.update(&self.volume_serial_number.to_le_bytes());
         hasher.update(&self.file_index.to_le_bytes());
@@ -2814,24 +3163,19 @@ impl BlobStatFingerprint {
         hasher.update(&self.last_write_time.to_le_bytes());
         hasher.update(&self.change_time.to_le_bytes());
         hasher.update(&self.file_attributes.to_le_bytes());
+        hasher.update(&self.nlink.to_le_bytes());
     }
 
     fn is_settled(self) -> bool {
-        const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
-        let Some(since_unix_100ns) = self
-            .last_write_time
-            .checked_sub(WINDOWS_TO_UNIX_EPOCH_100NS)
-        else {
+        self.is_settled_at(SystemTime::now())
+    }
+
+    fn is_settled_at(self, now: SystemTime) -> bool {
+        let Ok(change_time) = u64::try_from(self.change_time) else {
             return false;
         };
-        let secs = since_unix_100ns / 10_000_000;
-        let nanos = ((since_unix_100ns % 10_000_000) * 100) as u32;
-        let Some(mtime) = UNIX_EPOCH.checked_add(Duration::new(secs, nanos)) else {
-            return false;
-        };
-        SystemTime::now()
-            .duration_since(mtime)
-            .is_ok_and(|age| age >= SETTLED_BLOB_MTIME_MARGIN)
+        windows_filetime_is_settled(self.last_write_time, now)
+            && windows_filetime_is_settled(change_time, now)
     }
 }
 
@@ -2855,8 +3199,8 @@ impl BlobStatFingerprint {
         }
     }
 
-    fn same_content_identity(self, other: Self) -> bool {
-        self == other
+    fn is_hardlink_only_transition_from(self, _prior: Self) -> bool {
+        false
     }
 
     fn update_hasher(self, hasher: &mut blake3::Hasher) {
@@ -2866,33 +3210,40 @@ impl BlobStatFingerprint {
     }
 
     fn is_settled(self) -> bool {
-        let secs = u64::try_from(self.modified / 1_000_000_000).ok();
-        let nanos = (self.modified % 1_000_000_000) as u32;
-        let Some(mtime) = secs.and_then(|s| UNIX_EPOCH.checked_add(Duration::new(s, nanos))) else {
-            return false;
+        self.is_settled_at(SystemTime::now())
+    }
+
+    fn is_settled_at(self, now: SystemTime) -> bool {
+        let nanos_is_settled = |ts_nanos: u128| {
+            let secs = u64::try_from(ts_nanos / 1_000_000_000).ok();
+            let nanos = (ts_nanos % 1_000_000_000) as u32;
+            let Some(ts) = secs.and_then(|s| UNIX_EPOCH.checked_add(Duration::new(s, nanos)))
+            else {
+                return false;
+            };
+            now.duration_since(ts)
+                .is_ok_and(|age| age >= SETTLED_BLOB_MTIME_MARGIN)
         };
-        SystemTime::now()
-            .duration_since(mtime)
-            .is_ok_and(|age| age >= SETTLED_BLOB_MTIME_MARGIN)
+        nanos_is_settled(self.modified) && (self.created == 0 || nanos_is_settled(self.created))
     }
 }
 
-fn single_blob_stat_digest(key: &BlobKey, fingerprint: BlobStatFingerprint) -> [u64; 2] {
+fn single_blob_stat_digest(key: &BlobKey, fingerprint: BlobStatFingerprint) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"lpm-v3-blob-stat-entry-v1\0");
+    hasher.update(b"lpm-v3-blob-stat-entry-v2\0");
     hasher.update(key.digest.as_bytes());
     hasher.update(&key.mode.to_le_bytes());
     hasher.update(&key.size.to_le_bytes());
     fingerprint.update_hasher(&mut hasher);
     let bytes = *hasher.finalize().as_bytes();
-    [
-        u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
-        u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-    ]
+    bytes[0..16].try_into().unwrap()
 }
 
-fn encode_per_blob_stat_digests(keys: &[&BlobKey], stats: &[BlobStatFingerprint]) -> Vec<u64> {
-    let mut digests = Vec::with_capacity(keys.len().saturating_mul(2));
+fn encode_per_blob_stat_digests(keys: &[&BlobKey], stats: &[BlobStatFingerprint]) -> Vec<u8> {
+    if keys.len() > SOURCE_VALIDATION_MAX_TRAILER_BLOBS {
+        return Vec::new();
+    }
+    let mut digests = Vec::with_capacity(keys.len().saturating_mul(16));
     for (key, fingerprint) in keys.iter().zip(stats.iter().copied()) {
         digests.extend_from_slice(&single_blob_stat_digest(key, fingerprint));
     }
@@ -2989,7 +3340,7 @@ fn read_manifest_file_with_fingerprint(
     let read_cap = MANIFEST_MAX_BYTES + 1;
     let capacity = usize::try_from(pre_meta.len().min(read_cap)).unwrap_or(0);
     let mut bytes = Vec::with_capacity(capacity);
-    BufReader::new(&mut file)
+    (&mut file)
         .take(read_cap)
         .read_to_end(&mut bytes)
         .map_err(|error| {
@@ -3047,9 +3398,7 @@ fn read_capped_io(path: &Path, cap: u64) -> Result<Vec<u8>, std::io::Error> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "CAS read cap is too large"))?;
     let capacity = usize::try_from(metadata.len().min(read_cap)).unwrap_or(0);
     let mut bytes = Vec::with_capacity(capacity);
-    BufReader::new(file)
-        .take(read_cap)
-        .read_to_end(&mut bytes)?;
+    file.take(read_cap).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > cap {
         return Err(io::Error::other(format!(
             "CAS metadata exceeded {cap} bytes while being read"
@@ -3149,49 +3498,101 @@ fn publish_bytes_no_replace(path: &Path, bytes: &[u8], cap: u64) -> Result<(), L
     }
 }
 
-fn replace_with_hardlink(source: &Path, destination: &Path) -> Result<(), LpmError> {
-    let backup = tmp_sibling(destination);
-    fs::rename(destination, &backup).map_err(|error| {
-        LpmError::Store(format!(
-            "failed to stage duplicate v3 CAS object file {}: {error}",
-            destination.display()
-        ))
-    })?;
-    match fs::hard_link(source, destination) {
-        Ok(()) => {
-            fs::remove_file(&backup).map_err(|error| {
-                LpmError::Store(format!(
-                    "failed to remove replaced v3 CAS object file {}: {error}",
-                    backup.display()
-                ))
-            })?;
-            Ok(())
-        }
-        Err(error) => {
-            let _ = fs::rename(&backup, destination);
-            Err(LpmError::Store(format!(
-                "failed to hardlink existing v3 CAS blob into {}: {error}",
+struct HardlinkReplaceGuard<'a> {
+    destination: &'a Path,
+    backup: PathBuf,
+    active: bool,
+}
+
+impl<'a> HardlinkReplaceGuard<'a> {
+    fn stage(source: &Path, destination: &'a Path) -> Result<Self, LpmError> {
+        let backup = tmp_sibling(destination);
+        fs::rename(destination, &backup).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to stage duplicate v3 CAS object file {}: {error}",
                 destination.display()
-            )))
+            ))
+        })?;
+        match fs::hard_link(source, destination) {
+            Ok(()) => Ok(Self {
+                destination,
+                backup,
+                active: true,
+            }),
+            Err(error) => {
+                let _ = fs::rename(&backup, destination);
+                Err(LpmError::Store(format!(
+                    "failed to hardlink existing v3 CAS blob into {}: {error}",
+                    destination.display()
+                )))
+            }
+        }
+    }
+
+    fn commit(mut self) -> Result<(), LpmError> {
+        self.active = false;
+        fs::remove_file(&self.backup).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to remove replaced v3 CAS object file {}: {error}",
+                self.backup.display()
+            ))
+        })
+    }
+
+    fn rollback(mut self) -> Result<(), LpmError> {
+        self.active = false;
+        let _ = fs::remove_file(self.destination);
+        fs::rename(&self.backup, self.destination).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to restore staged v3 CAS object file {}: {error}",
+                self.destination.display()
+            ))
+        })
+    }
+}
+
+impl Drop for HardlinkReplaceGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = fs::remove_file(self.destination);
+            let _ = fs::rename(&self.backup, self.destination);
         }
     }
 }
 
-fn hash_file(path: &Path, buffer: &mut [u8]) -> Result<String, LpmError> {
+fn hash_file_bytes(path: &Path, buffer: &mut [u8]) -> Result<[u8; 32], LpmError> {
     let (mut file, _) = open_regular_file_nofollow(path).map_err(|error| {
         LpmError::Store(format!(
             "failed to open v3 CAS source file {}: {error}",
             path.display()
         ))
     })?;
-    hash_open_file(&mut file, path, buffer)
+    hash_open_file_bytes(&mut file, path, buffer)
+}
+
+#[cfg(all(unix, test))]
+fn hash_file(path: &Path, buffer: &mut [u8]) -> Result<String, LpmError> {
+    Ok(blake3::Hash::from_bytes(hash_file_bytes(path, buffer)?)
+        .to_hex()
+        .to_string())
 }
 
 fn hash_open_file(file: &mut File, path: &Path, buffer: &mut [u8]) -> Result<String, LpmError> {
-    let mut reader = BufReader::new(file);
+    Ok(
+        blake3::Hash::from_bytes(hash_open_file_bytes(file, path, buffer)?)
+            .to_hex()
+            .to_string(),
+    )
+}
+
+fn hash_open_file_bytes(
+    file: &mut File,
+    path: &Path,
+    buffer: &mut [u8],
+) -> Result<[u8; 32], LpmError> {
     let mut hasher = blake3::Hasher::new();
     loop {
-        let read = reader.read(buffer).map_err(|error| {
+        let read = file.read(buffer).map_err(|error| {
             LpmError::Store(format!(
                 "failed to hash v3 CAS source file {}: {error}",
                 path.display()
@@ -3202,7 +3603,7 @@ fn hash_open_file(file: &mut File, path: &Path, buffer: &mut [u8]) -> Result<Str
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hasher.finalize().to_hex().to_string())
+    Ok(*hasher.finalize().as_bytes())
 }
 
 fn validate_manifest(manifest: &CasManifest) -> Result<bool, LpmError> {
@@ -4059,19 +4460,22 @@ mod tests {
         let key = manifest.entries[0].blob.as_ref().unwrap();
         let blob = cas.blob_path(key).unwrap();
 
-        // Backdate the blob so its mtime is settled in `validated_blobs`, then
-        // ingest `second` (hits session cache without rehashing).
+        // Backdate the blob's mtime; `set_times` still refreshes ctime on Unix
+        // so it must not be considered settled at `now`, only once both mtime
+        // and ctime age past the settle margin.
         let old_time = SystemTime::now() - Duration::from_secs(60);
         fs::set_times(&blob, fs::FileTimes::new().set_modified(old_time)).unwrap();
         let settled_fp = cas.read_blob_stat(key).unwrap();
-        assert!(settled_fp.is_settled());
+        #[cfg(unix)]
+        assert!(!settled_fp.is_settled());
+        assert!(settled_fp.is_settled_at(SystemTime::now() + Duration::from_secs(1)));
         cas.record_validated_blob(key, settled_fp);
 
         cas.ingest_object_tree(&second, "sha512-second", false)
             .unwrap();
         assert_eq!(fs::read(&blob).unwrap(), b"clean-bytes");
 
-        // Tampering with the settled blob updates its mtime, invalidating the
+        // Tampering with the blob updates its timestamps, invalidating the
         // session cache so `third` quarantines and repairs it.
         fs::write(&blob, b"dirty-bytes").unwrap();
         cas.ingest_object_tree(&third, "sha512-third", false)
@@ -4085,5 +4489,351 @@ mod tests {
                 .next()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn registry_ingest_rejects_distinct_paths_sharing_same_file_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let cas = FileCas::at(root.path());
+        let object_dir = root.path().join("objects/pkg-a");
+        fs::create_dir_all(&object_dir).unwrap();
+        let first_file = object_dir.join("first.js");
+        let aliased_file = object_dir.join("second.js");
+        write_file(&first_file, b"genuine-bytes", 0o644);
+        fs::hard_link(&first_file, &aliased_file).unwrap();
+
+        let digest = *blake3::hash(b"genuine-bytes").as_bytes();
+        let mut ingest = cas
+            .begin_registry_ingest(&object_dir, "sha512-alias")
+            .unwrap();
+        cas.ingest_registry_file(
+            &mut ingest,
+            &object_dir,
+            Path::new("first.js"),
+            Some(13),
+            digest,
+        )
+        .unwrap();
+
+        let key = BlobKey {
+            digest: blake3::Hash::from_bytes(digest).to_hex().to_string(),
+            mode: normalized_mode(&fs::symlink_metadata(&first_file).unwrap()),
+            size: 13,
+        };
+        assert!(
+            cas.cached_validated_blob(&key).is_none(),
+            "unfinalized registry ingest must not mark first-publish blobs session-validated"
+        );
+
+        let err = cas
+            .ingest_registry_file(
+                &mut ingest,
+                &object_dir,
+                Path::new("second.js"),
+                Some(13),
+                digest,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("aliases") || err.to_string().contains("identity"),
+            "unexpected error: {err}"
+        );
+
+        let prepared = cas.finish_registry_ingest(ingest).unwrap();
+        cas.publish_source_record(&object_dir, &prepared).unwrap();
+        assert!(
+            cas.cached_validated_blob(&key).is_some(),
+            "finalized registry ingest records deferred first-publish blobs"
+        );
+    }
+
+    #[test]
+    fn materialization_does_not_promote_tampered_blob_from_stale_session_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let cas = FileCas::at(root.path());
+        let first = root.path().join("objects/first");
+        fs::create_dir_all(&first).unwrap();
+        write_file(&first.join("index.js"), b"clean-bytes", 0o644);
+
+        let prepared = cas
+            .ingest_object_tree(&first, "sha512-first", false)
+            .unwrap();
+        cas.publish_source_record(&first, &prepared).unwrap();
+        let manifest = cas
+            .manifest_for_digest(&prepared.record.tree_digest)
+            .unwrap();
+        let key = manifest.entries[0].blob.as_ref().unwrap();
+        let blob = cas.blob_path(key).unwrap();
+
+        let orig_mtime = fs::metadata(&blob).unwrap().modified().unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        fs::write(&blob, b"dirty-bytes").unwrap();
+        fs::set_times(&blob, fs::FileTimes::new().set_modified(orig_mtime)).unwrap();
+
+        let materialize_err = cas.materialized_source(&first, "sha512-first");
+        assert!(
+            materialize_err.is_err(),
+            "materialization must fail when a cached blob was tampered before hardlinking"
+        );
+        let status = cas.source_reuse_status(&first, "sha512-first").unwrap();
+        assert_eq!(
+            status,
+            SourceReuseStatus::CorruptBlob,
+            "materialization must never re-bless a tampered blob whose ctime changed"
+        );
+    }
+
+    #[test]
+    fn dedup_hardlink_window_tamper_with_restored_mtime_is_rejected_and_repaired() {
+        let root = tempfile::tempdir().unwrap();
+        let cas = FileCas::at(root.path());
+        let first = root.path().join("objects/first");
+        let second = root.path().join("objects/second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        write_file(&first.join("index.js"), b"clean-bytes", 0o644);
+        write_file(&second.join("index.js"), b"clean-bytes", 0o644);
+
+        let first_prepared = cas
+            .ingest_object_tree(&first, "sha512-first", false)
+            .unwrap();
+        cas.publish_source_record(&first, &first_prepared).unwrap();
+        let manifest = cas
+            .manifest_for_digest(&first_prepared.record.tree_digest)
+            .unwrap();
+        let key = manifest.entries[0].blob.as_ref().unwrap();
+        let blob = cas.blob_path(key).unwrap();
+        let orig_mtime = fs::metadata(&blob).unwrap().modified().unwrap();
+
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_clone = Arc::clone(&fired);
+        let target_blob = blob.clone();
+        let _guard = TestAfterPublishHardlinkGuard::install(move |path| {
+            if path == target_blob && !fired_clone.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(25));
+                fs::write(path, b"dirty-bytes").unwrap();
+                fs::set_times(path, fs::FileTimes::new().set_modified(orig_mtime)).unwrap();
+            }
+        });
+
+        let second_prepared = cas
+            .ingest_object_tree(&second, "sha512-second", false)
+            .unwrap();
+        cas.publish_source_record(&second, &second_prepared)
+            .unwrap();
+        assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            fs::read(&blob).unwrap(),
+            b"clean-bytes",
+            "blob tampered inside the hardlink window must be detected and repaired"
+        );
+        assert_eq!(
+            fs::read(second.join("index.js")).unwrap(),
+            b"clean-bytes",
+            "second package must retain genuine bytes"
+        );
+    }
+
+    #[test]
+    fn validate_blob_rejects_same_length_write_landing_after_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let cas = FileCas::at(root.path());
+        let first = root.path().join("objects/first");
+        fs::create_dir_all(&first).unwrap();
+        write_file(&first.join("index.js"), b"clean-bytes", 0o644);
+
+        let prepared = cas
+            .ingest_object_tree(&first, "sha512-first", false)
+            .unwrap();
+        let manifest = cas
+            .manifest_for_digest(&prepared.record.tree_digest)
+            .unwrap();
+        let key = manifest.entries[0].blob.as_ref().unwrap();
+        let blob = cas.blob_path(key).unwrap();
+
+        let target_blob = blob.clone();
+        let _guard = TestAfterValidateHashGuard::install(move |path| {
+            if path == target_blob {
+                std::thread::sleep(Duration::from_millis(25));
+                fs::write(path, b"tamper-data").unwrap();
+            }
+        });
+
+        let mut buf = vec![0_u8; 64 * 1024];
+        let result = cas.validate_blob(&blob, key, &mut buf);
+        assert!(
+            result.is_err(),
+            "validate_blob must reject a file modified after its content hash completed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blob_fingerprint_with_old_mtime_and_recent_ctime_is_not_settled() {
+        let root = tempfile::tempdir().unwrap();
+        let cas = FileCas::at(root.path());
+        let first = root.path().join("objects/first");
+        fs::create_dir_all(&first).unwrap();
+        write_file(&first.join("index.js"), b"clean-bytes", 0o644);
+
+        let prepared = cas
+            .ingest_object_tree(&first, "sha512-first", false)
+            .unwrap();
+        let manifest = cas
+            .manifest_for_digest(&prepared.record.tree_digest)
+            .unwrap();
+        let key = manifest.entries[0].blob.as_ref().unwrap();
+        let blob = cas.blob_path(key).unwrap();
+
+        let old_time = SystemTime::now() - Duration::from_secs(60);
+        fs::set_times(&blob, fs::FileTimes::new().set_modified(old_time)).unwrap();
+        let fp = cas.read_blob_stat(key).unwrap();
+        assert!(
+            !fp.is_settled(),
+            "old mtime with a freshly updated ctime must not be treated as settled"
+        );
+        assert!(
+            fp.is_settled_at(SystemTime::now() + Duration::from_secs(1)),
+            "fingerprint settles once both mtime and ctime age past the settle margin"
+        );
+    }
+
+    #[test]
+    fn source_validation_handles_70000_unique_blobs_without_failing_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let cas = FileCas::at(root.path());
+        let first = root.path().join("objects/first");
+        fs::create_dir_all(&first).unwrap();
+        write_file(&first.join("index.js"), b"seed", 0o644);
+        let seed_prepared = cas
+            .ingest_object_tree(&first, "sha512-seed", false)
+            .unwrap();
+        let seed_manifest = cas
+            .manifest_for_digest(&seed_prepared.record.tree_digest)
+            .unwrap();
+        let sample_fp = cas
+            .read_blob_stat(seed_manifest.entries[0].blob.as_ref().unwrap())
+            .unwrap();
+
+        let count = 70_000usize;
+        let keys: Vec<BlobKey> = (0..count)
+            .map(|i| BlobKey {
+                digest: blake3::hash(&i.to_le_bytes()).to_hex().to_string(),
+                mode: 0o644,
+                size: 4,
+            })
+            .collect();
+        let key_refs: Vec<&BlobKey> = keys.iter().collect();
+        let stats = vec![sample_fp; count];
+        let digests = encode_per_blob_stat_digests(&key_refs, &stats);
+        let validation = SourceValidationRecord {
+            schema: CAS_SCHEMA_VERSION,
+            source_sri: "sha512-large-package".to_string(),
+            tree_digest: "a".repeat(64),
+            blob_stat_fingerprint: "b".repeat(64),
+        };
+        cas.write_source_validation(&validation, &digests).expect(
+            "packages with 70,000 unique blobs must publish source validation without hitting cap",
+        );
+        let open = cas.open_source_validation("sha512-large-package").unwrap();
+        assert_eq!(open.record.blob_stat_fingerprint, "b".repeat(64));
+        let loaded_digests = open
+            .read_per_blob_digests(count)
+            .expect("lazy trailer should round-trip all 70,000 per-blob digests");
+        assert_eq!(loaded_digests, digests);
+    }
+
+    #[test]
+    fn source_validation_omits_optional_trailer_above_cap_without_failing() {
+        let root = tempfile::tempdir().unwrap();
+        let cas = FileCas::at(root.path());
+        let validation = SourceValidationRecord {
+            schema: CAS_SCHEMA_VERSION,
+            source_sri: "sha512-huge-package".to_string(),
+            tree_digest: "c".repeat(64),
+            blob_stat_fingerprint: "d".repeat(64),
+        };
+        let oversized = vec![0xAB_u8; (SOURCE_VALIDATION_MAX_TRAILER_BLOBS + 1) * 16];
+        cas.write_source_validation(&validation, &oversized)
+            .expect("oversized per-blob digest trailer must be omitted rather than failing");
+        let open = cas.open_source_validation("sha512-huge-package").unwrap();
+        assert_eq!(open.record.blob_stat_fingerprint, "d".repeat(64));
+        assert!(
+            open.read_per_blob_digests(SOURCE_VALIDATION_MAX_TRAILER_BLOBS + 1)
+                .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+type PathHookFn = Box<dyn Fn(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_AFTER_PUBLISH_HARDLINK_HOOK: std::cell::RefCell<Option<PathHookFn>> =
+        std::cell::RefCell::new(None);
+    static TEST_AFTER_VALIDATE_HASH_HOOK: std::cell::RefCell<Option<PathHookFn>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_test_after_publish_hardlink_hook(path: &Path) {
+    TEST_AFTER_PUBLISH_HARDLINK_HOOK.with(|cell| {
+        if let Some(hook) = cell.borrow().as_ref() {
+            hook(path);
+        }
+    });
+}
+
+#[cfg(test)]
+fn run_test_after_validate_hash_hook(path: &Path) {
+    TEST_AFTER_VALIDATE_HASH_HOOK.with(|cell| {
+        if let Some(hook) = cell.borrow().as_ref() {
+            hook(path);
+        }
+    });
+}
+
+#[cfg(test)]
+struct TestAfterPublishHardlinkGuard;
+
+#[cfg(test)]
+impl TestAfterPublishHardlinkGuard {
+    fn install(hook: impl Fn(&Path) + 'static) -> Self {
+        TEST_AFTER_PUBLISH_HARDLINK_HOOK.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(hook));
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestAfterPublishHardlinkGuard {
+    fn drop(&mut self) {
+        TEST_AFTER_PUBLISH_HARDLINK_HOOK.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+    }
+}
+
+#[cfg(test)]
+struct TestAfterValidateHashGuard;
+
+#[cfg(test)]
+impl TestAfterValidateHashGuard {
+    fn install(hook: impl Fn(&Path) + 'static) -> Self {
+        TEST_AFTER_VALIDATE_HASH_HOOK.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(hook));
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestAfterValidateHashGuard {
+    fn drop(&mut self) {
+        TEST_AFTER_VALIDATE_HASH_HOOK.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
     }
 }

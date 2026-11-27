@@ -1690,7 +1690,7 @@ impl Store {
                     ingest,
                     tmp_dir,
                     &extracted.relative_path,
-                    None,
+                    Some(extracted.size),
                     extracted.blake3_digest,
                 )?;
             }

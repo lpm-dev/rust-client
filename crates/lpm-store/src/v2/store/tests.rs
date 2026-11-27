@@ -3669,6 +3669,71 @@ fn v3_prune_streaming_inventories_preserve_totals_and_sorted_orphans() {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn v3_unicode_aliasing_tarball_cannot_poison_concurrent_package_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe_a = dir.path().join("probe_caf\u{00e9}");
+    let probe_b = dir.path().join("probe_cafe\u{0301}");
+    std::fs::write(&probe_a, b"1").unwrap();
+    let aliases_unicode = std::fs::symlink_metadata(&probe_b).is_ok();
+    let _ = std::fs::remove_file(&probe_a);
+    if !aliases_unicode {
+        return;
+    }
+
+    let store = std::sync::Arc::new(Store::at_v3(dir.path()));
+    let genuine = b"module.exports = 'genuine-victim-payload';";
+    let evil = b"module.exports = 'evil-attacker-payload!';";
+    assert_eq!(genuine.len(), evil.len());
+
+    let mut attacker_entries: Vec<(String, Vec<u8>)> = vec![
+        (
+            "package.json".to_string(),
+            br#"{"name":"attacker","version":"1.0.0"}"#.to_vec(),
+        ),
+        ("caf\u{00e9}.js".to_string(), genuine.to_vec()),
+    ];
+    for idx in 0..256 {
+        attacker_entries.push((format!("pad/{idx}.txt"), format!("p{idx}").into_bytes()));
+    }
+    attacker_entries.push(("cafe\u{0301}.js".to_string(), evil.to_vec()));
+    let attacker_refs: Vec<(&str, &[u8])> = attacker_entries
+        .iter()
+        .map(|(p, b)| (p.as_str(), b.as_slice()))
+        .collect();
+    let attacker_tarball = build_test_tarball(&attacker_refs);
+
+    let victim_tarball = build_test_tarball(&[
+        ("package.json", br#"{"name":"victim","version":"1.0.0"}"#),
+        ("index.js", genuine),
+    ]);
+
+    let store_a = std::sync::Arc::clone(&store);
+    let store_v = std::sync::Arc::clone(&store);
+    let attacker_handle =
+        std::thread::spawn(move || store_a.extract_object_from_bytes(&attacker_tarball, None));
+    let victim_handle =
+        std::thread::spawn(move || store_v.extract_object_from_bytes(&victim_tarball, None));
+
+    assert!(
+        attacker_handle.join().unwrap().is_err(),
+        "unicode-aliasing attacker tarball must fail extraction"
+    );
+    let (victim_dir, _, _) = victim_handle.join().unwrap().unwrap();
+    assert_eq!(
+        std::fs::read(victim_dir.join("index.js")).unwrap(),
+        genuine,
+        "victim package must always retain genuine bytes"
+    );
+    let verification = store.verify_file_cas(true).unwrap().unwrap();
+    assert!(
+        verification.issues.is_empty(),
+        "deep v3 CAS verification must report no corrupted blobs: {:?}",
+        verification.issues
+    );
+}
+
 #[test]
 fn v3_prune_refuses_to_plan_when_a_live_manifest_is_malformed() {
     let dir = tempfile::tempdir().unwrap();
