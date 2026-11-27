@@ -796,6 +796,7 @@ pub fn client_builder_trusting_only(
 
 /// Build a blocking reqwest client with the workspace redirect policy,
 /// trusting the [bundled root certificates](bundled_root_certificates).
+#[cfg(feature = "blocking")]
 pub fn blocking_client_builder() -> reqwest::blocking::ClientBuilder {
     reqwest::blocking::Client::builder()
         .redirect(redirect_policy(DEFAULT_REDIRECT_LIMIT))

@@ -1933,8 +1933,22 @@ pub fn render_html(graph: &DepGraph) -> Result<String, serde_json::Error> {
     Ok(String::from_utf8(output).expect("graph HTML must be UTF-8"))
 }
 
+fn graph_html_template() -> &'static str {
+    static TEMPLATE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEMPLATE.get_or_init(|| {
+        use std::io::Read as _;
+        const GRAPH_HTML_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/graph.html.gz"));
+        let mut decoder = flate2::read::GzDecoder::new(GRAPH_HTML_GZ);
+        let mut out = String::new();
+        decoder
+            .read_to_string(&mut out)
+            .expect("embedded graph HTML template must decompress to valid UTF-8");
+        out
+    })
+}
+
 pub fn write_html<W: Write>(mut writer: W, graph: &DepGraph) -> Result<(), serde_json::Error> {
-    let template = include_str!("templates/graph.html");
+    let template = graph_html_template();
     let (before_stats, after_stats) = template
         .split_once("__STATS__")
         .expect("graph template must contain the stats placeholder");

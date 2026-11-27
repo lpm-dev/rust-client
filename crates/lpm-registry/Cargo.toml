@@ -48,6 +48,7 @@ zstd = { version = "0.14", default-features = false }
 libc = "0.2"
 
 [dev-dependencies]
+lpm-http = { workspace = true, features = ["blocking"] }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tempfile = "3"

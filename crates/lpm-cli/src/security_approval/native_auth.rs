@@ -383,6 +383,14 @@ mod backend_tests {
             );
         }
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_local_authentication_framework_remains_loaded_for_la_context() {
+        // SAFETY: constructing an LAContext has no preconditions and verifies
+        // LocalAuthentication.framework stays linked under -Wl,-dead_strip_dylibs.
+        let _context = unsafe { objc2_local_authentication::LAContext::new() };
+    }
 }
 
 #[cfg(all(test, target_os = "windows"))]
