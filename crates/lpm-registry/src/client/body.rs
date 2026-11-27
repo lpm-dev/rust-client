@@ -18,10 +18,12 @@ const METADATA_MEMORY_BUDGET_QUANTUM: usize = 64 * 1024;
 const METADATA_MEMORY_BUDGET_UNITS: usize = (128 * 1024 * 1024) / METADATA_MEMORY_BUDGET_QUANTUM;
 // Initial upfront reservation for unknown-length chunked HTTP/1.1 bodies so up to 4
 // concurrent chunked packument streams overlap under the 128 MiB budget (4 * 16 MiB =
-// 64 MiB). Any stream that exceeds 16 MiB tries a non-blocking top-up first; if the
-// budget is tight it serializes through `chunked_overflow_limiter` (1 permit) before
-// acquiring up to `cap - 16 MiB <= 48 MiB` more permits, guaranteeing deadlock-freedom
-// (`4 * 16 + 48 = 112 MiB <= 128 MiB`) while enforcing the aggregate byte budget.
+// 64 MiB). No stream may grow past 16 MiB without first acquiring the single-permit
+// `chunked_overflow_limiter`, and once holding it the stream acquires its full remaining
+// headroom up to `cap` in one shot. Because every stream without `overflow_permit` holds
+// at most 16 MiB (or is a declared-length stream that already holds its full length and
+// never blocks again), both all-chunked (`4 * 16 + 48 = 112 MiB <= 128 MiB`) and mixed
+// FIFO declared-length (`3 * 16 + 64 = 112 MiB <= 128 MiB`) schedules are deadlock-free.
 const CHUNKED_INITIAL_RESERVE_BYTES: usize = 16 * 1024 * 1024;
 
 fn chunked_overflow_limiter() -> &'static Arc<tokio::sync::Semaphore> {
@@ -201,15 +203,14 @@ async fn read_metadata_body_with_budget_and_overflow(
                     )
                     .await;
                 } else if !is_declared_total {
-                    try_reserve_multiplexed_bytes(&budget, &mut guard, next_len);
                     let needed = budget_units_for_bytes(next_len);
                     if let Some(existing) = guard.as_mut()
                         && existing.reserved_units < needed
                     {
-                        // Serialize chunked HTTP/1.1 growth beyond the initial 16 MiB
-                        // quantum so at most one stream blocks for additional permits
-                        // while holding its initial slice, preventing hold-and-wait
-                        // deadlocks while enforcing the 128 MiB aggregate byte cap.
+                        // Never grow past the initial 16 MiB slice without first
+                        // acquiring `overflow_limiter`, and reserve up to `cap` in one
+                        // shot so neither concurrent chunked streams nor mixed FIFO
+                        // declared-length requests can enter hold-and-wait deadlock.
                         if existing.overflow_permit.is_none() {
                             existing.overflow_permit =
                                 Arc::clone(&overflow_limiter).acquire_owned().await.ok();
@@ -240,7 +241,7 @@ async fn read_metadata_body_with_budget_and_overflow(
         // next large chunked stream can proceed while this body is parsed.
         guard.overflow_permit = None;
         if result.is_ok() {
-            guard.shrink_to(body.len());
+            guard.shrink_to(body.capacity().min(cap).max(body.len()));
         }
     }
     (result, guard)
@@ -875,11 +876,16 @@ mod tests {
             read_metadata_body_with_budget(response, cap, &mut body, &limiter, &budget).await;
         read.unwrap();
         assert_eq!(body.len(), chunk_body.len());
+        let capacity_units = budget_units_for_bytes(body.capacity());
+        assert!(
+            cap_units > capacity_units && capacity_units >= actual_units,
+            "backing capacity units ({capacity_units}) must sit between payload ({actual_units}) and cap ({cap_units})"
+        );
         let guard = guard.expect("chunked large body must hold shrunk guard");
-        // Unused headroom must be returned to the semaphore immediately on EOF.
+        // Unused headroom above the live Vec backing allocation must be returned on EOF.
         assert_eq!(
             budget.available_permits(),
-            (cap_units - actual_units) as usize
+            (cap_units - capacity_units) as usize
         );
         drop(guard);
         assert_eq!(budget.available_permits(), cap_units as usize);
@@ -1256,6 +1262,212 @@ mod tests {
             METADATA_MEMORY_BUDGET_UNITS,
             "all byte budget permits must be returned after completion"
         );
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn four_concurrent_chunked_http1_bodies_exceeding_budget_complete_without_deadlock() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 4 concurrent 40 MiB chunked streams (160 MiB aggregate > 128 MiB budget) with
+        // cap = MAX_METADATA_BYTES (64 MiB) and 64 KiB chunks. Without gating growth
+        // past 16 MiB behind `overflow_limiter`, streams fill all 128 MiB and deadlock.
+        let body_len = 40 * 1024 * 1024;
+        let chunk_size = 64 * 1024;
+        let chunk_bytes = Arc::new(vec![b'b'; chunk_size]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn({
+            let chunk_bytes = Arc::clone(&chunk_bytes);
+            async move {
+                let mut handlers = Vec::new();
+                for _ in 0..4 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let chunk_bytes = Arc::clone(&chunk_bytes);
+                    handlers.push(tokio::spawn(async move {
+                        let mut req = [0u8; 1024];
+                        let _ = socket.read(&mut req).await;
+                        socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                            )
+                            .await
+                            .unwrap();
+                        let header = format!("{:x}\r\n", chunk_bytes.len());
+                        let mut sent = 0usize;
+                        while sent < body_len {
+                            socket.write_all(header.as_bytes()).await.unwrap();
+                            socket.write_all(&chunk_bytes).await.unwrap();
+                            socket.write_all(b"\r\n").await.unwrap();
+                            sent += chunk_bytes.len();
+                        }
+                        socket.write_all(b"0\r\n\r\n").await.unwrap();
+                    }));
+                }
+                for h in handlers {
+                    let _ = h.await;
+                }
+            }
+        });
+
+        let client = reqwest::Client::builder().http1_only().build().unwrap();
+        let limiter = Arc::new(tokio::sync::Semaphore::new(4));
+        let budget = Arc::new(tokio::sync::Semaphore::new(METADATA_MEMORY_BUDGET_UNITS));
+        let overflow = Arc::new(tokio::sync::Semaphore::new(1));
+
+        let mut tasks = Vec::new();
+        for i in 0..4 {
+            let client = client.clone();
+            let limiter = Arc::clone(&limiter);
+            let budget = Arc::clone(&budget);
+            let overflow = Arc::clone(&overflow);
+            tasks.push(tokio::spawn(async move {
+                let response = client
+                    .get(format!("http://{addr}/large-chunked-{i}"))
+                    .send()
+                    .await
+                    .unwrap();
+                let mut body = Vec::new();
+                let (read, guard) = read_metadata_body_with_budget_and_overflow(
+                    response,
+                    MAX_METADATA_BYTES,
+                    &mut body,
+                    &limiter,
+                    &budget,
+                    &overflow,
+                )
+                .await;
+                read.unwrap();
+                assert_eq!(body.len(), body_len);
+                assert!(
+                    body.capacity() <= MAX_METADATA_BYTES,
+                    "backing allocation {} must not exceed cap {MAX_METADATA_BYTES}",
+                    body.capacity()
+                );
+                let guard = guard.expect("40 MiB chunked body must hold a memory guard");
+                assert!(
+                    guard.reserved_units >= budget_units_for_bytes(body.capacity()),
+                    "guard must account for backing Vec capacity"
+                );
+            }));
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for task in tasks {
+                task.await.unwrap();
+            }
+        })
+        .await
+        .expect("four 40 MiB chunked streams must finish without deadlock");
+        assert_eq!(budget.available_permits(), METADATA_MEMORY_BUDGET_UNITS);
+        assert_eq!(limiter.available_permits(), 4);
+        assert_eq!(overflow.available_permits(), 1);
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn mixed_declared_and_chunked_http1_bodies_complete_without_fifo_deadlock() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let chunked_len = 36 * 1024 * 1024;
+        let declared_len = 48 * 1024 * 1024;
+        let chunk_bytes = Arc::new(vec![b'c'; 256 * 1024]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn({
+            let chunk_bytes = Arc::clone(&chunk_bytes);
+            async move {
+                let mut handlers = Vec::new();
+                for _ in 0..5 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let chunk_bytes = Arc::clone(&chunk_bytes);
+                    handlers.push(tokio::spawn(async move {
+                        let mut req = [0u8; 1024];
+                        let n = socket.read(&mut req).await.unwrap();
+                        let req_head = String::from_utf8_lossy(&req[..n]);
+                        if req_head.contains("/declared-") {
+                            let header = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {declared_len}\r\nConnection: close\r\n\r\n"
+                            );
+                            socket.write_all(header.as_bytes()).await.unwrap();
+                            let mut sent = 0usize;
+                            while sent < declared_len {
+                                let step = chunk_bytes.len().min(declared_len - sent);
+                                socket.write_all(&chunk_bytes[..step]).await.unwrap();
+                                sent += step;
+                            }
+                        } else {
+                            socket
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                                )
+                                .await
+                                .unwrap();
+                            let header = format!("{:x}\r\n", chunk_bytes.len());
+                            let mut sent = 0usize;
+                            while sent < chunked_len {
+                                socket.write_all(header.as_bytes()).await.unwrap();
+                                socket.write_all(&chunk_bytes).await.unwrap();
+                                socket.write_all(b"\r\n").await.unwrap();
+                                sent += chunk_bytes.len();
+                            }
+                            socket.write_all(b"0\r\n\r\n").await.unwrap();
+                        }
+                    }));
+                }
+                for h in handlers {
+                    let _ = h.await;
+                }
+            }
+        });
+
+        let client = reqwest::Client::builder().http1_only().build().unwrap();
+        let limiter = Arc::new(tokio::sync::Semaphore::new(4));
+        let budget = Arc::new(tokio::sync::Semaphore::new(METADATA_MEMORY_BUDGET_UNITS));
+        let overflow = Arc::new(tokio::sync::Semaphore::new(1));
+
+        let mut tasks = Vec::new();
+        for (path, expected_len) in [
+            ("chunked-0", chunked_len),
+            ("chunked-1", chunked_len),
+            ("declared-0", declared_len),
+            ("chunked-2", chunked_len),
+            ("declared-1", declared_len),
+        ] {
+            let client = client.clone();
+            let limiter = Arc::clone(&limiter);
+            let budget = Arc::clone(&budget);
+            let overflow = Arc::clone(&overflow);
+            tasks.push(tokio::spawn(async move {
+                let response = client.get(format!("http://{addr}/{path}")).send().await.unwrap();
+                let mut body = Vec::new();
+                let (read, guard) = read_metadata_body_with_budget_and_overflow(
+                    response,
+                    MAX_METADATA_BYTES,
+                    &mut body,
+                    &limiter,
+                    &budget,
+                    &overflow,
+                )
+                .await;
+                read.unwrap();
+                assert_eq!(body.len(), expected_len);
+                assert!(guard.is_some());
+            }));
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for task in tasks {
+                task.await.unwrap();
+            }
+        })
+        .await
+        .expect("mixed declared-length and chunked streams must finish without FIFO deadlock");
+        assert_eq!(budget.available_permits(), METADATA_MEMORY_BUDGET_UNITS);
+        assert_eq!(limiter.available_permits(), 4);
+        assert_eq!(overflow.available_permits(), 1);
         let _ = server_task.await;
     }
 }

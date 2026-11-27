@@ -873,6 +873,7 @@ impl RegistryClient {
         mutations.get_or_insert(path, || {
             Arc::new(MetadataCacheMutation {
                 revision: std::sync::atomic::AtomicU64::new(0),
+                published_revision: std::sync::atomic::AtomicU64::new(0),
                 operation: std::sync::Mutex::new(()),
             })
         })
@@ -1632,10 +1633,12 @@ impl RegistryClient {
                     && let Ok(handle) = runtime_handle
                 {
                     let pending_guard = self.pending_cache_writes.enter();
-                    handle.spawn_blocking(move || {
-                        let _pending_guard = pending_guard;
-                        remove_metadata_cache_files_locked(&path, &mutation, revision);
-                    });
+                    let _ = handle
+                        .spawn_blocking(move || {
+                            let _pending_guard = pending_guard;
+                            remove_metadata_cache_files_locked(&path, &mutation, revision);
+                        })
+                        .await;
                 } else {
                     remove_metadata_cache_files_locked(&path, &mutation, revision);
                 }
@@ -1852,10 +1855,14 @@ impl RegistryClient {
             }
             let now = std::time::SystemTime::now();
             let expires_at = now.checked_add(fresh_for).unwrap_or(now);
-            if let Err(error) =
-                std::fs::set_times(&path, std::fs::FileTimes::new().set_modified(expires_at))
-            {
-                tracing::warn!(%error, "failed to refresh metadata cache freshness");
+            match std::fs::set_times(&path, std::fs::FileTimes::new().set_modified(expires_at)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::debug!(%error, "metadata cache entry removed before freshness refresh");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to refresh metadata cache freshness");
+                }
             }
         };
         if self.synchronous_cache_writes {
@@ -2266,7 +2273,10 @@ fn remove_metadata_cache_files_locked(
         .operation
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if mutation.revision.load(Ordering::Acquire) != revision {
+    // Only a newer write that actually published replacement bytes on disk
+    // supersedes this removal; 304 freshness refreshes or failed/budget-skipped
+    // writes must never leave a `no-store` file behind.
+    if mutation.published_revision.load(Ordering::Acquire) > revision {
         return;
     }
     for path in [path.to_path_buf(), projection_path(path)] {
@@ -2319,10 +2329,19 @@ fn finish_metadata_cache_write(
             .history_guard
             .as_ref()
             .is_none_or(|(hc, generation)| hc.is_generation(*generation))
-        && let Err(e) = write_metadata_cache_file(&prepared.path, &content, prepared.expires_at)
     {
-        let key_for_log = sanitize_cache_key_for_log(key);
-        tracing::warn!("failed to write metadata cache for {key_for_log}: {e}");
+        match write_metadata_cache_file(&prepared.path, &content, prepared.expires_at) {
+            Ok(()) => {
+                prepared
+                    .mutation
+                    .published_revision
+                    .store(prepared.revision, Ordering::Release);
+            }
+            Err(e) => {
+                let key_for_log = sanitize_cache_key_for_log(key);
+                tracing::warn!("failed to write metadata cache for {key_for_log}: {e}");
+            }
+        }
     }
 }
 
@@ -3768,10 +3787,55 @@ mod timeline_tests {
             .unwrap();
         assert_eq!(returned["fresh"], true);
         assert!(no_store_written.is_none());
-        client.flush_pending_cache_writes().await;
         assert!(
             !path.exists(),
-            "NoStore directive must remove existing cache file via pending blocking flush"
+            "NoStore directive must remove existing cache file before the async call returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_store_removal_is_not_cancelled_by_freshness_refresh_or_unpublished_write() {
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let client = RegistryClient::new()
+            .with_cache_dir(Some(dir.path().to_owned()))
+            .with_synchronous_cache_writes(true);
+        client.write_metadata_cache(
+            "stale-pkg",
+            &serde_json::json!({"name": "stale-pkg", "v": 1}),
+            Some("\"v1\""),
+        );
+        let path = client.cache_path("stale-pkg").unwrap();
+        assert!(path.exists());
+
+        let mutation = client.metadata_cache_mutation(&path);
+        let no_store_rev = mutation.revision.fetch_add(1, Ordering::AcqRel) + 1;
+        // Simulate a 304 freshness refresh and an unpublished write advancing `revision`
+        // without publishing a replacement file on disk.
+        let _ = client.refresh_metadata_cache_freshness_async(
+            "stale-pkg",
+            std::time::Duration::from_secs(60),
+        );
+        let _unpublished_rev = mutation.revision.fetch_add(1, Ordering::AcqRel) + 1;
+
+        remove_metadata_cache_files_locked(&path, &mutation, no_store_rev);
+        assert!(
+            !path.exists(),
+            "freshness refresh and unpublished write must not suppress pending NoStore removal"
+        );
+
+        // Once a newer write actually publishes to disk, an older NoStore must not clobber it.
+        client.write_metadata_cache(
+            "stale-pkg",
+            &serde_json::json!({"name": "stale-pkg", "v": 2}),
+            Some("\"v2\""),
+        );
+        assert!(path.exists());
+        remove_metadata_cache_files_locked(&path, &mutation, no_store_rev);
+        assert!(
+            path.exists(),
+            "older NoStore removal must not clobber a newer published cache file"
         );
     }
 }

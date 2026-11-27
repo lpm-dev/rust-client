@@ -851,9 +851,9 @@ where
     if let Some(declared_len) = declared.and_then(|length| usize::try_from(length).ok()) {
         let initial_capacity = declared_len.min(cap);
         state = on_growth(state, initial_capacity, true).await;
-        body.reserve(initial_capacity);
+        body.reserve_exact(initial_capacity);
     } else {
-        body.reserve((64 * 1024).min(cap));
+        body.reserve_exact((64 * 1024).min(cap));
     }
 
     loop {
@@ -866,7 +866,20 @@ where
             return (Err(ResponseBodyError::StreamedTooLarge { cap }), state);
         }
         let next_len = body.len() + chunk.len();
-        state = on_growth(state, next_len, false).await;
+        let next_capacity = if next_len > body.capacity() {
+            body.capacity()
+                .max(64 * 1024)
+                .checked_mul(2)
+                .unwrap_or(cap)
+                .max(next_len)
+                .min(cap)
+        } else {
+            body.capacity()
+        };
+        state = on_growth(state, next_capacity, false).await;
+        if next_capacity > body.capacity() {
+            body.reserve_exact(next_capacity - body.len());
+        }
         body.extend_from_slice(&chunk);
     }
 }

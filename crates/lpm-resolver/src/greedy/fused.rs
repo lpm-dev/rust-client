@@ -4555,16 +4555,18 @@ mod metadata_timeline_bound_tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
-        // `/pkg/latest` fails with a firewall-blocked/500-style hard error after a short
-        // delay so the plain demand promotes onto the in-flight preferred-range prefetch;
-        // the full packument `/pkg` succeeds.
+        // `/pkg/latest` fails with HTTP 401 (`LpmError::AuthRequired`, a hard error that
+        // propagates out of `fetch_npm_preferred_latest` instead of soft-falling-back)
+        // after a short delay so the plain demand promotes onto the in-flight preferred
+        // prefetch; the promoted plain demand must then fall back to its own `/pkg` fetch.
         Mock::given(method("GET"))
             .and(path("/pkg/latest"))
             .respond_with(
-                ResponseTemplate::new(500)
+                ResponseTemplate::new(401)
                     .set_delay(Duration::from_millis(60))
-                    .set_body_string("latest endpoint broken"),
+                    .set_body_string("unauthorized latest endpoint"),
             )
+            .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -4580,6 +4582,7 @@ mod metadata_timeline_bound_tests {
                     }
                 }
             })))
+            .expect(1)
             .mount(&server)
             .await;
 

@@ -2021,22 +2021,49 @@ fn inclusion_is_traversal_eligible(
     !path_contains_node_modules(below_scan_root)
 }
 
+fn is_missing_or_not_dir_error(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(20) {
+        return true;
+    }
+    false
+}
+
 fn push_manifest_if_present(
     directory: &Path,
     dir_has_symlink: bool,
     manifests: &mut Vec<(PathBuf, bool)>,
-) {
+) -> Result<(), WorkspaceError> {
     let manifest = directory.join("package.json");
     match std::fs::symlink_metadata(&manifest) {
         Ok(metadata) if metadata.file_type().is_file() && !path_is_link_or_reparse(&metadata) => {
             manifests.push((manifest, dir_has_symlink));
+            Ok(())
         }
-        Ok(metadata) if path_is_link_or_reparse(&metadata) => {
-            if manifest.is_file() {
+        Ok(metadata) if path_is_link_or_reparse(&metadata) => match std::fs::metadata(&manifest) {
+            Ok(target_meta) if target_meta.is_file() => {
                 manifests.push((manifest, true));
+                Ok(())
             }
-        }
-        Ok(_) | Err(_) => {}
+            Ok(_) => Ok(()),
+            Err(error) if is_missing_or_not_dir_error(&error) => Ok(()),
+            Err(error) => Err(WorkspaceError::Io(format!(
+                "failed to inspect {}: {error}",
+                manifest.display()
+            ))),
+        },
+        Ok(_) => Ok(()),
+        Err(error) if is_missing_or_not_dir_error(&error) => Ok(()),
+        Err(error) => Err(WorkspaceError::Io(format!(
+            "failed to inspect {}: {error}",
+            manifest.display()
+        ))),
     }
 }
 
@@ -2100,7 +2127,7 @@ fn collect_member_manifest_paths(
                 continue;
             }
             if let Some(dir_has_symlink) = inspect_scan_root(root, &inclusion.scan_root)? {
-                push_manifest_if_present(&inclusion.scan_root, dir_has_symlink, &mut manifests);
+                push_manifest_if_present(&inclusion.scan_root, dir_has_symlink, &mut manifests)?;
             }
         }
     }
@@ -2214,7 +2241,7 @@ fn collect_member_manifest_paths(
 
             if !already_seen {
                 let relative = directory.strip_prefix(root).unwrap_or(&directory);
-                if !relative.as_os_str().is_empty() && !is_excluded(relative) {
+                if !relative.as_os_str().is_empty() {
                     let matched = if track_visited {
                         // Any wildcard inclusion eligible to match `directory` has its
                         // `scan_root` equal to `directory` or an ancestor up to `root`
@@ -2252,8 +2279,8 @@ fn collect_member_manifest_paths(
                         inclusion_is_traversal_eligible(inclusion, &directory, depth)
                             && inclusion.matches_directory(relative, match_options)
                     };
-                    if matched {
-                        push_manifest_if_present(&directory, dir_has_symlink, &mut manifests);
+                    if matched && !is_excluded(relative) {
+                        push_manifest_if_present(&directory, dir_has_symlink, &mut manifests)?;
                     }
                 }
             }
@@ -4041,9 +4068,15 @@ overrides:
 
         let dir = tempfile::tempdir().unwrap();
         let member_dir = dir.path().join("packages/locked");
+        let empty_dir = dir.path().join("packages/empty-no-manifest");
         fs::create_dir_all(&member_dir).unwrap();
+        fs::create_dir_all(&empty_dir).unwrap();
         create_package_json(dir.path(), r#"{"name":"root","workspaces":["packages/*"]}"#);
         create_package_json(&member_dir, r#"{"name":"locked","version":"1.0.0"}"#);
+
+        // Before locking permissions, empty sibling dir without package.json is ignored cleanly.
+        let baseline = discover_workspace(dir.path()).unwrap().unwrap();
+        assert_eq!(baseline.members.len(), 1);
 
         let root_canon = dir.path().canonicalize().unwrap();
         let open_root = open_directory_nofollow(&root_canon).unwrap();
@@ -4057,18 +4090,32 @@ overrides:
         }
 
         let canonical_root = std::sync::OnceLock::new();
-        let result = read_workspace_member(
+        let direct_result = read_workspace_member(
             dir.path(),
             Some(&open_root),
             &canonical_root,
             &manifest_path,
             false,
         );
+        let glob_result = discover_workspace(dir.path());
+        create_package_json(
+            dir.path(),
+            r#"{"name":"root","workspaces":["packages/locked"]}"#,
+        );
+        let literal_result = discover_workspace(dir.path());
         fs::set_permissions(&member_dir, fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(
-            matches!(result, Err(WorkspaceError::Io(_))),
-            "unreadable member directory must return WorkspaceError::Io, got {result:?}"
+            matches!(direct_result, Err(WorkspaceError::Io(_))),
+            "read_workspace_member must return WorkspaceError::Io, got {direct_result:?}"
+        );
+        assert!(
+            matches!(glob_result, Err(WorkspaceError::Io(_))),
+            "glob discover_workspace must surface WorkspaceError::Io for unreadable member, got {glob_result:?}"
+        );
+        assert!(
+            matches!(literal_result, Err(WorkspaceError::Io(_))),
+            "literal discover_workspace must surface WorkspaceError::Io for unreadable member, got {literal_result:?}"
         );
     }
 }
