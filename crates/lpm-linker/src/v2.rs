@@ -1275,31 +1275,31 @@ fn ensure_existing_link_package_dir(
         "package.json",
     ) {
         Ok(()) => Ok(()),
-        Err(lpm_common::DescendantVerifyError::UnsafeOrLink(path)) => Err(LpmError::Store(
-            format!(
+        Err(lpm_common::DescendantVerifyError::UnsafeOrLink(path)) => {
+            Err(LpmError::Store(format!(
                 "virtual-store linker: refusing existing link entry for {name}@{version} because {} is a symlink or unsafe component under {}",
                 path.display(),
                 links_root.display()
-            ),
-        )),
-        Err(lpm_common::DescendantVerifyError::NotDirectory(path)) => Err(LpmError::Store(
-            format!(
+            )))
+        }
+        Err(lpm_common::DescendantVerifyError::NotDirectory(path)) => {
+            Err(LpmError::Store(format!(
                 "virtual-store linker: refusing existing link package at {} (not a directory)",
                 path.display()
-            ),
-        )),
-        Err(lpm_common::DescendantVerifyError::NotRegularFile(path)) => Err(LpmError::Store(
-            format!(
+            )))
+        }
+        Err(lpm_common::DescendantVerifyError::NotRegularFile(path)) => {
+            Err(LpmError::Store(format!(
                 "virtual-store linker: refusing existing link entry for {name}@{version} with non-file package.json at {}",
                 path.display()
-            ),
-        )),
-        Err(lpm_common::DescendantVerifyError::Io { path, source }) => Err(LpmError::Store(
-            format!(
+            )))
+        }
+        Err(lpm_common::DescendantVerifyError::Io { path, source }) => {
+            Err(LpmError::Store(format!(
                 "virtual-store linker: required link entry for {name}@{version} is missing at {}: {source}",
                 path.display()
-            ),
-        )),
+            )))
+        }
     }
 }
 

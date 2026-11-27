@@ -253,8 +253,15 @@ pub(crate) async fn run_recursive_workspace_install(
                 && has_any_lockfile);
         if workspace_frozen {
             workspace_lockfile_coordinator.mark_frozen();
-            if filters.is_empty() && filter_prod.is_empty() {
-                workspace_lockfile_coordinator.validate_frozen_preflight()?;
+            if targets.is_empty() {
+                if filters.is_empty() && filter_prod.is_empty() {
+                    workspace_lockfile_coordinator.validate_frozen_preflight()?;
+                }
+            } else {
+                for target in &targets {
+                    workspace_lockfile_coordinator
+                        .validate_frozen_preflight_for_importer(Some(&target.importer))?;
+                }
             }
         }
         let workspace_project_state_coordinator =
@@ -606,6 +613,7 @@ pub(crate) async fn run_recursive_workspace_install(
                 }
             }
 
+            let mut frozen_commit_validated = false;
             if first_error.is_none()
                 && let Some((index, path, lifecycle)) = deferred_root_after_install
             {
@@ -620,6 +628,7 @@ pub(crate) async fn run_recursive_workspace_install(
                 {
                     first_error = Some(error);
                 } else {
+                    frozen_commit_validated = workspace_frozen;
                     let hook_start = Instant::now();
                     if let Err(error) =
                         lifecycle.run_after_successful_install(&path, options.json_output)
@@ -641,10 +650,11 @@ pub(crate) async fn run_recursive_workspace_install(
                 None => Ok((
                     active_workspace,
                     outcomes.into_iter().flatten().collect::<Vec<_>>(),
+                    frozen_commit_validated,
                 )),
             }
         };
-        let (active_workspace, outcomes) = match scheduler.await {
+        let (active_workspace, outcomes, frozen_commit_validated) = match scheduler.await {
             Ok(result) => result,
             Err(error) => {
                 return Err(rollback_workspace_project_state(
@@ -657,13 +667,17 @@ pub(crate) async fn run_recursive_workspace_install(
             .iter()
             .map(|outcome| outcome.importer.clone())
             .collect::<Vec<_>>();
-        let lockfile_committed = match workspace_lockfile_coordinator.commit(&required_importers) {
-            Ok(committed) => committed,
-            Err(error) => {
-                return Err(rollback_workspace_project_state(
-                    &workspace_project_state_coordinator,
-                    error,
-                ));
+        let lockfile_committed = if frozen_commit_validated {
+            false
+        } else {
+            match workspace_lockfile_coordinator.commit(&required_importers) {
+                Ok(committed) => committed,
+                Err(error) => {
+                    return Err(rollback_workspace_project_state(
+                        &workspace_project_state_coordinator,
+                        error,
+                    ));
+                }
             }
         };
         workspace_project_state_coordinator.commit();

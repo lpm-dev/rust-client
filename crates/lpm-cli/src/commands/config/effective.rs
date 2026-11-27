@@ -638,7 +638,10 @@ fn add_security_entries(
         Vec::new()
     };
     let has_workspace_excludes = !workspace_excludes.is_empty();
-    let excludes = merge_unique(merge_unique(project_excludes, workspace_excludes), global_excludes);
+    let excludes = merge_unique(
+        merge_unique(project_excludes, workspace_excludes),
+        global_excludes,
+    );
     let excludes_source = merged_source([
         package_json
             .pointer("/lpm/minimumReleaseAgeExclude")

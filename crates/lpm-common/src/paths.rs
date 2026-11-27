@@ -1574,12 +1574,13 @@ impl OpenRealDir {
             let parent = current.as_ref().unwrap_or(&self.dir);
             #[cfg(not(unix))]
             {
-                let meta = parent.symlink_metadata(part).map_err(|source| {
-                    DescendantVerifyError::Io {
-                        path: cursor.clone(),
-                        source,
-                    }
-                })?;
+                let meta =
+                    parent
+                        .symlink_metadata(part)
+                        .map_err(|source| DescendantVerifyError::Io {
+                            path: cursor.clone(),
+                            source,
+                        })?;
                 if capability_metadata_is_link_or_reparse(&meta) {
                     return Err(DescendantVerifyError::UnsafeOrLink(cursor));
                 }
@@ -1614,12 +1615,12 @@ impl OpenRealDir {
             })?;
             #[cfg(not(unix))]
             {
-                let opened_meta = next.dir_metadata().map_err(|source| {
-                    DescendantVerifyError::Io {
-                        path: cursor.clone(),
-                        source,
-                    }
-                })?;
+                let opened_meta =
+                    next.dir_metadata()
+                        .map_err(|source| DescendantVerifyError::Io {
+                            path: cursor.clone(),
+                            source,
+                        })?;
                 if !opened_meta.is_dir() || capability_metadata_is_link_or_reparse(&opened_meta) {
                     return Err(DescendantVerifyError::UnsafeOrLink(cursor));
                 }
@@ -1629,12 +1630,13 @@ impl OpenRealDir {
 
         let target_dir = current.as_ref().unwrap_or(&self.dir);
         let file_display = cursor.join(file_name);
-        let file_meta = target_dir.symlink_metadata(file_name).map_err(|source| {
-            DescendantVerifyError::Io {
-                path: file_display.clone(),
-                source,
-            }
-        })?;
+        let file_meta =
+            target_dir
+                .symlink_metadata(file_name)
+                .map_err(|source| DescendantVerifyError::Io {
+                    path: file_display.clone(),
+                    source,
+                })?;
         if capability_metadata_is_link_or_reparse(&file_meta) || !file_meta.is_file() {
             return Err(DescendantVerifyError::NotRegularFile(file_display));
         }
@@ -3520,8 +3522,7 @@ mod tests {
             let inner = search_only.join("sub");
             std::fs::create_dir_all(&inner).unwrap();
             std::fs::write(inner.join("package.json"), b"{}").unwrap();
-            std::fs::set_permissions(&search_only, std::fs::Permissions::from_mode(0o111))
-                .unwrap();
+            std::fs::set_permissions(&search_only, std::fs::Permissions::from_mode(0o111)).unwrap();
             let verified = OpenRealDir::open_ambient(&search_only).and_then(|dir| {
                 dir.verify_descendant_dir_and_regular_file(
                     &search_only,
@@ -3530,9 +3531,10 @@ mod tests {
                 )
                 .map_err(|e| std::io::Error::other(format!("{e:?}")))
             });
-            std::fs::set_permissions(&search_only, std::fs::Permissions::from_mode(0o755))
-                .unwrap();
-            verified.expect("search-only 0111 real root must allow verifying known descendants on Linux");
+            std::fs::set_permissions(&search_only, std::fs::Permissions::from_mode(0o755)).unwrap();
+            verified.expect(
+                "search-only 0111 real root must allow verifying known descendants on Linux",
+            );
         }
     }
 }

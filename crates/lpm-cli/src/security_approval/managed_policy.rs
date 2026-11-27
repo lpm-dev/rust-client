@@ -1208,7 +1208,8 @@ impl ManagedPolicyStamp {
 #[derive(Default)]
 pub(crate) struct ManagedPolicyCache {
     #[cfg(unix)]
-    entries: std::sync::Mutex<std::collections::HashMap<PathBuf, (ManagedPolicyStamp, ManagedPolicy)>>,
+    entries:
+        std::sync::Mutex<std::collections::HashMap<PathBuf, (ManagedPolicyStamp, ManagedPolicy)>>,
     #[cfg(unix)]
     load_lock: std::sync::Mutex<()>,
 }

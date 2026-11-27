@@ -335,7 +335,11 @@ impl ReleaseAgeResolver {
             &mut minimum_release_age_exclude,
             package_config.minimum_release_age_exclude,
         );
-        if inherits_root_age && !workspace_root_age_config.minimum_release_age_exclude.is_empty() {
+        if inherits_root_age
+            && !workspace_root_age_config
+                .minimum_release_age_exclude
+                .is_empty()
+        {
             ensure_inherited_workspace_excludes_authorized(
                 &effective_authorized,
                 project_dir,
@@ -386,10 +390,7 @@ impl ReleaseAgeResolver {
             } else if let Some(policy) = global_policy {
                 (policy, ReleaseAgePolicySource::Global)
             } else {
-                (
-                    ReleaseAgePolicy::default(),
-                    ReleaseAgePolicySource::Default,
-                )
+                (ReleaseAgePolicy::default(), ReleaseAgePolicySource::Default)
             };
         let effective_policy = enforce_release_age_policy_posture(
             project_dir,
@@ -575,10 +576,8 @@ pub(crate) fn workspace_root_release_age_config(
     let root_package =
         crate::workspace_discovery_cache::read_workspace_root_package(&workspace_root)
             .map_err(|error| LpmError::Workspace(error.to_string()))?;
-    Ok(
-        package_release_age_config_from_package(&root_package)?
-            .map(|config| (workspace_root, config)),
-    )
+    Ok(package_release_age_config_from_package(&root_package)?
+        .map(|config| (workspace_root, config)))
 }
 
 fn ensure_inherited_workspace_excludes_authorized(

@@ -726,7 +726,12 @@ async fn ci_treats_empty_workspaces_and_unlisted_pnpm_subdir_as_single_project()
         empty_json.get("recursive").is_none(),
         "workspaces:[] must dispatch single-project ci, got {empty_json}"
     );
-    assert!(empty_ws.path().join("node_modules/leaf-pkg/package.json").exists());
+    assert!(
+        empty_ws
+            .path()
+            .join("node_modules/leaf-pkg/package.json")
+            .exists()
+    );
 
     // Case 2: an unlisted directory under an ancestor pnpm-workspace.yaml must run single-project ci.
     let pnpm_parent = TempProject::empty(r#"{"name":"pnpm-root","private":true}"#);
@@ -762,13 +767,16 @@ async fn ci_treats_empty_workspaces_and_unlisted_pnpm_subdir_as_single_project()
         String::from_utf8_lossy(&ci_standalone.stdout),
         String::from_utf8_lossy(&ci_standalone.stderr),
     );
-    let standalone_json: serde_json::Value =
-        serde_json::from_slice(&ci_standalone.stdout).unwrap();
+    let standalone_json: serde_json::Value = serde_json::from_slice(&ci_standalone.stdout).unwrap();
     assert!(
         standalone_json.get("recursive").is_none(),
         "unlisted subdir under pnpm-workspace.yaml must not run recursive ci, got {standalone_json}"
     );
-    assert!(standalone_dir.join("node_modules/leaf-pkg/package.json").exists());
+    assert!(
+        standalone_dir
+            .join("node_modules/leaf-pkg/package.json")
+            .exists()
+    );
 
     // Case 3: a standalone project nested inside a listed pnpm member (`packages/listed/examples/demo`)
     // is NOT a declared workspace member and must use its own lockfile under both `lpm install` and `lpm ci`.

@@ -790,3 +790,60 @@ fn ci_default_filtered_workspace_install_rejects_before_running_deferred_root_an
         "CI=true filtered install must not run postinstall hook of a newly added unlocked member"
     );
 }
+
+#[test]
+fn frozen_workspace_preflight_rejects_missing_importer_before_running_locked_sibling_hooks() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "workspace-frozen-sibling-preflight",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"]
+        }"#,
+    );
+    project.write_file(
+        "packages/aaa-locked/package.json",
+        &serde_json::json!({
+            "name": "aaa-locked",
+            "version": "1.0.0",
+            "scripts": {
+                "postinstall": "node -e \"require('fs').writeFileSync('../../locked-sibling.marker', 'ran')\""
+            }
+        })
+        .to_string(),
+    );
+
+    install_workspace_once(&project);
+    let sibling_marker = project.path().join("locked-sibling.marker");
+    let _ = std::fs::remove_file(&sibling_marker);
+    // Remove node_modules so `aaa-locked` is not skipped as already up-to-date.
+    let _ = std::fs::remove_dir_all(project.path().join("packages/aaa-locked/node_modules"));
+    let _ = std::fs::remove_dir_all(project.path().join("packages/aaa-locked/.lpm"));
+
+    // Add a second member scheduled after `aaa-locked` that is missing from `lpm.lock`.
+    project.write_file(
+        "packages/zzz-unlocked/package.json",
+        r#"{ "name": "zzz-unlocked", "version": "1.0.0" }"#,
+    );
+
+    let output = lpm(&project)
+        .args([
+            "install",
+            "--frozen-lockfile",
+            "--no-skills",
+            "--no-security-summary",
+        ])
+        .output()
+        .expect("failed to run frozen workspace install");
+
+    assert!(
+        !output.status.success(),
+        "frozen workspace install must fail when a selected member is missing from lpm.lock:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !sibling_marker.exists(),
+        "frozen preflight must reject before running hooks on an already-locked sibling member"
+    );
+}

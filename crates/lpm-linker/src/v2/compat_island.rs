@@ -666,7 +666,8 @@ fn store_compat_island_complete(
         .get("captured_at_nanos")
         .and_then(serde_json::Value::as_str)
         .and_then(|value| value.parse::<i128>().ok());
-    let trust_restored = lpm_store::v2::trust_restored_store_enabled(store.object_integrity_policy());
+    let trust_restored =
+        lpm_store::v2::trust_restored_store_enabled(store.object_integrity_policy());
 
     let mut any_strict_guard_refresh_needed = false;
     let mut any_restored_only = false;

@@ -65,8 +65,8 @@ pub fn override_trust_restored_store_for_test(
         Some(false) => 1,
         Some(true) => 2,
     };
-    let previous = TRUST_RESTORED_STORE_TEST_OVERRIDE
-        .swap(encoded, std::sync::atomic::Ordering::SeqCst);
+    let previous =
+        TRUST_RESTORED_STORE_TEST_OVERRIDE.swap(encoded, std::sync::atomic::Ordering::SeqCst);
     TrustRestoredStoreOverrideGuard {
         previous,
         _lock: lock,
@@ -1188,8 +1188,8 @@ pub(crate) fn refresh_link_snapshot_shallow_guard_best_effort(
     let Some(shallow_guard) = read_shallow_package_guard(package_dir) else {
         return;
     };
-    let needs_backfill = snapshot.metadata_integrity_no_ctime.is_none()
-        && actual_metadata_no_ctime.is_some();
+    let needs_backfill =
+        snapshot.metadata_integrity_no_ctime.is_none() && actual_metadata_no_ctime.is_some();
     if !shallow_guard.is_non_racy() && !needs_backfill {
         return;
     }

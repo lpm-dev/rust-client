@@ -294,7 +294,8 @@ impl PathNodeVersionCache {
             .get_or_init(managed_node_root)
             .as_deref();
 
-        for _attempt in 0..3 {
+        let mut last_unstable_resolution = None;
+        for _attempt in 0..2 {
             let executable_before = node_executable_in_path(cwd, path);
             let identity_before = executable_before.as_deref().and_then(|executable| {
                 path_node_identity(executable, cwd, path, managed_node_root)
@@ -366,7 +367,8 @@ impl PathNodeVersionCache {
                     Some(resolution)
                 } else {
                     // Never publish an unstable probe result into the shared slot;
-                    // return `None` so both the probing caller and waiters retry freshly.
+                    // retain it locally as fallback if the retry also observes churn.
+                    last_unstable_resolution = Some(resolution);
                     None
                 }
             });
@@ -389,6 +391,9 @@ impl PathNodeVersionCache {
             }
         }
 
+        if let Some(resolution) = last_unstable_resolution {
+            return resolution;
+        }
         let executable_final = node_executable_in_path(cwd, path);
         let version = node_version_on_path(cwd, path, executable_final.as_deref());
         PathNodeResolution {

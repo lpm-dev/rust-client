@@ -6992,10 +6992,8 @@ fn trust_restored_store_never_poisons_strict_metadata_and_is_ignored_under_tree_
     use std::os::unix::fs::PermissionsExt as _;
 
     let dir = tempfile::tempdir().unwrap();
-    let source_store = Store::at_with_object_integrity_policy(
-        dir.path(),
-        ObjectIntegrityPolicy::Source,
-    );
+    let source_store =
+        Store::at_with_object_integrity_policy(dir.path(), ObjectIntegrityPolicy::Source);
     let tarball = build_test_tarball(&[
         ("package.json", br#"{"name":"trust-pkg","version":"1.0.0"}"#),
         ("index.js", b"module.exports = 'aaaa';\n"),
@@ -7073,10 +7071,8 @@ fn trust_restored_store_never_poisons_strict_metadata_and_is_ignored_under_tree_
 
     // Under Tree policy, LPM_TRUST_RESTORED_STORE is completely ignored.
     let tree_dir = tempfile::tempdir().unwrap();
-    let tree_store = Store::at_with_object_integrity_policy(
-        tree_dir.path(),
-        ObjectIntegrityPolicy::Tree,
-    );
+    let tree_store =
+        Store::at_with_object_integrity_policy(tree_dir.path(), ObjectIntegrityPolicy::Tree);
     let (tree_obj, tree_sri, _) = tree_store
         .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Tree)
         .unwrap();
@@ -7119,13 +7115,8 @@ fn trust_restored_store_never_poisons_strict_metadata_and_is_ignored_under_tree_
     let pkg_json = pkg_dir.join("package.json");
     let pkg_mtime = std::fs::metadata(&pkg_json).unwrap().modified().unwrap();
     let pkg_mode = std::fs::metadata(&pkg_json).unwrap().permissions().mode();
-    std::fs::set_permissions(&pkg_json, std::fs::Permissions::from_mode(pkg_mode | 0o100))
-        .unwrap();
-    std::fs::set_times(
-        &pkg_json,
-        std::fs::FileTimes::new().set_modified(pkg_mtime),
-    )
-    .unwrap();
+    std::fs::set_permissions(&pkg_json, std::fs::Permissions::from_mode(pkg_mode | 0o100)).unwrap();
+    std::fs::set_times(&pkg_json, std::fs::FileTimes::new().set_modified(pkg_mtime)).unwrap();
     let _guard = crate::v2::override_trust_restored_store_for_test(Some(true));
     let mode_rebuilt = source_store
         .populate_link_entry(LinkEntryRequest {
@@ -7215,7 +7206,8 @@ fn shallow_package_guard_requires_strict_ctime_and_non_racy_window() {
 
 #[cfg(unix)]
 #[test]
-fn local_source_object_ignores_trust_restored_store_and_object_snapshot_refuses_symlink_integrity() {
+fn local_source_object_ignores_trust_restored_store_and_object_snapshot_refuses_symlink_integrity()
+{
     let dir = tempfile::tempdir().unwrap();
     let store = Store::at_with_object_integrity_policy(dir.path(), ObjectIntegrityPolicy::Source);
     let tarball = build_test_tarball(&[
@@ -7246,7 +7238,11 @@ fn local_source_object_ignores_trust_restored_store_and_object_snapshot_refuses_
 
     // Mutate bytes keeping identical length and mtime (shifts ctime only).
     std::fs::write(&index_path, b"module.exports = 'hack';\n").unwrap();
-    std::fs::set_times(&index_path, std::fs::FileTimes::new().set_modified(orig_mtime)).unwrap();
+    std::fs::set_times(
+        &index_path,
+        std::fs::FileTimes::new().set_modified(orig_mtime),
+    )
+    .unwrap();
 
     let _trust = crate::v2::integrity::override_trust_restored_store_for_test(Some(true));
     let reused = store
@@ -7400,7 +7396,8 @@ fn read_only_store_reuses_link_entry_when_lock_file_already_exists() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let staging = tempfile::tempdir().unwrap();
-    let store = Store::at_with_object_integrity_policy(staging.path(), ObjectIntegrityPolicy::Source);
+    let store =
+        Store::at_with_object_integrity_policy(staging.path(), ObjectIntegrityPolicy::Source);
     let tarball = build_test_tarball(&[
         ("package.json", br#"{"name":"ro-locked","version":"1.0.0"}"#),
         ("index.js", b"module.exports = 'ro';\n"),
@@ -7419,7 +7416,10 @@ fn read_only_store_reuses_link_entry_when_lock_file_already_exists() {
         })
         .unwrap();
     assert!(populated.freshly_populated);
-    let lock_file = store.paths().build_entry_lock_path(&key.digest_hex()).unwrap();
+    let lock_file = store
+        .paths()
+        .build_entry_lock_path(&key.digest_hex())
+        .unwrap();
     assert!(lock_file.is_file(), "populated entry must have a lock file");
     // Widen locks dir to 0o755 so hardening attempts chmod on the read-only mount.
     std::fs::set_permissions(
