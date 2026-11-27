@@ -19,6 +19,7 @@ struct PendingBatch {
     jobs: Vec<Job>,
     bytes: usize,
     sender: Option<mpsc::Sender<Vec<Job>>>,
+    in_flight_batches: Arc<AtomicUsize>,
 }
 
 impl PendingBatch {
@@ -26,19 +27,24 @@ impl PendingBatch {
         if self.jobs.is_empty() {
             return Ok(());
         }
-        let batch = std::mem::replace(&mut self.jobs, Vec::with_capacity(JOB_BATCH_MAX_FILES));
+        let batch = std::mem::take(&mut self.jobs);
         self.bytes = 0;
-        self.sender
+        let sender = self
+            .sender
             .as_ref()
-            .ok_or_else(|| io::Error::other("tarball file writers already stopped"))?
-            .send(batch)
-            .map_err(|_| io::Error::other("tarball file writers disconnected").into())
+            .ok_or_else(|| io::Error::other("tarball file writers already stopped"))?;
+        self.in_flight_batches.fetch_add(1, Ordering::AcqRel);
+        if sender.send(batch).is_err() {
+            self.in_flight_batches.fetch_sub(1, Ordering::AcqRel);
+            return Err(io::Error::other("tarball file writers disconnected").into());
+        }
+        Ok(())
     }
 }
 
-struct BusyWorkerGuard(Arc<AtomicUsize>);
+struct InFlightBatchGuard(Arc<AtomicUsize>);
 
-impl Drop for BusyWorkerGuard {
+impl Drop for InFlightBatchGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
@@ -410,8 +416,9 @@ impl PendingEntries {
             self.front_sequence += 1;
             self.bytes -= bytes;
             let written = result?;
-            let record = E::from_extracted_file(path, written.size, written.digest)?;
-            let identity = written.output.commit()?;
+            let stamp = written.output.verify_for_commit()?;
+            let record = E::from_extracted_file(path, written.size, written.digest, stamp)?;
+            let identity = written.output.finish_commit();
             records.push(record);
             identities.push(identity);
         }
@@ -428,7 +435,7 @@ impl PendingEntries {
 
 pub(super) struct WriterPool {
     pending_batch: Arc<Mutex<PendingBatch>>,
-    busy_workers: Arc<AtomicUsize>,
+    in_flight_batches: Arc<AtomicUsize>,
     worker_count: usize,
     ready: mpsc::Receiver<Vec<Completion>>,
     buffered_completions: VecDeque<Completion>,
@@ -464,15 +471,16 @@ impl WriterPool {
         let (sender, receiver) = mpsc::channel::<Vec<Job>>();
         let receiver = Arc::new(Mutex::new(receiver));
         let (completed, ready) = mpsc::channel::<Vec<Completion>>();
+        let in_flight_batches = Arc::new(AtomicUsize::new(0));
         let pending_batch = Arc::new(Mutex::new(PendingBatch {
-            jobs: Vec::with_capacity(JOB_BATCH_MAX_FILES),
+            jobs: Vec::new(),
             bytes: 0,
             sender: Some(sender),
+            in_flight_batches: Arc::clone(&in_flight_batches),
         }));
-        let busy_workers = Arc::new(AtomicUsize::new(0));
         let mut pool = Self {
             pending_batch: Arc::clone(&pending_batch),
-            busy_workers: Arc::clone(&busy_workers),
+            in_flight_batches: Arc::clone(&in_flight_batches),
             worker_count: count,
             ready,
             buffered_completions: VecDeque::with_capacity(JOB_BATCH_MAX_FILES),
@@ -489,7 +497,7 @@ impl WriterPool {
             let jobs = Arc::clone(&receiver);
             let results = completed.clone();
             let failure = failure.clone();
-            let busy = Arc::clone(&busy_workers);
+            let in_flight = Arc::clone(&in_flight_batches);
             #[cfg(test)]
             let hooks = pool.hooks.clone();
             pool.workers.push(
@@ -504,8 +512,7 @@ impl WriterPool {
                                 Err(_) => return,
                             };
                             let Ok(batch) = batch else { return };
-                            busy.fetch_add(1, Ordering::AcqRel);
-                            let _busy_guard = BusyWorkerGuard(Arc::clone(&busy));
+                            let _in_flight_guard = InFlightBatchGuard(Arc::clone(&in_flight));
                             let mut completions = Vec::with_capacity(batch.len());
                             for job in batch {
                                 let sequence = job.sequence;
@@ -559,6 +566,11 @@ impl WriterPool {
         Ok(pool)
     }
 
+    #[cfg(test)]
+    pub(super) fn in_flight_batches(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.in_flight_batches)
+    }
+
     pub(super) fn submit(&mut self, job: Job) -> Result<(), LpmError> {
         let job_bytes = job.bytes.len();
         let mut batch = self
@@ -570,10 +582,9 @@ impl WriterPool {
         }
         batch.jobs.push(job);
         batch.bytes = batch.bytes.saturating_add(job_bytes);
-        // Dispatch immediately whenever any writer thread is idle so small
-        // packages (4-64 files) use full writer parallelism; accumulate up to
-        // JOB_BATCH_MAX_FILES while all writers are busy.
-        let writer_idle = self.busy_workers.load(Ordering::Acquire) < self.worker_count;
+        // Dispatch immediately whenever fewer batches are queued/running than
+        // workers; accumulate up to JOB_BATCH_MAX_FILES while all workers have work.
+        let writer_idle = self.in_flight_batches.load(Ordering::Acquire) < self.worker_count;
         if writer_idle
             || batch.jobs.len() >= JOB_BATCH_MAX_FILES
             || batch.bytes >= JOB_BATCH_MAX_BYTES

@@ -963,6 +963,17 @@ enum InspectionMode {
     WithoutCallback,
 }
 
+/// Handle-bound regular-file identity and timestamp stamp captured when an
+/// extracted file is accepted on disk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExtractedFileStamp {
+    pub identity: lpm_common::FileIdentity,
+    pub size: u64,
+    pub mode: u32,
+    pub mtime_ns: u64,
+    pub ctime_ns: u64,
+}
+
 /// A successfully extracted regular file and the BLAKE3 digest computed
 /// during its write pass.
 #[derive(Debug, Eq, PartialEq)]
@@ -973,6 +984,8 @@ pub struct ExtractedFileDigest {
     pub size: u64,
     /// BLAKE3 digest of the final bytes written for this archive entry.
     pub blake3_digest: [u8; 32],
+    /// Handle-bound file stamp captured at extraction acceptance, when available.
+    pub source_stamp: Option<ExtractedFileStamp>,
 }
 
 trait ExtractionRecord: Sized {
@@ -982,6 +995,7 @@ trait ExtractionRecord: Sized {
         relative_path: PathBuf,
         size: u64,
         blake3_digest: Option<[u8; 32]>,
+        source_stamp: Option<ExtractedFileStamp>,
     ) -> Result<Self, LpmError>;
 
     fn relative_path(&self) -> &Path;
@@ -994,6 +1008,7 @@ impl ExtractionRecord for PathBuf {
         relative_path: PathBuf,
         _size: u64,
         _blake3_digest: Option<[u8; 32]>,
+        _source_stamp: Option<ExtractedFileStamp>,
     ) -> Result<Self, LpmError> {
         Ok(relative_path)
     }
@@ -1010,6 +1025,7 @@ impl ExtractionRecord for ExtractedFileDigest {
         relative_path: PathBuf,
         size: u64,
         blake3_digest: Option<[u8; 32]>,
+        source_stamp: Option<ExtractedFileStamp>,
     ) -> Result<Self, LpmError> {
         let blake3_digest = blake3_digest.ok_or_else(|| {
             LpmError::Registry(format!(
@@ -1021,6 +1037,7 @@ impl ExtractionRecord for ExtractedFileDigest {
             relative_path,
             size,
             blake3_digest,
+            source_stamp,
         })
     }
 
@@ -1965,26 +1982,29 @@ where
                 compute_blake3,
             )?;
 
-            let extracted_file = E::from_extracted_file(relative_path, size, blake3_digest)?;
-            let accepted_identity = match inspection_mode {
+            let (accepted_identity, source_stamp) = match inspection_mode {
                 InspectionMode::WithCallback => {
                     output.validate_parent_for_inspection()?;
                     pending.validate()?;
+                    let stamp = pending.stamp();
                     pending.commit();
                     inspector(EntryInfo {
-                        relative_path: extracted_file.relative_path(),
+                        relative_path: &relative_path,
                         size,
                         bytes: buffered_bytes.as_deref(),
                         blake3_digest,
                     });
-                    output.accepted_file_identity(extracted_file.relative_path())?
+                    (output.accepted_file_identity(&relative_path)?, stamp)
                 }
                 InspectionMode::WithoutCallback => {
                     let identity = pending.identity()?;
+                    let stamp = pending.stamp();
                     pending.commit();
-                    identity
+                    (identity, stamp)
                 }
             };
+            let extracted_file =
+                E::from_extracted_file(relative_path, size, blake3_digest, source_stamp)?;
 
             match path_match {
                 ArchivePathMatch::New { folded_hash } => {
@@ -2259,6 +2279,13 @@ pub fn sanitize_entry_path(path: &Path) -> Result<Option<PathBuf>, LpmError> {
                     path.display()
                 )));
             }
+            #[cfg(windows)]
+            Component::Normal(name) if has_windows_invalid_filename_chars(name) => {
+                return Err(LpmError::Registry(format!(
+                    "invalid Windows filename characters in tarball entry: {}",
+                    path.display()
+                )));
+            }
             Component::Normal(_) | Component::CurDir => {}
         }
     }
@@ -2480,7 +2507,7 @@ fn is_windows_reserved_device_name(component: &OsStr) -> bool {
     let component = component.to_string_lossy();
     let trimmed = component.trim_end_matches([' ', '.']);
     let stem = trimmed
-        .split('.')
+        .split(['.', ':'])
         .next()
         .unwrap_or(trimmed)
         .trim_end_matches(' ');
@@ -2513,6 +2540,14 @@ fn is_windows_reserved_device_name(component: &OsStr) -> bool {
         );
     }
     false
+}
+
+#[cfg(any(windows, test))]
+fn has_windows_invalid_filename_chars(component: &OsStr) -> bool {
+    component
+        .to_string_lossy()
+        .chars()
+        .any(|ch| matches!(ch, ':' | '<' | '>' | '"' | '|' | '?' | '*') || (ch as u32) < 0x20)
 }
 
 #[cfg(test)]
@@ -4804,6 +4839,9 @@ mod tests {
             "aux.",
             "NUL.js",
             "NUL .txt",
+            "NUL:",
+            "COM1:",
+            "CON:x",
             "CLOCK$",
             "clock$.bin",
             "CONIN$",
@@ -4831,6 +4869,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn windows_invalid_filename_chars_rejects_ads_wildcards_and_controls() {
+        for invalid in [
+            "a.js:stream",
+            "sub::$INDEX_ALLOCATION",
+            "a<b.js",
+            "a>b.js",
+            "a\"b.js",
+            "a|b.js",
+            "a?b.js",
+            "a*b.js",
+            "ctrl\x01name.js",
+            "tab\tname.js",
+        ] {
+            assert!(
+                has_windows_invalid_filename_chars(OsStr::new(invalid)),
+                "expected invalid Windows filename: {invalid:?}"
+            );
+        }
+        for allowed in [
+            "index.js",
+            "file-name_1.2.3.mjs",
+            "caf\u{00e9}.ts",
+            "CLOCK$",
+        ] {
+            assert!(
+                !has_windows_invalid_filename_chars(OsStr::new(allowed)),
+                "expected allowed Windows filename: {allowed:?}"
+            );
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn extract_tarball_rejects_unicode_aliasing_entries_without_overwriting_earlier_file() {
@@ -4844,6 +4914,22 @@ mod tests {
         assert!(
             result.is_err(),
             "NFC/NFD aliasing entries on APFS must fail extraction instead of overwriting"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn extract_tarball_rejects_unicode_aliasing_directories_with_distinct_leaf_names() {
+        let archive = create_test_tarball_with_entries(&[
+            ("package.json", br#"{"name":"dir-alias","version":"1.0.0"}"#),
+            ("caf\u{00e9}/a.js", b"first"),
+            ("cafe\u{0301}/b.js", b"second"),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let result = extract_tarball(&archive, root.path());
+        assert!(
+            result.is_err(),
+            "NFC/NFD aliasing directories on APFS must fail extraction"
         );
     }
 }

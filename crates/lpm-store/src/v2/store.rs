@@ -1692,6 +1692,7 @@ impl Store {
                     &extracted.relative_path,
                     Some(extracted.size),
                     extracted.blake3_digest,
+                    extracted.source_stamp,
                 )?;
             }
         }

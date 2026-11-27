@@ -1,4 +1,4 @@
-use crate::{ExtractionRecord, PathLedgerBudget};
+use crate::{ExtractedFileStamp, ExtractionRecord, PathLedgerBudget};
 use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
 use cap_std::{
     ambient_authority,
@@ -13,7 +13,7 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub(crate) struct Identity(u64, u64);
 
 impl Identity {
@@ -142,6 +142,7 @@ pub(crate) struct OutputTree {
     root: Arc<Dir>,
     root_identity: Identity,
     directories: HashMap<PathBuf, DirectoryRecord>,
+    directory_identities: HashMap<Identity, PathBuf>,
     parent: Option<Parent>,
     recent_parents: ParentCache,
 }
@@ -150,12 +151,15 @@ impl OutputTree {
     pub(crate) fn new(root_path: PathBuf, visible_root_path: PathBuf) -> Result<Self, LpmError> {
         let root = Dir::open_ambient_dir(&root_path, ambient_authority())?;
         let root_identity = Identity::from_cap(&root.dir_metadata()?);
+        let mut directory_identities = HashMap::with_capacity(64);
+        directory_identities.insert(root_identity, PathBuf::new());
         Ok(Self {
             root_path,
             visible_root_path,
             root: Arc::new(root),
             root_identity,
             directories: HashMap::with_capacity(64),
+            directory_identities,
             parent: None,
             recent_parents: ParentCache::with_capacity(MAX_CACHED_PARENTS),
         })
@@ -225,11 +229,21 @@ impl OutputTree {
                     return Err(changed_directory(&prefix));
                 }
             } else {
+                if let Some(existing_dir) = self.directory_identities.get(&identity)
+                    && existing_dir != &prefix
+                {
+                    return Err(LpmError::Registry(format!(
+                        "directory path collision in tarball: {} aliases {}",
+                        prefix.display(),
+                        existing_dir.display()
+                    )));
+                }
                 if !created {
                     budget.reserve(&prefix)?;
                 }
                 self.directories
                     .insert(prefix.clone(), DirectoryRecord { identity, created });
+                self.directory_identities.insert(identity, prefix.clone());
             }
             current = Some(next);
         }
@@ -504,6 +518,29 @@ impl PendingFile {
             &self.file,
         )?))
     }
+    pub(crate) fn stamp(&self) -> Option<ExtractedFileStamp> {
+        #[cfg(windows)]
+        {
+            let stamp = lpm_common::windows_regular_file_stamp_from_open_file(&self.file)?;
+            let meta = self.file.metadata().ok()?;
+            let mode = if meta.permissions().readonly() {
+                0o444
+            } else {
+                0o644
+            };
+            Some(ExtractedFileStamp {
+                identity: stamp.identity,
+                size: stamp.len,
+                mode,
+                mtime_ns: stamp.mtime_ns,
+                ctime_ns: stamp.ctime_ns,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
     pub(crate) fn validate(&self) -> Result<(), LpmError> {
         let written = cap_std::fs::Metadata::from_file(&self.file)?;
         let current = self.directory.symlink_metadata(&self.name)?;
@@ -547,7 +584,7 @@ pub(crate) struct CompletedFile {
 }
 
 impl CompletedFile {
-    pub(crate) fn commit(self) -> Result<Identity, LpmError> {
+    pub(crate) fn verify_for_commit(&self) -> Result<Option<ExtractedFileStamp>, LpmError> {
         let current = self
             .pending
             .directory
@@ -557,8 +594,19 @@ impl CompletedFile {
                 "tarball output file changed before acceptance".into(),
             ));
         }
+        Ok(self.pending.stamp())
+    }
+
+    pub(crate) fn finish_commit(self) -> Identity {
+        let identity = self.identity;
         self.pending.commit();
-        Ok(self.identity)
+        identity
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit(self) -> Result<(Identity, Option<ExtractedFileStamp>), LpmError> {
+        let stamp = self.verify_for_commit()?;
+        Ok((self.finish_commit(), stamp))
     }
 }
 

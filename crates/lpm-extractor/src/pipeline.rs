@@ -1115,32 +1115,22 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn stalled_stream_flushes_sub_threshold_writer_batch_so_local_error_cancels_input() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         // Build a tar stream whose prefix exceeds BUFFER_SIZE so the decoder
-        // flushes entries 1-5 to DecodedReader immediately and then stalls
-        // waiting for the trailing bytes of entry 6.
+        // flushes entries 1-2 to DecodedReader immediately and then stalls
+        // waiting for the trailing bytes of entry 3.
         let large_padding = vec![b'x'; BUFFER_SIZE];
         let mut prefix = tar_stream(&[
-            (b"package/f1.js", b"1"),
-            (b"package/f2.js", b"2"),
-            (b"package/f3.js", b"3"),
-            (b"package/f4.js", b"4"),
-            (b"package/readonly/fail.js", b"5"),
-            (b"package/f6.js", &large_padding),
+            (b"package/hold.js", b"1"),
+            (b"package/fail.js", b"2"),
+            (b"package/stall.js", &large_padding),
         ]);
         // Keep enough bytes to cross one full BUFFER_SIZE chunk (delivering
-        // entries 1-5) while stopping mid-entry on f6.js so the stream stalls.
+        // hold.js and fail.js) while stopping mid-entry on stall.js so the stream stalls.
         prefix.truncate(BUFFER_SIZE + 512);
 
         let root = tempfile::tempdir().unwrap();
-        let ro_dir = root.path().join("readonly");
-        std::fs::create_dir(&ro_dir).unwrap();
-        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-
         let (cancel_tx, cancel_rx) = std::sync::mpsc::sync_channel::<()>(1);
         struct StallAfterPrefix {
             bytes: Vec<u8>,
@@ -1167,27 +1157,86 @@ mod tests {
 
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancelled_clone = Arc::clone(&cancelled);
+        let saw_stall_flush = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_stall_flush_clone = Arc::clone(&saw_stall_flush);
+        let in_flight_slot: Arc<Mutex<Option<Arc<std::sync::atomic::AtomicUsize>>>> =
+            Arc::new(Mutex::new(None));
+        let in_flight_for_hook = Arc::clone(&in_flight_slot);
         let reader = StallAfterPrefix {
             bytes: prefix,
             pos: 0,
             cancel_rx,
         };
         let started = std::time::Instant::now();
-        let result = extract_stream::<std::path::PathBuf>(
+        let result = with_decoder(
             reader,
-            root.path(),
-            DEFAULT_EXTRACTION_LIMITS,
             StreamFormat::Tar,
-            false,
+            DEFAULT_EXTRACTION_LIMITS,
             move || {
                 cancelled_clone.store(true, std::sync::atomic::Ordering::SeqCst);
                 let _ = cancel_tx.try_send(());
             },
+            |decoded| {
+                let failure = decoded
+                    .writer_failure_signal()
+                    .expect("parallel decoder must expose a failure signal");
+                let hooks = crate::writers::TestHooks {
+                    before_open: Some(Arc::new(move |job| {
+                        if job.sequence == 0 {
+                            // Hold the sole worker busy so job 1 sits in pending_batch
+                            // until DecodedReader's stall flush dispatches a second batch.
+                            let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+                            while std::time::Instant::now() < deadline {
+                                let count = in_flight_for_hook
+                                    .lock()
+                                    .unwrap()
+                                    .as_ref()
+                                    .map_or(0, |counter| {
+                                        counter.load(std::sync::atomic::Ordering::Acquire)
+                                    });
+                                if count >= 2 {
+                                    saw_stall_flush_clone
+                                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                                    return Ok(());
+                                }
+                                std::thread::sleep(Duration::from_millis(2));
+                            }
+                            return Ok(());
+                        }
+                        Err(LpmError::Io(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "injected open error",
+                        )))
+                    })),
+                    ..crate::writers::TestHooks::default()
+                };
+                let pool = crate::writers::WriterPool::new_with_hooks(1, hooks, Some(failure))?;
+                *in_flight_slot.lock().unwrap() = Some(pool.in_flight_batches());
+                extract_tar_archive_until::<_, _, _, _, std::path::PathBuf>(
+                    decoded,
+                    root.path(),
+                    DEFAULT_EXTRACTION_LIMITS,
+                    false,
+                    |_, _| false,
+                    |_| {},
+                    InspectionMode::WithoutCallback,
+                    |mut reader| {
+                        io::copy(&mut reader, &mut io::sink())
+                            .map(|_| ())
+                            .map_err(LpmError::Io)
+                    },
+                    crate::writers::WriterSetup::Ready(pool),
+                    ArchiveEnd::EndOfInput,
+                )
+            },
         );
-        let _ = std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o700));
         assert!(
             result.is_err(),
             "failing open in sub-threshold batch must fail extraction"
+        );
+        assert!(
+            saw_stall_flush.load(std::sync::atomic::Ordering::SeqCst),
+            "job 1 must remain buffered while worker is busy and dispatch only when DecodedReader flushes on stream stall"
         );
         assert!(
             cancelled.load(std::sync::atomic::Ordering::SeqCst),

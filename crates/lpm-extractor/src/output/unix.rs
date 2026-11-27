@@ -1,4 +1,4 @@
-use crate::{ExtractionRecord, PathLedgerBudget};
+use crate::{ExtractedFileStamp, ExtractionRecord, PathLedgerBudget};
 use lpm_common::LpmError;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -7,9 +7,9 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub(crate) struct Identity {
     device: i128,
     inode: i128,
@@ -178,22 +178,28 @@ pub(crate) struct OutputTree {
     root: Arc<File>,
     root_identity: Identity,
     directories: HashMap<PathBuf, DirectoryRecord>,
+    directory_identities: HashMap<Identity, PathBuf>,
     parent: Option<Parent>,
-    recent_parents: ParentCache,
+    recent_parents: Arc<Mutex<ParentCache>>,
 }
 
 impl OutputTree {
     pub(crate) fn new(root_path: PathBuf, visible_root_path: PathBuf) -> Result<Self, LpmError> {
         let root = open_directory(libc::AT_FDCWD, &c_path(&root_path)?)?;
         let root_identity = Identity::from_metadata(&root.metadata()?);
+        let mut directory_identities = HashMap::with_capacity(64);
+        directory_identities.insert(root_identity, PathBuf::new());
         Ok(Self {
             root_path,
             visible_root_path,
             root: Arc::new(root),
             root_identity,
             directories: HashMap::with_capacity(64),
+            directory_identities,
             parent: None,
-            recent_parents: ParentCache::with_capacity(parent_cache_capacity()),
+            recent_parents: Arc::new(Mutex::new(ParentCache::with_capacity(
+                parent_cache_capacity(),
+            ))),
         })
     }
 
@@ -201,7 +207,10 @@ impl OutputTree {
         let Some(previous) = self.parent.take() else {
             return;
         };
-        self.recent_parents.insert(previous);
+        self.recent_parents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(previous);
     }
 
     pub(crate) fn prepare_parent(
@@ -222,7 +231,12 @@ impl OutputTree {
             return Ok(());
         }
         self.park_current_parent();
-        if let Some(cached) = self.recent_parents.take(parent)
+        let taken = self
+            .recent_parents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take(parent);
+        if let Some(cached) = taken
             && self
                 .directories
                 .get(parent)
@@ -234,12 +248,21 @@ impl OutputTree {
         if let Some(record) = self.directories.get(parent) {
             let opened = match open_known_parent(&self.root, parent) {
                 Ok(opened) => opened,
-                Err(error)
-                    if is_descriptor_exhaustion(&error)
-                        && !self.recent_parents.index.is_empty() =>
-                {
-                    self.recent_parents.clear();
-                    open_known_parent(&self.root, parent)?
+                Err(error) if is_descriptor_exhaustion(&error) => {
+                    let evicted = {
+                        let mut recent = self
+                            .recent_parents
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let had_entries = !recent.index.is_empty();
+                        recent.clear();
+                        had_entries
+                    };
+                    if evicted {
+                        open_known_parent(&self.root, parent)?
+                    } else {
+                        return Err(error.into());
+                    }
                 }
                 Err(error) => return Err(error.into()),
             };
@@ -265,20 +288,32 @@ impl OutputTree {
             let name = CString::new(component.as_os_str().as_bytes()).map_err(invalid_path)?;
             let base = current.as_ref().unwrap_or(&self.root).as_raw_fd();
             let known = self.directories.get(&prefix);
-            let open_or_retry = |recent: &mut ParentCache| match open_directory(base, &name) {
+            let open_or_retry = || match open_directory(base, &name) {
                 Ok(next) => Ok(next),
-                Err(error) if is_descriptor_exhaustion(&error) && !recent.index.is_empty() => {
-                    recent.clear();
-                    open_directory(base, &name)
+                Err(error) if is_descriptor_exhaustion(&error) => {
+                    let evicted = {
+                        let mut recent = self
+                            .recent_parents
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let had_entries = !recent.index.is_empty();
+                        recent.clear();
+                        had_entries
+                    };
+                    if evicted {
+                        open_directory(base, &name)
+                    } else {
+                        Err(error)
+                    }
                 }
                 Err(error) => Err(error),
             };
-            let (next, created) = match open_or_retry(&mut self.recent_parents) {
+            let (next, created) = match open_or_retry() {
                 Ok(next) => (next, false),
                 Err(error) if error.kind() == io::ErrorKind::NotFound && known.is_none() => {
                     budget.reserve(&prefix)?;
                     mkdir(base, &name)?;
-                    match open_or_retry(&mut self.recent_parents) {
+                    match open_or_retry() {
                         Ok(directory) => (directory, true),
                         Err(error) => {
                             let _ = unlink(base, &name, libc::AT_REMOVEDIR);
@@ -294,11 +329,21 @@ impl OutputTree {
                     return Err(changed_directory(&prefix));
                 }
             } else {
+                if let Some(existing_dir) = self.directory_identities.get(&identity)
+                    && existing_dir != &prefix
+                {
+                    return Err(LpmError::Registry(format!(
+                        "directory path collision in tarball: {} aliases {}",
+                        prefix.display(),
+                        existing_dir.display()
+                    )));
+                }
                 if !created {
                     budget.reserve(&prefix)?;
                 }
                 self.directories
                     .insert(prefix.clone(), DirectoryRecord { identity, created });
+                self.directory_identities.insert(identity, prefix.clone());
             }
             current = Some(next);
         }
@@ -338,6 +383,7 @@ impl OutputTree {
             directory: Arc::clone(directory),
             name: CString::new(leaf.as_bytes()).map_err(invalid_path)?,
             path: path.to_path_buf(),
+            recent_parents: Arc::downgrade(&self.recent_parents),
         })
     }
 
@@ -389,7 +435,10 @@ impl OutputTree {
 
     pub(crate) fn validate(&mut self) -> Result<(), LpmError> {
         self.parent = None;
-        self.recent_parents.clear();
+        self.recent_parents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.validate_root()?;
         for (path, record) in &self.directories {
             if let Some((directory, _)) = open_known_parent(&self.root, path)? {
@@ -419,6 +468,10 @@ impl OutputTree {
 
     pub(crate) fn cleanup<E: ExtractionRecord>(&mut self, files: &[E], identities: &[Identity]) {
         self.parent = None;
+        self.recent_parents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         if files.len() != identities.len() {
             return;
         }
@@ -477,6 +530,7 @@ pub(crate) struct NewFile {
     directory: Arc<File>,
     name: CString,
     path: PathBuf,
+    recent_parents: Weak<Mutex<ParentCache>>,
 }
 
 impl NewFile {
@@ -503,7 +557,26 @@ impl NewFile {
     fn open(self, mode_flag: i32) -> Result<PendingFile, LpmError> {
         let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW | mode_flag;
         let base = self.directory.as_raw_fd();
-        let file = open_at(base, &self.name, flags, 0o666).map_err(|error| {
+        let open_result = match open_at(base, &self.name, flags, 0o666) {
+            Ok(file) => Ok(file),
+            Err(error) if is_descriptor_exhaustion(&error) => {
+                let evicted = self.recent_parents.upgrade().is_some_and(|cache| {
+                    let mut recent = cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let had_entries = !recent.index.is_empty();
+                    recent.clear();
+                    had_entries
+                });
+                if evicted {
+                    open_at(base, &self.name, flags, 0o666)
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let file = open_result.map_err(|error| {
             // POSIX specifies EEXIST for O_CREAT|O_EXCL|O_NOFOLLOW on an
             // existing symlink; classify symlinks as ELOOP so callers still
             // receive LpmError::PathTraversal.
@@ -524,6 +597,47 @@ impl NewFile {
     }
 }
 
+fn unix_timespec_to_ns(secs: i64, nsec: i64) -> Option<u64> {
+    u64::try_from(secs)
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::try_from(nsec).ok()?)
+}
+
+fn unix_stamp_from_metadata(meta: &Metadata) -> Option<ExtractedFileStamp> {
+    Some(ExtractedFileStamp {
+        identity: lpm_common::FileIdentity {
+            volume: meta.dev(),
+            file_id: u128::from(meta.ino()),
+        },
+        size: meta.len(),
+        mode: meta.mode() & 0o7777,
+        mtime_ns: unix_timespec_to_ns(meta.mtime(), meta.mtime_nsec())?,
+        ctime_ns: unix_timespec_to_ns(meta.ctime(), meta.ctime_nsec())?,
+    })
+}
+
+fn unix_stamp_from_stat(current: &libc::stat) -> Option<ExtractedFileStamp> {
+    let volume = u64::try_from(i128::from(current.st_dev)).ok()?;
+    let ino = u64::try_from(i128::from(current.st_ino)).ok()?;
+    let size = u64::try_from(i128::from(current.st_size)).ok()?;
+    let mode = u32::try_from(i128::from(current.st_mode)).ok()? & 0o7777;
+    let mtime = i64::try_from(i128::from(current.st_mtime)).ok()?;
+    let mtime_nsec = i64::try_from(i128::from(current.st_mtime_nsec)).ok()?;
+    let ctime = i64::try_from(i128::from(current.st_ctime)).ok()?;
+    let ctime_nsec = i64::try_from(i128::from(current.st_ctime_nsec)).ok()?;
+    Some(ExtractedFileStamp {
+        identity: lpm_common::FileIdentity {
+            volume,
+            file_id: u128::from(ino),
+        },
+        size,
+        mode,
+        mtime_ns: unix_timespec_to_ns(mtime, mtime_nsec)?,
+        ctime_ns: unix_timespec_to_ns(ctime, ctime_nsec)?,
+    })
+}
+
 pub(crate) struct PendingFile {
     pub(crate) file: File,
     directory: Arc<File>,
@@ -533,6 +647,10 @@ pub(crate) struct PendingFile {
 impl PendingFile {
     pub(crate) fn identity(&self) -> Result<Identity, LpmError> {
         Ok(Identity::from_metadata(&self.file.metadata()?))
+    }
+    pub(crate) fn stamp(&self) -> Option<ExtractedFileStamp> {
+        let meta = self.file.metadata().ok()?;
+        unix_stamp_from_metadata(&meta)
     }
     pub(crate) fn validate(&self) -> Result<(), LpmError> {
         let written = self.file.metadata()?;
@@ -585,7 +703,7 @@ pub(crate) struct CompletedFile {
 }
 
 impl CompletedFile {
-    pub(crate) fn commit(self) -> Result<Identity, LpmError> {
+    pub(crate) fn verify_for_commit(&self) -> Result<Option<ExtractedFileStamp>, LpmError> {
         let current = stat_at(self.pending.directory.as_raw_fd(), &self.pending.name)?;
         if current.st_mode & libc::S_IFMT != libc::S_IFREG
             || self.identity != Identity::from_stat(&current)
@@ -594,8 +712,19 @@ impl CompletedFile {
                 "tarball output file changed before acceptance".into(),
             ));
         }
+        Ok(unix_stamp_from_stat(&current))
+    }
+
+    pub(crate) fn finish_commit(self) -> Identity {
+        let identity = self.identity;
         self.pending.commit();
-        Ok(self.identity)
+        identity
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit(self) -> Result<(Identity, Option<ExtractedFileStamp>), LpmError> {
+        let stamp = self.verify_for_commit()?;
+        Ok((self.finish_commit(), stamp))
     }
 }
 
@@ -892,5 +1021,71 @@ mod parent_cache_tests {
             parent_cache_capacity_for_limit(10_240, 4),
             MAX_CACHED_PARENTS
         );
+    }
+
+    #[test]
+    fn root_file_creation_evicts_cached_parent_dirfds_on_emfile() {
+        const CHILD: &str = "LPM_TEST_ROOT_FILE_EMFILE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "output::unix::parent_cache_tests::root_file_creation_evicts_cached_parent_dirfds_on_emfile",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is valid writable storage for `getrlimit`.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let tight = libc::rlimit {
+            rlim_cur: 64.min(limit.rlim_max),
+            rlim_max: limit.rlim_max,
+        };
+        // SAFETY: lowering soft limit to <= hard limit in this isolated child process.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &tight) }, 0);
+
+        let mut output =
+            OutputTree::new(dir.path().to_path_buf(), dir.path().to_path_buf()).unwrap();
+        let mut budget = PathLedgerBudget::new(1024 * 1024);
+        for idx in 0..16 {
+            let rel = PathBuf::from(format!("sub{idx}/file.js"));
+            output.prepare_parent(&rel, &mut budget).unwrap();
+            let pending = output.create_file(&rel, false).unwrap();
+            pending.commit();
+        }
+        // Park the last parent into recent_parents by preparing a root-level file.
+        let root_file = Path::new("root-entry.js");
+        output.prepare_parent(root_file, &mut budget).unwrap();
+
+        // Exhaust all remaining file descriptors until opening fails with EMFILE.
+        let mut fillers = Vec::new();
+        while let Ok(f) = File::open(dir.path()) {
+            fillers.push(f);
+        }
+
+        // Creating the root-level file must evict cached parent dirfds and succeed.
+        let pending = output
+            .create_file(root_file, false)
+            .expect("file creation must evict cached parent dirfds on EMFILE");
+        pending.commit();
+        drop(fillers);
     }
 }

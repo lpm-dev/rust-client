@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use lpm_common::{LpmError, write_file_atomic};
+use lpm_common::{FileIdentity, LpmError, write_file_atomic};
+use lpm_extractor::ExtractedFileStamp;
 use serde::{Deserialize, Serialize};
 
 use crate::v2::fs_util::tmp_sibling;
@@ -65,8 +66,34 @@ impl CompactBlobId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct FileIdentity(u64, u64);
+const MAX_VALIDATE_BLOB_ATTEMPTS: usize = 4;
+
+enum ValidateBlobError {
+    Corrupt {
+        error: Box<LpmError>,
+        bad_identity: Option<FileIdentity>,
+    },
+    Contended(Box<LpmError>),
+}
+
+impl ValidateBlobError {
+    fn corrupt(error: LpmError, bad_identity: Option<FileIdentity>) -> Self {
+        Self::Corrupt {
+            error: Box::new(error),
+            bad_identity,
+        }
+    }
+
+    fn contended(error: LpmError) -> Self {
+        Self::Contended(Box::new(error))
+    }
+
+    fn into_error(self) -> LpmError {
+        match self {
+            Self::Corrupt { error, .. } | Self::Contended(error) => *error,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FirstPublishTrust {
@@ -185,8 +212,8 @@ struct ManifestStatFingerprint {
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ManifestStatFingerprint {
-    volume_serial_number: u32,
-    file_index: u64,
+    volume_serial_number: u64,
+    file_index: u128,
     creation_time: u64,
     last_write_time: u64,
     change_time: i64,
@@ -221,8 +248,8 @@ struct BlobStatFingerprint {
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BlobStatFingerprint {
-    volume_serial_number: u32,
-    file_index: u64,
+    volume_serial_number: u64,
+    file_index: u128,
     creation_time: u64,
     last_write_time: u64,
     change_time: i64,
@@ -434,6 +461,7 @@ impl FileCas {
         relative_path: &Path,
         expected_size: Option<u64>,
         digest: [u8; 32],
+        expected_stamp: Option<ExtractedFileStamp>,
     ) -> Result<(), LpmError> {
         let path_bytes = encode_relative_path(relative_path)?;
         let existing_entry = ingest.entry_indexes.get(&path_bytes).copied();
@@ -444,22 +472,14 @@ impl FileCas {
             )));
         }
         let source = object_root.join(relative_path);
-        let metadata = fs::symlink_metadata(&source).map_err(|error| {
-            LpmError::Store(format!(
-                "failed to inspect extracted v3 CAS entry {}: {error}",
-                source.display()
-            ))
-        })?;
-        let file_size = metadata.len();
-        if !metadata.file_type().is_file()
-            || expected_size.is_some_and(|expected| file_size != expected)
-        {
+        let (file_size, mode, identity, live_stamp) = inspect_registry_source_file(&source)?;
+        if expected_size.is_some_and(|expected| file_size != expected) {
             return Err(LpmError::Store(format!(
                 "extracted v3 CAS entry changed before publication at {}",
                 source.display()
             )));
         }
-        if let Some(identity) = file_identity_for_path(&source, &metadata)? {
+        if let Some(identity) = identity {
             if let Some(prior_path) = ingest.seen_identities.get(&identity)
                 && prior_path != &path_bytes
             {
@@ -470,7 +490,35 @@ impl FileCas {
             }
             ingest.seen_identities.insert(identity, path_bytes.clone());
         }
-        let mode = normalized_mode(&metadata);
+        let stamp_matches = matches!(
+            (expected_stamp, live_stamp),
+            (Some(expected), Some(live)) if expected == live
+        );
+        if !stamp_matches {
+            let (mut file, open_meta) = open_regular_file_nofollow(&source).map_err(|error| {
+                LpmError::Store(format!(
+                    "failed to open extracted v3 CAS entry {}: {error}",
+                    source.display()
+                ))
+            })?;
+            let open_identity = file_identity_from_open_file(&source, &file, &open_meta)?;
+            if open_identity != identity
+                || open_meta.len() != file_size
+                || normalized_mode(&open_meta) != mode
+            {
+                return Err(LpmError::Store(format!(
+                    "extracted v3 CAS entry changed before publication at {}",
+                    source.display()
+                )));
+            }
+            let actual_digest = hash_open_file_bytes(&mut file, &source, &mut ingest.hash_buffer)?;
+            if actual_digest != digest {
+                return Err(LpmError::Store(format!(
+                    "extracted v3 CAS entry digest changed before publication at {}",
+                    source.display()
+                )));
+            }
+        }
         let compact_id = CompactBlobId::from_raw(digest, mode, file_size);
         let key = BlobKey {
             digest: blake3::Hash::from_bytes(digest).to_hex().to_string(),
@@ -482,6 +530,7 @@ impl FileCas {
             &key,
             &mut ingest.hash_buffer,
             FirstPublishTrust::DeferUntilFinalized,
+            identity,
         )?;
         ingest.blob_stats.insert(compact_id, published.fingerprint);
         if published.deferred_validation {
@@ -801,6 +850,7 @@ impl FileCas {
                     && open.record.tree_digest == record.tree_digest
                     && open.record.blob_stat_fingerprint == observed_fingerprint
             }) {
+                self.record_validated_blobs_batch(&keys, &observed_stats);
                 return Ok(SourceReuseStatus::Reusable);
             }
         }
@@ -863,12 +913,27 @@ impl FileCas {
                         self.record_validated_blob(key, fingerprint);
                         fingerprint
                     }
-                    Err(error) => {
+                    Err(ValidateBlobError::Contended(error)) => {
+                        timings.blob_rehash_ms = timings
+                            .blob_rehash_ms
+                            .saturating_add(rehash_start.elapsed().as_millis());
+                        tracing::warn!(
+                            target = %blob.display(),
+                            "v3 CAS blob experienced concurrent link updates during validation: {error}"
+                        );
+                        return Ok(SourceReuseStatus::MissingOrInvalid);
+                    }
+                    Err(ValidateBlobError::Corrupt {
+                        error,
+                        bad_identity,
+                    }) => {
                         timings.blob_rehash_ms = timings
                             .blob_rehash_ms
                             .saturating_add(rehash_start.elapsed().as_millis());
                         self.evict_validated_blob(key);
-                        self.quarantine_entry(&blob, "blobs")?;
+                        if self.blob_matches_bad_identity(&blob, bad_identity) {
+                            self.quarantine_entry(&blob, "blobs")?;
+                        }
                         tracing::warn!(
                             target = %blob.display(),
                             "v3 CAS blob failed validation after its stat fingerprint changed: {error}"
@@ -962,13 +1027,21 @@ impl FileCas {
 
     fn read_blob_stat(&self, key: &BlobKey) -> Result<BlobStatFingerprint, LpmError> {
         let path = self.blob_path(key)?;
+        self.read_path_stat_as_blob(&path, key)
+    }
+
+    fn read_path_stat_as_blob(
+        &self,
+        path: &Path,
+        key: &BlobKey,
+    ) -> Result<BlobStatFingerprint, LpmError> {
         #[cfg(windows)]
         {
-            BlobStatFingerprint::from_validated_blob_path(&path, key)
+            BlobStatFingerprint::from_validated_blob_path(path, key)
         }
         #[cfg(not(windows))]
         {
-            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            let metadata = fs::symlink_metadata(path).map_err(|error| {
                 LpmError::Store(format!(
                     "failed to inspect v3 CAS blob {}: {error}",
                     path.display()
@@ -1376,20 +1449,8 @@ impl FileCas {
                         LpmError::Store("v3 CAS file entry is missing its blob key".into())
                     })?;
                     let blob = self.blob_path(key)?;
-                    let live_pre = self.read_blob_stat(key)?;
+                    let pre_fp = self.read_blob_stat(key)?;
                     let prior_validated = self.cached_validated_blob(key);
-                    if let Some(cached) = prior_validated
-                        && live_pre != cached
-                    {
-                        if hash_buffer.is_empty() {
-                            hash_buffer.resize(64 * 1024, 0);
-                        }
-                        if let Err(error) = self.validate_blob(&blob, key, &mut hash_buffer) {
-                            self.evict_validated_blob(key);
-                            self.quarantine_entry(&blob, "blobs")?;
-                            return Err(error);
-                        }
-                    }
                     if let Some(parent) = path.parent() {
                         fs::create_dir_all(parent).map_err(|error| {
                             LpmError::Store(format!(
@@ -1405,19 +1466,30 @@ impl FileCas {
                             path.display()
                         ))
                     })?;
-                    if let Some(cached) = prior_validated {
-                        let post_fp = self.read_blob_stat(key)?;
-                        if !(post_fp == cached && cached.is_settled()) {
-                            if hash_buffer.is_empty() {
-                                hash_buffer.resize(64 * 1024, 0);
-                            }
-                            match self.validate_blob(&blob, key, &mut hash_buffer) {
-                                Ok(validated) => self.record_validated_blob(key, validated),
-                                Err(error) => {
-                                    self.evict_validated_blob(key);
+                    let fast_path_post = prior_validated.and_then(|cached| {
+                        (pre_fp == cached && cached.is_settled())
+                            .then(|| self.read_path_stat_as_blob(&path, key).ok())
+                            .flatten()
+                            .filter(|post_fp| post_fp.is_hardlink_only_transition_from(pre_fp))
+                    });
+                    if let Some(post_fp) = fast_path_post {
+                        self.record_validated_blob(key, post_fp);
+                    } else {
+                        if hash_buffer.is_empty() {
+                            hash_buffer.resize(64 * 1024, 0);
+                        }
+                        match self.validate_blob(&path, key, &mut hash_buffer) {
+                            Ok(validated) => self.record_validated_blob(key, validated),
+                            Err(ValidateBlobError::Contended(error)) => return Err(*error),
+                            Err(ValidateBlobError::Corrupt {
+                                error,
+                                bad_identity,
+                            }) => {
+                                self.evict_validated_blob(key);
+                                if self.blob_matches_bad_identity(&blob, bad_identity) {
                                     self.quarantine_entry(&blob, "blobs")?;
-                                    return Err(error);
                                 }
+                                return Err(*error);
                             }
                         }
                     }
@@ -1496,9 +1568,19 @@ impl FileCas {
                         LpmError::Store("v3 CAS file entry is missing its blob key".into())
                     })?;
                     let blob = self.verify_blob(key, false, &mut [])?;
+                    let identity_matches = {
+                        #[cfg(any(unix, windows))]
+                        {
+                            paths_share_file_identity(&path, &blob)
+                        }
+                        #[cfg(not(any(unix, windows)))]
+                        {
+                            true
+                        }
+                    };
                     if metadata.len() != key.size
                         || normalized_mode(&metadata) != key.mode
-                        || !same_file_identity(&metadata, &fs::metadata(&blob)?)
+                        || !identity_matches
                     {
                         return Err(LpmError::Store(format!(
                             "v3 CAS materialized file does not match blob at {}",
@@ -1669,7 +1751,8 @@ impl FileCas {
     ) -> Result<PathBuf, LpmError> {
         let path = self.blob_path(key)?;
         if deep {
-            self.validate_blob(&path, key, hash_buffer)?;
+            self.validate_blob(&path, key, hash_buffer)
+                .map_err(ValidateBlobError::into_error)?;
         } else if !blob_metadata_is_valid(&path, key) {
             return Err(LpmError::Store(format!(
                 "v3 CAS blob metadata mismatch at {}",
@@ -1685,7 +1768,9 @@ impl FileCas {
         key: &BlobKey,
         hash_buffer: &mut [u8],
     ) -> Result<(), LpmError> {
-        self.validate_blob(path, key, hash_buffer).map(|_| ())
+        self.validate_blob(path, key, hash_buffer)
+            .map(|_| ())
+            .map_err(ValidateBlobError::into_error)
     }
 
     fn ingest_dir(
@@ -1787,23 +1872,61 @@ impl FileCas {
         metadata: &fs::Metadata,
         hash_buffer: &mut [u8],
     ) -> Result<(BlobKey, CompactBlobId, BlobStatFingerprint), LpmError> {
-        let raw_digest = hash_file_bytes(source, hash_buffer)?;
+        let (mut file, open_meta) = open_regular_file_nofollow(source).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to open v3 CAS source file {}: {error}",
+                source.display()
+            ))
+        })?;
+        let source_identity = file_identity_from_open_file(source, &file, &open_meta)?;
+        let raw_digest = hash_open_file_bytes(&mut file, source, hash_buffer)?;
         let mode = normalized_mode(metadata);
         let size = metadata.len();
+        if open_meta.len() != size || normalized_mode(&open_meta) != mode {
+            return Err(LpmError::Store(format!(
+                "v3 CAS source file changed while hashing {}",
+                source.display()
+            )));
+        }
         let compact_id = CompactBlobId::from_raw(raw_digest, mode, size);
         let key = BlobKey {
             digest: blake3::Hash::from_bytes(raw_digest).to_hex().to_string(),
             mode,
             size,
         };
-        let published =
-            self.publish_blob(source, &key, hash_buffer, FirstPublishTrust::Verified)?;
+        let published = self.publish_blob(
+            source,
+            &key,
+            hash_buffer,
+            FirstPublishTrust::Verified,
+            source_identity,
+        )?;
         Ok((key, compact_id, published.fingerprint))
     }
 
     fn record_validated_blob(&self, key: &BlobKey, fingerprint: BlobStatFingerprint) {
         if let Some(id) = CompactBlobId::try_from_key(key) {
             self.record_validated_blob_id(id, fingerprint);
+        }
+    }
+
+    fn record_validated_blobs_batch(
+        &self,
+        keys: &[&BlobKey],
+        observed_stats: &[Option<BlobStatFingerprint>],
+    ) {
+        let mut guard = self
+            .validated_blobs
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (key, maybe_fp) in keys.iter().zip(observed_stats.iter().copied()) {
+            let (Some(id), Some(fingerprint)) = (CompactBlobId::try_from_key(key), maybe_fp) else {
+                continue;
+            };
+            if guard.len() >= MAX_VALIDATED_BLOBS && !guard.contains_key(&id) {
+                guard.clear();
+            }
+            guard.insert(id, fingerprint);
         }
     }
 
@@ -1836,12 +1959,29 @@ impl FileCas {
             .copied()
     }
 
+    fn blob_matches_bad_identity(&self, blob: &Path, bad_identity: Option<FileIdentity>) -> bool {
+        let Some(bad_id) = bad_identity else {
+            return true;
+        };
+        let Ok(metadata) = fs::symlink_metadata(blob) else {
+            return false;
+        };
+        if !metadata.file_type().is_file() {
+            return true;
+        }
+        match file_identity_for_path(blob, &metadata) {
+            Ok(Some(live_id)) => live_id == bad_id,
+            Ok(None) | Err(_) => true,
+        }
+    }
+
     fn publish_blob(
         &self,
         source: &Path,
         key: &BlobKey,
         hash_buffer: &mut [u8],
         first_publish_trust: FirstPublishTrust,
+        expected_source_identity: Option<FileIdentity>,
     ) -> Result<PublishedBlob, LpmError> {
         let blob = self.blob_path(key)?;
         let parent = blob.parent().ok_or_else(|| {
@@ -1857,6 +1997,19 @@ impl FileCas {
         match fs::hard_link(source, &blob) {
             Ok(()) => {
                 let fingerprint = self.read_blob_stat(key)?;
+                if let Some(expected_id) = expected_source_identity
+                    && fingerprint
+                        .file_identity()
+                        .is_some_and(|live| live != expected_id)
+                {
+                    if self.blob_matches_bad_identity(&blob, fingerprint.file_identity()) {
+                        let _ = self.quarantine_entry(&blob, "blobs");
+                    }
+                    return Err(LpmError::Store(format!(
+                        "source file changed during v3 CAS blob publication at {}",
+                        source.display()
+                    )));
+                }
                 let deferred_validation =
                     first_publish_trust == FirstPublishTrust::DeferUntilFinalized;
                 if !deferred_validation {
@@ -1877,7 +2030,9 @@ impl FileCas {
         }
 
         if paths_share_file_identity(source, &blob) {
-            let validated = self.validate_blob(&blob, key, hash_buffer)?;
+            let validated = self
+                .validate_blob(source, key, hash_buffer)
+                .map_err(ValidateBlobError::into_error)?;
             self.record_validated_blob(key, validated);
             return Ok(PublishedBlob {
                 fingerprint: validated,
@@ -1885,22 +2040,25 @@ impl FileCas {
             });
         }
 
+        let pre_fp = self.read_blob_stat(key).ok();
+        let cached = self.cached_validated_blob(key);
         let backup = HardlinkReplaceGuard::stage(&blob, source)?;
         #[cfg(test)]
         run_test_after_publish_hardlink_hook(&blob);
-        if let Some(cached) = self.cached_validated_blob(key)
+        if let (Some(cached), Some(pre_fp)) = (cached, pre_fp)
+            && pre_fp == cached
             && cached.is_settled()
-            && self
-                .read_blob_stat(key)
-                .is_ok_and(|live| live == cached && live.is_settled())
+            && let Ok(post_fp) = self.read_path_stat_as_blob(source, key)
+            && post_fp.is_hardlink_only_transition_from(pre_fp)
         {
             backup.commit()?;
+            self.record_validated_blob(key, post_fp);
             return Ok(PublishedBlob {
-                fingerprint: cached,
+                fingerprint: post_fp,
                 deferred_validation: false,
             });
         }
-        match self.validate_blob(&blob, key, hash_buffer) {
+        match self.validate_blob(source, key, hash_buffer) {
             Ok(validated) => {
                 backup.commit()?;
                 self.record_validated_blob(key, validated);
@@ -1909,13 +2067,32 @@ impl FileCas {
                     deferred_validation: false,
                 })
             }
-            Err(_) => {
+            Err(ValidateBlobError::Contended(error)) => {
+                backup.rollback()?;
+                Err(*error)
+            }
+            Err(ValidateBlobError::Corrupt { bad_identity, .. }) => {
                 self.evict_validated_blob(key);
                 backup.rollback()?;
-                self.quarantine_entry(&blob, "blobs")?;
+                if self.blob_matches_bad_identity(&blob, bad_identity) {
+                    self.quarantine_entry(&blob, "blobs")?;
+                }
                 match fs::hard_link(source, &blob) {
                     Ok(()) => {
                         let fingerprint = self.read_blob_stat(key)?;
+                        if let Some(expected_id) = expected_source_identity
+                            && fingerprint
+                                .file_identity()
+                                .is_some_and(|live| live != expected_id)
+                        {
+                            if self.blob_matches_bad_identity(&blob, fingerprint.file_identity()) {
+                                let _ = self.quarantine_entry(&blob, "blobs");
+                            }
+                            return Err(LpmError::Store(format!(
+                                "source file changed during v3 CAS blob repair at {}",
+                                source.display()
+                            )));
+                        }
                         let deferred_validation =
                             first_publish_trust == FirstPublishTrust::DeferUntilFinalized;
                         if !deferred_validation {
@@ -1928,13 +2105,20 @@ impl FileCas {
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                         let retry_backup = HardlinkReplaceGuard::stage(&blob, source)?;
-                        let fingerprint = self.validate_blob(&blob, key, hash_buffer)?;
-                        retry_backup.commit()?;
-                        self.record_validated_blob(key, fingerprint);
-                        Ok(PublishedBlob {
-                            fingerprint,
-                            deferred_validation: false,
-                        })
+                        match self.validate_blob(source, key, hash_buffer) {
+                            Ok(fingerprint) => {
+                                retry_backup.commit()?;
+                                self.record_validated_blob(key, fingerprint);
+                                Ok(PublishedBlob {
+                                    fingerprint,
+                                    deferred_validation: false,
+                                })
+                            }
+                            Err(err) => {
+                                retry_backup.rollback()?;
+                                Err(err.into_error())
+                            }
+                        }
                     }
                     Err(error) => Err(LpmError::Store(format!(
                         "failed to repair v3 CAS blob {}: {error}",
@@ -1967,86 +2151,121 @@ impl FileCas {
         blob: &Path,
         key: &BlobKey,
         hash_buffer: &mut [u8],
-    ) -> Result<BlobStatFingerprint, LpmError> {
+    ) -> Result<BlobStatFingerprint, ValidateBlobError> {
         let (mut file, mut pre_meta) = open_regular_file_nofollow(blob).map_err(|error| {
-            LpmError::Store(format!(
-                "failed to inspect existing v3 CAS blob {}: {error}",
-                blob.display()
-            ))
+            ValidateBlobError::corrupt(
+                LpmError::Store(format!(
+                    "failed to inspect existing v3 CAS blob {}: {error}",
+                    blob.display()
+                )),
+                None,
+            )
         })?;
-        for attempt in 0..2 {
+        for attempt in 0..MAX_VALIDATE_BLOB_ATTEMPTS {
             if attempt > 0 {
                 file.seek(io::SeekFrom::Start(0)).map_err(|error| {
-                    LpmError::Store(format!(
-                        "failed to rewind existing v3 CAS blob {}: {error}",
-                        blob.display()
-                    ))
+                    ValidateBlobError::corrupt(
+                        LpmError::Store(format!(
+                            "failed to rewind existing v3 CAS blob {}: {error}",
+                            blob.display()
+                        )),
+                        None,
+                    )
                 })?;
                 pre_meta = file.metadata().map_err(|error| {
-                    LpmError::Store(format!(
-                        "failed to re-inspect existing v3 CAS blob {}: {error}",
-                        blob.display()
-                    ))
+                    ValidateBlobError::corrupt(
+                        LpmError::Store(format!(
+                            "failed to re-inspect existing v3 CAS blob {}: {error}",
+                            blob.display()
+                        )),
+                        None,
+                    )
                 })?;
             }
+            #[cfg(windows)]
+            let pre_fp = BlobStatFingerprint::from_open_file(blob, &file)
+                .map_err(|error| ValidateBlobError::corrupt(error, None))?;
+            #[cfg(not(windows))]
+            let pre_fp = BlobStatFingerprint::from_metadata(&pre_meta);
+            let bad_identity = pre_fp.file_identity();
+
             if !pre_meta.file_type().is_file()
                 || pre_meta.len() != key.size
                 || normalized_mode(&pre_meta) != key.mode
             {
-                return Err(LpmError::Store(format!(
-                    "existing v3 CAS blob failed integrity validation at {}",
-                    blob.display()
-                )));
+                return Err(ValidateBlobError::corrupt(
+                    LpmError::Store(format!(
+                        "existing v3 CAS blob failed integrity validation at {}",
+                        blob.display()
+                    )),
+                    bad_identity,
+                ));
             }
-            #[cfg(windows)]
-            let pre_fp = BlobStatFingerprint::from_open_file(blob, &file)?;
-            #[cfg(not(windows))]
-            let pre_fp = BlobStatFingerprint::from_metadata(&pre_meta);
 
-            let digest = hash_open_file(&mut file, blob, hash_buffer)?;
+            let digest = hash_open_file(&mut file, blob, hash_buffer)
+                .map_err(|error| ValidateBlobError::corrupt(error, bad_identity))?;
             if digest != key.digest {
-                return Err(LpmError::Store(format!(
-                    "existing v3 CAS blob failed integrity validation at {}",
-                    blob.display()
-                )));
+                return Err(ValidateBlobError::corrupt(
+                    LpmError::Store(format!(
+                        "existing v3 CAS blob failed integrity validation at {}",
+                        blob.display()
+                    )),
+                    bad_identity,
+                ));
             }
             #[cfg(test)]
             run_test_after_validate_hash_hook(blob);
             let post_meta = file.metadata().map_err(|error| {
-                LpmError::Store(format!(
-                    "failed to re-inspect existing v3 CAS blob {}: {error}",
-                    blob.display()
-                ))
+                ValidateBlobError::corrupt(
+                    LpmError::Store(format!(
+                        "failed to re-inspect existing v3 CAS blob {}: {error}",
+                        blob.display()
+                    )),
+                    bad_identity,
+                )
             })?;
             if !post_meta.file_type().is_file()
                 || post_meta.len() != key.size
                 || normalized_mode(&post_meta) != key.mode
             {
-                return Err(LpmError::Store(format!(
-                    "existing v3 CAS blob changed during integrity validation at {}",
-                    blob.display()
-                )));
+                return Err(ValidateBlobError::corrupt(
+                    LpmError::Store(format!(
+                        "existing v3 CAS blob changed during integrity validation at {}",
+                        blob.display()
+                    )),
+                    bad_identity,
+                ));
             }
             #[cfg(windows)]
-            let post_fp = BlobStatFingerprint::from_open_file(blob, &file)?;
+            let post_fp = BlobStatFingerprint::from_open_file(blob, &file)
+                .map_err(|error| ValidateBlobError::corrupt(error, bad_identity))?;
             #[cfg(not(windows))]
             let post_fp = BlobStatFingerprint::from_metadata(&post_meta);
 
             if post_fp == pre_fp {
                 return Ok(post_fp);
             }
-            if attempt == 0 && post_fp.is_hardlink_only_transition_from(pre_fp) {
-                continue;
+            if post_fp.is_link_count_only_transition_from(pre_fp) {
+                if attempt + 1 < MAX_VALIDATE_BLOB_ATTEMPTS {
+                    continue;
+                }
+                return Err(ValidateBlobError::contended(LpmError::Store(format!(
+                    "existing v3 CAS blob experienced concurrent link updates during validation at {}",
+                    blob.display()
+                ))));
             }
-            return Err(LpmError::Store(format!(
-                "existing v3 CAS blob changed during integrity validation at {}",
-                blob.display()
-            )));
+            return Err(ValidateBlobError::corrupt(
+                LpmError::Store(format!(
+                    "existing v3 CAS blob changed during integrity validation at {}",
+                    blob.display()
+                )),
+                bad_identity,
+            ));
         }
-        Err(LpmError::Store(format!(
-            "existing v3 CAS blob changed during integrity validation at {}",
+        Err(ValidateBlobError::contended(LpmError::Store(format!(
+            "existing v3 CAS blob experienced concurrent link updates during validation at {}",
             blob.display()
-        )))
+        ))))
     }
 
     fn publish_tree_manifest(&self, digest: &str, bytes: &[u8]) -> Result<(), LpmError> {
@@ -2731,17 +2950,6 @@ fn count_tree_entries(root: &Path) -> Result<usize, LpmError> {
     Ok(count)
 }
 
-#[cfg(unix)]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    (left.dev(), left.ino()) == (right.dev(), right.ino())
-}
-
-#[cfg(not(unix))]
-fn same_file_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
-    true
-}
-
 #[cfg(all(unix, any(target_os = "macos", test)))]
 fn set_normalized_mode(path: &Path, mode: u32) -> Result<(), LpmError> {
     use std::os::unix::fs::PermissionsExt;
@@ -2819,27 +3027,21 @@ impl ManifestStatFingerprint {
         use std::os::windows::fs::MetadataExt;
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandle,
-            GetFileInformationByHandleEx,
+            FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
         };
 
-        let handle = file.as_raw_handle();
-        let mut handle_info = BY_HANDLE_FILE_INFORMATION::default();
-        // SAFETY: `handle` comes from the live `File` above and
-        // `handle_info` is writable storage of the exact Win32 type.
-        if unsafe { GetFileInformationByHandle(handle, &mut handle_info) } == 0 {
-            return Err(LpmError::Store(format!(
-                "failed to read v3 CAS manifest identity at {}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            )));
-        }
+        let identity = FileIdentity::from_open_file(file).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to read v3 CAS manifest identity at {}: {error}",
+                path.display()
+            ))
+        })?;
         let mut basic_info = FILE_BASIC_INFO::default();
-        // SAFETY: `handle` is live and `basic_info` is writable storage for
+        // SAFETY: `file` is live and `basic_info` is writable storage for
         // the `FileBasicInfo` result requested from Win32.
         if unsafe {
             GetFileInformationByHandleEx(
-                handle,
+                file.as_raw_handle(),
                 FileBasicInfo,
                 &mut basic_info as *mut _ as *mut _,
                 std::mem::size_of::<FILE_BASIC_INFO>() as u32,
@@ -2854,9 +3056,8 @@ impl ManifestStatFingerprint {
         }
 
         Ok(Self {
-            volume_serial_number: handle_info.dwVolumeSerialNumber,
-            file_index: (u64::from(handle_info.nFileIndexHigh) << 32)
-                | u64::from(handle_info.nFileIndexLow),
+            volume_serial_number: identity.volume,
+            file_index: identity.file_id,
             creation_time: metadata.creation_time(),
             last_write_time: metadata.last_write_time(),
             change_time: basic_info.ChangeTime,
@@ -2895,8 +3096,7 @@ fn file_identity_for_path(
     _path: &Path,
     metadata: &fs::Metadata,
 ) -> Result<Option<FileIdentity>, LpmError> {
-    use std::os::unix::fs::MetadataExt;
-    Ok(Some(FileIdentity(metadata.dev(), metadata.ino())))
+    Ok(Some(FileIdentity::from_unix_metadata(metadata)))
 }
 
 #[cfg(windows)]
@@ -2904,31 +3104,19 @@ fn file_identity_for_path(
     path: &Path,
     _metadata: &fs::Metadata,
 ) -> Result<Option<FileIdentity>, LpmError> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-    };
-
     let file = open_attributes_nofollow(path).map_err(|error| {
         LpmError::Store(format!(
             "failed to inspect v3 CAS file identity at {}: {error}",
             path.display()
         ))
     })?;
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: `file` is open and `info` is valid writable storage for the Win32 struct.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
-        return Err(LpmError::Store(format!(
-            "failed to read v3 CAS file identity at {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        )));
-    }
-    let file_index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
-    Ok(Some(FileIdentity(
-        u64::from(info.dwVolumeSerialNumber),
-        file_index,
-    )))
+    let identity = FileIdentity::from_open_file(&file).map_err(|error| {
+        LpmError::Store(format!(
+            "failed to read v3 CAS file identity at {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(identity))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -2941,6 +3129,138 @@ fn file_identity_for_path(
     _metadata: &fs::Metadata,
 ) -> Result<Option<FileIdentity>, LpmError> {
     Ok(None)
+}
+
+#[cfg(unix)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Windows implementation, which queries handle identity"
+)]
+fn file_identity_from_open_file(
+    _path: &Path,
+    _file: &fs::File,
+    metadata: &fs::Metadata,
+) -> Result<Option<FileIdentity>, LpmError> {
+    Ok(Some(FileIdentity::from_unix_metadata(metadata)))
+}
+
+#[cfg(windows)]
+fn file_identity_from_open_file(
+    path: &Path,
+    file: &fs::File,
+    _metadata: &fs::Metadata,
+) -> Result<Option<FileIdentity>, LpmError> {
+    let identity = FileIdentity::from_open_file(file).map_err(|error| {
+        LpmError::Store(format!(
+            "failed to read v3 CAS file identity at {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(identity))
+}
+
+#[cfg(not(any(unix, windows)))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Windows implementation, which queries handle identity"
+)]
+fn file_identity_from_open_file(
+    _path: &Path,
+    _file: &fs::File,
+    _metadata: &fs::Metadata,
+) -> Result<Option<FileIdentity>, LpmError> {
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn unix_extracted_stamp_from_metadata(metadata: &fs::Metadata) -> Option<ExtractedFileStamp> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mtime_ns = u64::try_from(metadata.mtime())
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::try_from(metadata.mtime_nsec()).ok()?)?;
+    let ctime_ns = u64::try_from(metadata.ctime())
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::try_from(metadata.ctime_nsec()).ok()?)?;
+    Some(ExtractedFileStamp {
+        identity: FileIdentity::from_unix_metadata(metadata),
+        size: metadata.len(),
+        mode: normalized_mode(metadata),
+        mtime_ns,
+        ctime_ns,
+    })
+}
+
+fn inspect_registry_source_file(
+    source: &Path,
+) -> Result<(u64, u32, Option<FileIdentity>, Option<ExtractedFileStamp>), LpmError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        let file = open_attributes_nofollow(source).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to inspect extracted v3 CAS entry {}: {error}",
+                source.display()
+            ))
+        })?;
+        let metadata = file.metadata().map_err(|error| {
+            LpmError::Store(format!(
+                "failed to inspect extracted v3 CAS entry {}: {error}",
+                source.display()
+            ))
+        })?;
+        if !metadata.file_type().is_file()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(LpmError::Store(format!(
+                "extracted v3 CAS entry changed before publication at {}",
+                source.display()
+            )));
+        }
+        let file_size = metadata.len();
+        let mode = normalized_mode(&metadata);
+        if let Some(win_stamp) = lpm_common::windows_regular_file_stamp_from_open_file(&file) {
+            let identity = win_stamp.identity;
+            let live_stamp = ExtractedFileStamp {
+                identity,
+                size: win_stamp.len,
+                mode,
+                mtime_ns: win_stamp.mtime_ns,
+                ctime_ns: win_stamp.ctime_ns,
+            };
+            Ok((file_size, mode, Some(identity), Some(live_stamp)))
+        } else {
+            let identity = file_identity_from_open_file(source, &file, &metadata)?;
+            Ok((file_size, mode, identity, None))
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let metadata = fs::symlink_metadata(source).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to inspect extracted v3 CAS entry {}: {error}",
+                source.display()
+            ))
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(LpmError::Store(format!(
+                "extracted v3 CAS entry changed before publication at {}",
+                source.display()
+            )));
+        }
+        let file_size = metadata.len();
+        let mode = normalized_mode(&metadata);
+        let identity = file_identity_for_path(source, &metadata)?;
+        #[cfg(unix)]
+        let live_stamp = unix_extracted_stamp_from_metadata(&metadata);
+        #[cfg(not(unix))]
+        let live_stamp = None;
+        Ok((file_size, mode, identity, live_stamp))
+    }
 }
 
 fn paths_share_file_identity(left: &Path, right: &Path) -> bool {
@@ -2994,6 +3314,17 @@ impl BlobStatFingerprint {
         }
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "matches platforms where file identity cannot be queried"
+    )]
+    fn file_identity(self) -> Option<FileIdentity> {
+        Some(FileIdentity {
+            volume: self.dev,
+            file_id: u128::from(self.ino),
+        })
+    }
+
     fn same_content_identity(self, other: Self) -> bool {
         (self.dev, self.ino, self.mode, self.mtime, self.mtime_nsec)
             == (
@@ -3007,6 +3338,10 @@ impl BlobStatFingerprint {
 
     fn is_hardlink_only_transition_from(self, prior: Self) -> bool {
         self.same_content_identity(prior) && self.nlink > prior.nlink
+    }
+
+    fn is_link_count_only_transition_from(self, prior: Self) -> bool {
+        self.same_content_identity(prior) && self.nlink != prior.nlink
     }
 
     fn update_hasher(self, hasher: &mut blake3::Hasher) {
@@ -3115,6 +3450,12 @@ impl BlobStatFingerprint {
                 std::io::Error::last_os_error()
             )));
         }
+        let identity = FileIdentity::from_open_file(file).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to read v3 CAS blob file ID at {}: {error}",
+                path.display()
+            ))
+        })?;
         let creation_time = (u64::from(handle_info.ftCreationTime.dwHighDateTime) << 32)
             | u64::from(handle_info.ftCreationTime.dwLowDateTime);
         let last_write_time = (u64::from(handle_info.ftLastWriteTime.dwHighDateTime) << 32)
@@ -3123,9 +3464,8 @@ impl BlobStatFingerprint {
             (u64::from(handle_info.nFileSizeHigh) << 32) | u64::from(handle_info.nFileSizeLow);
         Ok((
             Self {
-                volume_serial_number: handle_info.dwVolumeSerialNumber,
-                file_index: (u64::from(handle_info.nFileIndexHigh) << 32)
-                    | u64::from(handle_info.nFileIndexLow),
+                volume_serial_number: identity.volume,
+                file_index: identity.file_id,
                 creation_time,
                 last_write_time,
                 change_time: basic_info.ChangeTime,
@@ -3134,6 +3474,17 @@ impl BlobStatFingerprint {
             },
             size,
         ))
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "matches platforms where file identity cannot be queried"
+    )]
+    fn file_identity(self) -> Option<FileIdentity> {
+        Some(FileIdentity {
+            volume: self.volume_serial_number,
+            file_id: self.file_index,
+        })
     }
 
     fn same_content_identity(self, other: Self) -> bool {
@@ -3154,6 +3505,10 @@ impl BlobStatFingerprint {
 
     fn is_hardlink_only_transition_from(self, prior: Self) -> bool {
         self.same_content_identity(prior) && self.nlink > prior.nlink
+    }
+
+    fn is_link_count_only_transition_from(self, prior: Self) -> bool {
+        self.same_content_identity(prior) && self.nlink != prior.nlink
     }
 
     fn update_hasher(self, hasher: &mut blake3::Hasher) {
@@ -3199,7 +3554,15 @@ impl BlobStatFingerprint {
         }
     }
 
+    fn file_identity(self) -> Option<FileIdentity> {
+        None
+    }
+
     fn is_hardlink_only_transition_from(self, _prior: Self) -> bool {
+        false
+    }
+
+    fn is_link_count_only_transition_from(self, _prior: Self) -> bool {
         false
     }
 
@@ -3529,25 +3892,58 @@ impl<'a> HardlinkReplaceGuard<'a> {
         }
     }
 
-    fn commit(mut self) -> Result<(), LpmError> {
-        self.active = false;
-        fs::remove_file(&self.backup).map_err(|error| {
-            LpmError::Store(format!(
-                "failed to remove replaced v3 CAS object file {}: {error}",
-                self.backup.display()
-            ))
-        })
+    fn commit(self) -> Result<(), LpmError> {
+        self.commit_with(|backup| fs::remove_file(backup))
     }
 
-    fn rollback(mut self) -> Result<(), LpmError> {
-        self.active = false;
-        let _ = fs::remove_file(self.destination);
-        fs::rename(&self.backup, self.destination).map_err(|error| {
+    fn commit_with(
+        mut self,
+        remove_backup: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> Result<(), LpmError> {
+        match remove_backup(&self.backup) {
+            Ok(()) => {
+                self.active = false;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.active = false;
+                Ok(())
+            }
+            Err(error) => Err(LpmError::Store(format!(
+                "failed to remove replaced v3 CAS object file {}: {error}",
+                self.backup.display()
+            ))),
+        }
+    }
+
+    fn rollback(self) -> Result<(), LpmError> {
+        self.rollback_with(
+            |destination| fs::remove_file(destination),
+            |backup, destination| fs::rename(backup, destination),
+        )
+    }
+
+    fn rollback_with(
+        mut self,
+        remove_destination: impl FnOnce(&Path) -> io::Result<()>,
+        rename_backup: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    ) -> Result<(), LpmError> {
+        if let Err(error) = remove_destination(self.destination)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(LpmError::Store(format!(
+                "failed to remove staged v3 CAS object file {}: {error}",
+                self.destination.display()
+            )));
+        }
+        rename_backup(&self.backup, self.destination).map_err(|error| {
             LpmError::Store(format!(
                 "failed to restore staged v3 CAS object file {}: {error}",
                 self.destination.display()
             ))
-        })
+        })?;
+        self.active = false;
+        Ok(())
     }
 }
 
@@ -3560,6 +3956,7 @@ impl Drop for HardlinkReplaceGuard<'_> {
     }
 }
 
+#[cfg(all(unix, test))]
 fn hash_file_bytes(path: &Path, buffer: &mut [u8]) -> Result<[u8; 32], LpmError> {
     let (mut file, _) = open_regular_file_nofollow(path).map_err(|error| {
         LpmError::Store(format!(
@@ -4512,6 +4909,7 @@ mod tests {
             Path::new("first.js"),
             Some(13),
             digest,
+            None,
         )
         .unwrap();
 
@@ -4532,6 +4930,7 @@ mod tests {
                 Path::new("second.js"),
                 Some(13),
                 digest,
+                None,
             )
             .unwrap_err();
         assert!(
@@ -4762,6 +5161,408 @@ mod tests {
             open.read_per_blob_digests(SOURCE_VALIDATION_MAX_TRAILER_BLOBS + 1)
                 .is_none()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_blob_reuses_settled_session_validated_blob_without_rehashing() {
+        let root = tempfile::tempdir().unwrap();
+        let cas = FileCas::at(root.path());
+        let first = root.path().join("objects/first");
+        let second = root.path().join("objects/second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        write_file(&first.join("shared.js"), b"shared-payload-bytes", 0o644);
+        write_file(&second.join("shared.js"), b"shared-payload-bytes", 0o644);
+
+        cas.ingest_object_tree(&first, "sha512-first", false)
+            .unwrap();
+        std::thread::sleep(SETTLED_BLOB_MTIME_MARGIN + Duration::from_millis(20));
+
+        let hash_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&hash_calls);
+        let _guard = TestAfterValidateHashGuard::install(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        cas.ingest_object_tree(&second, "sha512-second", false)
+            .unwrap();
+        assert_eq!(
+            hash_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "deduplicating against a settled session-validated blob must not re-hash it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_manifest_reuses_settled_session_validated_blob_without_rehashing() {
+        let root = tempfile::tempdir().unwrap();
+        let cas = FileCas::at(root.path());
+        let first = root.path().join("objects/mat-first");
+        fs::create_dir_all(&first).unwrap();
+        write_file(&first.join("index.js"), b"materialized-bytes", 0o644);
+        let prepared = cas
+            .ingest_object_tree(&first, "sha512-mat-first", false)
+            .unwrap();
+        let manifest = cas
+            .manifest_for_digest(&prepared.record.tree_digest)
+            .unwrap();
+        std::thread::sleep(SETTLED_BLOB_MTIME_MARGIN + Duration::from_millis(20));
+
+        let hash_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&hash_calls);
+        let _guard = TestAfterValidateHashGuard::install(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let materialized = cas
+            .ensure_materialized_entry(&prepared.record.tree_digest, &manifest)
+            .unwrap();
+        assert_eq!(
+            fs::read(materialized.join("index.js")).unwrap(),
+            b"materialized-bytes"
+        );
+        assert_eq!(
+            hash_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "materializing a settled session-validated blob must not re-hash it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_blob_cannot_commit_corrupt_staged_inode_when_blob_path_is_replaced_mid_stage() {
+        let root = tempfile::tempdir().unwrap();
+        let cas = FileCas::at(root.path());
+        let clean_bytes = b"clean-content-for-race";
+        let corrupt_bytes = b"CORRUPT-INODE-PAYLOAD!";
+        assert_eq!(clean_bytes.len(), corrupt_bytes.len());
+
+        let first = root.path().join("objects/seed");
+        let second = root.path().join("objects/victim");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        write_file(&first.join("index.js"), clean_bytes, 0o644);
+        let prepared = cas
+            .ingest_object_tree(&first, "sha512-seed-race", false)
+            .unwrap();
+        let manifest = cas
+            .manifest_for_digest(&prepared.record.tree_digest)
+            .unwrap();
+        let key = manifest.entries[0].blob.as_ref().unwrap().clone();
+        let blob_path = cas.blob_path(&key).unwrap();
+
+        // Replace blob at path with a corrupt inode X of identical length and mode.
+        let corrupt_staging = root.path().join("corrupt.tmp");
+        write_file(&corrupt_staging, corrupt_bytes, 0o644);
+        fs::rename(&corrupt_staging, &blob_path).unwrap();
+        cas.evict_validated_blob(&key);
+
+        // Prepare clean replacement inode Y that Worker B publishes between A's stage and validate.
+        let clean_replacement = root.path().join("clean-replacement.tmp");
+        write_file(&clean_replacement, clean_bytes, 0o644);
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_clone = std::sync::Arc::clone(&fired);
+        let _guard = TestAfterPublishHardlinkGuard::install(move |blob| {
+            if !fired_clone.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let _ = fs::rename(&clean_replacement, blob);
+            }
+        });
+
+        let victim_file = second.join("index.js");
+        write_file(&victim_file, clean_bytes, 0o644);
+        cas.ingest_object_tree(&second, "sha512-victim-race", false)
+            .unwrap();
+
+        assert_eq!(
+            fs::read(&victim_file).unwrap(),
+            clean_bytes,
+            "staged source file must never remain hardlinked to corrupt inode X after blob path is replaced with clean inode Y"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_blob_does_not_quarantine_valid_blob_on_concurrent_nlink_decrease_or_double_increase()
+     {
+        let root = tempfile::tempdir().unwrap();
+        let cas = FileCas::at(root.path());
+        let first = root.path().join("objects/nlink-seed");
+        let second = root.path().join("objects/nlink-second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        write_file(&first.join("index.js"), b"valid-nlink-bytes", 0o644);
+        let prepared = cas
+            .ingest_object_tree(&first, "sha512-nlink-seed", false)
+            .unwrap();
+        let manifest = cas
+            .manifest_for_digest(&prepared.record.tree_digest)
+            .unwrap();
+        let key = manifest.entries[0].blob.as_ref().unwrap().clone();
+        let blob_path = cas.blob_path(&key).unwrap();
+        let orig_id =
+            file_identity_for_path(&blob_path, &fs::symlink_metadata(&blob_path).unwrap())
+                .unwrap()
+                .unwrap();
+        let quarantine_blobs = root.path().join("quarantine/blobs");
+
+        // Case 1: concurrent hardlink unlink (nlink decreases) during validation.
+        let extra_link = root.path().join("extra-link");
+        fs::hard_link(&blob_path, &extra_link).unwrap();
+        cas.evict_validated_blob(&key);
+        let unlinked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let unlinked_clone = std::sync::Arc::clone(&unlinked);
+        let extra_for_hook = extra_link;
+        {
+            let _guard = TestAfterValidateHashGuard::install(move |_| {
+                if !unlinked_clone.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let _ = fs::remove_file(&extra_for_hook);
+                }
+            });
+            write_file(&second.join("index.js"), b"valid-nlink-bytes", 0o644);
+            cas.ingest_object_tree(&second, "sha512-nlink-second", false)
+                .unwrap();
+        }
+        assert_eq!(
+            file_identity_for_path(&blob_path, &fs::symlink_metadata(&blob_path).unwrap())
+                .unwrap()
+                .unwrap(),
+            orig_id,
+            "valid blob must keep its original inode when a sibling hardlink is unlinked during validation"
+        );
+        assert!(
+            !quarantine_blobs.exists(),
+            "concurrent hardlink unlink must never quarantine a valid blob"
+        );
+
+        // Case 2: two consecutive nlink increases during validation.
+        let third = root.path().join("objects/nlink-third");
+        fs::create_dir_all(&third).unwrap();
+        cas.evict_validated_blob(&key);
+        let adds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let adds_clone = std::sync::Arc::clone(&adds);
+        let link_root = root.path().to_path_buf();
+        {
+            let _guard = TestAfterValidateHashGuard::install(move |path| {
+                let n = adds_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n < 2 {
+                    let _ = fs::hard_link(path, link_root.join(format!("burst-link-{n}")));
+                }
+            });
+            write_file(&third.join("index.js"), b"valid-nlink-bytes", 0o644);
+            cas.ingest_object_tree(&third, "sha512-nlink-third", false)
+                .unwrap();
+        }
+        assert_eq!(
+            file_identity_for_path(&blob_path, &fs::symlink_metadata(&blob_path).unwrap())
+                .unwrap()
+                .unwrap(),
+            orig_id,
+            "valid blob must keep its original inode on two concurrent hardlink additions during validation"
+        );
+        assert!(
+            !quarantine_blobs.exists(),
+            "two concurrent hardlink additions must never quarantine a valid blob"
+        );
+
+        // Case 3: sustained contention across every attempt must fail without quarantining.
+        let fourth = root.path().join("objects/nlink-fourth");
+        fs::create_dir_all(&fourth).unwrap();
+        cas.evict_validated_blob(&key);
+        let sustained = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sustained_clone = std::sync::Arc::clone(&sustained);
+        let link_root = root.path().to_path_buf();
+        {
+            let _guard = TestAfterValidateHashGuard::install(move |path| {
+                let n = sustained_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = fs::hard_link(path, link_root.join(format!("sustained-link-{n}")));
+            });
+            write_file(&fourth.join("index.js"), b"valid-nlink-bytes", 0o644);
+            assert!(
+                cas.ingest_object_tree(&fourth, "sha512-nlink-fourth", false)
+                    .is_err(),
+                "sustained link-count contention across all validation retries must return an error"
+            );
+        }
+        assert_eq!(
+            file_identity_for_path(&blob_path, &fs::symlink_metadata(&blob_path).unwrap())
+                .unwrap()
+                .unwrap(),
+            orig_id,
+            "sustained link-count contention must preserve the original healthy blob inode"
+        );
+        assert!(
+            !quarantine_blobs.exists(),
+            "sustained link-count contention must never quarantine a healthy blob"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ingest_registry_file_rejects_same_length_substitution_before_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let cas = FileCas::at(root.path());
+        let obj_dir = root.path().join("objects/subst");
+        fs::create_dir_all(&obj_dir).unwrap();
+        let clean = b"clean-bytes-1234";
+        let swapped = b"EVIL!-bytes-1234";
+        assert_eq!(clean.len(), swapped.len());
+
+        let clean_digest = *blake3::hash(clean).as_bytes();
+        let target = obj_dir.join("index.js");
+        write_file(&target, clean, 0o644);
+        let original_stamp =
+            unix_extracted_stamp_from_metadata(&fs::symlink_metadata(&target).unwrap()).unwrap();
+
+        // Replace the file atomically with same-length malicious bytes (new inode).
+        let replacement = obj_dir.join("evil.tmp");
+        write_file(&replacement, swapped, 0o644);
+        fs::rename(&replacement, &target).unwrap();
+
+        let mut ingest = cas
+            .begin_registry_ingest(&obj_dir, "sha512-subst-none")
+            .unwrap();
+        let without_stamp = cas.ingest_registry_file(
+            &mut ingest,
+            &obj_dir,
+            Path::new("index.js"),
+            Some(clean.len() as u64),
+            clean_digest,
+            None,
+        );
+        assert!(
+            without_stamp.is_err(),
+            "ingest_registry_file without extractor stamp must reject substituted same-length bytes"
+        );
+
+        let mut ingest_stale = cas
+            .begin_registry_ingest(&obj_dir, "sha512-subst-stale")
+            .unwrap();
+        let with_stale_stamp = cas.ingest_registry_file(
+            &mut ingest_stale,
+            &obj_dir,
+            Path::new("index.js"),
+            Some(clean.len() as u64),
+            clean_digest,
+            Some(original_stamp),
+        );
+        assert!(
+            with_stale_stamp.is_err(),
+            "ingest_registry_file with stale extractor stamp must reject substituted same-length bytes"
+        );
+
+        // Positive control: genuine file matching its captured stamp publishes cleanly.
+        let clean_dir = root.path().join("objects/clean-ok");
+        fs::create_dir_all(&clean_dir).unwrap();
+        let clean_target = clean_dir.join("index.js");
+        write_file(&clean_target, clean, 0o644);
+        let clean_stamp =
+            unix_extracted_stamp_from_metadata(&fs::symlink_metadata(&clean_target).unwrap())
+                .unwrap();
+        let mut ingest_ok = cas
+            .begin_registry_ingest(&clean_dir, "sha512-clean-ok")
+            .unwrap();
+        cas.ingest_registry_file(
+            &mut ingest_ok,
+            &clean_dir,
+            Path::new("index.js"),
+            Some(clean.len() as u64),
+            clean_digest,
+            Some(clean_stamp),
+        )
+        .unwrap();
+        let prepared = cas.finish_registry_ingest(ingest_ok).unwrap();
+        cas.publish_source_record(&clean_dir, &prepared).unwrap();
+        assert_eq!(
+            cas.source_reuse_status(&clean_dir, "sha512-clean-ok")
+                .unwrap(),
+            SourceReuseStatus::Reusable
+        );
+    }
+
+    #[test]
+    fn hardlink_replace_guard_retains_recovery_state_on_commit_and_rollback_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let blob = root.path().join("blob");
+        let dest = root.path().join("dest");
+        fs::write(&blob, b"shared-blob").unwrap();
+        fs::write(&dest, b"original-dest").unwrap();
+
+        // Fault during commit must keep recovery active so drop restores the original file.
+        let guard = HardlinkReplaceGuard::stage(&blob, &dest).unwrap();
+        let backup_path = guard.backup.clone();
+        let commit_err = guard.commit_with(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "transient unlink failure",
+            ))
+        });
+        assert!(commit_err.is_err());
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            b"original-dest",
+            "failed commit must restore original destination via drop recovery"
+        );
+        assert!(
+            !backup_path.exists(),
+            "backup must not be leaked after failed commit drop recovery"
+        );
+
+        // Transient rename failure during rollback must keep recovery active so drop restores it.
+        let guard = HardlinkReplaceGuard::stage(&blob, &dest).unwrap();
+        let backup_path = guard.backup.clone();
+        let rollback_err = guard.rollback_with(
+            |destination| fs::remove_file(destination),
+            |_, _| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "transient rename failure",
+                ))
+            },
+        );
+        assert!(rollback_err.is_err());
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            b"original-dest",
+            "failed rollback must still recover original destination on drop"
+        );
+        assert!(
+            !backup_path.exists(),
+            "backup must be restored cleanly on drop after transient rollback rename failure"
+        );
+
+        // Non-NotFound remove_file failure during rollback must be surfaced as an error.
+        let guard = HardlinkReplaceGuard::stage(&blob, &dest).unwrap();
+        let remove_err = guard.rollback_with(
+            |_| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "cannot remove staged link",
+                ))
+            },
+            |backup, destination| fs::rename(backup, destination),
+        );
+        assert!(remove_err.is_err());
+        assert_eq!(fs::read(&dest).unwrap(), b"original-dest");
+    }
+
+    #[test]
+    fn file_identity_distinguishes_128_bit_ids_with_identical_lower_64_bits() {
+        let low = 0x0000_0000_DEAD_BEEF_u128;
+        let first = FileIdentity {
+            volume: 42,
+            file_id: (1_u128 << 64) | low,
+        };
+        let second = FileIdentity {
+            volume: 42,
+            file_id: (2_u128 << 64) | low,
+        };
+        assert_ne!(
+            first, second,
+            "128-bit file IDs sharing the lower 64 bits must not collide as aliases"
+        );
+        let mut seen = HashMap::new();
+        seen.insert(first, b"a.js".to_vec());
+        assert!(!seen.contains_key(&second));
     }
 }
 
