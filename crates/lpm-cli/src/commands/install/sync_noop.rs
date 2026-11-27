@@ -324,7 +324,11 @@ pub(crate) fn is_up_to_date(
     let mut node_fp_refreshed = false;
     if cached_engine.key != "none" {
         let runtime_fingerprint = engine_policy.resolved_node_runtime_fingerprint();
-        if runtime_fingerprint != cached_engine.runtime_fingerprint {
+        if runtime_fingerprint != cached_engine.runtime_fingerprint
+            && let Ok(Some(_install_lock)) = lpm_common::try_acquire_exclusive_lock(
+                lpm_common::project_install_lock(project_dir),
+            )
+        {
             match crate::install_state::refresh_install_hash_node_runtime_fingerprint(
                 project_dir,
                 cached_engine.key,

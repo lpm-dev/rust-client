@@ -1371,22 +1371,28 @@ fn open_monitor_verdict_cache_dir_nofollow(
     #[cfg(unix)]
     let root_dir = {
         use std::os::fd::AsRawFd as _;
-        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
+        let euid = unsafe { libc::geteuid() };
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(cache_root)
             .ok()?;
         let opened_meta = file.metadata().ok()?;
-        if !opened_meta.is_dir() {
+        if !opened_meta.is_dir() || opened_meta.uid() != euid {
             return None;
         }
-        if create && (opened_meta.permissions().mode() & 0o777) != 0o700 {
-            // SAFETY: `file` is a valid open directory descriptor pinned without following symlinks.
-            if unsafe { libc::fchmod(file.as_raw_fd(), 0o700) } != 0 {
-                return None;
+        let mode = opened_meta.permissions().mode() & 0o777;
+        if create {
+            if mode != 0o700 {
+                // SAFETY: `file` is a valid open directory descriptor pinned without following symlinks.
+                if unsafe { libc::fchmod(file.as_raw_fd(), 0o700) } != 0 {
+                    return None;
+                }
             }
+        } else if (mode & 0o022) != 0 {
+            return None;
         }
         cap_std::fs::Dir::from_std_file(file)
     };
@@ -1426,8 +1432,9 @@ fn open_monitor_verdict_cache_dir_nofollow(
     #[cfg(unix)]
     let sub_dir = {
         use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _};
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
+        let euid = unsafe { libc::geteuid() };
         let root_fd = root_dir.as_fd().as_raw_fd();
         let subdir_cstr = std::ffi::CString::new(MONITOR_VERDICT_SUBDIR).ok()?;
         if create {
@@ -1453,14 +1460,19 @@ fn open_monitor_verdict_cache_dir_nofollow(
         // SAFETY: `sub_fd` was just returned by `openat` and is exclusively owned here.
         let sub_file = unsafe { std::fs::File::from_raw_fd(sub_fd) };
         let sub_meta = sub_file.metadata().ok()?;
-        if !sub_meta.is_dir() {
+        if !sub_meta.is_dir() || sub_meta.uid() != euid {
             return None;
         }
-        if create && (sub_meta.permissions().mode() & 0o777) != 0o700 {
-            // SAFETY: `sub_file` is a real `O_RDONLY` directory descriptor opened with `O_NOFOLLOW`.
-            if unsafe { libc::fchmod(sub_file.as_raw_fd(), 0o700) } != 0 {
-                return None;
+        let sub_mode = sub_meta.permissions().mode() & 0o777;
+        if create {
+            if sub_mode != 0o700 {
+                // SAFETY: `sub_file` is a real `O_RDONLY` directory descriptor opened with `O_NOFOLLOW`.
+                if unsafe { libc::fchmod(sub_file.as_raw_fd(), 0o700) } != 0 {
+                    return None;
+                }
             }
+        } else if (sub_mode & 0o022) != 0 {
+            return None;
         }
         cap_std::fs::Dir::from_std_file(sub_file)
     };
@@ -3190,6 +3202,31 @@ mod tests {
         assert_eq!(
             target_mode, 0o755,
             "refusing a symlinked cache root must not chmod its target directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_monitor_verdict_cache_dir_read_mode_rejects_group_or_world_writable_directories() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let cache_root = root.path().join("metadata-cache");
+        let subdir = cache_root.join(MONITOR_VERDICT_SUBDIR);
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::set_permissions(&cache_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&subdir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        assert!(
+            open_monitor_verdict_cache_dir_nofollow(&cache_root, false).is_none(),
+            "read-only verdict cache open must reject world-writable monitor-verdicts directory"
+        );
+
+        std::fs::set_permissions(&subdir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&cache_root, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(
+            open_monitor_verdict_cache_dir_nofollow(&cache_root, false).is_none(),
+            "read-only verdict cache open must reject group-writable cache root"
         );
     }
 }

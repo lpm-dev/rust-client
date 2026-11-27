@@ -1700,6 +1700,10 @@ pub(crate) fn backfill_install_hash_sync_noop_proof_with_refresh(
     force_refresh: bool,
     expected_header: Option<(&str, &str, Option<SyncNoopFileStamp>)>,
 ) -> std::io::Result<bool> {
+    let lock_path = lpm_common::project_install_lock(project_dir);
+    let Ok(Some(_install_lock)) = lpm_common::try_acquire_exclusive_lock(lock_path) else {
+        return Ok(false);
+    };
     let hash_path = project_dir.join(".lpm").join("install-hash");
     let (content, current_stamp) = match read_text_regular_file_capped_with_stamp(
         &hash_path,
@@ -2164,9 +2168,19 @@ pub(crate) fn write_install_hash_with_integrity_platform_and_dependency_engine(
                 crate::source_analysis_config::DEFAULT_SECURITY_ANALYSIS_POLICY,
             sync_noop_proof: None,
             release_age_policy_key: None,
-            allow_mtime_fast_path: true,
+            mtime_policy: InstallHashMtimePolicy::StatFromDisk,
         },
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InstallHashMtimePolicy {
+    StatFromDisk,
+    Verified {
+        pkg_mtime_ns: u64,
+        lock_mtime_ns: u64,
+    },
+    Disable,
 }
 
 pub(crate) struct KnownInstallHashRuntimeState<'a> {
@@ -2195,7 +2209,7 @@ pub(crate) fn write_install_hash_with_known_runtime_state(
         platform,
         dependency_engine_key,
         runtime_state,
-        true,
+        InstallHashMtimePolicy::StatFromDisk,
     )
 }
 
@@ -2208,7 +2222,7 @@ pub(crate) fn write_install_hash_with_known_runtime_state_and_mtime_policy(
     platform: &PlatformTuple,
     dependency_engine_key: &str,
     runtime_state: KnownInstallHashRuntimeState<'_>,
-    allow_mtime_fast_path: bool,
+    mtime_policy: InstallHashMtimePolicy,
 ) -> std::io::Result<()> {
     write_install_hash_with_metadata(
         project_dir,
@@ -2223,7 +2237,7 @@ pub(crate) fn write_install_hash_with_known_runtime_state_and_mtime_policy(
             security_analysis_policy: runtime_state.security_analysis_policy,
             sync_noop_proof: runtime_state.sync_noop_proof,
             release_age_policy_key: runtime_state.release_age_policy_key,
-            allow_mtime_fast_path,
+            mtime_policy,
         },
     )
 }
@@ -2234,7 +2248,7 @@ struct InstallHashWriteMetadata<'a> {
     security_analysis_policy: SecurityAnalysisPolicy,
     sync_noop_proof: Option<&'a SyncNoopLockfileProofInput>,
     release_age_policy_key: Option<&'a str>,
-    allow_mtime_fast_path: bool,
+    mtime_policy: InstallHashMtimePolicy,
 }
 
 fn write_install_hash_with_metadata(
@@ -2255,20 +2269,27 @@ fn write_install_hash_with_metadata(
             "invalid Node runtime fingerprint",
         ));
     }
-    let mtime_line = if metadata.allow_mtime_fast_path {
-        let (pkg_ns, _) = mtime_ns_and_len(&project_dir.join("package.json")).unwrap_or((0, 0));
-        let lock_path = metadata.lockfile_path.map_or_else(
-            || {
-                std::borrow::Cow::Owned(
-                    crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir),
-                )
-            },
-            std::borrow::Cow::Borrowed,
-        );
-        let (lock_ns, _) = mtime_ns_and_len(&lock_path).unwrap_or((0, 0));
-        format!("m:{pkg_ns}:{lock_ns}")
-    } else {
-        "m:stale:stale".to_string()
+    let mtime_line = match metadata.mtime_policy {
+        InstallHashMtimePolicy::StatFromDisk => {
+            let (pkg_ns, _) = mtime_ns_and_len(&project_dir.join("package.json")).unwrap_or((0, 0));
+            let lock_path = metadata.lockfile_path.map_or_else(
+                || {
+                    std::borrow::Cow::Owned(
+                        crate::commands::install::workspace_lockfile::active_lockfile_path(
+                            project_dir,
+                        ),
+                    )
+                },
+                std::borrow::Cow::Borrowed,
+            );
+            let (lock_ns, _) = mtime_ns_and_len(&lock_path).unwrap_or((0, 0));
+            format!("m:{pkg_ns}:{lock_ns}")
+        }
+        InstallHashMtimePolicy::Verified {
+            pkg_mtime_ns,
+            lock_mtime_ns,
+        } => format!("m:{pkg_mtime_ns}:{lock_mtime_ns}"),
+        InstallHashMtimePolicy::Disable => "m:stale:stale".to_string(),
     };
 
     let hash_dir = lpm_common::ensure_project_state_dir(project_dir)?;
@@ -5071,5 +5092,47 @@ mod tests {
             result.is_err(),
             "symlink to FIFO must fail immediately instead of blocking"
         );
+    }
+
+    #[test]
+    fn backfill_install_hash_sync_noop_proof_skips_when_project_install_lock_is_held() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".lpm")).unwrap();
+        let hash_path = root.join(".lpm/install-hash");
+        let original = "hash_a\nm:100:200\n";
+        fs::write(&hash_path, original).unwrap();
+        let (_, real_stamp) = read_text_regular_file_capped_with_stamp(
+            &hash_path,
+            lpm_common::STATE_FILE_SIZE_CAP_BYTES,
+        )
+        .unwrap();
+
+        let lock_path = lpm_common::project_install_lock(root);
+        let _install_lock = lpm_common::acquire_exclusive_lock(&lock_path).unwrap();
+
+        let input = SyncNoopLockfileProofInput {
+            pkg_digest: sync_noop_content_digest_hex(b"{}"),
+            lock_digest: sync_noop_content_digest_hex(b""),
+            lockfile_eligible: true,
+            has_node_engines: false,
+            auto_install_peers: false,
+            frozen_ok: true,
+            routes_fingerprint: "0123456789abcdef".to_string(),
+            pkg_stamp: None,
+            lock_stamp: None,
+        };
+        let applied = backfill_install_hash_sync_noop_proof_with_refresh(
+            root,
+            &input,
+            true,
+            Some(("hash_a", "m:100:200", real_stamp)),
+        )
+        .unwrap();
+        assert!(
+            !applied,
+            "proof backfill must skip when another install holds the project install lock"
+        );
+        assert_eq!(fs::read_to_string(&hash_path).unwrap(), original);
     }
 }

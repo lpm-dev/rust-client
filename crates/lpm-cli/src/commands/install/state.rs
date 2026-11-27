@@ -92,6 +92,33 @@ fn write_post_install_hash_with_context_and_proof(
     lock: &workspace_lockfile::ActiveLockfileSnapshot,
     proof_context: Option<PostInstallSyncNoopProofContext<'_>>,
 ) -> std::io::Result<()> {
+    write_post_install_hash_with_context_and_proof_with_hook(
+        project_dir,
+        linker_mode,
+        object_integrity_policy,
+        security_analysis_policy,
+        dependency_engine_key,
+        node_runtime_fingerprint,
+        release_age_policy_key,
+        lock,
+        proof_context,
+        || {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_post_install_hash_with_context_and_proof_with_hook(
+    project_dir: &Path,
+    linker_mode: lpm_linker::LinkerMode,
+    object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
+    security_analysis_policy: lpm_store::SecurityAnalysisPolicy,
+    dependency_engine_key: &str,
+    node_runtime_fingerprint: Option<&str>,
+    release_age_policy_key: Option<&str>,
+    lock: &workspace_lockfile::ActiveLockfileSnapshot,
+    proof_context: Option<PostInstallSyncNoopProofContext<'_>>,
+    after_snapshot_read: impl FnOnce(),
+) -> std::io::Result<()> {
     let (pkg, pkg_stamp, pkg_read_ok) =
         match crate::install_state::read_text_regular_file_capped_with_stamp(
             &project_dir.join("package.json"),
@@ -169,6 +196,27 @@ fn write_post_install_hash_with_context_and_proof(
             security_analysis_policy,
         },
     );
+    let mtime_policy = if pkg_read_ok && lock_matches_on_disk {
+        let lock_mtime_ns = match &lock_disk {
+            Ok((_, Some(stamp))) => Some(stamp.mtime_ns),
+            Err(lpm_common::BoundedReadError::NotFound { .. }) if lock.content.is_empty() => {
+                Some(0)
+            }
+            _ => None,
+        };
+        match (pkg_stamp.map(|stamp| stamp.mtime_ns), lock_mtime_ns) {
+            (Some(pkg_mtime_ns), Some(lock_mtime_ns)) => {
+                crate::install_state::InstallHashMtimePolicy::Verified {
+                    pkg_mtime_ns,
+                    lock_mtime_ns,
+                }
+            }
+            _ => crate::install_state::InstallHashMtimePolicy::Disable,
+        }
+    } else {
+        crate::install_state::InstallHashMtimePolicy::Disable
+    };
+    after_snapshot_read();
     crate::install_state::write_install_hash_with_known_runtime_state_and_mtime_policy(
         project_dir,
         &hash,
@@ -183,7 +231,7 @@ fn write_post_install_hash_with_context_and_proof(
             sync_noop_proof: sync_noop_proof.as_ref(),
             release_age_policy_key,
         },
-        pkg_read_ok && lock_matches_on_disk,
+        mtime_policy,
     )
 }
 
@@ -1286,6 +1334,15 @@ mod workspace_freshness_tests {
                     source: None,
                 },
             );
+            lock.root_resolutions.insert(
+                "react".to_string(),
+                lpm_lockfile::LockedRootResolution {
+                    instance_id: Some(instance_id),
+                    package: "react".to_string(),
+                    version: version.to_string(),
+                    source: None,
+                },
+            );
             lock
         };
         let installed_lock = make_lock("1.0.0");
@@ -1337,6 +1394,85 @@ mod workspace_freshness_tests {
         assert!(
             !freshness.up_to_date,
             "post-install hash must not stamp substituted lockfile mtime as up-to-date:\n{state}"
+        );
+    }
+
+    #[test]
+    fn post_install_hash_records_verified_read_mtime_when_lockfile_is_replaced_mid_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let pkg_json = r#"{"name":"app","version":"1.0.0","dependencies":{"react":"^1.0.0"}}"#;
+        std::fs::write(project.join("package.json"), pkg_json).unwrap();
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+
+        let make_lock = |version: &str| {
+            let mut lock = lpm_lockfile::Lockfile::new();
+            let instance_id = lpm_common::PackageInstanceId::derive("react", version, "npm", "");
+            lock.add_package(lpm_lockfile::LockedPackage {
+                instance_id: Some(instance_id),
+                name: "react".to_string(),
+                version: version.to_string(),
+                ..lpm_lockfile::LockedPackage::default()
+            });
+            lock.root_resolutions.insert(
+                "react".to_string(),
+                lpm_lockfile::LockedRootResolution {
+                    instance_id: Some(instance_id),
+                    package: "react".to_string(),
+                    version: version.to_string(),
+                    source: None,
+                },
+            );
+            lock
+        };
+        let installed_lock = make_lock("1.0.0");
+        let installed_content = installed_lock.to_toml().unwrap();
+        let lock_path = project.join(lpm_lockfile::LOCKFILE_NAME);
+        installed_lock.write_to_file(&lock_path).unwrap();
+        let orig_mtime = std::fs::metadata(&lock_path).unwrap().modified().unwrap();
+        let replacement_mtime = orig_mtime + std::time::Duration::from_secs(5);
+        let replacement_lock = make_lock("2.0.0");
+        let replacement_path = lock_path.clone();
+
+        let lock_snapshot = super::workspace_lockfile::ActiveLockfileSnapshot {
+            path: lock_path,
+            content: Arc::from(installed_content),
+        };
+        write_post_install_hash_with_context_and_proof_with_hook(
+            project,
+            lpm_linker::LinkerMode::Hoisted,
+            lpm_store::v2::ObjectIntegrityPolicy::Source,
+            lpm_store::SecurityAnalysisPolicy::Disabled,
+            "none",
+            None,
+            None,
+            &lock_snapshot,
+            None,
+            move || {
+                replacement_lock.write_to_file(&replacement_path).unwrap();
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&replacement_path)
+                    .unwrap()
+                    .set_modified(replacement_mtime)
+                    .unwrap();
+            },
+        )
+        .unwrap();
+
+        let freshness =
+            crate::install_state::check_install_state_with_linker_integrity_dependency_engine_and_security_analysis(
+                project,
+                pkg_json,
+                lpm_linker::LinkerMode::Hoisted,
+                lpm_store::v2::ObjectIntegrityPolicy::Source,
+                "none",
+                lpm_store::StoreVersion::V2,
+                lpm_store::SecurityAnalysisPolicy::Disabled,
+            );
+        assert!(
+            !freshness.up_to_date,
+            "post-install hash must never stamp the replacement lockfile's mtime onto the old hash"
         );
     }
 }

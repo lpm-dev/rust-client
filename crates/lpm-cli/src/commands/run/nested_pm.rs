@@ -160,8 +160,7 @@ fn ensure_shim_dir(lpm: &Path, managers: &[&str]) -> Result<PathBuf, LpmError> {
         .join("nested-pm")
         .join(key);
     let marker = dir.join(SHIM_MARKER);
-    let marker_is_regular =
-        std::fs::symlink_metadata(&marker).is_ok_and(|meta| meta.is_file());
+    let marker_is_regular = std::fs::symlink_metadata(&marker).is_ok_and(|meta| meta.is_file());
     if marker_is_regular && shim_dir_is_warm(&dir, lpm, managers) {
         return Ok(dir);
     }
@@ -205,8 +204,7 @@ fn shim_file_is_valid(target: &Path, expected: &[u8]) -> bool {
             return false;
         }
     }
-    lpm_common::read_file_capped(target, MAX_SHIM_BYTES)
-        .is_ok_and(|existing| existing == expected)
+    lpm_common::read_file_capped(target, MAX_SHIM_BYTES).is_ok_and(|existing| existing == expected)
 }
 
 fn shim_dir_is_warm(dir: &Path, lpm: &Path, managers: &[&str]) -> bool {

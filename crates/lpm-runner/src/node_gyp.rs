@@ -589,6 +589,14 @@ impl CachedWrittenCommands {
 }
 
 fn command_directory_in(host: &[PathBuf], commands: &Path) -> Option<PathBuf> {
+    command_directory_in_with_hook(host, commands, || {})
+}
+
+fn command_directory_in_with_hook(
+    host: &[PathBuf],
+    commands: &Path,
+    after_write: impl FnOnce(),
+) -> Option<PathBuf> {
     // Re-check `NpmNodeGyp::beside_node_in` (which is stamp-cached) so manifest
     // upgrades or repaired installations are observed immediately, and key
     // cached command directories by `(commands_root, script)` with per-file stamps
@@ -598,33 +606,26 @@ fn command_directory_in(host: &[PathBuf], commands: &Path) -> Option<PathBuf> {
     static WRITTEN: OnceLock<Mutex<HashMap<WrittenCommandKey, CachedWrittenCommands>>> =
         OnceLock::new();
     let key = (commands.to_path_buf(), npm.script.clone());
-    let cached_hit = {
-        let written = WRITTEN
-            .get_or_init(Mutex::default)
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        written
-            .get(&key)
-            .filter(|entry| entry.is_fresh(&npm.version))
-            .map(|entry| entry.directory.clone())
-    };
-    if let Some(cached) = cached_hit {
-        return Some(cached);
+    let mut written = WRITTEN
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(entry) = written.get(&key)
+        && entry.is_fresh(&npm.version)
+    {
+        return Some(entry.directory.clone());
     }
     let directory = npm
         .write_commands(commands)
         .inspect_err(|error| tracing::debug!("npm's node-gyp isn't offered: {error}"))
         .ok()?;
+    after_write();
     let file_stamps: Option<Vec<(&'static str, FileStamp)>> = npm
         .command_files()
         .into_iter()
         .map(|(name, _)| Some((name, FileStamp::from_path(&directory.join(name))?)))
         .collect();
     if let Some(file_stamps) = file_stamps {
-        let mut written = WRITTEN
-            .get_or_init(Mutex::default)
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if written.len() >= MAX_NODE_GYP_CACHE_ENTRIES && !written.contains_key(&key) {
             written.clear();
         }
@@ -1091,6 +1092,58 @@ pub(crate) mod tests {
         assert!(
             cache_len <= MAX_NODE_GYP_CACHE_ENTRIES,
             "cache size {cache_len} exceeded bound {MAX_NODE_GYP_CACHE_ENTRIES}"
+        );
+    }
+
+    #[test]
+    fn concurrent_command_directory_writes_keep_version_and_shim_stamps_consistent() {
+        let root = tempfile::tempdir().unwrap();
+        let prefix = root.path().join("node-race");
+        let commands = root.path().join("commands");
+        let bin = node_with_npm(&prefix, "11.0.0", "console.log('ok');");
+        let manifest = NpmNodeGyp::beside_node_on(bin.as_os_str())
+            .expect("initial node-gyp")
+            .modules
+            .join("node-gyp")
+            .join("package.json");
+
+        let (writer_a_paused_tx, writer_a_paused_rx) = std::sync::mpsc::sync_channel(1);
+        let bin_b = bin.clone();
+        let commands_b = commands.clone();
+        let manifest_b = manifest.clone();
+        let thread_b = std::thread::spawn(move || {
+            writer_a_paused_rx.recv().unwrap();
+            std::fs::write(
+                &manifest_b,
+                r#"{"name":"node-gyp","version":"12.0.0-racer"}"#,
+            )
+            .unwrap();
+            command_directory_in(&[bin_b], &commands_b).expect("writer B command dir")
+        });
+
+        let dir_a =
+            command_directory_in_with_hook(std::slice::from_ref(&bin), &commands, move || {
+                writer_a_paused_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            })
+            .expect("writer A command dir");
+        let _dir_b = thread_b.join().unwrap();
+
+        // Restore version 11.0.0 and request its command directory again.
+        // If writer A captured writer B's 12.0.0 shim stamps under version 11.0.0,
+        // this call falsely hits the cache and leaves 12.0.0 shims on disk.
+        std::fs::write(&manifest, r#"{"name":"node-gyp","version":"11.0.0"}"#).unwrap();
+        let dir_restored = command_directory_in(&[bin], &commands).expect("restored 11.0.0 dir");
+        assert_eq!(dir_restored, dir_a);
+        let shim_name = if cfg!(windows) {
+            "node-gyp.cmd"
+        } else {
+            "node-gyp"
+        };
+        let shim_text = std::fs::read_to_string(dir_restored.join(shim_name)).unwrap();
+        assert!(
+            !shim_text.contains("12.0.0-racer"),
+            "restored 11.0.0 lookup must not serve cached 12.0.0 shims:\n{shim_text}"
         );
     }
 }
