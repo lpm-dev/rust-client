@@ -680,37 +680,117 @@ fn materialize_symlink_entry(
     Ok(())
 }
 
+static ACTIVE_MATERIALIZE_HELPERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+struct MaterializeHelperSlot;
+
+impl MaterializeHelperSlot {
+    fn try_acquire(cap: usize) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+
+        ACTIVE_MATERIALIZE_HELPERS
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < cap).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for MaterializeHelperSlot {
+    fn drop(&mut self) {
+        ACTIVE_MATERIALIZE_HELPERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_MATERIALIZE_SPAWN_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+type MaterializeWorkerResult = Result<Vec<(usize, Option<std::fs::Metadata>)>, LpmError>;
+
+fn spawn_materialize_helper<'scope, 'env, F>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    f: F,
+) -> std::io::Result<std::thread::ScopedJoinHandle<'scope, MaterializeWorkerResult>>
+where
+    F: FnOnce() -> MaterializeWorkerResult + Send + 'scope,
+{
+    #[cfg(test)]
+    if FORCE_MATERIALIZE_SPAWN_FAILURE.with(std::cell::Cell::get) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "injected materialize worker spawn failure",
+        ));
+    }
+    std::thread::Builder::new().spawn_scoped(scope, f)
+}
+
 fn materialize_regular_files_parallel(
     files: &[(PathBuf, PathBuf)],
     warm_source: bool,
     workers: usize,
 ) -> Result<Vec<Option<std::fs::Metadata>>, LpmError> {
-    let chunk_size = files.len().div_ceil(workers).max(1);
-    let mut results: Vec<Option<std::fs::Metadata>> = Vec::with_capacity(files.len());
-    let chunk_outputs: Vec<Result<Vec<Option<std::fs::Metadata>>, LpmError>> =
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(workers);
-            for chunk in files.chunks(chunk_size) {
-                handles.push(scope.spawn(move || {
-                    let mut local = Vec::with_capacity(chunk.len());
-                    for (src_path, dst_path) in chunk {
-                        local.push(materialize_regular_file(src_path, dst_path, warm_source)?);
-                    }
-                    Ok(local)
-                }));
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let global_helper_cap = lpm_common::resources::effective_cpu_count().clamp(2, 8);
+    let desired_helpers = workers.min(files.len()).saturating_sub(1);
+    let next_index = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+
+    let run_worker = || -> MaterializeWorkerResult {
+        let mut local = Vec::new();
+        while !failed.load(Ordering::Relaxed) {
+            let idx = next_index.fetch_add(1, Ordering::Relaxed);
+            let Some((src_path, dst_path)) = files.get(idx) else {
+                break;
+            };
+            match materialize_regular_file(src_path, dst_path, warm_source) {
+                Ok(meta) => local.push((idx, meta)),
+                Err(error) => {
+                    failed.store(true, Ordering::Relaxed);
+                    return Err(error);
+                }
             }
-            handles
-                .into_iter()
-                .map(|handle| match handle.join() {
-                    Ok(res) => res,
-                    Err(_) => Err(LpmError::Store(
-                        "virtual-store parallel file materialization panicked".into(),
-                    )),
-                })
-                .collect()
-        });
-    for chunk in chunk_outputs {
-        results.extend(chunk?);
+        }
+        Ok(local)
+    };
+
+    let worker_outputs: Vec<MaterializeWorkerResult> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(desired_helpers);
+        for _ in 0..desired_helpers {
+            let Some(slot) = MaterializeHelperSlot::try_acquire(global_helper_cap) else {
+                break;
+            };
+            match spawn_materialize_helper(scope, move || {
+                let _slot = slot;
+                run_worker()
+            }) {
+                Ok(handle) => handles.push(handle),
+                Err(_) => break,
+            }
+        }
+        let local_result = run_worker();
+        let mut outputs = Vec::with_capacity(handles.len() + 1);
+        outputs.push(local_result);
+        for handle in handles {
+            outputs.push(match handle.join() {
+                Ok(res) => res,
+                Err(_) => Err(LpmError::Store(
+                    "virtual-store parallel file materialization panicked".into(),
+                )),
+            });
+        }
+        outputs
+    });
+
+    let mut results: Vec<Option<std::fs::Metadata>> = vec![None; files.len()];
+    for output in worker_outputs {
+        for (idx, meta) in output? {
+            results[idx] = meta;
+        }
     }
     Ok(results)
 }
@@ -828,7 +908,7 @@ fn windows_copy_file_with_metadata(
                     dst.display()
                 ))
             })?;
-        let written = (|| -> std::io::Result<std::fs::Metadata> {
+        let written = (|| -> std::io::Result<()> {
             if copied > 0 {
                 destination.write_all(&buf[..copied])?;
             }
@@ -837,12 +917,15 @@ fn windows_copy_file_with_metadata(
                 perms.set_readonly(true);
                 destination.set_permissions(perms)?;
             }
-            destination.metadata()
+            Ok(())
         })();
+        drop(destination);
         match written {
-            Ok(meta) => Ok(Some(meta)),
+            // Return `None` so the caller stats `dst` after handle close, when
+            // Windows (NTFS, ReFS, SMB, shared folders) guarantees `LastWriteTime`
+            // has settled.
+            Ok(()) => Ok(None),
             Err(error) => {
-                drop(destination);
                 let _ = std::fs::remove_file(dst);
                 Err(LpmError::Store(format!(
                     "failed to copy virtual-store source file {} → {}: {error}",
@@ -1512,5 +1595,44 @@ mod libc {
             dst: *const std::os::raw::c_char,
             flags: u32,
         ) -> std::os::raw::c_int;
+    }
+}
+
+#[cfg(test)]
+mod parallel_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn parallel_materialization_falls_back_serially_when_worker_spawn_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let mut files = Vec::new();
+        for idx in 0..80 {
+            let s = src.join(format!("f-{idx:03}.js"));
+            let d = dst.join(format!("f-{idx:03}.js"));
+            std::fs::write(&s, format!("export const x = {idx};\n")).unwrap();
+            files.push((s, d));
+        }
+
+        FORCE_MATERIALIZE_SPAWN_FAILURE.with(|flag| flag.set(true));
+        let res = materialize_regular_files_parallel(&files, false, 4);
+        FORCE_MATERIALIZE_SPAWN_FAILURE.with(|flag| flag.set(false));
+
+        let metas =
+            res.expect("spawn failure must fall back to serial execution without panicking");
+        assert_eq!(metas.len(), 80);
+        for (idx, (_, dst_path)) in files.iter().enumerate() {
+            assert_eq!(
+                std::fs::read_to_string(dst_path).unwrap(),
+                format!("export const x = {idx};\n")
+            );
+        }
+        assert_eq!(
+            ACTIVE_MATERIALIZE_HELPERS.load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
     }
 }

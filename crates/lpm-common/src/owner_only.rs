@@ -684,6 +684,18 @@ fn set_security_object_raw(
 }
 
 #[cfg(test)]
+fn set_protected_dacl(
+    file: &impl std::os::windows::io::AsRawHandle,
+    sddl: &str,
+) -> std::io::Result<()> {
+    set_security_object(
+        file,
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+        &security_descriptor(sddl)?,
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write as _;

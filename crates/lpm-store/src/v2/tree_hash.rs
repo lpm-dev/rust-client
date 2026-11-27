@@ -466,26 +466,81 @@ fn read_object_tree_entries_fstatat(
         }
     }
 
-    let c_dir = CString::new(dir.as_os_str().as_bytes()).map_err(|_| {
-        LpmError::Store(format!(
-            "failed to read virtual-store object tree at {}: path contains NUL",
-            dir.display()
-        ))
-    })?;
-    // SAFETY: `c_dir` is NUL-terminated.
-    let fd = unsafe {
-        libc::open(
-            c_dir.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
+    let open_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = if let Ok(rel) = dir.strip_prefix(root) {
+        let c_root = CString::new(root.as_os_str().as_bytes()).map_err(|_| {
+            LpmError::Store(format!(
+                "failed to read virtual-store object tree at {}: path contains NUL",
+                root.display()
+            ))
+        })?;
+        // SAFETY: `c_root` is NUL-terminated.
+        let mut cur_fd = unsafe { libc::open(c_root.as_ptr(), open_flags) };
+        if cur_fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(LpmError::Store(format!(
+                "failed to read virtual-store object tree at {}: {error}",
+                root.display()
+            )));
+        }
+        for component in rel.components() {
+            let std::path::Component::Normal(name) = component else {
+                // SAFETY: `cur_fd` is owned here.
+                unsafe {
+                    libc::close(cur_fd);
+                }
+                return Err(LpmError::Store(format!(
+                    "failed to read virtual-store object tree at {}: invalid relative path component",
+                    dir.display()
+                )));
+            };
+            let c_name = match CString::new(name.as_bytes()) {
+                Ok(c_name) => c_name,
+                Err(_) => {
+                    // SAFETY: `cur_fd` is owned here.
+                    unsafe {
+                        libc::close(cur_fd);
+                    }
+                    return Err(LpmError::Store(format!(
+                        "failed to read virtual-store object tree at {}: path contains NUL",
+                        dir.display()
+                    )));
+                }
+            };
+            // SAFETY: `cur_fd` is an open directory fd and `c_name` is NUL-terminated.
+            let next_fd = unsafe { libc::openat(cur_fd, c_name.as_ptr(), open_flags) };
+            // SAFETY: `cur_fd` is no longer needed after `openat`.
+            unsafe {
+                libc::close(cur_fd);
+            }
+            if next_fd < 0 {
+                let error = std::io::Error::last_os_error();
+                return Err(LpmError::Store(format!(
+                    "failed to read virtual-store object tree at {}: {error}",
+                    dir.display()
+                )));
+            }
+            cur_fd = next_fd;
+        }
+        cur_fd
+    } else {
+        let c_dir = CString::new(dir.as_os_str().as_bytes()).map_err(|_| {
+            LpmError::Store(format!(
+                "failed to read virtual-store object tree at {}: path contains NUL",
+                dir.display()
+            ))
+        })?;
+        // SAFETY: `c_dir` is NUL-terminated.
+        let fd = unsafe { libc::open(c_dir.as_ptr(), open_flags) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(LpmError::Store(format!(
+                "failed to read virtual-store object tree at {}: {error}",
+                dir.display()
+            )));
+        }
+        fd
     };
-    if fd < 0 {
-        let error = std::io::Error::last_os_error();
-        return Err(LpmError::Store(format!(
-            "failed to read virtual-store object tree at {}: {error}",
-            dir.display()
-        )));
-    }
     // SAFETY: `fd` is an owned open directory descriptor; `fdopendir` takes ownership on success.
     let dir_ptr = unsafe { libc::fdopendir(fd) };
     if dir_ptr.is_null() {
@@ -1418,6 +1473,29 @@ mod tests {
         push_os_str_bytes(&mut expected, OsStr::new("child"));
 
         assert_eq!(relative_path_bytes(root, &path).unwrap(), expected);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn read_object_tree_entries_rejects_symlinked_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("object");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"outside").unwrap();
+        let symlink_sub = root.join("sub");
+        std::os::unix::fs::symlink(&outside, &symlink_sub).unwrap();
+
+        let err = match read_object_tree_entries(&root, &symlink_sub) {
+            Ok(_) => panic!("descending through a symlinked subdirectory must be refused"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("failed to read virtual-store object tree"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

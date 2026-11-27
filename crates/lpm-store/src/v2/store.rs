@@ -3508,29 +3508,31 @@ impl Store {
             let workers = lpm_common::resources::effective_cpu_count().min(8);
             if deep_checks.len() >= PARALLEL_DEEP_VERIFY_THRESHOLD && workers > 1 {
                 let next_index = std::sync::atomic::AtomicUsize::new(0);
-                let workers = workers.min(deep_checks.len());
-                let deep_issues = std::thread::scope(|scope| {
-                    let mut handles = Vec::with_capacity(workers);
-                    for _ in 0..workers {
-                        handles.push(scope.spawn(|| {
-                            let mut local_buf = vec![0_u8; 64 * 1024];
-                            let mut local_issues = Vec::new();
-                            loop {
-                                let idx =
-                                    next_index.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let Some((blob_path, key)) = deep_checks.get(idx) else {
-                                    break;
-                                };
-                                if let Err(error) =
-                                    cas.verify_blob_at_path(blob_path, key, &mut local_buf)
-                                {
-                                    local_issues.push(error.to_string());
-                                }
-                            }
-                            local_issues
-                        }));
+                let desired_helpers = workers.min(deep_checks.len()).saturating_sub(1);
+                let run_worker = || {
+                    let mut local_buf = vec![0_u8; 64 * 1024];
+                    let mut local_issues = Vec::new();
+                    loop {
+                        let idx = next_index.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some((blob_path, key)) = deep_checks.get(idx) else {
+                            break;
+                        };
+                        if let Err(error) = cas.verify_blob_at_path(blob_path, key, &mut local_buf)
+                        {
+                            local_issues.push(error.to_string());
+                        }
                     }
-                    let mut merged = Vec::new();
+                    local_issues
+                };
+                let deep_issues = std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(desired_helpers);
+                    for _ in 0..desired_helpers {
+                        match std::thread::Builder::new().spawn_scoped(scope, run_worker) {
+                            Ok(handle) => handles.push(handle),
+                            Err(_) => break,
+                        }
+                    }
+                    let mut merged = run_worker();
                     for handle in handles {
                         match handle.join() {
                             Ok(issues) => merged.extend(issues),
@@ -4828,52 +4830,18 @@ fn linux_overlay_upperdir_from_mountinfo(path: &Path, mountinfo: &[u8]) -> Optio
 }
 
 #[cfg(target_os = "linux")]
-fn share_host_root_prefix(upper: &Path, mount_root: &Path) -> bool {
-    let mut upper_components = upper
-        .components()
-        .filter(|c| matches!(c, std::path::Component::Normal(_)));
-    let mut root_components = mount_root
-        .components()
-        .filter(|c| matches!(c, std::path::Component::Normal(_)))
-        .peekable();
-    // Skip a btrfs top-level subvolume component such as `/@` or `/@var` only
-    // when it is literally `@`; keep ordinary host paths aligned.
-    if root_components
-        .peek()
-        .is_some_and(|component| component.as_os_str() == "@")
-    {
-        root_components.next();
-    }
-    let mut shared = 0usize;
-    for (u, r) in upper_components.by_ref().zip(root_components) {
-        if u == r {
-            shared += 1;
-            if shared >= 2 {
-                return true;
-            }
-        } else {
-            break;
-        }
-    }
-    false
-}
-
-#[cfg(target_os = "linux")]
 fn linux_overlay_upperdir_is_btrfs_from_mountinfo(path: &Path, mountinfo: &[u8]) -> Option<bool> {
     use std::os::unix::ffi::OsStringExt;
 
     let upper = linux_overlay_upperdir_from_mountinfo(path, mountinfo)?;
     let mut best_mount: Option<(usize, &[u8])> = None;
-    let mut inferred_from_host_bind: Option<bool> = None;
 
     for line in mountinfo
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
     {
         let fields: Vec<&[u8]> = line.split(|byte| *byte == b' ').collect();
-        let (Some(mount_root_raw), Some(mount_point_raw)) =
-            (fields.get(3).copied(), fields.get(4).copied())
-        else {
+        let Some(mount_point_raw) = fields.get(4).copied() else {
             continue;
         };
         let Some(sep) = (6..fields.len()).find(|index| fields[*index] == b"-") else {
@@ -4897,24 +4865,9 @@ fn linux_overlay_upperdir_is_btrfs_from_mountinfo(path: &Path, mountinfo: &[u8])
                 best_mount = Some((depth, fs_type));
             }
         }
-        let mount_root = PathBuf::from(std::ffi::OsString::from_vec(unescape_mountinfo_bytes(
-            mount_root_raw,
-        )));
-        if share_host_root_prefix(&upper, &mount_root) {
-            if fs_type == b"btrfs" {
-                inferred_from_host_bind = Some(true);
-            } else if inferred_from_host_bind.is_none()
-                && matches!(fs_type, b"ext4" | b"ext3" | b"xfs" | b"tmpfs" | b"zfs")
-            {
-                inferred_from_host_bind = Some(false);
-            }
-        }
     }
 
-    if let Some((_, fs_type)) = best_mount {
-        return Some(fs_type == b"btrfs");
-    }
-    inferred_from_host_bind
+    best_mount.map(|(_, fs_type)| fs_type == b"btrfs")
 }
 
 #[cfg(target_os = "linux")]

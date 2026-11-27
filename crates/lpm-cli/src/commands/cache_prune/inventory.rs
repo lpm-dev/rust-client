@@ -94,9 +94,11 @@ pub(super) fn walk_link_entries(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(super::prune_inspection_error(&root, error)),
     };
+    const MAX_VERIFIED_REAL_DIRS: usize = 4_096;
     let links_root_canonical = std::fs::canonicalize(&root)
         .map_err(|error| super::prune_inspection_error(&root, error))?;
     let mut verified_real_dirs: HashSet<PathBuf> = HashSet::new();
+    let mut scratch_cursor = PathBuf::with_capacity(root.as_os_str().len() + 128);
 
     for entry in entries {
         let entry = entry.map_err(|error| super::prune_inspection_error(&root, error))?;
@@ -116,6 +118,9 @@ pub(super) fn walk_link_entries(
         }
         if !metadata.is_dir() {
             continue;
+        }
+        if verified_real_dirs.len() >= MAX_VERIFIED_REAL_DIRS {
+            verified_real_dirs.clear();
         }
         verified_real_dirs.insert(path.clone());
         let meta = LinkMeta::read_from(&path)?;
@@ -199,10 +204,20 @@ pub(super) fn walk_link_entries(
             let expected_components = &expected_buf[..expected_len];
             let expected_path = store.paths().link_package_dir(&target);
 
-            let parent_is_real =
-                ensure_real_dir_chain(&root, parent_components, &mut verified_real_dirs)?;
-            let expected_is_real =
-                ensure_real_dir_chain(&root, expected_components, &mut verified_real_dirs)?;
+            let parent_is_real = ensure_real_dir_chain(
+                &root,
+                parent_components,
+                &mut verified_real_dirs,
+                MAX_VERIFIED_REAL_DIRS,
+                &mut scratch_cursor,
+            )?;
+            let expected_is_real = ensure_real_dir_chain(
+                &root,
+                expected_components,
+                &mut verified_real_dirs,
+                MAX_VERIFIED_REAL_DIRS,
+                &mut scratch_cursor,
+            )?;
             if parent_is_real && expected_is_real {
                 let expected_canonical =
                     path_from_components(&links_root_canonical, expected_components);
@@ -258,25 +273,34 @@ fn ensure_real_dir_chain(
     root: &Path,
     components: &[&OsStr],
     verified: &mut HashSet<PathBuf>,
+    max_entries: usize,
+    cursor: &mut PathBuf,
 ) -> Result<bool, LpmError> {
-    let full = path_from_components(root, components);
-    if verified.contains(&full) {
-        return Ok(true);
-    }
-    let mut cursor = PathBuf::with_capacity(full.as_os_str().len());
+    cursor.clear();
     cursor.push(root);
     for component in components {
         cursor.push(component);
-        if verified.contains(&cursor) {
+    }
+    if verified.contains(cursor.as_path()) {
+        return Ok(true);
+    }
+    cursor.clear();
+    cursor.push(root);
+    for component in components {
+        cursor.push(component);
+        if verified.contains(cursor.as_path()) {
             continue;
         }
-        match std::fs::symlink_metadata(&cursor) {
+        match std::fs::symlink_metadata(cursor.as_path()) {
             Ok(meta) if meta.is_dir() && !lpm_common::is_symlink_or_junction(&meta) => {
+                if verified.len() >= max_entries {
+                    verified.clear();
+                }
                 verified.insert(cursor.clone());
             }
             Ok(_) => return Ok(false),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(super::prune_inspection_error(&cursor, error)),
+            Err(error) => return Err(super::prune_inspection_error(cursor.as_path(), error)),
         }
     }
     Ok(true)

@@ -1357,7 +1357,7 @@ fn try_rename_open_std_file_replacing(file: &File, destination: &Path) -> io::Re
         let error = io::Error::from_raw_os_error(code as i32);
         if !matches!(code, ERROR_SHARING_VIOLATION | ERROR_ACCESS_DENIED)
             || delay_ms == 4_050
-            || (code == ERROR_ACCESS_DENIED && is_directory_entry(destination))
+            || (code == ERROR_ACCESS_DENIED && is_unreplaceable_destination(destination))
         {
             return Err(error);
         }
@@ -1476,7 +1476,7 @@ fn replace_file(from: &Path, to: &Path, write_through: bool) -> io::Result<()> {
             raw,
             Some(ERROR_SHARING_VIOLATION) | Some(ERROR_ACCESS_DENIED)
         ) || delay_ms == 4_050
-            || (raw == Some(ERROR_ACCESS_DENIED) && is_directory_entry(destination))
+            || (raw == Some(ERROR_ACCESS_DENIED) && is_unreplaceable_destination(destination))
         {
             return Err(error);
         }
@@ -1484,16 +1484,20 @@ fn replace_file(from: &Path, to: &Path, write_through: bool) -> io::Result<()> {
     Err(io::Error::other("atomic replacement retry loop exhausted"))
 }
 
-/// Whether `path` is a directory, or a link to one, which a renamed file can
-/// never replace: Windows reports that as ACCESS_DENIED, as it does a file a
-/// scanner holds for a moment, so the retries against the latter would only
-/// delay the error.
+/// Whether `path` is a directory, a directory symlink, or a read-only file,
+/// none of which an atomic file rename can replace: Windows reports those as
+/// `ACCESS_DENIED` just like a transient scanner lock, so retrying would only
+/// stall before returning the same error.
 #[cfg(windows)]
-fn is_directory_entry(path: &Path) -> bool {
-    use std::os::windows::fs::FileTypeExt as _;
+fn is_unreplaceable_destination(path: &Path) -> bool {
+    use std::os::windows::fs::{FileTypeExt as _, MetadataExt as _};
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY;
+
     fs::symlink_metadata(path).is_ok_and(|metadata| {
         let file_type = metadata.file_type();
-        file_type.is_dir() || file_type.is_symlink_dir()
+        file_type.is_dir()
+            || file_type.is_symlink_dir()
+            || (metadata.file_attributes() & FILE_ATTRIBUTE_READONLY != 0)
     })
 }
 

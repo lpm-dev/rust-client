@@ -98,9 +98,7 @@ pub fn remove_path_entry_counting_freed_bytes(path: &Path) -> std::io::Result<u6
         return Ok(0);
     }
     if !metadata.is_dir() {
-        let freed = freed_by_unlinking(path, &metadata);
-        std::fs::remove_file(path)?;
-        return Ok(freed);
+        return remove_regular_file_counting_freed_bytes(path, &metadata);
     }
     let name = path.file_name().ok_or_else(|| {
         std::io::Error::new(
@@ -136,100 +134,199 @@ fn clear_directory_counting_freed_bytes(directory: &cap_std::fs::Dir) -> std::io
             freed = freed.saturating_add(clear_directory_counting_freed_bytes(&child)?);
             drop(child);
             directory.remove_dir(&name)?;
+        } else if metadata.is_file() && !cap_metadata_is_link(&metadata) {
+            freed = freed.saturating_add(cap_remove_file_counting_freed_bytes(
+                directory, &name, &metadata, true,
+            )?);
         } else {
-            if metadata.is_file() {
-                freed = freed.saturating_add(cap_freed_by_unlinking(directory, &name, &metadata));
-            }
             directory.remove_file_or_symlink(&name)?;
         }
     }
     Ok(freed)
 }
 
-/// What unlinking a file frees: its bytes, once its last link goes.
-#[cfg(unix)]
-fn freed_by_unlinking(_path: &Path, metadata: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt as _;
-    if metadata.nlink() <= 1 {
-        metadata.len()
-    } else {
-        0
+/// Unlink one regular file inside `directory` and return the bytes freed
+/// (`metadata.len()` when removing its final link, `0` when other hardlinks
+/// remain). On Windows, when `may_have_hardlinks` is `true`, the link count
+/// is inspected and the file is unlinked through a single handle open so
+/// security scanners are not triggered twice per file.
+pub fn cap_remove_file_counting_freed_bytes(
+    directory: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+    metadata: &cap_std::fs::Metadata,
+    may_have_hardlinks: bool,
+) -> std::io::Result<u64> {
+    use cap_fs_ext::DirExt as _;
+
+    #[cfg(unix)]
+    {
+        use cap_std::fs::MetadataExt as _;
+        let _ = may_have_hardlinks;
+        let freed = if metadata.nlink() <= 1 {
+            metadata.len()
+        } else {
+            0
+        };
+        directory.remove_file_or_symlink(name)?;
+        Ok(freed)
+    }
+    #[cfg(windows)]
+    {
+        if !may_have_hardlinks {
+            directory.remove_file_or_symlink(name)?;
+            return Ok(metadata.len());
+        }
+        windows_cap_remove_file_counting_freed_bytes(directory, name, metadata)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = may_have_hardlinks;
+        directory.remove_file_or_symlink(name)?;
+        Ok(metadata.len())
     }
 }
 
+#[cfg(unix)]
+fn remove_regular_file_counting_freed_bytes(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    let freed = if metadata.nlink() <= 1 {
+        metadata.len()
+    } else {
+        0
+    };
+    std::fs::remove_file(path)?;
+    Ok(freed)
+}
+
 #[cfg(windows)]
-fn freed_by_unlinking(path: &Path, metadata: &std::fs::Metadata) -> u64 {
+fn remove_regular_file_counting_freed_bytes(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<u64> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE,
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     let open = std::fs::OpenOptions::new()
-        .access_mode(FILE_READ_ATTRIBUTES)
+        .access_mode(FILE_READ_ATTRIBUTES | DELETE)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path);
-    match open.and_then(|file| crate::atomic_write::windows_file_information(&file)) {
-        Ok(info) if info.nNumberOfLinks <= 1 => metadata.len(),
-        Ok(_) => 0,
-        Err(_) => metadata.len(),
+    match open {
+        Ok(file) => {
+            let freed = match crate::atomic_write::windows_file_information(&file) {
+                Ok(info) if info.nNumberOfLinks <= 1 => metadata.len(),
+                Ok(_) => 0,
+                Err(_) => metadata.len(),
+            };
+            if windows_delete_open_file(&file) {
+                drop(file);
+                return Ok(freed);
+            }
+            drop(file);
+            std::fs::remove_file(path)?;
+            Ok(freed)
+        }
+        Err(_) => {
+            std::fs::remove_file(path)?;
+            Ok(metadata.len())
+        }
     }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn freed_by_unlinking(_path: &Path, metadata: &std::fs::Metadata) -> u64 {
-    metadata.len()
-}
-
-#[cfg(unix)]
-fn cap_freed_by_unlinking(
-    _directory: &cap_std::fs::Dir,
-    _name: &std::ffi::OsStr,
-    metadata: &cap_std::fs::Metadata,
-) -> u64 {
-    use cap_std::fs::MetadataExt as _;
-    if metadata.nlink() <= 1 {
-        metadata.len()
-    } else {
-        0
-    }
+fn remove_regular_file_counting_freed_bytes(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<u64> {
+    std::fs::remove_file(path)?;
+    Ok(metadata.len())
 }
 
 #[cfg(windows)]
-fn cap_freed_by_unlinking(
+fn windows_cap_remove_file_counting_freed_bytes(
     directory: &cap_std::fs::Dir,
     name: &std::ffi::OsStr,
     metadata: &cap_std::fs::Metadata,
-) -> u64 {
-    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+) -> std::io::Result<u64> {
+    use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
     use cap_std::fs::OpenOptionsExt as _;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        DELETE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     let mut options = cap_std::fs::OpenOptions::new();
     options
-        .access_mode(FILE_READ_ATTRIBUTES)
+        .access_mode(FILE_READ_ATTRIBUTES | DELETE)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .follow(FollowSymlinks::No);
-    let open = directory
+    match directory
         .open_with(name, &options)
-        .map(cap_std::fs::File::into_std);
-    match open.and_then(|file| crate::atomic_write::windows_file_information(&file)) {
-        Ok(info) if info.nNumberOfLinks <= 1 => metadata.len(),
-        Ok(_) => 0,
-        Err(_) => metadata.len(),
+        .map(cap_std::fs::File::into_std)
+    {
+        Ok(file) => {
+            let freed = match crate::atomic_write::windows_file_information(&file) {
+                Ok(info) if info.nNumberOfLinks <= 1 => metadata.len(),
+                Ok(_) => 0,
+                Err(_) => metadata.len(),
+            };
+            if windows_delete_open_file(&file) {
+                drop(file);
+                return Ok(freed);
+            }
+            drop(file);
+            directory.remove_file_or_symlink(name)?;
+            Ok(freed)
+        }
+        Err(_) => {
+            directory.remove_file_or_symlink(name)?;
+            Ok(metadata.len())
+        }
     }
 }
 
-#[cfg(not(any(unix, windows)))]
-fn cap_freed_by_unlinking(
-    _directory: &cap_std::fs::Dir,
-    _name: &std::ffi::OsStr,
-    metadata: &cap_std::fs::Metadata,
-) -> u64 {
-    metadata.len()
+#[cfg(windows)]
+fn windows_delete_open_file(file: &std::fs::File) -> bool {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
+        FileDispositionInfo, FileDispositionInfoEx, SetFileInformationByHandle,
+    };
+
+    let handle = file.as_raw_handle();
+    let ex = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE
+            | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+            | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    };
+    // SAFETY: `handle` is open with `DELETE` access and `ex` is valid storage for `FileDispositionInfoEx`.
+    if unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfoEx,
+            std::ptr::from_ref(&ex).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
+    } != 0
+    {
+        return true;
+    }
+    let classic = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: `handle` is open with `DELETE` access and `classic` is valid storage for `FileDispositionInfo`.
+    unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfo,
+            std::ptr::from_ref(&classic).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        ) != 0
+    }
 }
 
 #[cfg(not(windows))]
@@ -542,9 +639,28 @@ pub fn lexically_clean(p: &Path) -> PathBuf {
     out
 }
 
+fn has_parent_dir_after_non_parent(path: &Path) -> bool {
+    let mut seen_non_parent = false;
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if seen_non_parent {
+                    return true;
+                }
+            }
+            Component::Normal(_) | Component::RootDir | Component::Prefix(_) => {
+                seen_non_parent = true;
+            }
+        }
+    }
+    false
+}
+
 /// Compare an existing symlink/junction target read from `link_path` against
-/// `expected_target`, handling relative `..` segments on every platform and
-/// Windows `\\?\` prefixes, slash differences, and ASCII case folding.
+/// `expected_target`, refusing lexical `..` collapse after any normal or root
+/// component (where intermediate symlinks would resolve elsewhere) and
+/// normalizing clean Windows `\\?\` / `\??\` prefixes and drive-letter case.
 pub fn link_targets_equivalent(
     existing_target: &Path,
     link_path: &Path,
@@ -553,6 +669,11 @@ pub fn link_targets_equivalent(
     if existing_target == expected_target {
         return true;
     }
+    if has_parent_dir_after_non_parent(existing_target)
+        || has_parent_dir_after_non_parent(expected_target)
+    {
+        return false;
+    }
     let resolved_existing = resolve_symlink_probe_path(existing_target, link_path);
     let resolved_expected = resolve_symlink_probe_path(expected_target, link_path);
     if resolved_existing == resolved_expected {
@@ -560,8 +681,13 @@ pub fn link_targets_equivalent(
     }
     #[cfg(windows)]
     {
-        normalize_windows_link_target_str(&resolved_existing.to_string_lossy())
-            == normalize_windows_link_target_str(&resolved_expected.to_string_lossy())
+        matches!(
+            (
+                normalize_windows_link_target_str(&resolved_existing.to_string_lossy()),
+                normalize_windows_link_target_str(&resolved_expected.to_string_lossy()),
+            ),
+            (Some(left), Some(right)) if left == right
+        )
     }
     #[cfg(not(windows))]
     {
@@ -570,53 +696,124 @@ pub fn link_targets_equivalent(
 }
 
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
-pub(crate) fn normalize_windows_link_target_str(raw: &str) -> String {
-    let mut s = raw.replace('/', "\\");
-    if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
-        s = format!(r"\\{unc}");
-    } else if let Some(verbatim) = s.strip_prefix(r"\\?\") {
-        s = verbatim.to_string();
-    } else if let Some(nt_unc) = s.strip_prefix(r"\??\UNC\") {
-        s = format!(r"\\{nt_unc}");
-    } else if let Some(nt) = s.strip_prefix(r"\??\") {
-        s = nt.to_string();
+pub(crate) fn normalize_windows_link_target_str(raw: &str) -> Option<String> {
+    let (verbatim, is_unc_verbatim, body) = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        (true, true, unc)
+    } else if let Some(nt_unc) = raw.strip_prefix(r"\??\UNC\") {
+        (true, true, nt_unc)
+    } else if let Some(v) = raw.strip_prefix(r"\\?\") {
+        (true, false, v)
+    } else if let Some(nt) = raw.strip_prefix(r"\??\") {
+        (true, false, nt)
+    } else {
+        (false, false, raw)
+    };
+
+    if verbatim {
+        if body.contains('/') {
+            return None;
+        }
+        let trimmed = body.trim_end_matches('\\');
+        if trimmed.split('\\').any(|seg| seg == "." || seg == "..") {
+            return None;
+        }
+        let canonical = if is_unc_verbatim {
+            let mut parts = trimmed.split('\\').filter(|seg| !seg.is_empty());
+            let server = parts.next()?;
+            let share = parts.next()?;
+            let mut out = String::with_capacity(trimmed.len() + 2);
+            out.push_str(r"\\");
+            out.push_str(server);
+            out.push('\\');
+            out.push_str(share);
+            for part in parts {
+                out.push('\\');
+                out.push_str(part);
+            }
+            out
+        } else {
+            normalize_windows_drive_prefix_preserving_case(trimmed)?
+        };
+        return Some(canonical);
     }
-    // Lexically collapse `\`-separated `.` and `..` segments even when tested on Unix hosts.
+
+    let s = body.replace('/', "\\");
     let (prefix, rest) = if let Some(unc_rest) = s.strip_prefix(r"\\") {
-        (r"\\", unc_rest)
+        let mut iter = unc_rest.splitn(3, '\\');
+        let server = iter
+            .next()
+            .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")?;
+        let share = iter
+            .next()
+            .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")?;
+        let tail = iter.next().unwrap_or("");
+        (format!(r"\\{server}\{share}"), tail)
     } else if s.len() >= 3
         && s.as_bytes()[0].is_ascii_alphabetic()
         && s.as_bytes()[1] == b':'
         && s.as_bytes()[2] == b'\\'
     {
-        (&s[..3], &s[3..])
+        let drive = s.as_bytes()[0].to_ascii_uppercase() as char;
+        (format!("{drive}:\\"), &s[3..])
     } else {
-        ("", s.as_str())
+        (String::new(), s.as_str())
     };
+
     let mut parts: Vec<&str> = Vec::new();
+    let mut seen_normal = false;
     for segment in rest.split('\\') {
         match segment {
             "" | "." => {}
             ".." => {
-                if parts.last().is_some_and(|last| *last != "..") {
-                    parts.pop();
-                } else if prefix.is_empty() {
-                    parts.push("..");
+                if !prefix.is_empty() || seen_normal {
+                    return None;
                 }
+                parts.push("..");
             }
-            other => parts.push(other),
+            other => {
+                seen_normal = true;
+                parts.push(other);
+            }
         }
     }
+
     let mut out = String::with_capacity(s.len());
-    out.push_str(prefix);
+    out.push_str(&prefix);
+    let need_leading_sep = !prefix.is_empty() && !prefix.ends_with('\\');
     for (idx, part) in parts.iter().enumerate() {
-        if idx > 0 {
+        if idx > 0 || need_leading_sep {
             out.push('\\');
         }
         out.push_str(part);
     }
-    out.make_ascii_lowercase();
-    out
+    Some(out)
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn normalize_windows_drive_prefix_preserving_case(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\' {
+        let drive = bytes[0].to_ascii_uppercase() as char;
+        let mut out = String::with_capacity(path.len());
+        out.push(drive);
+        out.push_str(":\\");
+        for (idx, seg) in path[3..]
+            .split('\\')
+            .filter(|seg| !seg.is_empty())
+            .enumerate()
+        {
+            if idx > 0 {
+                out.push('\\');
+            }
+            out.push_str(seg);
+        }
+        Some(out)
+    } else if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let drive = bytes[0].to_ascii_uppercase() as char;
+        Some(format!("{drive}:\\"))
+    } else {
+        None
+    }
 }
 
 /// The start of a `.cmd` shim that names paths relative to itself, as
@@ -1273,22 +1470,85 @@ mod entry_removal_tests {
     }
 
     #[test]
-    fn normalize_windows_link_target_handles_verbatim_prefixes_slashes_and_case() {
+    fn normalize_windows_link_target_handles_verbatim_prefixes_slashes_and_drive_case() {
         let verbatim = super::normalize_windows_link_target_str(
             r"\\?\C:\Users\Dev\.lpm\store\v2\links\pkg\node_modules\pkg",
         );
         let mixed = super::normalize_windows_link_target_str(
-            r"c:/Users/Dev/.lpm/store/v2/links/tmp/../pkg/node_modules/pkg/",
+            r"c:/Users/Dev/.lpm/store/v2/links/pkg/node_modules/pkg/",
         );
         let nt_prefix = super::normalize_windows_link_target_str(
             r"\??\C:\Users\Dev\.lpm\store\v2\links\pkg\node_modules\pkg",
         );
+        assert!(verbatim.is_some());
         assert_eq!(verbatim, mixed);
         assert_eq!(verbatim, nt_prefix);
 
         let unc_verbatim = super::normalize_windows_link_target_str(r"\\?\UNC\Server\Share\Pkg\");
-        let unc_plain = super::normalize_windows_link_target_str(r"\\server/share/pkg");
+        let unc_plain = super::normalize_windows_link_target_str(r"\\Server/Share/Pkg");
+        assert!(unc_verbatim.is_some());
         assert_eq!(unc_verbatim, unc_plain);
+    }
+
+    #[test]
+    fn link_targets_equivalent_rejects_parent_dir_after_normal_component() {
+        assert!(
+            !super::link_targets_equivalent(
+                Path::new("decoy/../target"),
+                Path::new("/workspace/project/node_modules/pkg"),
+                Path::new("/workspace/project/node_modules/target"),
+            ),
+            "parent traversal after a normal component must not be collapsed lexically"
+        );
+        assert!(
+            !super::link_targets_equivalent(
+                Path::new("/workspace/decoy/../target"),
+                Path::new("/workspace/project/node_modules/pkg"),
+                Path::new("/workspace/target"),
+            ),
+            "absolute path with parent traversal must not be collapsed lexically"
+        );
+        #[cfg(unix)]
+        {
+            let root = tempfile::tempdir().unwrap();
+            let outside = root.path().join("outside");
+            let nm = root.path().join("node_modules");
+            std::fs::create_dir_all(outside.join("sub")).unwrap();
+            std::fs::create_dir_all(outside.join("evil")).unwrap();
+            std::fs::create_dir_all(nm.join("target")).unwrap();
+            std::os::unix::fs::symlink(outside.join("sub"), nm.join("decoy")).unwrap();
+            let link = nm.join("pkg");
+            std::os::unix::fs::symlink(Path::new("decoy/../target"), &link).unwrap();
+            assert!(!super::link_targets_equivalent(
+                &std::fs::read_link(&link).unwrap(),
+                &link,
+                &nm.join("target"),
+            ));
+        }
+    }
+
+    #[test]
+    fn normalize_windows_link_target_rejects_verbatim_dotdot_unc_escape_and_path_case_mismatch() {
+        assert_eq!(
+            super::normalize_windows_link_target_str(r"\\?\C:\a\..\b"),
+            None,
+            "verbatim paths must not collapse parent segments"
+        );
+        assert_eq!(
+            super::normalize_windows_link_target_str(r"\\srv\share\..\..\x"),
+            None,
+            "UNC server and share roots must not be popped by parent segments"
+        );
+        assert_ne!(
+            super::normalize_windows_link_target_str(r"C:\dir\Pkg"),
+            super::normalize_windows_link_target_str(r"C:\dir\pkg"),
+            "path components must not be folded across case-sensitive directories"
+        );
+        assert_eq!(
+            super::normalize_windows_link_target_str(r"c:\dir\Pkg"),
+            super::normalize_windows_link_target_str(r"C:\dir\Pkg"),
+            "Windows drive letters remain case-insensitive"
+        );
     }
 }
 

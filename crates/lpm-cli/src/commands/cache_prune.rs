@@ -544,13 +544,13 @@ fn apply_plan(
             for source_record in &summary.cas_source_record_files_orphaned {
                 add_removed_bytes(
                     &mut summary.bytes_freed_or_eligible,
-                    prune_tombstones.remove_file_direct(source_record)?,
+                    prune_tombstones.remove_file_direct(source_record, false)?,
                 );
             }
             for validation in &summary.cas_source_validation_files_orphaned {
                 add_removed_bytes(
                     &mut summary.bytes_freed_or_eligible,
-                    prune_tombstones.remove_file_direct(validation)?,
+                    prune_tombstones.remove_file_direct(validation, false)?,
                 );
             }
             add_removed_bytes(
@@ -560,13 +560,13 @@ fn apply_plan(
             for manifest in &summary.cas_tree_files_orphaned {
                 add_removed_bytes(
                     &mut summary.bytes_freed_or_eligible,
-                    prune_tombstones.remove_file_direct(manifest)?,
+                    prune_tombstones.remove_file_direct(manifest, false)?,
                 );
             }
             for blob in &summary.cas_blob_files_orphaned {
                 add_removed_bytes(
                     &mut summary.bytes_freed_or_eligible,
-                    prune_tombstones.remove_file_direct(blob)?,
+                    prune_tombstones.remove_file_direct(blob, true)?,
                 );
             }
         }
@@ -670,7 +670,12 @@ impl PruneTombstones {
                 }
                 Err(error) => return Err(error.into()),
             };
-        Self::open_in(parent, path, create, cfg!(target_os = "macos"))
+        Self::open_in(
+            parent,
+            path,
+            create,
+            V2Store::at(parent_path).uses_serialized_volume_metadata(),
+        )
     }
 
     fn open_in(
@@ -763,7 +768,11 @@ impl PruneTombstones {
     /// shard directory. Single-file `unlink` is already atomic, avoiding the
     /// rename-to-tombstone round-trip on thousands of CAS files; unexpected
     /// non-file entries fall back to the tombstone path.
-    fn remove_file_direct(&mut self, path: &Path) -> Result<u64, LpmError> {
+    fn remove_file_direct(
+        &mut self,
+        path: &Path,
+        may_have_hardlinks: bool,
+    ) -> Result<u64, LpmError> {
         let (relative, source_name) = self.resolve_target(path)?;
         let Some(source_parent) = self.open_parent_dir(relative)? else {
             return Ok(0);
@@ -779,9 +788,13 @@ impl PruneTombstones {
             }
         };
         if metadata.is_file() && !super::cache::cap_metadata_is_link_or_reparse(&metadata) {
-            let len = metadata.len();
-            return match source_parent.remove_file(source_name) {
-                Ok(()) => Ok(len),
+            return match lpm_common::cap_remove_file_counting_freed_bytes(
+                source_parent,
+                source_name,
+                &metadata,
+                may_have_hardlinks,
+            ) {
+                Ok(freed) => Ok(freed),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
                 Err(error) => Err(LpmError::Store(format!(
                     "cache prune: failed to remove {}: {error}",
@@ -867,36 +880,45 @@ impl PruneTombstones {
             return Ok(total);
         }
 
-        let workers = self.sweep_workers.min(names.len());
+        let desired_helpers = self.sweep_workers.min(names.len()).saturating_sub(1);
         let next_index = AtomicUsize::new(0);
         let failed = AtomicBool::new(false);
         let directory = &self.directory;
 
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(workers);
-            for _ in 0..workers {
-                handles.push(scope.spawn(|| -> Result<u64, LpmError> {
-                    let mut local_bytes = 0u64;
-                    while !failed.load(Ordering::Relaxed) {
-                        let idx = next_index.fetch_add(1, Ordering::Relaxed);
-                        let Some(name) = names.get(idx) else {
-                            break;
-                        };
-                        match super::cache::remove_open_entry_with_size(directory, name) {
-                            Ok(Some(bytes)) => add_removed_bytes(&mut local_bytes, bytes),
-                            Ok(None) => {}
-                            Err(error) => {
-                                failed.store(true, Ordering::Relaxed);
-                                return Err(error);
-                            }
-                        }
+        let run_worker = || -> Result<u64, LpmError> {
+            let mut local_bytes = 0u64;
+            while !failed.load(Ordering::Relaxed) {
+                let idx = next_index.fetch_add(1, Ordering::Relaxed);
+                let Some(name) = names.get(idx) else {
+                    break;
+                };
+                match super::cache::remove_open_entry_with_size(directory, name) {
+                    Ok(Some(bytes)) => add_removed_bytes(&mut local_bytes, bytes),
+                    Ok(None) => {}
+                    Err(error) => {
+                        failed.store(true, Ordering::Relaxed);
+                        return Err(error);
                     }
-                    Ok(local_bytes)
-                }));
+                }
+            }
+            Ok(local_bytes)
+        };
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(desired_helpers);
+            for _ in 0..desired_helpers {
+                match spawn_prune_worker(scope, run_worker) {
+                    Ok(handle) => handles.push(handle),
+                    Err(_) => break,
+                }
             }
 
             let mut total = 0u64;
             let mut first_error: Option<LpmError> = None;
+            match run_worker() {
+                Ok(bytes) => add_removed_bytes(&mut total, bytes),
+                Err(error) => first_error = Some(error),
+            }
             for handle in handles {
                 match handle.join() {
                     Ok(Ok(bytes)) => add_removed_bytes(&mut total, bytes),
@@ -920,6 +942,29 @@ impl PruneTombstones {
             }
         })
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_PRUNE_SPAWN_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn spawn_prune_worker<'scope, 'env, T, F>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    f: F,
+) -> std::io::Result<std::thread::ScopedJoinHandle<'scope, T>>
+where
+    T: Send + 'scope,
+    F: FnOnce() -> T + Send + 'scope,
+{
+    #[cfg(test)]
+    if FORCE_PRUNE_SPAWN_FAILURE.with(std::cell::Cell::get) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "injected prune worker spawn failure",
+        ));
+    }
+    std::thread::Builder::new().spawn_scoped(scope, f)
 }
 
 #[cfg(unix)]
@@ -1473,12 +1518,15 @@ fn compute_prune(
 
     let mut bytes_freed_or_eligible = 0u64;
     if build_full_plan && !flags.apply {
-        bytes_freed_or_eligible = sum_orphan_dir_sizes(&[
-            &link_entries_orphaned,
-            &object_entries_orphaned,
-            &compat_islands_orphaned,
-            &build_artifacts_orphaned,
-        ]);
+        bytes_freed_or_eligible = sum_orphan_dir_sizes(
+            &[
+                &link_entries_orphaned,
+                &object_entries_orphaned,
+                &compat_islands_orphaned,
+                &build_artifacts_orphaned,
+            ],
+            v2_store.uses_serialized_volume_metadata(),
+        );
     }
 
     let stats = PruneStats {
@@ -1649,12 +1697,12 @@ fn parse_duration(s: &str) -> Result<Age, LpmError> {
     })
 }
 
-fn sum_orphan_dir_sizes(groups: &[&[PathBuf]]) -> u64 {
+fn sum_orphan_dir_sizes(groups: &[&[PathBuf]], serialized_volume: bool) -> u64 {
     let total_dirs: usize = groups.iter().map(|group| group.len()).sum();
     if total_dirs == 0 {
         return 0;
     }
-    let workers = lpm_common::resources::effective_cpu_count().min(4);
+    let workers = directory_sweep_workers(serialized_volume).min(4);
     if total_dirs < PARALLEL_DRY_RUN_DIR_SIZE_THRESHOLD || workers <= 1 {
         let mut total = 0u64;
         for dir in groups.iter().flat_map(|group| group.iter()) {
@@ -1667,23 +1715,27 @@ fn sum_orphan_dir_sizes(groups: &[&[PathBuf]]) -> u64 {
         .flat_map(|group| group.iter().map(PathBuf::as_path))
         .collect();
     let next_index = AtomicUsize::new(0);
-    let workers = workers.min(dirs.len());
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(workers);
-        for _ in 0..workers {
-            handles.push(scope.spawn(|| {
-                let mut local = 0u64;
-                loop {
-                    let idx = next_index.fetch_add(1, Ordering::Relaxed);
-                    let Some(&dir) = dirs.get(idx) else {
-                        break;
-                    };
-                    local = local.saturating_add(dir_size(dir).unwrap_or(0));
-                }
-                local
-            }));
+    let desired_helpers = workers.min(dirs.len()).saturating_sub(1);
+    let run_worker = || {
+        let mut local = 0u64;
+        loop {
+            let idx = next_index.fetch_add(1, Ordering::Relaxed);
+            let Some(&dir) = dirs.get(idx) else {
+                break;
+            };
+            local = local.saturating_add(dir_size(dir).unwrap_or(0));
         }
-        let mut total = 0u64;
+        local
+    };
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(desired_helpers);
+        for _ in 0..desired_helpers {
+            match spawn_prune_worker(scope, run_worker) {
+                Ok(handle) => handles.push(handle),
+                Err(_) => break,
+            }
+        }
+        let mut total = run_worker();
         for handle in handles {
             if let Ok(local) = handle.join() {
                 total = total.saturating_add(local);
@@ -3149,6 +3201,70 @@ mod tests {
                 "orphan CAS file should be directly unlinked: {}",
                 cas_file.display()
             );
+        }
+    }
+
+    #[test]
+    fn remove_file_direct_counts_zero_freed_bytes_while_other_hardlinks_remain() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_root = dir.path().join("store");
+        let blobs_shard = store_root.join("blobs/blake3/aa");
+        let retained_dir = store_root.join("objects/live");
+        std::fs::create_dir_all(&blobs_shard).unwrap();
+        std::fs::create_dir_all(&retained_dir).unwrap();
+        let orphan_blob = blobs_shard.join("shared-blob");
+        let retained_link = retained_dir.join("index.js");
+        std::fs::write(&orphan_blob, b"0123456789").unwrap();
+        std::fs::hard_link(&orphan_blob, &retained_link).unwrap();
+        let solo_blob = blobs_shard.join("solo-blob");
+        std::fs::write(&solo_blob, b"0123456789").unwrap();
+
+        let tombstone_root = store_root.join(".prune-tombstones");
+        let mut tombstones = PruneTombstones::open(&tombstone_root, true)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            tombstones.remove_file_direct(&orphan_blob, true).unwrap(),
+            0,
+            "unlinking a file with another remaining hardlink must report zero freed bytes"
+        );
+        assert!(!orphan_blob.exists());
+        assert!(retained_link.exists());
+        assert_eq!(
+            tombstones.remove_file_direct(&solo_blob, true).unwrap(),
+            10,
+            "unlinking the final link of a file must report its byte length"
+        );
+    }
+
+    #[test]
+    fn prune_tombstone_sweep_falls_back_serially_when_worker_spawn_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_root = dir.path().join("store");
+        let links_root = store_root.join("links");
+        std::fs::create_dir_all(&links_root).unwrap();
+        let mut orphan_dirs = Vec::new();
+        for idx in 0..10 {
+            let orphan = links_root.join(format!("orphan-{idx}"));
+            std::fs::create_dir_all(&orphan).unwrap();
+            std::fs::write(orphan.join("index.js"), b"hello").unwrap();
+            orphan_dirs.push(orphan);
+        }
+
+        let tombstone_root = store_root.join(".prune-tombstones");
+        let mut tombstones = PruneTombstones::open(&tombstone_root, true)
+            .unwrap()
+            .unwrap();
+        tombstones.sweep_workers = 4;
+
+        FORCE_PRUNE_SPAWN_FAILURE.with(|flag| flag.set(true));
+        let freed = tombstones.remove_directories(&orphan_dirs);
+        FORCE_PRUNE_SPAWN_FAILURE.with(|flag| flag.set(false));
+
+        assert_eq!(freed.unwrap(), 50);
+        for orphan in &orphan_dirs {
+            assert!(!orphan.exists());
         }
     }
 

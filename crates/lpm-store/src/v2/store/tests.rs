@@ -574,7 +574,7 @@ fn linux_warm_materialization_uses_lower_4kib_reflink_threshold_and_parses_overl
 
     let docker_btrfs_mountinfo = concat!(
         "100 99 0:45 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/docker/overlay2/l/A,upperdir=/var/lib/docker/overlay2/abc/diff,workdir=/var/lib/docker/overlay2/abc/work\n",
-        "101 100 0:30 /var/lib/docker/containers/abc/resolv.conf /etc/resolv.conf rw,relatime - btrfs /dev/nvme0n1p2 rw,space_cache=v2\n",
+        "101 100 0:30 / /var/lib/docker/overlay2 rw,relatime - btrfs /dev/nvme0n1p2 rw,space_cache=v2\n",
     );
     assert_eq!(
         super::linux_overlay_upperdir_is_btrfs_from_mountinfo(
@@ -586,7 +586,7 @@ fn linux_warm_materialization_uses_lower_4kib_reflink_threshold_and_parses_overl
 
     let docker_ext4_mountinfo = concat!(
         "100 99 0:45 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/docker/overlay2/l/A,upperdir=/var/lib/docker/overlay2/abc/diff,workdir=/var/lib/docker/overlay2/abc/work\n",
-        "101 100 8:1 /var/lib/docker/containers/abc/resolv.conf /etc/resolv.conf rw,relatime - ext4 /dev/sda1 rw\n",
+        "101 100 8:1 / /var/lib/docker/overlay2 rw,relatime - ext4 /dev/sda1 rw\n",
     );
     assert_eq!(
         super::linux_overlay_upperdir_is_btrfs_from_mountinfo(
@@ -594,6 +594,18 @@ fn linux_warm_materialization_uses_lower_4kib_reflink_threshold_and_parses_overl
             docker_ext4_mountinfo.as_bytes()
         ),
         Some(false)
+    );
+
+    let conflicting_prefix_mountinfo = concat!(
+        "100 99 0:45 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/docker/overlay2/l/A,upperdir=/var/lib/docker/overlay2/abc/diff,workdir=/var/lib/docker/overlay2/abc/work\n",
+        "101 100 0:30 /var/lib/docker/containers/abc/resolv.conf /etc/resolv.conf rw,relatime - btrfs /dev/nvme0n1p2 rw,space_cache=v2\n",
+    );
+    assert_eq!(
+        super::linux_overlay_upperdir_is_btrfs_from_mountinfo(
+            Path::new("/workspace/project"),
+            conflicting_prefix_mountinfo.as_bytes()
+        ),
+        None
     );
 }
 

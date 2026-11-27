@@ -147,9 +147,9 @@ pub use registry_http::{
     RegistryBodyKind, RegistryHttpError, RegistryKind, registry_error_body_message,
 };
 pub use symlink::{
-    create_dir_symlink_or_junction, create_symlink, is_symlink_or_junction, lexically_clean,
-    link_targets_equivalent, remove_path_entry, remove_path_entry_counting_freed_bytes,
-    remove_symlink_or_junction_entry,
+    cap_remove_file_counting_freed_bytes, create_dir_symlink_or_junction, create_symlink,
+    is_symlink_or_junction, lexically_clean, link_targets_equivalent, remove_path_entry,
+    remove_path_entry_counting_freed_bytes, remove_symlink_or_junction_entry,
 };
 pub use terminal::{
     is_terminal_control, sanitize_for_terminal, sanitize_server_text, sanitize_terminal_inline,
