@@ -436,13 +436,13 @@ pub(crate) struct NewFile {
 }
 
 impl NewFile {
-    /// Create or truncate the file without following a symlink at its name.
+    /// Create a brand-new regular file without following a symlink or
+    /// overwriting an already-existing aliased entry (e.g. 8.3 short names).
     pub(crate) fn create(self) -> Result<PendingFile, LpmError> {
         let mut options = OpenOptions::new();
         options
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .follow(FollowSymlinks::No);
         self.open(&options)
     }
@@ -469,7 +469,18 @@ impl NewFile {
         let file = self
             .directory
             .open_with(&self.name, options)
-            .map_err(|error| path_error(error, &self.path))?
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists
+                    && let Ok(meta) = self.directory.symlink_metadata(&self.name)
+                    && meta.file_type().is_symlink()
+                {
+                    return path_error(
+                        io::Error::new(io::ErrorKind::InvalidInput, error),
+                        &self.path,
+                    );
+                }
+                path_error(error, &self.path)
+            })?
             .into_std();
         Ok(PendingFile {
             file,

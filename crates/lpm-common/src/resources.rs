@@ -303,7 +303,7 @@ fn push_cgroup_mount_line(mounts: &mut CgroupMounts, line: &str) {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 fn parse_cgroup_mounts(mountinfo: &str) -> CgroupMounts {
     let mut mounts = CgroupMounts::default();
     for line in mountinfo.lines() {

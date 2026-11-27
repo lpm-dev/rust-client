@@ -54,12 +54,26 @@ impl Read for DecodedReader {
                     tracing::trace_span!(target: "lpm_install_timeline", "decoded_buffer_wait")
                         .entered();
                 if self.writer_failed.is_active() {
-                    loop {
-                        match self.ready.recv_timeout(Duration::from_millis(5)) {
-                            Err(RecvTimeoutError::Timeout) if !self.writer_failed.has_failed() => {
-                                continue;
+                    match self.ready.try_recv() {
+                        Ok(msg) => Ok(msg),
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            Err(RecvTimeoutError::Disconnected)
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            // Flush any queued sub-threshold writer batch before
+                            // blocking on network/decoder input so a local open
+                            // error cancels a stalled stream promptly.
+                            self.writer_failed.flush_pending_batch();
+                            loop {
+                                match self.ready.recv_timeout(Duration::from_millis(5)) {
+                                    Err(RecvTimeoutError::Timeout)
+                                        if !self.writer_failed.has_failed() =>
+                                    {
+                                        continue;
+                                    }
+                                    result => break result,
+                                }
                             }
-                            result => break result,
                         }
                     }
                 } else {
@@ -1099,5 +1113,91 @@ mod tests {
         for (file, (_, _, digest)) in files.iter().zip(&seen) {
             assert_eq!(Some(file.blake3_digest), *digest);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stalled_stream_flushes_sub_threshold_writer_batch_so_local_error_cancels_input() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Build a tar stream whose prefix exceeds BUFFER_SIZE so the decoder
+        // flushes entries 1-5 to DecodedReader immediately and then stalls
+        // waiting for the trailing bytes of entry 6.
+        let large_padding = vec![b'x'; BUFFER_SIZE];
+        let mut prefix = tar_stream(&[
+            (b"package/f1.js", b"1"),
+            (b"package/f2.js", b"2"),
+            (b"package/f3.js", b"3"),
+            (b"package/f4.js", b"4"),
+            (b"package/readonly/fail.js", b"5"),
+            (b"package/f6.js", &large_padding),
+        ]);
+        // Keep enough bytes to cross one full BUFFER_SIZE chunk (delivering
+        // entries 1-5) while stopping mid-entry on f6.js so the stream stalls.
+        prefix.truncate(BUFFER_SIZE + 512);
+
+        let root = tempfile::tempdir().unwrap();
+        let ro_dir = root.path().join("readonly");
+        std::fs::create_dir(&ro_dir).unwrap();
+        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        struct StallAfterPrefix {
+            bytes: Vec<u8>,
+            pos: usize,
+            cancel_rx: std::sync::mpsc::Receiver<()>,
+        }
+        impl Read for StallAfterPrefix {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.pos < self.bytes.len() {
+                    let n = (self.bytes.len() - self.pos).min(buf.len());
+                    buf[..n].copy_from_slice(&self.bytes[self.pos..self.pos + n]);
+                    self.pos += n;
+                    return Ok(n);
+                }
+                match self.cancel_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(()) => Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled")),
+                    Err(_) => Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "stalled stream timed out",
+                    )),
+                }
+            }
+        }
+
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled_clone = Arc::clone(&cancelled);
+        let reader = StallAfterPrefix {
+            bytes: prefix,
+            pos: 0,
+            cancel_rx,
+        };
+        let started = std::time::Instant::now();
+        let result = extract_stream::<std::path::PathBuf>(
+            reader,
+            root.path(),
+            DEFAULT_EXTRACTION_LIMITS,
+            StreamFormat::Tar,
+            false,
+            move || {
+                cancelled_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = cancel_tx.try_send(());
+            },
+        );
+        let _ = std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o700));
+        assert!(
+            result.is_err(),
+            "failing open in sub-threshold batch must fail extraction"
+        );
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "failing open in sub-threshold batch must cancel stalled input instead of waiting for timeout (elapsed {:?})",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cancellation must occur promptly rather than waiting for stream timeout: {:?}",
+            started.elapsed()
+        );
     }
 }

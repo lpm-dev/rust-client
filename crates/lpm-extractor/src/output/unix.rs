@@ -39,9 +39,18 @@ struct Parent {
     identity: Identity,
 }
 
-const MIN_CACHED_PARENTS: usize = 16;
-const MID_CACHED_PARENTS: usize = 32;
-const MAX_CACHED_PARENTS: usize = 64;
+const MIN_CACHED_PARENTS: usize = 4;
+const MAX_CACHED_PARENTS: usize = 32;
+
+fn parent_cache_capacity_for_limit(soft: u64, max_concurrent: usize) -> usize {
+    if soft < 128 {
+        return MIN_CACHED_PARENTS;
+    }
+    let per_extraction = (soft / 4) / (max_concurrent.max(1) as u64);
+    usize::try_from(per_extraction)
+        .unwrap_or(MAX_CACHED_PARENTS)
+        .clamp(MIN_CACHED_PARENTS, MAX_CACHED_PARENTS)
+}
 
 fn parent_cache_capacity() -> usize {
     let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
@@ -51,13 +60,15 @@ fn parent_cache_capacity() -> usize {
     }
     // SAFETY: getrlimit succeeded.
     let soft = unsafe { limit.assume_init() }.rlim_cur;
-    if soft >= 512 {
-        MAX_CACHED_PARENTS
-    } else if soft >= 256 {
-        MID_CACHED_PARENTS
-    } else {
-        MIN_CACHED_PARENTS
-    }
+    let max_concurrent = lpm_common::resources::default_fetch_extract_permits(
+        lpm_common::resources::effective_cpu_count(),
+        lpm_common::resources::effective_memory_limit_bytes(),
+    );
+    parent_cache_capacity_for_limit(soft, max_concurrent)
+}
+
+fn is_descriptor_exhaustion(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
 }
 
 struct LruNode {
@@ -220,20 +231,31 @@ impl OutputTree {
             self.parent = Some(cached);
             return Ok(());
         }
-        if let Some(record) = self.directories.get(parent)
-            && let Some((directory, name)) = open_known_parent(&self.root, parent)?
-        {
-            let identity = Identity::from_metadata(&directory.metadata()?);
-            if identity != record.identity {
-                return Err(changed_directory(parent));
+        if let Some(record) = self.directories.get(parent) {
+            let opened = match open_known_parent(&self.root, parent) {
+                Ok(opened) => opened,
+                Err(error)
+                    if is_descriptor_exhaustion(&error)
+                        && !self.recent_parents.index.is_empty() =>
+                {
+                    self.recent_parents.clear();
+                    open_known_parent(&self.root, parent)?
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if let Some((directory, name)) = opened {
+                let identity = Identity::from_metadata(&directory.metadata()?);
+                if identity != record.identity {
+                    return Err(changed_directory(parent));
+                }
+                self.parent = Some(Parent {
+                    path: parent.to_path_buf(),
+                    name,
+                    file: Arc::new(directory),
+                    identity,
+                });
+                return Ok(());
             }
-            self.parent = Some(Parent {
-                path: parent.to_path_buf(),
-                name,
-                file: Arc::new(directory),
-                identity,
-            });
-            return Ok(());
         }
         let mut current = None::<File>;
         let mut prefix = PathBuf::with_capacity(parent.as_os_str().len());
@@ -243,12 +265,20 @@ impl OutputTree {
             let name = CString::new(component.as_os_str().as_bytes()).map_err(invalid_path)?;
             let base = current.as_ref().unwrap_or(&self.root).as_raw_fd();
             let known = self.directories.get(&prefix);
-            let (next, created) = match open_directory(base, &name) {
+            let open_or_retry = |recent: &mut ParentCache| match open_directory(base, &name) {
+                Ok(next) => Ok(next),
+                Err(error) if is_descriptor_exhaustion(&error) && !recent.index.is_empty() => {
+                    recent.clear();
+                    open_directory(base, &name)
+                }
+                Err(error) => Err(error),
+            };
+            let (next, created) = match open_or_retry(&mut self.recent_parents) {
                 Ok(next) => (next, false),
                 Err(error) if error.kind() == io::ErrorKind::NotFound && known.is_none() => {
                     budget.reserve(&prefix)?;
                     mkdir(base, &name)?;
-                    match open_directory(base, &name) {
+                    match open_or_retry(&mut self.recent_parents) {
                         Ok(directory) => (directory, true),
                         Err(error) => {
                             let _ = unlink(base, &name, libc::AT_REMOVEDIR);
@@ -450,9 +480,10 @@ pub(crate) struct NewFile {
 }
 
 impl NewFile {
-    /// Create or truncate the file without following a symlink at its name.
+    /// Create a brand-new regular file without following a symlink or
+    /// overwriting an already-existing aliased entry (e.g. APFS NFC/NFD).
     pub(crate) fn create(self) -> Result<PendingFile, LpmError> {
-        self.open(libc::O_TRUNC)
+        self.open(libc::O_EXCL)
     }
 
     /// Remove the regular file an earlier entry wrote at this name, then create it.
@@ -471,8 +502,19 @@ impl NewFile {
 
     fn open(self, mode_flag: i32) -> Result<PendingFile, LpmError> {
         let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW | mode_flag;
-        let file = open_at(self.directory.as_raw_fd(), &self.name, flags, 0o666)
-            .map_err(|error| path_error(error, &self.path))?;
+        let base = self.directory.as_raw_fd();
+        let file = open_at(base, &self.name, flags, 0o666).map_err(|error| {
+            // POSIX specifies EEXIST for O_CREAT|O_EXCL|O_NOFOLLOW on an
+            // existing symlink; classify symlinks as ELOOP so callers still
+            // receive LpmError::PathTraversal.
+            if error.kind() == io::ErrorKind::AlreadyExists
+                && let Ok(meta) = stat_at(base, &self.name)
+                && (meta.st_mode & libc::S_IFMT) == libc::S_IFLNK
+            {
+                return path_error(io::Error::from_raw_os_error(libc::ELOOP), &self.path);
+            }
+            path_error(error, &self.path)
+        })?;
         Ok(PendingFile {
             file,
             directory: self.directory,
@@ -836,5 +878,19 @@ mod parent_cache_tests {
         assert_eq!(cache.take(Path::new("a")).unwrap().identity.inode, 1);
         assert_eq!(cache.take(Path::new("c")).unwrap().identity.inode, 3);
         assert_eq!(cache.take(Path::new("d")).unwrap().identity.inode, 4);
+    }
+
+    #[test]
+    fn parent_cache_capacity_leaves_descriptor_headroom_for_concurrent_extractions() {
+        let at_512 = parent_cache_capacity_for_limit(512, 8);
+        assert!(
+            at_512 * 8 <= 128,
+            "8 concurrent extractions at RLIMIT_NOFILE=512 must stay within 25% of soft limit, got {at_512} each"
+        );
+        assert_eq!(parent_cache_capacity_for_limit(64, 8), MIN_CACHED_PARENTS);
+        assert_eq!(
+            parent_cache_capacity_for_limit(10_240, 4),
+            MAX_CACHED_PARENTS
+        );
     }
 }

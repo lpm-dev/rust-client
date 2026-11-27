@@ -1908,14 +1908,8 @@ where
                         &mut extracted_files,
                         &mut accepted_identities,
                     )?;
-                    let mut bytes = Vec::with_capacity(length);
-                    let mut remaining = length;
-                    while remaining > 0 {
-                        let chunk = remaining.min(copy_buffer.len());
-                        entry.read_exact(&mut copy_buffer[..chunk])?;
-                        bytes.extend_from_slice(&copy_buffer[..chunk]);
-                        remaining -= chunk;
-                    }
+                    let mut bytes = vec![0u8; length];
+                    entry.read_exact(&mut bytes)?;
                     let capacity = bytes.capacity();
                     if capacity > length {
                         pending.make_room(
@@ -2478,22 +2472,40 @@ fn append_case_fold_component_key(key: &mut String, component: &OsStr) {
 fn is_windows_reserved_device_name(component: &OsStr) -> bool {
     let component = component.to_string_lossy();
     let trimmed = component.trim_end_matches([' ', '.']);
-    let stem = trimmed.split('.').next().unwrap_or(trimmed);
-    let bytes = stem.as_bytes();
-    match bytes.len() {
-        3 => {
-            stem.eq_ignore_ascii_case("CON")
-                || stem.eq_ignore_ascii_case("PRN")
-                || stem.eq_ignore_ascii_case("AUX")
-                || stem.eq_ignore_ascii_case("NUL")
-        }
-        4 => {
-            matches!(bytes[3], b'1'..=b'9')
-                && (stem[..3].eq_ignore_ascii_case("COM") || stem[..3].eq_ignore_ascii_case("LPT"))
-        }
-        6 => stem.eq_ignore_ascii_case("CLOCK$"),
-        _ => false,
+    let stem = trimmed
+        .split('.')
+        .next()
+        .unwrap_or(trimmed)
+        .trim_end_matches(' ');
+    if stem.eq_ignore_ascii_case("CON")
+        || stem.eq_ignore_ascii_case("PRN")
+        || stem.eq_ignore_ascii_case("AUX")
+        || stem.eq_ignore_ascii_case("NUL")
+        || stem.eq_ignore_ascii_case("CLOCK$")
+        || stem.eq_ignore_ascii_case("CONIN$")
+        || stem.eq_ignore_ascii_case("CONOUT$")
+    {
+        return true;
     }
+    if let Some(prefix) = stem.as_bytes().get(..3)
+        && (prefix.eq_ignore_ascii_case(b"COM") || prefix.eq_ignore_ascii_case(b"LPT"))
+    {
+        return matches!(
+            &stem[3..],
+            "1" | "2"
+                | "3"
+                | "4"
+                | "5"
+                | "6"
+                | "7"
+                | "8"
+                | "9"
+                | "\u{00B9}"
+                | "\u{00B2}"
+                | "\u{00B3}"
+        );
+    }
+    false
 }
 
 #[cfg(test)]
@@ -4784,12 +4796,18 @@ mod tests {
             "prn ",
             "aux.",
             "NUL.js",
+            "NUL .txt",
             "CLOCK$",
             "clock$.bin",
+            "CONIN$",
+            "conout$.js",
             "COM1",
             "com9.ts",
+            "COM\u{00B9}",
+            "com\u{00B2}.txt",
             "LPT1",
             "lpt5.json",
+            "LPT\u{00B3}.json",
         ] {
             assert!(
                 is_windows_reserved_device_name(OsStr::new(reserved)),
@@ -4804,5 +4822,21 @@ mod tests {
                 "expected allowed: {allowed}"
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn extract_tarball_rejects_unicode_aliasing_entries_without_overwriting_earlier_file() {
+        let archive = create_test_tarball_with_entries(&[
+            ("package.json", br#"{"name":"alias-pkg","version":"1.0.0"}"#),
+            ("caf\u{00e9}.js", b"genuine-bytes"),
+            ("cafe\u{0301}.js", b"attacker-byte"),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let result = extract_tarball(&archive, root.path());
+        assert!(
+            result.is_err(),
+            "NFC/NFD aliasing entries on APFS must fail extraction instead of overwriting"
+        );
     }
 }

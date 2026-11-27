@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread::JoinHandle;
 
 pub(super) const MAX_ENTRY_BYTES: usize = 512 * 1024;
@@ -15,10 +15,40 @@ const JOB_BATCH_MAX_BYTES: usize = 128 * 1024;
 const MAX_WRITER_POOLS: usize = 4;
 static ACTIVE_WRITER_POOLS: AtomicUsize = AtomicUsize::new(0);
 
+struct PendingBatch {
+    jobs: Vec<Job>,
+    bytes: usize,
+    sender: Option<mpsc::Sender<Vec<Job>>>,
+}
+
+impl PendingBatch {
+    fn flush(&mut self) -> Result<(), LpmError> {
+        if self.jobs.is_empty() {
+            return Ok(());
+        }
+        let batch = std::mem::replace(&mut self.jobs, Vec::with_capacity(JOB_BATCH_MAX_FILES));
+        self.bytes = 0;
+        self.sender
+            .as_ref()
+            .ok_or_else(|| io::Error::other("tarball file writers already stopped"))?
+            .send(batch)
+            .map_err(|_| io::Error::other("tarball file writers disconnected").into())
+    }
+}
+
+struct BusyWorkerGuard(Arc<AtomicUsize>);
+
+impl Drop for BusyWorkerGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 #[derive(Default)]
 pub(super) struct FailureSignal {
     active: AtomicBool,
     failed: AtomicBool,
+    pending_batch: Mutex<Option<Weak<Mutex<PendingBatch>>>>,
 }
 
 impl FailureSignal {
@@ -28,6 +58,28 @@ impl FailureSignal {
 
     pub(super) fn has_failed(&self) -> bool {
         self.failed.load(Ordering::Acquire)
+    }
+
+    fn attach_pending_batch(&self, batch: Weak<Mutex<PendingBatch>>) {
+        *self
+            .pending_batch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(batch);
+    }
+
+    pub(super) fn flush_pending_batch(&self) {
+        let batch = self
+            .pending_batch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(Weak::upgrade);
+        if let Some(batch) = batch {
+            let mut guard = batch
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = guard.flush();
+        }
     }
 }
 
@@ -374,9 +426,9 @@ impl PendingEntries {
 }
 
 pub(super) struct WriterPool {
-    sender: Option<mpsc::Sender<Vec<Job>>>,
-    pending_batch: Vec<Job>,
-    pending_batch_bytes: usize,
+    pending_batch: Arc<Mutex<PendingBatch>>,
+    busy_workers: Arc<AtomicUsize>,
+    worker_count: usize,
     ready: mpsc::Receiver<Vec<Completion>>,
     buffered_completions: VecDeque<Completion>,
     workers: Vec<JoinHandle<()>>,
@@ -411,10 +463,16 @@ impl WriterPool {
         let (sender, receiver) = mpsc::channel::<Vec<Job>>();
         let receiver = Arc::new(Mutex::new(receiver));
         let (completed, ready) = mpsc::channel::<Vec<Completion>>();
-        let mut pool = Self {
+        let pending_batch = Arc::new(Mutex::new(PendingBatch {
+            jobs: Vec::with_capacity(JOB_BATCH_MAX_FILES),
+            bytes: 0,
             sender: Some(sender),
-            pending_batch: Vec::with_capacity(JOB_BATCH_MAX_FILES),
-            pending_batch_bytes: 0,
+        }));
+        let busy_workers = Arc::new(AtomicUsize::new(0));
+        let mut pool = Self {
+            pending_batch: Arc::clone(&pending_batch),
+            busy_workers: Arc::clone(&busy_workers),
+            worker_count: count,
             ready,
             buffered_completions: VecDeque::with_capacity(JOB_BATCH_MAX_FILES),
             workers: Vec::with_capacity(count),
@@ -430,6 +488,7 @@ impl WriterPool {
             let jobs = Arc::clone(&receiver);
             let results = completed.clone();
             let failure = failure.clone();
+            let busy = Arc::clone(&busy_workers);
             #[cfg(test)]
             let hooks = pool.hooks.clone();
             pool.workers.push(
@@ -444,6 +503,8 @@ impl WriterPool {
                                 Err(_) => return,
                             };
                             let Ok(batch) = batch else { return };
+                            busy.fetch_add(1, Ordering::AcqRel);
+                            let _busy_guard = BusyWorkerGuard(Arc::clone(&busy));
                             let mut completions = Vec::with_capacity(batch.len());
                             for job in batch {
                                 let sequence = job.sequence;
@@ -491,59 +552,42 @@ impl WriterPool {
             );
         }
         if let Some(failure) = failure {
+            failure.attach_pending_batch(Arc::downgrade(&pending_batch));
             failure.active.store(true, Ordering::Release);
         }
         Ok(pool)
     }
 
-    #[cfg(test)]
-    fn has_test_hooks(&self) -> bool {
-        self.hooks.before_open.is_some()
-            || self.hooks.before_write.is_some()
-            || self.hooks.after_write.is_some()
-            || self.hooks.observer.is_some()
-    }
-
     pub(super) fn submit(&mut self, job: Job) -> Result<(), LpmError> {
-        #[cfg(test)]
-        if self.has_test_hooks() {
-            return self
-                .sender
-                .as_ref()
-                .ok_or_else(|| io::Error::other("tarball file writers already stopped"))?
-                .send(vec![job])
-                .map_err(|_| io::Error::other("tarball file writers disconnected").into());
-        }
         let job_bytes = job.bytes.len();
-        if !self.pending_batch.is_empty()
-            && self.pending_batch_bytes.saturating_add(job_bytes) > JOB_BATCH_MAX_BYTES
-        {
-            self.flush()?;
+        let mut batch = self
+            .pending_batch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !batch.jobs.is_empty() && batch.bytes.saturating_add(job_bytes) > JOB_BATCH_MAX_BYTES {
+            batch.flush()?;
         }
-        self.pending_batch.push(job);
-        self.pending_batch_bytes = self.pending_batch_bytes.saturating_add(job_bytes);
-        if self.pending_batch.len() >= JOB_BATCH_MAX_FILES
-            || self.pending_batch_bytes >= JOB_BATCH_MAX_BYTES
+        batch.jobs.push(job);
+        batch.bytes = batch.bytes.saturating_add(job_bytes);
+        // Dispatch immediately whenever any writer thread is idle so small
+        // packages (4-64 files) use full writer parallelism; accumulate up to
+        // JOB_BATCH_MAX_FILES while all writers are busy.
+        let writer_idle = self.busy_workers.load(Ordering::Acquire) < self.worker_count;
+        if writer_idle
+            || batch.jobs.len() >= JOB_BATCH_MAX_FILES
+            || batch.bytes >= JOB_BATCH_MAX_BYTES
         {
-            self.flush()?;
+            batch.flush()?;
         }
         Ok(())
     }
 
     pub(super) fn flush(&mut self) -> Result<(), LpmError> {
-        if self.pending_batch.is_empty() {
-            return Ok(());
-        }
-        let batch = std::mem::replace(
-            &mut self.pending_batch,
-            Vec::with_capacity(JOB_BATCH_MAX_FILES),
-        );
-        self.pending_batch_bytes = 0;
-        self.sender
-            .as_ref()
-            .ok_or_else(|| io::Error::other("tarball file writers already stopped"))?
-            .send(batch)
-            .map_err(|_| io::Error::other("tarball file writers disconnected").into())
+        let mut batch = self
+            .pending_batch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        batch.flush()
     }
 
     pub(super) fn receive(&mut self) -> Result<Completion, LpmError> {
@@ -590,8 +634,14 @@ impl WriterPool {
     }
 
     fn join(&mut self) -> Result<(), LpmError> {
-        let _ = self.flush();
-        self.sender.take();
+        {
+            let mut batch = self
+                .pending_batch
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = batch.flush();
+            batch.sender.take();
+        }
         let mut failed = false;
         for worker in self.workers.drain(..) {
             failed |= worker.join().is_err();
@@ -702,5 +752,79 @@ mod tests {
         ] {
             assert_eq!(pool_capacity_for_descriptor_limit(limit), expected);
         }
+    }
+
+    #[test]
+    fn writer_pool_batches_when_busy_and_flushes_via_failure_signal() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = root.path().canonicalize().unwrap();
+        let mut tree =
+            crate::output::OutputTree::new(canonical, root.path().to_path_buf()).unwrap();
+        let mut budget = crate::PathLedgerBudget::new(usize::MAX);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let hooks = TestHooks {
+            before_open: Some(Arc::new(move |job| {
+                if job.sequence == 0 {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.lock().unwrap().recv();
+                }
+                Ok(())
+            })),
+            ..TestHooks::default()
+        };
+        let failure = Arc::new(FailureSignal::default());
+        let mut pool = WriterPool::new_with_hooks(1, hooks, Some(Arc::clone(&failure))).unwrap();
+
+        let make_job = |tree: &mut crate::output::OutputTree,
+                        budget: &mut crate::PathLedgerBudget,
+                        seq: usize,
+                        name: &str| {
+            let rel = Path::new(name);
+            tree.prepare_parent(rel, budget).unwrap();
+            Job {
+                sequence: seq,
+                target: tree.new_file(rel).unwrap(),
+                bytes: b"ok".to_vec(),
+                exec_bits: 0,
+                compute_blake3: false,
+            }
+        };
+
+        // Job 0 dispatches immediately because the single worker is idle.
+        pool.submit(make_job(&mut tree, &mut budget, 0, "a.js"))
+            .unwrap();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("idle worker must receive job 0 immediately");
+
+        // While the worker is busy on job 0, jobs 1 and 2 accumulate in pending_batch.
+        pool.submit(make_job(&mut tree, &mut budget, 1, "b.js"))
+            .unwrap();
+        pool.submit(make_job(&mut tree, &mut budget, 2, "c.js"))
+            .unwrap();
+        assert_eq!(
+            pool.pending_batch.lock().unwrap().jobs.len(),
+            2,
+            "jobs submitted while all writers are busy must accumulate into a batch"
+        );
+
+        // FailureSignal::flush_pending_batch drains the partial batch without waiting for threshold.
+        failure.flush_pending_batch();
+        assert_eq!(
+            pool.pending_batch.lock().unwrap().jobs.len(),
+            0,
+            "FailureSignal::flush_pending_batch must dispatch queued sub-threshold jobs"
+        );
+
+        release_tx.send(()).unwrap();
+        for expected_seq in 0..3 {
+            let completion = pool.receive().unwrap();
+            assert_eq!(completion.sequence, expected_seq);
+            completion.result.unwrap().output.commit().unwrap();
+        }
+        pool.finish().unwrap();
     }
 }
