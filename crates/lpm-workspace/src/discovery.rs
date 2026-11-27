@@ -2301,8 +2301,7 @@ fn collect_member_manifest_paths(
                     #[cfg(windows)]
                     let child_has_symlink = dir_has_symlink
                         || std::fs::symlink_metadata(&child_path)
-                            .map(|metadata| path_is_link_or_reparse(&metadata))
-                            .unwrap_or(true);
+                            .map_or(true, |metadata| path_is_link_or_reparse(&metadata));
                     #[cfg(not(windows))]
                     let child_has_symlink = dir_has_symlink;
                     pending.push((child_path, next_depth, next_remaining, child_has_symlink));
