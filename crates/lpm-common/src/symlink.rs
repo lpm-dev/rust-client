@@ -122,27 +122,221 @@ pub fn remove_path_entry_counting_freed_bytes(path: &Path) -> std::io::Result<u6
     Ok(freed)
 }
 
+/// Maximum number of nested `cap_std::fs::Dir` handles kept open at once during
+/// [`clear_directory_counting_freed_bytes`]. Keeping a sliding window at the top
+/// of the traversal stack bounds FD usage to `O(1)` at arbitrary directory depth
+/// while incurring zero reopens for normal trees up to this depth.
+const MAX_CLEAR_OPEN_DIRS: usize = 24;
+
+struct ClearDirFrame {
+    name_in_parent: Option<std::ffi::OsString>,
+    dir: Option<cap_std::fs::Dir>,
+    pending: Vec<std::ffi::OsString>,
+}
+
+fn collect_dir_entry_names(
+    directory: &cap_std::fs::Dir,
+) -> std::io::Result<Vec<std::ffi::OsString>> {
+    let mut names = Vec::new();
+    for entry in directory.entries()? {
+        names.push(entry?.file_name());
+    }
+    Ok(names)
+}
+
+fn evict_oldest_open_dir(stack: &mut [ClearDirFrame], open_dirs: &mut usize, protected_idx: usize) {
+    for (idx, frame) in stack.iter_mut().enumerate().skip(1) {
+        if idx == protected_idx {
+            continue;
+        }
+        if frame.dir.take().is_some() {
+            *open_dirs -= 1;
+            return;
+        }
+    }
+}
+
+fn ensure_top_dir_open(
+    root: &cap_std::fs::Dir,
+    stack: &mut [ClearDirFrame],
+    open_dirs: &mut usize,
+) -> std::io::Result<()> {
+    use cap_fs_ext::DirExt as _;
+
+    let top = stack.len() - 1;
+    if top == 0 || stack[top].dir.is_some() {
+        return Ok(());
+    }
+
+    let anchor = (1..top)
+        .rev()
+        .find(|&idx| stack[idx].dir.is_some())
+        .unwrap_or(0);
+    let window_start = top.saturating_sub(MAX_CLEAR_OPEN_DIRS - 1).max(1);
+
+    let mut transient: Option<cap_std::fs::Dir> = None;
+    for step in (anchor + 1)..window_start {
+        let parent_ref = transient.as_ref().unwrap_or_else(|| {
+            if anchor == 0 {
+                root
+            } else {
+                stack[anchor]
+                    .dir
+                    .as_ref()
+                    .expect("anchor directory is open")
+            }
+        });
+        let name = stack[step]
+            .name_in_parent
+            .as_deref()
+            .expect("non-root frame carries its entry name");
+        transient = Some(parent_ref.open_dir_nofollow(name)?);
+    }
+
+    for step in window_start.max(anchor + 1)..=top {
+        if *open_dirs >= MAX_CLEAR_OPEN_DIRS {
+            evict_oldest_open_dir(stack, open_dirs, step - 1);
+        }
+        let parent_ref = if let Some(dir) = transient.as_ref() {
+            dir
+        } else if step - 1 == 0 {
+            root
+        } else {
+            stack[step - 1]
+                .dir
+                .as_ref()
+                .expect("parent frame is open in sliding window")
+        };
+        let name = stack[step]
+            .name_in_parent
+            .as_deref()
+            .expect("non-root frame carries its entry name");
+        let opened = parent_ref.open_dir_nofollow(name)?;
+        transient = None;
+        stack[step].dir = Some(opened);
+        *open_dirs += 1;
+    }
+
+    Ok(())
+}
+
 fn clear_directory_counting_freed_bytes(directory: &cap_std::fs::Dir) -> std::io::Result<u64> {
     use cap_fs_ext::DirExt as _;
 
     let mut freed = 0u64;
-    for entry in directory.entries()? {
-        let name = entry?.file_name();
-        let metadata = directory.symlink_metadata(&name)?;
+    let mut open_dirs = 0usize;
+    let mut stack = vec![ClearDirFrame {
+        name_in_parent: None,
+        dir: None,
+        pending: collect_dir_entry_names(directory)?,
+    }];
+
+    while !stack.is_empty() {
+        ensure_top_dir_open(directory, &mut stack, &mut open_dirs)?;
+        let parent_idx = stack.len() - 1;
+        let Some(name) = stack[parent_idx].pending.pop() else {
+            let mut finished = stack.pop().expect("stack is non-empty");
+            if finished.dir.take().is_some() {
+                open_dirs -= 1;
+            }
+            if let Some(dir_name) = finished.name_in_parent {
+                ensure_top_dir_open(directory, &mut stack, &mut open_dirs)?;
+                let top = stack.len() - 1;
+                let parent_dir = if top == 0 {
+                    directory
+                } else {
+                    stack[top].dir.as_ref().expect("parent directory is open")
+                };
+                parent_dir.remove_dir(&dir_name)?;
+            }
+            continue;
+        };
+
+        let parent_dir = if parent_idx == 0 {
+            directory
+        } else {
+            stack[parent_idx]
+                .dir
+                .as_ref()
+                .expect("active directory is open")
+        };
+        let metadata = parent_dir.symlink_metadata(&name)?;
         if metadata.is_dir() && !cap_metadata_is_link(&metadata) {
-            let child = directory.open_dir_nofollow(&name)?;
-            freed = freed.saturating_add(clear_directory_counting_freed_bytes(&child)?);
-            drop(child);
-            directory.remove_dir(&name)?;
+            if open_dirs >= MAX_CLEAR_OPEN_DIRS {
+                evict_oldest_open_dir(&mut stack, &mut open_dirs, parent_idx);
+            }
+            let parent_dir = if parent_idx == 0 {
+                directory
+            } else {
+                stack[parent_idx]
+                    .dir
+                    .as_ref()
+                    .expect("active directory is open")
+            };
+            let child = parent_dir.open_dir_nofollow(&name)?;
+            let child_pending = collect_dir_entry_names(&child)?;
+            if child_pending.is_empty() {
+                drop(child);
+                parent_dir.remove_dir(&name)?;
+            } else {
+                stack.push(ClearDirFrame {
+                    name_in_parent: Some(name),
+                    dir: Some(child),
+                    pending: child_pending,
+                });
+                open_dirs += 1;
+            }
         } else if metadata.is_file() && !cap_metadata_is_link(&metadata) {
             freed = freed.saturating_add(cap_remove_file_counting_freed_bytes(
-                directory, &name, &metadata, true,
+                parent_dir, &name, &metadata, true,
             )?);
         } else {
-            directory.remove_file_or_symlink(&name)?;
+            parent_dir.remove_file_or_symlink(&name)?;
         }
     }
+
     Ok(freed)
+}
+
+/// Return `((volume_id, file_id), link_count)` for a regular file without
+/// following symlinks, or `None` on platforms or filesystems where link
+/// identity cannot be queried.
+pub fn file_link_identity_and_count(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Option<((u64, u64), u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let _ = path;
+        Some(((metadata.dev(), metadata.ino()), metadata.nlink()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+        let _ = metadata;
+        let file = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .ok()?;
+        let info = crate::atomic_write::windows_file_information(&file).ok()?;
+        let file_index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+        Some((
+            (u64::from(info.dwVolumeSerialNumber), file_index),
+            u64::from(info.nNumberOfLinks),
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, metadata);
+        None
+    }
 }
 
 /// Unlink one regular file inside `directory` and return the bytes freed
@@ -1420,6 +1614,59 @@ mod entry_removal_tests {
         assert_eq!(freed, 5);
         assert!(!tree.exists());
         assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn counting_removal_succeeds_on_deep_tree_under_low_fd_limit() {
+        const CHILD: &str = "LPM_TEST_DEEP_COUNTING_REMOVAL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "symlink::entry_removal_tests::counting_removal_succeeds_on_deep_tree_under_low_fd_limit",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let tree = root.path().join("deep");
+        let mut cur = tree.clone();
+        for depth in 0..200 {
+            cur = cur.join(format!("d{depth}"));
+        }
+        std::fs::create_dir_all(&cur).unwrap();
+        std::fs::write(cur.join("leaf.txt"), b"hello").unwrap();
+
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is valid writable storage for `getrlimit`.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let tight = libc::rlimit {
+            rlim_cur: 128.min(limit.rlim_max),
+            rlim_max: limit.rlim_max,
+        };
+        // SAFETY: lowering soft limit to <= hard limit is valid POSIX usage in this child process.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &tight) }, 0);
+
+        let freed = super::remove_path_entry_counting_freed_bytes(&tree).unwrap();
+        assert_eq!(freed, 5);
+        assert!(!tree.exists());
     }
 
     #[test]

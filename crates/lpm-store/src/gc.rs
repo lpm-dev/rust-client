@@ -1,7 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher as _, RandomState};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use lpm_common::LpmError;
 
@@ -10,14 +11,69 @@ use crate::{PackageStore, STORE_VERSION, is_complete_package_dir};
 /// Minimum age before a `.tmp.` staging directory in `store/v1/` is treated as
 /// abandoned by a crashed extraction rather than an active concurrent write.
 const ABANDONED_TEMP_AGE: Duration = Duration::from_secs(10 * 60);
+const RETIRE_RENAME_ATTEMPTS: usize = 16;
 
 static GC_RETIRE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-fn next_retired_path(dir: &Path) -> PathBuf {
+fn next_retired_path(parent: &Path) -> PathBuf {
     let seq = GC_RETIRE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut name = dir.as_os_str().to_owned();
-    name.push(format!(".tmp.gc.{}.{seq}", std::process::id()));
-    PathBuf::from(name)
+    let nonce = RandomState::new().hash_one((std::process::id(), seq, Instant::now()));
+    // Bounded basename independent of the package directory name so entries near
+    // the 255-byte component limit never fail retirement with ENAMETOOLONG.
+    parent.join(format!(".tmp.gc.{}.{nonce:016x}.{seq}", std::process::id()))
+}
+
+fn retire_store_entry(path: &Path, now: SystemTime) -> Result<Option<PathBuf>, LpmError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut last_collision: Option<std::io::Error> = None;
+
+    for _ in 0..RETIRE_RENAME_ATTEMPTS {
+        let retired = next_retired_path(parent);
+        if std::fs::symlink_metadata(&retired).is_ok() {
+            last_collision = Some(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+            continue;
+        }
+        match std::fs::rename(path, &retired) {
+            Ok(()) => {
+                // Refresh mtime while holding the publication lock so a concurrent GC
+                // does not mistake a freshly retired old package for an abandoned temp dir.
+                let _ = std::fs::set_times(&retired, std::fs::FileTimes::new().set_modified(now));
+                return Ok(Some(retired));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                last_collision = Some(err);
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Err(last_collision
+        .unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "could not allocate a unique retirement path for {}",
+                    path.display()
+                ),
+            )
+        })
+        .into())
+}
+
+fn is_within_max_age(mtime: SystemTime, now: SystemTime, age_threshold: Duration) -> bool {
+    match now.duration_since(mtime) {
+        Ok(elapsed) => elapsed < age_threshold,
+        Err(_) => true,
+    }
 }
 
 impl PackageStore {
@@ -64,7 +120,6 @@ impl PackageStore {
             });
         }
 
-        let now = SystemTime::now();
         let mut kept = 0usize;
         let mut retired_packages: Vec<PathBuf> = Vec::new();
         let mut retired_junk: Vec<PathBuf> = Vec::new();
@@ -74,6 +129,7 @@ impl PackageStore {
         // filesystem deletion does not stall concurrent package publications.
         let retire_result: Result<(), LpmError> = (|| {
             let _publication = self.lock_publication()?;
+            let now = SystemTime::now();
             let mut entries = Vec::new();
             for entry in std::fs::read_dir(&store_dir)? {
                 let entry = entry?;
@@ -93,29 +149,22 @@ impl PackageStore {
                     if let Some(age_threshold) = max_age
                         && let Ok(meta) = std::fs::symlink_metadata(&path)
                         && let Ok(mtime) = meta.modified()
-                        && let Ok(elapsed) = now.duration_since(mtime)
-                        && elapsed < *age_threshold
+                        && is_within_max_age(mtime, now, *age_threshold)
                     {
                         kept += 1;
                         continue;
                     }
 
-                    let retired = next_retired_path(&path);
-                    match std::fs::rename(&path, &retired) {
-                        Ok(()) => retired_packages.push(retired),
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(err) => return Err(err.into()),
+                    if let Some(retired) = retire_store_entry(&path, now)? {
+                        retired_packages.push(retired);
                     }
                     continue;
                 }
 
-                if is_junk_store_dir(&path, &dir_name, now) {
-                    let retired = next_retired_path(&path);
-                    match std::fs::rename(&path, &retired) {
-                        Ok(()) => retired_junk.push(retired),
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(err) => return Err(err.into()),
-                    }
+                if is_junk_store_dir(&path, &dir_name, now)
+                    && let Some(retired) = retire_store_entry(&path, now)?
+                {
+                    retired_junk.push(retired);
                 }
             }
             Ok(())
@@ -131,12 +180,23 @@ impl PackageStore {
         let mut removed = 0usize;
         let mut freed_bytes: u64 = 0;
         for retired in retired_packages {
-            let freed = lpm_common::remove_path_entry_counting_freed_bytes(&retired)?;
-            freed_bytes = freed_bytes.saturating_add(freed);
-            removed += 1;
+            match lpm_common::remove_path_entry_counting_freed_bytes(&retired) {
+                Ok(freed) => {
+                    freed_bytes = freed_bytes.saturating_add(freed);
+                    removed += 1;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    removed += 1;
+                }
+                Err(err) => return Err(err.into()),
+            }
         }
         for retired in retired_junk {
-            lpm_common::remove_path_entry(&retired)?;
+            match lpm_common::remove_path_entry(&retired) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
         }
 
         Ok(GcResult {
@@ -165,15 +225,15 @@ impl PackageStore {
         }
 
         let now = SystemTime::now();
-        let mut would_remove = Vec::new();
+        let mut candidates: Vec<(String, PathBuf)> = Vec::new();
         let mut would_keep = 0;
-        let mut would_free_bytes: u64 = 0;
 
         for entry in std::fs::read_dir(&store_dir)? {
             let entry = entry?;
-            let dir_name = entry.file_name().to_string_lossy().to_string();
+            let path = entry.path();
+            let dir_name = entry.file_name().to_string_lossy().into_owned();
 
-            if let Some((pkg_name, version)) = complete_package_from_dir(&entry.path(), &dir_name) {
+            if let Some((pkg_name, version)) = complete_package_from_dir(&path, &dir_name) {
                 let key = format!("{pkg_name}@{version}");
 
                 if referenced.contains(&key) {
@@ -181,24 +241,29 @@ impl PackageStore {
                     continue;
                 }
 
-                // Check age filter
                 if let Some(age_threshold) = max_age
-                    && let Ok(meta) = entry.metadata()
+                    && let Ok(meta) = std::fs::symlink_metadata(&path)
                     && let Ok(mtime) = meta.modified()
-                    && let Ok(elapsed) = now.duration_since(mtime)
-                    && elapsed < *age_threshold
+                    && is_within_max_age(mtime, now, *age_threshold)
                 {
                     would_keep += 1;
                     continue;
                 }
 
-                let size = dir_size(&entry.path());
-                would_free_bytes = would_free_bytes.saturating_add(size);
-                would_remove.push((key, size));
+                candidates.push((key, path));
             }
         }
 
-        would_remove.sort_by(|a, b| a.0.cmp(&b.0));
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut seen_links: HashMap<(u64, u64), u64> = HashMap::new();
+        let mut would_remove = Vec::with_capacity(candidates.len());
+        let mut would_free_bytes: u64 = 0;
+        for (key, path) in candidates {
+            let size = reclaimable_dir_size(&path, &mut seen_links);
+            would_free_bytes = would_free_bytes.saturating_add(size);
+            would_remove.push((key, size));
+        }
 
         Ok(GcPreview {
             would_remove,
@@ -218,14 +283,16 @@ impl PackageStore {
             if std::fs::symlink_metadata(&dir).is_err() {
                 return Ok(false);
             }
-            let retired = next_retired_path(&dir);
-            match std::fs::rename(&dir, &retired) {
-                Ok(()) => retired,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-                Err(err) => return Err(err.into()),
-            }
+            let Some(retired) = retire_store_entry(&dir, SystemTime::now())? else {
+                return Ok(false);
+            };
+            retired
         };
-        lpm_common::remove_path_entry(&retired)?;
+        match lpm_common::remove_path_entry(&retired) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
         Ok(true)
     }
 }
@@ -253,13 +320,46 @@ fn is_junk_store_dir(dir: &Path, dir_name: &str, now: SystemTime) -> bool {
         return false;
     }
     if is_temp_store_dir_name(dir_name) {
-        return meta
+        let root_is_abandoned = meta
             .modified()
             .ok()
-            .and_then(|mtime| now.duration_since(mtime).ok())
-            .is_some_and(|age| age >= ABANDONED_TEMP_AGE);
+            .is_some_and(|mtime| !is_within_max_age(mtime, now, ABANDONED_TEMP_AGE));
+        return root_is_abandoned && !subtree_has_recent_activity(dir, now, ABANDONED_TEMP_AGE);
     }
     dir_name.rfind('@').is_some() && !is_complete_package_dir(dir)
+}
+
+fn subtree_has_recent_activity(root: &Path, now: SystemTime, threshold: Duration) -> bool {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return true,
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return true;
+            };
+            let path = entry.path();
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return true,
+            };
+            if meta
+                .modified()
+                .ok()
+                .is_some_and(|mtime| is_within_max_age(mtime, now, threshold))
+            {
+                return true;
+            }
+            if meta.is_dir() && !lpm_common::is_symlink_or_junction(&meta) {
+                stack.push(path);
+            }
+        }
+    }
+    false
 }
 
 /// Result of garbage collection.
@@ -281,9 +381,10 @@ pub struct GcPreview {
     pub would_free_bytes: u64,
 }
 
-/// Calculate the total regular-file size of a directory iteratively so deep
-/// trees keep a single `ReadDir` handle open at a time and never follow links.
-fn dir_size(root: &Path) -> u64 {
+/// Calculate reclaimable regular-file bytes in `root` without following links,
+/// matching [`lpm_common::remove_path_entry_counting_freed_bytes`]: a file is
+/// counted once when every link to its inode resides within the doomed set.
+fn reclaimable_dir_size(root: &Path, seen_links: &mut HashMap<(u64, u64), u64>) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -301,7 +402,22 @@ fn dir_size(root: &Path) -> u64 {
             if meta.is_dir() {
                 stack.push(path);
             } else if meta.is_file() {
-                total = total.saturating_add(meta.len());
+                let len = meta.len();
+                match lpm_common::file_link_identity_and_count(&path, &meta) {
+                    Some((_, nlink)) if nlink <= 1 => {
+                        total = total.saturating_add(len);
+                    }
+                    Some((identity, nlink)) => {
+                        let count = seen_links.entry(identity).or_insert(0);
+                        *count = count.saturating_add(1);
+                        if *count == nlink {
+                            total = total.saturating_add(len);
+                        }
+                    }
+                    None => {
+                        total = total.saturating_add(len);
+                    }
+                }
             }
         }
     }
@@ -532,7 +648,10 @@ mod tests {
         std::fs::write(stale_tmp.join("package.json"), b"{}").unwrap();
         std::fs::write(stale_tmp.join(".integrity"), b"sha512-stale").unwrap();
         let old = SystemTime::now() - Duration::from_secs(3600);
-        std::fs::set_times(&stale_tmp, std::fs::FileTimes::new().set_modified(old)).unwrap();
+        let old_times = std::fs::FileTimes::new().set_modified(old);
+        std::fs::set_times(stale_tmp.join("package.json"), old_times).unwrap();
+        std::fs::set_times(stale_tmp.join(".integrity"), old_times).unwrap();
+        std::fs::set_times(&stale_tmp, old_times).unwrap();
 
         let incomplete = store_v1.join("broken@1.0.0");
         std::fs::create_dir_all(&incomplete).unwrap();
@@ -633,5 +752,143 @@ mod tests {
         let result = handle.join().unwrap();
         assert_eq!(result.removed, 1);
         assert!(!store.has_package("doomed", "1.0.0"));
+    }
+
+    #[test]
+    fn gc_keeps_package_with_mtime_newer_than_cutoff_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[("package.json", b"{}")]);
+        let pkg_dir = store
+            .store_package("future-pkg", "1.0.0", &tarball)
+            .unwrap();
+        let future = SystemTime::now() + Duration::from_secs(60);
+        std::fs::set_times(&pkg_dir, std::fs::FileTimes::new().set_modified(future)).unwrap();
+
+        let max_age = Duration::from_secs(3600);
+        let preview = store.gc_preview(&HashSet::new(), Some(&max_age)).unwrap();
+        assert_eq!(preview.would_keep, 1);
+        assert!(
+            preview.would_remove.is_empty(),
+            "gc preview must keep packages newer than now"
+        );
+        let result = store.gc(&HashSet::new(), Some(&max_age)).unwrap();
+        assert_eq!(
+            result.removed, 0,
+            "package newer than now must not be removed"
+        );
+        assert_eq!(result.kept, 1);
+        assert!(store.has_package("future-pkg", "1.0.0"));
+    }
+
+    #[test]
+    fn gc_preview_and_apply_agree_on_cross_package_hardlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let pkg_a = store.package_dir("pkg-a", "1.0.0");
+        let pkg_b = store.package_dir("pkg-b", "1.0.0");
+        for pkg in [&pkg_a, &pkg_b] {
+            std::fs::create_dir_all(pkg).unwrap();
+            std::fs::write(pkg.join("package.json"), b"{}").unwrap();
+            std::fs::write(pkg.join(".integrity"), b"sha512-x").unwrap();
+        }
+        std::fs::write(pkg_a.join("shared.js"), vec![b's'; 64]).unwrap();
+        std::fs::hard_link(pkg_a.join("shared.js"), pkg_b.join("shared.js")).unwrap();
+
+        let preview = store.gc_preview(&HashSet::new(), None).unwrap();
+        let result = store.gc(&HashSet::new(), None).unwrap();
+        assert_eq!(preview.would_remove.len(), 2);
+        assert_eq!(result.removed, 2);
+        assert_eq!(
+            preview.would_free_bytes, result.freed_bytes,
+            "hardlink shared strictly between two doomed packages must be counted once"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_retires_entry_at_filesystem_name_limit_without_enametoolong() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        // 249 + "@1.0.0" (6) == 255 bytes (POSIX NAME_MAX).
+        let long_name = "a".repeat(249);
+        let create_complete_entry = |version: &str| {
+            let pkg_dir = store.package_dir(&long_name, version);
+            std::fs::create_dir_all(&pkg_dir).unwrap();
+            std::fs::write(pkg_dir.join("package.json"), b"{}").unwrap();
+            std::fs::write(pkg_dir.join(".integrity"), b"sha512-x").unwrap();
+        };
+
+        create_complete_entry("1.0.0");
+        let result = store.gc(&HashSet::new(), None).unwrap();
+        assert_eq!(result.removed, 1);
+        assert!(!store.has_package(&long_name, "1.0.0"));
+
+        create_complete_entry("2.0.0");
+        assert!(store.remove_package(&long_name, "2.0.0").unwrap());
+        assert!(!store.has_package(&long_name, "2.0.0"));
+    }
+
+    #[test]
+    fn next_retired_path_uses_bounded_unique_basename_under_parent() {
+        let parent = Path::new("/tmp/store/v1");
+        let first = next_retired_path(parent);
+        let second = next_retired_path(parent);
+        assert_eq!(first.parent(), Some(parent));
+        assert_ne!(first, second);
+        let first_name = first.file_name().unwrap().to_string_lossy();
+        assert!(is_temp_store_dir_name(&first_name));
+        assert!(
+            first_name.len() <= 64,
+            "retired basename must stay bounded, got {first_name} ({} bytes)",
+            first_name.len()
+        );
+    }
+
+    #[test]
+    fn gc_preserves_staging_dir_with_old_root_mtime_but_recent_nested_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let tarball = create_test_tarball(&[("package.json", b"{}")]);
+        store.store_package("keep", "1.0.0", &tarball).unwrap();
+
+        let store_v1 = dir.path().join("v1");
+        let active_tmp = store_v1.join("slow@1.0.0.tmp.12345.ThreadId(1)");
+        let nested = active_tmp.join("sub");
+        std::fs::create_dir_all(&nested).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        std::fs::set_times(&active_tmp, std::fs::FileTimes::new().set_modified(old)).unwrap();
+        std::fs::write(nested.join("fresh.js"), b"active").unwrap();
+
+        let mut referenced = HashSet::new();
+        referenced.insert("keep@1.0.0".to_string());
+        let _ = store.gc(&referenced, None).unwrap();
+        assert!(
+            active_tmp.exists(),
+            "staging dir with recent nested file writes must not be treated as abandoned"
+        );
+    }
+
+    #[test]
+    fn gc_preview_and_apply_agree_on_freed_bytes_for_internal_and_external_hardlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let pkg_dir = store.package_dir("hardlinked", "1.0.0");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("package.json"), b"{}").unwrap();
+        std::fs::write(pkg_dir.join(".integrity"), b"sha512-x").unwrap();
+        std::fs::write(pkg_dir.join("unique.js"), b"0123456789").unwrap();
+        std::fs::write(pkg_dir.join("internal-a.js"), b"01234567890123456789").unwrap();
+        std::fs::hard_link(pkg_dir.join("internal-a.js"), pkg_dir.join("internal-b.js")).unwrap();
+        let external = dir.path().join("external.js");
+        std::fs::write(&external, vec![b'z'; 40]).unwrap();
+        std::fs::hard_link(&external, pkg_dir.join("shared-outside.js")).unwrap();
+
+        let preview = store.gc_preview(&HashSet::new(), None).unwrap();
+        let result = store.gc(&HashSet::new(), None).unwrap();
+        assert_eq!(
+            preview.would_free_bytes, result.freed_bytes,
+            "gc preview and gc apply must agree on hardlink-reclaimed bytes"
+        );
     }
 }

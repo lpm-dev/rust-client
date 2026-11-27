@@ -730,8 +730,7 @@ fn create_bin_links_hoisted(
             };
         pkg_path.pop(); // pkg_path = node_modules/<name>
 
-        const BIN_KEY: &[u8] = b"\"bin\"";
-        if !content.windows(BIN_KEY.len()).any(|w| w == BIN_KEY) {
+        if !lpm_workspace::manifest_bytes_may_contain_bin(&content) {
             for _ in 0..n {
                 pkg_path.pop();
             }
@@ -826,4 +825,61 @@ fn create_bin_links_hoisted(
     }
 
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn hoisted_bin_links_recognize_json_escaped_bin_keys_for_string_and_map() {
+        let root = tempfile::tempdir().unwrap();
+        let nm = root.path().join("node_modules");
+        let pkg_str_dir = nm.join("esc-str");
+        let pkg_map_dir = nm.join("esc-map");
+        std::fs::create_dir_all(&pkg_str_dir).unwrap();
+        std::fs::create_dir_all(&pkg_map_dir).unwrap();
+
+        std::fs::write(
+            pkg_str_dir.join("package.json"),
+            br#"{"name":"esc-str","b\u0069n":"./cli.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg_str_dir.join("cli.js"), b"#!/usr/bin/env node\n").unwrap();
+
+        std::fs::write(
+            pkg_map_dir.join("package.json"),
+            br#"{"name":"esc-map","b\u0069n":{"tool-a":"./a.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg_map_dir.join("a.js"), b"#!/usr/bin/env node\n").unwrap();
+
+        let make_target = |name: &str, store_path: PathBuf| LinkTarget {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: None,
+            wrapper_id: None,
+            materialization: crate::Materialization::CasBacked,
+            peers: Vec::new(),
+            patch_fingerprint: None,
+        };
+        let packages = vec![
+            make_target("esc-str", pkg_str_dir),
+            make_target("esc-map", pkg_map_dir),
+        ];
+        let mut hoisted = HashMap::new();
+        hoisted.insert("esc-str".to_string(), 0usize);
+        hoisted.insert("esc-map".to_string(), 1usize);
+
+        let count = create_bin_links_hoisted(&nm, &packages, &hoisted).unwrap();
+        assert_eq!(
+            count, 2,
+            "hoisted bin linker must create shims for JSON-escaped bin keys"
+        );
+    }
 }

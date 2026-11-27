@@ -162,17 +162,15 @@ fn collect_project_package_bin_names(
             Err(lpm_common::BoundedReadError::NotFound { .. }) => return Some(()),
             Err(_) => return None,
         };
-    const BIN_KEY: &[u8] = b"\"bin\"";
-    if !content.windows(BIN_KEY.len()).any(|w| w == BIN_KEY) {
+    if !lpm_workspace::manifest_bytes_may_contain_bin(&content) {
         return Some(());
     }
-    let bin_config = match lpm_workspace::parse_bin_field(&content) {
-        Ok(Some(bin_config)) => bin_config,
-        Ok(None) => return Some(()),
+    let (manifest_name, bin_config) = match lpm_workspace::parse_name_and_bin_field(&content) {
+        Ok((name, Some(bin_config))) => (name, bin_config),
+        Ok((_, None)) => return Some(()),
         Err(_) => return None,
     };
-    let package_name =
-        package_name_from_manifest(&content).unwrap_or_else(|| fallback_package_name.to_string());
+    let package_name = manifest_name.unwrap_or_else(|| fallback_package_name.to_string());
     if manifest_needs_bin_compatibility(&content) {
         bin_names.extend(
             bin_config
@@ -182,12 +180,6 @@ fn collect_project_package_bin_names(
         );
     }
     Some(())
-}
-
-fn package_name_from_manifest(content: &[u8]) -> Option<String> {
-    let parsed: serde_json::Value =
-        serde_json::from_slice(lpm_common::strip_utf8_bom_bytes(content)).ok()?;
-    parsed.get("name")?.as_str().map(str::to_string)
 }
 
 pub(super) fn manifest_needs_bin_compatibility(content: &[u8]) -> bool {
@@ -1148,8 +1140,7 @@ fn collect_compatibility_roots_for_bins<'a>(
                 continue;
             }
         };
-        const BIN_KEY: &[u8] = b"\"bin\"";
-        if !content.windows(BIN_KEY.len()).any(|w| w == BIN_KEY) {
+        if !lpm_workspace::manifest_bytes_may_contain_bin(&content) {
             continue;
         }
         let bin_config = match lpm_workspace::parse_bin_field(&content) {
@@ -1985,13 +1976,11 @@ mod tests {
 
 #[cfg(test)]
 mod manifest_tests {
-    use super::package_name_from_manifest;
-
     #[test]
     fn package_name_is_read_from_a_manifest_with_a_byte_order_mark() {
-        assert_eq!(
-            package_name_from_manifest(b"\xEF\xBB\xBF{\"name\":\"marked\"}").as_deref(),
-            Some("marked")
-        );
+        let (name, bin) =
+            lpm_workspace::parse_name_and_bin_field(b"\xEF\xBB\xBF{\"name\":\"marked\"}").unwrap();
+        assert_eq!(name.as_deref(), Some("marked"));
+        assert!(bin.is_none());
     }
 }

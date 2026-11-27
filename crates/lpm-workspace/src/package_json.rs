@@ -796,23 +796,322 @@ pub fn parse_unshadowed_peer_dependencies(
     Ok((peers, meta))
 }
 
+/// Fast byte pre-scan before [`parse_name_and_bin_field`] or [`parse_bin_field`].
+///
+/// Returns `false` only when the raw JSON bytes cannot contain a `"bin"` key
+/// (neither literal `"bin"` nor any `\uXXXX` JSON string escape).
+#[inline]
+pub fn manifest_bytes_may_contain_bin(content: &[u8]) -> bool {
+    let len = content.len();
+    let mut i = 0;
+    while i + 1 < len {
+        match content[i] {
+            b'"' if i + 5 <= len && &content[i..i + 5] == b"\"bin\"" => return true,
+            b'\\' if content[i + 1] == b'u' => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Parse only the `name` and `bin` fields from already-read `package.json` bytes.
 ///
-/// Parses through `serde_json::Value` so duplicate keys and non-string map
-/// entries in third-party manifests don't reject the whole scan. Callers that
-/// byte-scan for `b"\"bin\""` before calling this can skip the parse entirely
-/// for packages that declare no binary — the common case.
+/// Streams directly over the JSON tokens without allocating a `serde_json::Value`
+/// DOM for unrelated fields, while preserving last-wins duplicate-key semantics
+/// and skipping non-string entries in third-party manifests. Callers can gate
+/// this with [`manifest_bytes_may_contain_bin`] on hot paths.
 pub fn parse_name_and_bin_field(
     content: &[u8],
 ) -> Result<(Option<String>, Option<BinConfig>), WorkspaceError> {
-    let parsed: serde_json::Value = serde_json::from_slice(strip_utf8_bom_bytes(content))
+    let parsed: NameAndBin = serde_json::from_slice(strip_utf8_bom_bytes(content))
         .map_err(|e| WorkspaceError::Parse(format!("parse error: {e}")))?;
-    let name = parsed
-        .get("name")
-        .and_then(|value| value.as_str())
-        .map(str::to_owned);
-    let bin = parsed.get("bin").and_then(bin_config_from_value);
-    Ok((name, bin))
+    Ok((parsed.name, parsed.bin))
+}
+
+struct NameAndBin {
+    name: Option<String>,
+    bin: Option<BinConfig>,
+}
+
+struct KeyStr<'de>(std::borrow::Cow<'de, str>);
+
+impl<'de> Deserialize<'de> for KeyStr<'de> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct KeyVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for KeyVisitor {
+            type Value = KeyStr<'de>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON object key")
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
+                Ok(KeyStr(std::borrow::Cow::Borrowed(value)))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(KeyStr(std::borrow::Cow::Owned(value.to_owned())))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(KeyStr(std::borrow::Cow::Owned(value)))
+            }
+        }
+
+        deserializer.deserialize_str(KeyVisitor)
+    }
+}
+
+struct LossyOptionalString(Option<String>);
+
+impl<'de> Deserialize<'de> for LossyOptionalString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct LossyStringVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for LossyStringVisitor {
+            type Value = LossyOptionalString;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("any JSON value")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(LossyOptionalString(Some(value.to_owned())))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(LossyOptionalString(Some(value)))
+            }
+
+            fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+                Ok(LossyOptionalString(None))
+            }
+
+            fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+                Ok(LossyOptionalString(None))
+            }
+
+            fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+                Ok(LossyOptionalString(None))
+            }
+
+            fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+                Ok(LossyOptionalString(None))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(LossyOptionalString(None))
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(LossyOptionalString(None))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(LossyOptionalString(None))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                while map
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(LossyOptionalString(None))
+            }
+        }
+
+        deserializer.deserialize_any(LossyStringVisitor)
+    }
+}
+
+struct LossyOptionalBinConfig(Option<BinConfig>);
+
+impl<'de> Deserialize<'de> for LossyOptionalBinConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct LossyBinVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for LossyBinVisitor {
+            type Value = LossyOptionalBinConfig;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a bin string, map, or ignored JSON value")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(LossyOptionalBinConfig(Some(BinConfig::Single(
+                    value.to_owned(),
+                ))))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(LossyOptionalBinConfig(Some(BinConfig::Single(value))))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut entries = HashMap::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if let Some(target) = map.next_value::<LossyOptionalString>()?.0 {
+                        entries.insert(key, target);
+                    } else {
+                        entries.remove(&key);
+                    }
+                }
+                Ok(LossyOptionalBinConfig(Some(BinConfig::Map(entries))))
+            }
+
+            fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+                Ok(LossyOptionalBinConfig(None))
+            }
+
+            fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+                Ok(LossyOptionalBinConfig(None))
+            }
+
+            fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+                Ok(LossyOptionalBinConfig(None))
+            }
+
+            fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+                Ok(LossyOptionalBinConfig(None))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(LossyOptionalBinConfig(None))
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(LossyOptionalBinConfig(None))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(LossyOptionalBinConfig(None))
+            }
+        }
+
+        deserializer.deserialize_any(LossyBinVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for NameAndBin {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct NameAndBinVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for NameAndBinVisitor {
+            type Value = NameAndBin;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a package.json value")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut name = None;
+                let mut bin = None;
+                while let Some(key) = map.next_key::<KeyStr<'de>>()? {
+                    match key.0.as_ref() {
+                        "name" => name = map.next_value::<LossyOptionalString>()?.0,
+                        "bin" => bin = map.next_value::<LossyOptionalBinConfig>()?.0,
+                        _ => {
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(NameAndBin { name, bin })
+            }
+
+            fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+                Ok(NameAndBin {
+                    name: None,
+                    bin: None,
+                })
+            }
+
+            fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+                Ok(NameAndBin {
+                    name: None,
+                    bin: None,
+                })
+            }
+
+            fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+                Ok(NameAndBin {
+                    name: None,
+                    bin: None,
+                })
+            }
+
+            fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+                Ok(NameAndBin {
+                    name: None,
+                    bin: None,
+                })
+            }
+
+            fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+                Ok(NameAndBin {
+                    name: None,
+                    bin: None,
+                })
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(NameAndBin {
+                    name: None,
+                    bin: None,
+                })
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(NameAndBin {
+                    name: None,
+                    bin: None,
+                })
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(NameAndBin {
+                    name: None,
+                    bin: None,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(NameAndBinVisitor)
+    }
 }
 
 /// Parse only the `bin` field from already-read `package.json` bytes.
@@ -1600,5 +1899,73 @@ mod tests {
             (a, b) => panic!("mismatch: full={a:?}, minimal={b:?}"),
         }
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn manifest_bytes_may_contain_bin_handles_literal_escaped_and_absent_keys() {
+        assert!(manifest_bytes_may_contain_bin(
+            br#"{"name":"cli","bin":"./cli.js"}"#
+        ));
+        assert!(manifest_bytes_may_contain_bin(
+            br#"{"name":"cli","b\u0069n":"./cli.js"}"#
+        ));
+        assert!(manifest_bytes_may_contain_bin(
+            br#"{"name":"cli","\u0062in":{"tool":"./cli.js"}}"#
+        ));
+        assert!(!manifest_bytes_may_contain_bin(
+            br#"{"name":"tool","scripts":{"start":"node dist/bin/index.js"},"dependencies":{}}"#
+        ));
+        assert!(!manifest_bytes_may_contain_bin(b""));
+        assert!(!manifest_bytes_may_contain_bin(b"{}"));
+    }
+
+    #[test]
+    fn parse_name_and_bin_field_handles_escapes_duplicates_lossy_values_and_non_objects() {
+        let escaped =
+            br#"{"na\u006de":"esc","b\u0069n":{"cmd":"./cli.js","skip":123,"drop":null}}"#;
+        let (name, bin) = parse_name_and_bin_field(escaped).unwrap();
+        assert_eq!(name.as_deref(), Some("esc"));
+        match bin.unwrap() {
+            BinConfig::Map(map) => {
+                assert_eq!(map.len(), 1);
+                assert_eq!(map.get("cmd").map(String::as_str), Some("./cli.js"));
+            }
+            other => panic!("expected Map, got {other:?}"),
+        }
+
+        let duplicate_last_wins = br#"{
+            "name": "first",
+            "name": "second",
+            "bin": "./first.js",
+            "bin": {"a": "./a.js", "b": "./b.js", "b": null},
+            "files": ["bin"],
+            "nested": {"bin": "./ignored.js", "deep": [1, true, null, {"k": "v"}]}
+        }"#;
+        let (name, bin) = parse_name_and_bin_field(duplicate_last_wins).unwrap();
+        assert_eq!(name.as_deref(), Some("second"));
+        match bin.unwrap() {
+            BinConfig::Map(map) => {
+                assert_eq!(map.len(), 1);
+                assert_eq!(map.get("a").map(String::as_str), Some("./a.js"));
+                assert!(!map.contains_key("b"));
+            }
+            other => panic!("expected Map, got {other:?}"),
+        }
+
+        let non_string_override = br#"{"name":"first","name":42,"bin":"./a.js","bin":false}"#;
+        let (name, bin) = parse_name_and_bin_field(non_string_override).unwrap();
+        assert_eq!(name, None);
+        assert!(bin.is_none());
+
+        let files_only_bin = br#"{"name":"pkg","files":["bin"]}"#;
+        let (name, bin) = parse_name_and_bin_field(files_only_bin).unwrap();
+        assert_eq!(name.as_deref(), Some("pkg"));
+        assert!(bin.is_none());
+
+        for non_obj in [b"null".as_slice(), b"[]", b"123", b"\"bin\"", b"true"] {
+            let (name, bin) = parse_name_and_bin_field(non_obj).unwrap();
+            assert_eq!(name, None);
+            assert!(bin.is_none());
+        }
     }
 }
