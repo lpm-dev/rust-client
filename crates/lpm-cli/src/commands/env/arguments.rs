@@ -342,10 +342,21 @@ pub(super) fn is_local_sync_subcommand(args: &[&str]) -> bool {
         || LOCAL_SYNC_SUBCOMMANDS.contains(&first)
 }
 
-pub(super) fn requests_help(args: &[&str]) -> bool {
-    args.iter()
+pub(super) fn try_display_help(args: &[&str]) -> bool {
+    if !args
+        .iter()
         .take_while(|&&arg| arg != "--")
         .any(|&arg| matches!(arg, "-h" | "--help"))
+    {
+        return false;
+    }
+    match LocalCommand::try_parse_from(std::iter::once("lpm env").chain(args.iter().copied())) {
+        Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => {
+            let _ = error.print();
+            true
+        }
+        _ => false,
+    }
 }
 
 pub(super) fn parse(args: &[&str], json_output: bool) -> Result<Option<LocalAction>, LpmError> {

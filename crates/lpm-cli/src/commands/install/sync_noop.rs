@@ -85,6 +85,7 @@ pub(crate) fn is_up_to_date(
         crate::install_state::SyncNoopFileStamp,
         crate::install_state::SyncNoopFileStamp,
         bool,
+        Option<crate::install_state::SyncNoopFileStamp>,
     )> = None;
     let fast_has_node_engines = if let Some(proof) = parsed_proof.as_ref()
         && proof.lockfile_eligible
@@ -153,15 +154,29 @@ pub(crate) fn is_up_to_date(
                     )
                 && lpm_common::strip_utf8_bom_str(&pkg_check) == package_json
             {
-                let stamps_changed = proof.pkg_stamp != Some(pkg_stamp)
-                    || proof.lock_stamp != Some(lock_stamp);
+                let stamps_changed =
+                    proof.pkg_stamp != Some(pkg_stamp) || proof.lock_stamp != Some(lock_stamp);
+                let now_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|dur| dur.as_nanos() as u64);
+                let can_self_heal_same_tick = now_ns.is_some_and(|now| {
+                    pkg_stamp.is_strictly_older_than_wall_clock(now)
+                        && lock_stamp.is_strictly_older_than_wall_clock(now)
+                });
                 let same_tick_collision = !stamps_changed
+                    && can_self_heal_same_tick
                     && mtime_match.hash_stamp.is_some_and(|hash_stamp| {
                         !pkg_stamp.is_strictly_older_than(hash_stamp)
                             || !lock_stamp.is_strictly_older_than(hash_stamp)
                     });
                 if stamps_changed || same_tick_collision {
-                    upgrade_v2_proof_stamps = Some((pkg_stamp, lock_stamp, same_tick_collision));
+                    upgrade_v2_proof_stamps = Some((
+                        pkg_stamp,
+                        lock_stamp,
+                        same_tick_collision,
+                        mtime_match.hash_stamp,
+                    ));
                 }
             }
             Some(proof.has_node_engines)
@@ -306,6 +321,7 @@ pub(crate) fn is_up_to_date(
     if current_engine_key != cached_engine.key {
         return Ok(false);
     }
+    let mut node_fp_refreshed = false;
     if cached_engine.key != "none" {
         let runtime_fingerprint = engine_policy.resolved_node_runtime_fingerprint();
         if runtime_fingerprint != cached_engine.runtime_fingerprint {
@@ -315,6 +331,7 @@ pub(crate) fn is_up_to_date(
                 runtime_fingerprint,
             ) {
                 Ok(true) => {
+                    node_fp_refreshed = true;
                     crate::cli::keep_state_ignored_at_exit_from(project_dir);
                     crate::cli::keep_state_ignored_at_exit();
                 }
@@ -327,7 +344,13 @@ pub(crate) fn is_up_to_date(
             }
         }
     }
-    if let (Some(proof), Some((pkg_stamp, lock_stamp, force_refresh))) =
+    let cached_header_lines = {
+        let mut lines = cached_state.lines();
+        lines
+            .next()
+            .and_then(|hash_line| Some((hash_line, lines.next()?)))
+    };
+    if let (Some(proof), Some((pkg_stamp, lock_stamp, force_refresh, hash_stamp))) =
         (parsed_proof.as_ref(), upgrade_v2_proof_stamps)
     {
         let upgraded = crate::install_state::SyncNoopLockfileProofInput {
@@ -341,10 +364,18 @@ pub(crate) fn is_up_to_date(
             pkg_stamp: Some(pkg_stamp),
             lock_stamp: Some(lock_stamp),
         };
+        let expected_header = cached_header_lines.map(|(hash_line, mtime_line)| {
+            (
+                hash_line,
+                mtime_line,
+                if node_fp_refreshed { None } else { hash_stamp },
+            )
+        });
         if let Ok(true) = crate::install_state::backfill_install_hash_sync_noop_proof_with_refresh(
             project_dir,
             &upgraded,
             force_refresh,
+            expected_header,
         ) {
             crate::cli::keep_state_ignored_at_exit_from(project_dir);
             crate::cli::keep_state_ignored_at_exit();
@@ -379,9 +410,14 @@ pub(crate) fn is_up_to_date(
             pkg_stamp,
             lock_stamp,
         );
-        if let Ok(true) =
-            crate::install_state::backfill_install_hash_sync_noop_proof(project_dir, &proof)
-        {
+        let expected_header =
+            cached_header_lines.map(|(hash_line, mtime_line)| (hash_line, mtime_line, None));
+        if let Ok(true) = crate::install_state::backfill_install_hash_sync_noop_proof_with_refresh(
+            project_dir,
+            &proof,
+            false,
+            expected_header,
+        ) {
             crate::cli::keep_state_ignored_at_exit_from(project_dir);
             crate::cli::keep_state_ignored_at_exit();
         }
@@ -2329,12 +2365,16 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         // Valid JSON without a `"workspaces"` key, yet ill-typed `lpm` field that
         // `PackageJson` / `find_workspace_root` rejects.
-        std::fs::write(parent.join("package.json"), r#"{"name": "parent", "lpm": 7}"#).unwrap();
+        std::fs::write(
+            parent.join("package.json"),
+            r#"{"name": "parent", "lpm": 7}"#,
+        )
+        .unwrap();
         std::fs::write(project.join("package.json"), r#"{"name":"app"}"#).unwrap();
 
-        let err = super::scan_ancestors(&project)
-            .err()
-            .expect("ill-typed ancestor package.json must surface an error like find_workspace_root");
+        let err = super::scan_ancestors(&project).err().expect(
+            "ill-typed ancestor package.json must surface an error like find_workspace_root",
+        );
         let full_err = lpm_workspace::find_workspace_root(&project)
             .expect_err("full discovery must reject ill-typed ancestor package.json");
         assert_eq!(

@@ -92,16 +92,30 @@ fn write_post_install_hash_with_context_and_proof(
     lock: &workspace_lockfile::ActiveLockfileSnapshot,
     proof_context: Option<PostInstallSyncNoopProofContext<'_>>,
 ) -> std::io::Result<()> {
-    let (pkg, pkg_stamp) = crate::install_state::read_text_regular_file_capped_with_stamp(
-        &project_dir.join("package.json"),
-        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    )
-    .unwrap_or_else(|_| (String::new(), None));
+    let (pkg, pkg_stamp, pkg_read_ok) =
+        match crate::install_state::read_text_regular_file_capped_with_stamp(
+            &project_dir.join("package.json"),
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) {
+            Ok((pkg, stamp)) => (pkg, stamp, true),
+            Err(_) => (String::new(), None, false),
+        };
+    let lock_disk = crate::install_state::read_regular_file_capped_with_stamp(
+        &lock.path,
+        lpm_common::STATE_FILE_SIZE_CAP_BYTES.max(64 * 1024 * 1024),
+    );
+    let lock_matches_on_disk = match &lock_disk {
+        Ok((lock_raw, _)) => lock_raw.as_slice() == lock.content.as_bytes(),
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => lock.content.is_empty(),
+        Err(_) => false,
+    };
     // Compute the proof from the exact on-disk `package.json` and `lpm.lock`
     // bytes hashed into `.lpm/install-hash` so concurrent edits during install
     // cannot stamp a stale manifest verdict onto the new bytes.
     let sync_noop_proof = proof_context.and_then(|ctx| {
-        if crate::install_state::package_json_needs_slow_freshness(&pkg)
+        if !pkg_read_ok
+            || !lock_matches_on_disk
+            || crate::install_state::package_json_needs_slow_freshness(&pkg)
             || lock.path != project_dir.join(lpm_lockfile::LOCKFILE_NAME)
             || crate::install_state::has_pnpm_workspace_yaml(project_dir)
             || lpm_workspace::find_workspace_root(project_dir)
@@ -113,16 +127,7 @@ fn write_post_install_hash_with_context_and_proof(
         }
         let pkg_stripped = lpm_common::strip_utf8_bom_str(&pkg);
         let fresh_package: lpm_workspace::PackageJson = serde_json::from_str(pkg_stripped).ok()?;
-        let (lock_raw, lock_stamp) = crate::install_state::read_regular_file_capped_with_stamp(
-            &lock.path,
-            lpm_common::STATE_FILE_SIZE_CAP_BYTES.max(64 * 1024 * 1024),
-        )
-        .ok()?;
-        // Never emit a proof if on-disk `lpm.lock` diverged from the exact
-        // snapshot this install materialized and hashes into `.lpm/install-hash`.
-        if lock_raw != lock.content.as_bytes() {
-            return None;
-        }
+        let (lock_raw, lock_stamp) = lock_disk.as_ref().ok()?;
         let owned_lockfile;
         let current_stamp = std::fs::metadata(&lock.path)
             .ok()
@@ -132,7 +137,7 @@ fn write_post_install_hash_with_context_and_proof(
         {
             parsed
         } else {
-            let lock_raw_str = std::str::from_utf8(&lock_raw).ok()?;
+            let lock_raw_str = std::str::from_utf8(lock_raw).ok()?;
             owned_lockfile = lpm_lockfile::Lockfile::from_toml(lock_raw_str).ok()?;
             &owned_lockfile
         };
@@ -142,11 +147,11 @@ fn write_post_install_hash_with_context_and_proof(
             &fresh_package,
             pkg_stripped,
             fresh_lockfile,
-            &lock_raw,
+            lock_raw,
             ctx.routes,
             ctx.auto_install_peers,
             pkg_stamp,
-            lock_stamp,
+            *lock_stamp,
         ))
     });
     let file_link_bytes =
@@ -164,7 +169,7 @@ fn write_post_install_hash_with_context_and_proof(
             security_analysis_policy,
         },
     );
-    crate::install_state::write_install_hash_with_known_runtime_state(
+    crate::install_state::write_install_hash_with_known_runtime_state_and_mtime_policy(
         project_dir,
         &hash,
         linker_mode,
@@ -178,6 +183,7 @@ fn write_post_install_hash_with_context_and_proof(
             sync_noop_proof: sync_noop_proof.as_ref(),
             release_age_policy_key,
         },
+        pkg_read_ok && lock_matches_on_disk,
     )
 }
 
@@ -1254,10 +1260,11 @@ mod workspace_freshness_tests {
 
     #[test]
     fn post_install_hash_omits_sync_noop_proof_when_on_disk_lockfile_differs_from_installed_snapshot()
-    {
+     {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path();
-        let pkg_json = r#"{"name":"proof-race","version":"1.0.0","dependencies":{"react":"^1.0.0"}}"#;
+        let pkg_json =
+            r#"{"name":"proof-race","version":"1.0.0","dependencies":{"react":"^1.0.0"}}"#;
         std::fs::write(project.join("package.json"), pkg_json).unwrap();
         std::fs::create_dir_all(project.join("node_modules")).unwrap();
 
@@ -1316,6 +1323,20 @@ mod workspace_freshness_tests {
         assert!(
             crate::install_state::SyncNoopLockfileProof::parse_from_state(&state).is_none(),
             "post-install hash must not emit a sync-noop proof when on-disk lpm.lock differs from lock.content:\n{state}"
+        );
+        let freshness =
+            crate::install_state::check_install_state_with_linker_integrity_dependency_engine_and_security_analysis(
+                project,
+                pkg_json,
+                lpm_linker::LinkerMode::Hoisted,
+                lpm_store::v2::ObjectIntegrityPolicy::Source,
+                "none",
+                lpm_store::StoreVersion::V2,
+                lpm_store::SecurityAnalysisPolicy::Disabled,
+            );
+        assert!(
+            !freshness.up_to_date,
+            "post-install hash must not stamp substituted lockfile mtime as up-to-date:\n{state}"
         );
     }
 }

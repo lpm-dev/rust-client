@@ -1344,8 +1344,6 @@ fn open_monitor_verdict_cache_dir_nofollow(
     cache_root: &Path,
     create: bool,
 ) -> Option<cap_std::fs::Dir> {
-    use cap_fs_ext::DirExt as _;
-
     // Reject a symlinked or non-directory cache root before mutating permissions
     // so pathname-based `chmod` can never follow a link to an unrelated target.
     match std::fs::symlink_metadata(cache_root) {
@@ -1394,37 +1392,96 @@ fn open_monitor_verdict_cache_dir_nofollow(
     };
     #[cfg(not(unix))]
     let root_dir = {
-        let root_meta = std::fs::symlink_metadata(cache_root).ok()?;
-        if !root_meta.is_dir() || lpm_common::is_symlink_or_junction(&root_meta) {
-            return None;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+                FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                FILE_TRAVERSE,
+            };
+
+            let file = std::fs::OpenOptions::new()
+                .access_mode(FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(cache_root)
+                .ok()?;
+            let opened_meta = file.metadata().ok()?;
+            if !opened_meta.is_dir() || lpm_common::is_symlink_or_junction(&opened_meta) {
+                return None;
+            }
+            cap_std::fs::Dir::from_std_file(file)
         }
-        cap_std::fs::Dir::open_ambient_dir(cache_root, cap_std::ambient_authority()).ok()?
+        #[cfg(not(windows))]
+        {
+            let root_meta = std::fs::symlink_metadata(cache_root).ok()?;
+            if !root_meta.is_dir() || lpm_common::is_symlink_or_junction(&root_meta) {
+                return None;
+            }
+            cap_std::fs::Dir::open_ambient_dir(cache_root, cap_std::ambient_authority()).ok()?
+        }
     };
 
-    if create {
-        match root_dir.create_dir(MONITOR_VERDICT_SUBDIR) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(_) => return None,
-        }
-    }
-    let sub_dir = root_dir.open_dir_nofollow(MONITOR_VERDICT_SUBDIR).ok()?;
-    let sub_meta = sub_dir.dir_metadata().ok()?;
-    if !sub_meta.is_dir() {
-        return None;
-    }
     #[cfg(unix)]
-    if create {
-        use cap_std::fs::PermissionsExt as _;
-        use std::os::fd::{AsFd as _, AsRawFd as _};
+    let sub_dir = {
+        use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _};
+        use std::os::unix::fs::PermissionsExt as _;
 
-        if (sub_meta.permissions().mode() & 0o777) != 0o700 {
-            // SAFETY: `sub_dir` is a valid open directory descriptor pinned with `open_dir_nofollow`.
-            if unsafe { libc::fchmod(sub_dir.as_fd().as_raw_fd(), 0o700) } != 0 {
+        let root_fd = root_dir.as_fd().as_raw_fd();
+        let subdir_cstr = std::ffi::CString::new(MONITOR_VERDICT_SUBDIR).ok()?;
+        if create {
+            // SAFETY: `root_fd` is a valid open directory descriptor and `subdir_cstr` is NUL-terminated.
+            let rc = unsafe { libc::mkdirat(root_fd, subdir_cstr.as_ptr(), 0o700) };
+            if rc != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
                 return None;
             }
         }
-    }
+        // Open with `O_RDONLY` rather than `cap_std`'s Linux `O_PATH` so `fchmod`
+        // succeeds on the pinned descriptor even when the process umask widens mode bits.
+        // SAFETY: `root_fd` is a valid open directory descriptor and `subdir_cstr` is NUL-terminated.
+        let sub_fd = unsafe {
+            libc::openat(
+                root_fd,
+                subdir_cstr.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if sub_fd < 0 {
+            return None;
+        }
+        // SAFETY: `sub_fd` was just returned by `openat` and is exclusively owned here.
+        let sub_file = unsafe { std::fs::File::from_raw_fd(sub_fd) };
+        let sub_meta = sub_file.metadata().ok()?;
+        if !sub_meta.is_dir() {
+            return None;
+        }
+        if create && (sub_meta.permissions().mode() & 0o777) != 0o700 {
+            // SAFETY: `sub_file` is a real `O_RDONLY` directory descriptor opened with `O_NOFOLLOW`.
+            if unsafe { libc::fchmod(sub_file.as_raw_fd(), 0o700) } != 0 {
+                return None;
+            }
+        }
+        cap_std::fs::Dir::from_std_file(sub_file)
+    };
+    #[cfg(not(unix))]
+    let sub_dir = {
+        use cap_fs_ext::DirExt as _;
+
+        if create {
+            match root_dir.create_dir(MONITOR_VERDICT_SUBDIR) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return None,
+            }
+        }
+        let sub_dir = root_dir.open_dir_nofollow(MONITOR_VERDICT_SUBDIR).ok()?;
+        let sub_meta = sub_dir.dir_metadata().ok()?;
+        if !sub_meta.is_dir() {
+            return None;
+        }
+        sub_dir
+    };
     Some(sub_dir)
 }
 

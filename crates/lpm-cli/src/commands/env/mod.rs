@@ -94,12 +94,8 @@ pub fn try_run_local_sync(
     if !arguments::is_local_sync_subcommand(&args) {
         return None;
     }
-    if arguments::requests_help(&args) {
-        return match arguments::parse(&args, json_output) {
-            Ok(None) => None,
-            Ok(Some(_)) => Some(Ok(())),
-            Err(error) => Some(Err(env_error(error))),
-        };
+    if arguments::try_display_help(&args) {
+        return Some(Ok(()));
     }
     // Resolve the project root BEFORE `arguments::parse` prints any JSON/clap
     // diagnostic so a disallowed directory (such as LPM_HOME) emits a single
@@ -432,6 +428,24 @@ mod tests {
         assert_eq!(
             count, 0,
             "found {count} env control-plane call(s) that still accept non-session tokens"
+        );
+    }
+
+    #[test]
+    fn help_token_as_option_value_does_not_bypass_project_dir_validation() {
+        let args = vec![
+            "list".to_string(),
+            "--env".to_string(),
+            "--help".to_string(),
+        ];
+        let result = super::try_run_local_sync(
+            || Err(super::LpmError::Env("disallowed LPM_HOME".into())),
+            &args,
+            false,
+        );
+        assert!(
+            matches!(result, Some(Err(super::LpmError::Env(ref msg))) if msg == "disallowed LPM_HOME"),
+            "non-help invocation containing `--help` as an option value must not swallow action or bypass project-dir check: {result:?}"
         );
     }
 }

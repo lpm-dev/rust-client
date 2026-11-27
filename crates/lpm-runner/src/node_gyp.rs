@@ -20,7 +20,7 @@ const NODE: &str = if cfg!(windows) { "node.exe" } else { "node" };
 static OFFERED_TO_SCRIPTS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, PartialEq, Eq)]
-struct FileStamp {
+struct StatStamp {
     len: u64,
     mtime: Option<std::time::SystemTime>,
     #[cfg(unix)]
@@ -31,7 +31,7 @@ struct FileStamp {
     ctime_nsec: i64,
 }
 
-impl FileStamp {
+impl StatStamp {
     fn from_metadata(meta: &std::fs::Metadata) -> Self {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt as _;
@@ -46,10 +46,38 @@ impl FileStamp {
             ctime_nsec: meta.ctime_nsec(),
         }
     }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct FileStamp {
+    link: StatStamp,
+    /// Populated when the path is a symlink so edits to the symlink target
+    /// invalidate cached metadata even when the symlink entry itself is unchanged.
+    target: Option<StatStamp>,
+}
+
+impl FileStamp {
+    fn from_metadata(meta: &std::fs::Metadata) -> Self {
+        Self {
+            link: StatStamp::from_metadata(meta),
+            target: None,
+        }
+    }
 
     fn from_path(path: &Path) -> Option<Self> {
-        let meta = std::fs::symlink_metadata(path).ok()?;
-        Some(Self::from_metadata(&meta))
+        let lmeta = std::fs::symlink_metadata(path).ok()?;
+        let target = if lmeta.file_type().is_symlink() {
+            std::fs::metadata(path)
+                .ok()
+                .as_ref()
+                .map(StatStamp::from_metadata)
+        } else {
+            None
+        };
+        Some(Self {
+            link: StatStamp::from_metadata(&lmeta),
+            target,
+        })
     }
 }
 
@@ -69,13 +97,16 @@ impl NodeGypCacheKey {
 }
 
 #[derive(Clone)]
+struct CachedNodeGypHit {
+    value: NpmNodeGyp,
+    script_stamp: FileStamp,
+    manifest_path: PathBuf,
+    manifest_stamp: FileStamp,
+}
+
+#[derive(Clone)]
 enum CachedNodeGypOutcome {
-    Hit {
-        value: NpmNodeGyp,
-        script_stamp: FileStamp,
-        manifest_path: PathBuf,
-        manifest_stamp: FileStamp,
-    },
+    Hit(Box<CachedNodeGypHit>),
     Miss {
         checked_paths: Vec<(PathBuf, Option<FileStamp>)>,
     },
@@ -84,14 +115,10 @@ enum CachedNodeGypOutcome {
 impl CachedNodeGypOutcome {
     fn is_fresh(&self) -> bool {
         match self {
-            Self::Hit {
-                value,
-                script_stamp,
-                manifest_path,
-                manifest_stamp,
-            } => {
-                FileStamp::from_path(&value.script).as_ref() == Some(script_stamp)
-                    && FileStamp::from_path(manifest_path).as_ref() == Some(manifest_stamp)
+            Self::Hit(hit) => {
+                FileStamp::from_path(&hit.value.script).as_ref() == Some(&hit.script_stamp)
+                    && FileStamp::from_path(&hit.manifest_path).as_ref()
+                        == Some(&hit.manifest_stamp)
             }
             Self::Miss { checked_paths } => checked_paths
                 .iter()
@@ -101,7 +128,7 @@ impl CachedNodeGypOutcome {
 
     fn value(&self) -> Option<NpmNodeGyp> {
         match self {
-            Self::Hit { value, .. } => Some(value.clone()),
+            Self::Hit(hit) => Some(hit.value.clone()),
             Self::Miss { .. } => None,
         }
     }
@@ -205,10 +232,7 @@ impl NpmNodeGyp {
                 .iter()
                 .filter_map(|node| npm_modules_beside(node))
                 .collect();
-            let found = candidate_dirs
-                .iter()
-                .cloned()
-                .find_map(Self::in_modules);
+            let found = candidate_dirs.iter().cloned().find_map(Self::in_modules);
             match found {
                 Some(value) => {
                     let manifest_path = value.modules.join("node-gyp").join("package.json");
@@ -217,12 +241,12 @@ impl NpmNodeGyp {
                         FileStamp::from_path(&manifest_path),
                     ) {
                         (Some(script_stamp), Some(manifest_stamp)) => {
-                            Some(CachedNodeGypOutcome::Hit {
+                            Some(CachedNodeGypOutcome::Hit(Box::new(CachedNodeGypHit {
                                 value: value.clone(),
                                 script_stamp,
                                 manifest_path,
                                 manifest_stamp,
-                            })
+                            })))
                         }
                         _ => None,
                     };
@@ -548,40 +572,71 @@ pub(crate) fn command_directory(host: &[PathBuf]) -> Option<PathBuf> {
     command_directory_in(host, &commands)
 }
 
+struct CachedWrittenCommands {
+    version: String,
+    directory: PathBuf,
+    file_stamps: Vec<(&'static str, FileStamp)>,
+}
+
+impl CachedWrittenCommands {
+    fn is_fresh(&self, expected_version: &str) -> bool {
+        self.version == expected_version
+            && self.directory.is_dir()
+            && self.file_stamps.iter().all(|(name, expected)| {
+                FileStamp::from_path(&self.directory.join(name)).as_ref() == Some(expected)
+            })
+    }
+}
+
 fn command_directory_in(host: &[PathBuf], commands: &Path) -> Option<PathBuf> {
     // Re-check `NpmNodeGyp::beside_node_in` (which is stamp-cached) so manifest
-    // upgrades or repaired installations are observed immediately, and cache
-    // only the generated command directory for the exact resolved `(root, script, version)`.
+    // upgrades or repaired installations are observed immediately, and key
+    // cached command directories by `(commands_root, script)` with per-file stamps
+    // so A -> B -> A version changes and deleted shims always rewrite cleanly.
     let npm = NpmNodeGyp::beside_node_in(host.iter().cloned())?;
-    type WrittenCommandKey = (PathBuf, PathBuf, String);
-    static WRITTEN: OnceLock<Mutex<HashMap<WrittenCommandKey, PathBuf>>> = OnceLock::new();
-    let key = (
-        commands.to_path_buf(),
-        npm.script.clone(),
-        npm.version.clone(),
-    );
-    if let Some(cached) = WRITTEN
-        .get_or_init(Mutex::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&key)
-        .cloned()
-        && cached.is_dir()
-    {
+    type WrittenCommandKey = (PathBuf, PathBuf);
+    static WRITTEN: OnceLock<Mutex<HashMap<WrittenCommandKey, CachedWrittenCommands>>> =
+        OnceLock::new();
+    let key = (commands.to_path_buf(), npm.script.clone());
+    let cached_hit = {
+        let written = WRITTEN
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        written
+            .get(&key)
+            .filter(|entry| entry.is_fresh(&npm.version))
+            .map(|entry| entry.directory.clone())
+    };
+    if let Some(cached) = cached_hit {
         return Some(cached);
     }
     let directory = npm
         .write_commands(commands)
         .inspect_err(|error| tracing::debug!("npm's node-gyp isn't offered: {error}"))
         .ok()?;
-    let mut written = WRITTEN
-        .get_or_init(Mutex::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if written.len() >= MAX_NODE_GYP_CACHE_ENTRIES && !written.contains_key(&key) {
-        written.clear();
+    let file_stamps: Option<Vec<(&'static str, FileStamp)>> = npm
+        .command_files()
+        .into_iter()
+        .map(|(name, _)| Some((name, FileStamp::from_path(&directory.join(name))?)))
+        .collect();
+    if let Some(file_stamps) = file_stamps {
+        let mut written = WRITTEN
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if written.len() >= MAX_NODE_GYP_CACHE_ENTRIES && !written.contains_key(&key) {
+            written.clear();
+        }
+        written.insert(
+            key,
+            CachedWrittenCommands {
+                version: npm.version.clone(),
+                directory: directory.clone(),
+                file_stamps,
+            },
+        );
     }
-    written.insert(key, directory.clone());
     Some(directory)
 }
 
@@ -970,6 +1025,58 @@ pub(crate) mod tests {
             second_shim.contains("12.0.0-upgrade.1"),
             "upgraded manifest version must rewrite the shim in place, got: {second_shim}"
         );
+
+        // Downgrading back to the earlier version (A -> B -> A) must rewrite the shim
+        // rather than hitting a stale `(root, script, A)` entry while B is on disk.
+        std::fs::write(
+            cmd_pkg.join("package.json"),
+            r#"{"name":"node-gyp","version":"11.4.0"}"#,
+        )
+        .unwrap();
+        let reverted_cmd_dir = command_directory_in(&host_dirs, &commands_root)
+            .expect("command_directory must observe A -> B -> A version revert");
+        let reverted_shim = std::fs::read_to_string(reverted_cmd_dir.join(shim_name)).unwrap();
+        assert!(
+            reverted_shim.contains("11.4.0"),
+            "reverting to earlier version must rewrite the shim back to 11.4.0, got: {reverted_shim}"
+        );
+
+        // Deleting a generated shim file must cause command_directory_in to recreate it.
+        std::fs::remove_file(reverted_cmd_dir.join(shim_name)).unwrap();
+        let repaired_cmd_dir = command_directory_in(&host_dirs, &commands_root)
+            .expect("command_directory must recreate deleted shim files");
+        assert!(
+            repaired_cmd_dir.join(shim_name).is_file(),
+            "deleted shim file must be recreated"
+        );
+
+        // Symlinked manifest target updates must invalidate the cached metadata stamp.
+        #[cfg(unix)]
+        {
+            let sym_prefix = root_path.join("node-symlink-manifest");
+            let sym_bin = sym_prefix.join("bin");
+            std::fs::create_dir_all(&sym_bin).unwrap();
+            std::fs::write(sym_bin.join(NODE), "").unwrap();
+            let sym_pkg = npm_modules_beside(&sym_bin.join(NODE))
+                .unwrap()
+                .join("node-gyp");
+            std::fs::create_dir_all(sym_pkg.join("bin")).unwrap();
+            std::fs::write(sym_pkg.join("bin").join("node-gyp.js"), "// symlinked").unwrap();
+            let real_manifest = root_path.join("real-node-gyp-package.json");
+            std::fs::write(&real_manifest, r#"{"name":"node-gyp","version":"10.1.0"}"#).unwrap();
+            std::os::unix::fs::symlink(&real_manifest, sym_pkg.join("package.json")).unwrap();
+            let first = NpmNodeGyp::beside_node_on(sym_bin.as_os_str()).expect("initial hit");
+            assert_eq!(first.version, "10.1.0");
+
+            std::fs::write(
+                &real_manifest,
+                r#"{"name":"node-gyp","version":"10.2.0-updated"}"#,
+            )
+            .unwrap();
+            let second = NpmNodeGyp::beside_node_on(sym_bin.as_os_str())
+                .expect("symlink target edit must invalidate cache");
+            assert_eq!(second.version, "10.2.0-updated");
+        }
 
         // Populate more distinct installations than MAX_NODE_GYP_CACHE_ENTRIES and verify bound.
         for idx in 0..(MAX_NODE_GYP_CACHE_ENTRIES + 4) {
