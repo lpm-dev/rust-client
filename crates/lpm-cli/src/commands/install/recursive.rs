@@ -258,10 +258,22 @@ pub(crate) async fn run_recursive_workspace_install(
                     workspace_lockfile_coordinator.validate_frozen_preflight()?;
                 }
             } else {
-                for target in &targets {
-                    workspace_lockfile_coordinator
-                        .validate_frozen_preflight_for_importer(Some(&target.importer))?;
+                let mut packages_by_path = HashMap::with_capacity(workspace.members.len() + 1);
+                packages_by_path.insert(workspace.root.as_path(), &workspace.root_package);
+                for member in &workspace.members {
+                    packages_by_path.insert(member.path.as_path(), &member.package);
                 }
+                let target_manifests: Vec<(&str, &lpm_workspace::PackageJson)> = targets
+                    .iter()
+                    .filter_map(|target| {
+                        packages_by_path
+                            .get(target.path.as_path())
+                            .copied()
+                            .map(|package| (target.importer.as_str(), package))
+                    })
+                    .collect();
+                workspace_lockfile_coordinator
+                    .validate_frozen_preflight_for_targets(&target_manifests)?;
             }
         }
         let workspace_project_state_coordinator =

@@ -847,3 +847,79 @@ fn frozen_workspace_preflight_rejects_missing_importer_before_running_locked_sib
         "frozen preflight must reject before running hooks on an already-locked sibling member"
     );
 }
+
+#[test]
+fn frozen_workspace_preflight_rejects_drifted_member_before_running_root_dev_preinstall() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "workspace-frozen-drift-preflight",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"],
+            "scripts": {
+                "pnpm:devPreinstall": "node -e \"require('fs').writeFileSync('root-dev-preinstall.marker', 'ran')\""
+            }
+        }"#,
+    );
+    project.write_file(
+        "packages/aaa-hooked/package.json",
+        &serde_json::json!({
+            "name": "aaa-hooked",
+            "version": "1.0.0",
+            "scripts": {
+                "pnpm:devPreinstall": "node -e \"require('fs').writeFileSync('../../sibling-dev-preinstall.marker', 'ran')\"",
+                "postinstall": "node -e \"require('fs').writeFileSync('../../sibling-postinstall.marker', 'ran')\""
+            }
+        })
+        .to_string(),
+    );
+    project.write_file(
+        "packages/zzz-drifted/package.json",
+        r#"{ "name": "zzz-drifted", "version": "1.0.0" }"#,
+    );
+
+    install_workspace_once(&project);
+    let root_marker = project.path().join("root-dev-preinstall.marker");
+    let sibling_pre_marker = project.path().join("sibling-dev-preinstall.marker");
+    let sibling_post_marker = project.path().join("sibling-postinstall.marker");
+    for marker in [&root_marker, &sibling_pre_marker, &sibling_post_marker] {
+        let _ = std::fs::remove_file(marker);
+    }
+    let _ = std::fs::remove_dir_all(project.path().join("packages/aaa-hooked/node_modules"));
+    let _ = std::fs::remove_dir_all(project.path().join("packages/aaa-hooked/.lpm"));
+
+    // Mutate zzz-drifted's declared dependency so its locked importer is stale.
+    project.write_file(
+        "packages/zzz-drifted/package.json",
+        r#"{ "name": "zzz-drifted", "version": "1.0.0", "dependencies": { "left-pad": "^1.3.0" } }"#,
+    );
+
+    let output = lpm(&project)
+        .args([
+            "install",
+            "--frozen-lockfile",
+            "--no-skills",
+            "--no-security-summary",
+        ])
+        .output()
+        .expect("failed to run frozen workspace install");
+
+    assert!(
+        !output.status.success(),
+        "frozen workspace install must fail when a member's declared dependencies drifted:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !root_marker.exists(),
+        "frozen preflight must reject manifest drift before running root pnpm:devPreinstall"
+    );
+    assert!(
+        !sibling_pre_marker.exists(),
+        "frozen preflight must reject manifest drift before running sibling pnpm:devPreinstall"
+    );
+    assert!(
+        !sibling_post_marker.exists(),
+        "frozen preflight must reject manifest drift before running sibling postinstall"
+    );
+}

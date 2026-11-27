@@ -432,6 +432,86 @@ impl WorkspaceLockfileCoordinator {
         Ok(())
     }
 
+    /// Run structural frozen-lockfile preflight once and verify that every
+    /// selected workspace target is present in `lpm.lock` with matching
+    /// declared dependency maps before scheduling any member or root hooks.
+    pub(super) fn validate_frozen_preflight_for_targets(
+        &self,
+        targets: &[(&str, &lpm_workspace::PackageJson)],
+    ) -> Result<(), LpmError> {
+        self.validate_frozen_preflight()?;
+        let non_persisting = self
+            .non_persisting_importers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(existing) = &self.existing else {
+            if targets
+                .iter()
+                .any(|(importer, _)| !non_persisting.contains(*importer))
+            {
+                return Err(LpmError::Registry(
+                    "workspace lockfile is missing and cannot be created in frozen mode. Run `lpm install` first."
+                        .to_string(),
+                ));
+            }
+            return Ok(());
+        };
+        let lockfile = existing.as_lockfile();
+        for &(importer, package) in targets {
+            if non_persisting.contains(importer) {
+                continue;
+            }
+            let Some(locked) = lockfile.importers.get(importer) else {
+                return Err(LpmError::Registry(format!(
+                    "workspace importer {importer:?} is missing from lpm.lock in frozen mode. Run `lpm install` to update lpm.lock."
+                )));
+            };
+            if let Some((section, name)) = Self::first_declared_dependency_drift(package, locked) {
+                return Err(LpmError::Registry(format!(
+                    "Frozen lockfile mismatch\n  importer    {importer}\n  {section}  {name}\n  hint        run `lpm install` locally and commit lpm.lock, or pass --no-frozen-lockfile"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn first_declared_dependency_drift<'a>(
+        package: &'a lpm_workspace::PackageJson,
+        locked: &'a lpm_lockfile::ImporterSnapshot,
+    ) -> Option<(&'static str, &'a str)> {
+        let sections = [
+            ("dependencies", &package.dependencies, &locked.dependencies),
+            (
+                "devDependencies",
+                &package.dev_dependencies,
+                &locked.dev_dependencies,
+            ),
+            (
+                "optionalDependencies",
+                &package.optional_dependencies,
+                &locked.optional_dependencies,
+            ),
+            (
+                "peerDependencies",
+                &package.peer_dependencies,
+                &locked.peer_dependencies,
+            ),
+        ];
+        for (section, manifest, lock) in sections {
+            for (name, spec) in manifest {
+                if lock.get(name) != Some(spec) {
+                    return Some((section, name.as_str()));
+                }
+            }
+            for name in lock.keys() {
+                if !manifest.contains_key(name) {
+                    return Some((section, name.as_str()));
+                }
+            }
+        }
+        None
+    }
+
     /// Verify that all required importers and staged lockfile projections satisfy
     /// frozen-lockfile invariants without modifying `lpm.lock`.
     pub(super) fn validate_frozen_commit(

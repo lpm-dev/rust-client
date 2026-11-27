@@ -1149,15 +1149,14 @@ fn dir_has_glibc_hwcap_variant(dir: &Path, soname: &str) -> bool {
 /// ELF `PT_INTERP` path (preserving custom sysroot prefixes).
 #[cfg(any(target_os = "linux", test))]
 fn musl_path_file_for_interp(interp: &str) -> Option<PathBuf> {
-    let interp_path = Path::new(interp);
-    if !interp_path.is_absolute()
-        || interp_path
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
+    if !interp.starts_with('/')
+        || interp.as_bytes().contains(&0)
+        || interp.split('/').any(|segment| segment == "..")
     {
         return None;
     }
-    let basename = interp_path.file_name()?.to_str()?;
+    let last_slash = interp.rfind('/')?;
+    let basename = &interp[last_slash + 1..];
     let arch = basename.strip_prefix("ld-musl-")?.strip_suffix(".so.1")?;
     if arch.is_empty()
         || !arch
@@ -1166,11 +1165,15 @@ fn musl_path_file_for_interp(interp: &str) -> Option<PathBuf> {
     {
         return None;
     }
-    // Match musl's ldso/dynlink.c prefix rule: drop both the loader filename
-    // and its parent directory (so `/lib/...` -> `/etc/...`, `/usr/lib/...` ->
-    // `/usr/etc/...`, and `/sysroot/lib64/...` -> `/sysroot/etc/...`).
-    let prefix = interp_path.parent()?.parent()?;
-    Some(prefix.join("etc").join(format!("ld-musl-{arch}.path")))
+    // Match musl's ldso/dynlink.c textual prefix rule: take everything before the
+    // second-to-last `/` (or empty prefix when there is only one `/`), then append
+    // `/etc/ld-musl-<arch>.path`.
+    let before_last = &interp[..last_slash];
+    let prefix = match before_last.rfind('/') {
+        Some(penultimate_slash) => &interp[..penultimate_slash],
+        None => "",
+    };
+    Some(PathBuf::from(format!("{prefix}/etc/ld-musl-{arch}.path")))
 }
 
 /// Parse glibc's `glibc-ld.so.cache1.1` binary table (pure new format or
@@ -3147,7 +3150,22 @@ mod tests {
             musl_path_file_for_interp("/custom/ld-musl-x86_64.so.1"),
             Some(PathBuf::from("/etc/ld-musl-x86_64.path"))
         );
-        assert_eq!(musl_path_file_for_interp("/ld-musl-x86_64.so.1"), None);
+        assert_eq!(
+            musl_path_file_for_interp("/ld-musl-x86_64.so.1"),
+            Some(PathBuf::from("/etc/ld-musl-x86_64.path"))
+        );
+        assert_eq!(
+            musl_path_file_for_interp("/opt//ld-musl-x86_64.so.1"),
+            Some(PathBuf::from("/opt/etc/ld-musl-x86_64.path"))
+        );
+        assert_eq!(
+            musl_path_file_for_interp("/lib//ld-musl-x86_64.so.1"),
+            Some(PathBuf::from("/lib/etc/ld-musl-x86_64.path"))
+        );
+        assert_eq!(
+            musl_path_file_for_interp("/lib/./ld-musl-x86_64.so.1"),
+            Some(PathBuf::from("/lib/etc/ld-musl-x86_64.path"))
+        );
         assert_eq!(
             musl_path_file_for_interp("/opt/../lib/ld-musl-x86_64.so.1"),
             None

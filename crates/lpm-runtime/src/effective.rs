@@ -294,7 +294,6 @@ impl PathNodeVersionCache {
             .get_or_init(managed_node_root)
             .as_deref();
 
-        let mut last_unstable_resolution = None;
         for _attempt in 0..2 {
             let executable_before = node_executable_in_path(cwd, path);
             let identity_before = executable_before.as_deref().and_then(|executable| {
@@ -366,9 +365,7 @@ impl PathNodeVersionCache {
                     }
                     Some(resolution)
                 } else {
-                    // Never publish an unstable probe result into the shared slot;
-                    // retain it locally as fallback if the retry also observes churn.
-                    last_unstable_resolution = Some(resolution);
+                    // Never publish or return a probe result already observed to be stale.
                     None
                 }
             });
@@ -391,9 +388,6 @@ impl PathNodeVersionCache {
             }
         }
 
-        if let Some(resolution) = last_unstable_resolution {
-            return resolution;
-        }
         let executable_final = node_executable_in_path(cwd, path);
         let version = node_version_on_path(cwd, path, executable_final.as_deref());
         PathNodeResolution {
@@ -1532,5 +1526,38 @@ mod tests {
             Some(new_fingerprint.as_str()),
             "waiting caller must return the new executable's stable fingerprint"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_node_probe_converges_on_settled_version_after_double_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_path = test_node_path(dir.path());
+        let v2_path = dir.path().join("node.v2");
+        let v3_path = dir.path().join("node.v3");
+        write_test_executable(&v3_path, b"#!/bin/sh\necho v22.0.0\n");
+        let v2_script = format!(
+            "#!/bin/sh\nmv '{}' '{}'\necho v21.0.0\n",
+            v3_path.display(),
+            node_path.display(),
+        );
+        write_test_executable(&v2_path, v2_script.as_bytes());
+        let v1_script = format!(
+            "#!/bin/sh\nmv '{}' '{}'\necho v20.0.0\n",
+            v2_path.display(),
+            node_path.display(),
+        );
+        write_test_executable(&node_path, v1_script.as_bytes());
+
+        let path =
+            std::env::join_paths([dir.path(), Path::new("/bin"), Path::new("/usr/bin")]).unwrap();
+        let cache = PathNodeVersionCache::default();
+        let resolved = cache.resolve_with_observed_shared(dir.path(), &path, None);
+        assert_eq!(
+            resolved.version(),
+            Some("22.0.0"),
+            "probe must not return the known-stale second version after double replacement"
+        );
+        assert_eq!(resolved.runtime_fingerprint(), None);
     }
 }
