@@ -566,3 +566,108 @@ fn lpm_ci_rejects_workspace_member_dependency_edge_absent_from_lockfile() {
         "a mutable install must record the new workspace dependency edge"
     );
 }
+
+#[test]
+fn ci_default_auto_frozen_workspace_install_preserves_lockfile_and_rejects_removed_importer() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-ci-auto-frozen-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{ "name": "foo", "version": "1.0.0" }"#,
+    );
+    project.write_file(
+        "packages/removed/package.json",
+        r#"{ "name": "removed", "version": "1.0.0" }"#,
+    );
+
+    install_workspace_once(&project);
+    let lock_before = project.read_file("lpm.lock");
+    std::fs::remove_dir_all(project.path().join("packages/removed"))
+        .expect("remove workspace member directory");
+
+    let output = lpm(&project)
+        .env("CI", "true")
+        .args(["install", "--no-skills", "--no-security-summary"])
+        .output()
+        .expect("failed to run CI-default lpm install");
+
+    assert!(
+        !output.status.success(),
+        "CI=true default install must refuse a workspace lockfile with a removed importer:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        project.read_file("lpm.lock"),
+        lock_before,
+        "CI=true auto-frozen install must preserve lpm.lock byte-for-byte"
+    );
+}
+
+#[test]
+fn filtered_frozen_workspace_install_rejects_removed_importer_before_running_member_hooks() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-filtered-frozen-preflight-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    let marker = project.path().join("hook-ran.marker");
+    project.write_file(
+        "packages/foo/package.json",
+        &serde_json::json!({
+            "name": "foo",
+            "version": "1.0.0",
+            "scripts": {
+                "postinstall": "node -e \"require('fs').writeFileSync('../../hook-ran.marker', 'ran')\""
+            }
+        })
+        .to_string(),
+    );
+    project.write_file(
+        "packages/removed/package.json",
+        r#"{ "name": "removed", "version": "1.0.0" }"#,
+    );
+
+    install_workspace_once(&project);
+    let _ = std::fs::remove_file(&marker);
+    let lock_before = project.read_file("lpm.lock");
+    std::fs::remove_dir_all(project.path().join("packages/removed"))
+        .expect("remove workspace member directory");
+
+    let output = lpm(&project)
+        .args([
+            "install",
+            "--frozen-lockfile",
+            "--filter",
+            "foo",
+            "--no-skills",
+            "--no-security-summary",
+        ])
+        .output()
+        .expect("failed to run filtered frozen workspace install");
+
+    assert!(
+        !output.status.success(),
+        "filtered frozen install must fail on a removed workspace importer:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "filtered frozen preflight must reject before running selected member lifecycle hooks"
+    );
+    assert_eq!(
+        project.read_file("lpm.lock"),
+        lock_before,
+        "rejected filtered frozen install must preserve lpm.lock byte-for-byte"
+    );
+}

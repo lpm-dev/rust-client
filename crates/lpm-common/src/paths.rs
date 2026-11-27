@@ -1492,7 +1492,36 @@ impl OpenRealDir {
     /// Open `path` as a pinned directory handle after confirming it is a real
     /// directory (not a symlink or junction).
     pub fn open_ambient(path: &Path) -> std::io::Result<Self> {
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
+        {
+            use std::ffi::CString;
+            use std::os::fd::FromRawFd as _;
+            use std::os::unix::ffi::OsStrExt as _;
+
+            let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("interior NUL in directory path {}", path.display()),
+                )
+            })?;
+            // `O_PATH` allows verifying known descendants beneath search-only (`0111`)
+            // directories while `O_DIRECTORY | O_NOFOLLOW` rejects symlinks and non-dirs.
+            // SAFETY: `c_path` is a valid NUL-terminated string for the duration of the call.
+            let fd = unsafe {
+                libc::open(
+                    c_path.as_ptr(),
+                    libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: `fd` is a newly opened owned descriptor returned by `libc::open`.
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            let dir = cap_std::fs::Dir::from_std_file(file);
+            Ok(Self { dir })
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -3483,6 +3512,28 @@ mod tests {
             ),
             Err(DescendantVerifyError::NotRegularFile(_))
         ));
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let search_only = tmp.path().join("search-only");
+            let inner = search_only.join("sub");
+            std::fs::create_dir_all(&inner).unwrap();
+            std::fs::write(inner.join("package.json"), b"{}").unwrap();
+            std::fs::set_permissions(&search_only, std::fs::Permissions::from_mode(0o111))
+                .unwrap();
+            let verified = OpenRealDir::open_ambient(&search_only).and_then(|dir| {
+                dir.verify_descendant_dir_and_regular_file(
+                    &search_only,
+                    Path::new("sub"),
+                    "package.json",
+                )
+                .map_err(|e| std::io::Error::other(format!("{e:?}")))
+            });
+            std::fs::set_permissions(&search_only, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            verified.expect("search-only 0111 real root must allow verifying known descendants on Linux");
+        }
     }
 }
 

@@ -23,7 +23,7 @@ use super::fs_util::{
     ensure_store_tier_dir_locked_once, harden_store_tier_once, invalidate_hardened_store_tier,
     materialize_into_with_integrity, tmp_sibling,
 };
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 pub use super::integrity::{
     TrustRestoredStoreOverrideGuard, override_trust_restored_store_for_test,
 };
@@ -1045,23 +1045,26 @@ impl Store {
         // Validate an existing lock tier without creating it (so restored
         // read-only stores stay read-only while hostile symlinks/widened perms
         // on an existing lock tier are still rejected/hardened). If chmod fails
-        // on a read-only filesystem for an existing real directory, degrade to
-        // unlocked verification instead of failing warm reuse.
+        // on a read-only filesystem (or owned chmod-denied directory) for an
+        // existing real directory, continue into the non-creating read-only
+        // shared lock instead of bypassing lock acquisition or failing reuse.
         if let Err(error) = harden_store_tier_once(locks_root) {
-            let is_readonly_real_dir = matches!(
-                error.kind(),
-                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
-            ) && std::fs::symlink_metadata(locks_root).is_ok_and(|meta| {
-                meta.is_dir() && !lpm_common::is_symlink_or_junction(&meta)
-            });
-            if is_readonly_real_dir {
-                return Ok((lock_path, None));
+            let can_degrade_readonly = is_readonly_owned_real_dir(locks_root, &error);
+            if !can_degrade_readonly {
+                return Err(LpmError::Store(format!(
+                    "failed to validate virtual-store build-entry locks dir: {error}"
+                )));
             }
-            return Err(LpmError::Store(format!(
-                "failed to validate virtual-store build-entry locks dir: {error}"
-            )));
         }
-        let handle = lpm_common::try_acquire_existing_single_file_shared_lock(&lock_path)?;
+        let handle = match lpm_common::try_acquire_existing_single_file_shared_lock(&lock_path) {
+            Ok(handle) => handle,
+            Err(LpmError::Io(error))
+                if error.kind() == std::io::ErrorKind::ReadOnlyFilesystem =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        };
         Ok((lock_path, handle))
     }
 
@@ -2255,16 +2258,21 @@ impl Store {
                             let package_dir = link_entry_package_dir(&final_dir, &graph_key);
                             if final_dir.exists()
                                 && package_dir.join("package.json").is_file()
-                                && apply_deferred_link_snapshot_heal(
-                                    &final_dir,
-                                    &package_dir,
-                                    &heal,
-                                )?
+                                && let Some(verified_sidecar_mtime) =
+                                    apply_deferred_link_snapshot_heal(
+                                        &final_dir,
+                                        &package_dir,
+                                        &graph_key,
+                                        &source_sri,
+                                        &deps,
+                                        cas_tree_digest.as_deref(),
+                                        &heal,
+                                    )?
                             {
                                 timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
                                 return Ok(Self::reused_link_entry(
                                     final_dir,
-                                    hit.sidecar_mtime,
+                                    verified_sidecar_mtime,
                                     total_start,
                                     timings,
                                 ));
@@ -3901,11 +3909,51 @@ enum DeferredLinkSnapshotHeal {
     },
 }
 
+fn is_readonly_owned_real_dir(path: &Path, error: &std::io::Error) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.is_dir() || lpm_common::is_symlink_or_junction(&meta) {
+        return false;
+    }
+    if error.kind() == std::io::ErrorKind::ReadOnlyFilesystem {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        // Refuse `EPERM` on a directory owned by another user while allowing
+        // chmod refusal on an owned directory (such as a read-only mount or
+        // immutable directory).
+        error.kind() == std::io::ErrorKind::PermissionDenied
+            && meta.uid() == lpm_common::current_uid()
+    }
+    #[cfg(not(unix))]
+    {
+        error.kind() == std::io::ErrorKind::PermissionDenied
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn apply_deferred_link_snapshot_heal(
     dir: &Path,
     package_dir: &Path,
+    key: &GraphKey,
+    source_sri: &str,
+    deps: &[DepLink],
+    tree_digest: Option<&str>,
     heal: &DeferredLinkSnapshotHeal,
-) -> Result<bool, LpmError> {
+) -> Result<Option<Option<std::time::SystemTime>>, LpmError> {
+    let Some((sidecar, sidecar_mtime)) = LinkMeta::read_from_with_mtime_if_present(dir)? else {
+        return Ok(None);
+    };
+    if sidecar.graph_key_digest_hex != key.digest_hex()
+        || sidecar.source_sri != source_sri
+        || sidecar.tree_digest.as_deref() != tree_digest
+        || !dependency_links_match(dir, key, deps, &sidecar.deps)?
+    {
+        return Ok(None);
+    }
     let expected_metadata = match heal {
         DeferredLinkSnapshotHeal::ShallowGuard {
             expected_metadata, ..
@@ -3914,7 +3962,7 @@ fn apply_deferred_link_snapshot_heal(
         DeferredLinkSnapshotHeal::LayoutSnapshot { actual, .. } => actual.metadata.as_str(),
     };
     if compute_tree_metadata_integrity(package_dir)? != expected_metadata {
-        return Ok(false);
+        return Ok(None);
     }
     match heal {
         DeferredLinkSnapshotHeal::ShallowGuard {
@@ -3947,7 +3995,7 @@ fn apply_deferred_link_snapshot_heal(
             }
         }
     }
-    Ok(true)
+    Ok(Some(sidecar_mtime))
 }
 
 struct LinkEntryReuseHit {

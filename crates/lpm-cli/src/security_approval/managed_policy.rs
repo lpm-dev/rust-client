@@ -1157,9 +1157,13 @@ impl UnixPathAuthorityStamp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ManagedPolicyStamp {
     file: UnixPathAuthorityStamp,
-    /// Stamps for every ancestor directory from the policy parent up to `/`,
-    /// so parent/ancestor permission or ownership changes invalidate cache hits.
-    ancestors: Vec<UnixPathAuthorityStamp>,
+    canonical_path: PathBuf,
+    /// Stamps for every lexical ancestor directory from the policy parent up to `/`.
+    lexical_ancestors: Vec<UnixPathAuthorityStamp>,
+    /// Stamps for every canonical ancestor directory validated by
+    /// `validate_managed_policy_authority` (for example `/private/etc` and
+    /// `/private` behind `/etc` on macOS).
+    canonical_ancestors: Vec<UnixPathAuthorityStamp>,
 }
 
 #[cfg(unix)]
@@ -1171,17 +1175,33 @@ impl ManagedPolicyStamp {
             Err(error) => return Err(error),
         };
         let file = UnixPathAuthorityStamp::from_metadata(&meta);
-        let mut ancestors = Vec::new();
+        let mut lexical_ancestors = Vec::new();
         let mut current = path.parent();
         while let Some(dir) = current {
             if dir.as_os_str().is_empty() {
                 break;
             }
             let dir_meta = std::fs::symlink_metadata(dir)?;
-            ancestors.push(UnixPathAuthorityStamp::from_metadata(&dir_meta));
+            lexical_ancestors.push(UnixPathAuthorityStamp::from_metadata(&dir_meta));
             current = dir.parent();
         }
-        Ok(Some(Self { file, ancestors }))
+        let canonical_path = std::fs::canonicalize(path)?;
+        let mut canonical_ancestors = Vec::new();
+        let mut canonical_current = canonical_path.parent();
+        while let Some(dir) = canonical_current {
+            if dir.as_os_str().is_empty() {
+                break;
+            }
+            let dir_meta = std::fs::symlink_metadata(dir)?;
+            canonical_ancestors.push(UnixPathAuthorityStamp::from_metadata(&dir_meta));
+            canonical_current = dir.parent();
+        }
+        Ok(Some(Self {
+            file,
+            canonical_path,
+            lexical_ancestors,
+            canonical_ancestors,
+        }))
     }
 }
 
@@ -1959,6 +1979,30 @@ mod access_tests {
                 assert_ne!(
                     stamp_before, stamp_after,
                     "parent directory permission change must invalidate the managed policy stamp"
+                );
+
+                // Changing a canonical ancestor behind a symlinked ancestor must also
+                // invalidate the stamp (matching macOS `/etc` -> `/private/etc`).
+                let real_root = dir.path().join("real-root");
+                let real_sub = real_root.join("etc");
+                std::fs::create_dir_all(&real_sub).unwrap();
+                let real_policy = real_sub.join("security-policy.toml");
+                std::fs::write(&real_policy, "minimum-release-age-secs = 3600\n").unwrap();
+                let link_dir = dir.path().join("linked-etc");
+                std::os::unix::fs::symlink(&real_sub, &link_dir).unwrap();
+                let via_symlink = link_dir.join("security-policy.toml");
+
+                let sym_stamp_before = super::ManagedPolicyStamp::capture(&via_symlink)
+                    .unwrap()
+                    .expect("symlink-ancestor policy stamp must exist");
+                std::fs::set_permissions(&real_root, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                let sym_stamp_after = super::ManagedPolicyStamp::capture(&via_symlink)
+                    .unwrap()
+                    .expect("symlink-ancestor policy stamp must exist after canonical ancestor chmod");
+                assert_ne!(
+                    sym_stamp_before, sym_stamp_after,
+                    "canonical ancestor permission change behind a symlinked parent must invalidate the managed policy stamp"
                 );
             }
 

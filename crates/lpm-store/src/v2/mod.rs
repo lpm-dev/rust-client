@@ -71,5 +71,5 @@ pub use store::{
     ReusableObjectValidationBatch, Store, StoreV2Paths, VerifiedObjectIntegrity, compat_island_key,
     trust_restored_store_enabled, trust_restored_store_from_env,
 };
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 pub use store::{TrustRestoredStoreOverrideGuard, override_trust_restored_store_for_test};

@@ -7280,3 +7280,185 @@ fn local_source_object_ignores_trust_restored_store_and_object_snapshot_refuses_
         "symlinked .integrity marker must be refused"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn deferred_link_snapshot_heal_rejects_sidecar_and_sibling_link_mutations() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_with_object_integrity_policy(dir.path(), ObjectIntegrityPolicy::Source);
+    let dep_tarball = build_test_tarball(&[
+        ("package.json", br#"{"name":"dep-a","version":"1.0.0"}"#),
+        ("index.js", b"module.exports = 1;\n"),
+    ]);
+    let (dep_object, dep_sri, _) = store
+        .extract_object_from_bytes_with_policy(&dep_tarball, None, ObjectIntegrityPolicy::Source)
+        .unwrap();
+    let dep_key = arc_key("dep-a", "1.0.0");
+    let dep_entry = store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&dep_key),
+            source_sri: dep_sri,
+            object_dir: dep_object.path,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+    assert!(dep_entry.freshly_populated);
+
+    let root_tarball = build_test_tarball(&[
+        ("package.json", br#"{"name":"root-a","version":"1.0.0"}"#),
+        ("index.js", b"module.exports = require('dep-a');\n"),
+    ]);
+    let (root_object, root_sri, _) = store
+        .extract_object_from_bytes_with_policy(&root_tarball, None, ObjectIntegrityPolicy::Source)
+        .unwrap();
+    let root_key = arc_key("root-a", "1.0.0");
+    let deps = vec![DepLink {
+        local: "dep-a".to_string(),
+        target: Arc::clone(&dep_key),
+    }];
+    let first = store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&root_key),
+            source_sri: root_sri.clone(),
+            object_dir: root_object.path,
+            deps: deps.clone(),
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+    let pkg_dir = link_entry_package_dir(&first.link_dir, &root_key);
+    let expected_meta = compute_tree_metadata_integrity(&pkg_dir).unwrap();
+    let snapshot = read_tree_snapshot(&first.link_dir).unwrap();
+    let heal = DeferredLinkSnapshotHeal::ShallowGuard {
+        snapshot: Box::new(snapshot),
+        expected_metadata: expected_meta,
+        expected_no_ctime: None,
+    };
+
+    // Unchanged entry accepts the deferred heal.
+    assert!(
+        apply_deferred_link_snapshot_heal(
+            &first.link_dir,
+            &pkg_dir,
+            &root_key,
+            &root_sri,
+            &deps,
+            None,
+            &heal,
+        )
+        .unwrap()
+        .is_some()
+    );
+
+    // Mutate the sibling dependency link without touching the package subtree.
+    let sibling_link = first.link_dir.join(LINK_NODE_MODULES).join("dep-a");
+    std::fs::remove_file(&sibling_link).unwrap();
+    std::os::unix::fs::symlink(dir.path(), &sibling_link).unwrap();
+    assert!(
+        apply_deferred_link_snapshot_heal(
+            &first.link_dir,
+            &pkg_dir,
+            &root_key,
+            &root_sri,
+            &deps,
+            None,
+            &heal,
+        )
+        .unwrap()
+        .is_none(),
+        "deferred snapshot heal must reject a mutated sibling dependency link"
+    );
+
+    // Restore sibling link and mutate the link sidecar metadata.
+    std::fs::remove_file(&sibling_link).unwrap();
+    let (_, expected_target) =
+        sibling_link_paths(&first.link_dir.join(LINK_NODE_MODULES), &deps[0], &root_key).unwrap();
+    std::os::unix::fs::symlink(&expected_target, &sibling_link).unwrap();
+    let sidecar_path = first.link_dir.join(LINK_META_FILENAME);
+    let mut sidecar_text = std::fs::read_to_string(&sidecar_path).unwrap();
+    sidecar_text = sidecar_text.replace(&root_sri, "sha512-tampered");
+    std::fs::write(&sidecar_path, sidecar_text).unwrap();
+    assert!(
+        apply_deferred_link_snapshot_heal(
+            &first.link_dir,
+            &pkg_dir,
+            &root_key,
+            &root_sri,
+            &deps,
+            None,
+            &heal,
+        )
+        .unwrap()
+        .is_none(),
+        "deferred snapshot heal must reject a mutated link sidecar"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn read_only_store_reuses_link_entry_when_lock_file_already_exists() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let staging = tempfile::tempdir().unwrap();
+    let store = Store::at_with_object_integrity_policy(staging.path(), ObjectIntegrityPolicy::Source);
+    let tarball = build_test_tarball(&[
+        ("package.json", br#"{"name":"ro-locked","version":"1.0.0"}"#),
+        ("index.js", b"module.exports = 'ro';\n"),
+    ]);
+    let (object, sri, _) = store
+        .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Source)
+        .unwrap();
+    let key = arc_key("ro-locked", "1.0.0");
+    let populated = store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&key),
+            source_sri: sri.clone(),
+            object_dir: object.path,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+    assert!(populated.freshly_populated);
+    let lock_file = store.paths().build_entry_lock_path(&key.digest_hex()).unwrap();
+    assert!(lock_file.is_file(), "populated entry must have a lock file");
+    // Widen locks dir to 0o755 so hardening attempts chmod on the read-only mount.
+    std::fs::set_permissions(
+        store.paths().build_entry_locks_root(),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    let image_root = tempfile::tempdir().unwrap();
+    let image_path = image_root.path().join("store.dmg");
+    let mount_point = image_root.path().join("mnt");
+    std::fs::create_dir_all(&mount_point).unwrap();
+    let src_folder = staging.path().to_str().expect("utf8 staging path");
+    let ro_image = lpm_common::test_disk_image::AttachedImage::new(
+        &image_path,
+        &mount_point,
+        &[
+            "-srcfolder",
+            src_folder,
+            "-fs",
+            "APFS",
+            "-format",
+            "UDRO",
+            "-volname",
+            "lpm-ro-store",
+        ],
+        &["-readonly"],
+    );
+    let ro_store =
+        Store::at_with_object_integrity_policy(ro_image.path(), ObjectIntegrityPolicy::Source);
+    let ro_object_dir = ro_store.paths().object_dir(&sri).unwrap();
+    let reused = ro_store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&key),
+            source_sri: sri,
+            object_dir: ro_object_dir,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .expect("read-only store must reuse a valid link entry even when its lock file exists");
+    assert!(!reused.freshly_populated);
+}

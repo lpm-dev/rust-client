@@ -293,20 +293,21 @@ impl PathNodeVersionCache {
             .managed_node_root
             .get_or_init(managed_node_root)
             .as_deref();
-        let executable_before = node_executable_in_path(cwd, path);
-        let identity_before = executable_before
-            .as_deref()
-            .and_then(|executable| path_node_identity(executable, cwd, path, managed_node_root));
-        let Some(identity) = identity_before else {
-            let version = node_version_on_path(cwd, path, executable_before.as_deref());
-            return PathNodeResolution {
-                version,
-                runtime_fingerprint: None,
-                executable: executable_before,
-            };
-        };
 
         for _attempt in 0..2 {
+            let executable_before = node_executable_in_path(cwd, path);
+            let identity_before = executable_before
+                .as_deref()
+                .and_then(|executable| path_node_identity(executable, cwd, path, managed_node_root));
+            let Some(identity) = identity_before else {
+                let version = node_version_on_path(cwd, path, executable_before.as_deref());
+                return PathNodeResolution {
+                    version,
+                    runtime_fingerprint: None,
+                    executable: executable_before,
+                };
+            };
+
             let slot = {
                 let mut map = self
                     .resolutions
@@ -392,11 +393,12 @@ impl PathNodeVersionCache {
             }
         }
 
-        let version = node_version_on_path(cwd, path, executable_before.as_deref());
+        let executable_final = node_executable_in_path(cwd, path);
+        let version = node_version_on_path(cwd, path, executable_final.as_deref());
         PathNodeResolution {
             version,
             runtime_fingerprint: None,
-            executable: executable_before,
+            executable: executable_final,
         }
     }
 }
@@ -1455,6 +1457,75 @@ mod tests {
             t_b.join().unwrap().version(),
             Some("22.2.0"),
             "distinct launcher probes must overlap rather than serialize on the cache lock"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn waiter_re_resolves_new_node_selection_after_unstable_probe_invalidates_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_path = test_node_path(dir.path());
+        let started_marker = dir.path().join("started");
+        let release_marker = dir.path().join("release");
+        let old_script = format!(
+            "#!/bin/sh\n: > '{}'\ni=0\nwhile [ ! -f '{}' ] && [ $i -lt 300 ]; do sleep 0.01; i=$((i+1)); done\necho v20.0.0\n",
+            started_marker.display(),
+            release_marker.display(),
+        );
+        write_test_executable(&node_path, old_script.as_bytes());
+
+        let path =
+            std::env::join_paths([dir.path(), Path::new("/bin"), Path::new("/usr/bin")]).unwrap();
+        let cache = Arc::new(PathNodeVersionCache::default());
+
+        let t1 = {
+            let cache = Arc::clone(&cache);
+            let cwd = dir.path().to_path_buf();
+            let path = path.clone();
+            std::thread::spawn(move || cache.resolve_with_observed_shared(&cwd, &path, None))
+        };
+
+        // Wait until thread 1 enters the probe for v20.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !started_marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(started_marker.exists(), "first probe must start");
+
+        // Launch thread 2 while thread 1 holds the OnceLock for v20's identity.
+        let t2 = {
+            let cache = Arc::clone(&cache);
+            let cwd = dir.path().to_path_buf();
+            let path = path.clone();
+            std::thread::spawn(move || cache.resolve_with_observed_shared(&cwd, &path, None))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Replace `node` atomically with a new v22 executable while both threads wait.
+        let replacement = dir.path().join("node.next");
+        write_test_executable(&replacement, b"#!/bin/sh\necho v22.9.0\n");
+        std::fs::rename(&replacement, &node_path).unwrap();
+        let new_fingerprint = probe_node_fingerprint_on_path(dir.path(), &path)
+            .expect("new node fingerprint must resolve");
+
+        // Release thread 1 so it observes instability and wakes thread 2.
+        std::fs::write(&release_marker, b"go").unwrap();
+
+        let first = t1.join().unwrap();
+        let second = t2.join().unwrap();
+        assert!(
+            first.runtime_fingerprint().is_none(),
+            "first caller saw an unstable probe and must not emit a stable fingerprint"
+        );
+        assert_eq!(
+            second.version(),
+            Some("22.9.0"),
+            "waiting caller must retry with the newly selected Node executable"
+        );
+        assert_eq!(
+            second.runtime_fingerprint(),
+            Some(new_fingerprint.as_str()),
+            "waiting caller must return the new executable's stable fingerprint"
         );
     }
 }

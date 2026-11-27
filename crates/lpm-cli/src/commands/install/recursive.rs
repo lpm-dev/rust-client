@@ -243,11 +243,14 @@ pub(crate) async fn run_recursive_workspace_install(
                 &workspace.root,
                 &legacy_importers,
             )?);
-        if options.frozen_lockfile == super::FrozenLockfileMode::Always {
+        let workspace_frozen = options.frozen_lockfile == super::FrozenLockfileMode::Always
+            || (options.frozen_lockfile == super::FrozenLockfileMode::Auto
+                && super::install_running_in_ci()
+                && (workspace.root.join(lpm_lockfile::LOCKFILE_NAME).is_file()
+                    || !legacy_importers.is_empty()));
+        if workspace_frozen {
             workspace_lockfile_coordinator.mark_frozen();
-            if filters.is_empty() && filter_prod.is_empty() {
-                workspace_lockfile_coordinator.validate_frozen_preflight()?;
-            }
+            workspace_lockfile_coordinator.validate_frozen_preflight()?;
         }
         let workspace_project_state_coordinator =
             Arc::new(workspace_project_state::WorkspaceProjectStateCoordinator::new(targets.len()));
@@ -653,7 +656,7 @@ pub(crate) async fn run_recursive_workspace_install(
             }
         };
         workspace_project_state_coordinator.commit();
-        if lockfile_committed && options.frozen_lockfile != super::FrozenLockfileMode::Always {
+        if lockfile_committed && !workspace_frozen {
             workspace_lockfile::remove_member_lockfiles(&legacy_importers);
         }
 

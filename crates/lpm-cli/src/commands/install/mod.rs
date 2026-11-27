@@ -1457,7 +1457,7 @@ async fn run_with_options_under_store_lock(
         min_release_age_exclude,
         timing,
     })?;
-    if frozen_lockfile == FrozenLockfileMode::Always {
+    if frozen_lockfile_active {
         workspace_lockfile::mark_active_install_frozen();
     }
     let caller_policy_package = if policy_project_dir != project_dir
