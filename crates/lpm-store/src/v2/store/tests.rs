@@ -4444,7 +4444,8 @@ fn reusable_object_tree_policy_rejects_tampered_source_object_with_matching_snap
         &object.path,
         &TreeIntegrities {
             content: original_snapshot.content_integrity,
-            metadata: current_metadata,
+            metadata: current_metadata.clone(),
+            metadata_no_ctime: current_metadata,
             stats: ObjectTreeStats::default(),
             content_schema: TreeContentSchema::from_snapshot_schema(original_snapshot.schema)
                 .unwrap(),
@@ -6845,12 +6846,15 @@ fn shallow_guard_refresh_skips_rewriting_snapshot_while_mtimes_are_racily_clean(
     let initial_snapshot = read_tree_snapshot(&first.link_dir).unwrap();
     let initial_captured = initial_snapshot.snapshot_captured_at_nanos;
 
+    let initial_metadata =
+        crate::v2::tree_hash::compute_tree_metadata_integrities(&pkg_dir).unwrap();
     // Immediately after creation, mtimes are inside the 2s racily-clean window;
     // refresh must not rewrite the snapshot with another racy timestamp.
     crate::v2::integrity::refresh_link_snapshot_shallow_guard_best_effort(
         &first.link_dir,
         &pkg_dir,
         &initial_snapshot,
+        &initial_metadata,
     );
     assert_eq!(
         read_tree_snapshot(&first.link_dir)
@@ -6867,10 +6871,12 @@ fn shallow_guard_refresh_skips_rewriting_snapshot_while_mtimes_are_racily_clean(
     )
     .unwrap();
     std::fs::set_times(&pkg_dir, std::fs::FileTimes::new().set_modified(old)).unwrap();
+    let aged_metadata = crate::v2::tree_hash::compute_tree_metadata_integrities(&pkg_dir).unwrap();
     crate::v2::integrity::refresh_link_snapshot_shallow_guard_best_effort(
         &first.link_dir,
         &pkg_dir,
         &initial_snapshot,
+        &aged_metadata,
     );
     let updated = read_tree_snapshot(&first.link_dir).unwrap();
     assert!(
@@ -6880,4 +6886,102 @@ fn shallow_guard_refresh_skips_rewriting_snapshot_while_mtimes_are_racily_clean(
         "aged package must receive a non-racy shallow guard at {}",
         snapshot_path.display()
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn link_entry_reuses_and_heals_snapshot_after_ctime_change_without_recreating_lock_file() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"ctime-heal\",\"version\":\"1.0.0\"}",
+        ),
+        ("index.js", b"module.exports = 'ok';\n"),
+    ]);
+    let (object, sri, _) = store
+        .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Source)
+        .unwrap();
+    let key = arc_key("ctime-heal", "1.0.0");
+    let first = store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&key),
+            source_sri: sri.clone(),
+            object_dir: object.path.clone(),
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+    assert!(first.freshly_populated);
+    let pkg_dir = link_entry_package_dir(&first.link_dir, &key);
+    let initial_snapshot = read_tree_snapshot(&first.link_dir).unwrap();
+    assert!(initial_snapshot.metadata_integrity_no_ctime.is_some());
+
+    // Remove the build-entry lock file to simulate a restored cache without
+    // build-entry-locks/, and bump ctime via chmod without altering file bytes.
+    let lock_path = store
+        .paths()
+        .build_entry_lock_path(&key.digest_hex())
+        .unwrap();
+    let _ = std::fs::remove_file(&lock_path);
+    let index_path = pkg_dir.join("index.js");
+    let mode = std::fs::metadata(&index_path).unwrap().permissions().mode();
+    std::fs::set_permissions(&index_path, std::fs::Permissions::from_mode(mode ^ 0o004)).unwrap();
+    std::fs::set_permissions(&index_path, std::fs::Permissions::from_mode(mode)).unwrap();
+
+    // Corrupt object_dir/index.js WITHOUT updating object_dir's snapshot:
+    // strict reuse validates against object_dir's verified snapshot digest in a
+    // single tree hash instead of re-hashing object_dir files.
+    std::fs::write(object.path.join("index.js"), b"tampered-object").unwrap();
+
+    let reused = store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&key),
+            source_sri: sri,
+            object_dir: object.path,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+    assert!(!reused.freshly_populated);
+    assert!(
+        !lock_path.exists(),
+        "warm reuse without an existing build-entry lock must not create {}",
+        lock_path.display()
+    );
+    let healed_snapshot = read_tree_snapshot(&first.link_dir).unwrap();
+    assert_eq!(
+        healed_snapshot.metadata_integrity,
+        compute_tree_metadata_integrity(&pkg_dir).unwrap(),
+        "ctime drift recovery must heal link snapshot metadata"
+    );
+}
+
+#[test]
+fn shallow_package_guard_ignoring_ctime_still_checks_mtime_size_and_raciness() {
+    let base = crate::v2::integrity::ShallowPackageGuard {
+        package_dir_mtime_nanos: 1_700_000_000_000_000_000,
+        package_dir_ctime_nanos: Some(1_700_000_000_000_000_000),
+        package_json_size: 42,
+        package_json_mtime_nanos: 1_700_000_000_000_000_000,
+        package_json_ctime_nanos: Some(1_700_000_000_000_000_000),
+        package_dir_entry_count: None,
+        captured_at_nanos: Some(1_700_000_010_000_000_000),
+    };
+    let mut ctime_only = base;
+    ctime_only.package_dir_ctime_nanos = Some(1_700_000_099_000_000_000);
+    ctime_only.package_json_ctime_nanos = Some(1_700_000_099_000_000_000);
+    assert!(!ctime_only.matches_non_racy(&base));
+    assert!(ctime_only.matches_non_racy_ignoring_ctime(&base));
+
+    let mut size_changed = ctime_only;
+    size_changed.package_json_size = 43;
+    assert!(!size_changed.matches_non_racy_ignoring_ctime(&base));
+
+    let mut racy = base;
+    racy.captured_at_nanos = Some(1_700_000_000_500_000_000);
+    assert!(!ctime_only.matches_non_racy_ignoring_ctime(&racy));
 }

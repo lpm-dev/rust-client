@@ -22,42 +22,50 @@ pub struct KeyMap {
 }
 
 struct GraphKeyCacheInput {
-    target: Arc<V2Target>,
+    name: Box<str>,
+    version: Box<str>,
     platform: PlatformTuple,
-    linker_tag: LinkerModeTag,
+    dependencies: Box<[LinkDependency]>,
+    aliases: Box<[(Box<str>, Box<str>)]>,
+    peers: Box<[lpm_common::PeerEdge]>,
+    wrapper_id: Option<Box<str>>,
+    patch_fingerprint: Option<Box<str>>,
 }
 
 impl GraphKeyCacheInput {
-    fn from_target(
-        target: &Arc<V2Target>,
-        platform: &PlatformTuple,
-        linker_tag: LinkerModeTag,
-    ) -> Self {
+    fn from_target(target: &V2Target, platform: &PlatformTuple) -> Self {
+        let link_target = &target.target;
+        let mut aliases: Vec<(Box<str>, Box<str>)> = link_target
+            .aliases
+            .iter()
+            .map(|(k, v)| (k.as_str().into(), v.as_str().into()))
+            .collect();
+        aliases.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         Self {
-            target: Arc::clone(target),
+            name: link_target.name.as_str().into(),
+            version: link_target.version.as_str().into(),
             platform: platform.clone(),
-            linker_tag,
+            dependencies: link_target.dependencies.clone().into_boxed_slice(),
+            aliases: aliases.into_boxed_slice(),
+            peers: link_target.peers.clone().into_boxed_slice(),
+            wrapper_id: link_target.wrapper_id.as_deref().map(Into::into),
+            patch_fingerprint: link_target.patch_fingerprint.as_deref().map(Into::into),
         }
     }
 
-    fn matches(
-        &self,
-        target: &V2Target,
-        platform: &PlatformTuple,
-        linker_tag: LinkerModeTag,
-    ) -> bool {
-        let cached_target = &self.target;
-        let cached_link_target = &cached_target.target;
+    fn matches(&self, target: &V2Target, platform: &PlatformTuple) -> bool {
         let link_target = &target.target;
-        cached_link_target.name == link_target.name
-            && cached_link_target.version == link_target.version
+        self.name.as_ref() == link_target.name.as_str()
+            && self.version.as_ref() == link_target.version.as_str()
             && &self.platform == platform
-            && self.linker_tag == linker_tag
-            && cached_link_target.dependencies == link_target.dependencies
-            && cached_link_target.aliases == link_target.aliases
-            && cached_link_target.peers == link_target.peers
-            && cached_link_target.wrapper_id == link_target.wrapper_id
-            && cached_link_target.patch_fingerprint == link_target.patch_fingerprint
+            && self.dependencies.as_ref() == link_target.dependencies.as_slice()
+            && self.aliases.len() == link_target.aliases.len()
+            && self.aliases.iter().all(|(k, v)| {
+                link_target.aliases.get(k.as_ref()).map(String::as_str) == Some(v.as_ref())
+            })
+            && self.peers.as_ref() == link_target.peers.as_slice()
+            && self.wrapper_id.as_deref() == link_target.wrapper_id.as_deref()
+            && self.patch_fingerprint.as_deref() == link_target.patch_fingerprint.as_deref()
     }
 }
 
@@ -66,9 +74,55 @@ struct CachedOwnDigest {
     own: [u8; 32],
 }
 
+#[derive(Clone, Eq, Hash, PartialEq)]
+enum EncodedSource {
+    Parsed { alg: u8, len: u8, hash: [u8; 64] },
+    Raw(Box<str>),
+}
+
+impl EncodedSource {
+    fn from_sri(source_sri: &str) -> Self {
+        match lpm_common::integrity::Integrity::parse(source_sri) {
+            Ok(integrity) if integrity.hash.len() <= 64 => {
+                let mut hash = [0u8; 64];
+                hash[..integrity.hash.len()].copy_from_slice(&integrity.hash);
+                let alg = match integrity.algorithm {
+                    lpm_common::integrity::HashAlgorithm::Sha1 => 1,
+                    lpm_common::integrity::HashAlgorithm::Sha256 => 2,
+                    lpm_common::integrity::HashAlgorithm::Sha512 => 3,
+                };
+                Self::Parsed {
+                    alg,
+                    len: integrity.hash.len() as u8,
+                    hash,
+                }
+            }
+            _ => Self::Raw(source_sri.into()),
+        }
+    }
+
+    fn hash_into(&self, hasher: &mut Sha256) {
+        match self {
+            Self::Parsed { alg, len, hash } => {
+                hasher.update([1, *alg]);
+                hasher.update(&hash[..usize::from(*len)]);
+            }
+            Self::Raw(raw) => {
+                hasher.update([0]);
+                hasher.update((raw.len() as u64).to_le_bytes());
+                hasher.update(raw.as_bytes());
+            }
+        }
+    }
+}
+
+type LeafDigestKey = ([u8; 32], EncodedSource);
+
 #[derive(Default)]
 struct CachedKeys {
     own_digests: HashMap<u64, Vec<CachedOwnDigest>>,
+    encoded_sources: HashMap<Box<str>, EncodedSource>,
+    leaf_digests: HashMap<LeafDigestKey, [u8; 32]>,
     by_digest: HashMap<[u8; 32], Arc<GraphKey>>,
 }
 
@@ -86,56 +140,114 @@ impl GraphKeyCache {
     ) -> Vec<Arc<GraphKey>> {
         let fingerprints: Vec<u64> = targets
             .iter()
-            .map(|target| graph_key_input_fingerprint(target, platform, linker_tag))
+            .map(|target| graph_key_input_fingerprint(target, platform))
             .collect();
-        let mut own_digests: Vec<Option<[u8; 32]>> = {
+        let (mut own_digests, mut encoded_sources): (
+            Vec<Option<[u8; 32]>>,
+            Vec<Option<EncodedSource>>,
+        ) = {
             let entries = self.lock();
-            targets
+            let own = targets
                 .iter()
                 .zip(fingerprints.iter().copied())
                 .map(|(target, fingerprint)| {
                     entries.own_digests.get(&fingerprint).and_then(|bucket| {
                         bucket
                             .iter()
-                            .find(|cached| cached.input.matches(target, platform, linker_tag))
+                            .find(|cached| cached.input.matches(target, platform))
                             .map(|cached| cached.own)
                     })
                 })
-                .collect()
+                .collect();
+            let sources = targets
+                .iter()
+                .map(|target| {
+                    entries
+                        .encoded_sources
+                        .get(target.source_sri.as_str())
+                        .cloned()
+                })
+                .collect();
+            (own, sources)
         };
-        let mut misses: Vec<(u64, CachedOwnDigest)> = Vec::new();
+        let mut own_misses: Vec<(u64, CachedOwnDigest)> = Vec::new();
+        let mut borrowed_deps_scratch: Vec<(&str, &str)> = Vec::new();
         for ((slot, target), fingerprint) in
             own_digests.iter_mut().zip(targets.iter()).zip(fingerprints)
         {
             if slot.is_none() {
-                let own = own_digest(target, platform, linker_tag);
+                let own = own_digest_with_scratch(
+                    target,
+                    platform,
+                    linker_tag,
+                    &mut borrowed_deps_scratch,
+                );
                 *slot = Some(own);
-                misses.push((
+                own_misses.push((
                     fingerprint,
                     CachedOwnDigest {
-                        input: GraphKeyCacheInput::from_target(target, platform, linker_tag),
+                        input: GraphKeyCacheInput::from_target(target, platform),
                         own,
                     },
                 ));
             }
         }
-        if !misses.is_empty() {
-            let mut entries = self.lock();
-            for (fingerprint, item) in misses {
-                let bucket = entries.own_digests.entry(fingerprint).or_default();
-                if !bucket.iter().any(|existing| existing.own == item.own) {
-                    bucket.push(item);
-                }
+        let mut source_misses: Vec<(Box<str>, EncodedSource)> = Vec::new();
+        for (slot, target) in encoded_sources.iter_mut().zip(targets.iter()) {
+            if slot.is_none() {
+                let encoded = EncodedSource::from_sri(&target.source_sri);
+                *slot = Some(encoded.clone());
+                source_misses.push((target.source_sri.as_str().into(), encoded));
             }
         }
         let own_digests: Vec<[u8; 32]> = own_digests
             .into_iter()
             .map(|slot| slot.expect("every target digest is computed"))
             .collect();
+        let encoded_sources: Vec<EncodedSource> = encoded_sources
+            .into_iter()
+            .map(|slot| slot.expect("every target source is encoded"))
+            .collect();
+
+        // Pre-fill cached leaf digests while updating misses under one lock acquisition.
+        let mut precomputed_leaves: Vec<Option<[u8; 32]>> = vec![None; targets.len()];
+        {
+            let mut entries = self.lock();
+            for (fingerprint, item) in own_misses {
+                let bucket = entries.own_digests.entry(fingerprint).or_default();
+                if !bucket.iter().any(|existing| existing.own == item.own) {
+                    bucket.push(item);
+                }
+            }
+            for (raw_sri, encoded) in source_misses {
+                entries.encoded_sources.entry(raw_sri).or_insert(encoded);
+            }
+            for index in 0..targets.len() {
+                if targets[index].dependency_targets.is_empty()
+                    && targets[index].peer_targets.is_empty()
+                {
+                    let key = (own_digests[index], encoded_sources[index].clone());
+                    if let Some(&digest) = entries.leaf_digests.get(&key) {
+                        precomputed_leaves[index] = Some(digest);
+                    }
+                }
+            }
+        }
+
         // Workspace members derive their keys at once, so the walk over the
         // graph stays outside the lock.
-        let digests = linked_digests(targets, &own_digests);
+        let mut new_leaves: Vec<(LeafDigestKey, [u8; 32])> = Vec::new();
+        let digests = linked_digests_with_sources(
+            targets,
+            &own_digests,
+            &encoded_sources,
+            Some(&precomputed_leaves),
+            Some(&mut new_leaves),
+        );
         let mut entries = self.lock();
+        for (leaf_key, digest) in new_leaves {
+            entries.leaf_digests.entry(leaf_key).or_insert(digest);
+        }
         targets
             .iter()
             .zip(digests)
@@ -181,11 +293,7 @@ fn fingerprint_optional(fingerprint: &mut u64, value: Option<&str>) {
     }
 }
 
-fn graph_key_input_fingerprint(
-    target: &V2Target,
-    platform: &PlatformTuple,
-    linker_tag: LinkerModeTag,
-) -> u64 {
+fn graph_key_input_fingerprint(target: &V2Target, platform: &PlatformTuple) -> u64 {
     let link_target = &target.target;
     let mut fingerprint = 0xcbf29ce484222325u64;
     for value in [
@@ -197,13 +305,6 @@ fn graph_key_input_fingerprint(
         fingerprint_bytes(&mut fingerprint, value.as_bytes());
     }
     fingerprint_optional(&mut fingerprint, platform.libc.as_deref());
-    fingerprint_bytes(
-        &mut fingerprint,
-        match linker_tag {
-            LinkerModeTag::Isolated => b"isolated",
-            LinkerModeTag::Hoisted => b"hoisted",
-        },
-    );
     for dependency in &link_target.dependencies {
         for value in [
             dependency.local.as_str(),
@@ -233,15 +334,20 @@ fn graph_key_input_fingerprint(
     fingerprint
 }
 
-fn own_digest(target: &V2Target, platform: &PlatformTuple, linker_tag: LinkerModeTag) -> [u8; 32] {
+fn own_digest_with_scratch<'a>(
+    target: &'a V2Target,
+    platform: &PlatformTuple,
+    linker_tag: LinkerModeTag,
+    scratch: &mut Vec<(&'a str, &'a str)>,
+) -> [u8; 32] {
     let link_target = &target.target;
-    let mut graph_key_deps: Vec<(String, String)> =
-        Vec::with_capacity(link_target.dependencies.len());
-    graph_key_deps.extend(
+    scratch.clear();
+    scratch.reserve(link_target.dependencies.len());
+    scratch.extend(
         link_target
             .dependencies
             .iter()
-            .map(|dep| (dep.local.clone(), dep.graph_key_value().to_string())),
+            .map(|dep| (dep.local.as_str(), dep.graph_key_value())),
     );
     let empty_targets = HashMap::new();
     // V2 link directories only materialize the package's files and sibling
@@ -249,12 +355,12 @@ fn own_digest(target: &V2Target, platform: &PlatformTuple, linker_tag: LinkerMod
     // and peer target identities are folded structurally by slot and target
     // GraphKey digest inside `closure_digest`, so content-identical link trees
     // across workspace targets share one store entry.
-    GraphKey::own_digest_raw(
+    GraphKey::own_digest_raw_borrowed(
         &link_target.name,
         &link_target.version,
         platform,
         linker_tag,
-        &graph_key_deps,
+        scratch,
         &empty_targets,
         &link_target.aliases,
         &link_target.peers,
@@ -288,7 +394,56 @@ fn graph_key(target: &V2Target, digest: [u8; 32]) -> Arc<GraphKey> {
 /// itself. A target on no cycle leaves its instance id out, which lets two
 /// instances of the same materialization keep one entry.
 fn linked_digests(targets: &[Arc<V2Target>], own_digests: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    let encoded_sources: Vec<EncodedSource> = targets
+        .iter()
+        .map(|target| EncodedSource::from_sri(&target.source_sri))
+        .collect();
+    linked_digests_with_sources(targets, own_digests, &encoded_sources, None, None)
+}
+
+fn linked_digests_with_sources(
+    targets: &[Arc<V2Target>],
+    own_digests: &[[u8; 32]],
+    encoded_sources: &[EncodedSource],
+    precomputed_leaves: Option<&[Option<[u8; 32]>]>,
+    mut new_leaves: Option<&mut Vec<(LeafDigestKey, [u8; 32])>>,
+) -> Vec<[u8; 32]> {
     const UNSEEN: usize = usize::MAX;
+
+    let mut discovered = vec![UNSEEN; targets.len()];
+    let mut lowest = vec![UNSEEN; targets.len()];
+    let mut completed = vec![false; targets.len()];
+    let mut digests = vec![[0; 32]; targets.len()];
+
+    // Complete leaf packages (no outgoing dependency or peer links) up front
+    // so they never enter Tarjan's stack or adjacency lists.
+    let mut remaining_non_leaves = 0usize;
+    for index in 0..targets.len() {
+        if targets[index].dependency_targets.is_empty() && targets[index].peer_targets.is_empty() {
+            let digest = if let Some(cached) = precomputed_leaves.and_then(|leaves| leaves[index]) {
+                cached
+            } else {
+                let mut hasher = Sha256::new();
+                hasher.update(b"lpm-link-closure-v2\0");
+                hasher.update([0]);
+                encoded_sources[index].hash_into(&mut hasher);
+                let closure: [u8; 32] = hasher.finalize().into();
+                let digest = GraphKey::linked_digest(&own_digests[index], &closure);
+                if let Some(record) = new_leaves.as_deref_mut() {
+                    record.push(((own_digests[index], encoded_sources[index].clone()), digest));
+                }
+                digest
+            };
+            discovered[index] = 0;
+            completed[index] = true;
+            digests[index] = digest;
+        } else {
+            remaining_non_leaves += 1;
+        }
+    }
+    if remaining_non_leaves == 0 {
+        return digests;
+    }
 
     let by_instance: HashMap<_, _> = targets
         .iter()
@@ -299,12 +454,15 @@ fn linked_digests(targets: &[Arc<V2Target>], own_digests: &[[u8; 32]]) -> Vec<[u
         .iter()
         .enumerate()
         .map(|(index, target)| {
+            if completed[index] {
+                return Vec::new();
+            }
             let mut linked: Vec<usize> = target
                 .dependency_targets
                 .values()
                 .chain(target.peer_targets.values())
                 .filter_map(|instance_id| by_instance.get(instance_id).copied())
-                .filter(|&other| other != index)
+                .filter(|&other| other != index && !completed[other])
                 .collect();
             linked.sort_unstable();
             linked.dedup();
@@ -315,13 +473,10 @@ fn linked_digests(targets: &[Arc<V2Target>], own_digests: &[[u8; 32]]) -> Vec<[u
     // Tarjan's algorithm, with its own stack so a deep graph can't exhaust
     // the thread's. It completes a cycle only after everything the cycle
     // reaches, so each key is ready when a dependent needs it.
-    let mut discovered = vec![UNSEEN; targets.len()];
-    let mut lowest = vec![UNSEEN; targets.len()];
-    let mut completed = vec![false; targets.len()];
-    let mut digests = vec![[0; 32]; targets.len()];
     let mut open = Vec::new();
     let mut visiting: Vec<(usize, usize)> = Vec::new();
-    let mut next = 0;
+    let mut edges_scratch: Vec<(u8, &str, [u8; 32])> = Vec::new();
+    let mut next = 1;
     for root in 0..targets.len() {
         if discovered[root] != UNSEEN {
             continue;
@@ -364,7 +519,9 @@ fn linked_digests(targets: &[Arc<V2Target>], own_digests: &[[u8; 32]]) -> Vec<[u
                 &members,
                 &completed,
                 own_digests,
+                encoded_sources,
                 &digests,
+                &mut edges_scratch,
             );
             for member in members {
                 completed[member] = true;
@@ -378,22 +535,25 @@ fn linked_digests(targets: &[Arc<V2Target>], own_digests: &[[u8; 32]]) -> Vec<[u
 /// The closure digest of the targets in `members`: one target on no cycle,
 /// or every target of one cycle. The members are not completed yet, which
 /// tells the targets they link to outside the cycle from each other.
-fn closure_digest(
-    targets: &[Arc<V2Target>],
+#[allow(clippy::too_many_arguments)]
+fn closure_digest<'a>(
+    targets: &'a [Arc<V2Target>],
     by_instance: &HashMap<PackageInstanceId, usize>,
     members: &[usize],
     completed: &[bool],
     own_digests: &[[u8; 32]],
+    encoded_sources: &[EncodedSource],
     digests: &[[u8; 32]],
+    edges: &mut Vec<(u8, &'a str, [u8; 32])>,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"lpm-link-closure-v2\0");
     if let [member] = members {
         hasher.update([0]);
         let target = &targets[*member];
-        hash_source(&mut hasher, &target.source_sri);
-        let mut edges: Vec<(u8, &str, [u8; 32])> =
-            Vec::with_capacity(target.dependency_targets.len() + target.peer_targets.len());
+        encoded_sources[*member].hash_into(&mut hasher);
+        edges.clear();
+        edges.reserve(target.dependency_targets.len() + target.peer_targets.len());
         for (edge_kind, map) in [
             (0u8, &target.dependency_targets),
             (1u8, &target.peer_targets),
@@ -413,7 +573,7 @@ fn closure_digest(
             }
         }
         edges.sort_unstable();
-        for (kind, slot, target_digest) in edges {
+        for &(kind, slot, target_digest) in edges.iter() {
             hasher.update([kind]);
             hasher.update((slot.len() as u64).to_le_bytes());
             hasher.update(slot.as_bytes());
@@ -428,9 +588,9 @@ fn closure_digest(
             let target = &targets[member];
             hasher.update(target.instance_id.as_bytes());
             hasher.update(own_digests[member]);
-            hash_source(&mut hasher, &target.source_sri);
-            let mut edges: Vec<(u8, &str, [u8; 32])> =
-                Vec::with_capacity(target.dependency_targets.len() + target.peer_targets.len());
+            encoded_sources[member].hash_into(&mut hasher);
+            edges.clear();
+            edges.reserve(target.dependency_targets.len() + target.peer_targets.len());
             for (edge_kind, map) in [
                 (0u8, &target.dependency_targets),
                 (1u8, &target.peer_targets),
@@ -448,7 +608,7 @@ fn closure_digest(
             }
             edges.sort_unstable();
             hasher.update((edges.len() as u64).to_le_bytes());
-            for (kind, slot, target_digest) in edges {
+            for &(kind, slot, target_digest) in edges.iter() {
                 hasher.update([kind]);
                 hasher.update((slot.len() as u64).to_le_bytes());
                 hasher.update(slot.as_bytes());
@@ -457,29 +617,6 @@ fn closure_digest(
         }
     }
     hasher.finalize().into()
-}
-
-/// Hashes what `source_sri` names instead of how it is written, so one
-/// object has one identity. A local source's SRI names its directory.
-fn hash_source(hasher: &mut Sha256, source_sri: &str) {
-    match lpm_common::integrity::Integrity::parse(source_sri) {
-        Ok(integrity) => {
-            hasher.update([
-                1,
-                match integrity.algorithm {
-                    lpm_common::integrity::HashAlgorithm::Sha1 => 1,
-                    lpm_common::integrity::HashAlgorithm::Sha256 => 2,
-                    lpm_common::integrity::HashAlgorithm::Sha512 => 3,
-                },
-            ]);
-            hasher.update(&integrity.hash);
-        }
-        Err(_) => {
-            hasher.update([0]);
-            hasher.update((source_sri.len() as u64).to_le_bytes());
-            hasher.update(source_sri.as_bytes());
-        }
-    }
 }
 
 impl KeyMap {
@@ -613,9 +750,10 @@ pub(super) fn derive_graph_keys(
     let key_targets = contextual_targets.as_deref().unwrap_or(targets);
     let graph_keys = cache.map_or_else(
         || {
+            let mut scratch: Vec<(&str, &str)> = Vec::new();
             let own_digests: Vec<_> = key_targets
                 .iter()
-                .map(|target| own_digest(target, platform, linker_tag))
+                .map(|target| own_digest_with_scratch(target, platform, linker_tag, &mut scratch))
                 .collect();
             key_targets
                 .iter()
@@ -677,15 +815,20 @@ mod tests {
         let explicit = target();
         let mut implicit = explicit.clone();
         Arc::make_mut(&mut implicit.target).root_link_names = None;
-        for mode in [LinkerModeTag::Isolated, LinkerModeTag::Hoisted] {
-            let keys = cache.derive_many(
-                &[Arc::new(explicit.clone()), Arc::new(implicit.clone())],
-                &platform,
-                mode,
-            );
-            assert!(Arc::ptr_eq(&keys[0], &keys[1]));
-        }
-        assert_eq!(cache.len(), 2);
+        let isolated = cache.derive_many(
+            &[Arc::new(explicit.clone()), Arc::new(implicit.clone())],
+            &platform,
+            LinkerModeTag::Isolated,
+        );
+        let hoisted = cache.derive_many(
+            &[Arc::new(explicit), Arc::new(implicit)],
+            &platform,
+            LinkerModeTag::Hoisted,
+        );
+        assert!(Arc::ptr_eq(&isolated[0], &isolated[1]));
+        assert!(Arc::ptr_eq(&hoisted[0], &hoisted[1]));
+        assert!(Arc::ptr_eq(&isolated[0], &hoisted[0]));
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]
@@ -790,7 +933,20 @@ mod tests {
             LinkerModeTag::Isolated,
         );
 
-        assert_eq!(cache.len(), 8);
+        assert_eq!(cache.len(), 7);
+    }
+
+    #[test]
+    fn graph_key_cache_does_not_retain_v2_target_arcs() {
+        let cache = GraphKeyCache::default();
+        let platform = PlatformTuple::new("darwin", "arm64", None);
+        let owned = Arc::new(target());
+        let weak = Arc::downgrade(&owned);
+        let _keys = cache.derive_many(&[owned], &platform, LinkerModeTag::Isolated);
+        assert!(
+            weak.upgrade().is_none(),
+            "GraphKeyCache must not retain Arc<V2Target> across workspace lifetime"
+        );
     }
 
     #[test]

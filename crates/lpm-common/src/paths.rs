@@ -1430,6 +1430,25 @@ pub fn acquire_single_file_shared_lock(
     acquire_single_file_shared_lock_from_file(file)
 }
 
+/// Acquire a shared single-file lock only when `lock_path` already exists.
+///
+/// Opens without creating the file so warm store reads avoid `O_CREAT` metadata
+/// churn (and avoid creating lock directories/files for restored read-only caches).
+/// Returns `Ok(None)` when `lock_path` does not exist.
+pub fn try_acquire_existing_single_file_shared_lock(
+    lock_path: impl AsRef<Path>,
+) -> Result<Option<SingleFileSharedLockHandle>, LpmError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    options.write(true);
+    match options.open(lock_path.as_ref()) {
+        Ok(file) => acquire_single_file_shared_lock_from_file(file).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(LpmError::Io(error)),
+    }
+}
+
 pub fn acquire_single_file_shared_lock_from_file(
     file: std::fs::File,
 ) -> Result<SingleFileSharedLockHandle, LpmError> {

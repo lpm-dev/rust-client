@@ -621,7 +621,6 @@ pub fn refresh_links_after_package_mutation(
     plan: &LinkPlanV2,
     store: &Store,
 ) -> Result<usize, LpmError> {
-    create_root_symlinks(project_dir, &plan.augmented_targets, store, &plan.key_map)?;
     let compatibility_links = create_project_compatibility_links(
         project_dir,
         &plan.augmented_targets,
@@ -629,6 +628,13 @@ pub fn refresh_links_after_package_mutation(
         &plan.key_map,
         &plan.compatibility_bin_names,
         true,
+    )?;
+    create_root_symlinks(
+        project_dir,
+        &plan.augmented_targets,
+        store,
+        &plan.key_map,
+        &compatibility_links,
     )?;
     create_bin_links_v2(
         project_dir,
@@ -661,12 +667,6 @@ fn link_v2_finalize_inner(
     reconcile_project_node_modules(project_dir, augmented_slice, self_package_name, true)?;
     let reconcile_ms = stage_timer.elapsed().as_millis();
     let stage_timer = std::time::Instant::now();
-    let symlinked = {
-        let _s = tracing::info_span!("linker.finalize.root_symlinks").entered();
-        create_root_symlinks(project_dir, augmented_slice, store, &plan.key_map)?
-    };
-    let root_symlinks_ms = stage_timer.elapsed().as_millis();
-    let stage_timer = std::time::Instant::now();
     let compatibility_links = {
         let _s = tracing::info_span!("linker.finalize.compatibility").entered();
         create_project_compatibility_links(
@@ -679,6 +679,18 @@ fn link_v2_finalize_inner(
         )?
     };
     let compatibility_ms = stage_timer.elapsed().as_millis();
+    let stage_timer = std::time::Instant::now();
+    let symlinked = {
+        let _s = tracing::info_span!("linker.finalize.root_symlinks").entered();
+        create_root_symlinks(
+            project_dir,
+            augmented_slice,
+            store,
+            &plan.key_map,
+            &compatibility_links,
+        )?
+    };
+    let root_symlinks_ms = stage_timer.elapsed().as_millis();
     let stage_timer = std::time::Instant::now();
     let bin_count = {
         let _s = tracing::info_span!("linker.finalize.bin_shims").entered();
@@ -1208,12 +1220,8 @@ fn existing_link_entry_packages(
     store: &Store,
 ) -> Result<Vec<MaterializedPackage>, LpmError> {
     let links_root = store.paths().links_root();
-    let canonical_links_root = std::fs::canonicalize(&links_root).map_err(|e| {
-        LpmError::Store(format!(
-            "virtual-store linker: failed to inspect links root at {}: {e}",
-            links_root.display()
-        ))
-    })?;
+    ensure_real_dir(&links_root, "links root")?;
+    let mut canonical_links_root: Option<PathBuf> = None;
 
     let mut materialized = Vec::with_capacity(plan.augmented_targets.len());
     for v2t in &plan.augmented_targets {
@@ -1225,8 +1233,9 @@ fn existing_link_entry_packages(
         })?;
         let package_dir = store.paths().link_package_dir(key);
         ensure_existing_link_package_dir(
+            &links_root,
+            &mut canonical_links_root,
             &package_dir,
-            &canonical_links_root,
             &v2t.target.name,
             &v2t.target.version,
         )?;
@@ -1242,25 +1251,76 @@ fn existing_link_entry_packages(
 }
 
 fn ensure_existing_link_package_dir(
+    links_root: &Path,
+    canonical_links_root: &mut Option<PathBuf>,
     package_dir: &Path,
-    canonical_links_root: &Path,
     name: &str,
     version: &str,
 ) -> Result<(), LpmError> {
-    let canonical_package_dir = std::fs::canonicalize(package_dir).map_err(|e| {
+    // Walk only the 3-4 components below `links_root` with `symlink_metadata`
+    // instead of running `canonicalize` from `/` on every package. Any symlink
+    // or non-normal component falls through to the canonical containment error.
+    let relative = package_dir.strip_prefix(links_root).map_err(|_| {
         LpmError::Store(format!(
-            "virtual-store linker: required link entry for {name}@{version} is missing at {}: {e}",
-            package_dir.display()
-        ))
-    })?;
-    if !canonical_package_dir.starts_with(canonical_links_root) {
-        return Err(LpmError::Store(format!(
             "virtual-store linker: refusing existing link entry for {name}@{version} because {} resolves outside {}",
             package_dir.display(),
-            canonical_links_root.display()
-        )));
+            links_root.display()
+        ))
+    })?;
+    let mut cursor = PathBuf::with_capacity(package_dir.as_os_str().len());
+    cursor.push(links_root);
+    let mut saw_symlink = false;
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            saw_symlink = true;
+            break;
+        };
+        cursor.push(part);
+        let metadata = std::fs::symlink_metadata(&cursor).map_err(|e| {
+            LpmError::Store(format!(
+                "virtual-store linker: required link entry for {name}@{version} is missing at {}: {e}",
+                package_dir.display()
+            ))
+        })?;
+        if lpm_common::is_symlink_or_junction(&metadata) {
+            saw_symlink = true;
+            break;
+        }
+        if !metadata.is_dir() {
+            return Err(LpmError::Store(format!(
+                "virtual-store linker: refusing existing link package at {} (not a directory)",
+                cursor.display()
+            )));
+        }
     }
-    ensure_real_dir(package_dir, "existing link package")?;
+    if saw_symlink {
+        let root_canon = match canonical_links_root {
+            Some(existing) => existing.as_path(),
+            None => {
+                let canon = std::fs::canonicalize(links_root).map_err(|e| {
+                    LpmError::Store(format!(
+                        "virtual-store linker: failed to inspect links root at {}: {e}",
+                        links_root.display()
+                    ))
+                })?;
+                canonical_links_root.insert(canon).as_path()
+            }
+        };
+        let canonical_package_dir = std::fs::canonicalize(package_dir).map_err(|e| {
+            LpmError::Store(format!(
+                "virtual-store linker: required link entry for {name}@{version} is missing at {}: {e}",
+                package_dir.display()
+            ))
+        })?;
+        if !canonical_package_dir.starts_with(root_canon) {
+            return Err(LpmError::Store(format!(
+                "virtual-store linker: refusing existing link entry for {name}@{version} because {} resolves outside {}",
+                package_dir.display(),
+                root_canon.display()
+            )));
+        }
+        ensure_real_dir(package_dir, "existing link package")?;
+    }
 
     let mut package_json = PathBuf::with_capacity(package_dir.as_os_str().len() + 13);
     package_json.push(package_dir);

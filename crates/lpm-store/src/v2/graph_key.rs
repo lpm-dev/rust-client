@@ -55,29 +55,23 @@ use lpm_common::PackageInstanceId;
 
 use crate::v2::platform::PlatformTuple;
 
-/// Linker mode tag stamped into the graph key.
+/// Linker mode tag accepted by [`GraphKeyInputs`].
 ///
-/// Two installations of `react@18.3.0` under different linker modes
-/// must produce different keys — even if every other input matches —
-/// because the wrapper layouts (sibling symlinks vs flat-hoisted) are
-/// not interchangeable.
+/// Virtual-store link entries under `v2/links/<key>/` always materialize the
+/// same sibling-symlink wrapper layout regardless of whether the project root
+/// uses isolated or hoisted symlinks, so both variants map to the canonical
+/// `"isolated"` store key and share on-disk entries without invalidating
+/// existing isolated stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LinkerModeTag {
     /// pnpm-style isolated, sibling symlinks under `node_modules/`.
     Isolated,
-    /// npm-style hoisted layout. Peer pinning still contributes because
-    /// link entries materialize peer siblings.
+    /// npm-style hoisted layout. Shares the identical virtual-store link entry
+    /// layout with [`Self::Isolated`].
     Hoisted,
 }
 
-impl LinkerModeTag {
-    fn as_str(self) -> &'static str {
-        match self {
-            LinkerModeTag::Isolated => "isolated",
-            LinkerModeTag::Hoisted => "hoisted",
-        }
-    }
-}
+const CANONICAL_STORE_LINKER_TAG: &[u8] = b"isolated";
 
 /// Compatibility input for a registry peer whose local and canonical names match.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -348,11 +342,7 @@ impl GraphKey {
         let platform_str = format_platform(&inputs.platform);
         write_field(&mut hasher, b"platform", platform_str.as_bytes());
 
-        write_field(
-            &mut hasher,
-            b"linker",
-            inputs.linker_mode.as_str().as_bytes(),
-        );
+        write_field(&mut hasher, b"linker", CANONICAL_STORE_LINKER_TAG);
 
         let peers_str = format_peers(&inputs.peers);
         write_field(&mut hasher, b"peers", peers_str.as_bytes());
@@ -545,6 +535,43 @@ impl GraphKey {
         wrapper_id: Option<&str>,
         patch_fingerprint: Option<&str>,
     ) -> [u8; 32] {
+        let borrowed_deps: Vec<(&str, &str)> = raw_deps
+            .iter()
+            .map(|(local, ver)| (local.as_str(), ver.as_str()))
+            .collect();
+        Self::own_digest_raw_borrowed(
+            name,
+            version,
+            platform,
+            linker_tag,
+            &borrowed_deps,
+            dependency_targets,
+            aliases,
+            peers,
+            peer_targets,
+            root_link_names,
+            wrapper_id,
+            patch_fingerprint,
+        )
+    }
+
+    /// Borrowed-slice variant of [`Self::own_digest_raw`] that avoids cloning
+    /// dependency `(local, value)` strings in hot linker loops.
+    #[allow(clippy::too_many_arguments)]
+    pub fn own_digest_raw_borrowed(
+        name: &str,
+        version: &str,
+        platform: &PlatformTuple,
+        _linker_tag: LinkerModeTag,
+        raw_deps: &[(&str, &str)],
+        dependency_targets: &HashMap<String, PackageInstanceId>,
+        aliases: &HashMap<String, String>,
+        peers: &[lpm_common::PeerEdge],
+        peer_targets: &HashMap<String, PackageInstanceId>,
+        root_link_names: Option<&[String]>,
+        wrapper_id: Option<&str>,
+        patch_fingerprint: Option<&str>,
+    ) -> [u8; 32] {
         let mut hasher = schema_hasher();
         hasher.update(b"\0");
 
@@ -552,7 +579,7 @@ impl GraphKey {
         write_field(&mut hasher, b"version", version.as_bytes());
 
         write_platform_direct(&mut hasher, platform);
-        write_field(&mut hasher, b"linker", linker_tag.as_str().as_bytes());
+        write_field(&mut hasher, b"linker", CANONICAL_STORE_LINKER_TAG);
 
         write_peers_raw_direct(&mut hasher, peers);
         write_deps_raw_direct(&mut hasher, raw_deps, aliases);
@@ -792,22 +819,61 @@ fn write_platform_direct(hasher: &mut blake3::Hasher, p: &PlatformTuple) {
 }
 
 fn write_peers_raw_direct(hasher: &mut blake3::Hasher, peers: &[lpm_common::PeerEdge]) {
-    let peers = format_peers(peers);
-    write_field(hasher, b"peers", peers.as_bytes());
+    hasher.update(b"peers=");
+    if !peers.is_empty() {
+        let mut sorted: Vec<&lpm_common::PeerEdge> = peers.iter().collect();
+        sorted.sort_unstable_by(|a, b| {
+            let a_wrap = a.target_wrapper_id.as_deref().unwrap_or("");
+            let b_wrap = b.target_wrapper_id.as_deref().unwrap_or("");
+            a.local_name
+                .bytes()
+                .chain(b"=>".iter().copied())
+                .chain(a.target_name.bytes())
+                .chain(std::iter::once(b'@'))
+                .chain(a.target_version.bytes())
+                .chain(std::iter::once(b'#'))
+                .chain(a_wrap.bytes())
+                .cmp(
+                    b.local_name
+                        .bytes()
+                        .chain(b"=>".iter().copied())
+                        .chain(b.target_name.bytes())
+                        .chain(std::iter::once(b'@'))
+                        .chain(b.target_version.bytes())
+                        .chain(std::iter::once(b'#'))
+                        .chain(b_wrap.bytes()),
+                )
+        });
+        for (i, peer) in sorted.iter().enumerate() {
+            if i > 0 {
+                hasher.update(b",");
+            }
+            hasher.update(peer.local_name.as_bytes());
+            hasher.update(b"=>");
+            hasher.update(peer.target_name.as_bytes());
+            hasher.update(b"@");
+            hasher.update(peer.target_version.as_bytes());
+            hasher.update(b"#");
+            if let Some(wrapper) = peer.target_wrapper_id.as_deref() {
+                hasher.update(wrapper.as_bytes());
+            }
+        }
+    }
+    hasher.update(b"\0");
 }
 
 fn write_deps_raw_direct(
     hasher: &mut blake3::Hasher,
-    deps: &[(String, String)],
+    deps: &[(&str, &str)],
     aliases: &HashMap<String, String>,
 ) {
     hasher.update(b"edges=");
     if !deps.is_empty() {
         let mut sorted: Vec<(&str, &str, &str)> = deps
             .iter()
-            .map(|(local, ver)| {
-                let canonical = aliases.get(local).map_or(local.as_str(), |s| s.as_str());
-                (local.as_str(), canonical, ver.as_str())
+            .map(|&(local, ver)| {
+                let canonical = aliases.get(local).map_or(local, String::as_str);
+                (local, canonical, ver)
             })
             .collect();
         // Sort by "local=>canonical@ver" byte sequence to match the old string sort.
@@ -981,14 +1047,14 @@ mod tests {
     }
 
     #[test]
-    fn different_linker_mode_yields_different_key() {
+    fn isolated_and_hoisted_share_the_same_store_graph_key() {
         let isolated = GraphKey::derive(&base_inputs());
         let hoisted = {
             let mut i = base_inputs();
             i.linker_mode = LinkerModeTag::Hoisted;
             GraphKey::derive(&i)
         };
-        assert_ne!(isolated, hoisted);
+        assert_eq!(isolated, hoisted);
     }
 
     #[test]
