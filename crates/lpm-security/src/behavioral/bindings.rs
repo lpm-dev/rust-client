@@ -13,6 +13,10 @@ pub(super) struct CallFacts {
     pub destructive_filesystem: Option<usize>,
     pub shell: Option<usize>,
     pub dynamic_load: Option<usize>,
+    /// The code runs a file it can't name: a `fork` or a `Worker` starts a
+    /// script from a path the code computes, a `Worker` runs code, or the
+    /// `require` loader is handed on as a value.
+    pub computed_script: Option<usize>,
     pub evaluation: Option<usize>,
     pub unresolved_evaluation: Option<usize>,
     /// Every call or construction `evaluation` and `unresolved_evaluation` found.
@@ -250,11 +254,25 @@ impl Memo {
     }
 }
 
+/// The module a call loads by name: the global `require(name)`, or
+/// `process.getBuiltinModule(name)`, Node's loader of its own modules.
 fn required_module(call: &CallExpression<'_>, semantic: &Semantic<'_>) -> Option<Origin> {
-    let Expression::Identifier(identifier) = call.callee.get_inner_expression() else {
-        return None;
+    let global = |expression: &Expression<'_>, name: &str| {
+        expression
+            .get_identifier_reference()
+            .is_some_and(|identifier| {
+                identifier.name == name && semantic.is_reference_to_global_variable(identifier)
+            })
     };
-    if identifier.name != "require" || !semantic.is_reference_to_global_variable(identifier) {
+    let loads = match call.callee.get_inner_expression() {
+        callee @ Expression::Identifier(_) => global(callee, "require"),
+        Expression::StaticMemberExpression(member) => {
+            member.property.name == "getBuiltinModule"
+                && global(member.object.get_inner_expression(), "process")
+        }
+        _ => false,
+    };
+    if !loads {
         return None;
     }
     module(static_string(call.arguments.first()?.as_expression()?, 0)?.as_ref())
@@ -557,6 +575,782 @@ fn has_shell_option(call: &CallExpression<'_>, semantic: &Semantic<'_>, memo: &m
         .any(|argument| shell_option(argument, semantic, memo, 0) == Some(true))
 }
 
+/// Aliases (`const W = Worker`) a binding is followed through to what it
+/// names. Real code aliases a module or a constructor once or twice. Past
+/// this, a binding is taken to be what it's asked about, so neither a long
+/// chain nor a cycle (`var a = b, b = a`) hides one.
+const MAX_ALIAS_DEPTH: usize = 16;
+
+/// The symbol an identifier reads and the node that declares it.
+fn declaration_of(
+    identifier: &IdentifierReference<'_>,
+    semantic: &Semantic<'_>,
+) -> Option<(SymbolId, oxc_semantic::NodeId)> {
+    let symbol = identifier
+        .reference_id
+        .get()
+        .and_then(|id| semantic.scoping().get_reference(id).symbol_id())?;
+    Some((symbol, semantic.scoping().symbol_declaration(symbol)))
+}
+
+/// Whether `pattern` binds `symbol` itself, with or without a default.
+fn binds(pattern: &BindingPattern<'_>, symbol: SymbolId) -> bool {
+    match pattern {
+        BindingPattern::BindingIdentifier(identifier) => identifier.symbol_id.get() == Some(symbol),
+        BindingPattern::AssignmentPattern(assignment) => binds(&assignment.left, symbol),
+        _ => false,
+    }
+}
+
+/// Whether a destructuring takes `symbol` from the property `name`:
+/// `{ Worker }`, `{ Worker: W }`, `{ Worker = Fallback }`.
+fn destructures(pattern: &ObjectPattern<'_>, name: &str, symbol: SymbolId) -> bool {
+    pattern.properties.iter().any(|property| {
+        property.key.static_name().is_some_and(|key| key == name) && binds(&property.value, symbol)
+    })
+}
+
+/// Whether the import declaration around `specifier` imports a module
+/// `is_name` accepts.
+fn imports_from(
+    specifier: oxc_semantic::NodeId,
+    is_name: fn(&str) -> bool,
+    semantic: &Semantic<'_>,
+) -> bool {
+    matches!(
+        semantic.nodes().kind(semantic.nodes().parent_id(specifier)),
+        AstKind::ImportDeclaration(import) if import.source.value.as_str().is_some_and(is_name)
+    )
+}
+
+/// Whether `callee` is Node's `worker_threads` `Worker`, which runs a script
+/// file: a `.Worker` member of that module, a binding taken from it
+/// (`import { Worker as W }`, `const { Worker } = require(…)`, `const W =
+/// threads.Worker`, a later `W = threads.Worker`), or a class extending it.
+/// A browser's global `Worker` loads a URL, not a package file, and a local
+/// class named `Worker` is neither. A `Worker` whose binding can't be
+/// followed, such as one a dynamic import's callback destructures, is
+/// Node's when the file names `worker_threads` (`mentions_worker_threads`).
+fn is_worker_constructor(
+    callee: &Expression<'_>,
+    semantic: &Semantic<'_>,
+    mentions_worker_threads: bool,
+    depth: usize,
+) -> bool {
+    if depth >= MAX_ALIAS_DEPTH {
+        return true;
+    }
+    let follow = |expression: &Expression<'_>| {
+        is_worker_constructor(expression, semantic, mentions_worker_threads, depth + 1)
+    };
+    match callee.get_inner_expression() {
+        Expression::StaticMemberExpression(member) => {
+            member.property.name == "Worker"
+                && (is_module(&member.object, is_worker_threads, semantic, depth + 1)
+                    || mentions_worker_threads)
+        }
+        Expression::ComputedMemberExpression(member) => {
+            static_string(&member.expression, 0).is_some_and(|name| name == "Worker")
+                && (is_module(&member.object, is_worker_threads, semantic, depth + 1)
+                    || mentions_worker_threads)
+        }
+        Expression::Identifier(identifier) => {
+            let named_worker = identifier.name == "Worker";
+            let Some((symbol, declaration)) = declaration_of(identifier, semantic) else {
+                return named_worker && mentions_worker_threads;
+            };
+            let declared = match semantic.nodes().kind(declaration) {
+                AstKind::ImportSpecifier(specifier) => {
+                    specifier.imported.name() == "Worker"
+                        && imports_from(declaration, is_worker_threads, semantic)
+                }
+                AstKind::Class(class) => class
+                    .heritage
+                    .as_ref()
+                    .is_some_and(|heritage| follow(&heritage.expression)),
+                AstKind::Function(_) => false,
+                AstKind::VariableDeclarator(variable) => match (&variable.id, &variable.init) {
+                    (BindingPattern::ObjectPattern(pattern), Some(init)) => {
+                        destructures(pattern, "Worker", symbol)
+                            && (is_module(init, is_worker_threads, semantic, depth + 1)
+                                || mentions_worker_threads)
+                    }
+                    (BindingPattern::BindingIdentifier(_), Some(init)) => follow(init),
+                    _ => false,
+                },
+                _ => named_worker && mentions_worker_threads,
+            };
+            declared || assigned_values(symbol, semantic).any(follow)
+        }
+        _ => false,
+    }
+}
+
+/// The values assigned to `symbol` after its declaration (`W = value`).
+fn assigned_values<'s>(
+    symbol: SymbolId,
+    semantic: &'s Semantic<'_>,
+) -> impl Iterator<Item = &'s Expression<'s>> {
+    semantic
+        .scoping()
+        .get_resolved_reference_ids(symbol)
+        .iter()
+        .map(|&id| semantic.scoping().get_reference(id))
+        .filter(|reference| reference.is_write())
+        .filter_map(|reference| {
+            semantic
+                .nodes()
+                .ancestor_kinds(reference.node_id())
+                .take(3)
+                .find_map(|kind| match kind {
+                    AstKind::AssignmentExpression(assignment) => Some(&assignment.right),
+                    _ => None,
+                })
+        })
+}
+
+/// Whether `expression` is a module `is_name` accepts: `require` of it, or a
+/// binding of that, of an alias of it, or of `import * as m` or a default
+/// import of it.
+fn is_module(
+    expression: &Expression<'_>,
+    is_name: fn(&str) -> bool,
+    semantic: &Semantic<'_>,
+    depth: usize,
+) -> bool {
+    if depth >= MAX_ALIAS_DEPTH {
+        return true;
+    }
+    let names_module = |argument: Option<&Expression<'_>>| {
+        argument
+            .and_then(|argument| static_string(argument, 0))
+            .is_some_and(|name| is_name(name.as_ref()))
+    };
+    match expression.get_inner_expression() {
+        Expression::CallExpression(call) => {
+            let loader = match call.callee.get_inner_expression() {
+                Expression::Identifier(identifier) => identifier.name == "require",
+                // `process.getBuiltinModule(name)`, Node's loader of its own modules.
+                Expression::StaticMemberExpression(member) => {
+                    member.property.name == "getBuiltinModule"
+                        && member
+                            .object
+                            .get_inner_expression()
+                            .is_specific_id("process")
+                }
+                _ => false,
+            };
+            loader && names_module(call.arguments.first().and_then(Argument::as_expression))
+        }
+        Expression::AwaitExpression(awaited) => {
+            is_module(&awaited.argument, is_name, semantic, depth + 1)
+        }
+        Expression::ImportExpression(import) => names_module(Some(&import.source)),
+        Expression::Identifier(identifier) => {
+            let Some((_, declaration)) = declaration_of(identifier, semantic) else {
+                return false;
+            };
+            match semantic.nodes().kind(declaration) {
+                AstKind::VariableDeclarator(variable) => {
+                    matches!(variable.id, BindingPattern::BindingIdentifier(_))
+                        && variable
+                            .init
+                            .as_ref()
+                            .is_some_and(|init| is_module(init, is_name, semantic, depth + 1))
+                }
+                AstKind::ImportNamespaceSpecifier(_) | AstKind::ImportDefaultSpecifier(_) => {
+                    imports_from(declaration, is_name, semantic)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Whether a module name is Node's `worker_threads`, whose `Worker` starts a
+/// script.
+fn is_worker_threads(name: &str) -> bool {
+    name.strip_prefix("node:").unwrap_or(name) == "worker_threads"
+}
+
+/// Whether `expression` is one of Node's module objects: the global `module`,
+/// `process.mainModule` or `require.main`.
+fn is_module_instance(expression: &Expression<'_>, semantic: &Semantic<'_>) -> bool {
+    let global = |expression: &Expression<'_>, name: &str| {
+        expression
+            .get_inner_expression()
+            .get_identifier_reference()
+            .is_some_and(|identifier| {
+                identifier.name == name && semantic.is_reference_to_global_variable(identifier)
+            })
+    };
+    match expression.get_inner_expression() {
+        Expression::StaticMemberExpression(member) => match member.property.name.as_str() {
+            "mainModule" => global(&member.object, "process"),
+            "main" => global(&member.object, "require"),
+            _ => false,
+        },
+        expression => global(expression, "module"),
+    }
+}
+
+/// Whether a module name is Node's `module`, whose `Module._load` loads a
+/// module by name.
+fn is_node_module(name: &str) -> bool {
+    name.strip_prefix("node:").unwrap_or(name) == "module"
+}
+
+/// Whether `object` is Node's `Module` class: the `module` builtin or its
+/// `Module` export, the CommonJS `module.constructor`, or a binding of one
+/// of those.
+fn is_module_class(object: &Expression<'_>, semantic: &Semantic<'_>, depth: usize) -> bool {
+    if depth >= MAX_ALIAS_DEPTH {
+        return true;
+    }
+    match object.get_inner_expression() {
+        Expression::CallExpression(_) => is_module(object, is_node_module, semantic, depth + 1),
+        Expression::StaticMemberExpression(member) => match member.property.name.as_str() {
+            "constructor" => is_module_instance(&member.object, semantic),
+            "Module" => is_module(&member.object, is_node_module, semantic, depth + 1),
+            _ => false,
+        },
+        Expression::Identifier(identifier) => {
+            let Some((symbol, declaration)) = declaration_of(identifier, semantic) else {
+                return false;
+            };
+            match semantic.nodes().kind(declaration) {
+                AstKind::ImportSpecifier(specifier) => {
+                    specifier.imported.name() == "Module"
+                        && imports_from(declaration, is_node_module, semantic)
+                }
+                AstKind::ImportNamespaceSpecifier(_) | AstKind::ImportDefaultSpecifier(_) => {
+                    imports_from(declaration, is_node_module, semantic)
+                }
+                AstKind::VariableDeclarator(variable) => match (&variable.id, &variable.init) {
+                    (BindingPattern::ObjectPattern(pattern), Some(init)) => {
+                        destructures(pattern, "Module", symbol)
+                            && is_module(init, is_node_module, semantic, depth + 1)
+                    }
+                    (BindingPattern::BindingIdentifier(_), Some(init)) => {
+                        is_module_class(init, semantic, depth + 1)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// The module name of a load that doesn't call `require` directly:
+/// `require.call(this, name)`, `require.apply(this, [name])`, the same of a
+/// `require` method (`Module.prototype.require.call(module, name)`),
+/// `require.extensions[ext](module, name)`, `Module._load(name)`,
+/// `Module.register(name)`, which loads hooks, and `module._compile(source)`.
+fn indirect_load_argument<'c>(
+    call: &'c CallExpression<'_>,
+    semantic: &Semantic<'_>,
+) -> Option<&'c Expression<'c>> {
+    let global_require = |expression: &Expression<'_>| {
+        expression
+            .get_inner_expression()
+            .get_identifier_reference()
+            .is_some_and(|identifier| {
+                identifier.name == "require" && semantic.is_reference_to_global_variable(identifier)
+            })
+    };
+    let extensions = |expression: &Expression<'_>| match expression.get_inner_expression() {
+        Expression::StaticMemberExpression(member) => {
+            (member.property.name == "extensions" && global_require(&member.object))
+                || (member.property.name == "_extensions"
+                    && is_module_class(&member.object, semantic, 0))
+        }
+        _ => false,
+    };
+    if let Expression::ComputedMemberExpression(member) = call.callee.get_inner_expression()
+        && extensions(&member.object)
+    {
+        return call.arguments.get(1).and_then(Argument::as_expression);
+    }
+    let Expression::StaticMemberExpression(member) = call.callee.get_inner_expression() else {
+        return None;
+    };
+    if extensions(&member.object) {
+        return call.arguments.get(1).and_then(Argument::as_expression);
+    }
+    let requires = || {
+        global_require(&member.object)
+            || matches!(
+                member.object.get_inner_expression(),
+                Expression::StaticMemberExpression(method) if method.property.name == "require"
+            )
+    };
+    match member.property.name.as_str() {
+        "call" if requires() => call.arguments.get(1).and_then(Argument::as_expression),
+        "apply" if requires() => match call.arguments.get(1).and_then(Argument::as_expression) {
+            Some(Expression::ArrayExpression(array)) => array
+                .elements
+                .first()
+                .and_then(|element| element.as_expression()),
+            other => other,
+        },
+        "_load" | "register" if is_module_class(&member.object, semantic, 0) => {
+            call.arguments.first().and_then(Argument::as_expression)
+        }
+        // Compiles the source it is given as a module.
+        "_compile" if is_module_instance(&member.object, semantic) => {
+            call.arguments.first().and_then(Argument::as_expression)
+        }
+        _ => None,
+    }
+}
+
+/// Whether a launch's script, its first argument, is computed: spread into
+/// the call, or neither a literal nor a path [`is_built_path`] accepts and
+/// [`super::syntax::is_static_path`] folds, which the file's path literals
+/// then name. A computed script could be any file.
+fn computed_script(arguments: &[Argument<'_>], semantic: &Semantic<'_>) -> bool {
+    match arguments.first() {
+        None => false,
+        Some(Argument::SpreadElement(_)) => true,
+        Some(argument) => argument
+            .as_expression()
+            .is_none_or(|argument| computed_script_path(argument, semantic)),
+    }
+}
+
+fn computed_script_path(argument: &Expression<'_>, semantic: &Semantic<'_>) -> bool {
+    let argument = argument.get_inner_expression();
+    !(argument.is_literal()
+        || is_static_string(argument, 0)
+        || (is_built_path(argument, semantic, 0) && super::syntax::is_static_path(argument)))
+}
+
+/// Whether `expression` builds a path from strings and the module's own
+/// location alone: string literals, `+` and templates of them, the global
+/// `__dirname` and `__filename` (not a binding of that name), `import.meta`'s
+/// `dirname`, `filename` and `url`, Node's path functions (`join`, `resolve`,
+/// `normalize`, `dirname` of the `path` module, `require.resolve`,
+/// `fileURLToPath` of the `url` module) and the global `URL` applied to such
+/// parts.
+fn is_built_path(expression: &Expression<'_>, semantic: &Semantic<'_>, depth: usize) -> bool {
+    if depth >= MAX_ALIAS_DEPTH {
+        return false;
+    }
+    let expression = expression.get_inner_expression();
+    if expression.is_literal() || is_static_string(expression, 0) {
+        return true;
+    }
+    let built = |part: &Expression<'_>| is_built_path(part, semantic, depth + 1);
+    let all_built = |arguments: &oxc_allocator::Vec<'_, Argument<'_>>| {
+        arguments
+            .iter()
+            .all(|argument| argument.as_expression().is_some_and(built))
+    };
+    match expression {
+        Expression::Identifier(identifier) => {
+            matches!(identifier.name.as_str(), "__dirname" | "__filename")
+                && semantic.is_reference_to_global_variable(identifier)
+        }
+        Expression::StaticMemberExpression(member) => {
+            matches!(
+                member.object.get_inner_expression(),
+                Expression::ImportMeta(_)
+            ) && matches!(
+                member.property.name.as_str(),
+                "dirname" | "filename" | "url"
+            )
+        }
+        Expression::BinaryExpression(binary) if binary.operator.as_str() == "+" => {
+            built(&binary.left) && built(&binary.right)
+        }
+        Expression::TemplateLiteral(template) => template.expressions.iter().all(built),
+        Expression::CallExpression(call) => {
+            is_path_function(&call.callee, semantic, depth + 1) && all_built(&call.arguments)
+        }
+        Expression::NewExpression(new) => {
+            new.callee
+                .get_inner_expression()
+                .get_identifier_reference()
+                .is_some_and(|identifier| {
+                    identifier.name == "URL" && semantic.is_reference_to_global_variable(identifier)
+                })
+                && (1..=2).contains(&new.arguments.len())
+                && all_built(&new.arguments)
+        }
+        _ => false,
+    }
+}
+
+/// Node's functions that build a path from their arguments: `join`,
+/// `resolve`, `normalize` and `dirname` of the `path` module, the global
+/// `require.resolve`, and `fileURLToPath` of the `url` module, by their
+/// bindings, so a local function of the same name isn't one.
+fn is_path_function(callee: &Expression<'_>, semantic: &Semantic<'_>, depth: usize) -> bool {
+    const PATH_FUNCTIONS: &[&str] = &["join", "resolve", "normalize", "dirname"];
+    match callee.get_inner_expression() {
+        Expression::StaticMemberExpression(member) => {
+            let name = member.property.name.as_str();
+            (PATH_FUNCTIONS.contains(&name) && is_path_module(&member.object, semantic, depth))
+                || (name == "resolve"
+                    && member
+                        .object
+                        .get_inner_expression()
+                        .get_identifier_reference()
+                        .is_some_and(|identifier| {
+                            identifier.name == "require"
+                                && semantic.is_reference_to_global_variable(identifier)
+                        }))
+                || (name == "fileURLToPath"
+                    && is_module(&member.object, is_url_module, semantic, depth))
+        }
+        Expression::Identifier(identifier) => {
+            let Some((symbol, declaration)) = declaration_of(identifier, semantic) else {
+                return false;
+            };
+            match semantic.nodes().kind(declaration) {
+                AstKind::ImportSpecifier(specifier) => {
+                    let imported = specifier.imported.name();
+                    (PATH_FUNCTIONS.contains(&imported.as_str())
+                        && imports_from(declaration, is_path_module_name, semantic))
+                        || (imported == "fileURLToPath"
+                            && imports_from(declaration, is_url_module, semantic))
+                }
+                AstKind::VariableDeclarator(variable) => match (&variable.id, &variable.init) {
+                    (BindingPattern::ObjectPattern(pattern), Some(init)) => {
+                        (PATH_FUNCTIONS
+                            .iter()
+                            .any(|function| destructures(pattern, function, symbol))
+                            && is_path_module(init, semantic, depth))
+                            || (destructures(pattern, "fileURLToPath", symbol)
+                                && is_module(init, is_url_module, semantic, depth))
+                    }
+                    _ => false,
+                },
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Whether `expression` is Node's `path` module, or its `posix` or `win32`.
+fn is_path_module(expression: &Expression<'_>, semantic: &Semantic<'_>, depth: usize) -> bool {
+    match expression.get_inner_expression() {
+        Expression::StaticMemberExpression(member)
+            if matches!(member.property.name.as_str(), "posix" | "win32") =>
+        {
+            is_path_module(&member.object, semantic, depth + 1)
+        }
+        other => is_module(other, is_path_module_name, semantic, depth),
+    }
+}
+
+fn is_path_module_name(name: &str) -> bool {
+    matches!(
+        name.strip_prefix("node:").unwrap_or(name),
+        "path" | "path/posix" | "path/win32"
+    )
+}
+
+fn is_url_module(name: &str) -> bool {
+    name.strip_prefix("node:").unwrap_or(name) == "url"
+}
+
+/// Whether a script path is fixed by the module's own location
+/// (`__dirname`, `__filename`, `import.meta`, `require.resolve`), so where the
+/// launch runs from doesn't move it.
+fn is_anchored_path(expression: &Expression<'_>, semantic: &Semantic<'_>, depth: usize) -> bool {
+    if depth >= MAX_ALIAS_DEPTH {
+        return false;
+    }
+    let anchored = |part: &Expression<'_>| is_anchored_path(part, semantic, depth + 1);
+    match expression.get_inner_expression() {
+        Expression::Identifier(identifier) => {
+            matches!(identifier.name.as_str(), "__dirname" | "__filename")
+                && semantic.is_reference_to_global_variable(identifier)
+        }
+        Expression::StaticMemberExpression(member) => {
+            matches!(
+                member.object.get_inner_expression(),
+                Expression::ImportMeta(_)
+            )
+        }
+        Expression::BinaryExpression(binary) => anchored(&binary.left),
+        Expression::TemplateLiteral(template) => template.expressions.first().is_some_and(anchored),
+        Expression::CallExpression(call) => {
+            matches!(
+                call.callee.get_inner_expression(),
+                Expression::StaticMemberExpression(member)
+                    if member.property.name == "resolve"
+                        && member.object.get_inner_expression().is_specific_id("require")
+            ) || call
+                .arguments
+                .first()
+                .and_then(Argument::as_expression)
+                .is_some_and(anchored)
+        }
+        Expression::NewExpression(new) => new
+            .arguments
+            .get(1)
+            .and_then(Argument::as_expression)
+            .is_some_and(anchored),
+        _ => false,
+    }
+}
+
+/// Whether a `fork`'s working directory moves a script that isn't
+/// [`is_anchored_path`] somewhere unknown: a computed `cwd`, or options the
+/// call doesn't spell out.
+fn launch_directory_unknown(arguments: &[Argument<'_>], semantic: &Semantic<'_>) -> bool {
+    let Some(script) = arguments.first().and_then(Argument::as_expression) else {
+        return false;
+    };
+    if is_anchored_path(script, semantic, 0) {
+        return false;
+    }
+    arguments[1..].iter().any(|argument| match argument {
+        Argument::SpreadElement(_) => true,
+        Argument::ArrayExpression(_) => false,
+        Argument::ObjectExpression(options) => {
+            options.properties.iter().any(|property| match property {
+                ObjectPropertyKind::SpreadProperty(_) => true,
+                ObjectPropertyKind::ObjectProperty(property) => {
+                    property.key.static_name().is_some_and(|name| name == "cwd")
+                        && computed_script_path(&property.value, semantic)
+                }
+            })
+        }
+        _ => true,
+    })
+}
+
+/// The options of a launch, as Node reads its arguments: a `fork`'s are the
+/// third argument, or the second when that isn't a list of arguments; a
+/// `Worker`'s are the second.
+fn launch_options<'a>(arguments: &'a [Argument<'a>], forks: bool) -> Option<&'a Argument<'a>> {
+    match (forks, arguments) {
+        (true, [_, _, options, ..]) => Some(options),
+        (true, [_, Argument::ArrayExpression(_)]) => None,
+        (_, [_, options, ..]) => Some(options),
+        _ => None,
+    }
+}
+
+/// Whether a launch's options preload code from somewhere unknown: an
+/// `execArgv`, whose `--require`, `--import` and `--loader` load what they
+/// name, that isn't spelled out, or, for a process, an environment whose
+/// `NODE_OPTIONS` isn't, or options that aren't written out. The parent's own
+/// `process.execArgv` and `process.env` are how the package was started, not
+/// code it chose.
+fn launch_preloads_unknown_code(
+    arguments: &[Argument<'_>],
+    forks: bool,
+    semantic: &Semantic<'_>,
+) -> bool {
+    let Some(options) = launch_options(arguments, forks) else {
+        return false;
+    };
+    let options = match options {
+        Argument::SpreadElement(_) => return true,
+        _ => match options
+            .as_expression()
+            .map(Expression::get_inner_expression)
+        {
+            Some(Expression::ObjectExpression(options)) => options,
+            Some(Expression::Identifier(identifier)) => match written_value(identifier, semantic) {
+                Some(Expression::ObjectExpression(options)) => options,
+                Some(Expression::ArrayExpression(_)) if forks && arguments.len() == 2 => {
+                    return false;
+                }
+                _ => return true,
+            },
+            Some(Expression::NullLiteral(_)) => return false,
+            Some(expression) if expression.is_undefined() => return false,
+            _ => return true,
+        },
+    };
+    options.properties.iter().any(|property| match property {
+        ObjectPropertyKind::SpreadProperty(_) => true,
+        ObjectPropertyKind::ObjectProperty(property) => match property.key.static_name() {
+            Some(name) if name == "execArgv" => !spelled_out_exec_argv(&property.value),
+            Some(name) if name == "env" => forks && !spelled_out_environment(&property.value),
+            Some(_) => false,
+            None => true,
+        },
+    })
+}
+
+/// The value a `const`, `let` or `var` binding of `identifier` starts with.
+fn written_value<'s>(
+    identifier: &IdentifierReference<'_>,
+    semantic: &'s Semantic<'_>,
+) -> Option<&'s Expression<'s>> {
+    let (_, declaration) = declaration_of(identifier, semantic)?;
+    match semantic.nodes().kind(declaration) {
+        AstKind::VariableDeclarator(variable)
+            if matches!(variable.id, BindingPattern::BindingIdentifier(_)) =>
+        {
+            variable.init.as_ref().map(Expression::get_inner_expression)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `expression` is the parent's own `process.execArgv`, or a filter
+/// or slice of it.
+fn is_parent_exec_argv(expression: &Expression<'_>) -> bool {
+    match expression.get_inner_expression() {
+        Expression::StaticMemberExpression(member) => {
+            member.property.name == "execArgv"
+                && member
+                    .object
+                    .get_inner_expression()
+                    .is_specific_id("process")
+        }
+        Expression::CallExpression(call) => match call.callee.get_inner_expression() {
+            Expression::StaticMemberExpression(method) => {
+                matches!(method.property.name.as_str(), "filter" | "slice")
+                    && is_parent_exec_argv(&method.object)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether an `execArgv` lists only literal flags, or the parent's own.
+fn spelled_out_exec_argv(value: &Expression<'_>) -> bool {
+    match value.get_inner_expression() {
+        Expression::ArrayExpression(array) => array.elements.iter().all(|element| match element {
+            ArrayExpressionElement::SpreadElement(spread) => is_parent_exec_argv(&spread.argument),
+            element => element
+                .as_expression()
+                .is_some_and(|element| static_string(element, 0).is_some()),
+        }),
+        value => is_parent_exec_argv(value),
+    }
+}
+
+/// Whether a process environment's `NODE_OPTIONS` is spelled out: it is the
+/// parent's own `process.env`, or an object of it and literal values.
+fn spelled_out_environment(value: &Expression<'_>) -> bool {
+    let parent = |expression: &Expression<'_>| match expression.get_inner_expression() {
+        Expression::StaticMemberExpression(member) => {
+            member.property.name == "env"
+                && member
+                    .object
+                    .get_inner_expression()
+                    .is_specific_id("process")
+        }
+        _ => false,
+    };
+    match value.get_inner_expression() {
+        Expression::ObjectExpression(environment) => {
+            environment
+                .properties
+                .iter()
+                .all(|property| match property {
+                    ObjectPropertyKind::SpreadProperty(spread) => parent(&spread.argument),
+                    ObjectPropertyKind::ObjectProperty(property) => {
+                        match property.key.static_name() {
+                            Some(name) if name == "NODE_OPTIONS" => {
+                                static_string(&property.value, 0).is_some()
+                            }
+                            Some(_) => true,
+                            None => false,
+                        }
+                    }
+                })
+        }
+        value => parent(value),
+    }
+}
+
+/// Whether a `worker_threads` `Worker` runs its first argument as code, not
+/// as a file: options with `eval` set, or options the call doesn't spell out.
+fn worker_runs_code(arguments: &[Argument<'_>]) -> bool {
+    match arguments.get(1) {
+        None => false,
+        Some(Argument::ObjectExpression(options)) => {
+            options.properties.iter().any(|property| match property {
+                ObjectPropertyKind::SpreadProperty(_) => true,
+                ObjectPropertyKind::ObjectProperty(property) => {
+                    property
+                        .key
+                        .static_name()
+                        .is_some_and(|name| name == "eval")
+                        && !matches!(
+                            property.value.get_inner_expression(),
+                            Expression::BooleanLiteral(literal) if !literal.value
+                        )
+                }
+            })
+        }
+        Some(_) => true,
+    }
+}
+
+/// Whether a reference to the global `require` passes the loader on as a
+/// value (`require.bind(null)`, `Reflect.apply(require, …)`, `const load =
+/// require`, `list.map(require)`), so what it loads isn't known. A call of
+/// it, `require.call` and `.apply` (read where they're called), its
+/// properties and `typeof require` aren't.
+fn passes_require_on(
+    node: oxc_semantic::NodeId,
+    span: oxc_span::Span,
+    semantic: &Semantic<'_>,
+) -> bool {
+    use oxc_span::GetSpan as _;
+    match semantic.nodes().parent_kind(node) {
+        AstKind::CallExpression(call) => call.callee.span() != span,
+        AstKind::StaticMemberExpression(member) => {
+            member.object.span() == span && member.property.name == "bind"
+        }
+        AstKind::ComputedMemberExpression(_) => false,
+        AstKind::UnaryExpression(unary) => unary.operator.as_str() != "typeof",
+        AstKind::BinaryExpression(binary) => !binary.operator.is_equality(),
+        _ => true,
+    }
+}
+
+/// Whether `fork.call(this, script, …)` or `fork.apply(this, [script, …])`
+/// starts a script whose path is computed, as a direct `fork` would.
+fn forwarded_fork_script_computed(call: &CallExpression<'_>, semantic: &Semantic<'_>) -> bool {
+    let Expression::StaticMemberExpression(member) = call.callee.get_inner_expression() else {
+        return false;
+    };
+    let forwards_fork = match member.object.get_inner_expression() {
+        Expression::StaticMemberExpression(inner) => inner.property.name == "fork",
+        Expression::Identifier(identifier) => identifier.name == "fork",
+        _ => false,
+    };
+    if !forwards_fork {
+        return false;
+    }
+    match member.property.name.as_str() {
+        "call" => computed_script(call.arguments.get(1..).unwrap_or_default(), semantic),
+        "apply" => match call.arguments.get(1) {
+            None => false,
+            Some(Argument::ArrayExpression(array)) => match array.elements.first() {
+                None => false,
+                Some(element) => element
+                    .as_expression()
+                    .is_none_or(|script| computed_script_path(script, semantic)),
+            },
+            Some(_) => true,
+        },
+        _ => false,
+    }
+}
+
+/// Whether a loader's argument is a spread, whose module isn't known.
+fn spread_first(arguments: &[Argument<'_>]) -> bool {
+    matches!(arguments.first(), Some(Argument::SpreadElement(_)))
+}
+
 fn dynamic_argument(argument: Option<&Expression<'_>>) -> bool {
     argument.is_some_and(|argument| {
         let argument = argument.get_inner_expression();
@@ -747,6 +1541,7 @@ impl<'a> Visit<'a> for CallCandidates {
                 | "spawn"
                 | "spawnSync"
                 | "fork"
+                | "Worker"
                 | "eval"
                 | "Function"
                 | "globalThis"
@@ -767,6 +1562,7 @@ impl<'a> Visit<'a> for CallCandidates {
                 .and_then(|argument| static_string(argument, 0))
         {
             self.found |= module(name.as_ref()).is_some()
+                || is_worker_threads(name.as_ref())
                 || (self.include_threats
                     && matches!(
                         name.strip_prefix("node:").unwrap_or(&name),
@@ -778,7 +1574,17 @@ impl<'a> Visit<'a> for CallCandidates {
     }
 
     fn visit_static_member_expression(&mut self, member: &StaticMemberExpression<'a>) {
-        self.found |= matches!(member.property.name.as_str(), "require" | "eval");
+        self.found |= matches!(
+            member.property.name.as_str(),
+            "require"
+                | "eval"
+                | "Worker"
+                | "_load"
+                | "getBuiltinModule"
+                | "extensions"
+                | "_extensions"
+                | "_compile"
+        );
         walk::walk_static_member_expression(self, member);
     }
 
@@ -798,6 +1604,7 @@ impl<'a> Visit<'a> for CallCandidates {
 
     fn visit_import_declaration(&mut self, import: &ImportDeclaration<'a>) {
         self.found |= import.source.value.as_str().and_then(module).is_some()
+            || import.source.value.as_str().is_some_and(is_worker_threads)
             || (self.include_threats
                 && matches!(
                     import
@@ -882,12 +1689,38 @@ pub(super) fn analyze(program: &Program<'_>, complete_input: bool) -> CallFacts 
     }
     memo.settled = true;
     let mut facts = CallFacts::default();
+    let mentions_worker_threads =
+        memchr::memmem::find(semantic.source_text().as_bytes(), b"worker_threads").is_some();
     for node in semantic.nodes().iter() {
         match node.kind() {
+            // The loader handed on as a value can load anything, so no test file
+            // is known to stay unrun. That isn't a computed `require` argument,
+            // the dynamic require tag's meaning: a UMD wrapper hands its
+            // factory the loader to call with constant names.
+            AstKind::IdentifierReference(identifier)
+                if identifier.name == "require"
+                    && semantic.is_reference_to_global_variable(identifier)
+                    && passes_require_on(node.id(), identifier.span, semantic) =>
+            {
+                facts
+                    .computed_script
+                    .get_or_insert(identifier.span.start as usize);
+            }
             AstKind::ImportExpression(import) if dynamic_argument(Some(&import.source)) => {
                 facts.dynamic_load.get_or_insert(import.span.start as usize);
             }
             AstKind::NewExpression(expression) => {
+                let worker =
+                    is_worker_constructor(&expression.callee, semantic, mentions_worker_threads, 0);
+                if worker
+                    && (computed_script(&expression.arguments, semantic)
+                        || worker_runs_code(&expression.arguments)
+                        || launch_preloads_unknown_code(&expression.arguments, false, semantic))
+                {
+                    facts
+                        .computed_script
+                        .get_or_insert(expression.span.start as usize);
+                }
                 if origin(&expression.callee, semantic, &assignments, &memo, 0)
                     .is_some_and(|value| value.0 & Origin::FUNCTION.0 != 0)
                 {
@@ -955,6 +1788,20 @@ pub(super) fn analyze(program: &Program<'_>, complete_input: bool) -> CallFacts 
                                 | "fork"
                         )
                     );
+                let forks = global_name == Some("fork")
+                    || value.is_some_and(|value| {
+                        value.contains(Module::Process, Method::Fork)
+                            || value.contains(Module::Execa, Method::Fork)
+                    });
+                if forks
+                    && (computed_script(&call.arguments, semantic)
+                        || launch_directory_unknown(&call.arguments, semantic)
+                        || launch_preloads_unknown_code(&call.arguments, true, semantic))
+                {
+                    facts
+                        .computed_script
+                        .get_or_insert(call.span.start as usize);
+                }
                 if process {
                     facts.process.get_or_insert(call.span.start as usize);
                     let shell = matches!(method, Method::Exec | Method::ExecSync)
@@ -972,8 +1819,19 @@ pub(super) fn analyze(program: &Program<'_>, complete_input: bool) -> CallFacts 
                     || value.is_some_and(|value| value.contains(Module::Loader, Method::Require))
                     || matches!(call.callee.get_inner_expression(), Expression::StaticMemberExpression(member) if member.property.name == "require");
                 if loader
-                    && dynamic_argument(call.arguments.first().and_then(Argument::as_expression))
+                    && (spread_first(&call.arguments)
+                        || dynamic_argument(
+                            call.arguments.first().and_then(Argument::as_expression),
+                        ))
                 {
+                    facts.dynamic_load.get_or_insert(call.span.start as usize);
+                }
+                if forwarded_fork_script_computed(call, semantic) {
+                    facts
+                        .computed_script
+                        .get_or_insert(call.span.start as usize);
+                }
+                if dynamic_argument(indirect_load_argument(call, semantic)) {
                     facts.dynamic_load.get_or_insert(call.span.start as usize);
                 }
             }

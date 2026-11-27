@@ -1,6 +1,8 @@
 use oxc_allocator::{Address, Allocator, GetAddress};
 use oxc_ast::AstKind;
-use oxc_ast::ast::{Expression, JSXText, RegExpLiteral, Statement, StringLiteral, TemplateElement};
+use oxc_ast::ast::{
+    Argument, Expression, JSXText, RegExpLiteral, Statement, StringLiteral, TemplateElement,
+};
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::{SourceType, Span};
@@ -16,6 +18,322 @@ pub(super) struct SourceContext<'s> {
     /// Whether the parser found a random-looking string literal, or `None`
     /// when it didn't read the literals.
     pub random_literal: Option<bool>,
+    /// The string literals that may name another package file, or `None`
+    /// when the parser didn't read the literals.
+    pub path_literals: Option<PathLiterals>,
+}
+
+/// String literals of a source file that may name another package file
+/// ([`super::roles::may_name_package_file`]).
+#[derive(Debug, Default)]
+pub(super) struct PathLiterals {
+    pub literals: Vec<String>,
+    /// No literal was left out for space.
+    pub complete: bool,
+}
+
+/// Most literals and bytes of them [`PathLiterals`] keeps; past them, it
+/// keeps none and is incomplete.
+const MAX_PATH_LITERALS: usize = 256;
+const MAX_PATH_LITERAL_BYTES: usize = 16 * 1024;
+
+/// Most nodes and bytes a constant `+` chain is folded through. Deeper
+/// chains aren't static to the call analysis either, so a `require` of one
+/// counts as computed.
+const MAX_FOLDED_NODES: usize = 64;
+const MAX_FOLDED_BYTES: usize = 4096;
+
+/// The value of a string literal, or of a template literal without
+/// expressions.
+fn static_string<'e>(expression: &'e Expression<'_>) -> Option<&'e str> {
+    match expression.get_inner_expression() {
+        Expression::StringLiteral(literal) => literal.value.as_str(),
+        Expression::TemplateLiteral(template) if template.expressions.is_empty() => {
+            let quasi = template.quasis.first()?;
+            match &quasi.value.cooked {
+                Some(cooked) => cooked.as_str(),
+                None => Some(quasi.value.raw.as_str()),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The segment a folded path gives the module's own file (`__filename`,
+/// `import.meta.url`), so `path.join(__filename, "..", x)` and
+/// `path.dirname(__filename)` normalize to its directory. No package file is
+/// named this.
+const OWN_FILE: &str = "./\u{1}";
+
+/// Whether `expression` is a path known before the code runs, as
+/// [`fold_static_path`] folds one. A process launch whose script path isn't
+/// could run any file.
+pub(super) fn is_static_path(expression: &Expression<'_>) -> bool {
+    fold_static_path(expression, &mut 0, &mut String::new())
+}
+
+/// Appends the path an expression builds to `folded`: string literals, `+`
+/// chains and templates of them, the module's own location (`__dirname` and
+/// `import.meta.dirname` as `.`, its directory; `__filename`,
+/// `import.meta.filename` and `import.meta.url` as its file), and calls that
+/// join, resolve or convert such parts (`path.join`, `path.dirname`,
+/// `require.resolve`, `fileURLToPath`, `new URL`). `false` when a part is
+/// computed, or the expression is longer than the fold allows.
+fn fold_static_path(expression: &Expression<'_>, nodes: &mut usize, folded: &mut String) -> bool {
+    *nodes += 1;
+    if *nodes > MAX_FOLDED_NODES || folded.len() > MAX_FOLDED_BYTES {
+        return false;
+    }
+    if let Some(value) = static_string(expression) {
+        folded.push_str(value);
+        return true;
+    }
+    match expression.get_inner_expression() {
+        Expression::Identifier(identifier) if identifier.name == "__dirname" => {
+            folded.push('.');
+            true
+        }
+        Expression::Identifier(identifier) if identifier.name == "__filename" => {
+            folded.push_str(OWN_FILE);
+            true
+        }
+        Expression::StaticMemberExpression(member)
+            if matches!(
+                member.object.get_inner_expression(),
+                Expression::ImportMeta(_)
+            ) =>
+        {
+            match member.property.name.as_str() {
+                "dirname" => folded.push('.'),
+                "filename" | "url" => folded.push_str(OWN_FILE),
+                _ => return false,
+            }
+            true
+        }
+        Expression::BinaryExpression(binary) if binary.operator.as_str() == "+" => {
+            fold_static_path(&binary.left, nodes, folded)
+                && fold_static_path(&binary.right, nodes, folded)
+        }
+        Expression::TemplateLiteral(template) => {
+            for (index, quasi) in template.quasis.iter().enumerate() {
+                folded.push_str(quasi.value.raw.as_str());
+                if let Some(part) = template.expressions.get(index)
+                    && !fold_static_path(part, nodes, folded)
+                {
+                    return false;
+                }
+            }
+            true
+        }
+        Expression::CallExpression(call) => {
+            fold_path_call(&call.callee, &call.arguments, nodes, folded)
+        }
+        Expression::NewExpression(new) => {
+            fold_path_call(&new.callee, &new.arguments, nodes, folded)
+        }
+        _ => false,
+    }
+}
+
+/// [`fold_static_path`] for `path.join(…)`, `path.resolve(…)`,
+/// `path.dirname(…)`, `require.resolve(…)`, `fileURLToPath(…)` and
+/// `URL(…)`.
+fn fold_path_call(
+    callee: &Expression<'_>,
+    arguments: &[Argument<'_>],
+    nodes: &mut usize,
+    folded: &mut String,
+) -> bool {
+    let name = match callee.get_inner_expression() {
+        Expression::StaticMemberExpression(member) => member.property.name.as_str(),
+        Expression::Identifier(identifier) => identifier.name.as_str(),
+        _ => return false,
+    };
+    match name {
+        "join" | "resolve" | "normalize" if !arguments.is_empty() => {
+            for (index, argument) in arguments.iter().enumerate() {
+                if index > 0 {
+                    folded.push('/');
+                }
+                let Some(argument) = argument.as_expression() else {
+                    return false;
+                };
+                if !fold_static_path(argument, nodes, folded) {
+                    return false;
+                }
+            }
+            true
+        }
+        "dirname" | "fileURLToPath" if arguments.len() == 1 => {
+            let Some(argument) = arguments[0].as_expression() else {
+                return false;
+            };
+            if !fold_static_path(argument, nodes, folded) {
+                return false;
+            }
+            if name == "dirname" {
+                folded.truncate(folded.trim_end_matches('/').len());
+                folded.push_str("/..");
+            }
+            true
+        }
+        "URL" => {
+            let mut parts = arguments.iter().map(Argument::as_expression);
+            let Some(Some(target)) = parts.next() else {
+                return false;
+            };
+            let mut relative = String::new();
+            if !fold_static_path(target, nodes, &mut relative) {
+                return false;
+            }
+            match parts.next() {
+                None => {}
+                Some(Some(base)) if !relative.starts_with('/') && !relative.contains("://") => {
+                    // A URL resolves against its base's directory: the base
+                    // without the segment after its last slash.
+                    let start = folded.len();
+                    if !fold_static_path(base, nodes, folded) {
+                        return false;
+                    }
+                    let directory = folded[start..]
+                        .rfind('/')
+                        .map_or(start, |slash| start + slash);
+                    folded.truncate(directory);
+                    if folded.len() == start {
+                        folded.push('.');
+                    }
+                    folded.push('/');
+                }
+                Some(Some(base)) => {
+                    if !fold_static_path(base, nodes, &mut String::new()) {
+                        return false;
+                    }
+                }
+                Some(None) => return false,
+            }
+            folded.push_str(&relative);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The working directory a call sets, as a `cd` command: `process.chdir(…)`,
+/// or a `cwd` option, when the path is static.
+fn working_directory(callee: &Expression<'_>, arguments: &[Argument<'_>]) -> Option<String> {
+    let fold = |expression: &Expression<'_>| {
+        let mut folded = String::from("cd ");
+        fold_static_path(expression, &mut 0, &mut folded).then_some(folded)
+    };
+    let chdir = match callee.get_inner_expression() {
+        Expression::StaticMemberExpression(member) => member.property.name == "chdir",
+        // `const { chdir } = process; chdir(…)`.
+        Expression::Identifier(identifier) => identifier.name == "chdir",
+        _ => false,
+    };
+    if chdir {
+        return arguments
+            .first()
+            .and_then(Argument::as_expression)
+            .and_then(fold);
+    }
+    arguments.iter().find_map(|argument| {
+        let Some(Expression::ObjectExpression(object)) = argument.as_expression() else {
+            return None;
+        };
+        object.properties.iter().find_map(|property| {
+            let oxc_ast::ast::ObjectPropertyKind::ObjectProperty(property) = property else {
+                return None;
+            };
+            (property.key.static_name().is_some_and(|name| name == "cwd"))
+                .then(|| fold(&property.value))
+                .flatten()
+        })
+    })
+}
+
+#[derive(Default)]
+struct PathLiteralCollector {
+    in_test_file: bool,
+    literals: Vec<String>,
+    bytes: usize,
+    overflowed: bool,
+}
+
+impl PathLiteralCollector {
+    fn for_file(in_test_file: bool) -> Self {
+        Self {
+            in_test_file,
+            ..Self::default()
+        }
+    }
+
+    fn note(&mut self, value: &str) {
+        if !super::roles::may_name_package_file(value, self.in_test_file) {
+            return;
+        }
+        self.keep(value);
+    }
+
+    /// Notes a bare module specifier a `require` or an `import` loads, which
+    /// Node finds in a `node_modules` directory: one a test file loads, and
+    /// one package code loads that names a test directory (`require("test")`),
+    /// can be a test file the package bundles.
+    fn note_module(&mut self, specifier: &str) {
+        if super::roles::is_bare_specifier(specifier)
+            && (self.in_test_file || super::roles::mentions_test_marker(specifier))
+        {
+            self.keep(&format!("{}{specifier}", super::roles::MODULE_SPECIFIER));
+        }
+    }
+
+    /// Notes a working directory the code enters (`cd <path>`), which names
+    /// no test file itself but moves what the file's other paths resolve
+    /// from.
+    fn note_working_directory(&mut self, cd: &str) {
+        self.keep(cd);
+    }
+
+    /// Notes the script a launch runs (`fork(script)`, an argument of
+    /// `spawn("node", [script])`), as node is given it: a bare name is a path
+    /// to node, resolved from the launch's working directory.
+    fn note_launch_script(&mut self, script: &str) {
+        if self.in_test_file || super::roles::mentions_test_marker(script) {
+            self.keep(&format!("node {script}"));
+        }
+    }
+
+    /// Notes a literal that is one part of a path the code builds: a part
+    /// written as a directory between separators (`"/tests/"`) names that
+    /// directory under the part before it, so it's kept as a directory, not
+    /// read as a filter fragment.
+    fn note_part(&mut self, value: &str) {
+        if value.len() > 1 && value.starts_with('/') && value.ends_with('/') {
+            self.note(&value[1..]);
+        } else {
+            self.note(value);
+        }
+    }
+
+    fn keep(&mut self, value: &str) {
+        if self.overflowed {
+            return;
+        }
+        self.bytes += value.len();
+        if self.literals.len() >= MAX_PATH_LITERALS || self.bytes > MAX_PATH_LITERAL_BYTES {
+            self.overflowed = true;
+            self.literals = Vec::new();
+            return;
+        }
+        self.literals.push(value.to_owned());
+    }
+
+    fn finish(self) -> PathLiterals {
+        PathLiterals {
+            literals: self.literals,
+            complete: !self.overflowed,
+        }
+    }
 }
 
 /// Room kept below a parse's stack floor: the parser checks the floor once
@@ -94,6 +412,17 @@ struct StackExhausted;
 struct LiteralSpans<'s> {
     executable: &'s mut [u8],
     random_literal: bool,
+    paths: PathLiteralCollector,
+    /// The expression being visited is an operand of a `+` chain that was
+    /// folded where it starts.
+    inside_concatenation: bool,
+    /// Where the string literal that is an operand of the `+` chain around
+    /// it starts: one part of a path the code builds. Set without a restore,
+    /// so deep chains don't grow the visitor's frames.
+    concatenated_literal: Option<u32>,
+    /// The template being visited has expressions: its elements are parts
+    /// of a path the code builds.
+    in_built_template: bool,
     stack_floor: usize,
     depth: usize,
     max_depth: usize,
@@ -173,6 +502,108 @@ impl LiteralSpans<'_> {
         self.random_literal |= value.is_some_and(super::supply_chain::looks_random);
     }
 
+    /// Notes each run of two or more string arguments joined with `/`, as
+    /// `path.join(__dirname, "test", "run.js")` joins them.
+    fn note_joined_arguments(&mut self, arguments: &[Argument<'_>]) {
+        let mut run: Vec<&str> = Vec::new();
+        for argument in arguments.iter().map(Some).chain(std::iter::once(None)) {
+            match argument
+                .and_then(Argument::as_expression)
+                .and_then(static_string)
+            {
+                Some(value) => run.push(value),
+                None => {
+                    if run.len() >= 2 {
+                        self.paths.note(&run.join("/"));
+                    }
+                    run.clear();
+                }
+            }
+        }
+    }
+
+    /// Notes the paths a call names: its joined arguments, a path call's
+    /// folded result, a launch's script and its working directory. Kept out
+    /// of [`Visit::visit_expression`] so deep nesting doesn't pay for its
+    /// locals in every frame.
+    #[inline(never)]
+    fn note_call(&mut self, callee: &Expression<'_>, arguments: &[Argument<'_>]) {
+        self.note_joined_arguments(arguments);
+        let mut folded = String::new();
+        if fold_path_call(callee, arguments, &mut 0, &mut folded) {
+            self.paths.note(&folded);
+        }
+        let launcher = match callee.get_inner_expression() {
+            Expression::StaticMemberExpression(member) => Some(member.property.name.as_str()),
+            Expression::Identifier(identifier) => Some(identifier.name.as_str()),
+            _ => None,
+        };
+        let loads_module = match callee.get_inner_expression() {
+            Expression::Identifier(identifier) => identifier.name == "require",
+            Expression::StaticMemberExpression(member) => {
+                member.property.name == "resolve"
+                    && member
+                        .object
+                        .get_inner_expression()
+                        .is_specific_id("require")
+            }
+            _ => false,
+        };
+        if loads_module
+            && let Some(specifier) = arguments
+                .first()
+                .and_then(Argument::as_expression)
+                .and_then(static_string)
+        {
+            self.paths.note_module(specifier);
+        }
+        match launcher {
+            Some("fork" | "Worker") => {
+                if let Some(script) = arguments
+                    .first()
+                    .and_then(Argument::as_expression)
+                    .and_then(static_string)
+                {
+                    self.paths.note_launch_script(script);
+                }
+            }
+            Some("spawn" | "spawnSync" | "execFile" | "execFileSync") => {
+                for argument in arguments.iter().filter_map(Argument::as_expression) {
+                    if let Expression::ArrayExpression(array) = argument.get_inner_expression() {
+                        for script in array
+                            .elements
+                            .iter()
+                            .filter_map(|element| element.as_expression())
+                            .filter_map(static_string)
+                        {
+                            self.paths.note_launch_script(script);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let Some(directory) = working_directory(callee, arguments) {
+            self.paths.note_working_directory(&directory);
+            // A launch's script and arguments resolve from its working
+            // directory, so each is noted run from there.
+            for argument in arguments.iter().filter_map(Argument::as_expression) {
+                let values: Vec<&str> = match argument.get_inner_expression() {
+                    Expression::ArrayExpression(array) => array
+                        .elements
+                        .iter()
+                        .filter_map(|element| element.as_expression())
+                        .filter_map(static_string)
+                        .collect(),
+                    other => static_string(other).into_iter().collect(),
+                };
+                for value in values {
+                    self.paths.note(&format!("{directory} && {value}"));
+                }
+            }
+        }
+    }
+
     /// Whether the visitor reached the stack floor. Expressions and
     /// statements are the nodes deep nesting recurses through, and skipping
     /// them there returns up the stack. Unwinding instead costs microseconds
@@ -225,7 +656,31 @@ impl<'a> Visit<'a> for LiteralSpans<'_> {
         };
         self.longest_wrapper_run = self.longest_wrapper_run.max(self.wrapper_run);
         self.run_continues_into = wrapped.map(GetAddress::address);
+        let concatenation = matches!(
+            expression,
+            Expression::BinaryExpression(binary) if binary.operator.as_str() == "+"
+        );
+        if concatenation && !self.inside_concatenation {
+            let mut folded = String::new();
+            if fold_static_path(expression, &mut 0, &mut folded) {
+                self.paths.note(&folded);
+            }
+        }
+        let call = match expression {
+            Expression::CallExpression(call) => Some((&call.callee, &call.arguments)),
+            Expression::NewExpression(new) => Some((&new.callee, &new.arguments)),
+            _ => None,
+        };
+        if let Some((callee, arguments)) = call {
+            self.note_call(callee, arguments);
+        }
+        let outer_concatenation = self.inside_concatenation;
+        if outer_concatenation && let Expression::StringLiteral(literal) = expression {
+            self.concatenated_literal = Some(literal.span.start);
+        }
+        self.inside_concatenation = concatenation;
         walk::walk_expression(self, expression);
+        self.inside_concatenation = outer_concatenation;
         self.wrapper_run = outer_run;
         self.run_continues_into = continued_into;
     }
@@ -288,11 +743,71 @@ impl<'a> Visit<'a> for LiteralSpans<'_> {
         }
     }
 
+    fn visit_import_declaration(&mut self, declaration: &oxc_ast::ast::ImportDeclaration<'a>) {
+        if let Some(specifier) = declaration.source.value.as_str() {
+            self.paths.note_module(specifier);
+        }
+        walk::walk_import_declaration(self, declaration);
+    }
+
+    fn visit_export_all_declaration(
+        &mut self,
+        declaration: &oxc_ast::ast::ExportAllDeclaration<'a>,
+    ) {
+        if let Some(specifier) = declaration.source.value.as_str() {
+            self.paths.note_module(specifier);
+        }
+        walk::walk_export_all_declaration(self, declaration);
+    }
+
+    fn visit_export_from_declaration(
+        &mut self,
+        declaration: &oxc_ast::ast::ExportFromDeclaration<'a>,
+    ) {
+        if let Some(specifier) = declaration.source.value.as_str() {
+            self.paths.note_module(specifier);
+        }
+        walk::walk_export_from_declaration(self, declaration);
+    }
+
+    fn visit_import_expression(&mut self, expression: &oxc_ast::ast::ImportExpression<'a>) {
+        if let Some(specifier) = static_string(&expression.source) {
+            self.paths.note_module(specifier);
+        }
+        walk::walk_import_expression(self, expression);
+    }
+
     fn visit_string_literal(&mut self, literal: &StringLiteral<'a>) {
         mask(self.executable, literal.span);
         if !self.random_literal {
             self.note_value(literal.value.as_str());
         }
+        if let Some(value) = literal.value.as_str() {
+            if self.concatenated_literal == Some(literal.span.start) {
+                self.paths.note_part(value);
+            } else {
+                self.paths.note(value);
+            }
+        }
+    }
+
+    fn visit_template_literal(&mut self, template: &oxc_ast::ast::TemplateLiteral<'a>) {
+        let outer = self.in_built_template;
+        self.in_built_template = !template.expressions.is_empty();
+        walk::walk_template_literal(self, template);
+        self.in_built_template = outer;
+    }
+
+    fn visit_object_property(&mut self, property: &oxc_ast::ast::ObjectProperty<'a>) {
+        // A working directory set wherever the options are written, for the
+        // launch they're handed to.
+        if property.key.static_name().is_some_and(|name| name == "cwd") {
+            let mut folded = String::from("cd ");
+            if fold_static_path(&property.value, &mut 0, &mut folded) {
+                self.paths.note_working_directory(&folded);
+            }
+        }
+        walk::walk_object_property(self, property);
     }
 
     fn visit_reg_exp_literal(&mut self, literal: &RegExpLiteral<'a>) {
@@ -301,12 +816,19 @@ impl<'a> Visit<'a> for LiteralSpans<'_> {
 
     fn visit_template_element(&mut self, literal: &TemplateElement<'a>) {
         mask(self.executable, literal.span);
+        let value = match literal.value.cooked {
+            Some(cooked) => cooked.as_str(),
+            None => Some(literal.value.raw.as_str()),
+        };
         if !self.random_literal {
-            let value = match literal.value.cooked {
-                Some(cooked) => cooked.as_str(),
-                None => Some(literal.value.raw.as_str()),
-            };
             self.note_value(value);
+        }
+        if let Some(value) = value {
+            if self.in_built_template {
+                self.paths.note_part(value);
+            } else {
+                self.paths.note(value);
+            }
         }
     }
 
@@ -321,6 +843,7 @@ struct Parsed {
     complete: bool,
     calls: Option<super::bindings::CallFacts>,
     random_literal: Option<bool>,
+    path_literals: Option<PathLiterals>,
 }
 
 /// Why a source wasn't parsed.
@@ -346,6 +869,7 @@ fn parse_above(
     source_type: SourceType,
     stripped: &mut [u8],
     complete_input: bool,
+    in_test_file: bool,
     stack_floor: usize,
 ) -> Result<Parsed, Unparsed> {
     let allocator = Allocator::default();
@@ -370,6 +894,10 @@ fn parse_above(
     let mut literals = LiteralSpans {
         executable: &mut executable,
         random_literal: false,
+        paths: PathLiteralCollector::for_file(in_test_file),
+        inside_concatenation: false,
+        concatenated_literal: None,
+        in_built_template: false,
         stack_floor,
         depth: 0,
         max_depth: 0,
@@ -392,6 +920,7 @@ fn parse_above(
         return Err(Unparsed::OutOfStack);
     }
     let random_literal = (!parsed.fatal_error).then_some(literals.random_literal);
+    let path_literals = (!parsed.fatal_error).then(|| std::mem::take(&mut literals.paths).finish());
     // A source with a longer run of wrappers keeps its comments and literals
     // masked, but the rules that read through wrappers don't run on it.
     let complete = !parsed.fatal_error
@@ -429,6 +958,7 @@ fn parse_above(
         complete,
         calls,
         random_literal,
+        path_literals,
     })
 }
 
@@ -454,10 +984,18 @@ fn parse(
     source_type: SourceType,
     stripped: &mut [u8],
     complete_input: bool,
+    in_test_file: bool,
 ) -> Option<Parsed> {
     let remaining = stacker::remaining_stack().unwrap_or(0);
     if let Some(floor) = current_stack_floor() {
-        match parse_above(source, source_type, stripped, complete_input, floor) {
+        match parse_above(
+            source,
+            source_type,
+            stripped,
+            complete_input,
+            in_test_file,
+            floor,
+        ) {
             Ok(parsed) => return Some(parsed),
             Err(
                 Unparsed::TooDeep
@@ -472,7 +1010,15 @@ fn parse(
     }
     on_new_stack(DEEP_PARSE_STACK, || {
         let floor = current_stack_floor()?;
-        parse_above(source, source_type, stripped, complete_input, floor).ok()
+        parse_above(
+            source,
+            source_type,
+            stripped,
+            complete_input,
+            in_test_file,
+            floor,
+        )
+        .ok()
     })
     .flatten()
 }
@@ -552,19 +1098,24 @@ impl<'s> SourceContext<'s> {
     ) -> Self {
         stripped.clear();
         stripped.extend_from_slice(source.as_bytes());
+        let in_test_file = super::roles::is_test_path(filename);
         let parsed = SourceType::from_path(filename)
             .ok()
-            .and_then(|source_type| parse(source, source_type, stripped, complete_input));
+            .and_then(|source_type| {
+                parse(source, source_type, stripped, complete_input, in_test_file)
+            });
         let Parsed {
             executable,
             complete,
             calls,
             random_literal,
+            path_literals,
         } = parsed.unwrap_or_else(|| Parsed {
             executable: source.as_bytes().to_vec(),
             complete: false,
             calls: None,
             random_literal: None,
+            path_literals: None,
         });
         Self {
             stripped: String::from_utf8_lossy(stripped),
@@ -572,6 +1123,7 @@ impl<'s> SourceContext<'s> {
             complete,
             calls,
             random_literal,
+            path_literals,
         }
     }
 
@@ -1022,6 +1574,10 @@ mod tests {
         let mut literals = LiteralSpans {
             executable: &mut executable,
             random_literal: false,
+            paths: PathLiteralCollector::default(),
+            inside_concatenation: false,
+            concatenated_literal: None,
+            in_built_template: false,
             stack_floor: stack_address().saturating_sub(room),
             depth: 0,
             max_depth: 0,
