@@ -21,13 +21,18 @@ export const SORT_OPTIONS: ReadonlyArray<{ id: SortId; label: string }> = [
 
 export type SourceCounts = Record<SourceTabId, number>;
 
+/** A skill a package delivered: an LPM.dev package set or a dependency's skill. */
+function fromPackage(skill: Skill): boolean {
+  return skill.category === 'package' || skill.category === 'dependency';
+}
+
 export function countBySource(skills: readonly Skill[]): SourceCounts {
   return {
     all: skills.length,
     attention: skills.filter(needsAttention).length,
     global: skills.filter((s) => s.scope === 'global').length,
     project: skills.filter((s) => s.scope === 'project').length,
-    package: skills.filter((s) => s.category === 'package').length,
+    package: skills.filter(fromPackage).length,
   };
 }
 
@@ -40,7 +45,7 @@ function matchesSource(skill: Skill, tab: SourceTabId): boolean {
     case 'project':
       return skill.scope === 'project';
     case 'package':
-      return skill.category === 'package';
+      return fromPackage(skill);
     case 'all':
       return true;
   }

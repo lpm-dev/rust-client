@@ -1,0 +1,39 @@
+---
+source: tests/workflows/tests/dependency_skills.rs
+expression: deps
+---
+{
+  "success": true,
+  "project": "[project]",
+  "enabled": true,
+  "policy": {
+    "allow": [],
+    "deny": [],
+    "targets": [
+      ".agents/skills"
+    ]
+  },
+  "problems": [],
+  "unlisted": [],
+  "count": 1,
+  "skills": [
+    {
+      "skill": "browser-tool",
+      "package": "browser-tool",
+      "version": "1.0.0",
+      "status": "not_allowed",
+      "change": null,
+      "reason": null,
+      "detail": null,
+      "description": "Guidance for driving the browser-tool tool.",
+      "hidden": false,
+      "allowed_tools": [
+        "Bash(browser-tool:*)"
+      ],
+      "permission": "broad",
+      "warnings": 0,
+      "suggested_selector": "#browser-tool:skill(browser-tool)",
+      "links": []
+    }
+  ]
+}

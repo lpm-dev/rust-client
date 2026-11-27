@@ -136,7 +136,7 @@ mod tty {
         input.push(b'\r');
         input.extend_from_slice(editor_input);
         input.push(b'\r');
-        for _ in 0..12 {
+        for _ in 0..13 {
             input.extend_from_slice(b"\x1b[B");
         }
         input.push(b'\r');

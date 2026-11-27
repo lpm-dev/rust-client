@@ -206,7 +206,13 @@ pub async fn run(cmd: &TrustCmd, project_dir: &Path, json_output: bool) -> Resul
     }
 }
 
-async fn scope_project_policy_mutation<F, T>(project_dir: &Path, mutation: F) -> Result<T, LpmError>
+/// Runs `mutation`, which changes policy in the project's `package.json`,
+/// inside the project's install transaction, so no install or other policy
+/// edit writes the manifest meanwhile.
+pub(crate) async fn scope_project_policy_mutation<F, T>(
+    project_dir: &Path,
+    mutation: F,
+) -> Result<T, LpmError>
 where
     F: std::future::Future<Output = Result<T, LpmError>>,
 {

@@ -1038,6 +1038,77 @@ fn a_lockfile_stamp_taken_too_soon_is_replaced_once_it_can_be_trusted() {
     );
 }
 
+#[test]
+fn a_target_entry_the_user_owns_is_not_drift_sync_could_fix() {
+    let project = Project::new();
+    std::fs::create_dir_all(project.join(".claude/skills/tool")).unwrap();
+    std::fs::write(project.join(".claude/skills/tool/SKILL.md"), "mine").unwrap();
+    project.reconcile();
+
+    assert_eq!(
+        drift(project.path(), settings()).unwrap(),
+        Vec::<String>::new()
+    );
+
+    std::fs::remove_dir_all(project.join(".claude/skills/tool")).unwrap();
+    let differences = drift(project.path(), settings()).unwrap();
+    assert_eq!(differences.len(), 1, "{differences:?}");
+    assert!(differences[0].contains("free now"), "{differences:?}");
+}
+
+#[test]
+fn a_link_left_in_a_folder_that_is_no_longer_a_target_is_drift() {
+    let project = Project::new();
+    std::fs::create_dir_all(project.join(".claude")).unwrap();
+    project.reconcile();
+    assert!(project.has_entry(".claude/skills/tool"));
+
+    project.set_policy(Some(serde_json::json!({
+        "allow": ["#tool"],
+        "targets": [".agents/skills"]
+    })));
+    let differences = drift(project.path(), settings()).unwrap();
+
+    assert!(
+        differences
+            .iter()
+            .any(|difference| difference.contains(".claude/skills/tool")),
+        "{differences:?}"
+    );
+    project.reconcile();
+    assert_eq!(
+        drift(project.path(), settings()).unwrap(),
+        Vec::<String>::new()
+    );
+    assert!(!project.has_entry(".claude/skills/tool"));
+}
+
+#[test]
+fn a_skill_an_undecided_entry_may_name_waits_for_data_rather_than_a_new_entry() {
+    let project = Project::new();
+    project.ship(
+        "tool",
+        "1.0.0",
+        &[(
+            "tool",
+            "---\nname: tool\ndescription: Use the tool.\nallowed-tools: Bash(git:*)\n---\n\nRun it.\n",
+        )],
+    );
+    project.set_policy(Some(serde_json::json!({
+        "allow": [":skills", "#tool:skill(tool):not(:malware)"]
+    })));
+
+    let report = project.reconcile();
+
+    assert_eq!(report.held.len(), 1, "{:?}", report.held);
+    assert_eq!(report.held[0].reason, HoldReason::NeedsData);
+    project.set_policy(Some(serde_json::json!({ "allow": [":skills"] })));
+    assert_eq!(
+        project.reconcile().held[0].reason,
+        HoldReason::NeedsSkillName
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_parent_whose_skills_cant_be_listed_leaves_a_selector_through_it_undecided() {
@@ -1079,6 +1150,113 @@ fn a_parent_whose_skills_cant_be_listed_leaves_a_selector_through_it_undecided()
         "the deny may match once host's skills can be read: {held:?}"
     );
     assert!(project.linked_document(".agents/skills", "tool").is_none());
+}
+
+#[test]
+fn each_installed_version_says_whether_it_may_link_on_its_own() {
+    let project = Project::new();
+    project.ship(
+        "tool",
+        "2.0.0",
+        &[(
+            "tool",
+            "---\nname: tool\ndescription: Use the tool.\nallowed-tools: Bash(git:*)\n---\n\nRun it.\n",
+        )],
+    );
+    project.ship_at(
+        "node_modules/host/node_modules/tool",
+        "tool",
+        "1.0.0",
+        &[("tool", &plain_skill("tool"))],
+    );
+    std::fs::write(
+        project.join("node_modules/host/package.json"),
+        serde_json::json!({
+            "name": "host",
+            "version": "1.0.0",
+            "dependencies": { "tool": "1.0.0" }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut manifest = project.manifest();
+    manifest["dependencies"] = serde_json::json!({ "tool": "2.0.0", "host": "1.0.0" });
+    manifest["lpm"] = serde_json::json!({ "skills": { "allow": ["#tool"] } });
+
+    let inspection = inspect_project(project.path(), &manifest, settings()).unwrap();
+
+    let tool = inspection
+        .skills
+        .iter()
+        .find(|skill| skill.skill == "tool")
+        .unwrap();
+    assert_eq!(tool.version, "2.0.0");
+    assert_eq!(
+        tool.instances
+            .iter()
+            .map(|instance| (instance.version.as_str(), instance.may_link))
+            .collect::<Vec<_>>(),
+        [("1.0.0", true), ("2.0.0", false)],
+        "the plain older version links under `#tool`; the newer one needs its skill named"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_version_held_for_a_reason_that_clears_may_link_and_one_held_for_good_may_not() {
+    let project = Project::new();
+    project.ship_at(
+        "node_modules/host/node_modules/tool",
+        "tool",
+        "0.9.0",
+        &[(
+            "tool",
+            "---\nname: other\ndescription: Use the tool.\n---\n\nRun it.\n",
+        )],
+    );
+    project.ship_at(
+        "node_modules/other/node_modules/tool",
+        "tool",
+        "1.5.0",
+        &[("tool", &plain_skill("tool"))],
+    );
+    for (parent, version) in [("host", "0.9.0"), ("other", "1.5.0")] {
+        std::fs::write(
+            project.join(&format!("node_modules/{parent}/package.json")),
+            serde_json::json!({
+                "name": parent,
+                "version": "1.0.0",
+                "dependencies": { "tool": version }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let mut manifest = project.manifest();
+    manifest["dependencies"] =
+        serde_json::json!({ "tool": "1.0.0", "host": "1.0.0", "other": "1.0.0" });
+    let unreadable = project.join("node_modules/other/node_modules/tool/skills/tool");
+    let mode = ModeGuard::set(&unreadable, 0o000);
+    if std::fs::read_dir(&unreadable).is_ok() {
+        return;
+    }
+
+    let inspection = inspect_project(project.path(), &manifest, settings()).unwrap();
+    drop(mode);
+
+    let tool = inspection
+        .skills
+        .iter()
+        .find(|skill| skill.skill == "tool")
+        .unwrap();
+    assert_eq!(
+        tool.instances
+            .iter()
+            .map(|instance| (instance.version.as_str(), instance.may_link))
+            .collect::<Vec<_>>(),
+        [("0.9.0", false), ("1.0.0", true), ("1.5.0", true)],
+        "an unreadable copy may link once it can be read; an invalid one never does"
+    );
 }
 
 #[cfg(unix)]

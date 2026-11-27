@@ -447,10 +447,7 @@ fn plan_install_against_state(
                 && existing_target
                     .is_none_or(|record| !target_is_owned(&target, record, &existing_canonical))
             {
-                return Err(LpmError::Registry(format!(
-                    "refusing to replace an external skill target: {}",
-                    target.display()
-                )));
+                return Err(foreign_target_error(store, &target));
             }
             changes.push(PlannedChange {
                 action: if requested_agents.contains(agent) {
@@ -618,6 +615,27 @@ fn apply_install_batch(
     Ok(())
 }
 
+/// The error for an entry at `target` that LPM didn't make for this
+/// skill. A dependency skill LPM linked there names the command that stops
+/// linking it.
+fn foreign_target_error(store: &Store, target: &Path) -> LpmError {
+    if store.scope == Scope::Project
+        && let Some((skill, package)) = crate::dependency_skills::linked_entry_owner(
+            &crate::dependency_skills::skills_root(&store.project_dir),
+            target,
+        )
+    {
+        return LpmError::Registry(format!(
+            "{} is the skill `{skill}` linked from the dependency {package}; run `lpm skills unlink '#{package}:skill({skill})'` first",
+            target.display()
+        ));
+    }
+    LpmError::Registry(format!(
+        "refusing to replace an external skill target: {}",
+        target.display()
+    ))
+}
+
 fn preflight_install_operations(
     store: &Store,
     state: &ManagedState,
@@ -636,16 +654,10 @@ fn preflight_install_operations(
                 continue;
             }
             let Some(previous_record) = previous else {
-                return Err(LpmError::Registry(format!(
-                    "refusing to replace an external skill target: {}",
-                    target.path.display()
-                )));
+                return Err(foreign_target_error(store, &target.path));
             };
             let Some(previous_target) = previous_record.targets.get(&target.agent) else {
-                return Err(LpmError::Registry(format!(
-                    "refusing to replace an external skill target: {}",
-                    target.path.display()
-                )));
+                return Err(foreign_target_error(store, &target.path));
             };
             let previous_canonical = store.root.join(&previous_record.canonical_dir);
             if !target_is_owned(&target.path, previous_target, &previous_canonical) {
@@ -1207,10 +1219,18 @@ pub(super) fn dashboard_inventory(project_dir: &Path, include_global: bool) -> I
     if include_global {
         append_dashboard_managed_scope(&mut result, Scope::Global, project_dir);
     }
+    result
+        .skills
+        .extend(dashboard_dependency_skills(project_dir));
     let managed_targets = result
         .skills
         .iter()
-        .filter(|skill| skill.kind == SkillInventoryKind::Managed)
+        .filter(|skill| {
+            matches!(
+                skill.kind,
+                SkillInventoryKind::Managed | SkillInventoryKind::Dependency
+            )
+        })
         .flat_map(|skill| skill.targets.iter())
         .map(|target| PathBuf::from(&target.path))
         .collect();
@@ -1220,6 +1240,71 @@ pub(super) fn dashboard_inventory(project_dir: &Path, include_global: bool) -> I
     result.warnings.extend(external.warnings);
     result.skipped_entries += external.skipped_entries;
     result
+}
+
+/// The dependency skills LPM linked for the project, as the dashboard
+/// shows them: read-only, since the project's skills policy decides them.
+fn dashboard_dependency_skills(project_dir: &Path) -> Vec<SkillInventoryItem> {
+    let root = crate::dependency_skills::skills_root(project_dir);
+    crate::dependency_skills::linked_skill_details(&root)
+        .into_iter()
+        .map(|linked| {
+            let assessment = read_and_scan_directory(&linked.copy);
+            let healthy = linked.healthy();
+            let targets = linked
+                .links
+                .iter()
+                .map(|(link, intact)| {
+                    let folder = link.path.rsplit_once('/').map_or("", |(folder, _)| folder);
+                    let agent = AgentTarget::ALL
+                        .into_iter()
+                        .find(|agent| project_agent_folder(*agent) == folder);
+                    SkillTarget {
+                        agent: agent.map_or("custom", agent_slug).into(),
+                        label: agent
+                            .map_or_else(|| folder.to_string(), |agent| agent.label().to_string()),
+                        path: root.join(&link.path).display().to_string(),
+                        enabled: true,
+                        healthy: *intact,
+                        status: if *intact { "healthy" } else { "broken-link" }.into(),
+                        materialization: match link.kind {
+                            crate::dependency_skills::LinkKind::Link => "link",
+                            crate::dependency_skills::LinkKind::Copy => "copy",
+                        }
+                        .into(),
+                    }
+                })
+                .collect();
+            SkillInventoryItem {
+                id: stable_id("dependency", &linked.name),
+                kind: SkillInventoryKind::Dependency,
+                description: linked
+                    .checked
+                    .as_ref()
+                    .map(|checked| checked.description.clone()),
+                source: format!("{}@{}", linked.record.package, linked.record.version),
+                scope: Scope::Project.as_str().into(),
+                package: Some(linked.record.package.clone()),
+                version: Some(linked.record.version.clone()),
+                path: Some(linked.copy.display().to_string()),
+                size_bytes: linked.checked.as_ref().map(|checked| checked.size),
+                context_tokens: assessment.context_tokens,
+                file_count: assessment.file_count,
+                modified_at_ms: assessment.modified_at_ms,
+                targets,
+                healthy,
+                integrity: if healthy {
+                    linked.record.integrity.clone()
+                } else {
+                    Some("broken-link".into())
+                },
+                security: assessment.security,
+                actions: Vec::new(),
+                command: format!("lpm skills view {}", linked.name),
+                name: linked.name,
+            }
+        })
+        .collect()
 }
 
 fn append_dashboard_managed_scope(result: &mut InventoryBatch, scope: Scope, project_dir: &Path) {
@@ -1533,6 +1618,9 @@ fn managed_target_paths(
             }
         }
     }
+    paths.extend(crate::dependency_skills::linked_entry_paths(
+        &crate::dependency_skills::skills_root(project_dir),
+    ));
     Ok(paths)
 }
 
@@ -1986,6 +2074,7 @@ pub fn doctor(project_dir: &Path, include_global: bool, json_output: bool) -> Re
         .into_iter()
         .filter(|skill| !skill.healthy)
         .collect();
+    let dependency_issues = dependency_skill_issues(project_dir);
     if json_output {
         let targets: Vec<_> = rows
             .iter()
@@ -2006,13 +2095,19 @@ pub fn doctor(project_dir: &Path, include_global: bool, json_output: bool) -> Re
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "success": true,
-                "healthy": rows.iter().all(|(_, _, diagnosis)| diagnosis.healthy) && external_broken.is_empty(),
+                "healthy": rows.iter().all(|(_, _, diagnosis)| diagnosis.healthy)
+                    && external_broken.is_empty()
+                    && dependency_issues.is_empty(),
                 "targets": targets,
                 "external_broken_links": external_broken,
+                "dependency_skills": {
+                    "healthy": dependency_issues.is_empty(),
+                    "issues": dependency_issues,
+                },
             }))
             .unwrap()
         );
-    } else if rows.is_empty() && external_broken.is_empty() {
+    } else if rows.is_empty() && external_broken.is_empty() && dependency_issues.is_empty() {
         super::install_ui::warn(
             "No managed standalone skills or broken external links to diagnose",
         );
@@ -2041,8 +2136,27 @@ pub fn doctor(project_dir: &Path, include_global: bool, json_output: bool) -> Re
             ]);
         }
         table.print_stdout();
+        for issue in &dependency_issues {
+            super::install_ui::warn_untrusted(&format!("dependency skill: {issue}"));
+        }
     }
     Ok(())
+}
+
+/// What differs between the dependency-skill links and what the project's
+/// policy links now, as `doctor` reports it. A project without links or a
+/// policy has nothing to report.
+fn dependency_skill_issues(project_dir: &Path) -> Vec<String> {
+    let root = crate::dependency_skills::skills_root(project_dir);
+    let settings = match crate::dependency_skills::Settings::resolve(
+        crate::lpm_skills_config::LpmSkillsPreference::Config,
+    ) {
+        Ok(Some(settings)) => settings,
+        Ok(None) => return Vec::new(),
+        Err(error) => return vec![error.to_string()],
+    };
+    crate::dependency_skills::drift(&root, settings)
+        .unwrap_or_else(|error| vec![format!("could not be checked: {error}")])
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -3531,8 +3645,9 @@ pub(super) fn portable_path(path: &Path) -> String {
         .join("/")
 }
 
-fn project_agent_root(project_dir: &Path, agent: AgentTarget) -> PathBuf {
-    let relative = match agent {
+/// The project-relative folder `agent` reads skills from.
+pub(super) fn project_agent_folder(agent: AgentTarget) -> &'static str {
+    match agent {
         AgentTarget::Codex => ".agents/skills",
         AgentTarget::ClaudeCode => ".claude/skills",
         AgentTarget::Cursor => ".cursor/skills",
@@ -3540,8 +3655,11 @@ fn project_agent_root(project_dir: &Path, agent: AgentTarget) -> PathBuf {
         AgentTarget::OpenCode => ".opencode/skills",
         AgentTarget::Pi => ".pi/skills",
         AgentTarget::Kimi => ".kimi/skills",
-    };
-    project_dir.join(relative)
+    }
+}
+
+fn project_agent_root(project_dir: &Path, agent: AgentTarget) -> PathBuf {
+    project_dir.join(project_agent_folder(agent))
 }
 
 fn configured_home(variable: &str, fallback: PathBuf) -> PathBuf {

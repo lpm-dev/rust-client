@@ -1,0 +1,16 @@
+---
+source: tests/workflows/tests/dependency_skills.rs
+expression: sync
+---
+{
+  "success": true,
+  "policy_changes": [],
+  "denied": [],
+  "dependency_skills": {
+    "linked": [],
+    "updated": [],
+    "removed": [],
+    "held": [],
+    "unchanged": 1
+  }
+}

@@ -33,6 +33,36 @@ it('raw view preserves the exact authored markdown', () => {
   expect(skillRawText(skill)).toBe(raw);
 });
 
+it('a dependency skill banner points at the policy commands that change it', () => {
+  const skill: Skill = {
+    id: 'dependency:browser-tool',
+    name: 'browser-tool',
+    namespace: 'browser-tool',
+    category: 'dependency',
+    scope: 'project',
+    state: 'enabled',
+    agent: 'Codex',
+    version: '1.0.0',
+    updated: '—',
+    updatedTs: 0,
+    description: 'Drive the browser tool',
+    path: '/tmp/browser-tool',
+    files: [],
+    stats: { files: 1, words: 0, lines: 0, keys: 0 },
+    context: '—',
+    integrity: 'healthy',
+    security: 'no findings',
+    globs: '—',
+    warnings: [],
+    targets: [],
+    actions: [],
+  };
+
+  expect(skillBanner(skill)).toBe(
+    "inspection only · linked from a dependency by the project's skills policy — change it with lpm skills link or unlink",
+  );
+});
+
 it('broken external link banner explains the missing target', () => {
   const skill: Skill = {
     id: 'external:broken',

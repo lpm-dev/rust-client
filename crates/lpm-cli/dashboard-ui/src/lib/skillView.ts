@@ -37,6 +37,9 @@ export function skillBanner(skill: Skill): string {
   if (skill.category === 'package') {
     return 'inspection only · this set is owned by an LPM.dev package manifest';
   }
+  if (skill.category === 'dependency') {
+    return "inspection only · linked from a dependency by the project's skills policy — change it with lpm skills link or unlink";
+  }
   if (skill.actions.length === 0) {
     return 'managed standalone · inspection only in this dashboard session';
   }

@@ -5,6 +5,7 @@
 //! into supported agent directories.
 
 pub(crate) mod author;
+mod dependencies;
 pub(crate) use managed::warning_detail;
 pub(crate) use managed::{project_skills_ready, restore_project_skills};
 mod dashboard;
@@ -53,6 +54,14 @@ pub enum SkillsCmd {
     Disable(ManageArgs),
     /// Remove stale managed targets and records after a preview and confirmation.
     Prune(PruneArgs),
+    /// List the skills installed dependencies ship and whether they are linked for agents.
+    Deps(dependencies::DepsArgs),
+    /// Allow dependency skills in package.json and link them for agents.
+    Link(dependencies::LinkArgs),
+    /// Stop linking dependency skills for agents.
+    Unlink(dependencies::UnlinkArgs),
+    /// Link dependency skills as package.json allows, without installing.
+    Sync(dependencies::SyncArgs),
 }
 
 #[derive(Debug, Args)]
@@ -237,6 +246,8 @@ pub enum SkillKind {
     Package,
     Managed,
     External,
+    /// Skills installed dependencies ship that LPM linked for agents.
+    Dependency,
 }
 
 /// Runs a skills command for the project at `project_dir`. A local source
@@ -270,6 +281,10 @@ pub async fn run(
             managed::mutate(project_dir, args, managed::Mutation::Disable, json_output)
         }
         SkillsCmd::Prune(args) => managed::prune(project_dir, args, json_output),
+        SkillsCmd::Deps(args) => dependencies::deps(project_dir, &args, json_output),
+        SkillsCmd::Link(args) => dependencies::link(project_dir, args, json_output).await,
+        SkillsCmd::Unlink(args) => dependencies::unlink(project_dir, args, json_output).await,
+        SkillsCmd::Sync(args) => dependencies::sync(project_dir, &args, json_output),
     }
 }
 
@@ -813,6 +828,24 @@ fn list_skills(project_dir: &Path, args: &ListArgs, json_output: bool) -> Result
     let managed = managed::inventory(project_dir, args.global)?;
     let external = managed::external_inventory(project_dir, args.global)?;
     let kind_matches = |kind| args.kind.is_none_or(|wanted| wanted == kind);
+    let dependency: Vec<_> = if kind_matches(SkillKind::Dependency) {
+        let root = crate::dependency_skills::skills_root(project_dir);
+        crate::dependency_skills::linked_skills(&root)
+            .into_iter()
+            .filter(|(_, record)| {
+                args.agent.is_none_or(|agent| {
+                    let folder = managed::project_agent_folder(agent);
+                    record.links.iter().any(|link| {
+                        link.path
+                            .rsplit_once('/')
+                            .is_some_and(|(target, _)| target == folder)
+                    })
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let managed: Vec<_> = managed
         .into_iter()
         .filter(|item| {
@@ -832,7 +865,7 @@ fn list_skills(project_dir: &Path, args: &ListArgs, json_output: bool) -> Result
         Vec::new()
     };
     let package_total: usize = packages.iter().map(|(_, skills)| skills.len()).sum();
-    let total = package_total + managed.len() + external.len();
+    let total = package_total + managed.len() + external.len() + dependency.len();
 
     if json_output {
         let mut map = serde_json::Map::new();
@@ -855,6 +888,7 @@ fn list_skills(project_dir: &Path, args: &ListArgs, json_output: bool) -> Result
                 "package": package_total,
                 "managed": managed.len(),
                 "external": external.len(),
+                "dependency": dependency.len(),
             }),
         );
         map.insert(
@@ -863,6 +897,13 @@ fn list_skills(project_dir: &Path, args: &ListArgs, json_output: bool) -> Result
                 "package": packages.iter().flat_map(|(package, skills)| skills.iter().map(move |(name, size)| serde_json::json!({"package": package, "name": name, "size": size}))).collect::<Vec<_>>(),
                 "managed": managed,
                 "external": external,
+                "dependency": dependency.iter().map(|(name, record)| serde_json::json!({
+                    "name": name,
+                    "package": record.package,
+                    "version": record.version,
+                    "permission": record.permission,
+                    "links": record.links.iter().map(|link| link.path.as_str()).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
             }),
         );
         println!("{}", serde_json::to_string_pretty(&map).unwrap());
@@ -880,8 +921,31 @@ fn list_skills(project_dir: &Path, args: &ListArgs, json_output: bool) -> Result
         .iter()
         .map(|skill| (skill.name.as_str(), skill.summary()))
         .collect::<Vec<_>>();
+    let dependency_rows = dependency
+        .iter()
+        .map(|(name, record)| {
+            (
+                name.as_str(),
+                format!(
+                    "{}@{} · {}",
+                    record.package,
+                    record.version,
+                    record
+                        .links
+                        .iter()
+                        .map(|link| link.path.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
     let mut table = install_ui::Table::new();
-    for (heading, rows) in [("managed", managed_rows), ("external", external_rows)] {
+    for (heading, rows) in [
+        ("managed", managed_rows),
+        ("dependency", dependency_rows),
+        ("external", external_rows),
+    ] {
         if rows.is_empty() {
             continue;
         }
@@ -897,7 +961,7 @@ fn list_skills(project_dir: &Path, args: &ListArgs, json_output: bool) -> Result
     table.print_stdout();
     if total == 0 {
         install_ui::warn("No skills installed or discovered");
-    } else if managed.is_empty() && external.is_empty() {
+    } else if managed.is_empty() && external.is_empty() && dependency.is_empty() {
         install_ui::done_untrusted(&format!(
             "{package_total} {} installed across {} {}",
             plural(package_total, "skill", "skills"),
@@ -925,7 +989,64 @@ fn view_skill(project_dir: &Path, args: &ViewArgs, json_output: bool) -> Result<
         print_package_view(package, &skills[0].0, skills[0].1, json_output);
         return Ok(());
     }
+    if let Some(linked) = crate::dependency_skills::linked_skill_details(
+        &crate::dependency_skills::skills_root(project_dir),
+    )
+    .into_iter()
+    .find(|linked| linked.name == args.selector)
+    {
+        print_dependency_view(&linked, json_output);
+        return Ok(());
+    }
     managed::view(project_dir, &args.selector, args.global, json_output)
+}
+
+fn print_dependency_view(linked: &crate::dependency_skills::LinkedSkillDetails, json_output: bool) {
+    let name = linked.name.as_str();
+    let record = &linked.record;
+    let copy = &linked.copy;
+    let description = linked
+        .checked
+        .as_ref()
+        .map(|checked| checked.description.clone());
+    let links: Vec<&str> = record.links.iter().map(|link| link.path.as_str()).collect();
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "kind": "dependency",
+                "name": name,
+                "package": record.package,
+                "version": record.version,
+                "permission": record.permission,
+                "digest": record.digest,
+                "description": description,
+                "copy": copy.display().to_string(),
+                "links": links,
+                "healthy": linked.healthy(),
+            }))
+            .unwrap()
+        );
+        return;
+    }
+    println!(
+        "{}",
+        crate::install_ui::terminal_line!("{}", install_ui::cyan(name))
+    );
+    for (label, value) in [
+        ("package", format!("{}@{}", record.package, record.version)),
+        ("permission", record.permission.clone()),
+        ("description", description.unwrap_or_default()),
+        ("links", links.join(", ")),
+        ("copy", copy.display().to_string()),
+    ] {
+        install_ui::detail_line(crate::install_ui::terminal_line!(
+            "  {} {}",
+            install_ui::dim(label),
+            &value
+        ));
+    }
 }
 
 fn print_package_view(package: &str, name: &str, size: u64, json_output: bool) {

@@ -17,5 +17,9 @@ expression: doctor
       "status": "healthy"
     }
   ],
-  "external_broken_links": []
+  "external_broken_links": [],
+  "dependency_skills": {
+    "healthy": true,
+    "issues": []
+  }
 }

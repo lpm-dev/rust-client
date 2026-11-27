@@ -62,3 +62,16 @@ it('source counts include skills that need attention', () => {
 
   expect(counts.attention).toBe(2);
 });
+
+it('the package source holds LPM.dev package skills and the skills dependencies ship', () => {
+  const skills = [
+    { ...skill('lpm-dev-set', '~1 token'), category: 'package' as const },
+    { ...skill('browser-tool', '~1 token'), category: 'dependency' as const },
+    skill('standalone', '~1 token'),
+  ];
+
+  const selected = selectSkills(skills, { tab: 'package', query: '', sort: 'name' });
+
+  expect(selected.map(({ name }) => name)).toEqual(['browser-tool', 'lpm-dev-set']);
+  expect(countBySource(skills).package).toBe(2);
+});

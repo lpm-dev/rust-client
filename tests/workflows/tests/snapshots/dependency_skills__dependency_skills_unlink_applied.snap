@@ -1,0 +1,27 @@
+---
+source: tests/workflows/tests/dependency_skills.rs
+expression: unlink
+---
+{
+  "success": true,
+  "policy_changes": [
+    "#browser-tool:skill(browser-tool)"
+  ],
+  "denied": [],
+  "dependency_skills": {
+    "linked": [],
+    "updated": [],
+    "removed": [
+      {
+        "skill": "browser-tool",
+        "package": "browser-tool",
+        "version": "1.0.0",
+        "targets": [
+          ".agents/skills"
+        ]
+      }
+    ],
+    "held": [],
+    "unchanged": 0
+  }
+}

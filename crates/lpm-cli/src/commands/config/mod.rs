@@ -9,7 +9,10 @@ mod tests;
 
 use crate::install_ui;
 use crate::lpm_insights_config::FETCH_LPM_SECURITY_INSIGHTS_KEY;
-use crate::lpm_skills_config::{AUTO_INSTALL_LPM_SKILLS_KEY, LEGACY_NO_SKILLS_KEY};
+use crate::lpm_skills_config::{
+    AUTO_INSTALL_LPM_SKILLS_KEY, LEGACY_NO_SKILLS_KEY, LPM_DEV_PACKAGES_SETTING,
+    OTHER_PACKAGES_SETTING,
+};
 use crate::npm_firewall_config::{FIREWALL_CONFIG_SECTION, NpmFirewallMode};
 use crate::prompt::prompt_err;
 use crate::sandbox_config::ResolvedSandboxMode;
@@ -37,17 +40,18 @@ use wizards::{
     FIREWALL_GUIDED_MENU_LABEL, INTEGRITY_GUIDED_MENU_LABEL, INTEGRITY_KEY,
     RELEASE_AGE_GUIDED_MENU_LABEL, RELEASE_AGE_KEY, RELEASE_AGE_POLICY_KEY, SANDBOX_MODE_VALUES,
     SCRIPT_POLICY_KEY, SCRIPT_POLICY_VALUES, SIGNATURES_KEY, SIGSTORE_AVAILABILITY_VALUES,
-    SIGSTORE_SCOPE_VALUES, SIGSTORE_VERIFY_VALUES, TRIAGE_ADVISOR_KEY, TRIAGE_ADVISOR_VALUES,
-    TRUST_POLICY_VALUES, apply_firewall_mode, apply_sandbox_mode, apply_sigstore_assignment,
-    format_bool_enabled, format_current_firewall_mode, format_current_integrity_policy,
-    format_current_lpm_skills, format_current_release_age, format_current_typosquat_guard,
-    parse_config_bool, parse_firewall_mode_selection, parse_integrity_policy_selection,
-    parse_sigstore_assignment, parse_typosquat_guard_selection, read_string_value,
-    run_firewall_wizard, run_integrity_wizard, run_lpm_dev_wizard, run_lpm_insights_wizard,
-    run_lpm_skills_wizard, run_release_age_configuration_wizard, run_release_age_policy_wizard,
+    SIGSTORE_SCOPE_VALUES, SIGSTORE_VERIFY_VALUES, SKILL_SETTINGS, TRIAGE_ADVISOR_KEY,
+    TRIAGE_ADVISOR_VALUES, TRUST_POLICY_VALUES, apply_firewall_mode, apply_sandbox_mode,
+    apply_sigstore_assignment, format_bool_enabled, format_current_firewall_mode,
+    format_current_integrity_policy, format_current_release_age, format_current_skill_settings,
+    format_current_typosquat_guard, parse_config_bool, parse_firewall_mode_selection,
+    parse_integrity_policy_selection, parse_sigstore_assignment, parse_typosquat_guard_selection,
+    persist_skill_settings, read_skill_settings, read_string_value, run_firewall_wizard,
+    run_integrity_wizard, run_lpm_dev_wizard, run_lpm_insights_wizard, run_lpm_skills_wizard,
+    run_npm_skills_wizard, run_release_age_configuration_wizard, run_release_age_policy_wizard,
     run_release_age_wizard, run_sandbox_wizard, run_scripts_wizard, run_signatures_wizard,
-    run_sigstore_wizard, run_source_analysis_wizard, run_triage_wizard, run_trust_policy_wizard,
-    run_typosquat_wizard, validate_trust_policy_value,
+    run_sigstore_wizard, run_skills_wizard, run_source_analysis_wizard, run_triage_wizard,
+    run_trust_policy_wizard, run_typosquat_wizard, validate_trust_policy_value,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,7 +61,35 @@ enum GenericSetTarget {
     Sandbox,
     Sigstore,
     Firewall,
+    /// `skills.lpm-dev-packages`, `skills.other-packages`, or the legacy
+    /// `auto-install-lpm-skills`, which writes `skills.lpm-dev-packages`.
+    SkillSetting,
+    /// The `[skills]` table itself, which holds both skill settings.
+    SkillsSection,
     UnsupportedNested,
+}
+
+/// Where `key` is stored in `table`, the user config: the legacy
+/// `auto-install-lpm-skills` reads the setting that replaced it once that
+/// is written.
+fn stored_setting_path<'a>(table: &toml::value::Table, key: &'a str) -> &'a str {
+    if key == AUTO_INSTALL_LPM_SKILLS_KEY
+        && config_value_at_path(table, LPM_DEV_PACKAGES_SETTING).is_some()
+    {
+        LPM_DEV_PACKAGES_SETTING
+    } else {
+        key
+    }
+}
+
+/// Removes the LPM.dev package-skills setting from `table`, the user
+/// config, with the legacy keys it replaced, so the default applies again.
+/// Whether any of them was set.
+fn remove_lpm_dev_skills_setting(table: &mut toml::value::Table) -> bool {
+    let mut existed = remove_config_value_at_path(table, LPM_DEV_PACKAGES_SETTING);
+    existed |= table.remove(AUTO_INSTALL_LPM_SKILLS_KEY).is_some();
+    existed |= table.remove(LEGACY_NO_SKILLS_KEY).is_some();
+    existed
 }
 
 fn generic_set_target(key: &str) -> GenericSetTarget {
@@ -66,6 +98,9 @@ fn generic_set_target(key: &str) -> GenericSetTarget {
         "sandbox" => GenericSetTarget::Sandbox,
         "sigstore" => GenericSetTarget::Sigstore,
         "firewall" => GenericSetTarget::Firewall,
+        AUTO_INSTALL_LPM_SKILLS_KEY => GenericSetTarget::SkillSetting,
+        _ if SKILL_SETTINGS.contains(&key) => GenericSetTarget::SkillSetting,
+        crate::lpm_skills_config::SKILLS_TABLE => GenericSetTarget::SkillsSection,
         "policy" | "tunnel" => GenericSetTarget::UnsupportedNested,
         _ if key.contains('.') => GenericSetTarget::UnsupportedNested,
         _ => GenericSetTarget::Scalar,
@@ -101,8 +136,9 @@ fn generic_set_target(key: &str) -> GenericSetTarget {
 /// - `lpm config release-age-policy` owns `release-age-policy = direct | strict`.
 ///   Bare `lpm config` groups both settings in one editor.
 /// - `lpm config release-age-exclude` owns the user-wide package exclusion list.
-/// - `lpm config lpm-skills` owns `auto-install-lpm-skills = true | false`
-///   for package-published skills from `@lpm.dev/*` packages.
+/// - `lpm config skills` edits `[skills]`: `lpm-dev-packages` and
+///   `other-packages`. `lpm config lpm-skills` and `lpm config npm-skills`
+///   set each one, for scripts.
 /// - `lpm config source-analysis` owns
 ///   `install-time-source-analysis = true | false`.
 /// - `lpm config lpm-insights` owns
@@ -137,6 +173,7 @@ pub async fn run(
                     | "release-age-policy"
                     | "source-analysis"
                     | "lpm-skills"
+                    | "npm-skills"
                     | "lpm-insights"
             )
         )
@@ -197,6 +234,12 @@ pub async fn run(
     if action == "lpm-skills" {
         return run_lpm_skills_wizard(&config_path, set, json_output).await;
     }
+    if action == "npm-skills" {
+        return run_npm_skills_wizard(&config_path, set, json_output).await;
+    }
+    if action == "skills" {
+        return run_skills_wizard(&config_path, set, json_output).await;
+    }
     if action == "lpm-dev" {
         return run_lpm_dev_wizard(&config_path, set, json_output).await;
     }
@@ -213,7 +256,7 @@ pub async fn run(
             let config = read_config(&config_path)?;
             let value = config
                 .as_table()
-                .and_then(|table| config_value_at_path(table, key));
+                .and_then(|table| config_value_at_path(table, stored_setting_path(table, key)));
             if json_output {
                 let envelope = serde_json::json!({
                     "success": true,
@@ -244,6 +287,19 @@ pub async fn run(
                     return Err(LpmError::Registry(format!(
                         "`lpm config set {key} {value}` cannot write an array setting. Use `lpm config release-age-exclude add {value}` instead"
                     )));
+                }
+                GenericSetTarget::SkillSetting => {
+                    let enabled = parse_config_bool(value)
+                        .map_err(|message| LpmError::Registry(format!("`{key}` {message}")))?;
+                    let other = key == OTHER_PACKAGES_SETTING;
+                    persist_skill_settings(
+                        &config_path,
+                        (!other).then_some(enabled),
+                        other.then_some(enabled),
+                    )
+                    .await?;
+                    announce_generic_set(key, value, serde_json::json!(enabled), json_output);
+                    return Ok(());
                 }
                 GenericSetTarget::Sandbox => {
                     apply_sandbox_mode(
@@ -297,6 +353,11 @@ pub async fn run(
                     );
                     return Ok(());
                 }
+                GenericSetTarget::SkillsSection => {
+                    return Err(LpmError::Registry(format!(
+                        "`{key}` holds two settings; use `lpm config set {LPM_DEV_PACKAGES_SETTING} <true|false>`, `lpm config set {OTHER_PACKAGES_SETTING} <true|false>`, or `lpm config skills`"
+                    )));
+                }
                 GenericSetTarget::UnsupportedNested => {
                     return Err(LpmError::Registry(format!(
                         "`lpm config set` cannot write nested section `{key}` from one value. Edit `~/.lpm/config.toml` instead."
@@ -344,9 +405,7 @@ pub async fn run(
                             &format!("lpm config set {key} {}", requested.as_str()),
                         )?;
                     }
-                    SIGNATURES_KEY
-                    | AUTO_INSTALL_LPM_SKILLS_KEY
-                    | FETCH_LPM_SECURITY_INSIGHTS_KEY => {
+                    SIGNATURES_KEY | FETCH_LPM_SECURITY_INSIGHTS_KEY => {
                         parse_config_bool(value)
                             .map_err(|message| LpmError::Registry(format!("`{key}` {message}")))?;
                     }
@@ -375,9 +434,6 @@ pub async fn run(
                 }
                 {
                     let table = config.table_mut();
-                    if key == AUTO_INSTALL_LPM_SKILLS_KEY {
-                        table.remove(LEGACY_NO_SKILLS_KEY);
-                    }
                     if key == TYPOSQUAT_GUARD_KEY
                         && parse_typosquat_guard_selection(value)?
                             == TyposquatGuardSelection::Default
@@ -387,7 +443,6 @@ pub async fn run(
                         let value = if matches!(
                             key,
                             SIGNATURES_KEY
-                                | AUTO_INSTALL_LPM_SKILLS_KEY
                                 | FETCH_LPM_SECURITY_INSIGHTS_KEY
                                 | INSTALL_TIME_SOURCE_ANALYSIS_KEY
                         ) {
@@ -419,7 +474,6 @@ pub async fn run(
                 let json_value = if matches!(
                     key,
                     SIGNATURES_KEY
-                        | AUTO_INSTALL_LPM_SKILLS_KEY
                         | FETCH_LPM_SECURITY_INSIGHTS_KEY
                         | INSTALL_TIME_SOURCE_ANALYSIS_KEY
                 ) {
@@ -456,7 +510,15 @@ pub async fn run(
         }
         "delete" | "unset" => {
             let key = key.ok_or_else(|| LpmError::Registry("missing key".into()))?;
-            let (existed, floor_weakened) = update_config(&config_path, |config| {
+            let (existed, floor_weakened) =
+                if matches!(key, AUTO_INSTALL_LPM_SKILLS_KEY | LPM_DEV_PACKAGES_SETTING) {
+                    update_config(&config_path, |config| {
+                        let existed = remove_lpm_dev_skills_setting(config.table_mut());
+                        Ok(((existed, false), existed))
+                    })
+                    .await?
+                } else {
+                    update_config(&config_path, |config| {
                 if config_value_at_path(config.table(), key).is_none() {
                     return Ok(((false, false), false));
                 }
@@ -528,7 +590,8 @@ pub async fn run(
                 let existed = remove_config_value_at_path(config.table_mut(), key);
                 Ok(((existed, floor_weakened), existed))
             })
-            .await?;
+            .await?
+                };
             if floor_weakened {
                 crate::security_approval::record_force_floor_removed();
             }
@@ -566,7 +629,7 @@ pub async fn run(
             return Err(LpmError::Registry(format!(
                 "unknown config action: {action}. \
                  Use: get, set, delete (alias: unset), list (alias: ls), \
-                 scripts, triage, sandbox, sigstore, signatures, trust-policy, typosquat, firewall, integrity, release-age, release-age-policy, release-age-exclude, source-analysis, lpm-dev, lpm-skills, lpm-insights"
+                 scripts, triage, sandbox, sigstore, signatures, trust-policy, typosquat, firewall, integrity, release-age, release-age-policy, release-age-exclude, source-analysis, skills, lpm-skills, npm-skills, lpm-dev, lpm-insights"
             )));
         }
     }
@@ -619,7 +682,8 @@ fn validate_action_arguments(
         Some(
             "scripts" | "triage" | "sandbox" | "sigstore" | "signatures" | "trust-policy"
             | "typosquat" | "firewall" | "integrity" | "release-age" | "release-age-policy"
-            | "source-analysis" | "lpm-dev" | "lpm-skills" | "lpm-insights",
+            | "source-analysis" | "skills" | "lpm-dev" | "lpm-skills" | "npm-skills"
+            | "lpm-insights",
         ) => key.is_some() || value.is_some(),
         Some(_) => false,
     };
@@ -720,13 +784,11 @@ async fn run_guided_config_menu(
                 "Install-time source analysis",
                 format!("current: {}", summary.source_analysis),
             )
+            .item("skills", "Skill settings", summary.skill_settings.clone())
             .item(
-                "lpm-dev",
-                "LPM.dev settings",
-                format!(
-                    "skills={}, insights={}",
-                    summary.lpm_skills, summary.lpm_insights
-                ),
+                "lpm-insights",
+                "LPM.dev security insights",
+                format!("current: {}", summary.lpm_insights),
             )
             .item("done", "Done", "exit")
             .interact()
@@ -749,7 +811,8 @@ async fn run_guided_config_menu(
                 run_release_age_configuration_wizard(config_path).await?
             }
             "source-analysis" => run_source_analysis_wizard(config_path, None, false).await?,
-            "lpm-dev" => run_lpm_dev_wizard(config_path, None, false).await?,
+            "skills" => run_skills_wizard(config_path, None, false).await?,
+            "lpm-insights" => run_lpm_insights_wizard(config_path, None, false).await?,
             "done" => return Ok(()),
             _ => unreachable!("guided config select returned unexpected setting"),
         }
@@ -787,7 +850,7 @@ struct GuidedConfigSummary {
     release_age: String,
     release_age_policy: String,
     source_analysis: &'static str,
-    lpm_skills: &'static str,
+    skill_settings: String,
     lpm_insights: &'static str,
 }
 
@@ -848,9 +911,7 @@ fn read_guided_config_summary(
         source_analysis: format_bool_enabled(
             crate::source_analysis_config::read_install_time_source_analysis(&global)?,
         ),
-        lpm_skills: format_current_lpm_skills(
-            crate::lpm_skills_config::LpmSkillsPreference::Config.resolve(&global)?,
-        ),
+        skill_settings: format_current_skill_settings(read_skill_settings(config_path)?),
         lpm_insights: format_bool_enabled(
             crate::lpm_insights_config::read_fetch_lpm_security_insights(&global)?,
         ),

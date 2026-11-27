@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use support::mock_registry::MockRegistry;
-use support::mock_registry::make_tarball;
+use support::mock_registry::{make_tarball, make_tarball_from_pkg_json};
 use support::{TempProject, lpm, lpm_spawnable, lpm_with_registry};
 
 struct DashboardProcess {
@@ -297,6 +297,74 @@ fn skills_dashboard_serves_authenticated_unified_inventory() {
     assert_eq!(inventory["skills"][0]["name"], "format-code");
     assert_eq!(inventory["skills"][0]["security"]["status"], "scanned");
     assert_eq!(inventory["read_only"], true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn skills_dashboard_lists_dependency_skills_the_project_links() {
+    let registry = MockRegistry::start().await;
+    let tarball = make_tarball_from_pkg_json(
+        serde_json::json!({ "name": "browser-tool", "version": "1.0.0" }),
+        &[(
+            "skills/browser-tool/SKILL.md",
+            b"---\nname: browser-tool\ndescription: Drive the browser tool\n---\n\nRun it.\n",
+        )],
+    );
+    registry
+        .with_package("browser-tool", "1.0.0", &tarball)
+        .await;
+    let project = TempProject::empty(
+        r##"{"name":"app","version":"1.0.0","dependencies":{"browser-tool":"1.0.0"},"lpm":{"skills":{"allow":["#browser-tool"]}}}"##,
+    );
+    let install = lpm_with_registry(&project, &registry.url())
+        .arg("install")
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    let inventory: serde_json::Value = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let dashboard = DashboardProcess::start(&project, &["--read-only"]);
+                dashboard
+                    .client()
+                    .get(dashboard.api_url("/api/v1/inventory"))
+                    .bearer_auth(&dashboard.token)
+                    .send()
+                    .expect("request dashboard inventory")
+                    .json()
+                    .expect("decode dashboard inventory")
+            })
+            .join()
+            .unwrap()
+    });
+
+    assert_eq!(inventory["counts"]["dependency"], 1, "{inventory:#}");
+    assert_eq!(
+        inventory["counts"]["external"], 0,
+        "LPM's links must not show as external: {inventory:#}"
+    );
+    let skill = inventory["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|skill| skill["kind"] == "dependency")
+        .unwrap_or_else(|| panic!("{inventory:#}"));
+    assert_eq!(skill["name"], "browser-tool");
+    assert_eq!(skill["package"], "browser-tool");
+    assert_eq!(skill["description"], "Drive the browser tool");
+    assert_eq!(skill["healthy"], true);
+    assert_eq!(skill["actions"], serde_json::json!([]));
+    assert!(
+        skill["targets"][0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("browser-tool"),
+        "{skill:#}"
+    );
 }
 
 #[test]
@@ -2253,7 +2321,7 @@ fn skills_list_json_combines_package_and_managed_inventory_categories() {
     assert_eq!(envelope["count"], serde_json::json!(2));
     assert_eq!(
         envelope["counts"],
-        serde_json::json!({"package": 1, "managed": 1, "external": 0})
+        serde_json::json!({"package": 1, "managed": 1, "external": 0, "dependency": 0})
     );
     envelope["skills"]["managed"][0]["source"] = serde_json::json!("[local source]");
     insta::assert_json_snapshot!(envelope, @r###"
@@ -2269,7 +2337,8 @@ fn skills_list_json_combines_package_and_managed_inventory_categories() {
       "counts": {
         "package": 1,
         "managed": 1,
-        "external": 0
+        "external": 0,
+        "dependency": 0
       },
       "skills": {
         "package": [
@@ -2292,7 +2361,8 @@ fn skills_list_json_combines_package_and_managed_inventory_categories() {
             "healthy": true
           }
         ],
-        "external": []
+        "external": [],
+        "dependency": []
       }
     }
     "###);

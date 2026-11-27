@@ -1,9 +1,11 @@
 use super::prelude::*;
 use crate::lpm_insights_config::FETCH_LPM_SECURITY_INSIGHTS_KEY;
+use crate::lpm_skills_config::LpmSkillsPreference;
+#[cfg(test)]
 use crate::lpm_skills_config::{
-    AUTO_INSTALL_LPM_SKILLS_KEY, LEGACY_NO_SKILLS_KEY, LpmSkillsPreference,
+    AUTO_INSTALL_LPM_SKILLS_KEY, LEGACY_NO_SKILLS_KEY, LPM_DEV_PACKAGES_KEY, SKILLS_TABLE,
 };
-use console::{Key, Term};
+use console::Term;
 use std::io;
 
 const LPM_DEV_EDITOR_PROMPT: &str = "LPM.dev settings";
@@ -108,11 +110,7 @@ async fn persist_lpm_dev_settings(
 ) -> Result<(), LpmError> {
     update_config(config_path, |config| {
         let table = config.table_mut();
-        table.remove(LEGACY_NO_SKILLS_KEY);
-        table.insert(
-            AUTO_INSTALL_LPM_SKILLS_KEY.to_string(),
-            toml::Value::Boolean(settings.package_skills),
-        );
+        crate::lpm_skills_config::write_skill_settings(table, Some(settings.package_skills), None)?;
         table.insert(
             FETCH_LPM_SECURITY_INSIGHTS_KEY.to_string(),
             toml::Value::Boolean(settings.security_insights),
@@ -122,82 +120,42 @@ async fn persist_lpm_dev_settings(
     .await
 }
 
+fn lpm_dev_toggles(settings: LpmDevSettings) -> Vec<super::editor::Toggle> {
+    vec![
+        super::editor::Toggle {
+            title: "LPM.dev package skills",
+            detail: "Install the reviewed skills of @lpm.dev/* dependencies?",
+            enabled: settings.package_skills,
+        },
+        super::editor::Toggle {
+            title: "Fetch LPM Registry Insights",
+            detail: "At install time, use registry behavioral tags and lifecycle-script data. Audits add AI findings.",
+            enabled: settings.security_insights,
+        },
+    ]
+}
+
 fn run_lpm_dev_editor(term: &mut Term, initial: LpmDevSettings) -> io::Result<LpmDevSettings> {
-    super::editor::run(term, |term| interact_lpm_dev_editor(term, initial))
+    let toggles = super::editor::run_toggles(
+        term,
+        LPM_DEV_EDITOR_PROMPT,
+        LPM_DEV_EDITOR_HELP,
+        lpm_dev_toggles(initial),
+    )?;
+    Ok(LpmDevSettings {
+        package_skills: toggles[0].enabled,
+        security_insights: toggles[1].enabled,
+    })
 }
 
-fn interact_lpm_dev_editor(
-    term: &mut Term,
-    mut settings: LpmDevSettings,
-) -> io::Result<LpmDevSettings> {
-    let mut cursor = 0;
-    let mut previous_line_count = 0;
-    loop {
-        let frame = format_lpm_dev_editor_frame(settings, cursor);
-        super::editor::draw_frame(term, &frame, &mut previous_line_count)?;
-
-        match term.read_key()? {
-            Key::ArrowUp | Key::ArrowDown | Key::Char('j') | Key::Char('k') => cursor ^= 1,
-            Key::ArrowLeft | Key::ArrowRight | Key::Char('h') | Key::Char('l') | Key::Char(' ') => {
-                if cursor == 0 {
-                    settings.package_skills = !settings.package_skills;
-                } else {
-                    settings.security_insights = !settings.security_insights;
-                }
-            }
-            Key::Enter => return Ok(settings),
-            Key::Escape | Key::CtrlC => return Err(io::ErrorKind::Interrupted.into()),
-            _ => {}
-        }
-    }
-}
-
+#[cfg(test)]
 fn format_lpm_dev_editor_frame(settings: LpmDevSettings, cursor: usize) -> String {
-    let rows = [
-        (
-            "LPM.dev package skills",
-            "Auto-install package-published skills from @lpm.dev/* packages?",
-            settings.package_skills,
-        ),
-        (
-            "Fetch LPM Registry Insights",
-            "At install time, use registry behavioral tags and lifecycle-script data. Audits add AI findings.",
-            settings.security_insights,
-        ),
-    ];
-    let mut frame = String::with_capacity(720);
-    frame.push_str(&format!("◆  {}\n", LPM_DEV_EDITOR_PROMPT.cyan().bold()));
-    frame.push_str(&format!("│  {}\n", LPM_DEV_EDITOR_HELP.dimmed()));
-    frame.push_str("│\n");
-    for (index, (title, detail, enabled)) in rows.into_iter().enumerate() {
-        let active = index == cursor;
-        let marker = if active {
-            "›".cyan().bold()
-        } else {
-            " ".to_string()
-        };
-        let title = if active {
-            title.bold()
-        } else {
-            title.to_string()
-        };
-        frame.push_str(&format!("│  {marker} {title}\n"));
-        frame.push_str(&format!("│    {}\n", detail.dimmed()));
-        frame.push_str(&format!("│    {}\n", format_bool_options(enabled)));
-        if index == 0 {
-            frame.push_str("│\n");
-        }
-    }
-    frame.push_str("└\n");
-    frame
-}
-
-fn format_bool_options(enabled: bool) -> String {
-    if enabled {
-        format!("{} {}  ○ Disabled", "●".cyan(), "Enabled".bold())
-    } else {
-        format!("○ Enabled  {} {}", "●".cyan(), "Disabled".bold())
-    }
+    super::editor::format_toggle_frame(
+        LPM_DEV_EDITOR_PROMPT,
+        LPM_DEV_EDITOR_HELP,
+        &lpm_dev_toggles(settings),
+        cursor,
+    )
 }
 
 #[cfg(test)]
@@ -244,9 +202,12 @@ mod tests {
 
         let config = read_config(&path).unwrap();
         assert_eq!(
-            config.get(AUTO_INSTALL_LPM_SKILLS_KEY),
+            config
+                .get(SKILLS_TABLE)
+                .and_then(|skills| skills.get(LPM_DEV_PACKAGES_KEY)),
             Some(&toml::Value::Boolean(true))
         );
+        assert!(config.get(AUTO_INSTALL_LPM_SKILLS_KEY).is_none());
         assert_eq!(
             config.get(FETCH_LPM_SECURITY_INSIGHTS_KEY),
             Some(&toml::Value::Boolean(false))

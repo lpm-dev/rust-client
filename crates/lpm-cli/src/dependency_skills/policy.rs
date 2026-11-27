@@ -280,6 +280,37 @@ fn standalone_root(selector: &Selector) -> Option<PseudoClass> {
     }
 }
 
+/// Parses `text` as a skill-policy selector, refusing what [`read_policy`]
+/// would drop, and returns it in canonical form.
+pub(crate) fn validate_selector(text: &str) -> Result<String, String> {
+    if text.len() > MAX_SELECTOR_LENGTH {
+        return Err(format!(
+            "`{text}` is longer than {MAX_SELECTOR_LENGTH} bytes"
+        ));
+    }
+    let selector = parse_selector(text)
+        .map_err(|error| format!("`{text}` is not a valid selector: {}", error.message))?;
+    if let Some(class) = standalone_root(&selector) {
+        return Err(format!(
+            "`{text}` uses `{}` on its own, which no installed package is; it works before `>`",
+            class.display_name()
+        ));
+    }
+    if let Some(class) = unsupported_class(&selector) {
+        return Err(format!(
+            "`{text}` uses `{}`, which skill selectors can't decide",
+            class.display_name()
+        ));
+    }
+    let canonical = selector.to_string();
+    if canonical.len() > MAX_SELECTOR_LENGTH {
+        return Err(format!(
+            "`{text}` is longer than {MAX_SELECTOR_LENGTH} bytes as LPM writes it"
+        ));
+    }
+    Ok(canonical)
+}
+
 /// The first pseudo-class in `selector` that skill selection has no data
 /// for: script and build state, vulnerability and deprecation data, and
 /// `:high`, which includes them. Accepting one would make `:not()` over it
@@ -405,6 +436,23 @@ mod tests {
         assert_eq!(policy.allow[0].text, "#ok:not(:eval)");
         assert_eq!(parsed.problems.len(), 3, "{:?}", parsed.problems);
         assert!(parsed.problems[0].contains("`:vulnerable`"));
+    }
+
+    #[test]
+    fn a_selector_whose_canonical_form_outgrows_the_limit_is_refused() {
+        let text = (0..160)
+            .map(|index| format!("#p{index:03}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(text.len() <= MAX_SELECTOR_LENGTH);
+
+        let refused = validate_selector(&text).unwrap_err();
+        assert!(refused.contains("as LPM writes it"), "{refused}");
+        let shorter = (0..140)
+            .map(|index| format!("#p{index:03}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(validate_selector(&shorter).is_ok());
     }
 
     #[test]

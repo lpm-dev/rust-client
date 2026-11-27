@@ -1,5 +1,5 @@
 use super::discovery::{read_skill_directory, skill_directory_listing};
-use super::policy::{ParsedPolicy, PolicyEntry, SkillsPolicy};
+use super::policy::{ParsedPolicy, SkillsPolicy};
 use crate::commands::audit::discovery::{DiscoveredPackage, ManagerKind};
 use crate::commands::audit::inventory::PackageInventory;
 use lpm_common::LpmError;
@@ -35,6 +35,20 @@ pub(crate) enum HoldReason {
 }
 
 impl HoldReason {
+    /// Whether the hold can clear without a new version of the package or
+    /// a change to the policy: data arriving, a conflict ending, a folder
+    /// becoming readable.
+    pub(crate) fn clears_on_its_own(self) -> bool {
+        match self {
+            Self::NeedsData | Self::NameConflict | Self::Unreadable => true,
+            Self::Invalid
+            | Self::Blocked
+            | Self::NeedsPackageName
+            | Self::NeedsSkillName
+            | Self::Hooks => false,
+        }
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::NeedsData => "needs_data",
@@ -81,9 +95,53 @@ pub(crate) struct Candidate {
     pub(crate) integrity: Option<String>,
     pub(crate) skill: String,
     pub(crate) status: CandidateStatus,
-    /// How specifically the allowing entries name it, when the policy
-    /// allows it.
+    /// How specifically the allowing entries that hold name it: what keeps
+    /// an earlier copy under a changed policy.
     pub(crate) naming: Naming,
+    /// How specifically the allowing entries that hold or can't be decided
+    /// yet would name it: what the skill may come to pre-approve.
+    pub(crate) possible_naming: Naming,
+    /// Whether the policy couldn't decide the skill, as when a selector
+    /// reads data the package lacks.
+    pub(crate) undecided: bool,
+    /// How many deny entries can't be decided for the skill yet: each may
+    /// deny it once the data it reads arrives.
+    pub(crate) open_denials: usize,
+    /// What the policy decided for every installed instance of the skill's
+    /// package, this one included, by version.
+    pub(crate) instances: Vec<InstanceRuling>,
+    /// What the skill's check found, when it was checked: always for an
+    /// allowed skill, and for every skill when inspecting.
+    pub(crate) details: Option<SkillDetails>,
+    /// When inspecting a skill the policy doesn't allow, the problem that
+    /// would keep it from linking even if it did.
+    pub(crate) blocker: Option<(HoldReason, String)>,
+    /// A direct dependency of the project, or of the workspace member that
+    /// installed it.
+    pub(crate) direct: bool,
+}
+
+/// What a skill's check found.
+#[derive(Debug, Clone)]
+pub(crate) struct SkillDetails {
+    pub(crate) description: String,
+    pub(crate) hidden: bool,
+    pub(crate) allowed_tools: Vec<String>,
+    pub(crate) permission: SkillPermission,
+    pub(crate) warnings: usize,
+    /// The narrowest allowing entry that links the skill.
+    pub(crate) suggested: String,
+    /// How specifically an allowing entry must name the skill to link it.
+    pub(crate) requires: Naming,
+}
+
+/// Whether a plan links skills or only reports on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlanMode {
+    /// Plan what the policy links; with no allowing entry, read nothing.
+    Apply,
+    /// Check every skill installed dependencies ship, allowed or not.
+    Inspect,
 }
 
 /// What the project's policy makes of every skill its installed
@@ -108,6 +166,19 @@ pub(crate) struct Plan {
     pub(crate) incomplete: bool,
 }
 
+/// What the policy decided for one installed instance of a package's skill.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct InstanceRuling {
+    pub(crate) version: String,
+    /// `allowed`, `undecided`, `denied` or `not_allowed`.
+    pub(crate) ruling: &'static str,
+    pub(crate) open_denials: usize,
+    /// Whether it links now or may once data arrives: the policy allows it
+    /// or can't decide yet, nothing in it keeps it out, and the entries that
+    /// may allow it name it as specifically as it needs.
+    pub(crate) may_link: bool,
+}
+
 /// How much an allowing entry singles a candidate out.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -126,18 +197,21 @@ pub(crate) fn read_manifest(project_dir: &Path) -> Result<serde_json::Value, Lpm
         .map_err(|error| LpmError::Registry(format!("invalid {}: {error}", path.display())))
 }
 
-/// Plans `project_dir`'s dependency skills under `policy`. In a workspace
-/// root the plan covers the root and every member. With no allowing entry,
-/// nothing is read.
 /// The skills earlier links recorded, by package, with how specifically an
 /// entry had to name each: what a plan judges for a package whose skills
 /// couldn't be listed.
 pub(crate) type RecordedSkills = BTreeMap<String, Vec<(String, Naming)>>;
 
+/// Plans `project_dir`'s dependency skills under `policy`. In a workspace
+/// root the plan covers the root and every member. With no allowing entry,
+/// nothing is read. `packages` limits the plan to the skills those
+/// packages ship.
 pub(crate) fn plan_project(
     project_dir: &Path,
     parsed: ParsedPolicy,
     manifest: &serde_json::Value,
+    mode: PlanMode,
+    packages: Option<&HashSet<String>>,
     recorded: &RecordedSkills,
 ) -> Result<Plan, LpmError> {
     let ParsedPolicy { policy, problems } = parsed;
@@ -146,8 +220,16 @@ pub(crate) fn plan_project(
         problems,
         ..Plan::default()
     };
-    let Some(policy) = plan.policy.as_ref().filter(|policy| policy.is_active()) else {
-        return Ok(plan);
+    let empty = SkillsPolicy {
+        allow: Vec::new(),
+        deny: Vec::new(),
+        targets: super::policy::Targets::Auto,
+        deny_unreadable: false,
+    };
+    let policy = match plan.policy.as_ref() {
+        Some(policy) if policy.is_active() => policy,
+        _ if mode == PlanMode::Inspect => plan.policy.as_ref().unwrap_or(&empty),
+        _ => return Ok(plan),
     };
     let needs_analysis = policy
         .allow
@@ -185,7 +267,11 @@ pub(crate) fn plan_project(
         };
         discoveries.push((discovery, names));
     }
-    let named = named_packages(policy);
+    let named = match (packages, mode) {
+        (Some(packages), _) => Some(packages.clone()),
+        (None, PlanMode::Apply) => named_packages(policy),
+        (None, PlanMode::Inspect) => None,
+    };
     let is_lpm_project = discoveries
         .iter()
         .any(|(discovery, _)| discovery.manager == ManagerKind::Lpm);
@@ -219,6 +305,7 @@ pub(crate) fn plan_project(
             &importers,
             lpm_root,
             Rules { policy, recorded },
+            mode,
         ))
     };
     let found = if is_lpm_project {
@@ -305,6 +392,19 @@ fn reads_parent_skills(selector: &Selector) -> bool {
     }
 }
 
+/// Whether `selector` may match one of `packages`: it names one of them,
+/// or it doesn't limit the packages it matches.
+pub(crate) fn may_match_any(selector: &str, packages: &[(String, String)]) -> bool {
+    if packages.is_empty() {
+        return false;
+    }
+    let Ok(selector) = lpm_security::query::parse_selector(selector) else {
+        return false;
+    };
+    selector_names(&selector)
+        .is_none_or(|names| packages.iter().any(|(package, _)| names.contains(package)))
+}
+
 /// The package names `selector` can match, when it limits them.
 fn selector_names(selector: &Selector) -> Option<HashSet<String>> {
     match selector {
@@ -385,6 +485,10 @@ struct Decided {
     package: usize,
     skill: String,
     decision: Decision,
+    /// How many deny entries can't be decided for the skill yet.
+    open_denials: usize,
+    /// How specifically the entries that may allow the skill would name it.
+    possible_naming: Naming,
     /// A direct dependency of its importer.
     direct: bool,
 }
@@ -427,6 +531,7 @@ fn candidates_from_importers(
     importers: &[Importer],
     lpm_root: Option<&lpm_common::LpmRoot>,
     rules: Rules<'_>,
+    mode: PlanMode,
 ) -> Found {
     let project_roots: Vec<Option<cap_std::fs::Dir>> = importers
         .iter()
@@ -477,6 +582,40 @@ fn candidates_from_importers(
         |entry: &Decided| &importers[entry.importer].inventory.discovery.packages[entry.package];
     let preferred = preferred_instances(&decided, &package_of);
     let conflicts = name_conflicts(&decided, &preferred, &package_of);
+    let mut rulings: HashMap<(&str, String), Vec<InstanceRuling>> = HashMap::new();
+    let mut inspected: Vec<Option<(CandidateStatus, Option<SkillDetails>)>> = Vec::new();
+    if mode == PlanMode::Inspect {
+        inspected.reserve_exact(decided.len());
+        for (position, entry) in decided.iter().enumerate() {
+            let package = package_of(entry);
+            let directory = directories[entry.importer][entry.package]
+                .as_ref()
+                .ok_or_else(|| LpmError::Registry(format!("{} could not be opened", package.name)));
+            let (status, details) = prepare_fully(directory, package, &entry.skill);
+            let may_link = matches!(entry.decision, Decision::Allowed(_) | Decision::Unknown)
+                && match &status {
+                    CandidateStatus::Linkable(_) => true,
+                    CandidateStatus::Held { reason, .. } => reason.clears_on_its_own(),
+                    CandidateStatus::NotAllowed | CandidateStatus::Denied => false,
+                }
+                && details
+                    .as_ref()
+                    .is_none_or(|details| details.requires <= entry.possible_naming);
+            rulings
+                .entry((package.name.as_str(), entry.skill.clone()))
+                .or_default()
+                .push(InstanceRuling {
+                    version: package.version.clone(),
+                    ruling: entry.decision.kind(),
+                    open_denials: entry.open_denials,
+                    may_link,
+                });
+            inspected.push(preferred.contains(&position).then_some((status, details)));
+        }
+        for instances in rulings.values_mut() {
+            instances.sort();
+        }
+    }
 
     let mut candidates = Vec::with_capacity(preferred.len());
     for (position, entry) in decided.into_iter().enumerate() {
@@ -485,14 +624,36 @@ fn candidates_from_importers(
         }
         let package = package_of(&entry);
         let skill = entry.skill;
+        let instances = rulings
+            .remove(&(package.name.as_str(), skill.clone()))
+            .unwrap_or_default();
         let directory = directories[entry.importer][entry.package].as_ref();
-        let status = match entry.decision {
-            Decision::NotAllowed => CandidateStatus::NotAllowed,
-            Decision::Denied => CandidateStatus::Denied,
-            Decision::Allowed(_) | Decision::Unknown if conflicts.contains_key(&skill) => {
-                CandidateStatus::Held {
-                    reason: HoldReason::NameConflict,
-                    detail: format!(
+        let check = |naming: Naming| {
+            let directory = directory
+                .ok_or_else(|| LpmError::Registry(format!("{} could not be opened", package.name)));
+            prepare(directory, package, &skill, naming)
+        };
+        let full = inspected.get_mut(position).and_then(Option::take);
+        let inspect =
+            |status: CandidateStatus, full: Option<(CandidateStatus, Option<SkillDetails>)>| {
+                match full {
+                    Some((checked, details)) => {
+                        let blocker = match checked {
+                            CandidateStatus::Held { reason, detail } => Some((reason, detail)),
+                            _ => None,
+                        };
+                        (status, details, blocker)
+                    }
+                    None => (status, None, None),
+                }
+            };
+        let (status, details, blocker) = match entry.decision {
+            Decision::NotAllowed => inspect(CandidateStatus::NotAllowed, full),
+            Decision::Denied => inspect(CandidateStatus::Denied, full),
+            Decision::Allowed(_) | Decision::Unknown if conflicts.contains_key(&skill) => inspect(
+                held(
+                    HoldReason::NameConflict,
+                    format!(
                         "{} also ship a skill named `{skill}`; name one with `#<package>:skill({skill})` and deny the others",
                         conflicts[&skill]
                             .iter()
@@ -501,19 +662,29 @@ fn candidates_from_importers(
                             .collect::<Vec<_>>()
                             .join(", ")
                     ),
-                }
-            }
-            Decision::Unknown => CandidateStatus::Held {
-                reason: HoldReason::NeedsData,
-                detail:
-                    "a selector reads a behavioral analysis or security verdict this package lacks"
-                        .into(),
-            },
+                ),
+                full,
+            ),
+            Decision::Unknown => inspect(held(HoldReason::NeedsData, UNDECIDED), full),
             Decision::Allowed(naming) => {
-                let directory = directory.ok_or_else(|| {
-                    LpmError::Registry(format!("{} could not be opened", package.name))
-                });
-                prepare(directory, package, &skill, naming)
+                let (status, details) = match full {
+                    Some((status, details)) => {
+                        (require_naming(status, details.as_ref(), naming), details)
+                    }
+                    None => check(naming),
+                };
+                match (&status, &details) {
+                    (
+                        CandidateStatus::Held {
+                            reason: HoldReason::NeedsPackageName | HoldReason::NeedsSkillName,
+                            ..
+                        },
+                        Some(found),
+                    ) if found.requires <= entry.possible_naming => {
+                        (held(HoldReason::NeedsData, UNDECIDED_NAMING), details, None)
+                    }
+                    _ => (status, details, None),
+                }
             }
         };
         candidates.push(Candidate {
@@ -526,6 +697,17 @@ fn candidates_from_importers(
                 Decision::Allowed(naming) => naming,
                 _ => Naming::None,
             },
+            possible_naming: match entry.decision {
+                Decision::Allowed(naming) => naming.max(entry.possible_naming),
+                Decision::Unknown => entry.possible_naming,
+                _ => Naming::None,
+            },
+            undecided: entry.decision == Decision::Unknown,
+            open_denials: entry.open_denials,
+            instances,
+            details,
+            blocker,
+            direct: entry.direct,
         });
     }
     candidates.sort_by(|left, right| {
@@ -861,10 +1043,10 @@ fn decide_importer(
         for (skill, requires) in recorded.get(&package.name).into_iter().flatten() {
             let mut candidate = copy_context(&contexts[index]);
             candidate.skill = Some(skill);
-            let allows = match decide(policy, &candidate, graph_keys[index], &graph, &all_packages)
-            {
+            let ruling = decide(policy, &candidate, graph_keys[index], &graph, &all_packages);
+            let allows = match ruling.decision {
                 Decision::Allowed(naming) => naming >= *requires,
-                Decision::Unknown => true,
+                Decision::Unknown => ruling.possible_naming >= *requires,
                 Decision::NotAllowed | Decision::Denied => false,
             };
             if allows {
@@ -880,12 +1062,14 @@ fn decide_importer(
         for skill in &skill_names[index] {
             let mut candidate = copy_context(context);
             candidate.skill = Some(skill);
-            let decision = decide(policy, &candidate, graph_keys[index], &graph, &all_packages);
+            let ruling = decide(policy, &candidate, graph_keys[index], &graph, &all_packages);
             decisions.decided.push(Decided {
                 importer: importer_index,
                 package: index,
                 skill: skill.clone(),
-                decision,
+                decision: ruling.decision,
+                open_denials: ruling.open_denials,
+                possible_naming: ruling.possible_naming,
                 direct: graph.root_deps.contains(graph_keys[index]),
             });
         }
@@ -932,7 +1116,7 @@ enum Listed {
     Refused(std::io::Error),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Decision {
     NotAllowed,
     Denied,
@@ -940,60 +1124,104 @@ enum Decision {
     Allowed(Naming),
 }
 
+impl Decision {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::NotAllowed => "not_allowed",
+            Self::Denied => "denied",
+            Self::Unknown => "undecided",
+            Self::Allowed(_) => "allowed",
+        }
+    }
+}
+
+/// What the policy decides for one skill, how many deny entries it can't
+/// decide yet, and how specifically the entries that may allow the skill
+/// would name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ruling {
+    decision: Decision,
+    open_denials: usize,
+    possible_naming: Naming,
+}
+
+/// What the policy decides for `candidate`.
 fn decide(
     policy: &SkillsPolicy,
     candidate: &PackageContext<'_>,
     key: &str,
     graph: &DepGraph<'_>,
     all_packages: &HashMap<&str, PackageContext<'_>>,
-) -> Decision {
+) -> Ruling {
     let mut denied = Truth::False;
+    let mut open_denials = 0;
     for entry in &policy.deny {
-        denied = denied.max(evaluate_with_key(
-            &entry.selector,
-            candidate,
-            key,
-            graph,
-            all_packages,
-        ));
-        if denied == Truth::True {
-            return Decision::Denied;
+        match evaluate_with_key(&entry.selector, candidate, key, graph, all_packages) {
+            Truth::True => {
+                return Ruling {
+                    decision: Decision::Denied,
+                    open_denials: 0,
+                    possible_naming: Naming::None,
+                };
+            }
+            Truth::Unknown => {
+                denied = Truth::Unknown;
+                open_denials += 1;
+            }
+            Truth::False => {}
         }
     }
     let mut allowed = Truth::False;
     let mut naming = Naming::None;
+    let mut possible_naming = Naming::None;
     for entry in &policy.allow {
         let truth = evaluate_with_key(&entry.selector, candidate, key, graph, all_packages);
+        if truth != Truth::False {
+            possible_naming = possible_naming.max(selector_naming(
+                &entry.selector,
+                candidate,
+                key,
+                graph,
+                all_packages,
+                Truth::Unknown,
+            ));
+        }
         if truth == Truth::True {
-            naming = naming.max(entry_naming(entry, candidate, key, graph, all_packages));
+            naming = naming.max(selector_naming(
+                &entry.selector,
+                candidate,
+                key,
+                graph,
+                all_packages,
+                Truth::True,
+            ));
         }
         allowed = allowed.max(truth);
     }
-    match (allowed, denied) {
+    let decision = match (allowed, denied) {
         (Truth::False, _) => Decision::NotAllowed,
         (Truth::True, Truth::False) => Decision::Allowed(naming),
         _ => Decision::Unknown,
+    };
+    Ruling {
+        decision,
+        open_denials,
+        possible_naming,
     }
 }
 
-fn entry_naming(
-    entry: &PolicyEntry,
-    candidate: &PackageContext<'_>,
-    key: &str,
-    graph: &DepGraph<'_>,
-    all_packages: &HashMap<&str, PackageContext<'_>>,
-) -> Naming {
-    selector_naming(&entry.selector, candidate, key, graph, all_packages)
-}
-
-/// How specifically the parts of `selector` that hold for `candidate` name
-/// it: `#pkg` names the package, and `#pkg:skill(name)` names the skill.
+/// How specifically the parts of `selector` that hold for `candidate` at
+/// least as surely as `holds` name it: `#pkg` names the package, and
+/// `#pkg:skill(name)` names the skill. With `Truth::Unknown`, a `,` branch
+/// that can't be decided yet counts, for how the entry may name it once
+/// data arrives.
 fn selector_naming(
     selector: &Selector,
     candidate: &PackageContext<'_>,
     key: &str,
     graph: &DepGraph<'_>,
     all_packages: &HashMap<&str, PackageContext<'_>>,
+    holds: Truth,
 ) -> Naming {
     match selector {
         Selector::Id(id) => {
@@ -1005,7 +1233,7 @@ fn selector_naming(
         }
         Selector::And(parts) => {
             let package = parts.iter().any(|part| {
-                selector_naming(part, candidate, key, graph, all_packages) >= Naming::Package
+                selector_naming(part, candidate, key, graph, all_packages, holds) >= Naming::Package
             });
             let skill = parts.iter().any(|part| match part {
                 Selector::Skill(names) => candidate
@@ -1021,14 +1249,12 @@ fn selector_naming(
         }
         Selector::Or(parts) => parts
             .iter()
-            .filter(|part| {
-                evaluate_with_key(part, candidate, key, graph, all_packages) == Truth::True
-            })
-            .map(|part| selector_naming(part, candidate, key, graph, all_packages))
+            .filter(|part| evaluate_with_key(part, candidate, key, graph, all_packages) >= holds)
+            .map(|part| selector_naming(part, candidate, key, graph, all_packages, holds))
             .max()
             .unwrap_or(Naming::None),
         Selector::DirectChild { child, .. } => {
-            selector_naming(child, candidate, key, graph, all_packages)
+            selector_naming(child, candidate, key, graph, all_packages, holds)
         }
         Selector::PseudoClass(_) | Selector::Not(_) | Selector::Skill(_) => Naming::None,
     }
@@ -1109,38 +1335,107 @@ fn name_conflicts<'a>(
         .collect()
 }
 
+fn held(reason: HoldReason, detail: impl Into<String>) -> CandidateStatus {
+    CandidateStatus::Held {
+        reason,
+        detail: detail.into(),
+    }
+}
+
+/// Why a skill whose decision waits on data is held.
+const UNDECIDED: &str = "a selector reads data this package lacks: a behavioral analysis, a security verdict, or the skills of a package LPM couldn't list";
+
+/// Why a skill an undecided entry may name specifically enough is held.
+const UNDECIDED_NAMING: &str = "an allowing entry that names it as specifically as it needs reads data this package lacks: a behavioral analysis, a security verdict, or the skills of a package LPM couldn't list";
+
+/// [`prepare_fully`], held when the allowing entries name the skill less
+/// specifically than `naming` it needs.
 fn prepare(
     directory: Result<&cap_std::fs::Dir, LpmError>,
     package: &DiscoveredPackage,
     skill: &str,
     naming: Naming,
+) -> (CandidateStatus, Option<SkillDetails>) {
+    let (status, details) = prepare_fully(directory, package, skill);
+    (require_naming(status, details.as_ref(), naming), details)
+}
+
+/// `status`, prepared as if fully named, held when `naming` names the skill
+/// less specifically than what it pre-approves needs.
+fn require_naming(
+    status: CandidateStatus,
+    details: Option<&SkillDetails>,
+    naming: Naming,
 ) -> CandidateStatus {
+    let (CandidateStatus::Linkable(prepared), Some(details)) = (&status, details) else {
+        return status;
+    };
+    if naming >= prepared.requires {
+        return status;
+    }
+    let detail = if prepared.permission == SkillPermission::None {
+        format!(
+            "the scan found warnings; allow `{}` to link it",
+            details.suggested
+        )
+    } else {
+        format!(
+            "it pre-approves {} for agents; allow `{}` to link it",
+            prepared.checked.allowed_tools.join(", "),
+            details.suggested
+        )
+    };
+    let reason = if prepared.requires == Naming::Skill {
+        HoldReason::NeedsSkillName
+    } else {
+        HoldReason::NeedsPackageName
+    };
+    held(reason, detail)
+}
+
+/// Reads and checks `package`'s `skill` as if an entry named it fully: what
+/// it ships, what it pre-approves, and anything that keeps it out.
+fn prepare_fully(
+    directory: Result<&cap_std::fs::Dir, LpmError>,
+    package: &DiscoveredPackage,
+    skill: &str,
+) -> (CandidateStatus, Option<SkillDetails>) {
     let directory = match directory {
         Ok(directory) => directory,
-        Err(error) => {
-            return CandidateStatus::Held {
-                reason: HoldReason::Unreadable,
-                detail: error.to_string(),
-            };
-        }
+        Err(error) => return (held(HoldReason::Unreadable, error.to_string()), None),
     };
     let entries = match read_skill_directory(directory, skill) {
         Ok(entries) => entries,
-        Err(error) => {
-            return CandidateStatus::Held {
-                reason: HoldReason::Unreadable,
-                detail: error.to_string(),
-            };
-        }
+        Err(error) => return (held(HoldReason::Unreadable, error.to_string()), None),
     };
     let checked = match check_skill_directory(skill, &entries) {
         Ok(checked) => checked,
-        Err(errors) => {
-            return CandidateStatus::Held {
-                reason: HoldReason::Invalid,
-                detail: errors.join("; "),
-            };
-        }
+        Err(errors) => return (held(HoldReason::Invalid, errors.join("; ")), None),
+    };
+    let permission = checked.permission();
+    let required = match permission {
+        SkillPermission::Broad => Naming::Skill,
+        SkillPermission::Hooks => Naming::Package,
+        SkillPermission::None if checked.has_warnings() => Naming::Package,
+        SkillPermission::None => Naming::None,
+    };
+    let suggested = if required == Naming::Skill {
+        format!("#{}:skill({skill})", package.name)
+    } else {
+        format!("#{}", package.name)
+    };
+    let details = SkillDetails {
+        description: checked.description.clone(),
+        hidden: checked.hidden,
+        allowed_tools: checked.allowed_tools.clone(),
+        permission,
+        warnings: checked
+            .findings
+            .iter()
+            .filter(|finding| finding.issue.severity == lpm_skill::SkillSecuritySeverity::Warning)
+            .count(),
+        suggested,
+        requires: required,
     };
     if checked.is_blocked() {
         let rules: Vec<String> = checked
@@ -1154,52 +1449,26 @@ fn prepare(
                 )
             })
             .collect();
-        return CandidateStatus::Held {
-            reason: HoldReason::Blocked,
-            detail: rules.join(", "),
-        };
+        return (held(HoldReason::Blocked, rules.join(", ")), Some(details));
     }
-    let permission = checked.permission();
-    let required = match permission {
-        SkillPermission::Hooks => {
-            return CandidateStatus::Held {
-                reason: HoldReason::Hooks,
-                detail:
-                    "the skill declares hooks, which run commands without the agent deciding to"
-                        .into(),
-            };
-        }
-        SkillPermission::Broad => Naming::Skill,
-        SkillPermission::None if checked.has_warnings() => Naming::Package,
-        SkillPermission::None => Naming::None,
-    };
-    if naming < required {
-        let (reason, detail) = if required == Naming::Skill {
-            (
-                HoldReason::NeedsSkillName,
-                format!(
-                    "it pre-approves {} for agents; allow `#{}:skill({skill})` to link it",
-                    checked.allowed_tools.join(", "),
-                    package.name
-                ),
-            )
-        } else {
-            (
-                HoldReason::NeedsPackageName,
-                format!(
-                    "the scan found warnings; allow `#{}` to link it",
-                    package.name
-                ),
-            )
-        };
-        return CandidateStatus::Held { reason, detail };
+    if permission == SkillPermission::Hooks {
+        return (
+            held(
+                HoldReason::Hooks,
+                "the skill declares hooks, which run commands without the agent deciding to",
+            ),
+            Some(details),
+        );
     }
-    CandidateStatus::Linkable(Box::new(Prepared {
-        entries,
-        checked,
-        permission,
-        requires: required,
-    }))
+    (
+        CandidateStatus::Linkable(Box::new(Prepared {
+            entries,
+            checked,
+            permission,
+            requires: required,
+        })),
+        Some(details),
+    )
 }
 
 fn copy_context<'a>(context: &PackageContext<'a>) -> PackageContext<'a> {
@@ -1255,7 +1524,18 @@ fn uses_behavioral_tags(selector: &Selector) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::policy::PolicyEntry;
     use super::*;
+
+    #[test]
+    fn a_selector_may_match_an_unlisted_package_it_names_or_doesnt_limit() {
+        let unlisted = vec![("tool".to_string(), "unreadable".to_string())];
+
+        assert!(may_match_any("#tool", &unlisted));
+        assert!(may_match_any(":skills", &unlisted));
+        assert!(!may_match_any("#other", &unlisted));
+        assert!(!may_match_any("#tool", &[]));
+    }
 
     #[test]
     fn ids_name_packages_with_or_without_a_version() {
@@ -1286,7 +1566,14 @@ mod tests {
             malware: None,
         };
         let graph = DepGraph::empty();
-        selector_naming(&selector, &context, "", &graph, &HashMap::new())
+        selector_naming(
+            &selector,
+            &context,
+            "",
+            &graph,
+            &HashMap::new(),
+            Truth::True,
+        )
     }
 
     fn entry(text: &str) -> PolicyEntry {
@@ -1323,14 +1610,56 @@ mod tests {
             deny_unreadable: false,
         };
         let skills = vec!["tool".to_string()];
-        let decision = decide(
+        let ruling = decide(
             &policy,
             &context(&skills),
             "node_modules/tool",
             &DepGraph::empty(),
             &HashMap::new(),
         );
-        assert!(matches!(decision, Decision::Denied), "{decision:?}");
+        assert!(matches!(ruling.decision, Decision::Denied), "{ruling:?}");
+    }
+
+    #[test]
+    fn an_undecided_skill_carries_the_naming_its_possible_allowing_entries_would_give() {
+        let skills = vec!["tool".to_string()];
+        let ruling_for = |allow: &[&str]| {
+            let policy = SkillsPolicy {
+                allow: allow.iter().map(|text| entry(text)).collect(),
+                deny: Vec::new(),
+                targets: super::super::policy::Targets::Auto,
+                deny_unreadable: false,
+            };
+            decide(
+                &policy,
+                &context(&skills),
+                "node_modules/tool",
+                &DepGraph::empty(),
+                &HashMap::new(),
+            )
+        };
+
+        let unnamed = ruling_for(&[":not(:malware)"]);
+        assert_eq!(unnamed.decision, Decision::Unknown);
+        assert_eq!(unnamed.possible_naming, Naming::None);
+        assert_eq!(
+            ruling_for(&[":not(:malware)", "#tool:skill(tool):not(:malware)"]).possible_naming,
+            Naming::Skill
+        );
+        let branch = ruling_for(&["#other, #tool:skill(tool):not(:malware)"]);
+        assert_eq!(branch.decision, Decision::Unknown);
+        assert_eq!(
+            branch.possible_naming,
+            Naming::Skill,
+            "an undecided `,` branch names the skill once the verdict arrives"
+        );
+        let masked = ruling_for(&[":skills", "#tool:skill(tool):not(:malware)"]);
+        assert_eq!(masked.decision, Decision::Allowed(Naming::None));
+        assert_eq!(
+            masked.possible_naming,
+            Naming::Skill,
+            "an entry that holds but names it less specifically hides nothing"
+        );
     }
 
     #[cfg(unix)]
@@ -1392,6 +1721,8 @@ mod tests {
                 package: 0,
                 skill: "guide".into(),
                 decision: Decision::Allowed(Naming::Package),
+                open_denials: 0,
+                possible_naming: Naming::Package,
                 direct: true,
             },
             Decided {
@@ -1399,6 +1730,8 @@ mod tests {
                 package: 1,
                 skill: "guide".into(),
                 decision: Decision::Unknown,
+                open_denials: 0,
+                possible_naming: Naming::None,
                 direct: true,
             },
         ];

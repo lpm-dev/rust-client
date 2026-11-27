@@ -25,8 +25,12 @@ const GROUP_NETWORK: &str = "Network";
 const GROUP_EXTENSIONS: &str = "Local policy extensions";
 const GROUP_ADDITIONAL: &str = "Additional saved values";
 
-const STATIC_CONFIG_ENTRY_COUNT: usize = 36;
-const LEGACY_CONFIG_PATHS: &[&str] = &["firewall.npm.policies.static_only_suspicious", "noSkills"];
+const STATIC_CONFIG_ENTRY_COUNT: usize = 37;
+const LEGACY_CONFIG_PATHS: &[&str] = &[
+    "firewall.npm.policies.static_only_suspicious",
+    "noSkills",
+    "auto-install-lpm-skills",
+];
 
 #[derive(Debug)]
 pub(super) struct EffectiveConfig {
@@ -1049,26 +1053,34 @@ fn add_install_entries(
     ));
 
     let skills = crate::lpm_skills_config::LpmSkillsPreference::Config.resolve(global)?;
-    let skills_source = if global
-        .get_value(crate::lpm_skills_config::AUTO_INSTALL_LPM_SKILLS_KEY)
-        .is_some()
-    {
-        user_source.to_string()
-    } else if read_optional_bool(
-        global,
-        crate::lpm_skills_config::LEGACY_NO_SKILLS_KEY,
-        global_path,
-    )?
-    .is_some()
-    {
-        format!("{user_source} (legacy noSkills)")
-    } else {
-        DEFAULT_SOURCE.to_string()
+    let skills_source = match crate::lpm_skills_config::lpm_dev_skills_source(global) {
+        crate::lpm_skills_config::LpmDevSkillsSource::Skills => user_source.to_string(),
+        crate::lpm_skills_config::LpmDevSkillsSource::LegacyAutoInstall => {
+            format!("{user_source} (legacy auto-install-lpm-skills)")
+        }
+        crate::lpm_skills_config::LpmDevSkillsSource::LegacyNoSkills => {
+            format!("{user_source} (legacy noSkills)")
+        }
+        crate::lpm_skills_config::LpmDevSkillsSource::Default => DEFAULT_SOURCE.to_string(),
     };
     entries.push(EffectiveConfigEntry::new(
-        crate::lpm_skills_config::AUTO_INSTALL_LPM_SKILLS_KEY,
+        crate::lpm_skills_config::LPM_DEV_PACKAGES_SETTING,
         skills,
         skills_source,
+        GROUP_INSTALL,
+    ));
+    let other_packages = crate::lpm_skills_config::other_package_skills_enabled(global)?;
+    let other_packages_configured = global
+        .get_table(crate::lpm_skills_config::SKILLS_TABLE)
+        .is_some_and(|table| table.contains_key(crate::lpm_skills_config::OTHER_PACKAGES_KEY));
+    entries.push(EffectiveConfigEntry::new(
+        crate::lpm_skills_config::OTHER_PACKAGES_SETTING,
+        other_packages,
+        if other_packages_configured {
+            user_source
+        } else {
+            DEFAULT_SOURCE
+        },
         GROUP_INSTALL,
     ));
 

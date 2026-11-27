@@ -18,6 +18,9 @@ pub(super) enum SkillInventoryKind {
     Package,
     Managed,
     External,
+    /// A skill an installed dependency ships, linked by the project's
+    /// skills policy.
+    Dependency,
 }
 
 impl SkillInventoryKind {
@@ -26,6 +29,7 @@ impl SkillInventoryKind {
             Self::Package => "package",
             Self::Managed => "managed",
             Self::External => "external",
+            Self::Dependency => "dependency",
         }
     }
 }
@@ -178,6 +182,7 @@ pub(super) struct InventoryCounts {
     package: usize,
     managed: usize,
     external: usize,
+    dependency: usize,
     disabled: usize,
     needs_attention: usize,
     security_warnings: usize,
@@ -450,6 +455,10 @@ fn inventory_counts(skills: &[SkillInventoryItem]) -> InventoryCounts {
         external: skills
             .iter()
             .filter(|skill| skill.kind == SkillInventoryKind::External)
+            .count(),
+        dependency: skills
+            .iter()
+            .filter(|skill| skill.kind == SkillInventoryKind::Dependency)
             .count(),
         disabled: skills
             .iter()
