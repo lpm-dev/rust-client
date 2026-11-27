@@ -55,11 +55,12 @@ use lpm_common::{
 use lpm_store::v2::Store as V2Store;
 use serde::Serialize;
 use serde::ser::SerializeSeq;
-use std::collections::HashSet;
-use std::ffi::OsStr;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::cache::PruneFlags;
@@ -516,9 +517,13 @@ fn apply_plan(
     {
         summary.bytes_freed_or_eligible = 0;
         let prune_tombstone_path = v2_store.paths().root().join(".prune-tombstones");
-        let prune_tombstones =
-            PruneTombstones::open_in(directory.try_clone()?, &prune_tombstone_path, true)?
-                .expect("creating the prune tombstone root must return an open directory");
+        let mut prune_tombstones = PruneTombstones::open_in(
+            directory.try_clone()?,
+            &prune_tombstone_path,
+            true,
+            v2_store.uses_serialized_volume_metadata(),
+        )?
+        .expect("creating the prune tombstone root must return an open directory");
         prune_tombstones.sweep()?;
         // When the registry is missing OR corrupt AND no explicit
         // `--project` was given, `compute_prune_plan` skipped the
@@ -528,46 +533,40 @@ fn apply_plan(
         // tombstone sweep below still runs because it's independent
         // of project reachability.
         if !summary.registry_missing && !summary.registry_corrupt {
-            for orphan in &summary.link_entries_orphaned {
-                add_removed_bytes(
-                    &mut summary.bytes_freed_or_eligible,
-                    prune_tombstones.remove(orphan)?,
-                );
-            }
-            for orphan in &summary.object_entries_orphaned {
-                add_removed_bytes(
-                    &mut summary.bytes_freed_or_eligible,
-                    prune_tombstones.remove(orphan)?,
-                );
-            }
+            add_removed_bytes(
+                &mut summary.bytes_freed_or_eligible,
+                prune_tombstones.remove_directories(&summary.link_entries_orphaned)?,
+            );
+            add_removed_bytes(
+                &mut summary.bytes_freed_or_eligible,
+                prune_tombstones.remove_directories(&summary.object_entries_orphaned)?,
+            );
             for source_record in &summary.cas_source_record_files_orphaned {
                 add_removed_bytes(
                     &mut summary.bytes_freed_or_eligible,
-                    prune_tombstones.remove(source_record)?,
+                    prune_tombstones.remove_file_direct(source_record)?,
                 );
             }
             for validation in &summary.cas_source_validation_files_orphaned {
                 add_removed_bytes(
                     &mut summary.bytes_freed_or_eligible,
-                    prune_tombstones.remove(validation)?,
+                    prune_tombstones.remove_file_direct(validation)?,
                 );
             }
-            for entry in &summary.cas_materialized_entries_orphaned {
-                add_removed_bytes(
-                    &mut summary.bytes_freed_or_eligible,
-                    prune_tombstones.remove(entry)?,
-                );
-            }
+            add_removed_bytes(
+                &mut summary.bytes_freed_or_eligible,
+                prune_tombstones.remove_directories(&summary.cas_materialized_entries_orphaned)?,
+            );
             for manifest in &summary.cas_tree_files_orphaned {
                 add_removed_bytes(
                     &mut summary.bytes_freed_or_eligible,
-                    prune_tombstones.remove(manifest)?,
+                    prune_tombstones.remove_file_direct(manifest)?,
                 );
             }
             for blob in &summary.cas_blob_files_orphaned {
                 add_removed_bytes(
                     &mut summary.bytes_freed_or_eligible,
-                    prune_tombstones.remove(blob)?,
+                    prune_tombstones.remove_file_direct(blob)?,
                 );
             }
         }
@@ -576,18 +575,14 @@ fn apply_plan(
         // unlike link/object orphan deletion it's LRU + crash-recovery
         // (never reachability), so a missing/corrupt registry can't make it
         // wrongly wipe a live island.
-        for island in &summary.compat_islands_orphaned {
-            add_removed_bytes(
-                &mut summary.bytes_freed_or_eligible,
-                prune_tombstones.remove(island)?,
-            );
-        }
-        for artifact in &summary.build_artifacts_orphaned {
-            add_removed_bytes(
-                &mut summary.bytes_freed_or_eligible,
-                prune_tombstones.remove(artifact)?,
-            );
-        }
+        add_removed_bytes(
+            &mut summary.bytes_freed_or_eligible,
+            prune_tombstones.remove_directories(&summary.compat_islands_orphaned)?,
+        );
+        add_removed_bytes(
+            &mut summary.bytes_freed_or_eligible,
+            prune_tombstones.remove_directories(&summary.build_artifacts_orphaned)?,
+        );
         remove_orphaned_build_locks_in(v2_store, directory)?;
         remove_orphaned_build_entry_locks_in(v2_store, directory, &summary.live_graph_keys)?;
 
@@ -634,10 +629,25 @@ fn sweep_prune_tombstones(tombstone_root: &Path) -> Result<(), LpmError> {
     Ok(())
 }
 
+const MAX_CACHED_PRUNE_PARENT_DIRS: usize = 32;
+const PARALLEL_TOMBSTONE_SWEEP_THRESHOLD: usize = 8;
+const PARALLEL_DRY_RUN_DIR_SIZE_THRESHOLD: usize = 32;
+
+fn directory_sweep_workers(serialized_volume: bool) -> usize {
+    let cpus = lpm_common::resources::effective_cpu_count();
+    if serialized_volume {
+        cpus.min(2)
+    } else {
+        cpus.min(8)
+    }
+}
+
 struct PruneTombstones {
     store_directory: cap_std::fs::Dir,
     directory: cap_std::fs::Dir,
     path: PathBuf,
+    parent_dirs: HashMap<PathBuf, Option<cap_std::fs::Dir>>,
+    sweep_workers: usize,
 }
 
 impl PruneTombstones {
@@ -660,13 +670,14 @@ impl PruneTombstones {
                 }
                 Err(error) => return Err(error.into()),
             };
-        Self::open_in(parent, path, create)
+        Self::open_in(parent, path, create, cfg!(target_os = "macos"))
     }
 
     fn open_in(
         parent: cap_std::fs::Dir,
         path: &Path,
         create: bool,
+        serialized_volume: bool,
     ) -> Result<Option<Self>, LpmError> {
         let name = path.file_name().ok_or_else(|| {
             LpmError::Store(format!(
@@ -700,20 +711,21 @@ impl PruneTombstones {
             store_directory: parent,
             directory,
             path: path.to_path_buf(),
+            parent_dirs: HashMap::new(),
+            sweep_workers: directory_sweep_workers(serialized_volume),
         }))
     }
 
     fn sweep(&self) -> Result<(), LpmError> {
+        let mut names = Vec::new();
         for entry in self.directory.entries()? {
-            let entry = entry?;
-            super::cache::remove_open_entry_with_size(&self.directory, &entry.file_name())?;
+            names.push(entry?.file_name());
         }
+        self.sweep_entries(&names)?;
         Ok(())
     }
 
-    fn remove(&self, path: &Path) -> Result<u64, LpmError> {
-        use rand::Rng;
-
+    fn resolve_target<'a>(&self, path: &'a Path) -> Result<(&'a Path, &'a OsStr), LpmError> {
         let parent_path = path.parent().ok_or_else(|| {
             LpmError::Store(format!(
                 "cache prune target has no parent: {}",
@@ -733,26 +745,180 @@ impl PruneTombstones {
         let relative = parent_path
             .strip_prefix(store_path)
             .map_err(|_| LpmError::Store("cache prune: deletion target escapes store".into()))?;
-        let Some(source_parent) = inventory::open_directory(&self.store_directory, relative)?
-        else {
+        Ok((relative, source_name))
+    }
+
+    fn open_parent_dir(&mut self, relative: &Path) -> Result<Option<&cap_std::fs::Dir>, LpmError> {
+        if !self.parent_dirs.contains_key(relative) {
+            if self.parent_dirs.len() >= MAX_CACHED_PRUNE_PARENT_DIRS {
+                self.parent_dirs.clear();
+            }
+            let opened = inventory::open_directory(&self.store_directory, relative)?;
+            self.parent_dirs.insert(relative.to_path_buf(), opened);
+        }
+        Ok(self.parent_dirs.get(relative).and_then(Option::as_ref))
+    }
+
+    /// Unlink a single regular CAS orphan directly inside its validated open
+    /// shard directory. Single-file `unlink` is already atomic, avoiding the
+    /// rename-to-tombstone round-trip on thousands of CAS files; unexpected
+    /// non-file entries fall back to the tombstone path.
+    fn remove_file_direct(&mut self, path: &Path) -> Result<u64, LpmError> {
+        let (relative, source_name) = self.resolve_target(path)?;
+        let Some(source_parent) = self.open_parent_dir(relative)? else {
             return Ok(0);
         };
+        let metadata = match source_parent.symlink_metadata(source_name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => {
+                return Err(LpmError::Store(format!(
+                    "cache prune: failed to inspect {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        if metadata.is_file() && !super::cache::cap_metadata_is_link_or_reparse(&metadata) {
+            let len = metadata.len();
+            return match source_parent.remove_file(source_name) {
+                Ok(()) => Ok(len),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+                Err(error) => Err(LpmError::Store(format!(
+                    "cache prune: failed to remove {}: {error}",
+                    path.display()
+                ))),
+            };
+        }
+        self.remove(path)
+    }
+
+    fn stage_for_removal(&mut self, path: &Path) -> Result<Option<OsString>, LpmError> {
+        use rand::Rng;
+
+        let (relative, source_name) = self.resolve_target(path)?;
         let suffix = rand::rng().next_u64();
         let label = source_name.to_string_lossy();
         let tombstone_name = format!("{label}.{suffix:016x}");
-        match source_parent.rename(source_name, &self.directory, OsStr::new(&tombstone_name)) {
-            Ok(()) => Ok(super::cache::remove_open_entry_with_size(
-                &self.directory,
-                OsStr::new(&tombstone_name),
-            )?
-            .unwrap_or(0)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        let tombstone_dir = &self.directory;
+        if !self.parent_dirs.contains_key(relative) {
+            if self.parent_dirs.len() >= MAX_CACHED_PRUNE_PARENT_DIRS {
+                self.parent_dirs.clear();
+            }
+            let opened = inventory::open_directory(&self.store_directory, relative)?;
+            self.parent_dirs.insert(relative.to_path_buf(), opened);
+        }
+        let Some(source_parent) = self.parent_dirs.get(relative).and_then(Option::as_ref) else {
+            return Ok(None);
+        };
+        match source_parent.rename(source_name, tombstone_dir, OsStr::new(&tombstone_name)) {
+            Ok(()) => Ok(Some(OsString::from(tombstone_name))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(LpmError::Store(format!(
                 "cache prune: failed to tombstone {} under {}: {error}",
                 path.display(),
                 self.path.display()
             ))),
         }
+    }
+
+    fn remove(&mut self, path: &Path) -> Result<u64, LpmError> {
+        let Some(tombstone_name) = self.stage_for_removal(path)? else {
+            return Ok(0);
+        };
+        Ok(
+            super::cache::remove_open_entry_with_size(&self.directory, &tombstone_name)?
+                .unwrap_or(0),
+        )
+    }
+
+    fn remove_directories(&mut self, paths: &[PathBuf]) -> Result<u64, LpmError> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        if paths.len() < PARALLEL_TOMBSTONE_SWEEP_THRESHOLD || self.sweep_workers <= 1 {
+            let mut total = 0u64;
+            for path in paths {
+                add_removed_bytes(&mut total, self.remove(path)?);
+            }
+            return Ok(total);
+        }
+        let mut staged = Vec::with_capacity(paths.len());
+        for path in paths {
+            if let Some(name) = self.stage_for_removal(path)? {
+                staged.push(name);
+            }
+        }
+        self.sweep_entries(&staged)
+    }
+
+    fn sweep_entries(&self, names: &[OsString]) -> Result<u64, LpmError> {
+        if names.is_empty() {
+            return Ok(0);
+        }
+        if names.len() < PARALLEL_TOMBSTONE_SWEEP_THRESHOLD || self.sweep_workers <= 1 {
+            let mut total = 0u64;
+            for name in names {
+                if let Some(removed) =
+                    super::cache::remove_open_entry_with_size(&self.directory, name)?
+                {
+                    add_removed_bytes(&mut total, removed);
+                }
+            }
+            return Ok(total);
+        }
+
+        let workers = self.sweep_workers.min(names.len());
+        let next_index = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        let directory = &self.directory;
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for _ in 0..workers {
+                handles.push(scope.spawn(|| -> Result<u64, LpmError> {
+                    let mut local_bytes = 0u64;
+                    while !failed.load(Ordering::Relaxed) {
+                        let idx = next_index.fetch_add(1, Ordering::Relaxed);
+                        let Some(name) = names.get(idx) else {
+                            break;
+                        };
+                        match super::cache::remove_open_entry_with_size(directory, name) {
+                            Ok(Some(bytes)) => add_removed_bytes(&mut local_bytes, bytes),
+                            Ok(None) => {}
+                            Err(error) => {
+                                failed.store(true, Ordering::Relaxed);
+                                return Err(error);
+                            }
+                        }
+                    }
+                    Ok(local_bytes)
+                }));
+            }
+
+            let mut total = 0u64;
+            let mut first_error: Option<LpmError> = None;
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(bytes)) => add_removed_bytes(&mut total, bytes),
+                    Ok(Err(error)) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                    Err(_) => {
+                        if first_error.is_none() {
+                            first_error = Some(LpmError::Store(
+                                "cache prune: tombstone sweep worker panicked".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(total),
+            }
+        })
     }
 }
 
@@ -1139,9 +1305,7 @@ fn compute_prune(
     // raw child path relative to the retained store directory.
     let mut all_link_entries = Vec::new();
     let mut root_link_indices = Vec::with_capacity(root_link_dirs.len());
-    inventory::walk_link_entries(v2_store, |raw_dir, meta| {
-        let canonical_dir = std::fs::canonicalize(&raw_dir)
-            .map_err(|error| prune_inspection_error(&raw_dir, error))?;
+    inventory::walk_link_entries(v2_store, |raw_dir, canonical_dir, meta| {
         if !canonical_dir.starts_with(&links_root_canonical) {
             return Err(LpmError::Store(
                 "cache prune: link entry escapes its store".into(),
@@ -1309,35 +1473,12 @@ fn compute_prune(
 
     let mut bytes_freed_or_eligible = 0u64;
     if build_full_plan && !flags.apply {
-        let total_orphan_dirs = link_entries_orphaned.len()
-            + object_entries_orphaned.len()
-            + compat_islands_orphaned.len()
-            + build_artifacts_orphaned.len();
-        if total_orphan_dirs >= 4 {
-            use rayon::prelude::*;
-            bytes_freed_or_eligible = [
-                &link_entries_orphaned,
-                &object_entries_orphaned,
-                &compat_islands_orphaned,
-                &build_artifacts_orphaned,
-            ]
-            .into_iter()
-            .flat_map(|dirs| dirs.iter())
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|dir| dir_size(dir).unwrap_or(0))
-            .reduce(|| 0u64, u64::saturating_add);
-        } else {
-            for dir in link_entries_orphaned
-                .iter()
-                .chain(&object_entries_orphaned)
-                .chain(&compat_islands_orphaned)
-                .chain(&build_artifacts_orphaned)
-            {
-                bytes_freed_or_eligible =
-                    bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
-            }
-        }
+        bytes_freed_or_eligible = sum_orphan_dir_sizes(&[
+            &link_entries_orphaned,
+            &object_entries_orphaned,
+            &compat_islands_orphaned,
+            &build_artifacts_orphaned,
+        ]);
     }
 
     let stats = PruneStats {
@@ -1505,6 +1646,50 @@ fn parse_duration(s: &str) -> Result<Age, LpmError> {
         LpmError::Registry(format!(
             "cache prune: --max-age {s} is too large to represent"
         ))
+    })
+}
+
+fn sum_orphan_dir_sizes(groups: &[&[PathBuf]]) -> u64 {
+    let total_dirs: usize = groups.iter().map(|group| group.len()).sum();
+    if total_dirs == 0 {
+        return 0;
+    }
+    let workers = lpm_common::resources::effective_cpu_count().min(4);
+    if total_dirs < PARALLEL_DRY_RUN_DIR_SIZE_THRESHOLD || workers <= 1 {
+        let mut total = 0u64;
+        for dir in groups.iter().flat_map(|group| group.iter()) {
+            total = total.saturating_add(dir_size(dir).unwrap_or(0));
+        }
+        return total;
+    }
+    let dirs: Vec<&Path> = groups
+        .iter()
+        .flat_map(|group| group.iter().map(PathBuf::as_path))
+        .collect();
+    let next_index = AtomicUsize::new(0);
+    let workers = workers.min(dirs.len());
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            handles.push(scope.spawn(|| {
+                let mut local = 0u64;
+                loop {
+                    let idx = next_index.fetch_add(1, Ordering::Relaxed);
+                    let Some(&dir) = dirs.get(idx) else {
+                        break;
+                    };
+                    local = local.saturating_add(dir_size(dir).unwrap_or(0));
+                }
+                local
+            }));
+        }
+        let mut total = 0u64;
+        for handle in handles {
+            if let Ok(local) = handle.join() {
+                total = total.saturating_add(local);
+            }
+        }
+        total
     })
 }
 
@@ -2787,6 +2972,184 @@ mod tests {
         assert_eq!(output.matches("object orphan:").count(), 10);
         assert!(!output.contains("compat island orphan:"));
         assert!(output.contains("7 additional orphan path(s) omitted"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn walk_link_entries_rejects_tampered_dep_and_symlink_traversal_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(dir.path().join("lpm-home"));
+        let store = V2Store::from_lpm_root(&root);
+
+        let parent_sri = synthetic_sri(b"tamper/parent");
+        let child_sri = synthetic_sri(b"tamper/child");
+        let other_sri = synthetic_sri(b"tamper/other");
+        write_object(&store, &parent_sri);
+        write_object(&store, &child_sri);
+        write_object(&store, &other_sri);
+
+        let parent_key = key_for("parent", "1.0.0");
+        let child_key = key_for("child", "1.0.0");
+        let other_key = key_for("other", "1.0.0");
+
+        for (key, sri, deps) in [
+            (child_key.clone(), child_sri, vec![]),
+            (other_key.clone(), other_sri, vec![]),
+            (
+                parent_key.clone(),
+                parent_sri,
+                vec![DepLink {
+                    local: "child".into(),
+                    target: child_key.clone(),
+                }],
+            ),
+        ] {
+            store
+                .populate_link_entry(LinkEntryRequest {
+                    graph_key: key,
+                    source_sri: sri.clone(),
+                    object_dir: store.paths().object_dir(&sri).unwrap(),
+                    deps,
+                    platform: Arc::new(sample_meta_platform()),
+                })
+                .unwrap();
+        }
+
+        let project = dir.path().join("project");
+        synthesize_project(&project, &store, &[("parent", parent_key.clone())]);
+        known_projects::register(&root.known_projects(), &project).unwrap();
+
+        let clean = compute_prune_plan(&root, &store, &PruneFlags::default(), None).unwrap();
+        assert_eq!(clean.link_entries_reachable, 2);
+
+        let dep_link = store
+            .paths()
+            .link_dir(&parent_key)
+            .join("node_modules")
+            .join("child");
+        std::fs::remove_file(&dep_link).unwrap();
+        std::os::unix::fs::symlink(store.paths().link_package_dir(&other_key), &dep_link).unwrap();
+        let err = compute_prune_plan(&root, &store, &PruneFlags::default(), None).unwrap_err();
+        assert!(
+            err.to_string().contains("disagrees with installed link"),
+            "tampered dep link must fail validation: {err}"
+        );
+
+        let outside_base = dir.path().join("outside-tree");
+        let decoy_target = outside_base.join("a").join("b").join("c");
+        let fake_child = outside_base
+            .join(child_key.dir_name())
+            .join("node_modules")
+            .join("child");
+        std::fs::create_dir_all(&decoy_target).unwrap();
+        std::fs::create_dir_all(&fake_child).unwrap();
+        let decoy_link = store
+            .paths()
+            .link_dir(&parent_key)
+            .join("node_modules")
+            .join("decoy");
+        std::os::unix::fs::symlink(&decoy_target, &decoy_link).unwrap();
+        std::fs::remove_file(&dep_link).unwrap();
+        let sneaky_target = PathBuf::from("decoy")
+            .join("..")
+            .join("..")
+            .join("..")
+            .join(child_key.dir_name())
+            .join("node_modules")
+            .join("child");
+        std::os::unix::fs::symlink(&sneaky_target, &dep_link).unwrap();
+
+        let err = compute_prune_plan(&root, &store, &PruneFlags::default(), None).unwrap_err();
+        assert!(
+            err.to_string().contains("disagrees with installed link"),
+            "symlink traversal must fall back to canonicalize and reject: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_apply_unlinks_cas_files_directly_and_sweeps_orphan_dir_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(dir.path().join("lpm-home"));
+        let v3 = V2Store::from_lpm_root_for_version(&root, lpm_store::StoreVersion::V3);
+
+        let live_sri = synthetic_sri(b"batch-prune/live");
+        write_object(&v3, &live_sri);
+        let live_key = key_for("live-pkg", "1.0.0");
+        v3.populate_link_entry(LinkEntryRequest {
+            graph_key: live_key.clone(),
+            source_sri: live_sri.clone(),
+            object_dir: v3.paths().object_dir(&live_sri).unwrap(),
+            deps: Vec::new(),
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+
+        for i in 0..10 {
+            let name = format!("orphan-{i}");
+            let seed = format!("batch-prune/orphan-{i}");
+            let sri = synthetic_sri(seed.as_bytes());
+            write_object(&v3, &sri);
+            let key = key_for(&name, "1.0.0");
+            v3.populate_link_entry(LinkEntryRequest {
+                graph_key: key,
+                source_sri: sri.clone(),
+                object_dir: v3.paths().object_dir(&sri).unwrap(),
+                deps: Vec::new(),
+                platform: Arc::new(sample_meta_platform()),
+            })
+            .unwrap();
+        }
+
+        let project = dir.path().join("project");
+        synthesize_project(&project, &v3, &[("live-pkg", live_key.clone())]);
+        known_projects::register(&root.known_projects(), &project).unwrap();
+
+        let summary = run_locked(
+            &root,
+            &v3,
+            &PruneFlags {
+                apply: true,
+                ..PruneFlags::default()
+            },
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert!(summary.applied);
+        assert_eq!(summary.link_entries_orphaned.len(), 10);
+        assert_eq!(summary.object_entries_orphaned.len(), 10);
+        assert!(summary.bytes_freed_or_eligible > 0);
+        assert!(v3.paths().link_dir(&live_key).exists());
+        for orphan in &summary.link_entries_orphaned {
+            assert!(
+                !orphan.exists(),
+                "orphan link dir should be removed: {}",
+                orphan.display()
+            );
+        }
+        for orphan in &summary.object_entries_orphaned {
+            assert!(
+                !orphan.exists(),
+                "orphan object dir should be removed: {}",
+                orphan.display()
+            );
+        }
+        for cas_file in summary
+            .cas_source_record_files_orphaned
+            .iter()
+            .chain(&summary.cas_source_validation_files_orphaned)
+            .chain(&summary.cas_tree_files_orphaned)
+            .chain(&summary.cas_blob_files_orphaned)
+        {
+            assert!(
+                !cas_file.exists(),
+                "orphan CAS file should be directly unlinked: {}",
+                cas_file.display()
+            );
+        }
     }
 
     #[test]

@@ -4653,6 +4653,26 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Returns `true` when the store lives on a filesystem whose volume-wide
+    /// metadata lock serializes concurrent directory writes and removals
+    /// (macOS APFS and Linux btrfs).
+    pub fn uses_serialized_volume_metadata(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            true
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.needs_linux_populate_cap()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            false
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn linux_statfs_type(path: &Path) -> Option<u64> {
     use std::ffi::CString;
