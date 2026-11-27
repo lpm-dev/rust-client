@@ -623,7 +623,12 @@ fn command_directory_in_with_hook(
     let file_stamps: Option<Vec<(&'static str, FileStamp)>> = npm
         .command_files()
         .into_iter()
-        .map(|(name, _)| Some((name, FileStamp::from_path(&directory.join(name))?)))
+        .map(|(name, expected)| {
+            Some((
+                name,
+                verified_written_shim_stamp(&directory.join(name), expected.as_bytes())?,
+            ))
+        })
         .collect();
     if let Some(file_stamps) = file_stamps {
         if written.len() >= MAX_NODE_GYP_CACHE_ENTRIES && !written.contains_key(&key) {
@@ -639,6 +644,31 @@ fn command_directory_in_with_hook(
         );
     }
     Some(directory)
+}
+
+/// Bind a shim file's cached stamp directly to the bytes we just wrote, so a
+/// concurrent writer in another process cannot have its stamps cached under
+/// this process's version.
+fn verified_written_shim_stamp(path: &Path, expected: &[u8]) -> Option<FileStamp> {
+    use std::io::Read as _;
+
+    let mut file = lpm_common::open_nofollow(path).ok()?;
+    let pre_meta = file.metadata().ok()?;
+    if !pre_meta.is_file() || pre_meta.len() != expected.len() as u64 {
+        return None;
+    }
+    let pre = FileStamp::from_metadata(&pre_meta);
+    let mut bytes = Vec::with_capacity(expected.len());
+    file.by_ref()
+        .take(expected.len().saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes != expected {
+        return None;
+    }
+    let post_fd = FileStamp::from_metadata(&file.metadata().ok()?);
+    let post_path = FileStamp::from_path(path)?;
+    (post_fd == pre && post_path == pre).then_some(pre)
 }
 
 #[cfg(test)]
@@ -1144,6 +1174,46 @@ pub(crate) mod tests {
         assert!(
             !shim_text.contains("12.0.0-racer"),
             "restored 11.0.0 lookup must not serve cached 12.0.0 shims:\n{shim_text}"
+        );
+    }
+
+    #[test]
+    fn external_process_overwrite_during_write_cannot_poison_version_shim_stamps() {
+        let root = tempfile::tempdir().unwrap();
+        let prefix = root.path().join("node-ext-race");
+        let commands = root.path().join("commands");
+        let bin = node_with_npm(&prefix, "11.0.0", "console.log('ok');");
+        let npm_initial = NpmNodeGyp::beside_node_on(bin.as_os_str()).expect("initial node-gyp");
+        let shim_name = if cfg!(windows) {
+            "node-gyp.cmd"
+        } else {
+            "node-gyp"
+        };
+        let other_process_npm = NpmNodeGyp {
+            script: npm_initial.script,
+            modules: npm_initial.modules,
+            version: "12.0.0-external".to_string(),
+        };
+        let commands_for_hook = commands.clone();
+
+        // Simulate an external process rewriting the shared commands dir right after
+        // process A writes its shims and before process A captures stamps.
+        let dir_a =
+            command_directory_in_with_hook(std::slice::from_ref(&bin), &commands, move || {
+                other_process_npm
+                    .write_commands(&commands_for_hook)
+                    .expect("external writer");
+            })
+            .expect("writer A command dir");
+
+        // Next request for 11.0.0 must NOT treat the external 12.0.0 shim on disk as
+        // a valid cached 11.0.0 shim.
+        let dir_next = command_directory_in(&[bin], &commands).expect("second 11.0.0 lookup");
+        assert_eq!(dir_next, dir_a);
+        let shim_text = std::fs::read_to_string(dir_next.join(shim_name)).unwrap();
+        assert!(
+            shim_text.contains("11.0.0") && !shim_text.contains("12.0.0-external"),
+            "cached stamps must not accept an externally overwritten shim:\n{shim_text}"
         );
     }
 }
