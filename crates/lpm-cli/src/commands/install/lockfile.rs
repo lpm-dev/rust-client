@@ -273,12 +273,14 @@ fn fresh_resolved_lockfile(
         index_prior_unpacked_sizes(&prior.packages)
     });
 
+    let mut locked_packages = Vec::with_capacity(persisted_packages.len());
     for package in persisted_packages {
         verify_local_manifest_fingerprint(input.project_dir, package)?;
         let mut locked_package = locked_package_from_install_package(package);
         preserve_prior_unpacked_size(&mut locked_package, &prior_unpacked_sizes);
-        lockfile.add_package(locked_package);
+        locked_packages.push(locked_package);
     }
+    lockfile.set_packages(locked_packages);
 
     lockfile.root_aliases = root_aliases_for_lockfile(persisted_packages, input.deps);
     lockfile.root_resolutions = root_resolutions_for_lockfile(persisted_packages);

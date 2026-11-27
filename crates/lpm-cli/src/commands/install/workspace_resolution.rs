@@ -992,11 +992,12 @@ impl RootProviderSnapshot {
     ) -> Self {
         super::ensure_install_package_instance_ids(&mut packages);
         let mut lockfile = lpm_lockfile::Lockfile::new();
-        for package in &packages {
-            lockfile.add_package(super::lockfile::locked_package_from_install_package(
-                package,
-            ));
-        }
+        lockfile.set_packages(
+            packages
+                .iter()
+                .map(super::lockfile::locked_package_from_install_package)
+                .collect(),
+        );
         let package = crate::workspace_discovery_cache::read_workspace_root_package(root_dir)
             .unwrap_or_default();
         let deps = super::manifest_install_deps(&package);

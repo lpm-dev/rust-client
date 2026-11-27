@@ -3,30 +3,55 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-pub(crate) type WorkspaceFreshnessEntries = Vec<(PathBuf, Vec<u8>)>;
+#[derive(Default)]
+pub(crate) struct WorkspaceFreshnessSnapshot {
+    pub(crate) entries: Vec<(PathBuf, Vec<u8>)>,
+    pub(crate) flattened: Vec<u8>,
+}
+
+impl WorkspaceFreshnessSnapshot {
+    pub(crate) fn from_normalized_entries(mut entries: Vec<(PathBuf, Vec<u8>)>) -> Self {
+        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        entries.dedup_by(|left, right| left.0 == right.0);
+        let capacity = entries.iter().fold(0usize, |total, (path, content)| {
+            total
+                .saturating_add(path.as_os_str().as_encoded_bytes().len())
+                .saturating_add(content.len())
+                .saturating_add(2)
+        });
+        let mut flattened = Vec::with_capacity(capacity);
+        for (path, content) in &entries {
+            flattened.extend_from_slice(path.to_string_lossy().as_bytes());
+            flattened.push(0);
+            flattened.extend_from_slice(content);
+            flattened.push(0);
+        }
+        Self { entries, flattened }
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct WorkspaceFreshnessCache {
-    entries: Mutex<Option<Arc<WorkspaceFreshnessEntries>>>,
+    snapshot: Mutex<Option<Arc<WorkspaceFreshnessSnapshot>>>,
 }
 
 impl WorkspaceFreshnessCache {
     pub(crate) fn invalidate(&self) {
         *self
-            .entries
+            .snapshot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     fn get_or_init(
         &self,
-        build: impl FnOnce() -> WorkspaceFreshnessEntries,
-    ) -> Arc<WorkspaceFreshnessEntries> {
-        let mut entries = self
-            .entries
+        build: impl FnOnce() -> WorkspaceFreshnessSnapshot,
+    ) -> Arc<WorkspaceFreshnessSnapshot> {
+        let mut snapshot = self
+            .snapshot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Arc::clone(entries.get_or_insert_with(|| Arc::new(build())))
+        Arc::clone(snapshot.get_or_insert_with(|| Arc::new(build())))
     }
 }
 
@@ -87,10 +112,10 @@ where
         .await
 }
 
-pub(crate) fn workspace_freshness_entries(
+pub(crate) fn workspace_freshness_snapshot(
     start_dir: &Path,
-    build: impl FnOnce() -> WorkspaceFreshnessEntries,
-) -> Arc<WorkspaceFreshnessEntries> {
+    build: impl FnOnce() -> WorkspaceFreshnessSnapshot,
+) -> Arc<WorkspaceFreshnessSnapshot> {
     if active_workspace(start_dir).is_none() {
         return Arc::new(build());
     }
@@ -252,13 +277,16 @@ mod tests {
         let builds = AtomicUsize::new(0);
 
         scope(workspace, None, cache, async {
-            let first = workspace_freshness_entries(directory.path(), || {
+            let first = workspace_freshness_snapshot(directory.path(), || {
                 builds.fetch_add(1, Ordering::SeqCst);
-                vec![(directory.path().to_path_buf(), b"first".to_vec())]
+                WorkspaceFreshnessSnapshot::from_normalized_entries(vec![(
+                    directory.path().to_path_buf(),
+                    b"first".to_vec(),
+                )])
             });
-            let second = workspace_freshness_entries(directory.path(), || {
+            let second = workspace_freshness_snapshot(directory.path(), || {
                 builds.fetch_add(1, Ordering::SeqCst);
-                Vec::new()
+                WorkspaceFreshnessSnapshot::default()
             });
 
             assert!(Arc::ptr_eq(&first, &second));
@@ -284,9 +312,11 @@ mod tests {
         let scoped_cache = Arc::clone(&cache);
 
         scope(workspace, None, cache, async {
-            let first = workspace_freshness_entries(directory.path(), Vec::new);
+            let first =
+                workspace_freshness_snapshot(directory.path(), WorkspaceFreshnessSnapshot::default);
             scoped_cache.invalidate();
-            let second = workspace_freshness_entries(directory.path(), Vec::new);
+            let second =
+                workspace_freshness_snapshot(directory.path(), WorkspaceFreshnessSnapshot::default);
 
             assert!(!Arc::ptr_eq(&first, &second));
         })

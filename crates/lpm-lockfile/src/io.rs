@@ -78,12 +78,20 @@ impl Lockfile {
         project_dir: &Path,
         lockfile: Lockfile,
     ) -> Result<PathBuf, LockfileError> {
-        match Self::read_for_project(project_dir) {
-            Ok(project) => {
-                let mut owner = Self::read_fast(&project.path)?;
-                owner.replace_importer(&project.importer, lockfile)?;
-                owner.write_all(&project.path)?;
-                Ok(project.path)
+        let project_root = if project_dir.join(LOCKFILE_NAME).exists() {
+            project_dir
+        } else {
+            project_dir
+                .ancestors()
+                .find(|ancestor| ancestor.join("package.json").is_file())
+                .unwrap_or(project_dir)
+        };
+        match read_project_document(project_root) {
+            Ok(selected) => {
+                let mut owner = selected.lockfile.0;
+                owner.replace_importer(&selected.importer, lockfile)?;
+                owner.write_all(&selected.path)?;
+                Ok(selected.path)
             }
             Err(LockfileError::NotFound(_)) => {
                 let path = project_dir.join(crate::LOCKFILE_NAME);
@@ -104,35 +112,38 @@ impl Lockfile {
     /// [`Lockfile::from_toml`]'s reader gate; together they make a
     /// bidirectional invariant rather than parser-only.
     pub fn to_toml(&self) -> Result<String, LockfileError> {
+        let lockfile_version = self.metadata.lockfile_version;
+        let mut first_git_package: Option<&str> = None;
         for package in self.packages.iter().chain(self.workspace_packages.values()) {
-            if !package.tarball_field_hint_is_consistent() {
+            let parsed_source = package.source_ref();
+            if !package.tarball_field_hint_is_consistent_with(&parsed_source) {
                 return Err(LockfileError::InvalidTarballHint {
                     package: package.name.clone(),
                 });
             }
-            Self::validate_loaded_package(package)?;
-            Self::validate_package_schema(package, self.metadata.lockfile_version)
+            Self::validate_loaded_package_with_source(package, &parsed_source)?;
+            Self::validate_package_schema_with_source(package, lockfile_version, &parsed_source)
                 .map_err(|error| LockfileError::Serialize(error.to_string()))?;
-            if let Some(reason) = package.git_metadata_error() {
+            if let Some(reason) = package.git_metadata_error_with_source(&parsed_source) {
                 return Err(LockfileError::Serialize(format!(
                     "package {:?} has invalid git metadata: {reason}",
                     package.name
                 )));
             }
+            if first_git_package.is_none()
+                && lockfile_version < crate::LOCKFILE_VERSION_WITH_GIT_RESOLUTIONS
+                && matches!(parsed_source, Some(Ok(crate::source::SourceRef::Git(_))))
+            {
+                first_git_package = Some(package.name.as_str());
+            }
         }
         Self::validate_standalone_package_order(&self.packages)
             .map_err(|error| LockfileError::Serialize(error.to_string()))?;
-        Self::validate_root_resolution_schema(
-            &self.root_resolutions,
-            self.metadata.lockfile_version,
-        )
-        .map_err(|error| LockfileError::Serialize(error.to_string()))?;
-        for snapshot in self.importers.values() {
-            Self::validate_root_resolution_schema(
-                &snapshot.root_resolutions,
-                self.metadata.lockfile_version,
-            )
+        Self::validate_root_resolution_schema(&self.root_resolutions, lockfile_version)
             .map_err(|error| LockfileError::Serialize(error.to_string()))?;
+        for snapshot in self.importers.values() {
+            Self::validate_root_resolution_schema(&snapshot.root_resolutions, lockfile_version)
+                .map_err(|error| LockfileError::Serialize(error.to_string()))?;
         }
         self.validate_workspace_projections()
             .map_err(|error| LockfileError::Serialize(error.to_string()))?;
@@ -142,8 +153,12 @@ impl Lockfile {
             .map_err(|error| LockfileError::Serialize(error.to_string()))?;
         self.validate_provenance()
             .map_err(LockfileError::Serialize)?;
-        if let Some(reason) = self.git_schema_error() {
-            return Err(LockfileError::Serialize(reason));
+        if let Some(package_name) = first_git_package {
+            return Err(LockfileError::Serialize(format!(
+                "package {:?} uses Git metadata, which requires lockfile version {}",
+                package_name,
+                crate::LOCKFILE_VERSION_WITH_GIT_RESOLUTIONS
+            )));
         }
         toml::to_string_pretty(self).map_err(|e| LockfileError::Serialize(e.to_string()))
     }
@@ -169,100 +184,58 @@ impl Lockfile {
         let lockfile: Lockfile = toml::from_str(input)
             .map_err(|error| LockfileError::Deserialize(error.message().to_string()))?;
 
-        if lockfile.metadata.lockfile_version > LOCKFILE_VERSION {
+        let lockfile_version = lockfile.metadata.lockfile_version;
+        if lockfile_version > LOCKFILE_VERSION {
             return Err(LockfileError::UnsupportedVersion {
-                found: lockfile.metadata.lockfile_version,
+                found: lockfile_version,
                 max_supported: LOCKFILE_VERSION,
             });
         }
+        let mut first_git_package: Option<&str> = None;
+        let mut first_empty_tarball_package: Option<&str> = None;
         for package in lockfile
             .packages
             .iter()
             .chain(lockfile.workspace_packages.values())
         {
-            if !package.tarball_field_hint_is_consistent() {
+            let parsed_source = package.source_ref();
+            if !package.tarball_field_hint_is_consistent_with(&parsed_source) {
                 return Err(LockfileError::InvalidTarballHint {
                     package: package.name.clone(),
                 });
             }
-            Self::validate_loaded_package(package)?;
-            Self::validate_package_schema(package, lockfile.metadata.lockfile_version)?;
+            Self::validate_loaded_package_with_source(package, &parsed_source)?;
+            Self::validate_package_schema_with_source(package, lockfile_version, &parsed_source)?;
+            if first_git_package.is_none()
+                && lockfile_version < crate::LOCKFILE_VERSION_WITH_GIT_RESOLUTIONS
+                && matches!(parsed_source, Some(Ok(crate::source::SourceRef::Git(_))))
+            {
+                first_git_package = Some(package.name.as_str());
+            }
+            if first_empty_tarball_package.is_none() && package.tarball.as_deref() == Some("") {
+                first_empty_tarball_package = Some(package.name.as_str());
+            }
         }
         Self::validate_standalone_package_order(&lockfile.packages)?;
-        Self::validate_root_resolution_schema(
-            &lockfile.root_resolutions,
-            lockfile.metadata.lockfile_version,
-        )?;
+        Self::validate_root_resolution_schema(&lockfile.root_resolutions, lockfile_version)?;
         for snapshot in lockfile.importers.values() {
-            Self::validate_root_resolution_schema(
-                &snapshot.root_resolutions,
-                lockfile.metadata.lockfile_version,
-            )?;
+            Self::validate_root_resolution_schema(&snapshot.root_resolutions, lockfile_version)?;
         }
-        if let Some(reason) = lockfile.git_schema_error() {
-            return Err(LockfileError::Deserialize(reason));
+        if let Some(package_name) = first_git_package {
+            return Err(LockfileError::Deserialize(format!(
+                "package {:?} uses Git metadata, which requires lockfile version {}",
+                package_name,
+                crate::LOCKFILE_VERSION_WITH_GIT_RESOLUTIONS
+            )));
         }
         lockfile.validate_workspace_projections()?;
         lockfile.validate_peer_edge_targets()?;
         lockfile.validate_instance_graph()?;
-
-        // An empty `tarball`, `source` or `integrity` would otherwise
-        // parse as a present value that names nothing.
-        for pkg in lockfile
-            .packages
-            .iter()
-            .chain(lockfile.workspace_packages.values())
-        {
-            if let Some(s) = pkg.source.as_deref()
-                && s.is_empty()
-            {
-                return Err(LockfileError::Deserialize(format!(
-                    "package '{}' has an empty 'source'; omit the field instead",
-                    pkg.name
-                )));
-            }
-            if let Some(s) = pkg.integrity.as_deref()
-                && s.is_empty()
-            {
-                return Err(LockfileError::Deserialize(format!(
-                    "package '{}' has an empty 'integrity'; omit the field instead",
-                    pkg.name
-                )));
-            }
-            if let Some(s) = pkg.tarball.as_deref()
-                && s.is_empty()
-            {
-                return Err(LockfileError::Deserialize(format!(
-                    "package '{}' has an empty 'tarball'; omit the field instead",
-                    pkg.name
-                )));
-            }
-
-            // `tarball` field-hint is valid only for Registry sources.
-            // Reject non-Registry shapes paired with a hint at the
-            // load boundary so the conflation never propagates into
-            // the install path.
-            if !pkg.tarball_field_hint_is_consistent() {
-                return Err(LockfileError::InvalidTarballHint {
-                    package: pkg.name.clone(),
-                });
-            }
-            if let Some(reason) = pkg.git_metadata_error() {
-                return Err(LockfileError::Deserialize(format!(
-                    "package {:?} has invalid git metadata: {reason}",
-                    pkg.name
-                )));
-            }
-
-            // Scope-pin `@lpm.dev/*` to the lpm.dev origin.
-            if let Some(source) = pkg.lpm_scope_origin_mismatch() {
-                return Err(LockfileError::InvalidScopeOrigin {
-                    package: pkg.name.clone(),
-                    source_identity: source,
-                });
-            }
+        if let Some(package_name) = first_empty_tarball_package {
+            return Err(LockfileError::Deserialize(format!(
+                "package '{package_name}' has an empty 'tarball'; omit the field instead"
+            )));
         }
-
         lockfile
             .validate_provenance()
             .map_err(LockfileError::Deserialize)?;

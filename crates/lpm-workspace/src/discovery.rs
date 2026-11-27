@@ -614,12 +614,30 @@ pub fn workspace_declares_member(root: &Path, project: &Path) -> Result<bool, Wo
         Err(error) => return Err(error),
     };
     let globs = workspace_member_globs(&root_package, pnpm_workspace.as_ref());
-    if !workspace_globs_include_project(project, root, &globs)? {
+    let (inclusions, exclusions) = compile_workspace_globs(root, &globs)?;
+    let Some(dir_has_symlink) =
+        directory_reachable_under_workspace_globs(project, root, &inclusions, &exclusions)?
+    else {
         return Ok(false);
-    }
+    };
     let manifest = project.join("package.json");
-    match std::fs::metadata(&manifest) {
-        Ok(metadata) => Ok(metadata.is_file()),
+    match std::fs::symlink_metadata(&manifest) {
+        Ok(metadata) => {
+            let needs_canonical =
+                if metadata.file_type().is_file() && !path_is_link_or_reparse(&metadata) {
+                    dir_has_symlink
+                } else if path_is_link_or_reparse(&metadata) && manifest.is_file() {
+                    true
+                } else {
+                    return Ok(false);
+                };
+            if needs_canonical {
+                let root_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+                let canonical_match = manifest.canonicalize().unwrap_or_else(|_| manifest.clone());
+                return Ok(canonical_match.starts_with(&root_canon));
+            }
+            Ok(true)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(WorkspaceError::Io(format!(
             "failed to inspect {}: {error}",
@@ -766,6 +784,146 @@ fn compiled_workspace_globs_include_project(
             .any(|glob| glob.matches_relative_directory(relative)))
 }
 
+fn directory_reachable_under_workspace_globs(
+    directory: &Path,
+    root: &Path,
+    inclusions: &[WorkspaceGlob],
+    exclusions: &[WorkspaceGlob],
+) -> Result<Option<bool>, WorkspaceError> {
+    let Ok(relative) = directory.strip_prefix(root) else {
+        return Ok(None);
+    };
+    let match_options = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    };
+    if exclusions
+        .iter()
+        .any(|exclusion| exclusion.matches_directory(relative, match_options))
+    {
+        return Ok(None);
+    }
+    let depth = relative
+        .components()
+        .filter(|component| matches!(component, std::path::Component::Normal(_)))
+        .count();
+    let mut best_has_symlink: Option<bool> = None;
+    for inclusion in inclusions {
+        if !inclusion.matches_directory(relative, match_options) {
+            continue;
+        }
+        if inclusion
+            .max_depth
+            .is_some_and(|max_depth| depth > max_depth)
+        {
+            continue;
+        }
+        let Ok(below_scan_root) = directory.strip_prefix(&inclusion.scan_root) else {
+            continue;
+        };
+        #[cfg(windows)]
+        let Some(mut dir_has_symlink) = inspect_scan_root(root, &inclusion.scan_root)? else {
+            continue;
+        };
+        #[cfg(not(windows))]
+        let Some(dir_has_symlink) = inspect_scan_root(root, &inclusion.scan_root)? else {
+            continue;
+        };
+        let mut cursor = inclusion.scan_root.clone();
+        let mut reachable = true;
+        for component in below_scan_root.components() {
+            let std::path::Component::Normal(part) = component else {
+                continue;
+            };
+            if part == "node_modules" {
+                reachable = false;
+                break;
+            }
+            cursor.push(part);
+            match std::fs::symlink_metadata(&cursor) {
+                Ok(metadata) => {
+                    #[cfg(windows)]
+                    {
+                        if path_is_link_or_reparse(&metadata) {
+                            dir_has_symlink = true;
+                            if !cursor.is_dir() {
+                                reachable = false;
+                                break;
+                            }
+                        } else if !metadata.file_type().is_dir() {
+                            reachable = false;
+                            break;
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        if path_is_link_or_reparse(&metadata) || !metadata.file_type().is_dir() {
+                            reachable = false;
+                            break;
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    reachable = false;
+                    break;
+                }
+                Err(error) => {
+                    return Err(WorkspaceError::Io(format!(
+                        "failed to inspect {}: {error}",
+                        cursor.display()
+                    )));
+                }
+            }
+        }
+        if reachable {
+            best_has_symlink = Some(match best_has_symlink {
+                Some(prev) => prev && dir_has_symlink,
+                None => dir_has_symlink,
+            });
+            if !dir_has_symlink {
+                break;
+            }
+        }
+    }
+    Ok(best_has_symlink)
+}
+
+fn directory_is_discovered_member(
+    directory: &Path,
+    root: &Path,
+    inclusions: &[WorkspaceGlob],
+    exclusions: &[WorkspaceGlob],
+) -> Result<bool, WorkspaceError> {
+    let Some(dir_has_symlink) =
+        directory_reachable_under_workspace_globs(directory, root, inclusions, exclusions)?
+    else {
+        return Ok(false);
+    };
+    let manifest = directory.join("package.json");
+    let needs_canonical = match std::fs::symlink_metadata(&manifest) {
+        Ok(metadata) if metadata.file_type().is_file() && !path_is_link_or_reparse(&metadata) => {
+            dir_has_symlink
+        }
+        Ok(metadata) if path_is_link_or_reparse(&metadata) => {
+            if manifest.is_file() {
+                true
+            } else {
+                return Ok(false);
+            }
+        }
+        Ok(_) | Err(_) => return Ok(false),
+    };
+    if needs_canonical {
+        let root_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let canonical_match = manifest.canonicalize().unwrap_or_else(|_| manifest.clone());
+        if !canonical_match.starts_with(&root_canon) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn start_belongs_to_workspace(
     start: &Path,
     root: &Path,
@@ -774,31 +932,21 @@ fn start_belongs_to_workspace(
     if start == root {
         return Ok(true);
     }
+    if !start.starts_with(root) {
+        return Ok(false);
+    }
+    let (inclusions, exclusions) = compile_workspace_globs(root, globs)?;
+    let mut has_nested_non_member_package = false;
     let mut current = Some(start);
     while let Some(directory) = current {
         if directory == root {
+            return Ok(!has_nested_non_member_package);
+        }
+        if directory_is_discovered_member(directory, root, &inclusions, &exclusions)? {
             return Ok(true);
         }
-        if directory.join("package.json").is_file() {
-            let relative = directory.strip_prefix(root).map_err(|_| {
-                WorkspaceError::Parse(format!(
-                    "workspace candidate {} is outside {}",
-                    directory.display(),
-                    root.display()
-                ))
-            })?;
-            let mut included = false;
-            let mut excluded = false;
-            for raw in globs {
-                if let Some(raw) = raw.strip_prefix('!') {
-                    excluded |=
-                        WorkspaceGlob::compile(root, raw)?.matches_relative_directory(relative);
-                } else {
-                    included |=
-                        WorkspaceGlob::compile(root, raw)?.matches_relative_directory(relative);
-                }
-            }
-            return Ok(included && !excluded);
+        if directory.join("package.json").exists() {
+            has_nested_non_member_package = true;
         }
         current = directory.parent();
     }
@@ -1531,54 +1679,304 @@ fn warn_on_member_catalogs(members: &[WorkspaceMember]) {
 
 /// Discover workspace member packages matching the given glob patterns.
 fn discover_members(root: &Path, globs: &[String]) -> Result<Vec<WorkspaceMember>, WorkspaceError> {
-    let mut manifest_paths = Vec::new();
-    let mut exclusions = Vec::new();
-    for pattern in globs {
-        let Some(excluded) = pattern.strip_prefix('!') else {
-            let workspace_glob = WorkspaceGlob::compile(root, pattern)?;
-            workspace_glob.collect_manifest_paths(root, &mut manifest_paths)?;
+    let (inclusions, exclusions) = compile_workspace_globs(root, globs)?;
+    let mut matched_manifests = collect_member_manifest_paths(root, &inclusions, &exclusions)?;
+    matched_manifests.sort_by(|left, right| left.0.cmp(&right.0));
+    matched_manifests.dedup_by(|right, left| {
+        if left.0 == right.0 {
+            left.1 |= right.1;
+            true
+        } else {
+            false
+        }
+    });
+
+    let mut canonical_root: Option<PathBuf> = None;
+    let mut verified_paths = Vec::with_capacity(matched_manifests.len());
+    for (pkg_json_path, needs_canonical) in matched_manifests {
+        if needs_canonical {
+            let root_canon = canonical_root
+                .get_or_insert_with(|| root.canonicalize().unwrap_or_else(|_| root.to_path_buf()));
+            let canonical_match = pkg_json_path
+                .canonicalize()
+                .unwrap_or_else(|_| pkg_json_path.clone());
+            if !canonical_match.starts_with(&*root_canon) {
+                tracing::warn!(
+                    matched = %pkg_json_path.display(),
+                    canonical = %canonical_match.display(),
+                    canonical_root = %root_canon.display(),
+                    "skipping workspace member outside project root"
+                );
+                continue;
+            }
+        }
+        verified_paths.push(pkg_json_path);
+    }
+
+    read_workspace_members(verified_paths)
+}
+
+fn read_workspace_member(pkg_json_path: &Path) -> Result<WorkspaceMember, WorkspaceError> {
+    let member_dir = pkg_json_path
+        .parent()
+        .expect("workspace manifest has a parent")
+        .to_path_buf();
+    let package = read_package_json(pkg_json_path)?;
+    Ok(WorkspaceMember {
+        path: member_dir,
+        package,
+    })
+}
+
+fn read_workspace_members(
+    manifest_paths: Vec<PathBuf>,
+) -> Result<Vec<WorkspaceMember>, WorkspaceError> {
+    const PARALLEL_MANIFEST_THRESHOLD: usize = 16;
+    if manifest_paths.len() < PARALLEL_MANIFEST_THRESHOLD {
+        return manifest_paths
+            .iter()
+            .map(|path| read_workspace_member(path))
+            .collect();
+    }
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(4)
+        .min(manifest_paths.len());
+    if workers <= 1 {
+        return manifest_paths
+            .iter()
+            .map(|path| read_workspace_member(path))
+            .collect();
+    }
+    let chunk_size = manifest_paths.len().div_ceil(workers);
+    let mut members = Vec::with_capacity(manifest_paths.len());
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = manifest_paths
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|path| read_workspace_member(path))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+            })
+            .collect();
+        for handle in handles {
+            let chunk_members = handle.join().expect("workspace manifest reader panicked")?;
+            members.extend(chunk_members);
+        }
+        Ok(members)
+    })
+}
+
+#[inline]
+fn more_depth_needed(previous: Option<usize>, needed: Option<usize>) -> bool {
+    match (previous, needed) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(prev), Some(next)) => next > prev,
+    }
+}
+
+#[inline]
+fn path_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+fn inspect_scan_root(root: &Path, scan_root: &Path) -> Result<Option<bool>, WorkspaceError> {
+    let relative = scan_root.strip_prefix(root).unwrap_or(Path::new(""));
+    let mut has_normal_components = false;
+    let mut has_symlink = false;
+    let mut prefix = root.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(part) = component else {
             continue;
         };
-        exclusions.push(WorkspaceGlob::compile(root, excluded)?);
+        has_normal_components = true;
+        prefix.push(part);
+        let is_last = components
+            .peek()
+            .is_none_or(|next| !matches!(next, std::path::Component::Normal(_)));
+        match std::fs::symlink_metadata(&prefix) {
+            Ok(metadata) => {
+                if path_is_link_or_reparse(&metadata) {
+                    if is_last {
+                        return Ok(None);
+                    }
+                    has_symlink = true;
+                } else if !metadata.file_type().is_dir() {
+                    return Ok(None);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(WorkspaceError::Io(format!(
+                    "failed to inspect {}: {error}",
+                    prefix.display()
+                )));
+            }
+        }
     }
-    manifest_paths.retain(|manifest| {
-        let directory = manifest.parent().expect("workspace manifest has a parent");
-        let relative = directory.strip_prefix(root).unwrap_or(directory);
-        !exclusions
-            .iter()
-            .any(|exclusion| exclusion.matches_relative_directory(relative))
-    });
-    manifest_paths.sort();
-    manifest_paths.dedup();
+    if !has_normal_components {
+        match std::fs::symlink_metadata(scan_root) {
+            Ok(metadata)
+                if metadata.file_type().is_dir() && !path_is_link_or_reparse(&metadata) => {}
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(WorkspaceError::Io(format!(
+                    "failed to inspect {}: {error}",
+                    scan_root.display()
+                )));
+            }
+        }
+    }
+    Ok(Some(has_symlink))
+}
 
-    let mut members = Vec::with_capacity(manifest_paths.len());
-    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    for pkg_json_path in manifest_paths {
-        let canonical_match = pkg_json_path
-            .canonicalize()
-            .unwrap_or_else(|_| pkg_json_path.clone());
-        if !canonical_match.starts_with(&canonical_root) {
-            tracing::warn!(
-                matched = %pkg_json_path.display(),
-                canonical = %canonical_match.display(),
-                canonical_root = %canonical_root.display(),
-                "skipping workspace member outside project root"
-            );
+fn collect_member_manifest_paths(
+    root: &Path,
+    inclusions: &[WorkspaceGlob],
+    exclusions: &[WorkspaceGlob],
+) -> Result<Vec<(PathBuf, bool)>, WorkspaceError> {
+    if inclusions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let match_options = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    };
+
+    // Traverse shallower and unbounded roots first so overlapping globs hit `visited` without re-walking.
+    let mut scan_order: Vec<usize> = (0..inclusions.len()).collect();
+    scan_order.sort_by_key(|&index| {
+        let inclusion = &inclusions[index];
+        (inclusion.scan_root_depth, inclusion.max_depth.is_some())
+    });
+
+    let mut visited: HashMap<PathBuf, Option<usize>> = HashMap::new();
+    let mut scan_root_status: HashMap<&Path, Option<bool>> =
+        HashMap::with_capacity(inclusions.len());
+    let mut manifests = Vec::new();
+    let mut pending: Vec<(PathBuf, Option<usize>, bool)> = Vec::new();
+
+    for index in scan_order {
+        let inclusion = &inclusions[index];
+        let remaining = inclusion
+            .max_depth
+            .map(|max_depth| max_depth.saturating_sub(inclusion.scan_root_depth));
+        if visited
+            .get(&inclusion.scan_root)
+            .is_some_and(|prev| !more_depth_needed(*prev, remaining))
+        {
             continue;
         }
+        let has_symlink = match scan_root_status.get(inclusion.scan_root.as_path()) {
+            Some(status) => *status,
+            None => {
+                let status = inspect_scan_root(root, &inclusion.scan_root)?;
+                scan_root_status.insert(inclusion.scan_root.as_path(), status);
+                status
+            }
+        };
+        let Some(scan_root_has_symlink) = has_symlink else {
+            continue;
+        };
 
-        let member_dir = pkg_json_path
-            .parent()
-            .expect("workspace manifest has a parent")
-            .to_path_buf();
-        let package = read_package_json(&pkg_json_path)?;
-        members.push(WorkspaceMember {
-            path: member_dir,
-            package,
-        });
+        pending.push((
+            inclusion.scan_root.clone(),
+            remaining,
+            scan_root_has_symlink,
+        ));
+        while let Some((directory, remaining, dir_has_symlink)) = pending.pop() {
+            let (already_seen, should_descend) = match visited.get_mut(&directory) {
+                Some(prev_remaining) => {
+                    if more_depth_needed(*prev_remaining, remaining) {
+                        *prev_remaining = remaining;
+                        (true, remaining != Some(0))
+                    } else {
+                        continue;
+                    }
+                }
+                None => {
+                    visited.insert(directory.clone(), remaining);
+                    (false, remaining != Some(0))
+                }
+            };
+
+            if !already_seen {
+                let relative = directory.strip_prefix(root).unwrap_or(&directory);
+                if inclusions
+                    .iter()
+                    .any(|candidate| candidate.matches_directory(relative, match_options))
+                    && !exclusions
+                        .iter()
+                        .any(|exclusion| exclusion.matches_directory(relative, match_options))
+                {
+                    let manifest = directory.join("package.json");
+                    match std::fs::symlink_metadata(&manifest) {
+                        Ok(metadata)
+                            if metadata.file_type().is_file()
+                                && !path_is_link_or_reparse(&metadata) =>
+                        {
+                            manifests.push((manifest, dir_has_symlink));
+                        }
+                        Ok(metadata) if path_is_link_or_reparse(&metadata) => {
+                            if manifest.is_file() {
+                                manifests.push((manifest, true));
+                            }
+                        }
+                        Ok(_) | Err(_) => {}
+                    }
+                }
+            }
+
+            if !should_descend {
+                continue;
+            }
+            let next_remaining = remaining.map(|depth| depth - 1);
+            let entries = std::fs::read_dir(&directory).map_err(|error| {
+                WorkspaceError::Io(format!("failed to read {}: {error}", directory.display()))
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    WorkspaceError::Io(format!("failed to read {}: {error}", directory.display()))
+                })?;
+                let file_type = entry.file_type().map_err(|error| {
+                    WorkspaceError::Io(format!(
+                        "failed to inspect {}: {error}",
+                        entry.path().display()
+                    ))
+                })?;
+                if file_type.is_dir() && entry.file_name() != "node_modules" {
+                    let child_path = entry.path();
+                    #[cfg(windows)]
+                    let child_has_symlink = dir_has_symlink
+                        || std::fs::symlink_metadata(&child_path)
+                            .map(|metadata| path_is_link_or_reparse(&metadata))
+                            .unwrap_or(true);
+                    #[cfg(not(windows))]
+                    let child_has_symlink = dir_has_symlink;
+                    pending.push((child_path, next_remaining, child_has_symlink));
+                }
+            }
+        }
     }
 
-    Ok(members)
+    Ok(manifests)
 }
 
 fn discover_members_from_open_root(
@@ -1777,6 +2175,7 @@ struct WorkspaceGlob {
     scan_root: PathBuf,
     scan_root_depth: usize,
     max_depth: Option<usize>,
+    needs_trailing_sep_fallback: bool,
 }
 
 impl WorkspaceGlob {
@@ -1807,71 +2206,27 @@ impl WorkspaceGlob {
             .iter()
             .all(|component| !component.as_os_str().to_string_lossy().contains("**"))
             .then_some(components.len());
+        // With `require_literal_separator`, appending a trailing separator can only turn a
+        // non-match into a match when the final normalized segment can match empty (`*`/`**`).
+        let needs_trailing_sep_fallback = components.last().is_some_and(|component| {
+            let text = component.as_os_str().to_string_lossy();
+            !text.is_empty() && text.bytes().all(|byte| byte == b'*')
+        });
         Ok(Self {
             pattern,
             scan_root,
             scan_root_depth: literal_components,
             max_depth,
+            needs_trailing_sep_fallback,
         })
-    }
-
-    fn collect_manifest_paths(
-        &self,
-        root: &Path,
-        manifests: &mut Vec<PathBuf>,
-    ) -> Result<(), WorkspaceError> {
-        match std::fs::symlink_metadata(&self.scan_root) {
-            Ok(metadata) if metadata.file_type().is_dir() => {}
-            Ok(_) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                return Err(WorkspaceError::Io(format!(
-                    "failed to inspect {}: {error}",
-                    self.scan_root.display()
-                )));
-            }
-        }
-        let match_options = glob::MatchOptions {
-            case_sensitive: true,
-            require_literal_separator: true,
-            require_literal_leading_dot: false,
-        };
-        let mut pending = vec![(self.scan_root.clone(), self.scan_root_depth)];
-        while let Some((directory, depth)) = pending.pop() {
-            let relative = directory.strip_prefix(root).unwrap_or(&directory);
-            if self.matches_directory(relative, match_options) {
-                let manifest = directory.join("package.json");
-                if manifest.is_file() {
-                    manifests.push(manifest);
-                }
-            }
-            if self.max_depth.is_some_and(|max_depth| depth >= max_depth) {
-                continue;
-            }
-            let entries = std::fs::read_dir(&directory).map_err(|error| {
-                WorkspaceError::Io(format!("failed to read {}: {error}", directory.display()))
-            })?;
-            for entry in entries {
-                let entry = entry.map_err(|error| {
-                    WorkspaceError::Io(format!("failed to read {}: {error}", directory.display()))
-                })?;
-                let file_type = entry.file_type().map_err(|error| {
-                    WorkspaceError::Io(format!(
-                        "failed to inspect {}: {error}",
-                        entry.path().display()
-                    ))
-                })?;
-                if file_type.is_dir() && entry.file_name() != "node_modules" {
-                    pending.push((entry.path(), depth + 1));
-                }
-            }
-        }
-        Ok(())
     }
 
     fn matches_directory(&self, relative: &Path, options: glob::MatchOptions) -> bool {
         if self.pattern.matches_path_with(relative, options) {
             return true;
+        }
+        if !self.needs_trailing_sep_fallback {
+            return false;
         }
         let relative = relative.to_string_lossy();
         let mut with_separator = String::with_capacity(relative.len() + 1);
@@ -2589,6 +2944,42 @@ mod tests {
     }
 
     #[test]
+    fn find_workspace_root_skips_package_under_node_modules_even_when_glob_covers_path() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{"name":"monorepo","workspaces":["sandbox/**"]}"#,
+        );
+        let nested = dir.path().join("sandbox/node_modules/app");
+        fs::create_dir_all(&nested).unwrap();
+        create_package_json(&nested, r#"{"name":"app"}"#);
+
+        assert!(find_workspace_root(&nested).unwrap().is_none());
+        assert!(!workspace_declares_member(dir.path(), &nested).unwrap());
+        assert!(discover_workspace(&nested).unwrap().is_none());
+    }
+
+    #[test]
+    fn find_workspace_root_attaches_nested_package_inside_declared_member() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{"name":"monorepo","workspaces":["packages/*"]}"#,
+        );
+        let app = dir.path().join("packages/app");
+        let demo = app.join("examples/demo");
+        fs::create_dir_all(&demo).unwrap();
+        create_package_json(&app, r#"{"name":"app"}"#);
+        create_package_json(&demo, r#"{"name":"demo"}"#);
+
+        assert_eq!(
+            find_workspace_root(&demo).unwrap().as_deref(),
+            Some(dir.path())
+        );
+        assert_eq!(discover_workspace(&demo).unwrap().unwrap().root, dir.path());
+    }
+
+    #[test]
     fn discover_workspace_does_not_attach_unlisted_nested_package_to_outer_workspace() {
         let dir = tempfile::tempdir().unwrap();
         create_package_json(
@@ -3068,5 +3459,62 @@ overrides:
                 .any(|key| key == "nested"),
             "non-string YAML override must be recorded as unsupported rather than failing discovery"
         );
+    }
+
+    #[test]
+    fn discover_workspace_deduplicates_overlapping_globs_and_preserves_sorted_order_at_parallel_scale()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "mono-overlap",
+                "workspaces": ["packages/*", "packages/**", "packages/pkg-01", "!packages/pkg-19"]
+            }"#,
+        );
+        for index in 0..20 {
+            let member_dir = dir.path().join(format!("packages/pkg-{index:02}"));
+            fs::create_dir_all(&member_dir).unwrap();
+            create_package_json(
+                &member_dir,
+                &format!(r#"{{"name":"pkg-{index:02}","version":"1.0.0"}}"#),
+            );
+        }
+
+        let ws = discover_workspace(dir.path()).unwrap().unwrap();
+        let names: Vec<_> = ws
+            .members
+            .iter()
+            .filter_map(|member| member.package.name.as_deref())
+            .collect();
+        let expected: Vec<String> = (0..19).map(|index| format!("pkg-{index:02}")).collect();
+        assert_eq!(names, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_workspace_skips_symlinked_manifest_escaping_root_while_keeping_regular_members() {
+        let outer = tempfile::tempdir().unwrap();
+        let outside_manifest = outer.path().join("outside.json");
+        fs::write(&outside_manifest, r#"{"name":"escaped","version":"1.0.0"}"#).unwrap();
+
+        let root = outer.path().join("workspace");
+        fs::create_dir_all(root.join("packages/good")).unwrap();
+        fs::create_dir_all(root.join("packages/escape")).unwrap();
+        create_package_json(&root, r#"{"name":"root","workspaces":["packages/*"]}"#);
+        create_package_json(
+            &root.join("packages/good"),
+            r#"{"name":"good","version":"1.0.0"}"#,
+        );
+        std::os::unix::fs::symlink(&outside_manifest, root.join("packages/escape/package.json"))
+            .unwrap();
+
+        let ws = discover_workspace(&root).unwrap().unwrap();
+        let names: Vec<_> = ws
+            .members
+            .iter()
+            .filter_map(|member| member.package.name.as_deref())
+            .collect();
+        assert_eq!(names, ["good"]);
     }
 }
