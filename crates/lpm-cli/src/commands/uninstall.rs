@@ -1049,7 +1049,12 @@ pub async fn run(
             }));
         }
         if json_output {
-            print_uninstall_json(&[], &[], &[])?;
+            print_uninstall_json(
+                &[],
+                &[],
+                &[],
+                &crate::dependency_skills::ReconcileReport::default(),
+            )?;
         } else {
             uninstall_ui::warn_no_filter_match();
             if let Some(h) = hint {
@@ -1171,8 +1176,14 @@ pub async fn run(
         return Ok(());
     }
 
+    let dependency_skills = reconcile_dependency_skills(&member_roots, all_removed.is_empty());
     if json_output {
-        print_uninstall_json(&all_removed, &all_not_found, &targets.member_manifests)?;
+        print_uninstall_json(
+            &all_removed,
+            &all_not_found,
+            &targets.member_manifests,
+            &dependency_skills,
+        )?;
     } else {
         eprintln!();
         for name in &all_removed {
@@ -1192,21 +1203,46 @@ pub async fn run(
         uninstall_ui::done_freed_disk(freed_bytes);
         eprintln!();
         uninstall_ui::done_removed(all_removed.len(), uninstall_start.elapsed());
+        crate::dependency_skills::print_report(&dependency_skills);
     }
 
     Ok(())
+}
+
+/// Reconciles the dependency-skill links of the project the uninstall
+/// changed (its workspace root in a workspace), so the skills of removed
+/// packages stop reaching agents now rather than at the next install.
+fn reconcile_dependency_skills(
+    member_roots: &[PathBuf],
+    nothing_removed: bool,
+) -> crate::dependency_skills::ReconcileReport {
+    match member_roots.first().filter(|_| !nothing_removed) {
+        Some(root) => crate::commands::install::reconcile_dependency_skills(
+            root,
+            crate::lpm_skills_config::LpmSkillsPreference::Config,
+            crate::commands::install::InstallOmitPolicy::default(),
+        ),
+        None => crate::dependency_skills::ReconcileReport::default(),
+    }
 }
 
 fn print_uninstall_json(
     removed: &[String],
     not_found: &[String],
     manifests: &[PathBuf],
+    dependency_skills: &crate::dependency_skills::ReconcileReport,
 ) -> Result<(), LpmError> {
     let target_set = manifests
         .iter()
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>();
-    let json = serde_json::json!({"success": true, "removed": removed, "not_found": not_found, "target_set": target_set});
+    let mut json = serde_json::json!({"success": true, "removed": removed, "not_found": not_found, "target_set": target_set});
+    if !dependency_skills.is_quiet() {
+        json["dependency_skills"] = crate::dependency_skills::report_json(dependency_skills);
+    }
+    if !dependency_skills.warnings.is_empty() {
+        json["warnings"] = serde_json::json!(dependency_skills.warnings);
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&json)

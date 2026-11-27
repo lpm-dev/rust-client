@@ -96,6 +96,8 @@ struct AddJsonOutput<'a> {
     /// in the `security.firewall` shape other commands report.
     #[serde(skip_serializing_if = "Option::is_none")]
     security: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dependency_skills: Option<serde_json::Value>,
 }
 
 /// Splits the bare specifiers a plain copy uses into the package names they
@@ -1528,7 +1530,7 @@ async fn run_locked(
             yes,
             json_output,
             no_engine_strict,
-            !no_skills,
+            crate::lpm_skills_config::LpmSkillsPreference::from_cli(false, no_skills),
             &effective_pm,
             &mut tx,
             &firewall_bypass_report,
@@ -1553,13 +1555,15 @@ async fn run_locked(
             inserted: Vec::new(),
         }
     };
+    let installed_with_lpm = effective_pm == "lpm"
+        && (removed_stale_dependencies || !dependency_outcome.requirements.is_empty());
     if removed_stale_dependencies && dependency_outcome.requirements.is_empty() {
         refresh_dependency_install(
             client,
             project_dir,
             json_output,
             no_engine_strict,
-            !no_skills,
+            crate::lpm_skills_config::LpmSkillsPreference::from_cli(false, no_skills),
             &effective_pm,
             &firewall_bypass_report,
         )
@@ -1756,6 +1760,21 @@ async fn run_locked(
 
     // Source recovery remains active across recursive Swift delivery.
     crate::commands::install::workspace_lockfile::commit_manifest_transaction_checked(tx)?;
+    let dependency_skills = (emit_output
+        && installed_with_lpm
+        && !crate::commands::install::dependency_skills_deferred())
+    .then(|| {
+        crate::commands::install::reconcile_dependency_skills(
+            project_dir,
+            crate::lpm_skills_config::LpmSkillsPreference::from_cli(false, no_skills),
+            crate::commands::install::InstallOmitPolicy::default(),
+        )
+    });
+    if json_output && let Some(reconciled) = &dependency_skills {
+        for warning in &reconciled.warnings {
+            swift_traversal.push_warning(warning.clone());
+        }
+    }
 
     // For Swift, handle recursive LPM dependencies.
     if ecosystem == "swift" {
@@ -1802,6 +1821,10 @@ async fn run_locked(
             errors: &[],
             firewall: firewall_json,
             security: firewall_bypass_report.take().security_json(),
+            dependency_skills: dependency_skills
+                .as_ref()
+                .filter(|reconciled| !reconciled.is_quiet() || reconciled.unchanged > 0)
+                .map(crate::dependency_skills::report_json),
         };
         let stdout = std::io::stdout();
         let mut stdout = stdout.lock();
@@ -1811,6 +1834,9 @@ async fn run_locked(
         use std::io::Write as _;
         stdout.write_all(b"\n").map_err(LpmError::Io)?;
     } else if !json_output {
+        if let Some(reconciled) = &dependency_skills {
+            crate::dependency_skills::print_report(reconciled);
+        }
         if ver_meta.has_security_issues() {
             print_security_warnings(&target.display(), &version, &ver_meta);
         }

@@ -947,6 +947,14 @@ fn is_lpm_origin(url_str: &str) -> bool {
     false
 }
 
+/// Whether `name` is a package name LPM accepts in a lockfile: a single
+/// path component or `@scope/name`, each a plain component on every
+/// platform (no `.` or `..`, separators, drive colons, control characters,
+/// trailing dots or spaces, or reserved Windows device names).
+pub fn is_valid_package_name(name: &str) -> bool {
+    validate_package_name(name).is_ok()
+}
+
 fn validate_package_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("name is empty".to_string());

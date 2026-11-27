@@ -4,6 +4,11 @@ use crate::commands::config::GlobalConfig;
 
 pub(crate) const AUTO_INSTALL_LPM_SKILLS_KEY: &str = "auto-install-lpm-skills";
 pub(crate) const LEGACY_NO_SKILLS_KEY: &str = "noSkills";
+/// The `[skills]` table in `~/.lpm/config.toml`.
+pub(crate) const SKILLS_TABLE: &str = "skills";
+/// `[skills] other-packages`: link the skills of npm and other non-LPM.dev
+/// dependencies that a project allows.
+pub(crate) const OTHER_PACKAGES_KEY: &str = "other-packages";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum LpmSkillsPreference {
@@ -19,14 +24,6 @@ impl LpmSkillsPreference {
             (true, false) => Self::Enabled,
             (false, true) => Self::Disabled,
             _ => Self::Config,
-        }
-    }
-
-    pub(crate) fn from_enabled(enabled: bool) -> Self {
-        if enabled {
-            Self::Enabled
-        } else {
-            Self::Disabled
         }
     }
 
@@ -49,6 +46,28 @@ fn resolve_from_config(config: &GlobalConfig) -> Result<bool, LpmError> {
     }
 
     Ok(!config.get_bool(LEGACY_NO_SKILLS_KEY).unwrap_or(false))
+}
+
+/// Whether the user lets projects link the skills of npm and other
+/// non-LPM.dev dependencies: `[skills] other-packages`, on by default. A
+/// project still has to allow each one.
+pub(crate) fn other_package_skills_enabled(config: &GlobalConfig) -> Result<bool, LpmError> {
+    let Some(skills) = config.get_value(SKILLS_TABLE) else {
+        return Ok(true);
+    };
+    let Some(table) = skills.as_table() else {
+        return Err(LpmError::Registry(format!(
+            "invalid `{SKILLS_TABLE}` in ~/.lpm/config.toml; must be a table"
+        )));
+    };
+    match table.get(OTHER_PACKAGES_KEY) {
+        None => Ok(true),
+        Some(value) => parse_bool(value).ok_or_else(|| {
+            LpmError::Registry(format!(
+                "invalid `{SKILLS_TABLE}.{OTHER_PACKAGES_KEY}` in ~/.lpm/config.toml; must be true or false"
+            ))
+        }),
+    }
 }
 
 fn parse_bool(value: &toml::Value) -> Option<bool> {
@@ -122,6 +141,19 @@ mod tests {
                 .resolve(&config("auto-install-lpm-skills = true"))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn other_package_skills_default_on_and_follow_the_skills_table() {
+        assert!(other_package_skills_enabled(&GlobalConfig::empty()).unwrap());
+        assert!(
+            !other_package_skills_enabled(&config("[skills]\nother-packages = false")).unwrap()
+        );
+        assert!(
+            other_package_skills_enabled(&config("[skills]\nother-packages = \"on\"")).unwrap()
+        );
+        assert!(other_package_skills_enabled(&config("[skills]\nother-packages = 3")).is_err());
+        assert!(other_package_skills_enabled(&config("skills = true")).is_err());
     }
 
     #[test]

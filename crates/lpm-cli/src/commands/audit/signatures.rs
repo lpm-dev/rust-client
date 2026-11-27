@@ -205,6 +205,7 @@ sig = "MEQCIEvidence"
                 is_dev: false,
                 is_optional: false,
                 platform_skipped: false,
+                installed: None,
                 dependencies: Vec::new(),
             }],
             lpm_lockfile: None,

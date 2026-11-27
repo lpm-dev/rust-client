@@ -880,6 +880,212 @@ pub(crate) async fn run_with_options_with_lpm_root(
     caller_context: Option<InstallCallerContext<'_>>,
     lpm_root: lpm_common::LpmRoot,
 ) -> Result<(), LpmError> {
+    if dependency_skills_deferred() {
+        return Box::pin(run_install_pipeline(
+            client,
+            project_dir,
+            json_output,
+            offline,
+            frozen_lockfile,
+            force,
+            allow_new,
+            strict_integrity,
+            cli_no_engine_strict,
+            strict_peer_dependencies_override,
+            linker_override,
+            lpm_skills_preference,
+            no_security_summary,
+            auto_build,
+            target_set,
+            direct_versions_out,
+            requested_add_count,
+            script_policy_override,
+            advisor_override,
+            min_release_age_override,
+            min_release_age_exclude,
+            drift_ignore_policy,
+            verify_policy,
+            omit_policy,
+            strict_sandbox,
+            no_sandbox,
+            verbose,
+            audit_after_install,
+            timing,
+            compatibility_bin_names,
+            emit_install_report,
+            reserve_stdout,
+            caller_context,
+            lpm_root,
+        ))
+        .await;
+    }
+    let capture = report_capture::new_capture();
+    let result = report_capture::scope(
+        capture.clone(),
+        Box::pin(run_install_pipeline(
+            client,
+            project_dir,
+            json_output,
+            offline,
+            frozen_lockfile,
+            force,
+            allow_new,
+            strict_integrity,
+            cli_no_engine_strict,
+            strict_peer_dependencies_override,
+            linker_override,
+            lpm_skills_preference,
+            no_security_summary,
+            auto_build,
+            target_set,
+            direct_versions_out,
+            requested_add_count,
+            script_policy_override,
+            advisor_override,
+            min_release_age_override,
+            min_release_age_exclude,
+            drift_ignore_policy,
+            verify_policy,
+            omit_policy,
+            strict_sandbox,
+            no_sandbox,
+            verbose,
+            audit_after_install,
+            timing,
+            compatibility_bin_names,
+            emit_install_report,
+            reserve_stdout,
+            caller_context,
+            lpm_root,
+        )),
+    )
+    .await;
+    let report = report_capture::take(&capture);
+    if result.is_ok() {
+        let reconciled =
+            reconcile_dependency_skills(project_dir, lpm_skills_preference, omit_policy);
+        match report {
+            Some(mut report) => {
+                attach_dependency_skills(&mut report, &reconciled);
+                report_capture::emit_install_json(&report);
+            }
+            None if !json_output => crate::dependency_skills::print_report(&reconciled),
+            None => {}
+        }
+    } else if let Some(report) = report {
+        report_capture::emit_install_json(&report);
+    }
+    result
+}
+
+tokio::task_local! {
+    static DEPENDENCY_SKILLS_DEFERRED: ();
+}
+
+/// Runs `future`, which installs, with reconciling dependency skills left
+/// to the caller: a command that commits manifests after installing, or
+/// installs workspace members one by one, reconciles once when it has
+/// committed, through [`reconcile_dependency_skills`].
+pub(crate) async fn defer_dependency_skills<F: std::future::Future>(future: F) -> F::Output {
+    DEPENDENCY_SKILLS_DEFERRED.scope((), future).await
+}
+
+/// Whether an enclosing command reconciles dependency skills once it
+/// commits, so the install running now must leave them alone.
+pub(crate) fn dependency_skills_deferred() -> bool {
+    DEPENDENCY_SKILLS_DEFERRED.try_with(|_| ()).is_ok()
+}
+
+/// Reconciles the dependency skills of the project at `project_dir`, at
+/// its workspace root in a workspace, after an install that left out
+/// `omitted`. Never fails: what goes wrong is a warning in the report.
+pub(crate) fn reconcile_dependency_skills(
+    project_dir: &Path,
+    preference: crate::lpm_skills_config::LpmSkillsPreference,
+    omitted: InstallOmitPolicy,
+) -> crate::dependency_skills::ReconcileReport {
+    let root = crate::dependency_skills::skills_root(project_dir);
+    if !crate::dependency_skills::may_have_skill_work(&root) {
+        return crate::dependency_skills::ReconcileReport::default();
+    }
+    match crate::dependency_skills::Settings::resolve(preference) {
+        Ok(Some(settings)) => {
+            crate::dependency_skills::reconcile_project(&root, settings.omitting(omitted))
+        }
+        Ok(None) => crate::dependency_skills::ReconcileReport::default(),
+        Err(error) => crate::dependency_skills::ReconcileReport {
+            warnings: vec![format!("dependency skills were not linked: {error}")],
+            ..Default::default()
+        },
+    }
+}
+
+/// Adds what reconciling dependency skills did to a command's JSON
+/// `report`: a `dependency_skills` block when anything is linked or
+/// changed, and its warnings to the report's `warnings`.
+pub(crate) fn attach_dependency_skills(
+    report: &mut serde_json::Value,
+    reconciled: &crate::dependency_skills::ReconcileReport,
+) {
+    if !reconciled.is_quiet() || reconciled.unchanged > 0 {
+        report["dependency_skills"] = crate::dependency_skills::report_json(reconciled);
+    }
+    if reconciled.warnings.is_empty() {
+        return;
+    }
+    let warnings = reconciled
+        .warnings
+        .iter()
+        .map(|warning| serde_json::Value::String(warning.clone()));
+    match report
+        .get_mut("warnings")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        Some(existing) => existing.extend(warnings),
+        None => report["warnings"] = serde_json::Value::Array(warnings.collect()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_install_pipeline(
+    client: &RegistryClient,
+    project_dir: &Path,
+    json_output: bool,
+    offline: bool,
+    frozen_lockfile: FrozenLockfileMode,
+    force: bool,
+    allow_new: bool,
+    strict_integrity: bool,
+    cli_no_engine_strict: bool,
+    strict_peer_dependencies_override: Option<bool>,
+    linker_override: Option<lpm_linker::LinkerMode>,
+    lpm_skills_preference: crate::lpm_skills_config::LpmSkillsPreference,
+    no_security_summary: bool,
+    auto_build: bool,
+    target_set: Option<&[String]>,
+    direct_versions_out: Option<&mut HashMap<String, lpm_semver::Version>>,
+    requested_add_count: Option<usize>,
+    script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    advisor_override: Option<String>,
+    min_release_age_override: Option<u64>,
+    min_release_age_exclude: &[String],
+    drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    verify_policy: crate::provenance_fetch::VerifyPolicy,
+    omit_policy: InstallOmitPolicy,
+    strict_sandbox: bool,
+    no_sandbox: bool,
+    verbose: bool,
+    audit_after_install: bool,
+    timing: bool,
+    compatibility_bin_names: &[String],
+    emit_install_report: bool,
+    // Internal stdio launchers reserve stdout for their child protocol.
+    // Install diagnostics remain on stderr, but every stdout-only report
+    // and lifecycle hint is suppressed until the child takes over.
+    reserve_stdout: bool,
+    caller_context: Option<InstallCallerContext<'_>>,
+    lpm_root: lpm_common::LpmRoot,
+) -> Result<(), LpmError> {
     let policy_project_dir = caller_context
         .as_ref()
         .and_then(|context| context.policy_project_dir)

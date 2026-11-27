@@ -42,17 +42,23 @@ pub(crate) fn remove_entry(directory: &Dir, name: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
+    if metadata.is_dir() && !is_link(&metadata) {
+        directory.open_dir_nofollow(name)?.remove_open_dir_all()
+    } else {
+        directory.remove_file_or_symlink(name)
+    }
+}
+
+/// Whether `metadata`, read without following links, describes a symbolic
+/// link or a Windows junction.
+pub(crate) fn is_link(metadata: &cap_std::fs::Metadata) -> bool {
     let linked = metadata.file_type().is_symlink();
     #[cfg(windows)]
     let linked = {
         use cap_std::fs::MetadataExt as _;
         linked || metadata.file_attributes() & 0x0400 != 0
     };
-    if metadata.is_dir() && !linked {
-        directory.open_dir_nofollow(name)?.remove_open_dir_all()
-    } else {
-        directory.remove_file_or_symlink(name)
-    }
+    linked
 }
 
 pub(crate) fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {

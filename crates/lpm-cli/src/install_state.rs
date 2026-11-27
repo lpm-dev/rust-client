@@ -398,6 +398,14 @@ fn manifest_for_install_hash(manifest: &[u8]) -> std::borrow::Cow<'_, [u8]> {
             document.shift_remove("scripts");
         }
     }
+    // The dependency-skills fingerprint covers `lpm.skills`; the dependency
+    // pipeline never reads it.
+    if let Some(serde_json::Value::Object(lpm)) = document.get_mut("lpm")
+        && lpm.shift_remove("skills").is_some()
+        && lpm.is_empty()
+    {
+        document.shift_remove("lpm");
+    }
     match serde_json::to_vec(&document) {
         Ok(canonical) => std::borrow::Cow::Owned(canonical),
         Err(_) => std::borrow::Cow::Borrowed(manifest),
@@ -2559,6 +2567,28 @@ mod tests {
 
         assert!(!plain.is_empty());
         assert_eq!(marked, plain);
+    }
+
+    #[test]
+    fn manifest_for_install_hash_ignores_the_dependency_skills_policy() {
+        let without = br#"{"name":"app","dependencies":{"a":"1.0.0"}}"#;
+        let with_policy =
+            br##"{"name":"app","dependencies":{"a":"1.0.0"},"lpm":{"skills":{"allow":["#a"]}}}"##;
+        let with_other_lpm =
+            br##"{"name":"app","dependencies":{"a":"1.0.0"},"lpm":{"skills":{"allow":["#a"]},"linker":"hoisted"}}"##;
+
+        assert_eq!(
+            manifest_for_install_hash(without),
+            manifest_for_install_hash(with_policy)
+        );
+        assert_ne!(
+            manifest_for_install_hash(without),
+            manifest_for_install_hash(with_other_lpm)
+        );
+        assert_eq!(
+            manifest_for_install_hash(br#"{"name":"app","lpm":{}}"#).as_ref(),
+            br#"{"name":"app","lpm":{}}"#
+        );
     }
 
     #[test]

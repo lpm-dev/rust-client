@@ -1521,7 +1521,8 @@ pub async fn run_add_packages(
         // inner install pipeline runs under the assumption that the
         // caller has serialized the snapshot+commit window.
         let javascript_capture = json_output.then(report_capture::new_capture);
-        let javascript_install = async {
+        let reconciles_skills = !super::dependency_skills_deferred();
+        let javascript_install = super::defer_dependency_skills(async {
             // 1. Snapshot the install state surface. Manifest is required (must
             // exist by precondition); lockfile + binary lockfile are optional
             // (absent on a fresh project); install-hash is invalidate-only
@@ -1628,7 +1629,7 @@ pub async fn run_add_packages(
             // edits persist.
             tx.commit();
             Ok::<(), LpmError>(())
-        };
+        });
         let javascript_result: Result<(), LpmError> =
             if let Some(capture) = javascript_capture.as_ref() {
                 report_capture::scope(Arc::clone(capture), javascript_install).await
@@ -1636,12 +1637,23 @@ pub async fn run_add_packages(
                 javascript_install.await
             };
         javascript_result?;
+        let dependency_skills = reconciles_skills.then(|| {
+            super::reconcile_dependency_skills(project_dir, lpm_skills_preference, omit_policy)
+        });
+        if !json_output && let Some(reconciled) = &dependency_skills {
+            crate::dependency_skills::print_report(reconciled);
+        }
         if let Some(transaction) = swift_transaction.take() {
             workspace_lockfile::commit_manifest_transaction(transaction);
         }
 
         if json_output {
-            let javascript_report = javascript_capture.as_ref().and_then(report_capture::take);
+            let mut javascript_report = javascript_capture.as_ref().and_then(report_capture::take);
+            if let (Some(report), Some(reconciled)) =
+                (javascript_report.as_mut(), dependency_skills.as_ref())
+            {
+                super::attach_dependency_skills(report, reconciled);
+            }
             let report = match (swift_report, javascript_report) {
                 (Some(swift), Some(javascript)) => serde_json::json!({
                     "success": true,
@@ -2077,7 +2089,8 @@ pub async fn run_install_filtered_add(
         // avoids that deadlock and uses the same `.install.lock` name as the
         // single-project path.
         let mut javascript_reports = Vec::new();
-        let js_result = async {
+        let reconciles_skills = !super::dependency_skills_deferred();
+        let js_result = super::defer_dependency_skills(async {
             let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
                 &required_refs,
                 &optional_refs,
@@ -2236,19 +2249,34 @@ pub async fn run_install_filtered_add(
             // All members succeeded — persist every staged + finalized manifest.
             workspace_lockfile::commit_manifest_transaction(tx);
             Ok(())
-        }
+        })
         .await;
         if js_result.is_ok()
             && let Some(transaction) = swift_transaction.take()
         {
             workspace_lockfile::commit_manifest_transaction(transaction);
         }
+        let dependency_skills = (js_result.is_ok() && reconciles_skills).then(|| {
+            super::reconcile_dependency_skills(
+                &workspace_root_for_config,
+                lpm_skills_preference,
+                omit_policy,
+            )
+        });
         if js_result.is_ok() && json_output {
-            report_capture::emit_install_json(&serde_json::json!({
+            let mut report = serde_json::json!({
                 "success": true,
                 "swift": swift_reports,
                 "javascript": javascript_reports,
-            }));
+            });
+            if let Some(reconciled) = &dependency_skills {
+                super::attach_dependency_skills(&mut report, reconciled);
+            }
+            report_capture::emit_install_json(&report);
+        } else if let Some(reconciled) = &dependency_skills
+            && !json_output
+        {
+            crate::dependency_skills::print_report(reconciled);
         }
         js_result
     };

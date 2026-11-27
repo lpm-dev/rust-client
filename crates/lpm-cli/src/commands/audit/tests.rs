@@ -104,6 +104,7 @@ fn osv_skips_lpm_packages() {
             is_dev: false,
             is_optional: false,
             platform_skipped: false,
+            installed: None,
             dependencies: Vec::new(),
         },
         DiscoveredPackage {
@@ -119,6 +120,7 @@ fn osv_skips_lpm_packages() {
             is_dev: false,
             is_optional: false,
             platform_skipped: false,
+            installed: None,
             dependencies: Vec::new(),
         },
     ];

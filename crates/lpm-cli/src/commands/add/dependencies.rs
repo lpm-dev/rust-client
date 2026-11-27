@@ -329,7 +329,7 @@ pub(super) async fn handle_dependencies(
     _yes: bool,
     json_output: bool,
     no_engine_strict: bool,
-    install_lpm_skills: bool,
+    lpm_skills_preference: crate::lpm_skills_config::LpmSkillsPreference,
     effective_pm: &str,
     transaction: &mut crate::manifest_tx::ManifestTransaction,
     firewall_bypass_report: &std::sync::Arc<crate::commands::install::FirewallBypassReport>,
@@ -537,7 +537,7 @@ pub(super) async fn handle_dependencies(
         project_dir,
         json_output,
         no_engine_strict,
-        install_lpm_skills,
+        lpm_skills_preference,
         effective_pm,
         firewall_bypass_report,
     )
@@ -556,7 +556,7 @@ pub(super) async fn refresh_dependency_install(
     project_dir: &Path,
     json_output: bool,
     no_engine_strict: bool,
-    install_lpm_skills: bool,
+    lpm_skills_preference: crate::lpm_skills_config::LpmSkillsPreference,
     effective_pm: &str,
     firewall_bypass_report: &std::sync::Arc<crate::commands::install::FirewallBypassReport>,
 ) -> Result<(), LpmError> {
@@ -565,7 +565,9 @@ pub(super) async fn refresh_dependency_install(
             // Use the injected client so post-add `lpm install` carries
             // the selected registry and shared session.
             let lpm_root = lpm_common::LpmRoot::from_env()?;
-            crate::commands::install::run_with_options_with_lpm_root(
+            // The add reconciles dependency skills itself once it commits.
+            crate::commands::install::defer_dependency_skills(
+                crate::commands::install::run_with_options_with_lpm_root(
                 client,
                 project_dir,
                 json_output,
@@ -577,7 +579,7 @@ pub(super) async fn refresh_dependency_install(
                 no_engine_strict,
                 None,  // strict_peer_dependencies_override
                 None,  // linker_override
-                crate::lpm_skills_config::LpmSkillsPreference::from_enabled(install_lpm_skills),
+                lpm_skills_preference,
                 true,  // no_security_summary
                 false, // auto_build
                 None,  // target_set: shadcn-style add never targets multiple workspace members
@@ -612,6 +614,7 @@ pub(super) async fn refresh_dependency_install(
                     ),
                 ),
                 lpm_root,
+                ),
             )
             .await
             .map_err(|e| match e {

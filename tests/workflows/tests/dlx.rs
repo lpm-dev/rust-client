@@ -1621,3 +1621,45 @@ async fn create_runs_the_initializer_package_with_its_arguments() {
         String::from_utf8_lossy(&output.stdout)
     );
 }
+
+#[tokio::test]
+async fn dlx_never_fetches_package_skills_for_its_throwaway_install() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let project = TempProject::empty(r#"{"name":"dlx-skills","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let name = "@lpm.dev/owner.tool";
+    let tarball = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": name,
+            "version": "1.0.0",
+            "bin": { "owner-tool": "bin/tool.js" }
+        }),
+        &[(
+            "bin/tool.js",
+            b"#!/usr/bin/env node\nconsole.log('ran');\n".as_slice(),
+        )],
+    );
+    mock.with_package_published_at(name, "1.0.0", &tarball, &iso8601_n_secs_ago(72 * 3600))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/skills"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "owner.tool",
+            "version": "1.0.0",
+            "available": true,
+            "skills": [],
+        })))
+        .expect(0)
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["dlx", name])
+        .output()
+        .unwrap();
+
+    assert_dlx_success(&output);
+    assert!(!dlx_entry(&project).join(".lpm/skills").exists());
+}
