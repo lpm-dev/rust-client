@@ -430,6 +430,19 @@ pub struct AnalysisMeta {
     /// `vm` module's script runs, and indirect `eval`.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub eval_calls: usize,
+    /// The test files the analysis read that count as code the package runs,
+    /// because its manifest names them or its code reaches them, sorted, as
+    /// package-relative paths spelled as the package spells them, so a
+    /// caller can open them: a caller that reads only package code can read
+    /// these too. Only a fresh analysis fills it: it isn't stored, so a
+    /// cached analysis has none.
+    #[serde(skip)]
+    pub runtime_test_files: Vec<PathBuf>,
+    /// Of `unparsed_files`, those of code the package runs, test files that
+    /// count as package code included. Like `runtime_test_files`, only a
+    /// fresh analysis fills it.
+    #[serde(skip)]
+    pub runtime_unparsed_files: usize,
 }
 
 fn is_zero(value: &usize) -> bool {
@@ -1331,7 +1344,7 @@ fn analyze_open_cap_source_file(
     let analysis = if sampled {
         analyze_oversized_source_sample(&source_file.path, source_file.size, &bytes, comment_buf)
     } else {
-        analyze_bytes_with_scratch(&path_to_slash(&source_file.path), &bytes, comment_buf, true)
+        analyze_package_file(&source_file.path, &bytes, comment_buf)
     };
     Ok(ScannedCapSourceFile {
         path: source_file.path,
@@ -1558,6 +1571,8 @@ pub struct FileAnalysisResult {
     pub(crate) references: roles::FileReferences,
     /// The file starts a script or a worker from a path it computes.
     pub(crate) loads_computed_code: bool,
+    /// [`exact_path`] of the file's path, when `path` spells it differently.
+    pub(crate) exact_path: Option<Box<Path>>,
 }
 
 /// Analyze one source file a directory walk found. `None` when it can't be
@@ -1580,12 +1595,7 @@ fn analyze_source_file(
     }
 
     let raw_content = lpm_common::read_file_capped(&full_path, limits.full_file_bytes).ok()?;
-    Some(analyze_bytes_with_scratch(
-        &path_to_slash(&file.path),
-        &raw_content,
-        comment_buf,
-        true,
-    ))
+    Some(analyze_package_file(&file.path, &raw_content, comment_buf))
 }
 
 /// Core scan pass without the filesystem read — takes the file's
@@ -1657,6 +1667,7 @@ fn analyze_bytes_with_scratch(
 
     FileAnalysisResult {
         path: filename.to_owned(),
+        exact_path: None,
         eval_calls,
         references,
         loads_computed_code,
@@ -1742,6 +1753,7 @@ fn analyze_oversized_source_sample(
         minified_filename: supply_chain::is_minified_filename(filename),
     };
     result.oversized_source_files = vec![evidence];
+    result.exact_path = exact_path(relative_path);
     result
 }
 
@@ -1804,6 +1816,7 @@ fn oversized_source_sample_from_bytes(bytes: &[u8], sample_bytes: usize) -> Vec<
 fn oversized_minified_result(relative_path: &Path, size: u64) -> FileAnalysisResult {
     let mut result = FileAnalysisResult {
         path: path_to_slash(relative_path),
+        exact_path: exact_path(relative_path),
         oversized_source_files: vec![OversizedSourceFileEvidence {
             path: path_to_slash(relative_path),
             size_bytes: size,
@@ -1862,6 +1875,29 @@ fn active_file_tags<'t>(
 
 fn path_to_slash(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+/// The path itself, when [`path_to_slash`] changed more than its separators:
+/// a name that isn't UTF-8, or one holding `\\` where that isn't a
+/// separator. Opening the file again takes this spelling.
+fn exact_path(relative: &Path) -> Option<Box<Path>> {
+    let changed = match relative.to_str() {
+        None => true,
+        Some(text) => !cfg!(windows) && text.contains('\\'),
+    };
+    changed.then(|| relative.into())
+}
+
+/// [`analyze_bytes_with_scratch`] for the package file at `relative`.
+fn analyze_package_file(
+    relative: &Path,
+    raw_content: &[u8],
+    comment_buf: &mut Vec<u8>,
+) -> FileAnalysisResult {
+    let mut result =
+        analyze_bytes_with_scratch(&path_to_slash(relative), raw_content, comment_buf, true);
+    result.exact_path = exact_path(relative);
+    result
 }
 
 fn extend_oversized_source_files(
@@ -2031,6 +2067,8 @@ pub struct PackageAnalyzer {
     oversized_source_files: Vec<OversizedSourceFileEvidence>,
     files_scanned: usize,
     unparsed_files: usize,
+    /// Of `unparsed_files`, those of files that aren't tests.
+    runtime_unparsed_files: usize,
     bytes_scanned: u64,
     sampled_files: usize,
     skipped_files: usize,
@@ -2136,6 +2174,7 @@ impl PackageAnalyzer {
             oversized_source_files: Vec::new(),
             files_scanned: 0,
             unparsed_files: 0,
+            runtime_unparsed_files: 0,
             bytes_scanned: 0,
             sampled_files: 0,
             skipped_files: 0,
@@ -2233,7 +2272,7 @@ impl PackageAnalyzer {
         }
 
         let scan_start = std::time::Instant::now();
-        let result = analyze_bytes(&path, bytes);
+        let result = analyze_package_file(relative_path, bytes, &mut Vec::new());
         self.merge(result);
         self.note_scan_time(scan_start);
     }
@@ -2354,6 +2393,7 @@ impl PackageAnalyzer {
             self.test_reference_bytes += result.references.byte_len();
             self.tests.push(result);
         } else {
+            self.runtime_unparsed_files += result.unparsed_files;
             let references = std::mem::take(&mut result.references);
             let loads_computed_code = result.source.dynamic_require || result.loads_computed_code;
             self.note_runtime_references(references, loads_computed_code);
@@ -2457,13 +2497,23 @@ impl PackageAnalyzer {
             .copied()
             .zip(named_addons.iter().copied())
             .collect();
+        let mut runtime_test_files = Vec::new();
+        let mut runtime_unparsed_files = self.runtime_unparsed_files;
         for (result, named) in test_results.into_iter().zip(named_results.iter().copied()) {
             if named {
+                runtime_unparsed_files += result.unparsed_files;
+                runtime_test_files.push(
+                    result
+                        .exact_path
+                        .as_deref()
+                        .map_or_else(|| PathBuf::from(&result.path), Path::to_path_buf),
+                );
                 self.runtime.add(result);
             } else {
                 tests.add(result);
             }
         }
+        runtime_test_files.sort_unstable();
         for path in &native_artifacts {
             if named_addons.get(path.as_str()) == Some(&false) {
                 tests.add_native_artifact(path);
@@ -2538,6 +2588,8 @@ impl PackageAnalyzer {
                 tag_files,
                 test_only_tags: test_only_tags.into_iter().map(str::to_owned).collect(),
                 eval_calls: runtime.eval_calls,
+                runtime_test_files,
+                runtime_unparsed_files,
             },
             manifest: manifest_tags.unwrap_or_default(),
         }
@@ -5057,6 +5109,17 @@ mod tests {
         };
         assert_eq!(comparable(&by_capability), comparable(&by_path));
         assert_eq!(comparable(&streamed), comparable(&by_path));
+        // Fields the serialized form leaves out.
+        for other in [&by_capability, &streamed] {
+            assert_eq!(
+                other.meta.runtime_test_files,
+                by_path.meta.runtime_test_files
+            );
+            assert_eq!(
+                other.meta.runtime_unparsed_files,
+                by_path.meta.runtime_unparsed_files
+            );
+        }
         by_path
     }
 
@@ -5151,6 +5214,94 @@ mod tests {
         assert!(!analysis.source.network);
         assert_eq!(analysis.meta.test_only_tags, ["network"]);
         assert!(!analysis.meta.tag_files["eval"].tests_only);
+    }
+
+    #[test]
+    fn the_analysis_lists_the_test_files_that_count_as_package_code_without_storing_them() {
+        let analysis = analyze_every_way(&[
+            (
+                "package.json",
+                br#"{"name":"kit","license":"MIT","main":"index.js"}"#,
+            ),
+            ("index.js", br#"require("./test/helper")"#),
+            ("test/helper.js", br#"require("./support")"#),
+            ("test/support.js", b"module.exports = 1"),
+            ("test/unrelated.test.js", b"eval(code)"),
+        ]);
+
+        assert_eq!(
+            analysis.meta.runtime_test_files,
+            [Path::new("test/helper.js"), Path::new("test/support.js")]
+        );
+        assert!(
+            serde_json::to_value(&analysis).unwrap()["meta"]
+                .get("runtimeTestFiles")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_analysis_counts_the_unparsed_files_of_package_code_apart() {
+        let analysis = analyze_every_way(&[
+            (
+                "package.json",
+                br#"{"name":"kit","license":"MIT","main":"index.js"}"#,
+            ),
+            ("index.js", b"module.exports = 1"),
+            ("lib/broken.js", b"function ("),
+            ("tests/broken.js", b"function ("),
+        ]);
+        assert_eq!(analysis.meta.unparsed_files, 2);
+        assert_eq!(analysis.meta.runtime_unparsed_files, 1);
+
+        let reached = analyze_every_way(&[
+            (
+                "package.json",
+                br#"{"name":"kit","license":"MIT","main":"index.js"}"#,
+            ),
+            ("index.js", br#"require("./tests/broken.js")"#),
+            ("tests/broken.js", b"function ("),
+        ]);
+        assert_eq!(reached.meta.unparsed_files, 1);
+        assert_eq!(reached.meta.runtime_unparsed_files, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_listed_test_files_keep_names_that_are_not_utf8_exactly() {
+        use std::os::unix::ffi::OsStrExt;
+        let not_utf8 = Path::new(std::ffi::OsStr::from_bytes(b"test/r\xffn.js"));
+        let replacement = Path::new("test/r\u{FFFD}n.js");
+        let backslash = Path::new("test/a\\b.js");
+        let mut streaming = PackageAnalyzer::new();
+        let files: [(&Path, &[u8]); 5] = [
+            (
+                Path::new("package.json"),
+                br#"{"name":"kit","license":"MIT"}"#,
+            ),
+            (Path::new("index.js"), b"require(pick())"),
+            (not_utf8, b"eval(code)"),
+            (replacement, b"eval(code)"),
+            (backslash, b"eval(code)"),
+        ];
+        for (path, content) in files {
+            streaming.note_entry(path);
+            if PackageAnalyzer::should_buffer_source(path, content.len() as u64) {
+                streaming.feed(path, content);
+            }
+        }
+        let package = tempfile::tempdir().unwrap();
+        let analysis = streaming.finalize(package.path());
+
+        let mut listed = analysis.meta.runtime_test_files;
+        listed.sort();
+        let mut expected = vec![
+            not_utf8.to_path_buf(),
+            replacement.to_path_buf(),
+            backslash.to_path_buf(),
+        ];
+        expected.sort();
+        assert_eq!(listed, expected);
     }
 
     #[test]
