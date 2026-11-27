@@ -74,6 +74,87 @@ pub async fn ensure_runtime(
 ///
 /// Callers can run fallible configuration detection before starting other
 /// work, then pass the validated requirements here without rereading files.
+/// Synchronously resolve all detected runtime selectors when every required
+/// runtime is already installed locally (or auto-install is disabled /
+/// unavailable). Returns `None` only when at least one runtime needs an async
+/// download so callers can stay off the Tokio runtime on the common warm path.
+pub fn try_ensure_detected_runtimes_sync(
+    detected: &[detect::DetectedRuntimeVersion],
+) -> Option<Vec<RuntimeStatus>> {
+    if detected.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut platform_cache: Option<Option<platform::Platform>> = None;
+    let no_auto_install =
+        std::env::var("LPM_NO_AUTO_INSTALL").is_ok_and(|v| v == "true" || v == "1");
+    let mut statuses = Vec::with_capacity(detected.len());
+
+    for runtime_entry in detected {
+        if !runtime_entry.is_runtime_selector() {
+            continue;
+        }
+        let runtime = runtime_entry.runtime;
+        let source = runtime_entry.source_label();
+        let spec = &runtime_entry.spec;
+
+        if let Err(e) = validate_version_spec(runtime, spec) {
+            tracing::warn!("invalid version spec from {source}: {e}");
+            statuses.push(RuntimeStatus::NotInstalled {
+                runtime,
+                spec: spec.to_string(),
+                source,
+            });
+            continue;
+        }
+
+        let clean_spec = clean_lookup_spec(runtime, spec);
+        if runtime == detect::RuntimeKind::Node {
+            let platform = platform_cache.get_or_insert_with(|| platform::Platform::current().ok());
+            if let Some(reason) = platform
+                .as_ref()
+                .and_then(platform::Platform::node_unavailable_reason)
+            {
+                tracing::warn!("not using a managed Node.js runtime: {reason}");
+                statuses.push(RuntimeStatus::NotInstalled {
+                    runtime,
+                    spec: clean_spec,
+                    source,
+                });
+                continue;
+            }
+        }
+
+        if let Ok(installed) = list_installed(runtime)
+            && let Some(version) = find_matching_installed(runtime, spec, &installed)
+            && let Ok(bin_dir) = bin_dir(runtime, &version)
+            && bin_dir.exists()
+        {
+            statuses.push(RuntimeStatus::Ready {
+                runtime,
+                version,
+                source,
+                bin_dir,
+            });
+            continue;
+        }
+
+        if no_auto_install {
+            statuses.push(RuntimeStatus::NotInstalled {
+                runtime,
+                spec: clean_spec,
+                source,
+            });
+            continue;
+        }
+
+        // Needs async network installation.
+        return None;
+    }
+
+    Some(statuses)
+}
+
 pub async fn ensure_detected_runtimes(
     detected: Vec<detect::DetectedRuntimeVersion>,
 ) -> Vec<RuntimeStatus> {

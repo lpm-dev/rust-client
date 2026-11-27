@@ -1,6 +1,8 @@
 use miette::Result;
 
-use super::{Commands, async_main, install_state, parse_cli_or_exit};
+use super::{
+    Commands, SyncDispatch, async_main, install_state, parse_cli_or_exit, try_run_sync_command,
+};
 
 /// The directory the command started in, until its project's and the LPM
 /// home's state is kept ignored as it ends.
@@ -47,29 +49,44 @@ pub(crate) fn keep_state_ignored_at_exit() {
 
 pub(super) fn run_async_main() -> Result<()> {
     crate::open_file_limit::raise();
+    let cli = parse_cli_or_exit();
+    let project_dir = std::env::current_dir().ok();
+    if let Some(cwd) = project_dir.as_deref()
+        && !writes_nothing(cli.command.as_ref())
+    {
+        keep_state_ignored_at_exit_from(cwd);
+    }
+
+    let cli = match try_run_sync_command(cli) {
+        SyncDispatch::Handled(result) => {
+            keep_state_ignored_at_exit();
+            return result;
+        }
+        SyncDispatch::ContinueAsync(cli) => cli,
+    };
+
     // Standalone and recursive installs poll large futures on different threads.
-    // Both need this stack budget for debug builds and large workspaces.
+    // Debug frames are unoptimized and need 64 MiB; release frames are much
+    // smaller so 16 MiB (2x the OS default) avoids reserving 64 MiB per worker.
+    #[cfg(debug_assertions)]
     const ASYNC_STACK_BYTES: usize = 64 * 1024 * 1024;
+    #[cfg(not(debug_assertions))]
+    const ASYNC_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+    let workers = runtime_worker_threads(
+        cli.command.as_ref(),
+        std::env::var_os("TOKIO_WORKER_THREADS").is_some(),
+        std::thread::available_parallelism().map_or(1, |count| count.get()),
+        project_dir.as_deref(),
+    );
     std::thread::Builder::new()
         .name("lpm-async-main".into())
         .stack_size(ASYNC_STACK_BYTES)
         .spawn(move || {
-            let cli = parse_cli_or_exit();
             let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
             runtime_builder.enable_all();
             runtime_builder.thread_stack_size(ASYNC_STACK_BYTES);
-            let project_dir = std::env::current_dir().ok();
-            if let Some(cwd) = project_dir.as_deref()
-                && !writes_nothing(cli.command.as_ref())
-            {
-                keep_state_ignored_at_exit_from(cwd);
-            }
-            if let Some(workers) = runtime_worker_threads(
-                cli.command.as_ref(),
-                std::env::var_os("TOKIO_WORKER_THREADS").is_some(),
-                std::thread::available_parallelism().map_or(1, |count| count.get()),
-                project_dir.as_deref(),
-            ) {
+            if let Some(workers) = workers {
                 runtime_builder.worker_threads(workers);
             }
             if let Some(cap) = std::env::var("LPM_MAX_BLOCKING_THREADS")
@@ -110,46 +127,160 @@ pub(super) fn keep_project_state_ignored(project_dir: &std::path::Path) {
     }
 }
 
-/// Commands that run one script, inspect local state, or run bounded
-/// registry/analysis work on rayon or the blocking pool without spawning
-/// workspace-wide async installs. A runtime worker per CPU only adds thread
-/// start-up and scheduler contention to them.
-fn runs_on_two_workers(command: Option<&Commands>) -> bool {
+enum WorkerPoolClass {
+    /// Commands whose async work stays bounded and benefits from avoiding a
+    /// CPU-count Tokio thread pool at startup.
+    TwoWorkers,
+    /// Install-like commands that run on two workers for a single-package
+    /// project and retain the full CPU-count pool for workspaces or uncertain
+    /// layouts.
+    SingleProjectOrFull,
+    /// Commands that run workspace-wide fan-out, watchers, servers, or heavy
+    /// multi-stream install/resolve pipelines.
+    FullPool,
+}
+
+fn classify_worker_pool(command: Option<&Commands>) -> WorkerPoolClass {
     match command {
-        Some(Commands::Run(args)) => {
-            args.scripts.len() <= 1
-                && !args.parallel
+        Some(Commands::Install(args)) => {
+            if !args.global
+                && args.packages.is_empty()
+                && !args.recursive
                 && args.workspace_concurrency.is_none()
-                && !args.all
                 && args.filter.is_empty()
                 && args.filter_prod.is_empty()
-                && !args.affected
-                && !args.watch
+                && !args.workspace_root
+                && !args.fail_if_no_match
+                && args.changed_files_ignore_pattern.is_empty()
+                && args.test_pattern.is_empty()
+            {
+                WorkerPoolClass::SingleProjectOrFull
+            } else {
+                WorkerPoolClass::FullPool
+            }
         }
-        Some(Commands::RunFile(args)) => !args.watch,
-        Some(Commands::Migrate(args)) => args.no_install || args.dry_run,
+        Some(Commands::Migrate(args)) => {
+            if args.no_install || args.dry_run {
+                WorkerPoolClass::TwoWorkers
+            } else {
+                WorkerPoolClass::SingleProjectOrFull
+            }
+        }
         Some(
-            Commands::Exec(_)
-            | Commands::Env(_)
-            | Commands::Pack(_)
-            | Commands::Why(_)
-            | Commands::Graph(_)
-            | Commands::Query(_)
-            | Commands::Licenses(_)
-            | Commands::Sbom(_)
-            | Commands::Doctor(_)
-            | Commands::Filter(_)
-            | Commands::Trust(_)
-            | Commands::Catalog(_)
-            | Commands::Cache(_)
-            | Commands::Store(_)
-            | Commands::Audit(_)
-            | Commands::Outdated(_)
-            | Commands::Info(_)
-            | Commands::Search(_),
-        ) => true,
-        _ => false,
+            Commands::Ci(_) | Commands::Upgrade(_) | Commands::Tidy(_) | Commands::Uninstall(_),
+        ) => WorkerPoolClass::SingleProjectOrFull,
+        Some(
+            Commands::Add(_)
+            | Commands::Fetch(_)
+            | Commands::Resolve(_)
+            | Commands::Deploy(_)
+            | Commands::Rebuild(_)
+            | Commands::Dev(_)
+            | Commands::Tunnel(_)
+            | Commands::Release(_),
+        ) => WorkerPoolClass::FullPool,
+        Some(Commands::Run(args)) => {
+            if args.scripts.len() > 1
+                || args.parallel
+                || args.workspace_concurrency.is_some()
+                || args.all
+                || !args.filter.is_empty()
+                || !args.filter_prod.is_empty()
+                || args.affected
+                || args.watch
+            {
+                WorkerPoolClass::FullPool
+            } else {
+                WorkerPoolClass::TwoWorkers
+            }
+        }
+        Some(Commands::RunFile(args)) => {
+            if args.watch {
+                WorkerPoolClass::FullPool
+            } else {
+                WorkerPoolClass::TwoWorkers
+            }
+        }
+        Some(Commands::Lint(args)) => {
+            workspace_tool_pool_class(args.all, args.affected, &args.filter, &args.filter_prod)
+        }
+        Some(Commands::Fmt(args)) => {
+            workspace_tool_pool_class(args.all, args.affected, &args.filter, &args.filter_prod)
+        }
+        Some(Commands::Check(args)) => {
+            workspace_tool_pool_class(args.all, args.affected, &args.filter, &args.filter_prod)
+        }
+        Some(Commands::Bundle(args)) => {
+            workspace_tool_pool_class(args.all, args.affected, &args.filter, &args.filter_prod)
+        }
+        Some(Commands::Pack(args)) => {
+            workspace_tool_pool_class(args.all, args.affected, &args.filter, &args.filter_prod)
+        }
+        Some(Commands::Test(args)) => {
+            workspace_tool_pool_class(args.all, args.affected, &args.filter, &args.filter_prod)
+        }
+        Some(Commands::Bench(args)) => {
+            workspace_tool_pool_class(args.all, args.affected, &args.filter, &args.filter_prod)
+        }
+        _ => WorkerPoolClass::TwoWorkers,
     }
+}
+
+fn workspace_tool_pool_class(
+    all: bool,
+    affected: bool,
+    filter: &[String],
+    filter_prod: &[String],
+) -> WorkerPoolClass {
+    if all || affected || !filter.is_empty() || !filter_prod.is_empty() {
+        WorkerPoolClass::FullPool
+    } else {
+        WorkerPoolClass::TwoWorkers
+    }
+}
+
+/// Checks that `content` is a valid JSON object without a top-level
+/// `"workspaces"` property, skipping full `serde_json::Value` DOM allocation.
+fn is_non_workspace_package_json_object(content: &str) -> bool {
+    struct NonWorkspaceObjectVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for NonWorkspaceObjectVisitor {
+        type Value = bool;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a package.json object")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut has_workspaces = false;
+            while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                if key == "workspaces" {
+                    has_workspaces = true;
+                }
+                let _ = map.next_value::<serde::de::IgnoredAny>()?;
+            }
+            Ok(!has_workspaces)
+        }
+    }
+
+    struct NonWorkspaceObject(bool);
+
+    impl<'de> serde::Deserialize<'de> for NonWorkspaceObject {
+        fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer
+                .deserialize_map(NonWorkspaceObjectVisitor)
+                .map(Self)
+        }
+    }
+
+    serde_json::from_str::<NonWorkspaceObject>(lpm_common::strip_utf8_bom_str(content))
+        .is_ok_and(|parsed| parsed.0)
 }
 
 fn runtime_worker_threads(
@@ -161,33 +292,10 @@ fn runtime_worker_threads(
     if explicit_worker_count {
         return None;
     }
-    if runs_on_two_workers(command) {
-        return Some(available_parallelism.clamp(1, 2));
-    }
-    let single_project_install_like = match command {
-        Some(Commands::Install(args)) => {
-            !args.global
-                && args.packages.is_empty()
-                && !args.recursive
-                && args.workspace_concurrency.is_none()
-                && args.filter.is_empty()
-                && args.filter_prod.is_empty()
-                && !args.workspace_root
-                && !args.fail_if_no_match
-                && args.changed_files_ignore_pattern.is_empty()
-                && args.test_pattern.is_empty()
-        }
-        Some(
-            Commands::Ci(_)
-            | Commands::Migrate(_)
-            | Commands::Upgrade(_)
-            | Commands::Tidy(_)
-            | Commands::Uninstall(_),
-        ) => true,
-        _ => false,
-    };
-    if !single_project_install_like {
-        return None;
+    match classify_worker_pool(command) {
+        WorkerPoolClass::TwoWorkers => return Some(available_parallelism.clamp(1, 2)),
+        WorkerPoolClass::FullPool => return None,
+        WorkerPoolClass::SingleProjectOrFull => {}
     }
     let project_dir = project_dir?;
     let (content, _) = lpm_common::read_text_regular_file_capped_with_metadata(
@@ -195,10 +303,7 @@ fn runtime_worker_threads(
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     )
     .ok()?;
-    let package: serde_json::Value =
-        serde_json::from_str(lpm_common::strip_utf8_bom_str(&content)).ok()?;
-    if !package.is_object()
-        || package.get("workspaces").is_some()
+    if !is_non_workspace_package_json_object(&content)
         || project_dir.join("Package.swift").exists()
         || install_state::has_pnpm_workspace_yaml(project_dir)
         || lpm_workspace::find_workspace_root(project_dir)
@@ -304,6 +409,14 @@ mod tests {
             vec!["lpm", "pack"],
             vec!["lpm", "migrate", "--no-install"],
             vec!["lpm", "env", "ls"],
+            vec!["lpm", "serve"],
+            vec!["lpm", "config"],
+            vec!["lpm", "self-update"],
+            vec!["lpm", "whoami"],
+            vec!["lpm", "lint"],
+            vec!["lpm", "test"],
+            vec!["lpm", "mcp", "status"],
+            vec!["lpm", "global", "list"],
         ] {
             let cli = Cli::try_parse_from(&args).unwrap();
             for available in [1, 2, 18] {
@@ -343,7 +456,10 @@ mod tests {
             vec!["lpm", "run", "test", "--affected"],
             vec!["lpm", "run", "test", "--watch"],
             vec!["lpm", "__run-file", "scripts/seed.ts", "--watch"],
-            vec!["lpm", "serve"],
+            vec!["lpm", "lint", "--all"],
+            vec!["lpm", "test", "--filter", "app"],
+            vec!["lpm", "pack", "--affected"],
+            vec!["lpm", "tunnel", "3000"],
         ] {
             let cli = Cli::try_parse_from(args).unwrap();
             assert_eq!(

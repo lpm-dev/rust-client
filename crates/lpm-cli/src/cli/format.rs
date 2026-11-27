@@ -75,9 +75,10 @@ pub(super) fn post_parse_error(cli: &Cli) -> Option<clap::Error> {
 
     if let Some(Commands::Login(args)) = &cli.command
         && args.save_env_token
-        && args.token.is_some()
+        && cli.token.is_some()
     {
         let mut command = Cli::command();
+        command.build();
         let login = command
             .find_subcommand_mut("login")
             .expect("login command must exist");
@@ -88,7 +89,7 @@ pub(super) fn post_parse_error(cli: &Cli) -> Option<clap::Error> {
     }
 
     if let Some(Commands::Login(args)) = &cli.command
-        && args.token.is_some()
+        && cli.token.is_some()
         && !args.npm
         && !args.github
         && !args.gitlab

@@ -430,18 +430,9 @@ impl RegistryClient {
     pub fn new() -> Self {
         let http = HttpClients::with_default_built_on_first_use();
 
-        // Initialize metadata cache at ~/.lpm/cache/metadata/ via LpmRoot.
-        // `None` here is a graceful degradation: if we can't even resolve a
-        // home directory (no $HOME, no $USERPROFILE, no $LPM_HOME), the
-        // registry client falls back to memory-only caching for this
-        // process. That is strictly better than failing construction.
-        let cache_dir = LpmRoot::from_env().ok().map(|root| {
-            let dir = root.cache_metadata();
-            if let Err(e) = super::cache::ensure_private_metadata_cache_dir(&dir) {
-                tracing::warn!("failed to create metadata cache directory: {}", e);
-            }
-            dir
-        });
+        // Defer creating ~/.lpm/cache/metadata/ until the first disk cache write
+        // so read-only / local commands never pay mkdir+chmod syscalls at startup.
+        let cache_dir = LpmRoot::from_env().ok().map(|root| root.cache_metadata());
 
         RegistryClient {
             http,

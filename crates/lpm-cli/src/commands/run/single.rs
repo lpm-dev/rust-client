@@ -88,13 +88,20 @@ fn script_command_for_display(
     project_dir: &Path,
     script_name: &str,
     lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+    preloaded_package: Option<&lpm_workspace::PackageJson>,
 ) -> Result<Option<String>, LpmError> {
-    let pkg_json_path = project_dir.join("package.json");
-    if pkg_json_path.exists() {
-        let pkg = lpm_workspace::read_package_json(&pkg_json_path)
-            .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
+    if let Some(pkg) = preloaded_package {
         if let Some(command) = pkg.scripts.get(script_name) {
             return Ok(Some(command.clone()));
+        }
+    } else {
+        let pkg_json_path = project_dir.join("package.json");
+        if pkg_json_path.exists() {
+            let pkg = lpm_workspace::read_package_json(&pkg_json_path)
+                .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
+            if let Some(command) = pkg.scripts.get(script_name) {
+                return Ok(Some(command.clone()));
+            }
         }
     }
 
@@ -120,39 +127,8 @@ fn print_run_metadata(cache_status: &str, command: Option<&str>) {
     install_ui::detail("");
 }
 
-/// Run a script from package.json (single package).
-///
-/// Delegates to `lpm_runner::script::run_script()` which provides:
-/// - PATH injection (`node_modules/.bin` prepended)
-/// - `.env` file loading (auto + `--env` flag + `lpm.json` mapping)
-/// - Pre/post script hooks (npm convention)
-/// - Task caching (when enabled in `lpm.json`)
-///
-/// **Caller contract:** invoke [`ensure_runtime`] first and pass its return
-/// value as `bin_hint`; doing so surfaces the runtime notice, performs
-/// auto-install when needed, and avoids re-probing the runtime for the script.
-pub async fn run(
-    project_dir: &Path,
-    script_name: &str,
-    extra_args: &[String],
-    env_mode: Option<&str>,
-    no_cache: bool,
-    bin_hint: &ManagedRuntimeHint,
-    session: Option<Arc<lpm_auth::SessionManager>>,
-) -> Result<(), LpmError> {
-    run_with_reserved_stdout(
-        project_dir,
-        script_name,
-        extra_args,
-        env_mode,
-        no_cache,
-        bin_hint,
-        session,
-        false,
-    )
-    .await
-}
-
+/// Run a script from package.json (single package), reserving stdout for `--json`
+/// callers so child output is captured and routed to stderr.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_with_reserved_stdout(
     project_dir: &Path,
@@ -164,18 +140,44 @@ pub(crate) async fn run_with_reserved_stdout(
     session: Option<Arc<lpm_auth::SessionManager>>,
     reserve_stdout: bool,
 ) -> Result<(), LpmError> {
+    let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    run_with_loaded_context(
+        project_dir,
+        script_name,
+        extra_args,
+        env_mode,
+        no_cache,
+        bin_hint,
+        session,
+        reserve_stdout,
+        lpm_config.as_ref(),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_with_loaded_context(
+    project_dir: &Path,
+    script_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    no_cache: bool,
+    bin_hint: &ManagedRuntimeHint,
+    session: Option<Arc<lpm_auth::SessionManager>>,
+    reserve_stdout: bool,
+    lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+    preloaded_package: Option<&lpm_workspace::PackageJson>,
+) -> Result<(), LpmError> {
     let env_access = lpm_runner::env_access::EnvAccessScope::current_or_new();
     let _env_access_binding = env_access.bind();
-    // Read lpm.json once so the cache lookup and task predicate share the same config.
-    let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
-    let command = script_command_for_display(project_dir, script_name, lpm_config.as_ref())?;
+    let command =
+        script_command_for_display(project_dir, script_name, lpm_config, preloaded_package)?;
     let mut no_cache = no_cache;
-    let workspace_contract =
-        if no_cache || !is_task_cached_with_config(script_name, lpm_config.as_ref()) {
-            None
-        } else {
-            WorkspaceCacheContract::for_cached_project_run(project_dir, &mut no_cache)
-        };
+    let workspace_contract = if no_cache || !is_task_cached_with_config(script_name, lpm_config) {
+        None
+    } else {
+        WorkspaceCacheContract::for_cached_project_run(project_dir, &mut no_cache)
+    };
     let cache_context = if no_cache {
         None
     } else {
@@ -186,7 +188,7 @@ pub(crate) async fn run_with_reserved_stdout(
             env_mode,
             extra_args,
             bin_hint,
-            lpm_config.as_ref(),
+            lpm_config,
             session,
         )?
     };
@@ -245,7 +247,7 @@ pub(crate) async fn run_with_reserved_stdout(
             env_mode,
             bin_hint,
             reserve_stdout,
-            lpm_config.as_ref(),
+            lpm_config,
         )?;
         let duration_ms = start.elapsed().as_millis() as u64;
         if let Some(context) = cache_context.as_ref() {
@@ -265,14 +267,15 @@ pub(crate) async fn run_with_reserved_stdout(
             );
         }
     } else {
-        // Run normally (inherited stdio, no capture)
-        lpm_runner::script::run_script_with_config(
+        // Run normally (inherited stdio, no capture), reusing the loaded manifest.
+        lpm_runner::script::run_script_with_config_and_package(
             project_dir,
             script_name,
             extra_args,
             env_mode,
             bin_hint,
-            lpm_config.as_ref(),
+            lpm_config,
+            preloaded_package,
         )?;
     }
 
@@ -405,7 +408,11 @@ fn task_watch_filter(
         if let Some(task) = task {
             outputs.extend(task.outputs.iter().cloned());
         }
-        if super::task::is_meta_task(task_name, plan.tasks(), plan.package_scripts.as_ref()) {
+        if super::task::is_meta_task(
+            task_name,
+            plan.tasks(),
+            plan.package.as_ref().map(|p| &p.scripts),
+        ) {
             continue;
         }
         if let Some(task) = task {
@@ -443,6 +450,30 @@ fn task_watch_filter(
 }
 
 /// Run a project-local binary from node_modules/.bin.
+/// Synchronous fast path for `lpm exec` when no managed runtime needs downloading.
+pub fn try_exec_sync(
+    project_dir: &Path,
+    command_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    no_env_check: bool,
+    json_output: bool,
+) -> Result<Option<()>, LpmError> {
+    let Some(bin_hint) = super::runtime::try_prepare_runtime_sync(project_dir, false)? else {
+        return Ok(None);
+    };
+    crate::commands::env::links::ensure_folder_linked(project_dir, json_output)?;
+    exec_with_hint(
+        project_dir,
+        command_name,
+        extra_args,
+        env_mode,
+        no_env_check,
+        &bin_hint,
+    )?;
+    Ok(Some(()))
+}
+
 pub async fn exec(
     project_dir: &Path,
     command_name: &str,
@@ -451,6 +482,24 @@ pub async fn exec(
     no_env_check: bool,
 ) -> Result<(), LpmError> {
     let bin_hint = prepare_runtime(project_dir, false).await?;
+    exec_with_hint(
+        project_dir,
+        command_name,
+        extra_args,
+        env_mode,
+        no_env_check,
+        &bin_hint,
+    )
+}
+
+fn exec_with_hint(
+    project_dir: &Path,
+    command_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    no_env_check: bool,
+    bin_hint: &ManagedRuntimeHint,
+) -> Result<(), LpmError> {
     install_ui::phase_line(crate::install_ui::terminal_line!(
         "Executing {}",
         install_ui::yellow(command_name)
@@ -462,7 +511,7 @@ pub async fn exec(
         extra_args,
         env_mode,
         no_env_check,
-        &bin_hint,
+        bin_hint,
     )?;
     install_ui::done_line(crate::install_ui::terminal_line!(
         "Done · exited 0 in {}",

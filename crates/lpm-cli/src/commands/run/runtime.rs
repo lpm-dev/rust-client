@@ -33,6 +33,22 @@ pub async fn prepare_runtime(
     Ok(hint)
 }
 
+/// Synchronous fast path for [`prepare_runtime`] when every required managed
+/// runtime is already installed locally (or none is declared). Returns `Ok(None)`
+/// only when an async runtime installation is required.
+pub fn try_prepare_runtime_sync(
+    project_dir: &Path,
+    json_output: bool,
+) -> Result<Option<ManagedRuntimeHint>, LpmError> {
+    let detected = detect_runtime_selectors_with_workspace_root(project_dir)?;
+    let Some(statuses) = lpm_runtime::try_ensure_detected_runtimes_sync(&detected) else {
+        return Ok(None);
+    };
+    let hint = finalize_runtime_statuses(statuses);
+    validate_runtime(project_dir, &hint, json_output)?;
+    Ok(Some(hint))
+}
+
 /// The project's runtime selectors, with the workspace root's selector for
 /// each runtime the project doesn't select itself: workspace members inherit
 /// root pins. Both are read before anything installs, so a root runtime the
@@ -135,6 +151,10 @@ pub async fn ensure_detected_runtimes(
     detected: Vec<lpm_runtime::detect::DetectedRuntimeVersion>,
 ) -> ManagedRuntimeHint {
     let statuses = lpm_runtime::ensure_detected_runtimes(detected).await;
+    finalize_runtime_statuses(statuses)
+}
+
+fn finalize_runtime_statuses(statuses: Vec<lpm_runtime::RuntimeStatus>) -> ManagedRuntimeHint {
     if statuses.is_empty() {
         return ManagedRuntimeHint::Absent;
     }

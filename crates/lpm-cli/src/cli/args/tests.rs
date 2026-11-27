@@ -573,11 +573,14 @@ fn release_publish_otp_flag_parses_for_non_interactive_lpm_publish() {
     .unwrap();
 
     match cli.command {
-        Some(Commands::Release(super::release::ReleaseArgs {
-            command: super::release::ReleaseCommands::Publish { otp, .. },
-        })) => {
-            assert_eq!(otp.as_deref(), Some("123456"));
-        }
+        Some(Commands::Release(args)) => match *args {
+            super::release::ReleaseArgs {
+                command: super::release::ReleaseCommands::Publish { otp, .. },
+            } => {
+                assert_eq!(otp.as_deref(), Some("123456"));
+            }
+            _ => panic!("expected release publish command"),
+        },
         _ => panic!("expected release publish command"),
     }
 }
@@ -599,9 +602,12 @@ fn release_publish_ignore_scripts_flag_parses() {
         .expect("release publish must expose the lifecycle escape hatch");
 
     match cli.command {
-        Some(Commands::Release(super::release::ReleaseArgs {
-            command: super::release::ReleaseCommands::Publish { ignore_scripts, .. },
-        })) => assert!(ignore_scripts),
+        Some(Commands::Release(args)) => match *args {
+            super::release::ReleaseArgs {
+                command: super::release::ReleaseCommands::Publish { ignore_scripts, .. },
+            } => assert!(ignore_scripts),
+            _ => panic!("expected release publish command"),
+        },
         _ => panic!("expected release publish command"),
     }
 }
@@ -675,7 +681,9 @@ fn stage_publish_provenance_modes_are_mutually_exclusive() {
 fn run_single_script_parses() {
     let cli = Cli::try_parse_from(["lpm", "run", "build"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Run(network::RunArgs { scripts, args, .. }) => {
+        Commands::Run(boxed) => {
+            let network::RunArgs { scripts, args, .. } = *boxed;
+
             assert_eq!(scripts, vec!["build"]);
             assert!(args.is_empty(), "args should be empty without --");
         }
@@ -687,7 +695,9 @@ fn run_single_script_parses() {
 fn run_multiple_scripts_parses() {
     let cli = Cli::try_parse_from(["lpm", "run", "build", "test", "lint"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Run(network::RunArgs { scripts, args, .. }) => {
+        Commands::Run(boxed) => {
+            let network::RunArgs { scripts, args, .. } = *boxed;
+
             assert_eq!(scripts, vec!["build", "test", "lint"]);
             assert!(args.is_empty());
         }
@@ -699,7 +709,9 @@ fn run_multiple_scripts_parses() {
 fn run_script_with_extra_args_after_separator() {
     let cli = Cli::try_parse_from(["lpm", "run", "build", "--", "--verbose", "--force"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Run(network::RunArgs { scripts, args, .. }) => {
+        Commands::Run(boxed) => {
+            let network::RunArgs { scripts, args, .. } = *boxed;
+
             assert_eq!(scripts, vec!["build"]);
             assert_eq!(args, vec!["--verbose", "--force"]);
         }
@@ -711,13 +723,15 @@ fn run_script_with_extra_args_after_separator() {
 fn run_script_with_flags_parses() {
     let cli = Cli::try_parse_from(["lpm", "run", "build", "--all", "--no-cache"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Run(network::RunArgs {
-            scripts,
-            all,
-            no_cache,
-            args,
-            ..
-        }) => {
+        Commands::Run(boxed) => {
+            let network::RunArgs {
+                scripts,
+                all,
+                no_cache,
+                args,
+                ..
+            } = *boxed;
+
             assert_eq!(scripts, vec!["build"]);
             assert!(all);
             assert!(no_cache);
@@ -732,12 +746,14 @@ fn run_script_with_flags_and_extra_args() {
     let cli =
         Cli::try_parse_from(["lpm", "run", "test", "--parallel", "--", "--coverage"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Run(network::RunArgs {
-            scripts,
-            parallel,
-            args,
-            ..
-        }) => {
+        Commands::Run(boxed) => {
+            let network::RunArgs {
+                scripts,
+                parallel,
+                args,
+                ..
+            } = *boxed;
+
             assert_eq!(scripts, vec!["test"]);
             assert!(parallel);
             assert_eq!(args, vec!["--coverage"]);
@@ -750,7 +766,9 @@ fn run_script_with_flags_and_extra_args() {
 fn run_watch_flag_parses() {
     let cli = Cli::try_parse_from(["lpm", "run", "dev", "--watch"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Run(network::RunArgs { scripts, watch, .. }) => {
+        Commands::Run(boxed) => {
+            let network::RunArgs { scripts, watch, .. } = *boxed;
+
             assert_eq!(scripts, vec!["dev"]);
             assert!(watch);
         }
@@ -863,7 +881,9 @@ fn run_filter_flag_collects_into_vec() {
     ])
     .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Run(network::RunArgs { filter, .. }) => {
+        Commands::Run(boxed) => {
+            let network::RunArgs { filter, .. } = *boxed;
+
             assert_eq!(filter, vec!["foo".to_string(), "@ui/*".to_string()]);
         }
         _ => panic!("expected Run command"),
@@ -883,7 +903,9 @@ fn run_filter_prod_flag_collects_into_vec() {
     ])
     .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Run(network::RunArgs { filter_prod, .. }) => {
+        Commands::Run(boxed) => {
+            let network::RunArgs { filter_prod, .. } = *boxed;
+
             assert_eq!(
                 filter_prod,
                 vec!["...app".to_string(), "core...".to_string()]
@@ -908,10 +930,12 @@ fn run_changed_files_ignore_pattern_flag_collects_into_vec() {
     ])
     .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Run(network::RunArgs {
-            changed_files_ignore_pattern,
-            ..
-        }) => {
+        Commands::Run(boxed) => {
+            let network::RunArgs {
+                changed_files_ignore_pattern,
+                ..
+            } = *boxed;
+
             assert_eq!(
                 changed_files_ignore_pattern,
                 vec!["**/README.md".to_string(), "docs/**".to_string()]
@@ -935,7 +959,9 @@ fn run_test_pattern_flag_collects_into_vec() {
     ])
     .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Run(network::RunArgs { test_pattern, .. }) => {
+        Commands::Run(boxed) => {
+            let network::RunArgs { test_pattern, .. } = *boxed;
+
             assert_eq!(
                 test_pattern,
                 vec!["**/*.test.js".to_string(), "**/*.spec.js".to_string()]
@@ -957,11 +983,13 @@ fn run_fail_if_no_match_flag_parses() {
     ])
     .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Run(network::RunArgs {
-            filter,
-            fail_if_no_match,
-            ..
-        }) => {
+        Commands::Run(boxed) => {
+            let network::RunArgs {
+                filter,
+                fail_if_no_match,
+                ..
+            } = *boxed;
+
             assert_eq!(filter, vec!["foo".to_string()]);
             assert!(fail_if_no_match);
         }
@@ -973,9 +1001,11 @@ fn run_fail_if_no_match_flag_parses() {
 fn run_no_bail_flag_parses() {
     let cli = Cli::try_parse_from(["lpm", "run", "build", "--no-bail"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Run(network::RunArgs {
-            continue_on_error, ..
-        }) => {
+        Commands::Run(boxed) => {
+            let network::RunArgs {
+                continue_on_error, ..
+            } = *boxed;
+
             assert!(continue_on_error);
         }
         _ => panic!("expected Run command"),
@@ -1004,10 +1034,12 @@ fn run_workspace_concurrency_flag_parses() {
     ])
     .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Run(network::RunArgs {
-            workspace_concurrency,
-            ..
-        }) => {
+        Commands::Run(boxed) => {
+            let network::RunArgs {
+                workspace_concurrency,
+                ..
+            } = *boxed;
+
             assert_eq!(workspace_concurrency.map(NonZeroUsize::get), Some(2));
         }
         _ => panic!("expected Run command"),
@@ -1040,10 +1072,12 @@ fn test_workspace_concurrency_flag_parses() {
     ])
     .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Test(build::TestArgs {
-            workspace_concurrency,
-            ..
-        }) => {
+        Commands::Test(boxed) => {
+            let build::TestArgs {
+                workspace_concurrency,
+                ..
+            } = *boxed;
+
             assert_eq!(workspace_concurrency.map(NonZeroUsize::get), Some(3));
         }
         _ => panic!("expected Test command"),
@@ -1062,10 +1096,12 @@ fn bench_workspace_concurrency_flag_parses() {
     ])
     .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Bench(build::BenchArgs {
-            workspace_concurrency,
-            ..
-        }) => {
+        Commands::Bench(boxed) => {
+            let build::BenchArgs {
+                workspace_concurrency,
+                ..
+            } = *boxed;
+
             assert_eq!(workspace_concurrency.map(NonZeroUsize::get), Some(4));
         }
         _ => panic!("expected Bench command"),
@@ -1242,13 +1278,15 @@ fn install_filter_flag_collects_into_vec() {
     ])
     .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs {
-            packages,
-            filter,
-            workspace_root,
-            fail_if_no_match,
-            ..
-        }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs {
+                packages,
+                filter,
+                workspace_root,
+                fail_if_no_match,
+                ..
+            } = *boxed;
+
             assert_eq!(packages, vec!["react".to_string()]);
             assert_eq!(filter, vec!["web".to_string(), "@ui/*".to_string()]);
             assert!(!workspace_root);
@@ -1262,12 +1300,14 @@ fn install_filter_flag_collects_into_vec() {
 fn install_workspace_root_short_flag_parses() {
     let cli = Cli::try_parse_from(["lpm", "install", "typescript", "-w"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs {
-            packages,
-            workspace_root,
-            filter,
-            ..
-        }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs {
+                packages,
+                workspace_root,
+                filter,
+                ..
+            } = *boxed;
+
             assert_eq!(packages, vec!["typescript".to_string()]);
             assert!(workspace_root, "-w must enable workspace_root");
             assert!(filter.is_empty());
@@ -1280,7 +1320,9 @@ fn install_workspace_root_short_flag_parses() {
 fn install_workspace_root_long_flag_parses() {
     let cli = Cli::try_parse_from(["lpm", "install", "typescript", "--workspace-root"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs { workspace_root, .. }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs { workspace_root, .. } = *boxed;
+
             assert!(workspace_root, "--workspace-root must enable the flag");
         }
         _ => panic!("expected Install command"),
@@ -1291,7 +1333,9 @@ fn install_workspace_root_long_flag_parses() {
 fn install_timing_flag_parses() {
     let cli = Cli::try_parse_from(["lpm", "install", "--json", "--timing"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs { timing, .. }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs { timing, .. } = *boxed;
+
             assert!(timing, "--timing must enable install timing diagnostics");
         }
         _ => panic!("expected Install command"),
@@ -1310,9 +1354,11 @@ fn install_fail_if_no_match_flag_parses() {
     ])
     .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs {
-            fail_if_no_match, ..
-        }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs {
+                fail_if_no_match, ..
+            } = *boxed;
+
             assert!(fail_if_no_match);
         }
         _ => panic!("expected Install command"),
@@ -1323,7 +1369,9 @@ fn install_fail_if_no_match_flag_parses() {
 fn install_yes_flag_parses() {
     let cli = Cli::try_parse_from(["lpm", "install", "react", "-y"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs { packages, yes, .. }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs { packages, yes, .. } = *boxed;
+
             assert_eq!(packages, vec!["react".to_string()]);
             assert!(yes, "-y must set the install confirmation bypass flag");
         }
@@ -1335,9 +1383,11 @@ fn install_yes_flag_parses() {
 fn install_catalog_flag_parses_without_consuming_package() {
     let cli = Cli::try_parse_from(["lpm", "install", "--catalog", "react"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs {
-            packages, catalog, ..
-        }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs {
+                packages, catalog, ..
+            } = *boxed;
+
             assert_eq!(packages, vec!["react".to_string()]);
             assert_eq!(catalog.as_deref(), Some("default"));
         }
@@ -1349,9 +1399,11 @@ fn install_catalog_flag_parses_without_consuming_package() {
 fn install_named_catalog_flag_parses_with_equals() {
     let cli = Cli::try_parse_from(["lpm", "install", "--catalog=testing", "react"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs {
-            packages, catalog, ..
-        }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs {
+                packages, catalog, ..
+            } = *boxed;
+
             assert_eq!(packages, vec!["react".to_string()]);
             assert_eq!(catalog.as_deref(), Some("testing"));
         }
@@ -1374,12 +1426,14 @@ fn install_save_dev_with_filter_composes() {
     let cli =
         Cli::try_parse_from(["lpm", "install", "-D", "vitest", "--filter", "./apps/*"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs {
-            packages,
-            save_dev,
-            filter,
-            ..
-        }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs {
+                packages,
+                save_dev,
+                filter,
+                ..
+            } = *boxed;
+
             assert_eq!(packages, vec!["vitest".to_string()]);
             assert!(save_dev);
             assert_eq!(filter, vec!["./apps/*".to_string()]);
@@ -1394,13 +1448,15 @@ fn install_bare_with_no_packages_and_no_filters_parses() {
     // does not break the bare-refresh path.
     let cli = Cli::try_parse_from(["lpm", "install"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs {
-            packages,
-            filter,
-            workspace_root,
-            fail_if_no_match,
-            ..
-        }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs {
+                packages,
+                filter,
+                workspace_root,
+                fail_if_no_match,
+                ..
+            } = *boxed;
+
             assert!(packages.is_empty());
             assert!(filter.is_empty());
             assert!(!workspace_root);
@@ -1414,11 +1470,13 @@ fn install_bare_with_no_packages_and_no_filters_parses() {
 fn install_strict_peer_dependencies_flags_parse_and_conflict() {
     let cli = Cli::try_parse_from(["lpm", "install", "--strict-peer-dependencies"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs {
-            strict_peer_dependencies,
-            no_strict_peer_dependencies,
-            ..
-        }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs {
+                strict_peer_dependencies,
+                no_strict_peer_dependencies,
+                ..
+            } = *boxed;
+
             assert!(strict_peer_dependencies);
             assert!(!no_strict_peer_dependencies);
         }
@@ -1428,11 +1486,13 @@ fn install_strict_peer_dependencies_flags_parse_and_conflict() {
     let cli = Cli::try_parse_from(["lpm", "install", "--no-strict-peer-dependencies"])
         .expect("`lpm install --no-strict-peer-dependencies` should parse");
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs {
-            strict_peer_dependencies,
-            no_strict_peer_dependencies,
-            ..
-        }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs {
+                strict_peer_dependencies,
+                no_strict_peer_dependencies,
+                ..
+            } = *boxed;
+
             assert!(!strict_peer_dependencies);
             assert!(no_strict_peer_dependencies);
         }
@@ -1448,12 +1508,14 @@ fn install_strict_peer_dependencies_flags_parse_and_conflict() {
     ])
     .expect("`lpm install -g --strict-peer-dependencies` should parse");
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs {
-            global,
-            strict_peer_dependencies,
-            no_strict_peer_dependencies,
-            ..
-        }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs {
+                global,
+                strict_peer_dependencies,
+                no_strict_peer_dependencies,
+                ..
+            } = *boxed;
+
             assert!(global);
             assert!(strict_peer_dependencies);
             assert!(!no_strict_peer_dependencies);
@@ -1529,13 +1591,15 @@ fn uninstall_filter_flag_collects_into_vec() {
     ])
     .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Uninstall(lifecycle::UninstallArgs {
-            packages,
-            filter,
-            workspace_root,
-            fail_if_no_match,
-            ..
-        }) => {
+        Commands::Uninstall(boxed) => {
+            let lifecycle::UninstallArgs {
+                packages,
+                filter,
+                workspace_root,
+                fail_if_no_match,
+                ..
+            } = *boxed;
+
             assert_eq!(packages, vec!["lodash".to_string()]);
             assert_eq!(filter, vec!["web".to_string(), "@ui/*".to_string()]);
             assert!(!workspace_root);
@@ -1549,7 +1613,9 @@ fn uninstall_filter_flag_collects_into_vec() {
 fn uninstall_workspace_root_short_flag_parses() {
     let cli = Cli::try_parse_from(["lpm", "uninstall", "shared", "-w"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Uninstall(lifecycle::UninstallArgs { workspace_root, .. }) => {
+        Commands::Uninstall(boxed) => {
+            let lifecycle::UninstallArgs { workspace_root, .. } = *boxed;
+
             assert!(workspace_root);
         }
         _ => panic!("expected Uninstall command"),
@@ -1560,7 +1626,9 @@ fn uninstall_workspace_root_short_flag_parses() {
 fn uninstall_workspace_root_long_flag_parses() {
     let cli = Cli::try_parse_from(["lpm", "uninstall", "shared", "--workspace-root"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Uninstall(lifecycle::UninstallArgs { workspace_root, .. }) => {
+        Commands::Uninstall(boxed) => {
+            let lifecycle::UninstallArgs { workspace_root, .. } = *boxed;
+
             assert!(workspace_root);
         }
         _ => panic!("expected Uninstall command"),
@@ -1579,9 +1647,11 @@ fn uninstall_fail_if_no_match_flag_parses() {
     ])
     .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Uninstall(lifecycle::UninstallArgs {
-            fail_if_no_match, ..
-        }) => {
+        Commands::Uninstall(boxed) => {
+            let lifecycle::UninstallArgs {
+                fail_if_no_match, ..
+            } = *boxed;
+
             assert!(fail_if_no_match);
         }
         _ => panic!("expected Uninstall command"),
@@ -1592,7 +1662,9 @@ fn uninstall_fail_if_no_match_flag_parses() {
 fn uninstall_yes_flag_parses() {
     let cli = Cli::try_parse_from(["lpm", "uninstall", "lodash", "-y"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Uninstall(lifecycle::UninstallArgs { packages, yes, .. }) => {
+        Commands::Uninstall(boxed) => {
+            let lifecycle::UninstallArgs { packages, yes, .. } = *boxed;
+
             assert_eq!(packages, vec!["lodash".to_string()]);
             assert!(yes, "-y must set the uninstall confirmation bypass flag");
         }
@@ -1606,11 +1678,13 @@ fn uninstall_visible_alias_un_still_works() {
     // the new flags.
     let cli = Cli::try_parse_from(["lpm", "un", "foo", "-w"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Uninstall(lifecycle::UninstallArgs {
-            packages,
-            workspace_root,
-            ..
-        }) => {
+        Commands::Uninstall(boxed) => {
+            let lifecycle::UninstallArgs {
+                packages,
+                workspace_root,
+                ..
+            } = *boxed;
+
             assert_eq!(packages, vec!["foo".to_string()]);
             assert!(workspace_root);
         }
@@ -1624,13 +1698,15 @@ fn uninstall_visible_alias_un_still_works() {
 fn deploy_command_parses_required_output_and_filter() {
     let cli = Cli::try_parse_from(["lpm", "deploy", "/prod/api", "--filter", "api"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Deploy(lifecycle::DeployArgs {
-            output,
-            filter,
-            force,
-            dry_run,
-            ..
-        }) => {
+        Commands::Deploy(boxed) => {
+            let lifecycle::DeployArgs {
+                output,
+                filter,
+                force,
+                dry_run,
+                ..
+            } = *boxed;
+
             assert_eq!(output, "/prod/api");
             assert_eq!(filter, vec!["api".to_string()]);
             assert!(!force);
@@ -1646,7 +1722,9 @@ fn deploy_command_filter_can_be_glob_or_path() {
     let cli =
         Cli::try_parse_from(["lpm", "deploy", "/prod/web", "--filter", "@scope/web"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Deploy(lifecycle::DeployArgs { filter, .. }) => {
+        Commands::Deploy(boxed) => {
+            let lifecycle::DeployArgs { filter, .. } = *boxed;
+
             assert_eq!(filter, vec!["@scope/web".to_string()]);
         }
         _ => panic!("expected Deploy command"),
@@ -1658,7 +1736,10 @@ fn deploy_command_force_flag_parses() {
     let cli =
         Cli::try_parse_from(["lpm", "deploy", "/prod/api", "--filter", "api", "--force"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Deploy(lifecycle::DeployArgs { force, .. }) => assert!(force),
+        Commands::Deploy(boxed) => {
+            let lifecycle::DeployArgs { force, .. } = *boxed;
+            assert!(force)
+        }
         _ => panic!("expected Deploy command"),
     }
 }
@@ -1668,7 +1749,10 @@ fn deploy_command_dry_run_flag_parses() {
     let cli = Cli::try_parse_from(["lpm", "deploy", "/prod/api", "--filter", "api", "--dry-run"])
         .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Deploy(lifecycle::DeployArgs { dry_run, .. }) => assert!(dry_run),
+        Commands::Deploy(boxed) => {
+            let lifecycle::DeployArgs { dry_run, .. } = *boxed;
+            assert!(dry_run)
+        }
         _ => panic!("expected Deploy command"),
     }
 }
@@ -1678,7 +1762,9 @@ fn deploy_command_dependency_mode_flags_parse() {
     let cli =
         Cli::try_parse_from(["lpm", "deploy", "/prod/api", "--filter", "api", "--prod"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Deploy(lifecycle::DeployArgs { prod, dev, .. }) => {
+        Commands::Deploy(boxed) => {
+            let lifecycle::DeployArgs { prod, dev, .. } = *boxed;
+
             assert!(prod);
             assert!(!dev);
         }
@@ -1688,7 +1774,9 @@ fn deploy_command_dependency_mode_flags_parse() {
     let cli =
         Cli::try_parse_from(["lpm", "deploy", "/prod/api", "--filter", "api", "--dev"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Deploy(lifecycle::DeployArgs { prod, dev, .. }) => {
+        Commands::Deploy(boxed) => {
+            let lifecycle::DeployArgs { prod, dev, .. } = *boxed;
+
             assert!(!prod);
             assert!(dev);
         }
@@ -1725,7 +1813,10 @@ fn deploy_command_no_optional_flag_parses() {
     ])
     .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Deploy(lifecycle::DeployArgs { no_optional, .. }) => assert!(no_optional),
+        Commands::Deploy(boxed) => {
+            let lifecycle::DeployArgs { no_optional, .. } = *boxed;
+            assert!(no_optional)
+        }
         _ => panic!("expected Deploy command"),
     }
 }
@@ -1734,11 +1825,13 @@ fn deploy_command_no_optional_flag_parses() {
 fn deploy_command_without_filter_parses_for_runtime_validation() {
     let cli = Cli::try_parse_from(["lpm", "deploy", "/prod/api"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Deploy(lifecycle::DeployArgs {
-            filter,
-            filter_prod,
-            ..
-        }) => {
+        Commands::Deploy(boxed) => {
+            let lifecycle::DeployArgs {
+                filter,
+                filter_prod,
+                ..
+            } = *boxed;
+
             assert!(filter.is_empty());
             assert!(filter_prod.is_empty());
         }
@@ -1751,7 +1844,9 @@ fn deploy_command_filter_prod_flag_parses() {
     let cli =
         Cli::try_parse_from(["lpm", "deploy", "/prod/api", "--filter-prod", "...api"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Deploy(lifecycle::DeployArgs { filter_prod, .. }) => {
+        Commands::Deploy(boxed) => {
+            let lifecycle::DeployArgs { filter_prod, .. } = *boxed;
+
             assert_eq!(filter_prod, vec!["...api".to_string()]);
         }
         _ => panic!("expected Deploy command"),
@@ -1783,7 +1878,9 @@ fn deploy_command_filter_can_be_passed_multiple_times() {
     ])
     .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Deploy(lifecycle::DeployArgs { filter, .. }) => {
+        Commands::Deploy(boxed) => {
+            let lifecycle::DeployArgs { filter, .. } = *boxed;
+
             assert_eq!(filter.len(), 2);
         }
         _ => panic!("expected Deploy command"),
@@ -2015,12 +2112,14 @@ fn install_sandbox_mode_flags_parse() {
     let cli = Cli::try_parse_from(["lpm", "install", "--strict-sandbox"])
         .expect("`lpm install --strict-sandbox` should parse");
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs {
-            strict_sandbox,
-            paranoid,
-            no_sandbox,
-            ..
-        }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs {
+                strict_sandbox,
+                paranoid,
+                no_sandbox,
+                ..
+            } = *boxed;
+
             assert!(strict_sandbox);
             assert!(!paranoid);
             assert!(!no_sandbox);
@@ -2031,11 +2130,13 @@ fn install_sandbox_mode_flags_parse() {
     let cli = Cli::try_parse_from(["lpm", "install", "--paranoid"])
         .expect("`lpm install --paranoid` should parse");
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs {
-            strict_sandbox,
-            paranoid,
-            ..
-        }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs {
+                strict_sandbox,
+                paranoid,
+                ..
+            } = *boxed;
+
             assert!(!strict_sandbox);
             assert!(paranoid);
         }
@@ -2045,7 +2146,9 @@ fn install_sandbox_mode_flags_parse() {
     let cli = Cli::try_parse_from(["lpm", "install", "--no-sandbox"])
         .expect("`lpm install --no-sandbox` should parse standalone");
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs { no_sandbox, .. }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs { no_sandbox, .. } = *boxed;
+
             assert!(no_sandbox);
         }
         _ => panic!("expected Install command"),
@@ -2073,11 +2176,13 @@ fn install_unverified_provenance_flag_parses_repeatable_and_blanket() {
     ])
     .expect("repeatable --unverified-provenance should parse");
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs {
-            unverified_provenance,
-            unverified_provenance_all,
-            ..
-        }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs {
+                unverified_provenance,
+                unverified_provenance_all,
+                ..
+            } = *boxed;
+
             assert_eq!(
                 unverified_provenance,
                 vec!["axios".to_string(), "lodash".to_string()],
@@ -2093,11 +2198,13 @@ fn install_unverified_provenance_flag_parses_repeatable_and_blanket() {
     let cli = Cli::try_parse_from(["lpm", "install", "--unverified-provenance-all"])
         .expect("--unverified-provenance-all should parse standalone");
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs {
-            unverified_provenance,
-            unverified_provenance_all,
-            ..
-        }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs {
+                unverified_provenance,
+                unverified_provenance_all,
+                ..
+            } = *boxed;
+
             assert!(unverified_provenance.is_empty());
             assert!(unverified_provenance_all);
         }
@@ -2118,11 +2225,13 @@ fn install_unverified_provenance_flag_parses_repeatable_and_blanket() {
     ])
     .expect("composing per-package + blanket flag must NOT be a clap error");
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs {
-            unverified_provenance,
-            unverified_provenance_all,
-            ..
-        }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs {
+                unverified_provenance,
+                unverified_provenance_all,
+                ..
+            } = *boxed;
+
             assert_eq!(unverified_provenance, vec!["axios".to_string()]);
             assert!(unverified_provenance_all);
         }
@@ -2283,7 +2392,9 @@ fn completions_subcommand_parses_for_every_supported_shell() {
 fn dev_dashboard_flag_parses() {
     let cli = Cli::try_parse_from(["lpm", "dev", "--dashboard"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Dev(build::DevArgs { dashboard, .. }) => {
+        Commands::Dev(boxed) => {
+            let build::DevArgs { dashboard, .. } = *boxed;
+
             assert!(dashboard);
         }
         _ => panic!("expected Dev command"),
@@ -2294,7 +2405,9 @@ fn dev_dashboard_flag_parses() {
 fn dev_quiet_flag_parses() {
     let cli = Cli::try_parse_from(["lpm", "dev", "-q"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Dev(build::DevArgs { quiet, .. }) => {
+        Commands::Dev(boxed) => {
+            let build::DevArgs { quiet, .. } = *boxed;
+
             assert!(quiet);
         }
         _ => panic!("expected Dev command"),
@@ -2305,7 +2418,9 @@ fn dev_quiet_flag_parses() {
 fn dev_quiet_long_flag_parses() {
     let cli = Cli::try_parse_from(["lpm", "dev", "--quiet"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Dev(build::DevArgs { quiet, .. }) => {
+        Commands::Dev(boxed) => {
+            let build::DevArgs { quiet, .. } = *boxed;
+
             assert!(quiet);
         }
         _ => panic!("expected Dev command"),
@@ -2316,9 +2431,11 @@ fn dev_quiet_long_flag_parses() {
 fn dev_dashboard_and_tunnel_flags_parse() {
     let cli = Cli::try_parse_from(["lpm", "dev", "--dashboard", "--tunnel"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Dev(build::DevArgs {
-            dashboard, tunnel, ..
-        }) => {
+        Commands::Dev(boxed) => {
+            let build::DevArgs {
+                dashboard, tunnel, ..
+            } = *boxed;
+
             assert!(dashboard);
             assert!(tunnel);
         }
@@ -2330,9 +2447,11 @@ fn dev_dashboard_and_tunnel_flags_parse() {
 fn dev_defaults_dashboard_false() {
     let cli = Cli::try_parse_from(["lpm", "dev"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Dev(build::DevArgs {
-            dashboard, quiet, ..
-        }) => {
+        Commands::Dev(boxed) => {
+            let build::DevArgs {
+                dashboard, quiet, ..
+            } = *boxed;
+
             assert!(!dashboard);
             assert!(!quiet);
         }
@@ -2344,11 +2463,13 @@ fn dev_defaults_dashboard_false() {
 fn dev_no_dashboard_flag_parses() {
     let cli = Cli::try_parse_from(["lpm", "dev", "--no-dashboard"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Dev(build::DevArgs {
-            dashboard,
-            no_dashboard,
-            ..
-        }) => {
+        Commands::Dev(boxed) => {
+            let build::DevArgs {
+                dashboard,
+                no_dashboard,
+                ..
+            } = *boxed;
+
             assert!(!dashboard);
             assert!(no_dashboard);
         }
@@ -2370,9 +2491,11 @@ fn dev_dashboard_and_no_dashboard_conflict() {
 fn dev_no_https_flag_parses() {
     let cli = Cli::try_parse_from(["lpm", "dev", "--https", "--no-https"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Dev(build::DevArgs {
-            https, no_https, ..
-        }) => {
+        Commands::Dev(boxed) => {
+            let build::DevArgs {
+                https, no_https, ..
+            } = *boxed;
+
             assert!(https);
             assert!(no_https);
             // Effective value: https && !no_https = false
@@ -2385,9 +2508,11 @@ fn dev_no_https_flag_parses() {
 fn dev_no_tunnel_flag_parses() {
     let cli = Cli::try_parse_from(["lpm", "dev", "--tunnel", "--no-tunnel"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Dev(build::DevArgs {
-            tunnel, no_tunnel, ..
-        }) => {
+        Commands::Dev(boxed) => {
+            let build::DevArgs {
+                tunnel, no_tunnel, ..
+            } = *boxed;
+
             assert!(tunnel);
             assert!(no_tunnel);
         }
@@ -2399,11 +2524,13 @@ fn dev_no_tunnel_flag_parses() {
 fn dev_tunnel_auth_flag_parses() {
     let cli = Cli::try_parse_from(["lpm", "dev", "--tunnel", "--tunnel-auth"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Dev(build::DevArgs {
-            tunnel,
-            tunnel_auth,
-            ..
-        }) => {
+        Commands::Dev(boxed) => {
+            let build::DevArgs {
+                tunnel,
+                tunnel_auth,
+                ..
+            } = *boxed;
+
             assert!(tunnel);
             assert!(tunnel_auth);
         }
@@ -2415,7 +2542,9 @@ fn dev_tunnel_auth_flag_parses() {
 fn dev_tunnel_auth_defaults_false() {
     let cli = Cli::try_parse_from(["lpm", "dev"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Dev(build::DevArgs { tunnel_auth, .. }) => {
+        Commands::Dev(boxed) => {
+            let build::DevArgs { tunnel_auth, .. } = *boxed;
+
             assert!(!tunnel_auth);
         }
         _ => panic!("expected Dev command"),
@@ -2426,7 +2555,9 @@ fn dev_tunnel_auth_defaults_false() {
 fn tunnel_tunnel_auth_flag_parses() {
     let cli = Cli::try_parse_from(["lpm", "tunnel", "start", "--tunnel-auth"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Tunnel(network::TunnelArgs { tunnel_auth, .. }) => {
+        Commands::Tunnel(boxed) => {
+            let network::TunnelArgs { tunnel_auth, .. } = *boxed;
+
             assert!(tunnel_auth);
         }
         _ => panic!("expected Tunnel command"),
@@ -2437,7 +2568,9 @@ fn tunnel_tunnel_auth_flag_parses() {
 fn tunnel_without_a_port_requests_active_dev_endpoint_discovery() {
     let cli = Cli::try_parse_from(["lpm", "tunnel"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Tunnel(network::TunnelArgs { action, .. }) => {
+        Commands::Tunnel(boxed) => {
+            let network::TunnelArgs { action, .. } = *boxed;
+
             assert_eq!(action, "start");
         }
         _ => panic!("expected Tunnel command"),
@@ -2458,7 +2591,9 @@ fn tunnel_inspect_port_default_is_none() {
     // contract this test protects.
     let cli = Cli::try_parse_from(["lpm", "tunnel", "3000"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Tunnel(network::TunnelArgs { inspect_port, .. }) => {
+        Commands::Tunnel(boxed) => {
+            let network::TunnelArgs { inspect_port, .. } = *boxed;
+
             assert_eq!(inspect_port, None);
         }
         _ => panic!("expected Tunnel command"),
@@ -2469,7 +2604,9 @@ fn tunnel_inspect_port_default_is_none() {
 fn tunnel_inspect_port_explicit_is_some() {
     let cli = Cli::try_parse_from(["lpm", "tunnel", "3000", "--inspect-port", "4500"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Tunnel(network::TunnelArgs { inspect_port, .. }) => {
+        Commands::Tunnel(boxed) => {
+            let network::TunnelArgs { inspect_port, .. } = *boxed;
+
             assert_eq!(inspect_port, Some(4500));
         }
         _ => panic!("expected Tunnel command"),
@@ -2483,14 +2620,16 @@ fn tunnel_local_action_flags_parse_without_a_double_dash_separator() {
     ])
     .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Tunnel(network::TunnelArgs {
-            domain,
-            args,
-            last,
-            filter,
-            status,
-            ..
-        }) => {
+        Commands::Tunnel(boxed) => {
+            let network::TunnelArgs {
+                domain,
+                args,
+                last,
+                filter,
+                status,
+                ..
+            } = *boxed;
+
             assert!(domain.is_none());
             assert!(args.is_empty());
             assert_eq!(last.as_deref(), Some("10"));
@@ -2505,9 +2644,11 @@ fn tunnel_local_action_flags_parse_without_a_double_dash_separator() {
 fn tunnel_replay_last_parses_without_a_value() {
     let cli = Cli::try_parse_from(["lpm", "tunnel", "replay", "--last", "--port", "4000"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Tunnel(network::TunnelArgs {
-            last, replay_port, ..
-        }) => {
+        Commands::Tunnel(boxed) => {
+            let network::TunnelArgs {
+                last, replay_port, ..
+            } = *boxed;
+
             assert_eq!(last.as_deref(), Some("latest"));
             assert_eq!(replay_port, Some(4000));
         }
@@ -2524,11 +2665,13 @@ fn tunnel_unknown_direct_flag_is_rejected_by_clap() {
 fn dev_inspect_port_default_is_none() {
     let cli = Cli::try_parse_from(["lpm", "dev"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Dev(build::DevArgs {
-            inspect_port,
-            no_inspect,
-            ..
-        }) => {
+        Commands::Dev(boxed) => {
+            let build::DevArgs {
+                inspect_port,
+                no_inspect,
+                ..
+            } = *boxed;
+
             assert_eq!(inspect_port, None);
             assert!(!no_inspect);
         }
@@ -2548,11 +2691,13 @@ fn dev_inspect_flags_parse() {
     ])
     .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Dev(build::DevArgs {
-            inspect_port,
-            no_inspect,
-            ..
-        }) => {
+        Commands::Dev(boxed) => {
+            let build::DevArgs {
+                inspect_port,
+                no_inspect,
+                ..
+            } = *boxed;
+
             assert_eq!(inspect_port, Some(4500));
             assert!(no_inspect);
         }
@@ -2565,12 +2710,14 @@ fn run_affected_with_base_parses() {
     let cli =
         Cli::try_parse_from(["lpm", "run", "build", "--affected", "--base", "develop"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Run(network::RunArgs {
-            scripts,
-            affected,
-            base,
-            ..
-        }) => {
+        Commands::Run(boxed) => {
+            let network::RunArgs {
+                scripts,
+                affected,
+                base,
+                ..
+            } = *boxed;
+
             assert_eq!(scripts, vec!["build"]);
             assert!(affected);
             assert_eq!(base, "develop");
@@ -2629,12 +2776,14 @@ fn install_global_replace_bin_flag_collects_to_vec() {
     ])
     .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs {
-            global,
-            replace_bin,
-            alias,
-            ..
-        }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs {
+                global,
+                replace_bin,
+                alias,
+                ..
+            } = *boxed;
+
             assert!(global);
             assert_eq!(replace_bin, vec!["serve".to_string(), "lint".to_string()]);
             assert!(alias.is_empty());
@@ -2657,12 +2806,14 @@ fn install_global_alias_flag_accepts_comma_and_repeated_forms() {
     ])
     .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs {
-            global,
-            alias,
-            replace_bin,
-            ..
-        }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs {
+                global,
+                alias,
+                replace_bin,
+                ..
+            } = *boxed;
+
             assert!(global);
             assert!(replace_bin.is_empty());
             assert_eq!(
@@ -2691,12 +2842,14 @@ fn install_global_collision_flags_coexist_with_g_short_flag() {
     ])
     .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs {
-            global,
-            replace_bin,
-            alias,
-            ..
-        }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs {
+                global,
+                replace_bin,
+                alias,
+                ..
+            } = *boxed;
+
             assert!(global);
             assert_eq!(replace_bin, vec!["serve".to_string()]);
             assert_eq!(alias, vec!["lint=foo-lint".to_string()]);
@@ -2723,16 +2876,51 @@ fn install_non_global_with_collision_flags_parses_at_clap_layer() {
     ])
     .unwrap();
     match cli.command.expect("test parse missing subcommand") {
-        Commands::Install(lifecycle::InstallArgs {
-            global,
-            replace_bin,
-            alias,
-            ..
-        }) => {
+        Commands::Install(boxed) => {
+            let lifecycle::InstallArgs {
+                global,
+                replace_bin,
+                alias,
+                ..
+            } = *boxed;
+
             assert!(!global, "no -g → global should be false");
             assert_eq!(replace_bin, vec!["serve".to_string()]);
             assert_eq!(alias, vec!["lint=foo-lint".to_string()]);
         }
         _ => panic!("expected Install command"),
     }
+}
+
+#[test]
+fn commands_enum_stays_compact_via_boxed_large_variants() {
+    let size = std::mem::size_of::<Commands>();
+    assert!(
+        size <= 160,
+        "Commands enum grew to {size} bytes; box newly large subcommand arg structs"
+    );
+}
+
+#[test]
+fn deferred_subcommands_materialize_for_help_and_build() {
+    use clap::CommandFactory;
+
+    let help = subcommand_long_help("install");
+    assert!(
+        help.contains("--frozen-lockfile"),
+        "deferred install subcommand must materialize flags for help: {help}"
+    );
+
+    let mut root = Cli::command();
+    root.build();
+    let install = root
+        .find_subcommand("install")
+        .expect("install subcommand must exist after build");
+    assert!(
+        install
+            .get_arguments()
+            .any(|arg| arg.get_long() == Some("frozen-lockfile")),
+        "Command::build() must materialize deferred subcommand arguments for completions"
+    );
+    Cli::command().debug_assert();
 }

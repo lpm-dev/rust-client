@@ -13,9 +13,10 @@ fn compress_embedded_asset(relative_src: &str, output_name: &str) {
     let out_dir = std::path::PathBuf::from(
         std::env::var_os("OUT_DIR").expect("OUT_DIR must be set for build script"),
     );
-    let mut encoder = flate2::GzBuilder::new()
-        .mtime(0)
-        .write(Vec::with_capacity(raw.len() / 3), flate2::Compression::best());
+    let mut encoder = flate2::GzBuilder::new().mtime(0).write(
+        Vec::with_capacity(raw.len() / 3),
+        flate2::Compression::best(),
+    );
     encoder
         .write_all(&raw)
         .expect("gzip compression of embedded asset must succeed");

@@ -19,6 +19,77 @@ const NODE: &str = if cfg!(windows) { "node.exe" } else { "node" };
 
 static OFFERED_TO_SCRIPTS: AtomicBool = AtomicBool::new(false);
 
+#[derive(Clone, PartialEq, Eq)]
+struct NodeGypCacheKey {
+    node_path: PathBuf,
+    len: u64,
+    mtime: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    ctime: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+}
+
+impl NodeGypCacheKey {
+    fn from_node(node: &Path, meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            node_path: node.to_path_buf(),
+            len: meta.len(),
+            mtime: meta.modified().ok(),
+            #[cfg(unix)]
+            ino: meta.ino(),
+            #[cfg(unix)]
+            ctime: meta.ctime(),
+            #[cfg(unix)]
+            ctime_nsec: meta.ctime_nsec(),
+        }
+    }
+}
+
+const MAX_NODE_GYP_CACHE_ENTRIES: usize = 8;
+
+type NodeGypCacheEntry = (NodeGypCacheKey, Option<NpmNodeGyp>);
+
+fn node_gyp_cache() -> &'static std::sync::Mutex<Vec<NodeGypCacheEntry>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Vec<NodeGypCacheEntry>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn lookup_cached_node_gyp(key: &NodeGypCacheKey) -> Option<Option<NpmNodeGyp>> {
+    if cfg!(test) {
+        return None;
+    }
+    let cache = node_gyp_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache
+        .iter()
+        .find(|(cached_key, _)| cached_key == key)
+        .map(|(_, value)| value.clone())
+}
+
+fn store_cached_node_gyp(key: NodeGypCacheKey, value: Option<NpmNodeGyp>) {
+    if cfg!(test) {
+        return;
+    }
+    let mut cache = node_gyp_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((_, existing)) = cache.iter_mut().find(|(cached_key, _)| cached_key == &key) {
+        *existing = value;
+        return;
+    }
+    if cache.len() >= MAX_NODE_GYP_CACHE_ENTRIES {
+        cache.remove(0);
+    }
+    cache.push((key, value));
+}
+
 /// Has every `PATH` this process builds for a script hold npm's `node-gyp`
 /// where npm is installed beside `node`. The commands are files in the LPM
 /// home, so only the command-line program asks for them: a test or another
@@ -58,14 +129,22 @@ impl NpmNodeGyp {
             .filter(|directory| directory.is_absolute())
             .map(|directory| directory.join(NODE))
             .find(|candidate| candidate.is_file())?;
-        let resolved = node.canonicalize().ok()?;
-        if in_a_package(&node) || in_a_package(&resolved) {
-            return None;
+        let meta = std::fs::metadata(&node).ok()?;
+        let cache_key = NodeGypCacheKey::from_node(&node, &meta);
+        if let Some(cached) = lookup_cached_node_gyp(&cache_key) {
+            return cached;
         }
-        [node, resolved]
-            .iter()
-            .filter_map(|node| npm_modules_beside(node))
-            .find_map(Self::in_modules)
+        let resolved = node.canonicalize().ok()?;
+        let result = if in_a_package(&node) || in_a_package(&resolved) {
+            None
+        } else {
+            [node, resolved]
+                .iter()
+                .filter_map(|node| npm_modules_beside(node))
+                .find_map(Self::in_modules)
+        };
+        store_cached_node_gyp(cache_key, result.clone());
+        result
     }
 
     fn in_modules(modules: PathBuf) -> Option<Self> {

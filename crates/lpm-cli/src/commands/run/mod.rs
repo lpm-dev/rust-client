@@ -20,8 +20,10 @@ use crate::install_ui;
 
 pub use dlx::{DlxOptions, dlx, initializer_package};
 pub(crate) use runtime::validate_runtime_with_cache;
-pub use runtime::{ensure_detected_runtimes, ensure_runtime, prepare_runtime};
-pub use single::{exec, run, run_file, run_file_watch, run_watch};
+pub use runtime::{
+    ensure_detected_runtimes, ensure_runtime, prepare_runtime, try_prepare_runtime_sync,
+};
+pub use single::{exec, run_file, run_file_watch, run_watch, try_exec_sync};
 pub use workspace::run_workspace;
 
 use parallel::run_tasks_parallel;
@@ -37,6 +39,59 @@ use task::reject_direct_hidden_scripts;
 /// Supports `--no-bail` to keep running after failures, `--stream` for
 /// interleaved output with task prefixes, and
 /// `--no-cache` to skip task caching.
+/// Synchronous fast path for single-package `lpm run` when no managed runtime
+/// needs downloading and remote task caching is not configured. Returns
+/// `Ok(None)` to fall back to the async path.
+#[allow(clippy::too_many_arguments)]
+pub fn try_run_multi_sync(
+    project_dir: &Path,
+    scripts: &[String],
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    parallel: bool,
+    continue_on_error: bool,
+    stream: bool,
+    no_cache: bool,
+    json_output: bool,
+    on_commit: impl FnOnce() -> Result<(), LpmError>,
+) -> Result<Option<()>, LpmError> {
+    let Some(bin_hint) = try_prepare_runtime_sync(project_dir, json_output)? else {
+        return Ok(None);
+    };
+    if scripts.is_empty() {
+        on_commit()?;
+        install_ui::warn("No scripts specified. Usage: lpm run <script> [scripts...]");
+        return Ok(Some(()));
+    }
+    reject_direct_hidden_scripts(scripts)?;
+    let plan = prepare_single_package_task_plan(project_dir, scripts)?;
+    // Remote task cache requires an authenticated SessionManager; fall back to async.
+    if !no_cache
+        && plan
+            .config
+            .as_ref()
+            .is_some_and(|c| c.remote_cache.is_some())
+    {
+        return Ok(None);
+    }
+    on_commit()?;
+    run_single_package_plan_sync(
+        project_dir,
+        scripts,
+        extra_args,
+        env_mode,
+        parallel,
+        continue_on_error,
+        stream,
+        no_cache,
+        json_output,
+        &bin_hint,
+        None,
+        &plan,
+    )?;
+    Ok(Some(()))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_multi(
     project_dir: &Path,
@@ -59,12 +114,44 @@ pub async fn run_multi(
     reject_direct_hidden_scripts(scripts)?;
 
     let plan = prepare_single_package_task_plan(project_dir, scripts)?;
+    run_single_package_plan_sync(
+        project_dir,
+        scripts,
+        extra_args,
+        env_mode,
+        parallel,
+        continue_on_error,
+        stream,
+        no_cache,
+        json_output,
+        &bin_hint,
+        session,
+        &plan,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_single_package_plan_sync(
+    project_dir: &Path,
+    scripts: &[String],
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    parallel: bool,
+    continue_on_error: bool,
+    stream: bool,
+    no_cache: bool,
+    json_output: bool,
+    bin_hint: &lpm_runner::bin_path::ManagedRuntimeHint,
+    session: Option<Arc<lpm_auth::SessionManager>>,
+    plan: &SinglePackageTaskPlan,
+) -> Result<(), LpmError> {
     let tasks = plan.tasks();
     let levels = &plan.levels;
 
     let total_tasks: usize = levels.iter().map(|l| l.len()).sum();
 
-    // Fast path: single task with no dependencies — delegate to simple runner
+    // Fast path: single task with no dependencies — reuse the already-loaded
+    // lpm.json and package.json instead of re-reading them.
     let has_lpm_task_command = scripts.first().is_some_and(|script| {
         tasks
             .get(script)
@@ -72,21 +159,23 @@ pub async fn run_multi(
             .is_some()
     });
     if total_tasks == 1 && scripts.len() == 1 && !json_output && !stream && !has_lpm_task_command {
-        return run(
+        return single::run_with_loaded_context(
             project_dir,
             &scripts[0],
             extra_args,
             env_mode,
             no_cache,
-            &bin_hint,
+            bin_hint,
             session,
-        )
-        .await;
+            false,
+            plan.config.as_ref(),
+            plan.package.as_ref(),
+        );
     }
 
     let report = execute_single_package_task_plan(
         project_dir,
-        &plan,
+        plan,
         extra_args,
         env_mode,
         TaskExecutionOptions {
@@ -96,7 +185,7 @@ pub async fn run_multi(
             no_cache,
             json_output,
         },
-        &bin_hint,
+        bin_hint,
         session,
     )?;
     if total_tasks == 1 && scripts.len() == 1 {
@@ -108,7 +197,7 @@ pub async fn run_multi(
 
 struct SinglePackageTaskPlan {
     config: Option<lpm_runner::lpm_json::LpmJsonConfig>,
-    package_scripts: Option<HashMap<String, String>>,
+    package: Option<lpm_workspace::PackageJson>,
     levels: Vec<Vec<String>>,
     sequential: Vec<String>,
 }
@@ -138,30 +227,32 @@ fn prepare_single_package_task_plan_with_config(
     scripts: &[String],
     lpm_config: Option<lpm_runner::lpm_json::LpmJsonConfig>,
 ) -> Result<SinglePackageTaskPlan, LpmError> {
+    let package: Option<lpm_workspace::PackageJson> = {
+        let pkg_json_path = project_dir.join("package.json");
+        if pkg_json_path.exists() {
+            lpm_workspace::read_package_json(&pkg_json_path).ok()
+        } else {
+            None
+        }
+    };
+    prepare_single_package_task_plan_with_loaded(scripts, lpm_config, package)
+}
+
+fn prepare_single_package_task_plan_with_loaded(
+    scripts: &[String],
+    lpm_config: Option<lpm_runner::lpm_json::LpmJsonConfig>,
+    package: Option<lpm_workspace::PackageJson>,
+) -> Result<SinglePackageTaskPlan, LpmError> {
     reject_direct_hidden_scripts(scripts)?;
     let empty_tasks = HashMap::new();
     let tasks = lpm_config
         .as_ref()
         .map_or(&empty_tasks, |config| &config.tasks);
 
-    // Collect all known scripts: package.json scripts + lpm.json task commands.
-    // This supports pure lpm.json projects without package.json.
-    //
-    // `pkg_scripts` is kept separately so `is_meta_task` can distinguish
-    // package.json scripts from lpm.json commands without re-reading
-    // package.json per task.
-    let pkg_scripts: Option<HashMap<String, String>> = {
-        let pkg_json_path = project_dir.join("package.json");
-        if pkg_json_path.exists() {
-            lpm_workspace::read_package_json(&pkg_json_path)
-                .ok()
-                .map(|p| p.scripts)
-        } else {
-            None
-        }
-    };
-
-    let mut all_scripts: HashMap<String, String> = pkg_scripts.clone().unwrap_or_default();
+    let mut all_scripts: HashMap<String, String> = package
+        .as_ref()
+        .map(|p| p.scripts.clone())
+        .unwrap_or_default();
 
     // Add lpm.json task commands (don't override package.json scripts)
     for (name, task) in tasks {
@@ -190,7 +281,7 @@ fn prepare_single_package_task_plan_with_config(
 
     Ok(SinglePackageTaskPlan {
         config: lpm_config,
-        package_scripts: pkg_scripts,
+        package,
         levels,
         sequential,
     })
@@ -223,7 +314,7 @@ fn execute_single_package_task_plan(
     } = options;
     let tasks = plan.tasks();
     let lpm_config = plan.config.as_ref();
-    let pkg_scripts = plan.package_scripts.as_ref();
+    let pkg_scripts = plan.package.as_ref().map(|p| &p.scripts);
     let levels = &plan.levels;
     let workspace_dependency_identities = HashMap::new();
     let initially_failed_tasks = HashSet::new();
@@ -291,6 +382,97 @@ fn execute_single_package_task_plan(
         )
     }?;
     Ok(report)
+}
+
+/// Synchronous fast path for unknown top-level script/task/binary shortcuts.
+/// Returns `Ok(None)` when managed runtime download or remote task caching
+/// requires the async path.
+pub fn try_run_external_shortcut_sync(
+    project_dir: &Path,
+    args: &[String],
+    json_output: bool,
+) -> Result<Option<()>, LpmError> {
+    let Some(command_name) = args.first() else {
+        return Ok(Some(()));
+    };
+    let extra_args = if args.len() > 1 { &args[1..] } else { &[] };
+
+    let package = {
+        let pkg_json_path = project_dir.join("package.json");
+        if pkg_json_path.exists() {
+            Some(
+                lpm_workspace::read_package_json(&pkg_json_path)
+                    .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?,
+            )
+        } else {
+            None
+        }
+    };
+    let in_pkg_scripts = package
+        .as_ref()
+        .is_some_and(|pkg| pkg.scripts.contains_key(command_name));
+    let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    let in_lpm_tasks = lpm_config
+        .as_ref()
+        .and_then(|config| config.tasks.get(command_name))
+        .is_some_and(|task| task.command.is_some() || !task.depends_on.is_empty());
+
+    if in_pkg_scripts || in_lpm_tasks {
+        if lpm_config
+            .as_ref()
+            .is_some_and(|config| config.remote_cache.is_some())
+        {
+            return Ok(None);
+        }
+        let Some(bin_hint) = try_prepare_runtime_sync(project_dir, json_output)? else {
+            return Ok(None);
+        };
+        crate::commands::env::links::ensure_folder_linked(project_dir, json_output)?;
+        let scripts = std::slice::from_ref(command_name);
+        let plan = prepare_single_package_task_plan_with_loaded(scripts, lpm_config, package)?;
+        run_single_package_plan_sync(
+            project_dir,
+            scripts,
+            extra_args,
+            None,
+            false,
+            false,
+            false,
+            false,
+            json_output,
+            &bin_hint,
+            None,
+            &plan,
+        )?;
+        return Ok(Some(()));
+    }
+
+    if !lpm_runner::script::local_bin_exists(project_dir, command_name) {
+        return Err(missing_external_shortcut_error(command_name));
+    }
+
+    let Some(bin_hint) = try_prepare_runtime_sync(project_dir, json_output)? else {
+        return Ok(None);
+    };
+    crate::commands::env::links::ensure_folder_linked(project_dir, json_output)?;
+    install_ui::phase_line(crate::install_ui::terminal_line!(
+        "Executing {}",
+        install_ui::yellow(command_name)
+    ));
+    let start = std::time::Instant::now();
+    nested_pm::run_local_tool(
+        project_dir,
+        command_name,
+        extra_args,
+        None,
+        false,
+        &bin_hint,
+    )?;
+    install_ui::done_line(crate::install_ui::terminal_line!(
+        "Done · exited 0 in {}",
+        install_ui::green(&install_ui::format_duration(start.elapsed())),
+    ));
+    Ok(Some(()))
 }
 
 /// Run an unknown top-level command as a script/task shortcut, then as a

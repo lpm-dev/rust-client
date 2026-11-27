@@ -80,22 +80,127 @@ fn canonicalize_self_update_probe_executable(
     })
 }
 
+fn is_lpx_program(program: Option<&std::ffi::OsStr>) -> bool {
+    program
+        .and_then(|value| std::path::Path::new(value).file_stem())
+        .is_some_and(|stem| stem == std::ffi::OsStr::new("lpx"))
+}
+
+fn is_valid_color_choice_str(value: &str) -> bool {
+    matches!(value, "auto" | "always" | "never")
+}
+
 pub(super) fn argv_requests_top_level_version<I, S>(args: I) -> bool
 where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
     let mut args = args.into_iter();
-    let _program = args.next();
-    let Some(flag) = args.next() else {
-        return false;
-    };
-
-    if args.next().is_some() {
+    let program = args.next();
+    if is_lpx_program(program.as_ref().map(AsRef::as_ref)) {
         return false;
     }
 
-    flag.as_ref() == std::ffi::OsStr::new("--version")
+    let mut saw_version = false;
+    let mut saw_color = false;
+    while let Some(arg) = args.next() {
+        let Some(value) = arg.as_ref().to_str() else {
+            return false;
+        };
+        match value {
+            "--version" | "-V" | "-v" => {
+                if saw_version {
+                    return false;
+                }
+                saw_version = true;
+            }
+            "--color" => {
+                if saw_color {
+                    return false;
+                }
+                let Some(choice) = args.next() else {
+                    return false;
+                };
+                if !choice
+                    .as_ref()
+                    .to_str()
+                    .is_some_and(is_valid_color_choice_str)
+                {
+                    return false;
+                }
+                saw_color = true;
+            }
+            _ if value.starts_with("--color=") => {
+                if saw_color || !is_valid_color_choice_str(&value["--color=".len()..]) {
+                    return false;
+                }
+                saw_color = true;
+            }
+            _ => return false,
+        }
+    }
+
+    saw_version
+}
+
+/// Match bare `lpm internal-ts-transform [--persistent]` before clap or Tokio
+/// initializes. Returns `Some(persistent)` on a match.
+pub(super) fn argv_fast_internal_ts_transform<I, S>(args: I) -> Option<bool>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let mut args = args.into_iter();
+    let program = args.next();
+    if is_lpx_program(program.as_ref().map(AsRef::as_ref)) {
+        return None;
+    }
+    let command = args.next()?;
+    if command.as_ref() != std::ffi::OsStr::new("internal-ts-transform") {
+        return None;
+    }
+    match args.next() {
+        None => Some(false),
+        Some(flag)
+            if flag.as_ref() == std::ffi::OsStr::new("--persistent") && args.next().is_none() =>
+        {
+            Some(true)
+        }
+        Some(_) => None,
+    }
+}
+
+/// Match bare `lpm internal-nested-pm <manager> [-- <args...>]` before clap or
+/// Tokio initializes.
+pub(super) fn argv_fast_internal_nested_pm<I, S>(
+    args: I,
+) -> Option<(String, Vec<std::ffi::OsString>)>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let mut args = args.into_iter();
+    let program = args.next();
+    if is_lpx_program(program.as_ref().map(AsRef::as_ref)) {
+        return None;
+    }
+    let command = args.next()?;
+    if command.as_ref() != std::ffi::OsStr::new("internal-nested-pm") {
+        return None;
+    }
+    let manager_os = args.next()?;
+    let manager = manager_os.as_ref().to_str()?;
+    if manager.is_empty() || manager.starts_with('-') {
+        return None;
+    }
+    match args.next() {
+        None => Some((manager.to_owned(), Vec::new())),
+        Some(sep) if sep.as_ref() == std::ffi::OsStr::new("--") => {
+            let forwarded = args.map(|arg| arg.as_ref().to_os_string()).collect();
+            Some((manager.to_owned(), forwarded))
+        }
+        Some(_) => None,
+    }
 }
 
 pub(super) fn args_for_cli_parse<I>(args: I) -> Vec<std::ffi::OsString>
@@ -955,16 +1060,88 @@ mod tests {
     }
 
     #[test]
-    fn top_level_long_version_is_handled_before_clap() {
-        assert!(argv_requests_top_level_version(["lpm", "--version"]));
-        assert!(!argv_requests_top_level_version(["lpm", "info", "react"]));
-        assert!(!argv_requests_top_level_version([
-            "lpm",
-            "info",
-            "react",
-            "--version",
-            "1.0.0"
-        ]));
+    fn top_level_version_flags_are_handled_before_clap() {
+        for fast in [
+            &["lpm", "--version"][..],
+            &["lpm", "-V"][..],
+            &["lpm", "-v"][..],
+            &["lpm", "--color=never", "-V"][..],
+            &["lpm", "-v", "--color", "always"][..],
+            &["lpm", "--color", "auto", "--version"][..],
+        ] {
+            assert!(
+                argv_requests_top_level_version(fast.iter().copied()),
+                "expected fast version path for {fast:?}"
+            );
+        }
+        for slow in [
+            &["lpm", "info", "react"][..],
+            &["lpm", "info", "react", "--version", "1.0.0"][..],
+            &["lpm", "-V", "--self-update-probe-executable", "/bin/lpm"][..],
+            &["lpm", "-V", "--color=invalid"][..],
+            &["lpm", "-V", "-v"][..],
+            &["lpm", "-V", "--json"][..],
+            &["lpx", "-V"][..],
+        ] {
+            assert!(
+                !argv_requests_top_level_version(slow.iter().copied()),
+                "expected clap path for {slow:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn internal_ts_transform_and_nested_pm_fast_lanes_match_strict_invocations() {
+        assert_eq!(
+            argv_fast_internal_ts_transform(["lpm", "internal-ts-transform"]),
+            Some(false)
+        );
+        assert_eq!(
+            argv_fast_internal_ts_transform(["lpm", "internal-ts-transform", "--persistent"]),
+            Some(true)
+        );
+        assert_eq!(
+            argv_fast_internal_ts_transform(["lpm", "internal-ts-transform", "--help"]),
+            None
+        );
+        assert_eq!(
+            argv_fast_internal_ts_transform(["lpx", "internal-ts-transform"]),
+            None
+        );
+
+        assert_eq!(
+            argv_fast_internal_nested_pm(["lpm", "internal-nested-pm", "npm"]),
+            Some(("npm".to_owned(), Vec::new()))
+        );
+        assert_eq!(
+            argv_fast_internal_nested_pm([
+                "lpm",
+                "internal-nested-pm",
+                "pnpm",
+                "--",
+                "install",
+                "--frozen-lockfile",
+            ]),
+            Some((
+                "pnpm".to_owned(),
+                vec![
+                    std::ffi::OsString::from("install"),
+                    std::ffi::OsString::from("--frozen-lockfile"),
+                ],
+            ))
+        );
+        assert_eq!(
+            argv_fast_internal_nested_pm(["lpm", "internal-nested-pm", "--help"]),
+            None
+        );
+        assert_eq!(
+            argv_fast_internal_nested_pm(["lpm", "internal-nested-pm", "npm", "install"]),
+            None
+        );
+        assert_eq!(
+            argv_fast_internal_nested_pm(["lpx", "internal-nested-pm", "npm"]),
+            None
+        );
     }
 
     #[test]

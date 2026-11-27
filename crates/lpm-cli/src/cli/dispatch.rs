@@ -21,14 +21,14 @@ use super::format::{
     parse_cli_or_exit,
 };
 use super::helpers::{
-    adds_no_secrets_to_the_lpm_home, argv_requests_top_level_version,
-    build_install_global_overrides_with_excludes, command_allows_background_update,
-    command_needs_global_state, install_omit_policy_from_cli, maybe_emit_network_fs_warning,
-    npmrc_project_dir, package_root_for, print_version_with_notice, project_relative_path,
-    project_root_for, project_root_for_state, resolve_install_project_dir, resolve_tunnel_bearer,
-    should_suppress_update_banner, spawn_background_update_check, tunnel_action_requires_session,
-    validate_global_install_project_scoped_flags, validate_global_install_unsupported_flags,
-    validate_global_uninstall_project_scoped_flags,
+    adds_no_secrets_to_the_lpm_home, argv_fast_internal_nested_pm, argv_fast_internal_ts_transform,
+    argv_requests_top_level_version, build_install_global_overrides_with_excludes,
+    command_allows_background_update, command_needs_global_state, install_omit_policy_from_cli,
+    maybe_emit_network_fs_warning, npmrc_project_dir, package_root_for, print_version_with_notice,
+    project_relative_path, project_root_for, project_root_for_state, resolve_install_project_dir,
+    resolve_tunnel_bearer, should_suppress_update_banner, spawn_background_update_check,
+    tunnel_action_requires_session, validate_global_install_project_scoped_flags,
+    validate_global_install_unsupported_flags, validate_global_uninstall_project_scoped_flags,
 };
 
 pub(crate) fn run() -> Result<()> {
@@ -62,6 +62,34 @@ pub(crate) fn run() -> Result<()> {
     if argv_requests_top_level_version(std::env::args_os()) {
         print_version_with_notice();
         return Ok(());
+    }
+
+    if let Some(persistent) = argv_fast_internal_ts_transform(std::env::args_os()) {
+        if let Err(error) = privilege::ensure_user_invocation_allowed()
+            .and_then(|()| crate::release_plan::fault_injection::ensure_fault_injection_supported())
+        {
+            exit_with_lpm_error(&error, false);
+        }
+        let result = if persistent {
+            lpm_runner::ts_transform::run_persistent_stdio()
+        } else {
+            lpm_runner::ts_transform::run_stdio()
+        };
+        if let Err(error) = result {
+            let error = error.to_string();
+            eprintln!("{}", lpm_common::sanitize_terminal_multiline(&error));
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+
+    if let Some((manager, args)) = argv_fast_internal_nested_pm(std::env::args_os()) {
+        if let Err(error) = privilege::ensure_user_invocation_allowed()
+            .and_then(|()| crate::release_plan::fault_injection::ensure_fault_injection_supported())
+        {
+            exit_with_lpm_error(&error, false);
+        }
+        commands::run::nested_pm::exit_with_shim(&manager, args);
     }
 
     // ── sync fast lane ──────────────────────────────────
@@ -185,154 +213,22 @@ pub(crate) fn run() -> Result<()> {
     run_async_main()
 }
 
-async fn async_main(cli: Cli) -> Result<()> {
-    // Color policy is already initialized at the top of `fn main()` via
-    // the argv pre-scan. Re-run init here so any difference between the
-    // pre-scan's flag detection and clap's parsed value (e.g., the user
-    // wrote `--color always` and the pre-scan failed for an unrelated
-    // reason) is resolved in clap's favor. `set_enabled` is idempotent.
-    color_policy::init(Some(cli.color));
+pub(super) enum SyncDispatch {
+    Handled(Result<()>),
+    ContinueAsync(Cli),
+}
 
-    // Version flag short-circuit. Replaces clap's auto `-V` handler so we
-    // can both (a) honour `-v` as an alias and (b) append the cached
-    // "update available" notice. Runs before tracing setup / subcommand
-    // dispatch — there is nothing to log and nothing to do beyond
-    // printing the version line.
-    if cli.version_flag {
-        if let Some(expected) = cli.self_update_probe_executable.as_deref() {
-            super::helpers::print_self_update_probe_version(expected)?;
+fn init_tracing_once(command: &Commands, verbose: bool) {
+    static TRACING_INIT: std::sync::Once = std::sync::Once::new();
+    TRACING_INIT.call_once(|| {
+        // Set up tracing based on verbosity. Tracing is pinned to stderr so
+        // stdout stays reserved for command output and `--json` remains a
+        // single parseable document.
+        let filter = if verbose {
+            "lpm=debug,reqwest=debug"
         } else {
-            print_version_with_notice();
-        }
-        return Ok(());
-    }
-
-    // No subcommand and no version request → print help and exit 2 (clap's
-    // standard "missing required argument" semantics). We can't lean on
-    // clap's automatic `arg_required_else_help` because the global short
-    // version flag still defaults to `false`; the user-typed `lpm` (no
-    // args, no flags) needs explicit handling.
-    let Some(command) = cli.command else {
-        use clap::CommandFactory;
-        let mut cmd = Cli::command();
-        let _ = cmd.print_help();
-        std::process::exit(2);
-    };
-
-    if let Err(error) = privilege::ensure_command_allowed(&command)
-        .and_then(|()| crate::release_plan::fault_injection::ensure_fault_injection_supported())
-    {
-        exit_with_lpm_error(&error, cli.json);
-    }
-
-    if let Commands::Completions(args) = &command {
-        if let Err(error) = commands::completions::run(args.shell) {
-            exit_with_lpm_error(&error, cli.json);
-        }
-        return Ok(());
-    }
-
-    let privileged_helper_result = match &command {
-        Commands::InternalHostsFile(args) => Some(commands::hosts::run_internal_hosts_file(
-            &args.action,
-            args.block_id.as_deref(),
-            &args.hosts,
-            args.expected_blocks,
-        )),
-        Commands::InternalSecurityPolicy(args) => {
-            Some(crate::security_approval::run_internal_managed_protection(
-                args.action,
-                args.run.as_deref(),
-            ))
-        }
-        Commands::InternalCertStore(args) => Some(commands::cert::run_internal_cert_store(
-            args.action,
-            args.certificate.as_deref(),
-            args.sha256.as_deref(),
-            args.sha1.as_deref(),
-        )),
-        _ => None,
-    };
-    if let Some(result) = privileged_helper_result {
-        match result {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                exit_with_lpm_error(&error, cli.json);
-            }
-        }
-    }
-
-    if let Commands::InternalVerifyRelease(args) = &command {
-        let release = crate::release_lookup::GithubRelease {
-            published_at: args.published_at,
-            target_commitish: args.release_commit.clone(),
+            "lpm=warn"
         };
-        if let Err(error) = commands::self_update::verify_release::run(
-            &args.version,
-            &args.manifest,
-            &args.bundle,
-            &release,
-            cli.json,
-        ) {
-            exit_with_lpm_error(&error, cli.json);
-        }
-        return Ok(());
-    }
-
-    if let Commands::InternalPackageSignals(args) = &command {
-        if let Err(error) =
-            commands::package_signals::run(args.ecosystem.into(), args.swift_manifest.as_deref())
-        {
-            exit_with_lpm_error(&error, true);
-        }
-        return Ok(());
-    }
-
-    if let Commands::InternalNestedPm(args) = &command {
-        commands::run::nested_pm::exit_with_shim(&args.manager, args.args.clone());
-    }
-
-    if let Commands::InternalProxyService(args) = &command {
-        if let Err(error) = commands::proxy::run_internal_proxy_service(
-            &args.home,
-            &args.project,
-            &args.stdout,
-            &args.stderr,
-            &args.args,
-        ) {
-            exit_with_lpm_error(&error, cli.json);
-        }
-        return Ok(());
-    }
-
-    if let Commands::InternalTsTransform(args) = &command {
-        let result = if args.persistent {
-            lpm_runner::ts_transform::run_persistent_stdio()
-        } else {
-            lpm_runner::ts_transform::run_stdio()
-        };
-        if let Err(error) = result {
-            let error = error.to_string();
-            eprintln!("{}", lpm_common::sanitize_terminal_multiline(&error));
-            std::process::exit(1);
-        }
-        std::process::exit(0);
-    }
-
-    let _timeline_export = super::install_timeline::ExportGuard;
-
-    // Set up tracing based on verbosity. Tracing is pinned to stderr so
-    // stdout stays reserved for command output and `--json` remains a
-    // single parseable document.
-    let filter = if cli.verbose {
-        "lpm=debug,reqwest=debug"
-    } else {
-        "lpm=warn"
-    };
-    // With `--features tracy`, layer a `TracyLayer` alongside the stderr
-    // fmt layer so install-pipeline spans land in the Tracy GUI without
-    // changing the stderr logging contract.
-    {
         use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
         use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -344,7 +240,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         let ordinary_filter = tracing_subscriber::filter::filter_fn(|metadata| {
             metadata.target() != super::install_timeline::TARGET
         });
-        let timeline = super::install_timeline::start(&command)
+        let timeline = super::install_timeline::start(command)
             .map(|layer| layer.with_filter(diagnostic_filter));
         let fmt_layer = tracing_subscriber::fmt::layer()
             .with_writer(crate::live_region::TracingEvent::default)
@@ -368,9 +264,11 @@ async fn async_main(cli: Cli) -> Result<()> {
             )
             .with(timeline);
 
-        registry.init();
-    }
+        let _ = registry.try_init();
+    });
+}
 
+fn check_lpm_home_guard(command: &Commands, json: bool) {
     // Before anything writes to the LPM home, it is kept out of git, or the
     // command doesn't run.
     if let Ok(root) = lpm_common::LpmRoot::from_env()
@@ -380,12 +278,287 @@ async fn async_main(cli: Cli) -> Result<()> {
             "{exposed}, so git could commit the login state, env secrets and packages saved there; {}",
             exposed.remedy()
         );
-        if adds_no_secrets_to_the_lpm_home(&command) {
+        if adds_no_secrets_to_the_lpm_home(command) {
             output::warn(&message);
         } else {
-            exit_with_lpm_error(&lpm_common::LpmError::LpmHome(message), cli.json);
+            exit_with_lpm_error(&lpm_common::LpmError::LpmHome(message), json);
         }
     }
+}
+
+fn finish_update_check(
+    pending: Option<update_check::PendingUpdateCheck>,
+    json: bool,
+    suppress_banner: bool,
+    allow_background_update: bool,
+) {
+    let needs_update_check = (!json && !suppress_banner) || allow_background_update;
+    if !needs_update_check {
+        return;
+    }
+    let snapshot = pending.map_or_else(
+        update_check::UpdateCheckSnapshot::load,
+        update_check::PendingUpdateCheck::finish,
+    );
+    if !json
+        && !suppress_banner
+        && let Some(notice) = snapshot.cached_notice()
+    {
+        eprint!("{notice}");
+    }
+    if allow_background_update && snapshot.should_spawn_background_check() {
+        spawn_background_update_check();
+    }
+}
+
+/// Handle purely synchronous commands directly on the main thread so they do
+/// not spawn the `lpm-async-main` thread or initialize a Tokio runtime.
+pub(super) fn try_run_sync_command(cli: Cli) -> SyncDispatch {
+    color_policy::init(Some(cli.color));
+
+    if cli.version_flag {
+        if let Some(expected) = cli.self_update_probe_executable.as_deref() {
+            return SyncDispatch::Handled(
+                super::helpers::print_self_update_probe_version(expected).map_err(Into::into),
+            );
+        }
+        print_version_with_notice();
+        return SyncDispatch::Handled(Ok(()));
+    }
+
+    let Some(command) = cli.command.as_ref() else {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let _ = cmd.print_help();
+        std::process::exit(2);
+    };
+
+    if let Err(error) = privilege::ensure_command_allowed(command)
+        .and_then(|()| crate::release_plan::fault_injection::ensure_fault_injection_supported())
+    {
+        exit_with_lpm_error(&error, cli.json);
+    }
+
+    if let Commands::Completions(args) = command {
+        if let Err(error) = commands::completions::run(args.shell) {
+            exit_with_lpm_error(&error, cli.json);
+        }
+        return SyncDispatch::Handled(Ok(()));
+    }
+
+    let privileged_helper_result = match command {
+        Commands::InternalHostsFile(args) => Some(commands::hosts::run_internal_hosts_file(
+            &args.action,
+            args.block_id.as_deref(),
+            &args.hosts,
+            args.expected_blocks,
+        )),
+        Commands::InternalSecurityPolicy(args) => {
+            Some(crate::security_approval::run_internal_managed_protection(
+                args.action,
+                args.run.as_deref(),
+            ))
+        }
+        Commands::InternalCertStore(args) => Some(commands::cert::run_internal_cert_store(
+            args.action,
+            args.certificate.as_deref(),
+            args.sha256.as_deref(),
+            args.sha1.as_deref(),
+        )),
+        _ => None,
+    };
+    if let Some(result) = privileged_helper_result {
+        match result {
+            Ok(()) => return SyncDispatch::Handled(Ok(())),
+            Err(error) => exit_with_lpm_error(&error, cli.json),
+        }
+    }
+
+    if let Commands::InternalVerifyRelease(args) = command {
+        let release = crate::release_lookup::GithubRelease {
+            published_at: args.published_at,
+            target_commitish: args.release_commit.clone(),
+        };
+        if let Err(error) = commands::self_update::verify_release::run(
+            &args.version,
+            &args.manifest,
+            &args.bundle,
+            &release,
+            cli.json,
+        ) {
+            exit_with_lpm_error(&error, cli.json);
+        }
+        return SyncDispatch::Handled(Ok(()));
+    }
+
+    if let Commands::InternalPackageSignals(args) = command {
+        if let Err(error) =
+            commands::package_signals::run(args.ecosystem.into(), args.swift_manifest.as_deref())
+        {
+            exit_with_lpm_error(&error, true);
+        }
+        return SyncDispatch::Handled(Ok(()));
+    }
+
+    if let Commands::InternalNestedPm(args) = command {
+        commands::run::nested_pm::exit_with_shim(&args.manager, args.args.clone());
+    }
+
+    if let Commands::InternalProxyService(args) = command {
+        if let Err(error) = commands::proxy::run_internal_proxy_service(
+            &args.home,
+            &args.project,
+            &args.stdout,
+            &args.stderr,
+            &args.args,
+        ) {
+            exit_with_lpm_error(&error, cli.json);
+        }
+        return SyncDispatch::Handled(Ok(()));
+    }
+
+    if let Commands::InternalTsTransform(args) = command {
+        let result = if args.persistent {
+            lpm_runner::ts_transform::run_persistent_stdio()
+        } else {
+            lpm_runner::ts_transform::run_stdio()
+        };
+        if let Err(error) = result {
+            let error = error.to_string();
+            eprintln!("{}", lpm_common::sanitize_terminal_multiline(&error));
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+
+    let sync_eligible = match command {
+        Commands::Schema(_) | Commands::Exec(_) | Commands::External(_) => true,
+        Commands::Env(args) => !commands::env::is_account_action(&args.extra),
+        Commands::Run(args) => {
+            !args.watch
+                && !args.all
+                && args.filter.is_empty()
+                && args.filter_prod.is_empty()
+                && !args.affected
+                && args.workspace_concurrency.is_none()
+        }
+        _ => false,
+    };
+    if !sync_eligible {
+        return SyncDispatch::ContinueAsync(cli);
+    }
+
+    init_tracing_once(command, cli.verbose);
+    check_lpm_home_guard(command, cli.json);
+    if let Err(error) = provenance_fetch::EnforceMode::validate_from_env() {
+        exit_with_lpm_error(&error, cli.json);
+    }
+
+    let allow_background_update = command_allows_background_update(command);
+    let sync_result: Option<std::result::Result<(), lpm_common::LpmError>> = match command {
+        Commands::Schema(args) => Some(commands::schema::run(&args.kind, args.out.as_deref())),
+        Commands::Env(args) => {
+            let json = cli.json;
+            commands::env::try_run_local_sync(
+                || {
+                    let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+                    project_root_for_state(&cwd, json)
+                },
+                &args.extra,
+                json,
+            )
+        }
+        Commands::Run(args) => {
+            let invocation_dir = match std::env::current_dir() {
+                Ok(dir) => dir,
+                Err(error) => {
+                    exit_with_lpm_error(&lpm_common::LpmError::Io(error), cli.json);
+                }
+            };
+            let home = dirs::home_dir();
+            let cwd = lpm_workspace::find_project_config_root(&invocation_dir, home.as_deref())
+                .unwrap_or_else(|| invocation_dir.clone());
+            match commands::run::try_run_multi_sync(
+                &cwd,
+                &args.scripts,
+                &args.args,
+                args.env.as_deref(),
+                args.parallel,
+                args.continue_on_error,
+                args.stream,
+                args.no_cache,
+                cli.json,
+                || {
+                    lpm_runner::script::set_skip_env_validation(args.no_env_check);
+                    if cwd != invocation_dir && !cli.json {
+                        crate::install_ui::phase_untrusted(&format!(
+                            "Using the project at {} (nearest package.json or lpm.json).",
+                            cwd.display(),
+                        ));
+                    }
+                    commands::env::links::ensure_folder_linked(&cwd, cli.json)
+                },
+            ) {
+                Ok(Some(())) => Some(Ok(())),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            }
+        }
+        Commands::Exec(args) => {
+            let cwd = match std::env::current_dir() {
+                Ok(dir) => dir,
+                Err(error) => {
+                    exit_with_lpm_error(&lpm_common::LpmError::Io(error), cli.json);
+                }
+            };
+            match commands::run::try_exec_sync(
+                &cwd,
+                &args.command,
+                &args.args,
+                args.env.as_deref(),
+                args.no_env_check,
+                cli.json,
+            ) {
+                Ok(Some(())) => Some(Ok(())),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            }
+        }
+        Commands::External(args) => {
+            let cwd = match std::env::current_dir() {
+                Ok(dir) => dir,
+                Err(error) => {
+                    exit_with_lpm_error(&lpm_common::LpmError::Io(error), cli.json);
+                }
+            };
+            match commands::run::try_run_external_shortcut_sync(&cwd, args, cli.json) {
+                Ok(Some(())) => Some(Ok(())),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            }
+        }
+        _ => None,
+    };
+
+    let Some(result) = sync_result else {
+        return SyncDispatch::ContinueAsync(cli);
+    };
+
+    finish_update_check(None, cli.json, false, allow_background_update);
+    if let Err(error) = &result {
+        exit_with_lpm_error(error, cli.json);
+    }
+    SyncDispatch::Handled(Ok(()))
+}
+
+async fn async_main(cli: Cli) -> Result<()> {
+    let Some(command) = cli.command else {
+        unreachable!("no-subcommand help exits before async dispatch");
+    };
+
+    let _timeline_export = super::install_timeline::ExportGuard;
+    init_tracing_once(&command, cli.verbose);
+    check_lpm_home_guard(&command, cli.json);
 
     // Startup gate for `LPM_PROVENANCE_ENFORCE`: an unknown value
     // (typo, stale spelling from an older release) must hard-fail
@@ -581,7 +754,9 @@ async fn async_main(cli: Cli) -> Result<()> {
     // sees the banner.
     let is_self_update_command = matches!(command, Commands::SelfUpdate(_));
     let allow_background_update = command_allows_background_update(&command);
-    let update_check = (!matches!(command, Commands::InternalUpdateCheck))
+    let suppress_banner = should_suppress_update_banner(is_self_update_command);
+    let needs_update_check = (!cli.json && !suppress_banner) || allow_background_update;
+    let update_check = (!matches!(command, Commands::InternalUpdateCheck) && needs_update_check)
         .then(update_check::PendingUpdateCheck::start);
 
     // Wrap the entire dispatch in an async block so every
@@ -733,7 +908,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 strict_sandbox,
                 paranoid,
                 no_sandbox,
-            } = args;
+            } = *args;
             let cli_strict_peer_dependencies =
                 match (strict_peer_dependencies, no_strict_peer_dependencies) {
                     (true, false) => Some(true),
@@ -1362,7 +1537,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 fail_if_no_match,
                 yes,
                 global,
-            } = args;
+            } = *args;
             // `lpm uninstall -g <pkg>` routes to the
             // global uninstall pipeline. Project flags are mutually
             // exclusive with -g — no `--filter` / `-w` /
@@ -1430,7 +1605,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 alias,
                 target,
                 no_engine_strict,
-            } = args;
+            } = *args;
             // Token expiry warnings.
             if !cli.json {
                 for warning in auth::check_token_expiry_warnings() {
@@ -1555,7 +1730,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             )
         }
         Commands::Release(args) => {
-            let release_args::ReleaseArgs { command } = args;
+            let release_args::ReleaseArgs { command } = *args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             match command {
                 ReleaseCommands::Plan { selection, bump } => {
@@ -1756,9 +1931,9 @@ async fn async_main(cli: Cli) -> Result<()> {
                 gitlab,
                 login_registry,
                 socket,
-                token,
                 save_env_token,
             } = args;
+            let token = cli.token.clone();
             if socket {
                 commands::third_party_login::run_socket(token, cli.json).await
             } else if npm {
@@ -2308,7 +2483,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 no_env_check,
                 watch,
                 args,
-            } = args;
+            } = *args;
             lpm_runner::script::set_skip_env_validation(no_env_check);
             let invocation_dir = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let workspace_mode = all || !filter.is_empty() || !filter_prod.is_empty() || affected;
@@ -2528,7 +2703,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 no_optional,
                 dry_run,
                 allow_secrets,
-            } = args;
+            } = *args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let output_path = std::path::PathBuf::from(&output);
             commands::deploy::run(
@@ -2652,7 +2827,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 test_pattern,
                 fail_if_no_match,
                 args,
-            } = args;
+            } = *args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
             if all || affected || !filter.is_empty() || !filter_prod.is_empty() {
@@ -2689,7 +2864,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 test_pattern,
                 fail_if_no_match,
                 args,
-            } = args;
+            } = *args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
             if all || affected || !filter.is_empty() || !filter_prod.is_empty() {
@@ -2726,7 +2901,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 fail_if_no_match,
                 engine,
                 args,
-            } = args;
+            } = *args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
             if all || affected || !filter.is_empty() || !filter_prod.is_empty() {
@@ -2769,7 +2944,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 minify,
                 sourcemap,
                 args,
-            } = args;
+            } = *args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
             let options = commands::bundle::BundleOptions {
@@ -2818,7 +2993,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 minify,
                 sourcemap,
                 args,
-            } = args;
+            } = *args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let options = commands::pack::PackOptions {
                 entry,
@@ -2860,7 +3035,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 fail_if_no_match,
                 workspace_concurrency,
                 args,
-            } = args;
+            } = *args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let project_dir = lpm_workspace::find_project_root(&cwd).unwrap_or(cwd);
             tool_pin_validation::warn_unsupported_tool_pins_once(&project_dir);
@@ -2893,7 +3068,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 fail_if_no_match,
                 workspace_concurrency,
                 args,
-            } = args;
+            } = *args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let project_dir = lpm_workspace::find_project_root(&cwd).unwrap_or(cwd);
             tool_pin_validation::warn_unsupported_tool_pins_once(&project_dir);
@@ -2944,7 +3119,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 strict_sandbox,
                 paranoid,
                 no_sandbox,
-            } = args;
+            } = *args;
             let cli_strict_peer_dependencies =
                 match (strict_peer_dependencies, no_strict_peer_dependencies) {
                     (true, false) => Some(true),
@@ -3168,7 +3343,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 yes,
                 allow_ca_bootstrap,
                 args,
-            } = args;
+            } = *args;
             lpm_runner::script::set_skip_env_validation(no_env_check);
             let cwd = project_root_for_state(
                 &std::env::current_dir().map_err(lpm_common::LpmError::Io)?,
@@ -3417,7 +3592,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 clear,
                 replay_port,
                 mut args,
-            } = args;
+            } = *args;
             if ui {
                 args.push("--ui".to_string());
             }
@@ -3579,24 +3754,12 @@ async fn async_main(cli: Cli) -> Result<()> {
     // 0.37.0 → 0.38.0` pair. The suppression is per-invocation; the
     // on-disk cache is untouched, so the next unrelated command still
     // surfaces the banner.
-    let suppress_banner = should_suppress_update_banner(is_self_update_command);
-    let update_check = update_check.map_or_else(
-        update_check::UpdateCheckSnapshot::load,
-        update_check::PendingUpdateCheck::finish,
+    finish_update_check(
+        update_check,
+        cli.json,
+        suppress_banner,
+        allow_background_update,
     );
-    if !cli.json
-        && !suppress_banner
-        && let Some(notice) = update_check.cached_notice()
-    {
-        eprint!("{notice}");
-    }
-
-    // spawn a detached child process to refresh the update cache
-    // if stale. The parent never waits for it — command exit is immediate.
-    // The staleness check is sync (file stat + timestamp comparison).
-    if allow_background_update && update_check.should_spawn_background_check() {
-        spawn_background_update_check();
-    }
 
     if let Err(e) = &result {
         exit_with_lpm_error(e, cli.json);

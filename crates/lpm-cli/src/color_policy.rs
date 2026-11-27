@@ -44,19 +44,45 @@ impl From<ColorChoice> for ResolvedChoice {
     }
 }
 
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+const INIT_UNSET: u8 = 0;
+const INIT_AUTO: u8 = 1;
+const INIT_ALWAYS: u8 = 2;
+const INIT_NEVER: u8 = 3;
+
+static FAST_CHOICE: AtomicU8 = AtomicU8::new(INIT_UNSET);
+static NO_COLOR_THEME_SET: AtomicBool = AtomicBool::new(false);
+
+fn choice_tag(choice: Option<ColorChoice>) -> u8 {
+    match choice.unwrap_or(ColorChoice::Auto) {
+        ColorChoice::Auto => INIT_AUTO,
+        ColorChoice::Always => INIT_ALWAYS,
+        ColorChoice::Never => INIT_NEVER,
+    }
+}
+
 /// Resolve the color policy and apply it process-wide.
 ///
 /// Must run BEFORE any styled output is emitted — the call site is at the
 /// **top of `fn main()`**, before the `--version` fast path and the
 /// bare-`lpm install` fast lane both emit. The policy is single-write: a
-/// re-call overwrites, but production fires this exactly once.
+/// re-call overwrites, but skips redundant env/TTY probes when `init_fast`
+/// already applied the same effective choice.
 ///
 /// The `cli` arg comes from [`peek_color_choice_from_argv`] when invoked
 /// pre-`Cli::parse` — the pre-scan is the only way to honor `--color`
 /// before clap runs.
 pub fn init(cli: Option<ColorChoice>) {
-    let enabled = apply_core_policy(cli);
-    if !enabled {
+    let tag = choice_tag(cli);
+    let enabled = if !cfg!(test) && FAST_CHOICE.load(Ordering::Relaxed) == tag {
+        color::enabled()
+    } else {
+        let enabled = apply_core_policy(cli);
+        FAST_CHOICE.store(tag, Ordering::Relaxed);
+        enabled
+    };
+    if !enabled && !NO_COLOR_THEME_SET.swap(true, Ordering::Relaxed) {
         cliclack::set_theme(NoColorTheme);
     }
 }
@@ -65,6 +91,7 @@ pub fn init(cli: Option<ColorChoice>) {
 /// up-to-date installs) that never invoke interactive `cliclack` prompts.
 pub fn init_fast(cli: Option<ColorChoice>) {
     let _ = apply_core_policy(cli);
+    FAST_CHOICE.store(choice_tag(cli), Ordering::Relaxed);
 }
 
 fn apply_core_policy(cli: Option<ColorChoice>) -> bool {

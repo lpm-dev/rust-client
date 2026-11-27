@@ -159,11 +159,11 @@ fn ensure_shim_dir(lpm: &Path, managers: &[&str]) -> Result<PathBuf, LpmError> {
         .cache_root()
         .join("nested-pm")
         .join(key);
-    std::fs::create_dir_all(&dir)?;
     let marker = dir.join(SHIM_MARKER);
-    if !marker.is_file() {
-        lpm_common::write_file_atomic(&marker, b"LPM package-manager shims\n")?;
+    if marker.is_file() && shim_dir_is_warm(&dir, lpm, managers) {
+        return Ok(dir);
     }
+    std::fs::create_dir_all(&dir)?;
     for manager in managers {
         let target = dir.join(shim_file_name(manager));
         let content = shim_script(lpm, manager);
@@ -185,7 +185,46 @@ fn ensure_shim_dir(lpm: &Path, managers: &[&str]) -> Result<PathBuf, LpmError> {
             ensure_launcher(lpm, &dir.join(format!("{manager}.exe")))?;
         }
     }
+    if !marker.is_file() {
+        lpm_common::write_file_atomic(&marker, b"LPM package-manager shims\n")?;
+    }
     Ok(dir)
+}
+
+fn shim_dir_is_warm(dir: &Path, lpm: &Path, managers: &[&str]) -> bool {
+    for manager in managers {
+        let target = dir.join(shim_file_name(manager));
+        let expected_len = shim_script(lpm, manager).len() as u64;
+        let Ok(meta) = std::fs::symlink_metadata(&target) else {
+            return false;
+        };
+        if !meta.is_file() || meta.len() != expected_len {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if meta.permissions().mode() & 0o111 == 0 {
+                return false;
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let record = dir.join(LPM_BINARY_RECORD);
+        let expected_record_len = encode_path(lpm).len() as u64;
+        if !std::fs::symlink_metadata(&record)
+            .is_ok_and(|meta| meta.is_file() && meta.len() == expected_record_len)
+        {
+            return false;
+        }
+        for manager in managers {
+            if !launcher_in_place(&dir.join(format!("{manager}.exe"))).is_ok_and(|ok| ok) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 #[cfg(any(windows, test))]
@@ -317,7 +356,22 @@ pub(crate) fn launcher_manager(exe: &Path) -> Option<&'static str> {
 
 /// Run a shimmed command and exit with its status.
 pub(crate) fn exit_with_shim(manager: &str, args: Vec<OsString>) -> ! {
-    let code = match run_shim(manager, args) {
+    let result = match prepare_shim_command(manager, args) {
+        Ok(mut command) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt as _;
+                let error = command.exec();
+                Err(LpmError::Io(error))
+            }
+            #[cfg(not(unix))]
+            {
+                execute_shim_command(&mut command)
+            }
+        }
+        Err(error) => Err(error),
+    };
+    let code = match result {
         Ok(()) => 0,
         Err(LpmError::ExitCode(code)) => code,
         Err(error) => {
@@ -990,8 +1044,18 @@ fn append_log(path: &Path, entry: &LogEntry) {
     }
 }
 
-/// Entry point of the hidden `internal-nested-pm` command the shims call.
-pub(crate) fn run_shim(manager: &str, args: Vec<OsString>) -> Result<(), LpmError> {
+#[cfg(not(unix))]
+fn execute_shim_command(command: &mut Command) -> Result<(), LpmError> {
+    let signals = lpm_runner::execution::ExecutionSignals::new()?;
+    let status = signals.run(command)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(LpmError::ExitCode(lpm_runner::shell::exit_code(&status)))
+    }
+}
+
+fn prepare_shim_command(manager: &str, args: Vec<OsString>) -> Result<Command, LpmError> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let cwd = std::env::current_dir()?;
     let text_args: Option<Vec<String>> = args
@@ -1035,7 +1099,7 @@ pub(crate) fn run_shim(manager: &str, args: Vec<OsString>) -> Result<(), LpmErro
             },
         );
     }
-    let mut command = match plan {
+    let command = match plan {
         Plan::Lpm { args, dir } => {
             let mut command = Command::new(lpm_binary_for(std::env::current_exe()?)?);
             command
@@ -1057,13 +1121,7 @@ pub(crate) fn run_shim(manager: &str, args: Vec<OsString>) -> Result<(), LpmErro
             command
         }
     };
-    let signals = lpm_runner::execution::ExecutionSignals::new()?;
-    let status = signals.run(&mut command)?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(LpmError::ExitCode(lpm_runner::shell::exit_code(&status)))
-    }
+    Ok(command)
 }
 
 fn path_without_shims(path: &OsStr) -> Result<OsString, LpmError> {

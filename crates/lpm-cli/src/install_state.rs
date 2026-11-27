@@ -1236,7 +1236,8 @@ impl<'a> FreshnessPaths<'a> {
     }
 }
 
-const SYNC_NOOP_PROOF_VERSION: &str = "v2";
+const SYNC_NOOP_PROOF_VERSION_V2: &str = "v2";
+const SYNC_NOOP_PROOF_VERSION: &str = "v3";
 const SYNC_NOOP_FLAG_ELIGIBLE: u8 = 1 << 0;
 const SYNC_NOOP_FLAG_HAS_NODE_ENGINES: u8 = 1 << 1;
 const SYNC_NOOP_FLAG_AUTO_INSTALL_PEERS: u8 = 1 << 2;
@@ -1245,6 +1246,88 @@ const SYNC_NOOP_FLAGS_MASK: u8 = SYNC_NOOP_FLAG_ELIGIBLE
     | SYNC_NOOP_FLAG_HAS_NODE_ENGINES
     | SYNC_NOOP_FLAG_AUTO_INSTALL_PEERS
     | SYNC_NOOP_FLAG_FROZEN_OK;
+
+/// Regular-file identity stamp captured without following symlinks so
+/// unchanged standalone manifests/lockfiles can skip re-reading and hashing
+/// `lpm.lock` when their stamps match and are strictly older than
+/// `.lpm/install-hash`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SyncNoopFileStamp {
+    pub(crate) len: u64,
+    pub(crate) mtime_ns: u64,
+    pub(crate) ctime_ns: u64,
+    pub(crate) ino: u64,
+}
+
+impl SyncNoopFileStamp {
+    pub(crate) fn from_path(path: &Path) -> Option<Self> {
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        Self::from_symlink_metadata(&meta)
+    }
+
+    pub(crate) fn from_symlink_metadata(meta: &std::fs::Metadata) -> Option<Self> {
+        if !meta.is_file() {
+            return None;
+        }
+        let modified = meta.modified().ok()?;
+        let mtime_ns = modified.duration_since(UNIX_EPOCH).ok()?.as_nanos() as u64;
+        #[cfg(unix)]
+        let (ctime_ns, ino) = {
+            use std::os::unix::fs::MetadataExt as _;
+            let sec = u64::try_from(meta.ctime()).ok()?;
+            let nsec = u64::try_from(meta.ctime_nsec()).ok()?;
+            (
+                sec.saturating_mul(1_000_000_000).saturating_add(nsec),
+                meta.ino(),
+            )
+        };
+        #[cfg(not(unix))]
+        let (ctime_ns, ino) = (0u64, 0u64);
+        Some(Self {
+            len: meta.len(),
+            mtime_ns,
+            ctime_ns,
+            ino,
+        })
+    }
+
+    /// True when this file was last modified/changed strictly before the
+    /// `.lpm/install-hash` stamp (guarding against same-quantum racily-clean edits).
+    pub(crate) fn is_strictly_older_than(self, hash_stamp: Self) -> bool {
+        if self.mtime_ns >= hash_stamp.mtime_ns {
+            return false;
+        }
+        #[cfg(unix)]
+        if self.ctime_ns >= hash_stamp.ctime_ns {
+            return false;
+        }
+        true
+    }
+
+    fn format_compact(self) -> String {
+        format!(
+            "{},{},{},{}",
+            self.len, self.mtime_ns, self.ctime_ns, self.ino
+        )
+    }
+
+    fn parse_compact(raw: &str) -> Option<Self> {
+        let mut parts = raw.split(',');
+        let len = parts.next()?.parse::<u64>().ok()?;
+        let mtime_ns = parts.next()?.parse::<u64>().ok()?;
+        let ctime_ns = parts.next()?.parse::<u64>().ok()?;
+        let ino = parts.next()?.parse::<u64>().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            len,
+            mtime_ns,
+            ctime_ns,
+            ino,
+        })
+    }
+}
 
 pub(crate) fn sync_noop_content_digest_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
@@ -1270,6 +1353,8 @@ pub(crate) struct SyncNoopLockfileProof {
     pub(crate) auto_install_peers: bool,
     pub(crate) frozen_ok: bool,
     pub(crate) routes_fingerprint: String,
+    pub(crate) pkg_stamp: Option<SyncNoopFileStamp>,
+    pub(crate) lock_stamp: Option<SyncNoopFileStamp>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1281,6 +1366,8 @@ pub(crate) struct SyncNoopLockfileProofInput {
     pub(crate) auto_install_peers: bool,
     pub(crate) frozen_ok: bool,
     pub(crate) routes_fingerprint: String,
+    pub(crate) pkg_stamp: Option<SyncNoopFileStamp>,
+    pub(crate) lock_stamp: Option<SyncNoopFileStamp>,
 }
 
 impl SyncNoopLockfileProof {
@@ -1294,6 +1381,8 @@ impl SyncNoopLockfileProof {
             auto_install_peers: input.auto_install_peers,
             frozen_ok: input.frozen_ok,
             routes_fingerprint: input.routes_fingerprint.clone(),
+            pkg_stamp: input.pkg_stamp,
+            lock_stamp: input.lock_stamp,
         }
     }
 
@@ -1311,10 +1400,22 @@ impl SyncNoopLockfileProof {
         if self.frozen_ok {
             flags |= SYNC_NOOP_FLAG_FROZEN_OK;
         }
-        format!(
-            "{SYNC_NOOP_PROOF_VERSION}:{}:{}:{}:{flags:02x}:{}",
-            self.lockfile_version, self.pkg_digest, self.lock_digest, self.routes_fingerprint
-        )
+        if let (Some(pkg_stamp), Some(lock_stamp)) = (self.pkg_stamp, self.lock_stamp) {
+            format!(
+                "{SYNC_NOOP_PROOF_VERSION}:{}:{}:{}:{flags:02x}:{}:{}:{}",
+                self.lockfile_version,
+                self.pkg_digest,
+                self.lock_digest,
+                self.routes_fingerprint,
+                pkg_stamp.format_compact(),
+                lock_stamp.format_compact(),
+            )
+        } else {
+            format!(
+                "{SYNC_NOOP_PROOF_VERSION_V2}:{}:{}:{}:{flags:02x}:{}",
+                self.lockfile_version, self.pkg_digest, self.lock_digest, self.routes_fingerprint
+            )
+        }
     }
 
     pub(crate) fn parse_from_state(content: &str) -> Option<Self> {
@@ -1327,9 +1428,12 @@ impl SyncNoopLockfileProof {
                 return None;
             }
             let mut parts = rest.split(':');
-            if parts.next()? != SYNC_NOOP_PROOF_VERSION {
-                return None;
-            }
+            let version_tag = parts.next()?;
+            let is_v3 = match version_tag {
+                SYNC_NOOP_PROOF_VERSION => true,
+                SYNC_NOOP_PROOF_VERSION_V2 => false,
+                _ => return None,
+            };
             let lockfile_version = parts.next()?.parse::<u32>().ok()?;
             if lockfile_version != lpm_lockfile::LOCKFILE_VERSION {
                 return None;
@@ -1338,6 +1442,13 @@ impl SyncNoopLockfileProof {
             let lock_digest = parts.next()?;
             let flags = u8::from_str_radix(parts.next()?, 16).ok()?;
             let routes_fingerprint = parts.next()?;
+            let (pkg_stamp, lock_stamp) = if is_v3 {
+                let pkg = SyncNoopFileStamp::parse_compact(parts.next()?)?;
+                let lock = SyncNoopFileStamp::parse_compact(parts.next()?)?;
+                (Some(pkg), Some(lock))
+            } else {
+                (None, None)
+            };
             if parts.next().is_some()
                 || flags & !SYNC_NOOP_FLAGS_MASK != 0
                 || !is_lower_hex(pkg_digest, 32)
@@ -1355,6 +1466,8 @@ impl SyncNoopLockfileProof {
                 auto_install_peers: flags & SYNC_NOOP_FLAG_AUTO_INSTALL_PEERS != 0,
                 frozen_ok: flags & SYNC_NOOP_FLAG_FROZEN_OK != 0,
                 routes_fingerprint: routes_fingerprint.to_string(),
+                pkg_stamp,
+                lock_stamp,
             });
         }
         parsed
@@ -1404,6 +1517,9 @@ pub(crate) fn backfill_install_hash_sync_noop_proof(
 
 pub(crate) struct CachedMtimeMatch {
     pub(crate) lock_size: u64,
+    pub(crate) pkg_stamp: Option<SyncNoopFileStamp>,
+    pub(crate) lock_stamp: Option<SyncNoopFileStamp>,
+    pub(crate) hash_stamp: Option<SyncNoopFileStamp>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1581,10 +1697,27 @@ fn try_mtime_fast_path_with_cached_content(
         None => return None,
     }
 
-    let (pkg_ns, _) = mtime_ns_and_len(&project_dir.join("package.json"))?;
+    let pkg_path = project_dir.join("package.json");
+    let pkg_lmeta = std::fs::symlink_metadata(&pkg_path).ok()?;
+    let (pkg_ns, pkg_stamp) = if pkg_lmeta.file_type().is_symlink() {
+        (mtime_ns_and_len(&pkg_path)?.0, None)
+    } else {
+        let stamp = SyncNoopFileStamp::from_symlink_metadata(&pkg_lmeta)?;
+        (stamp.mtime_ns, Some(stamp))
+    };
     // lpm.lock may be absent on a never-installed fast-lane entry; 0
     // sentinel lines up with the writer's convention.
-    let (lock_ns, lock_size) = mtime_ns_and_len(lock_path).unwrap_or((0, 0));
+    let (lock_ns, lock_size, lock_stamp) = match std::fs::symlink_metadata(lock_path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            let (ns, len) = mtime_ns_and_len(lock_path).unwrap_or((0, 0));
+            (ns, len, None)
+        }
+        Ok(meta) => match SyncNoopFileStamp::from_symlink_metadata(&meta) {
+            Some(stamp) => (stamp.mtime_ns, stamp.len, Some(stamp)),
+            None => (0, 0, None),
+        },
+        Err(_) => (0, 0, None),
+    };
 
     if pkg_ns != stored_pkg_ns || lock_ns != stored_lock_ns {
         return None;
@@ -1598,7 +1731,13 @@ fn try_mtime_fast_path_with_cached_content(
     // touched more recently than the hash file, the recorded state
     // cannot be trusted even with matching manifest mtimes.
     let nm_ns = mtime_ns(&nm)?;
-    let hash_ns = mtime_ns(&hash_file)?;
+    let hash_lmeta = std::fs::symlink_metadata(&hash_file).ok()?;
+    let (hash_ns, hash_stamp) = if hash_lmeta.file_type().is_symlink() {
+        (mtime_ns(&hash_file)?, None)
+    } else {
+        let stamp = SyncNoopFileStamp::from_symlink_metadata(&hash_lmeta)?;
+        (stamp.mtime_ns, Some(stamp))
+    };
     if nm_ns > hash_ns {
         return None;
     }
@@ -1608,7 +1747,12 @@ fn try_mtime_fast_path_with_cached_content(
             up_to_date: true,
             hash: Some(stored_hash.to_string()),
         },
-        CachedMtimeMatch { lock_size },
+        CachedMtimeMatch {
+            lock_size,
+            pkg_stamp,
+            lock_stamp,
+            hash_stamp,
+        },
     ))
 }
 
@@ -4292,12 +4436,30 @@ mod tests {
             auto_install_peers: false,
             frozen_ok: true,
             routes_fingerprint: "0123456789abcdef".to_string(),
+            pkg_stamp: Some(SyncNoopFileStamp {
+                len: 14,
+                mtime_ns: 1_700_000_000_000_000_000,
+                ctime_ns: 1_700_000_000_000_000_000,
+                ino: 42,
+            }),
+            lock_stamp: Some(SyncNoopFileStamp {
+                len: 128,
+                mtime_ns: 1_700_000_000_000_000_000,
+                ctime_ns: 1_700_000_000_000_000_000,
+                ino: 43,
+            }),
         };
         let proof = SyncNoopLockfileProof::from_input(&input);
         let state = format!("hash\nf:{}\n", proof.format_line_value());
         assert_eq!(SyncNoopLockfileProof::parse_from_state(&state), Some(proof));
 
+        // Legacy v2 proofs without file stamps continue to parse cleanly.
         let v = lpm_lockfile::LOCKFILE_VERSION;
+        let legacy_v2 = format!("hash\nf:v2:{v}:{pkg_digest}:{lock_digest}:0b:0123456789abcdef\n");
+        let parsed_v2 =
+            SyncNoopLockfileProof::parse_from_state(&legacy_v2).expect("v2 proof must still parse");
+        assert_eq!(parsed_v2.pkg_stamp, None);
+        assert_eq!(parsed_v2.lock_stamp, None);
         let wrong_version = format!(
             "hash\nf:v2:{}:{pkg_digest}:{lock_digest}:0b:0123456789abcdef\n",
             v + 1
