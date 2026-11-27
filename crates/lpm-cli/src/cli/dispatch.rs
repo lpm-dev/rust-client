@@ -1085,7 +1085,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             };
 
             if packages.is_empty() {
-                let manifest_declares_workspaces = lpm_workspace::read_package_json(
+                let manifest_declares_workspaces = match lpm_workspace::read_package_json(
                     &cwd.join("package.json"),
                 )
                 .map_err(|error| {
@@ -1094,11 +1094,17 @@ async fn async_main(cli: Cli) -> Result<()> {
                     ))
                 })?
                 .workspaces
-                .is_some();
+                {
+                    Some(lpm_workspace::WorkspacesConfig::Globs(globs)) => !globs.is_empty(),
+                    Some(lpm_workspace::WorkspacesConfig::Object { packages }) => {
+                        !packages.is_empty()
+                    }
+                    None => false,
+                };
+                let pnpm_workspace_active = install_state::pnpm_workspace_declares_packages(&cwd)
+                    && !matches!(lpm_workspace::find_workspace_root(&cwd), Ok(None));
                 let recursive_install = recursive
-                    || (!no_recursive
-                        && (manifest_declares_workspaces
-                            || install_state::pnpm_workspace_declares_packages(&cwd)));
+                    || (!no_recursive && (manifest_declares_workspaces || pnpm_workspace_active));
 
                 if catalog.is_some() {
                     return Err(lpm_common::LpmError::Script(
@@ -3036,17 +3042,15 @@ async fn async_main(cli: Cli) -> Result<()> {
 
 
             let cli_linker = linker.map(LinkerCli::into_linker_mode);
-            let manifest_declares_workspaces =
-                lpm_workspace::read_package_json(&cwd.join("package.json"))
-                    .map_err(|error| {
-                        lpm_common::LpmError::Script(format!(
-                            "failed to read package.json while detecting workspace install mode: {error}"
-                        ))
-                    })?
-                    .workspaces
-                    .is_some();
-            let recursive_install = manifest_declares_workspaces
-                || install_state::pnpm_workspace_declares_packages(&cwd);
+            let recursive_install = match lpm_workspace::find_workspace_root(&cwd) {
+                Ok(Some(root)) => lpm_workspace::is_same_directory(&root, &cwd),
+                Ok(None) => false,
+                Err(error) => {
+                    return Err(lpm_common::LpmError::Workspace(format!(
+                        "failed to inspect workspace layout before running `lpm ci`: {error}"
+                    )));
+                }
+            };
 
             if recursive_install {
                 commands::install::run_recursive_workspace_install(

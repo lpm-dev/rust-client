@@ -20,12 +20,17 @@ use sha2::{Digest, Sha256};
 use super::finalize_permits::v2_finalize_limiter;
 use super::fs_util::{
     copy_dir_recursively, create_dir_symlink, create_tmp_dir_locked, ensure_store_tier_dir_locked,
-    ensure_store_tier_dir_locked_once, invalidate_hardened_store_tier,
+    ensure_store_tier_dir_locked_once, harden_store_tier_once, invalidate_hardened_store_tier,
     materialize_into_with_integrity, tmp_sibling,
+};
+#[cfg(debug_assertions)]
+pub use super::integrity::{
+    TrustRestoredStoreOverrideGuard, override_trust_restored_store_for_test,
 };
 pub use super::integrity::{
     ENV_TRUST_RESTORED_STORE, ENV_V2_OBJECT_INTEGRITY, FreshObjectIntegrity, ObjectIntegrityPolicy,
-    ReusableObjectCheckTimings, VerifiedObjectIntegrity, trust_restored_store_from_env,
+    ReusableObjectCheckTimings, VerifiedObjectIntegrity, trust_restored_store_enabled,
+    trust_restored_store_from_env,
 };
 use super::integrity::{
     current_tree_content_matches_snapshot, finish_object_rename_after_collision, harden_tier_of,
@@ -33,8 +38,7 @@ use super::integrity::{
     object_integrity_for_link, object_integrity_or_remove, object_integrity_or_remove_with_timings,
     object_integrity_policy_from_env, read_object_integrity, read_shallow_package_guard,
     read_tree_snapshot, refresh_link_snapshot_shallow_guard_best_effort,
-    refresh_tree_snapshot_metadata_best_effort, remove_unusable_object_dir,
-    source_object_integrity, source_policy_uses_source_integrity,
+    remove_unusable_object_dir, source_object_integrity, source_policy_uses_source_integrity,
     write_link_tree_snapshot_best_effort, write_link_tree_snapshot_unpublished,
     write_object_integrity_for_policy, write_object_integrity_for_policy_with_tree,
     write_object_integrity_for_policy_with_tree_unpublished, write_tree_snapshot,
@@ -1036,6 +1040,15 @@ impl Store {
         &self,
         graph_key_digest: &str,
     ) -> Result<(PathBuf, Option<lpm_common::SingleFileSharedLockHandle>), LpmError> {
+        let locks_root = self.paths.build_entry_locks_root();
+        // Validate an existing lock tier without creating it (so restored
+        // read-only stores stay read-only while hostile symlinks/widened perms
+        // on an existing lock tier are still rejected/hardened).
+        harden_store_tier_once(locks_root).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to validate virtual-store build-entry locks dir: {error}"
+            ))
+        })?;
         let lock_path = self.paths.build_entry_lock_path(graph_key_digest)?;
         let handle = lpm_common::try_acquire_existing_single_file_shared_lock(&lock_path)?;
         Ok((lock_path, handle))
@@ -2193,7 +2206,8 @@ impl Store {
             let (lock_path, existing_read_lock) =
                 self.try_acquire_existing_build_entry_read_lock(&graph_key_digest)?;
             let reuse_check_start = std::time::Instant::now();
-            if let Some(sidecar_mtime) = link_entry_is_reusable(
+            let lock_held = existing_read_lock.is_some();
+            let check_result = link_entry_is_reusable(
                 &final_dir,
                 &graph_key,
                 &object_dir,
@@ -2202,37 +2216,84 @@ impl Store {
                 verified_object_digest,
                 cas_tree_digest.as_deref(),
                 policy,
-            )? {
-                if existing_read_lock.is_some() || !lock_path.exists() {
+                lock_held,
+            );
+            match check_result {
+                Ok(Some(hit)) if lock_held || (!lock_path.exists() && !hit.deferred_snapshot_write) => {
                     timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
                     return Ok(Self::reused_link_entry(
                         final_dir,
-                        sidecar_mtime,
+                        hit.sidecar_mtime,
                         total_start,
                         timings,
                     ));
                 }
-                // A concurrent writer created the lock file while we checked without
-                // holding it; synchronize on the shared lock and re-validate once.
-                let _entry_read_lock = self.acquire_build_entry_read_lock(&graph_key_digest)?;
-                if let Some(sidecar_mtime) = link_entry_is_reusable(
-                    &final_dir,
-                    &graph_key,
-                    &object_dir,
-                    &source_sri,
-                    &deps,
-                    verified_object_digest,
-                    cas_tree_digest.as_deref(),
-                    policy,
-                )? {
-                    timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
-                    return Ok(Self::reused_link_entry(
-                        final_dir,
-                        sidecar_mtime,
-                        total_start,
-                        timings,
-                    ));
+                // If we checked unlocked and saw a torn-read error, a concurrent
+                // writer creating the lock file, or a verified hit that wants to
+                // heal its snapshot, synchronize on the shared lock before writing
+                // or deciding. On read-only restored stores where lock creation is
+                // rejected, a verified hit without a lock file still succeeds.
+                Ok(Some(hit)) if !lock_held => {
+                    if let Ok(_entry_read_lock) =
+                        self.acquire_build_entry_read_lock(&graph_key_digest)
+                    {
+                        if final_dir.exists()
+                            && let Some(reverified) = link_entry_is_reusable(
+                                &final_dir,
+                                &graph_key,
+                                &object_dir,
+                                &source_sri,
+                                &deps,
+                                verified_object_digest,
+                                cas_tree_digest.as_deref(),
+                                policy,
+                                true,
+                            )?
+                        {
+                            timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
+                            return Ok(Self::reused_link_entry(
+                                final_dir,
+                                reverified.sidecar_mtime,
+                                total_start,
+                                timings,
+                            ));
+                        }
+                    } else if !lock_path.exists() {
+                        timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
+                        return Ok(Self::reused_link_entry(
+                            final_dir,
+                            hit.sidecar_mtime,
+                            total_start,
+                            timings,
+                        ));
+                    }
                 }
+                Err(_) if !lock_held => {
+                    let _entry_read_lock = self.acquire_build_entry_read_lock(&graph_key_digest)?;
+                    if final_dir.exists()
+                        && let Some(reverified) = link_entry_is_reusable(
+                            &final_dir,
+                            &graph_key,
+                            &object_dir,
+                            &source_sri,
+                            &deps,
+                            verified_object_digest,
+                            cas_tree_digest.as_deref(),
+                            policy,
+                            true,
+                        )?
+                    {
+                        timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
+                        return Ok(Self::reused_link_entry(
+                            final_dir,
+                            reverified.sidecar_mtime,
+                            total_start,
+                            timings,
+                        ));
+                    }
+                }
+                Ok(Some(_)) | Ok(None) => {}
+                Err(error) => return Err(error),
             }
             timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
         }
@@ -2247,7 +2308,7 @@ impl Store {
         // to hard-fail with ENOTEMPTY against a non-empty leftover.
         if final_dir.exists() {
             let reuse_check_start = std::time::Instant::now();
-            if let Some(sidecar_mtime) = link_entry_is_reusable(
+            if let Some(hit) = link_entry_is_reusable(
                 &final_dir,
                 &graph_key,
                 &object_dir,
@@ -2256,7 +2317,9 @@ impl Store {
                 verified_object_digest,
                 cas_tree_digest.as_deref(),
                 policy,
+                true,
             )? {
+                let sidecar_mtime = hit.sidecar_mtime;
                 timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
                 return Ok(Self::reused_link_entry(
                     final_dir,
@@ -2378,7 +2441,7 @@ impl Store {
             }),
             Err(e) => {
                 let recovery_start = std::time::Instant::now();
-                if let Some(sidecar_mtime) = link_entry_is_reusable(
+                if let Some(hit) = link_entry_is_reusable(
                     &final_dir,
                     &graph_key,
                     &object_dir,
@@ -2387,7 +2450,9 @@ impl Store {
                     verified_object_digest,
                     cas_tree_digest.as_deref(),
                     policy,
+                    true,
                 )? {
+                    let sidecar_mtime = hit.sidecar_mtime;
                     // Concurrent install beat us — discard our stage and
                     // refresh the existing sidecar's mtime when stale.
                     let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -3788,6 +3853,29 @@ fn should_touch_sidecar(mtime: Option<std::time::SystemTime>) -> bool {
     }
 }
 
+struct LinkEntryReuseHit {
+    sidecar_mtime: Option<std::time::SystemTime>,
+    /// True when the entry verified cleanly in an unlocked pass but wants to
+    /// persist a healed snapshot or shallow guard under the shared lock.
+    deferred_snapshot_write: bool,
+}
+
+impl LinkEntryReuseHit {
+    fn clean(sidecar_mtime: Option<std::time::SystemTime>) -> Self {
+        Self {
+            sidecar_mtime,
+            deferred_snapshot_write: false,
+        }
+    }
+
+    fn with_deferred_write(sidecar_mtime: Option<std::time::SystemTime>, deferred: bool) -> Self {
+        Self {
+            sidecar_mtime,
+            deferred_snapshot_write: deferred,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn link_entry_is_reusable(
     dir: &Path,
@@ -3798,7 +3886,8 @@ fn link_entry_is_reusable(
     verified_object_digest: Option<&VerifiedObjectIntegrity>,
     tree_digest: Option<&str>,
     policy: ObjectIntegrityPolicy,
-) -> Result<Option<Option<std::time::SystemTime>>, LpmError> {
+    allow_snapshot_writes: bool,
+) -> Result<Option<LinkEntryReuseHit>, LpmError> {
     harden_tier_of(dir, "links")?;
     let Some((sidecar, sidecar_mtime)) = LinkMeta::read_from_with_mtime_if_present(dir)? else {
         return Ok(None);
@@ -3824,7 +3913,7 @@ fn link_entry_is_reusable(
             .join(LINK_BUILD_MARKER)
             .symlink_metadata()
             .is_err();
-    let trust_restored = trust_restored_store_from_env();
+    let trust_restored = trust_restored_store_enabled(policy);
     let existing_snapshot = read_tree_snapshot(dir);
     if let Some(snapshot) = existing_snapshot.as_ref()
         && snapshot.content_integrity == expected.as_ref()
@@ -3833,39 +3922,70 @@ fn link_entry_is_reusable(
             && snapshot.layout_content_integrity.is_none()
             && let Some(recorded_guard) = snapshot.shallow_guard()
             && let Some(current_guard) = read_shallow_package_guard(&package_dir)
-            && (current_guard.matches_non_racy(&recorded_guard)
-                || (trust_restored
-                    && current_guard.matches_non_racy_ignoring_ctime(&recorded_guard)))
+            && current_guard.matches_non_racy(&recorded_guard)
         {
-            return Ok(Some(sidecar_mtime));
+            return Ok(Some(LinkEntryReuseHit::clean(sidecar_mtime)));
         }
-        let actual_metadata = compute_tree_metadata_integrities(&package_dir)?;
-        if actual_metadata.metadata == snapshot.metadata_integrity {
-            if source_shallow_eligible && snapshot.layout_content_integrity.is_none() {
-                refresh_link_snapshot_shallow_guard_best_effort(
-                    dir,
-                    &package_dir,
-                    snapshot,
-                    &actual_metadata,
-                );
+        if !trust_restored {
+            let actual_metadata = compute_tree_metadata_integrity(&package_dir)?;
+            if actual_metadata == snapshot.metadata_integrity {
+                let wants_guard =
+                    source_shallow_eligible && snapshot.layout_content_integrity.is_none();
+                if allow_snapshot_writes && wants_guard {
+                    refresh_link_snapshot_shallow_guard_best_effort(
+                        dir,
+                        &package_dir,
+                        snapshot,
+                        &actual_metadata,
+                        snapshot.metadata_integrity_no_ctime.as_deref(),
+                    );
+                    return Ok(Some(LinkEntryReuseHit::clean(sidecar_mtime)));
+                }
+                let deferred = wants_guard
+                    && !allow_snapshot_writes
+                    && read_shallow_package_guard(&package_dir)
+                        .is_some_and(|guard| guard.is_non_racy());
+                return Ok(Some(LinkEntryReuseHit::with_deferred_write(
+                    sidecar_mtime,
+                    deferred,
+                )));
             }
-            return Ok(Some(sidecar_mtime));
-        }
-        if trust_restored
-            && snapshot.metadata_integrity_no_ctime.as_deref()
+        } else {
+            let actual_metadata = compute_tree_metadata_integrities(&package_dir)?;
+            if actual_metadata.metadata == snapshot.metadata_integrity {
+                let wants_guard =
+                    source_shallow_eligible && snapshot.layout_content_integrity.is_none();
+                if allow_snapshot_writes && wants_guard {
+                    refresh_link_snapshot_shallow_guard_best_effort(
+                        dir,
+                        &package_dir,
+                        snapshot,
+                        &actual_metadata.metadata,
+                        Some(&actual_metadata.metadata_no_ctime),
+                    );
+                    return Ok(Some(LinkEntryReuseHit::clean(sidecar_mtime)));
+                }
+                let deferred = wants_guard
+                    && !allow_snapshot_writes
+                    && read_shallow_package_guard(&package_dir)
+                        .is_some_and(|guard| guard.is_non_racy());
+                return Ok(Some(LinkEntryReuseHit::with_deferred_write(
+                    sidecar_mtime,
+                    deferred,
+                )));
+            }
+            if snapshot.metadata_integrity_no_ctime.as_deref()
                 == Some(actual_metadata.metadata_no_ctime.as_str())
-        {
-            if source_shallow_eligible && snapshot.layout_content_integrity.is_none() {
-                refresh_link_snapshot_shallow_guard_best_effort(
-                    dir,
-                    &package_dir,
-                    snapshot,
-                    &actual_metadata,
-                );
-            } else {
-                refresh_tree_snapshot_metadata_best_effort(dir, snapshot, &actual_metadata, None);
+            {
+                // Never overwrite strict `metadata_integrity` or strict shallow
+                // guards from a ctime-free restored-store match so turning off
+                // `LPM_TRUST_RESTORED_STORE` enforces content verification once.
+                return Ok(Some(LinkEntryReuseHit::clean(sidecar_mtime)));
             }
-            return Ok(Some(sidecar_mtime));
+            tracing::debug!(
+                target = %dir.display(),
+                "LPM_TRUST_RESTORED_STORE enabled but ctime-free link metadata digest missed; falling back to content verification"
+            );
         }
     }
 
@@ -3893,29 +4013,86 @@ fn link_entry_is_reusable(
     };
     let actual = compute_object_tree_integrities_for_schema(&package_dir, primary_schema)?;
     if actual.content == expected.as_ref() {
-        write_link_tree_snapshot_best_effort(dir, &package_dir, &actual);
-        return Ok(Some(sidecar_mtime));
+        if allow_snapshot_writes {
+            write_link_tree_snapshot_best_effort(dir, &package_dir, &actual);
+        }
+        return Ok(Some(LinkEntryReuseHit::with_deferred_write(
+            sidecar_mtime,
+            !allow_snapshot_writes,
+        )));
     }
     if existing_snapshot.as_ref().is_some_and(|snapshot| {
         snapshot.content_integrity == expected.as_ref()
             && snapshot.layout_content_integrity.as_deref() == Some(actual.content.as_str())
     }) {
-        if let Err(error) = write_tree_snapshot_with_layout_content(dir, expected.as_ref(), &actual)
+        if allow_snapshot_writes
+            && let Err(error) =
+                write_tree_snapshot_with_layout_content(dir, expected.as_ref(), &actual)
         {
             tracing::debug!(
                 target = %dir.display(),
                 "virtual store: failed to refresh link layout snapshot: {error}"
             );
         }
-        return Ok(Some(sidecar_mtime));
+        return Ok(Some(LinkEntryReuseHit::with_deferred_write(
+            sidecar_mtime,
+            !allow_snapshot_writes,
+        )));
     }
     if source_policy {
         if let Some(obj_snapshot) = object_snapshot.as_ref()
             && obj_snapshot.content_integrity != expected.as_ref()
+            && object_snapshot_matches_live_object(object_dir, source_sri, obj_snapshot)?
         {
             if obj_snapshot.content_schema() == actual.content_schema
                 && actual.content == obj_snapshot.content_integrity
             {
+                if allow_snapshot_writes {
+                    write_link_tree_snapshot_best_effort(
+                        dir,
+                        &package_dir,
+                        &TreeIntegrities {
+                            content: expected.as_ref().to_owned(),
+                            metadata: actual.metadata,
+                            metadata_no_ctime: actual.metadata_no_ctime,
+                            stats: actual.stats,
+                            content_schema: actual.content_schema,
+                        },
+                    );
+                }
+                return Ok(Some(LinkEntryReuseHit::with_deferred_write(
+                    sidecar_mtime,
+                    !allow_snapshot_writes,
+                )));
+            }
+            if obj_snapshot.content_schema() != actual.content_schema {
+                let alt = compute_object_tree_integrities_for_schema(
+                    &package_dir,
+                    obj_snapshot.content_schema(),
+                )?;
+                if alt.content == obj_snapshot.content_integrity {
+                    if allow_snapshot_writes {
+                        write_link_tree_snapshot_best_effort(
+                            dir,
+                            &package_dir,
+                            &TreeIntegrities {
+                                content: expected.as_ref().to_owned(),
+                                metadata: alt.metadata,
+                                metadata_no_ctime: alt.metadata_no_ctime,
+                                stats: alt.stats,
+                                content_schema: alt.content_schema,
+                            },
+                        );
+                    }
+                    return Ok(Some(LinkEntryReuseHit::with_deferred_write(
+                        sidecar_mtime,
+                        !allow_snapshot_writes,
+                    )));
+                }
+            }
+        }
+        if link_tree_matches_object_tree(&actual, object_dir)? {
+            if allow_snapshot_writes {
                 write_link_tree_snapshot_best_effort(
                     dir,
                     &package_dir,
@@ -3927,55 +4104,55 @@ fn link_entry_is_reusable(
                         content_schema: actual.content_schema,
                     },
                 );
-                return Ok(Some(sidecar_mtime));
             }
-            if obj_snapshot.content_schema() != actual.content_schema {
-                let alt = compute_object_tree_integrities_for_schema(
-                    &package_dir,
-                    obj_snapshot.content_schema(),
-                )?;
-                if alt.content == obj_snapshot.content_integrity {
-                    write_link_tree_snapshot_best_effort(
-                        dir,
-                        &package_dir,
-                        &TreeIntegrities {
-                            content: expected.as_ref().to_owned(),
-                            metadata: alt.metadata,
-                            metadata_no_ctime: alt.metadata_no_ctime,
-                            stats: alt.stats,
-                            content_schema: alt.content_schema,
-                        },
-                    );
-                    return Ok(Some(sidecar_mtime));
-                }
-            }
-        }
-        if link_tree_matches_object_tree(&actual, object_dir)? {
-            write_link_tree_snapshot_best_effort(
-                dir,
-                &package_dir,
-                &TreeIntegrities {
-                    content: expected.as_ref().to_owned(),
-                    metadata: actual.metadata,
-                    metadata_no_ctime: actual.metadata_no_ctime,
-                    stats: actual.stats,
-                    content_schema: actual.content_schema,
-                },
-            );
-            return Ok(Some(sidecar_mtime));
+            return Ok(Some(LinkEntryReuseHit::with_deferred_write(
+                sidecar_mtime,
+                !allow_snapshot_writes,
+            )));
         }
     } else {
-        let alternate_schema = match primary_schema {
-            TreeContentSchema::SequentialV1 => TreeContentSchema::EntryDigestV2,
-            TreeContentSchema::EntryDigestV2 => TreeContentSchema::SequentialV1,
-        };
-        let alternate = compute_object_tree_integrities_for_schema(&package_dir, alternate_schema)?;
-        if alternate.content == expected.as_ref() {
-            write_link_tree_snapshot_best_effort(dir, &package_dir, &alternate);
-            return Ok(Some(sidecar_mtime));
+        let known_same_schema = object_snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.content_schema() == primary_schema
+                && snapshot.content_integrity == expected.as_ref()
+        });
+        if !known_same_schema {
+            let alternate_schema = match primary_schema {
+                TreeContentSchema::SequentialV1 => TreeContentSchema::EntryDigestV2,
+                TreeContentSchema::EntryDigestV2 => TreeContentSchema::SequentialV1,
+            };
+            let alternate =
+                compute_object_tree_integrities_for_schema(&package_dir, alternate_schema)?;
+            if alternate.content == expected.as_ref() {
+                if allow_snapshot_writes {
+                    write_link_tree_snapshot_best_effort(dir, &package_dir, &alternate);
+                }
+                return Ok(Some(LinkEntryReuseHit::with_deferred_write(
+                    sidecar_mtime,
+                    !allow_snapshot_writes,
+                )));
+            }
         }
     }
     Ok(None)
+}
+
+/// Confirm that an object's recorded tree snapshot still strictly matches the
+/// live object directory and source sidecar before using its `content_integrity`
+/// as the single-hash source-policy baseline.
+fn object_snapshot_matches_live_object(
+    object_dir: &Path,
+    source_sri: &str,
+    object_snapshot: &super::integrity::TreeSnapshot,
+) -> Result<bool, LpmError> {
+    let recorded_sri = match std::fs::read_to_string(object_dir.join(".integrity")) {
+        Ok(content) => content,
+        Err(_) => return Ok(false),
+    };
+    if recorded_sri.trim() != source_sri {
+        return Ok(false);
+    }
+    let live_metadata = compute_tree_metadata_integrity(object_dir)?;
+    Ok(live_metadata == object_snapshot.metadata_integrity)
 }
 
 fn dependency_links_match(

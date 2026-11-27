@@ -49,8 +49,13 @@ impl TaskRuntimeVersions {
 
     /// The version a runtime binary reports. It depends on the file alone, so
     /// one probe serves every project, and later commands reuse the record.
-    fn binary_version(&self, runtime: RuntimeKind, canonical: &Path) -> Option<String> {
-        let fingerprint = binary_fingerprint(runtime, canonical)?;
+    fn binary_version(
+        &self,
+        runtime: RuntimeKind,
+        canonical: &Path,
+        has_loader_override: bool,
+    ) -> Option<String> {
+        let fingerprint = binary_fingerprint(runtime, canonical, has_loader_override)?;
         let mut probed = None;
         let version = self
             .probe(&fingerprint)
@@ -66,7 +71,9 @@ impl TaskRuntimeVersions {
                 command.arg("--version");
                 let version = parse_system_node_version(node_version_output(&mut command)?)?;
                 // A binary replaced while it ran may have reported the old one.
-                if binary_fingerprint(runtime, canonical).as_deref() != Some(&fingerprint) {
+                if binary_fingerprint(runtime, canonical, has_loader_override).as_deref()
+                    != Some(&fingerprint)
+                {
                     return None;
                 }
                 probed = Some(version.clone());
@@ -142,7 +149,11 @@ impl TaskRuntimeVersions {
 /// A runtime binary's identity: its path and the metadata that changes when
 /// it is replaced or rewritten. Version files don't affect what a binary
 /// reports, so they are left out.
-fn binary_fingerprint(runtime: RuntimeKind, canonical: &Path) -> Option<String> {
+fn binary_fingerprint(
+    runtime: RuntimeKind,
+    canonical: &Path,
+    has_loader_override: bool,
+) -> Option<String> {
     let metadata = canonical.metadata().ok()?;
     let mut hasher = Sha256::new();
     hasher.update(BINARY_FINGERPRINT_DOMAIN);
@@ -157,6 +168,15 @@ fn binary_fingerprint(runtime: RuntimeKind, canonical: &Path) -> Option<String> 
         // An edit that restores the old size and mtime still moves ctime.
         hasher.update(metadata.ctime().to_le_bytes());
         hasher.update(metadata.ctime_nsec().to_le_bytes());
+    }
+    if !crate::node_identity::hash_dynamic_libnode_for_binary(
+        &mut hasher,
+        canonical,
+        &metadata,
+        runtime,
+        has_loader_override,
+    ) {
+        return None;
     }
     Some(hex::encode(hasher.finalize()))
 }
@@ -226,10 +246,13 @@ impl TaskRuntimeIdentity {
                 (Some(executable), Some(selected)) => {
                     match classify(selected, executable, cwd, &environment) {
                         RuntimeExecutable::Launcher => format!("local:{}", selected.fingerprint),
-                        RuntimeExecutable::Binary => {
-                            binary_identity(versions, runtime, &selected.canonical_executable)
-                                .unwrap_or_else(|| format!("local:{}", selected.fingerprint))
-                        }
+                        RuntimeExecutable::Binary => binary_identity(
+                            versions,
+                            runtime,
+                            &selected.canonical_executable,
+                            environment.has_loader_override(),
+                        )
+                        .unwrap_or_else(|| format!("local:{}", selected.fingerprint)),
                         RuntimeExecutable::VersionManagerShim => {
                             let selection = shim_selection_key(
                                 executable,
@@ -324,8 +347,9 @@ fn binary_identity(
     versions: &TaskRuntimeVersions,
     runtime: RuntimeKind,
     canonical: &Path,
+    has_loader_override: bool,
 ) -> Option<String> {
-    let version = versions.binary_version(runtime, canonical)?;
+    let version = versions.binary_version(runtime, canonical, has_loader_override)?;
     let target = binary_target(canonical);
     let arch = target.map_or(std::env::consts::ARCH, |target| target.arch);
     let libc = target
@@ -618,11 +642,16 @@ mod tests {
         let node = PathBuf::from(String::from_utf8(node.stdout).unwrap().trim());
         let records = tempfile::tempdir().unwrap();
         let versions = TaskRuntimeVersions::new(Some(RecordedNodeVersions::at(records.path())));
-        let first = versions.binary_version(RuntimeKind::Node, &node).unwrap();
+        let first = versions
+            .binary_version(RuntimeKind::Node, &node, false)
+            .unwrap();
         assert_eq!(std::fs::read_dir(records.path()).unwrap().count(), 1);
 
         let later = TaskRuntimeVersions::new(Some(RecordedNodeVersions::at(records.path())));
-        assert_eq!(later.binary_version(RuntimeKind::Node, &node), Some(first));
+        assert_eq!(
+            later.binary_version(RuntimeKind::Node, &node, false),
+            Some(first)
+        );
     }
 
     #[test]

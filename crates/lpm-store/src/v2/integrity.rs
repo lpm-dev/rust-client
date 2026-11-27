@@ -6,8 +6,8 @@ use sha2::{Digest, Sha256};
 
 use super::fs_util::{harden_store_tier_once, tmp_sibling};
 use super::tree_hash::{
-    TreeContentSchema, TreeIntegrities, TreeMetadataDigests, compute_object_tree_integrities,
-    compute_object_tree_integrities_for_schema, compute_tree_metadata_integrities,
+    TreeContentSchema, TreeIntegrities, compute_object_tree_integrities,
+    compute_object_tree_integrities_for_schema, compute_tree_metadata_integrity,
 };
 
 /// Store-owned metadata namespace for object attributes that must not
@@ -23,12 +23,47 @@ pub(crate) const TREE_SNAPSHOT_FILENAME: &str = ".lpm-tree-snapshot.json";
 const TREE_SNAPSHOT_MAX_BYTES: u64 = 4096;
 pub const ENV_V2_OBJECT_INTEGRITY: &str = "LPM_V2_OBJECT_INTEGRITY";
 /// Explicit opt-in for ephemeral CI runners restoring `~/.lpm/store` from an
-/// archive (which bumps file `ctime` while preserving `mtime`, size, and mode).
-/// When enabled, metadata/shallow-guard validation tolerates `ctime`-only drift
-/// and heals snapshot metadata on reuse instead of re-hashing every file body.
+/// archive (which bumps file `ctime`, truncates `mtime` subseconds, and alters
+/// directory `st_size` while preserving regular-file size, mode, and whole-second
+/// `mtime`). Honored only under `ObjectIntegrityPolicy::Source` (never `Tree`)
+/// and never overwrites strict `metadata_integrity` or shallow guards.
 pub const ENV_TRUST_RESTORED_STORE: &str = "LPM_TRUST_RESTORED_STORE";
 
-pub fn trust_restored_store_from_env() -> bool {
+static TRUST_RESTORED_STORE_CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static TRUST_RESTORED_STORE_WARNED: std::sync::Once = std::sync::Once::new();
+
+#[cfg(debug_assertions)]
+static TRUST_RESTORED_STORE_TEST_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(debug_assertions)]
+pub struct TrustRestoredStoreOverrideGuard {
+    previous: u8,
+}
+
+#[cfg(debug_assertions)]
+impl Drop for TrustRestoredStoreOverrideGuard {
+    fn drop(&mut self) {
+        TRUST_RESTORED_STORE_TEST_OVERRIDE
+            .store(self.previous, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(debug_assertions)]
+pub fn override_trust_restored_store_for_test(
+    value: Option<bool>,
+) -> TrustRestoredStoreOverrideGuard {
+    let encoded = match value {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    let previous = TRUST_RESTORED_STORE_TEST_OVERRIDE
+        .swap(encoded, std::sync::atomic::Ordering::SeqCst);
+    TrustRestoredStoreOverrideGuard { previous }
+}
+
+fn parse_trust_restored_store_env() -> bool {
     std::env::var(ENV_TRUST_RESTORED_STORE)
         .ok()
         .is_some_and(|value| {
@@ -37,6 +72,37 @@ pub fn trust_restored_store_from_env() -> bool {
                 "1" | "true" | "yes" | "on"
             )
         })
+}
+
+pub fn trust_restored_store_from_env() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        match TRUST_RESTORED_STORE_TEST_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    *TRUST_RESTORED_STORE_CACHED.get_or_init(parse_trust_restored_store_env)
+}
+
+/// Whether restored-store ctime/subsecond-mtime tolerance is active for `policy`.
+///
+/// Strict `ObjectIntegrityPolicy::Tree` never weakens tamper detection, even
+/// when `LPM_TRUST_RESTORED_STORE` is set in the environment.
+pub fn trust_restored_store_enabled(policy: ObjectIntegrityPolicy) -> bool {
+    if policy != ObjectIntegrityPolicy::Source {
+        return false;
+    }
+    let enabled = trust_restored_store_from_env();
+    if enabled {
+        TRUST_RESTORED_STORE_WARNED.call_once(|| {
+            tracing::warn!(
+                "{ENV_TRUST_RESTORED_STORE} is enabled: reusing restored source-policy store entries via ctime-free metadata digests without content rehashing"
+            );
+        });
+    }
+    enabled
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,20 +184,6 @@ impl ShallowPackageGuard {
             || self.package_json_size != recorded.package_json_size
             || self.package_json_mtime_nanos != recorded.package_json_mtime_nanos
             || self.package_json_ctime_nanos != recorded.package_json_ctime_nanos
-            || self.package_dir_entry_count != recorded.package_dir_entry_count
-        {
-            return false;
-        }
-        recorded.is_non_racy()
-    }
-
-    /// Variant of [`Self::matches_non_racy`] used only when
-    /// [`ENV_TRUST_RESTORED_STORE`] is explicitly enabled (e.g. CI cache
-    /// extraction that preserves `mtime` and size while bumping `ctime`).
-    pub(crate) fn matches_non_racy_ignoring_ctime(&self, recorded: &ShallowPackageGuard) -> bool {
-        if self.package_dir_mtime_nanos != recorded.package_dir_mtime_nanos
-            || self.package_json_size != recorded.package_json_size
-            || self.package_json_mtime_nanos != recorded.package_json_mtime_nanos
             || self.package_dir_entry_count != recorded.package_dir_entry_count
         {
             return false;
@@ -975,18 +1027,8 @@ pub(crate) fn tree_snapshot_matches(
     if snapshot.content_integrity != expected_content_integrity {
         return Ok(false);
     }
-    let actual_metadata = compute_tree_metadata_integrities(tree_dir)?;
-    if actual_metadata.metadata == snapshot.metadata_integrity {
-        return Ok(true);
-    }
-    if trust_restored_store_from_env()
-        && snapshot.metadata_integrity_no_ctime.as_deref()
-            == Some(actual_metadata.metadata_no_ctime.as_str())
-    {
-        refresh_tree_snapshot_metadata_best_effort(snapshot_dir, &snapshot, &actual_metadata, None);
-        return Ok(true);
-    }
-    Ok(false)
+    let actual_metadata = compute_tree_metadata_integrity(tree_dir)?;
+    Ok(actual_metadata == snapshot.metadata_integrity)
 }
 
 pub(crate) fn tree_snapshot_matches_with_timings(
@@ -1013,18 +1055,11 @@ pub(crate) fn tree_snapshot_matches_with_timings(
     }
     timings.metadata_hash_count = timings.metadata_hash_count.saturating_add(1);
     let metadata_hash_start = std::time::Instant::now();
-    let actual_metadata = compute_tree_metadata_integrities(tree_dir)?;
+    let actual_metadata = compute_tree_metadata_integrity(tree_dir)?;
     timings.metadata_hash_ms = timings
         .metadata_hash_ms
         .saturating_add(metadata_hash_start.elapsed().as_millis());
-    if actual_metadata.metadata == snapshot.metadata_integrity {
-        timings.snapshot_hit_count = timings.snapshot_hit_count.saturating_add(1);
-        Ok(true)
-    } else if trust_restored_store_from_env()
-        && snapshot.metadata_integrity_no_ctime.as_deref()
-            == Some(actual_metadata.metadata_no_ctime.as_str())
-    {
-        refresh_tree_snapshot_metadata_best_effort(snapshot_dir, &snapshot, &actual_metadata, None);
+    if actual_metadata == snapshot.metadata_integrity {
         timings.snapshot_hit_count = timings.snapshot_hit_count.saturating_add(1);
         Ok(true)
     } else {
@@ -1133,45 +1168,19 @@ pub(crate) fn write_link_tree_snapshot_best_effort(
     }
 }
 
-pub(crate) fn refresh_tree_snapshot_metadata_best_effort(
-    dir: &Path,
-    snapshot: &TreeSnapshot,
-    actual_metadata: &TreeMetadataDigests,
-    shallow_guard: Option<ShallowPackageGuard>,
-) {
-    if let Err(error) = write_tree_snapshot_fields(
-        dir,
-        snapshot.content_schema(),
-        &snapshot.content_integrity,
-        snapshot.layout_content_integrity.as_deref(),
-        &actual_metadata.metadata,
-        Some(&actual_metadata.metadata_no_ctime),
-        shallow_guard,
-        false,
-    ) {
-        tracing::debug!(
-            target = %dir.display(),
-            "virtual store: failed to heal tree snapshot metadata: {error}"
-        );
-    }
-}
-
 pub(crate) fn refresh_link_snapshot_shallow_guard_best_effort(
     dir: &Path,
     package_dir: &Path,
     snapshot: &TreeSnapshot,
-    actual_metadata: &TreeMetadataDigests,
+    actual_metadata_integrity: &str,
+    actual_metadata_no_ctime: Option<&str>,
 ) {
     let Some(shallow_guard) = read_shallow_package_guard(package_dir) else {
         return;
     };
-    // Avoid rewriting the snapshot while mtimes are still inside the
-    // racily-clean window unless we are backfilling `metadata_integrity_no_ctime`
-    // or healing a restored-store ctime mismatch.
-    let needs_metadata_refresh = snapshot.metadata_integrity != actual_metadata.metadata
-        || snapshot.metadata_integrity_no_ctime.as_deref()
-            != Some(actual_metadata.metadata_no_ctime.as_str());
-    if !shallow_guard.is_non_racy() && !needs_metadata_refresh {
+    let needs_backfill = snapshot.metadata_integrity_no_ctime.is_none()
+        && actual_metadata_no_ctime.is_some();
+    if !shallow_guard.is_non_racy() && !needs_backfill {
         return;
     }
     if let Err(error) = write_tree_snapshot_fields(
@@ -1179,8 +1188,8 @@ pub(crate) fn refresh_link_snapshot_shallow_guard_best_effort(
         snapshot.content_schema(),
         &snapshot.content_integrity,
         snapshot.layout_content_integrity.as_deref(),
-        &actual_metadata.metadata,
-        Some(&actual_metadata.metadata_no_ctime),
+        actual_metadata_integrity,
+        actual_metadata_no_ctime.or(snapshot.metadata_integrity_no_ctime.as_deref()),
         Some(shallow_guard),
         false,
     ) {

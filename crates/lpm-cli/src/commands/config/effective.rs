@@ -15,6 +15,7 @@ const DEFAULT_SOURCE: &str = "built-in default";
 const DEFAULT_USER_SOURCE: &str = "~/.lpm/config.toml";
 const PROJECT_TOML_SOURCE: &str = "lpm.toml";
 const PACKAGE_JSON_SOURCE: &str = "package.json > lpm";
+const WORKSPACE_PACKAGE_JSON_SOURCE: &str = "workspace package.json > lpm";
 
 const GROUP_SAVE: &str = "Dependency saving";
 const GROUP_SCRIPTS: &str = "Lifecycle scripts";
@@ -131,6 +132,7 @@ impl EffectiveConfig {
         )?;
         add_security_entries(
             &mut entries,
+            &project_dir,
             &package_json,
             &package_json_value,
             &global,
@@ -499,8 +501,10 @@ fn add_script_entries(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_security_entries(
     entries: &mut Vec<EffectiveConfigEntry>,
+    project_dir: &Path,
     package: &lpm_workspace::PackageJson,
     package_json: &serde_json::Value,
     global: &GlobalConfig,
@@ -509,11 +513,17 @@ fn add_security_entries(
     posture: &EffectiveAuthorizedPosture,
 ) -> Result<(), LpmError> {
     let lpm = package.lpm.as_ref();
+    let workspace_root_age_config =
+        crate::release_age_config::workspace_root_release_age_config(project_dir)?
+            .map(|(_, config)| config)
+            .unwrap_or_default();
     let global_release_age =
         read_optional_u64(global, crate::release_age_config::GLOBAL_KEY, global_path)?;
     let (candidate_age, candidate_age_source) =
         if let Some(value) = lpm.and_then(|lpm| lpm.minimum_release_age) {
             (value, PACKAGE_JSON_SOURCE)
+        } else if let Some(value) = workspace_root_age_config.minimum_release_age_secs {
+            (value, WORKSPACE_PACKAGE_JSON_SOURCE)
         } else if let Some(value) = global_release_age {
             (value, user_source)
         } else {
@@ -565,6 +575,8 @@ fn add_security_entries(
         .transpose()?;
     let (candidate_policy, candidate_policy_source) = if let Some(value) = project_policy {
         (value, PACKAGE_JSON_SOURCE)
+    } else if let Some(value) = workspace_root_age_config.minimum_release_age_policy {
+        (value, WORKSPACE_PACKAGE_JSON_SOURCE)
     } else if let Some(value) = global_policy {
         (value, user_source)
     } else {
@@ -599,12 +611,20 @@ fn add_security_entries(
         &format!("{} > minimum-release-age-exclude", global_path.display()),
         &global_excludes,
     )?;
-    let excludes = merge_unique(project_excludes, global_excludes);
+    let inherits_root_age = lpm.and_then(|lpm| lpm.minimum_release_age).is_none();
+    let workspace_excludes = if inherits_root_age {
+        workspace_root_age_config.minimum_release_age_exclude
+    } else {
+        Vec::new()
+    };
+    let has_workspace_excludes = !workspace_excludes.is_empty();
+    let excludes = merge_unique(merge_unique(project_excludes, workspace_excludes), global_excludes);
     let excludes_source = merged_source([
         package_json
             .pointer("/lpm/minimumReleaseAgeExclude")
             .is_some()
             .then_some(PACKAGE_JSON_SOURCE),
+        has_workspace_excludes.then_some(WORKSPACE_PACKAGE_JSON_SOURCE),
         global
             .get_value("minimum-release-age-exclude")
             .is_some()
@@ -1688,5 +1708,78 @@ fn display_json_value(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(value) => value.clone(),
         other => serde_json::to_string(other).unwrap_or_else(|_| "null".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_config_reports_workspace_root_inherited_release_age_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_root = dir.path();
+        let member_dir = workspace_root.join("packages/app");
+        std::fs::create_dir_all(&member_dir).unwrap();
+        std::fs::write(
+            workspace_root.join("package.json"),
+            serde_json::json!({
+                "name": "mono-root",
+                "private": true,
+                "workspaces": ["packages/*"],
+                "lpm": {
+                    "minimumReleaseAge": 604800,
+                    "minimumReleaseAgePolicy": "strict",
+                    "minimumReleaseAgeExclude": ["root-exempt"]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            member_dir.join("package.json"),
+            serde_json::json!({
+                "name": "@mono/app",
+                "version": "1.0.0"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let lpm_home = dir.path().join("lpm-home");
+        std::fs::create_dir_all(&lpm_home).unwrap();
+        let missing_policy = dir.path().join("missing-policy.toml");
+        let _env = crate::test_env::ScopedEnv::update([
+            ("LPM_HOME", Some(lpm_home.as_os_str().to_os_string())),
+            (
+                "LPM_SECURITY_POLICY_PATH",
+                Some(missing_policy.as_os_str().to_os_string()),
+            ),
+            ("LPM_MINIMUM_RELEASE_AGE", None),
+            ("LPM_RELEASE_AGE_POLICY", None),
+        ]);
+        let effective = EffectiveConfig::load(&member_dir).unwrap();
+        let entries = &effective.entries;
+
+        let age = entries
+            .iter()
+            .find(|e| e.key == crate::release_age_config::GLOBAL_KEY)
+            .unwrap();
+        assert_eq!(age.value, serde_json::json!(604800));
+        assert_eq!(age.source, WORKSPACE_PACKAGE_JSON_SOURCE);
+
+        let policy = entries
+            .iter()
+            .find(|e| e.key == "release-age-policy")
+            .unwrap();
+        assert_eq!(policy.value, serde_json::json!("strict"));
+        assert_eq!(policy.source, WORKSPACE_PACKAGE_JSON_SOURCE);
+
+        let excludes = entries
+            .iter()
+            .find(|e| e.key == "minimum-release-age-exclude")
+            .unwrap();
+        assert_eq!(excludes.value, serde_json::json!(["root-exempt"]));
+        assert_eq!(excludes.source, WORKSPACE_PACKAGE_JSON_SOURCE);
     }
 }

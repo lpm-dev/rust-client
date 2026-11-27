@@ -131,15 +131,16 @@ struct GlobalReleaseAgeConfig {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct PackageReleaseAgeConfig {
-    minimum_release_age_secs: Option<u64>,
-    minimum_release_age_exclude: Vec<String>,
-    minimum_release_age_policy: Option<ReleaseAgePolicy>,
+pub(crate) struct PackageReleaseAgeConfig {
+    pub(crate) minimum_release_age_secs: Option<u64>,
+    pub(crate) minimum_release_age_exclude: Vec<String>,
+    pub(crate) minimum_release_age_policy: Option<ReleaseAgePolicy>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReleaseAgePolicySource {
+enum ReleaseAgePolicySource<'a> {
     Project,
+    WorkspaceRoot(&'a Path),
     Global,
     Default,
 }
@@ -329,14 +330,24 @@ impl ReleaseAgeResolver {
             Some((root_dir, config)) => (Some(root_dir), config),
             None => (None, PackageReleaseAgeConfig::default()),
         };
+        let inherits_root_age = package_config.minimum_release_age_secs.is_none();
         extend_unique_excludes(
             &mut minimum_release_age_exclude,
             package_config.minimum_release_age_exclude,
         );
-        extend_unique_excludes(
-            &mut minimum_release_age_exclude,
-            workspace_root_age_config.minimum_release_age_exclude,
-        );
+        if inherits_root_age && !workspace_root_age_config.minimum_release_age_exclude.is_empty() {
+            ensure_inherited_workspace_excludes_authorized(
+                &effective_authorized,
+                project_dir,
+                workspace_root_dir.as_deref().unwrap_or(project_dir),
+                json_output,
+                &workspace_root_age_config.minimum_release_age_exclude,
+            )?;
+            extend_unique_excludes(
+                &mut minimum_release_age_exclude,
+                workspace_root_age_config.minimum_release_age_exclude,
+            );
+        }
         let global_release_age_config = match global_config_path() {
             Some(path) => match parse_global_release_age_config_from_table(&path, global.table()) {
                 Ok(mut config) => {
@@ -361,26 +372,27 @@ impl ReleaseAgeResolver {
             .ok()
             .and_then(|config| config.as_ref())
             .and_then(|config| config.minimum_release_age_policy);
-        let (requested_policy, policy_source, policy_unlock_dir) =
+        let (requested_policy, policy_source) =
             if let Some(policy) = package_config.minimum_release_age_policy {
-                (policy, ReleaseAgePolicySource::Project, project_dir)
+                (policy, ReleaseAgePolicySource::Project)
             } else if let Some(policy) = workspace_root_age_config.minimum_release_age_policy {
                 (
                     policy,
-                    ReleaseAgePolicySource::Project,
-                    workspace_root_dir.as_deref().unwrap_or(project_dir),
+                    match workspace_root_dir.as_deref() {
+                        Some(root) => ReleaseAgePolicySource::WorkspaceRoot(root),
+                        None => ReleaseAgePolicySource::Project,
+                    },
                 )
             } else if let Some(policy) = global_policy {
-                (policy, ReleaseAgePolicySource::Global, project_dir)
+                (policy, ReleaseAgePolicySource::Global)
             } else {
                 (
                     ReleaseAgePolicy::default(),
                     ReleaseAgePolicySource::Default,
-                    project_dir,
                 )
             };
         let effective_policy = enforce_release_age_policy_posture(
-            policy_unlock_dir,
+            project_dir,
             json_output,
             force_security_floor,
             requested_policy,
@@ -432,20 +444,30 @@ impl ReleaseAgeResolver {
         }
         let project_age = package_config
             .minimum_release_age_secs
-            .map(|secs| (secs, project_dir))
+            .map(|secs| (secs, None))
             .or_else(|| {
                 workspace_root_age_config
                     .minimum_release_age_secs
-                    .map(|secs| (secs, workspace_root_dir.as_deref().unwrap_or(project_dir)))
+                    .map(|secs| (secs, workspace_root_dir.as_deref()))
             });
-        if let Some((secs, unlock_dir)) = project_age {
+        if let Some((secs, inherited_from_root)) = project_age {
             if secs < authorized_floor {
+                let reason = match inherited_from_root {
+                    Some(root) => format!(
+                        "workspace root package.json at {} requests a lower minimum release age than this machine has approved.",
+                        root.display()
+                    ),
+                    None => {
+                        "package.json requests a lower minimum release age than this machine has approved."
+                            .to_string()
+                    }
+                };
                 crate::security_approval::ensure_project_unlock(
                     crate::security_approval::ApprovalScope::CooldownBypass,
-                    unlock_dir,
+                    project_dir,
                     json_output,
                     crate::security_approval::ApprovalSource::ProjectConfig,
-                    "package.json requests a lower minimum release age than this machine has approved.",
+                    &reason,
                     Some(secs),
                     &[],
                 )?;
@@ -506,11 +528,20 @@ impl ReleaseAgeResolver {
     }
 }
 
-fn workspace_root_release_age_config(
+pub(crate) fn workspace_root_release_age_config(
     project_dir: &Path,
 ) -> Result<Option<(PathBuf, PackageReleaseAgeConfig)>, LpmError> {
     if let Some(workspace) = crate::workspace_discovery_cache::active_workspace(project_dir) {
         if same_directory(&workspace.root, project_dir) {
+            return Ok(None);
+        }
+        // Only declared workspace members inherit the workspace root's cooldown
+        // settings; arbitrary nested directories under the root do not.
+        if !workspace
+            .members
+            .iter()
+            .any(|member| same_directory(&member.path, project_dir))
+        {
             return Ok(None);
         }
         return Ok(
@@ -518,17 +549,68 @@ fn workspace_root_release_age_config(
                 .map(|config| (workspace.root.clone(), config)),
         );
     }
-    let Ok(Some(workspace_root)) =
-        crate::workspace_discovery_cache::find_workspace_root(project_dir)
-    else {
-        return Ok(None);
+    let workspace_root = match crate::workspace_discovery_cache::find_workspace_root(project_dir) {
+        Ok(Some(workspace_root)) => workspace_root,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            // Preserve tolerant fallback when `project_dir/package.json` itself is
+            // malformed, while still failing closed on malformed ancestor workspace configs.
+            let project_manifest = project_dir.join("package.json");
+            if project_manifest.symlink_metadata().is_ok()
+                && lpm_workspace::read_package_json(&project_manifest).is_err()
+                && project_dir
+                    .join("pnpm-workspace.yaml")
+                    .symlink_metadata()
+                    .is_err()
+            {
+                return Ok(None);
+            }
+            return Err(LpmError::Workspace(error.to_string()));
+        }
     };
     if same_directory(&workspace_root, project_dir) {
         return Ok(None);
     }
+    let root_package =
+        crate::workspace_discovery_cache::read_workspace_root_package(&workspace_root)
+            .map_err(|error| LpmError::Workspace(error.to_string()))?;
     Ok(
-        read_package_json_release_age_config(&workspace_root.join("package.json"))?
+        package_release_age_config_from_package(&root_package)?
             .map(|config| (workspace_root, config)),
+    )
+}
+
+fn ensure_inherited_workspace_excludes_authorized(
+    effective: &crate::security_approval::EffectiveAuthorizedPosture,
+    project_dir: &Path,
+    workspace_root: &Path,
+    json_output: bool,
+    exclusions: &[String],
+) -> Result<(), LpmError> {
+    if exclusions.is_empty() {
+        return Ok(());
+    }
+    let managed_cooldown = matches!(
+        effective.sources.minimum_release_age_secs,
+        crate::security_approval::PostureSourceKind::ManagedPolicy
+    ) || matches!(
+        effective.sources.release_age_policy,
+        crate::security_approval::PostureSourceKind::ManagedPolicy
+    );
+    if !managed_cooldown {
+        return Ok(());
+    }
+    crate::security_approval::ensure_project_unlock(
+        crate::security_approval::ApprovalScope::CooldownBypass,
+        project_dir,
+        json_output,
+        crate::security_approval::ApprovalSource::ProjectConfig,
+        &format!(
+            "workspace root package.json at {} excludes matching packages from a managed cooldown policy.",
+            workspace_root.display()
+        ),
+        None,
+        exclusions,
     )
 }
 
@@ -591,19 +673,29 @@ fn enforce_release_age_policy_posture(
     json_output: bool,
     force_security_floor: bool,
     requested: ReleaseAgePolicy,
-    source: ReleaseAgePolicySource,
+    source: ReleaseAgePolicySource<'_>,
     authorized_floor: ReleaseAgePolicy,
     force_floor: ReleaseAgePolicy,
 ) -> Result<ReleaseAgePolicy, LpmError> {
     if requested.loosens(authorized_floor) {
         match source {
-            ReleaseAgePolicySource::Project => {
+            ReleaseAgePolicySource::Project | ReleaseAgePolicySource::WorkspaceRoot(_) => {
+                let reason = match source {
+                    ReleaseAgePolicySource::WorkspaceRoot(root) => format!(
+                        "workspace root package.json at {} requests a looser minimum release age policy than this machine has approved.",
+                        root.display()
+                    ),
+                    _ => {
+                        "package.json requests a looser minimum release age policy than this machine has approved."
+                            .to_string()
+                    }
+                };
                 crate::security_approval::ensure_project_unlock(
                     crate::security_approval::ApprovalScope::CooldownWindow,
                     project_dir,
                     json_output,
                     crate::security_approval::ApprovalSource::ProjectConfig,
-                    "package.json requests a looser minimum release age policy than this machine has approved.",
+                    &reason,
                     None,
                     &[],
                 )?;
@@ -1906,8 +1998,9 @@ minimum-release-age-exclude = ["global-pkg"]
             vec!["root-exempt".to_string()]
         );
 
-        // Member override takes precedence over workspace root while inheriting unset fields
-        // and merging excludes.
+        // Member setting its own minimumReleaseAge takes precedence over workspace
+        // root and is not silently widened by root excludes, while still inheriting
+        // unset policy.
         std::fs::write(
             member_dir.join("package.json"),
             serde_json::json!({
@@ -1930,7 +2023,37 @@ minimum-release-age-exclude = ["global-pkg"]
         );
         assert_eq!(
             overridden.minimum_release_age_exclude,
-            vec!["member-exempt".to_string(), "root-exempt".to_string()]
+            vec!["member-exempt".to_string()]
+        );
+
+        // Unlisted sibling directory inside the workspace root must not inherit root settings.
+        let non_member_dir = workspace.path().join("tools/scratch");
+        std::fs::create_dir_all(&non_member_dir).unwrap();
+        std::fs::write(
+            non_member_dir.join("package.json"),
+            r#"{"name":"scratch","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let non_member =
+            ReleaseAgeResolver::resolve_config(&non_member_dir, None, &[], true).unwrap();
+        assert_eq!(
+            non_member.minimum_release_age_secs,
+            DEFAULT_MIN_RELEASE_AGE_SECS
+        );
+        assert!(non_member.minimum_release_age_exclude.is_empty());
+
+        // Malformed pnpm-workspace.yaml at the ancestor root must surface a workspace
+        // error rather than silently dropping the root's strict cooldown policy.
+        std::fs::write(
+            workspace.path().join("pnpm-workspace.yaml"),
+            "packages: [invalid",
+        )
+        .unwrap();
+        let err = ReleaseAgeResolver::resolve_config(&member_dir, None, &[], true)
+            .expect_err("malformed ancestor workspace config must fail closed");
+        assert!(
+            matches!(err, LpmError::Workspace(_)),
+            "expected Workspace error, got {err:?}"
         );
     }
 }

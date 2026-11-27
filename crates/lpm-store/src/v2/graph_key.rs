@@ -60,18 +60,18 @@ use crate::v2::platform::PlatformTuple;
 /// Virtual-store link entries under `v2/links/<key>/` always materialize the
 /// same sibling-symlink wrapper layout regardless of whether the project root
 /// uses isolated or hoisted symlinks, so both variants map to the canonical
-/// `"isolated"` store key and share on-disk entries without invalidating
-/// existing isolated stores.
+/// `"hoisted"` store key (the default linker mode) and share on-disk entries
+/// without invalidating existing hoisted stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LinkerModeTag {
-    /// pnpm-style isolated, sibling symlinks under `node_modules/`.
+    /// pnpm-style isolated, sibling symlinks under `node_modules/`. Shares the
+    /// identical virtual-store link entry layout with [`Self::Hoisted`].
     Isolated,
-    /// npm-style hoisted layout. Shares the identical virtual-store link entry
-    /// layout with [`Self::Isolated`].
+    /// npm-style hoisted layout (default).
     Hoisted,
 }
 
-const CANONICAL_STORE_LINKER_TAG: &[u8] = b"isolated";
+const CANONICAL_STORE_LINKER_TAG: &[u8] = b"hoisted";
 
 /// Compatibility input for a registry peer whose local and canonical names match.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1475,5 +1475,41 @@ mod tests {
             raw_forward, raw_reverse,
             "derive_raw must be order-independent for prefix-named peers (react vs react-dom)"
         );
+    }
+
+    #[test]
+    fn isolated_and_hoisted_share_canonical_hoisted_digest() {
+        let platform = macos_arm64();
+        let hoisted = GraphKey::derive(&GraphKeyInputs::new(
+            "lodash",
+            "4.17.21",
+            platform.clone(),
+            LinkerModeTag::Hoisted,
+        ));
+        let isolated = GraphKey::derive(&GraphKeyInputs::new(
+            "lodash",
+            "4.17.21",
+            platform,
+            LinkerModeTag::Isolated,
+        ));
+        assert_eq!(hoisted, isolated);
+
+        // Pin exact canonical "hoisted" preimage so existing default hoisted stores remain warm.
+        let mut expected = schema_hasher();
+        expected.update(b"\0");
+        write_field(&mut expected, b"name", b"lodash");
+        write_field(&mut expected, b"version", b"4.17.21");
+        write_field(&mut expected, b"platform", b"darwin/arm64/");
+        write_field(&mut expected, b"linker", b"hoisted");
+        write_field(&mut expected, b"peers", b"");
+        write_field(&mut expected, b"edges", b"");
+        write_exact_targets_btree(&mut expected, b"dependency_targets", &BTreeMap::new());
+        write_field(&mut expected, b"aliases", b"");
+        write_exact_targets_btree(&mut expected, b"peer_targets", &BTreeMap::new());
+        write_field(&mut expected, b"root_link_names", b"");
+        write_field(&mut expected, b"wrapper_id", b"");
+        write_field(&mut expected, b"patch_fingerprint", b"");
+        let expected_linked = GraphKey::linked_digest(expected.finalize().as_bytes(), &[0u8; 32]);
+        assert_eq!(hoisted.digest(), &expected_linked);
     }
 }

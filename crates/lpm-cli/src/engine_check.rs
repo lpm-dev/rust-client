@@ -42,14 +42,14 @@ use lpm_workspace::{PackageJson, read_package_json};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 tokio::task_local! {
-    static SHARED_NODE_VERSIONS: Arc<Mutex<PathNodeVersionCache>>;
+    static SHARED_NODE_VERSIONS: Arc<PathNodeVersionCache>;
 }
 
 pub(crate) async fn scope_shared_node_versions<F>(
-    versions: Arc<Mutex<PathNodeVersionCache>>,
+    versions: Arc<PathNodeVersionCache>,
     future: F,
 ) -> F::Output
 where
@@ -78,7 +78,7 @@ pub(crate) struct NodeEngineRequirement {
 #[derive(Default)]
 pub(crate) struct NodeVersionReuse {
     observed: Option<ObservedNodeVersion>,
-    versions: Arc<Mutex<PathNodeVersionCache>>,
+    versions: Arc<PathNodeVersionCache>,
 }
 
 impl NodeVersionReuse {
@@ -87,7 +87,7 @@ impl NodeVersionReuse {
     pub(crate) fn recorded(observed: Option<ObservedNodeVersion>) -> Self {
         let versions = SHARED_NODE_VERSIONS
             .try_with(Arc::clone)
-            .unwrap_or_else(|_| Arc::new(Mutex::new(path_node_versions())));
+            .unwrap_or_else(|_| Arc::new(path_node_versions()));
         Self { observed, versions }
     }
 
@@ -99,15 +99,13 @@ impl NodeVersionReuse {
             });
         Self {
             observed: None,
-            versions: Arc::new(Mutex::new(versions)),
+            versions: Arc::new(versions),
         }
     }
 
     fn resolve(&self, cwd: &Path, path: &std::ffi::OsStr) -> PathNodeResolution {
         self.versions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .resolve_with_observed(cwd, path, self.observed.as_ref())
+            .resolve_with_observed_shared(cwd, path, self.observed.as_ref())
     }
 }
 

@@ -142,12 +142,13 @@ impl GraphKeyCache {
             .iter()
             .map(|target| graph_key_input_fingerprint(target, platform))
             .collect();
+        let mut precomputed_leaves: Vec<Option<[u8; 32]>> = vec![None; targets.len()];
         let (mut own_digests, mut encoded_sources): (
             Vec<Option<[u8; 32]>>,
             Vec<Option<EncodedSource>>,
         ) = {
             let entries = self.lock();
-            let own = targets
+            let own: Vec<Option<[u8; 32]>> = targets
                 .iter()
                 .zip(fingerprints.iter().copied())
                 .map(|(target, fingerprint)| {
@@ -159,7 +160,7 @@ impl GraphKeyCache {
                     })
                 })
                 .collect();
-            let sources = targets
+            let sources: Vec<Option<EncodedSource>> = targets
                 .iter()
                 .map(|target| {
                     entries
@@ -168,6 +169,17 @@ impl GraphKeyCache {
                         .cloned()
                 })
                 .collect();
+            for index in 0..targets.len() {
+                if targets[index].dependency_targets.is_empty()
+                    && targets[index].peer_targets.is_empty()
+                    && let (Some(own), Some(source)) = (own[index], sources[index].as_ref())
+                {
+                    let key = (own, source.clone());
+                    if let Some(&digest) = entries.leaf_digests.get(&key) {
+                        precomputed_leaves[index] = Some(digest);
+                    }
+                }
+            }
             (own, sources)
         };
         let mut own_misses: Vec<(u64, CachedOwnDigest)> = Vec::new();
@@ -209,9 +221,9 @@ impl GraphKeyCache {
             .map(|slot| slot.expect("every target source is encoded"))
             .collect();
 
-        // Pre-fill cached leaf digests while updating misses under one lock acquisition.
-        let mut precomputed_leaves: Vec<Option<[u8; 32]>> = vec![None; targets.len()];
-        {
+        // Only re-acquire the cache lock here when misses need recording or a
+        // newly-computed leaf might still hit an existing cached leaf digest.
+        if !own_misses.is_empty() || !source_misses.is_empty() {
             let mut entries = self.lock();
             for (fingerprint, item) in own_misses {
                 let bucket = entries.own_digests.entry(fingerprint).or_default();
@@ -223,7 +235,8 @@ impl GraphKeyCache {
                 entries.encoded_sources.entry(raw_sri).or_insert(encoded);
             }
             for index in 0..targets.len() {
-                if targets[index].dependency_targets.is_empty()
+                if precomputed_leaves[index].is_none()
+                    && targets[index].dependency_targets.is_empty()
                     && targets[index].peer_targets.is_empty()
                 {
                     let key = (own_digests[index], encoded_sources[index].clone());

@@ -31,9 +31,15 @@ impl WorkspaceFreshnessSnapshot {
 }
 
 #[derive(Default)]
+struct CanonicalPathState {
+    generation: u64,
+    entries: std::collections::HashMap<PathBuf, PathBuf>,
+}
+
+#[derive(Default)]
 pub(crate) struct WorkspaceFreshnessCache {
     snapshot: Mutex<Option<Arc<WorkspaceFreshnessSnapshot>>>,
-    canonical_paths: Mutex<std::collections::HashMap<PathBuf, PathBuf>>,
+    canonical_paths: Mutex<CanonicalPathState>,
 }
 
 impl WorkspaceFreshnessCache {
@@ -42,10 +48,12 @@ impl WorkspaceFreshnessCache {
             .snapshot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        self.canonical_paths
+        let mut state = self
+            .canonical_paths
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.generation = state.generation.wrapping_add(1);
+        state.entries.clear();
     }
 
     fn get_or_init(
@@ -60,20 +68,24 @@ impl WorkspaceFreshnessCache {
     }
 
     fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
-        if let Some(cached) = self
+        let generation = {
+            let state = self
+                .canonical_paths
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = state.entries.get(path) {
+                return Ok(cached.clone());
+            }
+            state.generation
+        };
+        let canonical = path.canonicalize()?;
+        let mut state = self
             .canonical_paths
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(path)
-            .cloned()
-        {
-            return Ok(cached);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation == generation {
+            state.entries.insert(path.to_path_buf(), canonical.clone());
         }
-        let canonical = path.canonicalize()?;
-        self.canonical_paths
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(path.to_path_buf(), canonical.clone());
         Ok(canonical)
     }
 }
@@ -378,5 +390,31 @@ mod tests {
         .await;
 
         assert!(discover_workspace(directory.path()).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_path_cache_clears_on_invalidation_and_reflects_retargeted_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_a = dir.path().join("target-a");
+        let target_b = dir.path().join("target-b");
+        std::fs::create_dir_all(&target_a).unwrap();
+        std::fs::create_dir_all(&target_b).unwrap();
+        let link = dir.path().join("current");
+        std::os::unix::fs::symlink(&target_a, &link).unwrap();
+
+        let cache = WorkspaceFreshnessCache::default();
+        assert_eq!(
+            cache.canonicalize(&link).unwrap(),
+            target_a.canonicalize().unwrap()
+        );
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&target_b, &link).unwrap();
+        cache.invalidate();
+        assert_eq!(
+            cache.canonicalize(&link).unwrap(),
+            target_b.canonicalize().unwrap()
+        );
     }
 }

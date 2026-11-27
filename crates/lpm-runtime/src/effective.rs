@@ -91,17 +91,25 @@ enum PathNodeCacheContext {
     ContextIndependent,
 }
 
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+
 /// Reuses Node version probes within the same script execution context.
 ///
-/// Executables in LPM's managed Node store are context-independent and may be
-/// reused across working directories. Other executables are cached per cwd and
-/// PATH because shims can select runtimes through project files or helper executables.
+/// Managed runtimes and verified real Node binaries (including dynamically-linked
+/// `libnode` executables whose library resolved concretely) are context-independent
+/// and reused across working directories. Launchers and version-manager shims are
+/// cached per cwd and PATH because they can select runtimes through project files
+/// or helper executables.
+///
+/// Concurrent probes for different identities run in parallel without holding
+/// the map lock across `node --version` subprocesses; identical identities
+/// coalesce onto a single probe.
 #[derive(Debug, Default)]
 pub struct PathNodeVersionCache {
-    resolutions: HashMap<PathNodeIdentity, PathNodeResolution>,
-    managed_node_root: Option<PathBuf>,
+    resolutions: Mutex<HashMap<PathNodeIdentity, Arc<OnceLock<PathNodeResolution>>>>,
+    managed_node_root: OnceLock<Option<PathBuf>>,
     recorded: Option<RecordedNodeVersions>,
-    recordings: Vec<std::thread::JoinHandle<()>>,
+    recordings: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl Drop for PathNodeVersionCache {
@@ -109,7 +117,12 @@ impl Drop for PathNodeVersionCache {
         // Records are written in the background, off the command's critical
         // path; they finish before the resolutions that produced them are
         // forgotten.
-        for recording in self.recordings.drain(..) {
+        for recording in self
+            .recordings
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain(..)
+        {
             let _ = recording.join();
         }
     }
@@ -236,10 +249,10 @@ impl PathNodeVersionCache {
     /// Reuse and record the versions of real Node binaries in `recorded`.
     pub fn with_recorded_versions(recorded: RecordedNodeVersions) -> Self {
         Self {
-            resolutions: HashMap::new(),
-            managed_node_root: None,
+            resolutions: Mutex::new(HashMap::new()),
+            managed_node_root: OnceLock::new(),
             recorded: Some(recorded),
-            recordings: Vec::new(),
+            recordings: Mutex::new(Vec::new()),
         }
     }
 
@@ -249,7 +262,7 @@ impl PathNodeVersionCache {
     /// only when the canonical executable, metadata fingerprint, and execution
     /// context match.
     pub fn resolve(&mut self, cwd: &Path, path: &OsStr) -> PathNodeResolution {
-        self.resolve_with_observed(cwd, path, None)
+        self.resolve_with_observed_shared(cwd, path, None)
     }
 
     /// Resolve like [`Self::resolve`], reusing `observed` instead of probing
@@ -263,69 +276,109 @@ impl PathNodeVersionCache {
         path: &OsStr,
         observed: Option<&ObservedNodeVersion>,
     ) -> PathNodeResolution {
-        if self.managed_node_root.is_none() {
-            self.managed_node_root = managed_node_root();
-        }
-        let managed_node_root = self.managed_node_root.as_deref();
+        self.resolve_with_observed_shared(cwd, path, observed)
+    }
+
+    /// Thread-safe counterpart to [`Self::resolve_with_observed`] that releases
+    /// internal synchronization before spawning `node --version`, coalescing
+    /// concurrent misses for the same identity while letting distinct identities
+    /// probe in parallel.
+    pub fn resolve_with_observed_shared(
+        &self,
+        cwd: &Path,
+        path: &OsStr,
+        observed: Option<&ObservedNodeVersion>,
+    ) -> PathNodeResolution {
+        let managed_node_root = self
+            .managed_node_root
+            .get_or_init(managed_node_root)
+            .as_deref();
         let executable_before = node_executable_in_path(cwd, path);
         let identity_before = executable_before
             .as_deref()
             .and_then(|executable| path_node_identity(executable, cwd, path, managed_node_root));
-        if let Some(cached) = identity_before
-            .as_ref()
-            .and_then(|identity| self.resolutions.get(identity))
-        {
-            return cached.clone();
-        }
-        if let (Some(identity), Some(observed)) = (identity_before.as_ref(), observed)
-            && identity.script.node_binary
-            && identity.script.fingerprint == observed.runtime_fingerprint
-        {
-            let resolution = PathNodeResolution {
-                version: Some(observed.version.clone()),
-                runtime_fingerprint: Some(observed.runtime_fingerprint.clone()),
+        let Some(identity) = identity_before else {
+            let version = node_version_on_path(cwd, path, executable_before.as_deref());
+            return PathNodeResolution {
+                version,
+                runtime_fingerprint: None,
                 executable: executable_before,
             };
-            self.resolutions
-                .insert(identity.clone(), resolution.clone());
-            return resolution;
-        }
-        if let (Some(identity), Some(recorded)) = (identity_before.as_ref(), self.recorded.as_ref())
-            && identity.script.node_binary
-            && let Some(version) = recorded.version(&identity.script.fingerprint)
-        {
-            let resolution = PathNodeResolution {
-                version: Some(version),
-                runtime_fingerprint: Some(identity.script.fingerprint.clone()),
-                executable: executable_before,
-            };
-            self.resolutions
-                .insert(identity.clone(), resolution.clone());
-            return resolution;
-        }
-
-        let version = node_version_on_path(cwd, path, executable_before.as_deref());
-        let identity_after = node_executable_in_path(cwd, path)
-            .as_deref()
-            .and_then(|executable| path_node_identity(executable, cwd, path, managed_node_root));
-        let stable_identity =
-            identity_before.filter(|before| Some(before) == identity_after.as_ref());
-        let resolution = PathNodeResolution {
-            version,
-            runtime_fingerprint: stable_identity
-                .as_ref()
-                .map(|identity| identity.script.fingerprint.clone()),
-            executable: executable_before,
         };
-        if let Some(identity) = stable_identity {
-            if identity.script.node_binary
-                && let (Some(recorded), Some(version)) =
-                    (self.recorded.as_ref(), resolution.version.as_deref())
-                && let Some(recording) = recorded.record(&identity.script.fingerprint, version)
+
+        let slot = {
+            let mut map = self
+                .resolutions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            Arc::clone(map.entry(identity.clone()).or_default())
+        };
+
+        let mut unstable = false;
+        let resolution = slot
+            .get_or_init(|| {
+                if let Some(observed) = observed
+                    && identity.script.node_binary
+                    && identity.script.fingerprint == observed.runtime_fingerprint
+                {
+                    return PathNodeResolution {
+                        version: Some(observed.version.clone()),
+                        runtime_fingerprint: Some(observed.runtime_fingerprint.clone()),
+                        executable: executable_before.clone(),
+                    };
+                }
+                if let Some(recorded) = self.recorded.as_ref()
+                    && identity.script.node_binary
+                    && let Some(version) = recorded.version(&identity.script.fingerprint)
+                {
+                    return PathNodeResolution {
+                        version: Some(version),
+                        runtime_fingerprint: Some(identity.script.fingerprint.clone()),
+                        executable: executable_before.clone(),
+                    };
+                }
+
+                let version = node_version_on_path(cwd, path, executable_before.as_deref());
+                let identity_after = node_executable_in_path(cwd, path).as_deref().and_then(
+                    |executable| path_node_identity(executable, cwd, path, managed_node_root),
+                );
+                let is_stable = identity_after.as_ref() == Some(&identity);
+                let resolution = PathNodeResolution {
+                    version,
+                    runtime_fingerprint: is_stable
+                        .then(|| identity.script.fingerprint.clone()),
+                    executable: executable_before.clone(),
+                };
+                if is_stable {
+                    if identity.script.node_binary
+                        && let (Some(recorded), Some(version)) =
+                            (self.recorded.as_ref(), resolution.version.as_deref())
+                        && let Some(recording) =
+                            recorded.record(&identity.script.fingerprint, version)
+                    {
+                        self.recordings
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push(recording);
+                    }
+                } else {
+                    unstable = true;
+                }
+                resolution
+            })
+            .clone();
+
+        if unstable {
+            let mut map = self
+                .resolutions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if map
+                .get(&identity)
+                .is_some_and(|current| Arc::ptr_eq(current, &slot))
             {
-                self.recordings.push(recording);
+                map.remove(&identity);
             }
-            self.resolutions.insert(identity, resolution.clone());
         }
         resolution
     }
@@ -1332,5 +1385,59 @@ mod tests {
             "real node binary resolution must reuse across workspace member cwds without re-probing"
         );
         assert_eq!(second.runtime_fingerprint(), Some(fingerprint.as_str()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_cache_runs_distinct_slow_launcher_probes_concurrently() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let marker_a = dir_a.path().join("started");
+        let marker_b = dir_b.path().join("started");
+        // Each probe creates its own started marker and waits up to 2s for the
+        // peer's started marker. If the shared cache serialized distinct probes
+        // under a mutex, the first probe would time out waiting for the second.
+        let script_a = format!(
+            "#!/bin/sh\n: > '{}'\ni=0\nwhile [ ! -f '{}' ] && [ $i -lt 100 ]; do sleep 0.01; i=$((i+1)); done\nif [ -f '{}' ]; then echo v22.1.0; else echo v0.0.0; fi\n",
+            marker_a.display(),
+            marker_b.display(),
+            marker_b.display(),
+        );
+        let script_b = format!(
+            "#!/bin/sh\n: > '{}'\ni=0\nwhile [ ! -f '{}' ] && [ $i -lt 100 ]; do sleep 0.01; i=$((i+1)); done\nif [ -f '{}' ]; then echo v22.2.0; else echo v0.0.0; fi\n",
+            marker_b.display(),
+            marker_a.display(),
+            marker_a.display(),
+        );
+        write_test_executable(&test_node_path(dir_a.path()), script_a.as_bytes());
+        write_test_executable(&test_node_path(dir_b.path()), script_b.as_bytes());
+
+        let cache = Arc::new(PathNodeVersionCache::default());
+        let cache_a = Arc::clone(&cache);
+        let cache_b = Arc::clone(&cache);
+        let cwd_a = dir_a.path().to_path_buf();
+        let cwd_b = dir_b.path().to_path_buf();
+        let path_a =
+            std::env::join_paths([dir_a.path(), Path::new("/bin"), Path::new("/usr/bin")]).unwrap();
+        let path_b =
+            std::env::join_paths([dir_b.path(), Path::new("/bin"), Path::new("/usr/bin")]).unwrap();
+
+        let t_a = std::thread::spawn(move || {
+            cache_a.resolve_with_observed_shared(&cwd_a, &path_a, None)
+        });
+        let t_b = std::thread::spawn(move || {
+            cache_b.resolve_with_observed_shared(&cwd_b, &path_b, None)
+        });
+
+        assert_eq!(
+            t_a.join().unwrap().version(),
+            Some("22.1.0"),
+            "distinct launcher probes must overlap rather than serialize on the cache lock"
+        );
+        assert_eq!(
+            t_b.join().unwrap().version(),
+            Some("22.2.0"),
+            "distinct launcher probes must overlap rather than serialize on the cache lock"
+        );
     }
 }

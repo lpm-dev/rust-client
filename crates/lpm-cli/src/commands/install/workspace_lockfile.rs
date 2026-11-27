@@ -359,7 +359,7 @@ impl WorkspaceLockfileCoordinator {
             .insert(importer.to_string());
     }
 
-    fn mark_frozen(&self) {
+    pub(super) fn mark_frozen(&self) {
         self.frozen
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -373,11 +373,80 @@ impl WorkspaceLockfileCoordinator {
             .non_persisting_importers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.frozen.load(std::sync::atomic::Ordering::Relaxed) {
+            if self.migration_pending {
+                return Err(LpmError::Registry(
+                    "workspace has legacy member lockfiles that require migration; cannot modify lockfiles in frozen mode. Run `lpm install` first."
+                        .to_string(),
+                ));
+            }
+            if self.exact_graph_migration_pending {
+                return Err(LpmError::Registry(
+                    "workspace lockfile requires an exact-graph upgrade; cannot modify lpm.lock in frozen mode. Run `lpm install` first."
+                        .to_string(),
+                ));
+            }
+            let Some(existing) = &self.existing else {
+                if staged.is_empty()
+                    && required_importers
+                        .iter()
+                        .all(|importer| non_persisting_importers.contains(importer))
+                {
+                    return Ok(false);
+                }
+                return Err(LpmError::Registry(
+                    "workspace lockfile is missing and cannot be created in frozen mode. Run `lpm install` first."
+                        .to_string(),
+                ));
+            };
+            if let Some(obsolete) = existing
+                .as_lockfile()
+                .importers
+                .keys()
+                .find(|importer| !self.valid_importers.contains(*importer))
+            {
+                return Err(LpmError::Registry(format!(
+                    "workspace lockfile contains removed importer {obsolete:?} and cannot be modified in frozen mode. Run `lpm install` to update lpm.lock."
+                )));
+            }
+            for importer in required_importers {
+                if !existing.as_lockfile().importers.contains_key(importer)
+                    && !non_persisting_importers.contains(importer)
+                {
+                    return Err(LpmError::Registry(format!(
+                        "workspace importer {importer:?} is missing from lpm.lock in frozen mode. Run `lpm install` to update lpm.lock."
+                    )));
+                }
+            }
+            if !staged.is_empty() {
+                for importer in staged.keys() {
+                    if !self.valid_importers.contains(importer) {
+                        return Err(LpmError::Registry(format!(
+                            "workspace importer {importer:?} is no longer a member and cannot be modified in frozen mode. Run `lpm install` to update lpm.lock."
+                        )));
+                    }
+                }
+                let replacements = staged
+                    .iter()
+                    .map(|(importer, lockfile)| (importer.clone(), lockfile.as_ref().clone()))
+                    .collect();
+                let mut union = existing
+                    .update_workspace_importers(&self.valid_importers, replacements)
+                    .map_err(lockfile_error)?;
+                drop_unrecordable_tarball_hints(&mut union).map_err(lockfile_error)?;
+                if existing.as_lockfile() != &union {
+                    return Err(LpmError::Registry(
+                        "workspace lockfile is out of date and cannot be modified in frozen mode. Run `lpm install` to update lpm.lock."
+                            .to_string(),
+                    ));
+                }
+            }
+            return Ok(false);
+        }
         if staged.is_empty()
             && !self.migration_pending
             && let Some(existing) = &self.existing
-            && (self.frozen.load(std::sync::atomic::Ordering::Relaxed)
-                || !holds_unrecordable_tarball_hint(existing.as_lockfile()))
+            && !holds_unrecordable_tarball_hint(existing.as_lockfile())
             && existing
                 .as_lockfile()
                 .importers
@@ -2050,5 +2119,73 @@ mod tests {
         assert_eq!(coordinator.projection_materialization_count(), 2);
         assert_ne!(app_before, app_after);
         assert!(app_after.contains("2.0.0"));
+    }
+
+    #[test]
+    fn frozen_workspace_commit_refuses_legacy_migration_and_obsolete_importers_without_mutating_lockfile()
+    {
+        // Case 1: obsolete importer present in frozen root lpm.lock must error without rewriting.
+        let dir = tempfile::tempdir().unwrap();
+        let mut union = lpm_lockfile::Lockfile::new();
+        for (importer, dep) in [(".", "root-dep"), ("packages/removed", "old-dep")] {
+            let mut standalone = lpm_lockfile::Lockfile::new();
+            add_exact_root(
+                &mut standalone,
+                dep,
+                "1.0.0",
+                exact_package(dep, "1.0.0", &format!("{importer}/{dep}")),
+            );
+            union.absorb_importer(importer, standalone).unwrap();
+        }
+        let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
+        union.write_to_file(&lockfile_path).unwrap();
+        let bytes_before = std::fs::read(&lockfile_path).unwrap();
+
+        let coordinator = WorkspaceLockfileCoordinator::new(dir.path(), &[]).unwrap();
+        coordinator.mark_frozen();
+        let err = coordinator
+            .commit(&[".".to_string()])
+            .expect_err("frozen commit must refuse obsolete importer pruning");
+        assert!(
+            err.to_string().contains("removed importer"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&lockfile_path).unwrap(),
+            bytes_before,
+            "frozen commit must leave lpm.lock byte-for-byte intact"
+        );
+
+        // Case 2: legacy member lockfile requiring migration must error without touching files.
+        let dir2 = tempfile::tempdir().unwrap();
+        let member_dir = dir2.path().join("packages/app");
+        std::fs::create_dir_all(&member_dir).unwrap();
+        let mut member_lock = lpm_lockfile::Lockfile::new();
+        add_exact_root(
+            &mut member_lock,
+            "app-dep",
+            "1.0.0",
+            exact_package("app-dep", "1.0.0", "app-dep@1"),
+        );
+        let member_lock_path = member_dir.join(lpm_lockfile::LOCKFILE_NAME);
+        member_lock.write_to_file(&member_lock_path).unwrap();
+        let legacy_importers = vec![("packages/app".to_string(), member_dir)];
+        let coord2 = WorkspaceLockfileCoordinator::new(dir2.path(), &legacy_importers).unwrap();
+        coord2.mark_frozen();
+        let err2 = coord2
+            .commit(&[".".to_string(), "packages/app".to_string()])
+            .expect_err("frozen commit must refuse legacy lockfile migration");
+        assert!(
+            err2.to_string().contains("legacy member lockfiles"),
+            "unexpected error: {err2}"
+        );
+        assert!(
+            member_lock_path.exists(),
+            "frozen mode must never delete legacy member lockfile"
+        );
+        assert!(
+            !dir2.path().join(lpm_lockfile::LOCKFILE_NAME).exists(),
+            "frozen mode must never create a root lockfile during migration refusal"
+        );
     }
 }

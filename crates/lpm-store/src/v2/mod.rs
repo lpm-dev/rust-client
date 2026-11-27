@@ -69,5 +69,7 @@ pub use store::{
     ENV_V2_OBJECT_INTEGRITY, ExtractedObject, FreshObjectIntegrity, LinkEntry, LinkEntryRequest,
     LinkEntryTimings, ObjectIntegrityPolicy, ReusableObject, ReusableObjectCheckTimings,
     ReusableObjectValidationBatch, Store, StoreV2Paths, VerifiedObjectIntegrity, compat_island_key,
-    trust_restored_store_from_env,
+    trust_restored_store_enabled, trust_restored_store_from_env,
 };
+#[cfg(debug_assertions)]
+pub use store::{TrustRestoredStoreOverrideGuard, override_trust_restored_store_for_test};

@@ -147,11 +147,8 @@ pub(crate) async fn run_recursive_workspace_install(
     options: RecursiveInstallOptions,
 ) -> Result<(), LpmError> {
     let command_started = Instant::now();
-    let shared_node_versions = Arc::new(std::sync::Mutex::new(
-        crate::engine_check::path_node_versions(),
-    ));
+    let shared_node_versions = Arc::new(crate::engine_check::path_node_versions());
     let shared_managed_policy = crate::security_approval::new_managed_policy_cache();
-    let discovery_started = Instant::now();
     let workspace_root = find_recursive_workspace_root(cwd)?;
     let timing_detail_mode = TimingDetailMode::from_env();
     let _registry_timing_scope = if options.timing {
@@ -172,6 +169,7 @@ pub(crate) async fn run_recursive_workspace_install(
             crate::engine_check::scope_shared_node_versions(
                 Arc::clone(&shared_node_versions),
                 async {
+        let discovery_started = Instant::now();
         let pre_discovery_root_stamp = capture_root_manifest_stamp(&workspace_root);
         let workspace = discover_recursive_workspace(cwd)?;
         let post_discovery_root_stamp = capture_root_manifest_stamp(&workspace.root);
@@ -245,6 +243,9 @@ pub(crate) async fn run_recursive_workspace_install(
                 &workspace.root,
                 &legacy_importers,
             )?);
+        if options.frozen_lockfile == super::FrozenLockfileMode::Always {
+            workspace_lockfile_coordinator.mark_frozen();
+        }
         let workspace_project_state_coordinator =
             Arc::new(workspace_project_state::WorkspaceProjectStateCoordinator::new(targets.len()));
         let root_target_index = targets.iter().position(|target| target.kind == "root");
@@ -643,7 +644,7 @@ pub(crate) async fn run_recursive_workspace_install(
             }
         };
         workspace_project_state_coordinator.commit();
-        if lockfile_committed {
+        if lockfile_committed && options.frozen_lockfile != super::FrozenLockfileMode::Always {
             workspace_lockfile::remove_member_lockfiles(&legacy_importers);
         }
 
@@ -841,7 +842,7 @@ fn spawn_workspace_target_install(
     root_provider_fingerprint: Option<Arc<str>>,
     root_manifest_stamp: Option<RootManifestStamp>,
     any_script_ran: Arc<AtomicBool>,
-    shared_node_versions: Arc<std::sync::Mutex<lpm_runtime::effective::PathNodeVersionCache>>,
+    shared_node_versions: Arc<lpm_runtime::effective::PathNodeVersionCache>,
     shared_managed_policy: Arc<crate::security_approval::ManagedPolicyCache>,
     outcomes: &mut [Option<WorkspaceInstallOutcome>],
 ) {

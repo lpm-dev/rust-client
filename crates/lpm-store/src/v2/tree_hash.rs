@@ -19,14 +19,21 @@ pub(crate) struct TreeMetadataDigests {
 
 pub(crate) struct TreeMetadataHasher {
     with_ctime: Sha256,
-    without_ctime: Sha256,
+    without_ctime: Option<Sha256>,
 }
 
 impl TreeMetadataHasher {
     pub(crate) fn new() -> Self {
         Self {
             with_ctime: Sha256::new(),
-            without_ctime: Sha256::new(),
+            without_ctime: Some(Sha256::new()),
+        }
+    }
+
+    pub(crate) fn strict_only() -> Self {
+        Self {
+            with_ctime: Sha256::new(),
+            without_ctime: None,
         }
     }
 
@@ -69,23 +76,39 @@ impl TreeMetadataHasher {
             change_time_nanos,
             payload,
         );
-        hash_tree_metadata_fields(
-            &mut self.without_ctime,
-            kind,
-            relative,
-            mode,
-            len,
-            modified_time_nanos,
-            0,
-            payload,
-        );
+        if let Some(without_ctime) = self.without_ctime.as_mut() {
+            // Restored archives (GNU tar, zip CI caches) often truncate mtimes
+            // to whole seconds and produce different directory st_size across
+            // filesystems, so normalize both along with zeroing ctime.
+            let restored_len = if kind == b"dir" { 0 } else { len };
+            let restored_mtime_nanos = modified_time_nanos
+                .div_euclid(1_000_000_000)
+                .saturating_mul(1_000_000_000);
+            hash_tree_metadata_fields(
+                without_ctime,
+                kind,
+                relative,
+                mode,
+                restored_len,
+                restored_mtime_nanos,
+                0,
+                payload,
+            );
+        }
     }
 
     pub(crate) fn finish(self) -> TreeMetadataDigests {
+        let without_ctime = self
+            .without_ctime
+            .expect("TreeMetadataHasher::finish requires dual-digest mode");
         TreeMetadataDigests {
             metadata: format!("sha256-{}", hex::encode(self.with_ctime.finalize())),
-            metadata_no_ctime: format!("sha256-{}", hex::encode(self.without_ctime.finalize())),
+            metadata_no_ctime: format!("sha256-{}", hex::encode(without_ctime.finalize())),
         }
+    }
+
+    pub(crate) fn finish_strict(self) -> String {
+        format!("sha256-{}", hex::encode(self.with_ctime.finalize()))
     }
 }
 
@@ -353,7 +376,20 @@ pub(crate) fn compute_tree_metadata_integrities(
 }
 
 pub(crate) fn compute_tree_metadata_integrity(dir: &Path) -> Result<String, LpmError> {
-    compute_tree_metadata_integrities(dir).map(|digests| digests.metadata)
+    #[cfg(target_os = "macos")]
+    match compute_tree_metadata_integrity_bulk(dir) {
+        Ok(digest) => return Ok(digest),
+        Err(error) => tracing::trace!(
+            target = %dir.display(),
+            "virtual store: bulk metadata walk unavailable, using portable walker: {error}"
+        ),
+    }
+    metadata_walk::tree_metadata_integrity(dir, metadata_walk::MetadataReader::Portable)
+}
+
+#[cfg(target_os = "macos")]
+fn compute_tree_metadata_integrity_bulk(dir: &Path) -> Result<String, LpmError> {
+    metadata_walk::tree_metadata_integrity(dir, metadata_walk::MetadataReader::Bulk)
 }
 
 fn compute_tree_metadata_integrities_portable(dir: &Path) -> Result<TreeMetadataDigests, LpmError> {

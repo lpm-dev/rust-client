@@ -653,8 +653,9 @@ async fn ci_at_workspace_root_installs_all_workspace_members_from_frozen_lockfil
         std::fs::remove_dir_all(workspace.path().join("node_modules")).unwrap();
     }
 
+    let lockfile_before = std::fs::read(workspace.path().join("lpm.lock")).unwrap();
     let ci = lpm_with_registry(&workspace, &registry.url())
-        .args(["ci", "--no-skills", "--no-security-summary"])
+        .args(["ci", "--json", "--no-skills", "--no-security-summary"])
         .output()
         .unwrap();
     assert!(
@@ -670,4 +671,102 @@ async fn ci_at_workspace_root_installs_all_workspace_members_from_frozen_lockfil
             .exists(),
         "lpm ci at a workspace root must install and link workspace member dependencies"
     );
+    assert_eq!(
+        std::fs::read(workspace.path().join("lpm.lock")).unwrap(),
+        lockfile_before,
+        "lpm ci must preserve lpm.lock byte-for-byte"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&ci.stdout).expect("lpm ci --json must emit valid JSON");
+    assert_eq!(json["success"], true);
+    assert_eq!(json["recursive"], true);
+    let targets = json["targets"].as_array().expect("targets array");
+    assert!(targets.iter().any(|t| t["kind"] == "root"));
+    assert!(targets.iter().any(|t| t["name"] == "@mono/app"));
+}
+
+#[tokio::test]
+async fn ci_treats_empty_workspaces_and_unlisted_pnpm_subdir_as_single_project() {
+    let registry = MockRegistry::start().await;
+    let leaf_tarball = make_tarball_from_pkg_json(
+        serde_json::json!({ "name": "leaf-pkg", "version": "1.0.0" }),
+        &[("index.js", b"module.exports = 'leaf';\n")],
+    );
+    registry
+        .with_package("leaf-pkg", "1.0.0", &leaf_tarball)
+        .await;
+
+    // Case 1: `"workspaces": []` is not a workspace and must run single-project ci.
+    let empty_ws = TempProject::empty(
+        r#"{
+            "name": "empty-ws-pkg",
+            "version": "1.0.0",
+            "workspaces": [],
+            "dependencies": { "leaf-pkg": "1.0.0" }
+        }"#,
+    );
+    let seed = lpm_with_registry(&empty_ws, &registry.url())
+        .args(["install", "--no-skills", "--no-security-summary"])
+        .output()
+        .unwrap();
+    assert!(seed.status.success());
+    std::fs::remove_dir_all(empty_ws.path().join("node_modules")).unwrap();
+    let ci_empty = lpm_with_registry(&empty_ws, &registry.url())
+        .args(["ci", "--json", "--no-skills", "--no-security-summary"])
+        .output()
+        .unwrap();
+    assert!(
+        ci_empty.status.success(),
+        "lpm ci on workspaces:[] failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&ci_empty.stdout),
+        String::from_utf8_lossy(&ci_empty.stderr),
+    );
+    let empty_json: serde_json::Value = serde_json::from_slice(&ci_empty.stdout).unwrap();
+    assert!(
+        empty_json.get("recursive").is_none(),
+        "workspaces:[] must dispatch single-project ci, got {empty_json}"
+    );
+    assert!(empty_ws.path().join("node_modules/leaf-pkg/package.json").exists());
+
+    // Case 2: an unlisted directory under an ancestor pnpm-workspace.yaml must run single-project ci.
+    let pnpm_parent = TempProject::empty(r#"{"name":"pnpm-root","private":true}"#);
+    pnpm_parent.write_file("pnpm-workspace.yaml", "packages:\n  - packages/*\n");
+    pnpm_parent.write_file(
+        "packages/listed/package.json",
+        r#"{"name":"@p/listed","version":"1.0.0"}"#,
+    );
+    pnpm_parent.write_file(
+        "standalone/package.json",
+        r#"{"name":"standalone","version":"1.0.0","dependencies":{"leaf-pkg":"1.0.0"}}"#,
+    );
+    let standalone_dir = pnpm_parent.path().join("standalone");
+    let seed_standalone = lpm_with_registry(&pnpm_parent, &registry.url())
+        .current_dir(&standalone_dir)
+        .args(["install", "--no-skills", "--no-security-summary"])
+        .output()
+        .unwrap();
+    assert!(
+        seed_standalone.status.success(),
+        "seed install in unlisted subdir failed: {}",
+        String::from_utf8_lossy(&seed_standalone.stderr)
+    );
+    std::fs::remove_dir_all(standalone_dir.join("node_modules")).unwrap();
+    let ci_standalone = lpm_with_registry(&pnpm_parent, &registry.url())
+        .current_dir(&standalone_dir)
+        .args(["ci", "--json", "--no-skills", "--no-security-summary"])
+        .output()
+        .unwrap();
+    assert!(
+        ci_standalone.status.success(),
+        "lpm ci in unlisted pnpm subdir failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&ci_standalone.stdout),
+        String::from_utf8_lossy(&ci_standalone.stderr),
+    );
+    let standalone_json: serde_json::Value =
+        serde_json::from_slice(&ci_standalone.stdout).unwrap();
+    assert!(
+        standalone_json.get("recursive").is_none(),
+        "unlisted subdir under pnpm-workspace.yaml must not run recursive ci, got {standalone_json}"
+    );
+    assert!(standalone_dir.join("node_modules/leaf-pkg/package.json").exists());
 }

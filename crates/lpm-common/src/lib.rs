@@ -112,9 +112,10 @@ pub use paths::absolute_extended_path;
 pub use paths::canonical_identity;
 pub use paths::credential_service;
 pub use paths::{
-    ExclusiveLockHandle, FsKind, GLOBAL_INSTALL_PATH_BUDGET, INSTALL_READY_MARKER, LpmRoot,
-    ProjectLockDirectory, ProjectLockKind, SharedLockHandle, SingleFileExclusiveLockHandle,
-    SingleFileSharedLockHandle, acquire_exclusive_lock, acquire_single_file_exclusive_lock,
+    DescendantVerifyError, ExclusiveLockHandle, FsKind, GLOBAL_INSTALL_PATH_BUDGET,
+    INSTALL_READY_MARKER, LpmRoot, OpenRealDir, ProjectLockDirectory, ProjectLockKind,
+    SharedLockHandle, SingleFileExclusiveLockHandle, SingleFileSharedLockHandle,
+    acquire_exclusive_lock, acquire_single_file_exclusive_lock,
     acquire_single_file_exclusive_lock_from_file,
     acquire_single_file_exclusive_lock_from_file_within, acquire_single_file_shared_lock,
     acquire_single_file_shared_lock_from_file, as_extended_path, check_install_path_budget,

@@ -65,7 +65,8 @@ pub(crate) use firewall_bypass::{add_firewall_bypass_rules, commit_firewall_bypa
 pub use helpers::format_unlock_duration;
 pub(crate) use helpers::project_dir_is_global_install;
 pub(crate) use managed_policy::{
-    ManagedPolicyCache, new_managed_policy_cache, scope_managed_policy_cache,
+    ManagedPolicyCache, current_or_new_managed_policy_cache, new_managed_policy_cache,
+    scope_managed_policy_cache,
 };
 pub(crate) use managed_policy::{
     apply_managed_protection_with_privilege, load_managed_protection_status,

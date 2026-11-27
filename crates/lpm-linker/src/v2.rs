@@ -1221,7 +1221,12 @@ fn existing_link_entry_packages(
 ) -> Result<Vec<MaterializedPackage>, LpmError> {
     let links_root = store.paths().links_root();
     ensure_real_dir(&links_root, "links root")?;
-    let mut canonical_links_root: Option<PathBuf> = None;
+    let open_links_root = lpm_common::OpenRealDir::open_ambient(&links_root).map_err(|e| {
+        LpmError::Store(format!(
+            "virtual-store linker: failed to open links root at {}: {e}",
+            links_root.display()
+        ))
+    })?;
 
     let mut materialized = Vec::with_capacity(plan.augmented_targets.len());
     for v2t in &plan.augmented_targets {
@@ -1233,8 +1238,8 @@ fn existing_link_entry_packages(
         })?;
         let package_dir = store.paths().link_package_dir(key);
         ensure_existing_link_package_dir(
+            &open_links_root,
             &links_root,
-            &mut canonical_links_root,
             &package_dir,
             &v2t.target.name,
             &v2t.target.version,
@@ -1251,15 +1256,12 @@ fn existing_link_entry_packages(
 }
 
 fn ensure_existing_link_package_dir(
+    open_links_root: &lpm_common::OpenRealDir,
     links_root: &Path,
-    canonical_links_root: &mut Option<PathBuf>,
     package_dir: &Path,
     name: &str,
     version: &str,
 ) -> Result<(), LpmError> {
-    // Walk only the 3-4 components below `links_root` with `symlink_metadata`
-    // instead of running `canonicalize` from `/` on every package. Any symlink
-    // or non-normal component falls through to the canonical containment error.
     let relative = package_dir.strip_prefix(links_root).map_err(|_| {
         LpmError::Store(format!(
             "virtual-store linker: refusing existing link entry for {name}@{version} because {} resolves outside {}",
@@ -1267,78 +1269,38 @@ fn ensure_existing_link_package_dir(
             links_root.display()
         ))
     })?;
-    let mut cursor = PathBuf::with_capacity(package_dir.as_os_str().len());
-    cursor.push(links_root);
-    let mut saw_symlink = false;
-    for component in relative.components() {
-        let std::path::Component::Normal(part) = component else {
-            saw_symlink = true;
-            break;
-        };
-        cursor.push(part);
-        let metadata = std::fs::symlink_metadata(&cursor).map_err(|e| {
-            LpmError::Store(format!(
-                "virtual-store linker: required link entry for {name}@{version} is missing at {}: {e}",
-                package_dir.display()
-            ))
-        })?;
-        if lpm_common::is_symlink_or_junction(&metadata) {
-            saw_symlink = true;
-            break;
-        }
-        if !metadata.is_dir() {
-            return Err(LpmError::Store(format!(
+    match open_links_root.verify_descendant_dir_and_regular_file(
+        links_root,
+        relative,
+        "package.json",
+    ) {
+        Ok(()) => Ok(()),
+        Err(lpm_common::DescendantVerifyError::UnsafeOrLink(path)) => Err(LpmError::Store(
+            format!(
+                "virtual-store linker: refusing existing link entry for {name}@{version} because {} is a symlink or unsafe component under {}",
+                path.display(),
+                links_root.display()
+            ),
+        )),
+        Err(lpm_common::DescendantVerifyError::NotDirectory(path)) => Err(LpmError::Store(
+            format!(
                 "virtual-store linker: refusing existing link package at {} (not a directory)",
-                cursor.display()
-            )));
-        }
+                path.display()
+            ),
+        )),
+        Err(lpm_common::DescendantVerifyError::NotRegularFile(path)) => Err(LpmError::Store(
+            format!(
+                "virtual-store linker: refusing existing link entry for {name}@{version} with non-file package.json at {}",
+                path.display()
+            ),
+        )),
+        Err(lpm_common::DescendantVerifyError::Io { path, source }) => Err(LpmError::Store(
+            format!(
+                "virtual-store linker: required link entry for {name}@{version} is missing at {}: {source}",
+                path.display()
+            ),
+        )),
     }
-    if saw_symlink {
-        let root_canon = match canonical_links_root {
-            Some(existing) => existing.as_path(),
-            None => {
-                let canon = std::fs::canonicalize(links_root).map_err(|e| {
-                    LpmError::Store(format!(
-                        "virtual-store linker: failed to inspect links root at {}: {e}",
-                        links_root.display()
-                    ))
-                })?;
-                canonical_links_root.insert(canon).as_path()
-            }
-        };
-        let canonical_package_dir = std::fs::canonicalize(package_dir).map_err(|e| {
-            LpmError::Store(format!(
-                "virtual-store linker: required link entry for {name}@{version} is missing at {}: {e}",
-                package_dir.display()
-            ))
-        })?;
-        if !canonical_package_dir.starts_with(root_canon) {
-            return Err(LpmError::Store(format!(
-                "virtual-store linker: refusing existing link entry for {name}@{version} because {} resolves outside {}",
-                package_dir.display(),
-                root_canon.display()
-            )));
-        }
-        ensure_real_dir(package_dir, "existing link package")?;
-    }
-
-    let mut package_json = PathBuf::with_capacity(package_dir.as_os_str().len() + 13);
-    package_json.push(package_dir);
-    package_json.push("package.json");
-    let metadata = std::fs::symlink_metadata(&package_json).map_err(|e| {
-        LpmError::Store(format!(
-            "virtual-store linker: required package.json for {name}@{version} is missing at {}: {e}",
-            package_json.display()
-        ))
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(LpmError::Store(format!(
-            "virtual-store linker: refusing existing link entry for {name}@{version} with non-file package.json at {}",
-            package_json.display()
-        )));
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

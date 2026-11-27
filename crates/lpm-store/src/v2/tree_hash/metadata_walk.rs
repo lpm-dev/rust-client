@@ -298,12 +298,11 @@ pub(super) fn tree_metadata_integrities(
     tree_metadata_integrities_with_helpers(root, reader).map(|(digests, _)| digests)
 }
 
-#[cfg(test)]
 pub(super) fn tree_metadata_integrity(
     root: &Path,
     reader: MetadataReader,
 ) -> Result<String, LpmError> {
-    tree_metadata_integrities(root, reader).map(|digests| digests.metadata)
+    tree_metadata_integrity_with_helpers(root, reader).map(|(digest, _)| digest)
 }
 
 fn tree_metadata_integrities_with_helpers(
@@ -316,13 +315,14 @@ fn tree_metadata_integrities_with_helpers(
     Ok((hasher.finish(), helpers))
 }
 
-#[cfg(test)]
 fn tree_metadata_integrity_with_helpers(
     root: &Path,
     reader: MetadataReader,
 ) -> Result<(String, usize), LpmError> {
-    tree_metadata_integrities_with_helpers(root, reader)
-        .map(|(digests, helpers)| (digests.metadata, helpers))
+    let Collected { mut dirs, helpers } = collect(root, reader);
+    let mut hasher = TreeMetadataHasher::strict_only();
+    hash_collected(&mut dirs, 0, reader, &mut Vec::new(), &mut hasher)?;
+    Ok((hasher.finish_strict(), helpers))
 }
 
 #[cfg(test)]

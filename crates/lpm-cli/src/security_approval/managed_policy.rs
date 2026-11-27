@@ -1122,9 +1122,55 @@ fn parse_policy_firewall(
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ManagedPolicyStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    ctime: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    uid: u32,
+}
+
+impl ManagedPolicyStamp {
+    fn from_metadata(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            Self {
+                len: meta.len(),
+                modified: meta.modified().ok(),
+                dev: meta.dev(),
+                ino: meta.ino(),
+                ctime: meta.ctime(),
+                ctime_nsec: meta.ctime_nsec(),
+                mode: meta.mode(),
+                uid: meta.uid(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                len: meta.len(),
+                modified: meta.modified().ok(),
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct ManagedPolicyCache {
-    entries: std::sync::Mutex<std::collections::HashMap<PathBuf, Option<ManagedPolicy>>>,
+    entries: std::sync::Mutex<std::collections::HashMap<PathBuf, (ManagedPolicyStamp, ManagedPolicy)>>,
+    load_lock: std::sync::Mutex<()>,
 }
 
 tokio::task_local! {
@@ -1133,6 +1179,12 @@ tokio::task_local! {
 
 pub(crate) fn new_managed_policy_cache() -> std::sync::Arc<ManagedPolicyCache> {
     std::sync::Arc::new(ManagedPolicyCache::default())
+}
+
+pub(crate) fn current_or_new_managed_policy_cache() -> std::sync::Arc<ManagedPolicyCache> {
+    SCOPED_MANAGED_POLICY_CACHE
+        .try_with(std::sync::Arc::clone)
+        .unwrap_or_else(|_| new_managed_policy_cache())
 }
 
 pub(crate) async fn scope_managed_policy_cache<F>(
@@ -1147,24 +1199,83 @@ where
 
 pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
     let path = managed_policy_path();
-    if let Ok(cache) = SCOPED_MANAGED_POLICY_CACHE.try_with(std::sync::Arc::clone)
-        && let Some(cached) = cache
-            .entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&path)
-            .cloned()
+    let Ok(cache) = SCOPED_MANAGED_POLICY_CACHE.try_with(std::sync::Arc::clone) else {
+        return load_managed_policy_from_disk(path);
+    };
+
+    // Always inspect the current file identity via `symlink_metadata` so
+    // newly-created, atomically-replaced, or chmod'd policy files are never
+    // shadowed by a stale cache entry or cached absence.
+    let current_stamp = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => ManagedPolicyStamp::from_metadata(&meta),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            cache
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&path);
+            return Ok(None);
+        }
+        Err(error) => return Err(privileged_policy_io_error(&path, "inspect", error)),
+    };
+
+    if let Some((cached_stamp, cached_policy)) = cache
+        .entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&path)
+        && *cached_stamp == current_stamp
     {
-        return Ok(cached);
+        return Ok(Some(cached_policy.clone()));
+    }
+
+    // Serialize cache-miss disk reads so concurrent workers share a single
+    // parse and cannot publish an older policy generation over a newer one.
+    let _loading = cache
+        .load_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pre_stamp = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => ManagedPolicyStamp::from_metadata(&meta),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            cache
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&path);
+            return Ok(None);
+        }
+        Err(error) => return Err(privileged_policy_io_error(&path, "inspect", error)),
+    };
+    if let Some((cached_stamp, cached_policy)) = cache
+        .entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&path)
+        && *cached_stamp == pre_stamp
+    {
+        return Ok(Some(cached_policy.clone()));
     }
 
     let policy = load_managed_policy_from_disk(path.clone())?;
-    if let Ok(cache) = SCOPED_MANAGED_POLICY_CACHE.try_with(std::sync::Arc::clone) {
-        cache
-            .entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(path, policy.clone());
+    let post_stamp = std::fs::symlink_metadata(&path)
+        .ok()
+        .map(|meta| ManagedPolicyStamp::from_metadata(&meta));
+    match (policy.as_ref(), post_stamp) {
+        (Some(parsed), Some(stamp)) if stamp == pre_stamp => {
+            cache
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(path, (stamp, parsed.clone()));
+        }
+        _ => {
+            cache
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&path);
+        }
     }
     Ok(policy)
 }
@@ -1770,39 +1881,55 @@ mod access_tests {
     }
 
     #[tokio::test]
-    async fn scoped_managed_policy_cache_reuses_policy_within_install_scope_only() {
+    async fn scoped_managed_policy_cache_validates_file_stamp_and_does_not_cache_absence() {
         let dir = tempfile::tempdir().unwrap();
         let policy_path = dir.path().join("security-policy.toml");
-        std::fs::write(&policy_path, "minimum-release-age-secs = 86400\n").unwrap();
         let _env = crate::test_env::ScopedEnv::update([(
             super::SECURITY_POLICY_PATH_ENV,
             Some(policy_path.as_os_str().to_os_string()),
         )]);
 
         let cache = super::new_managed_policy_cache();
-        let (first, second) = super::scope_managed_policy_cache(cache, async {
-            let first = super::load_managed_policy().unwrap();
-            std::fs::write(&policy_path, "minimum-release-age-secs = 172800\n").unwrap();
-            let second = super::load_managed_policy().unwrap();
-            (first, second)
+        super::scope_managed_policy_cache(cache.clone(), async {
+            assert!(
+                super::load_managed_policy().unwrap().is_none(),
+                "missing policy file must return None"
+            );
+
+            // Creating the policy file after an initial miss must be observed immediately.
+            std::fs::write(&policy_path, "minimum-release-age-secs = 86400\n").unwrap();
+            let created = super::load_managed_policy().unwrap();
+            assert_eq!(
+                created.as_ref().and_then(|p| p.minimum_release_age_secs),
+                Some(86400),
+                "absence must not be cached across subsequent creation"
+            );
+
+            // Nested scopes using current_or_new_managed_policy_cache reuse the outer cache.
+            let nested = super::current_or_new_managed_policy_cache();
+            assert!(
+                std::sync::Arc::ptr_eq(&cache, &nested),
+                "current_or_new_managed_policy_cache must reuse the active task-local cache"
+            );
+
+            // Atomic replacement with a new inode/length invalidates the cached stamp.
+            let replacement = dir.path().join("security-policy.toml.next");
+            std::fs::write(&replacement, "minimum-release-age-secs = 172800\n").unwrap();
+            std::fs::rename(&replacement, &policy_path).unwrap();
+            let replaced = super::load_managed_policy().unwrap();
+            assert_eq!(
+                replaced.as_ref().and_then(|p| p.minimum_release_age_secs),
+                Some(172800),
+                "atomic policy replacement must invalidate the cached entry"
+            );
+
+            // Deleting the policy file must immediately drop the cached entry.
+            std::fs::remove_file(&policy_path).unwrap();
+            assert!(
+                super::load_managed_policy().unwrap().is_none(),
+                "removing the policy file must clear the cached entry"
+            );
         })
         .await;
-
-        assert_eq!(
-            first.as_ref().and_then(|p| p.minimum_release_age_secs),
-            Some(86400)
-        );
-        assert_eq!(
-            second.as_ref().and_then(|p| p.minimum_release_age_secs),
-            Some(86400),
-            "scoped cache must reuse the loaded managed policy within the same install scope"
-        );
-
-        let outside = super::load_managed_policy().unwrap();
-        assert_eq!(
-            outside.as_ref().and_then(|p| p.minimum_release_age_secs),
-            Some(172800),
-            "reads outside the install scope must observe updated disk state"
-        );
     }
 }

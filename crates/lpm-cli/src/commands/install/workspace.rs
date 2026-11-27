@@ -232,13 +232,15 @@ fn workspace_package_link_source(
     }
 
     let source_dir = package_dir.join(relative);
-    let package_root =
-        crate::workspace_discovery_cache::canonicalize_cached(package_dir).map_err(|error| {
-            LpmError::Workspace(format!(
-                "failed to resolve workspace package directory {}: {error}",
-                package_dir.display()
-            ))
-        })?;
+    // Resolve containment directly at point of use rather than through the
+    // command-scoped canonical-path cache so symlink retargets cannot bypass
+    // package-directory bounds.
+    let package_root = package_dir.canonicalize().map_err(|error| {
+        LpmError::Workspace(format!(
+            "failed to resolve workspace package directory {}: {error}",
+            package_dir.display()
+        ))
+    })?;
     let mut existing_ancestor = source_dir.as_path();
     while !existing_ancestor.exists() {
         existing_ancestor = existing_ancestor.parent().ok_or_else(|| {
@@ -249,10 +251,7 @@ fn workspace_package_link_source(
             ))
         })?;
     }
-    let canonical_ancestor = crate::workspace_discovery_cache::canonicalize_cached(
-        existing_ancestor,
-    )
-    .map_err(|error| {
+    let canonical_ancestor = existing_ancestor.canonicalize().map_err(|error| {
         LpmError::Workspace(format!(
             "failed to resolve publishConfig.directory ancestor {}: {error}",
             existing_ancestor.display()
@@ -265,14 +264,12 @@ fn workspace_package_link_source(
         )));
     }
     if source_dir.exists() {
-        return crate::workspace_discovery_cache::canonicalize_cached(&source_dir).map_err(
-            |error| {
-                LpmError::Workspace(format!(
-                    "failed to resolve publishConfig.directory {}: {error}",
-                    source_dir.display()
-                ))
-            },
-        );
+        return source_dir.canonicalize().map_err(|error| {
+            LpmError::Workspace(format!(
+                "failed to resolve publishConfig.directory {}: {error}",
+                source_dir.display()
+            ))
+        });
     }
     Ok(source_dir)
 }
@@ -291,18 +288,15 @@ pub(super) fn is_declared_workspace_package_source(
     linkable_workspace_packages(&workspace).any(|(package, path)| {
         package.name.as_deref() == Some(package_name)
             && package.version.as_deref().unwrap_or("0.0.0") == package_version
-            && (crate::workspace_discovery_cache::canonicalize_cached(path)
-                .is_ok_and(|path| path == source_dir)
+            && (path.canonicalize().is_ok_and(|path| path == source_dir)
                 || workspace_package_link_source(package, path)
                     .and_then(|path| {
-                        crate::workspace_discovery_cache::canonicalize_cached(&path).map_err(
-                            |error| {
-                                LpmError::Workspace(format!(
-                                    "failed to resolve workspace package source {}: {error}",
-                                    path.display()
-                                ))
-                            },
-                        )
+                        path.canonicalize().map_err(|error| {
+                            LpmError::Workspace(format!(
+                                "failed to resolve workspace package source {}: {error}",
+                                path.display()
+                            ))
+                        })
                     })
                     .is_ok_and(|path| path == source_dir))
     })
@@ -745,7 +739,14 @@ pub(super) fn append_workspace_links_from_local_packages(
     all_workspace_members: &[WorkspaceMemberLink],
     skip_workspace_members: &[WorkspaceMemberLink],
 ) {
-    if all_workspace_members.is_empty() {
+    if all_workspace_members.is_empty()
+        || !packages.iter().any(|package| {
+            matches!(
+                package.source_kind(),
+                Ok(lpm_lockfile::Source::Directory { .. } | lpm_lockfile::Source::Link { .. })
+            )
+        })
+    {
         return;
     }
     let canonicalize_path = crate::workspace_discovery_cache::canonicalize_or_original;
@@ -1038,7 +1039,7 @@ pub(super) fn expand_workspace_member_deps_with_transitives(
     workspace_member_deps: &mut Vec<WorkspaceMemberLink>,
     all_workspace_members: &[WorkspaceMemberLink],
 ) -> Result<(), LpmError> {
-    if all_workspace_members.is_empty() {
+    if all_workspace_members.is_empty() || workspace_member_deps.is_empty() {
         return Ok(());
     }
     let canonicalize_path = crate::workspace_discovery_cache::canonicalize_or_original;
