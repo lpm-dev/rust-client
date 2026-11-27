@@ -42,7 +42,8 @@ pub struct FileCasPrunePlan {
 
 pub use cas::{BlobKey, CasEntryKind, CasManifest, CasManifestEntry, SourceRecord};
 pub(crate) use cas::{
-    FileCas, FileCasReuseTimings, FileCasValidationBatch, PreparedSourceRecord, SourceReuseStatus,
+    CompactBlobKey, FileCas, FileCasReuseTimings, FileCasValidationBatch, PreparedSourceRecord,
+    SourceReuseStatus,
 };
 
 pub use crate::v2::{

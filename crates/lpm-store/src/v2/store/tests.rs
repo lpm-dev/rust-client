@@ -3103,7 +3103,7 @@ fn v3_registry_ingest_uses_last_duplicate_tar_member() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert!(
-        blob_contents
+        !blob_contents
             .iter()
             .any(|content| content == b"module.exports = 'first';\n")
     );

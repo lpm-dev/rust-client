@@ -1552,10 +1552,10 @@ impl Store {
         let extract_start = std::time::Instant::now();
         let source_analysis_enabled = self.security_analysis_policy.is_enabled();
         let analyzer = std::cell::RefCell::new(lpm_security::behavioral::PackageAnalyzer::new());
-        let registry_cas_ingest = match (self.file_cas.as_ref(), registry_identity) {
-            (Some(cas), Some((object_dir, sri))) => Some(std::cell::RefCell::new(
-                cas.begin_registry_ingest(object_dir, sri)?,
-            )),
+        let mut registry_cas_ingest = match (self.file_cas.as_ref(), registry_identity) {
+            (Some(cas), Some((object_dir, sri))) => {
+                Some(cas.begin_registry_ingest(object_dir, sri)?)
+            }
             (Some(_), None) => {
                 return Err(LpmError::Store(
                     "streamed object ingest is unavailable for the v3 file CAS".into(),
@@ -1563,33 +1563,7 @@ impl Store {
             }
             (None, _) => None,
         };
-        let inspection_error = std::cell::RefCell::new(None);
         let inspect_entry = |entry: lpm_extractor::EntryInfo<'_>| {
-            if inspection_error.borrow().is_none()
-                && let (Some(ingest), Some(cas)) =
-                    (registry_cas_ingest.as_ref(), self.file_cas.as_ref())
-            {
-                let result = entry
-                    .blake3_digest
-                    .ok_or_else(|| {
-                        LpmError::Store(format!(
-                            "v3 CAS extraction omitted a digest for {}",
-                            entry.relative_path.display()
-                        ))
-                    })
-                    .and_then(|digest| {
-                        cas.ingest_registry_file(
-                            &mut ingest.borrow_mut(),
-                            tmp_dir,
-                            entry.relative_path,
-                            entry.size,
-                            digest,
-                        )
-                    });
-                if let Err(error) = result {
-                    *inspection_error.borrow_mut() = Some(error);
-                }
-            }
             if !source_analysis_enabled {
                 return;
             }
@@ -1608,7 +1582,7 @@ impl Store {
             source_analysis_enabled
                 && lpm_security::behavioral::PackageAnalyzer::should_buffer_source(path, size)
         };
-        let extract_result = if !source_analysis_enabled && registry_cas_ingest.is_none() {
+        let extract_result = if !source_analysis_enabled {
             let pipeline_file = matches!(&tarball_input, TarballInput::File(reader) if file_takes_pipelined_decoder(reader));
             match &mut tarball_input {
                 TarballInput::Bytes(bytes) => {
@@ -1684,9 +1658,6 @@ impl Store {
             }
         };
         let extracted_files = extract_result?;
-        if let Some(error) = inspection_error.into_inner() {
-            return Err(error);
-        }
 
         let computed_sri = match &mut tarball_input {
             TarballInput::Streaming {
@@ -1711,6 +1682,21 @@ impl Store {
             TarballInput::Bytes(_) | TarballInput::File(_) => None,
         };
         timings.extract_ms = extract_start.elapsed().as_millis();
+
+        // Ingest deduplicated extracted files into the v3 CAS after streamed
+        // integrity verification succeeds and before `StreamedTreeBuilder`
+        // records final metadata integrities (hardlinking updates file ctimes).
+        if let (Some(cas), Some(ingest)) = (self.file_cas.as_ref(), registry_cas_ingest.as_mut()) {
+            for extracted in &extracted_files {
+                cas.ingest_registry_file(
+                    ingest,
+                    tmp_dir,
+                    &extracted.relative_path,
+                    None,
+                    extracted.blake3_digest,
+                )?;
+            }
+        }
 
         tracing::event!(name: "finalize_admission_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
         let finalize_permit_wait_start = std::time::Instant::now();
@@ -1744,7 +1730,7 @@ impl Store {
             Some(ingest) => self
                 .file_cas
                 .as_ref()
-                .map(|cas| cas.finish_registry_ingest(ingest.into_inner()))
+                .map(|cas| cas.finish_registry_ingest(ingest))
                 .transpose()?,
             None => None,
         };
@@ -3403,11 +3389,18 @@ impl Store {
             ));
         }
 
+        let materialized_entries = cas.materialized_entry_dirs()?;
+        let materialized_digests: std::collections::HashSet<String> = materialized_entries
+            .iter()
+            .filter_map(|entry_dir| cas.materialized_digest_from_entry(entry_dir).ok())
+            .collect();
+
         let tree_files = cas.tree_manifest_files()?;
         verification.trees = tree_files.len();
         let mut all_tree_blobs = std::collections::HashSet::new();
-        let mut reachable_blob_paths = std::collections::HashSet::new();
-        let mut tree_manifests = std::collections::HashMap::new();
+        let mut reachable_blob_ids: std::collections::HashSet<crate::v3::CompactBlobKey> =
+            std::collections::HashSet::new();
+        let mut tree_manifests = std::collections::HashMap::with_capacity(materialized_digests.len());
         for tree_path in &tree_files {
             let (digest, manifest) = match cas.manifest_from_file(tree_path) {
                 Ok(manifest) => manifest,
@@ -3420,16 +3413,18 @@ impl Store {
                 verification.orphaned_trees = verification.orphaned_trees.saturating_add(1);
             }
             let tree_is_reachable = reachable_tree_digests.contains(&digest);
-            tree_manifests.insert(digest, manifest.clone());
+            if materialized_digests.contains(&digest) {
+                tree_manifests.insert(digest, manifest.clone());
+            }
             for key in manifest
                 .entries
                 .iter()
                 .filter_map(|entry| entry.blob.as_ref())
             {
-                match cas.blob_path(key) {
-                    Ok(path) => {
+                match cas.compact_blob_key(&key.digest, key.mode) {
+                    Ok(compact) => {
                         if tree_is_reachable {
-                            reachable_blob_paths.insert(path);
+                            reachable_blob_ids.insert(compact);
                         }
                         all_tree_blobs.insert(key.clone());
                     }
@@ -3438,7 +3433,6 @@ impl Store {
             }
         }
 
-        let materialized_entries = cas.materialized_entry_dirs()?;
         verification.materialized = materialized_entries.len();
         for entry_dir in &materialized_entries {
             let digest = match cas.materialized_digest_from_entry(entry_dir) {
@@ -3474,8 +3468,13 @@ impl Store {
 
         let blob_files = cas.blob_files()?;
         verification.blobs = blob_files.len();
-        let mut hash_buffer = vec![0_u8; 64 * 1024];
-        let mut verified_blob_paths = std::collections::HashSet::with_capacity(blob_files.len());
+        let mut verified_blob_ids: std::collections::HashSet<(crate::v3::CompactBlobKey, u64)> =
+            std::collections::HashSet::with_capacity(blob_files.len());
+        let mut deep_checks: Vec<(&Path, crate::v3::BlobKey)> = if deep {
+            Vec::with_capacity(blob_files.len())
+        } else {
+            Vec::new()
+        };
         for blob_path in &blob_files {
             let key = match cas.blob_key_from_file(blob_path) {
                 Ok(key) => key,
@@ -3484,20 +3483,77 @@ impl Store {
                     continue;
                 }
             };
-            verified_blob_paths.insert(blob_path.clone());
-            if !reachable_blob_paths.contains(blob_path) {
+            let compact = match cas.compact_blob_key(&key.digest, key.mode) {
+                Ok(compact) => compact,
+                Err(error) => {
+                    verification.issues.push(error.to_string());
+                    continue;
+                }
+            };
+            verified_blob_ids.insert((compact, key.size));
+            if !reachable_blob_ids.contains(&compact) {
                 verification.orphaned_blobs = verification.orphaned_blobs.saturating_add(1);
             }
             if deep {
-                verification.blobs_rehashed = verification.blobs_rehashed.saturating_add(1);
-                if let Err(error) = cas.verify_blob(&key, true, &mut hash_buffer) {
-                    verification.issues.push(error.to_string());
+                deep_checks.push((blob_path.as_path(), key));
+            }
+        }
+
+        let mut hash_buffer = vec![0_u8; 64 * 1024];
+        if deep && !deep_checks.is_empty() {
+            const PARALLEL_DEEP_VERIFY_THRESHOLD: usize = 16;
+            verification.blobs_rehashed = verification
+                .blobs_rehashed
+                .saturating_add(deep_checks.len());
+            let workers = lpm_common::resources::effective_cpu_count().min(8);
+            if deep_checks.len() >= PARALLEL_DEEP_VERIFY_THRESHOLD && workers > 1 {
+                let next_index = std::sync::atomic::AtomicUsize::new(0);
+                let workers = workers.min(deep_checks.len());
+                let deep_issues = std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(workers);
+                    for _ in 0..workers {
+                        handles.push(scope.spawn(|| {
+                            let mut local_buf = vec![0_u8; 64 * 1024];
+                            let mut local_issues = Vec::new();
+                            loop {
+                                let idx =
+                                    next_index.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let Some((blob_path, key)) = deep_checks.get(idx) else {
+                                    break;
+                                };
+                                if let Err(error) =
+                                    cas.verify_blob_at_path(blob_path, key, &mut local_buf)
+                                {
+                                    local_issues.push(error.to_string());
+                                }
+                            }
+                            local_issues
+                        }));
+                    }
+                    let mut merged = Vec::new();
+                    for handle in handles {
+                        match handle.join() {
+                            Ok(issues) => merged.extend(issues),
+                            Err(_) => {
+                                merged.push("v3 CAS deep verification worker panicked".into());
+                            }
+                        }
+                    }
+                    merged
+                });
+                verification.issues.extend(deep_issues);
+            } else {
+                for (blob_path, key) in &deep_checks {
+                    if let Err(error) = cas.verify_blob_at_path(blob_path, key, &mut hash_buffer) {
+                        verification.issues.push(error.to_string());
+                    }
                 }
             }
         }
+
         for key in &all_tree_blobs {
-            let path = cas.blob_path(key)?;
-            if verified_blob_paths.contains(&path) {
+            let compact = cas.compact_blob_key(&key.digest, key.mode)?;
+            if verified_blob_ids.contains(&(compact, key.size)) {
                 continue;
             }
             if let Err(error) = cas.verify_blob(key, deep, &mut hash_buffer) {
@@ -3529,7 +3585,8 @@ impl Store {
             .map(PathBuf::as_path)
             .collect::<std::collections::HashSet<_>>();
         let mut reachable_trees = std::collections::HashMap::new();
-        let mut reachable_blobs = std::collections::HashSet::new();
+        let mut reachable_blobs: std::collections::HashSet<crate::v3::CompactBlobKey> =
+            std::collections::HashSet::new();
         let mut live_source_digests = std::collections::HashSet::new();
         for (object_dir, _) in self.object_dirs_for_prune()? {
             if objects_to_remove.contains(object_dir.as_path()) {
@@ -3565,7 +3622,7 @@ impl Store {
                 )));
             }
             for blob in manifest.entries.into_iter().filter_map(|entry| entry.blob) {
-                reachable_blobs.insert(cas.blob_path(&blob)?);
+                reachable_blobs.insert(cas.compact_blob_key(&blob.digest, blob.mode)?);
             }
             reachable_trees.insert(record.tree_digest, record.local_source);
         }
