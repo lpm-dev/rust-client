@@ -4433,6 +4433,64 @@ async fn real_publish_ships_authored_skills_without_changing_package_json() {
 }
 
 #[tokio::test]
+async fn publish_ships_a_skill_with_a_warning_ordinary_code_matches_and_reports_it() {
+    let mock = MockRegistry::start().await;
+    mock.with_publish_endpoint().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    let project = authored_skills_project("@lpm.dev/testuser.scripted-skills");
+    project.write_file(
+        "lpm-skills/usage.md",
+        concat!(
+            "---\n",
+            "name: usage\n",
+            "description: Complete package usage guidance\n",
+            "---\n",
+            "# Usage\n\n",
+            "Rebuild the docs with subprocess.run(['make', 'docs']) after changing the ",
+            "public API, so the guidance an agent reads stays accurate.\n",
+        ),
+    );
+    let warning = "Skill security warning: lpm-skills/usage.md:7: shell-injection pattern `python-process-execution`";
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "--json",
+            "publish",
+            "--yes",
+            "--token",
+            "test-token-123",
+            "--lpm",
+        ])
+        .output()
+        .expect("run publish with a skill warning");
+
+    assert!(
+        output.status.success(),
+        "publish must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope = parse_json_output(&output.stdout);
+    assert_eq!(
+        envelope["results"][0]["warnings"],
+        serde_json::json!([warning]),
+        "{envelope}"
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    let tarball_data = lpm_published_tarball(&requests);
+    let skill = extract_uploaded_file(&tarball_data, "package/lpm-skills/usage.md");
+    assert_eq!(skill, project.read_file("lpm-skills/usage.md").into_bytes());
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["publish", "--dry-run", "--lpm"])
+        .output()
+        .expect("run a publish dry run with a skill warning");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains(warning), "{stderr}");
+}
+
+#[tokio::test]
 async fn publish_rewrites_catalog_dependency_in_uploaded_tarball() {
     let mock = MockRegistry::start().await;
     mock.with_publish_endpoint().await;

@@ -28,6 +28,7 @@ struct InputEntry {
 struct Output {
     skills: Vec<OutputSkill>,
     errors: Vec<String>,
+    warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -45,12 +46,14 @@ struct OutputSkill {
 
 /// Checks the entries a host found under a tarball's skills directory, as
 /// `{"prefix": "lpm-skills/", "entries": [{"path", "size", "contentBase64"}]}`,
-/// with the CLI's rules. Returns `{"skills": [...], "errors": [...]}`;
-/// skills are listed only when there are no errors.
+/// with the CLI's rules. Returns `{"skills": [...], "errors": [...],
+/// "warnings": [...]}`; skills are listed only when there are no errors, and
+/// warnings are security findings that don't keep them from publishing.
 #[wasm_bindgen]
 pub fn validate_skills_json(input: &str) -> String {
     serde_json::to_string(&validate(input)).unwrap_or_else(|_| {
-        "{\"skills\":[],\"errors\":[\"could not serialize skill diagnostics\"]}".to_string()
+        "{\"skills\":[],\"errors\":[\"could not serialize skill diagnostics\"],\"warnings\":[]}"
+            .to_string()
     })
 }
 
@@ -91,6 +94,7 @@ fn validate(input: &str) -> Output {
     let failed = |error: &str| Output {
         skills: Vec::new(),
         errors: vec![error.to_string()],
+        warnings: Vec::new(),
     };
     if input.len() > MAX_INPUT_BYTES {
         return failed("skill validation input exceeds the 4 MiB limit");
@@ -117,6 +121,7 @@ fn validate(input: &str) -> Output {
     }
     let report = lpm_skill::validate(&input.prefix, &entries);
     let errors = report.messages();
+    let warnings = report.warning_messages();
     Output {
         skills: report
             .skills
@@ -133,6 +138,7 @@ fn validate(input: &str) -> Output {
             })
             .collect(),
         errors,
+        warnings,
     }
 }
 
@@ -165,6 +171,7 @@ mod tests {
             serde_json::from_str(&validate_skills_json(&input(&skill()))).unwrap();
 
         assert_eq!(output["errors"], serde_json::json!([]));
+        assert_eq!(output["warnings"], serde_json::json!([]));
         assert_eq!(output["skills"][0]["name"], "usage");
         assert_eq!(output["skills"][0]["rawContent"], skill());
         assert_eq!(output["skills"][0]["sizeBytes"], skill().len());
@@ -190,6 +197,27 @@ mod tests {
                 "lpm-skills/usage.md:6: blocked shell-injection pattern `dynamic-code-execution`"
             ])
         );
+        assert_eq!(output["warnings"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn returns_findings_that_do_not_stop_the_publish_as_warnings_beside_the_skill() {
+        let content = skill().replace(
+            "Call the client once",
+            "subprocess.run(['make']) then call once",
+        );
+
+        let output: serde_json::Value =
+            serde_json::from_str(&validate_skills_json(&input(&content))).unwrap();
+
+        assert_eq!(output["errors"], serde_json::json!([]));
+        assert_eq!(output["skills"][0]["name"], "usage");
+        assert_eq!(
+            output["warnings"],
+            serde_json::json!([
+                "lpm-skills/usage.md:6: shell-injection pattern `python-process-execution`"
+            ])
+        );
     }
 
     #[test]
@@ -211,7 +239,16 @@ mod tests {
 
     #[test]
     fn refuses_malformed_or_oversized_input() {
-        assert!(validate_skills_json("{").contains("not valid"));
+        let malformed: serde_json::Value =
+            serde_json::from_str(&validate_skills_json("{")).unwrap();
+        assert_eq!(
+            malformed,
+            serde_json::json!({
+                "skills": [],
+                "errors": ["skill validation input is not valid"],
+                "warnings": [],
+            })
+        );
         assert!(validate_skills_json(&" ".repeat(MAX_INPUT_BYTES + 1)).contains("4 MiB"));
     }
 }

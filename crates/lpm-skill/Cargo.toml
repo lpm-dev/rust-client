@@ -8,9 +8,11 @@ repository.workspace = true
 description = "Agent Skill file rules for LPM: frontmatter, publish limits, and security patterns"
 
 [dependencies]
+hex = { workspace = true }
 regex = "1"
 serde = { workspace = true }
 serde_yaml = { workspace = true }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

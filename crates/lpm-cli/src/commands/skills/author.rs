@@ -21,6 +21,8 @@ pub(crate) struct ValidationReport {
     pub(crate) valid_files: Vec<String>,
     pub(crate) errors: Vec<String>,
     pub(crate) security_issues: Vec<LocatedSecurityIssue>,
+    /// Security warnings the skills publish with.
+    pub(crate) security_warnings: Vec<LocatedSecurityIssue>,
     pub(crate) total_size_bytes: u64,
     pub(crate) validated_files: Vec<ValidatedSkillFile>,
 }
@@ -143,6 +145,7 @@ pub(crate) fn validate_publish_directory(
             .collect(),
         errors,
         security_issues: report.security_issues,
+        security_warnings: report.security_warnings,
         total_size_bytes: report.total_size,
         validated_files,
     })

@@ -3215,6 +3215,78 @@ fn skills_validate_accepts_a_well_formed_skill() {
     );
 }
 
+fn scripted_publisher_skill(command: &str) -> String {
+    format!(
+        "---\nname: scripts\ndescription: Rebuilds the package docs from a Python helper\n---\n\nRun {command} to rebuild the docs. {}",
+        "well-formed body content. ".repeat(8),
+    )
+}
+
+#[test]
+fn skills_validate_passes_a_skill_with_a_warning_ordinary_code_matches_and_lists_it() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_publisher_skill(
+        &project,
+        "scripts",
+        &scripted_publisher_skill("subprocess.run(['make', 'docs'])"),
+    );
+
+    let envelope = json_command(&project, &["skills", "validate"]);
+
+    assert_eq!(envelope["success"], serde_json::json!(true), "{envelope}");
+    assert_eq!(envelope["valid"], serde_json::json!(1), "{envelope}");
+    assert_eq!(envelope["security_findings"], serde_json::json!([]));
+    assert_eq!(
+        envelope["security_warnings"],
+        serde_json::json!([{
+            "path": "lpm-skills/scripts.md",
+            "rule_id": "python-process-execution",
+            "category": "shell-injection",
+            "severity": "warning",
+            "line": 6,
+        }])
+    );
+
+    let output = lpm(&project)
+        .args(["skills", "validate"])
+        .output()
+        .expect("failed to run lpm skills validate");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "warning: lpm-skills/scripts.md:6: shell-injection pattern `python-process-execution`"
+        ),
+        "{stderr}"
+    );
+    assert!(stderr.contains("✓ 1 package skill valid"), "{stderr}");
+}
+
+#[test]
+fn skills_validate_still_fails_a_skill_with_other_warnings() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_publisher_skill(
+        &project,
+        "scripts",
+        &scripted_publisher_skill("child_process.exec('make docs')"),
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "skills", "validate"])
+        .output()
+        .expect("failed to run lpm skills validate");
+
+    assert_eq!(output.status.code(), Some(1));
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("validate must print JSON");
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(
+        envelope["security_findings"][0]["rule_id"],
+        serde_json::json!("child-process-execution")
+    );
+    assert_eq!(envelope["security_warnings"], serde_json::json!([]));
+}
+
 #[test]
 fn skills_validate_rejects_skill_exceeding_size_limit() {
     let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);

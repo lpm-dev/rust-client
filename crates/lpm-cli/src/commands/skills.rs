@@ -1038,19 +1038,20 @@ fn print_package_inventory(packages: &[(String, Vec<(String, u64)>)]) {
 fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
     let report = author::validate_project(project_dir)?;
     if json_output {
-        let security = report
-            .security_issues
-            .iter()
-            .map(|located| {
-                serde_json::json!({
-                    "path": located.path,
-                    "rule_id": located.issue.rule_id,
-                    "category": located.issue.category,
-                    "severity": located.issue.severity,
-                    "line": located.issue.line_number,
+        let findings = |issues: &[lpm_skill::LocatedSecurityIssue]| {
+            issues
+                .iter()
+                .map(|located| {
+                    serde_json::json!({
+                        "path": located.path,
+                        "rule_id": located.issue.rule_id,
+                        "category": located.issue.category,
+                        "severity": located.issue.severity,
+                        "line": located.issue.line_number,
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+        };
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
@@ -1059,7 +1060,8 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
                 "valid": report.valid_files.len(),
                 "files": report.valid_files,
                 "errors": report.errors,
-                "security_findings": security,
+                "security_findings": findings(&report.security_issues),
+                "security_warnings": findings(&report.security_warnings),
                 "total_size_bytes": report.total_size_bytes,
                 "quality_impact": if report.valid_files.len() >= 3 { 10 } else if !report.valid_files.is_empty() { 7 } else { 0 },
             }))
@@ -1089,6 +1091,9 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
                 located.issue.line_number,
                 located.issue.rule_id
             ));
+        }
+        for located in &report.security_warnings {
+            install_ui::warn_untrusted(&format!("warning: {}", located.message()));
         }
         if report.is_valid() {
             if report.valid_files.is_empty() {

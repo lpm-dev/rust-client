@@ -256,23 +256,34 @@ fn wait_for_file(path: &std::path::Path) -> String {
     }
 }
 
+/// The lifecycle timeout the probe runs under, in seconds: long enough for a
+/// loaded runner to start the probe's processes before it fires, since a
+/// grandchild spawned after it never exists to be terminated.
+const PROBE_TIMEOUT_SECS: u64 = 3;
+/// When a surviving leaf writes `late.txt`, after the timeout has fired.
+const LEAF_WRITE_MS: u64 = PROBE_TIMEOUT_SECS * 1_000 + 1_500;
+
 fn detached_probe(reparent: bool) {
-    let leaf = "setTimeout(()=>require('fs').writeFileSync('late.txt','survived'),1800);setTimeout(()=>process.exit(0),2800)";
+    let leaf = format!(
+        "setTimeout(()=>require('fs').writeFileSync('late.txt','survived'),{LEAF_WRITE_MS});setTimeout(()=>process.exit(0),{})",
+        LEAF_WRITE_MS + 1_000
+    );
     let spawn = format!(
         "const fs=require('fs'), c=require('child_process').spawn(process.execPath,['-e',{}],{{detached:true,stdio:'ignore'}});c.on('error',e=>fs.writeFileSync('child.pid',e.code));if(c.pid)fs.writeFileSync('child.pid',String(c.pid));c.unref();",
-        serde_json::to_string(leaf).unwrap()
+        serde_json::to_string(&leaf).unwrap()
     );
     let script = if reparent {
         format!(
-            "require('child_process').spawnSync(process.execPath,['-e',{}],{{stdio:'ignore'}});setTimeout(()=>process.exit(0),4000);",
-            serde_json::to_string(&spawn).unwrap()
+            "require('child_process').spawnSync(process.execPath,['-e',{}],{{stdio:'ignore'}});setTimeout(()=>process.exit(0),{});",
+            serde_json::to_string(&spawn).unwrap(),
+            PROBE_TIMEOUT_SECS * 1_000 * 3
         )
     } else {
         spawn
     };
     let fixture = Fixture::new(&script, serde_json::json!({}));
     let output = lpm(&fixture.project)
-        .args(["rebuild", "--timeout", "1"])
+        .args(["rebuild", "--timeout", &PROBE_TIMEOUT_SECS.to_string()])
         .output()
         .unwrap();
     let child_state = wait_for_file(&fixture.package.join("child.pid"));
@@ -288,7 +299,7 @@ fn detached_probe(reparent: bool) {
     } else {
         assert_success(&output);
     }
-    std::thread::sleep(Duration::from_millis(2000));
+    std::thread::sleep(Duration::from_millis(LEAF_WRITE_MS + 500));
     assert!(
         !fixture.package.join("late.txt").exists(),
         "descendant survived lifecycle completion (reparent={reparent})"

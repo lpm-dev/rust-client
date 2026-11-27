@@ -165,6 +165,9 @@ pub(crate) struct PreparedPublish {
     target_names: HashMap<String, String>,
     has_skills: bool,
     local_skills_digest: Option<String>,
+    /// What the skill checks found that doesn't stop the publish, reported
+    /// with the LPM.dev result.
+    skill_notices: Vec<String>,
     pkg_json: serde_json::Value,
     name: String,
     version: String,
@@ -1075,6 +1078,7 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
             std::time::Duration::from_secs,
         )
     });
+    let mut skill_notices: Vec<String> = Vec::new();
     let validated_skills = {
         let validation =
             author::validate_publish_directory(&publish_manifest.package_json_parent, project_dir)?;
@@ -1102,6 +1106,19 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
             return Err(LpmError::Registry(
                 "skills validation failed — fix errors above".into(),
             ));
+        }
+
+        if targets_lpm {
+            skill_notices = validation
+                .security_warnings
+                .iter()
+                .map(|located| format!("Skill security warning: {}", located.message()))
+                .collect();
+            if !json_output {
+                for notice in &skill_notices {
+                    install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(notice));
+                }
+            }
         }
 
         let has_authored_skills = !validation.validated_files.is_empty();
@@ -1315,6 +1332,7 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
         target_names,
         has_skills,
         local_skills_digest,
+        skill_notices,
         pkg_json,
         name,
         version,
@@ -1375,6 +1393,7 @@ async fn execute_prepared_inner(
         target_names,
         has_skills,
         local_skills_digest,
+        skill_notices,
         pkg_json,
         name,
         version,
@@ -1853,17 +1872,18 @@ async fn execute_prepared_inner(
                             }
                         }
                         results.push(PublishResult {
-                            warnings: resp
-                                .get("warnings")
-                                .and_then(serde_json::Value::as_array)
-                                .map(|warnings| {
-                                    warnings
-                                        .iter()
+                            warnings: skill_notices
+                                .iter()
+                                .cloned()
+                                .chain(
+                                    resp.get("warnings")
+                                        .and_then(serde_json::Value::as_array)
+                                        .into_iter()
+                                        .flatten()
                                         .filter_map(serde_json::Value::as_str)
-                                        .map(str::to_string)
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
+                                        .map(str::to_string),
+                                )
+                                .collect(),
                             target: "lpm".into(),
                             success: true,
                             error: None,
