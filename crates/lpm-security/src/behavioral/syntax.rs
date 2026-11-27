@@ -8,6 +8,7 @@ use oxc_parser::{ParseOptions, Parser};
 use oxc_span::{SourceType, Span};
 use regex::Regex;
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
 
 pub(super) struct SourceContext<'s> {
@@ -1079,63 +1080,137 @@ fn may_close_jsx_element(source: &[u8]) -> bool {
     })
 }
 
-/// Parses `source` as `source_type` and gives `inspect` the program and
-/// whether it parsed without a syntax error. The parse stops at a stack
-/// floor as [`parse`]'s does, and moves to a [`DEEP_PARSE_STACK`] segment
-/// when the caller's stack runs out. `None` when the source nests too deeply
-/// for that too, or fails to parse at all.
-pub(crate) fn inspect_program<T>(
-    source: &str,
-    source_type: SourceType,
-    inspect: impl FnOnce(&oxc_ast::ast::Program<'_>, bool) -> T,
-) -> Option<T> {
-    let mut inspect = Some(inspect);
-    let remaining = stacker::remaining_stack().unwrap_or(0);
-    if let Some(floor) = current_stack_floor()
-        && let Ok(result) = inspect_above(source, source_type, floor, &mut inspect)
-    {
-        return result;
-    }
-    if remaining >= DEEP_PARSE_STACK {
-        return None;
-    }
-    on_new_stack(DEEP_PARSE_STACK, || {
-        let floor = current_stack_floor()?;
-        inspect_above(source, source_type, floor, &mut inspect)
-            .ok()
-            .flatten()
-    })
-    .flatten()
+/// Parse options a caller of [`inspect_program`] chooses. The stack floor and
+/// speculation budget are always lpm-security's own.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ParseSettings {
+    /// Accept `return` outside a function, as Node.js does in a CommonJS
+    /// module.
+    pub allow_return_outside_function: bool,
+    /// Parse regular expression patterns, so an invalid one is a syntax
+    /// error.
+    pub parse_regular_expression: bool,
 }
 
-/// `Err` when the parse ran out of stack above `stack_floor`.
-fn inspect_above<T, F: FnOnce(&oxc_ast::ast::Program<'_>, bool) -> T>(
+/// The stack floor an [`inspect_program`] parse ran above, for the
+/// inspector's own recursion through the program. The parse kept the
+/// program's depth to what the parser's frames fit above the floor, but an
+/// inspector's frames per level may be larger: one that recurses checks
+/// [`reached`](Self::reached) at each node it recurses through and stops
+/// once it has.
+#[derive(Debug)]
+pub struct StackFloor {
+    address: usize,
+    reached: Cell<bool>,
+}
+
+impl StackFloor {
+    fn new(address: usize) -> Self {
+        Self {
+            address,
+            reached: Cell::new(false),
+        }
+    }
+
+    /// Whether the stack has reached the floor.
+    #[inline]
+    pub fn reached(&self) -> bool {
+        let reached = stack_address() < self.address;
+        if reached {
+            self.reached.set(true);
+        }
+        reached
+    }
+}
+
+/// Why [`inspect_program`] gave no program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unparsable {
+    /// The parser stopped at a syntax error it can't recover from.
+    SyntaxError,
+    /// The source nests too deeply for a 64 MiB stack segment, or no
+    /// segment could be mapped.
+    TooDeep,
+    /// Parsing it takes more speculative work than its length allows.
+    OverSpeculationBudget,
+}
+
+/// Parses `source` as `source_type` with lpm-security's stack floor and
+/// speculation budget, and gives `inspect` the program, whether it parsed
+/// without a syntax error, and the [`StackFloor`] for its own recursion.
+///
+/// A parse, or an inspection, that reaches the floor on the caller's stack
+/// runs again on a 64 MiB stack segment, so `inspect` may run twice.
+/// An inspection that reaches the floor there too returns what it found.
+pub fn inspect_program<T>(
     source: &str,
     source_type: SourceType,
+    settings: ParseSettings,
+    mut inspect: impl FnMut(&oxc_ast::ast::Program<'_>, bool, &StackFloor) -> T,
+) -> Result<T, Unparsable> {
+    let remaining = stacker::remaining_stack().unwrap_or(0);
+    let mut on_caller_stack = Err(Unparsable::TooDeep);
+    if let Some(floor) = current_stack_floor() {
+        match inspect_above(source, source_type, settings, floor, &mut inspect) {
+            Attempt::Finished(result) => return result,
+            Attempt::ParseReachedFloor => {}
+            Attempt::InspectionReachedFloor(partial) => on_caller_stack = Ok(partial),
+        }
+    }
+    if remaining >= DEEP_PARSE_STACK {
+        return on_caller_stack;
+    }
+    on_new_stack(DEEP_PARSE_STACK, || {
+        let floor = current_stack_floor().ok_or(Unparsable::TooDeep)?;
+        match inspect_above(source, source_type, settings, floor, &mut inspect) {
+            Attempt::Finished(result) => result,
+            Attempt::ParseReachedFloor => Err(Unparsable::TooDeep),
+            Attempt::InspectionReachedFloor(partial) => Ok(partial),
+        }
+    })
+    .unwrap_or(Err(Unparsable::TooDeep))
+}
+
+enum Attempt<T> {
+    Finished(Result<T, Unparsable>),
+    ParseReachedFloor,
+    /// What an inspection that reached the floor returned.
+    InspectionReachedFloor(T),
+}
+
+fn inspect_above<T>(
+    source: &str,
+    source_type: SourceType,
+    settings: ParseSettings,
     stack_floor: usize,
-    inspect: &mut Option<F>,
-) -> Result<Option<T>, ()> {
+    inspect: &mut impl FnMut(&oxc_ast::ast::Program<'_>, bool, &StackFloor) -> T,
+) -> Attempt<T> {
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, source_type)
         .with_options(ParseOptions {
+            allow_return_outside_function: settings.allow_return_outside_function,
+            parse_regular_expression: settings.parse_regular_expression,
             stack_floor,
             speculation_budget: parse_speculation_budget(source),
             ..ParseOptions::default()
         })
         .parse();
     if parsed.speculation_budget_exhausted {
-        return Ok(None);
+        return Attempt::Finished(Err(Unparsable::OverSpeculationBudget));
     }
     if parsed.stack_exhausted {
-        return Err(());
+        return Attempt::ParseReachedFloor;
     }
     if parsed.fatal_error {
-        return Ok(None);
+        return Attempt::Finished(Err(Unparsable::SyntaxError));
     }
-    let complete = !parsed.diagnostics.has_errors();
-    Ok(inspect
-        .take()
-        .map(|inspect| inspect(&parsed.program, complete)))
+    let floor = StackFloor::new(stack_floor);
+    let result = inspect(&parsed.program, !parsed.diagnostics.has_errors(), &floor);
+    if floor.reached.get() {
+        Attempt::InspectionReachedFloor(result)
+    } else {
+        Attempt::Finished(Ok(result))
+    }
 }
 
 impl<'s> SourceContext<'s> {
@@ -1252,6 +1327,158 @@ pub(super) fn exhausts_the_speculation_budget(filename: &str, source: &str) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TWO_MIB: usize = 2 * 1024 * 1024;
+
+    /// How deep `[[[…]]]` nests below `expression`, taking `PADDING` bytes
+    /// of stack per level. `None` once it reaches the floor.
+    fn array_depth<const PADDING: usize>(
+        expression: &Expression<'_>,
+        floor: &StackFloor,
+    ) -> Option<usize> {
+        let padding = std::hint::black_box([0u8; PADDING]);
+        if floor.reached() {
+            return None;
+        }
+        let Expression::ArrayExpression(array) = expression else {
+            return Some(usize::from(padding[0]));
+        };
+        match array
+            .elements
+            .first()
+            .and_then(|element| element.as_expression())
+        {
+            Some(inner) => array_depth::<PADDING>(inner, floor).map(|depth| depth + 1),
+            None => Some(1),
+        }
+    }
+
+    /// The depth of the array `x = [[[…]]]` holds, inspected on a thread
+    /// with `stack` bytes of stack, `PADDING` of them per level, and how
+    /// many times the program was inspected.
+    fn inspect_nested_arrays<const PADDING: usize>(
+        stack: usize,
+        depth: usize,
+    ) -> Result<(Option<usize>, u32), Unparsable> {
+        std::thread::Builder::new()
+            .stack_size(stack)
+            .spawn(move || {
+                let source = format!("x={}{};", "[".repeat(depth), "]".repeat(depth));
+                let mut inspections = 0;
+                let depth = inspect_program(
+                    &source,
+                    SourceType::cjs(),
+                    ParseSettings::default(),
+                    |program, _, floor| {
+                        inspections += 1;
+                        let Some(Statement::ExpressionStatement(statement)) = program.body.first()
+                        else {
+                            return None;
+                        };
+                        let Expression::AssignmentExpression(assignment) = &statement.expression
+                        else {
+                            return None;
+                        };
+                        array_depth::<PADDING>(&assignment.right, floor)
+                    },
+                )?;
+                Ok((depth, inspections))
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[test]
+    fn an_inspection_that_reaches_the_floor_runs_again_on_a_deep_stack_and_finishes() {
+        // The parse fits in 2 MiB; 200 levels of 16 KiB don't, but fit in
+        // 64 MiB.
+        assert_eq!(
+            inspect_nested_arrays::<{ 16 * 1024 }>(TWO_MIB, 200),
+            Ok((Some(200), 2))
+        );
+        assert_eq!(inspect_nested_arrays::<64>(TWO_MIB, 20), Ok((Some(20), 1)));
+    }
+
+    #[test]
+    fn an_inspection_that_reaches_the_floor_on_the_deep_stack_too_returns_what_it_found() {
+        // The parse fits in 8 MiB; 600 levels of 128 KiB don't fit in
+        // 64 MiB either.
+        assert_eq!(
+            inspect_nested_arrays::<{ 128 * 1024 }>(8 * 1024 * 1024, 600),
+            Ok((None, 2))
+        );
+        // A caller with more stack left than the deep stack has isn't moved.
+        assert_eq!(
+            inspect_nested_arrays::<{ 128 * 1024 }>(128 * 1024 * 1024, 1_100),
+            Ok((None, 1))
+        );
+    }
+
+    #[test]
+    fn inspect_program_reports_a_parse_too_deep_for_the_deep_stack() {
+        assert_eq!(
+            inspect_nested_arrays::<64>(TWO_MIB, 8_000_000),
+            Err(Unparsable::TooDeep)
+        );
+    }
+
+    #[test]
+    fn inspect_program_reports_a_syntax_error_it_can_t_recover_from() {
+        let inspected = inspect_program(
+            "x = (;",
+            SourceType::cjs(),
+            ParseSettings::default(),
+            |_, _, _| (),
+        );
+        assert_eq!(inspected, Err(Unparsable::SyntaxError));
+    }
+
+    #[test]
+    fn inspect_program_reports_a_parse_past_the_speculation_budget() {
+        let source = format!(
+            "x={}\"{}\"{};",
+            "<T>(a=".repeat(2_000),
+            "a".repeat(256 * 1024),
+            ")".repeat(2_000)
+        );
+        assert!(exhausts_the_speculation_budget("index.ts", &source));
+        let inspected = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                inspect_program(
+                    &source,
+                    SourceType::ts(),
+                    ParseSettings::default(),
+                    |_, _, _| (),
+                )
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(inspected, Err(Unparsable::OverSpeculationBudget));
+    }
+
+    #[test]
+    fn inspect_program_parses_with_the_settings_its_caller_chooses() {
+        let complete = |source: &str, settings| {
+            inspect_program(source, SourceType::mjs(), settings, |_, complete, _| {
+                complete
+            })
+        };
+        let returns = ParseSettings {
+            allow_return_outside_function: true,
+            ..ParseSettings::default()
+        };
+        let regular_expressions = ParseSettings {
+            parse_regular_expression: true,
+            ..ParseSettings::default()
+        };
+        assert_eq!(complete("return 1;", ParseSettings::default()), Ok(false));
+        assert_eq!(complete("return 1;", returns), Ok(true));
+        assert_eq!(complete("x = /(/;", ParseSettings::default()), Ok(true));
+        assert_eq!(complete("x = /(/;", regular_expressions), Ok(false));
+    }
 
     /// Whether parsing `source`, which is valid, with the floor
     /// [`current_stack_floor`] stopped at it. A parse that didn't must have

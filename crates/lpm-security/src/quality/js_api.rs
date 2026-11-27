@@ -2,7 +2,7 @@
 //! each exported name, whether a doc comment documents it, and the modules
 //! it re-exports from.
 
-use crate::behavioral::syntax::inspect_program;
+use crate::behavioral::{ParseSettings, inspect_program};
 use oxc_ast::ast::{
     BindingPattern, Comment, Declaration, ExportDefaultDeclarationKind, ModuleExportName, Program,
     Statement,
@@ -46,12 +46,14 @@ pub(crate) struct LocalExport {
 /// read with JSX.
 pub(crate) fn module_facts(path: &str, source: &str) -> Option<ModuleFacts> {
     let source_type = source_type_for(path)?;
+    let settings = ParseSettings::default();
     let read = |source_type| {
-        inspect_program(source, source_type, |program, complete| {
+        inspect_program(source, source_type, settings, |program, complete, _| {
             let mut facts = collect(program, source);
             facts.parsed = complete;
             facts
         })
+        .ok()
     };
     let facts = read(source_type);
     if path.ends_with(".js")
@@ -369,7 +371,8 @@ pub(crate) fn example_imports(code: &str, typescript: bool, package: &str) -> Ve
                 .strip_prefix(package)
                 .is_some_and(|rest| rest.starts_with('/'))
     };
-    inspect_program(code, source_type, |program, _| {
+    let settings = ParseSettings::default();
+    inspect_program(code, source_type, settings, |program, _, _| {
         let mut imports = Vec::new();
         for statement in &program.body {
             match statement {

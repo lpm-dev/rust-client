@@ -24,6 +24,7 @@ pub(crate) mod syntax;
 mod threats;
 
 pub use evidence::SourceEvidence;
+pub use syntax::{ParseSettings, StackFloor, Unparsable, inspect_program};
 
 use manifest::ManifestTags;
 use serde::{Deserialize, Serialize};
