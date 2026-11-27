@@ -796,18 +796,30 @@ pub fn parse_unshadowed_peer_dependencies(
     Ok((peers, meta))
 }
 
-/// Parse only the `bin` field from already-read `package.json` bytes.
+/// Parse only the `name` and `bin` fields from already-read `package.json` bytes.
 ///
 /// Parses through `serde_json::Value` so duplicate keys and non-string map
 /// entries in third-party manifests don't reject the whole scan. Callers that
 /// byte-scan for `b"\"bin\""` before calling this can skip the parse entirely
 /// for packages that declare no binary — the common case.
+pub fn parse_name_and_bin_field(
+    content: &[u8],
+) -> Result<(Option<String>, Option<BinConfig>), WorkspaceError> {
+    let parsed: serde_json::Value = serde_json::from_slice(strip_utf8_bom_bytes(content))
+        .map_err(|e| WorkspaceError::Parse(format!("parse error: {e}")))?;
+    let name = parsed
+        .get("name")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+    let bin = parsed.get("bin").and_then(bin_config_from_value);
+    Ok((name, bin))
+}
+
+/// Parse only the `bin` field from already-read `package.json` bytes.
 ///
 /// See `create_bin_links_v2` in `lpm-linker` for the canonical call site.
 pub fn parse_bin_field(content: &[u8]) -> Result<Option<BinConfig>, WorkspaceError> {
-    let parsed: serde_json::Value = serde_json::from_slice(strip_utf8_bom_bytes(content))
-        .map_err(|e| WorkspaceError::Parse(format!("parse error: {e}")))?;
-    Ok(parsed.get("bin").and_then(bin_config_from_value))
+    Ok(parse_name_and_bin_field(content)?.1)
 }
 
 #[cfg(test)]

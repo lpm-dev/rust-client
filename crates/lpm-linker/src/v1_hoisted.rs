@@ -33,33 +33,27 @@ use std::path::{Path, PathBuf};
 /// The lookup must keep package version identity all the way through
 /// the consumer chain. Picking a consumer by name alone is ambiguous
 /// when the same package name appears at multiple versions.
-fn find_hoisted_anchor(
+fn find_hoisted_anchor<'a>(
     start_idx: usize,
-    hoisted: &HashMap<String, usize>,
+    hoisted_slot_by_idx: &[Option<&'a str>],
     packages: &[LinkTarget],
     depended_by: &HashMap<(&str, &str), Vec<usize>>,
-) -> Option<String> {
+    visit_marks: &mut [u64],
+    visit_epoch: u64,
+) -> Option<&'a str> {
     let mut cur = start_idx;
-    let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    while visited.insert(cur) {
-        let pkg = &packages[cur];
-        // Alias-aware anchor lookup: check whether `cur` is hoisted
-        // under any slot. An aliased direct dep may have
-        // `root_link_names = ["a-alias"]` while `pkg.name = "lodash"`;
-        // the on-disk parent dir is the slot, not necessarily the
-        // canonical package name.
-        if let Some((slot, _)) = hoisted.iter().find(|&(_, &idx)| idx == cur) {
-            return Some(slot.clone());
+    while visit_marks[cur] != visit_epoch {
+        visit_marks[cur] = visit_epoch;
+        if let Some(slot) = hoisted_slot_by_idx[cur] {
+            return Some(slot);
         }
-        // Otherwise walk up: find a consumer of this package and recurse.
-        // Pick the first consumer (deterministic — packages are processed
-        // in resolver-determined order, so first-encountered is stable).
+        let pkg = &packages[cur];
         match depended_by.get(&(pkg.name.as_str(), pkg.version.as_str())) {
             Some(consumers) if !consumers.is_empty() => cur = consumers[0],
             _ => return None,
         }
     }
-    None // cycle detected
+    None
 }
 
 /// Create the npm v3+ style hoisted node_modules layout.
@@ -309,11 +303,31 @@ pub fn link_packages_hoisted(
     // If no hoisted ancestor exists in the chain (orphan, cycle, or
     // graph error), fall back to the conflict's own name; Stage 3's
     // `hoisted.contains_key` gate handles that via `hoisted_nested_root()`.
-    for (idx, consumer_idx) in nested_pending {
-        let parent = consumer_idx
-            .and_then(|c_idx| find_hoisted_anchor(c_idx, &hoisted, packages, &depended_by))
-            .unwrap_or_else(|| packages[idx].name.clone());
-        nested.push((idx, parent));
+    if !nested_pending.is_empty() {
+        let mut hoisted_slot_by_idx: Vec<Option<&str>> = vec![None; packages.len()];
+        for (slot, &pkg_idx) in &hoisted {
+            let entry = &mut hoisted_slot_by_idx[pkg_idx];
+            if entry.is_none_or(|existing| slot.as_str() < existing) {
+                *entry = Some(slot.as_str());
+            }
+        }
+        let mut visit_marks = vec![0u64; packages.len()];
+        for (step, (idx, consumer_idx)) in nested_pending.into_iter().enumerate() {
+            let visit_epoch = (step as u64).saturating_add(1);
+            let parent = consumer_idx
+                .and_then(|c_idx| {
+                    find_hoisted_anchor(
+                        c_idx,
+                        &hoisted_slot_by_idx,
+                        packages,
+                        &depended_by,
+                        &mut visit_marks,
+                        visit_epoch,
+                    )
+                })
+                .map_or_else(|| packages[idx].name.clone(), str::to_owned);
+            nested.push((idx, parent));
+        }
     }
 
     // Build the desired layout snapshot: name → "name@version" for both hoisted
@@ -332,20 +346,20 @@ pub fn link_packages_hoisted(
         desired_nested.insert(key, pkg.version.clone());
     }
 
-    // Stage 1.5: Incremental check — read saved metadata and compare.
+    // Stage 1.5: Incremental check — read saved metadata once and compare.
     // If the desired layout is identical to what we wrote last time, and
     // every expected directory still exists on disk, skip the expensive I/O.
     let metadata_path = layout.hoisted_metadata_path();
+    let saved_metadata = read_hoist_metadata(&metadata_path);
     let mut skipped_count = 0;
 
-    let needs_relink = force || {
-        match read_hoist_metadata(&metadata_path) {
+    let needs_relink = force
+        || match saved_metadata.as_ref() {
             Some(saved)
                 if saved.hoisted == desired_hoisted
                     && saved.nested == desired_nested
-                    && saved.self_ref == self_package_name.map(|s| s.to_string()) =>
+                    && saved.self_ref.as_deref() == self_package_name =>
             {
-                // Metadata matches. Spot-check that key directories still exist.
                 let dirs_intact = desired_hoisted
                     .keys()
                     .all(|name| node_modules.join(name).exists());
@@ -360,9 +374,8 @@ pub fn link_packages_hoisted(
                     true
                 }
             }
-            _ => true, // no metadata or mismatch → full re-link
-        }
-    };
+            _ => true,
+        };
 
     let mut linked_count = 0;
     let mut self_referenced = false;
@@ -381,7 +394,7 @@ pub fn link_packages_hoisted(
     if needs_relink {
         // Remove stale entries: anything in the old metadata that's been removed
         // or changed version needs to be cleaned up from disk so we can re-link.
-        if let Some(saved) = read_hoist_metadata(&metadata_path) {
+        if let Some(saved) = saved_metadata.as_ref() {
             for (name, old_ver) in &saved.hoisted {
                 let removed = !desired_hoisted.contains_key(name);
                 let version_changed = desired_hoisted
@@ -704,33 +717,40 @@ fn create_bin_links_hoisted(
         pkg_path.push(name.as_str()); // pkg_path = node_modules/<name>
         pkg_path.push("package.json"); // pkg_path = node_modules/<name>/package.json
 
-        if !pkg_path.exists() {
-            pkg_path.pop();
+        let content =
+            match lpm_common::read_file_capped(&pkg_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
+                Ok(content) => content,
+                Err(_) => {
+                    pkg_path.pop();
+                    for _ in 0..n {
+                        pkg_path.pop();
+                    }
+                    continue;
+                }
+            };
+        pkg_path.pop(); // pkg_path = node_modules/<name>
+
+        const BIN_KEY: &[u8] = b"\"bin\"";
+        if !content.windows(BIN_KEY.len()).any(|w| w == BIN_KEY) {
             for _ in 0..n {
                 pkg_path.pop();
             }
             continue;
         }
 
-        let pkg_json = match lpm_workspace::read_package_json(&pkg_path) {
-            Ok(p) => p,
+        let (manifest_name, bin_config) = match lpm_workspace::parse_name_and_bin_field(&content) {
+            Ok((name, Some(bin))) => (name, bin),
+            Ok((_, None)) => {
+                for _ in 0..n {
+                    pkg_path.pop();
+                }
+                continue;
+            }
             Err(e) => {
                 tracing::debug!(
                     "skipping bin links for {}: failed to parse package.json: {e}",
                     pkg.name
                 );
-                pkg_path.pop();
-                for _ in 0..n {
-                    pkg_path.pop();
-                }
-                continue;
-            }
-        };
-        pkg_path.pop(); // pkg_path = node_modules/<name>
-
-        let bin_config = match &pkg_json.bin {
-            Some(b) => b,
-            None => {
                 for _ in 0..n {
                     pkg_path.pop();
                 }
@@ -738,7 +758,7 @@ fn create_bin_links_hoisted(
             }
         };
 
-        let pkg_name = pkg_json.name.as_deref().unwrap_or(&pkg.name);
+        let pkg_name = manifest_name.as_deref().unwrap_or(&pkg.name);
         let entries = bin_config.entries(pkg_name);
 
         if entries.is_empty() {

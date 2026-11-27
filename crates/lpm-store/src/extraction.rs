@@ -198,7 +198,7 @@ impl PackageStore {
     /// holds. Threads of this process queue on a mutex first: the file lock
     /// is taken by polling, which would cost each of them a poll interval
     /// whenever two finish together.
-    fn lock_publication(&self) -> Result<PublicationLock, LpmError> {
+    pub(crate) fn lock_publication(&self) -> Result<PublicationLock, LpmError> {
         // One mutex per store root, kept for the life of the process, which
         // opens a handful of stores at most.
         static BY_ROOT: std::sync::Mutex<
@@ -668,7 +668,7 @@ impl PackageStore {
 
 /// Held while a v1 entry is cleared or moved into place, so that one
 /// publication never removes what another has just published.
-struct PublicationLock {
+pub(crate) struct PublicationLock {
     _across_processes: lpm_common::SingleFileExclusiveLockHandle,
     _in_process: std::sync::MutexGuard<'static, ()>,
 }
