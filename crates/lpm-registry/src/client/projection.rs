@@ -242,7 +242,16 @@ impl RegistryClient {
     ///
     /// The write is best-effort and runs off the calling thread. It is skipped
     /// when the pending cache-write budget is exhausted.
-    pub fn store_metadata_projection(&self, slot: ProjectionSlot, mut body: Vec<u8>) {
+    pub fn store_metadata_projection(&self, slot: ProjectionSlot, body: Vec<u8>) {
+        self.store_metadata_projection_with_hook(slot, body, || {});
+    }
+
+    pub(super) fn store_metadata_projection_with_hook(
+        &self,
+        slot: ProjectionSlot,
+        mut body: Vec<u8>,
+        before_lock: impl FnOnce() + Send + 'static,
+    ) {
         let Some(mut header) = projection_header(&slot) else {
             return;
         };
@@ -266,18 +275,34 @@ impl RegistryClient {
             );
             return;
         };
-        let mutation = self.metadata_cache_mutation(&projection_path(&slot.entry));
-        let revision = mutation
+        // Share the packument's mutation coordinator so awaited `no-store` /
+        // invalidation removals serialize against in-flight projection writes
+        // and stale projections never survive removal as orphaned files.
+        let mutation = self.metadata_cache_mutation(&slot.entry);
+        let packument_revision = mutation
             .revision
+            .load(std::sync::atomic::Ordering::Acquire);
+        let projection_revision = mutation
+            .projection_revision
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
             + 1;
         let write = move || {
             let _reservation = reservation;
+            before_lock();
             let _operation = mutation
                 .operation
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if mutation.revision.load(std::sync::atomic::Ordering::Acquire) != revision {
+            if mutation
+                .projection_revision
+                .load(std::sync::atomic::Ordering::Acquire)
+                != projection_revision
+                || mutation
+                    .revision
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != packument_revision
+                || !slot.entry.is_file()
+            {
                 return;
             }
             if let Err(error) = write_projection_file(&slot.entry, &header, &body) {
@@ -338,6 +363,61 @@ mod tests {
                 "{len}"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_projection_write_cannot_outlive_no_store_removal() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let client = RegistryClient::new().with_cache_dir(Some(cache_dir.path().to_path_buf()));
+        client.write_metadata_cache("proj-race", &serde_json::json!({"name": "proj-race"}), None);
+        client.flush_pending_cache_writes().await;
+
+        let entry_path = client.cache_path("proj-race").expect("cache path");
+        let proj_path = projection_path(&entry_path);
+        let opened = cache::open_metadata_cache_entry(&entry_path).expect("seeded packument");
+        let slot = ProjectionSlot {
+            entry: entry_path.clone(),
+            content_id: opened.header.content_id,
+            format: "test/1",
+            facts: ProjectionFacts {
+                versions_complete: true,
+                latest: None,
+            },
+        };
+        drop(opened);
+
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        client.store_metadata_projection_with_hook(slot, b"derived-body".to_vec(), move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("projection worker must start");
+
+        let _ = client
+            .write_metadata_cache_entry_async(
+                "proj-race",
+                serde_json::json!({"name": "proj-race"}),
+                None,
+                cache::MetadataCacheDirective::NoStore,
+                None,
+            )
+            .await
+            .unwrap();
+
+        release_tx.send(()).unwrap();
+        client.flush_pending_cache_writes().await;
+
+        assert!(
+            !entry_path.exists(),
+            "packument cache file must remain absent after no-store removal"
+        );
+        assert!(
+            !proj_path.exists(),
+            "paused projection write must not recreate an orphaned projection after no-store"
+        );
     }
 
     #[test]

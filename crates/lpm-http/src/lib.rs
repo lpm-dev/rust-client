@@ -818,14 +818,16 @@ pub async fn read_body_capped_into(
     cap: usize,
     body: &mut Vec<u8>,
 ) -> Result<(), ResponseBodyError> {
-    read_body_capped_with_budget(response, cap, body, (), |(), _, _| std::future::ready(()))
-        .await
-        .0
+    read_body_capped_with_budget(response, cap, body, (), |(), _, _, _| {
+        std::future::ready(())
+    })
+    .await
+    .0
 }
 
 /// Read a capped response body into `body`, threading `state` through
-/// `on_growth(state, next_len, is_declared_total)` before reserving a declared
-/// total size or appending a chunk that grows the buffer.
+/// `on_growth(state, next_len, next_capacity, is_declared_total)` before
+/// reserving a declared total size or appending a chunk that grows the buffer.
 pub async fn read_body_capped_with_budget<S, F, Fut>(
     mut response: reqwest::Response,
     cap: usize,
@@ -834,7 +836,7 @@ pub async fn read_body_capped_with_budget<S, F, Fut>(
     mut on_growth: F,
 ) -> (Result<(), ResponseBodyError>, S)
 where
-    F: FnMut(S, usize, bool) -> Fut,
+    F: FnMut(S, usize, usize, bool) -> Fut,
     Fut: std::future::Future<Output = S>,
 {
     body.clear();
@@ -850,7 +852,7 @@ where
 
     if let Some(declared_len) = declared.and_then(|length| usize::try_from(length).ok()) {
         let initial_capacity = declared_len.min(cap);
-        state = on_growth(state, initial_capacity, true).await;
+        state = on_growth(state, declared_len, initial_capacity, true).await;
         body.reserve_exact(initial_capacity);
     } else {
         body.reserve_exact((64 * 1024).min(cap));
@@ -876,7 +878,7 @@ where
         } else {
             body.capacity()
         };
-        state = on_growth(state, next_capacity, false).await;
+        state = on_growth(state, next_len, next_capacity, false).await;
         if next_capacity > body.capacity() {
             body.reserve_exact(next_capacity - body.len());
         }

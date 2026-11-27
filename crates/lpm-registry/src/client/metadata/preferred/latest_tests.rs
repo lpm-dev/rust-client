@@ -416,6 +416,7 @@ async fn latest_document_is_reused_while_disk_publication_is_pending() {
     let mutation = Arc::new(MetadataCacheMutation {
         revision: AtomicU64::new(0),
         published_revision: AtomicU64::new(0),
+        projection_revision: AtomicU64::new(0),
         operation: Mutex::new(()),
     });
     client

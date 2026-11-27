@@ -424,6 +424,7 @@ pub(super) struct MetadataCacheEntry<T> {
 pub(super) struct MetadataCacheMutation {
     pub(super) revision: std::sync::atomic::AtomicU64,
     pub(super) published_revision: std::sync::atomic::AtomicU64,
+    pub(super) projection_revision: std::sync::atomic::AtomicU64,
     pub(super) operation: std::sync::Mutex<()>,
 }
 

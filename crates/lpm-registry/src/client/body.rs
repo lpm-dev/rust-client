@@ -175,7 +175,7 @@ async fn read_metadata_body_with_budget_and_overflow(
         cap,
         body,
         None::<LargeMetadataMemoryGuard>,
-        move |mut guard, next_len, is_declared_total| {
+        move |mut guard, next_len, next_capacity, is_declared_total| {
             let limiter = Arc::clone(&limiter);
             let budget = Arc::clone(&budget);
             let overflow_limiter = Arc::clone(&overflow_limiter);
@@ -183,8 +183,9 @@ async fn read_metadata_body_with_budget_and_overflow(
                 if next_len < LARGE_METADATA_PARSE_THRESHOLD {
                     return guard;
                 }
+                let accounted_bytes = next_capacity.min(cap).max(next_len);
                 if is_multiplexed {
-                    try_reserve_multiplexed_bytes(&budget, &mut guard, next_len);
+                    try_reserve_multiplexed_bytes(&budget, &mut guard, accounted_bytes);
                     return guard;
                 }
                 if guard.is_none() {
@@ -192,9 +193,9 @@ async fn read_metadata_body_with_budget_and_overflow(
                     // quantum for unknown-length chunked streams so normal packuments
                     // keep full concurrency while avoiding mid-stream deadlocks.
                     let reserve_bytes = if is_declared_total {
-                        next_len
+                        accounted_bytes
                     } else {
-                        cap.min(CHUNKED_INITIAL_RESERVE_BYTES).max(next_len)
+                        cap.min(CHUNKED_INITIAL_RESERVE_BYTES).max(accounted_bytes)
                     };
                     guard = acquire_large_metadata_guard_units(
                         &limiter,
@@ -203,7 +204,7 @@ async fn read_metadata_body_with_budget_and_overflow(
                     )
                     .await;
                 } else if !is_declared_total {
-                    let needed = budget_units_for_bytes(next_len);
+                    let needed = budget_units_for_bytes(accounted_bytes);
                     if let Some(existing) = guard.as_mut()
                         && existing.reserved_units < needed
                     {
@@ -251,6 +252,7 @@ async fn run_blocking_metadata_parse_with_guard<T, F>(
     limiter: &Arc<tokio::sync::Semaphore>,
     budget: &Arc<tokio::sync::Semaphore>,
     buf_len: usize,
+    retained_bytes: usize,
     preacquired_guard: Option<LargeMetadataMemoryGuard>,
     parse: F,
 ) -> Result<T, tokio::task::JoinError>
@@ -259,13 +261,14 @@ where
     F: FnOnce() -> T + Send + 'static,
 {
     let guard = if buf_len >= LARGE_METADATA_PARSE_THRESHOLD {
-        let needed_units = budget_units_for_bytes(buf_len);
+        let accounted_bytes = retained_bytes.max(buf_len);
+        let needed_units = budget_units_for_bytes(accounted_bytes);
         match preacquired_guard {
             Some(mut existing)
                 if existing.concurrency_permit.is_some()
                     && existing.reserved_units >= needed_units =>
             {
-                existing.shrink_to(buf_len);
+                existing.shrink_to(accounted_bytes);
                 Some(existing)
             }
             partial => {
@@ -301,6 +304,7 @@ where
     run_blocking_metadata_parse_with_guard(
         limiter,
         metadata_body_memory_budget(),
+        buf_len,
         buf_len,
         None,
         parse,
@@ -361,11 +365,13 @@ pub(super) async fn parse_capped_metadata<T: serde::de::DeserializeOwned + Send 
     }
 
     let buf_len = buf.len();
+    let retained_bytes = buf.capacity().min(MAX_METADATA_BYTES).max(buf_len);
     let context_owned = context.to_string();
     run_blocking_metadata_parse_with_guard(
         large_metadata_parse_limiter(),
         metadata_body_memory_budget(),
         buf_len,
+        retained_bytes,
         guard,
         move || {
             let parsed = parse_metadata_buffer(&buf, &context_owned);
@@ -502,6 +508,7 @@ where
     }
 
     let buf_len = buf.len();
+    let retained_bytes = buf.capacity().min(cap).max(buf_len);
     let context_owned = context.to_string();
     let span =
         tracing::trace_span!(target: "lpm_install_timeline", "metadata_parse", blocking = true);
@@ -511,6 +518,7 @@ where
         large_metadata_parse_limiter(),
         metadata_body_memory_budget(),
         buf_len,
+        retained_bytes,
         guard,
         move || {
             let _entered = worker_span.enter();
@@ -1468,6 +1476,116 @@ mod tests {
         assert_eq!(budget.available_permits(), METADATA_MEMORY_BUDGET_UNITS);
         assert_eq!(limiter.available_permits(), 4);
         assert_eq!(overflow.available_permits(), 1);
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn blocking_metadata_parse_retains_backing_capacity_budget_until_parse_completes() {
+        let limiter = Arc::new(tokio::sync::Semaphore::new(4));
+        let budget = Arc::new(tokio::sync::Semaphore::new(METADATA_MEMORY_BUDGET_UNITS));
+        let buf_len = 33 * 1024 * 1024;
+        let capacity = 64 * 1024 * 1024;
+        let preacquired = acquire_large_metadata_guard_units(
+            &limiter,
+            &budget,
+            budget_units_for_bytes(capacity),
+        )
+        .await
+        .expect("capacity-sized guard");
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let parse_task = tokio::spawn({
+            let limiter = Arc::clone(&limiter);
+            let budget = Arc::clone(&budget);
+            async move {
+                run_blocking_metadata_parse_with_guard(
+                    &limiter,
+                    &budget,
+                    buf_len,
+                    capacity,
+                    Some(preacquired),
+                    move || {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.recv();
+                        42usize
+                    },
+                )
+                .await
+            }
+        });
+
+        entered_rx.await.unwrap();
+        let expected_remaining =
+            METADATA_MEMORY_BUDGET_UNITS - budget_units_for_bytes(capacity) as usize;
+        assert_eq!(
+            budget.available_permits(),
+            expected_remaining,
+            "byte budget must remain reserved for full backing capacity while parsing runs"
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(parse_task.await.unwrap().unwrap(), 42);
+        assert_eq!(budget.available_permits(), METADATA_MEMORY_BUDGET_UNITS);
+        assert_eq!(limiter.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn chunked_http1_body_below_large_threshold_does_not_acquire_large_guard() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 300 KiB body doubles backing Vec capacity to 512 KiB, but actual length stays
+        // below LARGE_METADATA_PARSE_THRESHOLD (512 KiB) so it must not consume large-body permits.
+        let body_len = 300 * 1024;
+        let chunk = vec![b'a'; 60 * 1024];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let _ = socket.read(&mut req).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let header = format!("{:x}\r\n", chunk.len());
+            for _ in 0..(body_len / chunk.len()) {
+                socket.write_all(header.as_bytes()).await.unwrap();
+                socket.write_all(&chunk).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+            }
+            socket.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+
+        let client = reqwest::Client::builder().http1_only().build().unwrap();
+        let limiter = Arc::new(tokio::sync::Semaphore::new(2));
+        let budget = Arc::new(tokio::sync::Semaphore::new(METADATA_MEMORY_BUDGET_UNITS));
+        let overflow = Arc::new(tokio::sync::Semaphore::new(1));
+        let response = client
+            .get(format!("http://{addr}/mid-chunked"))
+            .send()
+            .await
+            .unwrap();
+        let mut body = Vec::new();
+        let (read, guard) = read_metadata_body_with_budget_and_overflow(
+            response,
+            MAX_METADATA_BYTES,
+            &mut body,
+            &limiter,
+            &budget,
+            &overflow,
+        )
+        .await;
+        read.unwrap();
+        assert_eq!(body.len(), body_len);
+        assert!(
+            guard.is_none(),
+            "300 KiB chunked body must not trigger the 512 KiB large-body limiter"
+        );
+        assert_eq!(limiter.available_permits(), 2);
+        assert_eq!(budget.available_permits(), METADATA_MEMORY_BUDGET_UNITS);
         let _ = server_task.await;
     }
 }

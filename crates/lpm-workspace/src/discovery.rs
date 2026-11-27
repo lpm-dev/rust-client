@@ -2022,17 +2022,10 @@ fn inclusion_is_traversal_eligible(
 }
 
 fn is_missing_or_not_dir_error(error: &std::io::Error) -> bool {
-    if matches!(
+    matches!(
         error.kind(),
         std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-    ) {
-        return true;
-    }
-    #[cfg(unix)]
-    if error.raw_os_error() == Some(20) {
-        return true;
-    }
-    false
+    )
 }
 
 fn push_manifest_if_present(

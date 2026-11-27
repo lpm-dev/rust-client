@@ -874,6 +874,7 @@ impl RegistryClient {
             Arc::new(MetadataCacheMutation {
                 revision: std::sync::atomic::AtomicU64::new(0),
                 published_revision: std::sync::atomic::AtomicU64::new(0),
+                projection_revision: std::sync::atomic::AtomicU64::new(0),
                 operation: std::sync::Mutex::new(()),
             })
         })
@@ -2279,6 +2280,7 @@ fn remove_metadata_cache_files_locked(
     if mutation.published_revision.load(Ordering::Acquire) > revision {
         return;
     }
+    mutation.projection_revision.fetch_add(1, Ordering::AcqRel);
     for path in [path.to_path_buf(), projection_path(path)] {
         match std::fs::remove_file(&path) {
             Ok(()) => {}
