@@ -243,11 +243,14 @@ pub(crate) async fn run_recursive_workspace_install(
                 &workspace.root,
                 &legacy_importers,
             )?);
+        let has_any_lockfile = workspace.root.join(lpm_lockfile::LOCKFILE_NAME).is_file()
+            || legacy_importers
+                .iter()
+                .any(|(_, path)| path.join(lpm_lockfile::LOCKFILE_NAME).is_file());
         let workspace_frozen = options.frozen_lockfile == super::FrozenLockfileMode::Always
             || (options.frozen_lockfile == super::FrozenLockfileMode::Auto
                 && super::install_running_in_ci()
-                && (workspace.root.join(lpm_lockfile::LOCKFILE_NAME).is_file()
-                    || !legacy_importers.is_empty()));
+                && has_any_lockfile);
         if workspace_frozen {
             workspace_lockfile_coordinator.mark_frozen();
             if filters.is_empty() && filter_prod.is_empty() {
@@ -606,8 +609,14 @@ pub(crate) async fn run_recursive_workspace_install(
             if first_error.is_none()
                 && let Some((index, path, lifecycle)) = deferred_root_after_install
             {
-                if options.frozen_lockfile == super::FrozenLockfileMode::Always
-                    && let Err(error) = workspace_lockfile_coordinator.validate_frozen_preflight()
+                let required_importers = outcomes
+                    .iter()
+                    .flatten()
+                    .map(|outcome| outcome.importer.clone())
+                    .collect::<Vec<_>>();
+                if workspace_frozen
+                    && let Err(error) =
+                        workspace_lockfile_coordinator.validate_frozen_commit(&required_importers)
                 {
                     first_error = Some(error);
                 } else {

@@ -346,12 +346,73 @@ enum RuntimeBinaryMatch {
     DynamicLibnode(ResolvedLibnode),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ElfArch {
+    elf_class: u8,
+    e_machine: u16,
+}
+
+impl ElfArch {
+    #[cfg(any(target_os = "linux", test))]
+    fn glibc_ld_so_cache_flags(self) -> Option<(u32, bool)> {
+        const ELFCLASS32: u8 = 1;
+        const ELFCLASS64: u8 = 2;
+        const EM_386: u16 = 3;
+        const EM_PPC64: u16 = 21;
+        const EM_S390: u16 = 22;
+        const EM_X86_64: u16 = 62;
+        const EM_AARCH64: u16 = 183;
+
+        match (self.elf_class, self.e_machine) {
+            (ELFCLASS64, EM_X86_64) => Some((0x0300, false)),
+            (ELFCLASS64, EM_AARCH64) => Some((0x0a00, false)),
+            (ELFCLASS32, EM_386) => Some((0x0000, true)),
+            (ELFCLASS64, EM_PPC64) => Some((0x0500, false)),
+            (ELFCLASS64, EM_S390) => Some((0x0400, false)),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn host() -> Option<Self> {
+        if cfg!(target_arch = "x86_64") {
+            Some(Self {
+                elf_class: 2,
+                e_machine: 62,
+            })
+        } else if cfg!(target_arch = "aarch64") {
+            Some(Self {
+                elf_class: 2,
+                e_machine: 183,
+            })
+        } else if cfg!(target_arch = "x86") {
+            Some(Self {
+                elf_class: 1,
+                e_machine: 3,
+            })
+        } else if cfg!(target_arch = "powerpc64") {
+            Some(Self {
+                elf_class: 2,
+                e_machine: 21,
+            })
+        } else if cfg!(target_arch = "s390x") {
+            Some(Self {
+                elf_class: 2,
+                e_machine: 22,
+            })
+        } else {
+            None
+        }
+    }
+}
+
 enum DynamicLibnodeSpec {
     Elf {
         soname: String,
         rpath: Option<String>,
         runpath: Option<String>,
         interp: Option<String>,
+        arch: ElfArch,
     },
     MachO {
         install_name: String,
@@ -615,6 +676,10 @@ fn elf_libnode_dependency(file: &mut std::fs::File, file_len: u64) -> Option<Dyn
     };
     let ehdr_len = if is_64 { 64 } else { 52 };
     let ehdr = read_exact_at(file, 0, ehdr_len)?;
+    let arch = ElfArch {
+        elf_class: ident[4],
+        e_machine: read_u16_endian(&ehdr, 18, little_endian)?,
+    };
     let (phoff, phentsize, phnum) = if is_64 {
         (
             read_u64_endian(&ehdr, 32, little_endian)?,
@@ -760,6 +825,7 @@ fn elf_libnode_dependency(file: &mut std::fs::File, file_len: u64) -> Option<Dyn
         rpath,
         runpath,
         interp,
+        arch,
     })
 }
 
@@ -955,9 +1021,10 @@ fn resolve_dynamic_libnode(
             rpath,
             runpath,
             interp,
+            arch,
         } => {
             #[cfg(not(target_os = "linux"))]
-            let _ = &interp;
+            let _ = (&interp, arch);
             if soname.contains('/') {
                 let direct = Path::new(&soname);
                 if !direct.is_absolute() {
@@ -994,7 +1061,7 @@ fn resolve_dynamic_libnode(
             #[cfg(target_os = "linux")]
             {
                 if let Some(resolved) =
-                    resolve_linux_system_libnode(&soname, interp.as_deref())
+                    resolve_linux_system_libnode(&soname, interp.as_deref(), arch)
                 {
                     return Some(resolved);
                 }
@@ -1078,29 +1145,44 @@ fn dir_has_glibc_hwcap_variant(dir: &Path, soname: &str) -> bool {
     false
 }
 
+/// Derive the musl loader's `ld-musl-<arch>.path` configuration file from its
+/// ELF `PT_INTERP` path (preserving custom sysroot prefixes).
 #[cfg(any(target_os = "linux", test))]
-fn host_ld_so_cache_arch_flag() -> Option<u32> {
-    if cfg!(target_arch = "x86_64") {
-        Some(0x0300)
-    } else if cfg!(target_arch = "aarch64") {
-        Some(0x0a00)
-    } else if cfg!(target_arch = "x86") {
-        Some(0x0000)
-    } else if cfg!(target_arch = "powerpc64") {
-        Some(0x0500)
-    } else if cfg!(target_arch = "s390x") {
-        Some(0x0400)
-    } else {
-        None
+fn musl_path_file_for_interp(interp: &str) -> Option<PathBuf> {
+    let interp_path = Path::new(interp);
+    if !interp_path.is_absolute() {
+        return None;
     }
+    let basename = interp_path.file_name()?.to_str()?;
+    let arch = basename.strip_prefix("ld-musl-")?.strip_suffix(".so.1")?;
+    if arch.is_empty()
+        || !arch
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return None;
+    }
+    let lib_dir = interp_path.parent()?;
+    let prefix = if lib_dir == Path::new("/lib") || lib_dir == Path::new("/usr/lib") {
+        Path::new("/")
+    } else if lib_dir.file_name().and_then(|name| name.to_str()) == Some("lib") {
+        lib_dir.parent()?
+    } else {
+        return None;
+    };
+    Some(prefix.join("etc").join(format!("ld-musl-{arch}.path")))
 }
 
 /// Parse glibc's `glibc-ld.so.cache1.1` binary table (pure new format or
 /// compat old+new format) and return the unique non-hwcap library path matching
-/// `soname` for the host ELF class/architecture. Returns `None` (fail closed)
-/// on any ambiguity, hwcap variant, or unrecognized table format.
+/// `soname` for the target binary's ELF class/architecture. Returns `None`
+/// (fail closed) on any ambiguity, hwcap variant, or unrecognized table format.
 #[cfg(any(target_os = "linux", test))]
-fn lookup_soname_in_glibc_ld_so_cache(bytes: &[u8], soname: &str) -> Option<PathBuf> {
+fn lookup_soname_in_glibc_ld_so_cache(
+    bytes: &[u8],
+    soname: &str,
+    arch: ElfArch,
+) -> Option<PathBuf> {
     const NEW_MAGIC: &[u8] = b"glibc-ld.so.cache1.1";
     const OLD_MAGIC: &[u8] = b"ld.so-1.7.0";
     const NEW_HEADER_LEN: usize = 48;
@@ -1113,14 +1195,11 @@ fn lookup_soname_in_glibc_ld_so_cache(bytes: &[u8], soname: &str) -> Option<Path
     const FLAG_ELF_LIBC6: u32 = 0x0003;
     const FLAG_ARCH_MASK: u32 = 0xff00;
 
-    let expected_arch_flag = host_ld_so_cache_arch_flag()?;
+    let (expected_arch_flag, allow_plain_elf_type) = arch.glibc_ld_so_cache_flags()?;
     let new_header_offset = if bytes.starts_with(NEW_MAGIC) {
         0usize
     } else if bytes.starts_with(OLD_MAGIC) && bytes.len() >= OLD_HEADER_LEN {
-        let old_nlibs = usize::try_from(u32::from_ne_bytes(
-            bytes[12..16].try_into().ok()?,
-        ))
-        .ok()?;
+        let old_nlibs = usize::try_from(u32::from_ne_bytes(bytes[12..16].try_into().ok()?)).ok()?;
         if old_nlibs > MAX_LIBS {
             return None;
         }
@@ -1141,10 +1220,7 @@ fn lookup_soname_in_glibc_ld_so_cache(bytes: &[u8], soname: &str) -> Option<Path
     if section.len() < NEW_HEADER_LEN {
         return None;
     }
-    let nlibs = usize::try_from(u32::from_ne_bytes(
-        section[20..24].try_into().ok()?,
-    ))
-    .ok()?;
+    let nlibs = usize::try_from(u32::from_ne_bytes(section[20..24].try_into().ok()?)).ok()?;
     if nlibs > MAX_LIBS {
         return None;
     }
@@ -1170,7 +1246,7 @@ fn lookup_soname_in_glibc_ld_so_cache(bytes: &[u8], soname: &str) -> Option<Path
         let val_off = u32::from_ne_bytes(entry[8..12].try_into().ok()?);
         let hwcap = u64::from_ne_bytes(entry[16..24].try_into().ok()?);
         let entry_type = flags & FLAG_TYPE_MASK;
-        let type_matches = if cfg!(target_arch = "x86") {
+        let type_matches = if allow_plain_elf_type {
             matches!(entry_type, FLAG_ELF | FLAG_ELF_LIBC6)
         } else {
             entry_type == FLAG_ELF_LIBC6
@@ -1197,15 +1273,17 @@ fn lookup_soname_in_glibc_ld_so_cache(bytes: &[u8], soname: &str) -> Option<Path
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_linux_system_libnode(soname: &str, interp: Option<&str>) -> Option<ResolvedLibnode> {
-    let musl_arch = if cfg!(target_arch = "x86_64") {
-        Some("x86_64")
-    } else if cfg!(target_arch = "aarch64") {
-        Some("aarch64")
+fn resolve_linux_system_libnode(
+    soname: &str,
+    interp: Option<&str>,
+    arch: ElfArch,
+) -> Option<ResolvedLibnode> {
+    let loader = classify_linux_elf_loader(interp);
+    let musl_path_file = if loader == LinuxElfLoader::Musl {
+        Some(musl_path_file_for_interp(interp?)?)
     } else {
         None
     };
-    let musl_path_file = musl_arch.map(|arch| PathBuf::from(format!("/etc/ld-musl-{arch}.path")));
     let default_musl_dirs = [
         PathBuf::from("/lib"),
         PathBuf::from("/usr/local/lib"),
@@ -1213,7 +1291,8 @@ fn resolve_linux_system_libnode(soname: &str, interp: Option<&str>) -> Option<Re
     ];
     resolve_linux_system_libnode_with(
         soname,
-        classify_linux_elf_loader(interp),
+        loader,
+        arch,
         Path::new("/etc/ld.so.cache"),
         musl_path_file.as_deref(),
         &default_musl_dirs,
@@ -1224,6 +1303,7 @@ fn resolve_linux_system_libnode(soname: &str, interp: Option<&str>) -> Option<Re
 fn resolve_linux_system_libnode_with(
     soname: &str,
     loader: LinuxElfLoader,
+    arch: ElfArch,
     ld_so_cache_path: &Path,
     musl_path_file: Option<&Path>,
     default_musl_dirs: &[PathBuf],
@@ -1233,7 +1313,7 @@ fn resolve_linux_system_libnode_with(
         LinuxElfLoader::Glibc => {
             let cache_bytes =
                 lpm_common::read_file_capped(ld_so_cache_path, MAX_LD_SO_CACHE_BYTES).ok()?;
-            let resolved = lookup_soname_in_glibc_ld_so_cache(&cache_bytes, soname)?;
+            let resolved = lookup_soname_in_glibc_ld_so_cache(&cache_bytes, soname, arch)?;
             if resolved
                 .parent()
                 .is_some_and(|parent| dir_has_glibc_hwcap_variant(parent, soname))
@@ -1248,16 +1328,20 @@ fn resolve_linux_system_libnode_with(
             })
         }
         LinuxElfLoader::Musl => {
-            let search_dirs: Vec<PathBuf> = if let Some(path_file) = musl_path_file
-                && let Ok(raw) = lpm_common::read_text_file_capped(path_file, 64 * 1024)
-            {
-                raw.split([':', '\n'])
-                    .map(str::trim)
-                    .filter(|dir| !dir.is_empty())
-                    .map(PathBuf::from)
-                    .collect()
-            } else {
-                default_musl_dirs.to_vec()
+            let search_dirs: Vec<PathBuf> = match musl_path_file {
+                Some(path_file) => match lpm_common::read_text_file_capped(path_file, 64 * 1024) {
+                    Ok(raw) => raw
+                        .split([':', '\n'])
+                        .map(str::trim)
+                        .filter(|dir| !dir.is_empty())
+                        .map(PathBuf::from)
+                        .collect(),
+                    Err(lpm_common::BoundedReadError::NotFound { .. }) => {
+                        default_musl_dirs.to_vec()
+                    }
+                    Err(_) => return None,
+                },
+                None => default_musl_dirs.to_vec(),
             };
             let mut found: Option<PathBuf> = None;
             for dir in search_dirs {
@@ -2685,11 +2769,7 @@ mod tests {
             // Same-length library replacement with preserved mtime must still change fingerprint (ctime).
             let orig_mtime = fs::metadata(&libnode).unwrap().modified().unwrap();
             fs::write(&libnode, b"v20.19.0").unwrap();
-            fs::set_times(
-                &libnode,
-                fs::FileTimes::new().set_modified(orig_mtime),
-            )
-            .unwrap();
+            fs::set_times(&libnode, fs::FileTimes::new().set_modified(orig_mtime)).unwrap();
             let second = identity(&dyn_node, prefix.path(), OsStr::new(""), &home);
             assert_ne!(
                 first.fingerprint, second.fingerprint,
@@ -2697,21 +2777,30 @@ mod tests {
             );
         }
 
-        // Presence of `glibc-hwcaps` inside the RUNPATH dir must fail closed.
+        // An unrelated `glibc-hwcaps` directory does not block resolution, while
+        // a matching `glibc-hwcaps/<variant>/<soname>` entry must fail closed.
         let hwcaps_dir = custom_dir.join("glibc-hwcaps");
-        fs::create_dir(&hwcaps_dir).unwrap();
+        let hwcaps_variant = hwcaps_dir.join("x86-64-v3");
+        fs::create_dir_all(&hwcaps_variant).unwrap();
+        assert!(
+            identity(&dyn_node, prefix.path(), OsStr::new(""), &home).node_binary,
+            "unrelated glibc-hwcaps directory without matching soname should still resolve"
+        );
+        fs::write(hwcaps_variant.join(TEST_SONAME), b"hwcap-variant").unwrap();
         assert!(
             !identity(&dyn_node, prefix.path(), OsStr::new(""), &home).node_binary,
-            "RUNPATH directory containing glibc-hwcaps must fail closed"
+            "RUNPATH directory containing a glibc-hwcaps variant for libnode must fail closed"
         );
-        fs::remove_dir(&hwcaps_dir).unwrap();
+        fs::remove_dir_all(&hwcaps_dir).unwrap();
 
         // Distinct LD_LIBRARY_PATH values must fail closed AND yield distinct fingerprints.
         let mut env_a = environment(prefix.path());
-        env_a.loader_overrides = vec![(OsString::from("LD_LIBRARY_PATH"), OsString::from("/opt/a"))];
+        env_a.loader_overrides =
+            vec![(OsString::from("LD_LIBRARY_PATH"), OsString::from("/opt/a"))];
         env_a.has_loader_override = true;
         let mut env_b = environment(prefix.path());
-        env_b.loader_overrides = vec![(OsString::from("LD_LIBRARY_PATH"), OsString::from("/opt/b"))];
+        env_b.loader_overrides =
+            vec![(OsString::from("LD_LIBRARY_PATH"), OsString::from("/opt/b"))];
         env_b.has_loader_override = true;
         let id_a = identity(&dyn_node, prefix.path(), OsStr::new(""), &env_a);
         let id_b = identity(&dyn_node, prefix.path(), OsStr::new(""), &env_b);
@@ -2813,8 +2902,7 @@ mod tests {
                 }),
                 "{var} must trigger dynamic libnode fail-closed guard"
             );
-            let script_env =
-                SelectorEnvironment::with_script_variables([(var, "/tmp/evil.so")]);
+            let script_env = SelectorEnvironment::with_script_variables([(var, "/tmp/evil.so")]);
             assert!(
                 script_env.has_loader_override(),
                 "script-level {var} must mark SelectorEnvironment as loader-overridden"
@@ -2880,20 +2968,17 @@ mod tests {
         fs::remove_file(&libnode).unwrap();
         let mut h3 = Sha256::new();
         assert!(
-            !hash_dynamic_libnode_for_binary(
-                &mut h3,
-                &canonical,
-                &meta,
-                RuntimeKind::Node,
-                false
-            ),
+            !hash_dynamic_libnode_for_binary(&mut h3, &canonical, &meta, RuntimeKind::Node, false),
             "missing libnode must fail closed in task binary fingerprint helper"
         );
     }
 
     #[test]
     fn glibc_ld_so_cache_parser_resolves_unique_entry_and_fails_closed_on_hwcaps_or_ambiguity() {
-        let Some(arch_flag) = host_ld_so_cache_arch_flag() else {
+        let Some(host_arch) = ElfArch::host() else {
+            return;
+        };
+        let Some((arch_flag, _)) = host_arch.glibc_ld_so_cache_flags() else {
             return;
         };
         let build_new_cache = |entries: &[(&str, &str, u32, u64)]| -> Vec<u8> {
@@ -2936,24 +3021,45 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            lookup_soname_in_glibc_ld_so_cache(&unique, "libnode.so.109"),
+            lookup_soname_in_glibc_ld_so_cache(&unique, "libnode.so.109", host_arch),
             Some(PathBuf::from("/usr/local/lib/libnode.so.109"))
         );
 
-        // On 64-bit targets, legacy FLAG_ELF (0x01) entries without FLAG_ELF_LIBC6 (0x03)
-        // must be ignored, matching glibc's loader flag filter.
-        if !cfg!(target_arch = "x86") {
-            let legacy_only = build_new_cache(&[(
+        // Target ELF arch drives the filter (not compile-time host arch):
+        // x86_64 ignores legacy FLAG_ELF (0x01) and i386 matches FLAG_ELF | 0x0000.
+        let x86_64_arch = ElfArch {
+            elf_class: 2,
+            e_machine: 62,
+        };
+        let i386_arch = ElfArch {
+            elf_class: 1,
+            e_machine: 3,
+        };
+        let unknown_arch = ElfArch {
+            elf_class: 2,
+            e_machine: 243,
+        };
+        let multiarch_cache = build_new_cache(&[
+            ("libnode.so.109", "/usr/lib32/libnode.so.109", 0x0001, 0),
+            (
                 "libnode.so.109",
-                "/usr/lib/libnode.so.109",
-                0x0001 | arch_flag,
+                "/usr/lib64/libnode.so.109",
+                0x0003 | 0x0300,
                 0,
-            )]);
-            assert_eq!(
-                lookup_soname_in_glibc_ld_so_cache(&legacy_only, "libnode.so.109"),
-                None
-            );
-        }
+            ),
+        ]);
+        assert_eq!(
+            lookup_soname_in_glibc_ld_so_cache(&multiarch_cache, "libnode.so.109", x86_64_arch),
+            Some(PathBuf::from("/usr/lib64/libnode.so.109"))
+        );
+        assert_eq!(
+            lookup_soname_in_glibc_ld_so_cache(&multiarch_cache, "libnode.so.109", i386_arch),
+            Some(PathBuf::from("/usr/lib32/libnode.so.109"))
+        );
+        assert_eq!(
+            lookup_soname_in_glibc_ld_so_cache(&multiarch_cache, "libnode.so.109", unknown_arch),
+            None
+        );
 
         // Compat old+new wrapper (ld.so-1.7.0 prefix before glibc-ld.so.cache1.1).
         let mut compat = Vec::new();
@@ -2962,7 +3068,7 @@ mod tests {
         compat.extend_from_slice(&[0u8; 16]);
         compat.extend_from_slice(&unique);
         assert_eq!(
-            lookup_soname_in_glibc_ld_so_cache(&compat, "libnode.so.109"),
+            lookup_soname_in_glibc_ld_so_cache(&compat, "libnode.so.109", host_arch),
             Some(PathBuf::from("/usr/local/lib/libnode.so.109"))
         );
 
@@ -2974,7 +3080,7 @@ mod tests {
             1 << 62,
         )]);
         assert_eq!(
-            lookup_soname_in_glibc_ld_so_cache(&hwcaps, "libnode.so.109"),
+            lookup_soname_in_glibc_ld_so_cache(&hwcaps, "libnode.so.109", host_arch),
             None
         );
 
@@ -2989,7 +3095,7 @@ mod tests {
             ("libnode.so.109", "/usr/lib/libnode.so.109", host_flags, 0),
         ]);
         assert_eq!(
-            lookup_soname_in_glibc_ld_so_cache(&ambiguous, "libnode.so.109"),
+            lookup_soname_in_glibc_ld_so_cache(&ambiguous, "libnode.so.109", host_arch),
             None
         );
     }
@@ -3002,6 +3108,10 @@ mod tests {
         let musl_libnode = musl_dir.join("libnode.so.109");
         fs::write(&musl_libnode, b"musl libnode").unwrap();
         let missing_cache = dir.path().join("missing-ld.so.cache");
+        let arch = ElfArch {
+            elf_class: 2,
+            e_machine: 62,
+        };
 
         assert_eq!(
             classify_linux_elf_loader(Some("/lib64/ld-linux-x86-64.so.2")),
@@ -3017,12 +3127,26 @@ mod tests {
         );
         assert_eq!(classify_linux_elf_loader(None), LinuxElfLoader::Unknown);
 
+        assert_eq!(
+            musl_path_file_for_interp("/lib/ld-musl-x86_64.so.1"),
+            Some(PathBuf::from("/etc/ld-musl-x86_64.path"))
+        );
+        assert_eq!(
+            musl_path_file_for_interp("/opt/sysroot/lib/ld-musl-aarch64.so.1"),
+            Some(PathBuf::from("/opt/sysroot/etc/ld-musl-aarch64.path"))
+        );
+        assert_eq!(
+            musl_path_file_for_interp("/custom/ld-musl-x86_64.so.1"),
+            None
+        );
+
         // Glibc executable with an unavailable ld.so.cache must fail closed and never
         // resolve a library from musl search directories.
         assert!(
             resolve_linux_system_libnode_with(
                 "libnode.so.109",
                 LinuxElfLoader::Glibc,
+                arch,
                 &missing_cache,
                 None,
                 std::slice::from_ref(&musl_dir),
@@ -3035,6 +3159,7 @@ mod tests {
             resolve_linux_system_libnode_with(
                 "libnode.so.109",
                 LinuxElfLoader::Unknown,
+                arch,
                 &missing_cache,
                 None,
                 std::slice::from_ref(&musl_dir),
@@ -3042,29 +3167,63 @@ mod tests {
             .is_none()
         );
 
-        // Musl executable resolves unambiguously from musl search dirs.
+        // Musl executable resolves unambiguously from musl search dirs when path file is missing.
+        let missing_musl_path = dir.path().join("missing-ld-musl.path");
         let resolved = resolve_linux_system_libnode_with(
             "libnode.so.109",
             LinuxElfLoader::Musl,
+            arch,
             &missing_cache,
-            None,
+            Some(&missing_musl_path),
             std::slice::from_ref(&musl_dir),
         )
         .expect("musl interpreter must resolve libnode from musl search dirs");
-        assert_eq!(resolved.canonical_path, musl_libnode.canonicalize().unwrap());
+        assert_eq!(
+            resolved.canonical_path,
+            musl_libnode.canonicalize().unwrap()
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn host_glibc_ld_so_cache_resolves_libc_when_present() {
+        let Some(host_arch) = ElfArch::host() else {
+            return;
+        };
         let cache_path = Path::new("/etc/ld.so.cache");
         let Ok(bytes) = lpm_common::read_file_capped(cache_path, 16 * 1024 * 1024) else {
             return;
         };
-        let resolved = lookup_soname_in_glibc_ld_so_cache(&bytes, "libc.so.6");
+        let resolved = lookup_soname_in_glibc_ld_so_cache(&bytes, "libc.so.6", host_arch);
         assert!(
             resolved.is_some(),
             "host /etc/ld.so.cache must resolve libc.so.6 using real glibc LIBC6 flags"
+        );
+    }
+
+    #[test]
+    fn musl_loader_fails_closed_when_path_file_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_lib = dir.path().join("default-lib");
+        std::fs::create_dir_all(&default_lib).unwrap();
+        std::fs::write(default_lib.join("libnode.so.109"), b"default").unwrap();
+        let unreadable_path_file = dir.path().join("ld-musl.path");
+        std::fs::create_dir_all(&unreadable_path_file).unwrap();
+
+        let resolved = resolve_linux_system_libnode_with(
+            "libnode.so.109",
+            LinuxElfLoader::Musl,
+            ElfArch {
+                elf_class: 2,
+                e_machine: 62,
+            },
+            &dir.path().join("unused.cache"),
+            Some(&unreadable_path_file),
+            &[default_lib],
+        );
+        assert!(
+            resolved.is_none(),
+            "musl loader must fail closed instead of falling back to defaults when path file read fails"
         );
     }
 }

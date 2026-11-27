@@ -294,11 +294,11 @@ impl PathNodeVersionCache {
             .get_or_init(managed_node_root)
             .as_deref();
 
-        for _attempt in 0..2 {
+        for _attempt in 0..3 {
             let executable_before = node_executable_in_path(cwd, path);
-            let identity_before = executable_before
-                .as_deref()
-                .and_then(|executable| path_node_identity(executable, cwd, path, managed_node_root));
+            let identity_before = executable_before.as_deref().and_then(|executable| {
+                path_node_identity(executable, cwd, path, managed_node_root)
+            });
             let Some(identity) = identity_before else {
                 let version = node_version_on_path(cwd, path, executable_before.as_deref());
                 return PathNodeResolution {
@@ -316,7 +316,6 @@ impl PathNodeVersionCache {
                 Arc::clone(map.entry(identity.clone()).or_default())
             };
 
-            let mut local_unstable_resolution: Option<PathNodeResolution> = None;
             let cached = slot.get_or_init(|| {
                 if let Some(observed) = observed
                     && identity.script.node_binary
@@ -340,14 +339,16 @@ impl PathNodeVersionCache {
                 }
 
                 let version = node_version_on_path(cwd, path, executable_before.as_deref());
-                let identity_after = node_executable_in_path(cwd, path).as_deref().and_then(
-                    |executable| path_node_identity(executable, cwd, path, managed_node_root),
-                );
+                let identity_after =
+                    node_executable_in_path(cwd, path)
+                        .as_deref()
+                        .and_then(|executable| {
+                            path_node_identity(executable, cwd, path, managed_node_root)
+                        });
                 let is_stable = identity_after.as_ref() == Some(&identity);
                 let resolution = PathNodeResolution {
                     version,
-                    runtime_fingerprint: is_stable
-                        .then(|| identity.script.fingerprint.clone()),
+                    runtime_fingerprint: is_stable.then(|| identity.script.fingerprint.clone()),
                     executable: executable_before.clone(),
                 };
                 if is_stable {
@@ -364,9 +365,8 @@ impl PathNodeVersionCache {
                     }
                     Some(resolution)
                 } else {
-                    // Never publish an unstable probe result into the shared slot
-                    // for waiting callers; return `None` so waiters retry freshly.
-                    local_unstable_resolution = Some(resolution);
+                    // Never publish an unstable probe result into the shared slot;
+                    // return `None` so both the probing caller and waiters retry freshly.
                     None
                 }
             });
@@ -386,10 +386,6 @@ impl PathNodeVersionCache {
                 {
                     map.remove(&identity);
                 }
-            }
-
-            if let Some(resolution) = local_unstable_resolution {
-                return resolution;
             }
         }
 
@@ -1441,12 +1437,10 @@ mod tests {
         let path_b =
             std::env::join_paths([dir_b.path(), Path::new("/bin"), Path::new("/usr/bin")]).unwrap();
 
-        let t_a = std::thread::spawn(move || {
-            cache_a.resolve_with_observed_shared(&cwd_a, &path_a, None)
-        });
-        let t_b = std::thread::spawn(move || {
-            cache_b.resolve_with_observed_shared(&cwd_b, &path_b, None)
-        });
+        let t_a =
+            std::thread::spawn(move || cache_a.resolve_with_observed_shared(&cwd_a, &path_a, None));
+        let t_b =
+            std::thread::spawn(move || cache_b.resolve_with_observed_shared(&cwd_b, &path_b, None));
 
         assert_eq!(
             t_a.join().unwrap().version(),
@@ -1513,9 +1507,15 @@ mod tests {
 
         let first = t1.join().unwrap();
         let second = t2.join().unwrap();
-        assert!(
-            first.runtime_fingerprint().is_none(),
-            "first caller saw an unstable probe and must not emit a stable fingerprint"
+        assert_eq!(
+            first.version(),
+            Some("22.9.0"),
+            "probing caller must retry after observing mid-probe Node replacement"
+        );
+        assert_eq!(
+            first.runtime_fingerprint(),
+            Some(new_fingerprint.as_str()),
+            "probing caller must return the new executable's stable fingerprint after retry"
         );
         assert_eq!(
             second.version(),

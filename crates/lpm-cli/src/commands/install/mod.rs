@@ -2923,7 +2923,7 @@ async fn run_with_options_under_store_lock(
     let wf_tail_lockfile_write_ms = lockfile_write_result.write_ms;
     let wf_tail_lockfile_write_count = lockfile_write_result.write_count;
 
-    if frozen_lockfile_active && auto_build_attempted {
+    if auto_build_attempted {
         workspace_lockfile::validate_active_frozen_preflight()?;
     }
     let OnlineAutoBuildPhaseResult {

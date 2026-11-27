@@ -372,6 +372,16 @@ impl WorkspaceLockfileCoordinator {
     /// commit (legacy migrations, schema upgrades, or obsolete importers) before
     /// scheduling member installs or running lifecycle hooks.
     pub(super) fn validate_frozen_preflight(&self) -> Result<(), LpmError> {
+        self.validate_frozen_preflight_for_importer(None)
+    }
+
+    /// Like [`Self::validate_frozen_preflight`], and when `importer` is given
+    /// also rejects a newly added importer missing from `lpm.lock` (unless
+    /// marked non-persisting) before running member hooks or auto-builds.
+    pub(super) fn validate_frozen_preflight_for_importer(
+        &self,
+        importer: Option<&str>,
+    ) -> Result<(), LpmError> {
         if self.exact_graph_migration_pending {
             return Err(LpmError::Registry(
                 "workspace lockfile requires an exact-graph upgrade; cannot modify lpm.lock in frozen mode. Run `lpm install` first."
@@ -384,16 +394,114 @@ impl WorkspaceLockfileCoordinator {
                     .to_string(),
             ));
         }
-        if let Some(existing) = &self.existing
-            && let Some(obsolete) = existing
+        if let Some(existing) = &self.existing {
+            if let Some(obsolete) = existing
                 .as_lockfile()
                 .importers
                 .keys()
-                .find(|importer| !self.valid_importers.contains(*importer))
+                .find(|existing_importer| !self.valid_importers.contains(*existing_importer))
+            {
+                return Err(LpmError::Registry(format!(
+                    "workspace lockfile contains removed importer {obsolete:?} and cannot be modified in frozen mode. Run `lpm install` to update lpm.lock."
+                )));
+            }
+            if let Some(importer) = importer
+                && !existing.as_lockfile().importers.contains_key(importer)
+                && !self
+                    .non_persisting_importers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(importer)
+            {
+                return Err(LpmError::Registry(format!(
+                    "workspace importer {importer:?} is missing from lpm.lock in frozen mode. Run `lpm install` to update lpm.lock."
+                )));
+            }
+        } else if let Some(importer) = importer
+            && !self
+                .non_persisting_importers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(importer)
         {
-            return Err(LpmError::Registry(format!(
-                "workspace lockfile contains removed importer {obsolete:?} and cannot be modified in frozen mode. Run `lpm install` to update lpm.lock."
-            )));
+            return Err(LpmError::Registry(
+                "workspace lockfile is missing and cannot be created in frozen mode. Run `lpm install` first."
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Verify that all required importers and staged lockfile projections satisfy
+    /// frozen-lockfile invariants without modifying `lpm.lock`.
+    pub(super) fn validate_frozen_commit(
+        &self,
+        required_importers: &[String],
+    ) -> Result<(), LpmError> {
+        let staged = self
+            .staged
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let non_persisting_importers = self
+            .non_persisting_importers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.validate_frozen_commit_locked(required_importers, &staged, &non_persisting_importers)
+    }
+
+    fn validate_frozen_commit_locked(
+        &self,
+        required_importers: &[String],
+        staged: &BTreeMap<String, Arc<lpm_lockfile::Lockfile>>,
+        non_persisting_importers: &BTreeSet<String>,
+    ) -> Result<(), LpmError> {
+        self.validate_frozen_preflight()?;
+        let Some(existing) = &self.existing else {
+            if staged.is_empty()
+                && required_importers
+                    .iter()
+                    .all(|importer| non_persisting_importers.contains(importer))
+            {
+                return Ok(());
+            }
+            return Err(LpmError::Registry(
+                "workspace lockfile is missing and cannot be created in frozen mode. Run `lpm install` first."
+                    .to_string(),
+            ));
+        };
+        for importer in required_importers {
+            if !existing.as_lockfile().importers.contains_key(importer)
+                && !non_persisting_importers.contains(importer)
+            {
+                return Err(LpmError::Registry(format!(
+                    "workspace importer {importer:?} is missing from lpm.lock in frozen mode. Run `lpm install` to update lpm.lock."
+                )));
+            }
+        }
+        if !staged.is_empty() {
+            for importer in staged.keys() {
+                if !self.valid_importers.contains(importer) {
+                    return Err(LpmError::Registry(format!(
+                        "workspace importer {importer:?} is no longer a member and cannot be modified in frozen mode. Run `lpm install` to update lpm.lock."
+                    )));
+                }
+            }
+            let replacements = staged
+                .iter()
+                .map(|(importer, lockfile)| (importer.clone(), lockfile.as_ref().clone()))
+                .collect();
+            // Compare before any mutable cleanup (such as dropping legacy
+            // tarball hints) so an unchanged staged projection keeps an
+            // older lockfile byte-for-byte intact in frozen mode.
+            let union = existing
+                .update_workspace_importers(&self.valid_importers, replacements)
+                .map_err(lockfile_error)?;
+            if existing.as_lockfile() != &union {
+                return Err(LpmError::Registry(
+                    "workspace lockfile is out of date and cannot be modified in frozen mode. Run `lpm install` to update lpm.lock."
+                        .to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -408,54 +516,11 @@ impl WorkspaceLockfileCoordinator {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.frozen.load(std::sync::atomic::Ordering::Relaxed) {
-            self.validate_frozen_preflight()?;
-            let Some(existing) = &self.existing else {
-                if staged.is_empty()
-                    && required_importers
-                        .iter()
-                        .all(|importer| non_persisting_importers.contains(importer))
-                {
-                    return Ok(false);
-                }
-                return Err(LpmError::Registry(
-                    "workspace lockfile is missing and cannot be created in frozen mode. Run `lpm install` first."
-                        .to_string(),
-                ));
-            };
-            for importer in required_importers {
-                if !existing.as_lockfile().importers.contains_key(importer)
-                    && !non_persisting_importers.contains(importer)
-                {
-                    return Err(LpmError::Registry(format!(
-                        "workspace importer {importer:?} is missing from lpm.lock in frozen mode. Run `lpm install` to update lpm.lock."
-                    )));
-                }
-            }
-            if !staged.is_empty() {
-                for importer in staged.keys() {
-                    if !self.valid_importers.contains(importer) {
-                        return Err(LpmError::Registry(format!(
-                            "workspace importer {importer:?} is no longer a member and cannot be modified in frozen mode. Run `lpm install` to update lpm.lock."
-                        )));
-                    }
-                }
-                let replacements = staged
-                    .iter()
-                    .map(|(importer, lockfile)| (importer.clone(), lockfile.as_ref().clone()))
-                    .collect();
-                // Compare before any mutable cleanup (such as dropping legacy
-                // tarball hints) so an unchanged staged projection keeps an
-                // older lockfile byte-for-byte intact in frozen mode.
-                let union = existing
-                    .update_workspace_importers(&self.valid_importers, replacements)
-                    .map_err(lockfile_error)?;
-                if existing.as_lockfile() != &union {
-                    return Err(LpmError::Registry(
-                        "workspace lockfile is out of date and cannot be modified in frozen mode. Run `lpm install` to update lpm.lock."
-                            .to_string(),
-                    ));
-                }
-            }
+            self.validate_frozen_commit_locked(
+                required_importers,
+                &staged,
+                &non_persisting_importers,
+            )?;
             return Ok(false);
         }
         if staged.is_empty()
@@ -1292,7 +1357,9 @@ pub(super) fn mark_active_install_frozen() {
 pub(super) fn validate_active_frozen_preflight() -> Result<(), LpmError> {
     if let Ok(result) = ACTIVE_TARGET.try_with(|target| {
         if target.coordinator.is_frozen() {
-            target.coordinator.validate_frozen_preflight()
+            target
+                .coordinator
+                .validate_frozen_preflight_for_importer(Some(&target.importer))
         } else {
             Ok(())
         }
@@ -2174,7 +2241,7 @@ mod tests {
 
     #[test]
     fn frozen_workspace_commit_refuses_legacy_migration_and_obsolete_importers_without_mutating_lockfile()
-    {
+     {
         // Case 1: obsolete importer present in frozen root lpm.lock must error without rewriting.
         let dir = tempfile::tempdir().unwrap();
         let mut union = lpm_lockfile::Lockfile::new();
@@ -2261,8 +2328,7 @@ mod tests {
         let bytes_before = std::fs::read(&lockfile_path).unwrap();
 
         let legacy_importers = vec![("packages/a".to_string(), member_dir)];
-        let coordinator =
-            WorkspaceLockfileCoordinator::new(dir.path(), &legacy_importers).unwrap();
+        let coordinator = WorkspaceLockfileCoordinator::new(dir.path(), &legacy_importers).unwrap();
         coordinator.mark_frozen();
         coordinator.validate_frozen_preflight().unwrap();
         // Stage an unchanged dependency-free root projection while `packages/a` holds a legacy URL hint.

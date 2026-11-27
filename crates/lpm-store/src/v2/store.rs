@@ -17,20 +17,32 @@ use lpm_common::integrity::{HashAlgorithm, Integrity};
 use lpm_common::{LpmError, LpmRoot};
 use sha2::{Digest, Sha256};
 
+enum ExistingBuildEntryReadLock {
+    Held(
+        #[expect(
+            dead_code,
+            reason = "RAII shared lock handle held for the duration of the reuse check"
+        )]
+        lpm_common::SingleFileSharedLockHandle,
+    ),
+    Absent,
+    ReadOnlyFilesystem,
+}
+
 use super::finalize_permits::v2_finalize_limiter;
 use super::fs_util::{
     copy_dir_recursively, create_dir_symlink, create_tmp_dir_locked, ensure_store_tier_dir_locked,
     ensure_store_tier_dir_locked_once, harden_store_tier_once, invalidate_hardened_store_tier,
     materialize_into_with_integrity, tmp_sibling,
 };
-#[cfg(any(debug_assertions, test))]
-pub use super::integrity::{
-    TrustRestoredStoreOverrideGuard, override_trust_restored_store_for_test,
-};
 pub use super::integrity::{
     ENV_TRUST_RESTORED_STORE, ENV_V2_OBJECT_INTEGRITY, FreshObjectIntegrity, ObjectIntegrityPolicy,
     ReusableObjectCheckTimings, VerifiedObjectIntegrity, trust_restored_store_enabled,
     trust_restored_store_from_env,
+};
+#[cfg(any(debug_assertions, test))]
+pub use super::integrity::{
+    TrustRestoredStoreOverrideGuard, override_trust_restored_store_for_test,
 };
 use super::integrity::{
     current_tree_content_matches_snapshot, finish_object_rename_after_collision, harden_tier_of,
@@ -1039,7 +1051,7 @@ impl Store {
     fn try_acquire_existing_build_entry_read_lock(
         &self,
         graph_key_digest: &str,
-    ) -> Result<(PathBuf, Option<lpm_common::SingleFileSharedLockHandle>), LpmError> {
+    ) -> Result<(PathBuf, ExistingBuildEntryReadLock), LpmError> {
         let locks_root = self.paths.build_entry_locks_root();
         let lock_path = self.paths.build_entry_lock_path(graph_key_digest)?;
         // Validate an existing lock tier without creating it (so restored
@@ -1056,16 +1068,15 @@ impl Store {
                 )));
             }
         }
-        let handle = match lpm_common::try_acquire_existing_single_file_shared_lock(&lock_path) {
-            Ok(handle) => handle,
-            Err(LpmError::Io(error))
-                if error.kind() == std::io::ErrorKind::ReadOnlyFilesystem =>
-            {
-                None
+        let outcome = match lpm_common::try_acquire_existing_single_file_shared_lock(&lock_path) {
+            Ok(Some(handle)) => ExistingBuildEntryReadLock::Held(handle),
+            Ok(None) => ExistingBuildEntryReadLock::Absent,
+            Err(LpmError::Io(error)) if error.kind() == std::io::ErrorKind::ReadOnlyFilesystem => {
+                ExistingBuildEntryReadLock::ReadOnlyFilesystem
             }
             Err(error) => return Err(error),
         };
-        Ok((lock_path, handle))
+        Ok((lock_path, outcome))
     }
 
     /// Return the object directory when `sri` is already present and
@@ -2220,7 +2231,11 @@ impl Store {
             let (lock_path, existing_read_lock) =
                 self.try_acquire_existing_build_entry_read_lock(&graph_key_digest)?;
             let reuse_check_start = std::time::Instant::now();
-            let lock_held = existing_read_lock.is_some();
+            let lock_held = matches!(existing_read_lock, ExistingBuildEntryReadLock::Held(_));
+            let read_only_fs = matches!(
+                existing_read_lock,
+                ExistingBuildEntryReadLock::ReadOnlyFilesystem
+            );
             let check_result = link_entry_is_reusable(
                 &final_dir,
                 &graph_key,
@@ -2233,7 +2248,11 @@ impl Store {
                 lock_held,
             );
             match check_result {
-                Ok(Some(hit)) if lock_held || (!lock_path.exists() && hit.deferred_heal.is_none()) => {
+                Ok(Some(hit))
+                    if lock_held
+                        || read_only_fs
+                        || (!lock_path.exists() && hit.deferred_heal.is_none()) =>
+                {
                     timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
                     return Ok(Self::reused_link_entry(
                         final_dir,
@@ -2309,7 +2328,7 @@ impl Store {
                         ));
                     }
                 }
-                Err(_) if !lock_held => {
+                Err(_) if !lock_held && !read_only_fs => {
                     let _entry_read_lock = self.acquire_build_entry_read_lock(&graph_key_digest)?;
                     if final_dir.exists()
                         && let Some(reverified) = link_entry_is_reusable(

@@ -671,3 +671,122 @@ fn filtered_frozen_workspace_install_rejects_removed_importer_before_running_mem
         "rejected filtered frozen install must preserve lpm.lock byte-for-byte"
     );
 }
+
+#[test]
+fn ci_default_install_succeeds_in_fresh_workspace_without_any_lockfile() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-ci-fresh-no-lock-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{ "name": "foo", "version": "1.0.0" }"#,
+    );
+
+    let output = lpm(&project)
+        .env("CI", "true")
+        .args(["install", "--no-skills", "--no-security-summary"])
+        .output()
+        .expect("failed to run CI-default lpm install on fresh workspace");
+
+    assert!(
+        output.status.success(),
+        "CI=true default install must succeed in a fresh workspace with no lockfile:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        project.path().join("lpm.lock").is_file(),
+        "fresh workspace install under CI=true should create lpm.lock"
+    );
+}
+
+#[test]
+fn ci_default_filtered_workspace_install_rejects_before_running_deferred_root_and_new_member_hooks()
+{
+    let project = TempProject::empty(
+        &serde_json::json!({
+            "name": "workspace-ci-filtered-hooks-root",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"],
+            "scripts": {
+                "postinstall": "node -e \"require('fs').writeFileSync('root-hook.marker', 'ran')\""
+            }
+        })
+        .to_string(),
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{ "name": "foo", "version": "1.0.0" }"#,
+    );
+    project.write_file(
+        "packages/removed/package.json",
+        r#"{ "name": "removed", "version": "1.0.0" }"#,
+    );
+
+    install_workspace_once(&project);
+    let root_marker = project.path().join("root-hook.marker");
+    let _ = std::fs::remove_file(&root_marker);
+
+    // Case 1: adding a brand-new unlocked member `newpkg` + unfiltered CI=true install
+    // must reject before running the deferred root postinstall hook.
+    let new_marker = project.path().join("new-hook.marker");
+    project.write_file(
+        "packages/newpkg/package.json",
+        &serde_json::json!({
+            "name": "newpkg",
+            "version": "1.0.0",
+            "scripts": {
+                "postinstall": "node -e \"require('fs').writeFileSync('../../new-hook.marker', 'ran')\""
+            }
+        })
+        .to_string(),
+    );
+    let root_output = lpm(&project)
+        .env("CI", "true")
+        .args(["install", "--no-skills", "--no-security-summary"])
+        .output()
+        .expect("failed to run CI-default workspace install with new member");
+    assert!(
+        !root_output.status.success(),
+        "CI=true install must fail on newly added unlocked importer:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&root_output.stdout),
+        String::from_utf8_lossy(&root_output.stderr)
+    );
+    assert!(
+        !root_marker.exists(),
+        "CI=true install must not run deferred root postinstall hook before frozen rejection"
+    );
+    assert!(
+        !new_marker.exists(),
+        "CI=true install must not run postinstall hook of a newly added unlocked member"
+    );
+
+    // Case 2: filtered CI=true --filter newpkg must also reject before running `newpkg`'s hook.
+    let new_output = lpm(&project)
+        .env("CI", "true")
+        .args([
+            "install",
+            "--filter",
+            "newpkg",
+            "--no-skills",
+            "--no-security-summary",
+        ])
+        .output()
+        .expect("failed to run CI-default filtered new-member install");
+    assert!(
+        !new_output.status.success(),
+        "CI=true filtered install must reject a new unlocked importer:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&new_output.stdout),
+        String::from_utf8_lossy(&new_output.stderr)
+    );
+    assert!(
+        !new_marker.exists(),
+        "CI=true filtered install must not run postinstall hook of a newly added unlocked member"
+    );
+}
