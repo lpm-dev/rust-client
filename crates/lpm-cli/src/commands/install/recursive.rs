@@ -250,7 +250,9 @@ pub(crate) async fn run_recursive_workspace_install(
                     || !legacy_importers.is_empty()));
         if workspace_frozen {
             workspace_lockfile_coordinator.mark_frozen();
-            workspace_lockfile_coordinator.validate_frozen_preflight()?;
+            if filters.is_empty() && filter_prod.is_empty() {
+                workspace_lockfile_coordinator.validate_frozen_preflight()?;
+            }
         }
         let workspace_project_state_coordinator =
             Arc::new(workspace_project_state::WorkspaceProjectStateCoordinator::new(targets.len()));
@@ -935,6 +937,9 @@ async fn run_workspace_target_install(
     any_script_ran: Arc<AtomicBool>,
 ) -> Result<TargetTaskResult, LpmError> {
     crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(&plan.path)?;
+    if plan.lifecycle.has_dev_preinstall() {
+        workspace_lockfile::validate_active_frozen_preflight()?;
+    }
     plan.lifecycle
         .run_dev_preinstall(&plan.path, options.json_output)?;
     if plan.lifecycle.has_dev_preinstall() {
@@ -1048,6 +1053,9 @@ async fn run_workspace_target_install(
     let deferred_after_install = if defer_after_install {
         Some((plan.path, plan.lifecycle))
     } else {
+        if plan.lifecycle.has_scripts() {
+            workspace_lockfile::validate_active_frozen_preflight()?;
+        }
         plan.lifecycle
             .run_after_successful_install(&plan.path, options.json_output)?;
         if plan.lifecycle.has_scripts() {

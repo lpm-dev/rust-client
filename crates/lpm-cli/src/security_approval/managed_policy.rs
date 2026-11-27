@@ -1241,7 +1241,7 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
     let path = managed_policy_path();
     #[cfg(not(unix))]
     {
-        return load_managed_policy_from_disk(path);
+        load_managed_policy_from_disk(path)
     }
     #[cfg(unix)]
     {

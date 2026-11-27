@@ -364,6 +364,10 @@ impl WorkspaceLockfileCoordinator {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    pub(super) fn is_frozen(&self) -> bool {
+        self.frozen.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Reject structural workspace lockfile states that can never pass a frozen
     /// commit (legacy migrations, schema upgrades, or obsolete importers) before
     /// scheduling member installs or running lifecycle hooks.
@@ -1283,6 +1287,28 @@ pub(super) fn mark_active_install_frozen() {
     {
         let _ = ACTIVE_TRANSACTION.try_with(|transaction| transaction.coordinator.mark_frozen());
     }
+}
+
+pub(super) fn validate_active_frozen_preflight() -> Result<(), LpmError> {
+    if let Ok(result) = ACTIVE_TARGET.try_with(|target| {
+        if target.coordinator.is_frozen() {
+            target.coordinator.validate_frozen_preflight()
+        } else {
+            Ok(())
+        }
+    }) {
+        return result;
+    }
+    if let Ok(result) = ACTIVE_TRANSACTION.try_with(|transaction| {
+        if transaction.coordinator.is_frozen() {
+            transaction.coordinator.validate_frozen_preflight()
+        } else {
+            Ok(())
+        }
+    }) {
+        return result;
+    }
+    Ok(())
 }
 
 pub(crate) fn write(
