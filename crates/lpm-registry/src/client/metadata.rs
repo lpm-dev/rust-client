@@ -33,23 +33,14 @@ enum MetadataCachePolicy {
 /// a cache hit.
 async fn metadata_fetch_flight_guard(cache_key: &str) -> tokio::sync::OwnedMutexGuard<()> {
     static FLIGHTS: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+        std::sync::Mutex<super::state::WeakEntryMap<String, tokio::sync::Mutex<()>>>,
     > = std::sync::OnceLock::new();
     let flight = {
         let mut flights = FLIGHTS
-            .get_or_init(Default::default)
+            .get_or_init(|| std::sync::Mutex::new(super::state::WeakEntryMap::new()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(existing) = flights.get(cache_key).and_then(std::sync::Weak::upgrade) {
-            existing
-        } else {
-            if flights.len() >= 64 {
-                flights.retain(|_, weak| weak.strong_count() > 0);
-            }
-            let flight = Arc::new(tokio::sync::Mutex::new(()));
-            flights.insert(cache_key.to_owned(), Arc::downgrade(&flight));
-            flight
-        }
+        flights.get_or_insert(cache_key, || Arc::new(tokio::sync::Mutex::new(())))
     };
     flight.lock_owned().await
 }

@@ -16,7 +16,6 @@ pub(super) const BLOCKING_METADATA_PARSE_THRESHOLD: usize = 64 * 1024;
 const LARGE_METADATA_PARSE_THRESHOLD: usize = 512 * 1024;
 const METADATA_MEMORY_BUDGET_QUANTUM: usize = 64 * 1024;
 const METADATA_MEMORY_BUDGET_UNITS: usize = (128 * 1024 * 1024) / METADATA_MEMORY_BUDGET_QUANTUM;
-const CHUNKED_LARGE_BODY_UNITS: u32 = ((16 * 1024 * 1024) / METADATA_MEMORY_BUDGET_QUANTUM) as u32;
 
 fn large_metadata_parse_limiter() -> &'static Arc<tokio::sync::Semaphore> {
     static LIMITER: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
@@ -32,33 +31,81 @@ fn metadata_body_memory_budget() -> &'static Arc<tokio::sync::Semaphore> {
     BUDGET.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(METADATA_MEMORY_BUDGET_UNITS)))
 }
 
-struct LargeMetadataMemoryGuard {
-    _concurrency_permit: tokio::sync::OwnedSemaphorePermit,
-    _byte_budget_permit: tokio::sync::OwnedSemaphorePermit,
+#[inline]
+fn budget_units_for_bytes(bytes: usize) -> u32 {
+    u32::try_from(
+        bytes
+            .div_ceil(METADATA_MEMORY_BUDGET_QUANTUM)
+            .clamp(1, METADATA_MEMORY_BUDGET_UNITS),
+    )
+    .unwrap_or(METADATA_MEMORY_BUDGET_UNITS as u32)
 }
 
-async fn acquire_large_metadata_guard(
+struct LargeMetadataMemoryGuard {
+    concurrency_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    byte_budget_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    reserved_units: u32,
+}
+
+impl LargeMetadataMemoryGuard {
+    fn shrink_to(&mut self, actual_bytes: usize) {
+        let needed = budget_units_for_bytes(actual_bytes);
+        if self.reserved_units > needed
+            && let Some(permit) = self.byte_budget_permit.as_mut()
+            && let Some(excess) = permit.split((self.reserved_units - needed) as usize)
+        {
+            drop(excess);
+            self.reserved_units = needed;
+        }
+    }
+}
+
+async fn acquire_large_metadata_guard_units(
     limiter: &Arc<tokio::sync::Semaphore>,
     budget: &Arc<tokio::sync::Semaphore>,
-    bytes: usize,
-    is_declared_total: bool,
+    units: u32,
 ) -> Option<LargeMetadataMemoryGuard> {
     let concurrency_permit = Arc::clone(limiter).acquire_owned().await.ok()?;
-    let units = if is_declared_total {
-        u32::try_from(
-            bytes
-                .div_ceil(METADATA_MEMORY_BUDGET_QUANTUM)
-                .clamp(1, METADATA_MEMORY_BUDGET_UNITS),
-        )
-        .unwrap_or(METADATA_MEMORY_BUDGET_UNITS as u32)
-    } else {
-        CHUNKED_LARGE_BODY_UNITS.min(METADATA_MEMORY_BUDGET_UNITS as u32)
-    };
+    let units = units.clamp(1, METADATA_MEMORY_BUDGET_UNITS as u32);
     let byte_budget_permit = Arc::clone(budget).acquire_many_owned(units).await.ok()?;
     Some(LargeMetadataMemoryGuard {
-        _concurrency_permit: concurrency_permit,
-        _byte_budget_permit: byte_budget_permit,
+        concurrency_permit: Some(concurrency_permit),
+        byte_budget_permit: Some(byte_budget_permit),
+        reserved_units: units,
     })
+}
+
+fn try_reserve_multiplexed_bytes(
+    budget: &Arc<tokio::sync::Semaphore>,
+    guard: &mut Option<LargeMetadataMemoryGuard>,
+    bytes: usize,
+) {
+    let needed = budget_units_for_bytes(bytes);
+    match guard {
+        Some(existing) => {
+            if needed <= existing.reserved_units {
+                return;
+            }
+            let delta = needed - existing.reserved_units;
+            if let Ok(extra) = Arc::clone(budget).try_acquire_many_owned(delta) {
+                if let Some(permit) = existing.byte_budget_permit.as_mut() {
+                    permit.merge(extra);
+                } else {
+                    existing.byte_budget_permit = Some(extra);
+                }
+                existing.reserved_units += delta;
+            }
+        }
+        None => {
+            if let Ok(permit) = Arc::clone(budget).try_acquire_many_owned(needed) {
+                *guard = Some(LargeMetadataMemoryGuard {
+                    concurrency_permit: None,
+                    byte_budget_permit: Some(permit),
+                    reserved_units: needed,
+                });
+            }
+        }
+    }
 }
 
 async fn read_metadata_body_with_budget(
@@ -71,9 +118,16 @@ async fn read_metadata_body_with_budget(
     Result<(), lpm_http::ResponseBodyError>,
     Option<LargeMetadataMemoryGuard>,
 ) {
+    // Never park mid-stream on multiplexed connections (HTTP/2, HTTP/3): unread
+    // DATA frames pin stream windows against the shared connection window and
+    // can starve permit-holding streams until read timeout.
+    let is_multiplexed = matches!(
+        response.version(),
+        reqwest::Version::HTTP_2 | reqwest::Version::HTTP_3
+    );
     let limiter = Arc::clone(limiter);
     let budget = Arc::clone(budget);
-    lpm_http::read_body_capped_with_budget(
+    let (result, mut guard) = lpm_http::read_body_capped_with_budget(
         response,
         cap,
         body,
@@ -82,12 +136,22 @@ async fn read_metadata_body_with_budget(
             let limiter = Arc::clone(&limiter);
             let budget = Arc::clone(&budget);
             async move {
-                if guard.is_none() && next_len >= LARGE_METADATA_PARSE_THRESHOLD {
-                    guard = acquire_large_metadata_guard(
+                if next_len < LARGE_METADATA_PARSE_THRESHOLD {
+                    return guard;
+                }
+                if is_multiplexed {
+                    try_reserve_multiplexed_bytes(&budget, &mut guard, next_len);
+                    return guard;
+                }
+                if guard.is_none() {
+                    // Reserve full cap upfront for unknown-length chunked streams so
+                    // concurrent streams cannot deadlock waiting for incremental units,
+                    // then release unused units immediately on EOF.
+                    let reserve_bytes = if is_declared_total { next_len } else { cap };
+                    guard = acquire_large_metadata_guard_units(
                         &limiter,
                         &budget,
-                        next_len,
-                        is_declared_total,
+                        budget_units_for_bytes(reserve_bytes),
                     )
                     .await;
                 }
@@ -95,7 +159,13 @@ async fn read_metadata_body_with_budget(
             }
         },
     )
-    .await
+    .await;
+    if result.is_ok()
+        && let Some(guard) = guard.as_mut()
+    {
+        guard.shrink_to(body.len());
+    }
+    (result, guard)
 }
 
 async fn run_blocking_metadata_parse_with_guard<T, F>(
@@ -109,11 +179,25 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    let guard = if let Some(guard) = preacquired_guard {
-        Some(guard)
-    } else if buf_len >= LARGE_METADATA_PARSE_THRESHOLD {
-        acquire_large_metadata_guard(limiter, budget, buf_len, true).await
+    let guard = if buf_len >= LARGE_METADATA_PARSE_THRESHOLD {
+        let needed_units = budget_units_for_bytes(buf_len);
+        match preacquired_guard {
+            Some(mut existing)
+                if existing.concurrency_permit.is_some()
+                    && existing.reserved_units >= needed_units =>
+            {
+                existing.shrink_to(buf_len);
+                Some(existing)
+            }
+            partial => {
+                // Release partial non-blocking reservation before acquiring both
+                // permits in canonical order (limiter -> budget) to prevent deadlock.
+                drop(partial);
+                acquire_large_metadata_guard_units(limiter, budget, needed_units).await
+            }
+        }
     } else {
+        drop(preacquired_guard);
         None
     };
     tokio::task::spawn_blocking(move || {
@@ -654,5 +738,286 @@ mod tests {
         assert_eq!(len, payload.len());
         assert!(acquired_guard);
         assert_eq!(budget.available_permits(), METADATA_MEMORY_BUDGET_UNITS);
+    }
+
+    #[tokio::test]
+    async fn chunked_large_body_reserves_cap_upfront_shrinks_on_eof_and_releases_on_cancel() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chunk_body = "x".repeat(LARGE_METADATA_PARSE_THRESHOLD + 8192);
+        let chunk_body_for_server = chunk_body.clone();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut req_buf = [0u8; 1024];
+                let _ = socket.read(&mut req_buf).await;
+                let hex_len = format!("{:x}", chunk_body_for_server.len());
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n{hex_len}\r\n"
+                );
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(chunk_body_for_server.as_bytes()).await;
+                let _ = socket.write_all(b"\r\n0\r\n\r\n").await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let cap = 2 * 1024 * 1024;
+        let cap_units = budget_units_for_bytes(cap);
+        let actual_units = budget_units_for_bytes(chunk_body.len());
+        assert!(cap_units > actual_units);
+
+        let limiter = Arc::new(tokio::sync::Semaphore::new(2));
+        let budget = Arc::new(tokio::sync::Semaphore::new(cap_units as usize));
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/chunked"))
+            .send()
+            .await
+            .unwrap();
+        let mut body = Vec::new();
+        let (read, guard) =
+            read_metadata_body_with_budget(response, cap, &mut body, &limiter, &budget).await;
+        read.unwrap();
+        assert_eq!(body.len(), chunk_body.len());
+        let guard = guard.expect("chunked large body must hold shrunk guard");
+        // Unused cap headroom must be returned to the semaphore immediately on EOF.
+        assert_eq!(
+            budget.available_permits(),
+            (cap_units - actual_units) as usize
+        );
+        drop(guard);
+        assert_eq!(budget.available_permits(), cap_units as usize);
+
+        // Verify a second request makes full progress after release.
+        let response2 = reqwest::Client::new()
+            .get(format!("http://{addr}/chunked"))
+            .send()
+            .await
+            .unwrap();
+        let mut body2 = Vec::new();
+        let (read2, guard2) =
+            read_metadata_body_with_budget(response2, cap, &mut body2, &limiter, &budget).await;
+        read2.unwrap();
+        assert_eq!(body2.len(), chunk_body.len());
+        drop(guard2);
+        assert_eq!(budget.available_permits(), cap_units as usize);
+    }
+
+    #[tokio::test]
+    async fn multiplexed_http2_large_bodies_drain_without_deadlocking_on_limiter_or_budget() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        async fn write_h2_frame<W: tokio::io::AsyncWrite + Unpin>(
+            w: &mut W,
+            frame_type: u8,
+            flags: u8,
+            stream_id: u32,
+            payload: &[u8],
+        ) -> std::io::Result<()> {
+            let len = payload.len() as u32;
+            let header = [
+                ((len >> 16) & 0xff) as u8,
+                ((len >> 8) & 0xff) as u8,
+                (len & 0xff) as u8,
+                frame_type,
+                flags,
+                ((stream_id >> 24) & 0x7f) as u8,
+                ((stream_id >> 16) & 0xff) as u8,
+                ((stream_id >> 8) & 0xff) as u8,
+                (stream_id & 0xff) as u8,
+            ];
+            w.write_all(&header).await?;
+            w.write_all(payload).await?;
+            Ok(())
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = vec![b'z'; LARGE_METADATA_PARSE_THRESHOLD + 128 * 1024];
+        let payload_for_server = payload.clone();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut preface = [0u8; 24];
+            socket.read_exact(&mut preface).await.unwrap();
+            assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+            // Send empty server SETTINGS frame.
+            write_h2_frame(&mut socket, 4, 0, 0, &[]).await.unwrap();
+
+            let mut completed_streams = 0usize;
+            let mut saw_warmup = false;
+            let mut pending_streams: Vec<(u32, usize)> = Vec::new();
+            let mut conn_send_window: usize = 65_535;
+            let mut initial_stream_window: usize = 65_535;
+            let mut stream_send_windows: HashMap<u32, usize> = HashMap::new();
+
+            loop {
+                // Flush DATA frames round-robin until every pending stream is window-blocked or done.
+                loop {
+                    let mut progressed = false;
+                    let mut i = 0;
+                    while i < pending_streams.len() && conn_send_window > 0 {
+                        let (stream_id, offset) = pending_streams[i];
+                        let sw = stream_send_windows.get(&stream_id).copied().unwrap_or(0);
+                        let remaining = payload_for_server.len() - offset;
+                        let send_len = remaining.min(16_384).min(conn_send_window).min(sw);
+                        if send_len == 0 {
+                            i += 1;
+                            continue;
+                        }
+                        progressed = true;
+                        let next_offset = offset + send_len;
+                        let flags = if next_offset == payload_for_server.len() {
+                            0x01 // END_STREAM
+                        } else {
+                            0x00
+                        };
+                        if write_h2_frame(
+                            &mut socket,
+                            0,
+                            flags,
+                            stream_id,
+                            &payload_for_server[offset..next_offset],
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
+                        conn_send_window -= send_len;
+                        *stream_send_windows.get_mut(&stream_id).unwrap() -= send_len;
+                        if next_offset == payload_for_server.len() {
+                            pending_streams.swap_remove(i);
+                            completed_streams += 1;
+                        } else {
+                            pending_streams[i].1 = next_offset;
+                            i += 1;
+                        }
+                    }
+                    if !progressed {
+                        break;
+                    }
+                }
+                if completed_streams == 6 {
+                    break;
+                }
+
+                let mut hdr = [0u8; 9];
+                if socket.read_exact(&mut hdr).await.is_err() {
+                    break;
+                }
+                let frame_len =
+                    ((hdr[0] as usize) << 16) | ((hdr[1] as usize) << 8) | (hdr[2] as usize);
+                let frame_type = hdr[3];
+                let flags = hdr[4];
+                let stream_id = u32::from_be_bytes([hdr[5] & 0x7f, hdr[6], hdr[7], hdr[8]]);
+                let mut frame_payload = vec![0u8; frame_len];
+                if socket.read_exact(&mut frame_payload).await.is_err() {
+                    break;
+                }
+                match frame_type {
+                    4 if (flags & 1) == 0 => {
+                        for chunk in frame_payload.as_chunks::<6>().0 {
+                            let id = u16::from_be_bytes([chunk[0], chunk[1]]);
+                            let val = u32::from_be_bytes([chunk[2], chunk[3], chunk[4], chunk[5]])
+                                as usize;
+                            if id == 4 {
+                                initial_stream_window = val;
+                            }
+                        }
+                        // SETTINGS (non-ACK) -> acknowledge.
+                        let _ = write_h2_frame(&mut socket, 4, 1, 0, &[]).await;
+                    }
+                    1 => {
+                        if !saw_warmup {
+                            // First request warms up reqwest's shared H2 connection pool with an empty 200.
+                            saw_warmup = true;
+                            let _ = write_h2_frame(&mut socket, 1, 0x05, stream_id, &[0x88]).await;
+                        } else {
+                            // Subsequent requests multiplex large bodies over that single connection.
+                            let _ = write_h2_frame(&mut socket, 1, 0x04, stream_id, &[0x88]).await;
+                            stream_send_windows.insert(stream_id, initial_stream_window);
+                            pending_streams.push((stream_id, 0));
+                        }
+                    }
+                    8 if frame_payload.len() == 4 => {
+                        let inc = u32::from_be_bytes([
+                            frame_payload[0] & 0x7f,
+                            frame_payload[1],
+                            frame_payload[2],
+                            frame_payload[3],
+                        ]) as usize;
+                        if stream_id == 0 {
+                            conn_send_window += inc;
+                        } else if let Some(w) = stream_send_windows.get_mut(&stream_id) {
+                            *w += inc;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .build()
+            .unwrap();
+        // Establish the single HTTP/2 connection in reqwest's pool before fanning out streams.
+        let warmup = client
+            .get(format!("http://{addr}/warmup"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(warmup.version(), reqwest::Version::HTTP_2);
+        let _ = warmup.bytes().await.unwrap();
+        // Saturate both limiter and budget to prove multiplexed HTTP/2 reads never
+        // park mid-stream and starve hyper's shared connection window.
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let budget = Arc::new(tokio::sync::Semaphore::new(METADATA_MEMORY_BUDGET_UNITS));
+        let _held_limiter = Arc::clone(&limiter).try_acquire_owned().unwrap();
+        let _held_budget = Arc::clone(&budget)
+            .try_acquire_many_owned(METADATA_MEMORY_BUDGET_UNITS as u32)
+            .unwrap();
+
+        let mut tasks = Vec::new();
+        for i in 0..6 {
+            let client = client.clone();
+            let limiter = Arc::clone(&limiter);
+            let budget = Arc::clone(&budget);
+            let expected_len = payload.len();
+            tasks.push(tokio::spawn(async move {
+                let response = client
+                    .get(format!("http://{addr}/stream-{i}"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.version(), reqwest::Version::HTTP_2);
+                let mut body = Vec::new();
+                let (read, guard) = read_metadata_body_with_budget(
+                    response,
+                    MAX_METADATA_BYTES,
+                    &mut body,
+                    &limiter,
+                    &budget,
+                )
+                .await;
+                read.unwrap();
+                assert_eq!(body.len(), expected_len);
+                assert!(guard.is_none());
+            }));
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for task in tasks {
+                task.await.unwrap();
+            }
+        })
+        .await
+        .expect(
+            "multiplexed HTTP/2 large bodies must drain without stalling the connection window",
+        );
     }
 }

@@ -1026,16 +1026,17 @@ fn validate_package_name_component(component: &str) -> Result<(), String> {
         .trim_start_matches('@')
         .split('.')
         .next()
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .as_bytes();
     let is_reserved = matches!(device_stem.len(), 3 | 4)
-        && (device_stem.eq_ignore_ascii_case("CON")
-            || device_stem.eq_ignore_ascii_case("PRN")
-            || device_stem.eq_ignore_ascii_case("AUX")
-            || device_stem.eq_ignore_ascii_case("NUL")
+        && (device_stem.eq_ignore_ascii_case(b"CON")
+            || device_stem.eq_ignore_ascii_case(b"PRN")
+            || device_stem.eq_ignore_ascii_case(b"AUX")
+            || device_stem.eq_ignore_ascii_case(b"NUL")
             || (device_stem.len() == 4
-                && (device_stem[..3].eq_ignore_ascii_case("COM")
-                    || device_stem[..3].eq_ignore_ascii_case("LPT"))
-                && matches!(device_stem.as_bytes()[3], b'1'..=b'9')));
+                && (device_stem[..3].eq_ignore_ascii_case(b"COM")
+                    || device_stem[..3].eq_ignore_ascii_case(b"LPT"))
+                && matches!(device_stem[3], b'1'..=b'9')));
     if is_reserved {
         return Err("name contains a reserved Windows path component".to_string());
     }
@@ -2087,6 +2088,14 @@ impl Lockfile {
         }
         for package in packages.clone() {
             if !package.dependency_targets.is_empty() {
+                let alias_map: Option<HashMap<&str, &str>> =
+                    (!package.alias_dependencies.is_empty()).then(|| {
+                        package
+                            .alias_dependencies
+                            .iter()
+                            .map(|pair| (pair[0].as_str(), pair[1].as_str()))
+                            .collect()
+                    });
                 let mut matched_targets = 0usize;
                 for dependency in &package.dependencies {
                     let Some(at) = dependency.rfind('@') else {
@@ -2104,11 +2113,10 @@ impl Lockfile {
                             package.name, local_name
                         ))
                     })?;
-                    let expected_name = package
-                        .alias_dependencies
-                        .iter()
-                        .find(|pair| pair[0].as_str() == local_name)
-                        .map_or(local_name, |pair| pair[1].as_str());
+                    let expected_name = alias_map
+                        .as_ref()
+                        .and_then(|map| map.get(local_name).copied())
+                        .unwrap_or(local_name);
                     let expected_target_value = match target.source_ref() {
                         Some(Ok(SourceRef::Registry(_))) | None => {
                             Cow::Borrowed(target.version.as_str())
@@ -2813,5 +2821,121 @@ mod tarball_hint_tests {
         assert!(is_recordable_tarball_hint(
             "https://registry.npmjs.org/@scope/pkg/-/pkg-1.0.0.tgz"
         ));
+    }
+
+    #[test]
+    fn four_byte_multibyte_package_names_validate_and_round_trip_without_panicking() {
+        let source = "registry+https://registry.npmjs.org";
+        let valid_integrity = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+        for name in ["éé", "abé", "aaé", "a日", "😀", "@abé/pkg", "@scope/éé"] {
+            assert!(
+                super::Lockfile::validate_package_name_and_version(name, "1.0.0").is_ok(),
+                "expected multibyte package name {name:?} to validate cleanly without panicking"
+            );
+            let id = lpm_common::PackageInstanceId::derive(name, "1.0.0", source, "root");
+            let mut lockfile = super::Lockfile::new();
+            lockfile.add_package(super::LockedPackage {
+                instance_id: Some(id),
+                name: name.to_string(),
+                version: "1.0.0".to_string(),
+                source: Some(source.to_string()),
+                integrity: Some(valid_integrity.to_string()),
+                ..super::LockedPackage::default()
+            });
+            lockfile.root_resolutions.insert(
+                name.to_string(),
+                super::LockedRootResolution {
+                    instance_id: Some(id),
+                    package: name.to_string(),
+                    version: "1.0.0".to_string(),
+                    source: Some(source.to_string()),
+                },
+            );
+            let toml = lockfile.to_toml().expect("serialize multibyte lockfile");
+            let parsed = super::Lockfile::from_toml(&toml).expect("parse multibyte lockfile");
+            assert_eq!(parsed.packages.len(), 1);
+            assert_eq!(parsed.packages[0].name, name);
+        }
+        for reserved in ["CON", "con", "COM1", "com9", "LPT1", "@scope/COM1"] {
+            assert!(
+                super::Lockfile::validate_package_name_and_version(reserved, "1.0.0").is_err(),
+                "expected reserved Windows device name {reserved:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_graph_validation_indexes_many_aliased_slots_and_rejects_mismatched_target_name() {
+        let source = "registry+https://registry.npmjs.org";
+        let valid_integrity = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+        let mut lockfile = super::Lockfile::new();
+        let mut deps = Vec::new();
+        let mut alias_deps = Vec::new();
+        let mut dep_targets = std::collections::BTreeMap::new();
+        let mut packages = Vec::new();
+
+        for idx in 0..128 {
+            let target_name = format!("real-pkg-{idx}");
+            let local_name = format!("alias-pkg-{idx}");
+            let id = lpm_common::PackageInstanceId::derive(
+                &target_name,
+                "1.0.0",
+                source,
+                &format!("root/{local_name}"),
+            );
+            deps.push(format!("{local_name}@1.0.0"));
+            alias_deps.push([local_name.clone(), target_name.clone()]);
+            dep_targets.insert(local_name, id);
+            packages.push(super::LockedPackage {
+                instance_id: Some(id),
+                name: target_name,
+                version: "1.0.0".to_string(),
+                source: Some(source.to_string()),
+                integrity: Some(valid_integrity.to_string()),
+                ..super::LockedPackage::default()
+            });
+        }
+        let parent_id = lpm_common::PackageInstanceId::derive("parent", "1.0.0", source, "root");
+        packages.push(super::LockedPackage {
+            instance_id: Some(parent_id),
+            name: "parent".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(source.to_string()),
+            integrity: Some(valid_integrity.to_string()),
+            dependencies: deps,
+            alias_dependencies: alias_deps,
+            dependency_targets: dep_targets,
+            ..super::LockedPackage::default()
+        });
+        lockfile.set_packages(packages);
+        lockfile.root_resolutions.insert(
+            "parent".to_string(),
+            super::LockedRootResolution {
+                instance_id: Some(parent_id),
+                package: "parent".to_string(),
+                version: "1.0.0".to_string(),
+                source: Some(source.to_string()),
+            },
+        );
+        let toml = lockfile.to_toml().expect("serialize alias-heavy lockfile");
+        assert!(super::Lockfile::from_toml(&toml).is_ok());
+
+        // Break one alias target name and ensure exact graph validation rejects it on write and load.
+        let mut broken = super::Lockfile::from_toml(&toml).unwrap();
+        let parent = broken
+            .packages
+            .iter_mut()
+            .find(|pkg| pkg.name == "parent")
+            .unwrap();
+        parent.alias_dependencies[64][1] = "wrong-target".to_string();
+        assert!(
+            broken.to_toml().is_err(),
+            "aliased slot whose target package name disagrees must be rejected on serialize"
+        );
+        let broken_toml = toml::to_string_pretty(&broken).expect("encode raw broken lockfile");
+        assert!(
+            super::Lockfile::from_toml(&broken_toml).is_err(),
+            "aliased slot whose target package name disagrees must be rejected on parse"
+        );
     }
 }

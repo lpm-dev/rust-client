@@ -168,25 +168,53 @@ pub async fn resolve_greedy_fused_workspace_with_cache_options_policy_and_select
             shared_metadata_concurrency.clone(),
         )
         .await?;
-        let pass = project_union_result(
-            union,
+        let mut pass = project_union_result(
+            &union,
             &slots,
             &overrides,
             auto_install_peers,
             &policies,
             &mut retained_projections,
+            false,
         )?;
         if pass.missing_ambient_peers.is_empty() {
-            return Ok(pass.finalize_outcome(
-                retained_projections,
-                expansion_pass,
-                root_specifier_isolated_count,
-                false,
-                0,
-                0,
-            ));
+            if expansion_pass > 0 {
+                // Earlier passes may have projected importers before later ambient-peer
+                // roots changed root-preferred selections; re-project retained importers
+                // against the converged union so every graph matches a fresh projection.
+                pass = project_union_result(
+                    &union,
+                    &slots,
+                    &overrides,
+                    auto_install_peers,
+                    &policies,
+                    &mut retained_projections,
+                    true,
+                )?;
+            }
+            if pass.missing_ambient_peers.is_empty() {
+                return Ok(pass.finalize_outcome(
+                    retained_projections,
+                    expansion_pass,
+                    root_specifier_isolated_count,
+                    false,
+                    0,
+                    0,
+                ));
+            }
         }
         if expansion_pass >= MAX_AMBIENT_PEER_EXPANSION_PASSES {
+            if expansion_pass > 0 {
+                pass = project_union_result(
+                    &union,
+                    &slots,
+                    &overrides,
+                    auto_install_peers,
+                    &policies,
+                    &mut retained_projections,
+                    true,
+                )?;
+            }
             let isolated_importers = pass.ambient_peer_pending_importer_count;
             tracing::warn!(
                 expansion_pass,
@@ -217,6 +245,17 @@ pub async fn resolve_greedy_fused_workspace_with_cache_options_policy_and_select
             added += 1;
         }
         if added == 0 {
+            if expansion_pass > 0 {
+                pass = project_union_result(
+                    &union,
+                    &slots,
+                    &overrides,
+                    auto_install_peers,
+                    &policies,
+                    &mut retained_projections,
+                    true,
+                )?;
+            }
             tracing::debug!(
                 expansion_pass,
                 reason = "ambient-peer-expansion-stalled",
@@ -521,13 +560,19 @@ struct ImporterProjectionContext<'a> {
 }
 
 fn project_union_result(
-    union: ResolveResult,
+    union: &ResolveResult,
     slots: &[Option<Vec<RootSlot>>],
     overrides: &OverrideSet,
     auto_install_peers: bool,
     policies: &[ResolverPolicy],
     retained_projections: &mut [Option<ResolveResult>],
+    reproject_retained: bool,
 ) -> Result<WorkspaceProjectionPass, ResolveError> {
+    if reproject_retained {
+        for slot in retained_projections.iter_mut() {
+            *slot = None;
+        }
+    }
     let union_stage_timing = union.stage_timing;
     let package_index = package_indices_by_id(&union.packages);
     let artifact_index = package_ids_by_artifact(&union.packages);
@@ -542,11 +587,11 @@ fn project_union_result(
         let Some(root_slots) = root_slots else {
             continue;
         };
-        if retained_projections[root_index].is_some() {
+        if !reproject_retained && retained_projections[root_index].is_some() {
             continue;
         }
         let context = ImporterProjectionContext {
-            union: &union,
+            union,
             package_index: &package_index,
             artifact_index: &artifact_index,
             packages_by_canonical: &packages_by_canonical,
@@ -2350,5 +2395,58 @@ mod tests {
         assert!(results[1].packages.iter().any(|p| {
             p.package.canonical_name() == "runtime" && p.version.to_string() == "2.0.0"
         }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ambient_peer_expansion_reprojects_earlier_importer_when_new_root_changes_shared_edge()
+    {
+        let roots = vec![
+            RootDependencies::required(HashMap::from([
+                ("runtime".to_string(), "1.0.0".to_string()),
+                ("app".to_string(), "1.0.0".to_string()),
+            ])),
+            RootDependencies::required(HashMap::from([(
+                "consumer".to_string(),
+                "1.0.0".to_string(),
+            )])),
+        ];
+        let results = resolve_roots(
+            roots,
+            vec![
+                (
+                    "app",
+                    cached_package(&[("1.0.0", &[("runtime", "^1")], &[])]),
+                ),
+                (
+                    "consumer",
+                    cached_package(&[("1.0.0", &[], &[("runtime", "^1")])]),
+                ),
+                (
+                    "runtime",
+                    cached_package(&[("1.9.0", &[], &[]), ("1.0.0", &[], &[])]),
+                ),
+            ],
+        )
+        .await;
+
+        let importer_a = &results[0];
+        let app_pkg = importer_a
+            .packages
+            .iter()
+            .find(|pkg| pkg.package.canonical_name() == "app")
+            .expect("importer A includes app");
+        let app_runtime_id = app_pkg
+            .dependency_targets
+            .get("runtime")
+            .expect("app has runtime edge");
+        let app_runtime_pkg = importer_a
+            .packages
+            .iter()
+            .find(|pkg| pkg.resolution_id == *app_runtime_id)
+            .expect("runtime target present in importer A packages");
+        // After pass 1 adds runtime@1.9.0 as an ambient peer root for importer B,
+        // app's edge in the final union selects 1.9.0; importer A must be re-projected
+        // from the final union rather than keeping its stale pass-0 edge to 1.0.0.
+        assert_eq!(app_runtime_pkg.version.to_string(), "1.9.0");
     }
 }

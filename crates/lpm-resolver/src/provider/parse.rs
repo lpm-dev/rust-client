@@ -275,9 +275,21 @@ fn parse_metadata_to_cache_info_inner(
                     cpu: ver_meta.cpu.clone(),
                     libc: ver_meta.libc.clone(),
                 });
+        let mut canonical_stack = [0u8; 64];
+        let mut canonical_owned = None;
+        let canonical_version_str: &str = {
+            use std::io::Write as _;
+            let mut cursor = std::io::Cursor::new(&mut canonical_stack[..]);
+            if write!(cursor, "{version}").is_ok() {
+                let len = cursor.position() as usize;
+                std::str::from_utf8(&canonical_stack[..len]).expect("version formatting is ASCII")
+            } else {
+                canonical_owned.insert(version.to_string()).as_str()
+            }
+        };
         builder.push_borrowed_version(
             version,
-            ver_str,
+            canonical_version_str,
             dependencies,
             peers,
             ver_meta.engines.get("node").map(String::as_str),

@@ -200,12 +200,7 @@ impl Default for StringPoolBuilder {
             data: String::new(),
             spans: Vec::new(),
             table: Vec::new(),
-            hasher: ahash::RandomState::with_seeds(
-                0x243f_6a88_85a3_08d3,
-                0x1319_8a2e_0370_7344,
-                0xa409_3822_299f_31d0,
-                0x082e_fa98_ec4e_6c89,
-            ),
+            hasher: ahash::RandomState::new(),
         }
     }
 }
@@ -443,6 +438,10 @@ impl<'a> Iterator for ManifestPeerDependencyIter<'a> {
 impl ExactSizeIterator for ManifestPeerDependencyIter<'_> {}
 
 impl CachedPackageInfo {
+    #[inline]
+    pub(super) fn has_complete_release_records(&self) -> bool {
+        !self.versions.is_empty() && self.release.records.len() >= self.versions.len()
+    }
     #[expect(
         clippy::too_many_arguments,
         reason = "the constructor preserves independent cache provenance flags"
@@ -2604,5 +2603,22 @@ mod tests {
             ),
             crate::ReleaseTimeStatus::Allowed
         );
+    }
+
+    #[test]
+    fn string_pool_builder_randomizes_hash_seeds_while_keeping_deterministic_ids() {
+        let mut first = StringPoolBuilder::default();
+        let mut second = StringPoolBuilder::default();
+        assert_ne!(
+            first.hasher.hash_one("react"),
+            second.hasher.hash_one("react"),
+            "string pool builders must use randomized per-instance hash seeds"
+        );
+        for token in ["react", "^19.0.0", "scheduler", "0.25.0", "react"] {
+            assert_eq!(first.intern(token), second.intern(token));
+        }
+        let pool_a = first.finish();
+        let pool_b = second.finish();
+        assert_eq!(&*pool_a.data, &*pool_b.data);
     }
 }

@@ -55,8 +55,8 @@ impl PreferredMetadata {
 struct Catalog<'a> {
     #[serde(borrow)]
     name: Cow<'a, str>,
-    #[serde(default)]
-    description: Option<String>,
+    #[serde(borrow, default)]
+    description: Option<&'a RawValue>,
     #[serde(default)]
     modified: Option<String>,
     #[serde(default, rename = "dist-tags")]
@@ -65,16 +65,16 @@ struct Catalog<'a> {
     versions: Option<&'a RawValue>,
     #[serde(borrow, default)]
     time: Option<&'a RawValue>,
-    #[serde(default)]
-    downloads: Option<u64>,
-    #[serde(default, rename = "distributionMode")]
-    distribution_mode: Option<String>,
-    #[serde(default, rename = "packageType")]
-    package_type: Option<String>,
-    #[serde(default, rename = "latestVersion")]
-    latest_version: Option<String>,
-    #[serde(default)]
-    ecosystem: Option<String>,
+    #[serde(borrow, default)]
+    downloads: Option<&'a RawValue>,
+    #[serde(borrow, default, rename = "distributionMode")]
+    distribution_mode: Option<&'a RawValue>,
+    #[serde(borrow, default, rename = "packageType")]
+    package_type: Option<&'a RawValue>,
+    #[serde(borrow, default, rename = "latestVersion")]
+    latest_version: Option<&'a RawValue>,
+    #[serde(borrow, default)]
+    ecosystem: Option<&'a RawValue>,
 }
 
 struct PreferredVersions<'a> {
@@ -152,19 +152,29 @@ fn parse_preferred(
                 Some(raw_time) => serde_json::from_str(raw_time.get())?,
                 None => HashMap::new(),
             };
+            let parse_opt = |raw: Option<&RawValue>| -> Result<Option<String>, serde_json::Error> {
+                match raw {
+                    Some(raw) => serde_json::from_str(raw.get()),
+                    None => Ok(None),
+                }
+            };
+            let downloads: Option<u64> = match catalog.downloads {
+                Some(raw) => serde_json::from_str(raw.get())?,
+                None => None,
+            };
             PackageMetadata {
                 name: catalog.name.into_owned(),
-                description: catalog.description,
+                description: parse_opt(catalog.description)?,
                 modified: catalog.modified,
                 dist_tags: catalog.dist_tags,
                 versions,
                 time,
-                downloads: catalog.downloads,
-                distribution_mode: catalog.distribution_mode,
-                package_type: catalog.package_type,
-                latest_version: catalog.latest_version,
+                downloads,
+                distribution_mode: parse_opt(catalog.distribution_mode)?,
+                package_type: parse_opt(catalog.package_type)?,
+                latest_version: parse_opt(catalog.latest_version)?,
                 latest_hint: Default::default(),
-                ecosystem: catalog.ecosystem,
+                ecosystem: parse_opt(catalog.ecosystem)?,
             }
         } else {
             serde_json::from_slice(bytes)?
@@ -1364,5 +1374,28 @@ mod tests {
         assert!(!complete);
         assert!(!fetched.timings.not_modified);
         assert!(fetched.timings.body_bytes > 0);
+    }
+
+    #[test]
+    fn preferred_selective_parse_tolerates_nonstandard_optional_catalog_fields() {
+        let raw = serde_json::json!({
+            "name": "odd-pkg",
+            "description": ["not", "a", "string"],
+            "downloads": "many",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "odd-pkg",
+                    "version": "1.0.0",
+                    "dependencies": {}
+                }
+            }
+        });
+        let bytes = serde_json::to_vec(&raw).unwrap();
+        let parsed = parse_preferred(&bytes, "odd-pkg", &|version| version == "1.0.0").expect(
+            "selective preferred parse must ignore unexpected types in unused top-level fields",
+        );
+        assert!(!parsed.versions_complete);
+        assert!(parsed.metadata.versions.contains_key("1.0.0"));
     }
 }

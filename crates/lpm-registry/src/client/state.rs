@@ -489,6 +489,63 @@ impl Drop for PendingCacheWriteGuard {
     }
 }
 
+pub(super) struct WeakEntryMap<K, V> {
+    entries: HashMap<K, std::sync::Weak<V>>,
+    prune_at: usize,
+    #[cfg(test)]
+    prune_count: usize,
+}
+
+impl<K, V> WeakEntryMap<K, V>
+where
+    K: Eq + std::hash::Hash,
+{
+    pub(super) fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            prune_at: 64,
+            #[cfg(test)]
+            prune_count: 0,
+        }
+    }
+
+    pub(super) fn get_or_insert<Q>(&mut self, key: &Q, create: impl FnOnce() -> Arc<V>) -> Arc<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ToOwned<Owned = K> + ?Sized,
+    {
+        if let Some(existing) = self.entries.get(key).and_then(std::sync::Weak::upgrade) {
+            return existing;
+        }
+        if self.entries.len() >= self.prune_at {
+            self.entries.retain(|_, weak| weak.strong_count() > 0);
+            self.prune_at = self.entries.len().saturating_mul(2).max(64);
+            #[cfg(test)]
+            {
+                self.prune_count += 1;
+            }
+        }
+        let value = create();
+        self.entries.insert(key.to_owned(), Arc::downgrade(&value));
+        value
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn insert(&mut self, key: K, value: std::sync::Weak<V>) {
+        self.entries.insert(key, value);
+    }
+
+    #[cfg(test)]
+    pub(super) fn prune_count(&self) -> usize {
+        self.prune_count
+    }
+}
+
 /// Client for communicating with the LPM registry.
 pub struct RegistryClient {
     /// Bundle of HTTP clients keyed by origin. Default client + eager +
@@ -515,7 +572,7 @@ pub struct RegistryClient {
     /// burst would exceed this bound.
     pub(super) pending_cache_write_bytes: Arc<tokio::sync::Semaphore>,
     pub(super) metadata_cache_mutations:
-        Arc<std::sync::Mutex<HashMap<std::path::PathBuf, std::sync::Weak<MetadataCacheMutation>>>>,
+        Arc<std::sync::Mutex<WeakEntryMap<std::path::PathBuf, MetadataCacheMutation>>>,
     /// Optional command-scoped immutable packument cache. Recursive
     /// workspace installs enable it on client clones so independent
     /// importer resolvers can reuse one parsed registry response without

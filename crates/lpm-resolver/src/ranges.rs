@@ -50,7 +50,7 @@ impl NpmRange {
         }
         let parsed = lpm_semver::parse_node_semver_range(trimmed)
             .map_err(|error| format!("invalid range '{input}': {error}"))?;
-        let exact_raw = trimmed.strip_prefix('=').unwrap_or(trimmed);
+        let exact_raw = trimmed.strip_prefix('=').map_or(trimmed, str::trim_start);
         let exact_version = NpmVersion::parse_exact_candidate(exact_raw);
         Ok(NpmRange {
             raw: trimmed.to_string(),
@@ -481,5 +481,19 @@ mod tests {
     #[test]
     fn alias_empty_body_returns_none() {
         assert!(parse_npm_alias("npm:").is_none());
+    }
+
+    #[test]
+    fn spaced_equality_ranges_preserve_exact_version_fast_path() {
+        for raw in ["=1.2.3", "= 1.2.3", "=\t1.2.3", "1.2.3"] {
+            let parsed = NpmRange::parse(raw).expect("valid exact range");
+            assert_eq!(
+                parsed.exact_version().map(|v| v.to_string()).as_deref(),
+                Some("1.2.3"),
+                "expected exact version 1.2.3 for {raw:?}"
+            );
+        }
+        let multi = NpmRange::parse("= 1.2.3 || 2.0.0").expect("valid OR range");
+        assert_eq!(multi.exact_version(), None);
     }
 }

@@ -151,7 +151,13 @@ pub(crate) async fn run_recursive_workspace_install(
     };
 
     workspace_lockfile::with_project_install_lock(&workspace_root, async {
+        let pre_discovery_root_stamp = capture_root_manifest_stamp(&workspace_root);
         let workspace = discover_recursive_workspace(cwd)?;
+        let post_discovery_root_stamp = capture_root_manifest_stamp(&workspace.root);
+        let root_manifest_stamp = stable_discovery_root_manifest_stamp(
+            pre_discovery_root_stamp,
+            post_discovery_root_stamp,
+        );
         if workspace.root != workspace_root {
             return Err(LpmError::Script(format!(
                 "workspace root changed while waiting for the install transaction ({} -> {}); \
@@ -416,7 +422,6 @@ pub(crate) async fn run_recursive_workspace_install(
             .collect();
         let workspace_freshness_cache =
             Arc::new(crate::workspace_discovery_cache::WorkspaceFreshnessCache::default());
-        let root_manifest_stamp = capture_root_manifest_stamp(&workspace_root);
         let any_script_ran = Arc::new(AtomicBool::new(false));
         let scheduler = async {
             let mut active_workspace = Arc::new(workspace);
@@ -700,7 +705,7 @@ fn discover_recursive_workspace(cwd: &Path) -> Result<lpm_workspace::Workspace, 
         })
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileStamp {
     len: u64,
     modified: Option<std::time::SystemTime>,
@@ -712,7 +717,7 @@ struct FileStamp {
     ctime_nsec: i64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RootManifestStamp {
     package_json: Option<FileStamp>,
     pnpm_workspace_yaml: Option<FileStamp>,
@@ -741,6 +746,27 @@ fn capture_root_manifest_stamp(root: &Path) -> RootManifestStamp {
     }
 }
 
+fn stable_discovery_root_manifest_stamp(
+    pre_discovery: RootManifestStamp,
+    post_discovery: RootManifestStamp,
+) -> Option<RootManifestStamp> {
+    (pre_discovery == post_discovery).then_some(pre_discovery)
+}
+
+fn should_refresh_workspace_target(
+    plan_kind: &str,
+    has_dev_preinstall: bool,
+    any_script_ran: bool,
+    root_manifest_stamp: Option<RootManifestStamp>,
+    target_path: &Path,
+) -> bool {
+    has_dev_preinstall
+        || (plan_kind == "root"
+            && (any_script_ran
+                || root_manifest_stamp
+                    .is_none_or(|stamp| capture_root_manifest_stamp(target_path) != stamp)))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_workspace_target_install(
     in_flight: &mut JoinSet<(usize, Result<TargetTaskResult, LpmError>)>,
@@ -766,7 +792,7 @@ fn spawn_workspace_target_install(
     root_provider_coordinator: Option<Arc<workspace_resolution::WorkspaceRootProviderCoordinator>>,
     workspace_freshness_cache: Arc<crate::workspace_discovery_cache::WorkspaceFreshnessCache>,
     root_provider_fingerprint: Option<Arc<str>>,
-    root_manifest_stamp: RootManifestStamp,
+    root_manifest_stamp: Option<RootManifestStamp>,
     any_script_ran: Arc<AtomicBool>,
     outcomes: &mut [Option<WorkspaceInstallOutcome>],
 ) {
@@ -839,7 +865,7 @@ async fn run_workspace_target_install(
     locked_integrities: Option<Arc<super::LockedIntegrities>>,
     workspace_freshness_cache: Arc<crate::workspace_discovery_cache::WorkspaceFreshnessCache>,
     root_provider_fingerprint: Option<Arc<str>>,
-    root_manifest_stamp: RootManifestStamp,
+    root_manifest_stamp: Option<RootManifestStamp>,
     any_script_ran: Arc<AtomicBool>,
 ) -> Result<TargetTaskResult, LpmError> {
     crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(&plan.path)?;
@@ -852,10 +878,13 @@ async fn run_workspace_target_install(
 
     // `pnpm:devPreinstall` may edit the target manifest; the root target also
     // refreshes when any prior script ran or root manifest metadata drifted.
-    let needs_refresh = plan.lifecycle.has_dev_preinstall()
-        || (plan.kind == "root"
-            && (any_script_ran.load(Ordering::Acquire)
-                || capture_root_manifest_stamp(&plan.path) != root_manifest_stamp));
+    let needs_refresh = should_refresh_workspace_target(
+        plan.kind,
+        plan.lifecycle.has_dev_preinstall(),
+        any_script_ran.load(Ordering::Acquire),
+        root_manifest_stamp,
+        &plan.path,
+    );
     let scoped_workspace = if needs_refresh {
         let mut refreshed = (*base_workspace).clone();
         crate::workspace_discovery_cache::refresh_target(&mut refreshed, &plan.path).map_err(
@@ -2589,5 +2618,59 @@ mod tests {
     fn read_replay_ready_lockfile(project_dir: &Path) -> lpm_lockfile::Lockfile {
         lpm_lockfile::Lockfile::read_fast(&project_dir.join(lpm_lockfile::LOCKFILE_NAME))
             .expect("read replay-ready lockfile")
+    }
+
+    #[test]
+    fn root_target_refreshes_when_manifest_changes_during_or_after_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"root","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        let pre = capture_root_manifest_stamp(root);
+        let post_same = capture_root_manifest_stamp(root);
+        let stable_stamp = stable_discovery_root_manifest_stamp(pre, post_same);
+        assert!(stable_stamp.is_some());
+        assert!(
+            !should_refresh_workspace_target("root", false, false, stable_stamp, root),
+            "unchanged root manifest without scripts should reuse the discovered workspace"
+        );
+
+        // Concurrent edit during discovery invalidates the stamp and forces refresh.
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"root","version":"1.0.1","dependencies":{"lodash":"^4.17.0"}}"#,
+        )
+        .unwrap();
+        let post_changed = capture_root_manifest_stamp(root);
+        assert_eq!(
+            stable_discovery_root_manifest_stamp(pre, post_changed),
+            None
+        );
+        assert!(
+            should_refresh_workspace_target("root", false, false, None, root),
+            "unstable pre/post discovery stamp must force root workspace refresh"
+        );
+
+        // Edit after discovery mismatches the captured stable stamp and forces refresh.
+        assert!(
+            should_refresh_workspace_target("root", false, false, stable_stamp, root),
+            "post-discovery manifest change must force root workspace refresh"
+        );
+
+        // Non-root member skips root-stamp refresh unless it has devPreinstall.
+        assert!(!should_refresh_workspace_target(
+            "member", false, false, None, root
+        ));
+        assert!(should_refresh_workspace_target(
+            "member",
+            true,
+            false,
+            stable_stamp,
+            root
+        ));
     }
 }

@@ -29,6 +29,7 @@ pub(super) const METADATA_CACHE_JSON_MARKER: u8 = 0xc1;
 pub(super) const ZSTD_FRAME_MAGIC: &[u8] = &[0x28, 0xb5, 0x2f, 0xfd];
 const ZSTD_COMPRESS_THRESHOLD: usize = 4096;
 const ZSTD_COMPRESS_LEVEL: i32 = 1;
+pub(super) const ZSTD_WINDOW_LOG_MAX: u32 = 23;
 
 /// Magic header for the manifest cache file format. Replaces the
 /// per-payload HMAC-SHA256 that used to run on every write. The cache
@@ -228,6 +229,32 @@ pub(super) fn open_metadata_cache_entry(
     })
 }
 
+pub(super) fn decode_zstd_msgpack_with_seed<R, T, S>(reader: R, seed: S) -> Option<T>
+where
+    R: std::io::Read,
+    S: for<'de> serde::de::DeserializeSeed<'de, Value = T>,
+{
+    use std::io::Read as _;
+
+    let mut decoder = zstd::stream::read::Decoder::new(reader).ok()?;
+    decoder.window_log_max(ZSTD_WINDOW_LOG_MAX).ok()?;
+    let mut limited = std::io::Read::take(decoder, METADATA_CACHE_FILE_CAP + 1);
+    let mut deserializer = rmp_serde::Deserializer::new(&mut limited);
+    let value = seed.deserialize(&mut deserializer).ok()?;
+    let mut trailing = [0u8; 1];
+    if limited.read(&mut trailing).ok()? != 0 || limited.limit() == 0 {
+        return None;
+    }
+    Some(value)
+}
+
+#[cfg(test)]
+pub(super) fn decode_zstd_msgpack_payload<T: serde::de::DeserializeOwned>(
+    data: &[u8],
+) -> Option<T> {
+    decode_zstd_msgpack_with_seed(data, std::marker::PhantomData::<T>)
+}
+
 pub(super) fn decode_metadata_cache_payload_with_seed<T, S>(
     reader: &mut MetadataCacheReader,
     seed: S,
@@ -251,10 +278,7 @@ where
         }
         let chained = std::io::Read::chain(&head[..read_len], reader);
         if read_len == ZSTD_FRAME_MAGIC.len() && head == *ZSTD_FRAME_MAGIC {
-            let decoder = zstd::stream::read::Decoder::new(chained).ok()?;
-            let limited = std::io::Read::take(decoder, METADATA_CACHE_FILE_CAP);
-            let mut deserializer = rmp_serde::Deserializer::new(limited);
-            seed.deserialize(&mut deserializer).ok()
+            decode_zstd_msgpack_with_seed(chained, seed)
         } else {
             let mut deserializer = serde_json::Deserializer::from_reader(chained);
             let value = seed.deserialize(&mut deserializer).ok()?;
@@ -262,8 +286,13 @@ where
             Some(value)
         }
     } else {
-        let mut deserializer = rmp_serde::Deserializer::new(reader);
-        seed.deserialize(&mut deserializer).ok()
+        let mut deserializer = rmp_serde::Deserializer::new(&mut *reader);
+        let value = seed.deserialize(&mut deserializer).ok()?;
+        let mut trailing = [0u8; 1];
+        if reader.read(&mut trailing).ok()? != 0 {
+            return None;
+        }
+        Some(value)
     }
 }
 
@@ -841,18 +870,12 @@ impl RegistryClient {
             .metadata_cache_mutations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(existing) = mutations.get(path).and_then(std::sync::Weak::upgrade) {
-            return existing;
-        }
-        if mutations.len() >= 64 {
-            mutations.retain(|_, weak| weak.strong_count() > 0);
-        }
-        let mutation = Arc::new(MetadataCacheMutation {
-            revision: std::sync::atomic::AtomicU64::new(0),
-            operation: std::sync::Mutex::new(()),
-        });
-        mutations.insert(path.to_path_buf(), Arc::downgrade(&mutation));
-        mutation
+        mutations.get_or_insert(path, || {
+            Arc::new(MetadataCacheMutation {
+                revision: std::sync::atomic::AtomicU64::new(0),
+                operation: std::sync::Mutex::new(()),
+            })
+        })
     }
 
     fn invalidate_metadata_cache_path(&self, path: &std::path::Path) {
@@ -1306,7 +1329,7 @@ impl RegistryClient {
     /// back to in-place sync write when no tokio runtime is available
     /// (unit tests).
     #[cfg(test)]
-    pub(super) fn write_metadata_cache<T: serde::Serialize + ?Sized>(
+    pub(super) fn write_metadata_cache<T: serde::Serialize + 'static>(
         &self,
         key: &str,
         metadata: &T,
@@ -1378,7 +1401,7 @@ impl RegistryClient {
         }
     }
 
-    pub(super) fn write_metadata_cache_with_directive<T: serde::Serialize + ?Sized>(
+    pub(super) fn write_metadata_cache_with_directive<T: serde::Serialize + 'static>(
         &self,
         key: &str,
         metadata: &T,
@@ -1391,7 +1414,7 @@ impl RegistryClient {
 
     /// Write one entry and report its content ID, so the caller can bind a
     /// projection of `metadata` to it.
-    pub(super) fn write_metadata_cache_entry<T: serde::Serialize + ?Sized>(
+    pub(super) fn write_metadata_cache_entry<T: serde::Serialize + 'static>(
         &self,
         key: &str,
         metadata: &T,
@@ -1401,7 +1424,7 @@ impl RegistryClient {
         self.write_metadata_cache_entry_at_generation(key, metadata, etag, directive, None)
     }
 
-    pub(super) fn write_metadata_cache_entry_at_generation<T: serde::Serialize + ?Sized>(
+    pub(super) fn write_metadata_cache_entry_at_generation<T: serde::Serialize + 'static>(
         &self,
         key: &str,
         metadata: &T,
@@ -1468,7 +1491,7 @@ impl RegistryClient {
                 content_id,
             }),
         };
-        let content = match serialize_metadata_cache_buffer(
+        let (content, prefix_len, used_json_fallback) = match encode_metadata_cache_buffer(
             &self.pending_cache_write_bytes,
             key,
             &freshness,
@@ -1476,7 +1499,7 @@ impl RegistryClient {
             &content_id_line,
             metadata,
         ) {
-            Ok(content) => content,
+            Ok(encoded) => encoded,
             Err(Some(BufferLimit::Budget)) => {
                 tracing::debug!(
                     "skipping best-effort metadata cache write because the allocation budget is full"
@@ -1493,6 +1516,15 @@ impl RegistryClient {
             history_generation.map(|generation| (Arc::clone(&self.history_cache), generation));
         let runtime_handle = tokio::runtime::Handle::try_current();
         if self.synchronous_cache_writes || runtime_handle.is_err() {
+            let content = compress_metadata_cache_buffer(
+                content,
+                prefix_len,
+                used_json_fallback,
+                &self.pending_cache_write_bytes,
+                &freshness,
+                etag_str,
+                &content_id_line,
+            );
             let _operation = mutation
                 .operation
                 .lock()
@@ -1511,6 +1543,8 @@ impl RegistryClient {
 
         let handle = runtime_handle.unwrap();
         let key_owned = key.to_owned();
+        let etag_owned = etag_str.to_owned();
+        let budget = Arc::clone(&self.pending_cache_write_bytes);
         let pending_guard = self.pending_cache_writes.enter();
         let span = tracing::trace_span!(target: "lpm_install_timeline", "metadata_cache_write");
         tracing::event!(name: "enqueue", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, {});
@@ -1518,6 +1552,15 @@ impl RegistryClient {
             let _pending_guard = pending_guard;
             let _entered = span.enter();
             tracing::event!(name: "work_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
+            let content = compress_metadata_cache_buffer(
+                content,
+                prefix_len,
+                used_json_fallback,
+                &budget,
+                &freshness,
+                &etag_owned,
+                &content_id_line,
+            );
             let _operation = mutation
                 .operation
                 .lock()
@@ -1536,9 +1579,8 @@ impl RegistryClient {
         Some(written)
     }
 
-    /// Serialize and persist an owned cache entry on the blocking pool so
-    /// MessagePack/zstd work stays off Tokio worker threads, returning `metadata`
-    /// as soon as serialization finishes without waiting for disk I/O.
+    /// Encode a best-effort metadata cache entry without failing the fetch,
+    /// offloading zstd compression and disk I/O to the blocking pool.
     pub(super) async fn write_metadata_cache_entry_async<T: serde::Serialize + Send + 'static>(
         &self,
         key: &str,
@@ -1547,138 +1589,33 @@ impl RegistryClient {
         directive: MetadataCacheDirective,
         history_generation: Option<u64>,
     ) -> Result<(T, Option<MetadataCacheWrite>), LpmError> {
-        use std::sync::atomic::Ordering;
-
-        if history_generation
-            .is_some_and(|generation| !self.history_cache.is_generation(generation))
-        {
-            return Ok((metadata, None));
-        }
-        let runtime_handle = tokio::runtime::Handle::try_current();
-        if self.synchronous_cache_writes || runtime_handle.is_err() {
-            let written = self.write_metadata_cache_entry_at_generation(
-                key,
-                &metadata,
-                etag,
-                directive,
-                history_generation,
-            );
-            return Ok((metadata, written));
-        }
-
-        let fresh_for = match directive.local_freshness() {
-            Some(fresh_for) => {
-                let record = || {
-                    self.remember_command_cache_policy(
-                        key,
-                        MetadataCommandCachePolicy::StoreUntil(
-                            std::time::Instant::now() + fresh_for,
-                        ),
-                    );
-                };
-                if let Some(generation) = history_generation {
-                    self.history_cache.with_generation(generation, record);
-                    if !self.history_cache.is_generation(generation) {
-                        return Ok((metadata, None));
-                    }
-                } else {
-                    record();
-                }
-                fresh_for
-            }
-            None => {
-                let record_no_store = || {
-                    self.invalidate_metadata_cache_key(key);
-                    self.remember_command_cache_policy(key, MetadataCommandCachePolicy::NoStore);
-                };
-                if let Some(generation) = history_generation {
-                    self.history_cache
-                        .with_generation(generation, record_no_store);
-                } else {
-                    record_no_store();
-                }
-                return Ok((metadata, None));
-            }
-        };
-        let Some(path) = self.cache_path(key) else {
-            return Ok((metadata, None));
-        };
-        let now = std::time::SystemTime::now();
-        let expires_at = now.checked_add(fresh_for).unwrap_or(now);
-        let mutation = self.metadata_cache_mutation(&path);
-        let revision = mutation.revision.fetch_add(1, Ordering::AcqRel) + 1;
-        let etag_owned = sanitize_cache_etag(etag).to_owned();
-        let freshness = fresh_for.as_secs().to_string();
-        let content_id = rand::random::<u128>();
-        let content_id_line = format!("{content_id:032x}\n");
-        let budget = Arc::clone(&self.pending_cache_write_bytes);
-        let key_owned = key.to_owned();
-        let history_guard =
-            history_generation.map(|generation| (Arc::clone(&self.history_cache), generation));
-        let pending_guard = self.pending_cache_writes.enter();
-        let write_span =
-            tracing::trace_span!(target: "lpm_install_timeline", "metadata_cache_write");
-        tracing::event!(name: "enqueue", target: "lpm_install_timeline", parent: &write_span, tracing::Level::TRACE, {});
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let handle = runtime_handle.unwrap();
-        handle.spawn_blocking(move || {
-            let _pending_guard = pending_guard;
-            let _entered = write_span.enter();
-            let serialized = serialize_metadata_cache_buffer(
-                &budget,
-                &key_owned,
-                &freshness,
-                &etag_owned,
-                &content_id_line,
-                &metadata,
-            );
-            let (content, written) = match serialized {
-                Ok(content) => (
-                    Some(content),
-                    Some(MetadataCacheWrite {
-                        fresh_for,
-                        source: Some(ProjectionSource {
-                            entry: path.clone(),
-                            content_id,
-                        }),
-                    }),
-                ),
-                Err(Some(BufferLimit::Budget)) => {
-                    tracing::debug!(
-                        "skipping best-effort metadata cache write because the allocation budget is full"
-                    );
-                    (
-                        None,
-                        Some(MetadataCacheWrite {
-                            fresh_for,
-                            source: None,
-                        }),
-                    )
-                }
-                Err(Some(BufferLimit::FileSize) | None) => (None, None),
-            };
-            let _ = tx.send((metadata, written));
-            let Some(content) = content else {
-                return;
-            };
-            tracing::event!(name: "work_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
-            let _operation = mutation
-                .operation
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if mutation.revision.load(Ordering::Acquire) == revision
-                && history_guard
-                    .as_ref()
-                    .is_none_or(|(hc, generation)| hc.is_generation(*generation))
-                && let Err(e) = write_metadata_cache_file(&path, &content, expires_at)
-            {
-                let key_for_log = sanitize_cache_key_for_log(&key_owned);
-                tracing::warn!("failed to write metadata cache for {key_for_log}: {e}");
-            }
-            tracing::event!(name: "work_end", target: "lpm_install_timeline", tracing::Level::TRACE, {});
+        let multi_thread = tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
+            runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
         });
-        rx.await
-            .map_err(|_| LpmError::Registry("metadata cache serialization task aborted".into()))
+        let encode = || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.write_metadata_cache_entry_at_generation(
+                    key,
+                    &metadata,
+                    etag,
+                    directive,
+                    history_generation,
+                )
+            }))
+        };
+        let written = match if multi_thread {
+            tokio::task::block_in_place(encode)
+        } else {
+            encode()
+        } {
+            Ok(written) => written,
+            Err(_) => {
+                let key_for_log = sanitize_cache_key_for_log(key);
+                tracing::warn!("metadata cache serialization panicked for {key_for_log}");
+                None
+            }
+        };
+        Ok((metadata, written))
     }
 
     #[cfg(test)]
@@ -1825,14 +1762,202 @@ fn sanitize_cache_etag(etag: Option<&str>) -> &str {
         .unwrap_or("")
 }
 
-fn serialize_metadata_cache_buffer<T: serde::Serialize + ?Sized>(
+#[derive(serde::Serialize)]
+struct SparseDistInfo<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tarball: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    integrity: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shasum: &'a Option<String>,
+    #[serde(rename = "unpackedSize", skip_serializing_if = "Option::is_none")]
+    unpacked_size: &'a Option<std::num::NonZeroU64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signatures: &'a Option<Vec<crate::types::RegistrySignature>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attestations: &'a Option<crate::types::AttestationRef>,
+}
+
+impl<'a> From<&'a crate::types::DistInfo> for SparseDistInfo<'a> {
+    fn from(dist: &'a crate::types::DistInfo) -> Self {
+        Self {
+            tarball: &dist.tarball,
+            integrity: &dist.integrity,
+            shasum: &dist.shasum,
+            unpacked_size: &dist.unpacked_size,
+            signatures: &dist.signatures,
+            attestations: &dist.attestations,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct SparseVersionMetadata<'a> {
+    name: &'a str,
+    version: &'a str,
+    #[serde(rename = "publicationStatus", skip_serializing_if = "Option::is_none")]
+    publication_status: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deprecated: &'a Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    dependencies: &'a HashMap<String, String>,
+    #[serde(rename = "devDependencies", skip_serializing_if = "HashMap::is_empty")]
+    dev_dependencies: &'a HashMap<String, String>,
+    #[serde(rename = "peerDependencies", skip_serializing_if = "HashMap::is_empty")]
+    peer_dependencies: &'a HashMap<String, String>,
+    #[serde(
+        rename = "peerDependenciesMeta",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    peer_dependencies_meta: &'a HashMap<String, crate::types::PeerDependencyMeta>,
+    #[serde(rename = "bundleDependencies", skip_serializing_if = "Vec::is_empty")]
+    bundle_dependencies: &'a Vec<String>,
+    #[serde(
+        rename = "optionalDependencies",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    optional_dependencies: &'a HashMap<String, String>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    engines: &'a HashMap<String, String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    os: &'a Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cpu: &'a Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    libc: &'a Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dist: Option<SparseDistInfo<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    readme: &'a Option<String>,
+    #[serde(rename = "lpmConfig", skip_serializing_if = "Option::is_none")]
+    lpm_config: &'a Option<serde_json::Value>,
+    #[serde(rename = "_ecosystem", skip_serializing_if = "Option::is_none")]
+    ecosystem: &'a Option<String>,
+    #[serde(rename = "_swiftMeta", skip_serializing_if = "Option::is_none")]
+    swift_meta: &'a Option<Box<crate::types::SwiftMeta>>,
+    #[serde(rename = "_npmUser", skip_serializing_if = "Option::is_none")]
+    npm_user: &'a Option<Box<crate::types::NpmUserMetadata>>,
+    #[serde(rename = "_behavioralTags", skip_serializing_if = "Option::is_none")]
+    behavioral_tags: &'a Option<crate::types::BehavioralTags>,
+    #[serde(rename = "_testOnlyTags", skip_serializing_if = "Option::is_none")]
+    test_only_tags: &'a Option<Vec<String>>,
+    #[serde(rename = "_lifecycleScripts", skip_serializing_if = "Option::is_none")]
+    lifecycle_scripts: &'a Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scripts: &'a Option<HashMap<String, String>>,
+    #[serde(rename = "hasInstallScript", skip_serializing_if = "Option::is_none")]
+    has_install_script: &'a Option<bool>,
+    #[serde(rename = "_securityFindings", skip_serializing_if = "Option::is_none")]
+    security_findings: &'a Option<Vec<crate::types::SecurityFinding>>,
+    #[serde(rename = "_qualityScore", skip_serializing_if = "Option::is_none")]
+    quality_score: &'a Option<u32>,
+}
+
+impl<'a> From<&'a VersionMetadata> for SparseVersionMetadata<'a> {
+    fn from(version: &'a VersionMetadata) -> Self {
+        Self {
+            name: &version.name,
+            version: &version.version,
+            publication_status: &version.publication_status,
+            description: &version.description,
+            deprecated: &version.deprecated,
+            dependencies: &version.dependencies,
+            dev_dependencies: &version.dev_dependencies,
+            peer_dependencies: &version.peer_dependencies,
+            peer_dependencies_meta: &version.peer_dependencies_meta,
+            bundle_dependencies: &version.bundle_dependencies,
+            optional_dependencies: &version.optional_dependencies,
+            engines: &version.engines,
+            os: &version.os,
+            cpu: &version.cpu,
+            libc: &version.libc,
+            dist: version.dist.as_ref().map(SparseDistInfo::from),
+            readme: &version.readme,
+            lpm_config: &version.lpm_config,
+            ecosystem: &version.ecosystem,
+            swift_meta: &version.swift_meta,
+            npm_user: &version.npm_user,
+            behavioral_tags: &version.behavioral_tags,
+            test_only_tags: &version.test_only_tags,
+            lifecycle_scripts: &version.lifecycle_scripts,
+            scripts: &version.scripts,
+            has_install_script: &version.has_install_script,
+            security_findings: &version.security_findings,
+            quality_score: &version.quality_score,
+        }
+    }
+}
+
+struct SparseVersionMap<'a>(&'a HashMap<String, VersionMetadata>);
+
+impl serde::Serialize for SparseVersionMap<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (k, v) in self.0 {
+            map.serialize_entry(k, &SparseVersionMetadata::from(v))?;
+        }
+        map.end()
+    }
+}
+
+#[derive(serde::Serialize)]
+struct SparsePackageMetadata<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modified: &'a Option<String>,
+    #[serde(rename = "dist-tags", skip_serializing_if = "HashMap::is_empty")]
+    dist_tags: &'a HashMap<String, String>,
+    #[serde(skip_serializing_if = "sparse_versions_is_empty")]
+    versions: SparseVersionMap<'a>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    time: &'a HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    downloads: &'a Option<u64>,
+    #[serde(rename = "distributionMode", skip_serializing_if = "Option::is_none")]
+    distribution_mode: &'a Option<String>,
+    #[serde(rename = "packageType", skip_serializing_if = "Option::is_none")]
+    package_type: &'a Option<String>,
+    #[serde(rename = "latestVersion", skip_serializing_if = "Option::is_none")]
+    latest_version: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ecosystem: &'a Option<String>,
+}
+
+fn sparse_versions_is_empty(versions: &SparseVersionMap<'_>) -> bool {
+    versions.0.is_empty()
+}
+
+impl<'a> From<&'a PackageMetadata> for SparsePackageMetadata<'a> {
+    fn from(pkg: &'a PackageMetadata) -> Self {
+        Self {
+            name: &pkg.name,
+            description: &pkg.description,
+            modified: &pkg.modified,
+            dist_tags: &pkg.dist_tags,
+            versions: SparseVersionMap(&pkg.versions),
+            time: &pkg.time,
+            downloads: &pkg.downloads,
+            distribution_mode: &pkg.distribution_mode,
+            package_type: &pkg.package_type,
+            latest_version: &pkg.latest_version,
+            ecosystem: &pkg.ecosystem,
+        }
+    }
+}
+
+fn encode_metadata_cache_buffer<T: serde::Serialize + 'static>(
     budget: &Arc<tokio::sync::Semaphore>,
     key: &str,
     freshness: &str,
     etag_str: &str,
     content_id_line: &str,
     metadata: &T,
-) -> Result<MetadataCacheBuffer, Option<BufferLimit>> {
+) -> Result<(MetadataCacheBuffer, usize, bool), Option<BufferLimit>> {
     use std::io::Write as _;
 
     let prefix = [
@@ -1849,7 +1974,15 @@ fn serialize_metadata_cache_buffer<T: serde::Serialize + ?Sized>(
         tracing::trace_span!(target: "lpm_install_timeline", "metadata_cache_serialization")
             .entered();
     let mut used_json_fallback = false;
-    if let Err(messagepack_error) = rmp_serde::encode::write_named(&mut content, metadata) {
+    let any_value: &dyn std::any::Any = metadata;
+    let msgpack_result = if let Some(pkg) = any_value.downcast_ref::<PackageMetadata>() {
+        rmp_serde::encode::write_named(&mut content, &SparsePackageMetadata::from(pkg))
+    } else if let Some(ver) = any_value.downcast_ref::<VersionMetadata>() {
+        rmp_serde::encode::write_named(&mut content, &SparseVersionMetadata::from(ver))
+    } else {
+        rmp_serde::encode::write_named(&mut content, metadata)
+    };
+    if let Err(messagepack_error) = msgpack_result {
         if let Some(limit) = content.exhausted() {
             return Err(Some(limit));
         }
@@ -1874,6 +2007,20 @@ fn serialize_metadata_cache_buffer<T: serde::Serialize + ?Sized>(
         return Err(None);
     }
 
+    tracing::event!(name: "serialized", target: "lpm_install_timeline", tracing::Level::TRACE, bytes = content.len() as u64);
+    drop(serialization);
+    Ok((content, prefix_len, used_json_fallback))
+}
+
+fn compress_metadata_cache_buffer(
+    mut content: MetadataCacheBuffer,
+    prefix_len: usize,
+    used_json_fallback: bool,
+    budget: &Arc<tokio::sync::Semaphore>,
+    freshness: &str,
+    etag_str: &str,
+    content_id_line: &str,
+) -> MetadataCacheBuffer {
     if !used_json_fallback && content.len().saturating_sub(prefix_len) >= ZSTD_COMPRESS_THRESHOLD {
         let compressed_prefix = [
             METADATA_CACHE_MAGIC,
@@ -1890,16 +2037,14 @@ fn serialize_metadata_cache_buffer<T: serde::Serialize + ?Sized>(
             content.len().saturating_sub(1),
         ) && let Ok(mut encoder) =
             zstd::stream::write::Encoder::new(compressed_buf, ZSTD_COMPRESS_LEVEL)
+            && encoder.window_log(ZSTD_WINDOW_LOG_MAX).is_ok()
             && content.write_payload_to(prefix_len, &mut encoder).is_ok()
             && let Ok(compressed) = encoder.finish()
         {
             content = compressed;
         }
     }
-
-    tracing::event!(name: "serialized", target: "lpm_install_timeline", tracing::Level::TRACE, bytes = content.len() as u64);
-    drop(serialization);
-    Ok(content)
+    content
 }
 
 #[cfg(test)]
@@ -2363,6 +2508,146 @@ mod pending_write_budget_tests {
             retained < 64,
             "expected completed mutation locks to be pruned below 64, found {retained}"
         );
+    }
+
+    #[test]
+    fn weak_entry_map_prunes_amortized_logarithmically_when_all_keys_remain_live() {
+        let mut map = super::state::WeakEntryMap::<String, ()>::new();
+        let mut live = Vec::with_capacity(512);
+        for index in 0..512 {
+            live.push(map.get_or_insert(&format!("live-{index}"), || Arc::new(())));
+        }
+        assert_eq!(map.len(), 512);
+        assert!(
+            map.prune_count() <= 4,
+            "expected O(log N) prunes for 512 live entries, got {}",
+            map.prune_count()
+        );
+        drop(live);
+        let _ = map.get_or_insert("trigger-cleanup", || Arc::new(()));
+        assert!(map.len() < 512);
+    }
+
+    #[test]
+    fn public_metadata_types_preserve_json_fields_and_positional_msgpack_round_trip() {
+        let dist = crate::types::DistInfo {
+            tarball: None,
+            integrity: Some("sha512-only".to_string()),
+            shasum: None,
+            unpacked_size: std::num::NonZeroU64::new(4096),
+            signatures: None,
+            attestations: None,
+        };
+        let positional = rmp_serde::to_vec(&dist).expect("positional encode");
+        let decoded: crate::types::DistInfo =
+            rmp_serde::from_slice(&positional).expect("positional decode");
+        assert_eq!(decoded.tarball, None);
+        assert_eq!(decoded.integrity.as_deref(), Some("sha512-only"));
+        assert_eq!(decoded.unpacked_size, std::num::NonZeroU64::new(4096));
+
+        let pkg = PackageMetadata {
+            name: "shape-test".to_string(),
+            description: None,
+            modified: None,
+            dist_tags: HashMap::new(),
+            versions: HashMap::from([(
+                "1.0.0".to_string(),
+                VersionMetadata {
+                    name: "shape-test".to_string(),
+                    version: "1.0.0".to_string(),
+                    ..VersionMetadata::default()
+                },
+            )]),
+            time: HashMap::new(),
+            downloads: None,
+            distribution_mode: None,
+            package_type: None,
+            latest_version: None,
+            latest_hint: Default::default(),
+            ecosystem: None,
+        };
+        let json = serde_json::to_value(&pkg).expect("json serialize");
+        assert!(
+            json.get("description").is_some(),
+            "description key must stay present"
+        );
+        let ver = &json["versions"]["1.0.0"];
+        assert!(
+            ver.get("dependencies").is_some(),
+            "dependencies key must stay present"
+        );
+        assert!(ver.get("os").is_some(), "os key must stay present");
+        assert!(ver.get("dist").is_some(), "dist key must stay present");
+    }
+
+    #[tokio::test]
+    async fn panicking_cache_serializer_returns_fetched_metadata_without_error() {
+        struct PanickingSerialize(String);
+        impl serde::Serialize for PanickingSerialize {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                panic!("simulated cache serializer panic");
+            }
+        }
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let client = RegistryClient::new().with_cache_dir(Some(cache_dir.path().to_path_buf()));
+        let (returned, written) = client
+            .write_metadata_cache_entry_async(
+                "panic-pkg",
+                PanickingSerialize("payload-kept".to_string()),
+                None,
+                MetadataCacheDirective::Unspecified,
+                None,
+            )
+            .await
+            .expect("best-effort cache write must never fail a successful fetch");
+        assert_eq!(returned.0, "payload-kept");
+        assert!(written.is_none());
+    }
+
+    #[test]
+    fn zstd_cache_decoder_rejects_truncated_trailing_and_oversized_window_frames() {
+        use std::io::Write as _;
+
+        // Valid compressed payload round-trips cleanly.
+        let payload = rmp_serde::to_vec_named(&"hello-zstd".to_string()).unwrap();
+        let mut valid_frame = Vec::new();
+        {
+            let mut enc = zstd::stream::write::Encoder::new(&mut valid_frame, 1).unwrap();
+            enc.window_log(ZSTD_WINDOW_LOG_MAX).unwrap();
+            enc.write_all(&payload).unwrap();
+            enc.finish().unwrap();
+        }
+        assert_eq!(
+            decode_zstd_msgpack_payload::<String>(&valid_frame).as_deref(),
+            Some("hello-zstd")
+        );
+
+        // Truncated zstd frame must be rejected.
+        let truncated = &valid_frame[..valid_frame.len().saturating_sub(4)];
+        assert!(decode_zstd_msgpack_payload::<String>(truncated).is_none());
+
+        // Compressed payload with trailing decoded bytes after one MessagePack value must be rejected.
+        let mut trailing_frame = Vec::new();
+        {
+            let mut enc = zstd::stream::write::Encoder::new(&mut trailing_frame, 1).unwrap();
+            enc.window_log(ZSTD_WINDOW_LOG_MAX).unwrap();
+            enc.write_all(&payload).unwrap();
+            enc.write_all(&rmp_serde::to_vec_named(&"extra").unwrap())
+                .unwrap();
+            enc.finish().unwrap();
+        }
+        assert!(decode_zstd_msgpack_payload::<String>(&trailing_frame).is_none());
+
+        // Frame requesting a decoder window larger than ZSTD_WINDOW_LOG_MAX must be rejected.
+        let mut wide_window_frame = Vec::new();
+        {
+            let mut enc = zstd::stream::write::Encoder::new(&mut wide_window_frame, 1).unwrap();
+            enc.window_log(ZSTD_WINDOW_LOG_MAX + 2).unwrap();
+            enc.write_all(&payload).unwrap();
+            enc.finish().unwrap();
+        }
+        assert!(decode_zstd_msgpack_payload::<String>(&wide_window_frame).is_none());
     }
 }
 

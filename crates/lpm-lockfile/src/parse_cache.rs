@@ -65,14 +65,15 @@ struct InFlightParse {
 
 enum InFlightState {
     Pending,
-    Done(Option<Arc<Lockfile>>),
+    Done(Result<Arc<Lockfile>, LockfileError>),
+    Aborted,
 }
 
 struct InFlightGuard<'a> {
     cache: &'a ParseCache,
     key: CacheKey,
     flight: Arc<InFlightParse>,
-    result: Option<Arc<Lockfile>>,
+    result: Option<Result<Arc<Lockfile>, LockfileError>>,
 }
 
 impl Drop for InFlightGuard<'_> {
@@ -92,7 +93,10 @@ impl Drop for InFlightGuard<'_> {
             .state
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        *state = InFlightState::Done(self.result.take());
+        *state = match self.result.take() {
+            Some(result) => InFlightState::Done(result),
+            None => InFlightState::Aborted,
+        };
         self.flight.ready.notify_all();
     }
 }
@@ -153,15 +157,23 @@ impl ParseCache {
                     };
                     // Re-check LRU cache in case a peer finished between lookup and flight insert.
                     if let Some(lockfile) = self.lookup(key) {
-                        guard.result = Some(Arc::clone(&lockfile));
+                        guard.result = Some(Ok(Arc::clone(&lockfile)));
                         self.reuses.fetch_add(1, Ordering::Relaxed);
                         return Ok(lockfile);
                     }
-                    let lockfile = Arc::new(parse(text)?);
-                    self.parses.fetch_add(1, Ordering::Relaxed);
-                    self.insert(key, &lockfile);
-                    guard.result = Some(Arc::clone(&lockfile));
-                    return Ok(lockfile);
+                    match parse(text) {
+                        Ok(parsed) => {
+                            let lockfile = Arc::new(parsed);
+                            self.parses.fetch_add(1, Ordering::Relaxed);
+                            self.insert(key, &lockfile);
+                            guard.result = Some(Ok(Arc::clone(&lockfile)));
+                            return Ok(lockfile);
+                        }
+                        Err(error) => {
+                            guard.result = Some(Err(error.clone()));
+                            return Err(error);
+                        }
+                    }
                 }
                 Err(flight) => {
                     let mut state = flight.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -173,11 +185,14 @@ impl ParseCache {
                                     .wait(state)
                                     .unwrap_or_else(PoisonError::into_inner);
                             }
-                            InFlightState::Done(Some(lockfile)) => {
+                            InFlightState::Done(Ok(lockfile)) => {
                                 self.reuses.fetch_add(1, Ordering::Relaxed);
                                 return Ok(Arc::clone(lockfile));
                             }
-                            InFlightState::Done(None) => break,
+                            InFlightState::Done(Err(error)) => {
+                                return Err(error.clone());
+                            }
+                            InFlightState::Aborted => break,
                         }
                     }
                 }
@@ -360,5 +375,47 @@ mod tests {
                 reuses: 3,
             }
         );
+    }
+
+    #[test]
+    fn concurrent_corrupt_lockfile_reads_share_one_failure_and_subsequent_retry_succeeds() {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let cache = Arc::new(ParseCache::new());
+        let corrupt = Arc::new("not valid toml === [[[".to_string());
+        let barrier = Arc::new(Barrier::new(4));
+        let parse_calls = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let cache = Arc::clone(&cache);
+            let corrupt = Arc::clone(&corrupt);
+            let barrier = Arc::clone(&barrier);
+            let parse_calls = Arc::clone(&parse_calls);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                cache.parse(&corrupt, |input| {
+                    parse_calls.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    Lockfile::parse_uncached(input)
+                })
+            }));
+        }
+
+        for handle in handles {
+            assert!(
+                handle.join().unwrap().is_err(),
+                "every concurrent reader of corrupt text must receive the parse error"
+            );
+        }
+        assert_eq!(
+            parse_calls.load(Ordering::SeqCst),
+            1,
+            "concurrent waiters on the same corrupt text must share a single parse failure"
+        );
+
+        let valid = lockfile_text("3.0.0");
+        assert!(cache.parse(&valid, Lockfile::parse_uncached).is_ok());
     }
 }
