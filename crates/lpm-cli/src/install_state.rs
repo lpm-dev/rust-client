@@ -1256,20 +1256,29 @@ pub(crate) struct SyncNoopFileStamp {
     pub(crate) len: u64,
     pub(crate) mtime_ns: u64,
     pub(crate) ctime_ns: u64,
+    pub(crate) dev: u64,
     pub(crate) ino: u64,
 }
 
 impl SyncNoopFileStamp {
+    #[cfg(any(unix, test))]
     pub(crate) fn from_path(path: &Path) -> Option<Self> {
         let meta = std::fs::symlink_metadata(path).ok()?;
         Self::from_symlink_metadata(&meta)
     }
 
     pub(crate) fn from_symlink_metadata(meta: &std::fs::Metadata) -> Option<Self> {
+        if meta.file_type().is_symlink() {
+            return None;
+        }
+        Self::from_regular_metadata(meta)
+    }
+
+    fn from_regular_metadata(meta: &std::fs::Metadata) -> Option<Self> {
         #[cfg(not(unix))]
         {
             let _ = meta;
-            return None;
+            None
         }
         #[cfg(unix)]
         {
@@ -1285,6 +1294,7 @@ impl SyncNoopFileStamp {
                 len: meta.len(),
                 mtime_ns,
                 ctime_ns: sec.saturating_mul(1_000_000_000).saturating_add(nsec),
+                dev: meta.dev(),
                 ino: meta.ino(),
             })
         }
@@ -1305,8 +1315,8 @@ impl SyncNoopFileStamp {
 
     fn format_compact(self) -> String {
         format!(
-            "{},{},{},{}",
-            self.len, self.mtime_ns, self.ctime_ns, self.ino
+            "{},{},{},{},{}",
+            self.len, self.mtime_ns, self.ctime_ns, self.dev, self.ino
         )
     }
 
@@ -1315,6 +1325,7 @@ impl SyncNoopFileStamp {
         let len = parts.next()?.parse::<u64>().ok()?;
         let mtime_ns = parts.next()?.parse::<u64>().ok()?;
         let ctime_ns = parts.next()?.parse::<u64>().ok()?;
+        let dev = parts.next()?.parse::<u64>().ok()?;
         let ino = parts.next()?.parse::<u64>().ok()?;
         if parts.next().is_some() {
             return None;
@@ -1323,32 +1334,109 @@ impl SyncNoopFileStamp {
             len,
             mtime_ns,
             ctime_ns,
+            dev,
             ino,
         })
     }
+}
+
+#[cfg(any(unix, test))]
+fn verified_descriptor_stamp(
+    pre_fd: Option<SyncNoopFileStamp>,
+    post_fd: Option<SyncNoopFileStamp>,
+    post_path: Option<SyncNoopFileStamp>,
+    byte_len: u64,
+) -> Option<SyncNoopFileStamp> {
+    let stamp = pre_fd?;
+    (post_fd == Some(stamp) && post_path == Some(stamp) && stamp.len == byte_len).then_some(stamp)
 }
 
 pub(crate) fn read_regular_file_capped_with_stamp(
     path: &Path,
     cap: u64,
 ) -> Result<(Vec<u8>, Option<SyncNoopFileStamp>), lpm_common::BoundedReadError> {
-    let pre = SyncNoopFileStamp::from_path(path);
-    let bytes = lpm_common::read_file_capped(path, cap)?;
-    let post = SyncNoopFileStamp::from_path(path);
-    // Drop the stamp whenever the file changed between the pre- and post-read
-    // stats so a concurrent edit can never stamp new metadata onto stale bytes.
-    let stamp = pre.filter(|stamp| post == Some(*stamp) && stamp.len == bytes.len() as u64);
-    Ok((bytes, stamp))
+    #[cfg(unix)]
+    {
+        use std::io::Read as _;
+        let mut file = match lpm_common::open_nofollow(path) {
+            Ok(file) => file,
+            Err(source)
+                if matches!(source.raw_os_error(), Some(libc::ELOOP) | Some(libc::EMLINK)) =>
+            {
+                // Symlinked manifests remain readable but never receive a regular-file stamp.
+                let bytes = lpm_common::read_file_capped(path, cap)?;
+                return Ok((bytes, None));
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(lpm_common::BoundedReadError::NotFound {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(source) => {
+                return Err(lpm_common::BoundedReadError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        let pre_meta = file
+            .metadata()
+            .map_err(|source| lpm_common::BoundedReadError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if !pre_meta.is_file() {
+            return Err(lpm_common::BoundedReadError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, "not a regular file"),
+            });
+        }
+        if pre_meta.len() > cap {
+            return Err(lpm_common::BoundedReadError::TooLarge {
+                path: path.to_path_buf(),
+                limit: cap,
+            });
+        }
+        let pre_fd = SyncNoopFileStamp::from_regular_metadata(&pre_meta);
+        let initial_cap = usize::try_from(pre_meta.len().min(64 * 1024 * 1024)).unwrap_or(0);
+        let mut bytes = Vec::with_capacity(initial_cap);
+        let read_limit = cap.saturating_add(1);
+        std::io::Read::take(&mut file, read_limit)
+            .read_to_end(&mut bytes)
+            .map_err(|source| lpm_common::BoundedReadError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > cap {
+            return Err(lpm_common::BoundedReadError::TooLarge {
+                path: path.to_path_buf(),
+                limit: cap,
+            });
+        }
+        let post_fd = file
+            .metadata()
+            .ok()
+            .and_then(|meta| SyncNoopFileStamp::from_regular_metadata(&meta));
+        let post_path = SyncNoopFileStamp::from_path(path);
+        let stamp = verified_descriptor_stamp(pre_fd, post_fd, post_path, bytes.len() as u64);
+        Ok((bytes, stamp))
+    }
+    #[cfg(not(unix))]
+    {
+        let bytes = lpm_common::read_file_capped(path, cap)?;
+        Ok((bytes, None))
+    }
 }
 
 pub(crate) fn read_text_regular_file_capped_with_stamp(
     path: &Path,
     cap: u64,
 ) -> Result<(String, Option<SyncNoopFileStamp>), lpm_common::BoundedReadError> {
-    let pre = SyncNoopFileStamp::from_path(path);
-    let text = lpm_common::read_text_file_capped(path, cap)?;
-    let post = SyncNoopFileStamp::from_path(path);
-    let stamp = pre.filter(|stamp| post == Some(*stamp) && stamp.len == text.len() as u64);
+    let (bytes, stamp) = read_regular_file_capped_with_stamp(path, cap)?;
+    let text = String::from_utf8(bytes).map_err(|source| lpm_common::BoundedReadError::InvalidUtf8 {
+        path: path.to_path_buf(),
+        source: source.utf8_error(),
+    })?;
     Ok((text, stamp))
 }
 
@@ -1582,6 +1670,17 @@ pub(crate) fn backfill_install_hash_sync_noop_proof(
     project_dir: &Path,
     proof_input: &SyncNoopLockfileProofInput,
 ) -> std::io::Result<bool> {
+    backfill_install_hash_sync_noop_proof_with_refresh(project_dir, proof_input, false)
+}
+
+/// Like [`backfill_install_hash_sync_noop_proof`], and when `force_refresh` is
+/// true rewrites `.lpm/install-hash` even when the formatted proof text already
+/// matches so a same-tick timestamp collision can self-heal onto the stamp path.
+pub(crate) fn backfill_install_hash_sync_noop_proof_with_refresh(
+    project_dir: &Path,
+    proof_input: &SyncNoopLockfileProofInput,
+    force_refresh: bool,
+) -> std::io::Result<bool> {
     let hash_path = project_dir.join(".lpm").join("install-hash");
     let content = match lpm_common::read_text_file_capped(
         &hash_path,
@@ -1610,7 +1709,7 @@ pub(crate) fn backfill_install_hash_sync_noop_proof(
         updated.push_str(&new_line);
         updated.push('\n');
     }
-    if updated == content {
+    if updated == content && !force_refresh {
         return Ok(false);
     }
     write_state_file_owner_only(&hash_path, updated.as_bytes())?;
@@ -1803,9 +1902,13 @@ fn try_mtime_fast_path_with_cached_content(
     let pkg_lmeta = std::fs::symlink_metadata(&pkg_path).ok()?;
     let (pkg_ns, pkg_stamp) = if pkg_lmeta.file_type().is_symlink() {
         (mtime_ns_and_len(&pkg_path)?.0, None)
+    } else if pkg_lmeta.is_file() {
+        (
+            mtime_ns_from_metadata(&pkg_lmeta)?,
+            SyncNoopFileStamp::from_symlink_metadata(&pkg_lmeta),
+        )
     } else {
-        let stamp = SyncNoopFileStamp::from_symlink_metadata(&pkg_lmeta)?;
-        (stamp.mtime_ns, Some(stamp))
+        return None;
     };
     // lpm.lock may be absent on a never-installed fast-lane entry; 0
     // sentinel lines up with the writer's convention.
@@ -1814,11 +1917,11 @@ fn try_mtime_fast_path_with_cached_content(
             let (ns, len) = mtime_ns_and_len(lock_path).unwrap_or((0, 0));
             (ns, len, None)
         }
-        Ok(meta) => match SyncNoopFileStamp::from_symlink_metadata(&meta) {
-            Some(stamp) => (stamp.mtime_ns, stamp.len, Some(stamp)),
-            None => (0, 0, None),
-        },
-        Err(_) => (0, 0, None),
+        Ok(meta) if meta.is_file() => {
+            let ns = mtime_ns_from_metadata(&meta).unwrap_or(0);
+            (ns, meta.len(), SyncNoopFileStamp::from_symlink_metadata(&meta))
+        }
+        _ => (0, 0, None),
     };
 
     if pkg_ns != stored_pkg_ns || lock_ns != stored_lock_ns {
@@ -1836,9 +1939,13 @@ fn try_mtime_fast_path_with_cached_content(
     let hash_lmeta = std::fs::symlink_metadata(&hash_file).ok()?;
     let (hash_ns, hash_stamp) = if hash_lmeta.file_type().is_symlink() {
         (mtime_ns(&hash_file)?, None)
+    } else if hash_lmeta.is_file() {
+        (
+            mtime_ns_from_metadata(&hash_lmeta)?,
+            SyncNoopFileStamp::from_symlink_metadata(&hash_lmeta),
+        )
     } else {
-        let stamp = SyncNoopFileStamp::from_symlink_metadata(&hash_lmeta)?;
-        (stamp.mtime_ns, Some(stamp))
+        return None;
     };
     if nm_ns > hash_ns {
         return None;
@@ -1864,14 +1971,18 @@ pub(crate) fn package_json_needs_slow_freshness(pkg_content: &str) -> bool {
         || pkg_content.contains("\"workspaces\"")
 }
 
+fn mtime_ns_from_metadata(metadata: &std::fs::Metadata) -> Option<u64> {
+    let modified = metadata.modified().ok()?;
+    let dur = modified.duration_since(UNIX_EPOCH).ok()?;
+    // `as_nanos` returns u128; narrow to u64 — safe until year 2554.
+    Some(dur.as_nanos() as u64)
+}
+
 /// Return the modified-time (nanoseconds since Unix epoch) and byte length of
 /// `path` from a single `stat` syscall.
 fn mtime_ns_and_len(path: &Path) -> Option<(u64, u64)> {
     let metadata = std::fs::metadata(path).ok()?;
-    let modified = metadata.modified().ok()?;
-    let dur = modified.duration_since(UNIX_EPOCH).ok()?;
-    // `as_nanos` returns u128; narrow to u64 — safe until year 2554.
-    Some((dur.as_nanos() as u64, metadata.len()))
+    Some((mtime_ns_from_metadata(&metadata)?, metadata.len()))
 }
 
 /// Return the modified-time of `path` as nanoseconds since the Unix
@@ -4542,12 +4653,14 @@ mod tests {
                 len: 14,
                 mtime_ns: 1_700_000_000_000_000_000,
                 ctime_ns: 1_700_000_000_000_000_000,
+                dev: 7,
                 ino: 42,
             }),
             lock_stamp: Some(SyncNoopFileStamp {
                 len: 128,
                 mtime_ns: 1_700_000_000_000_000_000,
                 ctime_ns: 1_700_000_000_000_000_000,
+                dev: 7,
                 ino: 43,
             }),
         };
@@ -4586,6 +4699,61 @@ mod tests {
                 SyncNoopLockfileProof::parse_from_state(malformed),
                 None,
                 "malformed proof must be ignored: {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_stamp_rejects_fd_vs_path_identity_mismatch_and_symlinked_files() {
+        let fd_stamp = SyncNoopFileStamp {
+            len: 32,
+            mtime_ns: 1_700_000_000_000_000_000,
+            ctime_ns: 1_700_000_000_000_000_000,
+            dev: 1,
+            ino: 100,
+        };
+        let other_ino = SyncNoopFileStamp {
+            ino: 101,
+            ..fd_stamp
+        };
+        let other_dev = SyncNoopFileStamp {
+            dev: 2,
+            ..fd_stamp
+        };
+        assert_eq!(
+            verified_descriptor_stamp(Some(fd_stamp), Some(fd_stamp), Some(fd_stamp), 32),
+            Some(fd_stamp)
+        );
+        assert_eq!(
+            verified_descriptor_stamp(Some(fd_stamp), Some(fd_stamp), Some(other_ino), 32),
+            None,
+            "path inode mismatch against the opened descriptor must drop the stamp"
+        );
+        assert_eq!(
+            verified_descriptor_stamp(Some(fd_stamp), Some(other_dev), Some(fd_stamp), 32),
+            None,
+            "post-read descriptor change must drop the stamp"
+        );
+        assert_eq!(
+            verified_descriptor_stamp(Some(fd_stamp), Some(fd_stamp), Some(fd_stamp), 31),
+            None,
+            "byte length mismatch must drop the stamp"
+        );
+
+        #[cfg(unix)]
+        {
+            let dir = TempDir::new().unwrap();
+            let real = dir.path().join("real.json");
+            let link = dir.path().join("link.json");
+            fs::write(&real, br#"{"name":"linked"}"#).unwrap();
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let (bytes, stamp) =
+                read_regular_file_capped_with_stamp(&link, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+                    .unwrap();
+            assert_eq!(bytes, br#"{"name":"linked"}"#);
+            assert_eq!(
+                stamp, None,
+                "symlinked file must remain readable without receiving a regular-file stamp"
             );
         }
     }

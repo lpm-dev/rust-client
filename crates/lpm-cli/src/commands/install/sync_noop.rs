@@ -84,6 +84,7 @@ pub(crate) fn is_up_to_date(
     let mut upgrade_v2_proof_stamps: Option<(
         crate::install_state::SyncNoopFileStamp,
         crate::install_state::SyncNoopFileStamp,
+        bool,
     )> = None;
     let fast_has_node_engines = if let Some(proof) = parsed_proof.as_ref()
         && proof.lockfile_eligible
@@ -140,13 +141,10 @@ pub(crate) fn is_up_to_date(
             && !raw_lockfile_mentions_lpm_scope(&lock_raw)
             && crate::install_state::sync_noop_content_digest_hex(&lock_raw) == proof.lock_digest
         {
-            // Upgrade v2 proofs (or stale-stamp v3 proofs) on Unix once both files
-            // have verified TOCTOU-free stamps matching the exact bytes we validated.
+            // Upgrade v2 proofs, refresh stale stamps, or self-heal a same-tick
+            // timestamp collision on Unix once both files have verified
+            // descriptor-bound stamps matching the exact bytes we validated.
             if cfg!(unix)
-                && (proof.pkg_stamp.is_none()
-                    || proof.lock_stamp.is_none()
-                    || proof.pkg_stamp != mtime_match.pkg_stamp
-                    || proof.lock_stamp != lock_stamp)
                 && let Some(lock_stamp) = lock_stamp
                 && let Ok((pkg_check, Some(pkg_stamp))) =
                     crate::install_state::read_text_regular_file_capped_with_stamp(
@@ -155,7 +153,16 @@ pub(crate) fn is_up_to_date(
                     )
                 && lpm_common::strip_utf8_bom_str(&pkg_check) == package_json
             {
-                upgrade_v2_proof_stamps = Some((pkg_stamp, lock_stamp));
+                let stamps_changed = proof.pkg_stamp != Some(pkg_stamp)
+                    || proof.lock_stamp != Some(lock_stamp);
+                let same_tick_collision = !stamps_changed
+                    && mtime_match.hash_stamp.is_some_and(|hash_stamp| {
+                        !pkg_stamp.is_strictly_older_than(hash_stamp)
+                            || !lock_stamp.is_strictly_older_than(hash_stamp)
+                    });
+                if stamps_changed || same_tick_collision {
+                    upgrade_v2_proof_stamps = Some((pkg_stamp, lock_stamp, same_tick_collision));
+                }
             }
             Some(proof.has_node_engines)
         } else {
@@ -320,7 +327,7 @@ pub(crate) fn is_up_to_date(
             }
         }
     }
-    if let (Some(proof), Some((pkg_stamp, lock_stamp))) =
+    if let (Some(proof), Some((pkg_stamp, lock_stamp, force_refresh))) =
         (parsed_proof.as_ref(), upgrade_v2_proof_stamps)
     {
         let upgraded = crate::install_state::SyncNoopLockfileProofInput {
@@ -334,9 +341,11 @@ pub(crate) fn is_up_to_date(
             pkg_stamp: Some(pkg_stamp),
             lock_stamp: Some(lock_stamp),
         };
-        if let Ok(true) =
-            crate::install_state::backfill_install_hash_sync_noop_proof(project_dir, &upgraded)
-        {
+        if let Ok(true) = crate::install_state::backfill_install_hash_sync_noop_proof_with_refresh(
+            project_dir,
+            &upgraded,
+            force_refresh,
+        ) {
             crate::cli::keep_state_ignored_at_exit_from(project_dir);
             crate::cli::keep_state_ignored_at_exit();
         }
@@ -400,14 +409,19 @@ fn scan_ancestors(project_dir: &Path) -> Result<AncestorScan, LpmError> {
             if dir.join("pnpm-workspace.yaml").symlink_metadata().is_ok() {
                 may_have_workspace_root = true;
             } else {
+                let ancestor_pkg = dir.join("package.json");
                 match lpm_common::read_text_file_capped(
-                    &dir.join("package.json"),
+                    &ancestor_pkg,
                     lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
                 ) {
                     Ok(content) => {
-                        // Zero-alloc JSON key scan handles escaped `"workspaces"` and
-                        // delegates malformed ancestor manifests to `find_workspace_root`.
-                        if !crate::install_state::is_non_workspace_package_json_object(&content) {
+                        // Parse with `PackageJson` so type-invalid ancestor manifests
+                        // (e.g. `{"name": 7}`) delegate to `find_workspace_root` and
+                        // surface the exact same error as the full install path.
+                        let parsed = serde_json::from_str::<lpm_workspace::PackageJson>(
+                            lpm_common::strip_utf8_bom_str(&content),
+                        );
+                        if !matches!(parsed, Ok(pkg) if pkg.workspaces.is_none()) {
                             may_have_workspace_root = true;
                         }
                     }
@@ -2269,5 +2283,63 @@ mod tests {
             .expect("upgraded v3 proof must parse");
         assert!(upgraded.pkg_stamp.is_some());
         assert_eq!(upgraded.lock_stamp, lock_stamp);
+
+        // Force a same-tick collision between `.lpm/install-hash` and `lpm.lock`
+        // (while keeping `node_modules` at or before `install-hash` so the mtime
+        // fast path enters and reaches the v3 stamp check): the verified digest
+        // fallback must rewrite `.lpm/install-hash` so the next call returns to
+        // the strict stamp-only path.
+        let hash_path = project.join(".lpm/install-hash");
+        std::fs::File::open(project.join("node_modules"))
+            .unwrap()
+            .set_modified(older)
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&hash_path)
+            .unwrap()
+            .set_modified(older)
+            .unwrap();
+        let colliding_hash_stamp =
+            crate::install_state::SyncNoopFileStamp::from_path(&hash_path).unwrap();
+        assert!(
+            !upgraded
+                .lock_stamp
+                .unwrap()
+                .is_strictly_older_than(colliding_hash_stamp),
+            "test fixture must put install-hash on or before lockfile mtime"
+        );
+        assert!(super::is_up_to_date(project, pkg_json, &mode).unwrap());
+        let healed_hash_stamp =
+            crate::install_state::SyncNoopFileStamp::from_path(&hash_path).unwrap();
+        assert!(
+            upgraded
+                .lock_stamp
+                .unwrap()
+                .is_strictly_older_than(healed_hash_stamp),
+            "same-tick collision must self-heal install-hash onto a strictly newer stamp"
+        );
+    }
+
+    #[test]
+    fn ill_typed_ancestor_manifest_errors_consistently_on_fast_sync_noop_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        let project = parent.join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        // Valid JSON without a `"workspaces"` key, yet ill-typed `lpm` field that
+        // `PackageJson` / `find_workspace_root` rejects.
+        std::fs::write(parent.join("package.json"), r#"{"name": "parent", "lpm": 7}"#).unwrap();
+        std::fs::write(project.join("package.json"), r#"{"name":"app"}"#).unwrap();
+
+        let err = super::scan_ancestors(&project)
+            .err()
+            .expect("ill-typed ancestor package.json must surface an error like find_workspace_root");
+        let full_err = lpm_workspace::find_workspace_root(&project)
+            .expect_err("full discovery must reject ill-typed ancestor package.json");
+        assert_eq!(
+            err.to_string(),
+            lpm_common::LpmError::Workspace(full_err.to_string()).to_string()
+        );
     }
 }

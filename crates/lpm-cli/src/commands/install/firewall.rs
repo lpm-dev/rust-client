@@ -1346,15 +1346,61 @@ fn open_monitor_verdict_cache_dir_nofollow(
 ) -> Option<cap_std::fs::Dir> {
     use cap_fs_ext::DirExt as _;
 
-    if create {
-        let _ = lpm_registry::ensure_private_metadata_cache_dir(cache_root);
+    // Reject a symlinked or non-directory cache root before mutating permissions
+    // so pathname-based `chmod` can never follow a link to an unrelated target.
+    match std::fs::symlink_metadata(cache_root) {
+        Ok(root_meta) => {
+            if !root_meta.is_dir() || lpm_common::is_symlink_or_junction(&root_meta) {
+                return None;
+            }
+        }
+        Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                let mut builder = std::fs::DirBuilder::new();
+                builder.recursive(true).mode(0o700);
+                builder.create(cache_root).ok()?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::create_dir_all(cache_root).ok()?;
+            }
+        }
+        Err(_) => return None,
     }
-    let root_meta = std::fs::symlink_metadata(cache_root).ok()?;
-    if !root_meta.is_dir() || lpm_common::is_symlink_or_junction(&root_meta) {
-        return None;
-    }
-    let root_dir =
-        cap_std::fs::Dir::open_ambient_dir(cache_root, cap_std::ambient_authority()).ok()?;
+
+    #[cfg(unix)]
+    let root_dir = {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(cache_root)
+            .ok()?;
+        let opened_meta = file.metadata().ok()?;
+        if !opened_meta.is_dir() {
+            return None;
+        }
+        if create && (opened_meta.permissions().mode() & 0o777) != 0o700 {
+            // SAFETY: `file` is a valid open directory descriptor pinned without following symlinks.
+            if unsafe { libc::fchmod(file.as_raw_fd(), 0o700) } != 0 {
+                return None;
+            }
+        }
+        cap_std::fs::Dir::from_std_file(file)
+    };
+    #[cfg(not(unix))]
+    let root_dir = {
+        let root_meta = std::fs::symlink_metadata(cache_root).ok()?;
+        if !root_meta.is_dir() || lpm_common::is_symlink_or_junction(&root_meta) {
+            return None;
+        }
+        cap_std::fs::Dir::open_ambient_dir(cache_root, cap_std::ambient_authority()).ok()?
+    };
+
     if create {
         match root_dir.create_dir(MONITOR_VERDICT_SUBDIR) {
             Ok(()) => {}
@@ -1369,8 +1415,15 @@ fn open_monitor_verdict_cache_dir_nofollow(
     }
     #[cfg(unix)]
     if create {
-        use cap_std::fs::{Permissions, PermissionsExt as _};
-        let _ = root_dir.set_permissions(MONITOR_VERDICT_SUBDIR, Permissions::from_mode(0o700));
+        use cap_std::fs::PermissionsExt as _;
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+
+        if (sub_meta.permissions().mode() & 0o777) != 0o700 {
+            // SAFETY: `sub_dir` is a valid open directory descriptor pinned with `open_dir_nofollow`.
+            if unsafe { libc::fchmod(sub_dir.as_fd().as_raw_fd(), 0o700) } != 0 {
+                return None;
+            }
+        }
     }
     Some(sub_dir)
 }
@@ -3053,6 +3106,33 @@ mod tests {
         assert_eq!(
             subdir_mode, 0o700,
             "monitor verdict subdir must be owner-only 0o700"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_monitor_verdict_cache_dir_refuses_symlink_without_changing_target_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("real-target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let symlink_cache = root.path().join("linked-cache");
+        std::os::unix::fs::symlink(&target, &symlink_cache).unwrap();
+
+        assert!(
+            open_monitor_verdict_cache_dir_nofollow(&symlink_cache, true).is_none(),
+            "symlinked cache root must be refused"
+        );
+        let target_mode = std::fs::symlink_metadata(&target)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            target_mode, 0o755,
+            "refusing a symlinked cache root must not chmod its target directory"
         );
     }
 }

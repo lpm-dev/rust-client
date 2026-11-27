@@ -3955,19 +3955,38 @@ fn env_init_refuses_a_key_that_is_not_a_valid_name_and_names_its_hidden_characte
 #[test]
 fn malformed_local_env_json_in_lpm_home_emits_single_json_error() {
     let project = TempProject::empty(r#"{"name":"env-lpm-home-json","version":"1.0.0"}"#);
-    let lpm_home = project.home().join(".lpm");
-    std::fs::create_dir_all(&lpm_home).unwrap();
+    let project_lpm_dir = project.path().join(".lpm");
+    std::fs::create_dir_all(&project_lpm_dir).unwrap();
 
     let output = lpm(&project)
-        .current_dir(&lpm_home)
+        .env("LPM_HOME", &project_lpm_dir)
         .args(["--json", "env", "set", "--unknown-flag"])
         .output()
-        .expect("failed to run malformed local env command inside LPM_HOME");
+        .expect("failed to run malformed local env command when LPM_HOME is project .lpm");
 
     assert!(
         !output.status.success(),
-        "malformed local env command inside LPM_HOME must fail"
+        "malformed local env command with LPM_HOME == project .lpm must fail"
     );
-    let envelope = parse_json_stdout(&output, "malformed local env --json inside LPM_HOME");
+    let envelope = parse_json_stdout(&output, "malformed local env --json with LPM_HOME == .lpm");
     assert_eq!(envelope["success"], serde_json::json!(false));
+    let message = envelope["error"]
+        .as_str()
+        .expect("JSON error envelope must contain error string");
+    assert!(
+        message.contains("LPM's own home"),
+        "single JSON envelope must carry the project-root refusal:\n{envelope}"
+    );
+
+    // `--help` on a local subcommand must still display usage without requiring a valid project.
+    let help = lpm(&project)
+        .env("LPM_HOME", &project_lpm_dir)
+        .args(["env", "list", "--help"])
+        .output()
+        .expect("failed to run lpm env list --help when LPM_HOME is project .lpm");
+    assert!(
+        help.status.success(),
+        "lpm env list --help should succeed even when LPM_HOME is project .lpm:\n{}",
+        String::from_utf8_lossy(&help.stderr)
+    );
 }

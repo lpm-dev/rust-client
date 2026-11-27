@@ -94,6 +94,13 @@ pub fn try_run_local_sync(
     if !arguments::is_local_sync_subcommand(&args) {
         return None;
     }
+    if arguments::requests_help(&args) {
+        return match arguments::parse(&args, json_output) {
+            Ok(None) => None,
+            Ok(Some(_)) => Some(Ok(())),
+            Err(error) => Some(Err(env_error(error))),
+        };
+    }
     // Resolve the project root BEFORE `arguments::parse` prints any JSON/clap
     // diagnostic so a disallowed directory (such as LPM_HOME) emits a single
     // error envelope rather than both a clap error and a project-root error.

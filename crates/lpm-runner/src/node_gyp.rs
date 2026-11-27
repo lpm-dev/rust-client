@@ -8,7 +8,7 @@
 //! `node`.
 
 use std::collections::HashMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -77,7 +77,7 @@ enum CachedNodeGypOutcome {
         manifest_stamp: FileStamp,
     },
     Miss {
-        checked_dirs: Vec<(PathBuf, Option<FileStamp>)>,
+        checked_paths: Vec<(PathBuf, Option<FileStamp>)>,
     },
 }
 
@@ -93,9 +93,9 @@ impl CachedNodeGypOutcome {
                 FileStamp::from_path(&value.script).as_ref() == Some(script_stamp)
                     && FileStamp::from_path(manifest_path).as_ref() == Some(manifest_stamp)
             }
-            Self::Miss { checked_dirs } => checked_dirs
+            Self::Miss { checked_paths } => checked_paths
                 .iter()
-                .all(|(dir, expected)| FileStamp::from_path(dir) == *expected),
+                .all(|(path, expected)| FileStamp::from_path(path) == *expected),
         }
     }
 
@@ -197,7 +197,7 @@ impl NpmNodeGyp {
             (
                 None,
                 CachedNodeGypOutcome::Miss {
-                    checked_dirs: Vec::new(),
+                    checked_paths: Vec::new(),
                 },
             )
         } else {
@@ -232,14 +232,22 @@ impl NpmNodeGyp {
                     return Some(value);
                 }
                 None => {
-                    let checked_dirs = candidate_dirs
-                        .into_iter()
-                        .map(|dir| {
-                            let stamp = FileStamp::from_path(&dir);
-                            (dir, stamp)
-                        })
-                        .collect();
-                    (None, CachedNodeGypOutcome::Miss { checked_dirs })
+                    let mut checked_paths = Vec::with_capacity(candidate_dirs.len() * 5);
+                    for dir in candidate_dirs {
+                        let pkg_dir = dir.join("node-gyp");
+                        let bin_dir = pkg_dir.join("bin");
+                        for watched in [
+                            dir,
+                            pkg_dir.clone(),
+                            pkg_dir.join("package.json"),
+                            bin_dir.clone(),
+                            bin_dir.join("node-gyp.js"),
+                        ] {
+                            let stamp = FileStamp::from_path(&watched);
+                            checked_paths.push((watched, stamp));
+                        }
+                    }
+                    (None, CachedNodeGypOutcome::Miss { checked_paths })
                 }
             }
         };
@@ -533,27 +541,48 @@ pub(crate) fn command_directory(host: &[PathBuf]) -> Option<PathBuf> {
     if !OFFERED_TO_SCRIPTS.load(Ordering::Relaxed) {
         return None;
     }
-    // One command runs many scripts with the same host directories.
-    static FOUND: OnceLock<Mutex<HashMap<OsString, Option<PathBuf>>>> = OnceLock::new();
-    let key = std::env::join_paths(host).ok()?;
-    let mut found = FOUND
+    let commands = lpm_common::LpmRoot::from_env()
+        .ok()?
+        .cache_root()
+        .join("node-gyp-bin");
+    command_directory_in(host, &commands)
+}
+
+fn command_directory_in(host: &[PathBuf], commands: &Path) -> Option<PathBuf> {
+    // Re-check `NpmNodeGyp::beside_node_in` (which is stamp-cached) so manifest
+    // upgrades or repaired installations are observed immediately, and cache
+    // only the generated command directory for the exact resolved `(root, script, version)`.
+    let npm = NpmNodeGyp::beside_node_in(host.iter().cloned())?;
+    type WrittenCommandKey = (PathBuf, PathBuf, String);
+    static WRITTEN: OnceLock<Mutex<HashMap<WrittenCommandKey, PathBuf>>> = OnceLock::new();
+    let key = (
+        commands.to_path_buf(),
+        npm.script.clone(),
+        npm.version.clone(),
+    );
+    if let Some(cached) = WRITTEN
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .cloned()
+        && cached.is_dir()
+    {
+        return Some(cached);
+    }
+    let directory = npm
+        .write_commands(commands)
+        .inspect_err(|error| tracing::debug!("npm's node-gyp isn't offered: {error}"))
+        .ok()?;
+    let mut written = WRITTEN
         .get_or_init(Mutex::default)
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(directory) = found.get(&key) {
-        return directory.clone();
+    if written.len() >= MAX_NODE_GYP_CACHE_ENTRIES && !written.contains_key(&key) {
+        written.clear();
     }
-    let directory = NpmNodeGyp::beside_node_in(host.iter().cloned()).and_then(|npm| {
-        let commands = lpm_common::LpmRoot::from_env()
-            .ok()?
-            .cache_root()
-            .join("node-gyp-bin");
-        npm.write_commands(&commands)
-            .inspect_err(|error| tracing::debug!("npm's node-gyp isn't offered: {error}"))
-            .ok()
-    });
-    found.insert(key, directory.clone());
-    directory
+    written.insert(key, directory.clone());
+    Some(directory)
 }
 
 #[cfg(test)]
@@ -857,21 +886,90 @@ pub(crate) mod tests {
             .expect("lookup after sibling manifest edit should observe new version");
         assert_eq!(updated.version, "12.3.4-beta.1");
 
-        // A miss beside an existing node binary must invalidate once npm's node-gyp is installed.
+        // A miss beside an existing node binary must invalidate once npm's node-gyp is installed
+        // WITHOUT modifying bin/node (so the cache key stays identical and miss-invalidation runs).
         let miss_prefix = root_path.join("node-miss-then-hit");
         let miss_bin = if cfg!(windows) {
-            miss_prefix.clone()
+            miss_prefix
         } else {
             miss_prefix.join("bin")
         };
         std::fs::create_dir_all(&miss_bin).unwrap();
         std::fs::write(miss_bin.join(NODE), "").unwrap();
         assert!(NpmNodeGyp::beside_node_on(miss_bin.as_os_str()).is_none());
-        let populated_bin = node_with_npm(&miss_prefix, "11.9.0", "// installed later");
-        assert_eq!(populated_bin, miss_bin);
+
+        // Pre-create an incomplete `node-gyp` directory (missing package.json + script),
+        // cache a second miss, then repair it in place inside the existing `node-gyp` dir.
+        let miss_pkg = npm_modules_beside(&miss_bin.join(NODE))
+            .unwrap()
+            .join("node-gyp");
+        std::fs::create_dir_all(miss_pkg.join("bin")).unwrap();
+        assert!(NpmNodeGyp::beside_node_on(miss_bin.as_os_str()).is_none());
+
+        std::fs::write(miss_pkg.join("bin").join("node-gyp.js"), "// repaired").unwrap();
+        std::fs::write(
+            miss_pkg.join("package.json"),
+            r#"{"name":"node-gyp","version":"11.9.0"}"#,
+        )
+        .unwrap();
         let recovered = NpmNodeGyp::beside_node_on(miss_bin.as_os_str())
-            .expect("miss entry must invalidate when sibling npm modules appear");
+            .expect("miss entry must invalidate when files appear inside an existing node-gyp dir");
         assert_eq!(recovered.version, "11.9.0");
+
+        // Exercise `command_directory_in` with the same PATH: once after a miss is
+        // repaired in place, and again after the sibling manifest updates to a newer version.
+        let cmd_prefix = root_path.join("node-cmd-dir");
+        let cmd_bin = if cfg!(windows) {
+            cmd_prefix
+        } else {
+            cmd_prefix.join("bin")
+        };
+        std::fs::create_dir_all(&cmd_bin).unwrap();
+        std::fs::write(cmd_bin.join(NODE), "").unwrap();
+        let cmd_pkg = npm_modules_beside(&cmd_bin.join(NODE))
+            .unwrap()
+            .join("node-gyp");
+        std::fs::create_dir_all(cmd_pkg.join("bin")).unwrap();
+        let host_dirs = vec![cmd_bin];
+        let commands_root = root_path.join("node-gyp-bin");
+        assert!(
+            command_directory_in(&host_dirs, &commands_root).is_none(),
+            "incomplete node-gyp installation must return None"
+        );
+        std::fs::write(cmd_pkg.join("bin").join("node-gyp.js"), "// v1").unwrap();
+        std::fs::write(
+            cmd_pkg.join("package.json"),
+            r#"{"name":"node-gyp","version":"11.4.0"}"#,
+        )
+        .unwrap();
+        let first_cmd_dir = command_directory_in(&host_dirs, &commands_root)
+            .expect("command_directory must observe in-place repair on the same PATH");
+        let shim_name = if cfg!(windows) {
+            "node-gyp.cmd"
+        } else {
+            "node-gyp"
+        };
+        let first_shim = std::fs::read_to_string(first_cmd_dir.join(shim_name)).unwrap();
+        assert!(
+            first_shim.contains("11.4.0"),
+            "initial shim should carry 11.4.0, got: {first_shim}"
+        );
+        std::fs::write(
+            cmd_pkg.join("package.json"),
+            r#"{"name":"node-gyp","version":"12.0.0-upgrade.1"}"#,
+        )
+        .unwrap();
+        let second_cmd_dir = command_directory_in(&host_dirs, &commands_root)
+            .expect("command_directory must observe manifest upgrade on the same PATH");
+        assert_eq!(
+            first_cmd_dir, second_cmd_dir,
+            "same script path reuses its command directory"
+        );
+        let second_shim = std::fs::read_to_string(second_cmd_dir.join(shim_name)).unwrap();
+        assert!(
+            second_shim.contains("12.0.0-upgrade.1"),
+            "upgraded manifest version must rewrite the shim in place, got: {second_shim}"
+        );
 
         // Populate more distinct installations than MAX_NODE_GYP_CACHE_ENTRIES and verify bound.
         for idx in 0..(MAX_NODE_GYP_CACHE_ENTRIES + 4) {

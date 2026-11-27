@@ -62,13 +62,12 @@ pub(super) fn run_async_main() -> Result<()> {
             keep_state_ignored_at_exit();
             return result;
         }
-        SyncDispatch::ContinueAsync(cli) => cli,
+        SyncDispatch::ContinueAsync(cli) => *cli,
     };
 
     // Standalone and recursive installs poll large futures on different threads.
-    // Debug frames are unoptimized and need 64 MiB; release frames are much
-    // smaller so 32 MiB preserves ample recursive-workspace headroom while
-    // halving virtual stack reservation per worker on strict-overcommit hosts.
+    // Debug frames are unoptimized and need 64 MiB; release frames are smaller
+    // so 32 MiB retains deep-workspace recursion headroom over the 16 MiB baseline.
     #[cfg(debug_assertions)]
     const ASYNC_STACK_BYTES: usize = 64 * 1024 * 1024;
     #[cfg(not(debug_assertions))]

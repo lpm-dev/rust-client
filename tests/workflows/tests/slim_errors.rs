@@ -140,11 +140,15 @@ fn unusable_lpm_home_on_global_list_renders_slim_error_without_miette_debug_dump
 #[test]
 fn macos_binary_retains_local_authentication_framework_link() {
     let binary = support::lpm_binary();
-    let output = std::process::Command::new("otool")
+    let output = match std::process::Command::new("otool")
         .args(["-L"])
         .arg(&binary)
         .output()
-        .expect("failed to run otool -L on lpm-rs");
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => panic!("failed to run otool -L on lpm-rs: {error}"),
+    };
     assert!(
         output.status.success(),
         "otool -L failed: {}",

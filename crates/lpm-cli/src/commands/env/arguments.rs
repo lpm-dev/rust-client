@@ -326,72 +326,35 @@ fn source_group(value: &str) -> Result<lpm_vault::history::SourceGroup, String> 
     })
 }
 
+const LOCAL_SYNC_SUBCOMMANDS: &[&str] = &[
+    "set", "get", "list", "delete", "import", "export", "print", "example", "check", "validate",
+    "schema", "generate", "init", "repair", "ls", "copy", "cp", "history", "rollback", "link",
+    "unlink", "links",
+];
+
+const LOCAL_ASYNC_SUBCOMMANDS: &[&str] = &["log", "unpair", "diff"];
+
 pub(super) fn is_local_sync_subcommand(args: &[&str]) -> bool {
-    let debug_only = cfg!(debug_assertions) && args.first() == Some(&"debug-companion");
-    debug_only
-        || matches!(
-            args.first().copied(),
-            Some(
-                "set"
-                    | "get"
-                    | "list"
-                    | "delete"
-                    | "import"
-                    | "export"
-                    | "print"
-                    | "example"
-                    | "check"
-                    | "validate"
-                    | "schema"
-                    | "generate"
-                    | "init"
-                    | "repair"
-                    | "ls"
-                    | "copy"
-                    | "cp"
-                    | "history"
-                    | "rollback"
-                    | "link"
-                    | "unlink"
-                    | "links"
-            )
-        )
+    let Some(first) = args.first().copied() else {
+        return false;
+    };
+    (cfg!(debug_assertions) && first == "debug-companion")
+        || LOCAL_SYNC_SUBCOMMANDS.contains(&first)
+}
+
+pub(super) fn requests_help(args: &[&str]) -> bool {
+    args.iter()
+        .take_while(|&&arg| arg != "--")
+        .any(|&arg| matches!(arg, "-h" | "--help"))
 }
 
 pub(super) fn parse(args: &[&str], json_output: bool) -> Result<Option<LocalAction>, LpmError> {
-    let debug_only = cfg!(debug_assertions) && args.first() == Some(&"debug-companion");
-    if !debug_only
-        && !matches!(
-            args.first().copied(),
-            Some(
-                "set"
-                    | "get"
-                    | "list"
-                    | "delete"
-                    | "import"
-                    | "export"
-                    | "print"
-                    | "example"
-                    | "check"
-                    | "validate"
-                    | "schema"
-                    | "generate"
-                    | "init"
-                    | "repair"
-                    | "ls"
-                    | "copy"
-                    | "cp"
-                    | "log"
-                    | "history"
-                    | "rollback"
-                    | "unpair"
-                    | "diff"
-                    | "link"
-                    | "unlink"
-                    | "links"
-            )
-        )
-    {
+    let is_local_action = is_local_sync_subcommand(args)
+        || args
+            .first()
+            .copied()
+            .is_some_and(|first| LOCAL_ASYNC_SUBCOMMANDS.contains(&first));
+    if !is_local_action {
         return Ok(None);
     }
     LocalCommand::try_parse_from(std::iter::once("lpm env").chain(args.iter().copied()))

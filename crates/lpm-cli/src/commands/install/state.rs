@@ -118,13 +118,17 @@ fn write_post_install_hash_with_context_and_proof(
             lpm_common::STATE_FILE_SIZE_CAP_BYTES.max(64 * 1024 * 1024),
         )
         .ok()?;
+        // Never emit a proof if on-disk `lpm.lock` diverged from the exact
+        // snapshot this install materialized and hashes into `.lpm/install-hash`.
+        if lock_raw != lock.content.as_bytes() {
+            return None;
+        }
         let owned_lockfile;
         let current_stamp = std::fs::metadata(&lock.path)
             .ok()
             .and_then(|meta| Some((meta.len(), meta.modified().ok()?)));
         let fresh_lockfile = if let Some((parsed, committed_stamp)) = ctx.parsed_lockfile
             && current_stamp == Some(committed_stamp)
-            && lock_raw == lock.content.as_bytes()
         {
             parsed
         } else {
@@ -1245,6 +1249,73 @@ mod workspace_freshness_tests {
         assert_eq!(
             lockfile_deps.as_ref(),
             &HashMap::from([("registry-package".to_string(), "^1.0.0".to_string())])
+        );
+    }
+
+    #[test]
+    fn post_install_hash_omits_sync_noop_proof_when_on_disk_lockfile_differs_from_installed_snapshot()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let pkg_json = r#"{"name":"proof-race","version":"1.0.0","dependencies":{"react":"^1.0.0"}}"#;
+        std::fs::write(project.join("package.json"), pkg_json).unwrap();
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+
+        let make_lock = |version: &str| {
+            let mut lock = lpm_lockfile::Lockfile::new();
+            let instance_id = lpm_common::PackageInstanceId::derive("react", version, "npm", "");
+            lock.add_package(lpm_lockfile::LockedPackage {
+                instance_id: Some(instance_id),
+                name: "react".to_string(),
+                version: version.to_string(),
+                ..lpm_lockfile::LockedPackage::default()
+            });
+            lock.root_resolutions.insert(
+                "react".to_string(),
+                lpm_lockfile::LockedRootResolution {
+                    instance_id: Some(instance_id),
+                    package: "react".to_string(),
+                    version: version.to_string(),
+                    source: None,
+                },
+            );
+            lock
+        };
+        let installed_lock = make_lock("1.0.0");
+        let installed_content = installed_lock.to_toml().unwrap();
+
+        // Substitute a second valid lockfile on disk with a different resolved version
+        // while `lock.content` holds the originally installed lockfile snapshot.
+        let substituted_lock = make_lock("1.0.1");
+        let lock_path = project.join(lpm_lockfile::LOCKFILE_NAME);
+        substituted_lock.write_to_file(&lock_path).unwrap();
+
+        let routes = lpm_registry::RouteTable::from_env_and_filesystem(project).unwrap();
+        let lock_snapshot = super::workspace_lockfile::ActiveLockfileSnapshot {
+            path: lock_path,
+            content: Arc::from(installed_content),
+        };
+        write_post_install_hash_with_context_and_proof(
+            project,
+            lpm_linker::LinkerMode::Hoisted,
+            lpm_store::v2::ObjectIntegrityPolicy::Source,
+            lpm_store::SecurityAnalysisPolicy::Disabled,
+            "none",
+            None,
+            None,
+            &lock_snapshot,
+            Some(PostInstallSyncNoopProofContext {
+                routes: &routes,
+                auto_install_peers: true,
+                parsed_lockfile: None,
+            }),
+        )
+        .unwrap();
+
+        let state = std::fs::read_to_string(project.join(".lpm/install-hash")).unwrap();
+        assert!(
+            crate::install_state::SyncNoopLockfileProof::parse_from_state(&state).is_none(),
+            "post-install hash must not emit a sync-noop proof when on-disk lpm.lock differs from lock.content:\n{state}"
         );
     }
 }

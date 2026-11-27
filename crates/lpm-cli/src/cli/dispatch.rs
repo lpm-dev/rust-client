@@ -215,7 +215,7 @@ pub(crate) fn run() -> Result<()> {
 
 pub(super) enum SyncDispatch {
     Handled(Result<()>),
-    ContinueAsync(Cli),
+    ContinueAsync(Box<Cli>),
 }
 
 fn init_tracing_once(command: &Commands, verbose: bool) {
@@ -446,7 +446,7 @@ pub(super) fn try_run_sync_command(cli: Cli) -> SyncDispatch {
         _ => false,
     };
     if !sync_eligible {
-        return SyncDispatch::ContinueAsync(cli);
+        return SyncDispatch::ContinueAsync(Box::new(cli));
     }
 
     init_tracing_once(command, cli.verbose);
@@ -542,7 +542,7 @@ pub(super) fn try_run_sync_command(cli: Cli) -> SyncDispatch {
     };
 
     let Some(result) = sync_result else {
-        return SyncDispatch::ContinueAsync(cli);
+        return SyncDispatch::ContinueAsync(Box::new(cli));
     };
 
     finish_update_check(None, cli.json, false, allow_background_update);

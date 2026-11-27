@@ -201,7 +201,7 @@ fn shim_file_is_valid(target: &Path, expected: &[u8]) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        if meta.permissions().mode() & 0o111 == 0 {
+        if meta.permissions().mode() & 0o100 == 0 {
             return false;
         }
     }
@@ -2116,14 +2116,17 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-            assert!(!shim_dir_is_warm(&dir, &fake_lpm, &["npm"]));
+            std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o641)).unwrap();
+            assert!(
+                !shim_dir_is_warm(&dir, &fake_lpm, &["npm"]),
+                "shim without owner execute bit (0641) must not be treated as warm"
+            );
             ensure_shim_dir(&fake_lpm, &["npm"]).unwrap();
             let mode = std::fs::symlink_metadata(&shim_path)
                 .unwrap()
                 .permissions()
                 .mode();
-            assert_ne!(mode & 0o111, 0);
+            assert_ne!(mode & 0o100, 0);
         }
     }
 }
