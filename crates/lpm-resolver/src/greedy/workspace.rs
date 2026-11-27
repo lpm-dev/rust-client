@@ -148,6 +148,8 @@ pub async fn resolve_greedy_fused_workspace_with_cache_options_policy_and_select
     };
     let union_policy = first_policy.for_workspace_union();
     let mut supplemental_peers = HashSet::new();
+    let mut retained_projections: Vec<Option<ResolveResult>> =
+        (0..roots.len()).map(|_| None).collect();
     let mut expansion_pass = 0usize;
     loop {
         let union = resolve_greedy_fused_with_cache_options_policy_and_selected_events_roots(
@@ -166,9 +168,17 @@ pub async fn resolve_greedy_fused_workspace_with_cache_options_policy_and_select
             shared_metadata_concurrency.clone(),
         )
         .await?;
-        let pass = project_union_result(union, &slots, &overrides, auto_install_peers, &policies)?;
+        let pass = project_union_result(
+            union,
+            &slots,
+            &overrides,
+            auto_install_peers,
+            &policies,
+            &mut retained_projections,
+        )?;
         if pass.missing_ambient_peers.is_empty() {
-            return Ok(pass.into_outcome(
+            return Ok(pass.finalize_outcome(
+                retained_projections,
                 expansion_pass,
                 root_specifier_isolated_count,
                 false,
@@ -185,7 +195,8 @@ pub async fn resolve_greedy_fused_workspace_with_cache_options_policy_and_select
                 reason = "ambient-peer-expansion-cap",
                 "workspace union ambient-peer expansion reached its cap; falling back to isolated resolution for unconverged importers"
             );
-            return Ok(pass.into_outcome(
+            return Ok(pass.finalize_outcome(
+                retained_projections,
                 expansion_pass,
                 root_specifier_isolated_count,
                 true,
@@ -212,7 +223,8 @@ pub async fn resolve_greedy_fused_workspace_with_cache_options_policy_and_select
                 "workspace union resolution retained isolated importer fallbacks"
             );
             let isolated_importers = pass.ambient_peer_pending_importer_count;
-            return Ok(pass.into_outcome(
+            return Ok(pass.finalize_outcome(
+                retained_projections,
                 expansion_pass,
                 root_specifier_isolated_count,
                 false,
@@ -318,6 +330,7 @@ fn non_registry_specifier_kind(specifier: &Specifier) -> &'static str {
 
 struct WorkspaceProjectionPass {
     projected: Vec<Option<ResolveResult>>,
+    final_union_cache: Option<Arc<HashMap<CanonicalKey, Arc<CachedPackageInfo>>>>,
     missing_ambient_peers: Vec<(String, String)>,
     union_stage_timing: crate::resolve::StageTiming,
     eligible_importer_count: usize,
@@ -327,6 +340,30 @@ struct WorkspaceProjectionPass {
 }
 
 impl WorkspaceProjectionPass {
+    fn finalize_outcome(
+        mut self,
+        mut retained_projections: Vec<Option<ResolveResult>>,
+        expansion_pass_count: usize,
+        root_specifier_isolated_count: usize,
+        expansion_capped: bool,
+        ambient_peer_cap_isolated_count: usize,
+        ambient_peer_stalled_isolated_count: usize,
+    ) -> WorkspaceResolveOutcome {
+        if let Some(cache) = self.final_union_cache.take() {
+            for result in retained_projections.iter_mut().flatten() {
+                result.cache = Arc::clone(&cache);
+            }
+        }
+        self.projected = retained_projections;
+        self.into_outcome(
+            expansion_pass_count,
+            root_specifier_isolated_count,
+            expansion_capped,
+            ambient_peer_cap_isolated_count,
+            ambient_peer_stalled_isolated_count,
+        )
+    }
+
     fn into_outcome(
         mut self,
         expansion_pass_count: usize,
@@ -370,6 +407,101 @@ impl WorkspaceProjectionPass {
     }
 }
 
+struct ParsedUnionPeer {
+    peer_name: String,
+    target: String,
+    target_canonical: CanonicalKey,
+    range: NpmRange,
+    optional: bool,
+}
+
+struct PackageSubset {
+    included: Vec<bool>,
+    required: Vec<bool>,
+    included_indices: Vec<usize>,
+}
+
+impl PackageSubset {
+    fn new(len: usize) -> Self {
+        Self {
+            included: vec![false; len],
+            required: vec![false; len],
+            included_indices: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn contains(&self, index: usize) -> bool {
+        self.included[index]
+    }
+
+    #[inline]
+    fn is_required(&self, index: usize) -> bool {
+        self.required[index]
+    }
+
+    #[inline]
+    fn insert_included(&mut self, index: usize) -> bool {
+        if self.included[index] {
+            false
+        } else {
+            self.included[index] = true;
+            self.included_indices.push(index);
+            true
+        }
+    }
+
+    #[inline]
+    fn insert_required(&mut self, index: usize) -> bool {
+        if self.required[index] {
+            false
+        } else {
+            self.required[index] = true;
+            true
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.included_indices.len()
+    }
+}
+
+fn parsed_peers_for_package<'a>(
+    index: usize,
+    union: &ResolveResult,
+    cache: &'a mut [Option<Vec<ParsedUnionPeer>>],
+) -> Result<&'a [ParsedUnionPeer], ResolveError> {
+    if cache[index].is_none() {
+        let package = &union.packages[index];
+        let canonical = CanonicalKey::from(&package.package);
+        let mut parsed = Vec::new();
+        if let Some(info) = union.cache.get(&canonical) {
+            let version = package.version.to_string();
+            if let Some(peer_dependencies) = info.peer_dependencies(&version) {
+                for peer in peer_dependencies {
+                    let target = peer.alias.unwrap_or(peer.name);
+                    let range = NpmRange::parse_registry_spec(peer.range).map_err(|error| {
+                        ResolveError::Internal(format!(
+                            "failed to parse peer range {:?} for {target}: {error}",
+                            peer.range
+                        ))
+                    })?;
+                    parsed.push(ParsedUnionPeer {
+                        peer_name: peer.name.to_owned(),
+                        target: target.to_owned(),
+                        target_canonical: CanonicalKey::from_dep_name(target),
+                        range,
+                        optional: peer.optional,
+                    });
+                }
+            }
+        }
+        cache[index] = Some(parsed);
+    }
+    Ok(cache[index].as_deref().expect("populated above"))
+}
+
 enum ImporterProjection {
     Projected(Box<ResolveResult>),
     NeedsAmbientPeers(Vec<(String, String)>),
@@ -394,21 +526,25 @@ fn project_union_result(
     overrides: &OverrideSet,
     auto_install_peers: bool,
     policies: &[ResolverPolicy],
+    retained_projections: &mut [Option<ResolveResult>],
 ) -> Result<WorkspaceProjectionPass, ResolveError> {
     let union_stage_timing = union.stage_timing;
     let package_index = package_indices_by_id(&union.packages);
     let artifact_index = package_ids_by_artifact(&union.packages);
     let packages_by_canonical = package_indices_by_canonical(&union.packages);
-    let mut projected = Vec::with_capacity(slots.len());
+    let mut parsed_peers_cache: Vec<Option<Vec<ParsedUnionPeer>>> =
+        (0..union.packages.len()).map(|_| None).collect();
     let mut missing_ambient_peers = Vec::new();
     let mut release_age_policy_isolated_count = 0usize;
     let mut projection_isolated_count = 0usize;
     let mut ambient_peer_pending_importer_count = 0usize;
     for (root_index, root_slots) in slots.iter().enumerate() {
         let Some(root_slots) = root_slots else {
-            projected.push(None);
             continue;
         };
+        if retained_projections[root_index].is_some() {
+            continue;
+        }
         let context = ImporterProjectionContext {
             union: &union,
             package_index: &package_index,
@@ -419,12 +555,12 @@ fn project_union_result(
             policy: &policies[root_index],
             importer_index: root_index,
         };
-        let result = project_importer(root_slots, &context)?;
-        let result = match result {
+        let result = project_importer(root_slots, &context, &mut parsed_peers_cache)?;
+        match result {
             ImporterProjection::Projected(result)
                 if projection_satisfies_release_age_policy(&result, &policies[root_index]) =>
             {
-                Some(*result)
+                retained_projections[root_index] = Some(*result);
             }
             ImporterProjection::Projected(_) => {
                 release_age_policy_isolated_count += 1;
@@ -433,24 +569,21 @@ fn project_union_result(
                     reason = "release-age-policy",
                     "workspace union importer requires isolated resolution"
                 );
-                None
             }
             ImporterProjection::NeedsAmbientPeers(missing) => {
                 ambient_peer_pending_importer_count += 1;
                 missing_ambient_peers.extend(missing);
-                None
             }
             ImporterProjection::RequiresIsolatedResolution => {
                 projection_isolated_count += 1;
-                None
             }
-        };
-        projected.push(result);
+        }
     }
     missing_ambient_peers.sort_unstable();
     missing_ambient_peers.dedup();
     Ok(WorkspaceProjectionPass {
-        projected,
+        projected: Vec::new(),
+        final_union_cache: Some(Arc::clone(&union.cache)),
         missing_ambient_peers,
         union_stage_timing,
         eligible_importer_count: slots.iter().flatten().count(),
@@ -524,12 +657,12 @@ fn package_indices_by_canonical(packages: &[ResolvedPackage]) -> HashMap<String,
 fn project_importer(
     slots: &[RootSlot],
     context: &ImporterProjectionContext<'_>,
+    parsed_peers_cache: &mut [Option<Vec<ParsedUnionPeer>>],
 ) -> Result<ImporterProjection, ResolveError> {
     let union = context.union;
     let package_index = context.package_index;
     let importer_index = context.importer_index;
-    let mut included = HashSet::with_capacity(union.packages.len());
-    let mut required = HashSet::with_capacity(union.packages.len());
+    let mut subset = PackageSubset::new(union.packages.len());
     let mut root_aliases = HashMap::with_capacity(slots.len());
     let mut root_resolutions = HashMap::with_capacity(slots.len());
     let mut skipped_optional_roots = HashSet::new();
@@ -555,13 +688,7 @@ fn project_importer(
         root_resolutions.insert(slot.local.clone(), resolution.clone());
         seeds.push((resolution.target, !slot.optional));
     }
-    if !add_dependency_closure(
-        &mut included,
-        &mut required,
-        seeds,
-        &union.packages,
-        package_index,
-    ) {
+    if !add_dependency_closure(&mut subset, seeds, &union.packages, package_index) {
         tracing::debug!(
             importer_index,
             reason = "dangling-exact-dependency-target",
@@ -570,12 +697,13 @@ fn project_importer(
         return Ok(ImporterProjection::RequiresIsolatedResolution);
     }
 
-    let projection_overrides = context.overrides.clone();
+    let owned_overrides = (!context.overrides.is_empty()).then(|| context.overrides.clone());
+    let projection_overrides = owned_overrides.as_ref().unwrap_or(context.overrides);
     let peer_context = ImporterProjectionContext {
-        overrides: &projection_overrides,
+        overrides: projection_overrides,
         ..*context
     };
-    let peer_projection = project_peer_context(&mut included, &mut required, &peer_context)?;
+    let peer_projection = project_peer_context(&mut subset, &peer_context, parsed_peers_cache)?;
     let (mut peer_bindings, ambient_root_resolutions, peer_conflicts) = match peer_projection {
         PeerProjectionOutcome::Projected(projection) => projection,
         PeerProjectionOutcome::NeedsAmbientPeers(missing) => {
@@ -597,12 +725,13 @@ fn project_importer(
     }
     ambient_peer_installs.sort_unstable();
 
-    let mut packages = included
+    let mut packages = subset
+        .included_indices
         .iter()
         .copied()
         .map(|index| {
             let mut package = union.packages[index].clone();
-            package.optional = !required.contains(&index);
+            package.optional = !subset.is_required(index);
             let projected_peers = peer_bindings.remove(&index).unwrap_or_default();
             package.peer_targets = projected_peers
                 .iter()
@@ -620,20 +749,30 @@ fn project_importer(
         );
         return Ok(ImporterProjection::RequiresIsolatedResolution);
     }
-    packages.sort_by_cached_key(|package| (package.package.to_string(), package.version.clone()));
-    let package_names = packages
-        .iter()
-        .map(|package| package.package.canonical_name())
-        .collect::<HashSet<_>>();
-    let mut applied_overrides = union
-        .applied_overrides
-        .iter()
-        .filter(|hit| package_names.contains(&hit.package))
-        .cloned()
-        .collect::<Vec<_>>();
-    for hit in projection_overrides.take_hits() {
-        if !applied_overrides.contains(&hit) {
-            applied_overrides.push(hit);
+    packages.sort_by(|left, right| {
+        left.package
+            .cmp_display(&right.package)
+            .then_with(|| left.version.cmp(&right.version))
+    });
+    let mut applied_overrides = if union.applied_overrides.is_empty() {
+        Vec::new()
+    } else {
+        let package_names = packages
+            .iter()
+            .map(|package| package.package.canonical_name())
+            .collect::<HashSet<_>>();
+        union
+            .applied_overrides
+            .iter()
+            .filter(|hit| package_names.contains(&hit.package))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    if let Some(owned_overrides) = owned_overrides {
+        for hit in owned_overrides.take_hits() {
+            if !applied_overrides.contains(&hit) {
+                applied_overrides.push(hit);
+            }
         }
     }
     applied_overrides.sort_by(|left, right| {
@@ -667,12 +806,15 @@ fn all_projected_packages_reachable(
     for (index, package) in packages.iter().enumerate() {
         by_id.insert(package.resolution_id, index);
     }
-    let mut visited = HashSet::with_capacity(packages.len());
+    let mut visited = vec![false; packages.len()];
+    let mut visited_count = 0usize;
     let mut queue = VecDeque::with_capacity(root_resolutions.len());
     for root in root_resolutions.values() {
         if let Some(&index) = by_id.get(&root.target)
-            && visited.insert(index)
+            && !visited[index]
         {
+            visited[index] = true;
+            visited_count += 1;
             queue.push_back(index);
         }
     }
@@ -684,18 +826,19 @@ fn all_projected_packages_reachable(
             .chain(package.peer_targets.values())
         {
             if let Some(&child_index) = by_id.get(target)
-                && visited.insert(child_index)
+                && !visited[child_index]
             {
+                visited[child_index] = true;
+                visited_count += 1;
                 queue.push_back(child_index);
             }
         }
     }
-    visited.len() == packages.len()
+    visited_count == packages.len()
 }
 
 fn add_dependency_closure(
-    included: &mut HashSet<usize>,
-    required: &mut HashSet<usize>,
+    subset: &mut PackageSubset,
     seeds: Vec<(ResolutionNodeId, bool)>,
     packages: &[ResolvedPackage],
     package_index: &HashMap<ResolutionNodeId, usize>,
@@ -706,8 +849,8 @@ fn add_dependency_closure(
         let Some(&index) = package_index.get(&identity) else {
             return false;
         };
-        let was_included = included.insert(index);
-        let became_required = required_path && required.insert(index);
+        let was_included = subset.insert_included(index);
+        let became_required = required_path && subset.insert_required(index);
         if !was_included && !became_required {
             continue;
         }
@@ -735,78 +878,140 @@ enum PeerProjectionOutcome {
     RequiresIsolatedResolution,
 }
 
+struct EvaluatedPeerEdge {
+    consumer_idx: usize,
+    peer_name: String,
+    target: String,
+    range: NpmRange,
+    optional: bool,
+    bound_target: Option<(String, ResolutionNodeId)>,
+}
+
 fn project_peer_context(
-    included: &mut HashSet<usize>,
-    required: &mut HashSet<usize>,
+    subset: &mut PackageSubset,
     context: &ImporterProjectionContext<'_>,
+    parsed_peers_cache: &mut [Option<Vec<ParsedUnionPeer>>],
 ) -> Result<PeerProjectionOutcome, ResolveError> {
     let union = context.union;
     let package_index = context.package_index;
     let importer_index = context.importer_index;
     let mut ambient = HashMap::new();
-    let mut conflicts = Vec::new();
+    let mut conflicts: Vec<super::PeerConflictReport> = Vec::new();
+    let mut edges: Vec<EvaluatedPeerEdge> = Vec::new();
+    let mut edges_by_target: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut unbound_targets: HashSet<String> = HashSet::new();
+    let mut processed_cursor = 0usize;
+    let has_overrides = !context.overrides.is_empty();
+
     loop {
-        let mut bindings = HashMap::<usize, Vec<(lpm_common::PeerEdge, ResolutionNodeId)>>::new();
-        let mut missing = HashMap::<String, Vec<PeerRequirement>>::new();
-        let mut positions = included.iter().copied().collect::<Vec<_>>();
-        positions.sort_unstable();
-        for index in positions {
+        let mut new_positions = subset.included_indices[processed_cursor..].to_vec();
+        new_positions.sort_unstable();
+        let added_canonicals: HashSet<String> = if processed_cursor > 0 {
+            new_positions
+                .iter()
+                .map(|&idx| union.packages[idx].package.canonical_name())
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        processed_cursor = subset.included_indices.len();
+
+        for index in new_positions {
+            let parsed_peers = parsed_peers_for_package(index, union, parsed_peers_cache)?;
+            if parsed_peers.is_empty() {
+                continue;
+            }
             let package = &union.packages[index];
-            let canonical = CanonicalKey::from(&package.package);
-            let version = package.version.to_string();
-            let Some(info) = union.cache.get(&canonical) else {
-                continue;
-            };
-            let Some(peer_dependencies) = info.peer_dependencies(&version) else {
-                continue;
-            };
-            for peer in peer_dependencies {
-                let peer_name = peer.name;
-                let raw_range = peer.range;
-                let target = peer.alias.unwrap_or(peer_name);
-                let range = NpmRange::parse_registry_spec(raw_range).map_err(|error| {
-                    ResolveError::Internal(format!(
-                        "failed to parse peer range {raw_range:?} for {target}: {error}"
-                    ))
-                })?;
-                let Some(range) = apply_projected_peer_override(
-                    package,
-                    target,
-                    range,
-                    context.overrides,
-                    context.policy,
-                    &union.cache,
-                    importer_index,
-                )?
-                else {
-                    return Ok(PeerProjectionOutcome::RequiresIsolatedResolution);
+            for peer in parsed_peers {
+                let range = if has_overrides {
+                    let Some(range) = apply_projected_peer_override(
+                        package,
+                        &peer.target,
+                        peer.range.clone(),
+                        context.overrides,
+                        context.policy,
+                        &union.cache,
+                        importer_index,
+                    )?
+                    else {
+                        return Ok(PeerProjectionOutcome::RequiresIsolatedResolution);
+                    };
+                    range
+                } else {
+                    peer.range.clone()
                 };
-                let target_info = union.cache.get(&CanonicalKey::from_dep_name(target));
-                if let Some((version, target_id)) = newest_included_provider(
-                    included,
+                let target_info = union.cache.get(&peer.target_canonical);
+                let bound_target = newest_included_provider(
+                    subset,
                     context.packages_by_canonical,
                     &union.packages,
-                    target,
+                    &peer.target,
                     &range,
                     target_info.map(Arc::as_ref),
-                ) {
-                    bindings.entry(index).or_default().push((
-                        lpm_common::PeerEdge::registry(peer_name, target, version),
-                        target_id,
-                    ));
-                } else {
-                    missing.entry(target.to_owned()).or_default().push((
-                        index,
-                        peer_name.to_owned(),
-                        range,
-                        peer.optional,
-                    ));
+                );
+                let is_unbound = bound_target.is_none();
+                let edge_idx = edges.len();
+                edges.push(EvaluatedPeerEdge {
+                    consumer_idx: index,
+                    peer_name: peer.peer_name.clone(),
+                    target: peer.target.clone(),
+                    range,
+                    optional: peer.optional,
+                    bound_target,
+                });
+                edges_by_target
+                    .entry(peer.target.clone())
+                    .or_default()
+                    .push(edge_idx);
+                if is_unbound {
+                    unbound_targets.insert(peer.target.clone());
                 }
             }
         }
 
-        if !context.auto_install_peers {
+        for canonical in added_canonicals {
+            let Some(edge_indices) = edges_by_target.get(&canonical) else {
+                continue;
+            };
+            let target_info = union.cache.get(&CanonicalKey::from_dep_name(&canonical));
+            let mut any_unbound = false;
+            for &edge_idx in edge_indices {
+                let edge = &mut edges[edge_idx];
+                edge.bound_target = newest_included_provider(
+                    subset,
+                    context.packages_by_canonical,
+                    &union.packages,
+                    &edge.target,
+                    &edge.range,
+                    target_info.map(Arc::as_ref),
+                );
+                if edge.bound_target.is_none() {
+                    any_unbound = true;
+                }
+            }
+            if !any_unbound {
+                unbound_targets.remove(&canonical);
+            }
+        }
+
+        let build_bindings = |edges: &[EvaluatedPeerEdge]| {
+            let mut bindings =
+                HashMap::<usize, Vec<(lpm_common::PeerEdge, ResolutionNodeId)>>::new();
+            for edge in edges {
+                if let Some((version, target_id)) = &edge.bound_target {
+                    bindings.entry(edge.consumer_idx).or_default().push((
+                        lpm_common::PeerEdge::registry(&edge.peer_name, &edge.target, version),
+                        *target_id,
+                    ));
+                }
+            }
             normalize_peer_bindings(&mut bindings);
+            bindings
+        };
+
+        if !context.auto_install_peers || unbound_targets.is_empty() {
+            let bindings = build_bindings(&edges);
+            conflicts.sort_by(|left, right| left.canonical.cmp(&right.canonical));
             return Ok(PeerProjectionOutcome::Projected((
                 bindings, ambient, conflicts,
             )));
@@ -814,20 +1019,34 @@ fn project_peer_context(
 
         let mut synthesized = Vec::new();
         let mut unfetched_ranges = Vec::new();
-        let mut canonical_names = missing.keys().cloned().collect::<Vec<_>>();
+        let mut canonical_names = unbound_targets.iter().cloned().collect::<Vec<_>>();
         canonical_names.sort();
         for canonical in canonical_names {
-            let requirements = &missing[&canonical];
-            let required_requirements = requirements
+            let Some(edge_indices) = edges_by_target.get(&canonical) else {
+                continue;
+            };
+            let mut requirements: Vec<PeerRequirement> = edge_indices
                 .iter()
-                .filter(|requirement| !requirement.3)
-                .collect::<Vec<_>>();
-            if required_requirements.is_empty() {
+                .filter_map(|&edge_idx| {
+                    let edge = &edges[edge_idx];
+                    (edge.bound_target.is_none() && !edge.optional).then(|| {
+                        (
+                            edge.consumer_idx,
+                            edge.peer_name.clone(),
+                            edge.range.clone(),
+                            edge.optional,
+                        )
+                    })
+                })
+                .collect();
+            if requirements.is_empty() {
                 continue;
             }
+            requirements.sort_by_key(|requirement| requirement.0);
+            let required_refs = requirements.iter().collect::<Vec<_>>();
             let (version, unsatisfied) = match select_union_peer_candidate(
                 &canonical,
-                &required_requirements,
+                &required_refs,
                 &union.cache,
                 context.policy,
             ) {
@@ -869,7 +1088,7 @@ fn project_peer_context(
             return Ok(PeerProjectionOutcome::NeedsAmbientPeers(unfetched_ranges));
         }
         if synthesized.is_empty() {
-            normalize_peer_bindings(&mut bindings);
+            let bindings = build_bindings(&edges);
             conflicts.sort_by(|left, right| left.canonical.cmp(&right.canonical));
             return Ok(PeerProjectionOutcome::Projected((
                 bindings, ambient, conflicts,
@@ -886,7 +1105,7 @@ fn project_peer_context(
                 missing_ambient_peers,
             ));
         }
-        let before = included.len();
+        let before = subset.len();
         let mut synthesized_targets = Vec::with_capacity(synthesized.len());
         for (identity, required_path) in synthesized {
             let Some(targets) = context.artifact_index.get(&identity) else {
@@ -910,16 +1129,10 @@ fn project_peer_context(
             });
             synthesized_targets.push((*target, required_path));
         }
-        if !add_dependency_closure(
-            included,
-            required,
-            synthesized_targets,
-            &union.packages,
-            package_index,
-        ) {
+        if !add_dependency_closure(subset, synthesized_targets, &union.packages, package_index) {
             return Ok(PeerProjectionOutcome::RequiresIsolatedResolution);
         }
-        if included.len() == before {
+        if subset.len() == before {
             tracing::debug!(
                 importer_index,
                 reason = "ambient-peer-closure-did-not-grow",
@@ -994,7 +1207,7 @@ fn apply_projected_peer_override(
 }
 
 fn newest_included_provider(
-    included: &HashSet<usize>,
+    subset: &PackageSubset,
     packages_by_canonical: &HashMap<String, Vec<usize>>,
     packages: &[ResolvedPackage],
     canonical: &str,
@@ -1003,7 +1216,7 @@ fn newest_included_provider(
 ) -> Option<(String, ResolutionNodeId)> {
     let candidates = packages_by_canonical.get(canonical)?;
     for &index in candidates {
-        if !included.contains(&index) {
+        if !subset.contains(index) {
             continue;
         }
         let package = &packages[index];
@@ -1062,7 +1275,7 @@ fn select_union_peer_candidate<'a>(
     ) {
         if info.has_platform_metadata()
             && info
-                .platform_is_compatible(&candidate.to_string())
+                .platform_is_compatible_for(candidate)
                 .is_some_and(|compatible| !compatible)
         {
             continue;
@@ -1943,6 +2156,7 @@ mod tests {
     fn workspace_projection_retains_timing_when_every_importer_is_isolated() {
         let outcome = WorkspaceProjectionPass {
             projected: vec![None, None],
+            final_union_cache: None,
             missing_ambient_peers: Vec::new(),
             union_stage_timing: Default::default(),
             eligible_importer_count: 2,
@@ -2094,5 +2308,47 @@ mod tests {
                 pkg.version
             );
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn union_projection_retains_converged_importer_and_shares_final_cache_after_ambient_expansion()
+     {
+        let roots = vec![
+            RootDependencies::required(HashMap::from([
+                ("consumer".to_string(), "1.0.0".to_string()),
+                ("runtime".to_string(), "1.0.0".to_string()),
+            ])),
+            RootDependencies::required(HashMap::from([(
+                "consumer".to_string(),
+                "1.0.0".to_string(),
+            )])),
+        ];
+        let results = resolve_roots(
+            roots,
+            vec![
+                (
+                    "consumer",
+                    cached_package(&[("1.0.0", &[], &[("runtime", "*")])]),
+                ),
+                (
+                    "runtime",
+                    cached_package(&[("2.0.0", &[], &[]), ("1.0.0", &[], &[])]),
+                ),
+            ],
+        )
+        .await;
+
+        assert!(
+            Arc::ptr_eq(&results[0].cache, &results[1].cache),
+            "retained converged importers must share the final union cache Arc"
+        );
+        assert!(results[0].ambient_peer_installs.is_empty());
+        assert_eq!(results[1].ambient_peer_installs, vec!["runtime"]);
+        assert!(results[0].packages.iter().any(|p| {
+            p.package.canonical_name() == "runtime" && p.version.to_string() == "1.0.0"
+        }));
+        assert!(results[1].packages.iter().any(|p| {
+            p.package.canonical_name() == "runtime" && p.version.to_string() == "2.0.0"
+        }));
     }
 }

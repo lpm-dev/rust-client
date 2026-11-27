@@ -1,11 +1,26 @@
 use super::prelude::*;
 
+#[cfg(test)]
 pub(super) fn root_resolutions_from_solution(
     solution: &PubGrubSolution,
     root_dependencies: &RootDependencies,
     root_aliases: &HashMap<String, String>,
 ) -> HashMap<String, RootResolution> {
     let resolution_ids = resolution_ids_from_solution(solution);
+    root_resolutions_from_solution_with_ids(
+        solution,
+        &resolution_ids,
+        root_dependencies,
+        root_aliases,
+    )
+}
+
+fn root_resolutions_from_solution_with_ids(
+    solution: &PubGrubSolution,
+    resolution_ids: &HashMap<ResolverPackage, lpm_common::ResolutionNodeId>,
+    root_dependencies: &RootDependencies,
+    root_aliases: &HashMap<String, String>,
+) -> HashMap<String, RootResolution> {
     let mut resolutions = HashMap::with_capacity(root_dependencies.dependencies.len());
     for local_name in root_dependencies.dependencies.keys() {
         let target = root_aliases
@@ -34,15 +49,14 @@ fn resolution_ids_from_solution(
         .iter()
         .map(|(package, _)| package)
         .filter(|package| !package.is_root())
-        .cloned()
         .collect::<Vec<_>>();
-    packages.sort_by_key(ResolverPackage::to_string);
+    packages.sort_by(|left, right| left.cmp_display(right));
     packages
         .into_iter()
         .enumerate()
         .map(|(index, package)| {
             let id = u32::try_from(index).unwrap_or(u32::MAX);
-            (package, lpm_common::ResolutionNodeId::new(id))
+            (package.clone(), lpm_common::ResolutionNodeId::new(id))
         })
         .collect()
 }
@@ -65,144 +79,107 @@ impl From<ResolveError> for RejectedSolution {
     }
 }
 
-/// Convert PubGrub solution + cached metadata into `ResolvedPackage` list
-/// with dependency edges populated.
+pub(super) struct FormattedSolution {
+    pub(super) packages: Vec<ResolvedPackage>,
+    pub(super) root_resolutions: HashMap<String, RootResolution>,
+    pub(super) platform_skipped: usize,
+}
+
+/// Convert PubGrub solution + cached metadata into `ResolvedPackage` list,
+/// root resolution handles, and platform-skip count.
 pub(super) fn format_solution(
     solution: PubGrubSolution,
     cache: &HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
     root_dependencies: &RootDependencies,
     root_aliases: &HashMap<String, String>,
     skipped_dependencies: Vec<SkippedDependency>,
-) -> Result<(Vec<ResolvedPackage>, usize), RejectedSolution> {
+) -> Result<FormattedSolution, RejectedSolution> {
     let resolution_ids = resolution_ids_from_solution(&solution);
-    let resolved_versions: HashMap<ResolverPackage, String> = solution
-        .iter()
-        .filter(|(pkg, _)| !pkg.is_root())
-        .map(|(pkg, ver)| (pkg.clone(), ver.to_string()))
-        .collect();
-    let resolved_peer_versions: HashMap<String, Vec<(ResolverPackage, String)>> = solution
-        .iter()
-        .filter(|(pkg, _)| !pkg.is_root())
-        .fold(HashMap::new(), |mut acc, (pkg, ver)| {
-            acc.entry(pkg.canonical_name())
-                .or_default()
-                .push((pkg.clone(), ver.to_string()));
-            acc
-        });
+    let root_resolutions = root_resolutions_from_solution_with_ids(
+        &solution,
+        &resolution_ids,
+        root_dependencies,
+        root_aliases,
+    );
+    let mut resolved_versions = HashMap::with_capacity(resolution_ids.len());
+    let mut resolved_peer_versions: HashMap<String, Vec<(ResolverPackage, String)>> =
+        HashMap::with_capacity(resolution_ids.len());
+    for (pkg, ver) in solution.iter() {
+        if pkg.is_root() {
+            continue;
+        }
+        let ver_str = ver.to_string();
+        resolved_peer_versions
+            .entry(pkg.canonical_name())
+            .or_default()
+            .push((pkg.clone(), ver_str.clone()));
+        resolved_versions.insert(pkg.clone(), ver_str);
+    }
 
     let mut resolved: Vec<ResolvedPackage> = solution
         .into_iter()
         .filter(|(pkg, _)| !pkg.is_root())
         .map(|(package, version)| {
-            let ver_str = version.to_string();
-            // Cache is canonical-keyed. Split-retry identities of the
-            // same canonical package share one entry, so every lookup
-            // canonicalizes.
+            let ver_str = resolved_versions
+                .get(&package)
+                .map_or_else(|| version.to_string(), String::clone);
             let key = CanonicalKey::from(&package);
+            let version_view = cache.get(&key).and_then(|info| info.version_view(&ver_str));
 
-            // Pull the per-version alias map from the cache so we can
-            // (a) redirect edge-lookup to the aliased target's resolved
-            // version and (b) surface the alias map on the resolved
-            // package for the linker.
-            let cached_aliases: HashMap<String, String> = cache
-                .get(&key)
-                .map(|info| info.dependency_aliases(&ver_str))
-                .unwrap_or_default();
+            let mut dependencies = Vec::new();
+            let mut dependency_targets = HashMap::new();
+            let mut optional_dependencies = HashSet::new();
+            let mut aliases = HashMap::new();
 
-            // Look up this package's declared deps from the provider
-            // cache. `ver_deps` is keyed by the LOCAL dep name (what
-            // appears in the parent's `dependencies` map). Alias targets
-            // and split children must use the same resolver identity that
-            // the provider constructed for this parent.
-            let resolved_dependencies = cache
-                .get(&key)
-                .and_then(|info| info.dependencies(&ver_str))
-                .map(|dependencies| {
-                    dependencies
-                        .filter_map(|dependency| {
-                            if dependency.bundled {
-                                return None;
-                            }
-                            let local_name = dependency.name;
-                            let target_name = dependency.alias.unwrap_or(local_name);
+            if let Some(view) = version_view {
+                for dependency in view.dependencies() {
+                    if dependency.optional {
+                        optional_dependencies.insert(dependency.name.to_owned());
+                    }
+                    if dependency.bundled {
+                        continue;
+                    }
+                    let local_name = dependency.name;
+                    let target_name = dependency.alias.unwrap_or(local_name);
+                    let split_target = ResolverPackage::from_transitive_dependency(
+                        &package,
+                        &version,
+                        local_name,
+                        target_name,
+                        true,
+                    );
+                    let resolved_edge =
+                        if let Some(resolved_ver) = resolved_versions.get(&split_target) {
+                            Some((resolved_ver, resolution_ids[&split_target]))
+                        } else if local_name == target_name {
                             let target = ResolverPackage::from_dep_name(target_name);
-                            let split_target = ResolverPackage::from_transitive_dependency(
-                                &package,
-                                &version,
-                                local_name,
-                                target_name,
-                                true,
-                            );
                             resolved_versions
-                                .get(&split_target)
-                                .or_else(|| {
-                                    (local_name == target_name)
-                                        .then(|| resolved_versions.get(&target))
-                                        .flatten()
-                                })
-                                .map(|resolved_ver| {
-                                    let exact_target =
-                                        if resolved_versions.contains_key(&split_target) {
-                                            split_target
-                                        } else {
-                                            target
-                                        };
-                                    (
-                                        local_name.to_owned(),
-                                        resolved_ver.clone(),
-                                        resolution_ids[&exact_target],
-                                    )
-                                })
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let dependencies = resolved_dependencies
-                .iter()
-                .map(|(local, version, _)| (local.clone(), version.clone()))
-                .collect::<Vec<_>>();
-            let dependency_targets = resolved_dependencies
-                .iter()
-                .map(|(local, _, target)| (local.clone(), *target))
-                .collect::<HashMap<_, _>>();
-            let optional_dependencies = cache
-                .get(&key)
-                .map(|info| info.optional_dependency_names(&ver_str))
-                .unwrap_or_default();
+                                .get(&target)
+                                .map(|resolved_ver| (resolved_ver, resolution_ids[&target]))
+                        } else {
+                            None
+                        };
+                    if let Some((resolved_ver, target_id)) = resolved_edge {
+                        let local_owned = local_name.to_owned();
+                        if let Some(alias) = dependency.alias {
+                            aliases.insert(local_owned.clone(), alias.to_owned());
+                        }
+                        dependency_targets.insert(local_owned.clone(), target_id);
+                        dependencies.push((local_owned, resolved_ver.clone()));
+                    }
+                }
+            }
 
-            // Only surface aliases that actually survived resolution —
-            // an optional aliased dep skipped by the platform filter is
-            // not in `dependencies`, so carrying its alias entry would
-            // be dead weight for the linker.
-            let alive_locals: HashSet<&String> = dependencies.iter().map(|(l, _)| l).collect();
-            let aliases: HashMap<String, String> = cached_aliases
-                .iter()
-                .filter(|(local, _)| alive_locals.contains(local))
-                .map(|(l, t)| (l.clone(), t.clone()))
-                .collect();
+            let (tarball_url, integrity, platform, node_engine) = match version_view {
+                Some(view) => (
+                    view.tarball_url().map(str::to_owned),
+                    view.integrity().map(str::to_owned),
+                    view.platform(),
+                    view.node_engine().map(str::to_owned),
+                ),
+                None => (None, None, None, None),
+            };
 
-            // Extract tarball URL and integrity from cached dist info
-            let (tarball_url, integrity) = cache.get(&key).map_or_else(
-                || (None, None),
-                |info| {
-                    (
-                        info.tarball_url(&ver_str).map(str::to_owned),
-                        info.integrity(&ver_str).map(str::to_owned),
-                    )
-                },
-            );
-            let platform = cache.get(&key).and_then(|info| info.platform(&ver_str));
-            let node_engine = cache
-                .get(&key)
-                .and_then(|info| info.node_engine(&ver_str).map(str::to_owned));
-
-            // Surface resolved peers per package. The resolver already
-            // proved each peer's range was satisfied (or surfaced a
-            // `PeerWarning` for the gap); here we just intersect the
-            // declared peers against the install set's resolved-
-            // versions lookup. Missing peers simply don't appear in
-            // the output Vec — the linker / GraphKey only cares about
-            // peers that ARE present.
             let peer_bindings =
                 compute_resolved_peers(&package, &ver_str, cache, &resolved_peer_versions)?;
             let peer_targets = peer_bindings
@@ -234,13 +211,15 @@ pub(super) fn format_solution(
             })
         })
         .collect::<Result<_, ResolveError>>()?;
-    let root_resolutions =
-        root_resolutions_from_solution_for_ids(&resolved, root_dependencies, root_aliases);
     mark_optional_reachability(&mut resolved, root_dependencies, &root_resolutions);
     let platform_skipped =
         validate_selected_dependency_skips(&resolved, cache, skipped_dependencies)?;
-    resolved.sort_by_key(|a| a.package.to_string());
-    Ok((resolved, platform_skipped))
+    resolved.sort_by(|left, right| left.package.cmp_display(&right.package));
+    Ok(FormattedSolution {
+        packages: resolved,
+        root_resolutions,
+        platform_skipped,
+    })
 }
 
 fn validate_selected_dependency_skips(
@@ -323,34 +302,6 @@ fn validate_selected_dependency_skips(
         platform_skipped += usize::from(skipped.reason.counts_as_platform_skip());
     }
     Ok(platform_skipped)
-}
-
-fn root_resolutions_from_solution_for_ids(
-    packages: &[ResolvedPackage],
-    root_dependencies: &RootDependencies,
-    root_aliases: &HashMap<String, String>,
-) -> HashMap<String, RootResolution> {
-    let mut roots = HashMap::with_capacity(root_dependencies.dependencies.len());
-    for local in root_dependencies.dependencies.keys() {
-        let target = root_aliases
-            .get(local)
-            .map_or(local.as_str(), String::as_str);
-        let root_package = ResolverPackage::from_root_dependency(local, target);
-        if let Some(package) = packages
-            .iter()
-            .find(|package| package.package == root_package)
-        {
-            roots.insert(
-                local.clone(),
-                RootResolution {
-                    target: package.resolution_id,
-                    package: target.to_string(),
-                    version: package.version.to_string(),
-                },
-            );
-        }
-    }
-    roots
 }
 
 pub(crate) fn mark_optional_reachability(
@@ -563,7 +514,7 @@ mod root_resolution_tests {
             ("shared-dep".to_string(), "^1.0.0".to_string()),
         ]));
 
-        let (packages, _) =
+        let FormattedSolution { packages, .. } =
             format_solution(solution, &cache, &root_deps, &HashMap::new(), Vec::new())
                 .expect("format solution");
         let parent = packages

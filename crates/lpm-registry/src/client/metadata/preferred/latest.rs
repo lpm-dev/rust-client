@@ -184,6 +184,58 @@ impl RegistryClient {
         }
     }
 
+    /// Like [`Self::get_npm_preferred_resolution_with_timings`], but only tries
+    /// cached preferences and the single `/<pkg>/latest` document without racing
+    /// a partial packument download. Returns `Ok(None)` when `/latest` is absent
+    /// or does not satisfy `accepts`, letting speculative prefetch callers fall
+    /// back to a complete packument fetch without discarding versions.
+    pub async fn try_get_npm_latest_resolution_with_timings<P, F>(
+        &self,
+        name: &str,
+        access: PublicNpmAccess<'_>,
+        accepts: F,
+    ) -> Result<Option<TimedPreferredResolution<P>>, LpmError>
+    where
+        P: MetadataProjection,
+        F: Fn(&str) -> bool + Send + Sync + 'static,
+    {
+        let mut timings = PackageMetadataFetchTimings::default();
+        let latest_key = self.npm_latest_metadata_cache_key(name, access);
+        let started = std::time::Instant::now();
+        let cached = self
+            .read_preference_cache::<P>(name, access, &latest_key)
+            .await;
+        timings.cache_read_ms += started.elapsed().as_millis();
+        if let Some(preference) = cached {
+            return Ok(match select_preference(name, preference, &accepts) {
+                Selection::Ready(selected) => {
+                    timings.cache_hit = true;
+                    Some(selected.with_timings(timings))
+                }
+                Selection::CompleteHistory | Selection::History => None,
+            });
+        }
+        if self.has_stale_preferred_history_validator(name, access) {
+            return Ok(None);
+        }
+        let (latest_result, mut latest_timings) =
+            self.fetch_latest_leg::<P>(name, access, &latest_key).await;
+        latest_timings.add_attempt(&timings);
+        match latest_result {
+            Ok(preference) => match select_preference(name, preference, &accepts) {
+                Selection::Ready(selected) => Ok(Some(selected.with_timings(latest_timings))),
+                Selection::CompleteHistory | Selection::History => Ok(None),
+            },
+            Err(
+                error @ (LpmError::NpmFirewallBlocked(_)
+                | LpmError::AuthRequired
+                | LpmError::SessionExpired
+                | LpmError::EnvTokenRejected),
+            ) => Err(error),
+            Err(_) => Ok(None),
+        }
+    }
+
     async fn race_latest_and_history<P, F>(
         &self,
         name: &str,

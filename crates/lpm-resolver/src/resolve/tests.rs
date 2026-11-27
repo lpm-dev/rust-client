@@ -2401,7 +2401,7 @@ fn peer_binding_from_split_fallback_retains_exact_target_id() {
         ),
     ]);
 
-    let (packages, _) = format_solution(
+    let FormattedSolution { packages, .. } = format_solution(
         solution,
         &cache,
         &RootDependencies::default(),

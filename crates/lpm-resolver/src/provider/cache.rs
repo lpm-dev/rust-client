@@ -565,14 +565,20 @@ impl LpmDependencyProvider {
         npm_range: &NpmRange,
         available: &Arc<[NpmVersion]>,
     ) -> Ranges<NpmVersion> {
-        let key = (pkg.clone(), npm_range.raw().to_string());
+        use super::types::{RangeCacheKey, RangeCacheKeyRef};
+
+        let raw_range = npm_range.raw();
         let tagged_version = npm_range.dist_tag().and_then(|tag| {
             let canonical = CanonicalKey::from(pkg);
             self.cache
                 .get(&canonical)
                 .and_then(|info| info.dist_tag_version(tag).cloned())
         });
-        if let Some(cached) = self.range_cache.lock().get(&key)
+        let lookup = (pkg, raw_range);
+        if let Some(cached) = self
+            .range_cache
+            .lock()
+            .get(&lookup as &dyn RangeCacheKeyRef)
             && Arc::ptr_eq(&cached.available, available)
             && cached.tagged_version == tagged_version
         {
@@ -581,7 +587,10 @@ impl LpmDependencyProvider {
         let computed =
             npm_range.to_pubgrub_ranges_with_dist_tag(available, tagged_version.as_ref());
         self.range_cache.lock().insert(
-            key,
+            RangeCacheKey {
+                pkg: pkg.clone(),
+                raw: raw_range.to_string(),
+            },
             CachedRange {
                 available: Arc::clone(available),
                 tagged_version,

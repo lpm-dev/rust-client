@@ -290,11 +290,27 @@ impl LpmDependencyProvider {
         info: &mut CachedPackageInfo,
     ) -> Result<ReleaseTimePolicyFetchDetail, ProviderError> {
         let fetch_start = Instant::now();
+        let expected_modified = info.modified.as_deref();
+        let version_strs = if expected_modified.is_some() {
+            info.version_strs()
+        } else {
+            Vec::new()
+        };
+        let suffix_hint =
+            expected_modified.map(|expected_modified| lpm_registry::ReleaseTimeSuffixHint {
+                expected_modified,
+                known_versions: &version_strs,
+            });
         let release_times = self
             .rt
             .block_on(
                 self.client
-                    .get_npm_release_times_routed_full_with_timings(name, route.clone()),
+                    .get_npm_release_times_routed_full_with_timings_and_hint(
+                        name,
+                        route.clone(),
+                        expected_modified,
+                        suffix_hint,
+                    ),
             )
             .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
         let mut timings = release_times.timings;
@@ -315,11 +331,27 @@ impl LpmDependencyProvider {
             });
         }
 
+        let expected_modified = info.modified.as_deref();
+        let version_strs = if expected_modified.is_some() {
+            info.version_strs()
+        } else {
+            Vec::new()
+        };
+        let suffix_hint =
+            expected_modified.map(|expected_modified| lpm_registry::ReleaseTimeSuffixHint {
+                expected_modified,
+                known_versions: &version_strs,
+            });
         let direct_release_times = self
             .rt
             .block_on(
                 self.client
-                    .get_npm_release_times_routed_full_with_timings(name, UpstreamRoute::NpmDirect),
+                    .get_npm_release_times_routed_full_with_timings_and_hint(
+                        name,
+                        UpstreamRoute::NpmDirect,
+                        expected_modified,
+                        suffix_hint,
+                    ),
             )
             .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
         timings = direct_release_times.timings;

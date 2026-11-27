@@ -684,6 +684,109 @@ pub(super) async fn fetch_preferred_metadata_for_resolver(
     Ok(fetched)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn fetch_preferred_prefetch_metadata_for_resolver(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+    policy: &ResolverPolicy,
+    include_speculation: bool,
+    trace_metadata_fetches: bool,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    policy_semaphore: &Arc<tokio::sync::Semaphore>,
+    range: NpmRange,
+) -> Result<FetchedMetadata, ResolveError> {
+    let route = match canonical {
+        CanonicalKey::Npm { name } => Some((name, route_table.route_for_package(name))),
+        _ => None,
+    };
+    let public_npm = route
+        .as_ref()
+        .and_then(|(name, route)| Some((*name, client.public_npm_access(route)?)));
+    if let Some((name, access)) = public_npm {
+        let candidate_range = range.clone();
+        if let Some(preferred) = client
+            .try_get_npm_latest_resolution_with_timings::<ManifestProjection, _>(
+                name,
+                access,
+                move |version| {
+                    NpmVersion::parse(version)
+                        .is_ok_and(|version| candidate_range.satisfies(&version))
+                },
+            )
+            .await
+            .map_err(|error| metadata_fetch_error(canonical, error))?
+        {
+            drop(permit);
+            let versions_complete = preferred.versions_complete;
+            let projection = match preferred.metadata {
+                lpm_registry::ResolutionMetadata::Projected(projection) => projection,
+                lpm_registry::ResolutionMetadata::Document {
+                    metadata,
+                    projection,
+                } => {
+                    let version_count = metadata.versions.len() as u64;
+                    let dist_tags = metadata.dist_tags.clone();
+                    let info = if versions_complete {
+                        parse_owned_metadata_to_cache_info(*metadata)
+                    } else {
+                        parse_owned_partial_metadata_to_cache_info(*metadata)
+                    };
+                    if let Some(slot) = projection {
+                        client.store_metadata_projection(
+                            slot,
+                            ManifestProjection::encode(&info, &dist_tags, version_count),
+                        );
+                    }
+                    ManifestProjection {
+                        info,
+                        dist_tags,
+                        version_count,
+                    }
+                }
+            };
+            let ManifestProjection {
+                mut info,
+                dist_tags,
+                ..
+            } = projection;
+            let latest_version = info.latest_version.clone();
+            info.platform_metadata_complete |= preferred.platform_metadata_complete;
+            if info.needs_platform_metadata() {
+                let _policy_permit = Arc::clone(policy_semaphore).acquire_owned().await.ok();
+                fetch_platform_metadata(
+                    client,
+                    route_table,
+                    canonical,
+                    &mut info,
+                    trace_metadata_fetches,
+                )
+                .await?;
+            }
+            if !versions_complete {
+                info.preferred_latest = info.latest_version.clone();
+            }
+            let mut fetched =
+                fetched_metadata_from_info(latest_version, dist_tags, info, include_speculation);
+            fetched.shared_fact = Some(Arc::clone(&fetched.info));
+            return Ok(fetched);
+        }
+    }
+
+    fetch_metadata_for_resolver_with_permit_and_exact(
+        client,
+        route_table,
+        canonical,
+        policy,
+        include_speculation,
+        trace_metadata_fetches,
+        permit,
+        policy_semaphore,
+        None,
+    )
+    .await
+}
+
 pub(super) async fn fetch_exact_metadata_for_resolver_with_timings(
     client: &RegistryClient,
     route_table: &RouteTable,

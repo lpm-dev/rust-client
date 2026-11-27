@@ -52,14 +52,13 @@ mod prelude {
     pub(super) use super::format::dedupe_peer_superset_packages;
     #[allow(unused_imports)]
     pub(super) use super::format::{
-        format_solution, mark_optional_reachability, root_resolutions_from_solution,
+        FormattedSolution, format_solution, mark_optional_reachability,
     };
     #[allow(unused_imports)]
     pub(super) use super::peers::{
         AllowedVersionsSelector, CompiledPeerRules, GlobPattern, ParentSelector, PeerWarning,
-        check_unmet_peers, compute_resolved_peers, peer_version_satisfies,
-        resolve_peer_binding_version, select_peer_candidate, validate_allowed_versions_range,
-        validate_allowed_versions_selector,
+        check_unmet_peers, compute_resolved_peers, resolve_peer_binding_version,
+        select_peer_candidate, validate_allowed_versions_range, validate_allowed_versions_selector,
     };
     #[allow(unused_imports)]
     pub(super) use super::types::{
