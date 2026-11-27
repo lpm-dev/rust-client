@@ -38,10 +38,20 @@ fn public_command(source: &Command) -> Command {
                 .cloned(),
         )
     });
+    let visible_subcommands: Vec<_> = source
+        .get_subcommands()
+        .filter(|child| !child.is_hide_set() && child.get_name() != "help")
+        .map(public_command)
+        .collect();
     let mut command = Command::new(source.get_name().to_owned())
         .disable_help_flag(true)
         .disable_version_flag(true)
-        .disable_help_subcommand(true)
+        // Regenerate `help` from the already-materialized visible subcommands
+        // so deferred nested subcommands (e.g. `lpm help skills dashboard`)
+        // stay complete while hidden subcommands stay excluded.
+        .disable_help_subcommand(
+            source.is_disable_help_subcommand_set() || visible_subcommands.is_empty(),
+        )
         .allow_external_subcommands(source.is_allow_external_subcommands_set())
         .allow_missing_positional(source.is_allow_missing_positional_set())
         .args(
@@ -52,12 +62,7 @@ fn public_command(source: &Command) -> Command {
         )
         .groups(groups)
         .visible_aliases(source.get_visible_aliases().map(str::to_owned))
-        .subcommands(
-            source
-                .get_subcommands()
-                .filter(|child| !child.is_hide_set())
-                .map(public_command),
-        );
+        .subcommands(visible_subcommands);
     if let Some(about) = source.get_about() {
         command = command.about(about.clone());
     }
@@ -161,6 +166,27 @@ mod tests {
                 .map(|v| v.get_name().to_owned())
                 .collect::<Vec<_>>(),
             ["fast", "full"]
+        );
+    }
+
+    #[test]
+    fn completions_include_deferred_nested_subcommands_under_help_and_hide_internals() {
+        let mut source = crate::Cli::command();
+        source.build();
+        let mut public = public_command(&source);
+        public.build();
+
+        assert!(public.find_subcommand("internal-nested-pm").is_none());
+        let help = public
+            .find_subcommand("help")
+            .expect("public schema should retain top-level help subcommand");
+        assert!(help.find_subcommand("internal-nested-pm").is_none());
+        let help_skills = help
+            .find_subcommand("skills")
+            .expect("help subcommand should list skills");
+        assert!(
+            help_skills.find_subcommand("dashboard").is_some(),
+            "help subcommand should retain nested deferred subcommands like `lpm help skills dashboard`"
         );
     }
 }

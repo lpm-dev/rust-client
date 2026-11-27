@@ -1911,7 +1911,9 @@ impl<W: Write> Write for DigestWriter<W> {
     }
 }
 
-fn remote_cache_requested(lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>) -> bool {
+pub(crate) fn remote_cache_requested(
+    lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+) -> bool {
     if let Some(enabled) = env_flag("LPM_REMOTE_CACHE") {
         return enabled;
     }

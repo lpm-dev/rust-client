@@ -92,11 +92,11 @@ fn write_post_install_hash_with_context_and_proof(
     lock: &workspace_lockfile::ActiveLockfileSnapshot,
     proof_context: Option<PostInstallSyncNoopProofContext<'_>>,
 ) -> std::io::Result<()> {
-    let pkg = lpm_common::read_text_file_capped(
+    let (pkg, pkg_stamp) = crate::install_state::read_text_regular_file_capped_with_stamp(
         &project_dir.join("package.json"),
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     )
-    .unwrap_or_default();
+    .unwrap_or_else(|_| (String::new(), None));
     // Compute the proof from the exact on-disk `package.json` and `lpm.lock`
     // bytes hashed into `.lpm/install-hash` so concurrent edits during install
     // cannot stamp a stale manifest verdict onto the new bytes.
@@ -113,7 +113,7 @@ fn write_post_install_hash_with_context_and_proof(
         }
         let pkg_stripped = lpm_common::strip_utf8_bom_str(&pkg);
         let fresh_package: lpm_workspace::PackageJson = serde_json::from_str(pkg_stripped).ok()?;
-        let lock_raw = lpm_common::read_file_capped(
+        let (lock_raw, lock_stamp) = crate::install_state::read_regular_file_capped_with_stamp(
             &lock.path,
             lpm_common::STATE_FILE_SIZE_CAP_BYTES.max(64 * 1024 * 1024),
         )
@@ -141,6 +141,8 @@ fn write_post_install_hash_with_context_and_proof(
             &lock_raw,
             ctx.routes,
             ctx.auto_install_peers,
+            pkg_stamp,
+            lock_stamp,
         ))
     });
     let file_link_bytes =

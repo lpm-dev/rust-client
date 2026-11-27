@@ -1346,8 +1346,8 @@ fn open_monitor_verdict_cache_dir_nofollow(
 ) -> Option<cap_std::fs::Dir> {
     use cap_fs_ext::DirExt as _;
 
-    if create && !cache_root.exists() {
-        let _ = std::fs::create_dir_all(cache_root);
+    if create {
+        let _ = lpm_registry::ensure_private_metadata_cache_dir(cache_root);
     }
     let root_meta = std::fs::symlink_metadata(cache_root).ok()?;
     if !root_meta.is_dir() || lpm_common::is_symlink_or_junction(&root_meta) {
@@ -3019,6 +3019,40 @@ mod tests {
                 "summary": "Host and potentially sensitive root-readable file contents are sent to a hard-coded external host.",
                 "report_url": "https://firewall.lpm.dev/npm/n8n-nodes-pwn/v/1.0.1",
             })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_monitor_verdict_cache_dir_tightens_existing_cache_root_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let cache_root = root.path().join("metadata-cache");
+        std::fs::create_dir(&cache_root).unwrap();
+        std::fs::set_permissions(&cache_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dir = open_monitor_verdict_cache_dir_nofollow(&cache_root, true)
+            .expect("cache dir should open");
+        drop(dir);
+
+        let root_mode = std::fs::symlink_metadata(&cache_root)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            root_mode, 0o700,
+            "existing cache root must be tightened to owner-only 0o700"
+        );
+        let subdir_mode = std::fs::symlink_metadata(cache_root.join(MONITOR_VERDICT_SUBDIR))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            subdir_mode, 0o700,
+            "monitor verdict subdir must be owner-only 0o700"
         );
     }
 }

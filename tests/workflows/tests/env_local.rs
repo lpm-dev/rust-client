@@ -3951,3 +3951,23 @@ fn env_init_refuses_a_key_that_is_not_a_valid_name_and_names_its_hidden_characte
         String::from_utf8_lossy(&list.stderr)
     );
 }
+
+#[test]
+fn malformed_local_env_json_in_lpm_home_emits_single_json_error() {
+    let project = TempProject::empty(r#"{"name":"env-lpm-home-json","version":"1.0.0"}"#);
+    let lpm_home = project.home().join(".lpm");
+    std::fs::create_dir_all(&lpm_home).unwrap();
+
+    let output = lpm(&project)
+        .current_dir(&lpm_home)
+        .args(["--json", "env", "set", "--unknown-flag"])
+        .output()
+        .expect("failed to run malformed local env command inside LPM_HOME");
+
+    assert!(
+        !output.status.success(),
+        "malformed local env command inside LPM_HOME must fail"
+    );
+    let envelope = parse_json_stdout(&output, "malformed local env --json inside LPM_HOME");
+    assert_eq!(envelope["success"], serde_json::json!(false));
+}

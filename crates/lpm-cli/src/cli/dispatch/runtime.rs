@@ -67,11 +67,12 @@ pub(super) fn run_async_main() -> Result<()> {
 
     // Standalone and recursive installs poll large futures on different threads.
     // Debug frames are unoptimized and need 64 MiB; release frames are much
-    // smaller so 16 MiB (2x the OS default) avoids reserving 64 MiB per worker.
+    // smaller so 32 MiB preserves ample recursive-workspace headroom while
+    // halving virtual stack reservation per worker on strict-overcommit hosts.
     #[cfg(debug_assertions)]
     const ASYNC_STACK_BYTES: usize = 64 * 1024 * 1024;
     #[cfg(not(debug_assertions))]
-    const ASYNC_STACK_BYTES: usize = 16 * 1024 * 1024;
+    const ASYNC_STACK_BYTES: usize = 32 * 1024 * 1024;
 
     let workers = runtime_worker_threads(
         cli.command.as_ref(),
@@ -167,7 +168,12 @@ fn classify_worker_pool(command: Option<&Commands>) -> WorkerPoolClass {
             }
         }
         Some(
-            Commands::Ci(_) | Commands::Upgrade(_) | Commands::Tidy(_) | Commands::Uninstall(_),
+            Commands::Ci(_)
+            | Commands::Upgrade(_)
+            | Commands::Tidy(_)
+            | Commands::Uninstall(_)
+            | Commands::ApproveScripts(_)
+            | Commands::PatchCommit(_),
         ) => WorkerPoolClass::SingleProjectOrFull,
         Some(
             Commands::Add(_)
@@ -177,8 +183,30 @@ fn classify_worker_pool(command: Option<&Commands>) -> WorkerPoolClass {
             | Commands::Rebuild(_)
             | Commands::Dev(_)
             | Commands::Tunnel(_)
-            | Commands::Release(_),
+            | Commands::Release(_)
+            | Commands::Dlx(_)
+            | Commands::Create(_)
+            | Commands::Publish(_)
+            | Commands::Proxy(_)
+            | Commands::Skills(_),
         ) => WorkerPoolClass::FullPool,
+        Some(Commands::Mcp(args)) => {
+            if matches!(args.action, crate::commands::mcp::McpAction::Serve) {
+                WorkerPoolClass::FullPool
+            } else {
+                WorkerPoolClass::TwoWorkers
+            }
+        }
+        Some(Commands::Global(args)) => {
+            if matches!(
+                args.action,
+                crate::commands::global::GlobalCmd::Update { .. }
+            ) {
+                WorkerPoolClass::FullPool
+            } else {
+                WorkerPoolClass::TwoWorkers
+            }
+        }
         Some(Commands::Run(args)) => {
             if args.scripts.len() > 1
                 || args.parallel
@@ -239,50 +267,6 @@ fn workspace_tool_pool_class(
     }
 }
 
-/// Checks that `content` is a valid JSON object without a top-level
-/// `"workspaces"` property, skipping full `serde_json::Value` DOM allocation.
-fn is_non_workspace_package_json_object(content: &str) -> bool {
-    struct NonWorkspaceObjectVisitor;
-
-    impl<'de> serde::de::Visitor<'de> for NonWorkspaceObjectVisitor {
-        type Value = bool;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a package.json object")
-        }
-
-        fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
-        where
-            A: serde::de::MapAccess<'de>,
-        {
-            let mut has_workspaces = false;
-            while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
-                if key == "workspaces" {
-                    has_workspaces = true;
-                }
-                let _ = map.next_value::<serde::de::IgnoredAny>()?;
-            }
-            Ok(!has_workspaces)
-        }
-    }
-
-    struct NonWorkspaceObject(bool);
-
-    impl<'de> serde::Deserialize<'de> for NonWorkspaceObject {
-        fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-        where
-            D: serde::Deserializer<'de>,
-        {
-            deserializer
-                .deserialize_map(NonWorkspaceObjectVisitor)
-                .map(Self)
-        }
-    }
-
-    serde_json::from_str::<NonWorkspaceObject>(lpm_common::strip_utf8_bom_str(content))
-        .is_ok_and(|parsed| parsed.0)
-}
-
 fn runtime_worker_threads(
     command: Option<&Commands>,
     explicit_worker_count: bool,
@@ -303,7 +287,7 @@ fn runtime_worker_threads(
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     )
     .ok()?;
-    if !is_non_workspace_package_json_object(&content)
+    if !install_state::is_non_workspace_package_json_object(&content)
         || project_dir.join("Package.swift").exists()
         || install_state::has_pnpm_workspace_yaml(project_dir)
         || lpm_workspace::find_workspace_root(project_dir)
@@ -460,11 +444,19 @@ mod tests {
             vec!["lpm", "test", "--filter", "app"],
             vec!["lpm", "pack", "--affected"],
             vec!["lpm", "tunnel", "3000"],
+            vec!["lpm", "dlx", "cowsay"],
+            vec!["lpm", "create", "vite"],
+            vec!["lpm", "publish"],
+            vec!["lpm", "proxy", "status"],
+            vec!["lpm", "mcp", "serve"],
+            vec!["lpm", "global", "update"],
+            vec!["lpm", "skills", "list"],
         ] {
-            let cli = Cli::try_parse_from(args).unwrap();
+            let cli = Cli::try_parse_from(&args).unwrap();
             assert_eq!(
                 runtime_worker_threads(cli.command.as_ref(), false, 18, Some(project.path())),
                 None,
+                "{args:?}",
             );
         }
     }
@@ -487,6 +479,8 @@ mod tests {
             vec!["lpm", "upgrade"],
             vec!["lpm", "tidy"],
             vec!["lpm", "uninstall", "react"],
+            vec!["lpm", "approve-scripts"],
+            vec!["lpm", "patch-commit", "staging"],
         ] {
             let cli = Cli::try_parse_from(&args).unwrap();
             for path in [project.path(), member.as_path()] {
@@ -512,13 +506,28 @@ mod tests {
             runtime_worker_threads(cli.command.as_ref(), false, 18, Some(project.path())),
             None
         );
-        for manifest in ["invalid JSON", "[]", r#"{"workspaces":[]}"#] {
+        for manifest in [
+            "invalid JSON",
+            "[]",
+            r#"{"workspaces":[]}"#,
+            r#"{"\u0077orkspaces":[]}"#,
+        ] {
             std::fs::write(project.path().join("package.json"), manifest).unwrap();
             assert_eq!(
                 runtime_worker_threads(cli.command.as_ref(), false, 18, Some(project.path())),
-                None
+                None,
+                "manifest: {manifest}"
             );
         }
+        assert!(crate::install_state::is_non_workspace_package_json_object(
+            "\u{FEFF}{\"name\":\"app\",\"scripts\":{\"build\":\"echo workspaces\"}}"
+        ));
+        assert!(!crate::install_state::is_non_workspace_package_json_object(
+            r#"{"\u0077orkspaces":["packages/*"]}"#
+        ));
+        assert!(!crate::install_state::is_non_workspace_package_json_object(
+            r#"{"name":"app""#
+        ));
     }
 
     #[test]

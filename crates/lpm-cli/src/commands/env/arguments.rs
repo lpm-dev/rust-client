@@ -326,6 +326,38 @@ fn source_group(value: &str) -> Result<lpm_vault::history::SourceGroup, String> 
     })
 }
 
+pub(super) fn is_local_sync_subcommand(args: &[&str]) -> bool {
+    let debug_only = cfg!(debug_assertions) && args.first() == Some(&"debug-companion");
+    debug_only
+        || matches!(
+            args.first().copied(),
+            Some(
+                "set"
+                    | "get"
+                    | "list"
+                    | "delete"
+                    | "import"
+                    | "export"
+                    | "print"
+                    | "example"
+                    | "check"
+                    | "validate"
+                    | "schema"
+                    | "generate"
+                    | "init"
+                    | "repair"
+                    | "ls"
+                    | "copy"
+                    | "cp"
+                    | "history"
+                    | "rollback"
+                    | "link"
+                    | "unlink"
+                    | "links"
+            )
+        )
+}
+
 pub(super) fn parse(args: &[&str], json_output: bool) -> Result<Option<LocalAction>, LpmError> {
     let debug_only = cfg!(debug_assertions) && args.first() == Some(&"debug-companion");
     if !debug_only

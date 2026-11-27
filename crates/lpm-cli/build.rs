@@ -39,10 +39,16 @@ fn main() {
     );
     compress_embedded_asset("src/templates/graph.html", "graph.html.gz");
 
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
-        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
-    {
-        println!("cargo:rustc-link-arg-tests=/MANIFEST:EMBED");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        // Reserve an 8 MiB main-thread stack directly from build.rs so CI
+        // environments that set RUSTFLAGS (overriding .cargo/config.toml) do
+        // not silently fall back to Windows' 1 MiB default stack.
+        if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+            println!("cargo:rustc-link-arg-bins=/STACK:8388608");
+            println!("cargo:rustc-link-arg-tests=/MANIFEST:EMBED");
+        } else {
+            println!("cargo:rustc-link-arg-bins=-Wl,--stack,8388608");
+        }
     }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         // Drop unused system dylib load commands (such as libiconv.2.dylib),

@@ -91,25 +91,22 @@ pub fn try_run_local_sync(
                 .map_err(env_error),
         );
     }
+    if !arguments::is_local_sync_subcommand(&args) {
+        return None;
+    }
+    // Resolve the project root BEFORE `arguments::parse` prints any JSON/clap
+    // diagnostic so a disallowed directory (such as LPM_HOME) emits a single
+    // error envelope rather than both a clap error and a project-root error.
+    let project_dir = match resolve_project_dir() {
+        Ok(dir) => dir,
+        Err(error) => return Some(Err(env_error(error))),
+    };
     let parsed = match arguments::parse(&args, json_output) {
         Ok(Some(action)) => action,
         Ok(None) => return None,
-        Err(error) => {
-            return Some(resolve_project_dir().and(Err(error)).map_err(env_error));
-        }
+        Err(error) => return Some(Err(env_error(error))),
     };
-    use arguments::LocalAction;
-    if matches!(
-        parsed,
-        LocalAction::Log | LocalAction::Unpair | LocalAction::Diff { .. }
-    ) {
-        return None;
-    }
-    Some(
-        resolve_project_dir()
-            .and_then(|project_dir| run_local_sync_action(parsed, &project_dir, json_output))
-            .map_err(env_error),
-    )
+    Some(run_local_sync_action(parsed, &project_dir, json_output).map_err(env_error))
 }
 
 fn run_local_sync_action(

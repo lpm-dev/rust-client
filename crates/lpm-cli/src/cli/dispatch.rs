@@ -318,9 +318,10 @@ pub(super) fn try_run_sync_command(cli: Cli) -> SyncDispatch {
 
     if cli.version_flag {
         if let Some(expected) = cli.self_update_probe_executable.as_deref() {
-            return SyncDispatch::Handled(
-                super::helpers::print_self_update_probe_version(expected).map_err(Into::into),
-            );
+            if let Err(error) = super::helpers::print_self_update_probe_version(expected) {
+                exit_with_lpm_error(&error, cli.json);
+            }
+            return SyncDispatch::Handled(Ok(()));
         }
         print_version_with_notice();
         return SyncDispatch::Handled(Ok(()));
@@ -496,7 +497,7 @@ pub(super) fn try_run_sync_command(cli: Cli) -> SyncDispatch {
                             cwd.display(),
                         ));
                     }
-                    commands::env::links::ensure_folder_linked(&cwd, cli.json)
+                    Ok(())
                 },
             ) {
                 Ok(Some(())) => Some(Ok(())),
@@ -640,13 +641,21 @@ async fn async_main(cli: Cli) -> Result<()> {
     // (`--help`, `--version`, plain project install) so path
     // construction stays side-effect-free for the common case. Idempotent
     // when no recovery is needed (empty WAL → fast no-op).
-    let global_state_root = command_needs_global_state(&command)
+    let global_state_root = match command_needs_global_state(&command)
         .then(lpm_common::LpmRoot::from_env)
-        .transpose()?;
-    let _global_state_directories = global_state_root
+        .transpose()
+    {
+        Ok(root) => root,
+        Err(error) => exit_with_lpm_error(&error, cli.json),
+    };
+    let _global_state_directories = match global_state_root
         .as_ref()
         .map(lpm_common::GlobalStateDirectories::open_or_create)
-        .transpose()?;
+        .transpose()
+    {
+        Ok(dirs) => dirs,
+        Err(error) => exit_with_lpm_error(&error, cli.json),
+    };
     if let Some(root) = global_state_root.as_ref() {
         // one-time warning when $LPM_HOME sits on
         // NFS/SMB/CIFS — advisory locks on those filesystems are
@@ -656,7 +665,9 @@ async fn async_main(cli: Cli) -> Result<()> {
         // not nagged on every invocation.
         maybe_emit_network_fs_warning(root);
 
-        commands::global::recover_local_links(root)?;
+        if let Err(error) = commands::global::recover_local_links(root) {
+            exit_with_lpm_error(&error, cli.json);
+        }
         match lpm_global::recover(root) {
             Ok(report) => {
                 if !report.skipped_due_to_lock {

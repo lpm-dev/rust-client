@@ -20,8 +20,7 @@ const NODE: &str = if cfg!(windows) { "node.exe" } else { "node" };
 static OFFERED_TO_SCRIPTS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, PartialEq, Eq)]
-struct NodeGypCacheKey {
-    node_path: PathBuf,
+struct FileStamp {
     len: u64,
     mtime: Option<std::time::SystemTime>,
     #[cfg(unix)]
@@ -32,12 +31,11 @@ struct NodeGypCacheKey {
     ctime_nsec: i64,
 }
 
-impl NodeGypCacheKey {
-    fn from_node(node: &Path, meta: &std::fs::Metadata) -> Self {
+impl FileStamp {
+    fn from_metadata(meta: &std::fs::Metadata) -> Self {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt as _;
         Self {
-            node_path: node.to_path_buf(),
             len: meta.len(),
             mtime: meta.modified().ok(),
             #[cfg(unix)]
@@ -48,11 +46,70 @@ impl NodeGypCacheKey {
             ctime_nsec: meta.ctime_nsec(),
         }
     }
+
+    fn from_path(path: &Path) -> Option<Self> {
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        Some(Self::from_metadata(&meta))
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct NodeGypCacheKey {
+    node_path: PathBuf,
+    node_stamp: FileStamp,
+}
+
+impl NodeGypCacheKey {
+    fn from_node(node: &Path, meta: &std::fs::Metadata) -> Self {
+        Self {
+            node_path: node.to_path_buf(),
+            node_stamp: FileStamp::from_metadata(meta),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum CachedNodeGypOutcome {
+    Hit {
+        value: NpmNodeGyp,
+        script_stamp: FileStamp,
+        manifest_path: PathBuf,
+        manifest_stamp: FileStamp,
+    },
+    Miss {
+        checked_dirs: Vec<(PathBuf, Option<FileStamp>)>,
+    },
+}
+
+impl CachedNodeGypOutcome {
+    fn is_fresh(&self) -> bool {
+        match self {
+            Self::Hit {
+                value,
+                script_stamp,
+                manifest_path,
+                manifest_stamp,
+            } => {
+                FileStamp::from_path(&value.script).as_ref() == Some(script_stamp)
+                    && FileStamp::from_path(manifest_path).as_ref() == Some(manifest_stamp)
+            }
+            Self::Miss { checked_dirs } => checked_dirs
+                .iter()
+                .all(|(dir, expected)| FileStamp::from_path(dir) == *expected),
+        }
+    }
+
+    fn value(&self) -> Option<NpmNodeGyp> {
+        match self {
+            Self::Hit { value, .. } => Some(value.clone()),
+            Self::Miss { .. } => None,
+        }
+    }
 }
 
 const MAX_NODE_GYP_CACHE_ENTRIES: usize = 8;
 
-type NodeGypCacheEntry = (NodeGypCacheKey, Option<NpmNodeGyp>);
+type NodeGypCacheEntry = (NodeGypCacheKey, CachedNodeGypOutcome);
 
 fn node_gyp_cache() -> &'static std::sync::Mutex<Vec<NodeGypCacheEntry>> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<Vec<NodeGypCacheEntry>>> =
@@ -61,33 +118,34 @@ fn node_gyp_cache() -> &'static std::sync::Mutex<Vec<NodeGypCacheEntry>> {
 }
 
 fn lookup_cached_node_gyp(key: &NodeGypCacheKey) -> Option<Option<NpmNodeGyp>> {
-    if cfg!(test) {
-        return None;
+    let outcome = {
+        let cache = node_gyp_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache
+            .iter()
+            .find(|(cached_key, _)| cached_key == key)
+            .map(|(_, outcome)| outcome.clone())
+    }?;
+    if outcome.is_fresh() {
+        Some(outcome.value())
+    } else {
+        None
     }
-    let cache = node_gyp_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cache
-        .iter()
-        .find(|(cached_key, _)| cached_key == key)
-        .map(|(_, value)| value.clone())
 }
 
-fn store_cached_node_gyp(key: NodeGypCacheKey, value: Option<NpmNodeGyp>) {
-    if cfg!(test) {
-        return;
-    }
+fn store_cached_node_gyp(key: NodeGypCacheKey, outcome: CachedNodeGypOutcome) {
     let mut cache = node_gyp_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some((_, existing)) = cache.iter_mut().find(|(cached_key, _)| cached_key == &key) {
-        *existing = value;
+        *existing = outcome;
         return;
     }
     if cache.len() >= MAX_NODE_GYP_CACHE_ENTRIES {
         cache.remove(0);
     }
-    cache.push((key, value));
+    cache.push((key, outcome));
 }
 
 /// Has every `PATH` this process builds for a script hold npm's `node-gyp`
@@ -135,15 +193,57 @@ impl NpmNodeGyp {
             return cached;
         }
         let resolved = node.canonicalize().ok()?;
-        let result = if in_a_package(&node) || in_a_package(&resolved) {
-            None
+        let (result, outcome) = if in_a_package(&node) || in_a_package(&resolved) {
+            (
+                None,
+                CachedNodeGypOutcome::Miss {
+                    checked_dirs: Vec::new(),
+                },
+            )
         } else {
-            [node, resolved]
+            let candidate_dirs: Vec<PathBuf> = [node, resolved]
                 .iter()
                 .filter_map(|node| npm_modules_beside(node))
-                .find_map(Self::in_modules)
+                .collect();
+            let found = candidate_dirs
+                .iter()
+                .cloned()
+                .find_map(Self::in_modules);
+            match found {
+                Some(value) => {
+                    let manifest_path = value.modules.join("node-gyp").join("package.json");
+                    let outcome = match (
+                        FileStamp::from_path(&value.script),
+                        FileStamp::from_path(&manifest_path),
+                    ) {
+                        (Some(script_stamp), Some(manifest_stamp)) => {
+                            Some(CachedNodeGypOutcome::Hit {
+                                value: value.clone(),
+                                script_stamp,
+                                manifest_path,
+                                manifest_stamp,
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(outcome) = outcome {
+                        store_cached_node_gyp(cache_key, outcome);
+                    }
+                    return Some(value);
+                }
+                None => {
+                    let checked_dirs = candidate_dirs
+                        .into_iter()
+                        .map(|dir| {
+                            let stamp = FileStamp::from_path(&dir);
+                            (dir, stamp)
+                        })
+                        .collect();
+                    (None, CachedNodeGypOutcome::Miss { checked_dirs })
+                }
+            }
         };
-        store_cached_node_gyp(cache_key, result.clone());
+        store_cached_node_gyp(cache_key, outcome);
         result
     }
 
@@ -161,6 +261,37 @@ impl NpmNodeGyp {
         // Node can't start a script named with the prefix a resolved path
         // carries on Windows.
         let script = lpm_common::symlink::windows_plain_path(&script);
+        struct KeyIsVersion(bool);
+        impl<'de> serde::Deserialize<'de> for KeyIsVersion {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct KeyVisitor;
+                impl serde::de::Visitor<'_> for KeyVisitor {
+                    type Value = KeyIsVersion;
+
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str("a JSON object key")
+                    }
+
+                    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        Ok(KeyIsVersion(value == "version"))
+                    }
+
+                    fn visit_borrowed_str<E>(self, value: &str) -> Result<Self::Value, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        Ok(KeyIsVersion(value == "version"))
+                    }
+                }
+                deserializer.deserialize_str(KeyVisitor)
+            }
+        }
         struct NodeGypManifest {
             version: Option<String>,
         }
@@ -182,8 +313,8 @@ impl NpmNodeGyp {
                         A: serde::de::MapAccess<'de>,
                     {
                         let mut version = None;
-                        while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
-                            if key == "version" {
+                        while let Some(KeyIsVersion(is_ver)) = map.next_key::<KeyIsVersion>()? {
+                            if is_ver {
                                 let value: serde_json::Value = map.next_value()?;
                                 version = value.as_str().map(str::to_owned);
                             } else {
@@ -702,5 +833,59 @@ pub(crate) mod tests {
         .unwrap();
         let resolved = NpmNodeGyp::in_modules(modules).expect("duplicate version should parse");
         assert_eq!(resolved.version, "10.1.0");
+    }
+
+    #[test]
+    fn node_gyp_cache_invalidates_when_sibling_manifest_changes_and_evicts_oldest_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let bin = node_with_npm(&root_path.join("node-primary"), "11.2.0", "// v1");
+        let first = NpmNodeGyp::beside_node_on(bin.as_os_str()).expect("first lookup should hit");
+        assert_eq!(first.version, "11.2.0");
+
+        let cached = NpmNodeGyp::beside_node_on(bin.as_os_str()).expect("cached lookup should hit");
+        assert_eq!(cached, first);
+
+        // Mutate sibling node-gyp/package.json without touching the node binary.
+        let manifest_path = first.modules.join("node-gyp").join("package.json");
+        std::fs::write(
+            &manifest_path,
+            r#"{"name":"node-gyp","version":"12.3.4-beta.1"}"#,
+        )
+        .unwrap();
+        let updated = NpmNodeGyp::beside_node_on(bin.as_os_str())
+            .expect("lookup after sibling manifest edit should observe new version");
+        assert_eq!(updated.version, "12.3.4-beta.1");
+
+        // A miss beside an existing node binary must invalidate once npm's node-gyp is installed.
+        let miss_prefix = root_path.join("node-miss-then-hit");
+        let miss_bin = if cfg!(windows) {
+            miss_prefix.clone()
+        } else {
+            miss_prefix.join("bin")
+        };
+        std::fs::create_dir_all(&miss_bin).unwrap();
+        std::fs::write(miss_bin.join(NODE), "").unwrap();
+        assert!(NpmNodeGyp::beside_node_on(miss_bin.as_os_str()).is_none());
+        let populated_bin = node_with_npm(&miss_prefix, "11.9.0", "// installed later");
+        assert_eq!(populated_bin, miss_bin);
+        let recovered = NpmNodeGyp::beside_node_on(miss_bin.as_os_str())
+            .expect("miss entry must invalidate when sibling npm modules appear");
+        assert_eq!(recovered.version, "11.9.0");
+
+        // Populate more distinct installations than MAX_NODE_GYP_CACHE_ENTRIES and verify bound.
+        for idx in 0..(MAX_NODE_GYP_CACHE_ENTRIES + 4) {
+            let extra_bin =
+                node_with_npm(&root_path.join(format!("node-extra-{idx}")), "11.0.0", "");
+            assert!(NpmNodeGyp::beside_node_on(extra_bin.as_os_str()).is_some());
+        }
+        let cache_len = node_gyp_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        assert!(
+            cache_len <= MAX_NODE_GYP_CACHE_ENTRIES,
+            "cache size {cache_len} exceeded bound {MAX_NODE_GYP_CACHE_ENTRIES}"
+        );
     }
 }

@@ -1266,29 +1266,28 @@ impl SyncNoopFileStamp {
     }
 
     pub(crate) fn from_symlink_metadata(meta: &std::fs::Metadata) -> Option<Self> {
-        if !meta.is_file() {
+        #[cfg(not(unix))]
+        {
+            let _ = meta;
             return None;
         }
-        let modified = meta.modified().ok()?;
-        let mtime_ns = modified.duration_since(UNIX_EPOCH).ok()?.as_nanos() as u64;
         #[cfg(unix)]
-        let (ctime_ns, ino) = {
+        {
+            if !meta.is_file() {
+                return None;
+            }
+            let modified = meta.modified().ok()?;
+            let mtime_ns = modified.duration_since(UNIX_EPOCH).ok()?.as_nanos() as u64;
             use std::os::unix::fs::MetadataExt as _;
             let sec = u64::try_from(meta.ctime()).ok()?;
             let nsec = u64::try_from(meta.ctime_nsec()).ok()?;
-            (
-                sec.saturating_mul(1_000_000_000).saturating_add(nsec),
-                meta.ino(),
-            )
-        };
-        #[cfg(not(unix))]
-        let (ctime_ns, ino) = (0u64, 0u64);
-        Some(Self {
-            len: meta.len(),
-            mtime_ns,
-            ctime_ns,
-            ino,
-        })
+            Some(Self {
+                len: meta.len(),
+                mtime_ns,
+                ctime_ns: sec.saturating_mul(1_000_000_000).saturating_add(nsec),
+                ino: meta.ino(),
+            })
+        }
     }
 
     /// True when this file was last modified/changed strictly before the
@@ -1327,6 +1326,109 @@ impl SyncNoopFileStamp {
             ino,
         })
     }
+}
+
+pub(crate) fn read_regular_file_capped_with_stamp(
+    path: &Path,
+    cap: u64,
+) -> Result<(Vec<u8>, Option<SyncNoopFileStamp>), lpm_common::BoundedReadError> {
+    let pre = SyncNoopFileStamp::from_path(path);
+    let bytes = lpm_common::read_file_capped(path, cap)?;
+    let post = SyncNoopFileStamp::from_path(path);
+    // Drop the stamp whenever the file changed between the pre- and post-read
+    // stats so a concurrent edit can never stamp new metadata onto stale bytes.
+    let stamp = pre.filter(|stamp| post == Some(*stamp) && stamp.len == bytes.len() as u64);
+    Ok((bytes, stamp))
+}
+
+pub(crate) fn read_text_regular_file_capped_with_stamp(
+    path: &Path,
+    cap: u64,
+) -> Result<(String, Option<SyncNoopFileStamp>), lpm_common::BoundedReadError> {
+    let pre = SyncNoopFileStamp::from_path(path);
+    let text = lpm_common::read_text_file_capped(path, cap)?;
+    let post = SyncNoopFileStamp::from_path(path);
+    let stamp = pre.filter(|stamp| post == Some(*stamp) && stamp.len == text.len() as u64);
+    Ok((text, stamp))
+}
+
+/// Checks that `content` is a valid JSON object without a top-level
+/// `"workspaces"` property, using a zero-allocation key visitor (no `String`
+/// allocations for unescaped keys, while still decoding JSON escapes such as
+/// `"\u0077orkspaces"` and rejecting malformed JSON).
+pub(crate) fn is_non_workspace_package_json_object(content: &str) -> bool {
+    struct KeyIsWorkspaces(bool);
+
+    impl<'de> serde::Deserialize<'de> for KeyIsWorkspaces {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            struct KeyVisitor;
+            impl serde::de::Visitor<'_> for KeyVisitor {
+                type Value = KeyIsWorkspaces;
+
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("a JSON object key")
+                }
+
+                fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+                where
+                    E: serde::de::Error,
+                {
+                    Ok(KeyIsWorkspaces(value == "workspaces"))
+                }
+
+                fn visit_borrowed_str<E>(self, value: &str) -> Result<Self::Value, E>
+                where
+                    E: serde::de::Error,
+                {
+                    Ok(KeyIsWorkspaces(value == "workspaces"))
+                }
+            }
+            deserializer.deserialize_str(KeyVisitor)
+        }
+    }
+
+    struct NonWorkspaceObjectVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for NonWorkspaceObjectVisitor {
+        type Value = bool;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a package.json object")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut has_workspaces = false;
+            while let Some(KeyIsWorkspaces(is_ws)) = map.next_key::<KeyIsWorkspaces>()? {
+                if is_ws {
+                    has_workspaces = true;
+                }
+                let _ = map.next_value::<serde::de::IgnoredAny>()?;
+            }
+            Ok(!has_workspaces)
+        }
+    }
+
+    struct NonWorkspaceObject(bool);
+
+    impl<'de> serde::Deserialize<'de> for NonWorkspaceObject {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer
+                .deserialize_map(NonWorkspaceObjectVisitor)
+                .map(Self)
+        }
+    }
+
+    serde_json::from_str::<NonWorkspaceObject>(lpm_common::strip_utf8_bom_str(content))
+        .is_ok_and(|parsed| parsed.0)
 }
 
 pub(crate) fn sync_noop_content_digest_hex(bytes: &[u8]) -> String {

@@ -55,25 +55,28 @@ pub fn try_run_multi_sync(
     json_output: bool,
     on_commit: impl FnOnce() -> Result<(), LpmError>,
 ) -> Result<Option<()>, LpmError> {
-    let Some(bin_hint) = try_prepare_runtime_sync(project_dir, json_output)? else {
-        return Ok(None);
-    };
     if scripts.is_empty() {
+        crate::commands::env::links::ensure_folder_linked(project_dir, json_output)?;
+        let Some(_bin_hint) = try_prepare_runtime_sync(project_dir, json_output)? else {
+            return Ok(None);
+        };
         on_commit()?;
         install_ui::warn("No scripts specified. Usage: lpm run <script> [scripts...]");
         return Ok(Some(()));
     }
     reject_direct_hidden_scripts(scripts)?;
     let plan = prepare_single_package_task_plan(project_dir, scripts)?;
-    // Remote task cache requires an authenticated SessionManager; fall back to async.
-    if !no_cache
-        && plan
-            .config
-            .as_ref()
-            .is_some_and(|c| c.remote_cache.is_some())
-    {
+    // Remote task cache requires an authenticated SessionManager and async
+    // background-upload drain (`finish_background_work`); fall back before
+    // probing runtimes so engine warnings are never emitted twice.
+    if !no_cache && crate::commands::remote_cache::remote_cache_requested(plan.config.as_ref()) {
         return Ok(None);
     }
+    // Authorize the project folder before probing project-local `node_modules/.bin/node`.
+    crate::commands::env::links::ensure_folder_linked(project_dir, json_output)?;
+    let Some(bin_hint) = try_prepare_runtime_sync(project_dir, json_output)? else {
+        return Ok(None);
+    };
     on_commit()?;
     run_single_package_plan_sync(
         project_dir,
@@ -418,16 +421,13 @@ pub fn try_run_external_shortcut_sync(
         .is_some_and(|task| task.command.is_some() || !task.depends_on.is_empty());
 
     if in_pkg_scripts || in_lpm_tasks {
-        if lpm_config
-            .as_ref()
-            .is_some_and(|config| config.remote_cache.is_some())
-        {
+        if crate::commands::remote_cache::remote_cache_requested(lpm_config.as_ref()) {
             return Ok(None);
         }
+        crate::commands::env::links::ensure_folder_linked(project_dir, json_output)?;
         let Some(bin_hint) = try_prepare_runtime_sync(project_dir, json_output)? else {
             return Ok(None);
         };
-        crate::commands::env::links::ensure_folder_linked(project_dir, json_output)?;
         let scripts = std::slice::from_ref(command_name);
         let plan = prepare_single_package_task_plan_with_loaded(scripts, lpm_config, package)?;
         run_single_package_plan_sync(
@@ -451,10 +451,10 @@ pub fn try_run_external_shortcut_sync(
         return Err(missing_external_shortcut_error(command_name));
     }
 
+    crate::commands::env::links::ensure_folder_linked(project_dir, json_output)?;
     let Some(bin_hint) = try_prepare_runtime_sync(project_dir, json_output)? else {
         return Ok(None);
     };
-    crate::commands::env::links::ensure_folder_linked(project_dir, json_output)?;
     install_ui::phase_line(crate::install_ui::terminal_line!(
         "Executing {}",
         install_ui::yellow(command_name)

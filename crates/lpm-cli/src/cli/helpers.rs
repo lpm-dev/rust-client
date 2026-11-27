@@ -96,10 +96,7 @@ where
     S: AsRef<std::ffi::OsStr>,
 {
     let mut args = args.into_iter();
-    let program = args.next();
-    if is_lpx_program(program.as_ref().map(AsRef::as_ref)) {
-        return false;
-    }
+    let _program = args.next();
 
     let mut saw_version = false;
     let mut saw_color = false;
@@ -1068,6 +1065,9 @@ mod tests {
             &["lpm", "--color=never", "-V"][..],
             &["lpm", "-v", "--color", "always"][..],
             &["lpm", "--color", "auto", "--version"][..],
+            &["lpx", "--version"][..],
+            &["lpx", "-V"][..],
+            &["lpx", "-v"][..],
         ] {
             assert!(
                 argv_requests_top_level_version(fast.iter().copied()),
@@ -1081,7 +1081,7 @@ mod tests {
             &["lpm", "-V", "--color=invalid"][..],
             &["lpm", "-V", "-v"][..],
             &["lpm", "-V", "--json"][..],
-            &["lpx", "-V"][..],
+            &["lpx", "cowsay", "--version"][..],
         ] {
             assert!(
                 !argv_requests_top_level_version(slow.iter().copied()),

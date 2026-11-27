@@ -459,10 +459,10 @@ pub fn try_exec_sync(
     no_env_check: bool,
     json_output: bool,
 ) -> Result<Option<()>, LpmError> {
+    crate::commands::env::links::ensure_folder_linked(project_dir, json_output)?;
     let Some(bin_hint) = super::runtime::try_prepare_runtime_sync(project_dir, false)? else {
         return Ok(None);
     };
-    crate::commands::env::links::ensure_folder_linked(project_dir, json_output)?;
     exec_with_hint(
         project_dir,
         command_name,

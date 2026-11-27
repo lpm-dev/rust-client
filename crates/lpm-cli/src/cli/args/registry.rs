@@ -165,6 +165,7 @@ pub(crate) struct StageArgs {
 
 #[derive(Args)]
 #[command(
+    after_help = "Pass --token <TOKEN> to store an explicit token for npm, GitHub Packages, GitLab Packages, a custom registry, or Socket.",
     group(
         clap::ArgGroup::new("login_target")
             .args(["npm", "github", "gitlab", "login_registry", "socket"])
