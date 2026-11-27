@@ -67,9 +67,12 @@ impl Ecosystem {
         }
     }
 
+    /// Whether a file's extension makes it source. A name that is only an
+    /// extension (`.js`) has none, as the directory walks read it.
     fn reads(self, path: &str) -> bool {
         let name = path.rsplit('/').next().unwrap_or(path);
-        let Some((_, extension)) = name.rsplit_once('.') else {
+        let Some((_, extension)) = name.rsplit_once('.').filter(|(stem, _)| !stem.is_empty())
+        else {
             return false;
         };
         match self {
@@ -175,7 +178,20 @@ pub fn analyze_release_tarball<R: Read>(
                 .then(|| read_whole(&mut entry, size))
                 .transpose()
                 .map_err(LpmError::Io)?;
-        } else if size > 0 && ecosystem.reads(path) {
+            return Ok(());
+        }
+        // A file whose extension says nothing is source when its shebang line
+        // runs a JavaScript runtime: its first bytes tell, and are read again
+        // with the rest.
+        let mut head = Vec::new();
+        let shebang_script =
+            ecosystem == Ecosystem::Js && size > 0 && super::may_be_shebang_script(relative) && {
+                head = lpm_common::read_stream_prefix(&mut entry, super::SHEBANG_BYTES as u64)
+                    .map_err(LpmError::Io)?;
+                super::shebang_script_extension(&head).is_some()
+            };
+        let mut entry = io::Cursor::new(head).chain(entry);
+        if size > 0 && (ecosystem.reads(path) || shebang_script) {
             let limits = ScanLimits::REGISTRY;
             if size > limits.full_file_bytes {
                 let sample = match (quality.as_mut(), quality_bytes) {
@@ -813,6 +829,42 @@ mod tests {
             serde_json::to_value(&alone).unwrap(),
             serde_json::to_value(&quality).unwrap(),
             "lpm publish scores the archive as the registry does"
+        );
+    }
+
+    #[test]
+    fn reads_a_script_without_an_extension_whose_shebang_line_runs_node() {
+        let mut readme = b"# Kit\n\nParses and renders Markdown for the web.\n".to_vec();
+        readme.resize(4096, b'.');
+        let mut oversized = b"#!/usr/bin/env node\nprocess.env.TOKEN;\n".to_vec();
+        oversized.resize(ScanLimits::REGISTRY.full_file_bytes as usize + 1, b' ');
+        let entries: &[(&str, &[u8])] = &[
+            (
+                "package.json",
+                br#"{"name":"@lpm.dev/acme.kit","version":"1.0.0","license":"MIT","bin":{"kit":"bin/cli"}}"#,
+            ),
+            ("bin/cli", b"#!/usr/bin/env node\neval(process.argv[2]);\n"),
+            ("bin/big", &oversized),
+            ("LICENSE", b"require('child_process').exec(anything)"),
+            ("README", &readme),
+            // A name that is only an extension has none, as the walks read it.
+            ("lib/.js", b"fetch('https://example.com')"),
+        ];
+        let signals = analyze(entries);
+        assert!(!signals.tags["network"]);
+        assert!(signals.tags["eval"]);
+        assert!(signals.tags["environmentVars"]);
+        assert!(!signals.tags["childProcess"]);
+        assert_eq!(signals.coverage.source_files, 2);
+        assert_eq!(signals.coverage.sampled_files, 1);
+
+        let quality = signals.quality.expect("JavaScript is scored");
+        let alone =
+            analyze_release_quality(tarball(entries).as_slice(), QualityEcosystem::Js, None)
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(&alone).unwrap(),
+            serde_json::to_value(&quality).unwrap()
         );
     }
 

@@ -32,6 +32,16 @@ pub fn read_file_prefix(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// The first `limit` bytes `reader` gives, or all of them if it ends sooner.
+/// A stream of any length costs at most `limit` bytes.
+pub fn read_stream_prefix<R: Read>(reader: R, limit: u64) -> io::Result<Vec<u8>> {
+    let capacity = usize::try_from(limit.min(INITIAL_BUFFER_CAPACITY_BYTES))
+        .map_err(|_| io::Error::other("stream prefix capacity is unsupported"))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    reader.take(limit).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// Read at most `limit + 1` bytes from an arbitrary stream.
 ///
 /// This is intended for pipes and other readers that do not have meaningful
@@ -525,6 +535,13 @@ fn metadata_is_link_or_reparse(metadata: &Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stream_prefix_stops_at_its_limit_and_takes_a_shorter_stream_whole() {
+        let bytes = [7u8; 100];
+        assert_eq!(read_stream_prefix(&bytes[..], 10).unwrap(), [7u8; 10]);
+        assert_eq!(read_stream_prefix(&bytes[..5], 10).unwrap(), [7u8; 5]);
+    }
     use std::io::Cursor;
 
     #[test]
