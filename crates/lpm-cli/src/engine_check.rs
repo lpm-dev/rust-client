@@ -42,7 +42,21 @@ use lpm_workspace::{PackageJson, read_package_json};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
+
+tokio::task_local! {
+    static SHARED_NODE_VERSIONS: Arc<Mutex<PathNodeVersionCache>>;
+}
+
+pub(crate) async fn scope_shared_node_versions<F>(
+    versions: Arc<Mutex<PathNodeVersionCache>>,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    SHARED_NODE_VERSIONS.scope(versions, future).await
+}
 
 const DEFAULT_NODE_SELECTOR_HINT: &str = "22";
 const NEUTRAL_NODE_SELECTOR_HINT: &str = "<matching-version>";
@@ -64,17 +78,17 @@ pub(crate) struct NodeEngineRequirement {
 #[derive(Default)]
 pub(crate) struct NodeVersionReuse {
     observed: Option<ObservedNodeVersion>,
-    versions: std::sync::Mutex<PathNodeVersionCache>,
+    versions: Arc<Mutex<PathNodeVersionCache>>,
 }
 
 impl NodeVersionReuse {
     /// Reuse the versions recorded in the LPM home and, when given, the
     /// version this project's last install observed.
     pub(crate) fn recorded(observed: Option<ObservedNodeVersion>) -> Self {
-        Self {
-            observed,
-            versions: std::sync::Mutex::new(path_node_versions()),
-        }
+        let versions = SHARED_NODE_VERSIONS
+            .try_with(Arc::clone)
+            .unwrap_or_else(|_| Arc::new(Mutex::new(path_node_versions())));
+        Self { observed, versions }
     }
 
     /// Probe Node again, recording the result for later commands.
@@ -85,7 +99,7 @@ impl NodeVersionReuse {
             });
         Self {
             observed: None,
-            versions: std::sync::Mutex::new(versions),
+            versions: Arc::new(Mutex::new(versions)),
         }
     }
 

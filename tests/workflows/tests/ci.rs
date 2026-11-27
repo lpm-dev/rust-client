@@ -1,6 +1,7 @@
 mod support;
 
-use support::{TempProject, lpm};
+use support::mock_registry::{MockRegistry, make_tarball_from_pkg_json};
+use support::{TempProject, lpm, lpm_with_registry};
 
 const HOSTILE_ENV_NAME: &str =
     "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
@@ -600,4 +601,73 @@ fn ci_setup_gitlab_prints_a_copyable_yaml_job() {
         .unwrap();
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("\ndeploy:\n  id_tokens:"));
+}
+
+#[tokio::test]
+async fn ci_at_workspace_root_installs_all_workspace_members_from_frozen_lockfile() {
+    let registry = MockRegistry::start().await;
+    let leaf_tarball = make_tarball_from_pkg_json(
+        serde_json::json!({ "name": "leaf-pkg", "version": "1.0.0" }),
+        &[("index.js", b"module.exports = 'leaf';\n")],
+    );
+    registry
+        .with_package("leaf-pkg", "1.0.0", &leaf_tarball)
+        .await;
+
+    let workspace = TempProject::empty(
+        r#"{
+            "name": "mono-ci-root",
+            "private": true,
+            "workspaces": ["packages/*"]
+        }"#,
+    );
+    workspace.write_file(
+        "packages/app/package.json",
+        r#"{
+            "name": "@mono/app",
+            "version": "1.0.0",
+            "dependencies": { "leaf-pkg": "1.0.0" }
+        }"#,
+    );
+
+    let install = lpm_with_registry(&workspace, &registry.url())
+        .args(["install", "--no-skills", "--no-security-summary"])
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "seed install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+    assert!(workspace.path().join("lpm.lock").exists());
+    assert!(
+        workspace
+            .path()
+            .join("packages/app/node_modules/leaf-pkg/package.json")
+            .exists()
+    );
+
+    std::fs::remove_dir_all(workspace.path().join("packages/app/node_modules")).unwrap();
+    if workspace.path().join("node_modules").exists() {
+        std::fs::remove_dir_all(workspace.path().join("node_modules")).unwrap();
+    }
+
+    let ci = lpm_with_registry(&workspace, &registry.url())
+        .args(["ci", "--no-skills", "--no-security-summary"])
+        .output()
+        .unwrap();
+    assert!(
+        ci.status.success(),
+        "lpm ci at workspace root failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    assert!(
+        workspace
+            .path()
+            .join("packages/app/node_modules/leaf-pkg/package.json")
+            .exists(),
+        "lpm ci at a workspace root must install and link workspace member dependencies"
+    );
 }

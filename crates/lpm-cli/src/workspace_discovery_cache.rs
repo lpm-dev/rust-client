@@ -33,6 +33,7 @@ impl WorkspaceFreshnessSnapshot {
 #[derive(Default)]
 pub(crate) struct WorkspaceFreshnessCache {
     snapshot: Mutex<Option<Arc<WorkspaceFreshnessSnapshot>>>,
+    canonical_paths: Mutex<std::collections::HashMap<PathBuf, PathBuf>>,
 }
 
 impl WorkspaceFreshnessCache {
@@ -41,6 +42,10 @@ impl WorkspaceFreshnessCache {
             .snapshot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.canonical_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     fn get_or_init(
@@ -53,6 +58,35 @@ impl WorkspaceFreshnessCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Arc::clone(snapshot.get_or_insert_with(|| Arc::new(build())))
     }
+
+    fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+        if let Some(cached) = self
+            .canonical_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(path)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+        let canonical = path.canonicalize()?;
+        self.canonical_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.to_path_buf(), canonical.clone());
+        Ok(canonical)
+    }
+}
+
+pub(crate) fn canonicalize_cached(path: &Path) -> std::io::Result<PathBuf> {
+    match ACTIVE_WORKSPACE.try_with(|context| Arc::clone(&context.freshness_cache)) {
+        Ok(cache) => cache.canonicalize(path),
+        Err(_) => path.canonicalize(),
+    }
+}
+
+pub(crate) fn canonicalize_or_original(path: &Path) -> PathBuf {
+    canonicalize_cached(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 struct ActiveWorkspaceContext {

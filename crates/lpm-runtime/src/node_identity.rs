@@ -126,7 +126,8 @@ impl<'a> IdentityContext<'a> {
         if !metadata.is_file() {
             return None;
         }
-        let node_binary = is_runtime_binary(&canonical_executable, &metadata, runtime)
+        let binary_match = classify_runtime_binary(&canonical_executable, &metadata, runtime);
+        let node_binary = !matches!(binary_match, RuntimeBinaryMatch::NotBinary)
             && !is_version_manager_shim(
                 executable,
                 &canonical_executable,
@@ -139,6 +140,9 @@ impl<'a> IdentityContext<'a> {
         hash_symlink_chain(&mut hasher, executable);
         hasher.os(canonical_executable.as_os_str());
         crate::effective::update_with_file_metadata(&mut hasher.0, &metadata);
+        if node_binary && let RuntimeBinaryMatch::DynamicLibnode { ref soname } = binary_match {
+            hash_dynamic_libnode(&mut hasher, &canonical_executable, soname);
+        }
         if managed_node_root.is_some_and(|root| canonical_executable.starts_with(root)) {
             // Each managed runtime is installed under its own version, so no
             // project input can change the version it reports.
@@ -313,14 +317,37 @@ fn is_version_manager_shim(
     .any(|shims| shims.canonicalize().is_ok_and(|shims| shims == directory))
 }
 
+enum RuntimeBinaryMatch {
+    NotBinary,
+    StaticBinary,
+    DynamicLibnode { soname: String },
+}
+
+#[cfg(test)]
 fn is_runtime_binary(canonical: &Path, metadata: &Metadata, runtime: RuntimeKind) -> bool {
+    !matches!(
+        classify_runtime_binary(canonical, metadata, runtime),
+        RuntimeBinaryMatch::NotBinary
+    )
+}
+
+fn classify_runtime_binary(
+    canonical: &Path,
+    metadata: &Metadata,
+    runtime: RuntimeKind,
+) -> RuntimeBinaryMatch {
     #[cfg(debug_assertions)]
     if runtime == RuntimeKind::Node
         && let Some(test_binary) = std::env::var_os("LPM_TEST_NODE_BINARY")
     {
-        return Path::new(&test_binary)
+        return if Path::new(&test_binary)
             .canonicalize()
-            .is_ok_and(|test_binary| test_binary == canonical);
+            .is_ok_and(|test_binary| test_binary == canonical)
+        {
+            RuntimeBinaryMatch::StaticBinary
+        } else {
+            RuntimeBinaryMatch::NotBinary
+        };
     }
 
     // The npm `bun` package ships `bin/bun.exe` on every platform.
@@ -335,23 +362,43 @@ fn is_runtime_binary(canonical: &Path, metadata: &Metadata, runtime: RuntimeKind
             name == runtime.binary_name() || name == windows_name
         }
     });
-    if !named_node || metadata.len() < MIN_NODE_BINARY_BYTES {
-        return false;
+    if !named_node {
+        return RuntimeBinaryMatch::NotBinary;
     }
     #[cfg(windows)]
     if canonical.with_extension("shim").exists() {
         // Scoop shims read their target from this sidecar.
-        return false;
+        return RuntimeBinaryMatch::NotBinary;
     }
     let Ok(mut file) = std::fs::File::open(canonical) else {
-        return false;
+        return RuntimeBinaryMatch::NotBinary;
     };
     // Version managers hard-link one shim binary under several tool names,
     // as mise does on Windows in its `hardlink` shim mode.
     if !lpm_common::link_count(&file).is_ok_and(|links| links == 1) {
-        return false;
+        return RuntimeBinaryMatch::NotBinary;
     }
-    has_native_executable_header(&mut file)
+    if metadata.len() >= MIN_NODE_BINARY_BYTES {
+        return if has_native_executable_header(&mut file) {
+            RuntimeBinaryMatch::StaticBinary
+        } else {
+            RuntimeBinaryMatch::NotBinary
+        };
+    }
+    if runtime == RuntimeKind::Node
+        && !has_preload_override()
+        && let Some(soname) = dynamic_libnode_dependency(&mut file, metadata.len())
+    {
+        return RuntimeBinaryMatch::DynamicLibnode { soname };
+    }
+    RuntimeBinaryMatch::NotBinary
+}
+
+fn has_preload_override() -> bool {
+    const PRELOAD_VARS: [&str; 2] = ["LD_PRELOAD", "DYLD_INSERT_LIBRARIES"];
+    PRELOAD_VARS
+        .iter()
+        .any(|var| std::env::var_os(var).is_some_and(|value| !value.is_empty()))
 }
 
 fn has_native_executable_header(file: &mut std::fs::File) -> bool {
@@ -369,6 +416,337 @@ fn has_native_executable_header(file: &mut std::fs::File) -> bool {
             | [0xca, 0xfe, 0xba, 0xbe | 0xbf]
             | [b'M', b'Z', _, _]
     )
+}
+
+fn is_libnode_soname(name: &str) -> bool {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    base == "libnode.so"
+        || base.starts_with("libnode.so.")
+        || (base.starts_with("libnode-") && base.contains(".so"))
+        || base == "libnode.dylib"
+        || (base.starts_with("libnode.") && base.ends_with(".dylib"))
+}
+
+fn read_exact_at(file: &mut std::fs::File, offset: u64, len: usize) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut buf = vec![0u8; len];
+    file.read_exact(&mut buf).ok()?;
+    Some(buf)
+}
+
+fn read_u16_endian(bytes: &[u8], offset: usize, little_endian: bool) -> Option<u16> {
+    let raw: [u8; 2] = bytes.get(offset..offset + 2)?.try_into().ok()?;
+    Some(if little_endian {
+        u16::from_le_bytes(raw)
+    } else {
+        u16::from_be_bytes(raw)
+    })
+}
+
+fn read_u32_endian(bytes: &[u8], offset: usize, little_endian: bool) -> Option<u32> {
+    let raw: [u8; 4] = bytes.get(offset..offset + 4)?.try_into().ok()?;
+    Some(if little_endian {
+        u32::from_le_bytes(raw)
+    } else {
+        u32::from_be_bytes(raw)
+    })
+}
+
+fn read_u64_endian(bytes: &[u8], offset: usize, little_endian: bool) -> Option<u64> {
+    let raw: [u8; 8] = bytes.get(offset..offset + 8)?.try_into().ok()?;
+    Some(if little_endian {
+        u64::from_le_bytes(raw)
+    } else {
+        u64::from_be_bytes(raw)
+    })
+}
+
+fn dynamic_libnode_dependency(file: &mut std::fs::File, file_len: u64) -> Option<String> {
+    let magic = read_exact_at(file, 0, 4)?;
+    match magic.as_slice() {
+        [0x7f, b'E', b'L', b'F'] => elf_libnode_dependency(file, file_len),
+        [0xcf, 0xfa, 0xed, 0xfe] => macho64_libnode_dependency(file, file_len, true),
+        [0xfe, 0xed, 0xfa, 0xcf] => macho64_libnode_dependency(file, file_len, false),
+        _ => None,
+    }
+}
+
+fn elf_libnode_dependency(file: &mut std::fs::File, file_len: u64) -> Option<String> {
+    const MAX_PHNUM: usize = 128;
+    const MAX_DYNAMIC_BYTES: u64 = 256 * 1024;
+    const MAX_STRTAB_BYTES: u64 = 1024 * 1024;
+    const MAX_NEEDED: usize = 256;
+    const PT_LOAD: u32 = 1;
+    const PT_DYNAMIC: u32 = 2;
+    const DT_NULL: u64 = 0;
+    const DT_NEEDED: u64 = 1;
+    const DT_STRTAB: u64 = 5;
+    const DT_STRSZ: u64 = 10;
+
+    let ident = read_exact_at(file, 0, 16)?;
+    let is_64 = match ident[4] {
+        1 => false,
+        2 => true,
+        _ => return None,
+    };
+    let little_endian = match ident[5] {
+        1 => true,
+        2 => false,
+        _ => return None,
+    };
+    let ehdr_len = if is_64 { 64 } else { 52 };
+    let ehdr = read_exact_at(file, 0, ehdr_len)?;
+    let (phoff, phentsize, phnum) = if is_64 {
+        (
+            read_u64_endian(&ehdr, 32, little_endian)?,
+            usize::from(read_u16_endian(&ehdr, 54, little_endian)?),
+            usize::from(read_u16_endian(&ehdr, 56, little_endian)?),
+        )
+    } else {
+        (
+            u64::from(read_u32_endian(&ehdr, 28, little_endian)?),
+            usize::from(read_u16_endian(&ehdr, 42, little_endian)?),
+            usize::from(read_u16_endian(&ehdr, 44, little_endian)?),
+        )
+    };
+    let expected_phentsize = if is_64 { 56 } else { 32 };
+    if phentsize != expected_phentsize || phnum == 0 || phnum > MAX_PHNUM {
+        return None;
+    }
+    let ph_table_bytes = phentsize.checked_mul(phnum)?;
+    if phoff.checked_add(ph_table_bytes as u64)? > file_len {
+        return None;
+    }
+    let ph_table = read_exact_at(file, phoff, ph_table_bytes)?;
+
+    let mut load_segments: Vec<(u64, u64, u64)> = Vec::new();
+    let mut dynamic_segment: Option<(u64, u64)> = None;
+    for index in 0..phnum {
+        let base = index * phentsize;
+        let p_type = read_u32_endian(&ph_table, base, little_endian)?;
+        let (p_offset, p_vaddr, p_filesz) = if is_64 {
+            (
+                read_u64_endian(&ph_table, base + 8, little_endian)?,
+                read_u64_endian(&ph_table, base + 16, little_endian)?,
+                read_u64_endian(&ph_table, base + 32, little_endian)?,
+            )
+        } else {
+            (
+                u64::from(read_u32_endian(&ph_table, base + 4, little_endian)?),
+                u64::from(read_u32_endian(&ph_table, base + 8, little_endian)?),
+                u64::from(read_u32_endian(&ph_table, base + 16, little_endian)?),
+            )
+        };
+        if p_type == PT_LOAD {
+            load_segments.push((p_vaddr, p_offset, p_filesz));
+        } else if p_type == PT_DYNAMIC && dynamic_segment.is_none() {
+            dynamic_segment = Some((p_offset, p_filesz));
+        }
+    }
+
+    let (dyn_offset, dyn_size) = dynamic_segment?;
+    if dyn_size == 0 || dyn_size > MAX_DYNAMIC_BYTES || dyn_offset.checked_add(dyn_size)? > file_len
+    {
+        return None;
+    }
+    let dyn_bytes = read_exact_at(file, dyn_offset, usize::try_from(dyn_size).ok()?)?;
+    let entry_size = if is_64 { 16 } else { 8 };
+    let mut needed_offsets: Vec<u64> = Vec::new();
+    let mut strtab_vaddr: Option<u64> = None;
+    let mut strtab_size: Option<u64> = None;
+
+    for chunk in dyn_bytes.chunks_exact(entry_size) {
+        let (tag, val) = if is_64 {
+            (
+                read_u64_endian(chunk, 0, little_endian)?,
+                read_u64_endian(chunk, 8, little_endian)?,
+            )
+        } else {
+            (
+                u64::from(read_u32_endian(chunk, 0, little_endian)?),
+                u64::from(read_u32_endian(chunk, 4, little_endian)?),
+            )
+        };
+        match tag {
+            DT_NULL => break,
+            DT_NEEDED => {
+                if needed_offsets.len() < MAX_NEEDED {
+                    needed_offsets.push(val);
+                }
+            }
+            DT_STRTAB => strtab_vaddr = Some(val),
+            DT_STRSZ => strtab_size = Some(val),
+            _ => {}
+        }
+    }
+
+    let strtab_vaddr = strtab_vaddr?;
+    let strtab_size = strtab_size?;
+    if needed_offsets.is_empty() || strtab_size == 0 || strtab_size > MAX_STRTAB_BYTES {
+        return None;
+    }
+    let strtab_offset = load_segments
+        .iter()
+        .find_map(|&(p_vaddr, p_offset, p_filesz)| {
+            let delta = strtab_vaddr.checked_sub(p_vaddr)?;
+            if delta.checked_add(strtab_size)? <= p_filesz {
+                p_offset.checked_add(delta)
+            } else {
+                None
+            }
+        })?;
+    if strtab_offset.checked_add(strtab_size)? > file_len {
+        return None;
+    }
+    let strtab = read_exact_at(file, strtab_offset, usize::try_from(strtab_size).ok()?)?;
+    for offset in needed_offsets {
+        let Ok(start) = usize::try_from(offset) else {
+            continue;
+        };
+        let Some(tail) = strtab.get(start..) else {
+            continue;
+        };
+        let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+        if let Ok(name) = std::str::from_utf8(&tail[..end])
+            && is_libnode_soname(name)
+        {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+fn macho64_libnode_dependency(
+    file: &mut std::fs::File,
+    file_len: u64,
+    little_endian: bool,
+) -> Option<String> {
+    const MAX_NCMDS: usize = 512;
+    const MAX_SIZEOFCMDS: u64 = 1024 * 1024;
+    const LC_LOAD_DYLIB: u32 = 0x0c;
+    const LC_LOAD_WEAK_DYLIB: u32 = 0x8000_0018;
+    const LC_REEXPORT_DYLIB: u32 = 0x8000_001f;
+    const LC_LAZY_LOAD_DYLIB: u32 = 0x20;
+
+    let header = read_exact_at(file, 0, 32)?;
+    let ncmds = usize::try_from(read_u32_endian(&header, 16, little_endian)?).ok()?;
+    let sizeofcmds = u64::from(read_u32_endian(&header, 20, little_endian)?);
+    if ncmds == 0
+        || ncmds > MAX_NCMDS
+        || sizeofcmds == 0
+        || sizeofcmds > MAX_SIZEOFCMDS
+        || 32u64.checked_add(sizeofcmds)? > file_len
+    {
+        return None;
+    }
+    let cmds = read_exact_at(file, 32, usize::try_from(sizeofcmds).ok()?)?;
+    let mut cursor = 0usize;
+    for _ in 0..ncmds {
+        if cursor + 8 > cmds.len() {
+            break;
+        }
+        let cmd = read_u32_endian(&cmds, cursor, little_endian)?;
+        let cmdsize = usize::try_from(read_u32_endian(&cmds, cursor + 4, little_endian)?).ok()?;
+        if cmdsize < 8 || cursor.checked_add(cmdsize)? > cmds.len() {
+            break;
+        }
+        if matches!(
+            cmd,
+            LC_LOAD_DYLIB | LC_LOAD_WEAK_DYLIB | LC_REEXPORT_DYLIB | LC_LAZY_LOAD_DYLIB
+        ) && cmdsize >= 24
+        {
+            let name_offset =
+                usize::try_from(read_u32_endian(&cmds, cursor + 8, little_endian)?).ok()?;
+            if name_offset < cmdsize {
+                let tail = &cmds[cursor + name_offset..cursor + cmdsize];
+                let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+                if let Ok(name) = std::str::from_utf8(&tail[..end])
+                    && is_libnode_soname(name)
+                {
+                    return Some(name.to_string());
+                }
+            }
+        }
+        cursor += cmdsize;
+    }
+    None
+}
+
+fn hash_dynamic_libnode(hasher: &mut FieldHasher, canonical_executable: &Path, soname: &str) {
+    hasher.bytes(b"dynamic-libnode");
+    hasher.bytes(soname.as_bytes());
+    for var in [
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+    ] {
+        if let Some(value) = std::env::var_os(var)
+            && !value.is_empty()
+        {
+            hasher.bytes(var.as_bytes());
+            hasher.os(&value);
+        }
+    }
+
+    let mut candidates = Vec::with_capacity(12);
+    let soname_path = Path::new(soname);
+    if soname_path.is_absolute() {
+        candidates.push(soname_path.to_path_buf());
+    } else {
+        let base = soname.rsplit('/').next().unwrap_or(soname);
+        for var in ["LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"] {
+            if let Some(value) = std::env::var_os(var) {
+                for dir in std::env::split_paths(&value) {
+                    if !dir.as_os_str().is_empty() {
+                        candidates.push(dir.join(base));
+                    }
+                }
+            }
+        }
+        if let Some(bin_dir) = canonical_executable.parent() {
+            candidates.push(bin_dir.join(base));
+            if let Some(prefix) = bin_dir.parent() {
+                candidates.push(prefix.join("lib").join(base));
+                candidates.push(prefix.join("lib64").join(base));
+            }
+        }
+        for dir in [
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib/aarch64-linux-gnu",
+            "/usr/lib64",
+            "/usr/lib",
+            "/lib/x86_64-linux-gnu",
+            "/lib/aarch64-linux-gnu",
+        ] {
+            candidates.push(Path::new(dir).join(base));
+        }
+        if let Some(value) = std::env::var_os("DYLD_FALLBACK_LIBRARY_PATH") {
+            for dir in std::env::split_paths(&value) {
+                if !dir.as_os_str().is_empty() {
+                    candidates.push(dir.join(base));
+                }
+            }
+        }
+    }
+
+    for candidate in candidates {
+        if let Ok(canonical_lib) = candidate.canonicalize()
+            && let Ok(meta) = canonical_lib.metadata()
+            && meta.is_file()
+        {
+            hasher.os(canonical_lib.as_os_str());
+            crate::effective::update_with_file_metadata(&mut hasher.0, &meta);
+            return;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Ok(meta) = std::fs::metadata("/etc/ld.so.cache") {
+        hasher.bytes(b"ld-so-cache");
+        crate::effective::update_with_file_metadata(&mut hasher.0, &meta);
+    }
 }
 
 /// Hash each link target from the `PATH` entry to the executable, since a
@@ -1503,5 +1881,110 @@ mod tests {
         for name in ["PATH", "NODE_OPTIONS", "HOME", "__MISE_DIFF"] {
             assert!(!is_manager_variable(OsStr::new(name)), "{name}");
         }
+    }
+
+    fn build_synthetic_elf64_with_needed(needed: &[&str]) -> Vec<u8> {
+        let mut strtab = vec![0u8];
+        let mut needed_offsets = Vec::with_capacity(needed.len());
+        for name in needed {
+            needed_offsets.push(strtab.len() as u64);
+            strtab.extend_from_slice(name.as_bytes());
+            strtab.push(0);
+        }
+
+        let ehdr_size = 64usize;
+        let phdr_size = 56usize;
+        let phnum = 2usize;
+        let dyn_offset = ehdr_size + phdr_size * phnum;
+        let dyn_count = needed_offsets.len() + 3;
+        let dyn_size = dyn_count * 16;
+        let strtab_offset = dyn_offset + dyn_size;
+        let total_size = strtab_offset + strtab.len();
+
+        let mut buf = vec![0u8; total_size];
+        // ELF64 little-endian header
+        buf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        buf[4] = 2; // ELFCLASS64
+        buf[5] = 1; // ELFDATA2LSB
+        buf[6] = 1; // EV_CURRENT
+        buf[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        buf[32..40].copy_from_slice(&(ehdr_size as u64).to_le_bytes()); // e_phoff
+        buf[54..56].copy_from_slice(&(phdr_size as u16).to_le_bytes()); // e_phentsize
+        buf[56..58].copy_from_slice(&(phnum as u16).to_le_bytes()); // e_phnum
+
+        let base_vaddr = 0x400000u64;
+        // Program header 0: PT_LOAD covering the entire file
+        let p0 = ehdr_size;
+        buf[p0..p0 + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        buf[p0 + 8..p0 + 16].copy_from_slice(&0u64.to_le_bytes()); // p_offset
+        buf[p0 + 16..p0 + 24].copy_from_slice(&base_vaddr.to_le_bytes()); // p_vaddr
+        buf[p0 + 32..p0 + 40].copy_from_slice(&(total_size as u64).to_le_bytes()); // p_filesz
+        buf[p0 + 40..p0 + 48].copy_from_slice(&(total_size as u64).to_le_bytes()); // p_memsz
+
+        // Program header 1: PT_DYNAMIC
+        let p1 = ehdr_size + phdr_size;
+        buf[p1..p1 + 4].copy_from_slice(&2u32.to_le_bytes()); // PT_DYNAMIC
+        buf[p1 + 8..p1 + 16].copy_from_slice(&(dyn_offset as u64).to_le_bytes()); // p_offset
+        buf[p1 + 16..p1 + 24].copy_from_slice(&(base_vaddr + dyn_offset as u64).to_le_bytes());
+        buf[p1 + 32..p1 + 40].copy_from_slice(&(dyn_size as u64).to_le_bytes()); // p_filesz
+
+        let mut cursor = dyn_offset;
+        let mut push_dyn = |tag: u64, val: u64| {
+            buf[cursor..cursor + 8].copy_from_slice(&tag.to_le_bytes());
+            buf[cursor + 8..cursor + 16].copy_from_slice(&val.to_le_bytes());
+            cursor += 16;
+        };
+        for offset in needed_offsets {
+            push_dyn(1, offset); // DT_NEEDED
+        }
+        push_dyn(5, base_vaddr + strtab_offset as u64); // DT_STRTAB
+        push_dyn(10, strtab.len() as u64); // DT_STRSZ
+        push_dyn(0, 0); // DT_NULL
+
+        buf[strtab_offset..strtab_offset + strtab.len()].copy_from_slice(&strtab);
+        buf
+    }
+
+    #[test]
+    fn dynamically_linked_small_node_elf_is_recognized_as_node_binary_while_non_libnode_elf_is_rejected()
+     {
+        let prefix = tempfile::tempdir().unwrap();
+        let bin_dir = prefix.path().join("bin");
+        let lib_dir = prefix.path().join("lib");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&lib_dir).unwrap();
+        let home = environment(prefix.path());
+
+        let dyn_node = bin_dir.join(NODE);
+        fs::write(
+            &dyn_node,
+            build_synthetic_elf64_with_needed(&["libc.so.6", "libnode.so.109"]),
+        )
+        .unwrap();
+        let libnode = lib_dir.join("libnode.so.109");
+        fs::write(&libnode, b"v20.11.0").unwrap();
+        let first = identity(&dyn_node, prefix.path(), OsStr::new(""), &home);
+        assert!(
+            first.node_binary,
+            "small ELF dynamically linked against libnode.so must be recognized as a real node binary"
+        );
+        fs::write(&libnode, b"v20.19.0-upgraded").unwrap();
+        let second = identity(&dyn_node, prefix.path(), OsStr::new(""), &home);
+        assert_ne!(
+            first.fingerprint, second.fingerprint,
+            "updating the resolved libnode shared library must invalidate the fingerprint"
+        );
+
+        let shim_dir = tempfile::tempdir().unwrap();
+        let shim_elf = shim_dir.path().join(NODE);
+        fs::write(
+            &shim_elf,
+            build_synthetic_elf64_with_needed(&["libc.so.6", "libdl.so.2"]),
+        )
+        .unwrap();
+        assert!(
+            !identity(&shim_elf, shim_dir.path(), OsStr::new(""), &home).node_binary,
+            "small ELF without libnode DT_NEEDED must stay classified as a launcher"
+        );
     }
 }

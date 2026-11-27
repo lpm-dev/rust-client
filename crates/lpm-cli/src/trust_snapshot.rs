@@ -211,9 +211,12 @@ where
             return future.await;
         }
         let pending = std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new()));
-        let result = PENDING_INSTALL_SNAPSHOTS
-            .scope(std::sync::Arc::clone(&pending), future)
-            .await;
+        let managed_policy_cache = crate::security_approval::new_managed_policy_cache();
+        let result = crate::security_approval::scope_managed_policy_cache(
+            managed_policy_cache,
+            PENDING_INSTALL_SNAPSHOTS.scope(std::sync::Arc::clone(&pending), future),
+        )
+        .await;
         if result.is_ok() {
             let snapshots = std::mem::take(
                 &mut *pending

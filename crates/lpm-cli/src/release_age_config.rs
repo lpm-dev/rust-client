@@ -324,9 +324,18 @@ impl ReleaseAgeResolver {
             None => read_package_json_release_age_config(&project_dir.join("package.json"))?,
         }
         .unwrap_or_default();
+        let workspace_root_config = workspace_root_release_age_config(project_dir)?;
+        let (workspace_root_dir, workspace_root_age_config) = match workspace_root_config {
+            Some((root_dir, config)) => (Some(root_dir), config),
+            None => (None, PackageReleaseAgeConfig::default()),
+        };
         extend_unique_excludes(
             &mut minimum_release_age_exclude,
             package_config.minimum_release_age_exclude,
+        );
+        extend_unique_excludes(
+            &mut minimum_release_age_exclude,
+            workspace_root_age_config.minimum_release_age_exclude,
         );
         let global_release_age_config = match global_config_path() {
             Some(path) => match parse_global_release_age_config_from_table(&path, global.table()) {
@@ -352,16 +361,26 @@ impl ReleaseAgeResolver {
             .ok()
             .and_then(|config| config.as_ref())
             .and_then(|config| config.minimum_release_age_policy);
-        let (requested_policy, policy_source) =
+        let (requested_policy, policy_source, policy_unlock_dir) =
             if let Some(policy) = package_config.minimum_release_age_policy {
-                (policy, ReleaseAgePolicySource::Project)
+                (policy, ReleaseAgePolicySource::Project, project_dir)
+            } else if let Some(policy) = workspace_root_age_config.minimum_release_age_policy {
+                (
+                    policy,
+                    ReleaseAgePolicySource::Project,
+                    workspace_root_dir.as_deref().unwrap_or(project_dir),
+                )
             } else if let Some(policy) = global_policy {
-                (policy, ReleaseAgePolicySource::Global)
+                (policy, ReleaseAgePolicySource::Global, project_dir)
             } else {
-                (ReleaseAgePolicy::default(), ReleaseAgePolicySource::Default)
+                (
+                    ReleaseAgePolicy::default(),
+                    ReleaseAgePolicySource::Default,
+                    project_dir,
+                )
             };
         let effective_policy = enforce_release_age_policy_posture(
-            project_dir,
+            policy_unlock_dir,
             json_output,
             force_security_floor,
             requested_policy,
@@ -411,11 +430,19 @@ impl ReleaseAgeResolver {
                 minimum_release_age_policy: effective_policy,
             });
         }
-        if let Some(secs) = package_config.minimum_release_age_secs {
+        let project_age = package_config
+            .minimum_release_age_secs
+            .map(|secs| (secs, project_dir))
+            .or_else(|| {
+                workspace_root_age_config
+                    .minimum_release_age_secs
+                    .map(|secs| (secs, workspace_root_dir.as_deref().unwrap_or(project_dir)))
+            });
+        if let Some((secs, unlock_dir)) = project_age {
             if secs < authorized_floor {
                 crate::security_approval::ensure_project_unlock(
                     crate::security_approval::ApprovalScope::CooldownBypass,
-                    project_dir,
+                    unlock_dir,
                     json_output,
                     crate::security_approval::ApprovalSource::ProjectConfig,
                     "package.json requests a lower minimum release age than this machine has approved.",
@@ -476,6 +503,45 @@ impl ReleaseAgeResolver {
             minimum_release_age_exclude,
             minimum_release_age_policy: effective_policy,
         })
+    }
+}
+
+fn workspace_root_release_age_config(
+    project_dir: &Path,
+) -> Result<Option<(PathBuf, PackageReleaseAgeConfig)>, LpmError> {
+    if let Some(workspace) = crate::workspace_discovery_cache::active_workspace(project_dir) {
+        if same_directory(&workspace.root, project_dir) {
+            return Ok(None);
+        }
+        return Ok(
+            package_release_age_config_from_package(&workspace.root_package)?
+                .map(|config| (workspace.root.clone(), config)),
+        );
+    }
+    let Ok(Some(workspace_root)) =
+        crate::workspace_discovery_cache::find_workspace_root(project_dir)
+    else {
+        return Ok(None);
+    };
+    if same_directory(&workspace_root, project_dir) {
+        return Ok(None);
+    }
+    Ok(
+        read_package_json_release_age_config(&workspace_root.join("package.json"))?
+            .map(|config| (workspace_root, config)),
+    )
+}
+
+fn same_directory(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (
+        crate::workspace_discovery_cache::canonicalize_cached(left),
+        crate::workspace_discovery_cache::canonicalize_cached(right),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
     }
 }
 
@@ -1794,5 +1860,77 @@ minimum-release-age-exclude = ["global-pkg"]
     fn strict_u64_rejects_non_digit() {
         assert_eq!(parse_strict_u64_string("abc"), None);
         assert_eq!(parse_strict_u64_string("0x10"), None);
+    }
+
+    #[test]
+    fn workspace_member_inherits_workspace_root_release_age_policy_age_and_excludes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let _home = scoped_home_dir();
+        write_authorized_min_age(0);
+
+        let member_dir = workspace.path().join("packages").join("app");
+        std::fs::create_dir_all(&member_dir).unwrap();
+        std::fs::write(
+            workspace.path().join("package.json"),
+            serde_json::json!({
+                "name": "mono-root",
+                "private": true,
+                "workspaces": ["packages/*"],
+                "lpm": {
+                    "minimumReleaseAge": 604800,
+                    "minimumReleaseAgePolicy": "strict",
+                    "minimumReleaseAgeExclude": ["root-exempt"]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            member_dir.join("package.json"),
+            serde_json::json!({
+                "name": "@mono/app",
+                "version": "1.0.0"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let inherited = ReleaseAgeResolver::resolve_config(&member_dir, None, &[], true).unwrap();
+        assert_eq!(inherited.minimum_release_age_secs, 7 * 86_400);
+        assert_eq!(
+            inherited.minimum_release_age_policy,
+            ReleaseAgePolicy::Strict
+        );
+        assert_eq!(
+            inherited.minimum_release_age_exclude,
+            vec!["root-exempt".to_string()]
+        );
+
+        // Member override takes precedence over workspace root while inheriting unset fields
+        // and merging excludes.
+        std::fs::write(
+            member_dir.join("package.json"),
+            serde_json::json!({
+                "name": "@mono/app",
+                "version": "1.0.0",
+                "lpm": {
+                    "minimumReleaseAge": 864000,
+                    "minimumReleaseAgeExclude": ["member-exempt"]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let overridden = ReleaseAgeResolver::resolve_config(&member_dir, None, &[], true).unwrap();
+        assert_eq!(overridden.minimum_release_age_secs, 10 * 86_400);
+        assert_eq!(
+            overridden.minimum_release_age_policy,
+            ReleaseAgePolicy::Strict
+        );
+        assert_eq!(
+            overridden.minimum_release_age_exclude,
+            vec!["member-exempt".to_string(), "root-exempt".to_string()]
+        );
     }
 }

@@ -88,7 +88,7 @@ enum PathNodeCacheContext {
         working_directory: PathBuf,
         search_path: OsString,
     },
-    LpmManaged,
+    ContextIndependent,
 }
 
 /// Reuses Node version probes within the same script execution context.
@@ -718,15 +718,16 @@ fn path_node_identity(
     managed_node_root: Option<&Path>,
 ) -> Option<PathNodeIdentity> {
     let script = script_node_identity(executable, cwd, path, managed_node_root)?;
-    let context =
-        if managed_node_root.is_some_and(|root| script.canonical_executable.starts_with(root)) {
-            PathNodeCacheContext::LpmManaged
-        } else {
-            PathNodeCacheContext::Script {
-                working_directory: cwd.canonicalize().ok()?,
-                search_path: path.to_os_string(),
-            }
-        };
+    let context = if script.node_binary
+        || managed_node_root.is_some_and(|root| script.canonical_executable.starts_with(root))
+    {
+        PathNodeCacheContext::ContextIndependent
+    } else {
+        PathNodeCacheContext::Script {
+            working_directory: cwd.canonicalize().ok()?,
+            search_path: path.to_os_string(),
+        }
+    };
     Some(PathNodeIdentity { script, context })
 }
 
@@ -1303,5 +1304,33 @@ mod tests {
         let system = executable_fingerprint(b"system\0", &executable).unwrap();
 
         assert_ne!(managed, system);
+    }
+
+    #[test]
+    fn shared_cache_reuses_real_node_binary_resolution_across_different_working_directories() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let member_a = tempfile::tempdir().unwrap();
+        let member_b = tempfile::tempdir().unwrap();
+        let node = test_node_path(bin_dir.path());
+        crate::node_identity::write_unrunnable_node_binary(&node);
+
+        let path_a = std::env::join_paths([member_a.path(), bin_dir.path()]).unwrap();
+        let path_b = std::env::join_paths([member_b.path(), bin_dir.path()]).unwrap();
+        let fingerprint = probe_node_fingerprint_on_path(member_a.path(), &path_a).unwrap();
+        let observed = ObservedNodeVersion::new(fingerprint.clone(), "22.14.0");
+
+        let mut cache = PathNodeVersionCache::default();
+        let first = cache.resolve_with_observed(member_a.path(), &path_a, Some(&observed));
+        assert_eq!(first.version(), Some("22.14.0"));
+
+        // Second workspace member has a different cwd and PATH prefix and passes no observed
+        // version; an unrunnable binary can only succeed here if the shared in-memory cache hits.
+        let second = cache.resolve_with_observed(member_b.path(), &path_b, None);
+        assert_eq!(
+            second.version(),
+            Some("22.14.0"),
+            "real node binary resolution must reuse across workspace member cwds without re-probing"
+        );
+        assert_eq!(second.runtime_fingerprint(), Some(fingerprint.as_str()));
     }
 }

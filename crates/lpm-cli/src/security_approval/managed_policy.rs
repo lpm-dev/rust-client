@@ -1122,8 +1122,54 @@ fn parse_policy_firewall(
     })
 }
 
+#[derive(Default)]
+pub(crate) struct ManagedPolicyCache {
+    entries: std::sync::Mutex<std::collections::HashMap<PathBuf, Option<ManagedPolicy>>>,
+}
+
+tokio::task_local! {
+    static SCOPED_MANAGED_POLICY_CACHE: std::sync::Arc<ManagedPolicyCache>;
+}
+
+pub(crate) fn new_managed_policy_cache() -> std::sync::Arc<ManagedPolicyCache> {
+    std::sync::Arc::new(ManagedPolicyCache::default())
+}
+
+pub(crate) async fn scope_managed_policy_cache<F>(
+    cache: std::sync::Arc<ManagedPolicyCache>,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    SCOPED_MANAGED_POLICY_CACHE.scope(cache, future).await
+}
+
 pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
     let path = managed_policy_path();
+    if let Ok(cache) = SCOPED_MANAGED_POLICY_CACHE.try_with(std::sync::Arc::clone)
+        && let Some(cached) = cache
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&path)
+            .cloned()
+    {
+        return Ok(cached);
+    }
+
+    let policy = load_managed_policy_from_disk(path.clone())?;
+    if let Ok(cache) = SCOPED_MANAGED_POLICY_CACHE.try_with(std::sync::Arc::clone) {
+        cache
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path, policy.clone());
+    }
+    Ok(policy)
+}
+
+fn load_managed_policy_from_disk(path: PathBuf) -> Result<Option<ManagedPolicy>, LpmError> {
     match std::fs::symlink_metadata(&path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1721,5 +1767,42 @@ mod access_tests {
     fn policy_parent_child_deletion_is_a_modifying_permission() {
         assert!(super::windows_policy_access_can_modify(0x40));
         assert!(!super::windows_policy_access_can_modify(0x1));
+    }
+
+    #[tokio::test]
+    async fn scoped_managed_policy_cache_reuses_policy_within_install_scope_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_path = dir.path().join("security-policy.toml");
+        std::fs::write(&policy_path, "minimum-release-age-secs = 86400\n").unwrap();
+        let _env = crate::test_env::ScopedEnv::update([(
+            super::SECURITY_POLICY_PATH_ENV,
+            Some(policy_path.as_os_str().to_os_string()),
+        )]);
+
+        let cache = super::new_managed_policy_cache();
+        let (first, second) = super::scope_managed_policy_cache(cache, async {
+            let first = super::load_managed_policy().unwrap();
+            std::fs::write(&policy_path, "minimum-release-age-secs = 172800\n").unwrap();
+            let second = super::load_managed_policy().unwrap();
+            (first, second)
+        })
+        .await;
+
+        assert_eq!(
+            first.as_ref().and_then(|p| p.minimum_release_age_secs),
+            Some(86400)
+        );
+        assert_eq!(
+            second.as_ref().and_then(|p| p.minimum_release_age_secs),
+            Some(86400),
+            "scoped cache must reuse the loaded managed policy within the same install scope"
+        );
+
+        let outside = super::load_managed_policy().unwrap();
+        assert_eq!(
+            outside.as_ref().and_then(|p| p.minimum_release_age_secs),
+            Some(172800),
+            "reads outside the install scope must observe updated disk state"
+        );
     }
 }

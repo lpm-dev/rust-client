@@ -232,12 +232,13 @@ fn workspace_package_link_source(
     }
 
     let source_dir = package_dir.join(relative);
-    let package_root = package_dir.canonicalize().map_err(|error| {
-        LpmError::Workspace(format!(
-            "failed to resolve workspace package directory {}: {error}",
-            package_dir.display()
-        ))
-    })?;
+    let package_root =
+        crate::workspace_discovery_cache::canonicalize_cached(package_dir).map_err(|error| {
+            LpmError::Workspace(format!(
+                "failed to resolve workspace package directory {}: {error}",
+                package_dir.display()
+            ))
+        })?;
     let mut existing_ancestor = source_dir.as_path();
     while !existing_ancestor.exists() {
         existing_ancestor = existing_ancestor.parent().ok_or_else(|| {
@@ -248,7 +249,10 @@ fn workspace_package_link_source(
             ))
         })?;
     }
-    let canonical_ancestor = existing_ancestor.canonicalize().map_err(|error| {
+    let canonical_ancestor = crate::workspace_discovery_cache::canonicalize_cached(
+        existing_ancestor,
+    )
+    .map_err(|error| {
         LpmError::Workspace(format!(
             "failed to resolve publishConfig.directory ancestor {}: {error}",
             existing_ancestor.display()
@@ -261,12 +265,14 @@ fn workspace_package_link_source(
         )));
     }
     if source_dir.exists() {
-        return source_dir.canonicalize().map_err(|error| {
-            LpmError::Workspace(format!(
-                "failed to resolve publishConfig.directory {}: {error}",
-                source_dir.display()
-            ))
-        });
+        return crate::workspace_discovery_cache::canonicalize_cached(&source_dir).map_err(
+            |error| {
+                LpmError::Workspace(format!(
+                    "failed to resolve publishConfig.directory {}: {error}",
+                    source_dir.display()
+                ))
+            },
+        );
     }
     Ok(source_dir)
 }
@@ -285,15 +291,18 @@ pub(super) fn is_declared_workspace_package_source(
     linkable_workspace_packages(&workspace).any(|(package, path)| {
         package.name.as_deref() == Some(package_name)
             && package.version.as_deref().unwrap_or("0.0.0") == package_version
-            && (path.canonicalize().is_ok_and(|path| path == source_dir)
+            && (crate::workspace_discovery_cache::canonicalize_cached(path)
+                .is_ok_and(|path| path == source_dir)
                 || workspace_package_link_source(package, path)
                     .and_then(|path| {
-                        path.canonicalize().map_err(|error| {
-                            LpmError::Workspace(format!(
-                                "failed to resolve workspace package source {}: {error}",
-                                path.display()
-                            ))
-                        })
+                        crate::workspace_discovery_cache::canonicalize_cached(&path).map_err(
+                            |error| {
+                                LpmError::Workspace(format!(
+                                    "failed to resolve workspace package source {}: {error}",
+                                    path.display()
+                                ))
+                            },
+                        )
                     })
                     .is_ok_and(|path| path == source_dir))
     })
@@ -739,7 +748,7 @@ pub(super) fn append_workspace_links_from_local_packages(
     if all_workspace_members.is_empty() {
         return;
     }
-    let canonicalize_path = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let canonicalize_path = crate::workspace_discovery_cache::canonicalize_or_original;
     let skipped: HashSet<(String, PathBuf)> = skip_workspace_members
         .iter()
         .map(|m| (m.link_name.clone(), canonicalize_path(&m.source_dir)))
@@ -753,8 +762,21 @@ pub(super) fn append_workspace_links_from_local_packages(
             )
         })
         .collect();
+    let mut members_by_identity: HashMap<(&str, &str), Vec<&WorkspaceMemberLink>> =
+        HashMap::with_capacity(all_workspace_members.len());
+    for member in all_workspace_members {
+        members_by_identity
+            .entry((member.name.as_str(), member.version.as_str()))
+            .or_default()
+            .push(member);
+    }
 
     for package in packages {
+        let Some(candidates) =
+            members_by_identity.get(&(package.name.as_str(), package.version.as_str()))
+        else {
+            continue;
+        };
         let Ok(source) = package.source_kind() else {
             continue;
         };
@@ -765,11 +787,9 @@ pub(super) fn append_workspace_links_from_local_packages(
             _ => continue,
         };
         let canonical_source = canonicalize_path(&local_path);
-        let Some(member) = all_workspace_members.iter().find(|member| {
-            member.name == package.name
-                && member.version == package.version
-                && (canonicalize_path(&member.package_dir) == canonical_source
-                    || canonicalize_path(&member.source_dir) == canonical_source)
+        let Some(member) = candidates.iter().copied().find(|member| {
+            canonicalize_path(&member.package_dir) == canonical_source
+                || canonicalize_path(&member.source_dir) == canonical_source
         }) else {
             continue;
         };
@@ -786,7 +806,7 @@ pub(super) fn merge_workspace_member_links(
     workspace_member_deps: &mut Vec<WorkspaceMemberLink>,
     links: impl IntoIterator<Item = WorkspaceMemberLink>,
 ) {
-    let canonicalize_path = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let canonicalize_path = crate::workspace_discovery_cache::canonicalize_or_original;
     let mut existing: HashMap<(String, PathBuf), usize> = workspace_member_deps
         .iter()
         .enumerate()
@@ -858,7 +878,7 @@ pub(super) fn pre_extract_file_link_workspace_members(
         all_workspace_members,
         project_dir,
         json_output,
-        |path| path.canonicalize(),
+        crate::workspace_discovery_cache::canonicalize_cached,
     );
 }
 
@@ -1021,7 +1041,11 @@ pub(super) fn expand_workspace_member_deps_with_transitives(
     if all_workspace_members.is_empty() {
         return Ok(());
     }
-    let canonicalize_path = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let canonicalize_path = crate::workspace_discovery_cache::canonicalize_or_original;
+    let members_by_name: HashMap<&str, &WorkspaceMemberLink> = all_workspace_members
+        .iter()
+        .map(|member| (member.name.as_str(), member))
+        .collect();
     // Visited key: `(local_name, canonical realpath)`. Distinct local
     // names sharing one source dir (alias case — e.g.,
     // `"aliasfoo": "file:./packages/foo"` plus `"foo": "workspace:*"`)
@@ -1073,9 +1097,7 @@ pub(super) fn expand_workspace_member_deps_with_transitives(
                 if !raw_s.starts_with("workspace:") {
                     continue;
                 }
-                let Some(target_member) =
-                    all_workspace_members.iter().find(|m| m.name == *local_name)
-                else {
+                let Some(target_member) = members_by_name.get(local_name.as_str()).copied() else {
                     // **Invariant invariant — fail closed.** Mirror
                     // the the invariant reject in `recurse_local_source_deps`
                     // (file:/link: walker) so unresolved transitive
