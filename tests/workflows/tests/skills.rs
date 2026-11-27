@@ -1096,6 +1096,54 @@ fn standalone_skills_add_uses_each_agents_global_home_contract() {
 }
 
 #[test]
+fn standalone_skills_add_for_codex_globally_links_into_the_home_agents_skills_folder() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_standard_skill(
+        &project,
+        "team-skills",
+        "release-notes",
+        "Summarize the relevant commits into concise release notes.",
+    );
+
+    let output = lpm(&project)
+        .env_remove("CODEX_HOME")
+        .args([
+            "skills",
+            "add",
+            "./team-skills",
+            "--skill",
+            "release-notes",
+            "--agent",
+            "codex",
+            "--global",
+            "--yes",
+        ])
+        .output()
+        .expect("add a standalone skill for Codex globally");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        project
+            .home()
+            .join(".agents/skills/release-notes/SKILL.md")
+            .is_file()
+    );
+    assert!(!project.home().join(".codex").exists());
+    let listed = lpm(&project)
+        .env_remove("CODEX_HOME")
+        .args(["--json", "skills", "list", "--global"])
+        .output()
+        .expect("list global skills");
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["counts"]["managed"], 1, "{listed:#}");
+    assert_eq!(listed["counts"]["external"], 0, "{listed:#}");
+}
+
+#[test]
 fn skills_install_alias_routes_to_the_add_flow() {
     let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
     seed_standard_skill(

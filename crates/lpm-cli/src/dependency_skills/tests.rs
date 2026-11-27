@@ -9,7 +9,7 @@ fn plain_skill(name: &str) -> String {
     format!("---\nname: {name}\ndescription: Use the {name} tool.\n---\n\nRun {name}.\n")
 }
 
-fn settings() -> Settings {
+pub(super) fn settings() -> Settings {
     Settings {
         lpm_dev_packages: true,
         other_packages: true,
@@ -22,7 +22,7 @@ fn settings() -> Settings {
 /// Plans and applies the project's links whether or not they look current,
 /// as `lpm skills sync` does.
 fn force_reconcile(project_dir: &Path, settings: Settings) -> Result<ReconcileReport, LpmError> {
-    let lock = state::acquire_lock(project_dir)?;
+    let lock = state::acquire_lock(&state::Site::project(project_dir))?;
     let manifest = plan::read_manifest(project_dir)?;
     reconcile_locked(project_dir, manifest, settings, lock, checks::Asking::Now)
 }
@@ -334,7 +334,7 @@ fn planning_waits_for_the_lock_so_a_concurrent_policy_change_wins() {
         "LPM_TEST_LOCK_CONTENTION_MARKER",
         marker.clone().into_os_string(),
     )]);
-    let lock = state::acquire_lock(project.path()).unwrap();
+    let lock = state::acquire_lock(&state::Site::project(project.path())).unwrap();
     let path = project.path().to_path_buf();
     let reconcile = std::thread::spawn(move || reconcile_project(&path, settings()));
     let waiting_since = std::time::Instant::now();
@@ -1029,22 +1029,26 @@ fn a_lockfile_stamp_taken_too_soon_is_replaced_once_it_can_be_trusted() {
     };
     let manifest = project.manifest();
     let policy = policy::read_policy(&manifest).policy;
-    let state::StoredState::Present(mut recorded) = state::read_state(project.path()) else {
+    let state::StoredState::Present(mut recorded) =
+        state::read_state(&state::Site::project(project.path()))
+    else {
         panic!("no state");
     };
     recorded.fingerprint = fingerprint(
-        project.path(),
+        &state::Site::project(project.path()),
         policy.as_ref(),
         settings(),
         Some(&racy),
         &[project.path().to_path_buf()],
     );
     recorded.lockfile = Some(racy);
-    state::write_state(project.path(), &recorded).unwrap();
+    state::write_state(&state::Site::project(project.path()), &recorded).unwrap();
 
     assert!(links_ready(project.path(), &manifest, settings()));
 
-    let state::StoredState::Present(after) = state::read_state(project.path()) else {
+    let state::StoredState::Present(after) =
+        state::read_state(&state::Site::project(project.path()))
+    else {
         panic!("no state");
     };
     let settled = after.lockfile.unwrap();
@@ -1239,7 +1243,9 @@ fn each_installed_version_says_whether_it_may_link_on_its_own() {
     manifest["dependencies"] = serde_json::json!({ "tool": "2.0.0", "host": "1.0.0" });
     manifest["lpm"] = serde_json::json!({ "skills": { "allow": ["#tool"] } });
 
-    let inspection = inspect_project(project.path(), &manifest, settings()).unwrap();
+    let inspection = inspect::Inspector::new(inspect::Subject::Project(project.path()), settings())
+        .under(&manifest, settings())
+        .unwrap();
 
     let tool = inspection
         .skills
@@ -1297,7 +1303,9 @@ fn a_version_held_for_a_reason_that_clears_may_link_and_one_held_for_good_may_no
         return;
     }
 
-    let inspection = inspect_project(project.path(), &manifest, settings()).unwrap();
+    let inspection = inspect::Inspector::new(inspect::Subject::Project(project.path()), settings())
+        .under(&manifest, settings())
+        .unwrap();
     drop(mode);
 
     let tool = inspection

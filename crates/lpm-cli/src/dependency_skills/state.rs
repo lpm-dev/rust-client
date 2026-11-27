@@ -7,13 +7,145 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Where linked skills live in a project: their scanned copies, the record
-/// of what LPM linked, and the lock that serializes changes.
-pub(crate) const LINKED_SKILLS_DIR: &str = ".lpm/linked-skills";
+/// The folder holding the scanned copies and the record of what LPM
+/// linked, inside the project's `.lpm` or the LPM root's `global`.
 const LINKED_SKILLS_NAME: &str = "linked-skills";
 pub(crate) const STATE_FILE: &str = "state.json";
-const LOCK_FILE: &str = ".lpm/.linked-skills.lock";
+/// The lock that serializes changes, beside [`LINKED_SKILLS_NAME`].
+const LOCK_NAME: &str = ".linked-skills.lock";
+/// The folder in the LPM root that holds the global packages' state.
+const GLOBAL_STATE_DIR: &str = "global";
 const STATE_VERSION: u32 = 1;
+
+/// Where one set of dependency-skill links lives: the folder its targets
+/// and recorded entry paths are relative to, and the folder that keeps its
+/// copies, record and lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Site {
+    base: PathBuf,
+    /// The existing folder the state folder sits in.
+    anchor: PathBuf,
+    /// The state folder, a plain directory in `anchor`.
+    state_dir: &'static str,
+    global: bool,
+}
+
+impl Site {
+    /// A project's links: targets in the project, copies in its
+    /// `.lpm/linked-skills`.
+    pub(crate) fn project(project_dir: &Path) -> Self {
+        Self {
+            base: project_dir.to_path_buf(),
+            anchor: project_dir.to_path_buf(),
+            state_dir: lpm_common::PROJECT_STATE_DIR,
+            global: false,
+        }
+    }
+
+    /// The links of the user's global packages: targets in `home`, copies
+    /// in `global/linked-skills` under `lpm_root`.
+    pub(crate) fn global(home: &Path, lpm_root: &Path) -> Self {
+        Self {
+            base: home.to_path_buf(),
+            anchor: lpm_root.to_path_buf(),
+            state_dir: GLOBAL_STATE_DIR,
+            global: true,
+        }
+    }
+
+    /// What target folders and recorded entry paths are relative to.
+    #[inline]
+    pub(crate) fn base(&self) -> &Path {
+        &self.base
+    }
+
+    /// How messages and reports name `relative`, a target folder or entry
+    /// path: under `~/` for the global links, which live in the home folder.
+    pub(crate) fn label<'a>(&self, relative: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.global {
+            std::borrow::Cow::Owned(format!("~/{relative}"))
+        } else {
+            std::borrow::Cow::Borrowed(relative)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_global(&self) -> bool {
+        self.global
+    }
+
+    /// The name of the folder that holds the copies' folder: `.lpm` in a
+    /// project, `global` in the LPM root.
+    #[inline]
+    pub(crate) fn state_dir_name(&self) -> &'static str {
+        self.state_dir
+    }
+
+    /// The folder holding the copies and the record.
+    pub(crate) fn store_dir(&self) -> PathBuf {
+        let mut path = PathBuf::with_capacity(self.anchor.as_os_str().len() + 32);
+        path.push(&self.anchor);
+        path.push(self.state_dir);
+        path.push(LINKED_SKILLS_NAME);
+        path
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        let mut path = self.anchor.join(self.state_dir);
+        path.push(LOCK_NAME);
+        path
+    }
+
+    /// Opens the state folder, creating it when missing and refusing a
+    /// link in its place: for the global links, LPM's global folder, opened
+    /// as global installs open it, never through a linked LPM home.
+    fn create_state_dir(&self) -> Result<Dir, LpmError> {
+        if self.global {
+            return lpm_common::open_or_create_global_directory(&lpm_common::LpmRoot::from_dir(
+                &self.anchor,
+            ));
+        }
+        let project = Dir::open_ambient_dir(&self.anchor, cap_std::ambient_authority())?;
+        Ok(lpm_common::ensure_project_state_dir_in(
+            &project,
+            &self.anchor,
+        )?)
+    }
+
+    /// Opens the state folder when it exists, refusing a link in its place.
+    fn open_state_dir(&self) -> Result<Option<Dir>, LpmError> {
+        if self.global {
+            return lpm_common::open_global_directory(&lpm_common::LpmRoot::from_dir(&self.anchor));
+        }
+        Ok(crate::project_fs::open_directory(
+            &self.anchor,
+            Path::new(self.state_dir),
+        )?)
+    }
+}
+
+/// Opens `name` in `parent`, creating it when missing, and refusing
+/// anything but a plain directory.
+fn open_or_create_plain_dir(parent: &Dir, name: &str, shown: &Path) -> Result<Dir, LpmError> {
+    let refuse = |error: io::Error| {
+        LpmError::Registry(format!(
+            "refusing to keep linked skills in {}, which is not a plain directory: {error}",
+            shown.display()
+        ))
+    };
+    match parent.open_dir_nofollow(name) {
+        Ok(directory) => Ok(directory),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match parent.create_dir(name) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(LpmError::Io(error)),
+            }
+            parent.open_dir_nofollow(name).map_err(refuse)
+        }
+        Err(error) => Err(refuse(error)),
+    }
+}
 
 /// How a target holds a skill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,69 +280,54 @@ pub(crate) enum StoredState {
     Newer(String),
 }
 
-pub(crate) fn linked_skills_dir(project_dir: &Path) -> PathBuf {
-    project_dir.join(LINKED_SKILLS_DIR)
-}
-
-pub(crate) fn snapshot_dir(project_dir: &Path, skill: &str) -> PathBuf {
-    let mut path = linked_skills_dir(project_dir);
+pub(crate) fn snapshot_dir(site: &Site, skill: &str) -> PathBuf {
+    let mut path = site.store_dir();
     path.push(skill);
     path
 }
 
-fn state_path(project_dir: &Path) -> PathBuf {
-    let mut path = linked_skills_dir(project_dir);
+fn state_path(site: &Site) -> PathBuf {
+    let mut path = site.store_dir();
     path.push(STATE_FILE);
     path
 }
 
-/// Opens `.lpm/linked-skills` through real directories only: `Ok(None)`
+/// Opens the folder of copies through real directories only: `Ok(None)`
 /// when it doesn't exist, and an error when a link or a file is in the way.
-pub(crate) fn open_root(project_dir: &Path) -> io::Result<Option<Dir>> {
-    crate::project_fs::open_directory(project_dir, Path::new(LINKED_SKILLS_DIR))
-}
-
-/// Opens `.lpm/linked-skills`, creating it inside the project's state
-/// directory when missing, and refusing a link anywhere on the way.
-pub(crate) fn create_root(project_dir: &Path) -> Result<Dir, LpmError> {
-    let project = Dir::open_ambient_dir(project_dir, cap_std::ambient_authority())?;
-    let state = lpm_common::ensure_project_state_dir_in(&project, project_dir)?;
-    let refuse = |error: io::Error| {
-        LpmError::Registry(format!(
-            "refusing to keep linked skills in {}, which is not a plain directory: {error}",
-            linked_skills_dir(project_dir).display()
-        ))
+pub(crate) fn open_root(site: &Site) -> io::Result<Option<Dir>> {
+    let Some(state) = site.open_state_dir().map_err(io::Error::other)? else {
+        return Ok(None);
     };
     match state.open_dir_nofollow(LINKED_SKILLS_NAME) {
-        Ok(root) => Ok(root),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            match state.create_dir(LINKED_SKILLS_NAME) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(LpmError::Io(error)),
-            }
-            state.open_dir_nofollow(LINKED_SKILLS_NAME).map_err(refuse)
-        }
-        Err(error) => Err(refuse(error)),
+        Ok(root) => Ok(Some(root)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
-/// Removes `.lpm/linked-skills` when it holds nothing.
-pub(crate) fn remove_root_if_empty(project_dir: &Path) {
+/// Opens the folder of copies, creating it inside its state folder when
+/// missing, and refusing a link anywhere on the way.
+pub(crate) fn create_root(site: &Site) -> Result<Dir, LpmError> {
+    let state = site.create_state_dir()?;
+    open_or_create_plain_dir(&state, LINKED_SKILLS_NAME, &site.store_dir())
+}
+
+/// Removes the folder of copies when it holds nothing.
+pub(crate) fn remove_root_if_empty(site: &Site) {
     if let Ok(Some(state)) =
-        crate::project_fs::open_directory(project_dir, Path::new(lpm_common::PROJECT_STATE_DIR))
+        crate::project_fs::open_directory(&site.anchor, Path::new(site.state_dir))
     {
         let _ = state.remove_dir(LINKED_SKILLS_NAME);
     }
 }
 
-pub(crate) fn state_exists(project_dir: &Path) -> bool {
-    std::fs::symlink_metadata(state_path(project_dir)).is_ok()
+pub(crate) fn state_exists(site: &Site) -> bool {
+    std::fs::symlink_metadata(state_path(site)).is_ok()
 }
 
-pub(crate) fn read_state(project_dir: &Path) -> StoredState {
-    let path = state_path(project_dir);
-    let root = match open_root(project_dir) {
+pub(crate) fn read_state(site: &Site) -> StoredState {
+    let path = state_path(site);
+    let root = match open_root(site) {
         Ok(Some(root)) => root,
         Ok(None) => return StoredState::Missing,
         Err(error) => {
@@ -316,19 +433,22 @@ pub(crate) fn is_linked_skill_name(name: &str) -> bool {
     lpm_skill::is_skill_name(name)
 }
 
-pub(crate) fn write_state(project_dir: &Path, state: &LinkState) -> Result<(), LpmError> {
-    create_root(project_dir)?;
+pub(crate) fn write_state(site: &Site, state: &LinkState) -> Result<(), LpmError> {
+    let root = create_root(site)?;
     let mut state = state.clone();
     state.schema_version = STATE_VERSION;
     let content = serde_json::to_vec_pretty(&state).map_err(|error| {
         LpmError::Registry(format!("failed to serialize linked skills: {error}"))
     })?;
-    lpm_common::write_file_atomic(&state_path(project_dir), content)?;
+    lpm_common::write_file_atomic_in_dir_with(&root, std::ffi::OsStr::new(STATE_FILE), |file| {
+        use std::io::Write as _;
+        file.write_all(&content)
+    })?;
     Ok(())
 }
 
-pub(crate) fn remove_state(project_dir: &Path) -> Result<(), LpmError> {
-    let root = match open_root(project_dir) {
+pub(crate) fn remove_state(site: &Site) -> Result<(), LpmError> {
+    let root = match open_root(site) {
         Ok(Some(root)) => root,
         Ok(None) => return Ok(()),
         Err(error) => return Err(LpmError::Io(error)),
@@ -340,23 +460,21 @@ pub(crate) fn remove_state(project_dir: &Path) -> Result<(), LpmError> {
     }
 }
 
-/// Takes the lock that serializes reconciling a project's links. Hold it
-/// from reading the policy until the state is written, so a plan made from
-/// a policy another process has since changed is never applied.
-pub(crate) fn acquire_lock(
-    project_dir: &Path,
-) -> Result<lpm_common::ExclusiveLockHandle, LpmError> {
-    lpm_common::ensure_project_state_dir(project_dir)?;
-    lpm_common::acquire_exclusive_lock(project_dir.join(LOCK_FILE))
+/// Takes the lock that serializes reconciling a site's links. Hold it from
+/// reading the policy until the state is written, so a plan made from a
+/// policy another process has since changed is never applied.
+pub(crate) fn acquire_lock(site: &Site) -> Result<lpm_common::ExclusiveLockHandle, LpmError> {
+    site.create_state_dir()?;
+    lpm_common::acquire_exclusive_lock(site.lock_path())
 }
 
 /// [`acquire_lock`] without waiting: `Ok(None)` when another process holds
 /// the lock.
 pub(crate) fn try_acquire_lock(
-    project_dir: &Path,
+    site: &Site,
 ) -> Result<Option<lpm_common::ExclusiveLockHandle>, LpmError> {
-    lpm_common::ensure_project_state_dir(project_dir)?;
-    lpm_common::try_acquire_exclusive_lock(project_dir.join(LOCK_FILE))
+    site.create_state_dir()?;
+    lpm_common::try_acquire_exclusive_lock(site.lock_path())
 }
 
 #[cfg(test)]
@@ -393,9 +511,9 @@ mod tests {
             "agent-browser".into(),
             record(".agents/skills/agent-browser"),
         );
-        write_state(project.path(), &state).unwrap();
+        write_state(&Site::project(project.path()), &state).unwrap();
 
-        let StoredState::Present(read) = read_state(project.path()) else {
+        let StoredState::Present(read) = read_state(&Site::project(project.path())) else {
             panic!("state was not read back");
         };
         assert_eq!(read.skills, state.skills);
@@ -413,9 +531,9 @@ mod tests {
         granting.permission = "own_commands".into();
         granting.requires = Naming::Package;
         state.skills.insert("agent-browser".into(), granting);
-        write_state(project.path(), &state).unwrap();
+        write_state(&Site::project(project.path()), &state).unwrap();
 
-        let StoredState::Present(read) = read_state(project.path()) else {
+        let StoredState::Present(read) = read_state(&Site::project(project.path())) else {
             panic!("state was not read back");
         };
         let record = &read.skills["agent-browser"];
@@ -427,23 +545,26 @@ mod tests {
     #[test]
     fn a_state_from_a_newer_lpm_or_with_unsafe_paths_is_not_trusted() {
         let project = tempfile::tempdir().unwrap();
-        let directory = linked_skills_dir(project.path());
+        let directory = Site::project(project.path()).store_dir();
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(
             directory.join(STATE_FILE),
             r#"{"schema_version":99,"skills":[{"name":"reshaped"}]}"#,
         )
         .unwrap();
-        assert!(matches!(read_state(project.path()), StoredState::Newer(_)));
+        assert!(matches!(
+            read_state(&Site::project(project.path())),
+            StoredState::Newer(_)
+        ));
 
         let mut state = LinkState::default();
         state.skills.insert(
             "agent-browser".into(),
             record("../../outside/agent-browser"),
         );
-        write_state(project.path(), &state).unwrap();
+        write_state(&Site::project(project.path()), &state).unwrap();
         assert!(matches!(
-            read_state(project.path()),
+            read_state(&Site::project(project.path())),
             StoredState::Unusable(_)
         ));
 
@@ -456,9 +577,9 @@ mod tests {
                 digest: None,
             }],
         );
-        write_state(project.path(), &state).unwrap();
+        write_state(&Site::project(project.path()), &state).unwrap();
         assert!(matches!(
-            read_state(project.path()),
+            read_state(&Site::project(project.path())),
             StoredState::Unusable(_)
         ));
     }
@@ -466,8 +587,11 @@ mod tests {
     #[test]
     fn a_missing_state_is_missing() {
         let project = tempfile::tempdir().unwrap();
-        assert!(matches!(read_state(project.path()), StoredState::Missing));
-        assert!(!state_exists(project.path()));
+        assert!(matches!(
+            read_state(&Site::project(project.path())),
+            StoredState::Missing
+        ));
+        assert!(!state_exists(&Site::project(project.path())));
     }
 
     #[cfg(unix)]
@@ -481,12 +605,13 @@ mod tests {
         )
         .unwrap();
         std::fs::create_dir(project.path().join(".lpm")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), linked_skills_dir(project.path())).unwrap();
+        std::os::unix::fs::symlink(outside.path(), Site::project(project.path()).store_dir())
+            .unwrap();
 
         assert!(matches!(
-            read_state(project.path()),
+            read_state(&Site::project(project.path())),
             StoredState::Unusable(_)
         ));
-        assert!(create_root(project.path()).is_err());
+        assert!(create_root(&Site::project(project.path())).is_err());
     }
 }

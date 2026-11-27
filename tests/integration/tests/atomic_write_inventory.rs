@@ -263,8 +263,8 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "publishes exclusively created skill target directories",
     ),
     (
-        "crates/lpm-cli/src/commands/skills/managed.rs::rollback_target_stages",
-        "restores directories owned by the skill target transaction",
+        "crates/lpm-cli/src/commands/skills/managed.rs::restore_previous",
+        "keeps an entry the skill target transaction moved aside beside its target when its name was taken",
     ),
     (
         "crates/lpm-cli/src/commands/skills/managed.rs::rollback_removed_targets",

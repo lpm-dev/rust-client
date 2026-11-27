@@ -302,6 +302,20 @@ pub(crate) struct History<'a> {
     pub(crate) recorded: &'a RecordedSkills,
 }
 
+/// Whose installs a plan reads.
+#[derive(Clone, Copy)]
+pub(crate) enum Importers<'a> {
+    /// A project with its parsed `manifest`, and in a workspace root every
+    /// member.
+    Project {
+        dir: &'a Path,
+        manifest: &'a serde_json::Value,
+    },
+    /// The user's global packages, each installed in a folder of its own.
+    /// Their LPM.dev skills link only where the global policy allows them.
+    Global { installs: &'a [PathBuf] },
+}
+
 /// Plans `project_dir`'s dependency skills under `policy`, linking the
 /// kinds `sources` turns on, with what `history` holds. In a workspace root
 /// the plan covers the root and every member. With nothing to link, nothing
@@ -310,6 +324,47 @@ pub(crate) fn plan_project(
     project_dir: &Path,
     parsed: ParsedPolicy,
     manifest: &serde_json::Value,
+    mode: PlanMode,
+    sources: Sources,
+    history: History<'_>,
+    packages: Option<&HashSet<String>>,
+) -> Result<Plan, LpmError> {
+    plan(
+        Importers::Project {
+            dir: project_dir,
+            manifest,
+        },
+        parsed,
+        mode,
+        sources,
+        history,
+        packages,
+    )
+}
+
+/// Plans the dependency skills of the global packages installed in
+/// `installs` under the global policy.
+pub(crate) fn plan_global(
+    installs: &[PathBuf],
+    parsed: ParsedPolicy,
+    mode: PlanMode,
+    sources: Sources,
+    history: History<'_>,
+    packages: Option<&HashSet<String>>,
+) -> Result<Plan, LpmError> {
+    plan(
+        Importers::Global { installs },
+        parsed,
+        mode,
+        sources,
+        history,
+        packages,
+    )
+}
+
+fn plan(
+    importers: Importers<'_>,
+    parsed: ParsedPolicy,
     mode: PlanMode,
     sources: Sources,
     history: History<'_>,
@@ -340,7 +395,11 @@ pub(crate) fn plan_project(
     };
     let policy = plan.policy.as_ref().unwrap_or(&empty);
     let reads_others = reads_other_packages_skills(policy);
-    let directories = importer_directories(project_dir);
+    let automatic_lpm_dev = matches!(importers, Importers::Project { .. });
+    let directories = match importers {
+        Importers::Project { dir, .. } => importer_directories(dir),
+        Importers::Global { installs } => installs.to_vec(),
+    };
     let sets: Vec<Vec<super::lpm_dev::ReviewedSet>> = directories
         .iter()
         .map(|directory| {
@@ -352,7 +411,9 @@ pub(crate) fn plan_project(
         })
         .collect();
     let kinds = Sources {
-        lpm_dev: sources.lpm_dev && sets.iter().any(|sets| !sets.is_empty()),
+        lpm_dev: sources.lpm_dev
+            && sets.iter().any(|sets| !sets.is_empty())
+            && (automatic_lpm_dev || !policy.allow.is_empty()),
         other: sources.other && !policy.allow.is_empty(),
         ..sources
     };
@@ -368,30 +429,35 @@ pub(crate) fn plan_project(
 
     let mut discoveries = Vec::with_capacity(directories.len());
     for (index, (directory, sets)) in directories.into_iter().zip(sets).enumerate() {
-        let (names, declared) = if index == 0 {
+        let names_of = |manifest: &serde_json::Value| {
             (
                 root_dependency_names(manifest),
                 installed_dependency_names(manifest),
             )
-        } else {
-            let member_manifest = read_manifest(&directory).ok();
-            if member_manifest
-                .as_ref()
-                .is_some_and(|manifest| manifest.pointer("/lpm/skills").is_some())
-            {
-                plan.problems
-                    .push(member_policy_problem(project_dir, &directory));
-            }
-            member_manifest
-                .map(|manifest| {
-                    (
-                        root_dependency_names(&manifest),
-                        installed_dependency_names(&manifest),
-                    )
-                })
-                .unwrap_or_default()
         };
-        let discovery = match PackageInventory::discover_within(&directory, project_dir) {
+        let (names, declared) = match importers {
+            Importers::Project { manifest, .. } if index == 0 => names_of(manifest),
+            Importers::Project { dir, .. } => {
+                let member_manifest = read_manifest(&directory).ok();
+                if member_manifest
+                    .as_ref()
+                    .is_some_and(|manifest| manifest.pointer("/lpm/skills").is_some())
+                {
+                    plan.problems.push(member_policy_problem(dir, &directory));
+                }
+                member_manifest
+                    .map(|manifest| names_of(&manifest))
+                    .unwrap_or_default()
+            }
+            Importers::Global { .. } => read_manifest(&directory)
+                .map(|manifest| names_of(&manifest))
+                .unwrap_or_default(),
+        };
+        let boundary = match importers {
+            Importers::Project { dir, .. } => dir.to_path_buf(),
+            Importers::Global { .. } => directory.clone(),
+        };
+        let discovery = match PackageInventory::discover_within(&directory, &boundary) {
             Ok(discovery) => discovery,
             Err(LpmError::NotFound(_)) => {
                 crate::commands::audit::discovery::DiscoveryResult::nothing_installed(directory)
@@ -441,6 +507,7 @@ pub(crate) fn plan_project(
         recorded,
         book,
         reads_malware,
+        automatic_lpm_dev,
     };
     let build = |lpm_root: Option<&lpm_common::LpmRoot>| -> Result<Found, LpmError> {
         let store_version = lpm_store::StoreVersion::from_env();
@@ -521,6 +588,9 @@ struct Scope<'a> {
     /// Whether a selector reads `:malware`, so every candidate's verdict
     /// can change a decision, denied ones included.
     reads_malware: bool,
+    /// Whether reviewed LPM.dev skills link without an allowing entry: in
+    /// a project, not among global packages.
+    automatic_lpm_dev: bool,
 }
 
 impl Scope<'_> {
@@ -883,7 +953,11 @@ fn candidates_from_importers(
             scope,
         );
     }
-    let root = RootDependencies::of(importers.first());
+    let root = if scope.automatic_lpm_dev {
+        RootDependencies::of(importers.first())
+    } else {
+        RootDependencies::default()
+    };
     let mut decided = Vec::new();
     let mut judged = Judged::default();
     for (index, (importer, scanned)) in importers.iter().zip(&scanned).enumerate() {
@@ -948,6 +1022,7 @@ fn candidates_from_importers(
     let automatic_unlisted: BTreeSet<String> = importers
         .iter()
         .zip(&scanned)
+        .filter(|_| scope.automatic_lpm_dev)
         .flat_map(|(importer, scanned)| {
             let declared = importer.declared_instances();
             let packages = &importer.inventory.discovery.packages;
@@ -1992,7 +2067,8 @@ fn decide_importer(
         if !enabled {
             continue;
         }
-        let automatic = lpm_dev
+        let automatic = scope.automatic_lpm_dev
+            && lpm_dev
             && sets[index].is_some_and(|set| {
                 importer.declares(package, &declared) || importer.delivered_by_add(set)
             });
@@ -2029,7 +2105,8 @@ fn decide_importer(
         } else {
             scope.enabled.other
         };
-        let automatic = lpm_dev
+        let automatic = scope.automatic_lpm_dev
+            && lpm_dev
             && sets[index].is_some_and(|set| {
                 importer.declares(&packages[index], &declared) || importer.delivered_by_add(set)
             });
@@ -2090,7 +2167,7 @@ fn decide_importer(
                     "",
                     &graph,
                     &all_packages,
-                    automatic_naming(true, Some(set), skill),
+                    automatic_naming(scope.automatic_lpm_dev, Some(set), skill),
                 )
             } else {
                 Ruling::NOT_ALLOWED
@@ -2792,6 +2869,7 @@ mod tests {
             recorded: &RecordedSkills::new(),
             book: Some(&book),
             reads_malware: false,
+            automatic_lpm_dev: true,
         };
         let install = |version: &str, checkable: bool| PackageInstall {
             version: version.to_string(),

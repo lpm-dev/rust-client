@@ -283,9 +283,9 @@ pub async fn run(
         }
         SkillsCmd::Prune(args) => managed::prune(project_dir, args, json_output),
         SkillsCmd::Deps(args) => dependencies::deps(project_dir, &args, json_output),
-        SkillsCmd::Link(args) => dependencies::link(project_dir, args, json_output).await,
+        SkillsCmd::Link(args) => dependencies::link(client, project_dir, args, json_output).await,
         SkillsCmd::Unlink(args) => dependencies::unlink(project_dir, args, json_output).await,
-        SkillsCmd::Sync(args) => dependencies::sync(project_dir, &args, json_output),
+        SkillsCmd::Sync(args) => dependencies::sync(client, project_dir, &args, json_output).await,
     }
 }
 
@@ -851,19 +851,33 @@ fn list_skills(project_dir: &Path, args: &ListArgs, json_output: bool) -> Result
     let managed = managed::inventory(project_dir, args.global)?;
     let external = managed::external_inventory(project_dir, args.global)?;
     let kind_matches = |kind| args.kind.is_none_or(|wanted| wanted == kind);
+    let mut link_sites = vec![crate::dependency_skills::link_site(project_dir, false)?];
+    if args.global {
+        link_sites.push(crate::dependency_skills::link_site(project_dir, true)?);
+    }
     let dependency: Vec<_> = if kind_matches(SkillKind::Dependency) {
-        let root = crate::dependency_skills::skills_root(project_dir);
-        crate::dependency_skills::linked_skills(&root)
-            .into_iter()
-            .filter(|(_, record)| {
-                args.agent.is_none_or(|agent| {
-                    let folder = managed::project_agent_folder(agent);
-                    record.links.iter().any(|link| {
-                        link.path
-                            .rsplit_once('/')
-                            .is_some_and(|(target, _)| target == folder)
+        link_sites
+            .iter()
+            .flat_map(|site| {
+                let folder = args.agent.map(|agent| {
+                    managed::dependency_agent_folder(site, agent)
+                        .map(|folder| crate::project_fs::resolve_links_with_missing_tail(&folder))
+                });
+                crate::dependency_skills::linked_skills(site)
+                    .into_iter()
+                    .filter(move |(_, record)| match &folder {
+                        None => true,
+                        Some(folder) => folder.as_ref().is_some_and(|folder| {
+                            record.links.iter().any(|link| {
+                                link.path.rsplit_once('/').is_some_and(|(target, _)| {
+                                    crate::project_fs::resolve_links_with_missing_tail(
+                                        &site.base().join(target),
+                                    ) == *folder
+                                })
+                            })
+                        }),
                     })
-                })
+                    .map(move |(name, record)| (site, name, record))
             })
             .collect()
     } else {
@@ -920,12 +934,13 @@ fn list_skills(project_dir: &Path, args: &ListArgs, json_output: bool) -> Result
                 "package": packages.iter().flat_map(|(package, skills)| skills.iter().map(move |(name, size)| serde_json::json!({"package": package, "name": name, "size": size}))).collect::<Vec<_>>(),
                 "managed": managed,
                 "external": external,
-                "dependency": dependency.iter().map(|(name, record)| serde_json::json!({
+                "dependency": dependency.iter().map(|(site, name, record)| serde_json::json!({
                     "name": name,
+                    "scope": if site.is_global() { "global" } else { "project" },
                     "package": record.package,
                     "version": record.version,
                     "permission": record.permission,
-                    "links": record.links.iter().map(|link| link.path.as_str()).collect::<Vec<_>>(),
+                    "links": record.links.iter().map(|link| site.label(&link.path)).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>(),
             }),
         );
@@ -946,7 +961,7 @@ fn list_skills(project_dir: &Path, args: &ListArgs, json_output: bool) -> Result
         .collect::<Vec<_>>();
     let dependency_rows = dependency
         .iter()
-        .map(|(name, record)| {
+        .map(|(site, name, record)| {
             (
                 name.as_str(),
                 format!(
@@ -956,7 +971,7 @@ fn list_skills(project_dir: &Path, args: &ListArgs, json_output: bool) -> Result
                     record
                         .links
                         .iter()
-                        .map(|link| link.path.as_str())
+                        .map(|link| site.label(&link.path))
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
@@ -1012,12 +1027,16 @@ fn view_skill(project_dir: &Path, args: &ViewArgs, json_output: bool) -> Result<
         print_package_view(package, &skills[0].0, skills[0].1, json_output);
         return Ok(());
     }
-    if let Some(linked) = crate::dependency_skills::linked_skill_details(
-        &crate::dependency_skills::skills_root(project_dir),
-    )
-    .into_iter()
-    .find(|linked| linked.name == args.selector)
-    {
+    let mut sites = Vec::with_capacity(2);
+    if args.global {
+        sites.push(crate::dependency_skills::link_site(project_dir, true)?);
+    }
+    sites.push(crate::dependency_skills::link_site(project_dir, false)?);
+    if let Some(linked) = sites.iter().find_map(|site| {
+        crate::dependency_skills::linked_skill_details(site)
+            .into_iter()
+            .find(|linked| linked.name == args.selector)
+    }) {
         print_dependency_view(&linked, json_output);
         return Ok(());
     }
@@ -1032,13 +1051,18 @@ fn print_dependency_view(linked: &crate::dependency_skills::LinkedSkillDetails, 
         .checked
         .as_ref()
         .map(|checked| checked.description.clone());
-    let links: Vec<&str> = record.links.iter().map(|link| link.path.as_str()).collect();
+    let links: Vec<_> = record
+        .links
+        .iter()
+        .map(|link| linked.site.label(&link.path))
+        .collect();
     if json_output {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "success": true,
                 "kind": "dependency",
+                "scope": if linked.site.is_global() { "global" } else { "project" },
                 "name": name,
                 "package": record.package,
                 "version": record.version,

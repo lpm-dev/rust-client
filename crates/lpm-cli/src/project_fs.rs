@@ -79,6 +79,71 @@ pub(crate) fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Where `path` leads once every link on the way is followed, a link whose
+/// destination doesn't exist yet included, with the part that doesn't exist
+/// kept as written: the folder LPM would create there. A chain of more
+/// links than any file system follows is left where it stands.
+pub(crate) fn resolve_links_with_missing_tail(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    const MAX_LINKS: usize = 40;
+    let mut pending: Vec<std::ffi::OsString> = Vec::new();
+    let mut resolved = PathBuf::with_capacity(path.as_os_str().len());
+    fn push_components(path: &Path, pending: &mut Vec<std::ffi::OsString>) {
+        let start = pending.len();
+        pending.extend(
+            path.components()
+                .map(|component| component.as_os_str().to_os_string()),
+        );
+        pending[start..].reverse();
+    }
+    push_components(path, &mut pending);
+    let mut links = 0usize;
+    while let Some(part) = pending.pop() {
+        match Path::new(&part).components().next() {
+            Some(Component::Prefix(_) | Component::RootDir) => {
+                resolved.push(&part);
+                continue;
+            }
+            Some(Component::CurDir) | None => continue,
+            Some(Component::ParentDir) => {
+                resolved.pop();
+                continue;
+            }
+            Some(Component::Normal(_)) => resolved.push(&part),
+        }
+        let is_link = std::fs::symlink_metadata(&resolved)
+            .is_ok_and(|metadata| lpm_common::is_symlink_or_junction(&metadata));
+        if !is_link || links == MAX_LINKS {
+            continue;
+        }
+        let Ok(destination) = std::fs::read_link(&resolved) else {
+            continue;
+        };
+        links += 1;
+        resolved.pop();
+        if destination.is_absolute() {
+            resolved = PathBuf::with_capacity(destination.as_os_str().len());
+        }
+        push_components(&destination, &mut pending);
+    }
+    resolved
+}
+
+/// Where the entry at `path` really sits: its folder once the links on the
+/// way are followed, and its own name, which isn't followed, so one entry
+/// reached through two linked folders has one identity.
+pub(crate) fn resolve_entry(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => {
+            let mut entry = resolve_links_with_missing_tail(parent);
+            entry.push(name);
+            entry
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
 /// `typed`, a relative path a user gave in `invocation_dir`, as a path
 /// relative to `project_dir`, which holds `invocation_dir`. Leading `..`
 /// leave `invocation_dir` for its parent, as the operating system resolves
@@ -152,6 +217,32 @@ fn reserved_device_name(part: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn links_resolve_on_the_way_even_to_a_destination_not_created_yet() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        std::fs::create_dir(home.join(".claude")).unwrap();
+        std::os::unix::fs::symlink(home.join(".agents/skills"), home.join(".claude/skills"))
+            .unwrap();
+        std::fs::create_dir(home.join("dotfiles")).unwrap();
+        std::os::unix::fs::symlink("dotfiles", home.join(".cursor")).unwrap();
+
+        assert_eq!(
+            super::resolve_links_with_missing_tail(&home.join(".claude/skills")),
+            home.join(".agents/skills")
+        );
+        assert_eq!(
+            super::resolve_links_with_missing_tail(&home.join(".cursor/skills/x")),
+            home.join("dotfiles/skills/x")
+        );
+        std::os::unix::fs::symlink("loop", home.join("loop")).unwrap();
+        assert_eq!(
+            super::resolve_links_with_missing_tail(&home.join("loop")),
+            home.join("loop")
+        );
+    }
+
     use super::*;
 
     #[test]

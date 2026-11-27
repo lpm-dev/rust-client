@@ -49,6 +49,7 @@ mod resolve;
 pub(crate) mod root_versions;
 mod setup;
 mod skills;
+pub(crate) use skills::{FetchedPackageSkills, fetch_published_skills};
 mod source_resolution;
 mod state;
 mod strict_deps;

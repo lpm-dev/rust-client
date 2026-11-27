@@ -468,6 +468,7 @@ pub(super) fn build_install_global_overrides_with_excludes(
         advisor_override: None,
         strict_sandbox: false,
         no_sandbox: false,
+        no_skills: false,
     })
 }
 

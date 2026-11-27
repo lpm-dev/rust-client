@@ -69,7 +69,8 @@ pub async fn run(package: &str, json_output: bool) -> Result<(), LpmError> {
     // command's sweep retries.
     crate::commands::global::run_opportunistic_sweep(&root);
 
-    print_success(&result, json_output);
+    let skills = crate::dependency_skills::reconcile_after_global_change(None).await;
+    print_success(&result, &skills, json_output);
     Ok(())
 }
 
@@ -570,9 +571,13 @@ fn compute_uninstall_trust_prune(
     prune
 }
 
-fn print_success(out: &UninstallOutcome, json_output: bool) {
+fn print_success(
+    out: &UninstallOutcome,
+    skills: &crate::dependency_skills::ReconcileReport,
+    json_output: bool,
+) {
     if json_output {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "success": true,
             "package": out.package,
             "version": out.version,
@@ -587,6 +592,7 @@ fn print_success(out: &UninstallOutcome, json_output: bool) {
             // prose.
             "trust_entries_pruned": out.trust_entries_pruned,
         });
+        crate::commands::install::attach_dependency_skills(&mut body, skills);
         println!("{}", serde_json::to_string_pretty(&body).unwrap());
         return;
     }
@@ -617,6 +623,7 @@ fn print_success(out: &UninstallOutcome, json_output: bool) {
             "Install root was preserved because another manifest row references it or has an invalid root path: {root_safe}"
         ));
     }
+    crate::dependency_skills::print_report(skills);
 }
 
 /// Classify the result of a per-command shim removal so the abort path

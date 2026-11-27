@@ -1,13 +1,20 @@
-use super::policy::{MAX_POLICY_ENTRIES, POLICY_KEY};
+use super::policy::{MAX_POLICY_ENTRIES, POLICY_KEY, PolicySource};
 use lpm_common::LpmError;
 use lpm_security::query::parse_selector;
 use std::path::{Path, PathBuf};
 
-/// A project's `package.json`, read for an edit to its skills policy.
+/// A skills policy read for an edit: a project's `package.json`, or the
+/// global policy file.
 #[derive(Clone)]
-pub(crate) struct ManifestEdit {
+pub(crate) struct PolicyEdit {
     path: PathBuf,
-    reviewed: String,
+    source: PolicySource,
+    /// For the global policy, the LPM root whose `global` folder holds it,
+    /// opened afresh, never through a link, for each read and write.
+    lpm_root: Option<lpm_common::LpmRoot>,
+    /// The file's text as read; `None` for a global policy not written yet.
+    reviewed: Option<String>,
+    /// The whole document: the manifest, or the global policy object.
     pub(crate) value: serde_json::Value,
 }
 
@@ -27,8 +34,9 @@ impl PolicyList {
     }
 }
 
-impl ManifestEdit {
-    pub(crate) fn read(project_dir: &Path) -> Result<Self, LpmError> {
+impl PolicyEdit {
+    /// The policy in `project_dir`'s `package.json`.
+    pub(crate) fn project(project_dir: &Path) -> Result<Self, LpmError> {
         let path = project_dir.join("package.json");
         let (reviewed, _) = lpm_common::read_text_regular_file_capped_with_metadata(
             &path,
@@ -38,6 +46,29 @@ impl ManifestEdit {
             .map_err(|error| LpmError::Registry(format!("invalid {}: {error}", path.display())))?;
         Ok(Self {
             path,
+            source: PolicySource::Manifest,
+            lpm_root: None,
+            reviewed: Some(reviewed),
+            value,
+        })
+    }
+
+    /// The global policy of `lpm_root`, shown as `path`, empty when the file
+    /// doesn't exist.
+    pub(crate) fn global(lpm_root: lpm_common::LpmRoot, path: PathBuf) -> Result<Self, LpmError> {
+        let reviewed = read_global(&lpm_root, &path)?;
+        let value = match &reviewed {
+            Some(text) => {
+                serde_json::from_str(lpm_common::strip_utf8_bom_str(text)).map_err(|error| {
+                    LpmError::Registry(format!("invalid {}: {error}", path.display()))
+                })?
+            }
+            None => serde_json::Value::Object(serde_json::Map::new()),
+        };
+        Ok(Self {
+            path,
+            source: PolicySource::Global,
+            lpm_root: Some(lpm_root),
             reviewed,
             value,
         })
@@ -53,6 +84,7 @@ impl ManifestEdit {
         if selectors.is_empty() {
             return Ok(Vec::new());
         }
+        let source = self.source;
         let entries = self.list_mut(list)?;
         let mut present: Vec<String> = entries
             .iter()
@@ -73,8 +105,8 @@ impl ManifestEdit {
             if !present.contains(&canonical) {
                 if entries.len() >= MAX_POLICY_ENTRIES {
                     return Err(LpmError::Registry(format!(
-                        "`lpm.{POLICY_KEY}.{}` already holds {MAX_POLICY_ENTRIES} selectors; remove some before adding `{canonical}`",
-                        list.key()
+                        "{} already holds {MAX_POLICY_ENTRIES} selectors; remove some before adding `{canonical}`",
+                        source.key(&format!(".{}", list.key()))
                     )));
                 }
                 entries.push(serde_json::Value::String(canonical.clone()));
@@ -95,9 +127,7 @@ impl ManifestEdit {
             .map(|selector| selector.to_string())
             .collect();
         let Some(entries) = self
-            .value
-            .get_mut("lpm")
-            .and_then(|lpm| lpm.get_mut(POLICY_KEY))
+            .policy_object_mut()
             .and_then(|policy| policy.get_mut(list.key()))
             .and_then(serde_json::Value::as_array_mut)
         else {
@@ -121,10 +151,7 @@ impl ManifestEdit {
     /// Removes every entry of the list. Returns the entries removed.
     pub(crate) fn clear(&mut self, list: PolicyList) -> Vec<String> {
         let removed = self
-            .value
-            .get_mut("lpm")
-            .and_then(|lpm| lpm.get_mut(POLICY_KEY))
-            .and_then(serde_json::Value::as_object_mut)
+            .policy_object_mut()
             .and_then(|policy| policy.shift_remove(list.key()))
             .and_then(|entries| match entries {
                 serde_json::Value::Array(entries) => Some(entries),
@@ -138,55 +165,122 @@ impl ManifestEdit {
         removed
     }
 
-    /// Writes the edited manifest, unless the file changed since it was
-    /// read.
+    /// Writes the edited document, unless the file changed since it was
+    /// read. A global policy left empty is removed.
     pub(crate) fn write(&self) -> Result<(), LpmError> {
-        let (current, _) = lpm_common::read_text_regular_file_capped_with_metadata(
-            &self.path,
-            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-        )?;
-        if current != self.reviewed {
-            return Err(LpmError::Script(
-                "package.json changed while its skills policy was being edited; nothing was written. Retry against the current manifest."
-                    .into(),
-            ));
-        }
         let text = serde_json::to_string_pretty(&self.value).map_err(|error| {
-            LpmError::Registry(format!("failed to serialize package.json: {error}"))
+            LpmError::Registry(format!(
+                "failed to serialize {}: {error}",
+                self.path.display()
+            ))
         })?;
-        lpm_common::write_file_atomic(&self.path, format!("{text}\n"))?;
+        let Some(lpm_root) = &self.lpm_root else {
+            let current = lpm_common::read_text_regular_file_capped_with_metadata(
+                &self.path,
+                lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+            )?
+            .0;
+            self.ensure_unchanged(Some(current))?;
+            lpm_common::write_file_atomic(&self.path, format!("{text}\n"))?;
+            return Ok(());
+        };
+        let directory = lpm_common::open_or_create_global_directory(lpm_root)?;
+        self.ensure_unchanged(super::global::read_policy_text(&directory, &self.path)?)?;
+        let file = std::ffi::OsStr::new(super::global::POLICY_FILE);
+        if self
+            .value
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
+        {
+            return match directory.remove_file(file) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            };
+        }
+        lpm_common::write_file_atomic_in_dir_with(&directory, file, |output| {
+            use std::io::Write as _;
+            output.write_all(text.as_bytes())?;
+            output.write_all(b"\n")
+        })?;
         Ok(())
     }
 
+    /// Refuses the edit when the policy file changed since the edit read it,
+    /// for a caller that writes other things first under the same lock.
+    pub(crate) fn ensure_current(&self) -> Result<(), LpmError> {
+        match &self.lpm_root {
+            Some(lpm_root) => self.ensure_unchanged(read_global(lpm_root, &self.path)?),
+            None => self.ensure_unchanged(Some(
+                lpm_common::read_text_regular_file_capped_with_metadata(
+                    &self.path,
+                    lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+                )?
+                .0,
+            )),
+        }
+    }
+
+    /// Refuses to write over a policy file that changed since the edit read
+    /// it: `current` is its text now, `None` when it doesn't exist.
+    fn ensure_unchanged(&self, current: Option<String>) -> Result<(), LpmError> {
+        if current == self.reviewed {
+            return Ok(());
+        }
+        Err(LpmError::Script(format!(
+            "{} changed while its skills policy was being edited; nothing was written. Retry against the current file.",
+            self.path.display()
+        )))
+    }
+
+    /// The policy object, created when missing.
+    fn policy_mut(&mut self) -> Result<&mut serde_json::Value, LpmError> {
+        let source = self.source;
+        let document = describe(source);
+        match source {
+            PolicySource::Manifest => {
+                let lpm = object_entry(&mut self.value, "lpm", "`lpm`", &document)?;
+                object_entry(lpm, POLICY_KEY, "`lpm.skills`", &document)
+            }
+            PolicySource::Global if self.value.is_object() => Ok(&mut self.value),
+            PolicySource::Global => Err(LpmError::Registry(format!(
+                "{document} is not a JSON object; refusing to edit it"
+            ))),
+        }
+    }
+
+    /// The policy object, when there is one.
+    fn policy_object_mut(&mut self) -> Option<&mut serde_json::Map<String, serde_json::Value>> {
+        match self.source {
+            PolicySource::Manifest => self
+                .value
+                .get_mut("lpm")
+                .and_then(|lpm| lpm.get_mut(POLICY_KEY))
+                .and_then(serde_json::Value::as_object_mut),
+            PolicySource::Global => self.value.as_object_mut(),
+        }
+    }
+
     fn list_mut(&mut self, list: PolicyList) -> Result<&mut Vec<serde_json::Value>, LpmError> {
-        let lpm = object_entry(&mut self.value, "lpm", "`lpm`")?;
-        let policy = object_entry(lpm, POLICY_KEY, "`lpm.skills`")?;
-        let entries = policy
+        let source = self.source;
+        let entries = self
+            .policy_mut()?
             .as_object_mut()
-            .expect("object_entry returns an object")
+            .expect("policy_mut returns an object")
             .entry(list.key())
             .or_insert_with(|| serde_json::Value::Array(Vec::new()));
         entries.as_array_mut().ok_or_else(|| {
             LpmError::Registry(format!(
-                "package.json `lpm.skills.{}` is not an array; refusing to edit it",
-                list.key()
+                "{} is not an array; refusing to edit it",
+                source.key(&format!(".{}", list.key()))
             ))
         })
     }
 
-    /// Drops empty policy lists, an empty policy, and an empty `lpm`.
+    /// Drops empty policy lists and, in a manifest, an empty policy and an
+    /// empty `lpm`.
     fn prune_empty(&mut self) {
-        let Some(lpm) = self
-            .value
-            .get_mut("lpm")
-            .and_then(serde_json::Value::as_object_mut)
-        else {
-            return;
-        };
-        if let Some(policy) = lpm
-            .get_mut(POLICY_KEY)
-            .and_then(serde_json::Value::as_object_mut)
-        {
+        if let Some(policy) = self.policy_object_mut() {
             for key in ["allow", "deny"] {
                 if policy
                     .get(key)
@@ -196,9 +290,23 @@ impl ManifestEdit {
                     policy.shift_remove(key);
                 }
             }
-            if policy.is_empty() {
-                lpm.shift_remove(POLICY_KEY);
-            }
+        }
+        if self.source == PolicySource::Global {
+            return;
+        }
+        let Some(lpm) = self
+            .value
+            .get_mut("lpm")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            return;
+        };
+        if lpm
+            .get(POLICY_KEY)
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(serde_json::Map::is_empty)
+        {
+            lpm.shift_remove(POLICY_KEY);
         }
         if lpm.is_empty()
             && let Some(object) = self.value.as_object_mut()
@@ -208,20 +316,40 @@ impl ManifestEdit {
     }
 }
 
+/// How messages name the edited file.
+fn describe(source: PolicySource) -> String {
+    match source {
+        PolicySource::Manifest => "package.json".to_string(),
+        PolicySource::Global => "the global skills policy".to_string(),
+    }
+}
+
+/// The global policy file's text, shown as `path`: `None` when it or the
+/// global folder doesn't exist.
+fn read_global(lpm_root: &lpm_common::LpmRoot, path: &Path) -> Result<Option<String>, LpmError> {
+    match lpm_common::open_global_directory(lpm_root)? {
+        Some(directory) => super::global::read_policy_text(&directory, path),
+        None => Ok(None),
+    }
+}
+
 fn object_entry<'a>(
     value: &'a mut serde_json::Value,
     key: &str,
     label: &str,
+    document: &str,
 ) -> Result<&'a mut serde_json::Value, LpmError> {
     let object = value.as_object_mut().ok_or_else(|| {
-        LpmError::Registry("package.json is not a JSON object; refusing to edit it".into())
+        LpmError::Registry(format!(
+            "{document} is not a JSON object; refusing to edit it"
+        ))
     })?;
     let entry = object
         .entry(key)
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
     if !entry.is_object() {
         return Err(LpmError::Registry(format!(
-            "package.json {label} is not an object; refusing to edit it"
+            "{document} {label} is not an object; refusing to edit it"
         )));
     }
     Ok(entry)
@@ -231,10 +359,10 @@ fn object_entry<'a>(
 mod tests {
     use super::*;
 
-    fn open(json: &str) -> (tempfile::TempDir, ManifestEdit) {
+    fn open(json: &str) -> (tempfile::TempDir, PolicyEdit) {
         let project = tempfile::tempdir().unwrap();
         std::fs::write(project.path().join("package.json"), json).unwrap();
-        let edit = ManifestEdit::read(project.path()).unwrap();
+        let edit = PolicyEdit::project(project.path()).unwrap();
         (project, edit)
     }
 
@@ -310,5 +438,88 @@ mod tests {
         assert!(edit.add(PolicyList::Allow, &["#b".into()]).is_err());
         let (_project, mut edit) = open(r##"{"lpm":{"skills":{"allow":"#a"}}}"##);
         assert!(edit.add(PolicyList::Allow, &["#b".into()]).is_err());
+    }
+
+    fn global_edit(root: &lpm_common::LpmRoot) -> PolicyEdit {
+        PolicyEdit::global(root.clone(), root.global_root().join("skills.json")).unwrap()
+    }
+
+    #[test]
+    fn the_global_policy_file_is_created_on_the_first_entry_and_removed_when_empty() {
+        let home = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(home.path().join(".lpm"));
+        let path = root.global_root().join("skills.json");
+        let mut edit = global_edit(&root);
+        assert_eq!(edit.add(PolicyList::Allow, &["#a".into()]).unwrap(), ["#a"]);
+        edit.write().unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written, serde_json::json!({ "allow": ["#a"] }));
+
+        let mut edit = global_edit(&root);
+        assert_eq!(edit.remove(PolicyList::Allow, &["#a".into()]), ["#a"]);
+        edit.write().unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_global_policy_written_by_someone_else_meanwhile_is_not_overwritten() {
+        let home = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(home.path());
+        std::fs::create_dir_all(root.global_root()).unwrap();
+        let path = root.global_root().join("skills.json");
+        let mut edit = global_edit(&root);
+        edit.add(PolicyList::Allow, &["#a".into()]).unwrap();
+        std::fs::write(&path, r##"{"allow":["#b"]}"##).unwrap();
+        assert!(edit.write().is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r##"{"allow":["#b"]}"##
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_global_policy_read_before_its_folder_became_a_link_is_never_written_through_it() {
+        let home = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(home.path());
+        std::fs::create_dir_all(root.global_root()).unwrap();
+        let mut edit = global_edit(&root);
+        edit.add(PolicyList::Allow, &["#a".into()]).unwrap();
+        std::fs::remove_dir_all(root.global_root()).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), root.global_root()).unwrap();
+
+        assert!(edit.write().is_err());
+        assert!(edit.ensure_current().is_err());
+        assert!(!elsewhere.path().join("skills.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_global_policy_is_never_read_or_written_through_a_linked_file_or_folder() {
+        let home = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(home.path());
+        std::fs::create_dir_all(root.global_root()).unwrap();
+        std::fs::write(
+            elsewhere.path().join("skills.json"),
+            r##"{"allow":["#b"]}"##,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.path().join("skills.json"),
+            root.global_root().join("skills.json"),
+        )
+        .unwrap();
+        assert!(PolicyEdit::global(root.clone(), root.global_root().join("skills.json")).is_err());
+
+        std::fs::remove_dir_all(root.global_root()).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), root.global_root()).unwrap();
+        assert!(PolicyEdit::global(root.clone(), root.global_root().join("skills.json")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(elsewhere.path().join("skills.json")).unwrap(),
+            r##"{"allow":["#b"]}"##
+        );
     }
 }

@@ -329,7 +329,15 @@ pub async fn run(
     // matters. Best-effort — never fails the caller.
     crate::commands::global::run_opportunistic_sweep(&root);
 
-    emit_results(&results, json_output);
+    let skills = if results
+        .iter()
+        .any(|result| matches!(result, UpgradeResult::Upgraded(_)))
+    {
+        crate::dependency_skills::reconcile_after_global_change(Some(&install_registry)).await
+    } else {
+        crate::dependency_skills::ReconcileReport::default()
+    };
+    emit_results(&results, &skills, json_output);
 
     // `emit_results` listed each failure with its own reason, so the run
     // ends with a summary and an exit status rather than an error whose kind
@@ -1265,7 +1273,11 @@ fn result_failures(results: &[UpgradeResult]) -> impl Iterator<Item = &UpdateFai
     })
 }
 
-fn emit_results(results: &[UpgradeResult], json_output: bool) {
+fn emit_results(
+    results: &[UpgradeResult],
+    skills: &crate::dependency_skills::ReconcileReport,
+    json_output: bool,
+) {
     if json_output {
         let entries: Vec<_> = results
             .iter()
@@ -1307,7 +1319,7 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
         let any_failure = results
             .iter()
             .any(|r| matches!(r, UpgradeResult::Failed { .. }));
-        let envelope = with_bypass_next_step(
+        let mut envelope = with_bypass_next_step(
             serde_json::json!({
                 "success": !any_failure,
                 "dry_run": false,
@@ -1315,6 +1327,7 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
             }),
             result_failures(results),
         );
+        crate::commands::install::attach_dependency_skills(&mut envelope, skills);
         println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
         return;
     }
@@ -1379,6 +1392,7 @@ fn emit_results(results: &[UpgradeResult], json_output: bool) {
         }
     }
     print_firewall_bypass_hint(result_failures(results));
+    crate::dependency_skills::print_report(skills);
 }
 
 /// Manifest-only mutation: change `[packages.<pkg>].saved_spec` to

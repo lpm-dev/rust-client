@@ -25,6 +25,8 @@ const STATE_FILE: &str = "skills.lock.json";
 const PROJECT_STATE_FILE: &str = "lpm-agent-skills.json";
 const COPY_MARKER: &str = ".lpm-managed-skill.json";
 
+const KEEP_EDITED_OLD_CODEX_COPY: &str = "keep edited copy in Codex's old folder";
+
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT_STATE_WRITE: Cell<bool> = const { Cell::new(false) };
@@ -167,14 +169,52 @@ impl Store {
         agent: AgentTarget,
         directory: &Path,
     ) -> Result<(), LpmError> {
-        let root = self.target_root(agent)?;
-        let anchor = if self.scope == Scope::Project {
-            &self.project_dir
-        } else {
-            &root
+        let anchor = match self.scope {
+            Scope::Project => self.project_dir.clone(),
+            Scope::Global => match old_codex_root(agent) {
+                Some(old) if directory == old => old,
+                _ => self.target_root(agent)?,
+            },
         };
-        super::path_security::ensure_contained_directory(anchor, directory, "agent skill target")?;
+        super::path_security::ensure_contained_directory(&anchor, directory, "agent skill target")?;
         Ok(())
+    }
+
+    /// Whether `path`, a recorded target, is a global Codex entry in the
+    /// folder Codex read before `~/.agents/skills`.
+    fn is_old_codex_entry(&self, agent: AgentTarget, path: &Path) -> bool {
+        self.scope == Scope::Global
+            && old_codex_root(agent).is_some_and(|old| path.parent() == Some(old.as_path()))
+    }
+
+    /// Whether moving a record out of Codex's old folder leaves its entry
+    /// at `recorded` in place: a copy whose files differ from `canonical`,
+    /// the content it was made from, holds someone's edits.
+    fn keeps_old_codex_copy(
+        &self,
+        recorded: &Path,
+        target: &TargetRecord,
+        canonical: &Path,
+    ) -> bool {
+        target.materialization == Materialization::Copy
+            && recorded.symlink_metadata().is_ok()
+            && !copy_is_unchanged(recorded, canonical)
+    }
+
+    /// Where enabling `agent`'s recorded `target` for `name` puts it: where
+    /// LPM links it now, for a record in Codex's old folder.
+    fn enabled_target_path(
+        &self,
+        agent: AgentTarget,
+        name: &str,
+        target: &TargetRecord,
+    ) -> Result<PathBuf, LpmError> {
+        let recorded = self.resolve_target_path(&target.path);
+        if self.is_old_codex_entry(agent, &recorded) {
+            self.target_path(agent, name)
+        } else {
+            Ok(recorded)
+        }
     }
 
     fn relative_canonical_path(
@@ -228,7 +268,19 @@ pub struct InstallPlan {
 struct PendingRecord {
     expected_record: Option<ManagedSkillRecord>,
     record: ManagedSkillRecord,
+    /// Entries the record leaves behind, removed when it commits: those in
+    /// Codex's old folder.
+    retired: Vec<RetiredTarget>,
     targets: Vec<PlannedTarget>,
+}
+
+/// An agent entry an install moves away from, with what its record held.
+#[derive(Debug, Clone)]
+struct RetiredTarget {
+    agent: AgentTarget,
+    path: PathBuf,
+    record: TargetRecord,
+    canonical: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -411,8 +463,40 @@ fn plan_install_against_state(
         let mut target_records =
             existing.map_or_else(BTreeMap::new, |record| record.targets.clone());
         let target_id = managed_target_id(&descriptor, &skill.name);
-        for target in target_records.values_mut() {
+        let mut retired = Vec::new();
+        for (agent, target) in &mut target_records {
             target.id.clone_from(&target_id);
+            let recorded = store.resolve_target_path(&target.path);
+            if !store.is_old_codex_entry(*agent, &recorded) {
+                continue;
+            }
+            let moved_to = store.target_path(*agent, &skill.name)?;
+            if same_entry(&recorded, &moved_to) {
+                target.path = store.recorded_target_path(&moved_to);
+                continue;
+            }
+            if let Some(previous) = existing.and_then(|record| record.targets.get(agent)) {
+                if store.keeps_old_codex_copy(&recorded, previous, &existing_canonical) {
+                    changes.push(PlannedChange {
+                        action: KEEP_EDITED_OLD_CODEX_COPY.into(),
+                        path: recorded,
+                    });
+                } else {
+                    if recorded.symlink_metadata().is_ok() {
+                        changes.push(PlannedChange {
+                            action: "remove agent skill from Codex's old folder".into(),
+                            path: recorded.clone(),
+                        });
+                    }
+                    retired.push(RetiredTarget {
+                        agent: *agent,
+                        path: recorded,
+                        record: previous.clone(),
+                        canonical: existing_canonical.clone(),
+                    });
+                }
+            }
+            target.path = store.recorded_target_path(&store.target_path(*agent, &skill.name)?);
         }
         for (agent, materialization) in requested_targets {
             let target = store.target_path(*agent, &skill.name)?;
@@ -425,6 +509,30 @@ fn plan_install_against_state(
                     enabled: true,
                 },
             );
+        }
+
+        let mut placed: Vec<(AgentTarget, PathBuf)> = Vec::with_capacity(target_records.len());
+        let mut shared = Vec::new();
+        for (agent, target) in &target_records {
+            if !target.enabled {
+                continue;
+            }
+            let path = store.resolve_target_path(&target.path);
+            match placed.iter().find(|(_, kept)| same_entry(kept, &path)) {
+                Some((first, _)) => shared.push((*agent, *first, path)),
+                None => placed.push((*agent, path)),
+            }
+        }
+        for (agent, first, path) in shared {
+            target_records.remove(&agent);
+            changes.push(PlannedChange {
+                action: format!(
+                    "{} reads it through {}'s folder",
+                    agent_slug(agent),
+                    agent_slug(first)
+                ),
+                path,
+            });
         }
 
         let enabled_agents: Vec<_> = target_records
@@ -442,7 +550,9 @@ fn plan_install_against_state(
             if let Some(root) = &source_root {
                 ensure_source_does_not_hold(root, &target)?;
             }
-            let existing_target = existing.and_then(|record| record.targets.get(agent));
+            let existing_target = existing
+                .and_then(|record| record.targets.get(agent))
+                .filter(|record| same_entry(&store.resolve_target_path(&record.path), &target));
             if target.symlink_metadata().is_ok()
                 && existing_target
                     .is_none_or(|record| !target_is_owned(&target, record, &existing_canonical))
@@ -468,6 +578,7 @@ fn plan_install_against_state(
         }
         pending.push(PendingRecord {
             expected_record: existing.cloned(),
+            retired,
             record: ManagedSkillRecord {
                 name: skill.name.clone(),
                 description: skill.description.clone(),
@@ -550,6 +661,11 @@ struct StagedCanonical {
 struct StagedTarget {
     target: PathBuf,
     transaction: tempfile::TempDir,
+    /// The record, and its content, of the entry at `target` this stage may
+    /// replace, as the preflight found it; `None` when the target was
+    /// vacant, so any entry there at commit is someone else's.
+    owner: Option<(TargetRecord, PathBuf)>,
+    /// Whether the commit moved an entry aside, into the transaction.
     had_previous: bool,
     installed: bool,
     materialization: Materialization,
@@ -584,6 +700,16 @@ fn apply_install_batch(
             let target_record = record.targets.get(&target.agent).ok_or_else(|| {
                 LpmError::Registry("managed install plan omitted a target record".into())
             })?;
+            let owner = operation
+                .pending
+                .expected_record
+                .as_ref()
+                .and_then(|previous| {
+                    let recorded = previous.targets.get(&target.agent).filter(|recorded| {
+                        same_entry(&store.resolve_target_path(&recorded.path), &target.path)
+                    })?;
+                    Some((recorded.clone(), store.root.join(&previous.canonical_dir)))
+                });
             let stage = stage_target(
                 store,
                 target.agent,
@@ -592,6 +718,7 @@ fn apply_install_batch(
                 &target.path,
                 target.materialization,
                 &target_record.id,
+                owner,
             )?;
             if let Some(target_record) = record.targets.get_mut(&target.agent) {
                 target_record.materialization = stage.materialization;
@@ -599,6 +726,21 @@ fn apply_install_batch(
             target_stages.push(stage);
         }
         records.push(record);
+    }
+
+    let mut retired_stages = Vec::new();
+    for retired in operations
+        .iter()
+        .flat_map(|operation| &operation.pending.retired)
+    {
+        stage_removal_or_rollback(
+            &mut retired_stages,
+            store,
+            retired.agent,
+            &retired.path,
+            &retired.record,
+            &retired.canonical,
+        )?;
     }
 
     let commit_result = commit_staged_install(
@@ -610,6 +752,7 @@ fn apply_install_batch(
     );
     if let Err(error) = commit_result {
         rollback_staged_install(store, &mut canonical_stages, &mut target_stages);
+        rollback_removed_targets(&mut retired_stages);
         return Err(error);
     }
     Ok(())
@@ -619,14 +762,17 @@ fn apply_install_batch(
 /// skill. A dependency skill LPM linked there names the command that stops
 /// linking it.
 fn foreign_target_error(store: &Store, target: &Path) -> LpmError {
-    if store.scope == Scope::Project
-        && let Some((skill, package)) = crate::dependency_skills::linked_entry_owner(
-            &crate::dependency_skills::skills_root(&store.project_dir),
-            target,
-        )
+    let global = store.scope == Scope::Global;
+    if let Ok(site) = crate::dependency_skills::link_site(&store.project_dir, global)
+        && let Some((skill, package)) = crate::dependency_skills::linked_entry_owner(&site, target)
     {
+        let (owner, flag) = if global {
+            ("global package", " --global")
+        } else {
+            ("dependency", "")
+        };
         return LpmError::Registry(format!(
-            "{} is the skill `{skill}` linked from the dependency {package}; run `lpm skills unlink '#{package}:skill({skill})'` first",
+            "{} is the skill `{skill}` linked from the {owner} {package}; run `lpm skills unlink{flag} '#{package}:skill({skill})'` first",
             target.display()
         ));
     }
@@ -649,6 +795,14 @@ fn preflight_install_operations(
                 operation.skill.name
             )));
         }
+        if let Some(retired) = operation.pending.retired.iter().find(|retired| {
+            store.keeps_old_codex_copy(&retired.path, &retired.record, &retired.canonical)
+        }) {
+            return Err(LpmError::Registry(format!(
+                "{} was edited after preview; review the install plan again",
+                retired.path.display()
+            )));
+        }
         for target in &operation.pending.targets {
             if target.path.symlink_metadata().is_err() {
                 continue;
@@ -656,7 +810,14 @@ fn preflight_install_operations(
             let Some(previous_record) = previous else {
                 return Err(foreign_target_error(store, &target.path));
             };
-            let Some(previous_target) = previous_record.targets.get(&target.agent) else {
+            let Some(previous_target) =
+                previous_record
+                    .targets
+                    .get(&target.agent)
+                    .filter(|recorded| {
+                        same_entry(&store.resolve_target_path(&recorded.path), &target.path)
+                    })
+            else {
                 return Err(foreign_target_error(store, &target.path));
             };
             let previous_canonical = store.root.join(&previous_record.canonical_dir);
@@ -713,6 +874,7 @@ fn stage_canonical_skill(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stage_target(
     store: &Store,
     agent: AgentTarget,
@@ -721,6 +883,7 @@ fn stage_target(
     target: &Path,
     requested: Materialization,
     identifier: &str,
+    owner: Option<(TargetRecord, PathBuf)>,
 ) -> Result<StagedTarget, LpmError> {
     let parent = target
         .parent()
@@ -735,14 +898,15 @@ fn stage_target(
         canonical,
         materialization_source,
         &destination,
-        target,
+        (store.scope == Scope::Project).then_some(target),
         requested,
         identifier,
     )?;
     Ok(StagedTarget {
         target: target.to_path_buf(),
         transaction,
-        had_previous: target.symlink_metadata().is_ok(),
+        owner,
+        had_previous: false,
         installed: false,
         materialization,
     })
@@ -796,19 +960,7 @@ fn commit_staged_install(
         }
         stage.installed = true;
     }
-    for stage in target_stages.iter_mut() {
-        let previous = stage.transaction.path().join("previous");
-        if stage.had_previous {
-            std::fs::rename(&stage.target, &previous)?;
-        }
-        if let Err(error) = std::fs::rename(stage.transaction.path().join("next"), &stage.target) {
-            if stage.had_previous {
-                let _ = std::fs::rename(previous, &stage.target);
-            }
-            return Err(LpmError::Io(error));
-        }
-        stage.installed = true;
-    }
+    commit_target_stages(target_stages)?;
 
     for record in records {
         state.skills.insert(record.name.clone(), record);
@@ -831,16 +983,7 @@ fn rollback_staged_install(
     canonical_stages: &mut [StagedCanonical],
     target_stages: &mut [StagedTarget],
 ) {
-    for stage in target_stages.iter_mut().rev() {
-        if !stage.installed {
-            continue;
-        }
-        remove_path_if_present(&stage.target);
-        if stage.had_previous {
-            let _ = std::fs::rename(stage.transaction.path().join("previous"), &stage.target);
-        }
-        stage.installed = false;
-    }
+    rollback_target_stages(target_stages);
     for stage in canonical_stages.iter_mut().rev() {
         if stage.installed {
             let removed = store
@@ -920,21 +1063,126 @@ fn stage_removal_or_rollback(
     }
 }
 
+/// Puts each staged target in place: an entry there moves aside first,
+/// only while it is still the one its record names, and the staged one goes
+/// in only while nothing is there, so an entry another writer placed
+/// meanwhile is refused, never replaced.
 fn commit_target_stages(stages: &mut [StagedTarget]) -> Result<(), LpmError> {
     for stage in stages {
-        let previous = stage.transaction.path().join("previous");
-        if stage.had_previous {
-            std::fs::rename(&stage.target, &previous)?;
-        }
-        if let Err(error) = std::fs::rename(stage.transaction.path().join("next"), &stage.target) {
-            if stage.had_previous {
-                let _ = std::fs::rename(previous, &stage.target);
+        stage.had_previous = false;
+        if stage.target.symlink_metadata().is_ok() {
+            let owned = stage.owner.as_ref().is_some_and(|(record, canonical)| {
+                target_is_owned(&stage.target, record, canonical)
+            });
+            if !owned {
+                return Err(LpmError::Registry(format!(
+                    "{} appeared or changed while LPM was placing a managed skill there, so LPM left it alone",
+                    stage.target.display()
+                )));
             }
+            std::fs::rename(&stage.target, stage.transaction.path().join("previous"))?;
+            stage.had_previous = true;
+        }
+        if let Err(error) = publish_staged_target(stage) {
+            restore_previous(stage);
             return Err(LpmError::Io(error));
         }
         stage.installed = true;
     }
     Ok(())
+}
+
+/// Puts back the entry a stage moved aside, without replacing anything
+/// that took its name meanwhile; one that can't go back is kept beside the
+/// target under a name nothing removes.
+fn restore_previous(stage: &mut StagedTarget) {
+    if !stage.had_previous {
+        return;
+    }
+    stage.had_previous = false;
+    let (Some(parent), Some(name)) = (stage.target.parent(), stage.target.file_name()) else {
+        return;
+    };
+    let previous = stage.transaction.path().join("previous");
+    let restored =
+        cap_std::fs::Dir::open_ambient_dir(stage.transaction.path(), cap_std::ambient_authority())
+            .and_then(|transaction| {
+                let destination =
+                    cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())?;
+                crate::directory_transaction::publish_entry_noreplace(
+                    &transaction,
+                    std::ffi::OsStr::new("previous"),
+                    &destination,
+                    name,
+                )
+            });
+    if restored.is_ok() {
+        return;
+    }
+    let mut kept_name = std::ffi::OsString::from(".lpm-skill-kept-");
+    kept_name.push(name);
+    kept_name.push(format!("-{}", std::process::id()));
+    let kept = parent.join(kept_name);
+    match std::fs::rename(&previous, &kept) {
+        Ok(()) => tracing::warn!(
+            "{} was taken while LPM restored it; the earlier entry is kept at {}",
+            stage.target.display(),
+            kept.display()
+        ),
+        Err(error) => tracing::warn!(
+            "{} was taken while LPM restored it, and the earlier entry couldn't be kept: {error}",
+            stage.target.display()
+        ),
+    }
+}
+
+fn publish_staged_target(stage: &StagedTarget) -> std::io::Result<()> {
+    let (Some(parent), Some(name)) = (stage.target.parent(), stage.target.file_name()) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "agent target path has no parent directory",
+        ));
+    };
+    let transaction =
+        cap_std::fs::Dir::open_ambient_dir(stage.transaction.path(), cap_std::ambient_authority())?;
+    let destination = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())?;
+    crate::directory_transaction::publish_entry_noreplace(
+        &transaction,
+        std::ffi::OsStr::new("next"),
+        &destination,
+        name,
+    )
+    .map_err(|error| placement_error(&stage.target, error))
+}
+
+/// `error` from placing an entry at `target` without replacing one, said
+/// as what it means for the user.
+fn placement_error(target: &Path, error: std::io::Error) -> std::io::Error {
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        return std::io::Error::new(
+            error.kind(),
+            format!(
+                "{} appeared while LPM was placing a managed skill there, so LPM left it alone",
+                target.display()
+            ),
+        );
+    }
+    #[cfg(unix)]
+    let unsupported = error.raw_os_error().is_some_and(|code| {
+        [libc::EINVAL, libc::ENOSYS, libc::ENOTSUP, libc::EOPNOTSUPP].contains(&code)
+    });
+    #[cfg(not(unix))]
+    let unsupported = false;
+    if unsupported || error.kind() == std::io::ErrorKind::Unsupported {
+        return std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "the file system holding {} can't place an entry without replacing one, which LPM needs so it never overwrites another tool's skill: {error}",
+                target.display()
+            ),
+        );
+    }
+    error
 }
 
 fn rollback_target_stages(stages: &mut [StagedTarget]) {
@@ -943,9 +1191,7 @@ fn rollback_target_stages(stages: &mut [StagedTarget]) {
             continue;
         }
         remove_path_if_present(&stage.target);
-        if stage.had_previous {
-            let _ = std::fs::rename(stage.transaction.path().join("previous"), &stage.target);
-        }
+        restore_previous(stage);
         stage.installed = false;
     }
 }
@@ -967,14 +1213,23 @@ fn remove_path_if_present(path: &Path) {
     let _ = lpm_common::remove_path_entry(path);
 }
 
+/// Builds the entry for `canonical` at `destination`: a link, or a copy
+/// of `materialization_source` marked as this record's. A link placed at
+/// `relative_to` names the content relative to it, so a project keeps
+/// working when it moves; without one, as in the home folder, whose
+/// folders may be links to elsewhere, it names the content's absolute path.
 fn materialize_target_at(
     canonical: &Path,
     materialization_source: &Path,
     destination: &Path,
-    link_location: &Path,
+    relative_to: Option<&Path>,
     requested: Materialization,
     identifier: &str,
 ) -> Result<Materialization, LpmError> {
+    let link = relative_to.map_or_else(
+        || canonical.to_path_buf(),
+        |location| link_destination(canonical, location),
+    );
     let parent = destination
         .parent()
         .ok_or_else(|| LpmError::Registry("agent target path has no parent directory".into()))?;
@@ -982,17 +1237,12 @@ fn materialize_target_at(
     if requested == Materialization::Link {
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(link_destination(canonical, link_location), destination)?;
+            std::os::unix::fs::symlink(&link, destination)?;
             return Ok(Materialization::Link);
         }
         #[cfg(windows)]
         {
-            if std::os::windows::fs::symlink_dir(
-                link_destination(canonical, link_location),
-                destination,
-            )
-            .is_ok()
-            {
+            if std::os::windows::fs::symlink_dir(&link, destination).is_ok() {
                 return Ok(Materialization::Link);
             }
         }
@@ -1026,22 +1276,45 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<(), LpmError> {
     Ok(())
 }
 
-/// Whether `target` is this record's to replace or remove: what
-/// [`target_is_materialized`] accepts, or the placeholder Git leaves for its
-/// link.
+/// Whether `target` is this record's to replace or remove: a link LPM
+/// would write to the canonical content, where it leads or not, the
+/// placeholder Git leaves for such a link, or a copy that carries the
+/// record's marker.
 fn target_is_owned(target: &Path, record: &TargetRecord, canonical: &Path) -> bool {
-    target_is_materialized(target, record, canonical)
-        || (record.materialization == Materialization::Link
-            && is_link_placeholder(target, &link_destination(canonical, target)))
+    match record.materialization {
+        Materialization::Link => {
+            link_names_canonical(target, canonical)
+                || is_link_placeholder(target, &link_destination(canonical, target))
+        }
+        Materialization::Copy => copy_marker_matches(target, &record.id),
+    }
 }
 
-/// Whether `target` holds the skill as `record` says: a link to the
-/// canonical content, or a copy that carries the record's marker.
+/// Whether `target` holds the skill as `record` says: a link that names
+/// and leads to the canonical content, or a copy that carries the record's
+/// marker.
 fn target_is_materialized(target: &Path, record: &TargetRecord, canonical: &Path) -> bool {
     match record.materialization {
-        Materialization::Link => std::fs::read_link(target)
-            .is_ok_and(|path| path == canonical || path == link_destination(canonical, target)),
+        Materialization::Link => {
+            link_names_canonical(target, canonical) && link_leads_to(target, canonical)
+        }
         Materialization::Copy => copy_marker_matches(target, &record.id),
+    }
+}
+
+/// Whether the link at `target` names `canonical` as LPM writes it: by its
+/// absolute path, or relative to the folder the link sits in.
+fn link_names_canonical(target: &Path, canonical: &Path) -> bool {
+    std::fs::read_link(target)
+        .is_ok_and(|path| path == canonical || path == link_destination(canonical, target))
+}
+
+/// Whether `target` resolves to `canonical`: a relative link written through
+/// a linked folder can name the content and still lead elsewhere.
+fn link_leads_to(target: &Path, canonical: &Path) -> bool {
+    match (target.canonicalize(), canonical.canonicalize()) {
+        (Ok(resolved), Ok(canonical)) => resolved == canonical,
+        _ => false,
     }
 }
 
@@ -1057,11 +1330,52 @@ fn is_link_placeholder(target: &Path, destination: &Path) -> bool {
     )
 }
 
+/// Whether an enabled target of `record` outside `selected` is the entry at
+/// `path` under another name, so removing that entry would take it from an
+/// agent the change leaves alone.
+fn another_agent_reads(
+    store: &Store,
+    record: &ManagedSkillRecord,
+    selected: &[AgentTarget],
+    path: &Path,
+) -> bool {
+    record.targets.iter().any(|(agent, target)| {
+        !selected.contains(agent)
+            && target.enabled
+            && same_entry(&store.resolve_target_path(&target.path), path)
+    })
+}
+
+/// Whether `left` and `right` name one entry once the links the user made
+/// on the way are followed: an agent folder linked to another holds the
+/// same entries under both names.
+fn same_entry(left: &Path, right: &Path) -> bool {
+    left == right
+        || crate::project_fs::resolve_entry(left) == crate::project_fs::resolve_entry(right)
+}
+
 fn link_destination(canonical: &Path, target: &Path) -> PathBuf {
     target
         .parent()
         .and_then(|parent| pathdiff::diff_paths(canonical, parent))
         .unwrap_or_else(|| canonical.to_path_buf())
+}
+
+/// Whether the copy at `target` holds exactly the files of `canonical`
+/// besides its marker. A copy or content LPM can't read counts as changed.
+fn copy_is_unchanged(target: &Path, canonical: &Path) -> bool {
+    let digests = |directory: &Path| {
+        let mut files = BTreeMap::new();
+        source::visit_bounded_skill_directory(directory, |path, content| {
+            if path != Path::new(COPY_MARKER) {
+                files.insert(path, Sha256::digest(&content));
+            }
+            Ok(())
+        })
+        .ok()
+        .map(|()| files)
+    };
+    digests(target).is_some_and(|copy| digests(canonical).is_some_and(|content| copy == content))
 }
 
 fn copy_marker_matches(target: &Path, expected: &str) -> bool {
@@ -1082,7 +1396,7 @@ fn copy_marker_matches(target: &Path, expected: &str) -> bool {
     })
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum TargetStatus {
     Healthy,
@@ -1093,7 +1407,15 @@ enum TargetStatus {
     /// The file Git checks out for a committed link where it can't make
     /// links, which holds no skill an agent can read.
     LinkPlaceholder,
+    /// A link LPM wrote that leads nowhere near its content, as a relative
+    /// link written through a linked folder can; the next update rewrites
+    /// it.
+    BrokenLink,
     DisabledTargetPresent,
+    /// A global Codex entry in the folder Codex read before
+    /// `~/.agents/skills`, which Codex still reads; the next change to its
+    /// record moves it.
+    OldCodexFolder,
 }
 
 impl TargetStatus {
@@ -1105,7 +1427,9 @@ impl TargetStatus {
             Self::TargetMissing => "target missing",
             Self::OwnershipMismatch => "ownership mismatch",
             Self::LinkPlaceholder => "link placeholder",
+            Self::BrokenLink => "broken link",
             Self::DisabledTargetPresent => "disabled target present",
+            Self::OldCodexFolder => "old codex folder",
         }
     }
 }
@@ -1120,7 +1444,12 @@ struct TargetDiagnosis {
     status: TargetStatus,
 }
 
-fn diagnose_target(store: &Store, target: &TargetRecord, canonical: &Path) -> TargetDiagnosis {
+fn diagnose_target(
+    store: &Store,
+    agent: AgentTarget,
+    target: &TargetRecord,
+    canonical: &Path,
+) -> TargetDiagnosis {
     let path = store.resolve_target_path(&target.path);
     let canonical_exists = is_regular_directory(canonical);
     let target_exists = path.symlink_metadata().is_ok();
@@ -1129,13 +1458,18 @@ fn diagnose_target(store: &Store, target: &TargetRecord, canonical: &Path) -> Ta
     } else if target.enabled && !target_exists {
         TargetStatus::TargetMissing
     } else if target.enabled && !target_is_materialized(&path, target, canonical) {
-        if target_is_owned(&path, target, canonical) {
+        if target.materialization == Materialization::Link && link_names_canonical(&path, canonical)
+        {
+            TargetStatus::BrokenLink
+        } else if target_is_owned(&path, target, canonical) {
             TargetStatus::LinkPlaceholder
         } else {
             TargetStatus::OwnershipMismatch
         }
     } else if !target.enabled && target_exists {
         TargetStatus::DisabledTargetPresent
+    } else if target.enabled && store.is_old_codex_entry(agent, &path) {
+        TargetStatus::OldCodexFolder
     } else if target.enabled {
         TargetStatus::Healthy
     } else {
@@ -1146,7 +1480,10 @@ fn diagnose_target(store: &Store, target: &TargetRecord, canonical: &Path) -> Ta
         enabled: target.enabled,
         canonical_exists,
         target_exists,
-        healthy: matches!(status, TargetStatus::Healthy | TargetStatus::Disabled),
+        healthy: matches!(
+            status,
+            TargetStatus::Healthy | TargetStatus::Disabled | TargetStatus::OldCodexFolder
+        ),
         status,
     }
 }
@@ -1178,11 +1515,10 @@ fn inventory_scope(store: &Store) -> Result<Vec<ManagedInventory>, LpmError> {
                 .iter()
                 .filter_map(|(agent, target)| target.enabled.then_some(*agent))
                 .collect();
-            let healthy = record
-                .targets
-                .values()
-                .all(|target| diagnose_target(store, target, &canonical).healthy)
-                && is_regular_directory(&canonical);
+            let healthy =
+                record.targets.iter().all(|(agent, target)| {
+                    diagnose_target(store, *agent, target, &canonical).healthy
+                }) && is_regular_directory(&canonical);
             ManagedInventory {
                 name: record.name.clone(),
                 description: record.description.clone(),
@@ -1221,7 +1557,12 @@ pub(super) fn dashboard_inventory(project_dir: &Path, include_global: bool) -> I
     }
     result
         .skills
-        .extend(dashboard_dependency_skills(project_dir));
+        .extend(dashboard_dependency_skills(project_dir, Scope::Project));
+    if include_global {
+        result
+            .skills
+            .extend(dashboard_dependency_skills(project_dir, Scope::Global));
+    }
     let managed_targets = result
         .skills
         .iter()
@@ -1232,7 +1573,7 @@ pub(super) fn dashboard_inventory(project_dir: &Path, include_global: bool) -> I
             )
         })
         .flat_map(|skill| skill.targets.iter())
-        .map(|target| PathBuf::from(&target.path))
+        .map(|target| crate::project_fs::resolve_entry(Path::new(&target.path)))
         .collect();
     let external =
         dashboard_external_inventory_report(project_dir, include_global, &managed_targets);
@@ -1242,11 +1583,24 @@ pub(super) fn dashboard_inventory(project_dir: &Path, include_global: bool) -> I
     result
 }
 
-/// The dependency skills LPM linked for the project, as the dashboard
-/// shows them: read-only, since the project's skills policy decides them.
-fn dashboard_dependency_skills(project_dir: &Path) -> Vec<SkillInventoryItem> {
-    let root = crate::dependency_skills::skills_root(project_dir);
-    crate::dependency_skills::linked_skill_details(&root)
+/// The dependency skills LPM linked in `scope`, as the dashboard shows
+/// them: read-only, since the scope's skills policy decides them.
+fn dashboard_dependency_skills(project_dir: &Path, scope: Scope) -> Vec<SkillInventoryItem> {
+    let Ok(site) = crate::dependency_skills::link_site(project_dir, scope == Scope::Global) else {
+        return Vec::new();
+    };
+    let root = site.base();
+    let agent_folders: Vec<(AgentTarget, PathBuf)> = AgentTarget::ALL
+        .into_iter()
+        .filter_map(|agent| {
+            let folder = dependency_agent_folder(&site, agent)?;
+            Some((
+                agent,
+                crate::project_fs::resolve_links_with_missing_tail(&folder),
+            ))
+        })
+        .collect();
+    crate::dependency_skills::linked_skill_details(&site)
         .into_iter()
         .map(|linked| {
             let assessment = read_and_scan_directory(&linked.copy);
@@ -1254,12 +1608,11 @@ fn dashboard_dependency_skills(project_dir: &Path) -> Vec<SkillInventoryItem> {
             let targets = linked
                 .links
                 .iter()
-                .map(|(link, intact)| {
+                .flat_map(|(link, intact)| {
                     let folder = link.path.rsplit_once('/').map_or("", |(folder, _)| folder);
-                    let agent = AgentTarget::ALL
-                        .into_iter()
-                        .find(|agent| project_agent_folder(*agent) == folder);
-                    SkillTarget {
+                    let resolved =
+                        crate::project_fs::resolve_links_with_missing_tail(&root.join(folder));
+                    let row = |agent: Option<AgentTarget>| SkillTarget {
                         agent: agent.map_or("custom", agent_slug).into(),
                         label: agent
                             .map_or_else(|| folder.to_string(), |agent| agent.label().to_string()),
@@ -1272,18 +1625,28 @@ fn dashboard_dependency_skills(project_dir: &Path) -> Vec<SkillInventoryItem> {
                             crate::dependency_skills::LinkKind::Copy => "copy",
                         }
                         .into(),
+                    };
+                    let readers: Vec<SkillTarget> = agent_folders
+                        .iter()
+                        .filter(|(_, agent_folder)| *agent_folder == resolved)
+                        .map(|(agent, _)| row(Some(*agent)))
+                        .collect();
+                    if readers.is_empty() {
+                        vec![row(None)]
+                    } else {
+                        readers
                     }
                 })
                 .collect();
             SkillInventoryItem {
-                id: stable_id("dependency", &linked.name),
+                id: dependency_inventory_id(scope, &linked.name),
                 kind: SkillInventoryKind::Dependency,
                 description: linked
                     .checked
                     .as_ref()
                     .map(|checked| checked.description.clone()),
                 source: format!("{}@{}", linked.record.package, linked.record.version),
-                scope: Scope::Project.as_str().into(),
+                scope: scope.as_str().into(),
                 package: Some(linked.record.package.clone()),
                 version: Some(linked.record.version.clone()),
                 path: Some(linked.copy.display().to_string()),
@@ -1300,11 +1663,21 @@ fn dashboard_dependency_skills(project_dir: &Path) -> Vec<SkillInventoryItem> {
                 },
                 security: assessment.security,
                 actions: Vec::new(),
-                command: format!("lpm skills view {}", linked.name),
+                command: if scope == Scope::Global {
+                    format!("lpm skills view --global {}", linked.name)
+                } else {
+                    format!("lpm skills view {}", linked.name)
+                },
                 name: linked.name,
             }
         })
         .collect()
+}
+
+/// The dashboard's id for the dependency skill `name` linked in `scope`:
+/// a project and the global packages can each link a skill of that name.
+fn dependency_inventory_id(scope: Scope, name: &str) -> String {
+    stable_id("dependency", &format!("{}:{name}", scope.as_str()))
 }
 
 fn append_dashboard_managed_scope(result: &mut InventoryBatch, scope: Scope, project_dir: &Path) {
@@ -1340,7 +1713,7 @@ fn dashboard_managed_scope(store: &Store) -> Result<Vec<SkillInventoryItem>, Lpm
         let security = dashboard_managed_security(&assessment, &record.name);
         let mut targets = Vec::with_capacity(record.targets.len());
         for (agent, target) in &record.targets {
-            let diagnosis = diagnose_target(store, target, &canonical);
+            let diagnosis = diagnose_target(store, *agent, target, &canonical);
             targets.push(SkillTarget {
                 agent: agent_slug(*agent).into(),
                 label: agent.label().into(),
@@ -1614,13 +1987,25 @@ fn managed_target_paths(
     for store in stores_for(project_dir, include_global)? {
         for record in load_state(&store)?.skills.values() {
             for target in record.targets.values() {
-                paths.insert(store.resolve_target_path(&target.path));
+                paths.insert(crate::project_fs::resolve_entry(
+                    &store.resolve_target_path(&target.path),
+                ));
             }
         }
     }
-    paths.extend(crate::dependency_skills::linked_entry_paths(
-        &crate::dependency_skills::skills_root(project_dir),
-    ));
+    let mut linked = crate::dependency_skills::linked_entry_paths(
+        &crate::dependency_skills::link_site(project_dir, false)?,
+    );
+    if include_global {
+        linked.extend(crate::dependency_skills::linked_entry_paths(
+            &crate::dependency_skills::link_site(project_dir, true)?,
+        ));
+    }
+    paths.extend(
+        linked
+            .iter()
+            .map(|path| crate::project_fs::resolve_entry(path)),
+    );
     Ok(paths)
 }
 
@@ -1635,10 +2020,10 @@ fn scan_external_scope(
         scan_external_root(&root, agent, scope, managed_targets, &mut result)?;
     }
     if scope == Scope::Global
-        && let Some(home) = dirs::home_dir()
+        && let Some(old) = old_codex_root(AgentTarget::Codex)
     {
         scan_external_root(
-            &home.join(".agents/skills"),
+            &old,
             AgentTarget::Codex,
             scope,
             managed_targets,
@@ -1669,10 +2054,10 @@ fn scan_external_scope_best_effort(
         scan_external_root_best_effort(&root, agent, scope, managed_targets, result, report);
     }
     if scope == Scope::Global
-        && let Some(home) = dirs::home_dir()
+        && let Some(old) = old_codex_root(AgentTarget::Codex)
     {
         scan_external_root_best_effort(
-            &home.join(".agents/skills"),
+            &old,
             AgentTarget::Codex,
             scope,
             managed_targets,
@@ -1713,7 +2098,7 @@ fn scan_external_root(
         if !broken_symlink && !skill_file.is_file() {
             continue;
         }
-        if managed_targets.contains(&path) {
+        if managed_targets.contains(&crate::project_fs::resolve_entry(&path)) {
             continue;
         }
         result.push(ExternalInventory {
@@ -1772,7 +2157,7 @@ fn scan_external_root_best_effort(
         if !broken_symlink && !path.join("SKILL.md").is_file() {
             continue;
         }
-        if managed_targets.contains(&path) {
+        if managed_targets.contains(&crate::project_fs::resolve_entry(&path)) {
             continue;
         }
         result.push(ExternalInventory {
@@ -1801,7 +2186,7 @@ pub fn view(
                 .targets
                 .iter()
                 .map(|(agent, target)| {
-                    let diagnosis = diagnose_target(&store, target, &canonical);
+                    let diagnosis = diagnose_target(&store, *agent, target, &canonical);
                     serde_json::json!({
                         "agent": agent_slug(*agent),
                         "path": diagnosis.path,
@@ -1883,7 +2268,7 @@ pub fn view(
                 let mut table = super::install_ui::Table::new();
                 table.header(&["agent", "status", "path"]);
                 for (agent, target) in &record.targets {
-                    let diagnosis = diagnose_target(&store, target, &canonical);
+                    let diagnosis = diagnose_target(&store, *agent, target, &canonical);
                     table.row([
                         super::install_ui::field(agent_slug(*agent)),
                         styled_target_status(diagnosis.status),
@@ -2065,7 +2450,7 @@ pub fn doctor(project_dir: &Path, include_global: bool, json_output: bool) -> Re
                 rows.push((
                     record.name.clone(),
                     *agent,
-                    diagnose_target(&store, target, &canonical),
+                    diagnose_target(&store, *agent, target, &canonical),
                 ));
             }
         }
@@ -2074,7 +2459,12 @@ pub fn doctor(project_dir: &Path, include_global: bool, json_output: bool) -> Re
         .into_iter()
         .filter(|skill| !skill.healthy)
         .collect();
-    let dependency_issues = dependency_skill_issues(project_dir);
+    let dependency_issues = dependency_skill_issues(project_dir, false);
+    let global_dependency_issues = if include_global {
+        dependency_skill_issues(project_dir, true)
+    } else {
+        Vec::new()
+    };
     if json_output {
         let targets: Vec<_> = rows
             .iter()
@@ -2091,23 +2481,31 @@ pub fn doctor(project_dir: &Path, include_global: bool, json_output: bool) -> Re
                 })
             })
             .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "success": true,
-                "healthy": rows.iter().all(|(_, _, diagnosis)| diagnosis.healthy)
-                    && external_broken.is_empty()
-                    && dependency_issues.is_empty(),
-                "targets": targets,
-                "external_broken_links": external_broken,
-                "dependency_skills": {
-                    "healthy": dependency_issues.is_empty(),
-                    "issues": dependency_issues,
-                },
-            }))
-            .unwrap()
-        );
-    } else if rows.is_empty() && external_broken.is_empty() && dependency_issues.is_empty() {
+        let mut report = serde_json::json!({
+            "success": true,
+            "healthy": rows.iter().all(|(_, _, diagnosis)| diagnosis.healthy)
+                && external_broken.is_empty()
+                && dependency_issues.is_empty()
+                && global_dependency_issues.is_empty(),
+            "targets": targets,
+            "external_broken_links": external_broken,
+            "dependency_skills": {
+                "healthy": dependency_issues.is_empty(),
+                "issues": dependency_issues,
+            },
+        });
+        if include_global {
+            report["global_dependency_skills"] = serde_json::json!({
+                "healthy": global_dependency_issues.is_empty(),
+                "issues": global_dependency_issues,
+            });
+        }
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+    } else if rows.is_empty()
+        && external_broken.is_empty()
+        && dependency_issues.is_empty()
+        && global_dependency_issues.is_empty()
+    {
         super::install_ui::warn(
             "No managed standalone skills or broken external links to diagnose",
         );
@@ -2136,18 +2534,28 @@ pub fn doctor(project_dir: &Path, include_global: bool, json_output: bool) -> Re
             ]);
         }
         table.print_stdout();
+        for (name, _, _) in rows
+            .iter()
+            .filter(|(_, _, diagnosis)| diagnosis.status == TargetStatus::OldCodexFolder)
+        {
+            super::install_ui::warn_untrusted(&format!(
+                "Codex reads global skills from ~/.agents/skills now; `lpm skills update --global {name}` moves {name} there"
+            ));
+        }
         for issue in &dependency_issues {
             super::install_ui::warn_untrusted(&format!("dependency skill: {issue}"));
+        }
+        for issue in &global_dependency_issues {
+            super::install_ui::warn_untrusted(&format!("global dependency skill: {issue}"));
         }
     }
     Ok(())
 }
 
-/// What differs between the dependency-skill links and what the project's
-/// policy links now, as `doctor` reports it. A project without links or a
-/// policy has nothing to report.
-fn dependency_skill_issues(project_dir: &Path) -> Vec<String> {
-    let root = crate::dependency_skills::skills_root(project_dir);
+/// What differs between the dependency-skill links and what the policy
+/// links now, as `doctor` reports it: the project's, or with `global` the
+/// global packages'. Without links or a policy there is nothing to report.
+fn dependency_skill_issues(project_dir: &Path, global: bool) -> Vec<String> {
     let settings = match crate::dependency_skills::Settings::resolve(
         crate::lpm_skills_config::LpmSkillsPreference::Config,
     ) {
@@ -2155,8 +2563,15 @@ fn dependency_skill_issues(project_dir: &Path) -> Vec<String> {
         Ok(None) => return Vec::new(),
         Err(error) => return vec![error.to_string()],
     };
-    crate::dependency_skills::drift(&root, settings)
-        .unwrap_or_else(|error| vec![format!("could not be checked: {error}")])
+    let drift = if global {
+        crate::dependency_skills::global_drift(settings)
+    } else {
+        crate::dependency_skills::drift(
+            &crate::dependency_skills::skills_root(project_dir),
+            settings,
+        )
+    };
+    drift.unwrap_or_else(|error| vec![format!("could not be checked: {error}")])
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -2308,6 +2723,7 @@ pub(super) fn apply_mutation_plan(
     }
     let mut enabled_stages = Vec::new();
     let mut removed_stages = Vec::new();
+    let mut moved_from = Vec::new();
     let mut records_to_remove = Vec::new();
     for name in &names {
         let Some(record) = state.skills.get(name).cloned() else {
@@ -2335,7 +2751,10 @@ pub(super) fn apply_mutation_plan(
                     else {
                         continue;
                     };
-                    let path = store.resolve_target_path(&target.path);
+                    let recorded = store.resolve_target_path(&target.path);
+                    let path = store.enabled_target_path(agent, name, target)?;
+                    let owner =
+                        same_entry(&path, &recorded).then(|| (target.clone(), canonical.clone()));
                     enabled_stages.push(stage_target(
                         &store,
                         agent,
@@ -2344,12 +2763,18 @@ pub(super) fn apply_mutation_plan(
                         &path,
                         target.materialization,
                         &target.id,
+                        owner,
                     )?);
+                    if !same_entry(&path, &recorded)
+                        && !store.keeps_old_codex_copy(&recorded, target, &canonical)
+                    {
+                        moved_from.push((agent, recorded, target.clone(), canonical.clone()));
+                    }
                 }
             }
             Mutation::Disable => {
                 let canonical = store.root.join(&record.canonical_dir);
-                for agent in selected_agents {
+                for agent in selected_agents.iter().copied() {
                     let Some(target) = state
                         .skills
                         .get(name)
@@ -2358,6 +2783,9 @@ pub(super) fn apply_mutation_plan(
                         continue;
                     };
                     let path = store.resolve_target_path(&target.path);
+                    if another_agent_reads(&store, &record, &selected_agents, &path) {
+                        continue;
+                    }
                     stage_removal_or_rollback(
                         &mut removed_stages,
                         &store,
@@ -2370,11 +2798,14 @@ pub(super) fn apply_mutation_plan(
             }
             Mutation::Remove => {
                 let canonical = store.root.join(&record.canonical_dir);
-                for agent in selected_agents {
+                for agent in selected_agents.iter().copied() {
                     let Some(target) = record.targets.get(&agent) else {
                         continue;
                     };
                     let path = store.resolve_target_path(&target.path);
+                    if another_agent_reads(&store, &record, &selected_agents, &path) {
+                        continue;
+                    }
                     stage_removal_or_rollback(
                         &mut removed_stages,
                         &store,
@@ -2388,6 +2819,16 @@ pub(super) fn apply_mutation_plan(
         }
     }
 
+    for (agent, recorded, target, canonical) in &moved_from {
+        stage_removal_or_rollback(
+            &mut removed_stages,
+            &store,
+            *agent,
+            recorded,
+            target,
+            canonical,
+        )?;
+    }
     if let Err(error) = commit_target_stages(&mut enabled_stages) {
         rollback_target_stages(&mut enabled_stages);
         rollback_removed_targets(&mut removed_stages);
@@ -2414,8 +2855,9 @@ pub(super) fn apply_mutation_plan(
                         .get_mut(name)
                         .and_then(|record| record.targets.get_mut(&agent))
                     {
+                        let path = store.enabled_target_path(agent, name, target)?;
                         target.enabled = true;
-                        let path = store.resolve_target_path(&target.path);
+                        target.path = store.recorded_target_path(&path);
                         if let Some(materialization) = enabled_materializations.get(&path) {
                             target.materialization = *materialization;
                         }
@@ -2857,8 +3299,8 @@ fn record_is_materialized(store: &Store, record: &ManagedSkillRecord) -> bool {
     is_regular_directory(&canonical)
         && record
             .targets
-            .values()
-            .all(|target| diagnose_target(store, target, &canonical).healthy)
+            .iter()
+            .all(|(agent, target)| diagnose_target(store, *agent, target, &canonical).healthy)
 }
 
 /// Restores the content and agent targets of the managed skills a project
@@ -3263,13 +3705,33 @@ fn mutation_changes(
         };
         for agent in &selected_agents {
             if let Some(target) = record.targets.get(agent) {
+                if mutation == Mutation::Enable {
+                    let recorded = store.resolve_target_path(&target.path);
+                    if store.enabled_target_path(*agent, name, target)? != recorded
+                        && store.keeps_old_codex_copy(
+                            &recorded,
+                            target,
+                            &store.root.join(&record.canonical_dir),
+                        )
+                    {
+                        changes.push(PlannedChange {
+                            action: KEEP_EDITED_OLD_CODEX_COPY.into(),
+                            path: recorded,
+                        });
+                    }
+                }
                 changes.push(PlannedChange {
                     action: match mutation {
                         Mutation::Remove => "remove managed target".into(),
                         Mutation::Enable => "enable managed target".into(),
                         Mutation::Disable => "disable managed target".into(),
                     },
-                    path: store.resolve_target_path(&target.path),
+                    path: match mutation {
+                        Mutation::Enable => store.enabled_target_path(*agent, name, target)?,
+                        Mutation::Remove | Mutation::Disable => {
+                            store.resolve_target_path(&target.path)
+                        }
+                    },
                 });
             }
         }
@@ -3325,11 +3787,19 @@ fn preflight_mutation(
             let Some(target) = record.targets.get(&agent) else {
                 continue;
             };
-            let path = store.resolve_target_path(&target.path);
-            if path.symlink_metadata().is_ok() && !target_is_owned(&path, target, &canonical) {
+            let recorded = store.resolve_target_path(&target.path);
+            if matches!(mutation, Mutation::Enable) {
+                let destination = store.enabled_target_path(agent, name, target)?;
+                if !same_entry(&destination, &recorded) && destination.symlink_metadata().is_ok() {
+                    return Err(foreign_target_error(store, &destination));
+                }
+            }
+            if recorded.symlink_metadata().is_ok()
+                && !target_is_owned(&recorded, target, &canonical)
+            {
                 return Err(LpmError::Registry(format!(
                     "refusing to modify target that is no longer LPM-managed: {}",
-                    path.display()
+                    recorded.display()
                 )));
             }
         }
@@ -3492,7 +3962,10 @@ fn validate_managed_state(store: &Store, state: &ManagedState) -> Result<(), Lpm
         let expected_id = managed_target_id(&record.source, &record.name);
         for (agent, target) in &record.targets {
             let expected_path = store.target_path(*agent, &record.name)?;
-            if store.resolve_target_path(&target.path) != expected_path {
+            let recorded = store.resolve_target_path(&target.path);
+            let in_old_codex_folder = store.is_old_codex_entry(*agent, &recorded)
+                && recorded.file_name() == expected_path.file_name();
+            if recorded != expected_path && !in_old_codex_folder {
                 return Err(LpmError::Registry(format!(
                     "managed skill `{}` has an invalid {} target path",
                     record.name,
@@ -3646,7 +4119,7 @@ pub(super) fn portable_path(path: &Path) -> String {
 }
 
 /// The project-relative folder `agent` reads skills from.
-pub(super) fn project_agent_folder(agent: AgentTarget) -> &'static str {
+fn project_agent_folder(agent: AgentTarget) -> &'static str {
     match agent {
         AgentTarget::Codex => ".agents/skills",
         AgentTarget::ClaudeCode => ".claude/skills",
@@ -3655,6 +4128,19 @@ pub(super) fn project_agent_folder(agent: AgentTarget) -> &'static str {
         AgentTarget::OpenCode => ".opencode/skills",
         AgentTarget::Pi => ".pi/skills",
         AgentTarget::Kimi => ".kimi/skills",
+    }
+}
+
+/// The folder `agent` reads skills from for links in `site`: the project's
+/// own folder, or the home folder's for the global packages' links.
+pub(super) fn dependency_agent_folder(
+    site: &crate::dependency_skills::Site,
+    agent: AgentTarget,
+) -> Option<PathBuf> {
+    if site.is_global() {
+        global_agent_root(agent).ok()
+    } else {
+        Some(site.base().join(project_agent_folder(agent)))
     }
 }
 
@@ -3668,12 +4154,31 @@ fn configured_home(variable: &str, fallback: PathBuf) -> PathBuf {
         .map_or(fallback, PathBuf::from)
 }
 
-fn global_agent_root(agent: AgentTarget) -> Result<PathBuf, LpmError> {
-    let home = dirs::home_dir().ok_or_else(|| {
+fn home_dir() -> Result<PathBuf, LpmError> {
+    dirs::home_dir().ok_or_else(|| {
         LpmError::Registry("could not determine home directory for global agent skills".into())
-    })?;
+    })
+}
+
+/// The folder Codex read global skills from before `~/.agents/skills`,
+/// for `agent` when it is Codex and the folder differs. Records LPM wrote
+/// there stay valid; the next change to one moves its entry.
+fn old_codex_root(agent: AgentTarget) -> Option<PathBuf> {
+    if agent != AgentTarget::Codex {
+        return None;
+    }
+    let old = legacy_codex_root().ok()?;
+    (global_agent_root(agent).ok().as_ref() != Some(&old)).then_some(old)
+}
+
+fn legacy_codex_root() -> Result<PathBuf, LpmError> {
+    Ok(configured_home("CODEX_HOME", home_dir()?.join(".codex")).join("skills"))
+}
+
+fn global_agent_root(agent: AgentTarget) -> Result<PathBuf, LpmError> {
+    let home = home_dir()?;
     Ok(match agent {
-        AgentTarget::Codex => configured_home("CODEX_HOME", home.join(".codex")).join("skills"),
+        AgentTarget::Codex => home.join(".agents/skills"),
         AgentTarget::ClaudeCode => home.join(".claude/skills"),
         AgentTarget::Cursor => home.join(".cursor/skills"),
         AgentTarget::Grok => configured_home("GROK_HOME", home.join(".grok")).join("skills"),
@@ -3780,7 +4285,9 @@ fn styled_target_status(status: TargetStatus) -> super::install_ui::TerminalFrag
         | TargetStatus::TargetMissing
         | TargetStatus::OwnershipMismatch
         | TargetStatus::LinkPlaceholder
+        | TargetStatus::BrokenLink
         | TargetStatus::DisabledTargetPresent => super::install_ui::red(label),
+        TargetStatus::OldCodexFolder => super::install_ui::yellow(label),
     }
 }
 
@@ -3891,6 +4398,703 @@ mod tests {
     fn write_state_unchecked(store: &Store, state: &ManagedState) {
         std::fs::create_dir_all(&store.root).unwrap();
         std::fs::write(store.state_path(), serde_json::to_vec(state).unwrap()).unwrap();
+    }
+
+    // `dirs::home_dir` ignores `HOME` on Windows, so tests of the home
+    // folder's agent folders run where it can be redirected.
+    #[cfg(unix)]
+    fn global_home() -> (tempfile::TempDir, crate::test_env::ScopedEnv, Store) {
+        let home = tempfile::tempdir().unwrap();
+        let env = crate::test_env::ScopedEnv::update([
+            ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
+            ("CODEX_HOME", None),
+        ]);
+        let store = Store::for_scope(Scope::Global, home.path()).unwrap();
+        (home, env, store)
+    }
+
+    /// Moves `name`'s global Codex entry and record to the folder Codex
+    /// read before `~/.agents/skills`, as an earlier LPM left them.
+    #[cfg(unix)]
+    fn move_to_old_codex_folder(store: &Store, name: &str) -> PathBuf {
+        let current = store.target_path(AgentTarget::Codex, name).unwrap();
+        let old = legacy_codex_root().unwrap().join(name);
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::rename(&current, &old).unwrap();
+        let mut state = load_state(store).unwrap();
+        state
+            .skills
+            .get_mut(name)
+            .unwrap()
+            .targets
+            .get_mut(&AgentTarget::Codex)
+            .unwrap()
+            .path = store.recorded_target_path(&old);
+        write_state_unchecked(store, &state);
+        old
+    }
+
+    #[cfg(unix)]
+    fn codex_target_path(store: &Store, name: &str) -> PathBuf {
+        let state = load_state(store).unwrap();
+        store.resolve_target_path(&state.skills[name].targets[&AgentTarget::Codex].path)
+    }
+
+    #[cfg(unix)]
+    fn manage(name: &str) -> ManageArgs {
+        ManageArgs {
+            selectors: vec![name.to_string()],
+            global: true,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_global_link_through_a_users_dotfiles_folder_resolves_and_a_dangling_one_is_broken() {
+        let (home, _env, store) = global_home();
+        let dotfiles = home.path().join("repos/dotfiles/claude");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        std::os::unix::fs::symlink(&dotfiles, home.path().join(".claude")).unwrap();
+
+        install_skill(
+            &store,
+            &source_tree(),
+            &discovered_skill(),
+            &[AgentTarget::ClaudeCode],
+            false,
+        )
+        .unwrap();
+
+        let target = home.path().join(".claude/skills/release-notes");
+        assert!(target.join("SKILL.md").is_file());
+        let state = load_state(&store).unwrap();
+        let record = &state.skills["release-notes"];
+        let canonical = store.root.join(&record.canonical_dir);
+        assert_eq!(std::fs::read_link(&target).unwrap(), canonical);
+        let claude = &record.targets[&AgentTarget::ClaudeCode];
+        assert!(diagnose_target(&store, AgentTarget::ClaudeCode, claude, &canonical).healthy);
+
+        std::fs::remove_file(&target).unwrap();
+        std::os::unix::fs::symlink(link_destination(&canonical, &target), &target).unwrap();
+        let diagnosis = diagnose_target(&store, AgentTarget::ClaudeCode, claude, &canonical);
+        assert_eq!(diagnosis.status, TargetStatus::BrokenLink);
+        assert!(!diagnosis.healthy);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adding_for_two_agents_whose_home_folders_are_one_places_one_entry() {
+        let (home, _env, store) = global_home();
+        std::fs::create_dir_all(home.path().join(".agents/skills")).unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::os::unix::fs::symlink(
+            home.path().join(".agents/skills"),
+            home.path().join(".claude/skills"),
+        )
+        .unwrap();
+        let tree = source_tree();
+        let skill = discovered_skill();
+
+        let plan = plan_install(
+            &store,
+            &tree,
+            &[&skill],
+            &[AgentTarget::Codex, AgentTarget::ClaudeCode],
+            false,
+        )
+        .unwrap();
+        assert!(
+            plan.changes.iter().any(|change| change.action
+                == "claude-code reads it through codex's folder"
+                && change.path == home.path().join(".claude/skills/release-notes")),
+            "{:?}",
+            plan.changes
+        );
+        apply_install(&store, &tree, &[&skill], plan).unwrap();
+
+        assert!(
+            home.path()
+                .join(".claude/skills/release-notes/SKILL.md")
+                .is_file()
+        );
+        let state = load_state(&store).unwrap();
+        assert_eq!(
+            state.skills["release-notes"]
+                .targets
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [AgentTarget::Codex]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_codex_record_whose_old_folder_is_the_new_one_moves_without_touching_the_entry() {
+        let (home, _env, store) = global_home();
+        let tree = source_tree();
+        install_skill(
+            &store,
+            &tree,
+            &discovered_skill(),
+            &[AgentTarget::Codex],
+            true,
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        std::os::unix::fs::symlink(
+            home.path().join(".agents/skills"),
+            home.path().join(".codex/skills"),
+        )
+        .unwrap();
+        let old = home.path().join(".codex/skills/release-notes");
+        let mut state = load_state(&store).unwrap();
+        state
+            .skills
+            .get_mut("release-notes")
+            .unwrap()
+            .targets
+            .get_mut(&AgentTarget::Codex)
+            .unwrap()
+            .path = store.recorded_target_path(&old);
+        write_state_unchecked(&store, &state);
+
+        let plan = plan_update_with_loader(home.path(), manage("release-notes"), |_| {
+            std::future::ready(Ok(tree.clone()))
+        })
+        .await
+        .unwrap();
+        apply_update_plan(plan).unwrap();
+
+        let new = home.path().join(".agents/skills/release-notes");
+        assert!(new.join("SKILL.md").is_file());
+        assert_eq!(codex_target_path(&store, "release-notes"), new);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_one_agent_never_deletes_an_entry_another_agent_reads_under_another_name() {
+        let (home, _env, store) = global_home();
+        install_skill(
+            &store,
+            &source_tree(),
+            &discovered_skill(),
+            &[AgentTarget::Codex],
+            false,
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::os::unix::fs::symlink(
+            home.path().join(".agents/skills"),
+            home.path().join(".claude/skills"),
+        )
+        .unwrap();
+        let mut state = load_state(&store).unwrap();
+        let record = state.skills.get_mut("release-notes").unwrap();
+        let mut claude = record.targets[&AgentTarget::Codex].clone();
+        claude.path = store.recorded_target_path(&home.path().join(".claude/skills/release-notes"));
+        record.targets.insert(AgentTarget::ClaudeCode, claude);
+        write_state_unchecked(&store, &state);
+
+        let plan = plan_mutation(
+            home.path(),
+            ManageArgs {
+                agent: vec![AgentTarget::ClaudeCode],
+                ..manage("release-notes")
+            },
+            Mutation::Remove,
+        )
+        .unwrap();
+        apply_mutation_plan(plan).unwrap();
+
+        assert!(
+            home.path()
+                .join(".agents/skills/release-notes/SKILL.md")
+                .is_file()
+        );
+        assert_eq!(
+            load_state(&store).unwrap().skills["release-notes"]
+                .targets
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [AgentTarget::Codex]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_global_codex_skill_links_into_the_home_agents_skills_folder() {
+        let (home, _env, store) = global_home();
+
+        install_skill(
+            &store,
+            &source_tree(),
+            &discovered_skill(),
+            &[AgentTarget::Codex],
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            home.path()
+                .join(".agents/skills/release-notes/SKILL.md")
+                .is_file()
+        );
+        assert!(!home.path().join(".codex").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_codex_record_in_the_old_folder_stays_valid_until_update_moves_it() {
+        let (home, _env, store) = global_home();
+        let tree = source_tree();
+        install_skill(
+            &store,
+            &tree,
+            &discovered_skill(),
+            &[AgentTarget::Codex],
+            true,
+        )
+        .unwrap();
+        let old = move_to_old_codex_folder(&store, "release-notes");
+
+        let state = load_state(&store).unwrap();
+        let record = &state.skills["release-notes"];
+        let diagnosis = diagnose_target(
+            &store,
+            AgentTarget::Codex,
+            &record.targets[&AgentTarget::Codex],
+            &store.root.join(&record.canonical_dir),
+        );
+        assert_eq!(diagnosis.status, TargetStatus::OldCodexFolder);
+        assert!(
+            diagnosis.healthy,
+            "Codex still reads its old folder, so the entry works until it moves"
+        );
+
+        let plan = plan_update_with_loader(home.path(), manage("release-notes"), |_| {
+            std::future::ready(Ok(tree.clone()))
+        })
+        .await
+        .unwrap();
+        assert!(plan.changes.iter().any(|change| change.path == old));
+        apply_update_plan(plan).unwrap();
+
+        let new = home.path().join(".agents/skills/release-notes");
+        assert!(new.join("SKILL.md").is_file());
+        assert!(old.symlink_metadata().is_err());
+        assert_eq!(codex_target_path(&store, "release-notes"), new);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn moving_a_codex_record_refuses_another_skill_in_home_agents_skills_and_keeps_the_old_entry()
+     {
+        let (home, _env, store) = global_home();
+        let tree = source_tree();
+        install_skill(
+            &store,
+            &tree,
+            &discovered_skill(),
+            &[AgentTarget::Codex],
+            true,
+        )
+        .unwrap();
+        let old = move_to_old_codex_folder(&store, "release-notes");
+        let foreign = home.path().join(".agents/skills/release-notes");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("SKILL.md"), "the user's own skill").unwrap();
+
+        let result = plan_update_with_loader(home.path(), manage("release-notes"), |_| {
+            std::future::ready(Ok(tree.clone()))
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert!(old.join("SKILL.md").is_file());
+        assert_eq!(
+            std::fs::read_to_string(foreign.join("SKILL.md")).unwrap(),
+            "the user's own skill"
+        );
+        assert_eq!(codex_target_path(&store, "release-notes"), old);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_a_codex_record_in_the_old_folder_removes_its_entry_there() {
+        let (home, _env, store) = global_home();
+        install_skill(
+            &store,
+            &source_tree(),
+            &discovered_skill(),
+            &[AgentTarget::Codex],
+            true,
+        )
+        .unwrap();
+        let old = move_to_old_codex_folder(&store, "release-notes");
+
+        let plan = plan_mutation(home.path(), manage("release-notes"), Mutation::Remove).unwrap();
+        apply_mutation_plan(plan).unwrap();
+
+        assert!(old.symlink_metadata().is_err());
+        assert!(load_state(&store).unwrap().skills.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enabling_a_codex_target_disabled_in_the_old_folder_links_it_in_home_agents_skills() {
+        let (home, _env, store) = global_home();
+        install_skill(
+            &store,
+            &source_tree(),
+            &discovered_skill(),
+            &[AgentTarget::Codex],
+            true,
+        )
+        .unwrap();
+        let old = move_to_old_codex_folder(&store, "release-notes");
+        let plan = plan_mutation(home.path(), manage("release-notes"), Mutation::Disable).unwrap();
+        apply_mutation_plan(plan).unwrap();
+        assert!(old.symlink_metadata().is_err());
+
+        let plan = plan_mutation(home.path(), manage("release-notes"), Mutation::Enable).unwrap();
+        apply_mutation_plan(plan).unwrap();
+
+        let new = home.path().join(".agents/skills/release-notes");
+        assert!(new.join("SKILL.md").is_file());
+        assert!(old.symlink_metadata().is_err());
+        assert_eq!(codex_target_path(&store, "release-notes"), new);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_codex_enable_that_fails_to_place_the_new_entry_keeps_the_one_in_the_old_folder() {
+        let (home, _env, store) = global_home();
+        install_skill(
+            &store,
+            &source_tree(),
+            &discovered_skill(),
+            &[AgentTarget::Codex],
+            true,
+        )
+        .unwrap();
+        let old = move_to_old_codex_folder(&store, "release-notes");
+        std::fs::remove_dir_all(home.path().join(".agents/skills")).unwrap();
+        std::fs::write(home.path().join(".agents/skills"), "not a folder").unwrap();
+
+        let result = plan_mutation(home.path(), manage("release-notes"), Mutation::Enable)
+            .and_then(apply_mutation_plan);
+
+        assert!(result.is_err());
+        assert!(old.join("SKILL.md").is_file());
+        assert_eq!(codex_target_path(&store, "release-notes"), old);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn moving_a_codex_record_refuses_a_copy_at_the_new_path_that_carries_the_old_marker() {
+        let (home, _env, store) = global_home();
+        let tree = source_tree();
+        install_skill(
+            &store,
+            &tree,
+            &discovered_skill(),
+            &[AgentTarget::Codex],
+            true,
+        )
+        .unwrap();
+        let old = move_to_old_codex_folder(&store, "release-notes");
+        let new = home.path().join(".agents/skills/release-notes");
+        copy_directory(&old, &new).unwrap();
+        std::fs::write(new.join("SKILL.md"), "the user's edited copy").unwrap();
+
+        let update = plan_update_with_loader(home.path(), manage("release-notes"), |_| {
+            std::future::ready(Ok(tree.clone()))
+        })
+        .await;
+        let enable = plan_mutation(home.path(), manage("release-notes"), Mutation::Enable)
+            .and_then(apply_mutation_plan);
+
+        assert!(update.is_err());
+        assert!(enable.is_err());
+        assert_eq!(
+            std::fs::read_to_string(new.join("SKILL.md")).unwrap(),
+            "the user's edited copy"
+        );
+        assert!(old.join("SKILL.md").is_file());
+        assert_eq!(codex_target_path(&store, "release-notes"), old);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn moving_a_codex_record_keeps_an_edited_copy_in_the_old_folder_and_says_so() {
+        let (home, _env, store) = global_home();
+        let tree = source_tree();
+        install_skill(
+            &store,
+            &tree,
+            &discovered_skill(),
+            &[AgentTarget::Codex],
+            true,
+        )
+        .unwrap();
+        let old = move_to_old_codex_folder(&store, "release-notes");
+        std::fs::write(old.join("NOTES.md"), "the user's own notes").unwrap();
+
+        let plan = plan_update_with_loader(home.path(), manage("release-notes"), |_| {
+            std::future::ready(Ok(tree.clone()))
+        })
+        .await
+        .unwrap();
+        assert!(
+            plan.changes.iter().any(|change| change.path == old
+                && change.action == "keep edited copy in Codex's old folder"),
+            "{:?}",
+            plan.changes
+        );
+        apply_update_plan(plan).unwrap();
+
+        let new = home.path().join(".agents/skills/release-notes");
+        assert!(new.join("SKILL.md").is_file());
+        assert!(!new.join("NOTES.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(old.join("NOTES.md")).unwrap(),
+            "the user's own notes"
+        );
+        assert_eq!(codex_target_path(&store, "release-notes"), new);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_old_codex_copy_edited_after_the_preview_is_never_deleted_by_the_update() {
+        let (home, _env, store) = global_home();
+        let tree = source_tree();
+        install_skill(
+            &store,
+            &tree,
+            &discovered_skill(),
+            &[AgentTarget::Codex],
+            true,
+        )
+        .unwrap();
+        let old = move_to_old_codex_folder(&store, "release-notes");
+        let plan = plan_update_with_loader(home.path(), manage("release-notes"), |_| {
+            std::future::ready(Ok(tree.clone()))
+        })
+        .await
+        .unwrap();
+        std::fs::write(old.join("NOTES.md"), "written while the prompt was open").unwrap();
+
+        let result = apply_update_plan(plan);
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(old.join("NOTES.md")).unwrap(),
+            "written while the prompt was open"
+        );
+        assert_eq!(codex_target_path(&store, "release-notes"), old);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enabling_a_codex_record_keeps_an_edited_copy_in_the_old_folder() {
+        let (home, _env, store) = global_home();
+        install_skill(
+            &store,
+            &source_tree(),
+            &discovered_skill(),
+            &[AgentTarget::Codex],
+            true,
+        )
+        .unwrap();
+        let old = move_to_old_codex_folder(&store, "release-notes");
+        std::fs::write(old.join("SKILL.md"), "edited by the user").unwrap();
+
+        let plan = plan_mutation(home.path(), manage("release-notes"), Mutation::Enable).unwrap();
+        assert!(
+            plan.changes.iter().any(|change| change.path == old
+                && change.action == "keep edited copy in Codex's old folder"),
+            "{:?}",
+            plan.changes
+        );
+        apply_mutation_plan(plan).unwrap();
+
+        let new = home.path().join(".agents/skills/release-notes");
+        assert!(new.join("SKILL.md").is_file());
+        assert_eq!(
+            std::fs::read_to_string(old.join("SKILL.md")).unwrap(),
+            "edited by the user"
+        );
+        assert_eq!(codex_target_path(&store, "release-notes"), new);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_system_without_no_replace_renames_is_named_as_the_cause() {
+        let error = placement_error(
+            Path::new("/home/me/.claude/skills/notes"),
+            std::io::Error::from_raw_os_error(libc::EINVAL),
+        );
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(
+            error
+                .to_string()
+                .contains("can't place an entry without replacing one"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn committing_a_managed_target_never_replaces_an_entry_that_appeared_after_staging() {
+        let project = tempfile::tempdir().unwrap();
+        let store = Store::for_scope(Scope::Project, project.path()).unwrap();
+        let canonical = project.path().join("canonical/release-notes");
+        std::fs::create_dir_all(&canonical).unwrap();
+        std::fs::write(canonical.join("SKILL.md"), "managed").unwrap();
+        let target = project.path().join(".claude/skills/release-notes");
+        for materialization in [Materialization::Link, Materialization::Copy] {
+            let stage = stage_target(
+                &store,
+                AgentTarget::ClaudeCode,
+                &canonical,
+                &canonical,
+                &target,
+                materialization,
+                "managed-id",
+                None,
+            )
+            .unwrap();
+            assert!(!stage.had_previous);
+            let elsewhere = project.path().join("elsewhere");
+            std::os::unix::fs::symlink(&elsewhere, &target).unwrap();
+
+            let result = commit_target_stages(&mut [stage]);
+
+            assert!(result.is_err(), "{materialization:?}");
+            assert_eq!(std::fs::read_link(&target).unwrap(), elsewhere);
+            std::fs::remove_file(&target).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_dependency_skill_linked_in_a_project_and_globally_has_one_dashboard_id_per_scope() {
+        assert_ne!(
+            dependency_inventory_id(Scope::Project, "browser-tool"),
+            dependency_inventory_id(Scope::Global, "browser-tool")
+        );
+        assert_eq!(
+            dependency_inventory_id(Scope::Global, "browser-tool"),
+            dependency_inventory_id(Scope::Global, "browser-tool")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_commit_never_moves_aside_an_entry_preflight_didnt_find_or_one_that_changed_since() {
+        let project = tempfile::tempdir().unwrap();
+        let store = Store::for_scope(Scope::Project, project.path()).unwrap();
+        let canonical = project.path().join("canonical/release-notes");
+        std::fs::create_dir_all(&canonical).unwrap();
+        std::fs::write(canonical.join("SKILL.md"), "managed").unwrap();
+        let target = project.path().join(".claude/skills/release-notes");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let elsewhere = project.path().join("elsewhere");
+        let record = TargetRecord {
+            id: "managed-id".into(),
+            path: ".claude/skills/release-notes".into(),
+            materialization: Materialization::Link,
+            enabled: true,
+        };
+        for owner in [None, Some((record, canonical.clone()))] {
+            std::os::unix::fs::symlink(&elsewhere, &target).unwrap();
+            let stage = stage_target(
+                &store,
+                AgentTarget::ClaudeCode,
+                &canonical,
+                &canonical,
+                &target,
+                Materialization::Link,
+                "managed-id",
+                owner.clone(),
+            )
+            .unwrap();
+
+            let result = commit_target_stages(&mut [stage]);
+
+            assert!(result.is_err(), "{owner:?}");
+            assert_eq!(std::fs::read_link(&target).unwrap(), elsewhere);
+            std::fs::remove_file(&target).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restoring_an_entry_moved_aside_never_replaces_one_that_took_its_name() {
+        let project = tempfile::tempdir().unwrap();
+        let target = project.path().join(".claude/skills/release-notes");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let transaction = tempfile::Builder::new()
+            .prefix(".lpm-skill-transaction-")
+            .tempdir_in(target.parent().unwrap())
+            .unwrap();
+        std::fs::create_dir(transaction.path().join("previous")).unwrap();
+        std::fs::write(transaction.path().join("previous/SKILL.md"), "earlier").unwrap();
+        let elsewhere = project.path().join("elsewhere");
+        std::os::unix::fs::symlink(&elsewhere, &target).unwrap();
+        let mut stage = StagedTarget {
+            target: target.clone(),
+            transaction,
+            owner: None,
+            had_previous: true,
+            installed: false,
+            materialization: Materialization::Copy,
+        };
+
+        restore_previous(&mut stage);
+        drop(stage);
+
+        assert_eq!(std::fs::read_link(&target).unwrap(), elsewhere);
+        let kept: Vec<_> = std::fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| {
+                let name = entry.unwrap().file_name().into_string().unwrap();
+                name.starts_with(".lpm-skill-kept-release-notes")
+                    .then_some(name)
+            })
+            .collect();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(
+            std::fs::read_to_string(target.parent().unwrap().join(&kept[0]).join("SKILL.md"))
+                .unwrap(),
+            "earlier"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_global_external_inventory_lists_each_skill_in_either_codex_folder_once() {
+        let (home, _env, _store) = global_home();
+        let project = tempfile::tempdir().unwrap();
+        for (folder, name) in [(".agents/skills", "current"), (".codex/skills", "older")] {
+            let directory = home.path().join(folder).join(name);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: A skill the user keeps for Codex\n---\nUse it.\n"),
+            )
+            .unwrap();
+        }
+
+        let external = external_inventory(project.path(), true).unwrap();
+
+        let mut names: Vec<_> = external.iter().map(|skill| skill.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["current", "older"]);
     }
 
     #[tokio::test]
@@ -5022,6 +6226,7 @@ mod tests {
         let record = &state.skills["release-notes"];
         let diagnosis = diagnose_target(
             &store,
+            AgentTarget::Codex,
             &record.targets[&AgentTarget::Codex],
             &store.root.join(&record.canonical_dir),
         );

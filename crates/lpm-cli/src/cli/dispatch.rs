@@ -814,7 +814,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                     &alias,
                 )
                 .map_err(lpm_common::LpmError::Script)?;
-                let _ = (no_skills, no_security_summary, catalog);
+                let _ = (no_security_summary, catalog);
 
                 let mut overrides = build_install_global_overrides_with_excludes(
                     allow_new,
@@ -844,6 +844,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 overrides.advisor_override = advisor;
                 overrides.strict_sandbox = strict_sandbox || paranoid;
                 overrides.no_sandbox = no_sandbox;
+                overrides.no_skills = no_skills;
 
                 return commands::install_global::run(
                     &client,

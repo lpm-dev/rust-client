@@ -15,11 +15,13 @@ mod checks;
 mod discovery;
 mod edit;
 mod git_exclude;
+mod global;
 mod inspect;
 mod links;
 mod lpm_dev;
 mod plan;
 mod policy;
+mod scope;
 mod snapshot;
 mod socket;
 mod state;
@@ -29,18 +31,16 @@ mod tests;
 pub(crate) use apply::{ReconcileReport, SkillChange};
 pub(crate) use checks::credentials_changed as socket_credentials_changed;
 pub(crate) use discovery::{read_skill_directory, skill_directory_names};
-pub(crate) use edit::{ManifestEdit, PolicyList};
-pub(crate) use inspect::{
-    InspectedSkill, Inspection, Inspector, PlannedChange, SkillStatus, drift, inspect_project,
-};
+pub(crate) use edit::PolicyList;
+pub(crate) use inspect::{InspectedSkill, Inspection, PlannedChange, SkillStatus, drift};
 pub(crate) use lpm_dev::review_warning_note;
-pub(crate) use plan::read_manifest;
 #[cfg(test)]
 pub(crate) use plan::{HoldReason, Naming};
 pub(crate) use plan::{InstanceRuling, SkillDetails, may_match_any};
 pub(crate) use policy::validate_selector;
+pub(crate) use scope::Scope;
 pub(crate) use socket::login_organization as socket_organization;
-pub(crate) use state::{LinkKind, LinkedSkillRecord};
+pub(crate) use state::{LinkKind, LinkedSkillRecord, Site};
 
 use crate::lpm_skills_config::LpmSkillsPreference;
 use cap_fs_ext::DirExt as _;
@@ -178,35 +178,33 @@ fn readiness(
     let problems =
         (settings.lpm_dev_packages || settings.other_packages) && !parsed.problems.is_empty();
     let policy = parsed.policy;
-    let ready = match state::read_state(project_dir) {
+    let ready = match state::read_state(&state::Site::project(project_dir)) {
         state::StoredState::Newer(reason) => return Readiness::RecordedByNewer(reason),
         state::StoredState::Missing => {
             !problems && !could_link(policy.as_ref(), settings, importers)
         }
         state::StoredState::Unusable(_) => false,
         state::StoredState::Present(recorded) => {
+            let site = state::Site::project(project_dir);
             let importers = recorded_importers(project_dir, &recorded);
-            let lockfile = lockfile_stamp(project_dir, recorded.lockfile.as_ref());
-            let ready = !problems
-                && recorded.fingerprint
-                    == fingerprint(
-                        project_dir,
+            let lockfile = file_stamp(
+                &project_dir.join(lpm_lockfile::LOCKFILE_NAME),
+                recorded.lockfile.as_ref(),
+            );
+            !problems
+                && recorded_links_ready(
+                    &site,
+                    &recorded,
+                    fingerprint(
+                        &site,
                         policy.as_ref(),
                         settings,
                         lockfile.as_ref(),
                         &importers,
-                    )
-                && recorded.stale.is_empty()
-                && !recheck_due(&recorded, settings)
-                && links_intact(project_dir, &recorded);
-            if ready
-                && let Some(stamp) = lockfile
-                && recorded.lockfile.as_ref() != Some(&stamp)
-                && stamp_is_settled(&stamp)
-            {
-                keep_settled_stamp(project_dir, stamp);
-            }
-            ready
+                    ),
+                    lockfile,
+                    settings,
+                )
         }
     };
     if ready {
@@ -214,6 +212,30 @@ fn readiness(
     } else {
         Readiness::Stale
     }
+}
+
+/// Whether the links `recorded` at `site` already match `fingerprint` and
+/// are intact. A matching lockfile stamp taken too soon to trust is
+/// replaced once it can be.
+fn recorded_links_ready(
+    site: &state::Site,
+    recorded: &state::LinkState,
+    fingerprint: String,
+    lockfile: Option<state::FileStamp>,
+    settings: Settings,
+) -> bool {
+    let ready = recorded.fingerprint == fingerprint
+        && recorded.stale.is_empty()
+        && !recheck_due(recorded, settings)
+        && links_intact(site, recorded);
+    if ready
+        && let Some(stamp) = lockfile
+        && recorded.lockfile.as_ref() != Some(&stamp)
+        && stamp_is_settled(&stamp)
+    {
+        keep_settled_stamp(site, stamp);
+    }
+    ready
 }
 
 /// Whether the links are due to be reconciled for the security verdicts
@@ -289,7 +311,7 @@ pub(crate) fn links_ready_for_manifest_text(
     importers: &[PathBuf],
 ) -> bool {
     if !may_name_skills(manifest)
-        && !state::state_exists(project_dir)
+        && !state::state_exists(&state::Site::project(project_dir))
         && !(settings.lpm_dev_packages
             && importers
                 .iter()
@@ -310,7 +332,7 @@ pub(crate) fn links_ready_for_manifest_text(
 /// Whether every recorded skill's copy still holds the bytes LPM checked,
 /// each of its entries is still LPM's, and each target entry that was
 /// taken is still taken.
-fn links_intact(project_dir: &Path, recorded: &state::LinkState) -> bool {
+fn links_intact(site: &state::Site, recorded: &state::LinkState) -> bool {
     let mut directories: std::collections::BTreeMap<&str, Option<links::TargetDir>> =
         std::collections::BTreeMap::new();
     for record in recorded.skills.values() {
@@ -318,52 +340,73 @@ fn links_intact(project_dir: &Path, recorded: &state::LinkState) -> bool {
             if let Some((target, _)) = link.path.rsplit_once('/') {
                 directories
                     .entry(target)
-                    .or_insert_with(|| links::TargetDir::open(project_dir, target).ok().flatten());
+                    .or_insert_with(|| links::TargetDir::open(site, target).ok().flatten());
             }
         }
     }
     recorded.skills.iter().all(|(skill, record)| {
-        snapshot::snapshot_digest(project_dir, skill).as_deref() == Some(record.digest.as_str())
+        snapshot::snapshot_digest(site, skill).as_deref() == Some(record.digest.as_str())
             && record.links.iter().all(|link| {
                 link.path
                     .rsplit_once('/')
                     .and_then(|(target, _)| directories.get(target)?.as_ref())
                     .is_some_and(|directory| {
                         directory
-                            .inspect(project_dir, skill)
+                            .inspect(site, skill)
                             .is_intact(link.kind, &record.digest)
                     })
             })
             && record
                 .blocked
                 .iter()
-                .all(|path| still_blocked(project_dir, skill, path))
+                .all(|path| still_blocked(site, skill, path))
     })
 }
 
 /// Whether linking `skill` at `path`, a target entry that was taken or
 /// couldn't be made, would still be refused: something still holds it, or
 /// its directory still can't be reached through plain directories.
-fn still_blocked(project_dir: &Path, skill: &str, path: &str) -> bool {
+fn still_blocked(site: &state::Site, skill: &str, path: &str) -> bool {
     let Some((target, _)) = path.rsplit_once('/') else {
         return false;
     };
-    match links::TargetDir::open(project_dir, target) {
+    match links::TargetDir::open(site, target) {
         Err(_) => true,
         Ok(None) => false,
-        Ok(Some(directory)) => directory.inspect(project_dir, skill) != links::TargetEntry::Missing,
+        Ok(Some(directory)) => directory.inspect(site, skill) != links::TargetEntry::Missing,
+    }
+}
+
+/// What differs between the global packages' links and what the global
+/// policy links now, as `doctor` reports it: nothing without a global
+/// policy or links LPM made.
+pub(crate) fn global_drift(settings: Settings) -> Result<Vec<String>, LpmError> {
+    match global::GlobalSkills::locate_with_work()? {
+        Some(global) => inspect::drift_global(&global, settings),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Where the dependency-skill links of `project_dir` live, or with
+/// `global` those of the user's global packages.
+pub(crate) fn link_site(project_dir: &Path, global: bool) -> Result<Site, LpmError> {
+    if global {
+        global::global_site()
+    } else {
+        Ok(Site::project(&skills_root(project_dir)))
     }
 }
 
 /// The absolute paths of the target entries LPM linked dependency skills
-/// at, so inventories of agent folders don't count them as unmanaged.
-pub(crate) fn linked_entry_paths(project_dir: &Path) -> Vec<std::path::PathBuf> {
-    match state::read_state(project_dir) {
+/// at in `site`, so inventories of agent folders don't count them as
+/// unmanaged.
+pub(crate) fn linked_entry_paths(site: &Site) -> Vec<std::path::PathBuf> {
+    match state::read_state(site) {
         state::StoredState::Present(recorded) => recorded
             .skills
             .values()
             .flat_map(|record| record.links.iter())
-            .map(|link| links::project_path(project_dir, &link.path))
+            .map(|link| links::project_path(site.base(), &link.path))
             .collect(),
         _ => Vec::new(),
     }
@@ -371,6 +414,8 @@ pub(crate) fn linked_entry_paths(project_dir: &Path) -> Vec<std::path::PathBuf> 
 
 /// A dependency skill LPM linked, read back from its copy.
 pub(crate) struct LinkedSkillDetails {
+    /// Where it is linked: what its entry paths are relative to.
+    pub(crate) site: Site,
     pub(crate) name: String,
     pub(crate) record: LinkedSkillRecord,
     pub(crate) copy: std::path::PathBuf,
@@ -392,13 +437,13 @@ impl LinkedSkillDetails {
     }
 }
 
-/// Every dependency skill LPM linked in the project, each copy checked
-/// again with the strict rules installs apply.
-pub(crate) fn linked_skill_details(project_dir: &Path) -> Vec<LinkedSkillDetails> {
-    let state::StoredState::Present(recorded) = state::read_state(project_dir) else {
+/// Every dependency skill LPM linked in `site`, each copy checked again
+/// with the strict rules installs apply.
+pub(crate) fn linked_skill_details(site: &Site) -> Vec<LinkedSkillDetails> {
+    let state::StoredState::Present(recorded) = state::read_state(site) else {
         return Vec::new();
     };
-    let root = state::open_root(project_dir).ok().flatten();
+    let root = state::open_root(site).ok().flatten();
     let mut directories: std::collections::BTreeMap<String, Option<links::TargetDir>> =
         std::collections::BTreeMap::new();
     recorded
@@ -418,13 +463,11 @@ pub(crate) fn linked_skill_details(project_dir: &Path) -> Vec<LinkedSkillDetails
                     let intact = link.path.rsplit_once('/').is_some_and(|(target, _)| {
                         directories
                             .entry(target.to_string())
-                            .or_insert_with(|| {
-                                links::TargetDir::open(project_dir, target).ok().flatten()
-                            })
+                            .or_insert_with(|| links::TargetDir::open(site, target).ok().flatten())
                             .as_ref()
                             .is_some_and(|directory| {
                                 directory
-                                    .inspect(project_dir, &name)
+                                    .inspect(site, &name)
                                     .is_intact(link.kind, &record.digest)
                             })
                     });
@@ -441,7 +484,8 @@ pub(crate) fn linked_skill_details(project_dir: &Path) -> Vec<LinkedSkillDetails
                 )
             });
             LinkedSkillDetails {
-                copy: state::snapshot_dir(project_dir, &name),
+                site: site.clone(),
+                copy: state::snapshot_dir(site, &name),
                 name,
                 record,
                 checked,
@@ -452,24 +496,28 @@ pub(crate) fn linked_skill_details(project_dir: &Path) -> Vec<LinkedSkillDetails
         .collect()
 }
 
-/// The dependency skill LPM linked at `path`, an entry in one of the
-/// project's targets: its name and package.
-pub(crate) fn linked_entry_owner(project_dir: &Path, path: &Path) -> Option<(String, String)> {
-    let state::StoredState::Present(recorded) = state::read_state(project_dir) else {
+/// The dependency skill LPM linked at `path`, an entry in one of `site`'s
+/// targets: its name and package.
+pub(crate) fn linked_entry_owner(site: &Site, path: &Path) -> Option<(String, String)> {
+    let state::StoredState::Present(recorded) = state::read_state(site) else {
         return None;
     };
+    let entry = crate::project_fs::resolve_entry(path);
     recorded.skills.into_iter().find_map(|(skill, record)| {
         record
             .links
             .iter()
-            .any(|link| links::project_path(project_dir, &link.path) == path)
+            .any(|link| {
+                crate::project_fs::resolve_entry(&links::project_path(site.base(), &link.path))
+                    == entry
+            })
             .then_some((skill, record.package))
     })
 }
 
-/// Every dependency skill LPM linked in the project.
-pub(crate) fn linked_skills(project_dir: &Path) -> Vec<(String, LinkedSkillRecord)> {
-    match state::read_state(project_dir) {
+/// Every dependency skill LPM linked in `site`.
+pub(crate) fn linked_skills(site: &Site) -> Vec<(String, LinkedSkillRecord)> {
+    match state::read_state(site) {
         state::StoredState::Present(recorded) => recorded.skills.into_iter().collect(),
         _ => Vec::new(),
     }
@@ -568,17 +616,6 @@ fn unlinked_skill_hints(packages: &[&str], skills: &[inspect::InspectedSkill]) -
     hints
 }
 
-/// Refuses a change to the skills policy while a newer LPM's record of the
-/// links is in place: this LPM couldn't apply the change.
-pub(crate) fn ensure_links_are_ours(project_dir: &Path) -> Result<(), LpmError> {
-    match state::read_state(project_dir) {
-        state::StoredState::Newer(reason) => Err(LpmError::Script(format!(
-            "{reason}; update LPM before changing which dependency skills it links"
-        ))),
-        _ => Ok(()),
-    }
-}
-
 /// Where dependency skills live for `project_dir`: its workspace root in a
 /// workspace, else the project itself.
 pub(crate) fn skills_root(project_dir: &Path) -> std::path::PathBuf {
@@ -605,7 +642,7 @@ pub(crate) fn reconcile_now(
     project_dir: &Path,
     settings: Settings,
 ) -> Result<ReconcileReport, LpmError> {
-    let lock = state::acquire_lock(project_dir)?;
+    let lock = state::acquire_lock(&state::Site::project(project_dir))?;
     let manifest = plan::read_manifest(project_dir)?;
     reconcile_locked(project_dir, manifest, settings, lock, checks::Asking::Now)
 }
@@ -620,7 +657,7 @@ fn try_reconcile(project_dir: &Path, settings: Settings) -> Result<ReconcileRepo
         Readiness::Ready => return Ok(ReconcileReport::default()),
         Readiness::RecordedByNewer(reason) => return Ok(left_to_newer(&reason)),
     }
-    let lock = state::acquire_lock(project_dir)?;
+    let lock = state::acquire_lock(&state::Site::project(project_dir))?;
     let Some(work) = skill_work(project_dir, settings)? else {
         return Ok(ReconcileReport::default());
     };
@@ -649,7 +686,9 @@ fn left_to_newer(reason: &str) -> ReconcileReport {
 /// there, its manifest mentions `"skills"`, or an install materialized
 /// reviewed LPM.dev skills in it or, at a workspace root, in a member.
 pub(crate) fn may_have_skill_work(project_dir: &Path) -> bool {
-    if state::state_exists(project_dir) || lpm_dev::has_reviewed_sets(project_dir) {
+    if state::state_exists(&state::Site::project(project_dir))
+        || lpm_dev::has_reviewed_sets(project_dir)
+    {
         return true;
     }
     let Ok(text) = lpm_common::read_text_file_capped(
@@ -695,7 +734,7 @@ struct SkillWork {
 /// LPM.dev skills. A missing manifest is no work unless LPM linked
 /// something.
 fn skill_work(project_dir: &Path, settings: Settings) -> Result<Option<SkillWork>, LpmError> {
-    let has_state = state::state_exists(project_dir);
+    let has_state = state::state_exists(&state::Site::project(project_dir));
     let path = project_dir.join("package.json");
     let text =
         match lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
@@ -724,10 +763,7 @@ fn skill_work(project_dir: &Path, settings: Settings) -> Result<Option<SkillWork
 }
 
 /// Plans and applies the links `manifest` asks for; the caller holds the
-/// project's link `lock` from before it read `manifest`. When the plan
-/// rests on security verdicts `asking` wants asked for, the lock is let go
-/// while Socket answers, and the plan is made again from the manifest as it
-/// is then.
+/// project's link `lock` from before it read `manifest`.
 fn reconcile_locked(
     project_dir: &Path,
     manifest: serde_json::Value,
@@ -735,9 +771,39 @@ fn reconcile_locked(
     lock: lpm_common::ExclusiveLockHandle,
     asking: checks::Asking,
 ) -> Result<ReconcileReport, LpmError> {
+    let mut manifest = Some(manifest);
+    reconcile_with_checks(
+        &state::Site::project(project_dir),
+        settings,
+        lock,
+        asking,
+        |book| {
+            let manifest = match manifest.take() {
+                Some(manifest) => manifest,
+                None => plan::read_manifest(project_dir)?,
+            };
+            plan_locked(project_dir, &manifest, settings, book)
+        },
+    )
+}
+
+/// Applies the plan `plan_once` makes under the link `lock` of `site`,
+/// from one set of security verdicts. When the plan rests on verdicts
+/// `asking` wants asked for, the lock is let go while Socket answers,
+/// their answers join the set, and `plan_once` plans again from what the
+/// policy says then; it plans again too when another project recorded a
+/// newer verdict the plan rests on.
+fn reconcile_with_checks(
+    site: &state::Site,
+    settings: Settings,
+    lock: lpm_common::ExclusiveLockHandle,
+    asking: checks::Asking,
+    mut plan_once: impl FnMut(
+        &checks::Book,
+    ) -> Result<(plan::Plan, apply::Inputs, state::StoredState), LpmError>,
+) -> Result<ReconcileReport, LpmError> {
     let socket = settings.security_provider == crate::lpm_skills_config::SecurityProvider::Socket;
     let mut lock = lock;
-    let mut manifest = manifest;
     let mut book = if socket {
         checks::Book::load()
     } else {
@@ -749,11 +815,11 @@ fn reconcile_locked(
     let mut refreshed = 0;
     let checked_as = socket.then(checks::release_check).flatten();
     loop {
-        let (plan, inputs, stored) = plan_locked(project_dir, &manifest, settings, &book)?;
+        let (plan, inputs, stored) = plan_once(&book)?;
         let mut releases = plan.relied.clone();
         if socket && let state::StoredState::Present(previous) = &stored {
             releases.extend(apply::retained_releases(
-                project_dir,
+                site,
                 &plan,
                 previous,
                 &inputs.policy,
@@ -772,8 +838,7 @@ fn reconcile_locked(
                 unsaved = unsaved.or(error);
                 rounds += 1;
                 asked.extend(packages);
-                lock = state::acquire_lock(project_dir)?;
-                manifest = plan::read_manifest(project_dir)?;
+                lock = state::acquire_lock(site)?;
                 continue;
             }
         }
@@ -812,7 +877,7 @@ fn reconcile_locked(
             inputs.fingerprint.clear();
         }
         record_pending_reviews(&plan.pending_reviews);
-        let mut report = apply::apply(project_dir, &plan, stored, inputs, &lock)?;
+        let mut report = apply::apply(site, &plan, stored, inputs, &lock)?;
         if stale > 0 {
             report.warnings.push(format!(
                 "Socket's verdicts for {stale} {} are more than a day old and LPM couldn't ask again ({}); their skills stay as they were and no new one links until Socket answers",
@@ -854,14 +919,15 @@ fn plan_locked(
     book: &checks::Book,
 ) -> Result<(plan::Plan, apply::Inputs, state::StoredState), LpmError> {
     let parsed = policy::read_policy(manifest);
-    let stored = state::read_state(project_dir);
+    let site = state::Site::project(project_dir);
+    let stored = state::read_state(&site);
     let (recorded, recorded_skills) = match &stored {
         state::StoredState::Present(recorded) => {
             (recorded.lockfile.as_ref(), recorded.recorded_skills())
         }
         _ => (None, plan::RecordedSkills::new()),
     };
-    let lockfile = lockfile_stamp(project_dir, recorded);
+    let lockfile = file_stamp(&project_dir.join(lpm_lockfile::LOCKFILE_NAME), recorded);
     let members: Vec<String> = plan::importer_directories(project_dir)
         .iter()
         .skip(1)
@@ -869,7 +935,7 @@ fn plan_locked(
         .collect();
     let inputs = apply::Inputs {
         fingerprint: fingerprint(
-            project_dir,
+            &site,
             parsed.policy.as_ref(),
             settings,
             lockfile.as_ref(),
@@ -931,7 +997,7 @@ fn relative_member(project_dir: &Path, member: &Path) -> Option<String> {
 /// the policy and the directories it resolves to, the lockfile, and the
 /// reviewed LPM.dev skills materialized in `importers`.
 fn fingerprint(
-    project_dir: &Path,
+    site: &state::Site,
     policy: Option<&policy::SkillsPolicy>,
     settings: Settings,
     lockfile: Option<&state::FileStamp>,
@@ -967,7 +1033,7 @@ fn fingerprint(
         None => hasher.update("no-policy"),
     }
     let targets = policy.map_or(&policy::Targets::Auto, |policy| &policy.targets);
-    for target in apply::resolve_targets(project_dir, targets) {
+    for target in apply::resolve_targets(site, targets) {
         hasher.update([0]);
         hasher.update(target);
     }
@@ -988,15 +1054,12 @@ fn fingerprint(
 /// write within the clock's granularity of an earlier one can keep both.
 const RACY_WINDOW_NANOS: u64 = 2_000_000_000;
 
-/// `lpm.lock`'s identity, read again only when its size or modification
-/// time differs from `recorded`'s, or `recorded` was taken too soon after
-/// the file changed to prove anything.
-fn lockfile_stamp(
-    project_dir: &Path,
-    recorded: Option<&state::FileStamp>,
-) -> Option<state::FileStamp> {
-    let path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    let metadata = std::fs::metadata(&path).ok()?;
+/// The identity of the file at `path`, a lockfile or the global manifest,
+/// read again only when its size or modification time differs from
+/// `recorded`'s, or `recorded` was taken too soon after the file changed to
+/// prove anything.
+fn file_stamp(path: &Path, recorded: Option<&state::FileStamp>) -> Option<state::FileStamp> {
+    let metadata = std::fs::metadata(path).ok()?;
     let size = metadata.len();
     let modified_nanos = nanos_since_epoch(metadata.modified().ok()?)?;
     if let Some(recorded) = recorded
@@ -1011,7 +1074,7 @@ fn lockfile_stamp(
         size,
         modified_nanos,
         checked_nanos,
-        digest: hash_file(&path)?,
+        digest: hash_file(path)?,
     })
 }
 
@@ -1024,18 +1087,18 @@ fn stamp_is_settled(stamp: &state::FileStamp) -> bool {
 /// Records `stamp` in place of a stamp of the same lockfile taken too soon
 /// to trust, so later runs skip hashing the lockfile again. Skipped when
 /// another process holds the links, which records its own.
-fn keep_settled_stamp(project_dir: &Path, stamp: state::FileStamp) {
-    let Ok(Some(_lock)) = state::try_acquire_lock(project_dir) else {
+fn keep_settled_stamp(site: &state::Site, stamp: state::FileStamp) {
+    let Ok(Some(_lock)) = state::try_acquire_lock(site) else {
         return;
     };
-    if let state::StoredState::Present(mut recorded) = state::read_state(project_dir)
+    if let state::StoredState::Present(mut recorded) = state::read_state(site)
         && recorded
             .lockfile
             .as_ref()
             .is_some_and(|current| current.digest == stamp.digest)
     {
         recorded.lockfile = Some(stamp);
-        let _ = state::write_state(project_dir, &recorded);
+        let _ = state::write_state(site, &recorded);
     }
 }
 
@@ -1057,6 +1120,203 @@ fn hash_file(path: &Path) -> Option<String> {
         hasher.update(&buffer[..read]);
     }
     Some(format!("sha256:{}", hex::encode(hasher.finalize())))
+}
+
+/// Keeps the global packages' links in sync after a global install, update
+/// or removal. When the change may have installed a package, `client`
+/// fetches the LPM.dev skills the global policy may link that the package's
+/// folder lacks. Never fails: what goes wrong is a warning in the report.
+/// Without a global policy or links LPM made, nothing else is read.
+pub(crate) async fn reconcile_after_global_change(
+    client: Option<&lpm_registry::RegistryClient>,
+) -> ReconcileReport {
+    use tracing::Instrument as _;
+
+    reconcile_global_links(client)
+        .instrument(tracing::info_span!("global.dependency_skills"))
+        .await
+}
+
+async fn reconcile_global_links(client: Option<&lpm_registry::RegistryClient>) -> ReconcileReport {
+    let failed = |error: LpmError| ReconcileReport {
+        warnings: vec![format!("global dependency skills were not linked: {error}")],
+        ..ReconcileReport::default()
+    };
+    let global = match global::GlobalSkills::locate_with_work() {
+        Ok(Some(global)) => global,
+        Ok(None) => return ReconcileReport::default(),
+        Err(error) => return failed(error),
+    };
+    let settings = match Settings::resolve(LpmSkillsPreference::Config) {
+        Ok(Some(settings)) => settings,
+        Ok(None) => return ReconcileReport::default(),
+        Err(error) => return failed(error),
+    };
+    let fetched = match client {
+        Some(client) => {
+            let policy = global.read_policy().policy;
+            let fetched =
+                fetch_global_lpm_dev_skills(&global, policy.as_ref(), settings, client).await;
+            match global.write_fetched_sets(fetched) {
+                Ok(warnings) => warnings,
+                Err(error) => return failed(error),
+            }
+        }
+        None => Vec::new(),
+    };
+    let mut report =
+        try_reconcile_global(&global, settings, checks::Asking::WhenDue).unwrap_or_else(failed);
+    report.warnings.splice(0..0, fetched);
+    report
+}
+
+/// Fetches, writing nothing, the reviewed skills of each LPM.dev global
+/// package's installed version that `policy`, which may be an edit not
+/// written yet, may link under `settings` and that its folder lacks. Write
+/// them with [`global::GlobalSkills::write_fetched_sets`] under the global
+/// transaction lock.
+pub(crate) async fn fetch_global_lpm_dev_skills(
+    global: &global::GlobalSkills,
+    policy: Option<&policy::SkillsPolicy>,
+    settings: Settings,
+    client: &lpm_registry::RegistryClient,
+) -> Vec<(
+    global::GlobalPackage,
+    crate::commands::install::FetchedPackageSkills,
+)> {
+    let wanted: Vec<global::GlobalPackage> = global
+        .lpm_dev_sets_to_fetch(policy, settings)
+        .into_iter()
+        .cloned()
+        .collect();
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let packages: Vec<(&str, &str)> = wanted
+        .iter()
+        .map(|package| (package.name.as_str(), package.version.as_str()))
+        .collect();
+    let fetched = crate::commands::install::fetch_published_skills(client, &packages).await;
+    drop(packages);
+    wanted.into_iter().zip(fetched).collect()
+}
+
+/// Reconciles the global packages' links now, for the commands that change
+/// or check them, and reports failure as an error.
+fn reconcile_global_now(
+    global: &global::GlobalSkills,
+    settings: Settings,
+) -> Result<ReconcileReport, LpmError> {
+    try_reconcile_global(global, settings, checks::Asking::Now)
+}
+
+fn try_reconcile_global(
+    global: &global::GlobalSkills,
+    settings: Settings,
+    asking: checks::Asking,
+) -> Result<ReconcileReport, LpmError> {
+    if !global.may_have_work() {
+        return Ok(ReconcileReport::default());
+    }
+    let site = global.site().clone();
+    if asking == checks::Asking::WhenDue {
+        match global_readiness(global, settings) {
+            Readiness::Stale => {}
+            Readiness::Ready => return Ok(ReconcileReport::default()),
+            Readiness::RecordedByNewer(reason) => return Ok(left_to_newer(&reason)),
+        }
+    }
+    let lock = state::acquire_lock(&site)?;
+    reconcile_with_checks(&site, settings, lock, asking, |book| {
+        plan_global_locked(global, settings, book)
+    })
+}
+
+/// Whether the global links already match the global policy, the
+/// installed global packages and `settings`, and are intact.
+fn global_readiness(global: &global::GlobalSkills, settings: Settings) -> Readiness {
+    let parsed = global.read_policy();
+    let problems =
+        (settings.lpm_dev_packages || settings.other_packages) && !parsed.problems.is_empty();
+    let ready = match state::read_state(global.site()) {
+        state::StoredState::Newer(reason) => return Readiness::RecordedByNewer(reason),
+        state::StoredState::Missing => {
+            !problems
+                && !((settings.other_packages || settings.lpm_dev_packages)
+                    && parsed
+                        .policy
+                        .as_ref()
+                        .is_some_and(policy::SkillsPolicy::is_active))
+        }
+        state::StoredState::Unusable(_) => false,
+        state::StoredState::Present(recorded) => {
+            let lockfile = global.manifest().stamp(recorded.lockfile.as_ref());
+            !problems
+                && recorded_links_ready(
+                    global.site(),
+                    &recorded,
+                    fingerprint(
+                        global.site(),
+                        parsed.policy.as_ref(),
+                        settings,
+                        lockfile.as_ref(),
+                        global.installs(),
+                    ),
+                    lockfile,
+                    settings,
+                )
+        }
+    };
+    if ready {
+        Readiness::Ready
+    } else {
+        Readiness::Stale
+    }
+}
+
+/// The plan for the global policy and what it is reconciled from.
+fn plan_global_locked(
+    global: &global::GlobalSkills,
+    settings: Settings,
+    book: &checks::Book,
+) -> Result<(plan::Plan, apply::Inputs, state::StoredState), LpmError> {
+    let parsed = global.read_policy();
+    let stored = state::read_state(global.site());
+    let (recorded, recorded_skills) = match &stored {
+        state::StoredState::Present(recorded) => {
+            (recorded.lockfile.as_ref(), recorded.recorded_skills())
+        }
+        _ => (None, plan::RecordedSkills::new()),
+    };
+    let manifest = global.reread_manifest()?;
+    let lockfile = manifest.stamp(recorded);
+    let inputs = apply::Inputs {
+        fingerprint: fingerprint(
+            global.site(),
+            parsed.policy.as_ref(),
+            settings,
+            lockfile.as_ref(),
+            manifest.installs(),
+        ),
+        policy: policy::policy_digest(parsed.policy.as_ref()),
+        lockfile,
+        members: Vec::new(),
+        recheck: checks::Recheck::default(),
+        verdicts: None,
+        checked_as: None,
+    };
+    let plan = plan::plan_global(
+        manifest.installs(),
+        parsed,
+        plan::PlanMode::Apply,
+        settings.sources(),
+        plan::History {
+            verdicts: Some(book),
+            recorded: &recorded_skills,
+        },
+        None,
+    )?;
+    Ok((plan, inputs, stored))
 }
 
 /// Prints what reconciling did, for an install's human output.

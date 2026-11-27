@@ -241,6 +241,86 @@ fn load(path: &Path, registry: &str, package: &str, version: &str) -> Option<Rev
         .then_some(record)
 }
 
+/// How long the registry's word that a version's skills are still under
+/// review keeps LPM from asking again for the global packages' links.
+const UNDER_REVIEW_RECHECK_SECS: u64 = 60 * 60;
+/// How long its word that a version has no reviewed skills to offer does.
+const REFUSED_RECHECK_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// The registry's answer that it offers no reviewed skills for a version:
+/// not yet, while review runs, or not at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RefusalRecord {
+    schema_version: u32,
+    registry: String,
+    package: String,
+    version: String,
+    under_review: bool,
+    checked_at: u64,
+}
+
+fn refusal_path(root: &LpmRoot, registry: &str, package: &str, version: &str) -> Option<PathBuf> {
+    let mut path = record_path(root, registry, package, version)?;
+    path.set_extension("refused.json");
+    Some(path)
+}
+
+/// Records that the registry offers no reviewed skills for `package`
+/// (`owner.package`) at `version`, still `under_review` or for good, so the
+/// global packages' links stop asking until [`refusal_is_current`] lapses.
+pub(crate) fn write_refusal(
+    package: &str,
+    version: &str,
+    under_review: bool,
+) -> Result<(), LpmError> {
+    let registry = issuing_registry();
+    let root = LpmRoot::from_env()?;
+    let Some(path) = refusal_path(&root, registry, package, version) else {
+        return Ok(());
+    };
+    let record = RefusalRecord {
+        schema_version: RECORD_VERSION,
+        registry: registry.to_string(),
+        package: package.to_string(),
+        version: version.to_string(),
+        under_review,
+        checked_at: now_secs(),
+    };
+    let content = serde_json::to_vec_pretty(&record).map_err(|error| {
+        LpmError::Registry(format!("failed to serialize a skill review: {error}"))
+    })?;
+    with_record_locked(&path, || Ok(lpm_common::write_file_atomic(&path, content)?))
+}
+
+/// Whether the registry said recently enough that it offers no reviewed
+/// skills for `package` at `version`, so asking again would get the same
+/// answer.
+pub(crate) fn refusal_is_current(package: &str, version: &str) -> bool {
+    let registry = issuing_registry();
+    let Some(path) = LpmRoot::from_env()
+        .ok()
+        .and_then(|root| refusal_path(&root, registry, package, version))
+    else {
+        return false;
+    };
+    let Ok(content) = lpm_common::read_text_file_capped(&path, MAX_RECORD_SIZE) else {
+        return false;
+    };
+    let Ok(record) = serde_json::from_str::<RefusalRecord>(&content) else {
+        return false;
+    };
+    let lasts = if record.under_review {
+        UNDER_REVIEW_RECHECK_SECS
+    } else {
+        REFUSED_RECHECK_SECS
+    };
+    record.schema_version == RECORD_VERSION
+        && record.registry == registry
+        && record.package == package
+        && record.version == version
+        && now_secs().saturating_sub(record.checked_at) < lasts
+}
+
 /// Notes that `package` at `version` ships the skill directory `directory`
 /// its record doesn't name, so a later install asks the registry again.
 /// Only the record's `pending` flag changes, and only while the record

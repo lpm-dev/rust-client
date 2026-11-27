@@ -1,4 +1,4 @@
-use super::state::{LinkKind, snapshot_dir};
+use super::state::{LinkKind, Site, snapshot_dir};
 use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::Dir;
 use lpm_common::LpmError;
@@ -47,35 +47,43 @@ impl TargetEntry {
     }
 }
 
-/// A target directory, reached from the project through real directories
-/// only, which every inspection and removal goes through.
+/// A target directory, which every inspection and removal goes through. A
+/// project's is reached through real directories only, since a checkout
+/// can carry links; the home folder's agent folders may be links the user
+/// made, as to a dotfiles repository, and are followed. Either way the
+/// entries LPM makes inside are handled without following links.
 pub(crate) struct TargetDir {
     directory: Dir,
     path: PathBuf,
 }
 
 impl TargetDir {
-    /// Opens `target`, a project-relative directory: `Ok(None)` when it
-    /// doesn't exist, and an error when a link or file is in the way.
-    pub(crate) fn open(project_dir: &Path, target: &str) -> io::Result<Option<Self>> {
+    /// Opens `target`, a directory relative to `site`'s base: `Ok(None)`
+    /// when it doesn't exist, and an error when a file, or in a project a
+    /// link, is in the way.
+    pub(crate) fn open(site: &Site, target: &str) -> io::Result<Option<Self>> {
+        let path = project_path(site.base(), target);
+        if site.is_global() {
+            return match Dir::open_ambient_dir(&path, cap_std::ambient_authority()) {
+                Ok(directory) => Ok(Some(Self { directory, path })),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            };
+        }
         Ok(
-            crate::project_fs::open_directory(project_dir, Path::new(target))?.map(|directory| {
-                Self {
-                    directory,
-                    path: project_path(project_dir, target),
-                }
-            }),
+            crate::project_fs::open_directory(site.base(), Path::new(target))?
+                .map(|directory| Self { directory, path }),
         )
     }
 
-    /// Opens `target`, creating what is missing of it, and refusing a link
-    /// or file anywhere on the way. Adds the directories it created,
-    /// outermost first, to `created`.
-    pub(crate) fn create(
-        project_dir: &Path,
-        target: &str,
-        created: &mut Vec<String>,
-    ) -> io::Result<Self> {
+    /// Opens `target`, creating what is missing of it, and refusing a file,
+    /// or in a project a link, anywhere on the way. Adds the directories it
+    /// created, outermost first, to `created`.
+    pub(crate) fn create(site: &Site, target: &str, created: &mut Vec<String>) -> io::Result<Self> {
+        if site.is_global() {
+            return Self::create_following_links(site.base(), target, created);
+        }
+        let project_dir = site.base();
         let mut directory = Dir::open_ambient_dir(project_dir, cap_std::ambient_authority())?;
         let mut relative = String::with_capacity(target.len());
         for component in target.split('/') {
@@ -115,15 +123,71 @@ impl TargetDir {
         })
     }
 
-    pub(crate) fn inspect(&self, project_dir: &Path, skill: &str) -> TargetEntry {
+    /// [`Self::create`] for the home folder, through the links the user
+    /// made on the way.
+    fn create_following_links(
+        base: &Path,
+        target: &str,
+        created: &mut Vec<String>,
+    ) -> io::Result<Self> {
+        let mut path = base.to_path_buf();
+        let mut relative = String::with_capacity(target.len());
+        for component in target.split('/') {
+            path.push(component);
+            if !relative.is_empty() {
+                relative.push('/');
+            }
+            relative.push_str(component);
+            match std::fs::metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "refusing to link skills through {}, which is not a directory",
+                            path.display()
+                        ),
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    match std::fs::create_dir(&path) {
+                        Ok(()) => {
+                            if !created.contains(&relative) {
+                                created.push(relative.clone());
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                            if !std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::NotFound,
+                                    format!(
+                                        "refusing to link skills through {}, a link to something that doesn't exist",
+                                        path.display()
+                                    ),
+                                ));
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(Self {
+            directory: Dir::open_ambient_dir(&path, cap_std::ambient_authority())?,
+            path,
+        })
+    }
+
+    pub(crate) fn inspect(&self, site: &Site, skill: &str) -> TargetEntry {
         let metadata = match self.directory.symlink_metadata(skill) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return TargetEntry::Missing,
             Err(_) => return TargetEntry::Occupied,
         };
-        let copy = snapshot_dir(project_dir, skill);
+        let copy = snapshot_dir(site, skill);
         if crate::project_fs::is_link(&metadata) {
-            return if self.link_points_at(skill, &copy) {
+            return if self.link_points_at(site, skill, &copy) {
                 TargetEntry::Link
             } else {
                 TargetEntry::Occupied
@@ -134,7 +198,7 @@ impl TargetDir {
                 .copy_digest(skill)
                 .map_or(TargetEntry::Occupied, TargetEntry::Copy);
         }
-        if metadata.is_file() && self.is_placeholder(skill, &copy) {
+        if metadata.is_file() && self.is_placeholder(site, skill, &copy) {
             return TargetEntry::Placeholder;
         }
         TargetEntry::Occupied
@@ -145,16 +209,16 @@ impl TargetDir {
     /// files, `digest`.
     pub(crate) fn link(
         &self,
-        project_dir: &Path,
+        site: &Site,
         skill: &str,
         digest: &str,
     ) -> Result<LinkKind, LpmError> {
-        let copy = snapshot_dir(project_dir, skill);
-        let destination = relative_destination(&copy, &self.path.join(skill));
+        let copy = snapshot_dir(site, skill);
+        let destination = link_destination(site, &copy, &self.path.join(skill));
         #[cfg(unix)]
         {
             let _ = digest;
-            self.directory.symlink(&destination, skill)?;
+            rustix::fs::symlinkat(&destination, &self.directory, skill).map_err(io::Error::from)?;
             Ok(LinkKind::Link)
         }
         #[cfg(windows)]
@@ -164,8 +228,8 @@ impl TargetDir {
             {
                 return Ok(LinkKind::Link);
             }
-            let entries = super::snapshot::snapshot_entries(project_dir, skill)?;
-            let store = super::state::create_root(project_dir)?;
+            let entries = super::snapshot::snapshot_entries(site, skill)?;
+            let store = super::state::create_root(site)?;
             let staging = super::snapshot::staging_name();
             store.create_dir(&staging)?;
             let staged = store.open_dir_nofollow(&staging)?;
@@ -189,17 +253,17 @@ impl TargetDir {
     /// LPM's: a link or Git placeholder; a copy only when LPM `recorded` it
     /// there and it still holds the recorded files, so a copy LPM holds no
     /// record of, or one that changed, is never deleted; and a link it
-    /// recorded that still points at a `.lpm/linked-skills/<skill>`
+    /// recorded that still points at a copies folder of the same shape
     /// elsewhere, as a junction does after the project moves. `Ok(false)`
     /// when something else is there.
     pub(crate) fn remove(
         &self,
-        project_dir: &Path,
+        site: &Site,
         skill: &str,
         recorded: Option<Recorded<'_>>,
     ) -> Result<bool, LpmError> {
         let recorded_kind = recorded.map(|recorded| recorded.kind);
-        match self.inspect(project_dir, skill) {
+        match self.inspect(site, skill) {
             TargetEntry::Missing => Ok(true),
             TargetEntry::Link | TargetEntry::Placeholder => {
                 self.remove_link(skill)?;
@@ -207,12 +271,12 @@ impl TargetDir {
             }
             TargetEntry::Copy(found) => match recorded {
                 Some(recorded) if recorded.kind == LinkKind::Copy && recorded.digest == found => {
-                    self.remove_copy(project_dir, skill, recorded.digest)
+                    self.remove_copy(site, skill, recorded.digest)
                 }
                 _ => Ok(false),
             },
             TargetEntry::Occupied
-                if recorded_kind == Some(LinkKind::Link) && self.is_moved_link(skill) =>
+                if recorded_kind == Some(LinkKind::Link) && self.is_moved_link(site, skill) =>
             {
                 self.remove_link(skill)?;
                 Ok(true)
@@ -238,8 +302,8 @@ impl TargetDir {
     /// pending; a folder that fails the check and can't go back stays in
     /// the store under a name nothing deletes, and one that passes is
     /// renamed for the sweep to finish if deleting it fails.
-    fn remove_copy(&self, project_dir: &Path, skill: &str, digest: &str) -> Result<bool, LpmError> {
-        let store = super::state::create_root(project_dir)?;
+    fn remove_copy(&self, site: &Site, skill: &str, digest: &str) -> Result<bool, LpmError> {
+        let store = super::state::create_root(site)?;
         let retired = super::snapshot::retiring_name();
         self.directory
             .rename(skill, &store, &retired)
@@ -264,9 +328,7 @@ impl TargetDir {
                 LpmError::Registry(format!(
                     "{} changed before LPM could remove it and couldn't be put back; it is at {}: {error}",
                     self.path.join(skill).display(),
-                    super::state::linked_skills_dir(project_dir)
-                        .join(&retired)
-                        .display()
+                    site.store_dir().join(&retired).display()
                 ))
             })?;
             return Ok(false);
@@ -277,9 +339,15 @@ impl TargetDir {
         Ok(true)
     }
 
-    /// Whether `skill` here is a link to some `.lpm/linked-skills/<skill>`
-    /// other than this project's.
-    pub(crate) fn is_moved_link(&self, skill: &str) -> bool {
+    /// Whether `skill` here is a link to some `<state folder>/linked-skills/
+    /// <skill>` other than this site's, the state folder named as this
+    /// site's is: `.lpm` for a project. Never for the global links, whose
+    /// copies don't move with a project, and where such a link belongs to
+    /// another LPM root's global packages.
+    pub(crate) fn is_moved_link(&self, site: &Site, skill: &str) -> bool {
+        if site.is_global() {
+            return false;
+        }
         let is_link = self
             .directory
             .symlink_metadata(skill)
@@ -298,7 +366,7 @@ impl TargetDir {
         tail.len() == 3
             && tail[0].as_os_str() == skill
             && tail[1].as_os_str() == "linked-skills"
-            && tail[2].as_os_str() == lpm_common::PROJECT_STATE_DIR
+            && tail[2].as_os_str() == site.state_dir_name()
     }
 
     /// The names in this directory that could name a skill.
@@ -313,7 +381,7 @@ impl TargetDir {
             .collect()
     }
 
-    fn link_points_at(&self, skill: &str, copy: &Path) -> bool {
+    fn link_points_at(&self, site: &Site, skill: &str, copy: &Path) -> bool {
         let entry = self.path.join(skill);
         let target = match self.directory.read_link_contents(skill) {
             Ok(target) => target,
@@ -322,7 +390,7 @@ impl TargetDir {
                 Err(_) => return false,
             },
         };
-        if target == relative_destination(copy, &entry) {
+        if target == link_destination(site, copy, &entry) {
             return true;
         }
         let resolved = crate::project_fs::canonicalize_with_missing_tail(&self.path.join(&target));
@@ -339,8 +407,8 @@ impl TargetDir {
     /// Whether `skill` here is the file Git checks out for a committed link
     /// where it can't make links: a regular file holding just the link's
     /// destination.
-    fn is_placeholder(&self, skill: &str, copy: &Path) -> bool {
-        let destination = relative_destination(copy, &self.path.join(skill));
+    fn is_placeholder(&self, site: &Site, skill: &str, copy: &Path) -> bool {
+        let destination = link_destination(site, copy, &self.path.join(skill));
         let expected: String = destination
             .components()
             .map(|component| component.as_os_str().to_string_lossy())
@@ -378,10 +446,13 @@ pub(crate) fn project_path(project_dir: &Path, relative: &str) -> PathBuf {
     path
 }
 
-/// Removes `directory` (project-relative) if it is an empty plain
-/// directory reached through plain directories; anything else stays.
-/// `true` when it is gone.
-pub(crate) fn remove_if_empty(project_dir: &Path, directory: &str) -> bool {
+/// Removes `directory`, relative to `site`'s base, if it is an empty plain
+/// directory reached through plain directories; anything else stays. In
+/// the home folder too: a folder LPM created through a link the user made
+/// may since be another folder, once the link points elsewhere. `true` when
+/// it is gone.
+pub(crate) fn remove_if_empty(site: &Site, directory: &str) -> bool {
+    let project_dir = site.base();
     let (parent, name) = directory.rsplit_once('/').unwrap_or(("", directory));
     let parent = if parent.is_empty() {
         match Dir::open_ambient_dir(project_dir, cap_std::ambient_authority()) {
@@ -417,6 +488,18 @@ fn marked_copy_digest(copy: &Dir, skill: &str) -> Option<String> {
     (digest == recorded).then_some(digest)
 }
 
+/// Where the link at `entry` points: the copy by a relative path in a
+/// project, so the links keep working when the project moves, and by its
+/// absolute path for the global links, which a relative path could miss
+/// when the home folder or the LPM root is reached through a link.
+fn link_destination(site: &Site, copy: &Path, entry: &Path) -> PathBuf {
+    if site.is_global() {
+        copy.to_path_buf()
+    } else {
+        relative_destination(copy, entry)
+    }
+}
+
 fn relative_destination(copy: &Path, entry: &Path) -> PathBuf {
     entry
         .parent()
@@ -450,14 +533,54 @@ mod tests {
 
     fn project_with_copy(skill: &str) -> tempfile::TempDir {
         let project = tempfile::tempdir().unwrap();
-        let copy = snapshot_dir(project.path(), skill);
+        let copy = snapshot_dir(&Site::project(project.path()), skill);
         std::fs::create_dir_all(&copy).unwrap();
         std::fs::write(copy.join("SKILL.md"), "x").unwrap();
         project
     }
 
     fn target(project: &Path, target: &str) -> TargetDir {
-        TargetDir::create(project, target, &mut Vec::new()).unwrap()
+        TargetDir::create(&Site::project(project), target, &mut Vec::new()).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_global_link_points_at_its_copy_by_absolute_path() {
+        let home = tempfile::tempdir().unwrap();
+        let lpm_root = home.path().join(".lpm");
+        let site = Site::global(home.path(), &lpm_root);
+        let copy = snapshot_dir(&site, "deploy");
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::write(copy.join("SKILL.md"), "x").unwrap();
+        let skills = target(home.path(), ".agents/skills");
+
+        skills.link(&site, "deploy", "sha256:x").unwrap();
+
+        assert_eq!(
+            std::fs::read_link(home.path().join(".agents/skills/deploy")).unwrap(),
+            copy
+        );
+        assert!(matches!(skills.inspect(&site, "deploy"), TargetEntry::Link));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn another_lpm_roots_global_link_is_never_taken_for_a_moved_one() {
+        let home = tempfile::tempdir().unwrap();
+        let site = Site::global(home.path(), &home.path().join(".lpm"));
+        let other = Site::global(home.path(), &home.path().join("other-lpm"));
+        let skills = target(home.path(), ".agents/skills");
+        std::os::unix::fs::symlink(
+            snapshot_dir(&other, "deploy"),
+            home.path().join(".agents/skills/deploy"),
+        )
+        .unwrap();
+
+        assert!(!skills.is_moved_link(&site, "deploy"));
+        assert!(matches!(
+            skills.inspect(&site, "deploy"),
+            TargetEntry::Occupied
+        ));
     }
 
     #[cfg(unix)]
@@ -467,21 +590,30 @@ mod tests {
         let skills = target(project.path(), ".agents/skills");
 
         assert_eq!(
-            skills.link(project.path(), "deploy", "sha256:x").unwrap(),
+            skills
+                .link(&Site::project(project.path()), "deploy", "sha256:x")
+                .unwrap(),
             LinkKind::Link
         );
         assert_eq!(
             std::fs::read_link(project.path().join(".agents/skills/deploy")).unwrap(),
             Path::new("../../.lpm/linked-skills/deploy")
         );
-        assert_eq!(skills.inspect(project.path(), "deploy"), TargetEntry::Link);
-        assert!(skills.remove(project.path(), "deploy", None).unwrap());
         assert_eq!(
-            skills.inspect(project.path(), "deploy"),
+            skills.inspect(&Site::project(project.path()), "deploy"),
+            TargetEntry::Link
+        );
+        assert!(
+            skills
+                .remove(&Site::project(project.path()), "deploy", None)
+                .unwrap()
+        );
+        assert_eq!(
+            skills.inspect(&Site::project(project.path()), "deploy"),
             TargetEntry::Missing
         );
         assert!(
-            snapshot_dir(project.path(), "deploy")
+            snapshot_dir(&Site::project(project.path()), "deploy")
                 .join("SKILL.md")
                 .exists()
         );
@@ -496,13 +628,13 @@ mod tests {
         std::fs::create_dir_all(&entry).unwrap();
         std::fs::write(entry.join("SKILL.md"), "mine").unwrap();
         assert_eq!(
-            skills.inspect(project.path(), "deploy"),
+            skills.inspect(&Site::project(project.path()), "deploy"),
             TargetEntry::Occupied
         );
         assert!(
             !skills
                 .remove(
-                    project.path(),
+                    &Site::project(project.path()),
                     "deploy",
                     Some(Recorded {
                         kind: LinkKind::Copy,
@@ -519,7 +651,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            skills.inspect(project.path(), "other"),
+            skills.inspect(&Site::project(project.path()), "other"),
             TargetEntry::Occupied
         );
         std::os::unix::fs::symlink(
@@ -528,7 +660,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            skills.inspect(project.path(), "audit"),
+            skills.inspect(&Site::project(project.path()), "audit"),
             TargetEntry::Occupied
         );
     }
@@ -543,7 +675,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            skills.inspect(project.path(), "deploy"),
+            skills.inspect(&Site::project(project.path()), "deploy"),
             TargetEntry::Placeholder
         );
     }
@@ -558,27 +690,31 @@ mod tests {
         let digest = lpm_skill::skill_files_digest([("SKILL.md", b"x".as_slice())]);
         std::fs::write(entry.join(COPY_MARKER), copy_marker("deploy", &digest)).unwrap();
         assert_eq!(
-            skills.inspect(project.path(), "deploy"),
+            skills.inspect(&Site::project(project.path()), "deploy"),
             TargetEntry::Copy(digest.clone())
         );
-        assert!(!skills.remove(project.path(), "deploy", None).unwrap());
+        assert!(
+            !skills
+                .remove(&Site::project(project.path()), "deploy", None)
+                .unwrap()
+        );
         assert!(entry.exists(), "an unrecorded copy is never removed");
 
         std::fs::write(entry.join(COPY_MARKER), copy_marker("audit", &digest)).unwrap();
         assert_eq!(
-            skills.inspect(project.path(), "deploy"),
+            skills.inspect(&Site::project(project.path()), "deploy"),
             TargetEntry::Occupied
         );
         std::fs::write(entry.join(COPY_MARKER), copy_marker("deploy", &digest)).unwrap();
         std::fs::write(entry.join("SKILL.md"), "edited").unwrap();
         assert_eq!(
-            skills.inspect(project.path(), "deploy"),
+            skills.inspect(&Site::project(project.path()), "deploy"),
             TargetEntry::Occupied
         );
         assert!(
             !skills
                 .remove(
-                    project.path(),
+                    &Site::project(project.path()),
                     "deploy",
                     Some(Recorded {
                         kind: LinkKind::Copy,
@@ -596,25 +732,72 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), project.path().join(".agents")).unwrap();
-        assert!(TargetDir::create(project.path(), ".agents/skills", &mut Vec::new()).is_err());
-        assert!(TargetDir::open(project.path(), ".agents/skills").is_err());
+        let site = Site::project(project.path());
+        assert!(TargetDir::create(&site, ".agents/skills", &mut Vec::new()).is_err());
+        assert!(TargetDir::open(&site, ".agents/skills").is_err());
         assert!(!outside.path().join("skills").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_global_target_follows_a_link_the_user_made_to_an_agent_folder() {
+        let home = tempfile::tempdir().unwrap();
+        let dotfiles = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(dotfiles.path(), home.path().join(".claude")).unwrap();
+        let site = Site::global(home.path(), &home.path().join(".lpm"));
+        let mut created = Vec::new();
+
+        TargetDir::create(&site, ".claude/skills", &mut created).unwrap();
+
+        assert_eq!(created, [".claude/skills"]);
+        assert!(dotfiles.path().join("skills").is_dir());
+        assert!(TargetDir::open(&site, ".claude/skills").unwrap().is_some());
+        assert!(
+            !remove_if_empty(&site, ".claude/skills"),
+            "a folder reached through the user's link may since be someone else's"
+        );
+        assert!(dotfiles.path().join("skills").is_dir());
+        assert!(!remove_if_empty(&site, ".claude"));
+        std::fs::create_dir_all(home.path().join(".agents/skills")).unwrap();
+        assert!(remove_if_empty(&site, ".agents/skills"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_global_target_behind_a_link_to_nothing_says_so() {
+        let home = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(home.path().join("missing"), home.path().join(".claude"))
+            .unwrap();
+        let site = Site::global(home.path(), &home.path().join(".lpm"));
+
+        let error = TargetDir::create(&site, ".claude/skills", &mut Vec::new())
+            .err()
+            .expect("a dangling link refuses the target");
+
+        assert!(
+            error
+                .to_string()
+                .contains("a link to something that doesn't exist"),
+            "{error}"
+        );
+        assert!(!home.path().join("missing").exists());
     }
 
     #[test]
     fn created_directories_are_reported_and_removed_only_when_empty() {
         let project = tempfile::tempdir().unwrap();
         let mut created = Vec::new();
-        TargetDir::create(project.path(), ".agents/skills", &mut created).unwrap();
+        let site = Site::project(project.path());
+        TargetDir::create(&site, ".agents/skills", &mut created).unwrap();
         assert_eq!(created, [".agents", ".agents/skills"]);
         let mut again = Vec::new();
-        TargetDir::create(project.path(), ".agents/skills", &mut again).unwrap();
+        TargetDir::create(&site, ".agents/skills", &mut again).unwrap();
         assert!(again.is_empty());
         std::fs::write(project.path().join(".agents/skills/note.md"), "x").unwrap();
-        assert!(!remove_if_empty(project.path(), ".agents/skills"));
+        assert!(!remove_if_empty(&site, ".agents/skills"));
         std::fs::remove_file(project.path().join(".agents/skills/note.md")).unwrap();
-        assert!(remove_if_empty(project.path(), ".agents/skills"));
-        assert!(remove_if_empty(project.path(), ".agents"));
+        assert!(remove_if_empty(&site, ".agents/skills"));
+        assert!(remove_if_empty(&site, ".agents"));
     }
 
     #[test]
@@ -633,7 +816,7 @@ mod tests {
         };
         assert!(
             !skills
-                .remove(project.path(), "deploy", Some(other))
+                .remove(&Site::project(project.path()), "deploy", Some(other))
                 .unwrap()
         );
         assert!(entry.join("SKILL.md").exists());
@@ -644,7 +827,7 @@ mod tests {
         };
         assert!(
             skills
-                .remove(project.path(), "deploy", Some(recorded))
+                .remove(&Site::project(project.path()), "deploy", Some(recorded))
                 .unwrap()
         );
         assert!(!entry.exists());
@@ -677,7 +860,7 @@ mod tests {
         std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o555)).unwrap();
 
         let removed = skills.remove(
-            project.path(),
+            &Site::project(project.path()),
             "deploy",
             Some(Recorded {
                 kind: LinkKind::Copy,
