@@ -562,6 +562,73 @@ fn linux_warm_materialization_uses_lower_4kib_reflink_threshold_and_parses_overl
         ),
         Some(PathBuf::from("/var/lib/btrfs-upper"))
     );
+
+    let escaped_mountinfo = b"54 29 0:45 / /var/lib/my\\040app rw,relatime - overlay overlay rw,lowerdir=/lower,upperdir=/var/lib/btrfs\\040upper,workdir=/work\n";
+    assert_eq!(
+        super::linux_overlay_upperdir_from_mountinfo(
+            Path::new("/var/lib/my app/store/links"),
+            escaped_mountinfo
+        ),
+        Some(PathBuf::from("/var/lib/btrfs upper"))
+    );
+
+    let docker_btrfs_mountinfo = concat!(
+        "100 99 0:45 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/docker/overlay2/l/A,upperdir=/var/lib/docker/overlay2/abc/diff,workdir=/var/lib/docker/overlay2/abc/work\n",
+        "101 100 0:30 /var/lib/docker/containers/abc/resolv.conf /etc/resolv.conf rw,relatime - btrfs /dev/nvme0n1p2 rw,space_cache=v2\n",
+    );
+    assert_eq!(
+        super::linux_overlay_upperdir_is_btrfs_from_mountinfo(
+            Path::new("/workspace/project"),
+            docker_btrfs_mountinfo.as_bytes()
+        ),
+        Some(true)
+    );
+
+    let docker_ext4_mountinfo = concat!(
+        "100 99 0:45 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/docker/overlay2/l/A,upperdir=/var/lib/docker/overlay2/abc/diff,workdir=/var/lib/docker/overlay2/abc/work\n",
+        "101 100 8:1 /var/lib/docker/containers/abc/resolv.conf /etc/resolv.conf rw,relatime - ext4 /dev/sda1 rw\n",
+    );
+    assert_eq!(
+        super::linux_overlay_upperdir_is_btrfs_from_mountinfo(
+            Path::new("/workspace/project"),
+            docker_ext4_mountinfo.as_bytes()
+        ),
+        Some(false)
+    );
+}
+
+#[test]
+fn parallel_single_directory_materialization_matches_tree_metadata_integrity() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src-large");
+    let dst = dir.path().join("dst-large");
+    std::fs::create_dir_all(src.join("nested")).unwrap();
+    for idx in 0..80 {
+        std::fs::write(
+            src.join(format!("icon-{idx:03}.js")),
+            format!("export const id = {idx};\n"),
+        )
+        .unwrap();
+    }
+    std::fs::write(src.join("nested/leaf.js"), b"export const leaf = true;\n").unwrap();
+    let digests =
+        crate::v2::fs_util::materialize_into_with_integrity(&src, &dst, false, true, true).unwrap();
+    if let Some(digests) = digests {
+        assert_eq!(
+            digests.metadata,
+            compute_tree_metadata_integrity(&dst).unwrap()
+        );
+    }
+    for idx in 0..80 {
+        assert_eq!(
+            std::fs::read_to_string(dst.join(format!("icon-{idx:03}.js"))).unwrap(),
+            format!("export const id = {idx};\n")
+        );
+    }
+    assert_eq!(
+        std::fs::read(dst.join("nested/leaf.js")).unwrap(),
+        b"export const leaf = true;\n"
+    );
 }
 
 #[test]

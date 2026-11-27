@@ -5,6 +5,7 @@ use lpm_common::{LpmError, is_symlink_or_junction};
 use super::integrity::has_local_source_sentinel;
 use super::tree_hash::{
     TreeMetadataBuilder, TreeMetadataDigests, TreeMetadataKind, is_object_metadata_sidecar,
+    is_object_metadata_sidecar_name,
 };
 
 pub(crate) fn tmp_sibling(dir: &Path) -> PathBuf {
@@ -322,17 +323,24 @@ pub(crate) fn materialize_into_with_integrity(
     dst: &Path,
     allow_source_symlinks: bool,
     warm_source: bool,
+    allow_parallel_files: bool,
 ) -> Result<Option<TreeMetadataDigests>, LpmError> {
     #[cfg(target_os = "macos")]
     {
-        let _ = warm_source;
+        let _ = (warm_source, allow_parallel_files);
         if try_clonefile(src, dst) {
             remove_materialized_object_sidecars(dst)?;
             return Ok(None);
         }
     }
-    materialize_into_portable_with_integrity_inner(src, dst, allow_source_symlinks, warm_source)
-        .map(Some)
+    materialize_into_portable_with_integrity_inner(
+        src,
+        dst,
+        allow_source_symlinks,
+        warm_source,
+        allow_parallel_files,
+    )
+    .map(Some)
 }
 
 fn materialize_into_portable_with_integrity_inner(
@@ -340,6 +348,7 @@ fn materialize_into_portable_with_integrity_inner(
     dst: &Path,
     allow_source_symlinks: bool,
     warm_source: bool,
+    allow_parallel_files: bool,
 ) -> Result<TreeMetadataDigests, LpmError> {
     let mut metadata = TreeMetadataBuilder::new();
     materialize_into_inner_impl(
@@ -350,6 +359,7 @@ fn materialize_into_portable_with_integrity_inner(
         allow_source_symlinks,
         false,
         warm_source,
+        allow_parallel_files,
         Some(&mut metadata),
     )?;
     Ok(metadata.finish())
@@ -360,8 +370,14 @@ pub(crate) fn materialize_into_portable_with_integrity(
     src: &Path,
     dst: &Path,
 ) -> Result<String, LpmError> {
-    materialize_into_portable_with_integrity_inner(src, dst, has_local_source_sentinel(src), false)
-        .map(|digests| digests.metadata)
+    materialize_into_portable_with_integrity_inner(
+        src,
+        dst,
+        has_local_source_sentinel(src),
+        false,
+        false,
+    )
+    .map(|digests| digests.metadata)
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -369,8 +385,14 @@ pub(crate) fn materialize_into_portable_with_integrity_warm(
     src: &Path,
     dst: &Path,
 ) -> Result<String, LpmError> {
-    materialize_into_portable_with_integrity_inner(src, dst, has_local_source_sentinel(src), true)
-        .map(|digests| digests.metadata)
+    materialize_into_portable_with_integrity_inner(
+        src,
+        dst,
+        has_local_source_sentinel(src),
+        true,
+        false,
+    )
+    .map(|digests| digests.metadata)
 }
 
 #[cfg(all(test, unix))]
@@ -379,7 +401,7 @@ pub(crate) fn materialize_into_portable_with_integrity_and_symlink_policy(
     dst: &Path,
     allow_source_symlinks: bool,
 ) -> Result<String, LpmError> {
-    materialize_into_portable_with_integrity_inner(src, dst, allow_source_symlinks, false)
+    materialize_into_portable_with_integrity_inner(src, dst, allow_source_symlinks, false, false)
         .map(|digests| digests.metadata)
 }
 
@@ -389,8 +411,21 @@ pub(crate) fn materialize_into_inner(
     dst: &Path,
     allow_source_symlinks: bool,
 ) -> Result<(), LpmError> {
-    materialize_into_inner_impl(root, src, dst, dst, allow_source_symlinks, true, true, None)
+    materialize_into_inner_impl(
+        root,
+        src,
+        dst,
+        dst,
+        allow_source_symlinks,
+        true,
+        true,
+        false,
+        None,
+    )
 }
+
+const PARALLEL_MATERIALIZE_FILES_MIN: usize = 64;
+const PARALLEL_MATERIALIZE_MAX_WORKERS: usize = 4;
 
 #[allow(clippy::too_many_arguments)]
 fn materialize_into_inner_impl(
@@ -401,6 +436,7 @@ fn materialize_into_inner_impl(
     allow_source_symlinks: bool,
     allow_clonefile: bool,
     warm_source: bool,
+    allow_parallel_files: bool,
     mut tree_metadata: Option<&mut TreeMetadataBuilder>,
 ) -> Result<(), LpmError> {
     #[cfg(target_os = "macos")]
@@ -442,6 +478,105 @@ fn materialize_into_inner_impl(
     }
     entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
 
+    let regular_file_count = if allow_parallel_files {
+        entries
+            .iter()
+            .filter(|(name, ft)| {
+                !ft.is_dir()
+                    && !ft.is_symlink()
+                    && !is_object_metadata_sidecar_name(root, src, name)
+            })
+            .count()
+    } else {
+        0
+    };
+    let parallel_workers = if regular_file_count >= PARALLEL_MATERIALIZE_FILES_MIN {
+        lpm_common::resources::effective_cpu_count().clamp(1, PARALLEL_MATERIALIZE_MAX_WORKERS)
+    } else {
+        1
+    };
+
+    if parallel_workers > 1 {
+        let mut regular_files = Vec::with_capacity(regular_file_count);
+        let mut regular_slots = Vec::with_capacity(entries.len());
+        for (idx, (name, file_type)) in entries.iter().enumerate() {
+            if is_object_metadata_sidecar_name(root, src, name) {
+                regular_slots.push(None);
+                continue;
+            }
+            if !file_type.is_dir() && !file_type.is_symlink() {
+                let slot = regular_files.len();
+                regular_files.push((src.join(name), dst.join(name)));
+                regular_slots.push(Some(slot));
+            } else {
+                regular_slots.push(None);
+            }
+            let _ = idx;
+        }
+        let parallel_results =
+            materialize_regular_files_parallel(&regular_files, warm_source, parallel_workers)?;
+        for ((name, file_type), regular_slot) in entries.into_iter().zip(regular_slots) {
+            if is_object_metadata_sidecar_name(root, src, &name) {
+                continue;
+            }
+            if let Some(slot) = regular_slot {
+                let (_, dst_path) = &regular_files[slot];
+                if let Some(metadata) = tree_metadata.as_deref_mut() {
+                    if let Some(dst_meta) = &parallel_results[slot] {
+                        metadata.record_with_metadata(
+                            destination_root,
+                            dst_path,
+                            TreeMetadataKind::File,
+                            dst_meta,
+                            Vec::new(),
+                        )?;
+                    } else {
+                        metadata.record(
+                            destination_root,
+                            dst_path,
+                            TreeMetadataKind::File,
+                            Vec::new(),
+                        )?;
+                    }
+                }
+                continue;
+            }
+            let src_path = src.join(&name);
+            let dst_path = dst.join(&name);
+            if file_type.is_dir() {
+                let record = tree_metadata
+                    .as_deref_mut()
+                    .map(|metadata| {
+                        metadata.reserve(destination_root, &dst_path, TreeMetadataKind::Directory)
+                    })
+                    .transpose()?;
+                materialize_into_inner_impl(
+                    root,
+                    &src_path,
+                    &dst_path,
+                    destination_root,
+                    allow_source_symlinks,
+                    allow_clonefile,
+                    warm_source,
+                    allow_parallel_files,
+                    tree_metadata.as_deref_mut(),
+                )?;
+                if let (Some(metadata), Some(record)) = (tree_metadata.as_deref_mut(), record) {
+                    metadata.refresh(record, &dst_path, Vec::new())?;
+                }
+            } else if file_type.is_symlink() {
+                materialize_symlink_entry(
+                    &src_path,
+                    &dst_path,
+                    destination_root,
+                    allow_source_symlinks,
+                    tree_metadata.as_deref_mut(),
+                )?;
+            }
+        }
+        return Ok(());
+    }
+
     for (name, file_type) in entries {
         let src_path = src.join(&name);
         if is_object_metadata_sidecar(root, &src_path) {
@@ -464,45 +599,20 @@ fn materialize_into_inner_impl(
                 allow_source_symlinks,
                 allow_clonefile,
                 warm_source,
+                allow_parallel_files,
                 tree_metadata.as_deref_mut(),
             )?;
             if let (Some(metadata), Some(record)) = (tree_metadata.as_deref_mut(), record) {
                 metadata.refresh(record, &dst_path, Vec::new())?;
             }
         } else if file_type.is_symlink() {
-            if !allow_source_symlinks {
-                // Refuse symlink entries — the extractor's `is_file()`
-                // filter blocks them at extract time, so a symlink under
-                // `objects/` means a same-UID actor planted it. Symmetric
-                // with the v1→v2 `copy_dir_recursively` refusal.
-                let target = std::fs::read_link(&src_path).unwrap_or_default();
-                return Err(LpmError::Store(format!(
-                    "refusing virtual-store symlink entry {} → {}; symlinks must not appear under objects/",
-                    src_path.display(),
-                    target.display(),
-                )));
-            }
-            let target = std::fs::read_link(&src_path).map_err(|e| {
-                LpmError::Store(format!(
-                    "failed to read virtual-store local-source symlink {}: {e}",
-                    src_path.display()
-                ))
-            })?;
-            create_fs_symlink(&target, &dst_path).map_err(|e| {
-                LpmError::Store(format!(
-                    "failed to recreate virtual-store local-source symlink {} → {}: {e}",
-                    dst_path.display(),
-                    target.display()
-                ))
-            })?;
-            if let Some(metadata) = tree_metadata.as_deref_mut() {
-                metadata.record(
-                    destination_root,
-                    &dst_path,
-                    TreeMetadataKind::Symlink,
-                    os_str_bytes(target.as_os_str()),
-                )?;
-            }
+            materialize_symlink_entry(
+                &src_path,
+                &dst_path,
+                destination_root,
+                allow_source_symlinks,
+                tree_metadata.as_deref_mut(),
+            )?;
         } else {
             let file_metadata = materialize_regular_file(&src_path, &dst_path, warm_source)?;
             if let Some(metadata) = tree_metadata.as_deref_mut() {
@@ -529,6 +639,80 @@ fn materialize_into_inner_impl(
     }
 
     Ok(())
+}
+
+fn materialize_symlink_entry(
+    src_path: &Path,
+    dst_path: &Path,
+    destination_root: &Path,
+    allow_source_symlinks: bool,
+    tree_metadata: Option<&mut TreeMetadataBuilder>,
+) -> Result<(), LpmError> {
+    if !allow_source_symlinks {
+        let target = std::fs::read_link(src_path).unwrap_or_default();
+        return Err(LpmError::Store(format!(
+            "refusing virtual-store symlink entry {} → {}; symlinks must not appear under objects/",
+            src_path.display(),
+            target.display(),
+        )));
+    }
+    let target = std::fs::read_link(src_path).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to read virtual-store local-source symlink {}: {e}",
+            src_path.display()
+        ))
+    })?;
+    create_fs_symlink(&target, dst_path).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to recreate virtual-store local-source symlink {} → {}: {e}",
+            dst_path.display(),
+            target.display()
+        ))
+    })?;
+    if let Some(metadata) = tree_metadata {
+        metadata.record(
+            destination_root,
+            dst_path,
+            TreeMetadataKind::Symlink,
+            os_str_bytes(target.as_os_str()),
+        )?;
+    }
+    Ok(())
+}
+
+fn materialize_regular_files_parallel(
+    files: &[(PathBuf, PathBuf)],
+    warm_source: bool,
+    workers: usize,
+) -> Result<Vec<Option<std::fs::Metadata>>, LpmError> {
+    let chunk_size = files.len().div_ceil(workers).max(1);
+    let mut results: Vec<Option<std::fs::Metadata>> = Vec::with_capacity(files.len());
+    let chunk_outputs: Vec<Result<Vec<Option<std::fs::Metadata>>, LpmError>> =
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for chunk in files.chunks(chunk_size) {
+                handles.push(scope.spawn(move || {
+                    let mut local = Vec::with_capacity(chunk.len());
+                    for (src_path, dst_path) in chunk {
+                        local.push(materialize_regular_file(src_path, dst_path, warm_source)?);
+                    }
+                    Ok(local)
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| match handle.join() {
+                    Ok(res) => res,
+                    Err(_) => Err(LpmError::Store(
+                        "virtual-store parallel file materialization panicked".into(),
+                    )),
+                })
+                .collect()
+        });
+    for chunk in chunk_outputs {
+        results.extend(chunk?);
+    }
+    Ok(results)
 }
 
 fn materialize_regular_file(
@@ -740,6 +924,12 @@ pub(crate) mod linux_copy {
 
     pub fn copy_file_plain_io(src: &Path, dst: &Path) -> std::io::Result<()> {
         copy_file_io(src, dst, false)
+            .map(|_| ())
+            .map_err(|(_, error)| error)
+    }
+
+    pub fn copy_file_warm_plain_io(src: &Path, dst: &Path) -> std::io::Result<()> {
+        copy_file_io(src, dst, true)
             .map(|_| ())
             .map_err(|(_, error)| error)
     }

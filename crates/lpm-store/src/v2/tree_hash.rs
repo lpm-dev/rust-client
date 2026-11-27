@@ -3,7 +3,9 @@ use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use lpm_common::{LpmError, is_symlink_or_junction};
+use lpm_common::LpmError;
+#[cfg(any(not(target_os = "linux"), test))]
+use lpm_common::is_symlink_or_junction;
 use lpm_extractor::ExtractedFileDigest;
 use sha2::{Digest, Sha256};
 
@@ -434,6 +436,173 @@ fn hash_object_tree_dir(
 }
 
 fn read_object_tree_entries(root: &Path, dir: &Path) -> Result<Vec<ObjectTreeEntry>, LpmError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        read_object_tree_entries_fstatat(root, dir)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        read_object_tree_entries_portable(root, dir)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_object_tree_entries_fstatat(
+    root: &Path,
+    dir: &Path,
+) -> Result<Vec<ObjectTreeEntry>, LpmError> {
+    use std::ffi::{CStr, CString};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    struct DirGuard(*mut libc::DIR);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` was returned by `fdopendir` and is closed once on drop.
+                unsafe {
+                    libc::closedir(self.0);
+                }
+            }
+        }
+    }
+
+    let c_dir = CString::new(dir.as_os_str().as_bytes()).map_err(|_| {
+        LpmError::Store(format!(
+            "failed to read virtual-store object tree at {}: path contains NUL",
+            dir.display()
+        ))
+    })?;
+    // SAFETY: `c_dir` is NUL-terminated.
+    let fd = unsafe {
+        libc::open(
+            c_dir.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(LpmError::Store(format!(
+            "failed to read virtual-store object tree at {}: {error}",
+            dir.display()
+        )));
+    }
+    // SAFETY: `fd` is an owned open directory descriptor; `fdopendir` takes ownership on success.
+    let dir_ptr = unsafe { libc::fdopendir(fd) };
+    if dir_ptr.is_null() {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: `fdopendir` failed, so we still own `fd`.
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(LpmError::Store(format!(
+            "failed to read virtual-store object tree at {}: {error}",
+            dir.display()
+        )));
+    }
+    let _guard = DirGuard(dir_ptr);
+    // SAFETY: `dir_ptr` is live while `_guard` is in scope.
+    let dir_fd = unsafe { libc::dirfd(dir_ptr) };
+
+    let mut entries = Vec::new();
+    loop {
+        clear_unix_errno();
+        // SAFETY: `dir_ptr` is a live DIR* exclusively accessed on this thread.
+        let entry = unsafe { libc::readdir(dir_ptr) };
+        if entry.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error().unwrap_or(0) != 0 {
+                return Err(LpmError::Store(format!(
+                    "failed to enumerate virtual-store object tree entry: {error}"
+                )));
+            }
+            break;
+        }
+        // SAFETY: `entry` is non-null and `d_name` is NUL-terminated per POSIX.
+        let c_name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let name_bytes = c_name.to_bytes();
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+        let name_os = OsStr::from_bytes(name_bytes);
+        if is_object_metadata_sidecar_name(root, dir, name_os) {
+            continue;
+        }
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `dir_fd` is live, `c_name` is NUL-terminated, and `st` is writable.
+        if unsafe {
+            libc::fstatat(
+                dir_fd,
+                c_name.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            let error = std::io::Error::last_os_error();
+            return Err(LpmError::Store(format!(
+                "failed to stat virtual-store object tree entry {}: {error}",
+                dir.join(name_os).display()
+            )));
+        }
+        // SAFETY: `fstatat` succeeded and initialized `st`.
+        let st = unsafe { st.assume_init() };
+        #[cfg_attr(
+            target_os = "linux",
+            expect(
+                clippy::unnecessary_cast,
+                reason = "libc::mode_t is u32 on Linux and u16 on macOS"
+            )
+        )]
+        let (mode_bits, kind) = {
+            let mode_bits = st.st_mode as u32;
+            let file_type = mode_bits & (libc::S_IFMT as u32);
+            let kind = if file_type == (libc::S_IFLNK as u32) {
+                ObjectTreeEntryKind::Symlink
+            } else if file_type == (libc::S_IFDIR as u32) {
+                ObjectTreeEntryKind::Directory
+            } else if file_type == (libc::S_IFREG as u32) {
+                ObjectTreeEntryKind::File
+            } else {
+                ObjectTreeEntryKind::Unsupported
+            };
+            (mode_bits, kind)
+        };
+        entries.push(ObjectTreeEntry {
+            name: OsString::from_vec(name_bytes.to_vec()),
+            kind,
+            mode: mode_bits & 0o7777,
+            len: u64::try_from(st.st_size).unwrap_or(0),
+            modified_time_nanos: i128::from(st.st_mtime) * 1_000_000_000
+                + i128::from(st.st_mtime_nsec),
+            change_time_nanos: i128::from(st.st_ctime) * 1_000_000_000
+                + i128::from(st.st_ctime_nsec),
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(entries)
+}
+
+#[cfg(target_os = "linux")]
+fn clear_unix_errno() {
+    // SAFETY: `__errno_location` returns this thread's valid errno pointer.
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clear_unix_errno() {
+    // SAFETY: `__error` returns this thread's valid errno pointer.
+    unsafe {
+        *libc::__error() = 0;
+    }
+}
+
+#[cfg(any(not(any(target_os = "linux", target_os = "macos")), test))]
+fn read_object_tree_entries_portable(
+    root: &Path,
+    dir: &Path,
+) -> Result<Vec<ObjectTreeEntry>, LpmError> {
     let mut entries = Vec::new();
     // Unix DirEntry values keep the directory handle alive; store owned names
     // before recursing so deep warm-cache validation stays below RLIMIT_NOFILE.
@@ -859,6 +1028,7 @@ struct ObjectTreeEntry {
     change_time_nanos: i128,
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 impl ObjectTreeEntry {
     fn from_metadata(name: OsString, metadata: &std::fs::Metadata) -> Self {
         let kind = if is_symlink_or_junction(metadata) {
@@ -1617,5 +1787,33 @@ mod tests {
         let mut encoded = Vec::new();
         push_os_str_bytes(&mut encoded, &entry.name);
         assert_eq!(encoded, b"file-\xff");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unix_fstatat_tree_entries_match_portable_read_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
+        std::fs::write(dir.path().join("index.js"), b"export default 42;\n").unwrap();
+        let bin = dir.path().join("cli.sh");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("index.js", dir.path().join("alias.js")).unwrap();
+        std::fs::write(dir.path().join(".integrity"), b"sha512-ignored").unwrap();
+
+        let fast = read_object_tree_entries_fstatat(dir.path(), dir.path()).unwrap();
+        let portable = read_object_tree_entries_portable(dir.path(), dir.path()).unwrap();
+        assert_eq!(fast.len(), portable.len());
+        assert_eq!(fast.len(), 4);
+        for (a, b) in fast.iter().zip(&portable) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.kind, b.kind);
+            assert_eq!(a.mode, b.mode);
+            assert_eq!(a.len, b.len);
+            assert_eq!(a.modified_time_nanos, b.modified_time_nanos);
+            assert_eq!(a.change_time_nanos, b.change_time_nanos);
+        }
     }
 }

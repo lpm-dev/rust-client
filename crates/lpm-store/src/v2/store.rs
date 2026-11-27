@@ -2450,6 +2450,7 @@ impl Store {
                 policy,
                 fresh_object_integrity: fresh_object_digest,
                 tree_digest: cas_tree_digest.as_deref(),
+                allow_parallel_files: !self.uses_serialized_volume_metadata(),
             },
             &deps,
             &platform,
@@ -3676,6 +3677,7 @@ struct PopulateObject<'a> {
     policy: ObjectIntegrityPolicy,
     fresh_object_integrity: Option<&'a FreshObjectIntegrity>,
     tree_digest: Option<&'a str>,
+    allow_parallel_files: bool,
 }
 
 struct PopulateIntoResult {
@@ -3727,6 +3729,7 @@ fn populate_into(
         &pkg_dir,
         has_local_source_sentinel(object.dir),
         object.fresh_object_integrity.is_none(),
+        object.allow_parallel_files,
     )?;
     timings.materialize_ms = materialize_start.elapsed().as_millis();
 
@@ -4748,6 +4751,29 @@ fn linux_statfs_type(path: &Path) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
+fn unescape_mountinfo_bytes(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        if raw[index] == b'\\'
+            && index + 3 < raw.len()
+            && matches!(raw[index + 1], b'0'..=b'3')
+            && matches!(raw[index + 2], b'0'..=b'7')
+            && matches!(raw[index + 3], b'0'..=b'7')
+        {
+            let value =
+                ((raw[index + 1] - b'0') << 6) | ((raw[index + 2] - b'0') << 3) | (raw[index + 3] - b'0');
+            out.push(value);
+            index += 4;
+        } else {
+            out.push(raw[index]);
+            index += 1;
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
 fn linux_overlay_upperdir_from_mountinfo(path: &Path, mountinfo: &[u8]) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
 
@@ -4767,7 +4793,9 @@ fn linux_overlay_upperdir_from_mountinfo(path: &Path, mountinfo: &[u8]) -> Optio
         if fields.get(sep + 1).copied() != Some(b"overlay") {
             continue;
         }
-        let mount_point = PathBuf::from(std::ffi::OsString::from_vec(mount_point_raw.to_vec()));
+        let mount_point = PathBuf::from(std::ffi::OsString::from_vec(unescape_mountinfo_bytes(
+            mount_point_raw,
+        )));
         if !canonical.starts_with(&mount_point) {
             continue;
         }
@@ -4785,11 +4813,101 @@ fn linux_overlay_upperdir_from_mountinfo(path: &Path, mountinfo: &[u8]) -> Optio
         {
             best = Some((
                 depth,
-                PathBuf::from(std::ffi::OsString::from_vec(upper_raw.to_vec())),
+                PathBuf::from(std::ffi::OsString::from_vec(unescape_mountinfo_bytes(
+                    upper_raw,
+                ))),
             ));
         }
     }
     best.map(|(_, upper)| upper)
+}
+
+#[cfg(target_os = "linux")]
+fn share_host_root_prefix(upper: &Path, mount_root: &Path) -> bool {
+    let mut upper_components = upper.components().filter(|c| matches!(c, std::path::Component::Normal(_)));
+    let mut root_components = mount_root
+        .components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .peekable();
+    // Skip a btrfs top-level subvolume component such as `/@` or `/@var` only
+    // when it is literally `@`; keep ordinary host paths aligned.
+    if root_components
+        .peek()
+        .is_some_and(|component| component.as_os_str() == "@")
+    {
+        root_components.next();
+    }
+    let mut shared = 0usize;
+    for (u, r) in upper_components.by_ref().zip(root_components) {
+        if u == r {
+            shared += 1;
+            if shared >= 2 {
+                return true;
+            }
+        } else {
+            break;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn linux_overlay_upperdir_is_btrfs_from_mountinfo(path: &Path, mountinfo: &[u8]) -> Option<bool> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let upper = linux_overlay_upperdir_from_mountinfo(path, mountinfo)?;
+    let mut best_mount: Option<(usize, &[u8])> = None;
+    let mut inferred_from_host_bind: Option<bool> = None;
+
+    for line in mountinfo
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let fields: Vec<&[u8]> = line.split(|byte| *byte == b' ').collect();
+        let (Some(mount_root_raw), Some(mount_point_raw)) =
+            (fields.get(3).copied(), fields.get(4).copied())
+        else {
+            continue;
+        };
+        let Some(sep) = (6..fields.len()).find(|index| fields[*index] == b"-") else {
+            continue;
+        };
+        let Some(fs_type) = fields.get(sep + 1).copied() else {
+            continue;
+        };
+        if fs_type == b"overlay" {
+            continue;
+        }
+        let mount_point = PathBuf::from(std::ffi::OsString::from_vec(unescape_mountinfo_bytes(
+            mount_point_raw,
+        )));
+        if upper.starts_with(&mount_point) {
+            let depth = mount_point.as_os_str().len();
+            if best_mount
+                .as_ref()
+                .is_none_or(|(best_depth, _)| depth >= *best_depth)
+            {
+                best_mount = Some((depth, fs_type));
+            }
+        }
+        let mount_root = PathBuf::from(std::ffi::OsString::from_vec(unescape_mountinfo_bytes(
+            mount_root_raw,
+        )));
+        if share_host_root_prefix(&upper, &mount_root) {
+            if fs_type == b"btrfs" {
+                inferred_from_host_bind = Some(true);
+            } else if inferred_from_host_bind.is_none()
+                && matches!(fs_type, b"ext4" | b"ext3" | b"xfs" | b"tmpfs" | b"zfs")
+            {
+                inferred_from_host_bind = Some(false);
+            }
+        }
+    }
+
+    if let Some((_, fs_type)) = best_mount {
+        return Some(fs_type == b"btrfs");
+    }
+    inferred_from_host_bind
 }
 
 #[cfg(target_os = "linux")]
@@ -4805,9 +4923,14 @@ fn linux_path_needs_populate_cap(path: &Path) -> bool {
             else {
                 return false;
             };
-            linux_overlay_upperdir_from_mountinfo(path, &mountinfo)
-                .and_then(|upper| linux_statfs_type(&upper))
-                == Some(BTRFS_SUPER_MAGIC)
+            if let Some(upper) = linux_overlay_upperdir_from_mountinfo(path, &mountinfo)
+                && upper.exists()
+                && let Some(fs_type) = linux_statfs_type(&upper)
+                && fs_type != OVERLAYFS_SUPER_MAGIC
+            {
+                return fs_type == BTRFS_SUPER_MAGIC;
+            }
+            linux_overlay_upperdir_is_btrfs_from_mountinfo(path, &mountinfo).unwrap_or(false)
         }
         _ => false,
     }

@@ -286,35 +286,79 @@ fn build_compat_island_at(
 
     #[cfg(not(target_os = "macos"))]
     {
-        use rayon::prelude::*;
-
         const PARALLEL_COMPAT_THRESHOLD: usize = 4;
+        let max_workers = if store.uses_serialized_volume_metadata() {
+            lpm_common::resources::effective_cpu_count().clamp(1, 2)
+        } else {
+            lpm_common::resources::effective_cpu_count().clamp(1, 8)
+        };
         let mut compatibility_links = CompatibilityLinks::with_capacity(entries.len());
-        if entries.len() >= PARALLEL_COMPAT_THRESHOLD {
-            let copied: Vec<(&GraphKey, PathBuf)> = entries
-                .par_iter()
-                .map(|entry| {
-                    let package_dir = ensure_compatibility_package_copy(
-                        compatibility_root,
-                        entry,
-                        store,
-                        refresh_package_copies,
-                    )?;
-                    Ok((entry.key.as_ref(), package_dir))
-                })
-                .collect::<Result<Vec<_>, LpmError>>()?;
-            for (key, package_dir) in copied {
-                compatibility_links.insert(key, package_dir);
+        if entries.len() >= PARALLEL_COMPAT_THRESHOLD && max_workers > 1 {
+            let workers = max_workers.min(entries.len());
+            let chunk_size = entries.len().div_ceil(workers).max(1);
+            let copied_chunks: Vec<Result<Vec<(&GraphKey, PathBuf)>, LpmError>> =
+                std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(workers);
+                    for chunk in entries.chunks(chunk_size) {
+                        handles.push(scope.spawn(move || {
+                            let mut local = Vec::with_capacity(chunk.len());
+                            for entry in chunk {
+                                let package_dir = ensure_compatibility_package_copy(
+                                    compatibility_root,
+                                    entry,
+                                    store,
+                                    refresh_package_copies,
+                                )?;
+                                local.push((entry.key.as_ref(), package_dir));
+                            }
+                            Ok(local)
+                        }));
+                    }
+                    handles
+                        .into_iter()
+                        .map(|handle| match handle.join() {
+                            Ok(result) => result,
+                            Err(_) => Err(LpmError::Store(
+                                "compatibility island copy worker panicked".into(),
+                            )),
+                        })
+                        .collect()
+                });
+            for chunk in copied_chunks {
+                for (key, package_dir) in chunk? {
+                    compatibility_links.insert(key, package_dir);
+                }
             }
-            entries.par_iter().try_for_each(|entry| {
-                sync_compatibility_entry_links(
-                    compatibility_root,
-                    entry,
-                    key_map,
-                    &compatibility_links,
-                )?;
-                write_compatibility_marker(compatibility_root, entry)
-            })?;
+            let compat_links_ref = &compatibility_links;
+            let link_chunks: Vec<Result<(), LpmError>> = std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(workers);
+                for chunk in entries.chunks(chunk_size) {
+                    handles.push(scope.spawn(move || {
+                        for entry in chunk {
+                            sync_compatibility_entry_links(
+                                compatibility_root,
+                                entry,
+                                key_map,
+                                compat_links_ref,
+                            )?;
+                            write_compatibility_marker(compatibility_root, entry)?;
+                        }
+                        Ok(())
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .map(|handle| match handle.join() {
+                        Ok(result) => result,
+                        Err(_) => Err(LpmError::Store(
+                            "compatibility island link worker panicked".into(),
+                        )),
+                    })
+                    .collect()
+            });
+            for chunk in link_chunks {
+                chunk?;
+            }
         } else {
             for entry in entries {
                 let package_dir = ensure_compatibility_package_copy(
