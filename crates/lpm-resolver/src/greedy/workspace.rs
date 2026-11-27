@@ -177,6 +177,7 @@ pub async fn resolve_greedy_fused_workspace_with_cache_options_policy_and_select
             &mut retained_projections,
             false,
         )?;
+        let mut full_reprojected = false;
         if pass.missing_ambient_peers.is_empty() {
             if expansion_pass > 0 {
                 // Earlier passes may have projected importers before later ambient-peer
@@ -191,6 +192,7 @@ pub async fn resolve_greedy_fused_workspace_with_cache_options_policy_and_select
                     &mut retained_projections,
                     true,
                 )?;
+                full_reprojected = true;
             }
             if pass.missing_ambient_peers.is_empty() {
                 return Ok(pass.finalize_outcome(
@@ -204,7 +206,7 @@ pub async fn resolve_greedy_fused_workspace_with_cache_options_policy_and_select
             }
         }
         if expansion_pass >= MAX_AMBIENT_PEER_EXPANSION_PASSES {
-            if expansion_pass > 0 {
+            if expansion_pass > 0 && !full_reprojected {
                 pass = project_union_result(
                     &union,
                     &slots,
@@ -244,18 +246,40 @@ pub async fn resolve_greedy_fused_workspace_with_cache_options_policy_and_select
                 .insert(synthetic, format!("npm:{}@{}", identity.0, identity.1));
             added += 1;
         }
-        if added == 0 {
-            if expansion_pass > 0 {
-                pass = project_union_result(
-                    &union,
-                    &slots,
-                    &overrides,
-                    auto_install_peers,
-                    &policies,
-                    &mut retained_projections,
-                    true,
-                )?;
+        if added == 0 && expansion_pass > 0 && !full_reprojected {
+            // Re-project retained importers before concluding expansion stalled so any
+            // newly uncovered ambient peer requirements still get a chance to expand.
+            pass = project_union_result(
+                &union,
+                &slots,
+                &overrides,
+                auto_install_peers,
+                &policies,
+                &mut retained_projections,
+                true,
+            )?;
+            if pass.missing_ambient_peers.is_empty() {
+                return Ok(pass.finalize_outcome(
+                    retained_projections,
+                    expansion_pass,
+                    root_specifier_isolated_count,
+                    false,
+                    0,
+                    0,
+                ));
             }
+            for (position, identity) in pass.missing_ambient_peers.iter().enumerate() {
+                if !supplemental_peers.insert(identity.clone()) {
+                    continue;
+                }
+                let synthetic = format!("lpm-workspace-peer-{expansion_pass}-reproj-{position}");
+                dependencies
+                    .dependencies
+                    .insert(synthetic, format!("npm:{}@{}", identity.0, identity.1));
+                added += 1;
+            }
+        }
+        if added == 0 {
             tracing::debug!(
                 expansion_pass,
                 reason = "ambient-peer-expansion-stalled",

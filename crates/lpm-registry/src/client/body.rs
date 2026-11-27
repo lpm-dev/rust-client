@@ -16,6 +16,10 @@ pub(super) const BLOCKING_METADATA_PARSE_THRESHOLD: usize = 64 * 1024;
 const LARGE_METADATA_PARSE_THRESHOLD: usize = 512 * 1024;
 const METADATA_MEMORY_BUDGET_QUANTUM: usize = 64 * 1024;
 const METADATA_MEMORY_BUDGET_UNITS: usize = (128 * 1024 * 1024) / METADATA_MEMORY_BUDGET_QUANTUM;
+// Initial upfront reservation for unknown-length chunked HTTP/1.1 bodies so up to 8
+// concurrent chunked packument streams can overlap under the 128 MiB budget; bodies
+// that exceed this size top up non-blockingly and acquire any deficit before parsing.
+const CHUNKED_INITIAL_RESERVE_BYTES: usize = 16 * 1024 * 1024;
 
 fn large_metadata_parse_limiter() -> &'static Arc<tokio::sync::Semaphore> {
     static LIMITER: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
@@ -120,7 +124,10 @@ async fn read_metadata_body_with_budget(
 ) {
     // Never park mid-stream on multiplexed connections (HTTP/2, HTTP/3): unread
     // DATA frames pin stream windows against the shared connection window and
-    // can starve permit-holding streams until read timeout.
+    // can starve permit-holding streams until read timeout. Multiplexed streams
+    // therefore reserve bytes non-blockingly during reads (bounded in practice
+    // by the resolver's metadata fanout cap and `MAX_METADATA_BYTES`) and
+    // acquire full concurrency + byte permits in canonical order before parsing.
     let is_multiplexed = matches!(
         response.version(),
         reqwest::Version::HTTP_2 | reqwest::Version::HTTP_3
@@ -144,16 +151,22 @@ async fn read_metadata_body_with_budget(
                     return guard;
                 }
                 if guard.is_none() {
-                    // Reserve full cap upfront for unknown-length chunked streams so
-                    // concurrent streams cannot deadlock waiting for incremental units,
-                    // then release unused units immediately on EOF.
-                    let reserve_bytes = if is_declared_total { next_len } else { cap };
+                    // Reserve either the exact declared length or a bounded initial
+                    // quantum for unknown-length chunked streams so normal packuments
+                    // keep full concurrency while avoiding mid-stream deadlocks.
+                    let reserve_bytes = if is_declared_total {
+                        next_len
+                    } else {
+                        cap.min(CHUNKED_INITIAL_RESERVE_BYTES).max(next_len)
+                    };
                     guard = acquire_large_metadata_guard_units(
                         &limiter,
                         &budget,
                         budget_units_for_bytes(reserve_bytes),
                     )
                     .await;
+                } else if !is_declared_total {
+                    try_reserve_multiplexed_bytes(&budget, &mut guard, next_len);
                 }
                 guard
             }
@@ -741,27 +754,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chunked_large_body_reserves_cap_upfront_shrinks_on_eof_and_releases_on_cancel() {
+    async fn chunked_large_body_reserves_upfront_shrinks_on_eof_and_releases_on_cancel() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let chunk_body = "x".repeat(LARGE_METADATA_PARSE_THRESHOLD + 8192);
         let chunk_body_for_server = chunk_body.clone();
+        let stalled_sent = Arc::new(tokio::sync::Notify::new());
+        let stalled_sent_for_server = Arc::clone(&stalled_sent);
+        let release_stalled = Arc::new(tokio::sync::Notify::new());
+        let release_stalled_for_server = Arc::clone(&release_stalled);
         tokio::spawn(async move {
-            for _ in 0..2 {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut req_buf = [0u8; 1024];
-                let _ = socket.read(&mut req_buf).await;
-                let hex_len = format!("{:x}", chunk_body_for_server.len());
-                let header = format!(
-                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n{hex_len}\r\n"
-                );
-                let _ = socket.write_all(header.as_bytes()).await;
-                let _ = socket.write_all(chunk_body_for_server.as_bytes()).await;
-                let _ = socket.write_all(b"\r\n0\r\n\r\n").await;
-                let _ = socket.shutdown().await;
-            }
+            // Request 1: complete chunked response.
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut req_buf = [0u8; 1024];
+            let _ = socket.read(&mut req_buf).await;
+            let hex_len = format!("{:x}", chunk_body_for_server.len());
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n{hex_len}\r\n"
+            );
+            let _ = socket.write_all(header.as_bytes()).await;
+            let _ = socket.write_all(chunk_body_for_server.as_bytes()).await;
+            let _ = socket.write_all(b"\r\n0\r\n\r\n").await;
+            let _ = socket.shutdown().await;
+
+            // Request 2: sends first chunk exceeding threshold, then stalls mid-stream
+            // so the caller can cancel the future and verify permit release.
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut req_buf).await;
+            let _ = socket.write_all(header.as_bytes()).await;
+            let _ = socket.write_all(chunk_body_for_server.as_bytes()).await;
+            let _ = socket.write_all(b"\r\n").await;
+            let _ = socket.flush().await;
+            stalled_sent_for_server.notify_one();
+            release_stalled_for_server.notified().await;
+            drop(socket);
         });
 
         let cap = 2 * 1024 * 1024;
@@ -783,7 +811,7 @@ mod tests {
         read.unwrap();
         assert_eq!(body.len(), chunk_body.len());
         let guard = guard.expect("chunked large body must hold shrunk guard");
-        // Unused cap headroom must be returned to the semaphore immediately on EOF.
+        // Unused headroom must be returned to the semaphore immediately on EOF.
         assert_eq!(
             budget.available_permits(),
             (cap_units - actual_units) as usize
@@ -791,18 +819,40 @@ mod tests {
         drop(guard);
         assert_eq!(budget.available_permits(), cap_units as usize);
 
-        // Verify a second request makes full progress after release.
+        // Cancel a stalled chunked body mid-stream and verify both limiter and budget release.
         let response2 = reqwest::Client::new()
-            .get(format!("http://{addr}/chunked"))
+            .get(format!("http://{addr}/chunked-stalled"))
             .send()
             .await
             .unwrap();
-        let mut body2 = Vec::new();
-        let (read2, guard2) =
-            read_metadata_body_with_budget(response2, cap, &mut body2, &limiter, &budget).await;
-        read2.unwrap();
-        assert_eq!(body2.len(), chunk_body.len());
-        drop(guard2);
+        let limiter_for_task = Arc::clone(&limiter);
+        let budget_for_task = Arc::clone(&budget);
+        let stalled_task = tokio::spawn(async move {
+            let mut body2 = Vec::new();
+            let _ = read_metadata_body_with_budget(
+                response2,
+                cap,
+                &mut body2,
+                &limiter_for_task,
+                &budget_for_task,
+            )
+            .await;
+        });
+        stalled_sent.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while limiter.available_permits() == 2
+                || budget.available_permits() == cap_units as usize
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stalled chunked body must acquire permits after crossing threshold");
+
+        stalled_task.abort();
+        let _ = stalled_task.await;
+        release_stalled.notify_one();
+        assert_eq!(limiter.available_permits(), 2);
         assert_eq!(budget.available_permits(), cap_units as usize);
     }
 
@@ -838,6 +888,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let payload = vec![b'z'; LARGE_METADATA_PARSE_THRESHOLD + 128 * 1024];
         let payload_for_server = payload.clone();
+        let clients_done = Arc::new(tokio::sync::Notify::new());
+        let clients_done_for_server = Arc::clone(&clients_done);
 
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -902,6 +954,14 @@ mod tests {
                     }
                 }
                 if completed_streams == 6 {
+                    // Keep the TCP socket open until all client tasks finish draining
+                    // buffered DATA frames so teardown never injects a spurious RST.
+                    let _ = socket.flush().await;
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        clients_done_for_server.notified(),
+                    )
+                    .await;
                     break;
                 }
 
@@ -1019,5 +1079,6 @@ mod tests {
         .expect(
             "multiplexed HTTP/2 large bodies must drain without stalling the connection window",
         );
+        clients_done.notify_one();
     }
 }

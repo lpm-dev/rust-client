@@ -61,6 +61,8 @@ struct Entry {
 struct InFlightParse {
     state: Mutex<InFlightState>,
     ready: Condvar,
+    #[cfg(test)]
+    waiters: std::sync::atomic::AtomicUsize,
 }
 
 enum InFlightState {
@@ -142,6 +144,8 @@ impl ParseCache {
                     let flight = Arc::new(InFlightParse {
                         state: Mutex::new(InFlightState::Pending),
                         ready: Condvar::new(),
+                        #[cfg(test)]
+                        waiters: std::sync::atomic::AtomicUsize::new(0),
                     });
                     map.insert(key, Arc::clone(&flight));
                     Ok(flight)
@@ -180,6 +184,8 @@ impl ParseCache {
                     loop {
                         match &*state {
                             InFlightState::Pending => {
+                                #[cfg(test)]
+                                flight.waiters.fetch_add(1, Ordering::SeqCst);
                                 state = flight
                                     .ready
                                     .wait(state)
@@ -378,32 +384,65 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_corrupt_lockfile_reads_share_one_failure_and_subsequent_retry_succeeds() {
-        use std::sync::Barrier;
+    fn concurrent_corrupt_lockfile_reads_share_one_failure_and_do_not_cache_errors() {
         use std::sync::atomic::AtomicUsize;
 
         let cache = Arc::new(ParseCache::new());
         let corrupt = Arc::new("not valid toml === [[[".to_string());
-        let barrier = Arc::new(Barrier::new(4));
+        let key = CacheKey::from_text(&corrupt);
         let parse_calls = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
 
-        let mut handles = Vec::with_capacity(4);
-        for _ in 0..4 {
+        let leader = {
             let cache = Arc::clone(&cache);
             let corrupt = Arc::clone(&corrupt);
-            let barrier = Arc::clone(&barrier);
             let parse_calls = Arc::clone(&parse_calls);
-            handles.push(std::thread::spawn(move || {
-                barrier.wait();
+            std::thread::spawn(move || {
                 cache.parse(&corrupt, |input| {
                     parse_calls.fetch_add(1, Ordering::SeqCst);
-                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Lockfile::parse_uncached(input)
+                })
+            })
+        };
+
+        // Ensure the leader holds the `in_flight` slot before spawning followers.
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("leader must enter parse");
+
+        let mut followers = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let cache = Arc::clone(&cache);
+            let corrupt = Arc::clone(&corrupt);
+            let parse_calls = Arc::clone(&parse_calls);
+            followers.push(std::thread::spawn(move || {
+                cache.parse(&corrupt, |input| {
+                    parse_calls.fetch_add(1, Ordering::SeqCst);
                     Lockfile::parse_uncached(input)
                 })
             }));
         }
 
-        for handle in handles {
+        // Deterministically wait until all 3 followers are parked on the leader's Condvar.
+        let flight = {
+            let map = cache.in_flight.lock().unwrap();
+            Arc::clone(map.as_ref().unwrap().get(&key).unwrap())
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while flight.waiters.load(Ordering::SeqCst) < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for followers to park on in-flight parse"
+            );
+            std::thread::yield_now();
+        }
+        release_tx.send(()).unwrap();
+
+        assert!(leader.join().unwrap().is_err());
+        for handle in followers {
             assert!(
                 handle.join().unwrap().is_err(),
                 "every concurrent reader of corrupt text must receive the parse error"
@@ -413,6 +452,18 @@ mod tests {
             parse_calls.load(Ordering::SeqCst),
             1,
             "concurrent waiters on the same corrupt text must share a single parse failure"
+        );
+
+        // Retrying the exact same corrupt text must re-parse (errors are never cached).
+        let retry = cache.parse(&corrupt, |input| {
+            parse_calls.fetch_add(1, Ordering::SeqCst);
+            Lockfile::parse_uncached(input)
+        });
+        assert!(retry.is_err());
+        assert_eq!(
+            parse_calls.load(Ordering::SeqCst),
+            2,
+            "parse errors must not be cached for subsequent calls"
         );
 
         let valid = lockfile_text("3.0.0");

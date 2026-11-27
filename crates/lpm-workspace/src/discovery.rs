@@ -822,7 +822,7 @@ fn directory_reachable_under_workspace_globs(
         let Ok(below_scan_root) = directory.strip_prefix(&inclusion.scan_root) else {
             continue;
         };
-        let Some(dir_has_symlink) = inspect_scan_root(root, &inclusion.scan_root)? else {
+        let Some(mut dir_has_symlink) = inspect_scan_root(root, &inclusion.scan_root)? else {
             continue;
         };
         let mut cursor = inclusion.scan_root.clone();
@@ -838,9 +838,12 @@ fn directory_reachable_under_workspace_globs(
             cursor.push(part);
             match std::fs::symlink_metadata(&cursor) {
                 Ok(metadata) => {
-                    if path_is_link_or_reparse(&metadata) || !metadata.file_type().is_dir() {
+                    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
                         reachable = false;
                         break;
+                    }
+                    if path_is_link_or_reparse(&metadata) {
+                        dir_has_symlink = true;
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1672,14 +1675,18 @@ fn discover_members(root: &Path, globs: &[String]) -> Result<Vec<WorkspaceMember
 
     // Pin an open handle to `root` when possible so ordinary member reads
     // enforce kernel-level no-follow containment even if an ancestor directory
-    // is swapped to a symlink between traversal and manifest open.
-    let open_root = open_directory_nofollow(root).ok();
+    // is swapped to a symlink between traversal and manifest open. When an
+    // ancestor above `root` itself contains a symlink (e.g. `/var` -> `/private/var`
+    // on macOS), canonicalize `root` once so the workspace root handle still pins.
     let canonical_root = std::sync::OnceLock::<PathBuf>::new();
     let root_canon = || {
         canonical_root
             .get_or_init(|| root.canonicalize().unwrap_or_else(|_| root.to_path_buf()))
             .as_path()
     };
+    let open_root = open_directory_nofollow(root)
+        .or_else(|_| open_directory_nofollow(root_canon()))
+        .ok();
 
     let mut verified_paths = Vec::with_capacity(matched_manifests.len());
     for (pkg_json_path, needs_canonical) in matched_manifests {
@@ -1704,12 +1711,51 @@ fn discover_members(root: &Path, globs: &[String]) -> Result<Vec<WorkspaceMember
     read_workspace_members(root, open_root.as_ref(), &canonical_root, verified_paths)
 }
 
+fn open_member_directory_cached(
+    root_dir: &cap_std::fs::Dir,
+    relative_member_dir: &Path,
+    parent_cache: &mut Option<(PathBuf, cap_std::fs::Dir)>,
+) -> Result<Option<cap_std::fs::Dir>, WorkspaceError> {
+    use cap_fs_ext::DirExt as _;
+
+    let Some(leaf) = relative_member_dir.file_name() else {
+        return open_relative_directory(root_dir, relative_member_dir);
+    };
+    let parent_rel = relative_member_dir.parent().unwrap_or(Path::new(""));
+    let parent_dir: &cap_std::fs::Dir = if parent_rel.as_os_str().is_empty() {
+        root_dir
+    } else {
+        let cache_hit = parent_cache
+            .as_ref()
+            .is_some_and(|(cached_rel, _)| cached_rel.as_path() == parent_rel);
+        if !cache_hit {
+            let Some(opened_parent) = open_relative_directory(root_dir, parent_rel)? else {
+                return Ok(None);
+            };
+            *parent_cache = Some((parent_rel.to_path_buf(), opened_parent));
+        }
+        &parent_cache
+            .as_ref()
+            .expect("parent cache populated above")
+            .1
+    };
+    match parent_dir.open_dir_nofollow(leaf) {
+        Ok(child) => Ok(Some(child)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(WorkspaceError::Io(format!(
+            "failed to open workspace directory {} safely: {error}",
+            relative_member_dir.display()
+        ))),
+    }
+}
+
 fn read_workspace_member(
     root: &Path,
     open_root: Option<&cap_std::fs::Dir>,
     canonical_root: &std::sync::OnceLock<PathBuf>,
     pkg_json_path: &Path,
     allow_symlink_in_root: bool,
+    parent_cache: &mut Option<(PathBuf, cap_std::fs::Dir)>,
 ) -> Result<Option<WorkspaceMember>, WorkspaceError> {
     let member_dir = pkg_json_path
         .parent()
@@ -1719,7 +1765,7 @@ fn read_workspace_member(
         && let Some(root_dir) = open_root
         && let Ok(relative_member_dir) = member_dir.strip_prefix(root)
     {
-        match open_relative_directory(root_dir, relative_member_dir) {
+        match open_member_directory_cached(root_dir, relative_member_dir, parent_cache) {
             Ok(Some(directory)) => {
                 match read_package_json_from_open_dir(
                     &directory,
@@ -1733,24 +1779,26 @@ fn read_workspace_member(
                         }));
                     }
                     Err(WorkspaceError::Io(_)) => {
-                        // Fall through to containment verification if the leaf or an
-                        // ancestor was swapped concurrently between scan and open.
+                        // Leaf or ancestor changed concurrently; fall through to verified
+                        // canonical re-open through `root_dir` below.
+                        *parent_cache = None;
                     }
                     Err(error) => return Err(error),
                 }
             }
             Ok(None) => return Ok(None),
             Err(_) => {
-                // Concurrent swap to a symlink or non-directory; fall through to
-                // canonical containment check so out-of-root targets are rejected.
+                // Concurrent swap to a symlink or non-directory; invalidate cached parent
+                // and verify containment via `root_dir` below.
+                *parent_cache = None;
             }
         }
         let root_canon = canonical_root
             .get_or_init(|| root.canonicalize().unwrap_or_else(|_| root.to_path_buf()));
-        let canonical_match = pkg_json_path
-            .canonicalize()
-            .unwrap_or_else(|_| pkg_json_path.to_path_buf());
-        if !canonical_match.starts_with(root_canon) {
+        let Ok(canonical_match) = pkg_json_path.canonicalize() else {
+            return Ok(None);
+        };
+        let Ok(canonical_rel) = canonical_match.strip_prefix(root_canon) else {
             tracing::warn!(
                 matched = %pkg_json_path.display(),
                 canonical = %canonical_match.display(),
@@ -1758,6 +1806,24 @@ fn read_workspace_member(
                 "skipping workspace member outside project root after concurrent filesystem change"
             );
             return Ok(None);
+        };
+        let Some(canonical_file) = canonical_rel.file_name() else {
+            return Ok(None);
+        };
+        let canonical_parent = canonical_rel.parent().unwrap_or(Path::new(""));
+        match open_relative_directory(root_dir, canonical_parent) {
+            Ok(Some(directory)) => {
+                let package = read_package_json_from_open_dir(
+                    &directory,
+                    Path::new(canonical_file),
+                    pkg_json_path,
+                )?;
+                return Ok(Some(WorkspaceMember {
+                    path: member_dir,
+                    package,
+                }));
+            }
+            Ok(None) | Err(_) => return Ok(None),
         }
     }
     let package = read_package_json(pkg_json_path)?;
@@ -1776,10 +1842,16 @@ fn read_workspace_members(
     const PARALLEL_MANIFEST_THRESHOLD: usize = 16;
     if manifest_paths.len() < PARALLEL_MANIFEST_THRESHOLD {
         let mut members = Vec::with_capacity(manifest_paths.len());
+        let mut parent_cache = None;
         for (path, allow_symlink) in &manifest_paths {
-            if let Some(member) =
-                read_workspace_member(root, open_root, canonical_root, path, *allow_symlink)?
-            {
+            if let Some(member) = read_workspace_member(
+                root,
+                open_root,
+                canonical_root,
+                path,
+                *allow_symlink,
+                &mut parent_cache,
+            )? {
                 members.push(member);
             }
         }
@@ -1791,10 +1863,16 @@ fn read_workspace_members(
         .min(manifest_paths.len());
     if workers <= 1 {
         let mut members = Vec::with_capacity(manifest_paths.len());
+        let mut parent_cache = None;
         for (path, allow_symlink) in &manifest_paths {
-            if let Some(member) =
-                read_workspace_member(root, open_root, canonical_root, path, *allow_symlink)?
-            {
+            if let Some(member) = read_workspace_member(
+                root,
+                open_root,
+                canonical_root,
+                path,
+                *allow_symlink,
+                &mut parent_cache,
+            )? {
                 members.push(member);
             }
         }
@@ -1808,6 +1886,7 @@ fn read_workspace_members(
             .map(|chunk| {
                 scope.spawn(move || {
                     let mut local = Vec::with_capacity(chunk.len());
+                    let mut parent_cache = None;
                     for (path, allow_symlink) in chunk {
                         if let Some(member) = read_workspace_member(
                             root,
@@ -1815,6 +1894,7 @@ fn read_workspace_members(
                             canonical_root,
                             path,
                             *allow_symlink,
+                            &mut parent_cache,
                         )? {
                             local.push(member);
                         }
@@ -1872,13 +1952,15 @@ fn inspect_scan_root(root: &Path, scan_root: &Path) -> Result<Option<bool>, Work
             .is_none_or(|next| !matches!(next, std::path::Component::Normal(_)));
         match std::fs::symlink_metadata(&prefix) {
             Ok(metadata) => {
-                if path_is_link_or_reparse(&metadata) {
+                if metadata.file_type().is_symlink() {
                     if is_last {
                         return Ok(None);
                     }
                     has_symlink = true;
                 } else if !metadata.file_type().is_dir() {
                     return Ok(None);
+                } else if path_is_link_or_reparse(&metadata) {
+                    has_symlink = true;
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1892,8 +1974,11 @@ fn inspect_scan_root(root: &Path, scan_root: &Path) -> Result<Option<bool>, Work
     }
     if !has_normal_components {
         match std::fs::symlink_metadata(scan_root) {
-            Ok(metadata)
-                if metadata.file_type().is_dir() && !path_is_link_or_reparse(&metadata) => {}
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+                if path_is_link_or_reparse(&metadata) {
+                    has_symlink = true;
+                }
+            }
             Ok(_) => return Ok(None),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
@@ -2001,11 +2086,11 @@ fn collect_member_manifest_paths(
             if !seen_literals.insert(inclusion.scan_root.as_path()) {
                 continue;
             }
-            let relative = inclusion
-                .scan_root
-                .strip_prefix(root)
-                .unwrap_or(inclusion.scan_root.as_path());
-            if is_excluded(relative) {
+            let Ok(relative) = inclusion.scan_root.strip_prefix(root) else {
+                continue;
+            };
+            // The workspace root itself (e.g. `"."`) is never a member package.
+            if relative.as_os_str().is_empty() || is_excluded(relative) {
                 continue;
             }
             if let Some(dir_has_symlink) = inspect_scan_root(root, &inclusion.scan_root)? {
@@ -2023,25 +2108,49 @@ fn collect_member_manifest_paths(
     wildcard_inclusions
         .sort_by_key(|inclusion| (inclusion.scan_root_depth, inclusion.max_depth.is_some()));
 
-    // Only retain a `visited` map when at least two wildcard scan roots can
-    // actually overlap without crossing a `node_modules` boundary; single or
-    // disjoint wildcard walks retain zero non-manifest directory paths.
-    let mut wildcard_can_overlap = vec![false; wildcard_inclusions.len()];
-    for i in 0..wildcard_inclusions.len() {
-        for j in (i + 1)..wildcard_inclusions.len() {
-            let a = wildcard_inclusions[i];
-            let b = wildcard_inclusions[j];
-            let overlap = a
-                .scan_root
-                .strip_prefix(&b.scan_root)
-                .is_ok_and(|rel| !path_contains_node_modules(rel))
-                || b.scan_root
-                    .strip_prefix(&a.scan_root)
-                    .is_ok_and(|rel| !path_contains_node_modules(rel));
-            if overlap {
-                wildcard_can_overlap[i] = true;
-                wildcard_can_overlap[j] = true;
+    // Detect overlapping wildcard scan roots in O(N * depth) using an ancestor
+    // map instead of quadratic pairwise checks. Disjoint walks retain zero
+    // non-manifest directory paths in `visited`.
+    let mut roots_to_indices: HashMap<&Path, Vec<usize>> =
+        HashMap::with_capacity(wildcard_inclusions.len());
+    for (idx, inclusion) in wildcard_inclusions.iter().enumerate() {
+        roots_to_indices
+            .entry(inclusion.scan_root.as_path())
+            .or_default()
+            .push(idx);
+    }
+    let mut overlapping_peers: Vec<Vec<usize>> = vec![Vec::new(); wildcard_inclusions.len()];
+    for (idx, inclusion) in wildcard_inclusions.iter().enumerate() {
+        if let Some(same_root) = roots_to_indices.get(inclusion.scan_root.as_path())
+            && same_root.len() > 1
+        {
+            for &peer in same_root {
+                if peer != idx {
+                    overlapping_peers[idx].push(peer);
+                }
             }
+        }
+        let mut cursor = inclusion.scan_root.as_path();
+        while cursor != root {
+            if cursor
+                .file_name()
+                .is_some_and(|name| name == "node_modules")
+            {
+                break;
+            }
+            let Some(parent) = cursor.parent() else {
+                break;
+            };
+            if parent.strip_prefix(root).is_err() {
+                break;
+            }
+            if let Some(ancestors) = roots_to_indices.get(parent) {
+                for &anc in ancestors {
+                    overlapping_peers[idx].push(anc);
+                    overlapping_peers[anc].push(idx);
+                }
+            }
+            cursor = parent;
         }
     }
 
@@ -2051,7 +2160,7 @@ fn collect_member_manifest_paths(
     let mut pending: Vec<(PathBuf, usize, Option<usize>, bool)> = Vec::new();
 
     for (walk_idx, inclusion) in wildcard_inclusions.iter().copied().enumerate() {
-        let track_visited = wildcard_can_overlap[walk_idx];
+        let track_visited = !overlapping_peers[walk_idx].is_empty();
         let remaining = inclusion
             .max_depth
             .map(|max_depth| max_depth.saturating_sub(inclusion.scan_root_depth));
@@ -2077,20 +2186,12 @@ fn collect_member_manifest_paths(
         // Pre-filter candidate wildcard inclusions that can legally match any
         // directory visited by this walk without crossing `node_modules`.
         let active_candidates: Vec<&WorkspaceGlob> = if track_visited {
-            wildcard_inclusions
-                .iter()
-                .copied()
-                .filter(|candidate| {
-                    inclusion
-                        .scan_root
-                        .strip_prefix(&candidate.scan_root)
-                        .is_ok_and(|rel| !path_contains_node_modules(rel))
-                        || candidate
-                            .scan_root
-                            .strip_prefix(&inclusion.scan_root)
-                            .is_ok_and(|rel| !path_contains_node_modules(rel))
-                })
-                .collect()
+            let mut candidates = Vec::with_capacity(overlapping_peers[walk_idx].len() + 1);
+            candidates.push(inclusion);
+            for &peer_idx in &overlapping_peers[walk_idx] {
+                candidates.push(wildcard_inclusions[peer_idx]);
+            }
+            candidates
         } else {
             vec![inclusion]
         };
@@ -2123,10 +2224,12 @@ fn collect_member_manifest_paths(
 
             if !already_seen {
                 let relative = directory.strip_prefix(root).unwrap_or(&directory);
-                if active_candidates.iter().any(|candidate| {
-                    inclusion_is_traversal_eligible(candidate, &directory, depth)
-                        && candidate.matches_directory(relative, match_options)
-                }) && !is_excluded(relative)
+                if !relative.as_os_str().is_empty()
+                    && active_candidates.iter().any(|candidate| {
+                        inclusion_is_traversal_eligible(candidate, &directory, depth)
+                            && candidate.matches_directory(relative, match_options)
+                    })
+                    && !is_excluded(relative)
                 {
                     push_manifest_if_present(&directory, dir_has_symlink, &mut manifests);
                 }
@@ -3768,6 +3871,50 @@ overrides:
         assert_eq!(ws.members.len(), 200);
     }
 
+    #[test]
+    fn literal_dot_workspace_pattern_does_not_enroll_root_as_member() {
+        for (named_root, use_pnpm_yaml) in
+            [(true, false), (false, false), (true, true), (false, true)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let pkg_a = dir.path().join("packages/a");
+            fs::create_dir_all(&pkg_a).unwrap();
+            create_package_json(&pkg_a, r#"{"name":"@ws/a","version":"1.0.0"}"#);
+            if use_pnpm_yaml {
+                fs::write(
+                    dir.path().join("pnpm-workspace.yaml"),
+                    "packages:\n  - .\n  - packages/*\n",
+                )
+                .unwrap();
+                let root_json = if named_root {
+                    r#"{"name":"root-pkg","private":true}"#
+                } else {
+                    r#"{"private":true}"#
+                };
+                create_package_json(dir.path(), root_json);
+            } else {
+                let root_json = if named_root {
+                    r#"{"name":"root-pkg","private":true,"workspaces":[".","packages/*"]}"#
+                } else {
+                    r#"{"private":true,"workspaces":[".","packages/*"]}"#
+                };
+                create_package_json(dir.path(), root_json);
+            }
+
+            let ws = discover_workspace(dir.path()).unwrap().unwrap();
+            let member_names: Vec<Option<&str>> = ws
+                .members
+                .iter()
+                .map(|m| m.package.name.as_deref())
+                .collect();
+            assert_eq!(
+                member_names,
+                vec![Some("@ws/a")],
+                "literal '.' pattern must never enroll root as a member (named={named_root}, pnpm={use_pnpm_yaml})"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn open_root_member_read_rejects_parent_directory_swapped_to_out_of_root_symlink() {
@@ -3779,26 +3926,32 @@ overrides:
             r#"{"name":"escaped-after-swap","version":"1.0.0"}"#,
         );
 
-        let root = outer.path().join("workspace");
-        let member_dir = root.join("packages/victim");
+        let real_root = outer.path().join("real/workspace");
+        let member_dir = real_root.join("packages/victim");
         fs::create_dir_all(&member_dir).unwrap();
-        create_package_json(&root, r#"{"name":"root","workspaces":["packages/*"]}"#);
+        create_package_json(&real_root, r#"{"name":"root","workspaces":["packages/*"]}"#);
         create_package_json(&member_dir, r#"{"name":"victim","version":"1.0.0"}"#);
 
-        // Pin the root handle as `discover_members` does, then swap `packages/victim`
-        // to a symlink escaping `root` before reading the manifest.
-        let open_root = open_directory_nofollow(&root).unwrap();
-        let manifest_path = member_dir.join("package.json");
+        // Also exercise a symlinked ancestor above the workspace root (matching macOS `/var`).
+        let symlink_parent = outer.path().join("link-parent");
+        std::os::unix::fs::symlink(outer.path().join("real"), &symlink_parent).unwrap();
+        let root_via_symlink = symlink_parent.join("workspace");
+
+        let root_canon = root_via_symlink.canonicalize().unwrap();
+        let open_root = open_directory_nofollow(&root_canon).unwrap();
+        let manifest_path = root_via_symlink.join("packages/victim/package.json");
         fs::remove_dir_all(&member_dir).unwrap();
         std::os::unix::fs::symlink(&outside_dir, &member_dir).unwrap();
 
         let canonical_root = std::sync::OnceLock::new();
+        let mut parent_cache = None;
         let loaded = read_workspace_member(
-            &root,
+            &root_via_symlink,
             Some(&open_root),
             &canonical_root,
             &manifest_path,
             false,
+            &mut parent_cache,
         )
         .expect("containment rejection must skip without panicking");
         assert!(

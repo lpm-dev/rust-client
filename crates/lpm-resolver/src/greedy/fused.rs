@@ -983,6 +983,18 @@ impl MetadataFetchScheduler {
         {
             return false;
         }
+        let can_spawn_now = self.pending.is_empty()
+            && self.prefetch_inflight.len() < self.prefetch_cap
+            && self.semaphore.available_permits() > 1;
+        if !can_spawn_now && self.prefetch_pending.len() >= MAX_PREFETCH_PENDING {
+            if self.prefetch_pending.len() > self.prefetch_queued.len() {
+                self.prefetch_pending
+                    .retain(|entry| self.prefetch_queued.contains(&entry.canonical));
+            }
+            if self.prefetch_pending.len() >= MAX_PREFETCH_PENDING {
+                return false;
+            }
+        }
         let pending = PendingPrefetch {
             canonical: canonical.clone(),
             client: dispatch.client.clone(),
@@ -994,17 +1006,15 @@ impl MetadataFetchScheduler {
             trace_metadata_fetches: dispatch.trace_metadata_fetches,
             telemetry: Arc::clone(dispatch.telemetry),
         };
-        if self.pending.is_empty()
-            && self.prefetch_inflight.len() < self.prefetch_cap
-            && self.semaphore.available_permits() > 1
-            && let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned()
-        {
+        if can_spawn_now && let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() {
             self.spawn_prefetch(pending, permit);
             return true;
         }
         if self.prefetch_pending.len() >= MAX_PREFETCH_PENDING {
-            self.prefetch_pending
-                .retain(|entry| self.prefetch_queued.contains(&entry.canonical));
+            if self.prefetch_pending.len() > self.prefetch_queued.len() {
+                self.prefetch_pending
+                    .retain(|entry| self.prefetch_queued.contains(&entry.canonical));
+            }
             if self.prefetch_pending.len() >= MAX_PREFETCH_PENDING {
                 return false;
             }
@@ -1437,17 +1447,23 @@ impl MetadataFetchScheduler {
                         Ok((canonical, result)) => {
                             self.prefetch_inflight.remove(&canonical);
                             if let Some(promoted) = self.promoted_prefetches.remove(&canonical) {
-                                let mut delivered_any = false;
                                 let mut first_ready = None;
                                 for item in promoted {
-                                    let can_deliver = result.is_ok()
-                                        && prefetched_result_usable(
+                                    // Plain packument demands share the same failure as the
+                                    // speculative packument fetch and can receive it directly;
+                                    // exact/range-preferred demands fall back to their dedicated
+                                    // fetch path (e.g. exact version document endpoint).
+                                    let can_deliver = if result.is_ok() {
+                                        prefetched_result_usable(
                                             &result,
                                             item.pending.exact_version.as_deref(),
                                             item.pending.preferred_range.as_ref(),
-                                        );
+                                        )
+                                    } else {
+                                        item.pending.exact_version.is_none()
+                                            && item.pending.preferred_range.is_none()
+                                    };
                                     if can_deliver {
-                                        delivered_any = true;
                                         if first_ready.is_none() {
                                             first_ready = Some(item.request_key);
                                         } else {
@@ -1458,12 +1474,7 @@ impl MetadataFetchScheduler {
                                         self.enqueue_pending_demand(item.pending);
                                     }
                                 }
-                                if !delivered_any
-                                    && result.is_ok()
-                                    && self.prefetched_ready.len() < MAX_PREFETCHED_READY_CACHE
-                                {
-                                    self.prefetched_ready.insert(canonical, result);
-                                } else if let Some(first_key) = first_ready {
+                                if let Some(first_key) = first_ready {
                                     return Some(Ok((first_key, result)));
                                 }
                             } else if result.is_ok()
@@ -4276,11 +4287,12 @@ mod metadata_timeline_bound_tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
-        // Full packument fails after a short delay while the exact version endpoint succeeds.
+        // Full packument returns 404 after a short delay (non-retryable) while the
+        // exact version endpoint succeeds.
         Mock::given(method("GET"))
             .and(path("/exact-fallback"))
             .respond_with(
-                ResponseTemplate::new(500).set_delay(std::time::Duration::from_millis(40)),
+                ResponseTemplate::new(404).set_delay(std::time::Duration::from_millis(40)),
             )
             .mount(&server)
             .await;
@@ -4345,6 +4357,58 @@ mod metadata_timeline_bound_tests {
                 .versions
                 .iter()
                 .any(|v| v.to_string() == "1.0.0")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn speculative_packument_failure_delivers_error_directly_to_promoted_plain_demand() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/missing-plain"))
+            .respond_with(
+                ResponseTemplate::new(404).set_delay(std::time::Duration::from_millis(40)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        );
+        let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+        let policy = ResolverPolicy::default();
+        let telemetry = Arc::new(MetadataFetchTelemetry::default());
+        let dispatch = MetadataFetchDispatch {
+            client: &client,
+            route_table: &route_table,
+            policy: &policy,
+            trace_metadata_fetches: false,
+            telemetry: &telemetry,
+            timeline: None,
+        };
+        let mut jobs = MetadataFetchScheduler::new(
+            Arc::new(tokio::sync::Semaphore::new(4)),
+            Arc::new(tokio::sync::Semaphore::new(4)),
+        );
+        let canonical = CanonicalKey::npm("missing-plain");
+
+        assert!(jobs.enqueue_prefetch(&dispatch, canonical.clone(), None, None, false));
+        jobs.enqueue_preferred(&dispatch, canonical.clone(), None, false, None);
+
+        let (key, result) = jobs
+            .join_next()
+            .await
+            .expect("promoted plain demand must complete")
+            .expect("join must succeed");
+        assert_eq!(key.canonical, canonical);
+        assert!(
+            result.is_err(),
+            "promoted plain demand must receive the packument error without retrying the same URL"
         );
     }
 
