@@ -43,6 +43,7 @@ pub mod project_secret;
 pub mod project_state;
 pub mod provenance;
 pub mod registry_http;
+pub mod resources;
 pub mod script_directory;
 pub mod stored_env;
 pub mod symlink;

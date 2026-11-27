@@ -11,8 +11,29 @@ use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 /// Directories that must be waiting before helper threads start. Most package
 /// trees finish on the calling thread without starting any.
 const HELPER_START_PENDING_DIRS: usize = 16;
-/// Threads reading directories concurrently, including the caller.
-const WALK_THREADS: usize = 4;
+
+static ACTIVE_WALK_HELPERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct HelperSlot;
+
+impl HelperSlot {
+    fn try_acquire(cap: usize) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+
+        ACTIVE_WALK_HELPERS
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < cap).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for HelperSlot {
+    fn drop(&mut self) {
+        ACTIVE_WALK_HELPERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum MetadataReader {
@@ -206,12 +227,9 @@ fn collect(root: &Path, reader: MetadataReader) -> Collected {
         }),
         changed: Condvar::new(),
     };
-    static WALK_THREAD_BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let threads = *WALK_THREAD_BUDGET.get_or_init(|| {
-        std::thread::available_parallelism()
-            .map_or(1, std::num::NonZero::get)
-            .min(WALK_THREADS)
-    });
+    let helper_cap = lpm_common::resources::default_tree_walk_helper_cap(
+        lpm_common::resources::effective_cpu_count(),
+    );
     let mut helpers = 0;
     let mut helpers_requested = false;
     std::thread::scope(|scope| {
@@ -220,11 +238,17 @@ fn collect(root: &Path, reader: MetadataReader) -> Collected {
             let pending = walk.process(dir, &mut buffer);
             if !helpers_requested && pending >= HELPER_START_PENDING_DIRS {
                 helpers_requested = true;
-                for _ in 1..threads {
-                    // A failed spawn leaves the remaining reads on the threads that exist.
+                for _ in 0..helper_cap {
+                    let Some(slot) = HelperSlot::try_acquire(helper_cap) else {
+                        break;
+                    };
+                    // A failed spawn drops `slot` and leaves the remaining reads on active threads.
                     if std::thread::Builder::new()
                         .name("lpm-tree-walk".to_owned())
-                        .spawn_scoped(scope, || walk.work())
+                        .spawn_scoped(scope, || {
+                            let _slot = slot;
+                            walk.work();
+                        })
                         .is_ok()
                     {
                         helpers += 1;
@@ -435,5 +459,22 @@ mod tests {
             tree_metadata_integrity(tree.path(), MetadataReader::Bulk).unwrap(),
             tree_metadata_integrity(tree.path(), MetadataReader::Portable).unwrap()
         );
+    }
+
+    #[test]
+    fn walk_helper_slot_enforces_global_cap_and_releases_on_drop() {
+        let cap = 2;
+        let baseline = ACTIVE_WALK_HELPERS.load(std::sync::atomic::Ordering::Acquire);
+        let first = HelperSlot::try_acquire(baseline + cap).expect("first slot");
+        let second = HelperSlot::try_acquire(baseline + cap).expect("second slot");
+        assert!(
+            HelperSlot::try_acquire(baseline + cap).is_none(),
+            "helper admission must stop once the process-wide cap is reached"
+        );
+        drop(first);
+        let third = HelperSlot::try_acquire(baseline + cap)
+            .expect("dropping a slot must immediately restore capacity");
+        drop(second);
+        drop(third);
     }
 }

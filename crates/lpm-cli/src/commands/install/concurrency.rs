@@ -8,8 +8,8 @@ pub(super) const V2_CACHE_CHECK_MAX_CONCURRENCY: usize = 16;
 pub(super) const V2_LINK_TASK_MAX_CONCURRENCY: usize = 16;
 const ENV_V2_LINK_TASKS: &str = "LPM_V2_LINK_TASKS";
 
-fn v2_cache_check_concurrency(candidate_count: usize) -> usize {
-    let parallelism = std::thread::available_parallelism().map_or(4, |threads| threads.get());
+pub(super) fn v2_cache_check_concurrency(candidate_count: usize) -> usize {
+    let parallelism = lpm_common::resources::effective_cpu_count();
     parallelism
         .clamp(1, V2_CACHE_CHECK_MAX_CONCURRENCY)
         .min(candidate_count.max(1))
@@ -31,7 +31,7 @@ fn v2_link_task_concurrency_with_limit(target_count: usize, limit: usize) -> usi
     {
         return configured.min(target_count.max(1));
     }
-    let parallelism = std::thread::available_parallelism().map_or(4, |threads| threads.get());
+    let parallelism = lpm_common::resources::effective_cpu_count();
     parallelism.clamp(1, limit).min(target_count.max(1))
 }
 

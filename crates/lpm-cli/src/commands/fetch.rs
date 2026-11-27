@@ -15,8 +15,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-const DEFAULT_MAX_CONCURRENT_DOWNLOADS: usize = 24;
-
 #[derive(Debug, Clone, Serialize)]
 struct FetchPlatform {
     os: String,
@@ -1064,8 +1062,11 @@ fn is_remote_tarball_url(url: &str) -> bool {
 }
 
 fn max_concurrent_downloads() -> usize {
+    let default_downloads = lpm_common::resources::default_max_concurrent_downloads(
+        lpm_common::resources::effective_memory_limit_bytes(),
+    );
     let Some(raw) = std::env::var("LPM_CONCURRENT_DOWNLOADS").ok() else {
-        return DEFAULT_MAX_CONCURRENT_DOWNLOADS;
+        return default_downloads;
     };
 
     match raw.parse::<usize>() {
@@ -1073,9 +1074,9 @@ fn max_concurrent_downloads() -> usize {
         _ => {
             crate::output::warn(&format!(
                 "LPM_CONCURRENT_DOWNLOADS={raw:?} is not a valid integer in 1..=256 \
-                 - falling back to default ({DEFAULT_MAX_CONCURRENT_DOWNLOADS})"
+                 - falling back to default ({default_downloads})"
             ));
-            DEFAULT_MAX_CONCURRENT_DOWNLOADS
+            default_downloads
         }
     }
 }

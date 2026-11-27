@@ -776,29 +776,41 @@ const MAX_EXTRACTION_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 /// run in parallel and an arbitrary number of small ones; legitimate
 /// npm packages decompress well below the per-call cap and rarely
 /// hold a slot for more than a few ms.
+#[cfg(test)]
 const PARALLEL_EXTRACT_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Counting semaphore over bytes retained by buffered gzip decoding.
 /// The reservation remains held until the decoded buffer is dropped.
-static EXTRACT_BUDGET: std::sync::LazyLock<AllocBudget> =
-    std::sync::LazyLock::new(|| AllocBudget {
-        available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
-        cv: std::sync::Condvar::new(),
-    });
+static EXTRACT_BUDGET: std::sync::LazyLock<AllocBudget> = std::sync::LazyLock::new(|| {
+    let budget_bytes = lpm_common::resources::extract_memory_budget_bytes(
+        lpm_common::resources::effective_memory_limit_bytes(),
+    );
+    AllocBudget::new(budget_bytes)
+});
 
 struct AllocBudget {
+    budget_bytes: u64,
     available: std::sync::Mutex<u64>,
     cv: std::sync::Condvar,
 }
 
 impl AllocBudget {
+    fn new(budget_bytes: u64) -> Self {
+        let budget_bytes = budget_bytes.max(1);
+        Self {
+            budget_bytes,
+            available: std::sync::Mutex::new(budget_bytes),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
     fn acquire(&self, bytes: u64) -> AllocBudgetGuard<'_> {
         // Reservations larger than the whole budget would deadlock
         // (no path to make `available >= bytes` true). Cap at the
         // budget itself — the in-flight call still gets serialized
         // exclusivity, which is the right behavior for an outsized
         // legitimate tarball.
-        let request = bytes.min(PARALLEL_EXTRACT_BUDGET_BYTES);
+        let request = bytes.min(self.budget_bytes);
         let mut guard = self.lock_available();
         while *guard < request {
             guard = self.wait_available(guard);
@@ -843,7 +855,7 @@ impl AllocBudgetGuard<'_> {
         let mut available = self.budget.lock_available();
         *available = available
             .saturating_add(released)
-            .min(PARALLEL_EXTRACT_BUDGET_BYTES);
+            .min(self.budget.budget_bytes);
         self.bytes = retained;
         self.budget.cv.notify_all();
     }
@@ -854,7 +866,7 @@ impl Drop for AllocBudgetGuard<'_> {
         let mut guard = self.budget.lock_available();
         *guard = guard
             .saturating_add(self.bytes)
-            .min(PARALLEL_EXTRACT_BUDGET_BYTES);
+            .min(self.budget.budget_bytes);
         // `notify_all`, not `notify_one`: a single release can
         // unblock multiple waiters with different reservation
         // sizes simultaneously (e.g. releasing 256 MiB can satisfy
@@ -2646,10 +2658,7 @@ mod tests {
     fn owned_buffered_input_releases_its_reservation_before_tar_walking() {
         let tgz = create_test_tarball("payload.bin", b"contents");
         let output_size = decompress_gzip_libdeflate(&tgz).unwrap().len() as u64;
-        let budget = AllocBudget {
-            available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
-            cv: std::sync::Condvar::new(),
-        };
+        let budget = AllocBudget::new(PARALLEL_EXTRACT_BUDGET_BYTES);
         let dir = tempfile::tempdir().unwrap();
         let mut inspected = false;
         let files: Vec<PathBuf> = extract_buffered_gzip_tarball(
@@ -2678,10 +2687,7 @@ mod tests {
     fn borrowed_buffered_input_keeps_its_reservation_during_tar_walking() {
         let tgz = create_test_tarball("payload.bin", b"contents");
         let output_size = decompress_gzip_libdeflate(&tgz).unwrap().len() as u64;
-        let budget = AllocBudget {
-            available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
-            cv: std::sync::Condvar::new(),
-        };
+        let budget = AllocBudget::new(PARALLEL_EXTRACT_BUDGET_BYTES);
         let dir = tempfile::tempdir().unwrap();
         let mut inspected = false;
         let _: Vec<PathBuf> = extract_buffered_gzip_tarball(
@@ -2707,10 +2713,7 @@ mod tests {
 
     #[test]
     fn shrinking_allocation_reservation_preserves_ownership_until_drop() {
-        let budget = AllocBudget {
-            available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
-            cv: std::sync::Condvar::new(),
-        };
+        let budget = AllocBudget::new(PARALLEL_EXTRACT_BUDGET_BYTES);
         let mut reservation = budget.acquire(100);
         reservation.shrink_to(40);
         assert_eq!(*budget.lock_available(), PARALLEL_EXTRACT_BUDGET_BYTES - 40);
@@ -4540,10 +4543,7 @@ mod tests {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(&original).unwrap();
         let compressed = encoder.finish().unwrap();
-        let budget = AllocBudget {
-            available: std::sync::Mutex::new(BUDGET_BYTES),
-            cv: std::sync::Condvar::new(),
-        };
+        let budget = AllocBudget::new(BUDGET_BYTES);
         let limits = ExtractionLimits {
             max_buffered_compressed_size: 64 * 1024,
             max_buffered_decompressed_size: 64 * 1024,
@@ -4572,10 +4572,7 @@ mod tests {
     /// parallel-running suites.
     #[test]
     fn alloc_budget_serializes_when_request_would_exceed_ceiling() {
-        let budget = AllocBudget {
-            available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
-            cv: std::sync::Condvar::new(),
-        };
+        let budget = AllocBudget::new(PARALLEL_EXTRACT_BUDGET_BYTES);
         let huge = PARALLEL_EXTRACT_BUDGET_BYTES;
         let g1 = budget.acquire(huge);
         assert_eq!(*budget.available.lock().unwrap(), 0);
@@ -4609,10 +4606,7 @@ mod tests {
     /// reservation.
     #[test]
     fn alloc_budget_caps_oversized_request_to_full_budget() {
-        let budget = AllocBudget {
-            available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
-            cv: std::sync::Condvar::new(),
-        };
+        let budget = AllocBudget::new(PARALLEL_EXTRACT_BUDGET_BYTES);
         let _g = budget.acquire(PARALLEL_EXTRACT_BUDGET_BYTES * 4);
         // The acquire returned (didn't deadlock) and consumed the
         // whole budget rather than the impossible 4× request.
@@ -4621,10 +4615,7 @@ mod tests {
 
     #[test]
     fn alloc_budget_acquire_recovers_from_poisoned_mutex() {
-        let budget = AllocBudget {
-            available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
-            cv: std::sync::Condvar::new(),
-        };
+        let budget = AllocBudget::new(PARALLEL_EXTRACT_BUDGET_BYTES);
 
         let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = budget.available.lock().unwrap();
@@ -4638,5 +4629,15 @@ mod tests {
             Err(poisoned) => *poisoned.into_inner(),
         };
         assert_eq!(available, PARALLEL_EXTRACT_BUDGET_BYTES - 1);
+    }
+
+    #[test]
+    fn dynamic_container_alloc_budget_caps_and_serializes_at_configured_limit() {
+        let container_budget = 128 * 1024 * 1024;
+        let budget = AllocBudget::new(container_budget);
+        let guard = budget.acquire(container_budget * 2);
+        assert_eq!(*budget.lock_available(), 0);
+        drop(guard);
+        assert_eq!(*budget.lock_available(), container_budget);
     }
 }
