@@ -15,6 +15,7 @@ pub mod capability;
 mod cli;
 mod color_policy;
 mod commands;
+mod dependency_skills;
 mod directory_transaction;
 pub mod doctor_catalog;
 pub mod editor_skills;

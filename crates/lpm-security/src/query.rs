@@ -42,6 +42,9 @@ pub enum Selector {
         parent: Box<Selector>,
         child: Box<Selector>,
     },
+    /// Match one of the named Agent Skills (`:skill(a, b)`): the skill under
+    /// evaluation when one is, otherwise any skill the package ships.
+    Skill(Vec<String>),
 }
 
 impl Selector {
@@ -51,7 +54,7 @@ impl Selector {
             Self::DirectChild { .. } => true,
             Self::And(parts) | Self::Or(parts) => parts.iter().any(Self::needs_dependency_graph),
             Self::Not(inner) => inner.needs_dependency_graph(),
-            Self::PseudoClass(_) | Self::Id(_) => false,
+            Self::PseudoClass(_) | Self::Id(_) | Self::Skill(_) => false,
         }
     }
 
@@ -64,7 +67,46 @@ impl Selector {
             Self::DirectChild { parent, child } => {
                 parent.uses_workspace_root() || child.uses_workspace_root()
             }
+            Self::PseudoClass(_) | Self::Id(_) | Self::Skill(_) => false,
+        }
+    }
+
+    /// Return whether matching reads the skills a package ships.
+    pub fn uses_skills(&self) -> bool {
+        match self {
+            Self::Skill(_) | Self::PseudoClass(PseudoClass::Skills) => true,
+            Self::And(parts) | Self::Or(parts) => parts.iter().any(Self::uses_skills),
+            Self::Not(inner) => inner.uses_skills(),
+            Self::DirectChild { parent, child } => parent.uses_skills() || child.uses_skills(),
             Self::PseudoClass(_) | Self::Id(_) => false,
+        }
+    }
+}
+
+/// Writes the selector in canonical form, which parses back to an equal
+/// selector: `,` and `>` get single spaces, `:skill()` names are joined by
+/// `, `, and an empty conjunction is `*`.
+impl fmt::Display for Selector {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PseudoClass(class) => formatter.write_str(class.display_name()),
+            Self::Id(id) => write!(formatter, "#{id}"),
+            Self::And(parts) if parts.is_empty() => formatter.write_str("*"),
+            Self::And(parts) => parts
+                .iter()
+                .try_for_each(|part| write!(formatter, "{part}")),
+            Self::Or(parts) => {
+                for (index, part) in parts.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    write!(formatter, "{part}")?;
+                }
+                Ok(())
+            }
+            Self::Not(inner) => write!(formatter, ":not({inner})"),
+            Self::DirectChild { parent, child } => write!(formatter, "{parent} > {child}"),
+            Self::Skill(names) => write!(formatter, ":skill({})", names.join(", ")),
         }
     }
 }
@@ -439,6 +481,11 @@ pub enum PseudoClass {
     Deprecated,
     Lpm,
     Npm,
+    /// `:skills` — the package ships at least one Agent Skill directory.
+    Skills,
+    /// `:malware` — a security verdict calls this version malicious.
+    /// Unknown, never false, when no verdict is available.
+    Malware,
 
     // Severity aliases (expand to OR of constituent tags)
     Critical,
@@ -500,6 +547,8 @@ impl PseudoClass {
             "deprecated" => Some(Self::Deprecated),
             "lpm" => Some(Self::Lpm),
             "npm" => Some(Self::Npm),
+            "skills" => Some(Self::Skills),
+            "malware" => Some(Self::Malware),
 
             // Severity aliases
             "critical" => Some(Self::Critical),
@@ -552,6 +601,8 @@ impl PseudoClass {
             Self::Deprecated => ":deprecated",
             Self::Lpm => ":lpm",
             Self::Npm => ":npm",
+            Self::Skills => ":skills",
+            Self::Malware => ":malware",
             Self::Critical => ":critical",
             Self::High => ":high",
             Self::Medium => ":medium",
@@ -627,7 +678,7 @@ impl PseudoClass {
         }
         match self {
             Self::Scripts | Self::Vulnerable => Severity::High,
-            Self::Critical => Severity::Critical,
+            Self::Critical | Self::Malware => Severity::Critical,
             Self::High => Severity::High,
             Self::Medium => Severity::Medium,
             Self::Info => Severity::Info,
@@ -636,6 +687,7 @@ impl PseudoClass {
             | Self::Deprecated
             | Self::Lpm
             | Self::Npm
+            | Self::Skills
             | Self::Root
             | Self::WorkspaceRoot => Severity::Info,
             _ => unreachable!("behavioral tags return from their shared policy"),
@@ -759,6 +811,8 @@ enum Token {
     RParen,
     /// `*` wildcard (matches any package)
     Star,
+    /// A skill name inside `:skill(...)`
+    Ident(String),
 }
 
 /// Parse error with position info.
@@ -785,8 +839,17 @@ fn tokenize(input: &str) -> Result<Vec<(Token, usize)>, ParseError> {
     let mut tokens = Vec::new();
     let chars: Vec<char> = input.chars().collect();
     let mut i = 0;
+    let mut in_skill_arguments = false;
 
     while i < chars.len() {
+        if in_skill_arguments && is_skill_name_char(chars[i]) {
+            let start = i;
+            while i < chars.len() && is_skill_name_char(chars[i]) {
+                i += 1;
+            }
+            tokens.push((Token::Ident(chars[start..i].iter().collect()), start));
+            continue;
+        }
         match chars[i] {
             ' ' | '\t' => {
                 i += 1;
@@ -843,10 +906,13 @@ fn tokenize(input: &str) -> Result<Vec<(Token, usize)>, ParseError> {
                 i += 1;
             }
             '(' => {
+                in_skill_arguments =
+                    matches!(tokens.last(), Some((Token::Colon(name), _)) if name == "skill");
                 tokens.push((Token::LParen, i));
                 i += 1;
             }
             ')' => {
+                in_skill_arguments = false;
                 tokens.push((Token::RParen, i));
                 i += 1;
             }
@@ -864,6 +930,23 @@ fn tokenize(input: &str) -> Result<Vec<(Token, usize)>, ParseError> {
     }
 
     Ok(tokens)
+}
+
+fn is_skill_name_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '-' || character == '_'
+}
+
+/// Whether `name` follows the Agent Skills naming rules: lowercase letters,
+/// digits and single hyphens, neither first nor last, at most 64 bytes.
+fn is_valid_skill_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 /// Recursive-descent parser for selector expressions.
@@ -987,6 +1070,9 @@ impl Parser {
                     self.expect(&Token::RParen)?;
                     return Ok(Selector::Not(Box::new(inner)));
                 }
+                if name == "skill" {
+                    return self.parse_skill_arguments();
+                }
 
                 let pc = PseudoClass::from_name(&name).ok_or_else(|| ParseError {
                     message: format!("unknown pseudo-class ':{name}'"),
@@ -1014,6 +1100,57 @@ impl Parser {
                 message: "unexpected end of input".into(),
                 position: self.position(),
             }),
+        }
+    }
+
+    /// Parse `(name, name...)` after `:skill`.
+    fn parse_skill_arguments(&mut self) -> Result<Selector, ParseError> {
+        self.expect(&Token::LParen)?;
+        let mut names = Vec::new();
+        loop {
+            match self.advance() {
+                Some((Token::Ident(name), position)) => {
+                    if !is_valid_skill_name(&name) {
+                        return Err(ParseError {
+                            message: format!(
+                                "invalid skill name '{name}' in :skill(); use lowercase letters, digits and single hyphens"
+                            ),
+                            position,
+                        });
+                    }
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+                Some((token, position)) => {
+                    return Err(ParseError {
+                        message: format!("expected a skill name in :skill(), got {token:?}"),
+                        position,
+                    });
+                }
+                None => {
+                    return Err(ParseError {
+                        message: "expected a skill name in :skill()".into(),
+                        position: self.position(),
+                    });
+                }
+            }
+            match self.advance() {
+                Some((Token::Comma, _)) => {}
+                Some((Token::RParen, _)) => return Ok(Selector::Skill(names)),
+                Some((token, position)) => {
+                    return Err(ParseError {
+                        message: format!("expected ',' or ')' in :skill(), got {token:?}"),
+                        position,
+                    });
+                }
+                None => {
+                    return Err(ParseError {
+                        message: "expected ')' to close :skill()".into(),
+                        position: self.position(),
+                    });
+                }
+            }
         }
     }
 }
@@ -1071,6 +1208,16 @@ pub struct PackageContext<'a> {
     /// (only meaningful in monorepos where `is_root` refers to
     /// the invocation workspace, not the workspace container).
     pub is_workspace_root_dep: bool,
+    /// The names of the Agent Skill directories the package ships; `None`
+    /// when they couldn't be listed, which leaves `:skills` and `:skill()`
+    /// undecided for it.
+    pub skills: Option<&'a [String]>,
+    /// The one skill being evaluated, when a caller evaluates each skill
+    /// separately; `:skill()` then tests this name instead of `skills`.
+    pub skill: Option<&'a str>,
+    /// Whether a security verdict calls this version malicious; `None` when
+    /// no verdict is available.
+    pub malware: Option<bool>,
 }
 
 /// How the dependency graph is keyed.
@@ -1101,6 +1248,9 @@ pub struct DepGraph<'a> {
     /// Keys of the workspace root's direct dependencies (monorepo only).
     /// Empty when not in a workspace or when workspace root == invocation root.
     pub workspace_root_deps: HashSet<&'a str>,
+    /// Keys of packages whose install is uncertain: whether the project
+    /// holds them is unknown, so an edge from one may not hold.
+    pub uncertain_installs: HashSet<&'a str>,
 }
 
 /// A lightweight package reference for building dependency graphs.
@@ -1126,6 +1276,7 @@ impl<'a> DepGraph<'a> {
             parents: HashMap::new(),
             root_deps: HashSet::new(),
             workspace_root_deps: HashSet::new(),
+            uncertain_installs: HashSet::new(),
         }
     }
 
@@ -1171,6 +1322,7 @@ impl<'a> DepGraph<'a> {
             parents,
             root_deps,
             workspace_root_deps: HashSet::new(),
+            uncertain_installs: HashSet::new(),
         }
     }
 
@@ -1258,6 +1410,7 @@ impl<'a> DepGraph<'a> {
             parents,
             root_deps,
             workspace_root_deps: HashSet::new(),
+            uncertain_installs: HashSet::new(),
         }
     }
 
@@ -1315,12 +1468,18 @@ impl<'a> DepGraph<'a> {
             parents,
             root_deps,
             workspace_root_deps: HashSet::new(),
+            uncertain_installs: HashSet::new(),
         }
     }
 
     /// Set workspace root dependencies (call after construction for monorepos).
     pub fn set_workspace_root_deps(&mut self, deps: HashSet<&'a str>) {
         self.workspace_root_deps = deps;
+    }
+
+    /// Sets the keys of packages whose install is uncertain.
+    pub fn set_uncertain_installs(&mut self, keys: HashSet<&'a str>) {
+        self.uncertain_installs = keys;
     }
 
     /// Get direct dependencies of a package (by key).
@@ -1406,7 +1565,9 @@ pub fn matches(
     matches_with_key(selector, pkg, graph_key, graph, all_packages)
 }
 
-/// Evaluate a selector with an explicitly supplied graph identity.
+/// Evaluate a selector with an explicitly supplied graph identity. A package
+/// matches only when the selector is certainly true for it: a selector that
+/// depends on data the package lacks doesn't match, even under `:not()`.
 pub fn matches_with_key(
     selector: &Selector,
     pkg: &PackageContext<'_>,
@@ -1414,50 +1575,130 @@ pub fn matches_with_key(
     graph: &DepGraph<'_>,
     all_packages: &HashMap<&str, PackageContext<'_>>,
 ) -> bool {
-    match selector {
-        Selector::PseudoClass(pc) => matches_pseudo_class(*pc, pkg),
-        Selector::Id(id) => matches_id(id, pkg),
-        Selector::And(parts) => {
-            // Empty And = wildcard (*), always true
-            parts.is_empty()
-                || parts
-                    .iter()
-                    .all(|selector| matches_with_key(selector, pkg, graph_key, graph, all_packages))
+    evaluate_with_key(selector, pkg, graph_key, graph, all_packages) == Truth::True
+}
+
+/// Whether a selector holds for a package, when the data to decide exists.
+/// Ordered so that conjunction is the minimum and disjunction the maximum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Truth {
+    False,
+    /// The selector reads data the package lacks, such as a behavioral
+    /// analysis or a security verdict.
+    Unknown,
+    True,
+}
+
+impl Truth {
+    #[inline]
+    fn from_bool(value: bool) -> Self {
+        if value { Self::True } else { Self::False }
+    }
+
+    #[inline]
+    fn negate(self) -> Self {
+        match self {
+            Self::False => Self::True,
+            Self::Unknown => Self::Unknown,
+            Self::True => Self::False,
         }
-        Selector::Or(parts) => parts
-            .iter()
-            .any(|selector| matches_with_key(selector, pkg, graph_key, graph, all_packages)),
-        Selector::Not(inner) => !matches_with_key(inner, pkg, graph_key, graph, all_packages),
+    }
+
+    #[inline]
+    fn and(self, other: Self) -> Self {
+        self.min(other)
+    }
+
+    #[inline]
+    fn or(self, other: Self) -> Self {
+        self.max(other)
+    }
+}
+
+/// Evaluate a selector under three-valued logic: a selector that reads data
+/// the package lacks is [`Truth::Unknown`], `:not()` keeps it unknown, a
+/// conjunction is false if any part is false, and a disjunction is true if
+/// any part is true.
+pub fn evaluate_with_key(
+    selector: &Selector,
+    pkg: &PackageContext<'_>,
+    graph_key: &str,
+    graph: &DepGraph<'_>,
+    all_packages: &HashMap<&str, PackageContext<'_>>,
+) -> Truth {
+    match selector {
+        Selector::PseudoClass(pc) => evaluate_pseudo_class(*pc, pkg),
+        Selector::Id(id) => Truth::from_bool(matches_id(id, pkg)),
+        Selector::Skill(names) => match pkg.skill {
+            Some(skill) => Truth::from_bool(names.iter().any(|name| name == skill)),
+            None => pkg.skills.map_or(Truth::Unknown, |shipped| {
+                Truth::from_bool(
+                    shipped
+                        .iter()
+                        .any(|shipped| names.iter().any(|name| name == shipped)),
+                )
+            }),
+        },
+        Selector::And(parts) => {
+            let mut result = Truth::True;
+            for part in parts {
+                result = result.and(evaluate_with_key(part, pkg, graph_key, graph, all_packages));
+                if result == Truth::False {
+                    break;
+                }
+            }
+            result
+        }
+        Selector::Or(parts) => {
+            let mut result = Truth::False;
+            for part in parts {
+                result = result.or(evaluate_with_key(part, pkg, graph_key, graph, all_packages));
+                if result == Truth::True {
+                    break;
+                }
+            }
+            result
+        }
+        Selector::Not(inner) => {
+            evaluate_with_key(inner, pkg, graph_key, graph, all_packages).negate()
+        }
         Selector::DirectChild { parent, child } => {
             // The current package must match `child`, and at least one
             // of its parents in the graph must match `parent`.
-            if !matches_with_key(child, pkg, graph_key, graph, all_packages) {
-                return false;
+            let child_truth = evaluate_with_key(child, pkg, graph_key, graph, all_packages);
+            if child_truth == Truth::False {
+                return Truth::False;
             }
 
-            // Check if parent is :root or :workspace-root
             if matches!(
                 parent.as_ref(),
                 Selector::PseudoClass(PseudoClass::WorkspaceRoot)
             ) {
-                return graph.workspace_root_deps.contains(graph_key);
+                return child_truth.and(Truth::from_bool(
+                    graph.workspace_root_deps.contains(graph_key),
+                ));
             }
             if is_root_selector(parent) {
-                return graph.root_deps.contains(graph_key);
+                return child_truth.and(Truth::from_bool(graph.root_deps.contains(graph_key)));
             }
 
-            // Check actual parents
+            let mut parent_truth = Truth::False;
             if let Some(parent_keys) = graph.parents.get(graph_key) {
-                parent_keys.iter().any(|parent_key| {
+                for parent_key in parent_keys {
                     if let Some(parent_pkg) = all_packages.get(parent_key) {
-                        matches_with_key(parent, parent_pkg, parent_key, graph, all_packages)
-                    } else {
-                        false
+                        let mut truth =
+                            evaluate_with_key(parent, parent_pkg, parent_key, graph, all_packages);
+                        if graph.uncertain_installs.contains(parent_key) {
+                            truth = truth.and(Truth::Unknown);
+                        }
+                        parent_truth = parent_truth.or(truth);
+                        if parent_truth == Truth::True {
+                            break;
+                        }
                     }
-                })
-            } else {
-                false
+                }
             }
+            child_truth.and(parent_truth)
         }
     }
 }
@@ -1500,44 +1741,68 @@ fn is_root_selector(sel: &Selector) -> bool {
 }
 
 /// Evaluate a pseudo-class against a package's data.
-fn matches_pseudo_class(pc: PseudoClass, pkg: &PackageContext<'_>) -> bool {
+fn evaluate_pseudo_class(pc: PseudoClass, pkg: &PackageContext<'_>) -> Truth {
     if pc.behavioral_policy().is_some() {
         return tag_check(pkg, |analysis| pc.matches_analysis(analysis));
     }
 
     match pc {
-        PseudoClass::Scripts => pkg.has_scripts,
-        PseudoClass::Built => pkg.is_built,
-        PseudoClass::Vulnerable => pkg.is_vulnerable,
-        PseudoClass::Deprecated => pkg.is_deprecated,
-        PseudoClass::Lpm => pkg.name.starts_with("@lpm.dev/"),
-        PseudoClass::Npm => !pkg.name.starts_with("@lpm.dev/"),
-        PseudoClass::Root => pkg.is_root,
-        PseudoClass::WorkspaceRoot => pkg.is_workspace_root_dep,
+        PseudoClass::Scripts => Truth::from_bool(pkg.has_scripts),
+        PseudoClass::Built => Truth::from_bool(pkg.is_built),
+        PseudoClass::Vulnerable => Truth::from_bool(pkg.is_vulnerable),
+        PseudoClass::Deprecated => Truth::from_bool(pkg.is_deprecated),
+        PseudoClass::Lpm => Truth::from_bool(pkg.name.starts_with("@lpm.dev/")),
+        PseudoClass::Npm => Truth::from_bool(!pkg.name.starts_with("@lpm.dev/")),
+        PseudoClass::Skills if pkg.skill.is_some() => Truth::True,
+        PseudoClass::Skills => pkg.skills.map_or(Truth::Unknown, |skills| {
+            Truth::from_bool(!skills.is_empty())
+        }),
+        PseudoClass::Malware => pkg.malware.map_or(Truth::Unknown, Truth::from_bool),
+        PseudoClass::Root => Truth::from_bool(pkg.is_root),
+        PseudoClass::WorkspaceRoot => Truth::from_bool(pkg.is_workspace_root_dep),
 
-        PseudoClass::Critical => matches_behavioral_severity(pkg, Severity::Critical),
-        PseudoClass::High => {
-            matches_behavioral_severity(pkg, Severity::High)
-                || matches_pseudo_class(PseudoClass::Scripts, pkg)
-                || matches_pseudo_class(PseudoClass::Vulnerable, pkg)
-        }
-        PseudoClass::Medium => matches_behavioral_severity(pkg, Severity::Medium),
-        PseudoClass::Info => matches_behavioral_severity(pkg, Severity::Info),
+        PseudoClass::Critical => evaluate_behavioral_severity(pkg, Severity::Critical),
+        PseudoClass::High => evaluate_behavioral_severity(pkg, Severity::High)
+            .or(evaluate_pseudo_class(PseudoClass::Scripts, pkg))
+            .or(evaluate_pseudo_class(PseudoClass::Vulnerable, pkg)),
+        PseudoClass::Medium => evaluate_behavioral_severity(pkg, Severity::Medium),
+        PseudoClass::Info => evaluate_behavioral_severity(pkg, Severity::Info),
         _ => unreachable!("behavioral tags return before state and severity matching"),
     }
 }
 
-fn matches_behavioral_severity(pkg: &PackageContext<'_>, severity: Severity) -> bool {
-    behavioral_tag_policies()
+fn evaluate_behavioral_severity(pkg: &PackageContext<'_>, severity: Severity) -> Truth {
+    let mut result = Truth::False;
+    for policy in behavioral_tag_policies()
         .iter()
-        .any(|policy| policy.severity == severity && matches_pseudo_class(policy.tag, pkg))
+        .filter(|policy| policy.severity == severity)
+    {
+        result = result.or(evaluate_pseudo_class(policy.tag, pkg));
+        if result == Truth::True {
+            break;
+        }
+    }
+    result
 }
 
-/// Helper: check a behavioral tag from analysis data.
-/// Returns `false` if no analysis is available.
+/// Helper: check a behavioral tag from analysis data. A tag the analysis
+/// found holds; one it didn't find is unknown when the analysis is missing
+/// or didn't cover the whole package, as when a limit cut it short.
 #[inline]
-fn tag_check(pkg: &PackageContext<'_>, f: impl FnOnce(&PackageAnalysis) -> bool) -> bool {
-    pkg.analysis.is_some_and(f)
+fn tag_check(pkg: &PackageContext<'_>, f: impl FnOnce(&PackageAnalysis) -> bool) -> Truth {
+    match pkg.analysis {
+        None => Truth::Unknown,
+        Some(analysis) if f(analysis) => Truth::True,
+        Some(analysis) if analysis_is_complete(analysis) => Truth::False,
+        Some(_) => Truth::Unknown,
+    }
+}
+
+/// Whether an analysis covered all of its package's sources.
+fn analysis_is_complete(analysis: &PackageAnalysis) -> bool {
+    !analysis.meta.limit_reached
+        && !analysis.meta.input_incomplete
+        && analysis.meta.unparsed_files == 0
 }
 
 // ─── Count Mode ──────────────────────────────────────────────────────────────
@@ -1556,7 +1821,7 @@ pub fn count_all_tags(packages: &[PackageContext<'_>]) -> Vec<TagCount> {
     for &pc in PseudoClass::all_behavioral() {
         let count = packages
             .iter()
-            .filter(|pkg| matches_pseudo_class(pc, pkg))
+            .filter(|pkg| evaluate_pseudo_class(pc, pkg) == Truth::True)
             .count();
         counts.push(TagCount {
             pseudo_class: pc,
@@ -1569,7 +1834,7 @@ pub fn count_all_tags(packages: &[PackageContext<'_>]) -> Vec<TagCount> {
     for pc in state_selectors {
         let count = packages
             .iter()
-            .filter(|pkg| matches_pseudo_class(pc, pkg))
+            .filter(|pkg| evaluate_pseudo_class(pc, pkg) == Truth::True)
             .count();
         counts.push(TagCount {
             pseudo_class: pc,
@@ -1717,6 +1982,9 @@ mod tests {
             is_deprecated: false,
             is_root: false,
             is_workspace_root_dep: false,
+            skills: Some(&[]),
+            skill: None,
+            malware: None,
         }
     }
 
@@ -1727,7 +1995,38 @@ mod tests {
             parents: HashMap::new(),
             root_deps: HashSet::new(),
             workspace_root_deps: HashSet::new(),
+            uncertain_installs: HashSet::new(),
         }
+    }
+
+    #[test]
+    fn a_tag_missing_from_an_incomplete_analysis_is_unknown_and_a_found_one_true() {
+        let selector = parse_selector(":not(:eval)").unwrap();
+        let graph = empty_graph();
+        let complete = default_analysis();
+        let mut limited = default_analysis();
+        limited.meta.limit_reached = true;
+        let mut unreadable = default_analysis();
+        unreadable.meta.input_incomplete = true;
+        let mut unparsed = default_analysis();
+        unparsed.meta.unparsed_files = 1;
+        let truth = |analysis: &PackageAnalysis| {
+            evaluate_with_key(
+                &selector,
+                &make_pkg("tool", Some(analysis)),
+                "tool",
+                &graph,
+                &HashMap::new(),
+            )
+        };
+        assert_eq!(truth(&complete), Truth::True);
+        for incomplete in [&limited, &unreadable, &unparsed] {
+            assert_eq!(truth(incomplete), Truth::Unknown);
+        }
+        let mut found = default_analysis();
+        found.meta.limit_reached = true;
+        found.source.eval = true;
+        assert_eq!(truth(&found), Truth::False);
     }
 
     // ─── Tokenizer tests ─────────────────────────────────────────────────
@@ -2036,6 +2335,9 @@ mod tests {
             is_deprecated: false,
             is_root: false,
             is_workspace_root_dep: false,
+            skills: Some(&[]),
+            skill: None,
+            malware: None,
         };
         let graph = empty_graph();
         let all = HashMap::new();
@@ -2169,6 +2471,9 @@ mod tests {
             is_deprecated: false,
             is_root: false,
             is_workspace_root_dep: false,
+            skills: Some(&[]),
+            skill: None,
+            malware: None,
         };
 
         let mut root_deps = HashSet::new();
@@ -2180,6 +2485,7 @@ mod tests {
             parents: HashMap::new(),
             root_deps,
             workspace_root_deps: HashSet::new(),
+            uncertain_installs: HashSet::new(),
         };
         let all = HashMap::new();
 
@@ -2210,6 +2516,9 @@ mod tests {
             is_deprecated: false,
             is_root: false,
             is_workspace_root_dep: false,
+            skills: Some(&[]),
+            skill: None,
+            malware: None,
         };
 
         let parent_analysis = default_analysis();
@@ -2224,6 +2533,9 @@ mod tests {
             is_deprecated: false,
             is_root: false,
             is_workspace_root_dep: false,
+            skills: Some(&[]),
+            skill: None,
+            malware: None,
         };
 
         let mut parents = HashMap::new();
@@ -2237,6 +2549,7 @@ mod tests {
             parents,
             root_deps: HashSet::new(),
             workspace_root_deps: HashSet::new(),
+            uncertain_installs: HashSet::new(),
         };
 
         let mut all = HashMap::new();
@@ -2623,6 +2936,7 @@ mod tests {
             parents,
             root_deps: HashSet::new(),
             workspace_root_deps: HashSet::new(),
+            uncertain_installs: HashSet::new(),
         };
 
         let mut a_analysis = default_analysis();
@@ -2640,6 +2954,9 @@ mod tests {
             is_deprecated: false,
             is_root: false,
             is_workspace_root_dep: false,
+            skills: Some(&[]),
+            skill: None,
+            malware: None,
         };
 
         let pkg_b = PackageContext {
@@ -2653,6 +2970,9 @@ mod tests {
             is_deprecated: false,
             is_root: false,
             is_workspace_root_dep: false,
+            skills: Some(&[]),
+            skill: None,
+            malware: None,
         };
 
         let mut all = HashMap::new();
@@ -2669,6 +2989,9 @@ mod tests {
                 is_deprecated: false,
                 is_root: false,
                 is_workspace_root_dep: false,
+                skills: Some(&[]),
+                skill: None,
+                malware: None,
             },
         );
         all.insert(
@@ -2684,6 +3007,9 @@ mod tests {
                 is_deprecated: false,
                 is_root: false,
                 is_workspace_root_dep: false,
+                skills: Some(&[]),
+                skill: None,
+                malware: None,
             },
         );
 
@@ -2734,6 +3060,9 @@ mod tests {
                 is_deprecated: false,
                 is_root: false,
                 is_workspace_root_dep: false,
+                skills: Some(&[]),
+                skill: None,
+                malware: None,
             })
             .collect();
 
@@ -2900,6 +3229,9 @@ mod tests {
             is_deprecated: false,
             is_root: false,
             is_workspace_root_dep: false,
+            skills: Some(&[]),
+            skill: None,
+            malware: None,
         };
 
         let express_pkg = PackageContext {
@@ -2913,6 +3245,9 @@ mod tests {
             is_deprecated: false,
             is_root: false,
             is_workspace_root_dep: false,
+            skills: Some(&[]),
+            skill: None,
+            malware: None,
         };
 
         let mut all: HashMap<&str, PackageContext<'_>> = HashMap::new();
@@ -3095,6 +3430,9 @@ mod tests {
             is_deprecated: false,
             is_root: false,
             is_workspace_root_dep: false,
+            skills: Some(&[]),
+            skill: None,
+            malware: None,
         };
         let qs = PackageContext {
             name: "qs",
@@ -3107,6 +3445,9 @@ mod tests {
             is_deprecated: false,
             is_root: false,
             is_workspace_root_dep: false,
+            skills: Some(&[]),
+            skill: None,
+            malware: None,
         };
 
         // Graph is name-keyed, so all_packages must be name-keyed too
@@ -3225,6 +3566,9 @@ mod tests {
                 is_deprecated: false,
                 is_root: false,
                 is_workspace_root_dep: false,
+                skills: Some(&[]),
+                skill: None,
+                malware: None,
             })
             .collect::<Vec<_>>();
         let all = keys
@@ -3248,5 +3592,213 @@ mod tests {
             &graph,
             &all,
         ));
+    }
+
+    // ─── Skills, verdicts and three-valued matching ─────────────────────
+
+    fn evaluate(selector: &str, pkg: &PackageContext<'_>) -> Truth {
+        let selector = parse_selector(selector).unwrap();
+        evaluate_with_key(&selector, pkg, pkg.name, &empty_graph(), &HashMap::new())
+    }
+
+    #[test]
+    fn skill_selectors_parse_names_and_reject_invalid_ones() {
+        assert_eq!(
+            parse_selector("#agent-browser:skill(agent-browser, core)").unwrap(),
+            Selector::And(vec![
+                Selector::Id("agent-browser".into()),
+                Selector::Skill(vec!["agent-browser".into(), "core".into()]),
+            ])
+        );
+        assert_eq!(
+            parse_selector(":skill(a,a)").unwrap(),
+            Selector::Skill(vec!["a".into()])
+        );
+        for invalid in [
+            ":skill()",
+            ":skill(Deploy)",
+            ":skill(deploy--app)",
+            ":skill(-deploy)",
+            ":skill(deploy",
+            ":skill(a b)",
+            ":skill(#a)",
+        ] {
+            assert!(parse_selector(invalid).is_err(), "{invalid} was accepted");
+        }
+    }
+
+    #[test]
+    fn bare_words_outside_skill_arguments_stay_errors() {
+        let error = parse_selector("eval").unwrap_err();
+        assert!(error.message.contains("unexpected character"), "{error}");
+        assert!(parse_selector(":not(eval)").is_err());
+    }
+
+    #[test]
+    fn display_writes_a_canonical_selector_that_parses_back_equal() {
+        for (input, canonical) in [
+            ("#agent-browser", "#agent-browser"),
+            ("#a:skill(x,y)", "#a:skill(x, y)"),
+            (
+                ":root>:skills:not(:malware)",
+                ":root > :skills:not(:malware)",
+            ),
+            ("#a,#b@1.2.3", "#a, #b@1.2.3"),
+            ("*", "*"),
+            ("*:eval", "*:eval"),
+            ("#@lpm.dev/acme.ui", "#@lpm.dev/acme.ui"),
+            (":not(#a, #b)", ":not(#a, #b)"),
+        ] {
+            let parsed = parse_selector(input).unwrap();
+            assert_eq!(parsed.to_string(), canonical, "{input}");
+            assert_eq!(parse_selector(canonical).unwrap(), parsed, "{input}");
+        }
+    }
+
+    #[test]
+    fn a_negated_selector_over_missing_analysis_is_unknown_not_true() {
+        let pkg = make_pkg("pkg", None);
+        assert_eq!(evaluate(":eval", &pkg), Truth::Unknown);
+        assert_eq!(evaluate(":not(:eval)", &pkg), Truth::Unknown);
+        assert!(!matches_with_key(
+            &parse_selector(":not(:eval)").unwrap(),
+            &pkg,
+            "pkg",
+            &empty_graph(),
+            &HashMap::new()
+        ));
+        assert_eq!(evaluate("#pkg, :eval", &pkg), Truth::True);
+        assert_eq!(evaluate("#other:eval", &pkg), Truth::False);
+        assert_eq!(evaluate("#pkg:not(:critical)", &pkg), Truth::Unknown);
+
+        let analysis = default_analysis();
+        let analyzed = make_pkg("pkg", Some(&analysis));
+        assert_eq!(evaluate(":not(:eval)", &analyzed), Truth::True);
+    }
+
+    #[test]
+    fn malware_is_unknown_without_a_verdict() {
+        let mut pkg = make_pkg("pkg", None);
+        assert_eq!(evaluate(":malware", &pkg), Truth::Unknown);
+        assert_eq!(evaluate(":not(:malware)", &pkg), Truth::Unknown);
+        pkg.malware = Some(false);
+        assert_eq!(evaluate(":not(:malware)", &pkg), Truth::True);
+        pkg.malware = Some(true);
+        assert_eq!(evaluate(":not(:malware)", &pkg), Truth::False);
+        assert_eq!(evaluate(":malware", &pkg), Truth::True);
+    }
+
+    #[test]
+    fn skill_selectors_stay_undecided_for_a_package_whose_skills_could_not_be_listed() {
+        let mut pkg = make_pkg("a", None);
+        pkg.skills = None;
+
+        assert_eq!(evaluate(":skills", &pkg), Truth::Unknown);
+        assert_eq!(evaluate(":not(:skills)", &pkg), Truth::Unknown);
+        assert_eq!(evaluate(":skill(x)", &pkg), Truth::Unknown);
+        assert_eq!(evaluate("#a:skills", &pkg), Truth::Unknown);
+        assert_eq!(evaluate("#b:skills", &pkg), Truth::False);
+
+        pkg.skill = Some("x");
+        assert_eq!(
+            evaluate(":skill(x)", &pkg),
+            Truth::True,
+            "the skill being evaluated is known even when the rest aren't"
+        );
+        assert_eq!(
+            evaluate(":skills", &pkg),
+            Truth::True,
+            "the skill being evaluated shows the package ships one"
+        );
+    }
+
+    #[test]
+    fn skill_selectors_test_the_candidate_skill_or_any_shipped_skill() {
+        let shipped = vec!["x".to_string(), "y".to_string()];
+        let mut a = make_pkg("a", None);
+        a.skills = Some(&shipped);
+        let mut b = make_pkg("b", None);
+        b.skills = Some(&shipped);
+
+        assert_eq!(evaluate(":skills", &a), Truth::True);
+        assert_eq!(evaluate(":skill(y)", &a), Truth::True);
+        assert_eq!(evaluate(":skill(z)", &a), Truth::False);
+        assert_eq!(evaluate(":skills", &make_pkg("c", None)), Truth::False);
+
+        let selector = "#a:skill(x), #b:skill(y)";
+        for (pkg, skill, expected) in [
+            (&a, "x", Truth::True),
+            (&a, "y", Truth::False),
+            (&b, "y", Truth::True),
+            (&b, "x", Truth::False),
+        ] {
+            let mut candidate = make_pkg(pkg.name, None);
+            candidate.skills = pkg.skills;
+            candidate.skill = Some(skill);
+            assert_eq!(
+                evaluate(selector, &candidate),
+                expected,
+                "{}/{skill}",
+                pkg.name
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_parent_makes_a_child_combinator_unknown() {
+        let child = make_pkg("child", None);
+        let mut graph = empty_graph();
+        graph.parents.insert("child", vec!["parent"]);
+        let mut all = HashMap::new();
+        all.insert("parent", make_pkg("parent", None));
+
+        let unknown = parse_selector(":eval > #child").unwrap();
+        assert_eq!(
+            evaluate_with_key(&unknown, &child, "child", &graph, &all),
+            Truth::Unknown
+        );
+        let named = parse_selector("#parent > #child").unwrap();
+        assert_eq!(
+            evaluate_with_key(&named, &child, "child", &graph, &all),
+            Truth::True
+        );
+        let wrong_child = parse_selector("#parent > #other").unwrap();
+        assert_eq!(
+            evaluate_with_key(&wrong_child, &child, "child", &graph, &all),
+            Truth::False
+        );
+    }
+
+    #[test]
+    fn a_parent_whose_install_is_uncertain_decides_no_child_combinator_alone() {
+        let child = make_pkg("child", None);
+        let mut graph = empty_graph();
+        graph.parents.insert("child", vec!["host", "other"]);
+        graph.set_uncertain_installs(HashSet::from(["host"]));
+        let mut all = HashMap::new();
+        all.insert("host", make_pkg("host", None));
+        all.insert("other", make_pkg("other", None));
+
+        for (selector, expected) in [
+            ("#host > #child", Truth::Unknown),
+            (":not(#host > #child)", Truth::Unknown),
+            ("#other > #child", Truth::True),
+            ("#nobody > #child", Truth::False),
+        ] {
+            let parsed = parse_selector(selector).unwrap();
+            assert_eq!(
+                evaluate_with_key(&parsed, &child, "child", &graph, &all),
+                expected,
+                "{selector}"
+            );
+        }
+    }
+
+    #[test]
+    fn uses_skills_finds_skill_selectors_anywhere() {
+        assert!(parse_selector("#a:skill(x)").unwrap().uses_skills());
+        assert!(parse_selector(":root > :skills").unwrap().uses_skills());
+        assert!(parse_selector(":not(:skill(x))").unwrap().uses_skills());
+        assert!(!parse_selector("#a, :eval").unwrap().uses_skills());
     }
 }
