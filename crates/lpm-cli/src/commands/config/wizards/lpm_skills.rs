@@ -22,21 +22,22 @@ pub(in crate::commands::config) async fn run_lpm_skills_wizard(
         let current = read_auto_install_lpm_skills(config_path)?;
         println!();
         println!("  current: {}", format_bool_enabled(current).cyan());
-        let new_value: &str =
-            cliclack::select("Install the reviewed skills of @lpm.dev/* packages?")
-                .item(
-                    "true",
-                    "enabled",
-                    "default; installs fetch LPM.dev package skills",
-                )
-                .item(
-                    "false",
-                    "disabled",
-                    "skip automatic skill fetches; existing files are kept",
-                )
-                .initial_value(if current { "true" } else { "false" })
-                .interact()
-                .map_err(prompt_err)?;
+        let new_value: &str = cliclack::select(
+            "Install the reviewed skills of @lpm.dev/* packages and link them for agents?",
+        )
+        .item(
+            "true",
+            "enabled",
+            "default; installs fetch LPM.dev package skills and link them",
+        )
+        .item(
+            "false",
+            "disabled",
+            "skip skill fetches and remove LPM's links; fetched files are kept",
+        )
+        .initial_value(if current { "true" } else { "false" })
+        .interact()
+        .map_err(prompt_err)?;
         parse_config_bool(new_value).map_err(|message| {
             LpmError::Registry(format!("`{LPM_DEV_PACKAGES_SETTING}` {message}"))
         })?

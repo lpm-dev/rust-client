@@ -100,6 +100,13 @@ impl Drop for ScopedEnv {
     }
 }
 
+/// A fresh, empty `LPM_HOME` for as long as the returned guard lives.
+pub(crate) fn isolated_lpm_home() -> (tempfile::TempDir, ScopedEnv) {
+    let home = tempfile::tempdir().unwrap();
+    let env = ScopedEnv::set([("LPM_HOME", home.path().as_os_str().to_owned())]);
+    (home, env)
+}
+
 /// Whether this process runs only the test `path` (its full name, such as
 /// `commands::doctor::runtime::tests::a_test`), so it may set the process
 /// environment, which every test sharing a process reads; otherwise runs

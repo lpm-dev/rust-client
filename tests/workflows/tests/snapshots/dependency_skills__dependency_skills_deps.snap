@@ -32,6 +32,7 @@ expression: deps
       ],
       "permission": "broad",
       "warnings": 0,
+      "review_warning": null,
       "suggested_selector": "#browser-tool:skill(browser-tool)",
       "links": []
     }

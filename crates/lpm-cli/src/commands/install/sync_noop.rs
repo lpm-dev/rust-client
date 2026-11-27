@@ -220,7 +220,13 @@ pub(crate) fn is_up_to_date(
         return Ok(false);
     }
     let extensions = super::policy_extensions::load_policy_extension_configs(&global)?;
-    let skills_ready = mode.no_skills || skills_ready(project_dir, package_json, &global);
+    let skills_ready = mode.no_skills
+        || skills_ready(
+            project_dir,
+            package_json,
+            &global,
+            &[project_dir.to_path_buf()],
+        );
     if !extensions.is_empty() || !skills_ready {
         return Ok(false);
     }
@@ -1012,7 +1018,19 @@ pub(crate) fn try_workspace_up_to_date(
     }
 
     let extensions = super::policy_extensions::load_policy_extension_configs(&global)?;
-    let skills_ready = mode.no_skills || skills_ready(workspace_root, package_json, &global);
+    let importers: Vec<std::path::PathBuf> = state
+        .targets
+        .iter()
+        .map(|target| {
+            if target.rel_path == "." {
+                workspace_root.to_path_buf()
+            } else {
+                workspace_root.join(&target.rel_path)
+            }
+        })
+        .collect();
+    let skills_ready =
+        mode.no_skills || skills_ready(workspace_root, package_json, &global, &importers);
     if !extensions.is_empty() || !skills_ready {
         return Ok(None);
     }
@@ -1156,31 +1174,38 @@ fn lockfile_contains_lpm_package(project_dir: &Path) -> bool {
 }
 
 /// Whether the project's skills need no work, as the full install would
-/// find. A skill setting this can't read counts as work: the full install
-/// then reports it, so the fast lane never decides differently.
+/// find: the full install materializes the skills of the project and of
+/// each importer it installs. A workspace answers here only for a lockfile
+/// without LPM.dev packages, so its members have no direct LPM.dev
+/// dependency to materialize, and their manifests needn't be read. A skill
+/// setting this can't read counts as work: the full install then reports
+/// it, so the fast lane never decides differently.
 fn skills_ready(
     project_dir: &Path,
     package_json: &str,
     global: &crate::commands::config::GlobalConfig,
+    importers: &[std::path::PathBuf],
 ) -> bool {
-    let Ok(lpm_dev_packages) =
-        crate::lpm_skills_config::LpmSkillsPreference::Config.resolve(global)
-    else {
+    let Ok(settings) = crate::dependency_skills::Settings::from_config(global) else {
         return false;
     };
-    let Ok(other_packages) = crate::lpm_skills_config::other_package_skills_enabled(global) else {
-        return false;
-    };
+    let lpm_dev_packages = settings.lpm_dev_packages;
     (!lpm_dev_packages
         || crate::commands::skills::package::materialization_complete(project_dir, package_json))
         && crate::commands::skills::project_skills_ready(project_dir)
+        && importers
+            .iter()
+            .filter(|importer| importer.as_path() != project_dir)
+            .all(|member| {
+                (!lpm_dev_packages
+                    || crate::commands::skills::package::added_sources_materialized(member))
+                    && crate::commands::skills::project_skills_ready(member)
+            })
         && crate::dependency_skills::links_ready_for_manifest_text(
             project_dir,
             package_json,
-            crate::dependency_skills::Settings {
-                other_packages,
-                omitted: Default::default(),
-            },
+            settings,
+            importers,
         )
 }
 

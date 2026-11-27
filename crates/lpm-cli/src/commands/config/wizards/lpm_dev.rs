@@ -124,7 +124,7 @@ fn lpm_dev_toggles(settings: LpmDevSettings) -> Vec<super::editor::Toggle> {
     vec![
         super::editor::Toggle {
             title: "LPM.dev package skills",
-            detail: "Install the reviewed skills of @lpm.dev/* dependencies?",
+            detail: "Install the reviewed skills of @lpm.dev/* dependencies and link them for agents?",
             enabled: settings.package_skills,
         },
         super::editor::Toggle {

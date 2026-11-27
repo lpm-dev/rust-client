@@ -185,7 +185,7 @@ async fn package_skills_recovers_a_stored_session_after_concealed_denial() {
         .and(path("/api/registry/skills"))
         .and(header("authorization", "Bearer rotated-access"))
         .respond_with(ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({"name":"owner.widget", "available":false,"skills":[]}),
+            serde_json::json!({"name":"owner.widget", "version":"1.0.0", "available":false,"skills":[]}),
         ))
         .expect(1)
         .mount(mock.server())

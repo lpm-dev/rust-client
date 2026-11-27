@@ -449,7 +449,7 @@ pub async fn run(
     force: bool,
     dry_run: bool,
     no_install_deps: bool,
-    no_skills: bool,
+    skills: crate::lpm_skills_config::LpmSkillsPreference,
     no_engine_strict: bool,
     pm: &str,
     alias_override: Option<&str>,
@@ -474,7 +474,7 @@ pub async fn run(
             force,
             dry_run,
             no_install_deps,
-            no_skills,
+            skills,
             no_engine_strict,
             pm,
             alias_override,
@@ -518,7 +518,7 @@ async fn run_locked(
     force: bool,
     dry_run: bool,
     no_install_deps: bool,
-    no_skills: bool,
+    skills: crate::lpm_skills_config::LpmSkillsPreference,
     no_engine_strict: bool,
     pm: &str,
     alias_override: Option<&str>,
@@ -527,6 +527,7 @@ async fn run_locked(
     emit_output: bool,
 ) -> Result<(), LpmError> {
     let add_started = std::time::Instant::now();
+    let no_skills = !skills.resolve(&crate::commands::config::GlobalConfig::load_checked()?)?;
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
     let reviewed = crate::typosquat_guard::guard_explicit_package_specs(
         project_dir,
@@ -1109,7 +1110,7 @@ async fn run_locked(
                 force,
                 true,
                 no_install_deps,
-                no_skills,
+                skills,
                 no_engine_strict,
                 pm,
                 swift_traversal,
@@ -1530,7 +1531,7 @@ async fn run_locked(
             yes,
             json_output,
             no_engine_strict,
-            crate::lpm_skills_config::LpmSkillsPreference::from_cli(false, no_skills),
+            skills,
             &effective_pm,
             &mut tx,
             &firewall_bypass_report,
@@ -1563,7 +1564,7 @@ async fn run_locked(
             project_dir,
             json_output,
             no_engine_strict,
-            crate::lpm_skills_config::LpmSkillsPreference::from_cli(false, no_skills),
+            skills,
             &effective_pm,
             &firewall_bypass_report,
         )
@@ -1700,22 +1701,26 @@ async fn run_locked(
         tx.restore_only_if_current(path).map_err(LpmError::Io)?;
     }
 
+    let mut materialized_package_skills = false;
     if !no_skills && let AddTarget::Lpm(pkg) = &target {
         let short_name = pkg.short();
         let skills_result = async {
             let response = client.get_skills(&short_name, Some(&version)).await?;
+            crate::commands::skills::package::answers_for(&response, &short_name, Some(&version))?;
             crate::commands::skills::package::validate_response(&response)?;
             let result = crate::commands::skills::package::materialize(
                 project_dir,
                 &short_name,
                 Some(&version),
                 &response.skills,
+                &response.skill_directories,
             )?;
             Ok::<_, LpmError>(result.installed)
         }
         .await;
         match skills_result {
             Ok(installed) => {
+                materialized_package_skills = true;
                 added_sources_state
                     .record_package_skill_materialization(&package_state_key, &short_name);
                 let provenance_result =
@@ -1761,12 +1766,12 @@ async fn run_locked(
     // Source recovery remains active across recursive Swift delivery.
     crate::commands::install::workspace_lockfile::commit_manifest_transaction_checked(tx)?;
     let dependency_skills = (emit_output
-        && installed_with_lpm
+        && (installed_with_lpm || materialized_package_skills)
         && !crate::commands::install::dependency_skills_deferred())
     .then(|| {
         crate::commands::install::reconcile_dependency_skills(
             project_dir,
-            crate::lpm_skills_config::LpmSkillsPreference::from_cli(false, no_skills),
+            skills,
             crate::commands::install::InstallOmitPolicy::default(),
         )
     });
@@ -1787,7 +1792,7 @@ async fn run_locked(
             force,
             dry_run,
             no_install_deps,
-            no_skills,
+            skills,
             no_engine_strict,
             pm,
             swift_traversal,

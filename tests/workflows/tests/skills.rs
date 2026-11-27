@@ -2005,6 +2005,266 @@ async fn up_to_date_install_restores_a_recorded_skill_source_package_skill() {
 }
 
 #[tokio::test]
+async fn an_unchanged_install_under_a_registry_named_in_the_environment_answers_from_the_fast_lane()
+{
+    let (project, registry) = installed_npm_project("environment-registry").await;
+    project.write_file(
+        "lpm-sources.json",
+        &serde_json::json!({
+            "schemaVersion": 1,
+            "packages": {"@lpm.dev/owner.widget": {
+                "version": "1.4.0",
+                "files": {},
+                "skills": "owner.widget",
+            }},
+        })
+        .to_string(),
+    );
+    registry
+        .with_package_skills_for_version_expected(
+            "owner.widget",
+            "1.4.0",
+            vec![package_skill(
+                "widget-guide",
+                "Use the widget the way this release supports",
+                "Render the widget through its documented props.",
+            )],
+            1,
+        )
+        .await;
+    let restored = bare_install(&project, &registry);
+    assert!(
+        restored.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert!(project.file_exists(".lpm/skills/owner.widget/widget-guide.md"));
+
+    let unchanged = bare_install(&project, &registry);
+
+    let report: serde_json::Value = serde_json::from_slice(&unchanged.stdout).unwrap();
+    assert!(
+        report["up_to_date"] == true && report.get("counts").is_none(),
+        "the review recorded under LPM_REGISTRY_URL must let the fast lane answer: {report:#}"
+    );
+}
+
+/// A workspace whose member `packages/web` depends on `left-pad`,
+/// installed, and whose unchanged install answers from the fast lane.
+async fn installed_workspace() -> (TempProject, MockRegistry) {
+    let project = TempProject::empty(
+        &serde_json::json!({
+            "name": "monorepo",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"],
+        })
+        .to_string(),
+    );
+    project.write_file(
+        "packages/web/package.json",
+        &serde_json::json!({
+            "name": "web",
+            "version": "1.0.0",
+            "dependencies": {"left-pad": "1.0.0"},
+        })
+        .to_string(),
+    );
+    let registry = MockRegistry::start().await;
+    registry
+        .with_package("left-pad", "1.0.0", &make_tarball("left-pad", "1.0.0"))
+        .await;
+    lpm_with_registry(&project, &registry.url())
+        .arg("install")
+        .assert()
+        .success();
+    assert_workspace_install_answers_from_the_fast_lane(&project, &registry);
+    (project, registry)
+}
+
+/// `lpm --json install` with nothing on the command line that keeps the
+/// install off the fast lane.
+fn bare_install(project: &TempProject, registry: &MockRegistry) -> std::process::Output {
+    lpm(project)
+        .env("LPM_REGISTRY_URL", registry.url())
+        .args(["--json", "install"])
+        .output()
+        .unwrap()
+}
+
+fn assert_workspace_install_answers_from_the_fast_lane(
+    project: &TempProject,
+    registry: &MockRegistry,
+) {
+    let unchanged = bare_install(project, registry);
+    let report: serde_json::Value = serde_json::from_slice(&unchanged.stdout)
+        .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&unchanged.stderr)));
+    assert!(
+        report["up_to_date"] == true
+            && report["counts"]["resolved_package_row_count"] == 0
+            && report["targets"]
+                .as_array()
+                .is_some_and(|targets| targets.iter().all(|target| target.get("counts").is_none())),
+        "an unchanged workspace install must answer from the fast lane: {report:#}"
+    );
+}
+
+#[tokio::test]
+async fn an_unchanged_workspace_install_restores_a_members_recorded_package_skills() {
+    let (project, registry) = installed_workspace().await;
+    project.write_file(
+        "packages/web/lpm-sources.json",
+        &serde_json::json!({
+            "schemaVersion": 1,
+            "packages": {"@lpm.dev/owner.widget": {
+                "version": "1.4.0",
+                "files": {},
+                "skills": "owner.widget",
+            }},
+        })
+        .to_string(),
+    );
+    registry
+        .with_package_skills_for_version_expected(
+            "owner.widget",
+            "1.4.0",
+            vec![package_skill(
+                "widget-guide",
+                "Use the widget the way this release supports",
+                "Render the widget through its documented props.",
+            )],
+            1,
+        )
+        .await;
+
+    let output = bare_install(&project, &registry);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        project.file_exists("packages/web/.lpm/skills/owner.widget/widget-guide.md"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[tokio::test]
+async fn a_members_package_skill_review_coming_due_takes_the_workspace_install_off_the_fast_lane() {
+    let (project, registry) = installed_workspace().await;
+    project.write_file(
+        "packages/web/lpm-sources.json",
+        &serde_json::json!({
+            "schemaVersion": 1,
+            "packages": {"@lpm.dev/owner.widget": {
+                "version": "1.4.0",
+                "files": {},
+                "skills": "owner.widget",
+            }},
+        })
+        .to_string(),
+    );
+    registry
+        .with_package_skills_for_version_expected(
+            "owner.widget",
+            "1.4.0",
+            vec![package_skill(
+                "widget-guide",
+                "Use the widget the way this release supports",
+                "Render the widget through its documented props.",
+            )],
+            2,
+        )
+        .await;
+    lpm_with_registry(&project, &registry.url())
+        .arg("install")
+        .assert()
+        .success();
+    assert_workspace_install_answers_from_the_fast_lane(&project, &registry);
+    let reviews = project.home().join(".lpm/cache/skill-reviews");
+    let record = std::fs::read_dir(&reviews)
+        .unwrap()
+        .flatten()
+        .map(|registry| registry.path().join("owner.widget/1.4.0.json"))
+        .find(|path| path.is_file())
+        .unwrap();
+    let mut review: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    review["pending"] = serde_json::json!(true);
+    review["checked_at"] = serde_json::json!(0);
+    std::fs::write(&record, serde_json::to_vec(&review).unwrap()).unwrap();
+
+    let output = bare_install(&project, &registry);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["targets"]
+            .as_array()
+            .is_some_and(|targets| targets.iter().any(|target| target.get("counts").is_some())),
+        "a due review must take the install off the fast lane: {report:#}"
+    );
+}
+
+#[tokio::test]
+async fn an_unchanged_workspace_install_restores_a_members_recorded_managed_skill() {
+    let (project, registry) = installed_workspace().await;
+    seed_standard_skill(
+        &project,
+        "packages/web/team-skills",
+        "release-notes",
+        "Summarize the relevant commits into concise release notes.",
+    );
+    let mut add = lpm(&project);
+    add.current_dir(project.path().join("packages/web"))
+        .args([
+            "skills",
+            "add",
+            "./team-skills",
+            "--skill",
+            "release-notes",
+            "--agent",
+            "codex",
+            "--project",
+            "--yes",
+        ])
+        .assert()
+        .success();
+    assert!(project.file_exists("packages/web/.agents/skills/release-notes/SKILL.md"));
+    lpm_with_registry(&project, &registry.url())
+        .arg("install")
+        .assert()
+        .success();
+    assert_workspace_install_answers_from_the_fast_lane(&project, &registry);
+    std::fs::remove_dir_all(project.path().join("packages/web/.lpm/managed-skills")).unwrap();
+    lpm_common::remove_path_entry(
+        &project
+            .path()
+            .join("packages/web/.agents/skills/release-notes"),
+    )
+    .unwrap();
+
+    let output = bare_install(&project, &registry);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        project.file_exists("packages/web/.agents/skills/release-notes/SKILL.md"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[tokio::test]
 async fn up_to_date_install_restores_a_recorded_managed_skill() {
     let (project, registry) = installed_npm_project("pulled-agent-skills").await;
     seed_standard_skill(
@@ -3459,7 +3719,7 @@ fn skills_validate_with_no_skills_dir_succeeds_quietly() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("! No lpm-skills/ directory found"),
+        stderr.contains("! No lpm-skills/ or skills/ directory found"),
         "validate without a skills dir must use a slim warning, got:\n{stderr}",
     );
 }

@@ -7,8 +7,9 @@ pub(crate) const LEGACY_NO_SKILLS_KEY: &str = "noSkills";
 /// The `[skills]` table in `~/.lpm/config.toml`.
 pub(crate) const SKILLS_TABLE: &str = "skills";
 /// `[skills] lpm-dev-packages`: install the reviewed skills of `@lpm.dev/*`
-/// dependencies. Replaces the top-level `auto-install-lpm-skills`, which is
-/// still read when this key is absent, and `noSkills` before it.
+/// dependencies and link them for agents. Replaces the top-level
+/// `auto-install-lpm-skills`, which is still read when this key is absent,
+/// and `noSkills` before it.
 pub(crate) const LPM_DEV_PACKAGES_KEY: &str = "lpm-dev-packages";
 /// `[skills] other-packages`: link the skills of npm and other non-LPM.dev
 /// dependencies that a project allows.

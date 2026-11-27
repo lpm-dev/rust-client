@@ -6,10 +6,12 @@
 //! checks them on upload, so both apply the same rules with the same
 //! messages.
 
+mod review;
 mod scan;
 mod skill_directory;
 mod validate;
 
+pub use review::*;
 pub use scan::*;
 pub use skill_directory::*;
 pub use validate::*;

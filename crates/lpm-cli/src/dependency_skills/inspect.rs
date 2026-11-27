@@ -1,11 +1,11 @@
 use super::apply::{Desired, desired_skills};
 use super::links::TargetDir;
 use super::plan::{CandidateStatus, HoldReason, Plan, PlanMode, SkillDetails, plan_project};
-use super::policy::{ParsedPolicy, Targets, policy_digest, read_policy};
+use super::policy::{Targets, policy_digest, read_policy};
 use super::state::{LinkState, StoredState, read_state};
 use super::{Settings, apply, snapshot, still_blocked};
 use lpm_common::LpmError;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
 /// Where one skill an installed dependency ships stands.
@@ -133,7 +133,10 @@ pub(crate) struct Inspection {
     /// The packages whose skills couldn't be listed, with why: what they
     /// ship and how the policy decides it is unknown until they can be.
     pub(crate) unlisted: Vec<(String, String)>,
+    /// The LPM.dev packages among `unlisted` that link without an entry.
+    pub(crate) automatic_unlisted: BTreeSet<String>,
     pub(crate) other_packages: bool,
+    pub(crate) lpm_dev_packages: bool,
     pub(crate) skills: Vec<InspectedSkill>,
 }
 
@@ -188,11 +191,7 @@ fn inspect(
             .as_ref()
             .map_or(&Targets::Auto, |policy| &policy.targets),
     );
-    let policy = if settings.other_packages {
-        policy_digest(parsed.policy.as_ref())
-    } else {
-        policy_digest(None)
-    };
+    let policy = policy_digest(parsed.policy.as_ref());
     let state = match read_state(project_dir) {
         StoredState::Present(state) => state,
         _ => LinkState::default(),
@@ -202,6 +201,7 @@ fn inspect(
         parsed,
         manifest,
         PlanMode::Inspect,
+        settings.sources(),
         packages,
         &state.recorded_skills(),
     )?;
@@ -215,8 +215,10 @@ fn inspect(
             .iter()
             .map(|(package, detail)| (package.clone(), detail.clone()))
             .collect(),
+        automatic_unlisted: plan.automatic_unlisted.clone(),
         other_packages: settings.other_packages,
-        skills: inspected_skills(project_dir, &plan, &state, &policy, settings),
+        lpm_dev_packages: settings.lpm_dev_packages,
+        skills: inspected_skills(project_dir, &plan, &state, &policy),
     })
 }
 
@@ -225,13 +227,8 @@ fn inspected_skills(
     plan: &Plan,
     state: &LinkState,
     policy: &str,
-    settings: Settings,
 ) -> Vec<InspectedSkill> {
-    let (desired, _) = if settings.other_packages {
-        desired_skills(project_dir, plan, state, policy)
-    } else {
-        Default::default()
-    };
+    let (desired, _) = desired_skills(project_dir, plan, state, policy);
     plan.candidates
         .iter()
         .map(|candidate| {
@@ -328,11 +325,7 @@ pub(crate) fn drift(project_dir: &Path, settings: Settings) -> Result<Vec<String
         Err(_) if !super::state::state_exists(project_dir) => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    let parsed = if settings.other_packages {
-        read_policy(&manifest)
-    } else {
-        ParsedPolicy::default()
-    };
+    let parsed = read_policy(&manifest);
     let state = match read_state(project_dir) {
         StoredState::Present(state) => state,
         StoredState::Missing => LinkState::default(),
@@ -345,15 +338,20 @@ pub(crate) fn drift(project_dir: &Path, settings: Settings) -> Result<Vec<String
         parsed,
         &manifest,
         PlanMode::Apply,
+        settings.sources(),
         None,
         &state.recorded_skills(),
     )?;
-    let targets = plan
-        .policy
-        .as_ref()
-        .filter(|policy| policy.is_active())
-        .map(|policy| apply::resolve_targets(project_dir, &policy.targets))
-        .unwrap_or_default();
+    let targets = if plan.considered {
+        apply::resolve_targets(
+            project_dir,
+            plan.policy
+                .as_ref()
+                .map_or(&Targets::Auto, |policy| &policy.targets),
+        )
+    } else {
+        Vec::new()
+    };
     let (desired, _) = desired_skills(project_dir, &plan, &state, &policy);
     let mut differences = Vec::new();
     for (skill, wanted) in &desired {

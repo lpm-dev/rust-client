@@ -11,6 +11,7 @@ fn plain_skill(name: &str) -> String {
 
 fn settings() -> Settings {
     Settings {
+        lpm_dev_packages: true,
         other_packages: true,
         omitted: Default::default(),
     }
@@ -714,7 +715,7 @@ fn a_copy_left_half_made_by_an_interrupted_run_is_cleaned_up_from_lpms_store_onl
 }
 
 #[test]
-fn the_prefilter_names_what_allow_entries_name_and_steps_aside_for_broad_or_relational_ones() {
+fn the_prefilter_names_what_allow_entries_name_and_steps_aside_for_broad_ones() {
     let names = |allow: &[&str]| {
         let policy = policy::read_policy(&serde_json::json!({
             "lpm": { "skills": { "allow": allow } }
@@ -743,8 +744,15 @@ fn the_prefilter_names_what_allow_entries_name_and_steps_aside_for_broad_or_rela
         Some(vec!["a".into()]),
         "a parent named by name alone needs none of its skills read"
     );
-    assert_eq!(names(&[":skills > #a"]), None);
-    assert_eq!(names(&["#a", "#host:skill(x) > #b"]), None);
+    assert_eq!(
+        names(&[":skills > #a"]),
+        Some(vec!["a".into()]),
+        "the skills a parent ships are read for the selectors alone"
+    );
+    assert_eq!(
+        names(&["#a", "#host:skill(x) > #b"]),
+        Some(vec!["a".into(), "b".into()])
+    );
     assert_eq!(
         names(&[":root > #a"]),
         Some(vec!["a".into()]),
@@ -1022,7 +1030,13 @@ fn a_lockfile_stamp_taken_too_soon_is_replaced_once_it_can_be_trusted() {
     let state::StoredState::Present(mut recorded) = state::read_state(project.path()) else {
         panic!("no state");
     };
-    recorded.fingerprint = fingerprint(project.path(), policy.as_ref(), settings(), Some(&racy));
+    recorded.fingerprint = fingerprint(
+        project.path(),
+        policy.as_ref(),
+        settings(),
+        Some(&racy),
+        &[project.path().to_path_buf()],
+    );
     recorded.lockfile = Some(racy);
     state::write_state(project.path(), &recorded).unwrap();
 
@@ -1081,6 +1095,34 @@ fn a_link_left_in_a_folder_that_is_no_longer_a_target_is_drift() {
         Vec::<String>::new()
     );
     assert!(!project.has_entry(".claude/skills/tool"));
+}
+
+#[test]
+fn a_member_the_state_cannot_record_never_keeps_the_links_from_looking_ready() {
+    let _home = crate::test_env::isolated_lpm_home();
+    let project = Project::new();
+    let mut manifest = project.manifest();
+    manifest["workspaces"] = serde_json::json!(["packages/*"]);
+    std::fs::write(project.join("package.json"), manifest.to_string()).unwrap();
+    for member in ["packages/a-caf\u{e9}", "packages/b"] {
+        std::fs::create_dir_all(project.join(member)).unwrap();
+        std::fs::write(
+            project.join(member).join("package.json"),
+            serde_json::json!({ "name": member.rsplit('/').next().unwrap(), "version": "1.0.0" })
+                .to_string(),
+        )
+        .unwrap();
+    }
+    std::fs::create_dir_all(project.join("packages/b/.lpm/skills/acme.ui")).unwrap();
+    std::fs::write(
+        project.join("packages/b/.lpm/skills/acme.ui/.lpm-package-skills.json"),
+        r#"{"schema_version":1,"package":"acme.ui","version":"1.0.0","skills":{}}"#,
+    )
+    .unwrap();
+
+    project.reconcile();
+
+    assert!(links_ready(project.path(), &project.manifest(), settings()));
 }
 
 #[test]
@@ -1150,6 +1192,18 @@ fn a_parent_whose_skills_cant_be_listed_leaves_a_selector_through_it_undecided()
         "the deny may match once host's skills can be read: {held:?}"
     );
     assert!(project.linked_document(".agents/skills", "tool").is_none());
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("host") && warning.contains("could not be read")),
+        "{:?}",
+        report.warnings
+    );
+    assert!(
+        !links_ready(project.path(), &project.manifest(), settings()),
+        "host's skills must be read again next time"
+    );
 }
 
 #[test]
@@ -1257,6 +1311,21 @@ fn a_version_held_for_a_reason_that_clears_may_link_and_one_held_for_good_may_no
         [("0.9.0", false), ("1.0.0", true), ("1.5.0", true)],
         "an unreadable copy may link once it can be read; an invalid one never does"
     );
+}
+
+#[test]
+fn a_workspaces_key_spelled_with_escapes_still_marks_a_possible_workspace_root() {
+    let project = tempfile::tempdir().unwrap();
+
+    assert!(may_be_workspace_root(
+        project.path(),
+        r#"{"workspaces":["packages/*"]}"#
+    ));
+    assert!(may_be_workspace_root(
+        project.path(),
+        r#"{"work\u0073paces":["packages/*"]}"#
+    ));
+    assert!(!may_be_workspace_root(project.path(), r#"{"name":"app"}"#));
 }
 
 #[cfg(unix)]

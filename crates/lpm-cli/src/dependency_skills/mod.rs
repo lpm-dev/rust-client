@@ -16,6 +16,7 @@ mod edit;
 mod git_exclude;
 mod inspect;
 mod links;
+mod lpm_dev;
 mod plan;
 mod policy;
 mod snapshot;
@@ -24,15 +25,16 @@ mod state;
 mod tests;
 
 pub(crate) use apply::{ReconcileReport, SkillChange};
-pub(crate) use discovery::skill_directory_names;
+pub(crate) use discovery::{read_skill_directory, skill_directory_names};
 pub(crate) use edit::{ManifestEdit, PolicyList};
 pub(crate) use inspect::{
     InspectedSkill, Inspection, PlannedChange, SkillStatus, drift, inspect_project,
 };
+pub(crate) use lpm_dev::review_warning_note;
 pub(crate) use plan::read_manifest;
 #[cfg(test)]
-pub(crate) use plan::{HoldReason, Naming, SkillDetails};
-pub(crate) use plan::{InstanceRuling, may_match_any};
+pub(crate) use plan::{HoldReason, Naming};
+pub(crate) use plan::{InstanceRuling, SkillDetails, may_match_any};
 pub(crate) use policy::validate_selector;
 pub(crate) use state::{LinkKind, LinkedSkillRecord};
 
@@ -41,15 +43,18 @@ use cap_fs_ext::DirExt as _;
 use lpm_common::LpmError;
 use sha2::{Digest as _, Sha256};
 use std::io::Read as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Bumped when the rules that decide which skills link change, so that
 /// every project reconciles again.
-const RULES_VERSION: &str = "dependency-skills-1";
+const RULES_VERSION: &str = "dependency-skills-2";
 
 /// What this run does with dependency skills.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Settings {
+    /// "LPM.dev package skills": link the reviewed skills of LPM.dev
+    /// dependencies. Off, the links LPM made for them are removed.
+    pub(crate) lpm_dev_packages: bool,
     /// "npm and other package skills": follow the project's allow-list.
     /// Off, the links LPM made are removed.
     pub(crate) other_packages: bool,
@@ -66,18 +71,31 @@ impl Settings {
         match preference {
             LpmSkillsPreference::Disabled => Ok(None),
             LpmSkillsPreference::Enabled => Ok(Some(Self {
+                lpm_dev_packages: true,
                 other_packages: true,
                 omitted: Default::default(),
             })),
-            LpmSkillsPreference::Config => {
-                let config = crate::commands::config::GlobalConfig::load_checked()?;
-                Ok(Some(Self {
-                    other_packages: crate::lpm_skills_config::other_package_skills_enabled(
-                        &config,
-                    )?,
-                    omitted: Default::default(),
-                }))
-            }
+            LpmSkillsPreference::Config => Ok(Some(Self::from_config(
+                &crate::commands::config::GlobalConfig::load_checked()?,
+            )?)),
+        }
+    }
+
+    /// The user's skill settings in `config`.
+    pub(crate) fn from_config(
+        config: &crate::commands::config::GlobalConfig,
+    ) -> Result<Self, LpmError> {
+        Ok(Self {
+            lpm_dev_packages: LpmSkillsPreference::Config.resolve(config)?,
+            other_packages: crate::lpm_skills_config::other_package_skills_enabled(config)?,
+            omitted: Default::default(),
+        })
+    }
+
+    fn sources(self) -> plan::Sources {
+        plan::Sources {
+            lpm_dev: self.lpm_dev_packages,
+            other: self.other_packages,
         }
     }
 
@@ -87,18 +105,29 @@ impl Settings {
     }
 }
 
-/// Whether the project's links already match its policy, its lockfile and
-/// these settings, and are intact, so an install can skip reconciling.
-/// Reads nothing past the manifest when the project has no policy and LPM
-/// linked nothing.
+/// Whether the project's links already match its policy, its lockfile, the
+/// reviewed LPM.dev skills its installs materialized and these settings,
+/// and are intact, so an install can skip reconciling. Reads nothing past
+/// the manifest when LPM linked nothing and nothing could link.
 ///
-/// Links a newer LPM recorded count as ready: this one leaves them alone.
+/// A policy with problems is never ready, so every install warns until it
+/// is fixed. Links a newer LPM recorded count as ready: this one leaves
+/// them alone.
+#[cfg(test)]
 pub(crate) fn links_ready(
     project_dir: &Path,
     manifest: &serde_json::Value,
     settings: Settings,
 ) -> bool {
-    !matches!(readiness(project_dir, manifest, settings), Readiness::Stale)
+    !matches!(
+        readiness(
+            project_dir,
+            manifest,
+            settings,
+            &[project_dir.to_path_buf()]
+        ),
+        Readiness::Stale
+    )
 }
 
 enum Readiness {
@@ -107,29 +136,35 @@ enum Readiness {
     RecordedByNewer(String),
 }
 
-fn readiness(project_dir: &Path, manifest: &serde_json::Value, settings: Settings) -> Readiness {
-    let parsed = if settings.other_packages {
-        policy::read_policy(manifest)
-    } else {
-        policy::ParsedPolicy::default()
-    };
-    let active = parsed
-        .policy
-        .as_ref()
-        .is_some_and(policy::SkillsPolicy::is_active);
+/// [`links_ready`]'s verdict, looking for materialized LPM.dev skills in
+/// `importers` when LPM linked nothing yet.
+fn readiness(
+    project_dir: &Path,
+    manifest: &serde_json::Value,
+    settings: Settings,
+    importers: &[PathBuf],
+) -> Readiness {
+    let parsed = policy::read_policy(manifest);
+    let problems =
+        (settings.lpm_dev_packages || settings.other_packages) && !parsed.problems.is_empty();
+    let policy = parsed.policy;
     let ready = match state::read_state(project_dir) {
         state::StoredState::Newer(reason) => return Readiness::RecordedByNewer(reason),
-        state::StoredState::Missing => !active && parsed.problems.is_empty(),
+        state::StoredState::Missing => {
+            !problems && !could_link(policy.as_ref(), settings, importers)
+        }
         state::StoredState::Unusable(_) => false,
         state::StoredState::Present(recorded) => {
+            let importers = recorded_importers(project_dir, &recorded);
             let lockfile = lockfile_stamp(project_dir, recorded.lockfile.as_ref());
-            let ready = parsed.problems.is_empty()
+            let ready = !problems
                 && recorded.fingerprint
                     == fingerprint(
                         project_dir,
-                        parsed.policy.as_ref(),
+                        policy.as_ref(),
                         settings,
                         lockfile.as_ref(),
+                        &importers,
                     )
                 && recorded.stale.is_empty()
                 && links_intact(project_dir, &recorded);
@@ -150,19 +185,73 @@ fn readiness(project_dir: &Path, manifest: &serde_json::Value, settings: Setting
     }
 }
 
-/// [`links_ready`] from the manifest's text, for the install fast lanes: a
-/// manifest that never mentions `"skills"` in a project where LPM linked
-/// nothing is ready without parsing.
+/// Whether `policy` and `settings` could link anything in `importers`:
+/// the policy allows packages and npm and other package skills are on, or
+/// LPM.dev package skills are on and an install materialized some.
+fn could_link(
+    policy: Option<&policy::SkillsPolicy>,
+    settings: Settings,
+    importers: &[PathBuf],
+) -> bool {
+    if policy.is_some_and(|policy| policy.deny_unreadable) {
+        return false;
+    }
+    (settings.other_packages && policy.is_some_and(policy::SkillsPolicy::is_active))
+        || (settings.lpm_dev_packages
+            && importers
+                .iter()
+                .any(|importer| lpm_dev::has_reviewed_sets(importer)))
+}
+
+/// The project directories a recorded reconcile followed: the project and
+/// the workspace members it recorded.
+fn recorded_importers(project_dir: &Path, recorded: &state::LinkState) -> Vec<PathBuf> {
+    member_importers(project_dir, &recorded.members)
+}
+
+/// The project and `members`, project-relative, as the directories whose
+/// LPM.dev skills the fingerprint covers. Reconciling and checking
+/// readiness both build it from the recorded members, so a member the
+/// state can't record never makes the two disagree.
+fn member_importers(project_dir: &Path, members: &[String]) -> Vec<PathBuf> {
+    std::iter::once(project_dir.to_path_buf())
+        .chain(
+            members
+                .iter()
+                .map(|member| links::project_path(project_dir, member)),
+        )
+        .collect()
+}
+
+/// [`links_ready`] from the manifest's text, for the install fast lanes,
+/// whose installs may have materialized LPM.dev skills in any of
+/// `importers`: the project, or a workspace root and its members, which the
+/// caller already knows. A manifest that never mentions `"skills"` where
+/// LPM linked nothing and no importer holds LPM.dev skills is ready without
+/// parsing.
 pub(crate) fn links_ready_for_manifest_text(
     project_dir: &Path,
     manifest: &str,
     settings: Settings,
+    importers: &[PathBuf],
 ) -> bool {
-    if !may_name_skills(manifest) && !state::state_exists(project_dir) {
+    if !may_name_skills(manifest)
+        && !state::state_exists(project_dir)
+        && !(settings.lpm_dev_packages
+            && importers
+                .iter()
+                .any(|importer| lpm_dev::has_reviewed_sets(importer)))
+    {
         return true;
     }
-    serde_json::from_str::<serde_json::Value>(lpm_common::strip_utf8_bom_str(manifest))
-        .is_ok_and(|manifest| links_ready(project_dir, &manifest, settings))
+    serde_json::from_str::<serde_json::Value>(lpm_common::strip_utf8_bom_str(manifest)).is_ok_and(
+        |manifest| {
+            !matches!(
+                readiness(project_dir, &manifest, settings, importers),
+                Readiness::Stale
+            )
+        },
+    )
 }
 
 /// Whether every recorded skill's copy still holds the bytes LPM checked,
@@ -239,6 +328,8 @@ pub(crate) struct LinkedSkillDetails {
     /// Each recorded entry, with whether it is still LPM's and still shows
     /// the copy.
     pub(crate) links: Vec<(state::LinkRecord, bool)>,
+    /// What LPM.dev review warned about when it approved the copy.
+    pub(crate) review_warning: Option<Vec<lpm_registry::SkillReviewIssue>>,
 }
 
 impl LinkedSkillDetails {
@@ -287,12 +378,22 @@ pub(crate) fn linked_skill_details(project_dir: &Path) -> Vec<LinkedSkillDetails
                     (link.clone(), intact)
                 })
                 .collect();
+            let review_warning = record.reviewed_by.as_deref().and_then(|registry| {
+                lpm_dev::recorded_review_warning(
+                    registry,
+                    &record.package,
+                    &record.version,
+                    &name,
+                    &record.digest,
+                )
+            });
             LinkedSkillDetails {
                 copy: state::snapshot_dir(project_dir, &name),
                 name,
                 record,
                 checked,
                 links,
+                review_warning,
             }
         })
         .collect()
@@ -323,9 +424,10 @@ pub(crate) fn linked_skills(project_dir: &Path) -> Vec<(String, LinkedSkillRecor
 
 /// Points out the skills that `packages`, just installed into
 /// `project_dir` by name, ship and the project could link but doesn't, with
-/// the entries that link them. Prints nothing when the run skips skill work
-/// or the user turned these skills off, and reads nothing more when none of
-/// `packages` ships a skill.
+/// the entries that link them. LPM.dev packages are left out: their
+/// reviewed skills link without an entry. Prints nothing when the run skips
+/// skill work or the user turned these skills off, and reads nothing more
+/// when none of `packages` ships a skill.
 pub(crate) fn print_unlinked_skill_hints(
     project_dir: &Path,
     packages: &[&str],
@@ -339,7 +441,7 @@ pub(crate) fn print_unlinked_skill_hints(
     }
     let shipping: std::collections::HashSet<String> = packages
         .iter()
-        .filter(|package| ships_skills(project_dir, package))
+        .filter(|package| !plan::is_lpm_dev(package) && ships_skills(project_dir, package))
         .map(|package| (*package).to_string())
         .collect();
     if shipping.is_empty() {
@@ -456,8 +558,8 @@ pub(crate) fn reconcile_now(
 }
 
 fn try_reconcile(project_dir: &Path, settings: Settings) -> Result<ReconcileReport, LpmError> {
-    let unlocked = match manifest_with_skill_work(project_dir)? {
-        Some(manifest) => readiness(project_dir, &manifest, settings),
+    let unlocked = match skill_work(project_dir, settings)? {
+        Some(work) => readiness(project_dir, &work.manifest, settings, &work.importers),
         None => Readiness::Ready,
     };
     match unlocked {
@@ -466,11 +568,11 @@ fn try_reconcile(project_dir: &Path, settings: Settings) -> Result<ReconcileRepo
         Readiness::RecordedByNewer(reason) => return Ok(left_to_newer(&reason)),
     }
     let lock = state::acquire_lock(project_dir)?;
-    let Some(manifest) = manifest_with_skill_work(project_dir)? else {
+    let Some(work) = skill_work(project_dir, settings)? else {
         return Ok(ReconcileReport::default());
     };
-    match readiness(project_dir, &manifest, settings) {
-        Readiness::Stale => reconcile_locked(project_dir, &manifest, settings, &lock),
+    match readiness(project_dir, &work.manifest, settings, &work.importers) {
+        Readiness::Stale => reconcile_locked(project_dir, &work.manifest, settings, &lock),
         Readiness::Ready => Ok(ReconcileReport::default()),
         Readiness::RecordedByNewer(reason) => Ok(left_to_newer(&reason)),
     }
@@ -484,15 +586,25 @@ fn left_to_newer(reason: &str) -> ReconcileReport {
 }
 
 /// Whether `project_dir` may have dependency-skill work, judged without
-/// parsing anything: LPM linked something there, or its manifest mentions
-/// `"skills"`.
+/// parsing JSON or reading the user's settings: LPM linked something
+/// there, its manifest mentions `"skills"`, or an install materialized
+/// reviewed LPM.dev skills in it or, at a workspace root, in a member.
 pub(crate) fn may_have_skill_work(project_dir: &Path) -> bool {
-    state::state_exists(project_dir)
-        || lpm_common::read_text_file_capped(
-            &project_dir.join("package.json"),
-            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-        )
-        .is_ok_and(|text| may_name_skills(&text))
+    if state::state_exists(project_dir) || lpm_dev::has_reviewed_sets(project_dir) {
+        return true;
+    }
+    let Ok(text) = lpm_common::read_text_file_capped(
+        &project_dir.join("package.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) else {
+        return false;
+    };
+    may_name_skills(&text)
+        || (may_be_workspace_root(project_dir, &text)
+            && plan::importer_directories(project_dir)
+                .iter()
+                .skip(1)
+                .any(|member| lpm_dev::has_reviewed_sets(member)))
 }
 
 /// Whether manifest text may hold a skills policy: it says `"skills"`, or
@@ -501,9 +613,29 @@ fn may_name_skills(text: &str) -> bool {
     text.contains("\"skills\"") || text.contains("\\u")
 }
 
-/// The project's manifest, or `None` when there is no skill work: LPM
-/// linked nothing and the manifest never mentions `"skills"`, or is gone.
-fn manifest_with_skill_work(project_dir: &Path) -> Result<Option<serde_json::Value>, LpmError> {
+/// Whether the project whose manifest reads `text` may be a workspace
+/// root, judged without parsing it: it says `"workspaces"` or holds a `\u`
+/// escape, which can spell the key too, or a `pnpm-workspace.yaml` sits
+/// beside it.
+fn may_be_workspace_root(project_dir: &Path, text: &str) -> bool {
+    text.contains("\"workspaces\"")
+        || text.contains("\\u")
+        || std::fs::symlink_metadata(project_dir.join("pnpm-workspace.yaml")).is_ok()
+}
+
+/// What a reconcile reads: the project's manifest, and the directories
+/// whose installs may have materialized LPM.dev skills.
+struct SkillWork {
+    manifest: serde_json::Value,
+    importers: Vec<PathBuf>,
+}
+
+/// The project's skill work, or `None` when there is none: LPM linked
+/// nothing, the manifest never mentions `"skills"`, and no install in the
+/// project, or in a member when it is a workspace root, materialized
+/// LPM.dev skills. A missing manifest is no work unless LPM linked
+/// something.
+fn skill_work(project_dir: &Path, settings: Settings) -> Result<Option<SkillWork>, LpmError> {
     let has_state = state::state_exists(project_dir);
     let path = project_dir.join("package.json");
     let text =
@@ -512,12 +644,24 @@ fn manifest_with_skill_work(project_dir: &Path) -> Result<Option<serde_json::Val
             Err(_) if !has_state => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-    if !has_state && !may_name_skills(&text) {
+    let importers = if settings.lpm_dev_packages && may_be_workspace_root(project_dir, &text) {
+        plan::importer_directories(project_dir)
+    } else {
+        vec![project_dir.to_path_buf()]
+    };
+    let has_sets = settings.lpm_dev_packages
+        && importers
+            .iter()
+            .any(|importer| lpm_dev::has_reviewed_sets(importer));
+    if !has_state && !has_sets && !may_name_skills(&text) {
         return Ok(None);
     }
-    serde_json::from_str(lpm_common::strip_utf8_bom_str(&text))
-        .map(Some)
-        .map_err(|error| LpmError::Registry(format!("invalid {}: {error}", path.display())))
+    let manifest = serde_json::from_str(lpm_common::strip_utf8_bom_str(&text))
+        .map_err(|error| LpmError::Registry(format!("invalid {}: {error}", path.display())))?;
+    Ok(Some(SkillWork {
+        manifest,
+        importers,
+    }))
 }
 
 /// Plans and applies the links `manifest` asks for; the caller holds the
@@ -528,11 +672,7 @@ fn reconcile_locked(
     settings: Settings,
     lock: &lpm_common::ExclusiveLockHandle,
 ) -> Result<ReconcileReport, LpmError> {
-    let parsed = if settings.other_packages {
-        policy::read_policy(manifest)
-    } else {
-        policy::ParsedPolicy::default()
-    };
+    let parsed = policy::read_policy(manifest);
     let (recorded, recorded_skills) = match state::read_state(project_dir) {
         state::StoredState::Present(recorded) => {
             let skills = recorded.recorded_skills();
@@ -541,34 +681,75 @@ fn reconcile_locked(
         _ => (None, plan::RecordedSkills::new()),
     };
     let lockfile = lockfile_stamp(project_dir, recorded.as_ref());
+    let members: Vec<String> = plan::importer_directories(project_dir)
+        .iter()
+        .skip(1)
+        .filter_map(|member| relative_member(project_dir, member))
+        .collect();
     let inputs = apply::Inputs {
         fingerprint: fingerprint(
             project_dir,
             parsed.policy.as_ref(),
             settings,
             lockfile.as_ref(),
+            &member_importers(project_dir, &members),
         ),
         policy: policy::policy_digest(parsed.policy.as_ref()),
         lockfile,
+        members,
     };
     let plan = plan::plan_project(
         project_dir,
         parsed,
         manifest,
         plan::PlanMode::Apply,
+        settings.sources(),
         None,
         &recorded_skills,
     )?;
+    record_pending_reviews(&plan.pending_reviews);
     apply::apply(project_dir, &plan, inputs, lock)
 }
 
+/// Marks each review record that leaves one of its package's skill
+/// directories unnamed, so a later install asks the registry again. A
+/// record that can't be marked only means that install doesn't ask.
+fn record_pending_reviews(pending: &[plan::PendingReview]) {
+    for review in pending {
+        if let Err(error) = crate::commands::skills::reviews::mark_pending(
+            &review.package,
+            &review.version,
+            &review.directory,
+        ) {
+            tracing::debug!(
+                "couldn't mark the review of {}@{} to be asked again: {error}",
+                review.package,
+                review.version
+            );
+        }
+    }
+}
+
+/// `member`, a workspace member directory under `project_dir`, as the
+/// project-relative path the state records.
+fn relative_member(project_dir: &Path, member: &Path) -> Option<String> {
+    let relative = member.strip_prefix(project_dir).ok()?;
+    let parts: Vec<&str> = relative
+        .components()
+        .map(|component| component.as_os_str().to_str())
+        .collect::<Option<_>>()?;
+    policy::normalize_relative_dir(&parts.join("/")).ok()
+}
+
 /// What the links were reconciled from: the rules, the CLI, the settings,
-/// the active policy and the directories it resolves to, and the lockfile.
+/// the policy and the directories it resolves to, the lockfile, and the
+/// reviewed LPM.dev skills materialized in `importers`.
 fn fingerprint(
     project_dir: &Path,
     policy: Option<&policy::SkillsPolicy>,
     settings: Settings,
     lockfile: Option<&state::FileStamp>,
+    importers: &[PathBuf],
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(RULES_VERSION);
@@ -576,19 +757,23 @@ fn fingerprint(
     hasher.update(env!("CARGO_PKG_VERSION"));
     hasher.update([
         0,
+        u8::from(settings.lpm_dev_packages),
         u8::from(settings.other_packages),
         u8::from(settings.omitted.dev),
         u8::from(settings.omitted.optional),
     ]);
-    match policy.filter(|policy| policy.is_active()) {
-        Some(policy) => {
-            hasher.update(policy.fingerprint_text());
-            for target in apply::resolve_targets(project_dir, &policy.targets) {
-                hasher.update([0]);
-                hasher.update(target);
-            }
-        }
-        None => hasher.update("inactive"),
+    match policy {
+        Some(policy) => hasher.update(policy.fingerprint_text()),
+        None => hasher.update("no-policy"),
+    }
+    let targets = policy.map_or(&policy::Targets::Auto, |policy| &policy.targets);
+    for target in apply::resolve_targets(project_dir, targets) {
+        hasher.update([0]);
+        hasher.update(target);
+    }
+    hasher.update([0]);
+    if settings.lpm_dev_packages || policy.is_some_and(plan::reads_other_packages_skills) {
+        hasher.update(lpm_dev::sets_fingerprint(importers));
     }
     hasher.update([0]);
     match lockfile {

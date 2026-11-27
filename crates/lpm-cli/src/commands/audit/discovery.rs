@@ -473,6 +473,7 @@ fn lpm_discovered_packages(
         Reachability::Track => installed_lpm_instances(project_root, lockfile, &by_instance),
         Reachability::Skip => None,
     };
+    let legacy_local_names = legacy_local_names(lockfile);
     lockfile
         .packages
         .iter()
@@ -507,7 +508,16 @@ fn lpm_discovered_packages(
                 path: p
                     .instance_id
                     .and_then(|instance_id| project_paths.get(&instance_id).cloned())
-                    .unwrap_or_else(|| format!("node_modules/{}", p.name)),
+                    .unwrap_or_else(|| {
+                        let local = p
+                            .instance_id
+                            .is_none()
+                            .then(|| legacy_local_names.get(&(p.name.as_str(), p.version.as_str())))
+                            .flatten()
+                            .copied()
+                            .unwrap_or(p.name.as_str());
+                        format!("node_modules/{local}")
+                    }),
                 integrity: p.integrity.clone(),
                 patch_sha256,
                 resolved_url: None,
@@ -522,6 +532,32 @@ fn lpm_discovered_packages(
             }
         })
         .collect()
+}
+
+/// The name each release a lockfile without instance ids installs at the
+/// root is installed under: its own when the root installs it so, else an
+/// npm alias.
+fn legacy_local_names(lockfile: &lpm_lockfile::Lockfile) -> HashMap<(&str, &str), &str> {
+    let mut names = HashMap::new();
+    if lockfile
+        .packages
+        .iter()
+        .all(|package| package.instance_id.is_some())
+    {
+        return names;
+    }
+    for (local_name, resolution) in &lockfile.root_resolutions {
+        if resolution.instance_id.is_some() || !lpm_lockfile::is_valid_package_name(local_name) {
+            continue;
+        }
+        let release = (resolution.package.as_str(), resolution.version.as_str());
+        if *local_name == resolution.package {
+            names.insert(release, local_name.as_str());
+        } else {
+            names.entry(release).or_insert(local_name.as_str());
+        }
+    }
+    names
 }
 
 /// What an importer's install tree holds of its `lpm.lock` instances.
@@ -2759,6 +2795,41 @@ mod tests {
         let packages = lpm_discovered_packages(project.path(), &lockfile, Reachability::Skip);
 
         assert_eq!(packages[1].path, "node_modules/host/node_modules/marked");
+    }
+
+    #[test]
+    fn a_row_without_an_instance_takes_the_name_the_root_installs_it_under() {
+        let project = tempfile::tempdir().unwrap();
+        let legacy = |name: &str| lpm_lockfile::LockedPackage {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            ..Default::default()
+        };
+        let root = |package: &str| lpm_lockfile::LockedRootResolution {
+            package: package.to_string(),
+            version: "1.0.0".to_string(),
+            ..Default::default()
+        };
+        let lockfile = lpm_lockfile::Lockfile {
+            packages: vec![legacy("@lpm.dev/acme.ui"), legacy("tool"), legacy("both")],
+            root_resolutions: BTreeMap::from([
+                ("ui".to_string(), root("@lpm.dev/acme.ui")),
+                ("../escape".to_string(), root("tool")),
+                ("alias".to_string(), root("both")),
+                ("both".to_string(), root("both")),
+            ]),
+            ..lpm_lockfile::Lockfile::new()
+        };
+
+        let packages = lpm_discovered_packages(project.path(), &lockfile, Reachability::Skip);
+
+        assert_eq!(
+            packages
+                .iter()
+                .map(|package| package.path.as_str())
+                .collect::<Vec<_>>(),
+            ["node_modules/ui", "node_modules/tool", "node_modules/both"]
+        );
     }
 
     #[test]
