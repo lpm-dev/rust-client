@@ -321,10 +321,20 @@ impl RegistryClient {
         {
             return;
         }
-        let projection_revision = mutation
-            .projection_revision
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            + 1;
+        // Only write-originated projections advance `projection_revision` upfront;
+        // cache-read slots sample the current revision so a stale read from an
+        // older document cannot cancel an in-flight fresh projection write before
+        // discovering its disk `content_id` mismatch under the operation lock.
+        let projection_revision = if slot.write_revision.is_some() {
+            mutation
+                .projection_revision
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                + 1
+        } else {
+            mutation
+                .projection_revision
+                .load(std::sync::atomic::Ordering::Acquire)
+        };
         let write = move || {
             before_lock();
             let mut state = mutation
@@ -371,8 +381,7 @@ impl RegistryClient {
                 .completed_content_revision
                 .load(std::sync::atomic::Ordering::Acquire)
                 < content_revision
-                || !cache::open_metadata_cache_entry(&slot.entry)
-                    .is_some_and(|entry| entry.header.content_id == slot.content_id)
+                || cache::read_metadata_cache_content_id(&slot.entry) != Some(slot.content_id)
             {
                 return;
             }
@@ -811,6 +820,99 @@ mod tests {
             projected.map(|(body, _)| body),
             Some(RawBody(b"v2-body".to_vec())),
             "delayed cache-read slot from older document must not overwrite newer projection"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_cache_read_slot_cannot_cancel_in_flight_fresh_projection() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let mut client = RegistryClient::new()
+            .with_cache_dir(Some(cache_dir.path().to_path_buf()))
+            .with_synchronous_cache_writes(true);
+
+        client
+            .write_metadata_cache_entry_async(
+                "cancel-race",
+                serde_json::json!({"name": "cancel-race", "version": "1.0.0"}),
+                None,
+                cache::MetadataCacheDirective::Unspecified,
+                None,
+            )
+            .await
+            .unwrap();
+
+        client.synchronous_cache_writes = false;
+        let (v2_paused_tx, v2_paused_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_v2_tx, release_v2_rx) = std::sync::mpsc::sync_channel(1);
+        let (_m2, w2) = client
+            .write_metadata_cache_entry_async_with_hook(
+                "cancel-race",
+                serde_json::json!({"name": "cancel-race", "version": "2.0.0"}),
+                None,
+                cache::MetadataCacheDirective::Unspecified,
+                None,
+                move || {
+                    let _ = v2_paused_tx.send(());
+                    let _ = release_v2_rx.recv();
+                },
+            )
+            .await
+            .unwrap();
+        v2_paused_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("v2 writer must pause");
+
+        let cached = client
+            .read_metadata_cache_resolution_async::<serde_json::Value, RawBody>("cancel-race")
+            .await
+            .expect("v1 entry must still be readable");
+        let stale_read_slot = match cached.value {
+            cache::CachedResolution::Document { source, .. } => source
+                .expect("v1 read source")
+                .slot::<RawBody>(ProjectionFacts {
+                    versions_complete: true,
+                    latest: Some("1.0.0".to_string()),
+                })
+                .expect("v1 read slot"),
+            cache::CachedResolution::Projected { .. } => panic!("expected unprojected document"),
+        };
+
+        release_v2_tx.send(()).unwrap();
+        client.flush_pending_cache_writes().await;
+
+        let v2_source = w2.and_then(|w| w.source).expect("v2 source");
+        let v2_entry = v2_source.entry.clone();
+        let v2_content_id = v2_source.content_id;
+        let v2_slot = v2_source
+            .slot::<RawBody>(ProjectionFacts {
+                versions_complete: true,
+                latest: Some("2.0.0".to_string()),
+            })
+            .expect("v2 slot");
+
+        let (v2_proj_paused_tx, v2_proj_paused_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_v2_proj_tx, release_v2_proj_rx) = std::sync::mpsc::sync_channel(1);
+        client.store_metadata_projection_with_hook(v2_slot, b"v2-fresh-body".to_vec(), move || {
+            let _ = v2_proj_paused_tx.send(());
+            let _ = release_v2_proj_rx.recv();
+        });
+        v2_proj_paused_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("v2 projection worker must pause before operation lock");
+
+        // Stale cache-read slot runs while V2's fresh projection is parked.
+        client.synchronous_cache_writes = true;
+        client.store_metadata_projection(stale_read_slot, b"stale-v1-read-body".to_vec());
+        client.synchronous_cache_writes = false;
+
+        release_v2_proj_tx.send(()).unwrap();
+        client.flush_pending_cache_writes().await;
+
+        let projected = read_projection::<RawBody>(&v2_entry, v2_content_id);
+        assert_eq!(
+            projected.map(|(body, _)| body),
+            Some(RawBody(b"v2-fresh-body".to_vec())),
+            "stale cache-read slot must not cancel an in-flight fresh projection write"
         );
     }
 }

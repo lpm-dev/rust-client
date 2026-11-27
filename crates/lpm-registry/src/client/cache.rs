@@ -229,6 +229,29 @@ pub(super) fn open_metadata_cache_entry(
     })
 }
 
+/// Read only the header `content_id` of an on-disk metadata cache entry using a
+/// small header buffer instead of allocating a full payload `BufReader`.
+pub(super) fn read_metadata_cache_content_id(path: &std::path::Path) -> Option<u128> {
+    use std::io::Read as _;
+
+    const HEADER_READ_BUF_BYTES: usize = 256;
+    let file = std::fs::File::open(path).ok()?;
+    let file_metadata = file.metadata().ok()?;
+    if file_metadata.len() > METADATA_CACHE_FILE_CAP {
+        return None;
+    }
+    let mut reader = std::io::BufReader::with_capacity(
+        HEADER_READ_BUF_BYTES,
+        std::io::Read::take(file, METADATA_CACHE_FILE_CAP),
+    );
+    let mut magic = [0u8; METADATA_CACHE_MAGIC.len()];
+    reader.read_exact(&mut magic).ok()?;
+    if magic != *METADATA_CACHE_MAGIC {
+        return None;
+    }
+    Some(read_metadata_cache_header(&mut reader)?.content_id)
+}
+
 pub(super) fn decode_zstd_msgpack_with_seed<R, T, S>(reader: R, seed: S) -> Option<T>
 where
     R: std::io::Read,
