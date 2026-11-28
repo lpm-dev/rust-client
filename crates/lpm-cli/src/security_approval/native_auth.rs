@@ -281,6 +281,21 @@ fn windows_hello_unavailable_error(reason: &str) -> LpmError {
 }
 
 #[cfg(target_os = "macos")]
+#[link(name = "LocalAuthentication", kind = "framework")]
+unsafe extern "C" {
+    static LAErrorDomain: *const std::ffi::c_void;
+}
+
+/// Anchors a direct Mach-O symbol reference into `LocalAuthentication.framework`
+/// so `-Wl,-dead_strip_dylibs` cannot strip the framework even though
+/// `objc2-local-authentication` resolves `LAContext` via `objc_getClass`.
+#[cfg(target_os = "macos")]
+#[inline(never)]
+fn ensure_local_authentication_framework_linked() {
+    let _ = std::hint::black_box(&raw const LAErrorDomain);
+}
+
+#[cfg(target_os = "macos")]
 fn request_macos_local_authentication(prompt: &str) -> Result<bool, LpmError> {
     use block2::RcBlock;
     use objc2::runtime::Bool;
@@ -288,6 +303,7 @@ fn request_macos_local_authentication(prompt: &str) -> Result<bool, LpmError> {
     use objc2_local_authentication::LAContext;
     use std::sync::mpsc;
 
+    ensure_local_authentication_framework_linked();
     // SAFETY: `new` returns a retained `LAContext` instance managed by objc2.
     let context = unsafe { LAContext::new() };
     let policy = macos_local_auth_policy();
@@ -387,6 +403,7 @@ mod backend_tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_local_authentication_framework_remains_loaded_for_la_context() {
+        super::ensure_local_authentication_framework_linked();
         // SAFETY: constructing an LAContext has no preconditions and verifies
         // LocalAuthentication.framework stays linked under -Wl,-dead_strip_dylibs.
         let _context = unsafe { objc2_local_authentication::LAContext::new() };

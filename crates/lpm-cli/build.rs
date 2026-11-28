@@ -51,10 +51,11 @@ fn main() {
         }
     }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-        // Drop unused system dylib load commands (such as libiconv.2.dylib),
-        // while preserving LocalAuthentication for objc2's runtime LAContext lookup.
+        // Drop unused system dylib load commands (such as libiconv.2.dylib);
+        // `native_auth::ensure_local_authentication_framework_linked` holds a
+        // direct `LAErrorDomain` symbol reference so LocalAuthentication stays
+        // linked across all Apple ld64 / ld_prime versions.
         println!("cargo:rustc-link-arg-bins=-Wl,-dead_strip_dylibs");
-        println!("cargo:rustc-link-arg-bins=-Wl,-needed_framework,LocalAuthentication");
     }
     // Rust's arm64 macOS deployment target (11.0) leaves ld64 writing classic
     // rebase opcodes, which dyld applies to ~72k pointers at every launch.

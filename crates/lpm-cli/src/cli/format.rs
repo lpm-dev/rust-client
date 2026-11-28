@@ -179,7 +179,10 @@ pub(super) fn exit_with_lpm_error(error: &lpm_common::LpmError, json_output: boo
     // task, so what it let through is reported here, before the error.
     let firewall_bypassed =
         crate::commands::install::settle_firewall_bypasses_before_exit(json_output, error);
-    super::install_timeline::finish("error");
+    // Normal command failures freeze the timeline as `"error"` before calling
+    // here; only startup failures before command execution still leave it open,
+    // matching `ExportGuard::drop`'s `"incomplete"` outcome.
+    super::install_timeline::finish("incomplete");
     super::dispatch::keep_state_ignored_at_exit();
     if json_output && !matches!(error, lpm_common::LpmError::ExitCode(_)) {
         print_json_error(error, &firewall_bypassed);

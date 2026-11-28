@@ -1663,12 +1663,12 @@ mod tests {
             project, &lock_path, &package, pkg_json, &lockfile, &lock_raw, &routes, true,
             pkg_stamp, lock_stamp,
         );
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             assert!(proof.pkg_stamp.is_some());
             assert!(proof.lock_stamp.is_some());
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             assert!(proof.pkg_stamp.is_none());
             assert!(proof.lock_stamp.is_none());
