@@ -1,4 +1,7 @@
-use super::manifest_core::{ManifestDependency, ManifestPeerDependency, ManifestVersion};
+use super::manifest_core::{
+    ManifestDependency, ManifestDependencyRef, ManifestPeerDependency, ManifestPeerDependencyRef,
+    ManifestVersion,
+};
 use super::prelude::*;
 
 /// Shared metadata → CachedPackageInfo parser.
@@ -62,7 +65,6 @@ fn parse_metadata_to_cache_info_inner(
     versions_complete: bool,
     platform_metadata_complete: bool,
 ) -> CachedPackageInfo {
-    let version_count = metadata.versions.len();
     let latest_version_hint = metadata
         .latest_version_hint()
         .and_then(|version| NpmVersion::parse(version).ok());
@@ -78,21 +80,231 @@ fn parse_metadata_to_cache_info_inner(
                 .map(|version| (tag.clone(), version))
         })
         .collect();
-    let projected_versions = metadata
-        .versions
-        .iter()
-        .map(|(version, metadata)| project_borrowed_version(version, metadata));
-    let mut info = parse_projected_metadata(
+    let mut builder = CachedPackageInfo::builder(
         metadata.modified.clone(),
-        latest_version,
-        dist_tags,
-        ReleaseTimes::Borrowed(&metadata.time),
-        projected_versions,
-        version_count,
         trust_metadata_complete,
         versions_complete,
+        HashSet::new(),
+        HashSet::new(),
         platform_metadata_complete,
+        latest_version,
+        metadata.versions.len(),
     );
+    builder.set_dist_tags(dist_tags);
+
+    let mut alias_storage: Vec<(String, String)> = Vec::new();
+    for (ver_str, ver_meta) in &metadata.versions {
+        if !is_valid_version_string(ver_str) {
+            tracing::warn!("skipping invalid version string: {ver_str:?}");
+            continue;
+        }
+        let Ok(version) = NpmVersion::parse(ver_str) else {
+            continue;
+        };
+        let bundled_names: HashSet<&str> = ver_meta
+            .bundle_dependencies
+            .iter()
+            .map(String::as_str)
+            .filter(|name| {
+                is_valid_dep_name(name)
+                    && (ver_meta.dependencies.contains_key(*name)
+                        || ver_meta.optional_dependencies.contains_key(*name))
+            })
+            .collect();
+
+        // Collect owned alias strings into a single scratch vec so borrowed
+        // `ManifestDependencyRef` / `ManifestPeerDependencyRef` slices can
+        // borrow directly without cloning non-aliased dep names/ranges.
+        alias_storage.clear();
+        struct RawDep<'a> {
+            name: &'a str,
+            raw_range: &'a str,
+            alias_idx: Option<usize>,
+            optional: bool,
+            bundled: bool,
+        }
+        let mut raw_deps =
+            Vec::with_capacity(ver_meta.dependencies.len() + ver_meta.optional_dependencies.len());
+        let mut optional_valid = HashSet::new();
+        for (name, raw_range) in &ver_meta.optional_dependencies {
+            if !is_valid_dep_name(name) {
+                tracing::debug!("skipping invalid dep name: {name:?}");
+                continue;
+            }
+            let alias_idx = if let Some(alias) = crate::ranges::parse_npm_alias(raw_range) {
+                if !is_valid_dep_name(&alias.target) {
+                    tracing::debug!(
+                        "skipping alias dep {name:?}: invalid target {:?}",
+                        alias.target
+                    );
+                    continue;
+                }
+                let idx = alias_storage.len();
+                alias_storage.push((alias.range, alias.target));
+                Some(idx)
+            } else {
+                None
+            };
+            optional_valid.insert(name.as_str());
+            raw_deps.push(RawDep {
+                name: name.as_str(),
+                raw_range: raw_range.as_str(),
+                alias_idx,
+                optional: true,
+                bundled: bundled_names.contains(name.as_str()),
+            });
+        }
+        for (name, raw_range) in &ver_meta.dependencies {
+            if optional_valid.contains(name.as_str()) {
+                continue;
+            }
+            if !is_valid_dep_name(name) {
+                tracing::debug!("skipping invalid dep name: {name:?}");
+                continue;
+            }
+            let alias_idx = if let Some(alias) = crate::ranges::parse_npm_alias(raw_range) {
+                if !is_valid_dep_name(&alias.target) {
+                    tracing::debug!(
+                        "skipping alias dep {name:?}: invalid target {:?}",
+                        alias.target
+                    );
+                    continue;
+                }
+                let idx = alias_storage.len();
+                alias_storage.push((alias.range, alias.target));
+                Some(idx)
+            } else {
+                None
+            };
+            raw_deps.push(RawDep {
+                name: name.as_str(),
+                raw_range: raw_range.as_str(),
+                alias_idx,
+                optional: false,
+                bundled: bundled_names.contains(name.as_str()),
+            });
+        }
+
+        struct RawPeer<'a> {
+            name: &'a str,
+            raw_range: &'a str,
+            alias_idx: Option<usize>,
+            optional: bool,
+        }
+        let mut raw_peers = Vec::with_capacity(ver_meta.peer_dependencies.len());
+        for (peer_name, peer_range) in &ver_meta.peer_dependencies {
+            if !is_valid_dep_name(peer_name) {
+                tracing::debug!("skipping invalid peer dep name: {peer_name:?}");
+                continue;
+            }
+            let alias_idx = if let Some(alias) = crate::ranges::parse_npm_alias(peer_range) {
+                if !is_valid_dep_name(&alias.target) {
+                    tracing::debug!(
+                        "skipping peer alias {peer_name:?}: invalid target name {:?}",
+                        alias.target
+                    );
+                    continue;
+                }
+                let idx = alias_storage.len();
+                alias_storage.push((alias.range, alias.target));
+                Some(idx)
+            } else {
+                None
+            };
+            raw_peers.push(RawPeer {
+                name: peer_name.as_str(),
+                raw_range: peer_range.as_str(),
+                alias_idx,
+                optional: ver_meta
+                    .peer_dependencies_meta
+                    .get(peer_name)
+                    .is_some_and(|meta| meta.optional),
+            });
+        }
+
+        let dependencies: Vec<ManifestDependencyRef<'_>> = raw_deps
+            .iter()
+            .map(|dep| {
+                let (range, alias) = match dep.alias_idx {
+                    Some(idx) => (
+                        alias_storage[idx].0.as_str(),
+                        Some(alias_storage[idx].1.as_str()),
+                    ),
+                    None => (dep.raw_range, None),
+                };
+                ManifestDependencyRef {
+                    name: dep.name,
+                    range,
+                    alias,
+                    optional: dep.optional,
+                    bundled: dep.bundled,
+                }
+            })
+            .collect();
+        let peers: Vec<ManifestPeerDependencyRef<'_>> = raw_peers
+            .iter()
+            .map(|peer| {
+                let (range, alias) = match peer.alias_idx {
+                    Some(idx) => (
+                        alias_storage[idx].0.as_str(),
+                        Some(alias_storage[idx].1.as_str()),
+                    ),
+                    None => (peer.raw_range, None),
+                };
+                ManifestPeerDependencyRef {
+                    name: peer.name,
+                    range,
+                    alias,
+                    optional: peer.optional,
+                }
+            })
+            .collect();
+
+        let integrity = ver_meta.integrity_or_shasum();
+        let signatures = ver_meta
+            .dist
+            .as_ref()
+            .and_then(|dist| dist.signatures.as_deref())
+            .unwrap_or(&[]);
+        let published_at = metadata.time.get(ver_str).cloned();
+        let published_at_unix = published_at.as_deref().and_then(parse_npm_time_unix);
+        let platform =
+            (!ver_meta.os.is_empty() || !ver_meta.cpu.is_empty() || !ver_meta.libc.is_empty())
+                .then(|| PlatformMeta {
+                    os: ver_meta.os.clone(),
+                    cpu: ver_meta.cpu.clone(),
+                    libc: ver_meta.libc.clone(),
+                });
+        let mut canonical_stack = [0u8; 64];
+        let mut canonical_owned = None;
+        let canonical_version_str: &str = {
+            use std::io::Write as _;
+            let mut cursor = std::io::Cursor::new(&mut canonical_stack[..]);
+            if write!(cursor, "{version}").is_ok() {
+                let len = cursor.position() as usize;
+                std::str::from_utf8(&canonical_stack[..len]).expect("version formatting is ASCII")
+            } else {
+                canonical_owned.insert(version.to_string()).as_str()
+            }
+        };
+        builder.push_borrowed_version(
+            version,
+            canonical_version_str,
+            dependencies,
+            peers,
+            ver_meta.engines.get("node").map(String::as_str),
+            ver_meta.tarball_url(),
+            integrity.as_deref(),
+            ver_meta.dist.as_ref().and_then(|dist| dist.unpacked_size),
+            signatures,
+            published_at,
+            published_at_unix,
+            platform,
+            detect_trust_evidence(ver_meta),
+        );
+    }
+
+    let mut info = builder.finish();
     info.latest_version_hint = latest_version_hint;
     info
 }
@@ -157,38 +369,6 @@ struct ProjectedVersion {
     dist: CachedDistInfo,
 }
 
-fn project_borrowed_version(
-    version: &str,
-    metadata: &lpm_registry::VersionMetadata,
-) -> ProjectedVersion {
-    ProjectedVersion {
-        version: version.to_owned(),
-        dependencies: metadata.dependencies.clone(),
-        optional_dependencies: metadata.optional_dependencies.clone(),
-        peer_dependencies: metadata.peer_dependencies.clone(),
-        peer_dependencies_meta: metadata.peer_dependencies_meta.clone(),
-        bundle_dependencies: metadata.bundle_dependencies.clone(),
-        node_engine: metadata.engines.get("node").cloned(),
-        os: metadata.os.clone(),
-        cpu: metadata.cpu.clone(),
-        libc: metadata.libc.clone(),
-        dist: CachedDistInfo {
-            tarball_url: metadata.tarball_url().map(str::to_owned),
-            integrity: metadata
-                .integrity_or_shasum()
-                .map(std::borrow::Cow::into_owned),
-            unpacked_size: metadata.dist.as_ref().and_then(|dist| dist.unpacked_size),
-            signatures: metadata
-                .dist
-                .as_ref()
-                .and_then(|dist| dist.signatures.clone())
-                .unwrap_or_default(),
-            trust_evidence: detect_trust_evidence(metadata),
-            ..CachedDistInfo::default()
-        },
-    }
-}
-
 fn project_owned_version(
     version: String,
     metadata: lpm_registry::VersionMetadata,
@@ -241,15 +421,13 @@ fn project_owned_version(
     }
 }
 
-enum ReleaseTimes<'a> {
-    Borrowed(&'a HashMap<String, String>),
+enum ReleaseTimes {
     Owned(HashMap<String, String>),
 }
 
-impl ReleaseTimes<'_> {
+impl ReleaseTimes {
     fn published_at(&mut self, version: &str) -> Option<String> {
         match self {
-            Self::Borrowed(times) => times.get(version).cloned(),
             Self::Owned(times) => times.remove(version),
         }
     }
@@ -260,7 +438,7 @@ fn parse_projected_metadata(
     modified: Option<String>,
     latest_version: Option<NpmVersion>,
     dist_tags: HashMap<String, NpmVersion>,
-    mut release_times: ReleaseTimes<'_>,
+    mut release_times: ReleaseTimes,
     projected_versions: impl Iterator<Item = ProjectedVersion>,
     version_count: usize,
     trust_metadata_complete: bool,

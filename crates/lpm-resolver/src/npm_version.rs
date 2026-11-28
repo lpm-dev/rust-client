@@ -39,6 +39,24 @@ impl NpmVersion {
         Ok(NpmVersion { inner })
     }
 
+    pub(crate) fn parse_exact_candidate(input: &str) -> Option<Self> {
+        let first = *input.as_bytes().first()?;
+        if !first.is_ascii_digit() && first != b'v' && first != b'V' {
+            return None;
+        }
+        if let Some(inner) = parse_canonical(input) {
+            return Some(NpmVersion { inner });
+        }
+        node_semver::Version::parse(input)
+            .ok()
+            .map(|inner| NpmVersion { inner })
+    }
+
+    #[inline]
+    pub(crate) fn from_inner(inner: node_semver::Version) -> Self {
+        NpmVersion { inner }
+    }
+
     pub fn major(&self) -> u64 {
         self.inner.major
     }
@@ -156,10 +174,18 @@ impl std::hash::Hash for NpmVersion {
         self.inner.major.hash(state);
         self.inner.minor.hash(state);
         self.inner.patch.hash(state);
-        // Hash pre-release identifiers for consistency with Eq
+        self.inner.pre_release.len().hash(state);
         for id in &self.inner.pre_release {
-            let s: String = id.to_string();
-            s.hash(state);
+            match id {
+                node_semver::Identifier::Numeric(n) => {
+                    0u8.hash(state);
+                    n.hash(state);
+                }
+                node_semver::Identifier::AlphaNumeric(s) => {
+                    1u8.hash(state);
+                    s.hash(state);
+                }
+            }
         }
     }
 }

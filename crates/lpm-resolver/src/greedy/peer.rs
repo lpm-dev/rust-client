@@ -128,11 +128,8 @@ fn find_version_satisfying_all(
         {
             continue;
         }
-        // Platform filter — same gate the regular dep path uses, so
-        // an ambient install never lands a tarball the current OS/CPU
-        // can't use.
-        let platform_ok = !info.has_platform_metadata()
-            || info.platform_is_compatible(&v.to_string()).unwrap_or(true);
+        let platform_ok =
+            !info.has_platform_metadata() || info.platform_is_compatible_for(v).unwrap_or(true);
         if !platform_ok {
             continue;
         }
@@ -141,71 +138,61 @@ fn find_version_satisfying_all(
     None
 }
 
-/// Best-effort fallback when no version satisfies EVERY required
-/// consumer's range (transitive peer conflict). Returns
-/// `Some((chosen, unsatisfied_required_indices))` where:
-/// - `chosen` is the platform-compatible version that satisfies the
-///   most REQUIRED consumer ranges (ties broken by newest semver — the
-///   `info.versions` walk is already newest-first);
-/// - `unsatisfied_required_indices` indexes into `reqs` for required
-///   consumers whose range does NOT include `chosen`. Optional
-///   consumers are excluded from the unsatisfied list — they're never
-///   surfaced as warnings.
-///
-/// Returns `None` when no platform-compatible version satisfies even
-/// ONE required consumer's range — that's the truly-irreconcilable
-/// terminal case the caller should turn into a hard `PeerConflict`
-/// error.
-///
-/// Mirrors npm v7+ / pnpm hoisted-mode behavior: pick a single
-/// top-level peer version, warn about consumers stuck with the wrong
-/// one. lpm pre-fix raised `PeerConflict` here, blocking real-world
-/// installs (e.g. nestjs/typescript-starter's transitive
-/// ajv-keywords@5 vs @8 chain).
 fn find_version_satisfying_most<'a>(
     canonical: &CanonicalKey,
     info: &CachedPackageInfo,
     reqs: &'a [&'a PeerRequirement],
     policy: &ResolverPolicy,
 ) -> Option<(NpmVersion, Vec<usize>)> {
-    let required_indices: Vec<usize> = reqs
-        .iter()
-        .enumerate()
-        .filter_map(|(i, r)| (!r.optional).then_some(i))
-        .collect();
+    let mut required_indices: Vec<usize> = Vec::with_capacity(reqs.len());
+    let mut unique_ranges: Vec<(&NpmRange, usize)> = Vec::new();
+    let mut range_index: AHashMap<(&str, Option<&str>), usize> = AHashMap::new();
+    for (i, r) in reqs.iter().enumerate() {
+        if r.optional {
+            continue;
+        }
+        required_indices.push(i);
+        let key = (r.range.raw(), r.range.dist_tag());
+        if let Some(&slot) = range_index.get(&key) {
+            unique_ranges[slot].1 += 1;
+        } else {
+            let slot = unique_ranges.len();
+            range_index.insert(key, slot);
+            unique_ranges.push((&r.range, 1));
+        }
+    }
     if required_indices.is_empty() {
         return None;
     }
 
-    let mut best: Option<(NpmVersion, usize, Vec<usize>)> = None;
+    let has_platform = info.has_platform_metadata();
+    let mut best: Option<(&NpmVersion, usize)> = None;
     for v in peer_versions_by_npm_preference(info, reqs) {
-        let platform_ok = !info.has_platform_metadata()
-            || info.platform_is_compatible(&v.to_string()).unwrap_or(true);
+        let platform_ok = !has_platform || info.platform_is_compatible_for(v).unwrap_or(true);
         if !platform_ok || !version_allowed_by_policy(canonical, info, v, policy) {
             continue;
         }
         let mut hits = 0usize;
-        let mut misses: Vec<usize> = Vec::new();
-        for &i in &required_indices {
-            if info.range_satisfies(&reqs[i].range, v) {
-                hits += 1;
-            } else {
-                misses.push(i);
+        for &(range, count) in &unique_ranges {
+            if info.range_satisfies(range, v) {
+                hits += count;
             }
         }
         if hits == 0 {
             continue;
         }
-        // Newest-first walk + strictly-greater hit count = stable
-        // tiebreak on newest. Equal hit count loses to the version
-        // already chosen (which was newer in the walk).
-        match &best {
-            None => best = Some((v.clone(), hits, misses)),
-            Some((_, prev_hits, _)) if hits > *prev_hits => best = Some((v.clone(), hits, misses)),
-            _ => {}
+        if best.is_none_or(|(_, prev_hits)| hits > prev_hits) {
+            best = Some((v, hits));
         }
     }
-    best.map(|(v, _, misses)| (v, misses))
+    let (chosen, best_hits) = best?;
+    let mut misses = Vec::with_capacity(required_indices.len().saturating_sub(best_hits));
+    for &i in &required_indices {
+        if !info.range_satisfies(&reqs[i].range, chosen) {
+            misses.push(i);
+        }
+    }
+    Some((chosen.clone(), misses))
 }
 
 fn peer_versions_by_npm_preference<'a>(
@@ -342,11 +329,11 @@ pub(super) fn peer_resolution_cache_key(
     canonical: &CanonicalKey,
     reqs: &[&PeerRequirement],
 ) -> PeerResolutionCacheKey {
-    let mut parent_peers: Vec<(String, String, bool)> = Vec::with_capacity(reqs.len());
+    let mut parent_peers: Vec<(&str, &str, bool)> = Vec::with_capacity(reqs.len());
     for req in reqs {
-        parent_peers.push((req.peer_name.clone(), req.range.to_string(), req.optional));
+        parent_peers.push((req.peer_name.as_str(), req.range.raw(), req.optional));
     }
-    parent_peers.sort();
+    parent_peers.sort_unstable();
 
     let mut hasher = Sha256::new();
     hasher.update(b"lpm-peer-resolution-cache-v1\0");
@@ -452,17 +439,31 @@ fn peer_conflict_consumer_entry(state: &ResolveState, req: &PeerRequirement) -> 
 /// spawns metadata jobs through its existing infrastructure. Tests
 /// can drive it directly with hand-built state + cached/inflight
 /// sets to verify the four predicates.
+#[cfg(test)]
 pub(super) fn pick_peer_prefetch_candidates(
     state: &ResolveState,
     cached_canonicals: &dashmap::DashMap<CanonicalKey, Arc<CachedPackageInfo>>,
     inflight_canonicals: &AHashSet<CanonicalKey>,
 ) -> Vec<CanonicalKey> {
-    if state.peer_requirements.is_empty() {
+    pick_peer_prefetch_candidates_from(state, cached_canonicals, inflight_canonicals, 0)
+}
+
+pub(super) fn pick_peer_prefetch_candidates_from(
+    state: &ResolveState,
+    cached_canonicals: &dashmap::DashMap<CanonicalKey, Arc<CachedPackageInfo>>,
+    inflight_canonicals: &AHashSet<CanonicalKey>,
+    start_index: usize,
+) -> Vec<CanonicalKey> {
+    let slice = state
+        .peer_requirements
+        .get(start_index..)
+        .unwrap_or_default();
+    if slice.is_empty() {
         return Vec::new();
     }
 
     let mut picked_set: AHashSet<&CanonicalKey> = AHashSet::new();
-    for req in &state.peer_requirements {
+    for req in slice {
         if req.optional
             || picked_set.contains(&req.canonical)
             || cached_canonicals.contains_key(&req.canonical)
@@ -481,8 +482,7 @@ pub(super) fn pick_peer_prefetch_candidates(
     }
 
     let mut picks: Vec<CanonicalKey> = picked_set.into_iter().cloned().collect();
-    // Deterministic dispatch order.
-    picks.sort_by_key(|c| c.to_string());
+    picks.sort_by(CanonicalKey::cmp_display);
     picks
 }
 
@@ -518,7 +518,7 @@ where
         grouped.entry(req.canonical.clone()).or_default().push(req);
     }
     let mut canonicals: Vec<CanonicalKey> = grouped.keys().cloned().collect();
-    canonicals.sort_by_key(|c| c.to_string());
+    canonicals.sort_by(CanonicalKey::cmp_display);
 
     let mut synthesized: Vec<Edge> = Vec::new();
     for canonical in canonicals {

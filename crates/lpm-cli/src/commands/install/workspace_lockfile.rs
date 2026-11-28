@@ -2,12 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use lpm_common::LpmError;
 use rayon::prelude::*;
+
+struct CachedProjectionContent {
+    revision: u64,
+    content: Option<Arc<str>>,
+}
 
 pub(super) struct WorkspaceLockfileCoordinator {
     root: PathBuf,
@@ -20,8 +24,7 @@ pub(super) struct WorkspaceLockfileCoordinator {
     migrated_lockfile: bool,
     valid_importers: BTreeSet<String>,
     existing_projection_metadata: Mutex<BTreeMap<String, Arc<lpm_lockfile::Lockfile>>>,
-    projection_content: Mutex<BTreeMap<String, (u64, Arc<str>)>>,
-    projection_revision: AtomicU64,
+    projection_content: Mutex<BTreeMap<String, CachedProjectionContent>>,
     staged: Mutex<BTreeMap<String, Arc<lpm_lockfile::Lockfile>>>,
     non_persisting_importers: Mutex<BTreeSet<String>>,
     /// An install in this transaction runs with a frozen lockfile, so a
@@ -130,7 +133,6 @@ impl WorkspaceLockfileCoordinator {
             valid_importers,
             existing_projection_metadata: Mutex::new(BTreeMap::new()),
             projection_content: Mutex::new(BTreeMap::new()),
-            projection_revision: AtomicU64::new(0),
             staged: Mutex::new(BTreeMap::new()),
             non_persisting_importers: Mutex::new(BTreeSet::new()),
             frozen: std::sync::atomic::AtomicBool::new(false),
@@ -162,24 +164,54 @@ impl WorkspaceLockfileCoordinator {
 
     fn projection_content(&self, importer: &str) -> Result<Arc<str>, lpm_lockfile::LockfileError> {
         loop {
-            let revision = self.projection_revision.load(Ordering::Acquire);
-            if let Some(content) = self
-                .projection_content
+            let revision = {
+                let cache = self
+                    .projection_content
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(entry) = cache.get(importer) {
+                    if let Some(content) = &entry.content {
+                        return Ok(Arc::clone(content));
+                    }
+                    entry.revision
+                } else {
+                    0
+                }
+            };
+
+            let staged = self
+                .staged
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(importer)
-                .filter(|(cached_revision, _)| *cached_revision == revision)
-                .map(|(_, content)| Arc::clone(content))
-            {
-                return Ok(content);
-            }
+                .map(Arc::clone);
+            let content = if let Some(lockfile) = staged {
+                Arc::<str>::from(lockfile.to_toml()?)
+            } else {
+                let existing = self.existing.as_ref().ok_or_else(|| {
+                    lpm_lockfile::LockfileError::NotFound(
+                        "workspace lockfile does not exist".to_string(),
+                    )
+                })?;
+                #[cfg(test)]
+                self.projection_materializations
+                    .fetch_add(1, Ordering::Relaxed);
+                Arc::<str>::from(existing.project_importer_to_toml(importer)?)
+            };
 
-            let content = Arc::<str>::from(self.projection(importer)?.to_toml()?);
-            if self.projection_revision.load(Ordering::Acquire) == revision {
-                self.projection_content
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(importer.to_string(), (revision, Arc::clone(&content)));
+            let mut cache = self
+                .projection_content
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let current_revision = cache.get(importer).map_or(0, |entry| entry.revision);
+            if current_revision == revision {
+                cache.insert(
+                    importer.to_string(),
+                    CachedProjectionContent {
+                        revision,
+                        content: Some(Arc::clone(&content)),
+                    },
+                );
                 return Ok(content);
             }
         }
@@ -306,7 +338,18 @@ impl WorkspaceLockfileCoordinator {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(importer.to_string(), Arc::new(lockfile));
-        self.projection_revision.fetch_add(1, Ordering::Release);
+        let mut cache = self
+            .projection_content
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = cache
+            .entry(importer.to_string())
+            .or_insert(CachedProjectionContent {
+                revision: 0,
+                content: None,
+            });
+        entry.revision = entry.revision.wrapping_add(1);
+        entry.content = None;
     }
 
     fn mark_non_persisting(&self, importer: &str) {
@@ -666,19 +709,18 @@ where
     if ACTIVE_PROJECT_INSTALL_ROOT.try_with(|_| ()).is_ok() {
         return future.await;
     }
-    let Some(initial_workspace) = discover_workspace(project_dir)? else {
+    let Some(workspace_root) = find_workspace_root(project_dir)? else {
         let transaction = async {
-            if let Some(workspace) = discover_workspace(project_dir)? {
+            if let Some(root) = find_workspace_root(project_dir)? {
                 return Err(LpmError::Script(format!(
                     "a workspace rooted at {} appeared while waiting for the install transaction; retry the command",
-                    workspace.root.display(),
+                    root.display(),
                 )));
             }
             future.await
         };
         return with_project_install_lock(project_dir, transaction).await;
     };
-    let workspace_root = initial_workspace.root;
     let transaction = async {
         let workspace = discover_workspace(project_dir)?
             .ok_or_else(|| workspace_changed_while_waiting(&workspace_root, None))?;
@@ -752,15 +794,13 @@ where
         return future.await;
     }
 
-    let initial_workspace = discover_workspace(project_dir)?;
-    let lock_root = initial_workspace.as_ref().map_or_else(
-        || project_dir.to_path_buf(),
-        |workspace| workspace.root.clone(),
-    );
-    let expected_workspace_root = initial_workspace.map(|workspace| workspace.root);
+    let expected_workspace_root = find_workspace_root(project_dir)?;
+    let lock_root = expected_workspace_root
+        .as_deref()
+        .unwrap_or(project_dir)
+        .to_path_buf();
     let transaction = async {
-        let current_workspace_root =
-            discover_workspace(project_dir)?.map(|workspace| workspace.root);
+        let current_workspace_root = find_workspace_root(project_dir)?;
         if current_workspace_root != expected_workspace_root {
             return Err(workspace_changed_while_waiting(
                 expected_workspace_root.as_deref().unwrap_or(project_dir),
@@ -810,12 +850,12 @@ where
         return future.await;
     }
 
-    let Some(initial_workspace) = discover_workspace(cwd)? else {
+    let Some(workspace_root) = find_workspace_root(cwd)? else {
         let transaction = async {
-            if let Some(workspace) = discover_workspace(cwd)? {
+            if let Some(root) = find_workspace_root(cwd)? {
                 return Err(LpmError::Script(format!(
                     "a workspace rooted at {} appeared while waiting for the install transaction; retry the command",
-                    workspace.root.display(),
+                    root.display(),
                 )));
             }
             future.await
@@ -823,7 +863,6 @@ where
         return with_project_install_lock(cwd, transaction).await;
     };
 
-    let workspace_root = initial_workspace.root;
     let transaction = async {
         let workspace = discover_workspace(cwd)?
             .ok_or_else(|| workspace_changed_while_waiting(&workspace_root, None))?;
@@ -873,6 +912,11 @@ where
         Ok(result)
     };
     with_project_install_lock(&workspace_root, transaction).await
+}
+
+fn find_workspace_root(project_dir: &Path) -> Result<Option<PathBuf>, LpmError> {
+    lpm_workspace::find_workspace_root(project_dir)
+        .map_err(|error| LpmError::Script(format!("workspace discovery failed: {error}")))
 }
 
 fn discover_workspace(project_dir: &Path) -> Result<Option<lpm_workspace::Workspace>, LpmError> {
@@ -1943,5 +1987,68 @@ mod tests {
 
         assert!(locked.contains("axois"));
         assert_eq!(coordinator.projection_materialization_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn staging_one_importer_keeps_other_importers_cached_lockfile_content_warm() {
+        let directory = tempfile::tempdir().expect("create workspace directory");
+        let mut union = lpm_lockfile::Lockfile::new();
+        for (importer, dep) in [(".", "root-dep"), ("packages/app", "app-dep")] {
+            let mut standalone = lpm_lockfile::Lockfile::new();
+            add_exact_root(
+                &mut standalone,
+                dep,
+                "1.0.0",
+                exact_package(dep, "1.0.0", &format!("{importer}/{dep}")),
+            );
+            union.absorb_importer(importer, standalone).unwrap();
+        }
+        union
+            .write_to_file(&directory.path().join(lpm_lockfile::LOCKFILE_NAME))
+            .unwrap();
+        let legacy_importers = vec![(
+            "packages/app".to_string(),
+            directory.path().join("packages/app"),
+        )];
+        let coordinator = Arc::new(
+            WorkspaceLockfileCoordinator::new(directory.path(), &legacy_importers).unwrap(),
+        );
+
+        let root_before = scope(Arc::clone(&coordinator), Arc::<str>::from("."), async {
+            active_lockfile_content(directory.path())
+        })
+        .await;
+        let app_before = scope(
+            Arc::clone(&coordinator),
+            Arc::<str>::from("packages/app"),
+            async { active_lockfile_content(&directory.path().join("packages/app")) },
+        )
+        .await;
+        assert_eq!(coordinator.projection_materialization_count(), 2);
+
+        let mut replacement = lpm_lockfile::Lockfile::new();
+        add_exact_root(
+            &mut replacement,
+            "app-dep",
+            "2.0.0",
+            exact_package("app-dep", "2.0.0", "packages/app/app-dep@2"),
+        );
+        coordinator.stage("packages/app", replacement);
+
+        let root_after = scope(Arc::clone(&coordinator), Arc::<str>::from("."), async {
+            active_lockfile_content(directory.path())
+        })
+        .await;
+        let app_after = scope(
+            Arc::clone(&coordinator),
+            Arc::<str>::from("packages/app"),
+            async { active_lockfile_content(&directory.path().join("packages/app")) },
+        )
+        .await;
+
+        assert!(Arc::ptr_eq(&root_before, &root_after));
+        assert_eq!(coordinator.projection_materialization_count(), 2);
+        assert_ne!(app_before, app_after);
+        assert!(app_after.contains("2.0.0"));
     }
 }

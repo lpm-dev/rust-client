@@ -174,6 +174,7 @@ fn process_edge_inner(
 ) -> Result<(), ResolveError> {
     let is_root_edge = edge.parent == 0;
 
+    let preselected = selected.is_some();
     let (target_version, override_selected, override_hit) = match selected {
         Some(selection) => selection,
         None => {
@@ -214,42 +215,45 @@ fn process_edge_inner(
         }
     };
 
-    match release_age_status_for_version(&edge.canonical, info, &target_version, &state.policy) {
-        ReleaseTimeStatus::Allowed => {}
-        ReleaseTimeStatus::Missing => {
+    if preselected {
+        match release_age_status_for_version(&edge.canonical, info, &target_version, &state.policy)
+        {
+            ReleaseTimeStatus::Allowed => {}
+            ReleaseTimeStatus::Missing => {
+                return handle_policy_blocked(
+                    edge,
+                    PolicyBlock::ReleaseAge {
+                        version: target_version,
+                        remaining_secs: state.policy.minimum_release_age_secs(),
+                        minimum_secs: state.policy.minimum_release_age_secs(),
+                    },
+                    state,
+                );
+            }
+            ReleaseTimeStatus::TooNew { remaining_secs } => {
+                return handle_policy_blocked(
+                    edge,
+                    PolicyBlock::ReleaseAge {
+                        version: target_version,
+                        remaining_secs,
+                        minimum_secs: state.policy.minimum_release_age_secs(),
+                    },
+                    state,
+                );
+            }
+        }
+        if state.policy.trust_policy().is_no_downgrade()
+            && let Some(reason) = trust_downgrade_violation(info, &target_version)
+        {
             return handle_policy_blocked(
                 edge,
-                PolicyBlock::ReleaseAge {
+                PolicyBlock::TrustPolicy {
                     version: target_version,
-                    remaining_secs: state.policy.minimum_release_age_secs(),
-                    minimum_secs: state.policy.minimum_release_age_secs(),
+                    reason,
                 },
                 state,
             );
         }
-        ReleaseTimeStatus::TooNew { remaining_secs } => {
-            return handle_policy_blocked(
-                edge,
-                PolicyBlock::ReleaseAge {
-                    version: target_version,
-                    remaining_secs,
-                    minimum_secs: state.policy.minimum_release_age_secs(),
-                },
-                state,
-            );
-        }
-    }
-    if state.policy.trust_policy().is_no_downgrade()
-        && let Some(reason) = trust_downgrade_violation(info, &target_version)
-    {
-        return handle_policy_blocked(
-            edge,
-            PolicyBlock::TrustPolicy {
-                version: target_version,
-                reason,
-            },
-            state,
-        );
     }
 
     let split_gate = !state.overrides.split_targets().is_empty()

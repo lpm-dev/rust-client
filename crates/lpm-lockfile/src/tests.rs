@@ -5238,3 +5238,208 @@ fn workspace_importer_batch_refuses_an_older_importer_after_one_brought_structur
 
     assert!(error.to_string().contains("fresh resolution"), "{error}");
 }
+
+#[test]
+fn project_importer_to_toml_matches_materialized_projection_serialization() {
+    let source = "registry+https://registry.npmjs.org";
+    let sha512_hex = "dd8f32aea2d2c23bb3a57b99d2821867f5c680bc14201537b8bbdb7296f4a62743f5cb694a125de3729294412455083a0d2d06f4d2b2ccebc17d4b43284c87bd";
+    let sri = "sha512-3Y8yrqLSwjuzpXuZ0oIYZ/XGgLwUIBU3uLvbcpb0pidD9ctpShJd43KSlEEkVQg6DS0G9NKyzOvBfUtDKEyHvQ==";
+    let mut union = Lockfile::new();
+
+    for (importer, pkg_name, pkg_version) in [
+        (".", "root-dep", "1.0.0"),
+        ("packages/app", "app-dep", "2.3.4"),
+    ] {
+        let mut standalone = Lockfile::new();
+        standalone.metadata.auto_isolated_peer_conflicts = importer == "packages/app";
+        let instance_id = lpm_common::PackageInstanceId::derive(
+            pkg_name,
+            pkg_version,
+            source,
+            &format!("{importer}/{pkg_name}"),
+        );
+        let package = LockedPackage {
+            instance_id: Some(instance_id),
+            name: pkg_name.to_string(),
+            version: pkg_version.to_string(),
+            source: Some(source.to_string()),
+            integrity: Some(sri.to_string()),
+            ..LockedPackage::default()
+        };
+        let package_key = package.package_key();
+        standalone.add_package(package);
+        standalone.root_resolutions.insert(
+            pkg_name.to_string(),
+            LockedRootResolution {
+                instance_id: Some(instance_id),
+                package: pkg_name.to_string(),
+                version: pkg_version.to_string(),
+                source: Some(source.to_string()),
+            },
+        );
+        let mut snapshot = ImporterSnapshot::default();
+        snapshot
+            .dependencies
+            .insert(pkg_name.to_string(), format!("^{pkg_version}"));
+        if importer == "packages/app" {
+            let peer_id = lpm_common::PackageInstanceId::derive(
+                "ambient-peer",
+                "1.0.0",
+                source,
+                "packages/app/ambient-peer",
+            );
+            standalone.packages[0]
+                .peer_edges
+                .push(lpm_common::PeerEdge::registry(
+                    "ambient-peer",
+                    "ambient-peer",
+                    "1.0.0",
+                ));
+            standalone.packages[0]
+                .peer_targets
+                .insert("ambient-peer".to_string(), peer_id);
+            standalone.add_package(LockedPackage {
+                instance_id: Some(peer_id),
+                name: "ambient-peer".to_string(),
+                version: "1.0.0".to_string(),
+                source: Some(source.to_string()),
+                integrity: Some(sri.to_string()),
+                ..LockedPackage::default()
+            });
+            standalone.root_resolutions.insert(
+                "ambient-peer".to_string(),
+                LockedRootResolution {
+                    instance_id: Some(peer_id),
+                    package: "ambient-peer".to_string(),
+                    version: "1.0.0".to_string(),
+                    source: Some(source.to_string()),
+                },
+            );
+            standalone
+                .root_aliases
+                .insert("aliased-app".to_string(), pkg_name.to_string());
+            standalone
+                .ambient_peer_installs
+                .push("ambient-peer".to_string());
+            standalone.patches.insert(
+                format!("{pkg_name}@{pkg_version}"),
+                LockfilePatch {
+                    path: "patches/app-dep.patch".to_string(),
+                    sha256: format!("sha256-{}", "12".repeat(32)),
+                    original_integrity: sri.to_string(),
+                },
+            );
+            standalone.catalogs.insert(
+                "default".to_string(),
+                BTreeMap::from([(
+                    pkg_name.to_string(),
+                    CatalogSnapshotEntry {
+                        specifier: "^2.0.0".to_string(),
+                        version: pkg_version.to_string(),
+                        reference: "catalog:".to_string(),
+                    },
+                )]),
+            );
+            standalone.set_verified_provenance(
+                &package_key,
+                LockedProvenance {
+                    snapshot: lpm_common::ProvenanceSnapshot {
+                        present: true,
+                        publisher: Some("github:example/app-dep".to_string()),
+                        workflow_path: Some(".github/workflows/publish.yml".to_string()),
+                        workflow_ref: Some("refs/tags/v2.3.4".to_string()),
+                        attestation_cert_sha256: Some("sha256-leaf".to_string()),
+                    },
+                    subject_name: format!("pkg:npm/{pkg_name}@{pkg_version}"),
+                    subject_sha512: sha512_hex.to_string(),
+                    integrated_time_secs: 1_700_000_000,
+                    log_id: "rekor-log".to_string(),
+                    log_index: 42,
+                    bundle_sha256: format!("sha256-{}", "ab".repeat(32)),
+                },
+            );
+        }
+        standalone.importers.insert(".".to_string(), snapshot);
+        union
+            .absorb_importer(importer, standalone)
+            .expect("absorb rich importer");
+    }
+
+    let validated = crate::ValidatedLockfile::from_toml(&union.to_toml().unwrap()).unwrap();
+    for importer in [".", "packages/app"] {
+        let borrowed_toml = validated
+            .project_importer_to_toml(importer)
+            .expect("borrowed projection serialization");
+        let materialized_toml = validated
+            .project_importer(importer)
+            .expect("materialized projection")
+            .to_toml()
+            .expect("materialized serialization");
+        assert_eq!(borrowed_toml, materialized_toml, "importer {importer}");
+    }
+}
+
+#[test]
+fn set_packages_matches_repeated_add_package_including_last_write_wins() {
+    use std::num::NonZeroU64;
+
+    let source_a = "registry+https://registry.npmjs.org";
+    let source_b = "tarball+https://example.com/foo-1.0.0.tgz";
+    let id_1 = lpm_common::PackageInstanceId::derive("alpha", "1.0.0", source_a, "1");
+    let id_2 = lpm_common::PackageInstanceId::derive("alpha", "1.0.0", source_a, "2");
+    let rows = vec![
+        LockedPackage {
+            instance_id: Some(id_1),
+            name: "zeta".to_string(),
+            version: "2.0.0".to_string(),
+            source: Some(source_a.to_string()),
+            unpacked_size: NonZeroU64::new(10),
+            ..LockedPackage::default()
+        },
+        LockedPackage {
+            instance_id: Some(id_1),
+            name: "alpha".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(source_a.to_string()),
+            unpacked_size: NonZeroU64::new(100),
+            ..LockedPackage::default()
+        },
+        LockedPackage {
+            instance_id: Some(id_2),
+            name: "alpha".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(source_a.to_string()),
+            unpacked_size: NonZeroU64::new(200),
+            ..LockedPackage::default()
+        },
+        LockedPackage {
+            instance_id: None,
+            name: "alpha".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(source_b.to_string()),
+            integrity: Some("sha512-abc".to_string()),
+            unpacked_size: NonZeroU64::new(300),
+            ..LockedPackage::default()
+        },
+        LockedPackage {
+            instance_id: Some(id_1),
+            name: "alpha".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(source_a.to_string()),
+            unpacked_size: NonZeroU64::new(999),
+            ..LockedPackage::default()
+        },
+    ];
+
+    let mut incremental = Lockfile::new();
+    for row in rows.clone() {
+        incremental.add_package(row);
+    }
+
+    let mut bulk = Lockfile::new();
+    bulk.set_packages(rows);
+
+    assert_eq!(bulk.packages, incremental.packages);
+    assert_eq!(bulk.packages.len(), 4);
+    assert_eq!(bulk.packages[0].unpacked_size, NonZeroU64::new(999));
+}

@@ -5,11 +5,12 @@ use super::manifest::{
     ensure_policy_metadata_for_cached_manifest, exact_metadata_fast_path_eligible,
     fetch_metadata_for_resolver_with_permit, fetch_metadata_for_resolver_with_permit_and_exact,
     fetch_metadata_for_resolver_with_trace_detail, fetch_preferred_metadata_for_resolver,
-    hydrate_cached_manifest_for_edge, parse_cached_metadata_for_resolver, parse_fetched_metadata,
+    fetch_preferred_prefetch_metadata_for_resolver, hydrate_cached_manifest_for_edge,
+    parse_borrowed_fetched_metadata, parse_cached_metadata_for_resolver, parse_fetched_metadata,
     parse_partial_fetched_metadata, publish_direct_base_fact, reads_public_npm,
     try_fetch_exact_metadata_for_resolver,
 };
-use super::peer::{drain_peer_requirements_one_pass, pick_peer_prefetch_candidates};
+use super::peer::{drain_peer_requirements_one_pass, pick_peer_prefetch_candidates_from};
 use super::prelude::*;
 use super::state::{PendingRootConstraints, ResolveState, selected_package_cardinality};
 use super::tree_policy::{TreeManifestProvider, preferred_tree_compatible_version};
@@ -769,16 +770,65 @@ struct PendingMetadataFetch {
 }
 
 const MAX_PREFETCHED_READY_CACHE: usize = 256;
+const MAX_PREFETCH_PENDING: usize = 64;
+const MAX_PREFETCH_DEPTH: u8 = 3;
+const MAX_PREFETCH_PER_BLOCKED_CALL: usize = 64;
+
+fn prefetched_result_usable(
+    result: &FetchResult,
+    exact_version: Option<&str>,
+    preferred_range: Option<&NpmRange>,
+) -> bool {
+    match result {
+        Ok(fetched) => {
+            let covers_requested = if fetched.info.versions_complete {
+                true
+            } else if let Some(version) = exact_version {
+                fetched.info.version_view(version).is_some()
+            } else if let Some(range) = preferred_range {
+                !fetched.info.needs_metadata_for_range(range)
+                    || fetched.info.preferred_latest_satisfies(range)
+            } else {
+                false
+            };
+            let platform_ok = match exact_version {
+                Some(version) => !fetched.info.needs_platform_metadata_for_version(version),
+                None => !fetched.info.needs_platform_metadata(),
+            };
+            covers_requested && platform_ok
+        }
+        Err(_) => false,
+    }
+}
+
+struct PendingPrefetch {
+    canonical: CanonicalKey,
+    client: Arc<RegistryClient>,
+    route_table: RouteTable,
+    policy: ResolverPolicy,
+    exact_version: Option<String>,
+    preferred_range: Option<NpmRange>,
+    include_speculation: bool,
+    trace_metadata_fetches: bool,
+    telemetry: Arc<MetadataFetchTelemetry>,
+}
+
+struct PromotedPrefetch {
+    request_key: MetadataFetchKey,
+    pending: PendingMetadataFetch,
+}
 
 struct MetadataFetchScheduler {
     semaphore: Arc<tokio::sync::Semaphore>,
     exact_document_semaphore: Arc<tokio::sync::Semaphore>,
     policy_semaphore: Arc<tokio::sync::Semaphore>,
     jobs: tokio::task::JoinSet<(MetadataFetchKey, FetchResult)>,
-    prefetch_jobs: tokio::task::JoinSet<(CanonicalKey, FetchResult)>,
+    prefetch_jobs: tokio::task::JoinSet<(CanonicalKey, FetchResult, bool)>,
     prefetch_inflight: AHashSet<CanonicalKey>,
+    prefetch_pending: VecDeque<PendingPrefetch>,
+    prefetch_queued: AHashSet<CanonicalKey>,
     prefetched_ready: AHashMap<CanonicalKey, FetchResult>,
-    promoted_prefetches: AHashMap<CanonicalKey, Vec<MetadataFetchKey>>,
+    promoted_prefetches: AHashMap<CanonicalKey, Vec<PromotedPrefetch>>,
     prefetch_cap: usize,
     pending: VecDeque<PendingMetadataFetch>,
     pending_exact_documents: VecDeque<PendingMetadataFetch>,
@@ -829,6 +879,8 @@ impl MetadataFetchScheduler {
             jobs: tokio::task::JoinSet::new(),
             prefetch_jobs: tokio::task::JoinSet::new(),
             prefetch_inflight: AHashSet::with_capacity(prefetch_cap),
+            prefetch_pending: VecDeque::new(),
+            prefetch_queued: AHashSet::new(),
             prefetched_ready: AHashMap::new(),
             promoted_prefetches: AHashMap::new(),
             prefetch_cap,
@@ -839,57 +891,139 @@ impl MetadataFetchScheduler {
         }
     }
 
+    fn spawn_prefetch(
+        &mut self,
+        pending: PendingPrefetch,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        self.prefetch_inflight.insert(pending.canonical.clone());
+        let policy_semaphore = Arc::clone(&self.policy_semaphore);
+        let is_plain_packument_prefetch =
+            pending.exact_version.is_none() && pending.preferred_range.is_none();
+        self.prefetch_jobs.spawn(async move {
+            let _active_fetch = pending.telemetry.enter();
+            let result = if pending.exact_version.is_none()
+                && let Some(range) = pending.preferred_range
+            {
+                fetch_preferred_prefetch_metadata_for_resolver(
+                    &pending.client,
+                    &pending.route_table,
+                    &pending.canonical,
+                    &pending.policy,
+                    pending.include_speculation,
+                    pending.trace_metadata_fetches,
+                    permit,
+                    &policy_semaphore,
+                    range,
+                )
+                .await
+            } else {
+                fetch_metadata_for_resolver_with_permit_and_exact(
+                    &pending.client,
+                    &pending.route_table,
+                    &pending.canonical,
+                    &pending.policy,
+                    pending.include_speculation,
+                    pending.trace_metadata_fetches,
+                    permit,
+                    &policy_semaphore,
+                    pending.exact_version.as_deref(),
+                )
+                .await
+            };
+            (pending.canonical, result, is_plain_packument_prefetch)
+        });
+    }
+
+    fn drain_prefetch_pending(&mut self) {
+        while self.pending.is_empty()
+            && self.prefetch_inflight.len() < self.prefetch_cap
+            && self.prefetched_ready.len() < MAX_PREFETCHED_READY_CACHE
+            && self.semaphore.available_permits() > 1
+        {
+            let Some(pending) = self.prefetch_pending.pop_front() else {
+                break;
+            };
+            if !self.prefetch_queued.remove(&pending.canonical)
+                || self.prefetch_inflight.contains(&pending.canonical)
+                || self.prefetched_ready.contains_key(&pending.canonical)
+            {
+                continue;
+            }
+            match Arc::clone(&self.semaphore).try_acquire_owned() {
+                Ok(permit) => self.spawn_prefetch(pending, permit),
+                Err(_) => {
+                    self.prefetch_queued.insert(pending.canonical.clone());
+                    self.prefetch_pending.push_front(pending);
+                    break;
+                }
+            }
+        }
+    }
+
     fn enqueue_prefetch(
         &mut self,
         dispatch: &MetadataFetchDispatch<'_>,
         canonical: CanonicalKey,
         exact_version: Option<String>,
+        preferred_range: Option<NpmRange>,
         include_speculation: bool,
-    ) {
+    ) -> bool {
         let CanonicalKey::Npm { name } = &canonical else {
-            return;
+            return false;
         };
         if !matches!(
             dispatch.route_table.route_for_package(name),
             UpstreamRoute::NpmDirect
         ) {
-            return;
+            return false;
         }
-        if !self.pending.is_empty()
-            || self.prefetch_inflight.len() >= self.prefetch_cap
-            || self.prefetched_ready.len() >= MAX_PREFETCHED_READY_CACHE
-            || self.semaphore.available_permits() <= 1
+        if self.prefetched_ready.len() >= MAX_PREFETCHED_READY_CACHE
             || self.prefetch_inflight.contains(&canonical)
             || self.prefetched_ready.contains_key(&canonical)
+            || self.prefetch_queued.contains(&canonical)
         {
-            return;
+            return false;
         }
-        let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() else {
-            return;
+        let can_spawn_now = self.pending.is_empty()
+            && self.prefetch_inflight.len() < self.prefetch_cap
+            && self.semaphore.available_permits() > 1;
+        if !can_spawn_now && self.prefetch_pending.len() >= MAX_PREFETCH_PENDING {
+            if self.prefetch_pending.len() > self.prefetch_queued.len() {
+                self.prefetch_pending
+                    .retain(|entry| self.prefetch_queued.contains(&entry.canonical));
+            }
+            if self.prefetch_pending.len() >= MAX_PREFETCH_PENDING {
+                return false;
+            }
+        }
+        let pending = PendingPrefetch {
+            canonical: canonical.clone(),
+            client: dispatch.client.clone(),
+            route_table: dispatch.route_table.clone(),
+            policy: dispatch.policy.clone(),
+            exact_version,
+            preferred_range,
+            include_speculation,
+            trace_metadata_fetches: dispatch.trace_metadata_fetches,
+            telemetry: Arc::clone(dispatch.telemetry),
         };
-        self.prefetch_inflight.insert(canonical.clone());
-        let client = dispatch.client.clone();
-        let route_table = dispatch.route_table.clone();
-        let policy = dispatch.policy.clone();
-        let policy_semaphore = Arc::clone(&self.policy_semaphore);
-        let telemetry = Arc::clone(dispatch.telemetry);
-        let trace_metadata_fetches = dispatch.trace_metadata_fetches;
-        self.prefetch_jobs.spawn(async move {
-            let _active_fetch = telemetry.enter();
-            let result = fetch_metadata_for_resolver_with_permit_and_exact(
-                &client,
-                &route_table,
-                &canonical,
-                &policy,
-                include_speculation,
-                trace_metadata_fetches,
-                permit,
-                &policy_semaphore,
-                exact_version.as_deref(),
-            )
-            .await;
-            (canonical, result)
-        });
+        if can_spawn_now && let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() {
+            self.spawn_prefetch(pending, permit);
+            return true;
+        }
+        if self.prefetch_pending.len() >= MAX_PREFETCH_PENDING {
+            if self.prefetch_pending.len() > self.prefetch_queued.len() {
+                self.prefetch_pending
+                    .retain(|entry| self.prefetch_queued.contains(&entry.canonical));
+            }
+            if self.prefetch_pending.len() >= MAX_PREFETCH_PENDING {
+                return false;
+            }
+        }
+        self.prefetch_queued.insert(canonical);
+        self.prefetch_pending.push_back(pending);
+        true
     }
 
     fn enqueue_hydration(
@@ -922,6 +1056,8 @@ impl MetadataFetchScheduler {
     }
 
     fn abort_unpromoted_prefetches(&mut self) {
+        self.prefetch_pending.clear();
+        self.prefetch_queued.clear();
         if self.promoted_prefetches.is_empty() && !self.prefetch_jobs.is_empty() {
             self.prefetch_jobs.abort_all();
             self.prefetch_inflight.clear();
@@ -980,24 +1116,38 @@ impl MetadataFetchScheduler {
             &route_table,
             &policy,
         );
-        if let Some(prefetched_result) = self.prefetched_ready.remove(&canonical) {
-            let usable = match &prefetched_result {
-                Ok(fetched) => match exact_version.as_deref() {
-                    Some(version) => !fetched.info.needs_platform_metadata_for_version(version),
-                    None => !fetched.info.needs_platform_metadata(),
-                },
-                Err(_) => false,
-            };
-            if usable {
-                self.ready.push_back((request_key, prefetched_result));
-                return;
-            }
+        self.prefetch_queued.remove(&canonical);
+        if let Some(prefetched_result) = self.prefetched_ready.remove(&canonical)
+            && prefetched_result_usable(
+                &prefetched_result,
+                exact_version.as_deref(),
+                preferred_range.as_ref(),
+            )
+        {
+            self.ready.push_back((request_key, prefetched_result));
+            return;
         }
         if self.prefetch_inflight.contains(&canonical) {
+            let pending = PendingMetadataFetch {
+                timeline,
+                canonical: canonical.clone(),
+                client,
+                route_table,
+                policy,
+                exact_version,
+                preferred_range,
+                include_speculation,
+                trace_metadata_fetches: dispatch.trace_metadata_fetches,
+                telemetry: Arc::clone(dispatch.telemetry),
+                queued_at: Instant::now(),
+            };
             self.promoted_prefetches
                 .entry(canonical)
                 .or_default()
-                .push(request_key);
+                .push(PromotedPrefetch {
+                    request_key,
+                    pending,
+                });
             return;
         }
         if !dispatch.trace_metadata_fetches
@@ -1029,6 +1179,10 @@ impl MetadataFetchScheduler {
             telemetry: Arc::clone(dispatch.telemetry),
             queued_at: Instant::now(),
         };
+        self.enqueue_pending_demand(pending);
+    }
+
+    fn enqueue_pending_demand(&mut self, pending: PendingMetadataFetch) {
         let exact_document_lane = pending.exact_version.is_some()
             && exact_metadata_fast_path_eligible(
                 &pending.client,
@@ -1227,6 +1381,7 @@ impl MetadataFetchScheduler {
                 .expect("checked non-empty");
             self.spawn(pending, permit);
         }
+        self.drain_prefetch_pending();
     }
 
     async fn join_next(
@@ -1291,13 +1446,39 @@ impl MetadataFetchScheduler {
                 Some(joined) = self.prefetch_jobs.join_next(), if !self.prefetch_jobs.is_empty() => {
                     self.fill_available();
                     match joined {
-                        Ok((canonical, result)) => {
+                        Ok((canonical, result, is_plain_packument_prefetch)) => {
                             self.prefetch_inflight.remove(&canonical);
-                            if let Some(mut keys) = self.promoted_prefetches.remove(&canonical) {
-                                if let Some(first_key) = keys.pop() {
-                                    for extra_key in keys {
-                                        self.ready.push_back((extra_key, result.clone()));
+                            if let Some(promoted) = self.promoted_prefetches.remove(&canonical) {
+                                let mut first_ready = None;
+                                for item in promoted {
+                                    // Deliver a failed speculative prefetch directly ONLY when
+                                    // the prefetch itself ran the plain packument endpoint AND
+                                    // the promoted demand is also a plain packument demand;
+                                    // otherwise fall back to the demand's own fetch path so a
+                                    // failing `/latest` or exact prefetch never fails resolution.
+                                    let can_deliver = if result.is_ok() {
+                                        prefetched_result_usable(
+                                            &result,
+                                            item.pending.exact_version.as_deref(),
+                                            item.pending.preferred_range.as_ref(),
+                                        )
+                                    } else {
+                                        is_plain_packument_prefetch
+                                            && item.pending.exact_version.is_none()
+                                            && item.pending.preferred_range.is_none()
+                                    };
+                                    if can_deliver {
+                                        if first_ready.is_none() {
+                                            first_ready = Some(item.request_key);
+                                        } else {
+                                            self.ready
+                                                .push_back((item.request_key, result.clone()));
+                                        }
+                                    } else {
+                                        self.enqueue_pending_demand(item.pending);
                                     }
+                                }
+                                if let Some(first_key) = first_ready {
                                     return Some(Ok((first_key, result)));
                                 }
                             } else if result.is_ok()
@@ -1643,6 +1824,195 @@ mod metadata_fetch_scheduler_tests {
         result.expect("packument fallback should resolve");
         server.verify().await;
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_prefetch_drains_when_permits_free_and_satisfies_matching_demand() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/queued-pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "queued-pkg",
+                "dist-tags": { "latest": "1.2.0" },
+                "versions": {
+                    "1.2.0": {
+                        "name": "queued-pkg",
+                        "version": "1.2.0",
+                        "dist": {
+                            "tarball": "https://example.invalid/queued-pkg-1.2.0.tgz",
+                            "integrity": "sha512-queued"
+                        },
+                        "dependencies": {}
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let metadata_semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+        let exact_document_semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+        let held_permit_1 = Arc::clone(&metadata_semaphore)
+            .acquire_owned()
+            .await
+            .unwrap();
+        let held_permit_2 = Arc::clone(&metadata_semaphore)
+            .acquire_owned()
+            .await
+            .unwrap();
+        let telemetry = Arc::new(MetadataFetchTelemetry::default());
+        let client = Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        );
+        let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+        let policy = ResolverPolicy::default();
+        let dispatch = MetadataFetchDispatch {
+            timeline: None,
+            telemetry: &telemetry,
+            client: &client,
+            route_table: &route_table,
+            policy: &policy,
+            trace_metadata_fetches: false,
+        };
+        let mut scheduler =
+            MetadataFetchScheduler::new(Arc::clone(&metadata_semaphore), exact_document_semaphore);
+
+        let range = NpmRange::parse("^1.0.0").unwrap();
+        assert!(scheduler.enqueue_prefetch(
+            &dispatch,
+            CanonicalKey::npm("queued-pkg"),
+            None,
+            Some(range.clone()),
+            false,
+        ));
+        assert_eq!(scheduler.prefetch_pending.len(), 1);
+        assert!(scheduler.prefetch_inflight.is_empty());
+
+        drop(held_permit_1);
+        drop(held_permit_2);
+        scheduler.fill_available();
+        assert!(scheduler.prefetch_pending.is_empty());
+        assert_eq!(scheduler.prefetch_inflight.len(), 1);
+
+        scheduler.enqueue_preferred(
+            &dispatch,
+            CanonicalKey::npm("queued-pkg"),
+            None,
+            false,
+            Some(range),
+        );
+        let (_, result) = tokio::time::timeout(Duration::from_secs(2), scheduler.join_next())
+            .await
+            .expect("promoted prefetch should finish")
+            .expect("scheduler item")
+            .expect("task join");
+        let fetched = result.expect("promoted prefetch result");
+        assert!(fetched.info.version_view("1.2.0").is_some());
+        server.verify().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn partial_preferred_prefetch_is_not_reused_for_full_history_demand() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/partial-pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "partial-pkg",
+                "dist-tags": { "latest": "2.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "partial-pkg",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": "https://example.invalid/partial-pkg-1.0.0.tgz",
+                            "integrity": "sha512-p1"
+                        },
+                        "dependencies": {}
+                    },
+                    "2.0.0": {
+                        "name": "partial-pkg",
+                        "version": "2.0.0",
+                        "dist": {
+                            "tarball": "https://example.invalid/partial-pkg-2.0.0.tgz",
+                            "integrity": "sha512-p2"
+                        },
+                        "dependencies": {}
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let metadata_semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+        let exact_document_semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+        let telemetry = Arc::new(MetadataFetchTelemetry::default());
+        let client = Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        );
+        let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+        let policy = ResolverPolicy::default();
+        let dispatch = MetadataFetchDispatch {
+            timeline: None,
+            telemetry: &telemetry,
+            client: &client,
+            route_table: &route_table,
+            policy: &policy,
+            trace_metadata_fetches: false,
+        };
+        let mut scheduler =
+            MetadataFetchScheduler::new(Arc::clone(&metadata_semaphore), exact_document_semaphore);
+
+        let partial_raw: lpm_registry::PackageMetadata =
+            serde_json::from_value(serde_json::json!({
+                "name": "partial-pkg",
+                "dist-tags": { "latest": "2.0.0" },
+                "versions": {
+                    "2.0.0": {
+                        "name": "partial-pkg",
+                        "version": "2.0.0",
+                        "dist": {
+                            "tarball": "https://example.invalid/partial-pkg-2.0.0.tgz",
+                            "integrity": "sha512-p2"
+                        },
+                        "dependencies": {}
+                    }
+                }
+            }))
+            .unwrap();
+        let partial = parse_partial_fetched_metadata(partial_raw, false, false, []);
+        scheduler
+            .prefetched_ready
+            .insert(CanonicalKey::npm("partial-pkg"), Ok(partial));
+
+        // Full-history demand (preferred_range = None) must not reuse partial entry.
+        scheduler.enqueue_preferred(
+            &dispatch,
+            CanonicalKey::npm("partial-pkg"),
+            None,
+            false,
+            None,
+        );
+        let (_, result) = tokio::time::timeout(Duration::from_secs(2), scheduler.join_next())
+            .await
+            .expect("full fetch should complete")
+            .expect("scheduler item")
+            .expect("task join");
+        let fetched = result.expect("full packument");
+        assert!(fetched.info.versions_complete);
+        assert!(fetched.info.version_view("1.0.0").is_some());
+        assert!(fetched.info.version_view("2.0.0").is_some());
+        server.verify().await;
+    }
 }
 
 fn spawn_metadata_fetch_job(
@@ -1659,7 +2029,7 @@ fn spawn_metadata_fetch_job(
 fn prefetch_children_of_blocked_manifest(
     edges: &[Edge],
     canonical: &CanonicalKey,
-    info: &CachedPackageInfo,
+    info: &Arc<CachedPackageInfo>,
     overrides: &OverrideSet,
     policy: &ResolverPolicy,
     shared_cache: &SharedCache,
@@ -1669,6 +2039,9 @@ fn prefetch_children_of_blocked_manifest(
     dispatch: &MetadataFetchDispatch<'_>,
     include_speculation: bool,
 ) {
+    let mut queue: VecDeque<(CanonicalKey, Arc<CachedPackageInfo>, NpmVersion, u8)> =
+        VecDeque::new();
+    let mut visited: AHashSet<(CanonicalKey, NpmVersion)> = AHashSet::new();
     for edge in edges {
         let super::version::VersionPick::Picked(version) =
             super::version::find_best_version_with_policy_unprofiled(
@@ -1680,10 +2053,34 @@ fn prefetch_children_of_blocked_manifest(
         else {
             continue;
         };
-        let Some(dependencies) = info.dependencies(&version.to_string()) else {
+        if visited.insert((canonical.clone(), version.clone())) {
+            queue.push_back((canonical.clone(), Arc::clone(info), version, 0));
+        }
+    }
+
+    const MAX_PREFETCH_WALK_NODES: usize = 64;
+    const MAX_PREFETCH_WALK_EDGES: usize = 256;
+    let mut dispatched = 0usize;
+    let mut walked_nodes = 0usize;
+    let mut walked_edges = 0usize;
+    while let Some((_, current_info, current_version, depth)) = queue.pop_front() {
+        if dispatched >= MAX_PREFETCH_PER_BLOCKED_CALL
+            || walked_nodes >= MAX_PREFETCH_WALK_NODES
+            || walked_edges >= MAX_PREFETCH_WALK_EDGES
+        {
+            break;
+        }
+        walked_nodes += 1;
+        let Some(dependencies) = current_info.dependencies(&current_version.to_string()) else {
             continue;
         };
         for dep in dependencies {
+            if dispatched >= MAX_PREFETCH_PER_BLOCKED_CALL
+                || walked_edges >= MAX_PREFETCH_WALK_EDGES
+            {
+                break;
+            }
+            walked_edges += 1;
             if dep.bundled || dep.optional || super::version::is_workspace_specifier(dep.range) {
                 continue;
             }
@@ -1694,20 +2091,49 @@ fn prefetch_children_of_blocked_manifest(
             if !overrides.is_empty() && overrides.may_match_package(&child_canonical.to_string()) {
                 continue;
             }
-            if shared_cache.contains_key(&child_canonical)
-                || shared_fact_cache.is_some_and(|facts| facts.contains_key(&child_canonical))
-                || ordered_metadata.inflight().contains(&child_canonical)
+            if let Some(child_info) = cached_manifest_from_importer_or_facts(
+                shared_cache,
+                shared_fact_cache,
+                &child_canonical,
+            ) {
+                if depth + 1 < MAX_PREFETCH_DEPTH
+                    && let super::version::VersionPick::Picked(child_version) =
+                        super::version::find_best_version_with_policy_unprofiled(
+                            &child_canonical,
+                            &child_info,
+                            &parsed_range,
+                            policy,
+                        )
+                    && visited.insert((child_canonical.clone(), child_version.clone()))
+                {
+                    queue.push_back((child_canonical, child_info, child_version, depth + 1));
+                }
+                continue;
+            }
+            if ordered_metadata.inflight().contains(&child_canonical)
                 || ordered_metadata.has_committed(&child_canonical)
             {
                 continue;
             }
-            let child_exact = parsed_range.exact_version().map(|v| v.to_string());
-            metadata_jobs.enqueue_prefetch(
+            let child_exact = parsed_range.exact_version_ref().map(|v| v.to_string());
+            let child_preferred = (child_exact.is_none()
+                && exact_metadata_fast_path_eligible(
+                    dispatch.client,
+                    dispatch.route_table,
+                    &child_canonical,
+                    policy,
+                )
+                && parsed_range.dist_tag().is_none_or(|tag| tag == "latest"))
+            .then_some(parsed_range);
+            if metadata_jobs.enqueue_prefetch(
                 dispatch,
                 child_canonical,
                 child_exact,
+                child_preferred,
                 include_speculation,
-            );
+            ) {
+                dispatched += 1;
+            }
         }
     }
 }
@@ -2305,8 +2731,8 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             continue;
         };
         let canonical = CanonicalKey::from_dep_name(&name);
-        let fetched = parse_fetched_metadata(
-            metadata.as_ref().clone(),
+        let fetched = parse_borrowed_fetched_metadata(
+            metadata.as_ref(),
             spec_tx.is_some(),
             trace_metadata_fetches,
         );
@@ -2479,6 +2905,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             }
         }
     }
+    let mut peer_prefetch_cursor = 0usize;
     loop {
         let mut worker_batch_candidates: Vec<(CanonicalKey, String)> = Vec::new();
         let edge_drain_started = trace_metadata_fetches.then(Instant::now);
@@ -2570,14 +2997,20 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     }
                     continue;
                 }
-                let edge_exact_version = edge.range.exact_version().map(|v| v.to_string());
-                let needs_platform = match edge_exact_version.as_deref() {
-                    Some(version) => info_arc.needs_platform_metadata_for_version(version),
-                    None => info_arc.needs_platform_metadata(),
+                let needs_platform = if info_arc.platform_metadata_complete {
+                    false
+                } else {
+                    match edge.range.exact_version_ref() {
+                        Some(version) => {
+                            info_arc.needs_platform_metadata_for_version(&version.to_string())
+                        }
+                        None => info_arc.needs_platform_metadata(),
+                    }
                 };
                 let needs_supplemental =
                     info_arc.needs_policy_metadata(&edge.canonical, &policy) || needs_platform;
                 if needs_supplemental && matches!(&edge.canonical, CanonicalKey::Npm { .. }) {
+                    let edge_exact_version = edge.range.exact_version_ref().map(|v| v.to_string());
                     let request = MetadataFetchKey {
                         canonical: edge.canonical.clone(),
                         exact_version: edge_exact_version,
@@ -2599,14 +3032,14 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     let canonical = edge.canonical.clone();
                     let request = MetadataFetchKey::packument(canonical.clone());
                     let new_completion = ordered_metadata.start_request(&request)?;
-                    parked.entry(request).or_default().push(edge);
+                    parked.entry(request.clone()).or_default().push(edge);
                     if new_completion {
                         ordered_metadata.queue_cached_tracked(
-                            canonical,
+                            canonical.clone(),
                             Ok(FetchedMetadata {
                                 speculation: None,
                                 latest_version: info_arc.latest_version.clone(),
-                                info: info_arc,
+                                info: Arc::clone(&info_arc),
                                 shared_fact: None,
                             }),
                         )?;
@@ -2624,6 +3057,23 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                             pending_root_constraints: &mut pending_root_constraints,
                         };
                         ordered_metadata.commit_ready(&mut completion)?;
+                        if ordered_metadata.is_blocked_behind_earlier(&request)
+                            && let Some(edges) = parked.get(&request)
+                        {
+                            prefetch_children_of_blocked_manifest(
+                                edges,
+                                &canonical,
+                                &info_arc,
+                                &state.overrides,
+                                &policy,
+                                &shared_cache,
+                                shared_fact_cache.as_ref(),
+                                &ordered_metadata,
+                                &mut metadata_jobs,
+                                &metadata_dispatch,
+                                spec_tx.is_some(),
+                            );
+                        }
                     }
                     continue;
                 }
@@ -2943,8 +3393,13 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
         // dispatch. The dispatcher's `inflight.insert` guard would
         // catch any miss but is redundant here.
         if auto_install_peers {
-            let candidates =
-                pick_peer_prefetch_candidates(&state, &shared_cache, ordered_metadata.inflight());
+            let candidates = pick_peer_prefetch_candidates_from(
+                &state,
+                &shared_cache,
+                ordered_metadata.inflight(),
+                peer_prefetch_cursor,
+            );
+            peer_prefetch_cursor = state.peer_requirements.len();
             for canonical in candidates {
                 // Mirror the cache-miss spawn path — same metadata
                 // semaphore, same is_npm derivation, same tarball-spec
@@ -3161,17 +3616,140 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                 .await?;
             }
 
-            // Peer-drain pass. The fetch closure consults `shared_cache`
-            // first (hot path — manifests for peer canonicals are usually
-            // already there because the regular dep walk pulled them as
-            // transitive children). On true cache miss, fetch directly via
-            // `fetch_metadata_raw` — no need to park/spawn through the
-            // dispatcher because drains run sequentially outside the queue drain.
+            // Pre-fetch missing peer manifests concurrently before the
+            // deterministic classification loop so unmet peers finish in
+            // one bounded round-trip instead of N serial requests while
+            // preserving exact canonical-order error and fallback handling.
+            type PrefetchedPeerMap =
+                AHashMap<CanonicalKey, Result<Arc<CachedPackageInfo>, ResolveError>>;
+            let prefetched_peer_results: Arc<parking_lot::Mutex<PrefetchedPeerMap>> =
+                Arc::new(parking_lot::Mutex::new(AHashMap::new()));
+            if !state.peer_requirements.is_empty() {
+                let mut missing_peer_canonicals: Vec<CanonicalKey> = Vec::new();
+                let mut seen_peers: AHashSet<&CanonicalKey> = AHashSet::new();
+                for req in &state.peer_requirements {
+                    let needs_override = !state.overrides.is_empty()
+                        && state
+                            .overrides
+                            .may_match_package(&req.canonical.to_string());
+                    let needs_dist_tag = req.range.dist_tag().is_some();
+                    let needs_install = auto_install_peers
+                        && !req.optional
+                        && !state.resolved.get(&req.canonical).is_some_and(|nodes| {
+                            nodes
+                                .iter()
+                                .any(|(version, _)| req.range.satisfies(version))
+                        });
+                    if !(needs_override || needs_dist_tag || needs_install) {
+                        continue;
+                    }
+                    if !seen_peers.insert(&req.canonical) {
+                        continue;
+                    }
+                    let already_ready = cached_manifest_from_importer_or_facts(
+                        &shared_cache,
+                        shared_fact_cache.as_ref(),
+                        &req.canonical,
+                    )
+                    .is_some_and(|info| {
+                        info.versions_complete
+                            && !info.needs_policy_metadata(&req.canonical, &policy)
+                            && !info.needs_platform_metadata()
+                    });
+                    if !already_ready {
+                        missing_peer_canonicals.push(req.canonical.clone());
+                    }
+                }
+                if missing_peer_canonicals.len() > 1 {
+                    let concurrency = npm_fanout.clamp(1, 16);
+                    let fetched_batch: Vec<(
+                        CanonicalKey,
+                        Result<Arc<CachedPackageInfo>, ResolveError>,
+                    )> = futures::stream::iter(missing_peer_canonicals)
+                        .map(|canonical| {
+                            let client = client.clone();
+                            let route_table = route_table.clone();
+                            let shared_cache = shared_cache.clone();
+                            let shared_fact_cache = shared_fact_cache.clone();
+                            let policy = policy.clone();
+                            async move {
+                                let res = if let Some(info_arc) =
+                                    cached_manifest_from_importer_or_facts(
+                                        &shared_cache,
+                                        shared_fact_cache.as_ref(),
+                                        &canonical,
+                                    )
+                                    && info_arc.versions_complete
+                                {
+                                    ensure_policy_metadata_for_cached_manifest(
+                                        &canonical,
+                                        info_arc,
+                                        &client,
+                                        &route_table,
+                                        &shared_cache,
+                                        &policy,
+                                        trace_metadata_fetches,
+                                    )
+                                    .await
+                                } else {
+                                    match fetch_metadata_for_resolver_with_trace_detail(
+                                        &client,
+                                        &route_table,
+                                        &canonical,
+                                        &policy,
+                                        false,
+                                        trace_metadata_fetches,
+                                    )
+                                    .await
+                                    {
+                                        Ok(fetched) => {
+                                            publish_direct_base_fact(
+                                                shared_fact_cache.as_ref(),
+                                                &route_table,
+                                                &canonical,
+                                                fetched.shared_fact,
+                                            );
+                                            Ok(insert_or_merge_cached_package_info(
+                                                &shared_cache,
+                                                canonical.clone(),
+                                                fetched.info,
+                                            ))
+                                        }
+                                        Err(error) => {
+                                            if matches!(error, ResolveError::PackageNotFound { .. })
+                                                && let Some(workspace) =
+                                                    crate::provider::activate_workspace_fallback(
+                                                        &shared_cache,
+                                                        &canonical,
+                                                    )
+                                            {
+                                                Ok(workspace)
+                                            } else {
+                                                Err(error)
+                                            }
+                                        }
+                                    }
+                                };
+                                (canonical, res)
+                            }
+                        })
+                        .buffer_unordered(concurrency)
+                        .collect()
+                        .await;
+                    let mut guard = prefetched_peer_results.lock();
+                    for (canonical, result) in fetched_batch {
+                        guard.insert(canonical, result);
+                    }
+                }
+            }
+
             let client_drain = client.clone();
             let route_table_drain = route_table.clone();
             let shared_cache_drain = shared_cache.clone();
             let shared_fact_cache_drain = shared_fact_cache.clone();
             let policy_drain = policy.clone();
+            let prefetched_drain = Arc::clone(&prefetched_peer_results);
+            peer_prefetch_cursor = 0;
             let synthesized = drain_peer_requirements_one_pass(
                 &mut state,
                 auto_install_peers,
@@ -3181,8 +3759,11 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     let shared_cache = shared_cache_drain.clone();
                     let shared_fact_cache = shared_fact_cache_drain.clone();
                     let policy = policy_drain.clone();
+                    let prefetched = Arc::clone(&prefetched_drain);
                     async move {
-                        // Cache hit: refcount bump, return immediately.
+                        if let Some(result) = prefetched.lock().remove(&canonical) {
+                            return result;
+                        }
                         if let Some(info_arc) = cached_manifest_from_importer_or_facts(
                             &shared_cache,
                             shared_fact_cache.as_ref(),
@@ -3200,12 +3781,6 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                             )
                             .await;
                         }
-                        // Cache miss: direct fetch + parse + insert.
-                        // Peer manifests are typically a small tail
-                        // (e.g., react when only react-dom was a
-                        // direct dep), so the serial fetch here is
-                        // bounded by the count of unmet-peer canonicals
-                        // — usually 0–3.
                         let fetched = match fetch_metadata_for_resolver_with_trace_detail(
                             &client,
                             &route_table,
@@ -3644,5 +4219,412 @@ mod metadata_timeline_bound_tests {
             timeline.lock().unwrap().len(),
             MAX_METADATA_TIMELINE_REQUESTS
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unusable_prefetched_ready_entry_is_evicted_on_exact_demand() {
+        use crate::ManifestVersion;
+        use crate::provider::CachedDistInfo;
+
+        let mut jobs = MetadataFetchScheduler::new(
+            Arc::new(tokio::sync::Semaphore::new(4)),
+            Arc::new(tokio::sync::Semaphore::new(4)),
+        );
+        let canonical = CanonicalKey::npm("partial-pkg");
+        let partial_info = CachedPackageInfo::from_manifest_versions(
+            None,
+            false,
+            false,
+            HashSet::new(),
+            HashSet::new(),
+            true,
+            Some(NpmVersion::parse("2.0.0").unwrap()),
+            vec![ManifestVersion {
+                version: NpmVersion::parse("2.0.0").unwrap(),
+                dependencies: Vec::new(),
+                peer_dependencies: Vec::new(),
+                node_engine: None,
+                platform: None,
+                dist: CachedDistInfo::default(),
+            }],
+        );
+        jobs.prefetched_ready.insert(
+            canonical.clone(),
+            Ok(FetchedMetadata {
+                info: Arc::new(partial_info),
+                speculation: None,
+                shared_fact: None,
+                latest_version: Some(NpmVersion::parse("2.0.0").unwrap()),
+            }),
+        );
+
+        let client = Arc::new(RegistryClient::new());
+        let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+        let policy = ResolverPolicy::default();
+        let telemetry = Arc::new(MetadataFetchTelemetry::default());
+        let dispatch = MetadataFetchDispatch {
+            client: &client,
+            route_table: &route_table,
+            policy: &policy,
+            trace_metadata_fetches: false,
+            telemetry: &telemetry,
+            timeline: None,
+        };
+
+        // Demand exact version 1.0.0 which is NOT covered by the 2.0.0 partial prefetch.
+        jobs.enqueue_preferred(
+            &dispatch,
+            canonical.clone(),
+            Some("1.0.0".to_string()),
+            false,
+            None,
+        );
+        assert!(
+            !jobs.prefetched_ready.contains_key(&canonical),
+            "unusable prefetched_ready entry must be removed so stale partials cannot fill the cache cap"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn speculative_packument_failure_falls_back_to_promoted_exact_document_demand() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Full packument returns 404 after a short delay (non-retryable) while the
+        // exact version endpoint succeeds.
+        Mock::given(method("GET"))
+            .and(path("/exact-fallback"))
+            .respond_with(
+                ResponseTemplate::new(404).set_delay(std::time::Duration::from_millis(40)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/exact-fallback/1.0.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "exact-fallback",
+                "version": "1.0.0",
+                "dependencies": {},
+                "dist": {
+                    "tarball": format!("{}/exact-fallback/-/exact-fallback-1.0.0.tgz", server.uri()),
+                    "integrity": "sha512-exact"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        );
+        let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+        let policy = ResolverPolicy::default();
+        let telemetry = Arc::new(MetadataFetchTelemetry::default());
+        let dispatch = MetadataFetchDispatch {
+            client: &client,
+            route_table: &route_table,
+            policy: &policy,
+            trace_metadata_fetches: false,
+            telemetry: &telemetry,
+            timeline: None,
+        };
+        let mut jobs = MetadataFetchScheduler::new(
+            Arc::new(tokio::sync::Semaphore::new(4)),
+            Arc::new(tokio::sync::Semaphore::new(4)),
+        );
+        let canonical = CanonicalKey::npm("exact-fallback");
+
+        // Start a speculative full-packument prefetch first.
+        assert!(jobs.enqueue_prefetch(&dispatch, canonical.clone(), None, None, false));
+        // While the speculative packument is in flight, an exact-version demand joins.
+        jobs.enqueue_preferred(
+            &dispatch,
+            canonical.clone(),
+            Some("1.0.0".to_string()),
+            false,
+            None,
+        );
+
+        let (key, result) = jobs
+            .join_next()
+            .await
+            .expect("promoted exact demand must complete")
+            .expect("join must succeed");
+        assert_eq!(key.canonical, canonical);
+        let fetched =
+            result.expect("exact-document demand must succeed after speculative packument failure");
+        assert!(
+            fetched
+                .info
+                .versions
+                .iter()
+                .any(|v| v.to_string() == "1.0.0")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn speculative_packument_failure_delivers_error_directly_to_promoted_plain_demand() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/missing-plain"))
+            .respond_with(
+                ResponseTemplate::new(404).set_delay(std::time::Duration::from_millis(40)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        );
+        let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+        let policy = ResolverPolicy::default();
+        let telemetry = Arc::new(MetadataFetchTelemetry::default());
+        let dispatch = MetadataFetchDispatch {
+            client: &client,
+            route_table: &route_table,
+            policy: &policy,
+            trace_metadata_fetches: false,
+            telemetry: &telemetry,
+            timeline: None,
+        };
+        let mut jobs = MetadataFetchScheduler::new(
+            Arc::new(tokio::sync::Semaphore::new(4)),
+            Arc::new(tokio::sync::Semaphore::new(4)),
+        );
+        let canonical = CanonicalKey::npm("missing-plain");
+
+        assert!(jobs.enqueue_prefetch(&dispatch, canonical.clone(), None, None, false));
+        jobs.enqueue_preferred(&dispatch, canonical.clone(), None, false, None);
+
+        let (key, result) = jobs
+            .join_next()
+            .await
+            .expect("promoted plain demand must complete")
+            .expect("join must succeed");
+        assert_eq!(key.canonical, canonical);
+        assert!(
+            result.is_err(),
+            "promoted plain demand must receive the packument error without retrying the same URL"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parallel_peer_prefetch_does_not_skip_required_unmet_peer_after_optional_consumer() {
+        use crate::provider::CachedDistInfo;
+        use crate::{ManifestPeerDependency, ManifestVersion};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        for name in ["peer-a", "peer-b"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/{name}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "name": name,
+                    "dist-tags": { "latest": "1.0.0" },
+                    "versions": {
+                        "1.0.0": {
+                            "name": name,
+                            "version": "1.0.0",
+                            "dependencies": {}
+                        }
+                    }
+                })))
+                .mount(&server)
+                .await;
+        }
+
+        let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+        // Consumer 1 has optional peers on peer-a and peer-b; consumer 2 requires both.
+        shared_cache.insert(
+            CanonicalKey::npm("opt-host"),
+            Arc::new(CachedPackageInfo::from_manifest_versions(
+                None,
+                true,
+                true,
+                HashSet::new(),
+                HashSet::new(),
+                true,
+                Some(NpmVersion::parse("1.0.0").unwrap()),
+                vec![ManifestVersion {
+                    version: NpmVersion::parse("1.0.0").unwrap(),
+                    dependencies: Vec::new(),
+                    peer_dependencies: vec![
+                        ManifestPeerDependency {
+                            name: "peer-a".to_string(),
+                            range: "^1.0.0".to_string(),
+                            alias: None,
+                            optional: true,
+                        },
+                        ManifestPeerDependency {
+                            name: "peer-b".to_string(),
+                            range: "^1.0.0".to_string(),
+                            alias: None,
+                            optional: true,
+                        },
+                    ],
+                    node_engine: None,
+                    platform: None,
+                    dist: CachedDistInfo::default(),
+                }],
+            )),
+        );
+        shared_cache.insert(
+            CanonicalKey::npm("req-host"),
+            Arc::new(CachedPackageInfo::from_manifest_versions(
+                None,
+                true,
+                true,
+                HashSet::new(),
+                HashSet::new(),
+                true,
+                Some(NpmVersion::parse("1.0.0").unwrap()),
+                vec![ManifestVersion {
+                    version: NpmVersion::parse("1.0.0").unwrap(),
+                    dependencies: Vec::new(),
+                    peer_dependencies: vec![
+                        ManifestPeerDependency {
+                            name: "peer-a".to_string(),
+                            range: "^1.0.0".to_string(),
+                            alias: None,
+                            optional: false,
+                        },
+                        ManifestPeerDependency {
+                            name: "peer-b".to_string(),
+                            range: "^1.0.0".to_string(),
+                            alias: None,
+                            optional: false,
+                        },
+                    ],
+                    node_engine: None,
+                    platform: None,
+                    dist: CachedDistInfo::default(),
+                }],
+            )),
+        );
+
+        let client = Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        );
+        let roots = HashMap::from([
+            ("opt-host".to_string(), "1.0.0".to_string()),
+            ("req-host".to_string(), "1.0.0".to_string()),
+        ]);
+        let resolved = resolve_greedy_fused_with_cache_options_and_policy(
+            client,
+            roots,
+            OverrideSet::empty(),
+            RouteTable::from_mode_only(RouteMode::Direct),
+            4,
+            None,
+            shared_cache,
+            true,
+            true,
+            ResolverPolicy::default(),
+        )
+        .await
+        .expect("resolution with optional + required peer consumers must succeed");
+
+        assert!(
+            resolved
+                .packages
+                .iter()
+                .any(|pkg| pkg.package.canonical_name() == "peer-a")
+        );
+        assert!(
+            resolved
+                .packages
+                .iter()
+                .any(|pkg| pkg.package.canonical_name() == "peer-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_preferred_range_prefetch_falls_back_for_promoted_plain_demand() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // `/pkg/latest` fails with HTTP 401 (`LpmError::AuthRequired`, a hard error that
+        // propagates out of `fetch_npm_preferred_latest` instead of soft-falling-back)
+        // after a short delay so the plain demand promotes onto the in-flight preferred
+        // prefetch; the promoted plain demand must then fall back to its own `/pkg` fetch.
+        Mock::given(method("GET"))
+            .and(path("/pkg/latest"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_delay(Duration::from_millis(60))
+                    .set_body_string("unauthorized latest endpoint"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "pkg",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "pkg",
+                        "version": "1.0.0",
+                        "dependencies": {}
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        );
+        let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+        let policy = ResolverPolicy::default();
+        let telemetry = Arc::new(MetadataFetchTelemetry::default());
+        let dispatch = MetadataFetchDispatch {
+            client: &client,
+            route_table: &route_table,
+            policy: &policy,
+            trace_metadata_fetches: false,
+            telemetry: &telemetry,
+            timeline: None,
+        };
+        let mut scheduler = MetadataFetchScheduler::new(
+            Arc::new(tokio::sync::Semaphore::new(4)),
+            Arc::new(tokio::sync::Semaphore::new(4)),
+        );
+        let canonical = CanonicalKey::npm("pkg");
+        let range = NpmRange::parse("^1.0.0").unwrap();
+        assert!(
+            scheduler.enqueue_prefetch(&dispatch, canonical.clone(), None, Some(range), false,)
+        );
+        assert!(scheduler.prefetch_inflight.contains(&canonical));
+
+        // Promote a plain packument demand while the preferred-range prefetch is in flight.
+        scheduler.enqueue(&dispatch, canonical.clone(), None, false);
+        assert!(scheduler.promoted_prefetches.contains_key(&canonical));
+
+        let (_, result) = scheduler
+            .join_next()
+            .await
+            .expect("promoted demand must complete")
+            .expect("worker task must not panic");
+        let fetched = result.expect(
+            "promoted plain demand must fall back to full packument instead of inheriting /latest prefetch failure",
+        );
+        assert!(fetched.info.version_view("1.0.0").is_some());
     }
 }

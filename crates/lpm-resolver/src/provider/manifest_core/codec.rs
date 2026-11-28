@@ -52,7 +52,7 @@ impl ManifestProjection {
 impl lpm_registry::MetadataProjection for ManifestProjection {
     /// Includes the crate version, so a release that changes how metadata is
     /// parsed never reads projections an older parser derived.
-    const FORMAT: &'static str = concat!("lpm-resolver-manifest/", env!("CARGO_PKG_VERSION"), "/3");
+    const FORMAT: &'static str = concat!("lpm-resolver-manifest/", env!("CARGO_PKG_VERSION"), "/4");
 
     fn decode(bytes: &[u8]) -> Option<Self> {
         let mut reader = Reader(bytes);
@@ -132,8 +132,8 @@ impl CachedPackageInfo {
         }
         writer.len(core.signatures.len());
         for signature in &core.signatures {
-            writer.optional_str(signature.keyid.as_deref());
-            writer.optional_str(signature.sig.as_deref());
+            writer.optional_id(signature.keyid);
+            writer.optional_id(signature.sig);
         }
         writer.len(core.versions.len());
         for version in &core.versions {
@@ -259,11 +259,11 @@ impl CachedPackageInfo {
                 })
             })
             .collect::<Option<Box<[_]>>>()?;
-        let signatures = (0..reader.count(2)?)
+        let signatures = (0..reader.count(8)?)
             .map(|_| {
-                let keyid = reader.optional_str()?.map(str::to_owned);
-                let sig = reader.optional_str()?.map(str::to_owned);
-                Some(lpm_registry::RegistrySignature { keyid, sig })
+                let keyid = reader.optional_id(string_count)?;
+                let sig = reader.optional_id(string_count)?;
+                Some(SignatureRecord { keyid, sig })
             })
             .collect::<Option<Box<[_]>>>()?;
         let version_count = reader.count(48)?;
@@ -385,6 +385,8 @@ impl CachedPackageInfo {
         }
 
         let modified_unix = modified.as_deref().and_then(parse_npm_time_unix);
+        let versions_arc: Arc<[NpmVersion]> = Arc::from(versions);
+        let trust_timeline = build_trust_timeline(&versions_arc, &release_records, &trust);
         Some(Self {
             modified,
             modified_unix,
@@ -398,7 +400,7 @@ impl CachedPackageInfo {
             latest_version,
             latest_version_hint,
             preferred_latest,
-            versions: Arc::from(versions),
+            versions: versions_arc,
             dist_tags: Arc::new(dist_tags),
             core: Arc::new(ManifestCore {
                 strings,
@@ -418,6 +420,7 @@ impl CachedPackageInfo {
                 records: platform_records,
             }),
             trust,
+            trust_timeline,
         })
     }
 }

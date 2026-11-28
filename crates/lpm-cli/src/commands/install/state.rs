@@ -143,12 +143,13 @@ fn write_post_install_hash_with_context_and_proof(
             ctx.auto_install_peers,
         ))
     });
-    let file_link_bytes = crate::install_state::collect_file_link_manifest_bytes(project_dir, &pkg);
+    let file_link_bytes =
+        crate::install_state::collect_file_link_manifest_bytes_shared(project_dir, &pkg);
     let platform = lpm_store::v2::PlatformTuple::current();
     let hash = crate::install_state::compute_install_hash_v10(
         &pkg,
         &lock.content,
-        &file_link_bytes,
+        file_link_bytes.as_ref(),
         linker_mode,
         object_integrity_policy,
         &platform,

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::LockfileError;
-use crate::source::{Source, SourceParseError};
+use crate::source::{Source, SourceParseError, SourceRef};
 
 /// Three-tuple package identity for cross-source collision avoidance.
 ///
@@ -820,6 +820,17 @@ impl LockedPackage {
         self.source.as_deref().map(Source::parse)
     }
 
+    pub(crate) fn source_ref(&self) -> Option<Result<SourceRef<'_>, SourceParseError>> {
+        self.source.as_deref().map(SourceRef::parse)
+    }
+
+    pub(crate) fn source_id_cow(&self) -> Cow<'static, str> {
+        match self.source_ref() {
+            Some(Ok(source)) => Cow::Owned(source.source_id()),
+            _ => Cow::Borrowed(PackageKey::UNKNOWN_SOURCE_ID),
+        }
+    }
+
     /// Three-tuple identity for cross-source collision avoidance.
     /// See [`PackageKey`].
     ///
@@ -830,11 +841,24 @@ impl LockedPackage {
     pub fn package_key(&self) -> PackageKey {
         #[cfg(test)]
         PACKAGE_KEY_CALLS.with(|calls| calls.set(calls.get() + 1));
-        let source_id = match self.source_kind() {
-            Some(Ok(s)) => s.source_id(),
-            _ => PackageKey::UNKNOWN_SOURCE_ID.to_string(),
-        };
+        let source_id = self.source_id_cow().into_owned();
         PackageKey::new(self.name.clone(), self.version.clone(), source_id)
+    }
+
+    pub(crate) fn tarball_field_hint_is_consistent_with(
+        &self,
+        source: &Option<Result<SourceRef<'_>, SourceParseError>>,
+    ) -> bool {
+        let Some(hint) = self.tarball.as_deref() else {
+            return true;
+        };
+        if hint.is_empty() {
+            return true;
+        }
+        match source {
+            None | Some(Err(_)) | Some(Ok(SourceRef::Registry(_))) => true,
+            Some(Ok(_)) => false,
+        }
     }
 
     /// Whether the `tarball` field-hint is consistent with the parsed
@@ -860,16 +884,25 @@ impl LockedPackage {
     /// reader: invalid lockfile shapes drop to error, not silent
     /// acceptance (manifest-as-truth).
     pub fn tarball_field_hint_is_consistent(&self) -> bool {
-        let Some(hint) = self.tarball.as_deref() else {
-            return true;
-        };
-        if hint.is_empty() {
-            return true;
+        self.tarball_field_hint_is_consistent_with(&self.source_ref())
+    }
+
+    pub(crate) fn lpm_scope_origin_mismatch_with_source(
+        &self,
+        parsed: &Option<Result<SourceRef<'_>, SourceParseError>>,
+    ) -> Option<String> {
+        if !self.name.starts_with("@lpm.dev/") {
+            return None;
         }
-        match self.source_kind() {
-            None | Some(Err(_)) => true,
-            Some(Ok(Source::Registry { .. })) => true,
-            Some(Ok(_)) => false,
+        let Some(Ok(SourceRef::Registry(url))) = parsed else {
+            return None;
+        };
+        if is_lpm_origin(url) {
+            None
+        } else {
+            Some(crate::safe_source_identity(
+                self.source.as_deref().unwrap_or_default(),
+            ))
         }
     }
 
@@ -879,24 +912,16 @@ impl LockedPackage {
     /// regardless of what other registries the client is configured to
     /// talk to.
     pub fn lpm_scope_origin_mismatch(&self) -> Option<String> {
-        if !self.name.starts_with("@lpm.dev/") {
-            return None;
-        }
-        let source = self.source.as_deref()?;
-        let Ok(Source::Registry { url }) = Source::parse(source) else {
-            return None;
-        };
-        if is_lpm_origin(&url) {
-            None
-        } else {
-            Some(crate::safe_source_identity(source))
-        }
+        self.lpm_scope_origin_mismatch_with_source(&self.source_ref())
     }
 
-    pub fn git_metadata_error(&self) -> Option<&'static str> {
-        match self.source_kind() {
-            Some(Ok(Source::Git { url })) => {
-                if !is_safe_github_source(&url) {
+    pub(crate) fn git_metadata_error_with_source(
+        &self,
+        parsed: &Option<Result<SourceRef<'_>, SourceParseError>>,
+    ) -> Option<&'static str> {
+        match parsed {
+            Some(Ok(SourceRef::Git(url))) => {
+                if !is_safe_github_source(url) {
                     return Some("git source is not a pinned public GitHub repository");
                 }
                 if self.integrity.as_deref().is_none_or(str::is_empty) {
@@ -904,9 +929,12 @@ impl LockedPackage {
                 }
                 None
             }
-            Some(Ok(_)) | None => None,
-            Some(Err(_)) => None,
+            Some(Ok(_)) | None | Some(Err(_)) => None,
         }
+    }
+
+    pub fn git_metadata_error(&self) -> Option<&'static str> {
+        self.git_metadata_error_with_source(&self.source_ref())
     }
 }
 
@@ -979,7 +1007,7 @@ fn validate_package_name(name: &str) -> Result<(), String> {
         validate_package_name_component(scope)?;
         validate_package_name_component(package)?;
     } else {
-        if components.clone().count() != 1 {
+        if name.contains('/') {
             return Err("unscoped name must contain exactly one path component".to_string());
         }
         validate_package_name_component(name)?;
@@ -998,16 +1026,18 @@ fn validate_package_name_component(component: &str) -> Result<(), String> {
         .trim_start_matches('@')
         .split('.')
         .next()
-        .unwrap_or_default();
-    let upper = device_stem.to_ascii_uppercase();
-    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || upper
-            .strip_prefix("COM")
-            .or_else(|| upper.strip_prefix("LPT"))
-            .is_some_and(|suffix| {
-                matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
-            })
-    {
+        .unwrap_or_default()
+        .as_bytes();
+    let is_reserved = matches!(device_stem.len(), 3 | 4)
+        && (device_stem.eq_ignore_ascii_case(b"CON")
+            || device_stem.eq_ignore_ascii_case(b"PRN")
+            || device_stem.eq_ignore_ascii_case(b"AUX")
+            || device_stem.eq_ignore_ascii_case(b"NUL")
+            || (device_stem.len() == 4
+                && (device_stem[..3].eq_ignore_ascii_case(b"COM")
+                    || device_stem[..3].eq_ignore_ascii_case(b"LPT"))
+                && matches!(device_stem[3], b'1'..=b'9')));
+    if is_reserved {
         return Err("name contains a reserved Windows path component".to_string());
     }
     Ok(())
@@ -1065,20 +1095,51 @@ impl Lockfile {
     /// artifact identity and then exact instance ID. Distinct graph instances
     /// of one artifact occupy separate rows.
     pub fn add_package(&mut self, pkg: LockedPackage) {
-        let key = pkg.package_key();
+        let source_id = pkg.source_id_cow();
         let instance_id = pkg.instance_id;
         match self.packages.binary_search_by(|p| {
-            let other = p.package_key();
-            other
-                .name
-                .cmp(&key.name)
-                .then_with(|| other.version.cmp(&key.version))
-                .then_with(|| other.source_id.cmp(&key.source_id))
+            p.name
+                .as_str()
+                .cmp(pkg.name.as_str())
+                .then_with(|| p.version.as_str().cmp(pkg.version.as_str()))
+                .then_with(|| p.source_id_cow().as_ref().cmp(source_id.as_ref()))
                 .then_with(|| p.instance_id.cmp(&instance_id))
         }) {
             Ok(pos) => self.packages[pos] = pkg,
             Err(pos) => self.packages.insert(pos, pkg),
         }
+    }
+
+    /// Replace all packages in one sorted, deduplicated pass, keeping the last
+    /// entry on duplicate `(name, version, source_id, instance_id)` identities.
+    pub fn set_packages(&mut self, packages: Vec<LockedPackage>) {
+        if packages.is_empty() {
+            self.packages.clear();
+            return;
+        }
+        let mut keyed: Vec<(Cow<'static, str>, usize, LockedPackage)> = packages
+            .into_iter()
+            .enumerate()
+            .map(|(index, pkg)| (pkg.source_id_cow(), index, pkg))
+            .collect();
+        keyed.sort_unstable_by(|(l_src, l_idx, l_pkg), (r_src, r_idx, r_pkg)| {
+            l_pkg
+                .name
+                .as_str()
+                .cmp(r_pkg.name.as_str())
+                .then_with(|| l_pkg.version.as_str().cmp(r_pkg.version.as_str()))
+                .then_with(|| l_src.as_ref().cmp(r_src.as_ref()))
+                .then_with(|| l_pkg.instance_id.cmp(&r_pkg.instance_id))
+                // Reverse insertion index so dedup keeps the last-written entry, matching add_package.
+                .then_with(|| r_idx.cmp(l_idx))
+        });
+        keyed.dedup_by(|right, left| {
+            left.2.name == right.2.name
+                && left.2.version == right.2.version
+                && left.0 == right.0
+                && left.2.instance_id == right.2.instance_id
+        });
+        self.packages = keyed.into_iter().map(|(_, _, pkg)| pkg).collect();
     }
 
     /// Add one standalone importer graph to a workspace union lockfile.
@@ -1444,7 +1505,16 @@ impl Lockfile {
         packages.extend(keyed_packages.into_iter().map(|(_, package)| package));
         projected.packages = packages;
         projected.validate_peer_edge_targets()?;
-        projected.validate_instance_graph()?;
+        if projected.metadata.lockfile_version >= LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES {
+            Self::validate_instance_graph_in_packages(
+                None,
+                projected.packages.iter(),
+                &projected.root_resolutions,
+                &projected.ambient_peer_installs,
+                projected.importers.get("."),
+                false,
+            )?;
+        }
         Ok(projected)
     }
 
@@ -1595,12 +1665,15 @@ impl Lockfile {
                     &snapshot.root_resolutions,
                     &snapshot.ambient_peer_installs,
                     Some(snapshot),
+                    true,
                 )?;
             }
             if !snapshot.provenance.is_empty() {
-                self.project_validated_importer(importer)?
-                    .validate_provenance()
-                    .map_err(LockfileError::Deserialize)?;
+                Self::validate_provenance_for_packages(
+                    &snapshot.provenance,
+                    importer_packages.iter().copied(),
+                )
+                .map_err(LockfileError::Deserialize)?;
             }
         }
         if let Some(id) = self
@@ -1615,27 +1688,17 @@ impl Lockfile {
         Ok(())
     }
 
-    pub(crate) fn git_schema_error(&self) -> Option<String> {
-        if self.metadata.lockfile_version >= LOCKFILE_VERSION_WITH_GIT_RESOLUTIONS {
-            return None;
-        }
-        self.packages
-            .iter()
-            .chain(self.workspace_packages.values())
-            .find_map(|package| {
-                matches!(package.source_kind(), Some(Ok(Source::Git { .. }))).then(|| {
-                    format!(
-                        "package {:?} uses Git metadata, which requires lockfile version {}",
-                        package.name, LOCKFILE_VERSION_WITH_GIT_RESOLUTIONS
-                    )
-                })
-            })
-    }
-
     /// Package-shape invariants every loaded lockfile package must hold.
     pub fn validate_loaded_package(pkg: &LockedPackage) -> Result<(), LockfileError> {
+        Self::validate_loaded_package_with_source(pkg, &pkg.source_ref())
+    }
+
+    pub(crate) fn validate_loaded_package_with_source(
+        pkg: &LockedPackage,
+        parsed_source: &Option<Result<SourceRef<'_>, SourceParseError>>,
+    ) -> Result<(), LockfileError> {
         Self::validate_package_identity(pkg)?;
-        match pkg.source_kind() {
+        let is_local_source = match parsed_source {
             Some(Err(error)) => {
                 return Err(LockfileError::InvalidPackageField {
                     package: pkg.name.clone(),
@@ -1643,31 +1706,31 @@ impl Lockfile {
                     reason: error.to_string(),
                 });
             }
-            Some(Ok(Source::Tarball { .. })) if pkg.integrity.is_none() => {
+            Some(Ok(SourceRef::Tarball(_))) if pkg.integrity.is_none() => {
                 return Err(LockfileError::MissingPackageIntegrity {
                     package: pkg.name.clone(),
                     source_kind: "tarball",
                 });
             }
-            Some(Ok(Source::Git { .. })) if pkg.integrity.is_none() => {
+            Some(Ok(SourceRef::Git(_))) if pkg.integrity.is_none() => {
                 return Err(LockfileError::MissingPackageIntegrity {
                     package: pkg.name.clone(),
                     source_kind: "Git",
                 });
             }
-            Some(Ok(Source::Directory { .. })) if pkg.integrity.is_some() => {
+            Some(Ok(SourceRef::Directory(_))) if pkg.integrity.is_some() => {
                 return Err(LockfileError::UnexpectedPackageIntegrity {
                     package: pkg.name.clone(),
                     source_kind: "directory",
                 });
             }
-            Some(Ok(Source::Link { .. })) if pkg.integrity.is_some() => {
+            Some(Ok(SourceRef::Link(_))) if pkg.integrity.is_some() => {
                 return Err(LockfileError::UnexpectedPackageIntegrity {
                     package: pkg.name.clone(),
                     source_kind: "link",
                 });
             }
-            Some(Ok(Source::Directory { .. } | Source::Link { .. })) => {
+            Some(Ok(SourceRef::Directory(_) | SourceRef::Link(_))) => {
                 if let Some(fingerprint) = pkg.manifest_fingerprint.as_deref()
                     && !valid_sha256_prefixed_hex(fingerprint)
                 {
@@ -1676,27 +1739,23 @@ impl Lockfile {
                         pkg.name
                     )));
                 }
+                true
             }
-            Some(Ok(_)) | None => {}
-        }
-        if pkg.manifest_fingerprint.is_some()
-            && !matches!(
-                pkg.source_kind(),
-                Some(Ok(Source::Directory { .. } | Source::Link { .. }))
-            )
-        {
+            Some(Ok(_)) | None => false,
+        };
+        if pkg.manifest_fingerprint.is_some() && !is_local_source {
             return Err(LockfileError::Deserialize(format!(
                 "package {:?} has a local manifest fingerprint on a non-local source",
                 pkg.name
             )));
         }
-        if let Some(source) = pkg.lpm_scope_origin_mismatch() {
+        if let Some(source) = pkg.lpm_scope_origin_mismatch_with_source(parsed_source) {
             return Err(LockfileError::InvalidScopeOrigin {
                 package: pkg.name.clone(),
                 source_identity: source,
             });
         }
-        if let Some(reason) = pkg.git_metadata_error() {
+        if let Some(reason) = pkg.git_metadata_error_with_source(parsed_source) {
             return Err(LockfileError::Deserialize(format!(
                 "package {:?} has invalid git metadata: {reason}",
                 pkg.name
@@ -1705,13 +1764,14 @@ impl Lockfile {
         Ok(())
     }
 
-    pub(crate) fn validate_package_schema(
+    pub(crate) fn validate_package_schema_with_source(
         pkg: &LockedPackage,
         lockfile_version: u32,
+        parsed_source: &Option<Result<SourceRef<'_>, SourceParseError>>,
     ) -> Result<(), LockfileError> {
         let local_source = matches!(
-            pkg.source_kind(),
-            Some(Ok(Source::Directory { .. } | Source::Link { .. }))
+            parsed_source,
+            Some(Ok(SourceRef::Directory(_) | SourceRef::Link(_)))
         );
         if lockfile_version >= LOCKFILE_VERSION_WITH_LOCAL_MANIFEST_FINGERPRINTS
             && local_source
@@ -1797,88 +1857,97 @@ impl Lockfile {
             }
         }
         if exact_instance_schema
-            && pkg
-                .dependency_targets
-                .keys()
-                .map(String::as_str)
-                .collect::<HashSet<_>>()
-                != dependency_slots
+            && (pkg.dependency_targets.len() != dependency_slots.len()
+                || !pkg
+                    .dependency_targets
+                    .keys()
+                    .all(|slot| dependency_slots.contains(slot.as_str())))
         {
             return Err(LockfileError::Deserialize(format!(
                 "package {:?} dependency-target slots do not match dependency slots",
                 pkg.name
             )));
         }
-        let mut alias_slots = HashSet::with_capacity(pkg.alias_dependencies.len());
-        for [local_name, target_name] in &pkg.alias_dependencies {
-            validate_package_name(local_name).map_err(|reason| {
-                LockfileError::Deserialize(format!(
-                    "package {:?} has invalid alias local name {:?}: {reason}",
-                    pkg.name, local_name
-                ))
-            })?;
-            validate_package_name(target_name).map_err(|reason| {
-                LockfileError::Deserialize(format!(
-                    "package {:?} has invalid alias target name {:?}: {reason}",
-                    pkg.name, target_name
-                ))
-            })?;
-            if !alias_slots.insert(local_name.as_str()) {
-                return Err(LockfileError::Deserialize(format!(
-                    "package {:?} contains duplicate alias slot {:?}",
-                    pkg.name, local_name
-                )));
-            }
-            if !dependency_slots.contains(local_name.as_str()) {
-                return Err(LockfileError::Deserialize(format!(
-                    "package {:?} alias slot {:?} has no matching dependency edge",
-                    pkg.name, local_name
-                )));
+        if !pkg.alias_dependencies.is_empty() {
+            let mut alias_slots = HashSet::with_capacity(pkg.alias_dependencies.len());
+            for [local_name, target_name] in &pkg.alias_dependencies {
+                validate_package_name(local_name).map_err(|reason| {
+                    LockfileError::Deserialize(format!(
+                        "package {:?} has invalid alias local name {:?}: {reason}",
+                        pkg.name, local_name
+                    ))
+                })?;
+                validate_package_name(target_name).map_err(|reason| {
+                    LockfileError::Deserialize(format!(
+                        "package {:?} has invalid alias target name {:?}: {reason}",
+                        pkg.name, target_name
+                    ))
+                })?;
+                if !alias_slots.insert(local_name.as_str()) {
+                    return Err(LockfileError::Deserialize(format!(
+                        "package {:?} contains duplicate alias slot {:?}",
+                        pkg.name, local_name
+                    )));
+                }
+                if !dependency_slots.contains(local_name.as_str()) {
+                    return Err(LockfileError::Deserialize(format!(
+                        "package {:?} alias slot {:?} has no matching dependency edge",
+                        pkg.name, local_name
+                    )));
+                }
             }
         }
-        let mut peer_slots = HashSet::with_capacity(pkg.peer_edges.len());
-        for peer in &pkg.peer_edges {
-            if peer.local_name.is_empty()
-                || peer.target_name.is_empty()
-                || peer.target_version.is_empty()
-            {
+        if pkg.peer_edges.is_empty() {
+            if exact_instance_schema && !pkg.peer_targets.is_empty() {
                 return Err(LockfileError::Deserialize(format!(
-                    "package {:?} has a structured peer edge with an empty identity field",
+                    "package {:?} peer-target slots do not match peer slots",
                     pkg.name
                 )));
             }
-            validate_package_name(&peer.local_name).map_err(|reason| {
-                LockfileError::Deserialize(format!(
-                    "package {:?} has invalid peer local name {:?}: {reason}",
-                    pkg.name, peer.local_name
-                ))
-            })?;
-            Self::validate_package_name_and_version(&peer.target_name, &peer.target_version)?;
-            if !peer_slots.insert(peer.local_name.as_str()) {
+        } else {
+            let mut peer_slots = HashSet::with_capacity(pkg.peer_edges.len());
+            for peer in &pkg.peer_edges {
+                if peer.local_name.is_empty()
+                    || peer.target_name.is_empty()
+                    || peer.target_version.is_empty()
+                {
+                    return Err(LockfileError::Deserialize(format!(
+                        "package {:?} has a structured peer edge with an empty identity field",
+                        pkg.name
+                    )));
+                }
+                validate_package_name(&peer.local_name).map_err(|reason| {
+                    LockfileError::Deserialize(format!(
+                        "package {:?} has invalid peer local name {:?}: {reason}",
+                        pkg.name, peer.local_name
+                    ))
+                })?;
+                Self::validate_package_name_and_version(&peer.target_name, &peer.target_version)?;
+                if !peer_slots.insert(peer.local_name.as_str()) {
+                    return Err(LockfileError::Deserialize(format!(
+                        "package {:?} contains duplicate peer slot {:?}",
+                        pkg.name, peer.local_name
+                    )));
+                }
+                if dependency_slots.contains(peer.local_name.as_str()) {
+                    return Err(LockfileError::Deserialize(format!(
+                        "package {:?} uses local slot {:?} as both dependency and peer",
+                        pkg.name, peer.local_name
+                    )));
+                }
+            }
+            if exact_instance_schema
+                && (pkg.peer_targets.len() != peer_slots.len()
+                    || !pkg
+                        .peer_targets
+                        .keys()
+                        .all(|slot| peer_slots.contains(slot.as_str())))
+            {
                 return Err(LockfileError::Deserialize(format!(
-                    "package {:?} contains duplicate peer slot {:?}",
-                    pkg.name, peer.local_name
+                    "package {:?} peer-target slots do not match peer slots",
+                    pkg.name
                 )));
             }
-            if dependency_slots.contains(peer.local_name.as_str()) {
-                return Err(LockfileError::Deserialize(format!(
-                    "package {:?} uses local slot {:?} as both dependency and peer",
-                    pkg.name, peer.local_name
-                )));
-            }
-        }
-        if exact_instance_schema
-            && pkg
-                .peer_targets
-                .keys()
-                .map(String::as_str)
-                .collect::<HashSet<_>>()
-                != peer_slots
-        {
-            return Err(LockfileError::Deserialize(format!(
-                "package {:?} peer-target slots do not match peer slots",
-                pkg.name
-            )));
         }
         Ok(())
     }
@@ -1981,6 +2050,7 @@ impl Lockfile {
             &self.root_resolutions,
             &self.ambient_peer_installs,
             self.importers.get("."),
+            true,
         )
     }
 
@@ -1990,13 +2060,20 @@ impl Lockfile {
         root_resolutions: &RootResolutions,
         ambient_peer_installs: &[String],
         importer_snapshot: Option<&ImporterSnapshot>,
+        schema_already_validated: bool,
     ) -> Result<(), LockfileError> {
         let importer_context = importer
             .map(|importer| format!(" in workspace importer {importer:?}"))
             .unwrap_or_default();
-        let mut by_instance = HashMap::new();
+        let mut by_instance = HashMap::with_capacity(packages.size_hint().0);
         for package in packages.clone() {
-            Self::validate_package_schema(package, LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES)?;
+            if !schema_already_validated {
+                Self::validate_package_schema_with_source(
+                    package,
+                    LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES,
+                    &package.source_ref(),
+                )?;
+            }
             let instance_id = package.instance_id.ok_or_else(|| {
                 LockfileError::Deserialize(format!(
                     "package {:?}{importer_context} is missing instance-id",
@@ -2010,47 +2087,66 @@ impl Lockfile {
             }
         }
         for package in packages.clone() {
-            let aliases = package
-                .alias_dependencies
-                .iter()
-                .map(|pair| (pair[0].as_str(), pair[1].as_str()))
-                .collect::<HashMap<_, _>>();
-            let dependency_versions = package
-                .dependencies
-                .iter()
-                .filter_map(|dependency| {
-                    dependency
-                        .rfind('@')
-                        .map(|at| (&dependency[..at], &dependency[at + 1..]))
-                })
-                .collect::<HashMap<_, _>>();
-            for (local_name, target_id) in &package.dependency_targets {
-                let target = by_instance.get(target_id).ok_or_else(|| {
-                    LockfileError::Deserialize(format!(
-                        "package {:?}{importer_context} dependency slot {:?} references missing instance {target_id}",
-                        package.name, local_name
-                    ))
-                })?;
-                let expected_name = aliases
-                    .get(local_name.as_str())
-                    .copied()
-                    .unwrap_or(local_name.as_str());
-                let expected_version = dependency_versions.get(local_name.as_str()).ok_or_else(|| {
-                    LockfileError::Deserialize(format!(
-                        "package {:?}{importer_context} dependency target {:?} has no matching dependency edge",
-                        package.name, local_name
-                    ))
-                })?;
-                let expected_target_value = match target.source_kind() {
-                    Some(Ok(Source::Registry { .. })) | None => target.version.clone(),
-                    Some(Ok(source)) => source.source_id(),
-                    Some(Err(_)) => continue,
-                };
-                if target.name != expected_name || expected_target_value != **expected_version {
-                    return Err(LockfileError::Deserialize(format!(
-                        "package {:?}{importer_context} dependency slot {:?} metadata disagrees with target instance {target_id}",
-                        package.name, local_name
-                    )));
+            if !package.dependency_targets.is_empty() {
+                let alias_map: Option<HashMap<&str, &str>> =
+                    (!package.alias_dependencies.is_empty()).then(|| {
+                        package
+                            .alias_dependencies
+                            .iter()
+                            .map(|pair| (pair[0].as_str(), pair[1].as_str()))
+                            .collect()
+                    });
+                let mut matched_targets = 0usize;
+                for dependency in &package.dependencies {
+                    let Some(at) = dependency.rfind('@') else {
+                        continue;
+                    };
+                    let local_name = &dependency[..at];
+                    let expected_version = &dependency[at + 1..];
+                    let Some(target_id) = package.dependency_targets.get(local_name) else {
+                        continue;
+                    };
+                    matched_targets += 1;
+                    let target = by_instance.get(target_id).ok_or_else(|| {
+                        LockfileError::Deserialize(format!(
+                            "package {:?}{importer_context} dependency slot {:?} references missing instance {target_id}",
+                            package.name, local_name
+                        ))
+                    })?;
+                    let expected_name = alias_map
+                        .as_ref()
+                        .and_then(|map| map.get(local_name).copied())
+                        .unwrap_or(local_name);
+                    let expected_target_value = match target.source_ref() {
+                        Some(Ok(SourceRef::Registry(_))) | None => {
+                            Cow::Borrowed(target.version.as_str())
+                        }
+                        Some(Ok(source)) => Cow::Owned(source.source_id()),
+                        Some(Err(_)) => continue,
+                    };
+                    if target.name != expected_name
+                        || expected_target_value.as_ref() != expected_version
+                    {
+                        return Err(LockfileError::Deserialize(format!(
+                            "package {:?}{importer_context} dependency slot {:?} metadata disagrees with target instance {target_id}",
+                            package.name, local_name
+                        )));
+                    }
+                }
+                if matched_targets != package.dependency_targets.len() {
+                    for local_name in package.dependency_targets.keys() {
+                        let has_edge = package.dependencies.iter().any(|dependency| {
+                            dependency
+                                .rfind('@')
+                                .is_some_and(|at| &dependency[..at] == local_name.as_str())
+                        });
+                        if !has_edge {
+                            return Err(LockfileError::Deserialize(format!(
+                                "package {:?}{importer_context} dependency target {:?} has no matching dependency edge",
+                                package.name, local_name
+                            )));
+                        }
+                    }
                 }
             }
             for peer in &package.peer_edges {
@@ -2066,8 +2162,8 @@ impl Lockfile {
                         package.name, peer.local_name
                     ))
                 })?;
-                let wrapper_id = match target.source_kind() {
-                    Some(Ok(Source::Registry { .. })) | None => None,
+                let wrapper_id = match target.source_ref() {
+                    Some(Ok(SourceRef::Registry(_))) | None => None,
                     Some(Ok(source)) => Some(source.source_id()),
                     Some(Err(_)) => continue,
                 };
@@ -2190,10 +2286,17 @@ impl Lockfile {
         importer: Option<&str>,
         packages: impl Iterator<Item = &'a LockedPackage> + Clone,
     ) -> Result<(), LockfileError> {
-        let mut targets: HashSet<(&str, &str, Option<Cow<'_, str>>)> = HashSet::new();
+        if !packages
+            .clone()
+            .any(|package| !package.peer_edges.is_empty())
+        {
+            return Ok(());
+        }
+        let mut targets: HashSet<(&str, &str, Option<Cow<'_, str>>)> =
+            HashSet::with_capacity(packages.size_hint().0);
         for package in packages.clone() {
-            let wrapper_id = match package.source_kind() {
-                Some(Ok(Source::Registry { .. })) | None => None,
+            let wrapper_id = match package.source_ref() {
+                Some(Ok(SourceRef::Registry(_))) | None => None,
                 Some(Ok(source)) => Some(Cow::Owned(source.source_id())),
                 Some(Err(_)) => continue,
             };
@@ -2251,11 +2354,11 @@ impl Lockfile {
     pub fn find_package_by_key(&self, key: &PackageKey) -> Option<&LockedPackage> {
         self.packages
             .binary_search_by(|p| {
-                let pk = p.package_key();
-                pk.name
-                    .cmp(&key.name)
-                    .then_with(|| pk.version.cmp(&key.version))
-                    .then_with(|| pk.source_id.cmp(&key.source_id))
+                p.name
+                    .as_str()
+                    .cmp(key.name.as_str())
+                    .then_with(|| p.version.as_str().cmp(key.version.as_str()))
+                    .then_with(|| p.source_id_cow().as_ref().cmp(key.source_id.as_str()))
             })
             .ok()
             .map(|idx| &self.packages[idx])
@@ -2274,15 +2377,22 @@ impl Lockfile {
     }
 
     pub(crate) fn validate_provenance(&self) -> Result<(), String> {
-        if self.provenance.is_empty() {
+        Self::validate_provenance_for_packages(&self.provenance, self.packages.iter())
+    }
+
+    fn validate_provenance_for_packages<'a>(
+        provenance: &BTreeMap<String, LockedProvenance>,
+        packages: impl Iterator<Item = &'a LockedPackage>,
+    ) -> Result<(), String> {
+        if provenance.is_empty() {
             return Ok(());
         }
-        let mut packages_by_lockfile_id = HashMap::with_capacity(self.packages.len());
-        for package in &self.packages {
+        let mut packages_by_lockfile_id = HashMap::with_capacity(packages.size_hint().0);
+        for package in packages {
             packages_by_lockfile_id.insert(package.package_key().lockfile_id(), package);
         }
 
-        for (lockfile_id, evidence) in &self.provenance {
+        for (lockfile_id, evidence) in provenance {
             let Some(package) = packages_by_lockfile_id.get(lockfile_id) else {
                 return Err(format!(
                     "provenance entry {lockfile_id:?} does not match any locked package"
@@ -2417,6 +2527,80 @@ impl ValidatedLockfile {
     /// Borrow validated package rows in standalone package identity order.
     pub fn importer_packages(&self, importer: &str) -> Result<Vec<&LockedPackage>, LockfileError> {
         self.0.validated_importer_packages(importer)
+    }
+
+    /// Serialize one validated importer projection directly to canonical TOML
+    /// without cloning package rows or re-running load-boundary validation.
+    pub fn project_importer_to_toml(&self, importer: &str) -> Result<String, LockfileError> {
+        if self.0.metadata.lockfile_version < LOCKFILE_VERSION_WITH_WORKSPACE_PROJECTIONS
+            || self.0.workspace_packages.is_empty() && self.0.importers.keys().all(|key| key == ".")
+        {
+            if importer == "." {
+                return toml::to_string_pretty(&self.0)
+                    .map_err(|e| LockfileError::Serialize(e.to_string()));
+            }
+            return Err(LockfileError::Deserialize(format!(
+                "lockfile has no workspace importer {importer:?}"
+            )));
+        }
+
+        validate_importer_path(importer)?;
+        let snapshot = self.0.importers.get(importer).ok_or_else(|| {
+            LockfileError::Deserialize(format!("lockfile has no workspace importer {importer:?}"))
+        })?;
+        let packages = self.0.validated_importer_packages(importer)?;
+        let metadata = LockfileMetadata {
+            lockfile_version: self.0.metadata.lockfile_version,
+            resolved_with: Some(
+                self.0
+                    .metadata
+                    .resolved_with
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_RESOLVED_WITH.to_string()),
+            ),
+            auto_isolated_peer_conflicts: snapshot.auto_isolated_peer_conflicts,
+        };
+        let mut importers = BTreeMap::new();
+        importers.insert(".", snapshot.without_projection());
+
+        #[derive(Serialize)]
+        struct BorrowedStandaloneLockfile<'a> {
+            metadata: LockfileMetadata,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            importers: BTreeMap<&'static str, ImporterSnapshot>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            patches: &'a LockfilePatches,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            catalogs: &'a CatalogSnapshots,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            provenance: &'a BTreeMap<String, LockedProvenance>,
+            packages: Vec<&'a LockedPackage>,
+            #[serde(rename = "root-aliases", skip_serializing_if = "BTreeMap::is_empty")]
+            root_aliases: &'a BTreeMap<String, String>,
+            #[serde(
+                rename = "root-resolutions",
+                skip_serializing_if = "BTreeMap::is_empty"
+            )]
+            root_resolutions: &'a RootResolutions,
+            #[serde(
+                rename = "ambient-peer-installs",
+                skip_serializing_if = "Vec::is_empty"
+            )]
+            ambient_peer_installs: &'a Vec<String>,
+        }
+
+        let borrowed = BorrowedStandaloneLockfile {
+            metadata,
+            importers,
+            patches: &snapshot.patches,
+            catalogs: &snapshot.catalog_resolutions,
+            provenance: &snapshot.provenance,
+            packages,
+            root_aliases: &snapshot.root_aliases,
+            root_resolutions: &snapshot.root_resolutions,
+            ambient_peer_installs: &snapshot.ambient_peer_installs,
+        };
+        toml::to_string_pretty(&borrowed).map_err(|e| LockfileError::Serialize(e.to_string()))
     }
 
     /// Reuse validated union rows while pruning removed importers and replacing changed ones.
@@ -2637,5 +2821,121 @@ mod tarball_hint_tests {
         assert!(is_recordable_tarball_hint(
             "https://registry.npmjs.org/@scope/pkg/-/pkg-1.0.0.tgz"
         ));
+    }
+
+    #[test]
+    fn four_byte_multibyte_package_names_validate_and_round_trip_without_panicking() {
+        let source = "registry+https://registry.npmjs.org";
+        let valid_integrity = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+        for name in ["éé", "abé", "aaé", "a日", "😀", "@abé/pkg", "@scope/éé"] {
+            assert!(
+                super::Lockfile::validate_package_name_and_version(name, "1.0.0").is_ok(),
+                "expected multibyte package name {name:?} to validate cleanly without panicking"
+            );
+            let id = lpm_common::PackageInstanceId::derive(name, "1.0.0", source, "root");
+            let mut lockfile = super::Lockfile::new();
+            lockfile.add_package(super::LockedPackage {
+                instance_id: Some(id),
+                name: name.to_string(),
+                version: "1.0.0".to_string(),
+                source: Some(source.to_string()),
+                integrity: Some(valid_integrity.to_string()),
+                ..super::LockedPackage::default()
+            });
+            lockfile.root_resolutions.insert(
+                name.to_string(),
+                super::LockedRootResolution {
+                    instance_id: Some(id),
+                    package: name.to_string(),
+                    version: "1.0.0".to_string(),
+                    source: Some(source.to_string()),
+                },
+            );
+            let toml = lockfile.to_toml().expect("serialize multibyte lockfile");
+            let parsed = super::Lockfile::from_toml(&toml).expect("parse multibyte lockfile");
+            assert_eq!(parsed.packages.len(), 1);
+            assert_eq!(parsed.packages[0].name, name);
+        }
+        for reserved in ["CON", "con", "COM1", "com9", "LPT1", "@scope/COM1"] {
+            assert!(
+                super::Lockfile::validate_package_name_and_version(reserved, "1.0.0").is_err(),
+                "expected reserved Windows device name {reserved:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_graph_validation_indexes_many_aliased_slots_and_rejects_mismatched_target_name() {
+        let source = "registry+https://registry.npmjs.org";
+        let valid_integrity = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+        let mut lockfile = super::Lockfile::new();
+        let mut deps = Vec::new();
+        let mut alias_deps = Vec::new();
+        let mut dep_targets = std::collections::BTreeMap::new();
+        let mut packages = Vec::new();
+
+        for idx in 0..128 {
+            let target_name = format!("real-pkg-{idx}");
+            let local_name = format!("alias-pkg-{idx}");
+            let id = lpm_common::PackageInstanceId::derive(
+                &target_name,
+                "1.0.0",
+                source,
+                &format!("root/{local_name}"),
+            );
+            deps.push(format!("{local_name}@1.0.0"));
+            alias_deps.push([local_name.clone(), target_name.clone()]);
+            dep_targets.insert(local_name, id);
+            packages.push(super::LockedPackage {
+                instance_id: Some(id),
+                name: target_name,
+                version: "1.0.0".to_string(),
+                source: Some(source.to_string()),
+                integrity: Some(valid_integrity.to_string()),
+                ..super::LockedPackage::default()
+            });
+        }
+        let parent_id = lpm_common::PackageInstanceId::derive("parent", "1.0.0", source, "root");
+        packages.push(super::LockedPackage {
+            instance_id: Some(parent_id),
+            name: "parent".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(source.to_string()),
+            integrity: Some(valid_integrity.to_string()),
+            dependencies: deps,
+            alias_dependencies: alias_deps,
+            dependency_targets: dep_targets,
+            ..super::LockedPackage::default()
+        });
+        lockfile.set_packages(packages);
+        lockfile.root_resolutions.insert(
+            "parent".to_string(),
+            super::LockedRootResolution {
+                instance_id: Some(parent_id),
+                package: "parent".to_string(),
+                version: "1.0.0".to_string(),
+                source: Some(source.to_string()),
+            },
+        );
+        let toml = lockfile.to_toml().expect("serialize alias-heavy lockfile");
+        assert!(super::Lockfile::from_toml(&toml).is_ok());
+
+        // Break one alias target name and ensure exact graph validation rejects it on write and load.
+        let mut broken = super::Lockfile::from_toml(&toml).unwrap();
+        let parent = broken
+            .packages
+            .iter_mut()
+            .find(|pkg| pkg.name == "parent")
+            .unwrap();
+        parent.alias_dependencies[64][1] = "wrong-target".to_string();
+        assert!(
+            broken.to_toml().is_err(),
+            "aliased slot whose target package name disagrees must be rejected on serialize"
+        );
+        let broken_toml = toml::to_string_pretty(&broken).expect("encode raw broken lockfile");
+        assert!(
+            super::Lockfile::from_toml(&broken_toml).is_err(),
+            "aliased slot whose target package name disagrees must be rejected on parse"
+        );
     }
 }

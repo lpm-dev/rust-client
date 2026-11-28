@@ -1,4 +1,3 @@
-use super::manifest_core::ManifestVersion;
 use super::prelude::*;
 use super::types::{CachedAvailableVersions, CachedRange, PubGrubSolution};
 
@@ -96,40 +95,50 @@ pub(crate) fn merge_cached_package_info(
         && (incoming.release_metadata_complete || !incoming_adds_versions))
         || (incoming.release_metadata_complete && !existing_adds_versions);
 
-    if !incoming_adds_versions
-        && incoming
-            .modified
-            .as_ref()
-            .is_none_or(|value| existing.modified.as_ref() == Some(value))
-        && incoming
-            .latest_version
-            .as_ref()
-            .is_none_or(|value| existing.latest_version.as_ref() == Some(value))
-        && incoming
-            .dist_tags()
-            .iter()
-            .all(|(tag, version)| existing.dist_tags().get(tag) == Some(version))
-        && incoming.versions.iter().all(|version| {
-            let current = existing.manifest_version_owned_for(version);
-            let updated = merge_manifest_version(
-                current.as_ref(),
-                incoming.manifest_version_owned_for(version),
-                existing.workspace_versions.contains(version),
-            );
-            current == updated
-        })
-    {
-        let mut merged = existing.clone();
-        merged.covered_ranges = covered_ranges;
-        merged.workspace_versions = workspace_versions;
-        merged.versions_complete = versions_complete;
-        merged.trust_metadata_complete = trust_metadata_complete;
-        merged.platform_metadata_complete = platform_metadata_complete;
-        merged.platform_hydrated_versions = platform_hydrated_versions;
-        merged.release_metadata_complete = release_metadata_complete;
-        merged.latest_version_hint = latest_version_hint;
-        merged.preferred_latest = merged_preferred_latest(existing, incoming, &merged);
-        return merged;
+    if !incoming_adds_versions {
+        let diff = existing.analyze_subset_merge(incoming);
+        if !diff.core_changed {
+            let mut merged = existing.clone();
+            if let Some(value) = incoming.modified.as_ref()
+                && existing.modified.as_ref() != Some(value)
+            {
+                merged.modified = Some(value.clone());
+                merged.modified_unix = incoming.modified_unix;
+            }
+            if let Some(value) = incoming.latest_version.as_ref()
+                && existing.latest_version.as_ref() != Some(value)
+            {
+                merged.latest_version = Some(value.clone());
+            }
+            if !incoming
+                .dist_tags()
+                .iter()
+                .all(|(tag, version)| existing.dist_tags().get(tag) == Some(version))
+            {
+                let mut dist_tags = existing.dist_tags().clone();
+                dist_tags.extend(
+                    incoming
+                        .dist_tags()
+                        .iter()
+                        .map(|(tag, version)| (tag.clone(), version.clone())),
+                );
+                merged.set_dist_tags(dist_tags);
+            }
+            if diff.release_changed || diff.platform_changed || diff.trust_changed {
+                merged.merge_overlays_from(incoming, diff);
+            }
+            merged.covered_ranges = covered_ranges;
+            merged.workspace_versions = workspace_versions;
+            merged.versions_complete = versions_complete;
+            merged.trust_metadata_complete = trust_metadata_complete;
+            merged.platform_metadata_complete = platform_metadata_complete;
+            merged.platform_hydrated_versions = platform_hydrated_versions;
+            merged.release_metadata_complete =
+                release_metadata_complete || merged.has_complete_release_records();
+            merged.latest_version_hint = latest_version_hint;
+            merged.preferred_latest = merged_preferred_latest(existing, incoming, &merged);
+            return merged;
+        }
     }
 
     let modified = incoming
@@ -147,11 +156,7 @@ pub(crate) fn merge_cached_package_info(
             .iter()
             .map(|(tag, version)| (tag.clone(), version.clone())),
     );
-    let mut versions = Vec::with_capacity(existing.versions.len() + incoming.versions.len());
-    versions.extend(existing.versions.iter().cloned());
-    versions.extend(incoming.versions.iter().cloned());
-    versions.sort_unstable_by(|left, right| right.cmp(left));
-    versions.dedup();
+    let max_versions = existing.versions.len() + incoming.versions.len();
     let mut builder = CachedPackageInfo::builder(
         modified,
         trust_metadata_complete,
@@ -160,20 +165,47 @@ pub(crate) fn merge_cached_package_info(
         workspace_versions,
         platform_metadata_complete,
         latest_version,
-        versions.len(),
+        max_versions,
     );
     builder.set_dist_tags(dist_tags);
-    for version in versions {
-        let existing_manifest = existing.manifest_version_owned_for(&version);
-        let incoming_manifest = incoming.manifest_version_owned_for(&version);
-        let manifest =
-            if existing.workspace_versions.contains(&version) || incoming_manifest.is_none() {
-                existing_manifest
-            } else {
-                merge_manifest_version(existing_manifest.as_ref(), incoming_manifest, false)
-            };
-        if let Some(manifest) = manifest {
-            builder.push(manifest);
+    let mut ex_idx = 0usize;
+    let mut inc_idx = 0usize;
+    let ex_len = existing.versions.len();
+    let inc_len = incoming.versions.len();
+    while ex_idx < ex_len || inc_idx < inc_len {
+        match (
+            existing.versions.get(ex_idx),
+            incoming.versions.get(inc_idx),
+        ) {
+            (Some(ex_v), Some(inc_v)) => match ex_v.cmp(inc_v) {
+                std::cmp::Ordering::Greater => {
+                    builder.push_merged_from_cache(Some((existing, ex_idx)), None, false);
+                    ex_idx += 1;
+                }
+                std::cmp::Ordering::Less => {
+                    builder.push_merged_from_cache(None, Some((incoming, inc_idx)), false);
+                    inc_idx += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    let preserve_existing = existing.workspace_versions.contains(ex_v);
+                    builder.push_merged_from_cache(
+                        Some((existing, ex_idx)),
+                        Some((incoming, inc_idx)),
+                        preserve_existing,
+                    );
+                    ex_idx += 1;
+                    inc_idx += 1;
+                }
+            },
+            (Some(_), None) => {
+                builder.push_merged_from_cache(Some((existing, ex_idx)), None, false);
+                ex_idx += 1;
+            }
+            (None, Some(_)) => {
+                builder.push_merged_from_cache(None, Some((incoming, inc_idx)), false);
+                inc_idx += 1;
+            }
+            (None, None) => break,
         }
     }
     let mut merged = builder.finish();
@@ -198,77 +230,6 @@ fn merged_preferred_latest(
         .or(existing.preferred_latest.as_ref())
         .filter(|latest| Some(*latest) == merged.latest_version.as_ref())
         .cloned()
-}
-
-fn merge_manifest_version(
-    existing: Option<&ManifestVersion>,
-    incoming: Option<ManifestVersion>,
-    preserve_existing: bool,
-) -> Option<ManifestVersion> {
-    if preserve_existing {
-        return existing.cloned();
-    }
-    match (existing, incoming) {
-        (Some(existing), Some(mut incoming)) => {
-            if incoming.dependencies.is_empty() {
-                incoming.dependencies.clone_from(&existing.dependencies);
-            }
-            if incoming.peer_dependencies.is_empty() {
-                incoming
-                    .peer_dependencies
-                    .clone_from(&existing.peer_dependencies);
-            }
-            if incoming.node_engine.is_none() {
-                incoming.node_engine.clone_from(&existing.node_engine);
-            }
-            match (&existing.platform, &mut incoming.platform) {
-                (Some(existing_platform), Some(incoming_platform)) => {
-                    if incoming_platform.os.is_empty() {
-                        incoming_platform.os.clone_from(&existing_platform.os);
-                    }
-                    if incoming_platform.cpu.is_empty() {
-                        incoming_platform.cpu.clone_from(&existing_platform.cpu);
-                    }
-                    if incoming_platform.libc.is_empty() {
-                        incoming_platform.libc.clone_from(&existing_platform.libc);
-                    }
-                }
-                (Some(existing_platform), None) => {
-                    incoming.platform = Some(existing_platform.clone());
-                }
-                (None, _) => {}
-            }
-            incoming.dist = merge_cached_dist_info(&existing.dist, &incoming.dist);
-            Some(incoming)
-        }
-        (Some(existing), None) => Some(existing.clone()),
-        (None, incoming) => incoming,
-    }
-}
-
-fn merge_cached_dist_info(existing: &CachedDistInfo, incoming: &CachedDistInfo) -> CachedDistInfo {
-    CachedDistInfo {
-        tarball_url: incoming
-            .tarball_url
-            .clone()
-            .or_else(|| existing.tarball_url.clone()),
-        integrity: incoming
-            .integrity
-            .clone()
-            .or_else(|| existing.integrity.clone()),
-        unpacked_size: incoming.unpacked_size.or(existing.unpacked_size),
-        signatures: if incoming.signatures.is_empty() {
-            existing.signatures.clone()
-        } else {
-            incoming.signatures.clone()
-        },
-        published_at: incoming
-            .published_at
-            .clone()
-            .or_else(|| existing.published_at.clone()),
-        published_at_unix: incoming.published_at_unix.or(existing.published_at_unix),
-        trust_evidence: incoming.trust_evidence.or(existing.trust_evidence),
-    }
 }
 
 impl StreamingBfsMetrics {
@@ -605,14 +566,20 @@ impl LpmDependencyProvider {
         npm_range: &NpmRange,
         available: &Arc<[NpmVersion]>,
     ) -> Ranges<NpmVersion> {
-        let key = (pkg.clone(), npm_range.raw().to_string());
+        use super::types::{RangeCacheKey, RangeCacheKeyRef};
+
+        let raw_range = npm_range.raw();
         let tagged_version = npm_range.dist_tag().and_then(|tag| {
             let canonical = CanonicalKey::from(pkg);
             self.cache
                 .get(&canonical)
                 .and_then(|info| info.dist_tag_version(tag).cloned())
         });
-        if let Some(cached) = self.range_cache.lock().get(&key)
+        let lookup = (pkg, raw_range);
+        if let Some(cached) = self
+            .range_cache
+            .lock()
+            .get(&lookup as &dyn RangeCacheKeyRef)
             && Arc::ptr_eq(&cached.available, available)
             && cached.tagged_version == tagged_version
         {
@@ -621,7 +588,10 @@ impl LpmDependencyProvider {
         let computed =
             npm_range.to_pubgrub_ranges_with_dist_tag(available, tagged_version.as_ref());
         self.range_cache.lock().insert(
-            key,
+            RangeCacheKey {
+                pkg: pkg.clone(),
+                raw: raw_range.to_string(),
+            },
             CachedRange {
                 available: Arc::clone(available),
                 tagged_version,
@@ -791,6 +761,7 @@ mod merge_tests {
 #[cfg(test)]
 mod preferred_provenance_tests {
     use super::*;
+    use crate::provider::manifest_core::ManifestVersion;
 
     fn partial(latest: &str) -> CachedPackageInfo {
         let metadata = serde_json::from_value(serde_json::json!({
@@ -901,6 +872,123 @@ mod preferred_provenance_tests {
             merge_cached_package_info(&original, &workspace)
                 .preferred_latest
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn subset_overlay_merge_marks_release_metadata_complete_when_combined_times_cover_all_versions()
+    {
+        let existing = CachedPackageInfo::from_manifest_versions(
+            None,
+            false,
+            true,
+            HashSet::new(),
+            HashSet::new(),
+            true,
+            None,
+            vec![
+                manifest_with_time("1.0.0", Some("2025-01-01T00:00:00.000Z")),
+                manifest_with_time("2.0.0", None),
+                manifest_with_time("3.0.0", None),
+            ],
+        );
+        assert!(!existing.release_metadata_complete);
+
+        let incoming = CachedPackageInfo::from_manifest_versions(
+            None,
+            false,
+            false,
+            HashSet::new(),
+            HashSet::new(),
+            true,
+            None,
+            vec![
+                manifest_with_time("2.0.0", Some("2025-02-01T00:00:00.000Z")),
+                manifest_with_time("3.0.0", Some("2025-03-01T00:00:00.000Z")),
+            ],
+        );
+        let merged = merge_cached_package_info(&existing, &incoming);
+        assert!(
+            merged.release_metadata_complete,
+            "subset overlay merge covering every version's timestamp must set release_metadata_complete"
+        );
+    }
+
+    fn manifest_with_time(version: &str, published_at: Option<&str>) -> ManifestVersion {
+        ManifestVersion {
+            version: NpmVersion::parse(version).unwrap(),
+            dependencies: Vec::new(),
+            peer_dependencies: Vec::new(),
+            node_engine: None,
+            platform: None,
+            dist: CachedDistInfo {
+                published_at: published_at.map(str::to_string),
+                published_at_unix: published_at.and_then(parse_npm_time_unix),
+                ..CachedDistInfo::default()
+            },
+        }
+    }
+
+    #[test]
+    fn borrowed_and_owned_metadata_parsers_normalize_noncanonical_version_keys_identically() {
+        let mut versions = HashMap::new();
+        versions.insert(
+            "v1.2.3".to_string(),
+            lpm_registry::VersionMetadata {
+                name: "norm-pkg".to_string(),
+                version: "v1.2.3".to_string(),
+                dependencies: HashMap::from([("dep-a".to_string(), "^1.0.0".to_string())]),
+                os: vec!["linux".to_string()],
+                dist: Some(lpm_registry::DistInfo {
+                    tarball: Some(
+                        "https://registry.npmjs.org/norm-pkg/-/norm-pkg-1.2.3.tgz".into(),
+                    ),
+                    integrity: Some("sha512-norm".into()),
+                    signatures: Some(vec![lpm_registry::RegistrySignature {
+                        keyid: Some("SHA256:key".into()),
+                        sig: Some("sig-bytes".into()),
+                    }]),
+                    ..lpm_registry::DistInfo::default()
+                }),
+                ..lpm_registry::VersionMetadata::default()
+            },
+        );
+        let metadata = lpm_registry::PackageMetadata {
+            name: "norm-pkg".to_string(),
+            description: None,
+            modified: None,
+            dist_tags: HashMap::from([("latest".to_string(), "1.2.3".to_string())]),
+            versions,
+            time: HashMap::from([("v1.2.3".to_string(), "2025-01-01T00:00:00.000Z".to_string())]),
+            downloads: None,
+            distribution_mode: None,
+            package_type: None,
+            latest_version: None,
+            latest_hint: Default::default(),
+            ecosystem: None,
+        };
+
+        let borrowed = crate::provider::parse_metadata_to_cache_info(&metadata);
+        let owned = crate::provider::parse_owned_metadata_to_cache_info(metadata);
+
+        assert_eq!(borrowed.tarball_url("1.2.3"), owned.tarball_url("1.2.3"));
+        assert!(borrowed.tarball_url("1.2.3").is_some());
+        assert_eq!(borrowed.integrity("1.2.3"), owned.integrity("1.2.3"));
+        assert_eq!(
+            borrowed.platform("1.2.3").map(|p| p.os),
+            owned.platform("1.2.3").map(|p| p.os)
+        );
+        assert_eq!(
+            borrowed.dependencies("1.2.3").map(|deps| deps
+                .map(|d| (d.name.to_string(), d.range.to_string()))
+                .collect::<Vec<_>>()),
+            owned.dependencies("1.2.3").map(|deps| deps
+                .map(|d| (d.name.to_string(), d.range.to_string()))
+                .collect::<Vec<_>>())
+        );
+        assert_eq!(
+            borrowed.signatures("1.2.3").len(),
+            owned.signatures("1.2.3").len()
         );
     }
 }

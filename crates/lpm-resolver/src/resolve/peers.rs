@@ -128,7 +128,12 @@ pub(super) fn select_peer_candidate<'a>(
             newest_candidate = Some((candidate, parsed.clone()));
         }
 
-        if peer_version_satisfies(version, peer_range, tagged_version) {
+        let satisfies = peer_range.is_none_or(|range| {
+            parsed
+                .as_ref()
+                .is_some_and(|v| range.satisfies_with_dist_tag(v, tagged_version))
+        });
+        if satisfies {
             first_satisfying.get_or_insert(candidate);
             if let Some(parsed) = parsed
                 && newest_satisfying
@@ -150,18 +155,6 @@ pub(super) fn select_peer_candidate<'a>(
         return Some((&candidate.0, &candidate.1, false));
     }
     first_candidate.map(|candidate| (&candidate.0, &candidate.1, false))
-}
-
-pub(super) fn peer_version_satisfies(
-    version: &str,
-    peer_range: Option<&NpmRange>,
-    tagged_version: Option<&NpmVersion>,
-) -> bool {
-    peer_range.is_none_or(|range| {
-        NpmVersion::parse(version)
-            .ok()
-            .is_some_and(|parsed| range.satisfies_with_dist_tag(&parsed, tagged_version))
-    })
 }
 
 /// A warning about an unmet peer dependency.
@@ -815,68 +808,83 @@ pub fn check_unmet_peers(
             let tagged_version = parsed_range.as_ref().and_then(|range| {
                 target_info.and_then(|info| info.tagged_version_for_range(range))
             });
-            let resolved_peer_ver = if let Some(target) = resolved_pkg.peer_targets.get(peer_name) {
-                resolved_by_id
+            enum ResolvedPeerCheck<'a> {
+                Satisfied,
+                Mismatch {
+                    version_str: std::borrow::Cow<'a, str>,
+                    parsed: Option<NpmVersion>,
+                },
+                Missing,
+            }
+
+            let peer_check = if let Some(target) = resolved_pkg.peer_targets.get(peer_name) {
+                match resolved_by_id
                     .get(target)
                     .filter(|provider| provider.package.canonical_name() == target_name)
-                    .map(|provider| {
-                        let version = provider.version.to_string();
-                        let satisfies =
-                            peer_version_satisfies(&version, parsed_range.as_ref(), tagged_version);
-                        (std::borrow::Cow::Owned(version), satisfies)
-                    })
+                {
+                    Some(provider) => {
+                        let satisfies = parsed_range.as_ref().is_none_or(|range| {
+                            range.satisfies_with_dist_tag(&provider.version, tagged_version)
+                        });
+                        if satisfies {
+                            ResolvedPeerCheck::Satisfied
+                        } else {
+                            ResolvedPeerCheck::Mismatch {
+                                version_str: std::borrow::Cow::Owned(provider.version.to_string()),
+                                parsed: Some(provider.version.clone()),
+                            }
+                        }
+                    }
+                    None => ResolvedPeerCheck::Missing,
+                }
             } else if peer.optional && peer.alias.is_some() {
-                None
+                ResolvedPeerCheck::Missing
             } else {
-                resolve_peer_binding_version(
+                match resolve_peer_binding_version(
                     &resolved_pkg.package,
                     target_name,
                     parsed_range.as_ref(),
                     &resolved_versions,
                     tagged_version,
-                )
-                .map(|(_, version, satisfies)| {
-                    (std::borrow::Cow::Borrowed(version.as_str()), satisfies)
-                })
+                ) {
+                    Some((_, _, true)) => ResolvedPeerCheck::Satisfied,
+                    Some((_, version, false)) => ResolvedPeerCheck::Mismatch {
+                        version_str: std::borrow::Cow::Borrowed(version.as_str()),
+                        parsed: NpmVersion::parse(version).ok(),
+                    },
+                    None => ResolvedPeerCheck::Missing,
+                }
             };
 
-            match resolved_peer_ver {
-                Some((resolved_ver, satisfies)) => {
-                    // Peer is in the tree — check if the resolved version satisfies the range
-                    let parsed_resolved = NpmVersion::parse(&resolved_ver).ok();
-
-                    if !satisfies {
-                        // peerDependencyRules filter: allow_any
-                        // suppresses every version-mismatch warning
-                        // for matched names. allowed_versions tries
-                        // a user-widened range as a fallback, with
-                        // selector-aware matching against the consumer
-                        // (the package declaring the peer) so
-                        // `foo@^2>react` only fires for foo@^2.
-                        if peer_rules.allow_any_matches(peer_name) {
-                            continue;
-                        }
-                        if let Some(v) = parsed_resolved.as_ref()
-                            && peer_rules.allowed_versions_satisfies(
-                                &canonical,
-                                &resolved_pkg.version,
-                                peer_name,
-                                v,
-                            )
-                        {
-                            continue;
-                        }
-                        warnings.push(PeerWarning {
-                            package: canonical.clone(),
-                            version: ver_str.clone(),
-                            peer: peer_name.to_owned(),
-                            target: target_name.to_owned(),
-                            required_range: peer_range_str.to_owned(),
-                            resolved_version: Some(resolved_ver.into_owned()),
-                        });
+            match peer_check {
+                ResolvedPeerCheck::Satisfied => {}
+                ResolvedPeerCheck::Mismatch {
+                    version_str: resolved_ver,
+                    parsed: parsed_resolved,
+                } => {
+                    if peer_rules.allow_any_matches(peer_name) {
+                        continue;
                     }
+                    if let Some(v) = parsed_resolved.as_ref()
+                        && peer_rules.allowed_versions_satisfies(
+                            &canonical,
+                            &resolved_pkg.version,
+                            peer_name,
+                            v,
+                        )
+                    {
+                        continue;
+                    }
+                    warnings.push(PeerWarning {
+                        package: canonical.clone(),
+                        version: ver_str.clone(),
+                        peer: peer_name.to_owned(),
+                        target: target_name.to_owned(),
+                        required_range: peer_range_str.to_owned(),
+                        resolved_version: Some(resolved_ver.into_owned()),
+                    });
                 }
-                None => {
+                ResolvedPeerCheck::Missing => {
                     // Peer is completely missing from the resolved
                     // tree. peerDependencyRules.ignoreMissing can
                     // suppress the warning entirely.

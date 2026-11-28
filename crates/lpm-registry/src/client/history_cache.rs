@@ -15,26 +15,52 @@ pub(super) struct HistoryBody {
     _permit: OwnedSemaphorePermit,
 }
 
-#[derive(Default)]
-struct HistoryBuffer(Vec<u8>);
+struct HistoryBuffer {
+    bytes: Vec<u8>,
+    budget: Arc<Semaphore>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl HistoryBuffer {
+    fn try_new(budget: &Arc<Semaphore>) -> Option<Self> {
+        let initial = 1024usize.min(MAX_HISTORY_ENTRY_BYTES);
+        let permit = Arc::clone(budget)
+            .try_acquire_many_owned(initial as u32)
+            .ok()?;
+        Some(Self {
+            bytes: Vec::with_capacity(initial),
+            budget: Arc::clone(budget),
+            permit: Some(permit),
+        })
+    }
+}
 
 impl std::io::Write for HistoryBuffer {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let length = self.0.len().saturating_add(bytes.len());
+        let length = self.bytes.len().saturating_add(bytes.len());
         if length > MAX_HISTORY_ENTRY_BYTES {
             return Err(std::io::Error::other(
                 "history entry exceeds retention limit",
             ));
         }
-        if length > self.0.capacity() {
+        if length > self.bytes.capacity() {
             let capacity = length
                 .next_power_of_two()
                 .clamp(1024, MAX_HISTORY_ENTRY_BYTES);
-            self.0
-                .try_reserve_exact(capacity - self.0.len())
+            let additional_cap = capacity.saturating_sub(self.bytes.capacity());
+            let extra_permit = Arc::clone(&self.budget)
+                .try_acquire_many_owned(additional_cap as u32)
+                .map_err(|_| std::io::Error::other("history retention budget exhausted"))?;
+            self.bytes
+                .try_reserve_exact(capacity - self.bytes.len())
                 .map_err(std::io::Error::other)?;
+            if let Some(permit) = &mut self.permit {
+                permit.merge(extra_permit);
+            } else {
+                self.permit = Some(extra_permit);
+            }
         }
-        self.0.extend_from_slice(bytes);
+        self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
 
@@ -65,6 +91,7 @@ struct HistoryState {
 
 pub(super) struct HistoryCache {
     state: Mutex<HistoryState>,
+    generation: std::sync::atomic::AtomicU64,
     budget: Arc<Semaphore>,
 }
 
@@ -72,6 +99,7 @@ impl Default for HistoryCache {
     fn default() -> Self {
         Self {
             state: Mutex::new(HistoryState::default()),
+            generation: std::sync::atomic::AtomicU64::new(0),
             budget: Arc::new(Semaphore::new(MAX_HISTORY_BYTES)),
         }
     }
@@ -134,9 +162,22 @@ impl HistoryCache {
     }
 
     pub(super) fn retain_json(&self, value: &impl serde::Serialize) -> Option<Arc<HistoryBody>> {
-        let mut buffer = HistoryBuffer::default();
+        let mut buffer = HistoryBuffer::try_new(&self.budget)?;
         serde_json::to_writer(&mut buffer, value).ok()?;
-        self.retain(buffer.0)
+        let mut permit = buffer.permit?;
+        let final_cap = buffer.bytes.capacity();
+        if permit.num_permits() > final_cap {
+            drop(permit.split(permit.num_permits() - final_cap));
+        }
+        Some(Arc::new(HistoryBody {
+            bytes: buffer.bytes,
+            _permit: permit,
+        }))
+    }
+
+    #[inline]
+    pub(super) fn is_generation(&self, generation: u64) -> bool {
+        self.generation.load(std::sync::atomic::Ordering::Acquire) == generation
     }
 
     pub(super) fn retain_compact(&self, bytes: Vec<u8>) -> Option<Arc<HistoryBody>> {
@@ -212,6 +253,8 @@ impl HistoryCache {
         // Invalidations are rare recovery operations. One epoch also prevents
         // detached reads from publishing histories fetched before recovery.
         state.generation = state.generation.wrapping_add(1);
+        self.generation
+            .store(state.generation, std::sync::atomic::Ordering::Release);
         state.entries.clear();
     }
 }
@@ -343,5 +386,25 @@ mod tests {
             drop(cache.flight(&index.to_string()).await.unwrap());
         }
         assert!(cache.state.lock().unwrap().flights.len() <= 1);
+    }
+
+    #[test]
+    fn retain_json_skips_serialization_when_budget_is_exhausted() {
+        struct CountingSerialize(std::sync::atomic::AtomicUsize);
+        impl serde::Serialize for CountingSerialize {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                serializer.serialize_str("payload")
+            }
+        }
+        let cache = HistoryCache::default();
+        let drained = Arc::clone(&cache.budget)
+            .try_acquire_many_owned(MAX_HISTORY_BYTES as u32)
+            .unwrap();
+        let value = CountingSerialize(std::sync::atomic::AtomicUsize::new(0));
+        assert!(cache.retain_json(&value).is_none());
+        assert_eq!(value.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+        drop(drained);
+        assert_eq!(cache.budget.available_permits(), MAX_HISTORY_BYTES);
     }
 }

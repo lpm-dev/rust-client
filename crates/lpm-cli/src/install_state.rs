@@ -454,73 +454,156 @@ fn platform_tuple_key(platform: &PlatformTuple) -> String {
 ///
 /// Depth bound matches umbrella prepare-runner posture: 3.
 /// Realpath cycle-detect prevents `A → B → A` infinite loops.
-pub fn collect_file_link_manifest_bytes(
+pub(crate) enum FileLinkManifestBytes {
+    Shared(std::sync::Arc<crate::workspace_discovery_cache::WorkspaceFreshnessSnapshot>),
+    Owned(Vec<u8>),
+}
+
+impl AsRef<[u8]> for FileLinkManifestBytes {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Shared(snapshot) => &snapshot.flattened,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+}
+
+impl FileLinkManifestBytes {
+    fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Shared(snapshot) => snapshot.flattened.clone(),
+            Self::Owned(bytes) => bytes,
+        }
+    }
+}
+
+#[inline]
+fn may_contain_local_source_specifier(pkg_content: &str) -> bool {
+    pkg_content.contains("file:") || pkg_content.contains("link:") || pkg_content.contains("\\u")
+}
+
+pub(crate) fn collect_file_link_manifest_bytes_shared(
     project_dir: &std::path::Path,
     pkg_content: &str,
-) -> Vec<u8> {
-    let mut visited: std::collections::HashSet<std::path::PathBuf> =
-        std::collections::HashSet::new();
+) -> FileLinkManifestBytes {
     let mut buf: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
+    if may_contain_local_source_specifier(pkg_content) {
+        let mut visited: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        walk_file_link_deps(project_dir, pkg_content, 0, 3, &mut visited, &mut buf);
+    }
 
-    walk_file_link_deps(project_dir, pkg_content, 0, 3, &mut visited, &mut buf);
-    let workspace_entries =
-        crate::workspace_discovery_cache::workspace_freshness_entries(project_dir, || {
-            collect_workspace_freshness_entries(project_dir)
+    let workspace_snapshot =
+        crate::workspace_discovery_cache::workspace_freshness_snapshot(project_dir, || {
+            collect_workspace_freshness_snapshot(project_dir)
         });
-    let mut entries = Vec::with_capacity(buf.len() + workspace_entries.len());
-    entries.extend(
-        buf.iter()
-            .map(|(path, content)| (path.as_path(), content.as_slice())),
-    );
-    entries.extend(
-        workspace_entries
-            .iter()
-            .map(|(path, content)| (path.as_path(), content.as_slice())),
-    );
-    entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
-    entries.dedup_by(|left, right| left.0 == right.0);
 
-    let output_capacity = entries.iter().fold(0usize, |total, (path, content)| {
+    if buf.is_empty() {
+        return FileLinkManifestBytes::Shared(workspace_snapshot);
+    }
+
+    let mut local_entries: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::with_capacity(buf.len());
+    for (path, content) in buf {
+        let normalized = manifest_for_install_hash(&content).into_owned();
+        local_entries.push((path, normalized));
+    }
+    local_entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    local_entries.dedup_by(|left, right| left.0 == right.0);
+
+    let ws_entries = &workspace_snapshot.entries;
+    if local_entries.iter().all(|(path, content)| {
+        ws_entries
+            .binary_search_by(|(ws_path, _)| ws_path.cmp(path))
+            .is_ok_and(|index| ws_entries[index].1 == *content)
+    }) {
+        return FileLinkManifestBytes::Shared(workspace_snapshot);
+    }
+
+    let local_capacity = local_entries.iter().fold(0usize, |total, (path, content)| {
         total
             .saturating_add(path.as_os_str().as_encoded_bytes().len())
             .saturating_add(content.len())
             .saturating_add(2)
     });
-    let mut out = Vec::with_capacity(output_capacity);
-    for (path, content) in entries {
-        out.extend_from_slice(path.to_string_lossy().as_bytes());
-        out.push(0);
-        out.extend_from_slice(&manifest_for_install_hash(content));
-        out.push(0);
+    let mut out = Vec::with_capacity(
+        workspace_snapshot
+            .flattened
+            .len()
+            .saturating_add(local_capacity),
+    );
+    let mut li = 0usize;
+    let mut wi = 0usize;
+    while li < local_entries.len() && wi < ws_entries.len() {
+        match local_entries[li].0.cmp(&ws_entries[wi].0) {
+            std::cmp::Ordering::Less => {
+                append_manifest_wire_entry(&mut out, &local_entries[li].0, &local_entries[li].1);
+                li += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                append_manifest_wire_entry(&mut out, &ws_entries[wi].0, &ws_entries[wi].1);
+                wi += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                append_manifest_wire_entry(&mut out, &local_entries[li].0, &local_entries[li].1);
+                li += 1;
+                wi += 1;
+            }
+        }
     }
-    out
+    for (path, content) in &local_entries[li..] {
+        append_manifest_wire_entry(&mut out, path, content);
+    }
+    for (path, content) in &ws_entries[wi..] {
+        append_manifest_wire_entry(&mut out, path, content);
+    }
+    FileLinkManifestBytes::Owned(out)
 }
 
-fn collect_workspace_freshness_entries(
+#[inline]
+fn append_manifest_wire_entry(out: &mut Vec<u8>, path: &std::path::Path, normalized: &[u8]) {
+    out.extend_from_slice(path.to_string_lossy().as_bytes());
+    out.push(0);
+    out.extend_from_slice(normalized);
+    out.push(0);
+}
+
+pub fn collect_file_link_manifest_bytes(
     project_dir: &std::path::Path,
-) -> crate::workspace_discovery_cache::WorkspaceFreshnessEntries {
+    pkg_content: &str,
+) -> Vec<u8> {
+    collect_file_link_manifest_bytes_shared(project_dir, pkg_content).into_vec()
+}
+
+fn collect_workspace_freshness_snapshot(
+    project_dir: &std::path::Path,
+) -> crate::workspace_discovery_cache::WorkspaceFreshnessSnapshot {
     let mut freshness_files = std::collections::HashSet::new();
     let mut visited = std::collections::HashSet::new();
-    let mut entries = Vec::new();
+    let mut normalized_entries = Vec::new();
+    let mut raw_local_deps = Vec::new();
 
     if let Some(path) = nearest_pnpm_workspace_yaml(project_dir) {
-        push_freshness_file(path, &mut freshness_files, &mut entries);
+        push_freshness_file(path, &mut freshness_files, &mut normalized_entries);
     }
 
     let Ok(Some(workspace)) = crate::workspace_discovery_cache::discover_workspace(project_dir)
     else {
-        return entries;
+        return crate::workspace_discovery_cache::WorkspaceFreshnessSnapshot::from_normalized_entries(
+            normalized_entries,
+        );
     };
     push_freshness_file(
         workspace.root.join("pnpm-workspace.yaml"),
         &mut freshness_files,
-        &mut entries,
+        &mut normalized_entries,
     );
     push_freshness_file(
         workspace.root.join("package.json"),
         &mut freshness_files,
-        &mut entries,
+        &mut normalized_entries,
     );
+    normalized_entries.reserve(workspace.members.len());
     for member in &workspace.members {
         let Ok(realpath) = member.path.canonicalize() else {
             continue;
@@ -534,10 +617,26 @@ fn collect_workspace_freshness_entries(
         ) else {
             continue;
         };
-        entries.push((realpath.clone(), member_content.as_bytes().to_vec()));
-        walk_file_link_deps(&realpath, &member_content, 0, 3, &mut visited, &mut entries);
+        let normalized = manifest_for_install_hash(member_content.as_bytes()).into_owned();
+        normalized_entries.push((realpath.clone(), normalized));
+        if may_contain_local_source_specifier(&member_content) {
+            walk_file_link_deps(
+                &realpath,
+                &member_content,
+                0,
+                3,
+                &mut visited,
+                &mut raw_local_deps,
+            );
+        }
     }
-    entries
+    for (path, raw_content) in raw_local_deps {
+        let normalized = manifest_for_install_hash(&raw_content).into_owned();
+        normalized_entries.push((path, normalized));
+    }
+    crate::workspace_discovery_cache::WorkspaceFreshnessSnapshot::from_normalized_entries(
+        normalized_entries,
+    )
 }
 
 fn nearest_pnpm_workspace_yaml(project_dir: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -590,7 +689,7 @@ fn push_freshness_file(
     };
     let key = path.canonicalize().unwrap_or(path);
     if seen.insert(key.clone()) {
-        buf.push((key, content));
+        buf.push((key, manifest_for_install_hash(&content).into_owned()));
     }
 }
 
@@ -762,12 +861,12 @@ pub fn check_install_state_with_content(project_dir: &Path, pkg_content: &str) -
 fn invalid_linker_state(project_dir: &Path, pkg_content: &str) -> InstallState {
     let lock_content =
         crate::commands::install::workspace_lockfile::active_lockfile_content(project_dir);
-    let file_link_bytes = collect_file_link_manifest_bytes(project_dir, pkg_content);
+    let file_link_bytes = collect_file_link_manifest_bytes_shared(project_dir, pkg_content);
     let platform = PlatformTuple::current();
     let placeholder = compute_install_hash_v8(
         pkg_content,
         &lock_content,
-        &file_link_bytes,
+        file_link_bytes.as_ref(),
         lpm_linker::LinkerMode::Isolated,
         ObjectIntegrityPolicy::Source,
         &platform,
@@ -785,12 +884,12 @@ fn invalid_integrity_state(
 ) -> InstallState {
     let lock_content =
         crate::commands::install::workspace_lockfile::active_lockfile_content(project_dir);
-    let file_link_bytes = collect_file_link_manifest_bytes(project_dir, pkg_content);
+    let file_link_bytes = collect_file_link_manifest_bytes_shared(project_dir, pkg_content);
     let platform = PlatformTuple::current();
     let placeholder = compute_install_hash_v8(
         pkg_content,
         &lock_content,
-        &file_link_bytes,
+        file_link_bytes.as_ref(),
         linker_mode,
         ObjectIntegrityPolicy::Source,
         &platform,
@@ -938,11 +1037,11 @@ fn check_install_state_with_paths(
     // Local directory source manifests participate in freshness. Empty
     // bytes for projects without local-source deps preserve the common
     // no-local-source path.
-    let file_link_bytes = collect_file_link_manifest_bytes(project_dir, pkg_content);
+    let file_link_bytes = collect_file_link_manifest_bytes_shared(project_dir, pkg_content);
     let current_hash = compute_install_hash_v10(
         pkg_content,
         &lock_content,
-        &file_link_bytes,
+        file_link_bytes.as_ref(),
         linker_mode,
         object_integrity_policy,
         &platform,
@@ -4225,5 +4324,54 @@ mod tests {
                 "malformed proof must be ignored: {malformed:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn cached_workspace_freshness_snapshot_matches_uncached_file_link_manifest_bytes() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"root","workspaces":["packages/*"],"scripts":{"dev":"vite"}}"#,
+        )
+        .unwrap();
+        let member_a = root.join("packages/a");
+        let member_b = root.join("packages/b");
+        let external = root.join("vendor-local");
+        fs::create_dir_all(&member_a).unwrap();
+        fs::create_dir_all(&member_b).unwrap();
+        fs::create_dir_all(&external).unwrap();
+
+        let pkg_a = r#"{"name":"a","version":"1.0.0","scripts":{"build":"tsc"}}"#;
+        let pkg_b = r#"{"name":"b","version":"1.0.0","dependencies":{"vendor-local":"file:../../vendor-local","a":"file:../a"}}"#;
+        fs::write(member_a.join("package.json"), pkg_a).unwrap();
+        fs::write(member_b.join("package.json"), pkg_b).unwrap();
+        fs::write(
+            external.join("package.json"),
+            r#"{"name":"vendor-local","version":"0.1.0","scripts":{"test":"vitest"}}"#,
+        )
+        .unwrap();
+
+        let uncached_a = collect_file_link_manifest_bytes(&member_a, pkg_a);
+        let uncached_b = collect_file_link_manifest_bytes(&member_b, pkg_b);
+
+        let workspace =
+            std::sync::Arc::new(lpm_workspace::discover_workspace(root).unwrap().unwrap());
+        let freshness_cache = std::sync::Arc::new(
+            crate::workspace_discovery_cache::WorkspaceFreshnessCache::default(),
+        );
+
+        crate::workspace_discovery_cache::scope(workspace, None, freshness_cache, async {
+            let shared_a = collect_file_link_manifest_bytes_shared(&member_a, pkg_a);
+            assert!(
+                matches!(shared_a, FileLinkManifestBytes::Shared(_)),
+                "member without file:/link: specs must borrow the cached workspace snapshot"
+            );
+            assert_eq!(shared_a.as_ref(), uncached_a.as_slice());
+
+            let shared_b = collect_file_link_manifest_bytes_shared(&member_b, pkg_b);
+            assert_eq!(shared_b.as_ref(), uncached_b.as_slice());
+        })
+        .await;
     }
 }

@@ -29,8 +29,79 @@
 //! source contains the resolved commit so source identity and root
 //! selection use the same immutable value.
 
-use lpm_common::integrity::{HashAlgorithm, Integrity};
+use sha2::{Digest, Sha256};
 use std::fmt;
+
+/// Borrowed view of a parsed lockfile source string for zero-allocation validation and key checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceRef<'a> {
+    Registry(&'a str),
+    Tarball(&'a str),
+    Directory(&'a str),
+    Link(&'a str),
+    Git(&'a str),
+}
+
+impl<'a> SourceRef<'a> {
+    pub(crate) fn parse(s: &'a str) -> Result<Self, SourceParseError> {
+        if s.is_empty() {
+            return Err(SourceParseError::Empty);
+        }
+        if let Some(rest) = s.strip_prefix("registry+") {
+            return if rest.is_empty() {
+                Err(SourceParseError::EmptyValue {
+                    kind: "registry".into(),
+                })
+            } else {
+                Ok(Self::Registry(rest))
+            };
+        }
+        if let Some(rest) = s.strip_prefix("tarball+") {
+            return if rest.is_empty() {
+                Err(SourceParseError::EmptyValue {
+                    kind: "tarball".into(),
+                })
+            } else {
+                Ok(Self::Tarball(rest))
+            };
+        }
+        if let Some(rest) = s.strip_prefix("directory+") {
+            return if rest.is_empty() {
+                Err(SourceParseError::EmptyValue {
+                    kind: "directory".into(),
+                })
+            } else {
+                Ok(Self::Directory(rest))
+            };
+        }
+        if let Some(rest) = s.strip_prefix("link+") {
+            return if rest.is_empty() {
+                Err(SourceParseError::EmptyValue {
+                    kind: "link".into(),
+                })
+            } else {
+                Ok(Self::Link(rest))
+            };
+        }
+        if s.starts_with("git+") {
+            if s.len() == 4 {
+                return Err(SourceParseError::EmptyValue { kind: "git".into() });
+            }
+            return Ok(Self::Git(s));
+        }
+        Err(SourceParseError::UnknownKind)
+    }
+
+    pub(crate) fn source_id(self) -> String {
+        match self {
+            Self::Registry(url) => format_source_id("npm-", url),
+            Self::Tarball(url) => format_source_id("t-", url),
+            Self::Directory(path) => format_source_id("f-", path),
+            Self::Link(path) => format_source_id("l-", path),
+            Self::Git(url) => format_source_id("g-", url),
+        }
+    }
+}
 
 /// Source discriminator for a lockfile package entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -93,11 +164,11 @@ impl Source {
     /// enough to inline into lockfile keys without bloat.
     pub fn source_id(&self) -> String {
         match self {
-            Source::Registry { url } => format!("npm-{}", hash16(url)),
-            Source::Tarball { url } => format!("t-{}", hash16(url)),
-            Source::Directory { path } => format!("f-{}", hash16(path)),
-            Source::Link { path } => format!("l-{}", hash16(path)),
-            Source::Git { url } => format!("g-{}", hash16(url)),
+            Source::Registry { url } => format_source_id("npm-", url),
+            Source::Tarball { url } => format_source_id("t-", url),
+            Source::Directory { path } => format_source_id("f-", path),
+            Source::Link { path } => format_source_id("l-", path),
+            Source::Git { url } => format_source_id("g-", url),
         }
     }
 
@@ -167,19 +238,17 @@ fn safe_url_origin(raw: &str) -> Option<String> {
     (origin != "null").then_some(origin)
 }
 
-/// Compute the 16-hex truncated SHA-256 digest of `s`.
-///
-/// Reuses [`lpm_common::integrity::Integrity::from_bytes`] so the
-/// hashing implementation is shared with the SRI machinery (single
-/// source of truth, no duplicate sha2 wiring in `lpm-lockfile`).
-/// 16 hex chars = first 8 bytes of the digest (= 64 bits).
-fn hash16(s: &str) -> String {
-    let int = Integrity::from_bytes(HashAlgorithm::Sha256, s.as_bytes());
-    int.hash
-        .iter()
-        .take(8)
-        .map(|b| format!("{b:02x}"))
-        .collect()
+/// Format `<prefix><16-hex truncated SHA-256 digest of s>` in one allocation.
+fn format_source_id(prefix: &str, s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(s.as_bytes());
+    let mut out = String::with_capacity(prefix.len() + 16);
+    out.push_str(prefix);
+    for &byte in &digest[..8] {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn non_empty(rest: &str, kind: &str) -> Result<String, SourceParseError> {

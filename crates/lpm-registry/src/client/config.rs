@@ -88,8 +88,11 @@ impl RegistryClient {
     pub(super) fn deserialize_cached_metadata_as<T: serde::de::DeserializeOwned>(
         data: &[u8],
     ) -> Option<T> {
-        if let Some(json) = data.strip_prefix(&[super::cache::METADATA_CACHE_JSON_MARKER]) {
-            return serde_json::from_slice(json).ok();
+        if let Some(rest) = data.strip_prefix(&[super::cache::METADATA_CACHE_JSON_MARKER]) {
+            if rest.starts_with(super::cache::ZSTD_FRAME_MAGIC) {
+                return super::cache::decode_zstd_msgpack_payload(rest);
+            }
+            return serde_json::from_slice(rest).ok();
         }
         rmp_serde::from_slice(data)
             .or_else(|_| serde_json::from_slice(data))
@@ -447,11 +450,13 @@ impl RegistryClient {
             npm_transport_url: None,
             token: None,
             cache_dir,
-            pending_cache_writes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            pending_cache_writes: Arc::new(super::state::PendingCacheWrites::default()),
             pending_cache_write_bytes: Arc::new(tokio::sync::Semaphore::new(
                 super::cache::MAX_PENDING_METADATA_CACHE_BYTES,
             )),
-            metadata_cache_mutations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            metadata_cache_mutations: Arc::new(std::sync::Mutex::new(
+                super::state::WeakEntryMap::new(),
+            )),
             history_cache: Arc::new(super::history_cache::HistoryCache::default()),
             metadata_memory_cache: None,
             release_time_memory_cache: None,

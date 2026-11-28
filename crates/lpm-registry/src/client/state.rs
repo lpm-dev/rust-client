@@ -421,9 +421,33 @@ pub(super) struct MetadataCacheEntry<T> {
     pub(super) remaining_freshness: std::time::Duration,
 }
 
+#[derive(Default)]
+pub(super) struct MetadataCacheOperationState {
+    pub(super) pending_projection: Option<super::projection::PendingProjection>,
+}
+
 pub(super) struct MetadataCacheMutation {
     pub(super) revision: std::sync::atomic::AtomicU64,
-    pub(super) operation: std::sync::Mutex<()>,
+    pub(super) content_revision: std::sync::atomic::AtomicU64,
+    pub(super) completed_revision: std::sync::atomic::AtomicU64,
+    pub(super) completed_content_revision: std::sync::atomic::AtomicU64,
+    pub(super) published_revision: std::sync::atomic::AtomicU64,
+    pub(super) projection_revision: std::sync::atomic::AtomicU64,
+    pub(super) operation: std::sync::Mutex<MetadataCacheOperationState>,
+}
+
+impl MetadataCacheMutation {
+    pub(super) fn new() -> Self {
+        Self {
+            revision: std::sync::atomic::AtomicU64::new(0),
+            content_revision: std::sync::atomic::AtomicU64::new(0),
+            completed_revision: std::sync::atomic::AtomicU64::new(0),
+            completed_content_revision: std::sync::atomic::AtomicU64::new(0),
+            published_revision: std::sync::atomic::AtomicU64::new(0),
+            projection_revision: std::sync::atomic::AtomicU64::new(0),
+            operation: std::sync::Mutex::new(MetadataCacheOperationState::default()),
+        }
+    }
 }
 
 /// Observability for [`RegistryClient::parallel_fetch_npm_manifests`].
@@ -440,6 +464,117 @@ pub struct FanOutStats {
     pub final_concurrency: usize,
     /// Number of 429 observations that triggered a pool halving.
     pub halve_events: usize,
+}
+
+/// Tracks in-flight asynchronous metadata cache writes without retaining
+/// completed `JoinHandle`s across long-lived clients.
+#[derive(Default)]
+pub(super) struct PendingCacheWrites {
+    active: std::sync::atomic::AtomicUsize,
+    drained: tokio::sync::Notify,
+}
+
+pub(super) struct PendingCacheWriteGuard {
+    tracker: Arc<PendingCacheWrites>,
+}
+
+impl PendingCacheWrites {
+    pub(super) fn enter(self: &Arc<Self>) -> PendingCacheWriteGuard {
+        self.active
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        PendingCacheWriteGuard {
+            tracker: Arc::clone(self),
+        }
+    }
+
+    pub(super) async fn flush(&self) {
+        loop {
+            let notified = self.drained.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.active.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for PendingCacheWriteGuard {
+    fn drop(&mut self) {
+        if self
+            .tracker
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.tracker.drained.notify_waiters();
+        }
+    }
+}
+
+pub(super) struct WeakEntryMap<K, V> {
+    entries: HashMap<K, std::sync::Weak<V>>,
+    prune_at: usize,
+    misses_since_prune: usize,
+    #[cfg(test)]
+    prune_count: usize,
+}
+
+impl<K, V> WeakEntryMap<K, V>
+where
+    K: Eq + std::hash::Hash,
+{
+    pub(super) fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            prune_at: 64,
+            misses_since_prune: 0,
+            #[cfg(test)]
+            prune_count: 0,
+        }
+    }
+
+    pub(super) fn get_or_insert<Q>(&mut self, key: &Q, create: impl FnOnce() -> Arc<V>) -> Arc<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ToOwned<Owned = K> + ?Sized,
+    {
+        if let Some(existing) = self.entries.get(key).and_then(std::sync::Weak::upgrade) {
+            return existing;
+        }
+        if self.entries.len() >= self.prune_at || self.misses_since_prune >= self.prune_at {
+            self.entries.retain(|_, weak| weak.strong_count() > 0);
+            self.misses_since_prune = 0;
+            self.prune_at = self.entries.len().saturating_mul(2).max(64);
+            if self.entries.capacity() > self.prune_at.saturating_mul(4) {
+                self.entries.shrink_to(self.prune_at);
+            }
+            #[cfg(test)]
+            {
+                self.prune_count += 1;
+            }
+        }
+        self.misses_since_prune = self.misses_since_prune.saturating_add(1);
+        let value = create();
+        self.entries.insert(key.to_owned(), Arc::downgrade(&value));
+        value
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn insert(&mut self, key: K, value: std::sync::Weak<V>) {
+        self.entries.insert(key, value);
+    }
+
+    #[cfg(test)]
+    pub(super) fn prune_count(&self) -> usize {
+        self.prune_count
+    }
 }
 
 /// Client for communicating with the LPM registry.
@@ -461,20 +596,14 @@ pub struct RegistryClient {
     pub(super) token: Option<SecretString>,
     /// Path to the metadata cache directory. None disables caching.
     pub(super) cache_dir: Option<std::path::PathBuf>,
-    /// Handles for in-flight `spawn_blocking` cache writes. Production
-    /// callers never observe this (the writes are fire-and-forget and the
-    /// handles drop on `RegistryClient::drop`). Tests call
-    /// [`Self::flush_pending_cache_writes`] to deterministically await all
-    /// pending writes before reading the cache back. The push is one
-    /// `Mutex` acquire + `Vec` push per write — sub-µs vs the ms-scale
-    /// `std::fs::write` it tracks.
-    pub(super) pending_cache_writes: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Count + waiter notification for in-flight `spawn_blocking` cache writes.
+    pub(super) pending_cache_writes: Arc<PendingCacheWrites>,
     /// Byte budget held by queued asynchronous metadata-cache buffers.
     /// Cache writes are best-effort and are skipped when a cold metadata
     /// burst would exceed this bound.
     pub(super) pending_cache_write_bytes: Arc<tokio::sync::Semaphore>,
     pub(super) metadata_cache_mutations:
-        Arc<std::sync::Mutex<HashMap<std::path::PathBuf, Arc<MetadataCacheMutation>>>>,
+        Arc<std::sync::Mutex<WeakEntryMap<std::path::PathBuf, MetadataCacheMutation>>>,
     /// Optional command-scoped immutable packument cache. Recursive
     /// workspace installs enable it on client clones so independent
     /// importer resolvers can reuse one parsed registry response without
@@ -723,6 +852,29 @@ mod lazy_default_client_tests {
                 .count();
             assert_eq!(built_policy_lanes, 2);
         }
+    }
+
+    #[test]
+    fn weak_entry_map_prunes_dead_entries_after_burst_during_in_place_reuse() {
+        let mut map: WeakEntryMap<String, usize> = WeakEntryMap::new();
+        {
+            let mut live = Vec::with_capacity(200);
+            for i in 0..200 {
+                live.push(map.get_or_insert(&format!("burst-{i}"), || Arc::new(i)));
+            }
+            assert_eq!(map.len(), 200);
+        }
+        // All 200 burst entries are now dead, while `prune_at` is elevated above 200.
+        // Repeatedly replacing a small set of keys in-place must still trigger pruning.
+        for round in 0..300 {
+            let key = format!("burst-{}", round % 4);
+            let _ = map.get_or_insert(&key, || Arc::new(round));
+        }
+        assert!(
+            map.len() <= 64,
+            "dead burst keys must be pruned during repeated in-place reuse (remaining={})",
+            map.len()
+        );
     }
 }
 

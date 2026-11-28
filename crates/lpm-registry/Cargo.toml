@@ -42,6 +42,7 @@ time = { version = "0.3", features = ["parsing"] }
 # See `tls_identity.rs` for the loader.
 pkcs8 = { workspace = true }
 rpassword = { workspace = true }
+zstd = { version = "0.14", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -55,7 +56,6 @@ rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc
 # Encoders for the responses the client must decode.
 flate2 = { workspace = true }
 brotli = "9"
-zstd = { version = "0.14", default-features = false }
 # Hand-rolled TLS test server for the cafile/strict-ssl integration matrix.
 # Versions match the transitive deps reqwest brings in (tokio-rustls 0.26 /
 # rustls 0.23) so we don't fork the trust-store impl.

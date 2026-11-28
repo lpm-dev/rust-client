@@ -796,14 +796,12 @@ impl ResolveState {
             .filter(|(_, n)| !matches!(n.canonical, CanonicalKey::Root))
             .map(|(node_index, n)| {
                 let pkg = canonical_to_resolver_package(&n.canonical);
-                let ver_str = n.version.to_string();
+                let ver_str = &id_to_version[node_index];
                 let selected_peer_bindings = peer_bindings.get(&(node_index as NodeId));
                 let resolution_id = lpm_common::ResolutionNodeId::new(node_index as NodeId);
-
-                let cached_aliases: HashMap<String, String> = cache
+                let version_view = cache
                     .get(&n.canonical)
-                    .map(|info| info.dependency_aliases(&ver_str))
-                    .unwrap_or_default();
+                    .and_then(|info| info.version_view(ver_str));
 
                 // Sort each parent's dependency list by local_name for
                 // byte-identical lockfile output across resolver arms.
@@ -830,42 +828,46 @@ impl ResolveState {
                         (local.clone(), lpm_common::ResolutionNodeId::new(*child_id))
                     })
                     .collect();
-                let optional_dependencies = cache
-                    .get(&n.canonical)
-                    .map(|info| info.optional_dependency_names(&ver_str))
-                    .unwrap_or_default();
 
-                let alive_locals: HashSet<&String> = dependencies.iter().map(|(l, _)| l).collect();
-                let aliases: HashMap<String, String> = cached_aliases
-                    .iter()
-                    .filter(|(local, _)| alive_locals.contains(local))
-                    .map(|(l, t)| (l.clone(), t.clone()))
-                    .collect();
+                let mut optional_dependencies = HashSet::new();
+                let mut aliases = HashMap::new();
+                if let Some(view) = version_view {
+                    let has_aliases = view.has_dependency_aliases();
+                    let alive_locals: Option<HashSet<&str>> =
+                        has_aliases.then(|| dependencies.iter().map(|(l, _)| l.as_str()).collect());
+                    for dep in view.dependencies() {
+                        if dep.optional {
+                            optional_dependencies.insert(dep.name.to_owned());
+                        }
+                        if let Some(alias) = dep.alias
+                            && alive_locals
+                                .as_ref()
+                                .is_some_and(|alive| alive.contains(dep.name))
+                        {
+                            aliases.insert(dep.name.to_owned(), alias.to_owned());
+                        }
+                    }
+                }
 
-                let (tarball_url, integrity) = cache.get(&n.canonical).map_or_else(
-                    || (None, None),
-                    |info| {
+                let (tarball_url, integrity, platform, node_engine) = version_view.map_or_else(
+                    || (None, None, None, None),
+                    |view| {
                         (
-                            info.tarball_url(&ver_str).map(str::to_owned),
-                            info.integrity(&ver_str).map(str::to_owned),
+                            view.tarball_url().map(str::to_owned),
+                            view.integrity().map(str::to_owned),
+                            view.platform(),
+                            view.node_engine().map(str::to_owned),
                         )
                     },
                 );
-                let platform = cache
-                    .get(&n.canonical)
-                    .and_then(|info| info.platform(&ver_str));
-                let node_engine = cache
-                    .get(&n.canonical)
-                    .and_then(|info| info.node_engine(&ver_str).map(str::to_owned));
 
                 // Surface resolved peers per package so the v2 GraphKey
                 // can fold them in. The resolved-versions lookup is built
                 // from the same node table.
-                let peers: Vec<lpm_common::PeerEdge> = cache
-                    .get(&n.canonical)
-                    .and_then(|info| info.peer_dependencies(&ver_str))
-                    .map(|peer_dependencies| {
-                        let mut out: Vec<lpm_common::PeerEdge> = peer_dependencies
+                let peers: Vec<lpm_common::PeerEdge> = version_view
+                    .map(|view| {
+                        let mut out: Vec<lpm_common::PeerEdge> = view
+                            .peer_dependencies()
                             .filter_map(|peer| {
                                 let peer_name = peer.name;
                                 let target_name = peer.alias.unwrap_or(peer_name);

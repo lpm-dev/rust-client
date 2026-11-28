@@ -1,4 +1,4 @@
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum LockfileError {
     #[error("failed to serialize lockfile: {0}")]
     Serialize(String),

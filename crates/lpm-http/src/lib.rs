@@ -814,30 +814,80 @@ pub async fn read_body_capped(
 
 /// Read a capped response body into a caller-owned buffer, retaining its allocation for reuse.
 pub async fn read_body_capped_into(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     cap: usize,
     body: &mut Vec<u8>,
 ) -> Result<(), ResponseBodyError> {
+    read_body_capped_with_budget(
+        response,
+        cap,
+        body,
+        (),
+        |(), _, _, _| std::future::ready(()),
+    )
+    .await
+    .0
+}
+
+/// Read a capped response body into `body`, threading `state` through
+/// `on_growth(state, next_len, next_capacity, is_declared_total)` before
+/// reserving a declared total size or appending a chunk that grows the buffer.
+pub async fn read_body_capped_with_budget<S, F, Fut>(
+    mut response: reqwest::Response,
+    cap: usize,
+    body: &mut Vec<u8>,
+    mut state: S,
+    mut on_growth: F,
+) -> (Result<(), ResponseBodyError>, S)
+where
+    F: FnMut(S, usize, usize, bool) -> Fut,
+    Fut: std::future::Future<Output = S>,
+{
     body.clear();
-    if let Some(declared) = response.content_length()
+    let declared = response.content_length();
+    if let Some(declared) = declared
         && declared > cap as u64
     {
-        return Err(ResponseBodyError::DeclaredTooLarge { declared, cap });
+        return (
+            Err(ResponseBodyError::DeclaredTooLarge { declared, cap }),
+            state,
+        );
     }
 
-    let initial_capacity = response
-        .content_length()
-        .and_then(|length| usize::try_from(length).ok())
-        .unwrap_or(64 * 1024)
-        .min(cap);
-    body.reserve(initial_capacity);
-    while let Some(chunk) = response.chunk().await.map_err(ResponseBodyError::Read)? {
+    if let Some(declared_len) = declared.and_then(|length| usize::try_from(length).ok()) {
+        let initial_capacity = declared_len.min(cap);
+        state = on_growth(state, declared_len, initial_capacity, true).await;
+        body.reserve_exact(initial_capacity);
+    } else {
+        body.reserve_exact((64 * 1024).min(cap));
+    }
+
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => return (Ok(()), state),
+            Err(error) => return (Err(ResponseBodyError::Read(error)), state),
+        };
         if chunk.len() > cap.saturating_sub(body.len()) {
-            return Err(ResponseBodyError::StreamedTooLarge { cap });
+            return (Err(ResponseBodyError::StreamedTooLarge { cap }), state);
+        }
+        let next_len = body.len() + chunk.len();
+        let next_capacity = if next_len > body.capacity() {
+            body.capacity()
+                .max(64 * 1024)
+                .checked_mul(2)
+                .unwrap_or(cap)
+                .max(next_len)
+                .min(cap)
+        } else {
+            body.capacity()
+        };
+        state = on_growth(state, next_len, next_capacity, false).await;
+        if next_capacity > body.capacity() {
+            body.reserve_exact(next_capacity - body.len());
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(())
 }
 
 /// Build a bounded redirect policy that refuses cleartext after any HTTPS hop.

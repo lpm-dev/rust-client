@@ -60,25 +60,25 @@ pub(super) fn extract_conflicting_packages(report: &str) -> HashSet<String> {
 /// Primary extraction: looks for "depends on PKG VERSION" patterns where PKG
 /// appears with 2+ different version constraints.
 pub(super) fn extract_conflicts_primary(report: &str) -> HashSet<String> {
-    let mut package_versions: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut package_versions: HashMap<&str, HashSet<&str>> = HashMap::new();
 
     for line in report.lines() {
         let line = line.trim();
-        let parts: Vec<&str> = line.split("depends on ").collect();
-        for part in parts.iter().skip(1) {
-            let tokens: Vec<&str> = part.split_whitespace().collect();
-            if tokens.len() >= 2 {
-                let pkg_name = tokens[0].trim_matches(',');
-                let version = tokens[1].trim_matches(',');
-                if !pkg_name.is_empty()
-                    && !pkg_name.starts_with('<')
-                    && version.chars().next().is_some_and(|c| c.is_ascii_digit())
-                {
-                    package_versions
-                        .entry(pkg_name.to_string())
-                        .or_default()
-                        .insert(version.to_string());
-                }
+        for part in line.split("depends on ").skip(1) {
+            let mut tokens = part.split_whitespace();
+            let (Some(raw_pkg), Some(raw_ver)) = (tokens.next(), tokens.next()) else {
+                continue;
+            };
+            let pkg_name = raw_pkg.trim_matches(',');
+            let version = raw_ver.trim_matches(',');
+            if !pkg_name.is_empty()
+                && !pkg_name.starts_with('<')
+                && version.as_bytes().first().is_some_and(u8::is_ascii_digit)
+            {
+                package_versions
+                    .entry(pkg_name)
+                    .or_default()
+                    .insert(version);
             }
         }
     }
@@ -86,7 +86,7 @@ pub(super) fn extract_conflicts_primary(report: &str) -> HashSet<String> {
     package_versions
         .into_iter()
         .filter(|(_, versions)| versions.len() >= 2)
-        .map(|(name, _)| name)
+        .map(|(name, _)| name.to_owned())
         .collect()
 }
 
@@ -94,34 +94,36 @@ pub(super) fn extract_conflicts_primary(report: &str) -> HashSet<String> {
 /// (contain only valid npm name chars) mentioned alongside version-like tokens.
 /// Returns any package name that appears 2+ times in different contexts.
 pub(super) fn extract_conflicts_fallback(report: &str) -> HashSet<String> {
-    let mut name_occurrences: HashMap<String, usize> = HashMap::new();
+    let mut name_occurrences: HashMap<&str, usize> = HashMap::new();
 
     for line in report.lines() {
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        for window in tokens.windows(2) {
-            let candidate = window[0].trim_matches(|c: char| {
+        let mut tokens = line.split_whitespace();
+        let Some(mut prev) = tokens.next() else {
+            continue;
+        };
+        for curr in tokens {
+            let candidate = prev.trim_matches(|c: char| {
                 !c.is_alphanumeric() && c != '@' && c != '/' && c != '.' && c != '-' && c != '_'
             });
-            let next = window[1].trim_matches(',');
-            // candidate looks like a package name, next looks like a version
+            let next = curr.trim_matches(',');
             if !candidate.is_empty()
                 && !candidate.starts_with('<')
                 && !candidate.starts_with('>')
-                && next.chars().next().is_some_and(|c| c.is_ascii_digit())
+                && next.as_bytes().first().is_some_and(u8::is_ascii_digit)
                 && candidate
                     .chars()
                     .all(|c| c.is_alphanumeric() || matches!(c, '@' | '/' | '.' | '-' | '_'))
             {
-                *name_occurrences.entry(candidate.to_string()).or_default() += 1;
+                *name_occurrences.entry(candidate).or_default() += 1;
             }
+            prev = curr;
         }
     }
 
-    // Return packages mentioned 2+ times as likely conflict participants
     name_occurrences
         .into_iter()
         .filter(|(_, count)| *count >= 2)
-        .map(|(name, _)| name)
+        .map(|(name, _)| name.to_owned())
         .collect()
 }
 

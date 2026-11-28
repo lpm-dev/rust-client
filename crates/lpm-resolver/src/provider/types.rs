@@ -161,6 +161,50 @@ pub(super) struct CachedAvailableVersions {
     pub versions: Arc<[NpmVersion]>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(super) struct RangeCacheKey {
+    pub(super) pkg: ResolverPackage,
+    pub(super) raw: String,
+}
+
+pub(super) trait RangeCacheKeyRef {
+    fn key_parts(&self) -> (&ResolverPackage, &str);
+}
+
+impl RangeCacheKeyRef for RangeCacheKey {
+    fn key_parts(&self) -> (&ResolverPackage, &str) {
+        (&self.pkg, self.raw.as_str())
+    }
+}
+
+impl RangeCacheKeyRef for (&ResolverPackage, &str) {
+    fn key_parts(&self) -> (&ResolverPackage, &str) {
+        (self.0, self.1)
+    }
+}
+
+impl<'a> std::borrow::Borrow<dyn RangeCacheKeyRef + 'a> for RangeCacheKey {
+    fn borrow(&self) -> &(dyn RangeCacheKeyRef + 'a) {
+        self
+    }
+}
+
+impl PartialEq for dyn RangeCacheKeyRef + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.key_parts() == other.key_parts()
+    }
+}
+
+impl Eq for dyn RangeCacheKeyRef + '_ {}
+
+impl std::hash::Hash for dyn RangeCacheKeyRef + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let (pkg, raw) = self.key_parts();
+        pkg.hash(state);
+        raw.hash(state);
+    }
+}
+
 pub(super) struct CachedRange {
     pub available: Arc<[NpmVersion]>,
     pub tagged_version: Option<NpmVersion>,
@@ -239,7 +283,7 @@ pub struct LpmDependencyProvider {
     /// as unavailable, so it chooses another version.
     pub(super) unusable_versions: Arc<UnusableVersions>,
     /// Cache conversions against the exact available-version snapshot and tag.
-    pub(super) range_cache: Mutex<HashMap<(ResolverPackage, String), CachedRange>>,
+    pub(super) range_cache: Mutex<HashMap<RangeCacheKey, CachedRange>>,
     pub(super) refreshed_metadata: Mutex<HashSet<CanonicalKey>>,
     pub(super) available_versions_cache: Mutex<HashMap<ResolverPackage, CachedAvailableVersions>>,
     pub(super) include_optional_dependencies: bool,

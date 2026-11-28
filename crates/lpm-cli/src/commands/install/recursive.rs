@@ -3,6 +3,7 @@ use lpm_task::graph::WorkspaceGraph;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::JoinSet;
 
 const ENV_WORKSPACE_CONCURRENCY: &str = "LPM_WORKSPACE_CONCURRENCY";
@@ -136,7 +137,7 @@ pub(crate) async fn run_recursive_workspace_install(
     fail_if_no_match: bool,
     options: RecursiveInstallOptions,
 ) -> Result<(), LpmError> {
-    let workspace_root = discover_recursive_workspace(cwd)?.root;
+    let workspace_root = find_recursive_workspace_root(cwd)?;
     let timing_detail_mode = TimingDetailMode::from_env();
     let _registry_timing_scope = if options.timing {
         Some(lpm_registry::timing::command_scope().await)
@@ -150,7 +151,13 @@ pub(crate) async fn run_recursive_workspace_install(
     };
 
     workspace_lockfile::with_project_install_lock(&workspace_root, async {
+        let pre_discovery_root_stamp = capture_root_manifest_stamp(&workspace_root);
         let workspace = discover_recursive_workspace(cwd)?;
+        let post_discovery_root_stamp = capture_root_manifest_stamp(&workspace.root);
+        let root_manifest_stamp = stable_discovery_root_manifest_stamp(
+            pre_discovery_root_stamp,
+            post_discovery_root_stamp,
+        );
         if workspace.root != workspace_root {
             return Err(LpmError::Script(format!(
                 "workspace root changed while waiting for the install transaction ({} -> {}); \
@@ -415,6 +422,7 @@ pub(crate) async fn run_recursive_workspace_install(
             .collect();
         let workspace_freshness_cache =
             Arc::new(crate::workspace_discovery_cache::WorkspaceFreshnessCache::default());
+        let any_script_ran = Arc::new(AtomicBool::new(false));
         let scheduler = async {
             let mut active_workspace = Arc::new(workspace);
             let target_count = targets.len();
@@ -497,6 +505,8 @@ pub(crate) async fn run_recursive_workspace_install(
                             root_provider_coordinator.as_ref().map(Arc::clone),
                             Arc::clone(&workspace_freshness_cache),
                             root_provider_fingerprint.as_ref().map(Arc::clone),
+                            root_manifest_stamp,
+                            Arc::clone(&any_script_ran),
                             &mut outcomes,
                         );
                     }
@@ -671,6 +681,18 @@ fn rollback_workspace_project_state(
     }
 }
 
+fn find_recursive_workspace_root(cwd: &Path) -> Result<PathBuf, LpmError> {
+    lpm_workspace::find_workspace_root(cwd)
+        .map_err(|error| LpmError::Script(format!("workspace discovery failed: {error}")))?
+        .ok_or_else(|| {
+            LpmError::Script(
+                "`--recursive` requires a workspace. Run `lpm install` without `--recursive` \
+                 for a standalone project."
+                    .into(),
+            )
+        })
+}
+
 fn discover_recursive_workspace(cwd: &Path) -> Result<lpm_workspace::Workspace, LpmError> {
     lpm_workspace::discover_workspace(cwd)
         .map_err(|error| LpmError::Script(format!("workspace discovery failed: {error}")))?
@@ -681,6 +703,68 @@ fn discover_recursive_workspace(cwd: &Path) -> Result<lpm_workspace::Workspace, 
                     .into(),
             )
         })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    ctime: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RootManifestStamp {
+    package_json: Option<FileStamp>,
+    pnpm_workspace_yaml: Option<FileStamp>,
+}
+
+fn stat_file_stamp(path: &Path) -> Option<FileStamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt as _;
+    Some(FileStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        ctime: metadata.ctime(),
+        #[cfg(unix)]
+        ctime_nsec: metadata.ctime_nsec(),
+    })
+}
+
+fn capture_root_manifest_stamp(root: &Path) -> RootManifestStamp {
+    RootManifestStamp {
+        package_json: stat_file_stamp(&root.join("package.json")),
+        pnpm_workspace_yaml: stat_file_stamp(&root.join("pnpm-workspace.yaml")),
+    }
+}
+
+fn stable_discovery_root_manifest_stamp(
+    pre_discovery: RootManifestStamp,
+    post_discovery: RootManifestStamp,
+) -> Option<RootManifestStamp> {
+    (pre_discovery == post_discovery).then_some(pre_discovery)
+}
+
+fn should_refresh_workspace_target(
+    plan_kind: &str,
+    has_dev_preinstall: bool,
+    any_script_ran: bool,
+    root_manifest_stamp: Option<RootManifestStamp>,
+    target_path: &Path,
+) -> bool {
+    has_dev_preinstall
+        || (plan_kind == "root"
+            && (any_script_ran
+                || root_manifest_stamp
+                    .is_none_or(|stamp| capture_root_manifest_stamp(target_path) != stamp)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -708,6 +792,8 @@ fn spawn_workspace_target_install(
     root_provider_coordinator: Option<Arc<workspace_resolution::WorkspaceRootProviderCoordinator>>,
     workspace_freshness_cache: Arc<crate::workspace_discovery_cache::WorkspaceFreshnessCache>,
     root_provider_fingerprint: Option<Arc<str>>,
+    root_manifest_stamp: Option<RootManifestStamp>,
+    any_script_ran: Arc<AtomicBool>,
     outcomes: &mut [Option<WorkspaceInstallOutcome>],
 ) {
     outcomes[index] = Some(WorkspaceInstallOutcome {
@@ -733,6 +819,8 @@ fn spawn_workspace_target_install(
             locked_integrities,
             workspace_freshness_cache,
             root_provider_fingerprint,
+            root_manifest_stamp,
+            any_script_ran,
         );
         let install = async {
             match root_provider_coordinator {
@@ -777,19 +865,26 @@ async fn run_workspace_target_install(
     locked_integrities: Option<Arc<super::LockedIntegrities>>,
     workspace_freshness_cache: Arc<crate::workspace_discovery_cache::WorkspaceFreshnessCache>,
     root_provider_fingerprint: Option<Arc<str>>,
+    root_manifest_stamp: Option<RootManifestStamp>,
+    any_script_ran: Arc<AtomicBool>,
 ) -> Result<TargetTaskResult, LpmError> {
     crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(&plan.path)?;
     plan.lifecycle
         .run_dev_preinstall(&plan.path, options.json_output)?;
     if plan.lifecycle.has_dev_preinstall() {
+        any_script_ran.store(true, Ordering::Release);
         workspace_freshness_cache.invalidate();
     }
 
-    // `pnpm:devPreinstall` may edit the target manifest, and the root
-    // install must see current root configuration; both re-read from
-    // disk into a private workspace view. Scriptless members reuse the
-    // shared view — their manifests cannot have changed since discovery.
-    let needs_refresh = plan.lifecycle.has_dev_preinstall() || plan.kind == "root";
+    // `pnpm:devPreinstall` may edit the target manifest; the root target also
+    // refreshes when any prior script ran or root manifest metadata drifted.
+    let needs_refresh = should_refresh_workspace_target(
+        plan.kind,
+        plan.lifecycle.has_dev_preinstall(),
+        any_script_ran.load(Ordering::Acquire),
+        root_manifest_stamp,
+        &plan.path,
+    );
     let scoped_workspace = if needs_refresh {
         let mut refreshed = (*base_workspace).clone();
         crate::workspace_discovery_cache::refresh_target(&mut refreshed, &plan.path).map_err(
@@ -890,6 +985,7 @@ async fn run_workspace_target_install(
         plan.lifecycle
             .run_after_successful_install(&plan.path, options.json_output)?;
         if plan.lifecycle.has_scripts() {
+            any_script_ran.store(true, Ordering::Release);
             workspace_freshness_cache.invalidate();
         }
         None
@@ -2522,5 +2618,59 @@ mod tests {
     fn read_replay_ready_lockfile(project_dir: &Path) -> lpm_lockfile::Lockfile {
         lpm_lockfile::Lockfile::read_fast(&project_dir.join(lpm_lockfile::LOCKFILE_NAME))
             .expect("read replay-ready lockfile")
+    }
+
+    #[test]
+    fn root_target_refreshes_when_manifest_changes_during_or_after_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"root","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        let pre = capture_root_manifest_stamp(root);
+        let post_same = capture_root_manifest_stamp(root);
+        let stable_stamp = stable_discovery_root_manifest_stamp(pre, post_same);
+        assert!(stable_stamp.is_some());
+        assert!(
+            !should_refresh_workspace_target("root", false, false, stable_stamp, root),
+            "unchanged root manifest without scripts should reuse the discovered workspace"
+        );
+
+        // Concurrent edit during discovery invalidates the stamp and forces refresh.
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"root","version":"1.0.1","dependencies":{"lodash":"^4.17.0"}}"#,
+        )
+        .unwrap();
+        let post_changed = capture_root_manifest_stamp(root);
+        assert_eq!(
+            stable_discovery_root_manifest_stamp(pre, post_changed),
+            None
+        );
+        assert!(
+            should_refresh_workspace_target("root", false, false, None, root),
+            "unstable pre/post discovery stamp must force root workspace refresh"
+        );
+
+        // Edit after discovery mismatches the captured stable stamp and forces refresh.
+        assert!(
+            should_refresh_workspace_target("root", false, false, stable_stamp, root),
+            "post-discovery manifest change must force root workspace refresh"
+        );
+
+        // Non-root member skips root-stamp refresh unless it has devPreinstall.
+        assert!(!should_refresh_workspace_target(
+            "member", false, false, None, root
+        ));
+        assert!(should_refresh_workspace_target(
+            "member",
+            true,
+            false,
+            stable_stamp,
+            root
+        ));
     }
 }

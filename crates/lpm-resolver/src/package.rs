@@ -171,6 +171,91 @@ impl ResolverPackage {
             ResolverPackage::Npm { context, .. } => context.is_some(),
         }
     }
+
+    /// Compare two packages by their `Display` representation without allocating.
+    #[inline]
+    pub(crate) fn cmp_display(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (
+                ResolverPackage::Npm {
+                    name: a,
+                    context: None,
+                },
+                ResolverPackage::Npm {
+                    name: b,
+                    context: None,
+                },
+            ) => a.cmp(b),
+            _ => cmp_str_segments(self.display_segments(), other.display_segments()),
+        }
+    }
+
+    #[inline]
+    fn display_segments(&self) -> [&str; 7] {
+        match self {
+            ResolverPackage::Root => ["<root>", "", "", "", "", "", ""],
+            ResolverPackage::Lpm {
+                owner,
+                name,
+                context: None,
+            } => ["@lpm.dev/", owner.as_str(), ".", name.as_str(), "", "", ""],
+            ResolverPackage::Lpm {
+                owner,
+                name,
+                context: Some(ctx),
+            } => [
+                "@lpm.dev/",
+                owner.as_str(),
+                ".",
+                name.as_str(),
+                "[",
+                ctx.as_str(),
+                "]",
+            ],
+            ResolverPackage::Npm {
+                name,
+                context: None,
+            } => [name.as_str(), "", "", "", "", "", ""],
+            ResolverPackage::Npm {
+                name,
+                context: Some(ctx),
+            } => [name.as_str(), "[", ctx.as_str(), "]", "", "", ""],
+        }
+    }
+}
+
+fn cmp_str_segments(a: [&str; 7], b: [&str; 7]) -> std::cmp::Ordering {
+    let mut ai = 0usize;
+    let mut ao = 0usize;
+    let mut bi = 0usize;
+    let mut bo = 0usize;
+    loop {
+        while ai < a.len() && ao == a[ai].len() {
+            ai += 1;
+            ao = 0;
+        }
+        while bi < b.len() && bo == b[bi].len() {
+            bi += 1;
+            bo = 0;
+        }
+        match (ai < a.len(), bi < b.len()) {
+            (false, false) => return std::cmp::Ordering::Equal,
+            (false, true) => return std::cmp::Ordering::Less,
+            (true, false) => return std::cmp::Ordering::Greater,
+            (true, true) => {
+                let ra = &a[ai].as_bytes()[ao..];
+                let rb = &b[bi].as_bytes()[bo..];
+                let common = ra.len().min(rb.len());
+                match ra[..common].cmp(&rb[..common]) {
+                    std::cmp::Ordering::Equal => {
+                        ao += common;
+                        bo += common;
+                    }
+                    ord => return ord,
+                }
+            }
+        }
+    }
 }
 
 /// Canonical, context-free identity of a package.
@@ -255,6 +340,26 @@ impl CanonicalKey {
         }
         CanonicalKey::Npm {
             name: name.to_string(),
+        }
+    }
+
+    /// Compare two canonical keys by their `Display` representation without allocating.
+    #[inline]
+    pub(crate) fn cmp_display(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (CanonicalKey::Npm { name: a }, CanonicalKey::Npm { name: b }) => a.cmp(b),
+            _ => cmp_str_segments(self.display_segments(), other.display_segments()),
+        }
+    }
+
+    #[inline]
+    fn display_segments(&self) -> [&str; 7] {
+        match self {
+            CanonicalKey::Root => ["<root>", "", "", "", "", "", ""],
+            CanonicalKey::Lpm { owner, name } => {
+                ["@lpm.dev/", owner.as_str(), ".", name.as_str(), "", "", ""]
+            }
+            CanonicalKey::Npm { name } => [name.as_str(), "", "", "", "", "", ""],
         }
     }
 }
@@ -412,5 +517,57 @@ mod tests {
         // A split-context ResolverPackage must hit the SAME entry via its canonical key.
         let split = ResolverPackage::npm("lodash").with_context("parent");
         assert_eq!(map.get(&CanonicalKey::from(&split)), Some(&"flat"));
+    }
+
+    #[test]
+    fn cmp_display_matches_formatted_ordering_across_all_package_and_canonical_variants() {
+        let packages = vec![
+            ResolverPackage::Root,
+            ResolverPackage::npm("a"),
+            ResolverPackage::npm("a").with_context("b"),
+            ResolverPackage::npm("a").with_context("b[c]"),
+            ResolverPackage::npm("a-b"),
+            ResolverPackage::npm("a["),
+            ResolverPackage::npm("@a/b"),
+            ResolverPackage::npm("@lpm.dev/a"),
+            ResolverPackage::lpm("a", "b"),
+            ResolverPackage::lpm("a", "b").with_context("c"),
+            ResolverPackage::lpm("a", "bc"),
+            ResolverPackage::lpm("ab", "c"),
+            ResolverPackage::npm("@lpm.dev/a.b"),
+            ResolverPackage::npm("@types/node"),
+            ResolverPackage::npm("@types/node").with_context("ts"),
+        ];
+        for left in &packages {
+            for right in &packages {
+                assert_eq!(
+                    left.cmp_display(right),
+                    left.to_string().cmp(&right.to_string()),
+                    "ResolverPackage::cmp_display diverged for {left} vs {right}"
+                );
+            }
+        }
+
+        let canonicals = vec![
+            CanonicalKey::Root,
+            CanonicalKey::npm("a"),
+            CanonicalKey::npm("a-b"),
+            CanonicalKey::npm("@a/b"),
+            CanonicalKey::npm("@lpm.dev/a"),
+            CanonicalKey::lpm("a", "b"),
+            CanonicalKey::lpm("a", "bc"),
+            CanonicalKey::lpm("ab", "c"),
+            CanonicalKey::npm("@lpm.dev/a.b"),
+            CanonicalKey::npm("@types/node"),
+        ];
+        for left in &canonicals {
+            for right in &canonicals {
+                assert_eq!(
+                    left.cmp_display(right),
+                    left.to_string().cmp(&right.to_string()),
+                    "CanonicalKey::cmp_display diverged for {left} vs {right}"
+                );
+            }
+        }
     }
 }

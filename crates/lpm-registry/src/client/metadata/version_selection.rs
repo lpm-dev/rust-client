@@ -237,6 +237,115 @@ impl<'de> Visitor<'de> for VersionsSeed<'_> {
     }
 }
 
+pub(in crate::client) struct SingleVersionPackumentSeed {
+    pub(in crate::client) expected_name: String,
+    pub(in crate::client) target_version: String,
+}
+
+impl<'de> DeserializeSeed<'de> for SingleVersionPackumentSeed {
+    type Value = super::PackageMetadata;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for SingleVersionPackumentSeed {
+    type Value = super::PackageMetadata;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a cached package metadata document")
+    }
+
+    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+        let mut name_seen = false;
+        let mut description = None;
+        let mut modified = None;
+        let mut dist_tags = std::collections::HashMap::new();
+        let mut selected_version = None;
+        let mut published_at = None;
+        let mut downloads = None;
+        let mut distribution_mode = None;
+        let mut package_type = None;
+        let mut latest_version = None;
+        let mut ecosystem = None;
+
+        while let Some(field) = map.next_key_seed(StringSeed)? {
+            match field.as_ref() {
+                "name" => {
+                    if name_seen {
+                        return Err(M::Error::duplicate_field("name"));
+                    }
+                    name_seen = true;
+                    let actual = map.next_value_seed(StringSeed)?;
+                    if actual != self.expected_name {
+                        return Err(M::Error::custom(
+                            "cached packument name does not match requested package",
+                        ));
+                    }
+                }
+                "description" => description = map.next_value()?,
+                "modified" => modified = map.next_value()?,
+                "dist-tags" => dist_tags = map.next_value()?,
+                "versions" => {
+                    selected_version = map.next_value_seed(VersionsSeed {
+                        version: &self.target_version,
+                    })?;
+                }
+                "time" => {
+                    published_at = map.next_value_seed(PublicationTimeSeed {
+                        version: &self.target_version,
+                    })?;
+                }
+                "downloads" => downloads = map.next_value()?,
+                "distributionMode" => distribution_mode = map.next_value()?,
+                "packageType" => package_type = map.next_value()?,
+                "latestVersion" => latest_version = map.next_value()?,
+                "ecosystem" => ecosystem = map.next_value()?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+
+        if !name_seen {
+            return Err(M::Error::missing_field("name"));
+        }
+        let manifest = selected_version
+            .ok_or_else(|| M::Error::custom("requested version is absent from cached packument"))?;
+        if manifest.name != self.expected_name || manifest.version != self.target_version {
+            return Err(M::Error::custom(
+                "cached version manifest identity does not match requested version",
+            ));
+        }
+
+        let mut versions = std::collections::HashMap::with_capacity(1);
+        versions.insert(self.target_version.clone(), manifest);
+        let mut time = std::collections::HashMap::new();
+        if let Some(timestamp) = published_at {
+            time.insert(self.target_version, timestamp);
+        }
+
+        Ok(super::PackageMetadata {
+            name: self.expected_name,
+            description,
+            modified,
+            dist_tags,
+            versions,
+            time,
+            downloads,
+            distribution_mode,
+            package_type,
+            latest_version,
+            latest_hint: Default::default(),
+            ecosystem,
+        })
+    }
+}
+
 pub(super) struct StringSeed;
 
 impl<'de> DeserializeSeed<'de> for StringSeed {
