@@ -359,12 +359,24 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "moves a corrupt CAS entry to a randomized quarantine path without rewriting its contents",
     ),
     (
+        "crates/lpm-store/src/gc.rs::retire_store_entry",
+        "moves an unreferenced or expired store directory to a fresh randomized `.gc-retiring.` sibling under the publication lock so subtree removal can run outside the lock without clobbering live entries",
+    ),
+    (
         "crates/lpm-store/src/v3/cas.rs::ensure_materialized_entry",
         "publishes a complete materialized tree from a randomized private staging directory",
     ),
     (
-        "crates/lpm-store/src/v3/cas.rs::replace_with_hardlink",
-        "swaps a duplicate object file for its validated CAS hardlink with a randomized rollback backup",
+        "crates/lpm-store/src/v3/cas.rs::stage",
+        "moves a duplicate object file aside to a randomized rollback backup before hardlinking the CAS blob into its path",
+    ),
+    (
+        "crates/lpm-store/src/v3/cas.rs::rollback",
+        "restores a duplicate object file from its randomized rollback backup when CAS blob validation fails",
+    ),
+    (
+        "crates/lpm-store/src/v3/cas.rs::drop",
+        "restores a duplicate object file from its randomized rollback backup if validation exits early without committing",
     ),
 ];
 
