@@ -3753,6 +3753,7 @@ process.exit(printed.status === null ? 1 : printed.status);
 
     let run = lpm(&project)
         .env("LPM_TEST_BIN", support::lpm_binary())
+        .env("LPM_REMOTE_CACHE_URL", project_remote_cache_url(&project))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["run", "build"])
@@ -3814,6 +3815,7 @@ async fn a_task_after_one_run_with_personal_overrides_never_uses_the_remote_cach
         .success();
 
     let run = lpm(&project)
+        .env("LPM_REMOTE_CACHE_URL", project_remote_cache_url(&project))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["run", "build", "--filter", "@test/app"])
@@ -8170,8 +8172,21 @@ async fn artifact_requests(server: &MockServer, verb: &str) -> usize {
         .count()
 }
 
+/// The remote cache URL the project's `lpm.json` names, if it names one.
+fn configured_remote_cache_url(project: &TempProject) -> Option<String> {
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(project.path().join("lpm.json")).ok()?)
+            .ok()?;
+    config["remoteCache"]["url"].as_str().map(str::to_owned)
+}
+
 fn run_with_remote_cache(project: &TempProject, args: &[&str]) -> std::process::Output {
-    let output = lpm(project)
+    let mut command = lpm(project);
+    // LPM sends the token only to the host LPM_REMOTE_CACHE_URL names.
+    if let Some(url) = configured_remote_cache_url(project) {
+        command.env("LPM_REMOTE_CACHE_URL", url);
+    }
+    let output = command
         .env("LPM_TEST_BIN", support::lpm_binary())
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
@@ -8551,6 +8566,7 @@ async fn a_script_run_by_its_name_leaves_no_marker_behind() {
         .env("TMP", &temp)
         .env("TEMP", &temp)
         .env("LPM_TEST_BIN", support::lpm_binary())
+        .env("LPM_REMOTE_CACHE_URL", project_remote_cache_url(&project))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["gen"])
@@ -8702,6 +8718,7 @@ async fn a_relative_temporary_directory_still_reports_to_the_task_s_marker() {
         .env("TMP", "tmp")
         .env("TEMP", "tmp")
         .env("LPM_TEST_BIN", support::lpm_binary())
+        .env("LPM_REMOTE_CACHE_URL", project_remote_cache_url(&project))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["run", "gen"])
@@ -9154,6 +9171,7 @@ waitFor('finish');
     let mut running = support::lpm_spawnable(&project);
     running
         .env("LPM_TEST_BIN", support::lpm_binary())
+        .env("LPM_REMOTE_CACHE_URL", project_remote_cache_url(&project))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["run", "gen"]);
@@ -9192,6 +9210,7 @@ waitFor('finish');
     );
     lpm(&project)
         .env("LPM_TEST_BIN", support::lpm_binary())
+        .env("LPM_REMOTE_CACHE_URL", project_remote_cache_url(&project))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["run", "gen"])
@@ -9241,6 +9260,7 @@ fs.writeFileSync(pause + '.go', '');
             format!("staging:{}", pause.display()),
         )
         .env("LPM_TEST_BIN", support::lpm_binary())
+        .env("LPM_REMOTE_CACHE_URL", project_remote_cache_url(&project))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["run", "gen"])
@@ -9425,6 +9445,7 @@ fs.writeFileSync({done}, '');
     project.write_file("arm-late", "");
     let held = lpm_spawnable(&project)
         .env("LPM_TEST_BIN", support::lpm_binary())
+        .env("LPM_REMOTE_CACHE_URL", project_remote_cache_url(&project))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .env(
@@ -9514,6 +9535,7 @@ fs.writeFileSync(pause + '.go', '');
             format!("stored:{}", pause.display()),
         )
         .env("LPM_TEST_BIN", support::lpm_binary())
+        .env("LPM_REMOTE_CACHE_URL", project_remote_cache_url(&project))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["run", "build"])
