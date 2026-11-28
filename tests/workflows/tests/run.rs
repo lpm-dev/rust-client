@@ -9350,6 +9350,7 @@ fs.writeFileSync(pause + '.go', '');
             format!("staging:{}", pause.display()),
         )
         .env("LPM_TEST_BIN", support::lpm_binary())
+        .env("LPM_REMOTE_CACHE_URL", project_remote_cache_url(&project))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["run", "gen"])
@@ -9426,6 +9427,7 @@ fs.writeFileSync({done}, '');
     project.write_file("arm-late", "");
     let held = lpm_spawnable(&project)
         .env("LPM_TEST_BIN", support::lpm_binary())
+        .env("LPM_REMOTE_CACHE_URL", project_remote_cache_url(&project))
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .env(
