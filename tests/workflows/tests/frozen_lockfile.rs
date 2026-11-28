@@ -923,3 +923,85 @@ fn frozen_workspace_preflight_rejects_drifted_member_before_running_root_dev_pre
         "frozen preflight must reject manifest drift before running sibling postinstall"
     );
 }
+
+#[test]
+fn frozen_workspace_preflight_rejects_peer_rules_and_overrides_drift_before_hooks() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "workspace-frozen-policy-drift-preflight",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"],
+            "scripts": {
+                "pnpm:devPreinstall": "node -e \"require('fs').writeFileSync('root-dev-preinstall.marker', 'ran')\""
+            }
+        }"#,
+    );
+    project.write_file(
+        "packages/member-a/package.json",
+        &serde_json::json!({
+            "name": "member-a",
+            "version": "1.0.0",
+            "scripts": {
+                "pnpm:devPreinstall": "node -e \"require('fs').writeFileSync('../../member-dev-preinstall.marker', 'ran')\""
+            }
+        })
+        .to_string(),
+    );
+
+    install_workspace_once(&project);
+    let root_marker = project.path().join("root-dev-preinstall.marker");
+    let member_marker = project.path().join("member-dev-preinstall.marker");
+    assert!(
+        root_marker.exists() && member_marker.exists(),
+        "initial workspace install must run pnpm:devPreinstall hooks so marker assertions are non-vacuous"
+    );
+    let _ = std::fs::remove_file(&root_marker);
+    let _ = std::fs::remove_file(&member_marker);
+
+    // Change only `lpm.peerDependencyRules` (not the 4 dependency maps).
+    project.write_file(
+        "packages/member-a/package.json",
+        &serde_json::json!({
+            "name": "member-a",
+            "version": "1.0.0",
+            "lpm": {
+                "peerDependencyRules": {
+                    "ignoreMissing": ["react"]
+                }
+            },
+            "scripts": {
+                "pnpm:devPreinstall": "node -e \"require('fs').writeFileSync('../../member-dev-preinstall.marker', 'ran')\""
+            }
+        })
+        .to_string(),
+    );
+
+    let output = lpm(&project)
+        .args([
+            "install",
+            "--frozen-lockfile",
+            "--no-skills",
+            "--no-security-summary",
+        ])
+        .output()
+        .expect("failed to run frozen workspace install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "frozen workspace install must fail on peerDependencyRules drift:\nstdout: {}\nstderr: {stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        stderr.contains("peer dependency rules") || stderr.contains("Frozen lockfile mismatch"),
+        "expected frozen peer dependency rules mismatch error, got: {stderr}"
+    );
+    assert!(
+        !root_marker.exists(),
+        "frozen preflight must reject peerDependencyRules drift before running root pnpm:devPreinstall"
+    );
+    assert!(
+        !member_marker.exists(),
+        "frozen preflight must reject peerDependencyRules drift before running member pnpm:devPreinstall"
+    );
+}

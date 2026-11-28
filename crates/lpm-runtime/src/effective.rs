@@ -389,9 +389,16 @@ impl PathNodeVersionCache {
         }
 
         let executable_final = node_executable_in_path(cwd, path);
+        let identity_before = executable_final
+            .as_deref()
+            .and_then(|executable| path_node_identity(executable, cwd, path, managed_node_root));
         let version = node_version_on_path(cwd, path, executable_final.as_deref());
+        let identity_after = node_executable_in_path(cwd, path)
+            .as_deref()
+            .and_then(|executable| path_node_identity(executable, cwd, path, managed_node_root));
+        let is_stable = identity_before.is_some() && identity_after == identity_before;
         PathNodeResolution {
-            version,
+            version: is_stable.then_some(version).flatten(),
             runtime_fingerprint: None,
             executable: executable_final,
         }
@@ -1557,6 +1564,46 @@ mod tests {
             resolved.version(),
             Some("22.0.0"),
             "probe must not return the known-stale second version after double replacement"
+        );
+        assert_eq!(resolved.runtime_fingerprint(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_node_probe_returns_unknown_when_final_attempt_still_churns() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_path = test_node_path(dir.path());
+        let v2_path = dir.path().join("node.v2");
+        let v3_path = dir.path().join("node.v3");
+        let v4_path = dir.path().join("node.v4");
+        write_test_executable(&v4_path, b"#!/bin/sh\necho v23.0.0\n");
+        let v3_script = format!(
+            "#!/bin/sh\nmv '{}' '{}'\necho v22.0.0\n",
+            v4_path.display(),
+            node_path.display(),
+        );
+        write_test_executable(&v3_path, v3_script.as_bytes());
+        let v2_script = format!(
+            "#!/bin/sh\nmv '{}' '{}'\necho v21.0.0\n",
+            v3_path.display(),
+            node_path.display(),
+        );
+        write_test_executable(&v2_path, v2_script.as_bytes());
+        let v1_script = format!(
+            "#!/bin/sh\nmv '{}' '{}'\necho v20.0.0\n",
+            v2_path.display(),
+            node_path.display(),
+        );
+        write_test_executable(&node_path, v1_script.as_bytes());
+
+        let path =
+            std::env::join_paths([dir.path(), Path::new("/bin"), Path::new("/usr/bin")]).unwrap();
+        let cache = PathNodeVersionCache::default();
+        let resolved = cache.resolve_with_observed_shared(dir.path(), &path, None);
+        assert_eq!(
+            resolved.version(),
+            None,
+            "final probe attempt must reject a version whose binary was replaced mid-probe"
         );
         assert_eq!(resolved.runtime_fingerprint(), None);
     }

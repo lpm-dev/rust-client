@@ -272,8 +272,14 @@ pub(crate) async fn run_recursive_workspace_install(
                             .map(|package| (target.importer.as_str(), package))
                     })
                     .collect();
-                workspace_lockfile_coordinator
-                    .validate_frozen_preflight_for_targets(&target_manifests)?;
+                let global_auto_install_peers = crate::commands::config::GlobalConfig::load_checked()
+                    .ok()
+                    .and_then(|config| config.get_bool("auto-install-peers"));
+                workspace_lockfile_coordinator.validate_frozen_preflight_for_targets(
+                    &workspace.root_package,
+                    &target_manifests,
+                    global_auto_install_peers,
+                )?;
             }
         }
         let workspace_project_state_coordinator =

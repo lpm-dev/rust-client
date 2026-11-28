@@ -433,11 +433,13 @@ impl WorkspaceLockfileCoordinator {
     }
 
     /// Run structural frozen-lockfile preflight once and verify that every
-    /// selected workspace target is present in `lpm.lock` with matching
-    /// declared dependency maps before scheduling any member or root hooks.
+    /// selected workspace target is present in `lpm.lock` with a matching
+    /// manifest importer snapshot before scheduling any member or root hooks.
     pub(super) fn validate_frozen_preflight_for_targets(
         &self,
+        workspace_root: &lpm_workspace::PackageJson,
         targets: &[(&str, &lpm_workspace::PackageJson)],
+        global_auto_install_peers: Option<bool>,
     ) -> Result<(), LpmError> {
         self.validate_frozen_preflight()?;
         let non_persisting = self
@@ -466,50 +468,15 @@ impl WorkspaceLockfileCoordinator {
                     "workspace importer {importer:?} is missing from lpm.lock in frozen mode. Run `lpm install` to update lpm.lock."
                 )));
             };
-            if let Some((section, name)) = Self::first_declared_dependency_drift(package, locked) {
-                return Err(LpmError::Registry(format!(
-                    "Frozen lockfile mismatch\n  importer    {importer}\n  {section}  {name}\n  hint        run `lpm install` locally and commit lpm.lock, or pass --no-frozen-lockfile"
-                )));
-            }
+            super::validation::validate_frozen_importer_manifest_preflight(
+                importer,
+                package,
+                workspace_root,
+                locked,
+                global_auto_install_peers,
+            )?;
         }
         Ok(())
-    }
-
-    fn first_declared_dependency_drift<'a>(
-        package: &'a lpm_workspace::PackageJson,
-        locked: &'a lpm_lockfile::ImporterSnapshot,
-    ) -> Option<(&'static str, &'a str)> {
-        let sections = [
-            ("dependencies", &package.dependencies, &locked.dependencies),
-            (
-                "devDependencies",
-                &package.dev_dependencies,
-                &locked.dev_dependencies,
-            ),
-            (
-                "optionalDependencies",
-                &package.optional_dependencies,
-                &locked.optional_dependencies,
-            ),
-            (
-                "peerDependencies",
-                &package.peer_dependencies,
-                &locked.peer_dependencies,
-            ),
-        ];
-        for (section, manifest, lock) in sections {
-            for (name, spec) in manifest {
-                if lock.get(name) != Some(spec) {
-                    return Some((section, name.as_str()));
-                }
-            }
-            for name in lock.keys() {
-                if !manifest.contains_key(name) {
-                    return Some((section, name.as_str()));
-                }
-            }
-        }
-        None
     }
 
     /// Verify that all required importers and staged lockfile projections satisfy
