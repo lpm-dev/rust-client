@@ -3796,15 +3796,13 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
     }
 }
 
-#[tokio::test]
-async fn install_fetch_overlap_threshold_one_keeps_install_output_authoritative() {
-    let mock = MockRegistry::start().await;
-    mount_ms_2_1_3(&mock).await;
-
-    let project = TempProject::empty(
-        r#"{"name":"fetch-overlap-install","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
-    );
-    let output = lpm_with_registry(&project, &mock.url())
+/// `lpm install --json` with fetch overlap admitted from one selection,
+/// checked to succeed and to install `ms`; its JSON envelope.
+fn install_with_overlap_from_one_selection(
+    project: &TempProject,
+    registry: &str,
+) -> serde_json::Value {
+    let output = lpm_with_registry(project, registry)
         .env("LPM_STORE_VERSION", "v2")
         .env("LPM_TIMING_DETAIL", "1")
         .env("LPM_FETCH_OVERLAP_MIN_SELECTED", "1")
@@ -3822,9 +3820,12 @@ async fn install_fetch_overlap_threshold_one_keeps_install_output_authoritative(
         project.file_exists("node_modules/ms/package.json"),
         "install output must still be driven by the final resolved package graph"
     );
+    serde_json::from_str(&stdout).expect("install --json must emit parseable JSON")
+}
 
-    let envelope: serde_json::Value =
-        serde_json::from_str(&stdout).expect("install --json must emit parseable JSON");
+/// The overlap counters of an install's envelope, after checking it saw the
+/// selection, took the package and failed no task.
+fn admitted_overlap(envelope: &serde_json::Value) -> &serde_json::Map<String, serde_json::Value> {
     let overlap = envelope["timing"]["detail"]["fetch"]["overlap"]
         .as_object()
         .unwrap_or_else(|| panic!("timing.detail.fetch.overlap missing; got {envelope:#}"));
@@ -3834,18 +3835,28 @@ async fn install_fetch_overlap_threshold_one_keeps_install_output_authoritative(
             .is_some_and(|count| count >= 1),
         "forced overlap admission should observe at least one resolver selection; got {overlap:#?}"
     );
+    // The overlap fetches the package, or finds it stored once its task
+    // starts after the install's own fetch, as a loaded runner can order
+    // them. Either way it took it.
+    let taken = ["dispatched_count", "cache_hit_count"]
+        .iter()
+        .filter_map(|count| overlap[*count].as_u64())
+        .sum::<u64>();
     assert!(
-        overlap["dispatched_count"]
-            .as_u64()
-            .is_some_and(|count| count >= 1),
-        "forced overlap admission should dispatch at least one early fetch; got {overlap:#?}"
+        taken >= 1,
+        "forced overlap admission should fetch the package early, or find it stored; got {overlap:#?}"
     );
     assert_eq!(
         overlap["failed_count"].as_u64(),
         Some(0),
         "early fetch overlap must fall back cleanly without task failures; got {overlap:#?}"
     );
+    overlap
+}
 
+/// The install's own counts and timings describe its authoritative fetches
+/// alone, and the overlap's tasks are timed apart.
+fn assert_install_output_is_authoritative(envelope: &serde_json::Value) {
     let downloaded = envelope["downloaded"]
         .as_u64()
         .unwrap_or_else(|| panic!("downloaded must be numeric; got {envelope:#}"));
@@ -3857,7 +3868,7 @@ async fn install_fetch_overlap_threshold_one_keeps_install_output_authoritative(
         .unwrap_or_else(|| panic!("count must be numeric; got {envelope:#}"));
     let fetch_breakdown = &envelope["timing"]["fetch_breakdown"];
     let detail_breakdown = &envelope["timing"]["detail"]["fetch"]["breakdown"];
-    let overlap_breakdown = &envelope["timing"]["detail"]["fetch"]["overlap"]["breakdown"];
+    let overlap = &envelope["timing"]["detail"]["fetch"]["overlap"];
     assert_eq!(
         cached + downloaded,
         package_count,
@@ -3874,10 +3885,54 @@ async fn install_fetch_overlap_threshold_one_keeps_install_output_authoritative(
         "detail fetch breakdown must mirror authoritative fetch task count; got {envelope:#}"
     );
     assert_eq!(
-        overlap_breakdown["task_count"].as_u64(),
+        overlap["breakdown"]["task_count"].as_u64(),
         overlap["completed_count"].as_u64(),
         "overlap breakdown must carry early fetch task timings separately; got {envelope:#}"
     );
+}
+
+#[tokio::test]
+async fn install_fetch_overlap_threshold_one_keeps_install_output_authoritative() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+    let project = TempProject::empty(
+        r#"{"name":"fetch-overlap-install","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+
+    let envelope = install_with_overlap_from_one_selection(&project, &mock.url());
+
+    admitted_overlap(&envelope);
+    assert_install_output_is_authoritative(&envelope);
+}
+
+#[tokio::test]
+async fn install_fetch_overlap_threshold_one_takes_a_stored_package_from_the_store() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+    let project = TempProject::empty(
+        r#"{"name":"fetch-overlap-install","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+    install_with_overlap_from_one_selection(&project, &mock.url());
+    std::fs::remove_dir_all(project.path().join("node_modules")).expect("remove node_modules");
+    std::fs::remove_file(project.path().join(lpm_lockfile::LOCKFILE_NAME))
+        .expect("remove the lockfile");
+
+    let envelope = install_with_overlap_from_one_selection(&project, &mock.url());
+
+    let overlap = admitted_overlap(&envelope);
+    assert_eq!(
+        overlap["dispatched_count"].as_u64(),
+        Some(0),
+        "a stored package is never fetched early; got {overlap:#?}"
+    );
+    assert!(
+        overlap["cache_hit_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "the overlap takes a stored package from the store; got {overlap:#?}"
+    );
+    assert_eq!(envelope["downloaded"].as_u64(), Some(0), "got {envelope:#}");
+    assert_install_output_is_authoritative(&envelope);
 }
 
 #[tokio::test]
@@ -11783,18 +11838,24 @@ async fn install_fetch_overlap_skips_auth_bearing_custom_registry_tarballs() {
 }
 
 #[tokio::test]
-async fn install_fetch_overlap_dispatches_credentialed_npm_registry_tarballs() {
+async fn install_fetch_overlap_never_skips_npm_registry_tarballs_for_their_credentials() {
     let (overlap, tarball_requests) = credentialed_registry_overlap_install(true).await;
     assert_eq!(
         overlap["skipped_auth_count"].as_u64(),
         Some(0),
         "the public npm registry is not a private mirror; got {overlap:#}"
     );
-    let early_handled = overlap["dispatched_count"].as_u64().unwrap_or(0)
-        + overlap["cache_hit_count"].as_u64().unwrap_or(0);
+    // Which fetch gets the tarball first is the scheduler's to say: the
+    // overlap's, or the install's own, which the overlap then finds stored,
+    // before it dispatches the package or once its task starts. Either way
+    // the overlap took it.
+    let taken = ["dispatched_count", "cache_hit_count"]
+        .iter()
+        .filter_map(|count| overlap[count].as_u64())
+        .sum::<u64>();
     assert!(
-        early_handled >= 1,
-        "credentialed npm registry selections must overlap resolution; got {overlap:#}"
+        taken >= 1,
+        "the overlap fetches the npm registry's tarball, or finds it stored; got {overlap:#}"
     );
     assert_eq!(tarball_requests.len(), 1);
     assert_eq!(
