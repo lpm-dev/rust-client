@@ -5915,6 +5915,9 @@ struct CacheWarmOverlapResult {
 #[derive(Clone, Copy)]
 enum CacheWarmFixtureSeed {
     Cold,
+    /// Cold, with the required root answering late, so the optional
+    /// parent's edge reaches the shared child before the required chain's.
+    ColdOptionalFirst,
     RequiredChain,
     Complete,
 }
@@ -5967,15 +5970,26 @@ async fn resolve_deep_required_and_shallow_optional_overlap(
         ("middle", middle.clone(), required_chain_seeded),
         ("shared-child", shared_child.clone(), fully_seeded),
     ] {
-        let mock = Mock::given(method("GET"))
-            .and(path(format!("/{name}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(metadata));
-        let mock = if name == "shared-child" && !fully_seeded {
-            mock.expect(1..=2)
+        // A fetch for a range keeps the versions in it. The required chain's
+        // ~1.1.1 keeps 1.1.1 alone, so the optional parent's ^1.1.1 fetches
+        // again; ^1.1.1 first keeps both. Until the shared child is cached,
+        // whichever edge reaches it first decides, and that's the scheduler's
+        // to say.
+        let requests: wiremock::Times = if name == "shared-child" && !fully_seeded {
+            (1..=2).into()
         } else {
-            mock.expect(u64::from(!seeded))
+            u64::from(!seeded).into()
         };
-        mock.mount(&server).await;
+        let mut response = ResponseTemplate::new(200).set_body_json(metadata);
+        if name == "a-required-parent" && matches!(seed, CacheWarmFixtureSeed::ColdOptionalFirst) {
+            response = response.set_delay(std::time::Duration::from_millis(300));
+        }
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(response)
+            .expect(requests)
+            .mount(&server)
+            .await;
     }
 
     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
@@ -6053,53 +6067,48 @@ async fn resolve_deep_required_and_shallow_optional_overlap(
     }
 }
 
+/// The deep overlap resolved cold, cold with the optional edge first, with
+/// the required chain seeded, and fully seeded.
+async fn resolve_deep_overlap_every_way() -> [CacheWarmOverlapResult; 4] {
+    [
+        resolve_deep_required_and_shallow_optional_overlap(CacheWarmFixtureSeed::Cold).await,
+        resolve_deep_required_and_shallow_optional_overlap(CacheWarmFixtureSeed::ColdOptionalFirst)
+            .await,
+        resolve_deep_required_and_shallow_optional_overlap(CacheWarmFixtureSeed::RequiredChain)
+            .await,
+        resolve_deep_required_and_shallow_optional_overlap(CacheWarmFixtureSeed::Complete).await,
+    ]
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn fusion_deep_overlap_selection_is_independent_of_shared_cache_warmth() {
-    let cold = resolve_deep_required_and_shallow_optional_overlap(CacheWarmFixtureSeed::Cold).await;
-    let partially_seeded =
-        resolve_deep_required_and_shallow_optional_overlap(CacheWarmFixtureSeed::RequiredChain)
-            .await;
-    let fully_seeded =
-        resolve_deep_required_and_shallow_optional_overlap(CacheWarmFixtureSeed::Complete).await;
+    let [cold, others @ ..] = resolve_deep_overlap_every_way().await;
+    let selection = |run: &CacheWarmOverlapResult| {
+        (
+            run.required_parent_child.clone(),
+            run.optional_parent_child.clone(),
+        )
+    };
 
     assert_eq!(
-        [
-            (
-                partially_seeded.required_parent_child,
-                partially_seeded.optional_parent_child,
-            ),
-            (
-                fully_seeded.required_parent_child,
-                fully_seeded.optional_parent_child,
-            ),
-        ],
-        [
-            (
-                cold.required_parent_child.clone(),
-                cold.optional_parent_child.clone(),
-            ),
-            (cold.required_parent_child, cold.optional_parent_child),
-        ],
-        "shared-cache warmth must not change overlapping transitive selections"
+        others.each_ref().map(selection),
+        [selection(&cold), selection(&cold), selection(&cold)],
+        "neither shared-cache warmth nor which edge reaches the shared child first may change overlapping transitive selections"
     );
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn fusion_required_reachability_is_independent_of_shared_cache_warmth() {
-    let cold = resolve_deep_required_and_shallow_optional_overlap(CacheWarmFixtureSeed::Cold).await;
-    let partially_seeded =
-        resolve_deep_required_and_shallow_optional_overlap(CacheWarmFixtureSeed::RequiredChain)
-            .await;
-    let fully_seeded =
-        resolve_deep_required_and_shallow_optional_overlap(CacheWarmFixtureSeed::Complete).await;
+    let [cold, others @ ..] = resolve_deep_overlap_every_way().await;
 
     assert_eq!(
+        others.map(|run| run.shared_versions),
         [
-            partially_seeded.shared_versions,
-            fully_seeded.shared_versions
+            cold.shared_versions.clone(),
+            cold.shared_versions.clone(),
+            cold.shared_versions,
         ],
-        [cold.shared_versions.clone(), cold.shared_versions],
-        "shared-cache warmth must not change required versus optional reachability"
+        "neither shared-cache warmth nor which edge reaches the shared child first may change required versus optional reachability"
     );
 }
 
