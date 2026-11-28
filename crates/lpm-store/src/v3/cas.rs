@@ -4,7 +4,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(any(test, not(any(unix, windows))))]
+use std::time::UNIX_EPOCH;
+#[cfg(test)]
+use std::time::{Duration, SystemTime};
 
 use lpm_common::{FileIdentity, LpmError, write_file_atomic};
 use lpm_extractor::ExtractedFileStamp;
@@ -34,6 +37,7 @@ const MAX_VALIDATED_BLOBS: usize = 65_536;
 /// settled past coarse OS filesystem timestamp granularity (Linux HZ ticks and
 /// Windows 15.6 ms system clock). Blobs newer than this margin rehash on dedup
 /// hits so same-tick in-place tampering cannot bypass repair.
+#[cfg(test)]
 const SETTLED_BLOB_MTIME_MARGIN: Duration = Duration::from_millis(50);
 
 /// Allocation-free identity for a CAS blob file `(blake3_digest, normalized_mode)`.
@@ -472,7 +476,13 @@ impl FileCas {
             )));
         }
         let source = object_root.join(relative_path);
-        let (file_size, mode, identity, live_stamp) = inspect_registry_source_file(&source)?;
+        let InspectedRegistrySourceFile {
+            file_size,
+            mode,
+            identity,
+            live_stamp,
+            fingerprint: inspected_fp,
+        } = inspect_registry_source_file(&source)?;
         if expected_size.is_some_and(|expected| file_size != expected) {
             return Err(LpmError::Store(format!(
                 "extracted v3 CAS entry changed before publication at {}",
@@ -494,7 +504,9 @@ impl FileCas {
             (expected_stamp, live_stamp),
             (Some(expected), Some(live)) if expected == live
         );
-        if !stamp_matches {
+        let expected_source_fp = if stamp_matches {
+            inspected_fp
+        } else {
             let (mut file, open_meta) = open_regular_file_nofollow(&source).map_err(|error| {
                 LpmError::Store(format!(
                     "failed to open extracted v3 CAS entry {}: {error}",
@@ -511,6 +523,10 @@ impl FileCas {
                     source.display()
                 )));
             }
+            #[cfg(windows)]
+            let pre_hash_fp = BlobStatFingerprint::from_open_file(&source, &file)?;
+            #[cfg(not(windows))]
+            let pre_hash_fp = BlobStatFingerprint::from_metadata(&open_meta);
             let actual_digest = hash_open_file_bytes(&mut file, &source, &mut ingest.hash_buffer)?;
             if actual_digest != digest {
                 return Err(LpmError::Store(format!(
@@ -518,7 +534,24 @@ impl FileCas {
                     source.display()
                 )));
             }
-        }
+            #[cfg(windows)]
+            let post_hash_fp = BlobStatFingerprint::from_open_file(&source, &file)?;
+            #[cfg(not(windows))]
+            let post_hash_fp =
+                BlobStatFingerprint::from_metadata(&file.metadata().map_err(|error| {
+                    LpmError::Store(format!(
+                        "failed to re-inspect extracted v3 CAS entry {}: {error}",
+                        source.display()
+                    ))
+                })?);
+            if post_hash_fp != pre_hash_fp {
+                return Err(LpmError::Store(format!(
+                    "extracted v3 CAS entry changed during fallback hash at {}",
+                    source.display()
+                )));
+            }
+            post_hash_fp
+        };
         let compact_id = CompactBlobId::from_raw(digest, mode, file_size);
         let key = BlobKey {
             digest: blake3::Hash::from_bytes(digest).to_hex().to_string(),
@@ -530,7 +563,7 @@ impl FileCas {
             &key,
             &mut ingest.hash_buffer,
             FirstPublishTrust::DeferUntilFinalized,
-            identity,
+            Some(expected_source_fp),
         )?;
         ingest.blob_stats.insert(compact_id, published.fingerprint);
         if published.deferred_validation {
@@ -850,7 +883,6 @@ impl FileCas {
                     && open.record.tree_digest == record.tree_digest
                     && open.record.blob_stat_fingerprint == observed_fingerprint
             }) {
-                self.record_validated_blobs_batch(&keys, &observed_stats);
                 return Ok(SourceReuseStatus::Reusable);
             }
         }
@@ -1449,8 +1481,6 @@ impl FileCas {
                         LpmError::Store("v3 CAS file entry is missing its blob key".into())
                     })?;
                     let blob = self.blob_path(key)?;
-                    let pre_fp = self.read_blob_stat(key)?;
-                    let prior_validated = self.cached_validated_blob(key);
                     if let Some(parent) = path.parent() {
                         fs::create_dir_all(parent).map_err(|error| {
                             LpmError::Store(format!(
@@ -1466,31 +1496,21 @@ impl FileCas {
                             path.display()
                         ))
                     })?;
-                    let fast_path_post = prior_validated.and_then(|cached| {
-                        (pre_fp == cached && cached.is_settled())
-                            .then(|| self.read_path_stat_as_blob(&path, key).ok())
-                            .flatten()
-                            .filter(|post_fp| post_fp.is_hardlink_only_transition_from(pre_fp))
-                    });
-                    if let Some(post_fp) = fast_path_post {
-                        self.record_validated_blob(key, post_fp);
-                    } else {
-                        if hash_buffer.is_empty() {
-                            hash_buffer.resize(64 * 1024, 0);
-                        }
-                        match self.validate_blob(&path, key, &mut hash_buffer) {
-                            Ok(validated) => self.record_validated_blob(key, validated),
-                            Err(ValidateBlobError::Contended(error)) => return Err(*error),
-                            Err(ValidateBlobError::Corrupt {
-                                error,
-                                bad_identity,
-                            }) => {
-                                self.evict_validated_blob(key);
-                                if self.blob_matches_bad_identity(&blob, bad_identity) {
-                                    self.quarantine_entry(&blob, "blobs")?;
-                                }
-                                return Err(*error);
+                    if hash_buffer.is_empty() {
+                        hash_buffer.resize(64 * 1024, 0);
+                    }
+                    match self.validate_blob(&path, key, &mut hash_buffer) {
+                        Ok(validated) => self.record_validated_blob(key, validated),
+                        Err(ValidateBlobError::Contended(error)) => return Err(*error),
+                        Err(ValidateBlobError::Corrupt {
+                            error,
+                            bad_identity,
+                        }) => {
+                            self.evict_validated_blob(key);
+                            if self.blob_matches_bad_identity(&blob, bad_identity) {
+                                self.quarantine_entry(&blob, "blobs")?;
                             }
+                            return Err(*error);
                         }
                     }
                 }
@@ -1878,11 +1898,30 @@ impl FileCas {
                 source.display()
             ))
         })?;
-        let source_identity = file_identity_from_open_file(source, &file, &open_meta)?;
+        #[cfg(windows)]
+        let pre_hash_fp = BlobStatFingerprint::from_open_file(source, &file)?;
+        #[cfg(not(windows))]
+        let pre_hash_fp = BlobStatFingerprint::from_metadata(&open_meta);
         let raw_digest = hash_open_file_bytes(&mut file, source, hash_buffer)?;
         let mode = normalized_mode(metadata);
         let size = metadata.len();
         if open_meta.len() != size || normalized_mode(&open_meta) != mode {
+            return Err(LpmError::Store(format!(
+                "v3 CAS source file changed while hashing {}",
+                source.display()
+            )));
+        }
+        #[cfg(windows)]
+        let post_hash_fp = BlobStatFingerprint::from_open_file(source, &file)?;
+        #[cfg(not(windows))]
+        let post_hash_fp =
+            BlobStatFingerprint::from_metadata(&file.metadata().map_err(|error| {
+                LpmError::Store(format!(
+                    "failed to re-inspect v3 CAS source file {}: {error}",
+                    source.display()
+                ))
+            })?);
+        if post_hash_fp != pre_hash_fp {
             return Err(LpmError::Store(format!(
                 "v3 CAS source file changed while hashing {}",
                 source.display()
@@ -1899,7 +1938,7 @@ impl FileCas {
             &key,
             hash_buffer,
             FirstPublishTrust::Verified,
-            source_identity,
+            Some(post_hash_fp),
         )?;
         Ok((key, compact_id, published.fingerprint))
     }
@@ -1907,26 +1946,6 @@ impl FileCas {
     fn record_validated_blob(&self, key: &BlobKey, fingerprint: BlobStatFingerprint) {
         if let Some(id) = CompactBlobId::try_from_key(key) {
             self.record_validated_blob_id(id, fingerprint);
-        }
-    }
-
-    fn record_validated_blobs_batch(
-        &self,
-        keys: &[&BlobKey],
-        observed_stats: &[Option<BlobStatFingerprint>],
-    ) {
-        let mut guard = self
-            .validated_blobs
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (key, maybe_fp) in keys.iter().zip(observed_stats.iter().copied()) {
-            let (Some(id), Some(fingerprint)) = (CompactBlobId::try_from_key(key), maybe_fp) else {
-                continue;
-            };
-            if guard.len() >= MAX_VALIDATED_BLOBS && !guard.contains_key(&id) {
-                guard.clear();
-            }
-            guard.insert(id, fingerprint);
         }
     }
 
@@ -1981,7 +2000,7 @@ impl FileCas {
         key: &BlobKey,
         hash_buffer: &mut [u8],
         first_publish_trust: FirstPublishTrust,
-        expected_source_identity: Option<FileIdentity>,
+        expected_source_fp: Option<BlobStatFingerprint>,
     ) -> Result<PublishedBlob, LpmError> {
         let blob = self.blob_path(key)?;
         let parent = blob.parent().ok_or_else(|| {
@@ -1994,13 +2013,13 @@ impl FileCas {
             ))
         })?;
 
+        #[cfg(all(test, unix))]
+        run_test_before_first_publish_hardlink_hook(source);
         match fs::hard_link(source, &blob) {
             Ok(()) => {
                 let fingerprint = self.read_blob_stat(key)?;
-                if let Some(expected_id) = expected_source_identity
-                    && fingerprint
-                        .file_identity()
-                        .is_some_and(|live| live != expected_id)
+                if let Some(expected_fp) = expected_source_fp
+                    && !fingerprint.same_content_identity(expected_fp)
                 {
                     if self.blob_matches_bad_identity(&blob, fingerprint.file_identity()) {
                         let _ = self.quarantine_entry(&blob, "blobs");
@@ -2040,24 +2059,9 @@ impl FileCas {
             });
         }
 
-        let pre_fp = self.read_blob_stat(key).ok();
-        let cached = self.cached_validated_blob(key);
         let backup = HardlinkReplaceGuard::stage(&blob, source)?;
         #[cfg(test)]
         run_test_after_publish_hardlink_hook(&blob);
-        if let (Some(cached), Some(pre_fp)) = (cached, pre_fp)
-            && pre_fp == cached
-            && cached.is_settled()
-            && let Ok(post_fp) = self.read_path_stat_as_blob(source, key)
-            && post_fp.is_hardlink_only_transition_from(pre_fp)
-        {
-            backup.commit()?;
-            self.record_validated_blob(key, post_fp);
-            return Ok(PublishedBlob {
-                fingerprint: post_fp,
-                deferred_validation: false,
-            });
-        }
         match self.validate_blob(source, key, hash_buffer) {
             Ok(validated) => {
                 backup.commit()?;
@@ -2077,13 +2081,13 @@ impl FileCas {
                 if self.blob_matches_bad_identity(&blob, bad_identity) {
                     self.quarantine_entry(&blob, "blobs")?;
                 }
+                #[cfg(all(test, unix))]
+                run_test_before_first_publish_hardlink_hook(source);
                 match fs::hard_link(source, &blob) {
                     Ok(()) => {
                         let fingerprint = self.read_blob_stat(key)?;
-                        if let Some(expected_id) = expected_source_identity
-                            && fingerprint
-                                .file_identity()
-                                .is_some_and(|live| live != expected_id)
+                        if let Some(expected_fp) = expected_source_fp
+                            && !fingerprint.same_content_identity(expected_fp)
                         {
                             if self.blob_matches_bad_identity(&blob, fingerprint.file_identity()) {
                                 let _ = self.quarantine_entry(&blob, "blobs");
@@ -2245,7 +2249,7 @@ impl FileCas {
             if post_fp == pre_fp {
                 return Ok(post_fp);
             }
-            if post_fp.is_link_count_only_transition_from(pre_fp) {
+            if post_fp.same_content_identity(pre_fp) {
                 if attempt + 1 < MAX_VALIDATE_BLOB_ATTEMPTS {
                     continue;
                 }
@@ -3193,9 +3197,15 @@ fn unix_extracted_stamp_from_metadata(metadata: &fs::Metadata) -> Option<Extract
     })
 }
 
-fn inspect_registry_source_file(
-    source: &Path,
-) -> Result<(u64, u32, Option<FileIdentity>, Option<ExtractedFileStamp>), LpmError> {
+struct InspectedRegistrySourceFile {
+    file_size: u64,
+    mode: u32,
+    identity: Option<FileIdentity>,
+    live_stamp: Option<ExtractedFileStamp>,
+    fingerprint: BlobStatFingerprint,
+}
+
+fn inspect_registry_source_file(source: &Path) -> Result<InspectedRegistrySourceFile, LpmError> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -3223,6 +3233,7 @@ fn inspect_registry_source_file(
         }
         let file_size = metadata.len();
         let mode = normalized_mode(&metadata);
+        let fingerprint = BlobStatFingerprint::from_open_file(source, &file)?;
         if let Some(win_stamp) = lpm_common::windows_regular_file_stamp_from_open_file(&file) {
             let identity = win_stamp.identity;
             let live_stamp = ExtractedFileStamp {
@@ -3232,10 +3243,22 @@ fn inspect_registry_source_file(
                 mtime_ns: win_stamp.mtime_ns,
                 ctime_ns: win_stamp.ctime_ns,
             };
-            Ok((file_size, mode, Some(identity), Some(live_stamp)))
+            Ok(InspectedRegistrySourceFile {
+                file_size,
+                mode,
+                identity: Some(identity),
+                live_stamp: Some(live_stamp),
+                fingerprint,
+            })
         } else {
             let identity = file_identity_from_open_file(source, &file, &metadata)?;
-            Ok((file_size, mode, identity, None))
+            Ok(InspectedRegistrySourceFile {
+                file_size,
+                mode,
+                identity,
+                live_stamp: None,
+                fingerprint,
+            })
         }
     }
     #[cfg(not(windows))]
@@ -3255,11 +3278,18 @@ fn inspect_registry_source_file(
         let file_size = metadata.len();
         let mode = normalized_mode(&metadata);
         let identity = file_identity_for_path(source, &metadata)?;
+        let fingerprint = BlobStatFingerprint::from_metadata(&metadata);
         #[cfg(unix)]
         let live_stamp = unix_extracted_stamp_from_metadata(&metadata);
         #[cfg(not(unix))]
         let live_stamp = None;
-        Ok((file_size, mode, identity, live_stamp))
+        Ok(InspectedRegistrySourceFile {
+            file_size,
+            mode,
+            identity,
+            live_stamp,
+            fingerprint,
+        })
     }
 }
 
@@ -3279,7 +3309,7 @@ fn paths_share_file_identity(left: &Path, right: &Path) -> bool {
     )
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn unix_timestamp_is_settled(secs: i64, nanos: i64, now: SystemTime) -> bool {
     let Ok(secs) = u64::try_from(secs) else {
         return false;
@@ -3336,14 +3366,6 @@ impl BlobStatFingerprint {
             )
     }
 
-    fn is_hardlink_only_transition_from(self, prior: Self) -> bool {
-        self.same_content_identity(prior) && self.nlink > prior.nlink
-    }
-
-    fn is_link_count_only_transition_from(self, prior: Self) -> bool {
-        self.same_content_identity(prior) && self.nlink != prior.nlink
-    }
-
     fn update_hasher(self, hasher: &mut blake3::Hasher) {
         hasher.update(&self.dev.to_le_bytes());
         hasher.update(&self.ino.to_le_bytes());
@@ -3355,17 +3377,14 @@ impl BlobStatFingerprint {
         hasher.update(&self.ctime_nsec.to_le_bytes());
     }
 
-    fn is_settled(self) -> bool {
-        self.is_settled_at(SystemTime::now())
-    }
-
+    #[cfg(test)]
     fn is_settled_at(self, now: SystemTime) -> bool {
         unix_timestamp_is_settled(self.mtime, self.mtime_nsec, now)
             && unix_timestamp_is_settled(self.ctime, self.ctime_nsec, now)
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn windows_filetime_is_settled(ticks_100ns: u64, now: SystemTime) -> bool {
     const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
     let Some(since_unix_100ns) = ticks_100ns.checked_sub(WINDOWS_TO_UNIX_EPOCH_100NS) else {
@@ -3503,14 +3522,6 @@ impl BlobStatFingerprint {
         )
     }
 
-    fn is_hardlink_only_transition_from(self, prior: Self) -> bool {
-        self.same_content_identity(prior) && self.nlink > prior.nlink
-    }
-
-    fn is_link_count_only_transition_from(self, prior: Self) -> bool {
-        self.same_content_identity(prior) && self.nlink != prior.nlink
-    }
-
     fn update_hasher(self, hasher: &mut blake3::Hasher) {
         hasher.update(&self.volume_serial_number.to_le_bytes());
         hasher.update(&self.file_index.to_le_bytes());
@@ -3521,10 +3532,7 @@ impl BlobStatFingerprint {
         hasher.update(&self.nlink.to_le_bytes());
     }
 
-    fn is_settled(self) -> bool {
-        self.is_settled_at(SystemTime::now())
-    }
-
+    #[cfg(test)]
     fn is_settled_at(self, now: SystemTime) -> bool {
         let Ok(change_time) = u64::try_from(self.change_time) else {
             return false;
@@ -3558,12 +3566,8 @@ impl BlobStatFingerprint {
         None
     }
 
-    fn is_hardlink_only_transition_from(self, _prior: Self) -> bool {
-        false
-    }
-
-    fn is_link_count_only_transition_from(self, _prior: Self) -> bool {
-        false
+    fn same_content_identity(self, other: Self) -> bool {
+        self == other
     }
 
     fn update_hasher(self, hasher: &mut blake3::Hasher) {
@@ -3572,10 +3576,7 @@ impl BlobStatFingerprint {
         hasher.update(&[u8::from(self.readonly)]);
     }
 
-    fn is_settled(self) -> bool {
-        self.is_settled_at(SystemTime::now())
-    }
-
+    #[cfg(test)]
     fn is_settled_at(self, now: SystemTime) -> bool {
         let nanos_is_settled = |ts_nanos: u128| {
             let secs = u64::try_from(ts_nanos / 1_000_000_000).ok();
@@ -4864,7 +4865,7 @@ mod tests {
         fs::set_times(&blob, fs::FileTimes::new().set_modified(old_time)).unwrap();
         let settled_fp = cas.read_blob_stat(key).unwrap();
         #[cfg(unix)]
-        assert!(!settled_fp.is_settled());
+        assert!(!settled_fp.is_settled_at(SystemTime::now()));
         assert!(settled_fp.is_settled_at(SystemTime::now() + Duration::from_secs(1)));
         cas.record_validated_blob(key, settled_fp);
 
@@ -4997,6 +4998,9 @@ mod tests {
             .ingest_object_tree(&first, "sha512-first", false)
             .unwrap();
         cas.publish_source_record(&first, &first_prepared).unwrap();
+        // Let the validated fingerprint settle past SETTLED_BLOB_MTIME_MARGIN so any
+        // stat-only dedup shortcut is exercised under the tamper window.
+        std::thread::sleep(SETTLED_BLOB_MTIME_MARGIN + Duration::from_millis(20));
         let manifest = cas
             .manifest_for_digest(&first_prepared.record.tree_digest)
             .unwrap();
@@ -5088,7 +5092,7 @@ mod tests {
         fs::set_times(&blob, fs::FileTimes::new().set_modified(old_time)).unwrap();
         let fp = cas.read_blob_stat(key).unwrap();
         assert!(
-            !fp.is_settled(),
+            !fp.is_settled_at(SystemTime::now()),
             "old mtime with a freshly updated ctime must not be treated as settled"
         );
         assert!(
@@ -5165,66 +5169,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn publish_blob_reuses_settled_session_validated_blob_without_rehashing() {
+    fn materialize_manifest_rejects_settled_blob_tampered_with_restored_mtime() {
         let root = tempfile::tempdir().unwrap();
         let cas = FileCas::at(root.path());
-        let first = root.path().join("objects/first");
-        let second = root.path().join("objects/second");
+        let first = root.path().join("objects/mat-tamper");
         fs::create_dir_all(&first).unwrap();
-        fs::create_dir_all(&second).unwrap();
-        write_file(&first.join("shared.js"), b"shared-payload-bytes", 0o644);
-        write_file(&second.join("shared.js"), b"shared-payload-bytes", 0o644);
-
-        cas.ingest_object_tree(&first, "sha512-first", false)
-            .unwrap();
-        std::thread::sleep(SETTLED_BLOB_MTIME_MARGIN + Duration::from_millis(20));
-
-        let hash_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = std::sync::Arc::clone(&hash_calls);
-        let _guard = TestAfterValidateHashGuard::install(move |_| {
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        });
-        cas.ingest_object_tree(&second, "sha512-second", false)
-            .unwrap();
-        assert_eq!(
-            hash_calls.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "deduplicating against a settled session-validated blob must not re-hash it"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn materialize_manifest_reuses_settled_session_validated_blob_without_rehashing() {
-        let root = tempfile::tempdir().unwrap();
-        let cas = FileCas::at(root.path());
-        let first = root.path().join("objects/mat-first");
-        fs::create_dir_all(&first).unwrap();
-        write_file(&first.join("index.js"), b"materialized-bytes", 0o644);
+        let clean = b"materialized-bytes";
+        let dirty = b"TAMPERED-IN-PLACE!";
+        assert_eq!(clean.len(), dirty.len());
+        write_file(&first.join("index.js"), clean, 0o644);
         let prepared = cas
-            .ingest_object_tree(&first, "sha512-mat-first", false)
+            .ingest_object_tree(&first, "sha512-mat-tamper", false)
             .unwrap();
         let manifest = cas
             .manifest_for_digest(&prepared.record.tree_digest)
             .unwrap();
+        let key = manifest.entries[0].blob.as_ref().unwrap();
+        let blob = cas.blob_path(key).unwrap();
+        let orig_mtime = fs::metadata(&blob).unwrap().modified().unwrap();
         std::thread::sleep(SETTLED_BLOB_MTIME_MARGIN + Duration::from_millis(20));
 
-        let hash_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = std::sync::Arc::clone(&hash_calls);
-        let _guard = TestAfterValidateHashGuard::install(move |_| {
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        });
-        let materialized = cas
-            .ensure_materialized_entry(&prepared.record.tree_digest, &manifest)
-            .unwrap();
-        assert_eq!(
-            fs::read(materialized.join("index.js")).unwrap(),
-            b"materialized-bytes"
+        // Tamper the settled session-validated blob in place and restore its mtime.
+        fs::write(&blob, dirty).unwrap();
+        fs::set_times(&blob, fs::FileTimes::new().set_modified(orig_mtime)).unwrap();
+
+        let err = cas.ensure_materialized_entry(&prepared.record.tree_digest, &manifest);
+        assert!(
+            err.is_err(),
+            "materializing a settled session-validated blob tampered with restored mtime must fail"
         );
-        assert_eq!(
-            hash_calls.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "materializing a settled session-validated blob must not re-hash it"
+        assert!(
+            !blob.exists(),
+            "tampered CAS blob must be quarantined instead of persisted"
         );
     }
 
@@ -5393,6 +5369,39 @@ mod tests {
         assert!(
             !quarantine_blobs.exists(),
             "sustained link-count contention must never quarantine a healthy blob"
+        );
+
+        // Case 4: adding and removing a hardlink in the same validation attempt leaves
+        // nlink unchanged while advancing ctime; must retry without quarantining.
+        let fifth = root.path().join("objects/nlink-fifth");
+        fs::create_dir_all(&fifth).unwrap();
+        cas.evict_validated_blob(&key);
+        let toggled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let toggled_clone = std::sync::Arc::clone(&toggled);
+        let link_root = root.path().to_path_buf();
+        {
+            let _guard = TestAfterValidateHashGuard::install(move |path| {
+                if !toggled_clone.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let temp_link = link_root.join("add-remove-link");
+                    if fs::hard_link(path, &temp_link).is_ok() {
+                        let _ = fs::remove_file(&temp_link);
+                    }
+                }
+            });
+            write_file(&fifth.join("index.js"), b"valid-nlink-bytes", 0o644);
+            cas.ingest_object_tree(&fifth, "sha512-nlink-fifth", false)
+                .unwrap();
+        }
+        assert_eq!(
+            file_identity_for_path(&blob_path, &fs::symlink_metadata(&blob_path).unwrap())
+                .unwrap()
+                .unwrap(),
+            orig_id,
+            "add+remove link churn in one validation attempt must keep the original healthy inode"
+        );
+        assert!(
+            !quarantine_blobs.exists(),
+            "add+remove link churn in one validation attempt must never quarantine a healthy blob"
         );
     }
 
@@ -5564,6 +5573,61 @@ mod tests {
         seen.insert(first, b"a.js".to_vec());
         assert!(!seen.contains_key(&second));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_publish_rejects_source_modified_in_place_before_hardlink() {
+        let root = tempfile::tempdir().unwrap();
+        let cas = FileCas::at(root.path());
+        let obj = root.path().join("objects/first-pub-race");
+        fs::create_dir_all(&obj).unwrap();
+        let clean = b"clean-initial-data";
+        let dirty = b"DIRTY-INPLACE-DATA";
+        assert_eq!(clean.len(), dirty.len());
+        let file = obj.join("index.js");
+        write_file(&file, clean, 0o644);
+        let digest = *blake3::hash(clean).as_bytes();
+        let key = BlobKey {
+            digest: blake3::Hash::from_bytes(digest).to_hex().to_string(),
+            mode: 0o644,
+            size: clean.len() as u64,
+        };
+        let blob_path = cas.blob_path(&key).unwrap();
+
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_clone = Arc::clone(&fired);
+        let target_file = file;
+        let _guard = TestBeforeFirstPublishHardlinkGuard::install(move |path| {
+            if path == target_file && !fired_clone.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(20));
+                // Rewrite the SAME inode in place (preserving dev/ino, changing bytes + mtime).
+                let mut f = fs::OpenOptions::new().write(true).open(path).unwrap();
+                use std::io::Write as _;
+                f.write_all(dirty).unwrap();
+            }
+        });
+
+        let mut ingest = cas
+            .begin_registry_ingest(&obj, "sha512-inplace-race")
+            .unwrap();
+        let err = cas.ingest_registry_file(
+            &mut ingest,
+            &obj,
+            Path::new("index.js"),
+            Some(clean.len() as u64),
+            digest,
+            None,
+        );
+        assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            err.is_err(),
+            "in-place source overwrite between ingest validation and hardlink must fail publication"
+        );
+        assert!(
+            !blob_path.exists(),
+            "corrupted blob must not remain published at canonical CAS blob path"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5571,10 +5635,44 @@ type PathHookFn = Box<dyn Fn(&Path)>;
 
 #[cfg(test)]
 thread_local! {
+    #[cfg(unix)]
+    static TEST_BEFORE_FIRST_PUBLISH_HARDLINK_HOOK: std::cell::RefCell<Option<PathHookFn>> =
+        std::cell::RefCell::new(None);
     static TEST_AFTER_PUBLISH_HARDLINK_HOOK: std::cell::RefCell<Option<PathHookFn>> =
         std::cell::RefCell::new(None);
     static TEST_AFTER_VALIDATE_HASH_HOOK: std::cell::RefCell<Option<PathHookFn>> =
         std::cell::RefCell::new(None);
+}
+
+#[cfg(all(test, unix))]
+fn run_test_before_first_publish_hardlink_hook(path: &Path) {
+    TEST_BEFORE_FIRST_PUBLISH_HARDLINK_HOOK.with(|cell| {
+        if let Some(hook) = cell.borrow().as_ref() {
+            hook(path);
+        }
+    });
+}
+
+#[cfg(all(test, unix))]
+struct TestBeforeFirstPublishHardlinkGuard;
+
+#[cfg(all(test, unix))]
+impl TestBeforeFirstPublishHardlinkGuard {
+    fn install(hook: impl Fn(&Path) + 'static) -> Self {
+        TEST_BEFORE_FIRST_PUBLISH_HARDLINK_HOOK.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(hook));
+        });
+        Self
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for TestBeforeFirstPublishHardlinkGuard {
+    fn drop(&mut self) {
+        TEST_BEFORE_FIRST_PUBLISH_HARDLINK_HOOK.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+    }
 }
 
 #[cfg(test)]

@@ -208,6 +208,8 @@ impl PackageStore {
         // filesystem deletion does not stall concurrent package publications.
         let retire_result: Result<(), LpmError> = (|| {
             let _publication = self.lock_publication()?;
+            #[cfg(all(test, unix))]
+            run_gc_after_prescan_hook();
             let now = SystemTime::now();
             let mut entries = Vec::new();
             for entry in std::fs::read_dir(&store_dir)? {
@@ -438,7 +440,8 @@ fn is_junk_store_entry_locked(
         return meta.modified().ok().is_some_and(|live_mtime| {
             live_mtime == prescanned_mtime
                 && !is_within_max_age(live_mtime, now, ABANDONED_TEMP_AGE)
-        }) && !has_fresh_active_marker(path, now);
+        }) && !has_fresh_active_marker(path, now)
+            && !subtree_has_recent_activity(path, now, ABANDONED_TEMP_AGE);
     }
     dir_name.rfind('@').is_some() && !is_complete_package_dir(path)
 }
@@ -1109,4 +1112,77 @@ mod tests {
             "freshly retired tombstone must be protected by its active lease even if set_times failed"
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_does_not_retire_temp_dir_that_resumed_nested_writes_after_prescan() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(dir.path());
+        let store_v1 = dir.path().join("v1");
+        let tmp_dir = store_v1.join(".tmp.resumed-staging");
+        let nested_dir = tmp_dir.join("lib");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        let nested_file = nested_dir.join("index.js");
+        std::fs::write(&nested_file, b"initial").unwrap();
+        let very_old = SystemTime::now() - Duration::from_secs(3600);
+        for p in [&nested_file, &nested_dir, &tmp_dir] {
+            std::fs::set_times(p, std::fs::FileTimes::new().set_modified(very_old)).unwrap();
+        }
+
+        let file_to_touch = nested_file.clone();
+        let _guard = GcAfterPrescanHookGuard::install(move || {
+            // Writing an existing nested file bumps its mtime without touching tmp_dir's mtime.
+            std::fs::write(&file_to_touch, b"resumed-write").unwrap();
+        });
+
+        let result = store.gc(&HashSet::new(), None).unwrap();
+        assert_eq!(
+            result.removed, 0,
+            "temp dir that resumed nested writes after prescan must not be retired"
+        );
+        assert!(
+            tmp_dir.is_dir() && nested_file.is_file(),
+            "resumed staging temp directory must remain intact"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+type GcAfterPrescanHookFn = Box<dyn FnMut()>;
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static GC_AFTER_PRESCAN_HOOK: std::cell::RefCell<Option<GcAfterPrescanHookFn>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+struct GcAfterPrescanHookGuard;
+
+#[cfg(all(test, unix))]
+impl GcAfterPrescanHookGuard {
+    fn install(hook: impl FnMut() + 'static) -> Self {
+        GC_AFTER_PRESCAN_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(hook));
+        });
+        Self
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for GcAfterPrescanHookGuard {
+    fn drop(&mut self) {
+        GC_AFTER_PRESCAN_HOOK.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+    }
+}
+
+#[cfg(all(test, unix))]
+fn run_gc_after_prescan_hook() {
+    GC_AFTER_PRESCAN_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook();
+        }
+    });
 }

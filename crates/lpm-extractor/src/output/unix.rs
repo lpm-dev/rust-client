@@ -648,10 +648,6 @@ impl PendingFile {
     pub(crate) fn identity(&self) -> Result<Identity, LpmError> {
         Ok(Identity::from_metadata(&self.file.metadata()?))
     }
-    pub(crate) fn stamp(&self) -> Option<ExtractedFileStamp> {
-        let meta = self.file.metadata().ok()?;
-        unix_stamp_from_metadata(&meta)
-    }
     pub(crate) fn validate(&self) -> Result<(), LpmError> {
         let written = self.file.metadata()?;
         let current = stat_at(self.directory.as_raw_fd(), &self.name)?;
@@ -670,6 +666,15 @@ impl PendingFile {
             pending: self,
             identity,
         })
+    }
+    pub(crate) fn commit_with_stamp(
+        mut self,
+    ) -> Result<(Identity, Option<ExtractedFileStamp>), LpmError> {
+        let meta = self.file.metadata()?;
+        let identity = Identity::from_metadata(&meta);
+        let stamp = unix_stamp_from_metadata(&meta);
+        self.committed = true;
+        Ok((identity, stamp))
     }
     pub(crate) fn commit(mut self) {
         self.committed = true;

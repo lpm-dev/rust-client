@@ -1986,8 +1986,7 @@ where
                 InspectionMode::WithCallback => {
                     output.validate_parent_for_inspection()?;
                     pending.validate()?;
-                    let stamp = pending.stamp();
-                    pending.commit();
+                    let (_, stamp) = pending.commit_with_stamp()?;
                     inspector(EntryInfo {
                         relative_path: &relative_path,
                         size,
@@ -1996,12 +1995,7 @@ where
                     });
                     (output.accepted_file_identity(&relative_path)?, stamp)
                 }
-                InspectionMode::WithoutCallback => {
-                    let identity = pending.identity()?;
-                    let stamp = pending.stamp();
-                    pending.commit();
-                    (identity, stamp)
-                }
+                InspectionMode::WithoutCallback => pending.commit_with_stamp()?,
             };
             let extracted_file =
                 E::from_extracted_file(relative_path, size, blake3_digest, source_stamp)?;

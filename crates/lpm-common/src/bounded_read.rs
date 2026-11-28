@@ -336,6 +336,15 @@ impl FileIdentity {
     }
 
     #[cfg(windows)]
+    pub fn from_borrowed_handle(
+        handle: std::os::windows::io::BorrowedHandle<'_>,
+    ) -> io::Result<Self> {
+        use std::os::windows::io::AsRawHandle as _;
+
+        windows_file_identity_from_raw_handle(handle.as_raw_handle())
+    }
+
+    #[cfg(windows)]
     pub(crate) fn from_raw_handle(
         handle: windows_sys::Win32::Foundation::HANDLE,
     ) -> io::Result<Self> {

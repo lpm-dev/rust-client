@@ -185,9 +185,22 @@ fn collect_project_package_bin_names(
 pub(super) fn manifest_needs_bin_compatibility(content: &[u8]) -> bool {
     const DEPS_KEY: &[u8] = b"\"dependencies\"";
     const PEERS_KEY: &[u8] = b"\"peerDependencies\"";
-    content.windows(DEPS_KEY.len()).any(|w| w == DEPS_KEY)
+    if content.windows(DEPS_KEY.len()).any(|w| w == DEPS_KEY)
         || content.windows(PEERS_KEY.len()).any(|w| w == PEERS_KEY)
-        || content.windows(2).any(|w| w == b"\\u")
+    {
+        return true;
+    }
+    if !content.windows(2).any(|w| w == b"\\u") {
+        return false;
+    }
+    let trimmed = content.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(content);
+    match serde_json::from_slice::<serde_json::Value>(trimmed) {
+        Ok(serde_json::Value::Object(map)) => {
+            map.contains_key("dependencies") || map.contains_key("peerDependencies")
+        }
+        Ok(_) => false,
+        Err(_) => true,
+    }
 }
 
 pub(super) fn create_project_compatibility_links(
@@ -1995,6 +2008,9 @@ mod manifest_tests {
         ));
         assert!(!super::manifest_needs_bin_compatibility(
             br#"{"name":"cli","bin":"./cli.js","version":"1.0.0"}"#
+        ));
+        assert!(!super::manifest_needs_bin_compatibility(
+            br#"{"name":"cli","bin":"./cli.js","description":"caf\u00e9"}"#
         ));
     }
 }
