@@ -416,7 +416,11 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
     } = match vault_id.as_deref() {
         Some(vault_id) => lpm_vault::try_get_all_run_environments_for_vault_id(vault_id)
             .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?,
-        None => lpm_vault::AllRunEnvironments::default(),
+        None => {
+            lpm_vault::override_marker::report_no_project(project_dir)
+                .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
+            lpm_vault::AllRunEnvironments::default()
+        }
     };
     let all_envs = lpm_env::resolver::list_all_from_vault_names(
         env_map,

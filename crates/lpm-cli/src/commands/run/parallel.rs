@@ -224,9 +224,12 @@ pub(super) fn run_tasks_parallel(
                 let context = cache_context.as_ref().ok_or_else(|| {
                     LpmError::Task(format!("cache context missing for task '{task_name}'"))
                 })?;
-                if let Some(identity) =
-                    complete_task_cache_identity(project_dir, task_name, context)
-                {
+                if let Some(identity) = complete_task_cache_identity(
+                    project_dir,
+                    task_name,
+                    context,
+                    &hit.meta.folders_without_env_project,
+                ) {
                     cache_identities.insert(task_name.clone(), identity);
                 }
                 print_result(all_results.last().unwrap());
@@ -444,8 +447,12 @@ pub(super) fn run_tasks_parallel(
                                         "cache context missing for task '{name}'"
                                     ))
                                 })?;
-                                let cache_identity =
-                                    complete_task_cache_identity(&dir, &name, context);
+                                let cache_identity = complete_task_cache_identity(
+                                    &dir,
+                                    &name,
+                                    context,
+                                    &hit.meta.folders_without_env_project,
+                                );
                                 return Ok((
                                     TaskResult {
                                         name,

@@ -279,12 +279,27 @@ pub fn client_from_config(
     }
 }
 
+/// What the check of a remote entry's metadata, made before any of its
+/// outputs is read, says of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applies {
+    Yes,
+    /// It doesn't apply now, but it may again, so the local cache keeps it,
+    /// for the next lookup to turn it down there without a download.
+    NotNow,
+    /// It never applies here, so nothing keeps it.
+    Never,
+}
+
+/// Restore the remote entry under `key` if `applies` accepts its metadata,
+/// and `validate` still does once its outputs are staged.
 pub fn try_restore(
     client: &RemoteCacheClient,
     key: &str,
     project_dir: &Path,
     output_globs: &[String],
-    validate: impl FnOnce() -> Result<bool, lpm_common::LpmError>,
+    applies: impl FnOnce(&lpm_task::cache::CacheMeta) -> Applies,
+    validate: impl FnOnce(&lpm_task::cache::CacheMeta) -> Result<bool, lpm_common::LpmError>,
 ) -> Option<lpm_task::cache::CacheHit> {
     if client.limits.lookups_refused() {
         return None;
@@ -293,7 +308,7 @@ pub fn try_restore(
         client.skipping_while_busy(LimitedRequest::Lookup);
         return None;
     }
-    match client.restore(key, project_dir, output_globs, validate) {
+    match client.restore(key, project_dir, output_globs, applies, validate) {
         Ok(hit) => hit,
         Err(reason) => {
             warn_once(&reason);
@@ -622,7 +637,8 @@ impl RemoteCacheClient {
         key: &str,
         project_dir: &Path,
         output_globs: &[String],
-        validate: impl FnOnce() -> Result<bool, lpm_common::LpmError>,
+        applies: impl FnOnce(&lpm_task::cache::CacheMeta) -> Applies,
+        validate: impl FnOnce(&lpm_task::cache::CacheMeta) -> Result<bool, lpm_common::LpmError>,
     ) -> Result<Option<lpm_task::cache::CacheHit>, String> {
         let Some(artifact) = block_on_remote(self.clone().fetch_verified_artifact(key.to_owned()))?
         else {
@@ -632,15 +648,21 @@ impl RemoteCacheClient {
             .as_file()
             .try_clone()
             .map_err(|e| format!("failed to retain verified remote cache artifact: {e}"))?;
+        let mut keep = false;
         let hit = lpm_task::cache::restore_remote_artifact_from_file_if(
             key,
             file,
             project_dir,
             output_globs,
+            |meta| {
+                let applies = applies(meta);
+                keep = applies == Applies::NotNow;
+                applies == Applies::Yes
+            },
             validate,
         )
         .map_err(|e| format!("remote cache artifact could not be restored: {e}"))?;
-        if hit.is_some() {
+        if hit.is_some() || keep {
             fill_local_cache_in_background(key.to_owned(), artifact);
         }
         Ok(hit)
@@ -2758,7 +2780,13 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
 
         for key in ["a", "b", "c"] {
-            let restored = client.restore(&key.repeat(64), project.path(), &[], || Ok(true));
+            let restored = client.restore(
+                &key.repeat(64),
+                project.path(),
+                &[],
+                |_| Applies::Yes,
+                |_| Ok(true),
+            );
             assert!(matches!(restored, Ok(None)), "lookup {key} was not a miss");
         }
 
@@ -2938,7 +2966,14 @@ mod tests {
         let client = client.clone();
         tokio::task::spawn_blocking(move || {
             let project = tempfile::tempdir().unwrap();
-            let restored = try_restore(&client, &"b".repeat(64), project.path(), &[], || Ok(true));
+            let restored = try_restore(
+                &client,
+                &"b".repeat(64),
+                project.path(),
+                &[],
+                |_| Applies::Yes,
+                |_| Ok(true),
+            );
             assert!(restored.is_none());
         })
         .await
@@ -2984,7 +3019,14 @@ mod tests {
         let client = client.clone();
         tokio::task::spawn_blocking(move || {
             let project = tempfile::tempdir().unwrap();
-            let restored = try_restore(&client, &"b".repeat(64), project.path(), &[], || Ok(true));
+            let restored = try_restore(
+                &client,
+                &"b".repeat(64),
+                project.path(),
+                &[],
+                |_| Applies::Yes,
+                |_| Ok(true),
+            );
             assert!(restored.is_none());
             store_with(&client);
         })
@@ -3071,7 +3113,15 @@ mod tests {
         tokio::task::spawn_blocking(move || {
             let project = tempfile::tempdir().unwrap();
             assert!(
-                try_restore(&client, &"b".repeat(64), project.path(), &[], || Ok(true)).is_none()
+                try_restore(
+                    &client,
+                    &"b".repeat(64),
+                    project.path(),
+                    &[],
+                    |_| Applies::Yes,
+                    |_| Ok(true)
+                )
+                .is_none()
             );
             store_with(&client);
         })
@@ -3451,7 +3501,14 @@ mod tests {
             .pause(LimitedRequest::Lookup, Duration::from_secs(3));
         let project = tempfile::tempdir().unwrap();
 
-        let hit = try_restore(&client, "abc123", project.path(), &[], || Ok(true));
+        let hit = try_restore(
+            &client,
+            "abc123",
+            project.path(),
+            &[],
+            |_| Applies::Yes,
+            |_| Ok(true),
+        );
 
         assert!(hit.is_none());
         assert!(!client.limits.first_busy_notice(LimitedRequest::Lookup));

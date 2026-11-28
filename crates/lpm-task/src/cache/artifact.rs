@@ -2,15 +2,17 @@
 //! artifact that read the archive already written instead of the project.
 //!
 //! The local entry holds its outputs as `outputs.tar.gz` with paths relative
-//! to the project. The remote artifact holds the same files under `outputs/`,
-//! followed by `.lpm-cache/meta.json`, `stdout.log` and `stderr.log`.
+//! to the project. The remote artifact holds `.lpm-cache/meta.json`,
+//! `stdout.log` and `stderr.log`, then the same files under `outputs/`, so a
+//! restore reads the metadata, and can turn the artifact down, before any
+//! output.
 
 use super::{
     CacheMeta, MAX_CACHE_ARCHIVE_ENTRIES, MAX_CACHE_ENTRY_BYTES, MAX_CACHE_LOG_BYTES,
-    PublishedCacheEntry, append_bytes, cache_entry_lock_path, check_archive_size_limits,
-    create_private_cache_file, directory_identity, open_cache_entry, open_cache_entry_file,
-    open_task_cache, publish_cache_entry, read_cache_log, read_cache_meta, read_entry_to_string,
-    validate_archive_entry_type, validate_archive_path, validate_cache_key,
+    PublishedCacheEntry, append_bytes, cache_entry_lock_path, cache_meta_json,
+    check_archive_size_limits, create_private_cache_file, directory_identity, open_cache_entry,
+    open_cache_entry_file, open_task_cache, publish_cache_entry, read_cache_log, read_cache_meta,
+    read_entry_to_string, validate_archive_entry_type, validate_archive_path, validate_cache_key,
     validate_local_cache_entry, validate_text_entry_size, write_cache_meta,
     write_private_cache_file,
 };
@@ -75,6 +77,13 @@ pub(super) fn write_remote_artifact_from_local_entry_with_root<W: Write>(
 
         let encoder = flate2::write::GzEncoder::new(writer, flate2::Compression::fast());
         let mut builder = tar::Builder::new(encoder);
+        append_bytes(
+            &mut builder,
+            Path::new(REMOTE_META),
+            &cache_meta_json(&meta)?,
+        )?;
+        append_bytes(&mut builder, Path::new(REMOTE_STDOUT), stdout.as_bytes())?;
+        append_bytes(&mut builder, Path::new(REMOTE_STDERR), stderr.as_bytes())?;
         let mut copied = 0;
         if let Some(archive) = archive {
             let mut total_bytes = 0;
@@ -100,12 +109,6 @@ pub(super) fn write_remote_artifact_from_local_entry_with_root<W: Write>(
                 meta.output_file_count
             )));
         }
-
-        let meta_json = serde_json::to_string_pretty(&meta)
-            .map_err(|e| LpmError::Task(format!("failed to serialize remote cache meta: {e}")))?;
-        append_bytes(&mut builder, Path::new(REMOTE_META), meta_json.as_bytes())?;
-        append_bytes(&mut builder, Path::new(REMOTE_STDOUT), stdout.as_bytes())?;
-        append_bytes(&mut builder, Path::new(REMOTE_STDERR), stderr.as_bytes())?;
         builder.finish().map_err(|e| {
             LpmError::Task(format!("failed to finalize remote cache artifact: {e}"))
         })?;

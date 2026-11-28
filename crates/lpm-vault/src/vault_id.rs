@@ -486,9 +486,13 @@ pub fn checked_vault_id(project_dir: &Path) -> Result<Option<String>, String> {
         Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
         Err(error) => return Err(format!("failed to read lpm.json: {error}")),
     };
-    let config =
-        serde_json::from_str::<serde_json::Value>(lpm_common::strip_utf8_bom_str(&content))
-            .map_err(|error| format!("failed to parse lpm.json: {error}"))?;
+    checked_vault_id_in(&content)
+}
+
+/// [`checked_vault_id`] of `content`, an lpm.json.
+pub(crate) fn checked_vault_id_in(content: &str) -> Result<Option<String>, String> {
+    let config = serde_json::from_str::<serde_json::Value>(lpm_common::strip_utf8_bom_str(content))
+        .map_err(|error| format!("failed to parse lpm.json: {error}"))?;
     let config = config
         .as_object()
         .ok_or_else(|| "failed to parse lpm.json: top-level config must be an object".to_owned())?;
