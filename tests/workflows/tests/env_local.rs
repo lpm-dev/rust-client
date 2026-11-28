@@ -2789,6 +2789,124 @@ fn denied_process_hooks_cannot_satisfy_requirements_through_defaults() {
     assert!(!project.path().join("child.marker").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn a_projects_shell_hooks_never_reach_a_script_or_run_in_a_trace_but_the_shells_own_do() {
+    let project = TempProject::empty(r#"{"scripts":{"traced":"node show.cjs && bash -xc true"}}"#);
+    project.write_file(
+        "show.cjs",
+        "for (const name of ['PS4', 'PROMPT_COMMAND', 'SHELLOPTS', 'BASHOPTS', 'FPATH', 'TEAM_VALUE']) console.log(`${name}=${process.env[name]}`)",
+    );
+    lpm(&project)
+        .args([
+            "env",
+            "set",
+            "PS4=$(touch ps4.marker)+ ",
+            "PROMPT_COMMAND=touch prompt.marker",
+            "SHELLOPTS=xtrace",
+            "BASHOPTS=xpg_echo",
+            "FPATH=./functions",
+            "TEAM_VALUE=kept",
+        ])
+        .assert()
+        .success();
+    let run = |inherited: &[(&str, &str)]| {
+        let mut command = lpm(&project);
+        command.args(["run", "traced", "--no-cache"]);
+        for name in ["PS4", "PROMPT_COMMAND", "SHELLOPTS", "BASHOPTS", "FPATH"] {
+            command.env_remove(name);
+        }
+        for (name, value) in inherited {
+            command.env(name, value);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+
+    let output = run(&[]);
+    assert!(
+        !project.path().join("ps4.marker").exists(),
+        "bash ran the project's PS4 while tracing"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in [
+        "PS4=undefined",
+        "PROMPT_COMMAND=undefined",
+        "SHELLOPTS=undefined",
+        "BASHOPTS=undefined",
+        "FPATH=undefined",
+        "TEAM_VALUE=kept",
+    ] {
+        assert!(stdout.contains(line), "{line} in {stdout}");
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ignored BASHOPTS, FPATH, PROMPT_COMMAND, PS4 and SHELLOPTS from project env: LPM never passes a project's value for them to processes"),
+        "{stderr}"
+    );
+
+    let output = run(&[
+        ("PS4", "inherited+ "),
+        ("PROMPT_COMMAND", "inherited-prompt"),
+        ("FPATH", "/inherited/functions"),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in [
+        "PS4=inherited+ ",
+        "PROMPT_COMMAND=inherited-prompt",
+        "FPATH=/inherited/functions",
+    ] {
+        assert!(stdout.contains(line), "{line} in {stdout}");
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("inherited+ true"),
+        "the shell's own PS4 runs in the trace: {stderr}"
+    );
+}
+
+#[test]
+fn a_projects_comspec_never_reaches_a_script_but_the_inherited_one_does() {
+    let project = TempProject::empty(r#"{"scripts":{"show":"node show.cjs"}}"#);
+    project.write_file(
+        "show.cjs",
+        "console.log(`COMSPEC=${process.env.COMSPEC ?? process.env.ComSpec}`)",
+    );
+    lpm(&project)
+        .args(["env", "set", "COMSPEC=project-shell.exe"])
+        .assert()
+        .success();
+    let inherited = if cfg!(windows) {
+        std::env::var("ComSpec").expect("Windows names its command processor")
+    } else {
+        "inherited-shell".to_owned()
+    };
+
+    let output = lpm(&project)
+        .args(["run", "show"])
+        .env("COMSPEC", &inherited)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(&format!("COMSPEC={inherited}")), "{stdout}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("ignored COMSPEC from project env"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn team_values_that_run_code_never_reach_a_script_but_the_shells_own_do() {
     let project = TempProject::empty(r#"{"scripts":{"show":"node show.cjs"}}"#);

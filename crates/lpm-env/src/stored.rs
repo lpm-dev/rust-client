@@ -7,11 +7,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 pub const DEFAULT_ENVIRONMENT: &str = "default";
 
 /// Names that make a process run code it wasn't asked to run: libraries the
-/// dynamic linker preloads, interpreter options and startup files, the module
-/// search paths, profilers and libraries a runtime loads, and the helpers and
-/// configuration files Git, SSH, Cargo, npm and Yarn execute. Build settings a
-/// project deliberately hands its own toolchain, such as `CC`, `RUSTFLAGS` or
-/// `JAVA_HOME`, aren't among them.
+/// dynamic linker preloads, interpreter options and startup files, the
+/// commands Bash runs before a prompt and expands in prompts and `set -x`
+/// traces, the options a shell turns on from its environment and the folders
+/// zsh loads functions from, the module search paths, profilers and libraries
+/// a runtime loads, and the helpers and configuration files Git, SSH, Cargo,
+/// npm and Yarn execute. Build settings a project deliberately hands its own
+/// toolchain, such as `CC`, `RUSTFLAGS` or `JAVA_HOME`, aren't among them.
 ///
 /// .NET reads each runtime setting as `DOTNET_<name>`, falling back to
 /// `CORECLR_<name>` for profilers and `COMPlus_<name>` otherwise, so every
@@ -71,6 +73,14 @@ const CODE_RUNNING_ENV_VARS: &[&str] = &[
     "BASH_ENV",
     "ENV",
     "ZDOTDIR",
+    "PROMPT_COMMAND",
+    "PS0",
+    "PS1",
+    "PS2",
+    "PS4",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "FPATH",
     "GIT_SSH",
     "GIT_SSH_COMMAND",
     "GIT_PROXY_COMMAND",
@@ -116,8 +126,11 @@ const CODE_RUNNING_ENV_PREFIXES: &[&str] = &[
 ];
 
 /// Names that describe the process's own environment, which project env
-/// never replaces.
-const PROCESS_ENV_VARS: &[&str] = &["PATH", "HOME", "LPM_HOME", "USER", "SHELL", "TERM"];
+/// never replaces. `COMSPEC` is Windows' command processor, which cmd and
+/// Node start for a shell.
+const PROCESS_ENV_VARS: &[&str] = &[
+    "PATH", "HOME", "LPM_HOME", "USER", "SHELL", "TERM", "COMSPEC",
+];
 
 /// Runtime hooks LPM also removes from the environment a process inherits,
 /// even when the person's own shell set them, so no value for one reaches a
@@ -325,13 +338,15 @@ mod tests {
         assert!(is_denied_env_var("NODE_OPTIONS"));
         assert!(is_denied_env_var("node_options"));
         assert!(is_denied_env_var("Path"));
+        assert!(is_denied_env_var("ComSpec"));
         assert!(!is_denied_env_var("NODE_ENV"));
         assert!(!is_denied_env_var("DATABASE_URL"));
     }
 
     /// Names that make a process run code it wasn't asked to run, beyond
-    /// the dynamic linker's: interpreter options and startup files, module
-    /// search paths, and the helpers Git, SSH, Cargo and npm execute.
+    /// the dynamic linker's: interpreter options and startup files, the
+    /// commands Bash runs around a prompt and in a trace, module search
+    /// paths, and the helpers Git, SSH, Cargo and npm execute.
     const CODE_RUNNING: &[&str] = &[
         "JAVA_TOOL_OPTIONS",
         "_JAVA_OPTIONS",
@@ -362,6 +377,14 @@ mod tests {
         "NPM_CONFIG_SCRIPT_SHELL",
         "NPM_CONFIG_NODE_OPTIONS",
         "ZDOTDIR",
+        "PROMPT_COMMAND",
+        "PS0",
+        "PS1",
+        "PS2",
+        "PS4",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "FPATH",
         "DOTNET_STARTUP_HOOKS",
         "CORECLR_ENABLE_PROFILING",
         "COR_ENABLE_PROFILING",
@@ -450,6 +473,9 @@ mod tests {
             "DOTNET_gcServer",
             "YARN_ENABLE_IMMUTABLE_INSTALLS",
             "NPM_CONFIG_GIT_TAG_VERSION",
+            "PROMPT",
+            "SYSTEM_PROMPT",
+            "PS3",
         ] {
             assert!(!is_denied_env_var(name), "{name}");
         }
