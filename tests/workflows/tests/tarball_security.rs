@@ -531,8 +531,53 @@ async fn tarball_with_dot_dot_path_entry_is_rejected_by_install() {
     );
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
-async fn tarball_with_windows_reserved_basename_is_rejected_by_install() {
+async fn tarball_with_windows_device_names_installs_off_windows() {
+    let files: [(&str, &[u8]); 2] = [
+        ("lib/NUL.txt", b"an ordinary file off Windows"),
+        ("dist/chunks/aux.d.ts.map", b"{\"version\":3}"),
+    ];
+    let tgz = tarball_with_extra_entries("device-name-pkg", "1.0.0", |builder| {
+        for (path, content) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("package/{path}"), content)
+                .unwrap();
+        }
+    });
+
+    let mock = MockRegistry::start().await;
+    mock.with_package("device-name-pkg", "1.0.0", &tgz).await;
+
+    let project = TempProject::empty(r#"{"name":"sec-test","version":"1.0.0"}"#);
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(install_args("device-name-pkg@1.0.0"))
+        .output()
+        .expect("run install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "install of a package with Windows device names failed off Windows:\nstderr:\n{stderr}"
+    );
+    let package = project.path().join("node_modules/device-name-pkg");
+    for (path, content) in files {
+        assert_eq!(
+            std::fs::read(package.join(path)).expect("installed file"),
+            content,
+            "{path}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn tarball_with_windows_device_name_is_rejected_by_install_on_windows() {
     let tgz = tarball_with_extra_entries("reserved-name-pkg", "1.0.0", |builder| {
         let content = b"reserved device payload";
         let mut header = tar::Header::new_gnu();
@@ -566,7 +611,7 @@ async fn tarball_with_windows_reserved_basename_is_rejected_by_install() {
     let stderr_l = stderr.to_lowercase();
     assert!(
         stderr_l.contains("reserved") && stderr_l.contains("windows"),
-        "reserved-device rejection should name the portable path concern. stderr:\n{stderr}"
+        "reserved-device rejection should name the Windows device-name concern. stderr:\n{stderr}"
     );
     assert!(
         !project

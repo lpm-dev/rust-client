@@ -2249,6 +2249,11 @@ fn strip_first_component(path: &Path) -> Option<PathBuf> {
 /// one git would read as its own, running what its config names, where the
 /// dependency is committed, as a deploy output's are, and git refuses to
 /// commit a path under any other spelling of it.
+///
+/// On Windows it also rejects a component Windows reads as a device (`aux.js`,
+/// `CON`, `COM1`) or one holding a character Windows forbids in a name (`:`,
+/// `?`, `*` and others): Windows can't create that file. Elsewhere these are
+/// ordinary names, and npm unpacks them.
 pub fn sanitize_entry_path(path: &Path) -> Result<Option<PathBuf>, LpmError> {
     let Some(relative_path) = strip_first_component(path) else {
         return Ok(None);
@@ -2267,6 +2272,7 @@ pub fn sanitize_entry_path(path: &Path) -> Result<Option<PathBuf>, LpmError> {
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 return Err(path_traversal_error(path));
             }
+            #[cfg(windows)]
             Component::Normal(name) if is_windows_reserved_device_name(name) => {
                 return Err(LpmError::Registry(format!(
                     "reserved Windows device name in tarball entry: {}",
@@ -2292,8 +2298,9 @@ pub fn sanitize_entry_path(path: &Path) -> Result<Option<PathBuf>, LpmError> {
 ///
 /// The first component, conventionally `package/`, is stripped, and `None`
 /// is that component itself. A remaining traversal, root, or platform-prefix
-/// component is an error. Unlike [`sanitize_entry_path`], `.git` paths and
-/// reserved Windows device names are kept: npm unpacks them.
+/// component is an error. Unlike [`sanitize_entry_path`], `.git` paths are
+/// kept, and so are the names Windows can't create, on every host: npm
+/// unpacks them.
 pub fn package_relative_entry_path(path: &Path) -> Result<Option<PathBuf>, LpmError> {
     let Some(relative_path) = strip_first_component(path) else {
         return Ok(None);
@@ -2497,6 +2504,7 @@ fn append_case_fold_component_key(key: &mut String, component: &OsStr) {
     }
 }
 
+#[cfg(any(windows, test))]
 fn is_windows_reserved_device_name(component: &OsStr) -> bool {
     let component = component.to_string_lossy();
     let trimmed = component.trim_end_matches([' ', '.']);
@@ -3455,7 +3463,10 @@ mod tests {
             sanitize_entry_path(Path::new("package/.git/hooks/run.js")).unwrap(),
             None
         );
-        assert!(sanitize_entry_path(Path::new("package/lib/aux.js")).is_err());
+        assert_eq!(
+            sanitize_entry_path(Path::new("package/lib/aux.js")).is_err(),
+            cfg!(windows)
+        );
     }
 
     #[test]
@@ -3926,6 +3937,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn sanitize_entry_path_rejects_windows_reserved_device_names() {
         for path in [
@@ -3943,6 +3955,85 @@ mod tests {
                 "expected reserved-device diagnostic for {path}, got: {error}"
             );
         }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn sanitize_entry_path_keeps_windows_device_names_off_windows() {
+        for (entry, relative) in [
+            ("package/CON", "CON"),
+            ("package/lib/nul.txt", "lib/nul.txt"),
+            ("package/AUX.", "AUX."),
+            ("package/COM1/readme.md", "COM1/readme.md"),
+            (
+                "package/dist/chunks/aux.d.ts.map",
+                "dist/chunks/aux.d.ts.map",
+            ),
+            ("package/lib/conout$.js", "lib/conout$.js"),
+        ] {
+            assert_eq!(
+                sanitize_entry_path(Path::new(entry)).unwrap(),
+                Some(PathBuf::from(relative)),
+                "{entry}"
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn every_extraction_route_writes_files_named_for_windows_devices_off_windows() {
+        let entries: [(&str, &[u8]); 3] = [
+            (
+                "dist/render/static/runtime/chunks/aux.d.ts.map",
+                b"{\"version\":3}",
+            ),
+            ("lib/con.js", b"module.exports = 1;\n"),
+            ("COM1/readme.md", b"# port\n"),
+        ];
+        let tarball = create_test_tarball_with_entries(&entries);
+        let mut tar = Vec::new();
+        std::io::Read::read_to_end(&mut GzDecoder::new(tarball.as_slice()), &mut tar).unwrap();
+        let mut expected: Vec<PathBuf> = entries.iter().map(|(path, _)| path.into()).collect();
+        expected.sort();
+
+        let buffered = tempfile::tempdir().unwrap();
+        let streaming = tempfile::tempdir().unwrap();
+        let pipelined = tempfile::tempdir().unwrap();
+        let routes = [
+            (
+                "buffered",
+                buffered.path(),
+                extract_tarball(&tarball, buffered.path()).unwrap(),
+            ),
+            (
+                "streaming",
+                streaming.path(),
+                extract_tarball_from_reader_streaming_digests(tarball.as_slice(), streaming.path())
+                    .unwrap()
+                    .into_iter()
+                    .map(|file| file.relative_path)
+                    .collect(),
+            ),
+            (
+                "pipelined",
+                pipelined.path(),
+                extract_tar_from_reader_pipelined(tar.as_slice(), pipelined.path(), || {}).unwrap(),
+            ),
+        ];
+        for (route, dir, mut files) in routes {
+            files.sort();
+            assert_eq!(files, expected, "{route}");
+            for (path, content) in entries {
+                assert_eq!(
+                    std::fs::read(dir.join(path)).unwrap(),
+                    content,
+                    "{route}: {path}"
+                );
+            }
+        }
+        let mut listed = list_tarball_contents(&tarball).unwrap();
+        listed.sort();
+        assert_eq!(listed, expected);
     }
 
     #[test]
