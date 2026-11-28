@@ -445,6 +445,24 @@ pub fn get_or_create_vault_id(project_dir: &Path) -> Result<String, String> {
     .map_err(|error| error.to_string())
 }
 
+/// A new vault ID for `project_dir`, written to its lpm.json in one locked
+/// update; `None` when lpm.json names a vault by then.
+pub fn create_vault_id(project_dir: &Path) -> Result<Option<String>, String> {
+    lpm_common::update_lpm_json(project_dir, |root, _| {
+        if root.get("vault").is_some_and(|value| !value.is_null()) {
+            return Ok(lpm_common::LpmJsonMutation::Unchanged(None));
+        }
+        let vault_id = generate_uuid();
+        root.insert(
+            "vault".to_string(),
+            serde_json::Value::String(vault_id.clone()),
+        );
+        Ok(lpm_common::LpmJsonMutation::Changed(Some(vault_id)))
+    })
+    .map(lpm_common::LpmJsonMutation::into_inner)
+    .map_err(|error| error.to_string())
+}
+
 fn validate_vault_id(vault_id: &str) -> Result<(), String> {
     if is_safe_vault_id(vault_id) {
         return Ok(());
@@ -453,6 +471,31 @@ fn validate_vault_id(vault_id: &str) -> Result<(), String> {
         "lpm.json vault id {vault_id:?} contains path-traversal or non-portable characters; \
          refusing to use as a vault filename. Remove the `vault` field to regenerate."
     ))
+}
+
+/// Refuse a `vault` field in `project_dir`'s lpm.json that no write could
+/// use, as [`get_or_create_vault_id`] would, without changing anything: one
+/// that isn't a string, or isn't a safe ID.
+pub fn check_vault_field(project_dir: &Path) -> Result<(), String> {
+    let Ok(content) = lpm_common::read_text_file_capped(
+        &project_dir.join("lpm.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) else {
+        return Ok(());
+    };
+    let Ok(config) =
+        serde_json::from_str::<serde_json::Value>(lpm_common::strip_utf8_bom_str(&content))
+    else {
+        return Ok(());
+    };
+    match config.get("vault").filter(|value| !value.is_null()) {
+        None => Ok(()),
+        Some(value) => validate_vault_id(
+            value
+                .as_str()
+                .ok_or_else(|| "lpm.json vault field must be a string".to_string())?,
+        ),
+    }
 }
 
 /// Read the vault ID from lpm.json without creating one.

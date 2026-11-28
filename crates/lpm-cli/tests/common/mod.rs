@@ -8,6 +8,8 @@
 //! - [`strip_ansi`] — best-effort ANSI escape stripping for
 //!   assertions over CLI stdout/stderr.
 //! - [`parse_json_stdout`] — strip ANSI then parse stdout as JSON.
+//! - [`pty::run_in_pty`] — run `lpm-rs` in a pseudo-terminal, answering
+//!   its prompts once they show with echo off (Unix).
 //! - Mock npm-style registry mounting ([`mount_mock_registry`] +
 //!   [`MockPackage`] / [`MockPackageVersion`] and the lower-level
 //!   [`make_mock_tarball`], [`sri_for`], [`tarball_route`] builders).
@@ -31,6 +33,9 @@
 //! `#![allow(dead_code)]`.
 
 #![allow(dead_code)]
+
+#[cfg(unix)]
+pub mod pty;
 
 use aes_gcm::{
     Aes256Gcm, KeyInit,

@@ -37,7 +37,7 @@ mod validate;
 pub use characters::{
     CharacterKind, CharacterRun, FoundCharacter, HiddenCharacter, MAX_LISTED_CHARACTERS,
     MAX_LISTED_RUNS, ShownCharacters, ValueCharacters, check_value_characters,
-    remove_hidden_characters, show_hidden_characters, trim_ends,
+    remove_hidden_characters, show_hidden_characters, strip_single_line_end, trim_ends,
 };
 pub use example::generate as generate_env_example;
 pub use inheritance::{EnvDefinition, EnvironmentsConfig, list_environments, resolve_chain};

@@ -23,6 +23,7 @@ mod response;
 mod rotation;
 mod schema;
 mod sync_payload;
+mod value_input;
 
 mod prelude {
     pub(super) use crate::{install_ui, output};
@@ -118,16 +119,17 @@ fn run_local_sync_action(
     json_output: bool,
 ) -> Result<(), LpmError> {
     use arguments::LocalAction;
-    if action.uses_project_values() {
+    // set checks its arguments first, so a wrong one never asks to link.
+    if action.uses_project_values() && !matches!(action, LocalAction::Set { .. }) {
         links::ensure_folder_linked(project_dir, json_output)?;
     }
     let result = match action {
         LocalAction::Set {
             environment,
-            assignments,
+            values,
         } => local::env_set(
             environment.env.as_deref(),
-            &assignments,
+            &values,
             project_dir,
             json_output,
         ),
@@ -387,7 +389,53 @@ mod tests {
         include_str!("rotation.rs"),
         include_str!("schema.rs"),
         include_str!("sync_payload.rs"),
+        include_str!("value_input.rs"),
     ];
+
+    /// std's buffered stdin keeps what it read in a buffer it never wipes,
+    /// so secret input reads standard input from its descriptor
+    /// (`secret_read::read_secret_stdin`) and never through std's reader.
+    #[test]
+    fn secret_input_never_reads_through_std_s_buffered_stdin() {
+        // What a file holds before its tests: a test hook in production code
+        // carries `#[cfg(test)]` too.
+        let production = |source: &'static str| {
+            source
+                .split("#[cfg(test)]\nmod tests")
+                .next()
+                .unwrap_or(source)
+        };
+        // Here std's stdin only says whether it's a terminal.
+        for (name, source) in [
+            ("value_input.rs", include_str!("value_input.rs")),
+            ("local.rs", include_str!("local.rs")),
+            ("hidden_prompt.rs", include_str!("../../hidden_prompt.rs")),
+            (
+                "hidden_prompt/unix.rs",
+                include_str!("../../hidden_prompt/unix.rs"),
+            ),
+            (
+                "hidden_prompt/windows.rs",
+                include_str!("../../hidden_prompt/windows.rs"),
+            ),
+        ] {
+            let source = production(source);
+            assert_eq!(
+                source.matches("stdin()").count(),
+                source.matches("stdin().is_terminal()").count(),
+                "{name} uses std's stdin for more than whether it's a terminal"
+            );
+        }
+        // The reader takes its descriptor and reads that alone.
+        let secret_read = production(include_str!("../../../../lpm-common/src/secret_read.rs"));
+        assert_eq!(secret_read.matches("stdin()").count(), 1);
+        assert_eq!(
+            secret_read.matches("stdin.").count(),
+            secret_read.matches("stdin.as_raw_fd()").count()
+                + secret_read.matches("stdin.as_raw_handle()").count(),
+            "secret_read.rs reads std's stdin rather than its descriptor"
+        );
+    }
 
     #[test]
     fn a_script_error_from_a_shared_helper_is_reported_as_an_env_error() {

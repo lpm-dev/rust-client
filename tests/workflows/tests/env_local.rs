@@ -942,9 +942,631 @@ fn env_set_without_pairs_fails_with_usage_message() {
     assert!(!out.status.success(), "env set with no pairs must fail");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("usage:") || stderr.contains("KEY=VALUE"),
+        stderr.to_lowercase().contains("usage:"),
         "stderr must show usage, got:\n{stderr}",
     );
+}
+
+// ─── set from standard input, files and the prompt ────────────────────
+
+fn revealed(project: &TempProject, key: &str) -> Option<String> {
+    let output = lpm(project)
+        .args(["--json", "env", "get", key, "--reveal"])
+        .output()
+        .expect("failed to run lpm env get");
+    output
+        .status
+        .success()
+        .then(|| {
+            parse_json_stdout(&output, "env get --json")["value"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .flatten()
+}
+
+fn failure_text(output: &std::process::Output) -> String {
+    strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
+}
+
+#[test]
+fn env_set_stdin_stores_one_line_without_the_line_end_echo_adds() {
+    let project = TempProject::empty(r#"{"name":"env-set-stdin","version":"1.0.0"}"#);
+    let set = lpm(&project)
+        .args(["env", "set", "TOKEN", "--stdin"])
+        .write_stdin("fixture-token\n")
+        .output()
+        .expect("failed to run lpm env set --stdin");
+    assert!(set.status.success(), "{}", failure_text(&set));
+    let stderr = strip_ansi(&String::from_utf8_lossy(&set.stderr));
+    assert!(
+        !stderr.contains("hard to see"),
+        "no stray line end is left to warn about:\n{stderr}"
+    );
+    assert_eq!(
+        revealed(&project, "TOKEN").as_deref(),
+        Some("fixture-token")
+    );
+
+    let crlf = lpm(&project)
+        .args(["env", "set", "TOKEN", "--stdin"])
+        .write_stdin("fixture-crlf\r\n")
+        .output()
+        .expect("failed to run lpm env set --stdin");
+    assert!(crlf.status.success(), "{}", failure_text(&crlf));
+    assert_eq!(revealed(&project, "TOKEN").as_deref(), Some("fixture-crlf"));
+}
+
+#[test]
+fn env_set_keeps_a_value_of_several_lines_exactly_from_stdin_and_files() {
+    let project = TempProject::empty(r#"{"name":"env-set-multiline","version":"1.0.0"}"#);
+    let pem = "-----BEGIN PRIVATE KEY-----\nZml4dHVyZQ==\n-----END PRIVATE KEY-----\n";
+    project.write_file("tls.key", pem);
+    let set = lpm(&project)
+        .args([
+            "env",
+            "set",
+            "PIPED_KEY",
+            "--stdin",
+            "--from-file",
+            "FILED_KEY=tls.key",
+        ])
+        .write_stdin(pem)
+        .output()
+        .expect("failed to run lpm env set");
+    assert!(set.status.success(), "{}", failure_text(&set));
+    assert_eq!(revealed(&project, "PIPED_KEY").as_deref(), Some(pem));
+    assert_eq!(revealed(&project, "FILED_KEY").as_deref(), Some(pem));
+}
+
+#[test]
+fn env_set_reads_files_relative_to_the_directory_it_runs_in_with_other_values_at_once() {
+    let project = TempProject::empty(r#"{"name":"env-set-files","version":"1.0.0"}"#);
+    project.write_file("secrets/api.txt", "fixture-api\n");
+    project.write_file("secrets/db.txt", "fixture-db");
+    let set = lpm(&project)
+        .current_dir(project.path().join("secrets"))
+        .args([
+            "--json",
+            "env",
+            "set",
+            "PORT=3000",
+            "--from-file",
+            "API_KEY=api.txt",
+            "--from-file",
+            "DB_PASSWORD=db.txt",
+        ])
+        .output()
+        .expect("failed to run lpm env set --from-file");
+    assert!(set.status.success(), "{}", failure_text(&set));
+    let envelope = parse_json_stdout(&set, "env set --from-file --json");
+    assert_eq!(
+        envelope["stored"],
+        serde_json::json!(["PORT", "API_KEY", "DB_PASSWORD"])
+    );
+    assert_eq!(revealed(&project, "PORT").as_deref(), Some("3000"));
+    assert_eq!(
+        revealed(&project, "API_KEY").as_deref(),
+        Some("fixture-api")
+    );
+    assert_eq!(
+        revealed(&project, "DB_PASSWORD").as_deref(),
+        Some("fixture-db")
+    );
+}
+
+#[test]
+fn env_set_without_a_value_or_a_terminal_fails_at_once_and_stores_nothing() {
+    let project = TempProject::empty(r#"{"name":"env-set-no-terminal","version":"1.0.0"}"#);
+    lpm(&project)
+        .args(["env", "set", "KEPT=fixture-kept"])
+        .assert()
+        .success();
+    let human = lpm(&project)
+        .args(["env", "set", "OTHER=fixture-other", "TOKEN"])
+        .output()
+        .expect("failed to run lpm env set");
+    assert!(!human.status.success());
+    let text = failure_text(&human);
+    assert!(text.contains("TOKEN has no value."), "{text}");
+    assert!(text.contains("`lpm env set TOKEN --stdin`"), "{text}");
+    assert!(
+        text.contains("`lpm env set --from-file TOKEN=PATH`"),
+        "{text}"
+    );
+    assert_eq!(
+        revealed(&project, "OTHER"),
+        None,
+        "nothing from the command is stored"
+    );
+
+    let json = lpm(&project)
+        .args(["--json", "env", "set", "TOKEN"])
+        .output()
+        .expect("failed to run lpm env set --json");
+    assert!(!json.status.success());
+    let envelope = parse_json_stdout(&json, "env set --json");
+    assert_eq!(envelope["success"], false);
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("doesn't ask for values with --json")),
+        "{envelope}"
+    );
+    assert_eq!(revealed(&project, "KEPT").as_deref(), Some("fixture-kept"));
+}
+
+#[test]
+fn env_set_stdin_takes_exactly_one_key_without_a_value() {
+    let project = TempProject::empty(r#"{"name":"env-set-stdin-keys","version":"1.0.0"}"#);
+    for (args, expected) in [
+        (
+            &["env", "set", "A=fixture", "--stdin"][..],
+            "--stdin reads one value",
+        ),
+        (
+            &["env", "set", "A", "B", "--stdin"][..],
+            "2 keys have none: A, B",
+        ),
+    ] {
+        let output = lpm(&project)
+            .args(args)
+            .write_stdin("fixture-piped")
+            .output()
+            .expect("failed to run lpm env set --stdin");
+        assert!(!output.status.success(), "{args:?}");
+        let text = failure_text(&output);
+        assert!(text.contains(expected), "{args:?}: {text}");
+        assert!(!text.contains("fixture-piped"), "{args:?}: {text}");
+    }
+    assert_eq!(revealed(&project, "A"), None);
+}
+
+#[test]
+fn env_set_refuses_empty_values_from_stdin_and_files_and_says_how_to_store_one() {
+    let project = TempProject::empty(r#"{"name":"env-set-empty","version":"1.0.0"}"#);
+    project.write_file("empty.txt", "");
+    project.write_file("newline.txt", "\n");
+    for (args, stdin, said) in [
+        (
+            &["env", "set", "TOKEN", "--stdin"][..],
+            "",
+            "the value piped in for TOKEN is empty",
+        ),
+        (
+            &["env", "set", "TOKEN", "--stdin"][..],
+            "\n",
+            "the value piped in for TOKEN is empty",
+        ),
+        (
+            &["env", "set", "--from-file", "TOKEN=empty.txt"][..],
+            "",
+            "--from-file: empty.txt holds an empty value for TOKEN",
+        ),
+        (
+            &["env", "set", "--from-file", "TOKEN=newline.txt"][..],
+            "",
+            "--from-file: newline.txt holds an empty value for TOKEN",
+        ),
+    ] {
+        let output = lpm(&project)
+            .args(args)
+            .write_stdin(stdin)
+            .output()
+            .expect("failed to run lpm env set");
+        assert!(!output.status.success(), "{args:?}");
+        let text = failure_text(&output);
+        assert!(
+            text.contains(&format!("{said}, so nothing was stored")),
+            "{text}"
+        );
+        assert!(text.contains("`lpm env set TOKEN=`"), "{text}");
+    }
+    assert_eq!(revealed(&project, "TOKEN"), None);
+
+    lpm(&project)
+        .args(["env", "set", "TOKEN="])
+        .assert()
+        .success();
+    assert_eq!(revealed(&project, "TOKEN").as_deref(), Some(""));
+}
+
+#[test]
+fn env_set_refuses_a_file_larger_than_a_value_can_be_and_nul_characters() {
+    let project = TempProject::empty(r#"{"name":"env-set-limits","version":"1.0.0"}"#);
+    project.write_file("big.txt", &"x".repeat(100 * 1024 + 1));
+    let big = lpm(&project)
+        .args(["env", "set", "--from-file", "BIG=big.txt"])
+        .output()
+        .expect("failed to run lpm env set --from-file");
+    assert!(!big.status.success());
+    let text = failure_text(&big);
+    assert!(
+        text.contains("big.txt is larger than 100 KiB, the most one value can hold"),
+        "{text}"
+    );
+
+    let piped = lpm(&project)
+        .args(["env", "set", "BIG", "--stdin"])
+        .write_stdin("x".repeat(100 * 1024 + 1))
+        .output()
+        .expect("failed to run lpm env set --stdin");
+    assert!(!piped.status.success());
+    assert!(failure_text(&piped).contains("larger than 100 KiB"));
+
+    let nul = lpm(&project)
+        .args(["env", "set", "NUL", "--stdin"])
+        .write_stdin("fixture\0secret")
+        .output()
+        .expect("failed to run lpm env set --stdin");
+    assert!(!nul.status.success());
+    let text = failure_text(&nul);
+    assert!(text.contains("contains a NUL character"), "{text}");
+    assert!(!text.contains("fixture"), "{text}");
+    assert_eq!(revealed(&project, "BIG"), None);
+    assert_eq!(revealed(&project, "NUL"), None);
+}
+
+/// A named pipe at `path` that a thread writes `content` to once a reader
+/// opens it, as a shell's process substitution does.
+#[cfg(unix)]
+fn piped_file(path: &std::path::Path, content: &'static str) -> std::thread::JoinHandle<()> {
+    let name = std::ffi::CString::new(path.to_str().expect("UTF-8 path")).expect("no NUL");
+    // SAFETY: `name` is a valid NUL-terminated path that outlives the call.
+    assert_eq!(
+        unsafe { libc::mkfifo(name.as_ptr(), 0o600) },
+        0,
+        "create FIFO"
+    );
+    let path = path.to_owned();
+    std::thread::spawn(move || {
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open the FIFO once lpm reads it");
+        std::io::Write::write_all(&mut writer, content.as_bytes()).expect("write the FIFO");
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn env_set_reads_a_value_from_a_pipe_and_refuses_a_directory_or_a_device() {
+    let project = TempProject::empty(r#"{"name":"env-set-special","version":"1.0.0"}"#);
+    std::fs::create_dir(project.path().join("folder")).expect("create folder");
+    for (name, said) in [
+        ("folder", "--from-file: folder is a directory"),
+        ("/dev/null", "--from-file: /dev/null isn't a file or a pipe"),
+    ] {
+        let output = lpm(&project)
+            .args(["env", "set", "--from-file", &format!("VALUE={name}")])
+            .output()
+            .expect("failed to run lpm env set --from-file");
+        assert!(!output.status.success(), "{name}");
+        let text = failure_text(&output);
+        assert!(text.contains(said), "{name}: {text}");
+    }
+    assert_eq!(revealed(&project, "VALUE"), None);
+
+    let writer = piped_file(&project.path().join("pipe"), "fixture-piped\n");
+    let output = lpm(&project)
+        .args(["env", "set", "--from-file", "VALUE=pipe"])
+        .output()
+        .expect("failed to run lpm env set --from-file");
+    writer.join().expect("the writer finished");
+    assert!(output.status.success(), "{}", failure_text(&output));
+    assert_eq!(
+        revealed(&project, "VALUE").as_deref(),
+        Some("fixture-piped")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn env_import_reads_a_pipe_and_refuses_a_directory_or_a_device() {
+    let project = TempProject::empty(r#"{"name":"env-import-special","version":"1.0.0"}"#);
+    std::fs::create_dir(project.path().join("folder")).expect("create folder");
+    for (name, said) in [
+        ("folder", "it's a directory"),
+        ("/dev/null", "it isn't a file or a pipe"),
+    ] {
+        let output = lpm(&project)
+            .args(["env", "import", name])
+            .output()
+            .expect("failed to run lpm env import");
+        assert!(!output.status.success(), "{name}");
+        let text = failure_text(&output);
+        assert!(text.contains(said), "{name}: {text}");
+    }
+
+    let writer = piped_file(&project.path().join("env-pipe"), "A=fixture-a\n");
+    let output = lpm(&project)
+        .args(["env", "import", "env-pipe"])
+        .output()
+        .expect("failed to run lpm env import");
+    writer.join().expect("the writer finished");
+    assert!(output.status.success(), "{}", failure_text(&output));
+    assert_eq!(revealed(&project, "A").as_deref(), Some("fixture-a"));
+}
+
+#[cfg(unix)]
+#[test]
+fn stdin_that_is_a_device_is_refused_rather_than_read() {
+    let project = TempProject::empty(r#"{"name":"stdin-device","version":"1.0.0"}"#);
+    for (args, said) in [
+        (
+            &["env", "set", "TOKEN", "--stdin"][..],
+            "standard input is a device, such as a terminal or /dev/null; nothing was read for TOKEN",
+        ),
+        (
+            &["env", "import", "-"][..],
+            "but standard input is a device",
+        ),
+    ] {
+        let output = support::lpm_spawnable(&project)
+            .args(args)
+            .stdin(std::fs::File::open("/dev/zero").expect("open /dev/zero"))
+            .output()
+            .expect("failed to run lpm");
+        assert!(!output.status.success(), "{args:?}");
+        let text = failure_text(&output);
+        assert!(text.contains(said), "{args:?}: {text}");
+    }
+    assert_eq!(revealed(&project, "TOKEN"), None);
+}
+
+/// Wait for `child` to exit; one still waiting at the deadline, which only
+/// bounds a failure, is killed and fails the test.
+fn exit_of(mut child: std::process::Child, waiting_on: &str) -> std::process::Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while child.try_wait().expect("inspect lpm").is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("lpm waited on {waiting_on} instead of refusing first");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    child.wait_with_output().expect("lpm's output")
+}
+
+#[test]
+fn import_refuses_a_project_it_cant_change_before_it_reads_its_source() {
+    let project = TempProject::empty(r#"{"name":"import-read-only","version":"1.0.0"}"#);
+    for args in [
+        &["env", "set", "SEEDED=team"][..],
+        &["env", "debug-companion", "read-only"],
+    ] {
+        lpm(&project).args(args).assert().success();
+    }
+
+    let mut child = support::lpm_spawnable(&project)
+        .args(["env", "import", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run lpm");
+    let held_open = child.stdin.take();
+    let output = exit_of(child, "standard input");
+    drop(held_open);
+    assert!(!output.status.success());
+    assert_eq!(revealed(&project, "IMPORTED"), None);
+
+    #[cfg(unix)]
+    {
+        let fifo = project.path().join("never-written.env");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo");
+        assert!(status.success());
+        let child = support::lpm_spawnable(&project)
+            .args(["env", "import", "never-written.env"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to run lpm");
+        let output = exit_of(child, "a named pipe without a writer");
+        assert!(!output.status.success());
+    }
+}
+
+#[test]
+fn stdin_that_is_a_directory_is_refused_by_name() {
+    let project = TempProject::empty(r#"{"name":"stdin-directory","version":"1.0.0"}"#);
+    for (args, said) in [
+        (
+            &["env", "set", "TOKEN", "--stdin"][..],
+            "standard input is a directory; nothing was read for TOKEN",
+        ),
+        (
+            &["env", "import", "-"][..],
+            "but standard input is a directory",
+        ),
+    ] {
+        // Windows opens a folder only with backup semantics.
+        #[cfg(windows)]
+        let folder = {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(project.path())
+        };
+        #[cfg(not(windows))]
+        let folder = std::fs::File::open(project.path());
+        let output = support::lpm_spawnable(&project)
+            .args(args)
+            .stdin(folder.expect("open the project folder"))
+            .output()
+            .expect("failed to run lpm");
+        assert!(!output.status.success(), "{args:?}");
+        let text = failure_text(&output);
+        assert!(text.contains(said), "{args:?}: {text}");
+    }
+    assert_eq!(revealed(&project, "TOKEN"), None);
+}
+
+#[test]
+fn env_set_warns_about_hidden_characters_in_values_from_stdin_and_files() {
+    let project = TempProject::empty(r#"{"name":"env-set-hidden-input","version":"1.0.0"}"#);
+    project.write_file("spaced.txt", "fixture value \n");
+    let set = lpm(&project)
+        .args([
+            "env",
+            "set",
+            "PIPED",
+            "--stdin",
+            "--from-file",
+            "FILED=spaced.txt",
+        ])
+        .write_stdin("fixture\u{200B}token\n")
+        .output()
+        .expect("failed to run lpm env set");
+    assert!(set.status.success(), "{}", failure_text(&set));
+    let stderr = strip_ansi(&String::from_utf8_lossy(&set.stderr));
+    assert!(
+        stderr.contains("PIPED has characters that are hard to see"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("ZERO WIDTH SPACE"), "{stderr}");
+    assert!(
+        stderr.contains("FILED has characters that are hard to see"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("fixture"), "{stderr}");
+
+    let json = lpm(&project)
+        .args(["--json", "env", "set", "PIPED", "--stdin"])
+        .write_stdin("fixture\u{200B}token\n")
+        .output()
+        .expect("failed to run lpm env set --stdin --json");
+    assert!(json.status.success(), "{}", failure_text(&json));
+    let envelope = parse_json_stdout(&json, "env set --stdin --json");
+    assert!(!envelope.to_string().contains("fixture"));
+    insta::assert_json_snapshot!(envelope, @r#"
+    {
+      "success": true,
+      "stored": [
+        "PIPED"
+      ],
+      "ignored": [],
+      "env": "default",
+      "value_warnings": [
+        {
+          "key": "PIPED",
+          "characters": [
+            {
+              "kind": "invisible",
+              "code_point": "U+200B",
+              "escape": "\\u{200b}",
+              "name": "ZERO WIDTH SPACE",
+              "group": null,
+              "count": 1,
+              "runs": [
+                {
+                  "position": 8,
+                  "count": 1
+                }
+              ]
+            }
+          ],
+          "more": 0
+        }
+      ]
+    }
+    "#);
+}
+
+#[test]
+fn env_import_reads_a_piped_env_file_with_the_file_parser() {
+    let project = TempProject::empty(r#"{"name":"env-import-stdin","version":"1.0.0"}"#);
+    let import = lpm(&project)
+        .args(["--json", "env", "import", "-", "--env=staging"])
+        .write_stdin("# piped\nA=fixture-a\nexport B=\"fixture b\"\nC='fixture c'\n")
+        .output()
+        .expect("failed to run lpm env import -");
+    assert!(import.status.success(), "{}", failure_text(&import));
+    let envelope = parse_json_stdout(&import, "env import - --json");
+    assert_eq!(envelope["imported"], 3);
+    assert_eq!(envelope["from"], "-");
+    assert_eq!(envelope["warnings"], serde_json::json!([]));
+    assert!(
+        !project.path().join(".gitignore").exists(),
+        "standard input has no file to keep out of git"
+    );
+    let staged = |key: &str| {
+        let output = lpm(&project)
+            .args(["--json", "env", "get", key, "--reveal", "--env=staging"])
+            .output()
+            .expect("failed to run lpm env get");
+        parse_json_stdout(&output, "env get --json")["value"].clone()
+    };
+    assert_eq!(staged("A"), "fixture-a");
+    assert_eq!(staged("B"), "fixture b");
+    assert_eq!(staged("C"), "fixture c");
+
+    let human = lpm(&project)
+        .args(["env", "import", "-"])
+        .write_stdin("D=fixture-d\n")
+        .output()
+        .expect("failed to run lpm env import -");
+    assert!(human.status.success(), "{}", failure_text(&human));
+    assert!(
+        failure_text(&human).contains("imported 1 secret from standard input (default)"),
+        "{}",
+        failure_text(&human)
+    );
+    assert_eq!(revealed(&project, "D").as_deref(), Some("fixture-d"));
+}
+
+#[test]
+fn env_import_from_standard_input_warns_about_hidden_characters_without_the_value() {
+    let project = TempProject::empty(r#"{"name":"env-import-stdin-hidden","version":"1.0.0"}"#);
+    let import = lpm(&project)
+        .args(["--json", "env", "import", "-"])
+        .write_stdin("A=fixture\u{200B}value\nB=fixture-plain\n")
+        .output()
+        .expect("failed to run lpm env import -");
+    assert!(import.status.success(), "{}", failure_text(&import));
+    let stdout = String::from_utf8_lossy(&import.stdout);
+    assert!(!stdout.contains("fixture"), "{stdout}");
+    let envelope = parse_json_stdout(&import, "env import - --json");
+    assert_eq!(envelope["imported"], 2);
+    let warnings = envelope["value_warnings"].as_array().expect("warnings");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0]["key"], "A");
+
+    let human = lpm(&project)
+        .args(["env", "import", "-", "--overwrite"])
+        .write_stdin("A=fixture\u{200B}value\n")
+        .output()
+        .expect("failed to run lpm env import -");
+    assert!(human.status.success(), "{}", failure_text(&human));
+    let text = failure_text(&human);
+    assert!(text.contains("ZERO WIDTH SPACE"), "{text}");
+    assert!(!text.contains("fixture"), "{text}");
+}
+
+#[test]
+fn env_import_refuses_a_piped_env_file_larger_than_an_env_file_can_be() {
+    let project = TempProject::empty(r#"{"name":"env-import-stdin-limit","version":"1.0.0"}"#);
+    let mut content = String::from("A=fixture\n");
+    content.push_str(&"#".repeat(16 * 1024 * 1024));
+    let import = lpm(&project)
+        .args(["env", "import", "-"])
+        .write_stdin(content)
+        .output()
+        .expect("failed to run lpm env import -");
+    assert!(!import.status.success());
+    assert!(failure_text(&import).contains("is larger than 16 MiB"));
+    assert_eq!(revealed(&project, "A"), None);
 }
 
 // ─── multi-env (--env=staging) ─────────────────────────────────────────
@@ -1446,7 +2068,7 @@ fn env_validate_json_exits_nonzero_and_reports_missing_keys() {
 }
 
 #[test]
-fn env_validate_human_remediation_assigns_each_missing_key() {
+fn env_validate_human_remediation_asks_for_each_missing_key_hidden() {
     let project = TempProject::empty(r#"{"name":"env-validate","version":"1.0.0"}"#);
     write_dotenv(
         &project,
@@ -1469,8 +2091,8 @@ fn env_validate_human_remediation_assigns_each_missing_key() {
     );
     let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
     assert!(
-        stdout.contains("lpm env set REQUIRED_TWO=... REQUIRED_THREE=..."),
-        "human remediation must provide one KEY=VALUE operand per missing key:\n{stdout}"
+        stdout.contains("lpm env set REQUIRED_TWO REQUIRED_THREE"),
+        "human remediation names each missing key, which env set asks for hidden:\n{stdout}"
     );
 }
 
@@ -1687,6 +2309,60 @@ fn env_check_reads_the_vault_once_for_every_environment() {
     assert!(output.status.success(), "{envelope}");
     assert_eq!(envelope["environments"].as_array().unwrap().len(), 3);
     assert_eq!(vault_transactions(&log), 1);
+}
+
+#[test]
+fn an_import_checks_the_project_first_only_from_a_source_that_can_wait() {
+    let project = TempProject::empty(r#"{"name":"import-checks","version":"1.0.0"}"#);
+    lpm(&project)
+        .args(["env", "set", "TOKEN=value"])
+        .assert()
+        .success();
+    project.write_file("values.env", "IMPORTED=value\n");
+    let log = project.path().join("vault-transactions.log");
+
+    let output = lpm(&project)
+        .env("LPM_TEST_VAULT_TRANSACTION_LOG", &log)
+        .args(["env", "import", "values.env"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        vault_transactions(&log),
+        0,
+        "a regular file waits on no one, so the import's own write checks the project"
+    );
+    std::fs::create_dir_all(project.path().join("a-folder")).unwrap();
+    for missing in ["nope.env", "a-folder"] {
+        let output = lpm(&project)
+            .env("LPM_TEST_VAULT_TRANSACTION_LOG", &log)
+            .args(["env", "import", missing])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{missing}");
+    }
+    assert_eq!(
+        vault_transactions(&log),
+        0,
+        "a source that can't be read is refused before the project is checked"
+    );
+
+    let output = lpm(&project)
+        .env("LPM_TEST_VAULT_TRANSACTION_LOG", &log)
+        .args(["env", "import", "-"])
+        .write_stdin("PIPED=value\n")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(vault_transactions(&log), 1, "standard input can wait");
 }
 
 #[test]

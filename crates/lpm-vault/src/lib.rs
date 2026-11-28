@@ -224,6 +224,56 @@ pub(crate) fn authorize_companion(
     }
 }
 
+/// The env project a values write was checked for: the one `project_dir`
+/// named, or none yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedValues {
+    vault_id: Option<String>,
+}
+
+impl CheckedValues {
+    /// The vault the values go to: the checked project's, or a new one for a
+    /// folder that named none, refused when `project_dir` names another
+    /// project since, while `gathered`. The folder is linked to it when it's
+    /// the first to store values there.
+    fn vault_id(&self, project_dir: &Path, gathered: &str) -> Result<String, String> {
+        let changed =
+            || format!("this directory's env project changed while {gathered}; nothing was stored");
+        let vault_id = match &self.vault_id {
+            Some(checked) => {
+                if vault_id::read_vault_id(project_dir).as_ref() != Some(checked) {
+                    return Err(changed());
+                }
+                checked.clone()
+            }
+            None => {
+                #[cfg(test)]
+                tests::before_vault_id_is_created();
+                vault_id::create_vault_id(project_dir)?.ok_or_else(changed)?
+            }
+        };
+        link_for_write(project_dir, &vault_id)?;
+        Ok(vault_id)
+    }
+}
+
+/// Refuse what a write of `project_dir`'s values is refused for, before
+/// they're read or asked for: a `vault` field in its lpm.json that no write
+/// could use, newer data that refuses writes, or an interrupted step that
+/// can't be finished. Nothing for a folder without an
+/// env project yet, which the write creates. [`set_checked`] writes to the
+/// project it checked.
+pub fn check_values_writable(project_dir: &Path) -> Result<CheckedValues, String> {
+    vault_id::check_vault_field(project_dir)?;
+    let vault_id = linked_vault_id(project_dir)?;
+    if let Some(vault_id) = &vault_id {
+        with_project_vault_transaction(|directory| {
+            authorize_companion(directory, vault_id, companion::gate::Operation::Write)
+        })?;
+    }
+    Ok(CheckedValues { vault_id })
+}
+
 fn with_project_vault_transaction<T>(
     operation: impl FnOnce(&storage_transaction::VaultStorageDirectory) -> Result<T, String>,
 ) -> Result<T, String> {
@@ -301,13 +351,21 @@ fn linked_vault_id(project_dir: &Path) -> Result<Option<String>, String> {
 /// names none, when this machine lets the folder store values in it.
 fn linked_vault_id_for_write(project_dir: &Path) -> Result<String, String> {
     let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
-    if !is_listed(&vault_id, &links::link_folder_path(project_dir)) {
-        let folder = with_link_transaction(|directory| {
-            links::require_for_write(directory, project_dir, &vault_id)
-        })?;
-        remember_listed(&vault_id, folder);
-    }
+    link_for_write(project_dir, &vault_id)?;
     Ok(vault_id)
+}
+
+/// Fails unless `project_dir` may store values in the vault `vault_id`,
+/// linking it as the first folder to when the vault has neither values nor
+/// links on this machine.
+fn link_for_write(project_dir: &Path, vault_id: &str) -> Result<(), String> {
+    if !is_listed(vault_id, &links::link_folder_path(project_dir)) {
+        let folder = with_link_transaction(|directory| {
+            links::require_for_write(directory, project_dir, vault_id)
+        })?;
+        remember_listed(vault_id, folder);
+    }
+    Ok(())
 }
 
 /// Whether `project_dir` may use the vault its lpm.json names; `None` when
@@ -755,28 +813,22 @@ pub fn set(
     pairs: &[(&str, &str)],
     source: &history::Source,
 ) -> Result<(), String> {
+    set_env(project_dir, "default", pairs, source)
+}
+
+/// [`set_env`] into the project `checked` was for, refused when
+/// `project_dir` names another one since, such as while its values were
+/// asked for.
+pub fn set_checked(
+    project_dir: &Path,
+    checked: &CheckedValues,
+    env: &str,
+    pairs: &[(&str, &str)],
+    source: &history::Source,
+) -> Result<(), String> {
     reject_invalid_keys(pairs.iter().map(|(k, _)| *k))?;
-
-    let vault_id = linked_vault_id_for_write(project_dir)?;
-    let project_name = vault_id::read_project_name(project_dir);
-    let project_path = project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.to_path_buf())
-        .display()
-        .to_string();
-
-    mutate_secrets_env(
-        &vault_id,
-        &project_name,
-        &project_path,
-        "default",
-        |secrets| {
-            for (key, value) in pairs {
-                secrets.insert((*key).to_owned(), (*value).to_owned());
-            }
-        },
-        source,
-    )
+    let vault_id = checked.vault_id(project_dir, "its values were read or asked for")?;
+    write_env(project_dir, &vault_id, env, pairs, source)
 }
 
 /// Set secrets for a specific environment.
@@ -787,8 +839,17 @@ pub fn set_env(
     source: &history::Source,
 ) -> Result<(), String> {
     reject_invalid_keys(pairs.iter().map(|(k, _)| *k))?;
-
     let vault_id = linked_vault_id_for_write(project_dir)?;
+    write_env(project_dir, &vault_id, env, pairs, source)
+}
+
+fn write_env(
+    project_dir: &Path,
+    vault_id: &str,
+    env: &str,
+    pairs: &[(&str, &str)],
+    source: &history::Source,
+) -> Result<(), String> {
     let project_name = vault_id::read_project_name(project_dir);
     let project_path = project_dir
         .canonicalize()
@@ -797,7 +858,7 @@ pub fn set_env(
         .to_string();
 
     mutate_secrets_env(
-        &vault_id,
+        vault_id,
         &project_name,
         &project_path,
         env,
@@ -906,7 +967,7 @@ struct PreparedEnvironmentFileInitialization<'a> {
     initialization: &'a EnvironmentFileInitialization,
     file_present: bool,
     file_variable_count: usize,
-    secrets: Option<SecretMap>,
+    secrets: Option<wiping::ParsedValues>,
 }
 
 /// Decode a vault once for inventory planning and later initialization.
@@ -970,7 +1031,7 @@ fn prepare_environment_file_initializations<'a>(
                 "dotenv sources exceed the {source_budget_bytes}-byte aggregate limit"
             ));
         }
-        let secrets = parse_env_content(&content);
+        let secrets = wiping::ParsedValues::from(parse_env_content(&content));
         let file_variable_count = secrets.len();
         if initialization.import_if_present && !secrets.is_empty() {
             reject_invalid_keys(secrets.keys().map(String::as_str))?;
@@ -1673,61 +1734,121 @@ pub fn delete_env(
     Ok(removed.unwrap_or_default())
 }
 
+/// A .env file or pipe to import, opened once, so whether reading it can
+/// wait is known before it's read and stays true through the read.
+pub struct EnvFileSource {
+    source: lpm_common::secret_read::SecretSource,
+    path: PathBuf,
+}
+
+impl EnvFileSource {
+    /// Whether reading it can wait on whatever writes to it: a pipe.
+    pub fn can_wait(&self) -> bool {
+        self.source.can_wait()
+    }
+
+    fn read(self) -> Result<zeroize::Zeroizing<String>, String> {
+        let Self { source, path } = self;
+        source
+            .read()
+            .map_err(|error| import_read_error(&path, error))
+    }
+}
+
+/// The .env file or pipe at `env_path`, without waiting for a pipe's
+/// writer; a device or a directory is refused.
+pub fn open_env_file_to_import(env_path: &Path) -> Result<EnvFileSource, String> {
+    let limit = usize::try_from(lpm_common::CONFIG_FILE_SIZE_CAP_BYTES).unwrap_or(usize::MAX);
+    lpm_common::secret_read::open_secret_source(env_path, limit)
+        .map(|source| EnvFileSource {
+            source,
+            path: env_path.to_path_buf(),
+        })
+        .map_err(|error| import_read_error(env_path, error))
+}
+
+fn import_read_error(env_path: &Path, error: lpm_common::secret_read::SecretReadError) -> String {
+    let path = env_path.display();
+    match error {
+        lpm_common::secret_read::SecretReadError::TooLarge => format!(
+            "{path} is larger than {} MiB, the most a .env file to import can be",
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES / (1024 * 1024)
+        ),
+        other => format!("failed to read {path}: {other}"),
+    }
+}
+
 /// Import secrets from a .env file into the vault, as they're written there.
 pub fn import_env_file(
     project_dir: &Path,
-    env_path: &Path,
+    env: Option<&str>,
+    file: EnvFileSource,
     overwrite: bool,
     source: &history::Source,
 ) -> Result<EnvFileImport, String> {
-    let content =
-        lpm_common::read_text_file_capped(env_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-            .map_err(|e| format!("failed to read {}: {e}", env_path.display()))?;
-
-    let parsed = parse_env_content(&content);
-    if parsed.is_empty() {
-        return Ok(EnvFileImport::default());
-    }
-
-    let vault_id = linked_vault_id_for_write(project_dir)?;
-    let project_name = vault_id::read_project_name(project_dir);
-    let project_path = project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.to_path_buf())
-        .display()
-        .to_string();
-
-    let imported = mutate_secrets_env(
-        &vault_id,
-        &project_name,
-        &project_path,
-        "default",
-        move |secrets| merge_imported_secrets(secrets, parsed, overwrite),
-        source,
-    )?;
-
-    Ok(imported)
+    let content = file.read()?;
+    import_env_content(project_dir, env, &content, overwrite, source)
 }
 
-/// Import secrets from a .env file into a specific environment, as they're
-/// written there.
-pub fn import_env_file_to_env(
+/// [`import_env_file`] into `env`, or `default` when it's `None`, of the
+/// project `checked` was for: refused when `project_dir` names another one
+/// once the file is read, which can wait on a pipe's writer.
+pub fn import_env_file_checked(
     project_dir: &Path,
-    env: &str,
-    env_path: &Path,
+    checked: &CheckedValues,
+    env: Option<&str>,
+    file: EnvFileSource,
     overwrite: bool,
     source: &history::Source,
 ) -> Result<EnvFileImport, String> {
-    let content =
-        lpm_common::read_text_file_capped(env_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-            .map_err(|e| format!("failed to read {}: {e}", env_path.display()))?;
+    let content = file.read()?;
+    import_env_content_checked(project_dir, checked, env, &content, overwrite, source)
+}
 
-    let parsed = parse_env_content(&content);
+/// Import secrets from .env `content` read elsewhere, such as from standard
+/// input, into `env`, or `default` when it's `None`, parsed exactly as a .env
+/// file is.
+pub fn import_env_content(
+    project_dir: &Path,
+    env: Option<&str>,
+    content: &str,
+    overwrite: bool,
+    source: &history::Source,
+) -> Result<EnvFileImport, String> {
+    let parsed = wiping::ParsedValues::from(parse_env_content(content));
     if parsed.is_empty() {
         return Ok(EnvFileImport::default());
     }
-
     let vault_id = linked_vault_id_for_write(project_dir)?;
+    import_parsed(project_dir, &vault_id, env, parsed, overwrite, source)
+}
+
+/// [`import_env_content`] into the project `checked` was for, refused when
+/// `project_dir` names another one since.
+pub fn import_env_content_checked(
+    project_dir: &Path,
+    checked: &CheckedValues,
+    env: Option<&str>,
+    content: &str,
+    overwrite: bool,
+    source: &history::Source,
+) -> Result<EnvFileImport, String> {
+    let parsed = wiping::ParsedValues::from(parse_env_content(content));
+    if parsed.is_empty() {
+        return Ok(EnvFileImport::default());
+    }
+    let vault_id = checked.vault_id(project_dir, "the values to import were read")?;
+    import_parsed(project_dir, &vault_id, env, parsed, overwrite, source)
+}
+
+fn import_parsed(
+    project_dir: &Path,
+    vault_id: &str,
+    env: Option<&str>,
+    parsed: wiping::ParsedValues,
+    overwrite: bool,
+    source: &history::Source,
+) -> Result<EnvFileImport, String> {
     let project_name = vault_id::read_project_name(project_dir);
     let project_path = project_dir
         .canonicalize()
@@ -1735,16 +1856,14 @@ pub fn import_env_file_to_env(
         .display()
         .to_string();
 
-    let imported = mutate_secrets_env(
-        &vault_id,
+    mutate_secrets_env(
+        vault_id,
         &project_name,
         &project_path,
-        env,
+        env.unwrap_or(lpm_env::DEFAULT_ENVIRONMENT),
         move |secrets| merge_imported_secrets(secrets, parsed, overwrite),
         source,
-    )?;
-
-    Ok(imported)
+    )
 }
 
 /// Serialize a secret map into sorted dotenv lines, applying the
@@ -1954,7 +2073,15 @@ fn write_all_environments(
 ///
 /// Public so callers like `vars init` can count variables before importing.
 pub fn parse_env_content(content: &str) -> HashMap<String, String> {
-    parse_env_entries(content).into_iter().collect()
+    use zeroize::Zeroize as _;
+    let entries = parse_env_entries(content);
+    let mut parsed = HashMap::with_capacity(entries.len());
+    for (key, value) in entries {
+        if let Some(mut replaced) = parsed.insert(key, value) {
+            replaced.zeroize();
+        }
+    }
+    parsed
 }
 
 /// The entries of a .env file in file order, a later one for the same key
@@ -1978,9 +2105,11 @@ pub fn parse_env_entries(content: &str) -> Vec<(String, String)> {
 
         if let Some((key, value)) = line.split_once('=') {
             let key = trim_dotenv_blanks(key).to_string();
-            let value = parse_env_value(value.trim_start_matches(is_dotenv_blank), &mut lines);
+            let mut value = parse_env_value(value.trim_start_matches(is_dotenv_blank), &mut lines);
 
-            if !key.is_empty() {
+            if key.is_empty() {
+                zeroize::Zeroize::zeroize(&mut value);
+            } else {
                 entries.push((key, value));
             }
         }
@@ -1989,7 +2118,10 @@ pub fn parse_env_entries(content: &str) -> Vec<(String, String)> {
     entries
 }
 
-fn parse_env_value(value: &str, lines: &mut std::str::Lines<'_>) -> String {
+fn parse_env_value<'content>(
+    value: &'content str,
+    lines: &mut std::str::Lines<'content>,
+) -> String {
     if let Some(rest) = value.strip_prefix('"') {
         return parse_double_quoted_env_value(rest, lines);
     }
@@ -2023,19 +2155,21 @@ pub fn is_dotenv_blank_line(line: &str) -> bool {
 }
 
 /// Writes each parsed value unless its key is there and `overwrite` is off,
-/// noting what each written value holds that's hard to see.
+/// noting what each written value holds that's hard to see. A value it
+/// skips or replaces is wiped.
 fn merge_imported_secrets(
     secrets: &mut HashMap<String, String>,
-    parsed: HashMap<String, String>,
+    mut parsed: wiping::ParsedValues,
     overwrite: bool,
 ) -> EnvFileImport {
     use std::collections::hash_map::Entry;
+    use zeroize::Zeroize as _;
     let mut import = EnvFileImport::default();
-    for (key, value) in parsed {
+    for (key, mut value) in parsed.drain() {
         let key = match secrets.entry(key) {
             Entry::Occupied(mut entry) if overwrite => {
                 let found = lpm_env::check_value_characters(&value);
-                entry.insert(value);
+                entry.insert(value).zeroize();
                 found.map(|found| (entry.key().clone(), found))
             }
             Entry::Vacant(entry) => {
@@ -2044,7 +2178,10 @@ fn merge_imported_secrets(
                 entry.insert(value);
                 key
             }
-            Entry::Occupied(_) => continue,
+            Entry::Occupied(_) => {
+                value.zeroize();
+                continue;
+            }
         };
         import.count += 1;
         import.characters.extend(key);
@@ -2057,39 +2194,58 @@ fn merge_imported_secrets(
 
 /// Decode a dotenv value after its opening double quote, consuming continuation lines.
 /// Escaped quotes and backslashes remain part of the value; the first unescaped quote closes it.
-pub fn parse_double_quoted_env_value(value: &str, lines: &mut std::str::Lines<'_>) -> String {
-    let mut decoded = String::with_capacity(value.len());
-    let mut fragment = value;
-    let mut pending_escape = false;
-
-    loop {
-        if let Some(close_idx) = find_closing_quote(fragment, '"') {
-            append_unescaped_double_quoted(
-                &mut decoded,
-                &fragment[..close_idx],
-                &mut pending_escape,
-            );
-            if pending_escape {
-                decoded.push('\\');
-            }
-            return decoded;
+pub fn parse_double_quoted_env_value<'content>(
+    value: &'content str,
+    lines: &mut std::str::Lines<'content>,
+) -> String {
+    let fragments = quoted_fragments(value, lines, |fragment| find_closing_quote(fragment, '"'));
+    // Decoding never lengthens a line, so the value never outgrows its block.
+    let mut decoded = String::with_capacity(spanned_length(&fragments));
+    for (index, fragment) in fragments.iter().enumerate() {
+        if index > 0 {
+            decoded.push('\n');
         }
-
-        decoded.reserve(fragment.len().saturating_add(1));
+        let mut pending_escape = false;
         append_unescaped_double_quoted(&mut decoded, fragment, &mut pending_escape);
         if pending_escape {
             decoded.push('\\');
-            pending_escape = false;
-        }
-
-        match lines.next() {
-            Some(next_line) => {
-                decoded.push('\n');
-                fragment = next_line;
-            }
-            None => return decoded,
         }
     }
+    decoded
+}
+
+/// The lines a quoted value spans, from the text after its opening quote:
+/// each line `closes` finds no closing quote in, then the one it does, up to
+/// that quote, or every line left when none has one. `lines` moves past the
+/// lines the value takes. Finding them first lets the value be given its
+/// whole block at once, so no block it outgrows keeps a copy of it.
+fn quoted_fragments<'content>(
+    first: &'content str,
+    lines: &mut std::str::Lines<'content>,
+    closes: impl Fn(&str) -> Option<usize>,
+) -> smallvec::SmallVec<[&'content str; 1]> {
+    let mut fragments = smallvec::SmallVec::new();
+    let mut fragment = first;
+    loop {
+        if let Some(close) = closes(fragment) {
+            fragments.push(&fragment[..close]);
+            return fragments;
+        }
+        fragments.push(fragment);
+        match lines.next() {
+            Some(next) => fragment = next,
+            None => return fragments,
+        }
+    }
+}
+
+/// The length of `fragments` joined by line breaks.
+fn spanned_length(fragments: &[&str]) -> usize {
+    fragments
+        .iter()
+        .map(|fragment| fragment.len())
+        .sum::<usize>()
+        + fragments.len().saturating_sub(1)
 }
 
 fn append_unescaped_double_quoted(output: &mut String, value: &str, pending_escape: &mut bool) {
@@ -2123,7 +2279,10 @@ fn append_unescaped_double_quoted(output: &mut String, value: &str, pending_esca
 /// on the same line makes that quote part of the value, which then reads as
 /// written, without its outer quotes when it ends with one, as dotenv reads
 /// `'Tolga's App'`.
-fn parse_single_quoted_env_value(value: &str, lines: &mut std::str::Lines<'_>) -> String {
+fn parse_single_quoted_env_value<'content>(
+    value: &'content str,
+    lines: &mut std::str::Lines<'content>,
+) -> String {
     if let Some(close_idx) = value.find('\'') {
         let after = value[close_idx + 1..].trim_start_matches(is_dotenv_blank);
         if after.is_empty() || after.starts_with('#') {
@@ -2136,26 +2295,15 @@ fn parse_single_quoted_env_value(value: &str, lines: &mut std::str::Lines<'_>) -
         };
     }
 
-    let mut collected = String::with_capacity(value.len());
-    let mut fragment = value;
-
-    loop {
-        if let Some(close_idx) = fragment.find('\'') {
-            collected.push_str(&fragment[..close_idx]);
-            return collected;
+    let fragments = quoted_fragments(value, lines, |fragment| fragment.find('\''));
+    let mut collected = String::with_capacity(spanned_length(&fragments));
+    for (index, fragment) in fragments.iter().enumerate() {
+        if index > 0 {
+            collected.push('\n');
         }
-
-        collected.reserve(fragment.len().saturating_add(1));
         collected.push_str(fragment);
-
-        match lines.next() {
-            Some(next_line) => {
-                collected.push('\n');
-                fragment = next_line;
-            }
-            None => return collected,
-        }
     }
+    collected
 }
 
 fn find_closing_quote(value: &str, quote: char) -> Option<usize> {
@@ -2186,6 +2334,122 @@ fn find_closing_quote(value: &str, quote: char) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        static BEFORE_VAULT_ID_IS_CREATED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    /// What a test does once a checked write is about to give its folder a
+    /// vault ID, such as another process naming one first.
+    pub(super) fn before_vault_id_is_created() {
+        if let Some(hook) = BEFORE_VAULT_ID_IS_CREATED.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    fn import_checked(project_dir: &Path, checked: &CheckedValues) -> Result<(), String> {
+        import_env_content_checked(
+            project_dir,
+            checked,
+            None,
+            "TOKEN=value\n",
+            false,
+            &history::Source::new(history::Action::Import),
+        )
+        .map(drop)
+    }
+
+    fn set_checked(project_dir: &Path, checked: &CheckedValues) -> Result<(), String> {
+        super::set_checked(
+            project_dir,
+            checked,
+            "default",
+            &[("TOKEN", "value")],
+            &history::Source::new(history::Action::Set),
+        )
+    }
+
+    #[test]
+    fn a_checked_first_write_links_the_folder_to_the_vault_its_lpm_json_names() {
+        crate::fallback::tests::with_temp_vault_home(|_| {
+            crate::fallback::tests::force_file_vault();
+            for (vault_id, write) in [
+                (
+                    "named-checkout-set",
+                    set_checked as fn(&Path, &CheckedValues) -> _,
+                ),
+                ("named-checkout-import", import_checked),
+            ] {
+                let project = tempfile::tempdir().unwrap();
+                std::fs::write(
+                    project.path().join("lpm.json"),
+                    format!(r#"{{"vault":"{vault_id}"}}"#),
+                )
+                .unwrap();
+                let checked = check_values_writable(project.path()).unwrap();
+                write(project.path(), &checked).unwrap();
+
+                let read = try_get_run_environment(project.path(), None)
+                    .unwrap_or_else(|error| panic!("{vault_id}: {error}"));
+                assert_eq!(read.values["TOKEN"], "value", "{vault_id}");
+                cleanup_vault(project.path());
+            }
+        });
+    }
+
+    #[test]
+    fn a_vault_field_no_write_could_use_is_refused_before_any_value_is_read() {
+        crate::fallback::tests::with_temp_vault_home(|_| {
+            crate::fallback::tests::force_file_vault();
+            for (field, said) in [
+                (r#""../outside""#, "path-traversal"),
+                ("123", "must be a string"),
+            ] {
+                let project = tempfile::tempdir().unwrap();
+                std::fs::write(
+                    project.path().join("lpm.json"),
+                    format!(r#"{{"vault":{field}}}"#),
+                )
+                .unwrap();
+
+                let refused = check_values_writable(project.path())
+                    .expect_err("no write could use this vault field");
+
+                assert!(refused.contains(said), "{field}: {refused}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_checked_write_refuses_a_vault_named_while_it_gave_the_folder_one() {
+        crate::fallback::tests::with_temp_vault_home(|_| {
+            crate::fallback::tests::force_file_vault();
+            for write in [
+                set_checked as fn(&Path, &CheckedValues) -> _,
+                import_checked,
+            ] {
+                let project = tempfile::tempdir().unwrap();
+                let checked = check_values_writable(project.path()).unwrap();
+                let manifest = project.path().join("lpm.json");
+                BEFORE_VAULT_ID_IS_CREATED.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        std::fs::write(manifest, r#"{"vault":"named-meanwhile"}"#).unwrap();
+                    }));
+                });
+
+                let refused = write(project.path(), &checked).expect_err("another project");
+
+                assert!(refused.contains("nothing was stored"), "{refused}");
+                assert!(
+                    crate::fallback::read_vault_file_env("named-meanwhile", "default")
+                        .unwrap()
+                        .is_none(),
+                    "the value reached the project named meanwhile"
+                );
+            }
+        });
+    }
 
     #[test]
     fn one_read_of_several_environments_matches_reading_each() {
@@ -2243,7 +2507,8 @@ mod tests {
     ) -> Result<EnvFileImport, String> {
         super::import_env_file(
             project_dir,
-            env_path,
+            None,
+            open_env_file_to_import(env_path)?,
             overwrite,
             &history::Source::new(history::Action::Import),
         )
@@ -2469,7 +2734,7 @@ KEY3=no-quotes"#;
         let value = "transferred-value".to_owned();
         let key_ptr = key.as_ptr();
         let value_ptr = value.as_ptr();
-        let parsed = HashMap::from([(key, value)]);
+        let parsed = HashMap::from([(key, value)]).into();
         let mut secrets = HashMap::new();
 
         assert_eq!(merge_imported_secrets(&mut secrets, parsed, false).count, 1);
@@ -2478,6 +2743,89 @@ KEY3=no-quotes"#;
             .expect("imported secret");
         assert_eq!(stored_key.as_ptr(), key_ptr);
         assert_eq!(stored_value.as_ptr(), value_ptr);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn parsing_leaves_no_copy_of_a_value_a_later_line_replaces_or_a_quoted_value_outgrows() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        let continued = "x".repeat(4096);
+        for (case, content) in [
+            ("a later line", format!("TOKEN={MARKER}\nTOKEN=later\n")),
+            (
+                "a double-quoted value",
+                format!("TOKEN=\"{MARKER}\n{continued}\n{continued}\"\n"),
+            ),
+            (
+                "a single-quoted value",
+                format!("TOKEN='{MARKER}\n{continued}\n{continued}'\n"),
+            ),
+            ("a quote inside a value", format!("TOKEN='{MARKER}'s app\n")),
+            (
+                "a quote inside a value that ends unquoted",
+                format!("TOKEN='{MARKER}'tail\n"),
+            ),
+            ("a line with no key", format!("={MARKER}\nTOKEN=kept\n")),
+        ] {
+            let (mut parsed, found) = watch(|| parse_env_content(&content));
+
+            assert!(!found, "{case}: a freed block kept the value");
+            assert!(!parsed["TOKEN"].is_empty(), "{case}: the value was parsed");
+            history::wipe_environment(&mut parsed);
+        }
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn an_import_leaves_no_copy_of_a_value_it_skips_or_replaces() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        for (overwrite, stored, imported) in [(false, "stored", MARKER), (true, MARKER, "imported")]
+        {
+            let mut secrets = HashMap::from([("TOKEN".to_owned(), stored.to_owned())]);
+            let parsed = wiping::ParsedValues::from(HashMap::from([(
+                "TOKEN".to_owned(),
+                imported.to_owned(),
+            )]));
+
+            let (import, found) = watch(|| merge_imported_secrets(&mut secrets, parsed, overwrite));
+
+            assert!(
+                !found,
+                "overwrite {overwrite}: a dropped value wasn't wiped"
+            );
+            assert_eq!(import.count, usize::from(overwrite));
+            history::wipe_environment(&mut secrets);
+        }
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn a_refused_checked_import_leaves_no_copy_of_what_it_parsed() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        crate::fallback::tests::with_temp_vault_home(|_| {
+            crate::fallback::tests::force_file_vault();
+            let project = tempfile::tempdir().unwrap();
+            let manifest = project.path().join("lpm.json");
+            std::fs::write(&manifest, r#"{"vault":"checked-project"}"#).unwrap();
+            let checked = check_values_writable(project.path()).unwrap();
+            std::fs::write(&manifest, r#"{"vault":"named-meanwhile"}"#).unwrap();
+            let content = format!("TOKEN={MARKER}\n");
+
+            let (refused, found) = watch(|| {
+                import_env_content_checked(
+                    project.path(),
+                    &checked,
+                    None,
+                    &content,
+                    false,
+                    &history::Source::new(history::Action::Import),
+                )
+            });
+
+            let refused = refused.expect_err("another project");
+            assert!(!refused.contains(MARKER), "{refused}");
+            assert!(!found, "the parsed value wasn't wiped");
+        });
     }
 
     #[cfg(debug_assertions)]
@@ -3782,7 +4130,8 @@ KEY3=no-quotes"#;
                 let value = "x".repeat(48_000);
                 let parsed = (0..256)
                     .map(|index| (format!("KEY_{index}"), value.clone()))
-                    .collect();
+                    .collect::<HashMap<_, _>>()
+                    .into();
                 let mut secrets = HashMap::new();
                 let imported = merge_imported_secrets(&mut secrets, parsed, false).count;
                 imported + secrets.values().map(String::len).sum::<usize>()

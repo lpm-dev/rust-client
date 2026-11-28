@@ -3,6 +3,8 @@ use lpm_common::LpmError;
 
 #[derive(Args)]
 pub(super) struct Environment {
+    /// The environment, by name or by an alias lpm.json gives it; default
+    /// when left out.
     #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub env: Option<String>,
 }
@@ -33,13 +35,52 @@ struct LocalCommand {
     action: LocalAction,
 }
 
+/// Where `set` and `override set` take values from.
+#[derive(Args)]
+#[command(group(
+    clap::ArgGroup::new("values")
+        .required(true)
+        .multiple(true)
+        .args(["entries", "from_files"])
+))]
+pub(super) struct Values {
+    /// A key to ask for, hidden, in a terminal, or KEY=VALUE.
+    #[arg(num_args = 1.., value_name = "KEY")]
+    pub entries: Vec<String>,
+    /// Read the value of the one KEY given without = from standard input.
+    #[arg(long)]
+    pub stdin: bool,
+    /// Read a key's value from a file or a pipe, at most 100 KiB. Can be
+    /// repeated.
+    #[arg(long = "from-file", value_name = "KEY=PATH")]
+    pub from_files: Vec<String>,
+}
+
+const SET_AFTER_HELP: &str = "\
+Examples:
+  lpm env set API_KEY                          Ask for the value, hidden
+  op read op://dev/api/key | lpm env set API_KEY --stdin
+  lpm env set --from-file TLS_KEY=./tls.key
+  lpm env set --from-file A=<(op read op://dev/a) --from-file B=<(op read op://dev/b)
+  lpm env set PORT=3000                        A value that isn't secret
+
+A KEY=VALUE argument is saved in your shell history and is visible to other
+processes on this computer while lpm runs. Use it only for values that aren't
+secret.
+
+From the prompt, standard input or a file, a value that is one line loses the
+line break at its end. A value of several lines, such as a PEM key, is kept
+exactly, except that each line break pasted into the prompt is a line feed.";
+
 #[derive(Subcommand)]
 pub(super) enum LocalAction {
+    /// Store values in this project's env.
+    #[command(after_help = SET_AFTER_HELP)]
     Set {
         #[command(flatten)]
         environment: Environment,
-        #[arg(required = true, num_args = 1.., value_name = "KEY=VALUE")]
-        assignments: Vec<String>,
+        #[command(flatten)]
+        values: Values,
     },
     Get {
         #[command(flatten)]
@@ -60,10 +101,15 @@ pub(super) enum LocalAction {
         #[arg(required = true, num_args = 1..)]
         keys: Vec<String>,
     },
+    /// Store the values a .env file holds.
     Import {
         #[command(flatten)]
         environment: Environment,
+        /// The .env file or pipe, or - to read it from standard input
+        /// (./- names a file called -).
+        #[arg(value_name = "FILE")]
         file: String,
+        /// Replace values the env already has.
         #[arg(long)]
         overwrite: bool,
     },

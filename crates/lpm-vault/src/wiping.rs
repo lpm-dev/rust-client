@@ -2,7 +2,9 @@
 //! to a larger block, wiping the old, when they outgrow theirs, so no freed
 //! block keeps a copy.
 
-use zeroize::Zeroizing;
+use std::collections::HashMap;
+
+use zeroize::{Zeroize as _, Zeroizing};
 
 /// A growable buffer that wipes every block it leaves.
 pub(crate) struct WipingBuffer(Zeroizing<Vec<u8>>);
@@ -34,6 +36,41 @@ impl std::io::Write for WipingBuffer {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// Values parsed from input, each wiped when the map is dropped: a value an
+/// operation moves out is its to keep, and every one left, such as when the
+/// operation is refused, goes with the map. It has no `Debug`, so they can't
+/// be printed.
+#[derive(Default)]
+pub(crate) struct ParsedValues(HashMap<String, String>);
+
+impl From<HashMap<String, String>> for ParsedValues {
+    fn from(values: HashMap<String, String>) -> Self {
+        Self(values)
+    }
+}
+
+impl std::ops::Deref for ParsedValues {
+    type Target = HashMap<String, String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ParsedValues {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ParsedValues {
+    fn drop(&mut self) {
+        for value in self.0.values_mut() {
+            value.zeroize();
+        }
     }
 }
 

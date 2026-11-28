@@ -106,6 +106,7 @@ crypto_box = { workspace = true }
 hex = { workspace = true }
 subtle = { workspace = true }
 secrecy = { workspace = true }
+zeroize = "1"
 
 # Config
 toml = { workspace = true }
@@ -162,6 +163,7 @@ spdx = { version = "0.13.5", default-features = false }
 # Unix process group management (build.rs timeout kill)
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.4"
+errno = "0.3"
 libc = "0.2"
 rustix = { version = "1.1", features = ["fs"] }
 
@@ -191,7 +193,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
     "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Pipes",

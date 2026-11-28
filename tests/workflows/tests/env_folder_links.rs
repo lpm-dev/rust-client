@@ -89,6 +89,27 @@ fn a_folder_that_isn_t_linked_uses_none_of_the_project_s_values() {
 }
 
 #[test]
+fn invalid_value_arguments_are_refused_before_an_unlinked_folder_is_asked_about() {
+    let project = project_with_a_value();
+    let other = copied_checkout(&project, "other-checkout");
+
+    for args in [
+        &["env", "set", "--from-file", "NOT-A-KEY=./value"][..],
+        &["env", "set", "--from-file", "A_SECRET"],
+    ] {
+        let output = lpm_in(&project, &other, args);
+
+        let text = output_of(&output);
+        assert!(!output.status.success(), "{args:?}: {text}");
+        assert!(text.contains("--from-file"), "{args:?}: {text}");
+        assert!(
+            !text.contains("lpm env link"),
+            "the arguments are wrong whichever folder runs them: {args:?}: {text}"
+        );
+    }
+}
+
+#[test]
 fn commands_that_sync_list_or_compare_values_refuse_an_unlinked_folder() {
     let project = project_with_a_value();
     let other = copied_checkout(&project, "other-checkout");

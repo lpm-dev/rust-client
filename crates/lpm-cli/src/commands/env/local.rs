@@ -1,40 +1,52 @@
 use super::prelude::*;
 
+/// The most the values `env set` stores at once may hold in all, the most
+/// `env import` reads from one file.
+const MAX_VALUES_AT_ONCE: usize = lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize;
+
 pub(super) fn env_set(
     env_input: Option<&str>,
-    assignments: &[String],
+    values: &super::arguments::Values,
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let pairs: Vec<(&str, &str)> = assignments
-        .iter()
-        .map(|arg| {
-            let pair = arg
-                .split_once('=')
-                .ok_or_else(|| LpmError::Env("expected KEY=VALUE".into()))?;
-            if !lpm_env::is_valid_env_var_name(pair.0) {
-                return Err(LpmError::Env(
-                    "env keys must match [A-Za-z_][A-Za-z0-9_]*".into(),
-                ));
-            }
-            Ok(pair)
-        })
-        .collect::<Result<_, _>>()?;
-
     let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
     let env_label = resolved_env.as_deref().unwrap_or("default");
+    let request = super::value_input::Request {
+        entries: &values.entries,
+        stdin: values.stdin,
+        from_files: &values.from_files,
+        json_output,
+        command: "lpm env set",
+        asking: super::value_input::Asking {
+            what: "Value",
+            environment: env_label,
+        },
+        total_limit: MAX_VALUES_AT_ONCE,
+    };
+    // A value that's typed, piped or read waits on the person, so what
+    // refuses the write whatever it holds is found first, and the write
+    // goes to the project that was checked.
+    let arguments = super::value_input::check(&request, &super::value_input::ProcessSources)?;
+    super::links::ensure_folder_linked(project_dir, json_output)?;
+    let checked = arguments
+        .reads_input
+        .then(|| lpm_vault::check_values_writable(project_dir))
+        .transpose()
+        .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
+    let assignments =
+        super::value_input::collect(&request, arguments, &mut super::value_input::ProcessSources)?;
+    let pairs: Vec<(&str, &str)> = assignments
+        .iter()
+        .map(|assignment| (assignment.key.as_str(), assignment.value.as_str()))
+        .collect();
 
     let source = lpm_vault::history::Source::new(lpm_vault::history::Action::Set);
-    match &resolved_env {
-        Some(env) => {
-            lpm_vault::set_env(project_dir, env, &pairs, &source)
-                .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
-        }
-        None => {
-            lpm_vault::set(project_dir, &pairs, &source)
-                .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
-        }
+    match &checked {
+        Some(checked) => lpm_vault::set_checked(project_dir, checked, env_label, &pairs, &source),
+        None => lpm_vault::set_env(project_dir, env_label, &pairs, &source),
     }
+    .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
 
     let stored = stored_values(&pairs);
     if json_output {
@@ -218,6 +230,9 @@ pub(super) fn env_delete(
     Ok(())
 }
 
+/// The `lpm env import` argument that reads the file from standard input.
+const STANDARD_INPUT: &str = "-";
+
 pub(super) fn env_import(
     env_input: Option<&str>,
     file: &str,
@@ -225,30 +240,69 @@ pub(super) fn env_import(
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let path = invocation_relative(file)?;
-
     let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
     let env_label = resolved_env.as_deref().unwrap_or("default");
 
-    let source = lpm_vault::history::Source::with_detail(
-        lpm_vault::history::Action::Import,
-        lpm_vault::history::SourceDetail {
-            file_name: path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .filter(|name| !name.is_empty() && name.len() <= 255)
-                .map(str::to_owned),
-            ..lpm_vault::history::SourceDetail::default()
-        },
-    );
-    let imported = match &resolved_env {
-        Some(env) => lpm_vault::import_env_file_to_env(project_dir, env, &path, overwrite, &source)
-            .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?,
-        None => lpm_vault::import_env_file(project_dir, &path, overwrite, &source)
-            .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?,
+    // Reading a pipe waits on its writer, so what refuses the write whatever
+    // it holds is found first, and the import goes to the project that was
+    // checked. A regular file is read at once, so the import's write checks.
+    let checked_values = || {
+        lpm_vault::check_values_writable(project_dir)
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))
+    };
+    let (imported, warnings) = if file == STANDARD_INPUT {
+        refuse_terminal_stdin_for_import()?;
+        let checked = checked_values()?;
+        let content = read_piped_env_file()?;
+        let source = lpm_vault::history::Source::new(lpm_vault::history::Action::Import);
+        let imported = lpm_vault::import_env_content_checked(
+            project_dir,
+            &checked,
+            resolved_env.as_deref(),
+            &content,
+            overwrite,
+            &source,
+        )
+        .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
+        (imported, Vec::new())
+    } else {
+        let path = invocation_relative(file)?;
+        let opened = lpm_vault::open_env_file_to_import(&path)
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
+        let checked = opened.can_wait().then(checked_values).transpose()?;
+        let source = lpm_vault::history::Source::with_detail(
+            lpm_vault::history::Action::Import,
+            lpm_vault::history::SourceDetail {
+                file_name: path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.is_empty() && name.len() <= 255)
+                    .map(str::to_owned),
+                ..lpm_vault::history::SourceDetail::default()
+            },
+        );
+        let imported = match &checked {
+            Some(checked) => lpm_vault::import_env_file_checked(
+                project_dir,
+                checked,
+                resolved_env.as_deref(),
+                opened,
+                overwrite,
+                &source,
+            ),
+            None => lpm_vault::import_env_file(
+                project_dir,
+                resolved_env.as_deref(),
+                opened,
+                overwrite,
+                &source,
+            ),
+        }
+        .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
+        let warnings = keep_env_source_ignored(project_dir, &path)?;
+        (imported, warnings)
     };
     let count = imported.count;
-    let warnings = keep_env_source_ignored(project_dir, &path)?;
 
     if json_output {
         println!(
@@ -269,7 +323,11 @@ pub(super) fn env_import(
             "imported {} secret{} from {} ({})",
             install_ui::bold(&count.to_string()),
             if count == 1 { "" } else { "s" },
-            install_ui::cyan(file),
+            install_ui::cyan(if file == STANDARD_INPUT {
+                "standard input"
+            } else {
+                file
+            }),
             env_label,
         ));
         for (key, found) in &imported.characters {
@@ -344,6 +402,45 @@ pub(super) fn env_export(
         ));
     }
     Ok(())
+}
+
+/// A .env file piped to `lpm env import -`, as large as a .env file may be.
+/// A terminal is refused: what's pasted there shows on screen, and the
+/// import would wait for an end of input the person may not know to type.
+fn refuse_terminal_stdin_for_import() -> Result<(), LpmError> {
+    use std::io::IsTerminal as _;
+
+    if std::io::stdin().is_terminal() {
+        return Err(LpmError::Env(
+            "`lpm env import -` reads a .env file piped to lpm, but standard input is this terminal. Pipe the file in, such as `op inject -i .env.tpl | lpm env import -`, or name the file: `lpm env import .env`".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_piped_env_file() -> Result<zeroize::Zeroizing<String>, LpmError> {
+    use lpm_common::secret_read::SecretReadError;
+
+    let limit = usize::try_from(lpm_common::CONFIG_FILE_SIZE_CAP_BYTES).unwrap_or(usize::MAX);
+    lpm_common::secret_read::read_secret_stdin(limit).map_err(|error| {
+        LpmError::Env(match error {
+            SecretReadError::TooLarge => format!(
+                "the .env file piped to `lpm env import -` is larger than {} MiB",
+                lpm_common::CONFIG_FILE_SIZE_CAP_BYTES / (1024 * 1024)
+            ),
+            SecretReadError::NotText => {
+                "the .env file piped to `lpm env import -` isn't UTF-8 text".into()
+            }
+            SecretReadError::NotFileOrPipe => format!(
+                "`lpm env import -` reads a .env file piped to lpm or redirected from a file, but standard input is a device, such as a terminal or {}",
+                super::value_input::NULL_DEVICE
+            ),
+            SecretReadError::Directory => {
+                "`lpm env import -` reads a .env file piped to lpm or redirected from a file, but standard input is a directory".into()
+            }
+            other => format!("failed to read standard input: {other}"),
+        })
+    })
 }
 
 /// `file` as the user typed it, relative to the directory the command ran
@@ -421,7 +518,7 @@ pub(super) fn vars_list(
         }
     } else if secrets.is_empty() {
         output::info(&format!("No secrets in vault ({env_label})"));
-        println!("  Run {} to add one", "lpm env set KEY=VALUE".cyan());
+        println!("  Run {} to add one", "lpm env set KEY".cyan());
     } else {
         let mut keys: Vec<&String> = secrets.keys().collect();
         keys.sort();
