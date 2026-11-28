@@ -4444,7 +4444,8 @@ fn reusable_object_tree_policy_rejects_tampered_source_object_with_matching_snap
         &object.path,
         &TreeIntegrities {
             content: original_snapshot.content_integrity,
-            metadata: current_metadata,
+            metadata: current_metadata.clone(),
+            metadata_no_ctime: current_metadata,
             stats: ObjectTreeStats::default(),
             content_schema: TreeContentSchema::from_snapshot_schema(original_snapshot.schema)
                 .unwrap(),
@@ -6845,12 +6846,16 @@ fn shallow_guard_refresh_skips_rewriting_snapshot_while_mtimes_are_racily_clean(
     let initial_snapshot = read_tree_snapshot(&first.link_dir).unwrap();
     let initial_captured = initial_snapshot.snapshot_captured_at_nanos;
 
+    let initial_metadata =
+        crate::v2::tree_hash::compute_tree_metadata_integrities(&pkg_dir).unwrap();
     // Immediately after creation, mtimes are inside the 2s racily-clean window;
     // refresh must not rewrite the snapshot with another racy timestamp.
     crate::v2::integrity::refresh_link_snapshot_shallow_guard_best_effort(
         &first.link_dir,
         &pkg_dir,
         &initial_snapshot,
+        &initial_metadata.metadata,
+        Some(&initial_metadata.metadata_no_ctime),
     );
     assert_eq!(
         read_tree_snapshot(&first.link_dir)
@@ -6867,10 +6872,13 @@ fn shallow_guard_refresh_skips_rewriting_snapshot_while_mtimes_are_racily_clean(
     )
     .unwrap();
     std::fs::set_times(&pkg_dir, std::fs::FileTimes::new().set_modified(old)).unwrap();
+    let aged_metadata = crate::v2::tree_hash::compute_tree_metadata_integrities(&pkg_dir).unwrap();
     crate::v2::integrity::refresh_link_snapshot_shallow_guard_best_effort(
         &first.link_dir,
         &pkg_dir,
         &initial_snapshot,
+        &aged_metadata.metadata,
+        Some(&aged_metadata.metadata_no_ctime),
     );
     let updated = read_tree_snapshot(&first.link_dir).unwrap();
     assert!(
@@ -6880,4 +6888,577 @@ fn shallow_guard_refresh_skips_rewriting_snapshot_while_mtimes_are_racily_clean(
         "aged package must receive a non-racy shallow guard at {}",
         snapshot_path.display()
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn link_entry_reuses_and_heals_snapshot_after_ctime_change_without_recreating_lock_file() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"ctime-heal\",\"version\":\"1.0.0\"}",
+        ),
+        ("index.js", b"module.exports = 'ok';\n"),
+    ]);
+    let (object, sri, _) = store
+        .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Source)
+        .unwrap();
+    let key = arc_key("ctime-heal", "1.0.0");
+    let first = store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&key),
+            source_sri: sri.clone(),
+            object_dir: object.path.clone(),
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+    assert!(first.freshly_populated);
+    let pkg_dir = link_entry_package_dir(&first.link_dir, &key);
+    let initial_snapshot = read_tree_snapshot(&first.link_dir).unwrap();
+    assert!(initial_snapshot.metadata_integrity_no_ctime.is_some());
+
+    // Remove the build-entry lock file to simulate a restored cache without
+    // build-entry-locks/, and bump ctime via chmod without altering file bytes.
+    let lock_path = store
+        .paths()
+        .build_entry_lock_path(&key.digest_hex())
+        .unwrap();
+    let _ = std::fs::remove_file(&lock_path);
+    // Warm reuse with intact metadata and no lock file must not recreate the lock file.
+    let warm = store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&key),
+            source_sri: sri.clone(),
+            object_dir: object.path.clone(),
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+    assert!(!warm.freshly_populated);
+    assert!(
+        !lock_path.exists(),
+        "warm reuse without an existing build-entry lock must not create {}",
+        lock_path.display()
+    );
+
+    // Bump ctime via chmod without altering file bytes.
+    let index_path = pkg_dir.join("index.js");
+    let mode = std::fs::metadata(&index_path).unwrap().permissions().mode();
+    std::fs::set_permissions(&index_path, std::fs::Permissions::from_mode(mode ^ 0o004)).unwrap();
+    std::fs::set_permissions(&index_path, std::fs::Permissions::from_mode(mode)).unwrap();
+
+    // Recovery verifies content against the intact object snapshot and heals
+    // the link snapshot under the shared build-entry lock (never unlocked).
+    let reused = store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&key),
+            source_sri: sri.clone(),
+            object_dir: object.path.clone(),
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+    assert!(!reused.freshly_populated);
+    assert!(
+        lock_path.exists(),
+        "snapshot healing after ctime drift must synchronize through {}",
+        lock_path.display()
+    );
+    let healed_snapshot = read_tree_snapshot(&first.link_dir).unwrap();
+    assert_eq!(
+        healed_snapshot.metadata_integrity,
+        compute_tree_metadata_integrity(&pkg_dir).unwrap(),
+        "ctime drift recovery must heal link snapshot metadata"
+    );
+
+    // Tampering object_dir without updating its snapshot must invalidate the
+    // object snapshot baseline so stale object snapshots are never trusted.
+    std::fs::write(object.path.join("index.js"), b"tampered-object").unwrap();
+    let obj_snapshot = read_tree_snapshot(&object.path).unwrap();
+    assert!(
+        !object_snapshot_matches_live_object(&object.path, &sri, &obj_snapshot).unwrap(),
+        "stale object snapshot must not match a modified live object tree"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn trust_restored_store_never_poisons_strict_metadata_and_is_ignored_under_tree_policy() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source_store =
+        Store::at_with_object_integrity_policy(dir.path(), ObjectIntegrityPolicy::Source);
+    let tarball = build_test_tarball(&[
+        ("package.json", br#"{"name":"trust-pkg","version":"1.0.0"}"#),
+        ("index.js", b"module.exports = 'aaaa';\n"),
+    ]);
+    let (object, sri, _) = source_store
+        .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Source)
+        .unwrap();
+    let key = arc_key("trust-pkg", "1.0.0");
+    let first = source_store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&key),
+            source_sri: sri.clone(),
+            object_dir: object.path.clone(),
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+    let pkg_dir = link_entry_package_dir(&first.link_dir, &key);
+    let index_path = pkg_dir.join("index.js");
+    let orig_mtime = std::fs::metadata(&index_path).unwrap().modified().unwrap();
+    let orig_snapshot = read_tree_snapshot(&first.link_dir).unwrap();
+
+    // Same-length tamper with preserved mtime (ctime changes).
+    std::fs::write(&index_path, b"module.exports = 'bbbb';\n").unwrap();
+    std::fs::set_times(
+        &index_path,
+        std::fs::FileTimes::new().set_modified(orig_mtime),
+    )
+    .unwrap();
+
+    // With opt-in enabled under Source policy, the restored ctime-free digest matches,
+    // but strict `metadata_integrity` MUST NOT be overwritten.
+    {
+        let _guard = crate::v2::override_trust_restored_store_for_test(Some(true));
+        let trusted = source_store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: Arc::clone(&key),
+                source_sri: sri.clone(),
+                object_dir: object.path.clone(),
+                deps: vec![],
+                platform: Arc::new(sample_meta_platform()),
+            })
+            .unwrap();
+        assert!(!trusted.freshly_populated);
+        assert_eq!(
+            read_tree_snapshot(&first.link_dir)
+                .unwrap()
+                .metadata_integrity,
+            orig_snapshot.metadata_integrity,
+            "trust-only match must never overwrite strict metadata_integrity"
+        );
+    }
+
+    // With opt-in disabled, strict verification detects the tampered bytes and rebuilds.
+    {
+        let _guard = crate::v2::override_trust_restored_store_for_test(Some(false));
+        let rebuilt = source_store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: Arc::clone(&key),
+                source_sri: sri.clone(),
+                object_dir: object.path.clone(),
+                deps: vec![],
+                platform: Arc::new(sample_meta_platform()),
+            })
+            .unwrap();
+        assert!(
+            rebuilt.freshly_populated,
+            "disabling LPM_TRUST_RESTORED_STORE must detect tampered bytes and repopulate"
+        );
+        assert_eq!(
+            std::fs::read(&index_path).unwrap(),
+            b"module.exports = 'aaaa';\n"
+        );
+    }
+
+    // Under Tree policy, LPM_TRUST_RESTORED_STORE is completely ignored.
+    let tree_dir = tempfile::tempdir().unwrap();
+    let tree_store =
+        Store::at_with_object_integrity_policy(tree_dir.path(), ObjectIntegrityPolicy::Tree);
+    let (tree_obj, tree_sri, _) = tree_store
+        .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Tree)
+        .unwrap();
+    let tree_first = tree_store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&key),
+            source_sri: tree_sri.clone(),
+            object_dir: tree_obj.path.clone(),
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+    let tree_pkg_dir = link_entry_package_dir(&tree_first.link_dir, &key);
+    let tree_index = tree_pkg_dir.join("index.js");
+    let tree_mtime = std::fs::metadata(&tree_index).unwrap().modified().unwrap();
+    std::fs::write(&tree_index, b"module.exports = 'cccc';\n").unwrap();
+    std::fs::set_times(
+        &tree_index,
+        std::fs::FileTimes::new().set_modified(tree_mtime),
+    )
+    .unwrap();
+    {
+        let _guard = crate::v2::override_trust_restored_store_for_test(Some(true));
+        let tree_rebuilt = tree_store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: Arc::clone(&key),
+                source_sri: tree_sri,
+                object_dir: tree_obj.path,
+                deps: vec![],
+                platform: Arc::new(sample_meta_platform()),
+            })
+            .unwrap();
+        assert!(
+            tree_rebuilt.freshly_populated,
+            "Tree integrity policy must ignore LPM_TRUST_RESTORED_STORE"
+        );
+    }
+
+    // Mode-only change on package.json is caught even with opt-in enabled.
+    let pkg_json = pkg_dir.join("package.json");
+    let pkg_mtime = std::fs::metadata(&pkg_json).unwrap().modified().unwrap();
+    let pkg_mode = std::fs::metadata(&pkg_json).unwrap().permissions().mode();
+    std::fs::set_permissions(&pkg_json, std::fs::Permissions::from_mode(pkg_mode | 0o100)).unwrap();
+    std::fs::set_times(&pkg_json, std::fs::FileTimes::new().set_modified(pkg_mtime)).unwrap();
+    let _guard = crate::v2::override_trust_restored_store_for_test(Some(true));
+    let mode_rebuilt = source_store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: key,
+            source_sri: sri,
+            object_dir: object.path,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+    assert!(
+        mode_rebuilt.freshly_populated,
+        "mode-only package.json change must not be accepted by LPM_TRUST_RESTORED_STORE"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn trust_restored_store_matches_whole_second_tar_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_with_object_integrity_policy(dir.path(), ObjectIntegrityPolicy::Source);
+    let tarball = build_test_tarball(&[
+        ("package.json", br#"{"name":"tar-pkg","version":"1.0.0"}"#),
+        ("index.js", b"module.exports = 42;\n"),
+    ]);
+    let (object, sri, _) = store
+        .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Source)
+        .unwrap();
+    let key = arc_key("tar-pkg", "1.0.0");
+    let first = store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&key),
+            source_sri: sri,
+            object_dir: object.path,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+    let pkg_dir = link_entry_package_dir(&first.link_dir, &key);
+    let orig_snapshot = read_tree_snapshot(&first.link_dir).unwrap();
+
+    // Archive and extract with standard ustar/GNU tar (truncating subsecond mtimes
+    // to whole seconds and creating fresh directory inodes + ctimes).
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        builder.append_dir_all(".", &pkg_dir).unwrap();
+        builder.finish().unwrap();
+    }
+    let restored_dir = tempfile::tempdir().unwrap();
+    let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+    archive.set_preserve_mtime(true);
+    archive.set_preserve_permissions(true);
+    archive.unpack(restored_dir.path()).unwrap();
+
+    let restored_digests =
+        crate::v2::tree_hash::compute_tree_metadata_integrities(restored_dir.path()).unwrap();
+    assert_eq!(
+        orig_snapshot.metadata_integrity_no_ctime.as_deref(),
+        Some(restored_digests.metadata_no_ctime.as_str()),
+        "no-ctime digest must match across a whole-second tar round trip"
+    );
+}
+
+#[test]
+fn shallow_package_guard_requires_strict_ctime_and_non_racy_window() {
+    let base = crate::v2::integrity::ShallowPackageGuard {
+        package_dir_mtime_nanos: 1_700_000_000_000_000_000,
+        package_dir_ctime_nanos: Some(1_700_000_000_000_000_000),
+        package_json_size: 42,
+        package_json_mtime_nanos: 1_700_000_000_000_000_000,
+        package_json_ctime_nanos: Some(1_700_000_000_000_000_000),
+        package_dir_entry_count: None,
+        captured_at_nanos: Some(1_700_000_010_000_000_000),
+    };
+    assert!(base.matches_non_racy(&base));
+
+    let mut ctime_only = base;
+    ctime_only.package_dir_ctime_nanos = Some(1_700_000_099_000_000_000);
+    ctime_only.package_json_ctime_nanos = Some(1_700_000_099_000_000_000);
+    assert!(!ctime_only.matches_non_racy(&base));
+
+    let mut racy = base;
+    racy.captured_at_nanos = Some(1_700_000_000_500_000_000);
+    assert!(!base.matches_non_racy(&racy));
+}
+
+#[cfg(unix)]
+#[test]
+fn local_source_object_ignores_trust_restored_store_and_object_snapshot_refuses_symlink_integrity()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_with_object_integrity_policy(dir.path(), ObjectIntegrityPolicy::Source);
+    let tarball = build_test_tarball(&[
+        ("package.json", br#"{"name":"local-src","version":"1.0.0"}"#),
+        ("index.js", b"module.exports = 'orig';\n"),
+    ]);
+    let (object, sri, _) = store
+        .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Source)
+        .unwrap();
+    // Mark the object as local-source (forces Tree integrity even under Source policy).
+    let local_sentinel = crate::v2::integrity::local_source_sentinel_path(&object.path).unwrap();
+    std::fs::create_dir_all(local_sentinel.parent().unwrap()).unwrap();
+    std::fs::write(&local_sentinel, b"1").unwrap();
+
+    let key = arc_key("local-src", "1.0.0");
+    let first = store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&key),
+            source_sri: sri.clone(),
+            object_dir: object.path.clone(),
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+    let pkg_dir = link_entry_package_dir(&first.link_dir, &key);
+    let index_path = pkg_dir.join("index.js");
+    let orig_mtime = std::fs::metadata(&index_path).unwrap().modified().unwrap();
+
+    // Mutate bytes keeping identical length and mtime (shifts ctime only).
+    std::fs::write(&index_path, b"module.exports = 'hack';\n").unwrap();
+    std::fs::set_times(
+        &index_path,
+        std::fs::FileTimes::new().set_modified(orig_mtime),
+    )
+    .unwrap();
+
+    let _trust = crate::v2::integrity::override_trust_restored_store_for_test(Some(true));
+    let reused = store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&key),
+            source_sri: sri.clone(),
+            object_dir: object.path.clone(),
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+    assert!(
+        reused.freshly_populated,
+        "local-source link entry uses Tree integrity and must reject ctime-only mutation even with LPM_TRUST_RESTORED_STORE=1"
+    );
+    assert_eq!(
+        std::fs::read(&index_path).unwrap(),
+        b"module.exports = 'orig';\n"
+    );
+
+    // Symlinked `.integrity` marker must be refused by `object_snapshot_matches_live_object`.
+    let obj_snapshot = read_tree_snapshot(&object.path).unwrap();
+    assert!(object_snapshot_matches_live_object(&object.path, &sri, &obj_snapshot).unwrap());
+    let outside_marker = dir.path().join("outside-integrity");
+    std::fs::write(&outside_marker, &sri).unwrap();
+    let integrity_path = object.path.join(".integrity");
+    std::fs::remove_file(&integrity_path).unwrap();
+    std::os::unix::fs::symlink(&outside_marker, &integrity_path).unwrap();
+    assert!(
+        !object_snapshot_matches_live_object(&object.path, &sri, &obj_snapshot).unwrap(),
+        "symlinked .integrity marker must be refused"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn deferred_link_snapshot_heal_rejects_sidecar_and_sibling_link_mutations() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_with_object_integrity_policy(dir.path(), ObjectIntegrityPolicy::Source);
+    let dep_tarball = build_test_tarball(&[
+        ("package.json", br#"{"name":"dep-a","version":"1.0.0"}"#),
+        ("index.js", b"module.exports = 1;\n"),
+    ]);
+    let (dep_object, dep_sri, _) = store
+        .extract_object_from_bytes_with_policy(&dep_tarball, None, ObjectIntegrityPolicy::Source)
+        .unwrap();
+    let dep_key = arc_key("dep-a", "1.0.0");
+    let dep_entry = store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&dep_key),
+            source_sri: dep_sri,
+            object_dir: dep_object.path,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+    assert!(dep_entry.freshly_populated);
+
+    let root_tarball = build_test_tarball(&[
+        ("package.json", br#"{"name":"root-a","version":"1.0.0"}"#),
+        ("index.js", b"module.exports = require('dep-a');\n"),
+    ]);
+    let (root_object, root_sri, _) = store
+        .extract_object_from_bytes_with_policy(&root_tarball, None, ObjectIntegrityPolicy::Source)
+        .unwrap();
+    let root_key = arc_key("root-a", "1.0.0");
+    let deps = vec![DepLink {
+        local: "dep-a".to_string(),
+        target: Arc::clone(&dep_key),
+    }];
+    let first = store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&root_key),
+            source_sri: root_sri.clone(),
+            object_dir: root_object.path,
+            deps: deps.clone(),
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+    let pkg_dir = link_entry_package_dir(&first.link_dir, &root_key);
+    let expected_meta = compute_tree_metadata_integrity(&pkg_dir).unwrap();
+    let snapshot = read_tree_snapshot(&first.link_dir).unwrap();
+    let heal = DeferredLinkSnapshotHeal::ShallowGuard {
+        snapshot: Box::new(snapshot),
+        expected_metadata: expected_meta,
+        expected_no_ctime: None,
+    };
+
+    // Unchanged entry accepts the deferred heal.
+    assert!(
+        apply_deferred_link_snapshot_heal(
+            &first.link_dir,
+            &pkg_dir,
+            &root_key,
+            &root_sri,
+            &deps,
+            None,
+            &heal,
+        )
+        .unwrap()
+        .is_some()
+    );
+
+    // Mutate the sibling dependency link without touching the package subtree.
+    let sibling_link = first.link_dir.join(LINK_NODE_MODULES).join("dep-a");
+    std::fs::remove_file(&sibling_link).unwrap();
+    std::os::unix::fs::symlink(dir.path(), &sibling_link).unwrap();
+    assert!(
+        apply_deferred_link_snapshot_heal(
+            &first.link_dir,
+            &pkg_dir,
+            &root_key,
+            &root_sri,
+            &deps,
+            None,
+            &heal,
+        )
+        .unwrap()
+        .is_none(),
+        "deferred snapshot heal must reject a mutated sibling dependency link"
+    );
+
+    // Restore sibling link and mutate the link sidecar metadata.
+    std::fs::remove_file(&sibling_link).unwrap();
+    let (_, expected_target) =
+        sibling_link_paths(&first.link_dir.join(LINK_NODE_MODULES), &deps[0], &root_key).unwrap();
+    std::os::unix::fs::symlink(&expected_target, &sibling_link).unwrap();
+    let sidecar_path = first.link_dir.join(LINK_META_FILENAME);
+    let mut sidecar_text = std::fs::read_to_string(&sidecar_path).unwrap();
+    sidecar_text = sidecar_text.replace(&root_sri, "sha512-tampered");
+    std::fs::write(&sidecar_path, sidecar_text).unwrap();
+    assert!(
+        apply_deferred_link_snapshot_heal(
+            &first.link_dir,
+            &pkg_dir,
+            &root_key,
+            &root_sri,
+            &deps,
+            None,
+            &heal,
+        )
+        .unwrap()
+        .is_none(),
+        "deferred snapshot heal must reject a mutated link sidecar"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn read_only_store_reuses_link_entry_when_lock_file_already_exists() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let staging = tempfile::tempdir().unwrap();
+    let store =
+        Store::at_with_object_integrity_policy(staging.path(), ObjectIntegrityPolicy::Source);
+    let tarball = build_test_tarball(&[
+        ("package.json", br#"{"name":"ro-locked","version":"1.0.0"}"#),
+        ("index.js", b"module.exports = 'ro';\n"),
+    ]);
+    let (object, sri, _) = store
+        .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Source)
+        .unwrap();
+    let key = arc_key("ro-locked", "1.0.0");
+    let populated = store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&key),
+            source_sri: sri.clone(),
+            object_dir: object.path,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+    assert!(populated.freshly_populated);
+    let lock_file = store
+        .paths()
+        .build_entry_lock_path(&key.digest_hex())
+        .unwrap();
+    assert!(lock_file.is_file(), "populated entry must have a lock file");
+    // Widen locks dir to 0o755 so hardening attempts chmod on the read-only mount.
+    std::fs::set_permissions(
+        store.paths().build_entry_locks_root(),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    let image_root = tempfile::tempdir().unwrap();
+    let image_path = image_root.path().join("store.dmg");
+    let mount_point = image_root.path().join("mnt");
+    std::fs::create_dir_all(&mount_point).unwrap();
+    let src_folder = staging.path().to_str().expect("utf8 staging path");
+    let ro_image = lpm_common::test_disk_image::AttachedImage::new(
+        &image_path,
+        &mount_point,
+        &[
+            "-srcfolder",
+            src_folder,
+            "-fs",
+            "APFS",
+            "-format",
+            "UDRO",
+            "-volname",
+            "lpm-ro-store",
+        ],
+        &["-readonly"],
+    );
+    let ro_store =
+        Store::at_with_object_integrity_policy(ro_image.path(), ObjectIntegrityPolicy::Source);
+    let ro_object_dir = ro_store.paths().object_dir(&sri).unwrap();
+    let reused = ro_store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&key),
+            source_sri: sri,
+            object_dir: ro_object_dir,
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .expect("read-only store must reuse a valid link entry even when its lock file exists");
+    assert!(!reused.freshly_populated);
 }

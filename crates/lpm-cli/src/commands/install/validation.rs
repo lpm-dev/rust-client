@@ -231,6 +231,53 @@ pub(super) fn frozen_install_accepts_lockfile(
     validate_frozen_importer_snapshot(lockfile_path, lockfile, &current.importer_snapshot)
 }
 
+pub(super) fn validate_frozen_importer_manifest_preflight(
+    importer: &str,
+    package: &lpm_workspace::PackageJson,
+    workspace_root: &lpm_workspace::PackageJson,
+    locked: &lpm_lockfile::ImporterSnapshot,
+    global_auto_install_peers: Option<bool>,
+) -> Result<(), LpmError> {
+    let mut catalog_resolutions = Vec::new();
+    let overrides = prepare_override_resolution_state(OverrideResolutionInput {
+        package,
+        workspace_root: Some(workspace_root),
+        catalog_resolutions: &mut catalog_resolutions,
+    })?;
+    let patches: HashMap<String, PatchedDependencyEntry> = package
+        .lpm
+        .as_ref()
+        .map(|l| l.patched_dependencies.clone())
+        .unwrap_or_default();
+    let patch_fingerprint = patch_state::compute_fingerprint(&patches);
+    let importer_patch_fingerprint = (!patches.is_empty()).then_some(patch_fingerprint.as_str());
+    let auto_install_peers = package
+        .lpm
+        .as_ref()
+        .and_then(|lpm| lpm.auto_install_peers)
+        .or(global_auto_install_peers)
+        .unwrap_or(true);
+    let mut current = importer_snapshot_for_current_manifest(
+        package,
+        &overrides.lpm_overrides,
+        overrides.overrides.as_ref(),
+        overrides.resolutions.as_ref(),
+        overrides.override_catalogs,
+        importer_patch_fingerprint,
+        auto_install_peers,
+    );
+    // Root-provider fingerprint is resolved per member from the projected lockfile later.
+    current.workspace_root_peer_providers_fingerprint =
+        locked.workspace_root_peer_providers_fingerprint.clone();
+    if let Some(diff) = first_importer_snapshot_diff(&current, locked) {
+        return Err(LpmError::Registry(format!(
+            "Frozen lockfile mismatch\n  importer    {importer}\n  {}  {}\n  manifest    {}\n  lockfile    {}\n  hint        run `lpm install` locally and commit lpm.lock, or pass --no-frozen-lockfile",
+            diff.kind, diff.name, diff.manifest, diff.lockfile,
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_install_lockfile_state(
     input: LockfileValidationInput<'_>,
 ) -> Result<LockfileValidationState, LpmError> {

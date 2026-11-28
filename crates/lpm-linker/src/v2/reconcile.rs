@@ -181,12 +181,14 @@ pub(super) fn remove_node_modules_entry(path: &Path, label: &str) -> Result<(), 
 }
 
 /// Create `<project>/node_modules/<root_link_name>` symlinks pointing
-/// into the v2 store's link package dirs.
+/// directly to the project compatibility island when present for the package's
+/// canonical root name, or otherwise into the v2 store's link package dirs.
 pub(super) fn create_root_symlinks(
     project_dir: &Path,
     targets: &[Arc<V2Target>],
     store: &Store,
     key_map: &KeyMap,
+    compatibility_links: &super::compat_island::CompatibilityLinks,
 ) -> Result<usize, LpmError> {
     let nm = ensure_node_modules_dir(project_dir)?;
 
@@ -207,13 +209,23 @@ pub(super) fn create_root_symlinks(
                 v2t.target.name, v2t.target.version
             ))
         })?;
-        let target_path = store.paths().link_package_dir(key);
+        let compat_target = compatibility_links.package_dir_for_key(key);
+        let mut store_target_path: Option<PathBuf> = None;
         for root_name in names {
+            let target_path: &Path = if root_name == v2t.target.name
+                && let Some(compat_dir) = compat_target
+            {
+                compat_dir
+            } else {
+                store_target_path
+                    .get_or_insert_with(|| store.paths().link_package_dir(key))
+                    .as_path()
+            };
             link_path.clear();
             link_path.push(&nm);
             link_path.push(&root_name);
             ensure_link_parent_dir(&nm, &link_path, "root symlink")?;
-            if symlink_points_to(&link_path, &target_path) {
+            if symlink_points_to(&link_path, target_path) {
                 count += 1;
                 continue;
             }
@@ -230,7 +242,7 @@ pub(super) fn create_root_symlinks(
                 if link_path.symlink_metadata().is_ok() {
                     let _ = remove_path_entry(&link_path);
                 }
-                match create_dir_symlink_or_junction(&target_path, &link_path) {
+                match create_dir_symlink_or_junction(target_path, &link_path) {
                     Ok(()) => break,
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
                         // A racing installer re-populated the slot

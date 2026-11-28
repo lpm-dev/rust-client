@@ -17,15 +17,32 @@ use lpm_common::integrity::{HashAlgorithm, Integrity};
 use lpm_common::{LpmError, LpmRoot};
 use sha2::{Digest, Sha256};
 
+enum ExistingBuildEntryReadLock {
+    Held(
+        #[expect(
+            dead_code,
+            reason = "RAII shared lock handle held for the duration of the reuse check"
+        )]
+        lpm_common::SingleFileSharedLockHandle,
+    ),
+    Absent,
+    ReadOnlyFilesystem,
+}
+
 use super::finalize_permits::v2_finalize_limiter;
 use super::fs_util::{
     copy_dir_recursively, create_dir_symlink, create_tmp_dir_locked, ensure_store_tier_dir_locked,
-    ensure_store_tier_dir_locked_once, invalidate_hardened_store_tier,
+    ensure_store_tier_dir_locked_once, harden_store_tier_once, invalidate_hardened_store_tier,
     materialize_into_with_integrity, tmp_sibling,
 };
 pub use super::integrity::{
-    ENV_V2_OBJECT_INTEGRITY, FreshObjectIntegrity, ObjectIntegrityPolicy,
-    ReusableObjectCheckTimings, VerifiedObjectIntegrity,
+    ENV_TRUST_RESTORED_STORE, ENV_V2_OBJECT_INTEGRITY, FreshObjectIntegrity, ObjectIntegrityPolicy,
+    ReusableObjectCheckTimings, VerifiedObjectIntegrity, trust_restored_store_enabled,
+    trust_restored_store_from_env,
+};
+#[cfg(any(debug_assertions, test))]
+pub use super::integrity::{
+    TrustRestoredStoreOverrideGuard, override_trust_restored_store_for_test,
 };
 use super::integrity::{
     current_tree_content_matches_snapshot, finish_object_rename_after_collision, harden_tier_of,
@@ -47,7 +64,8 @@ use super::local_source::{
 };
 use super::tree_hash::{
     ObjectTreeStats, StreamedTreeBuilder, TreeContentSchema, TreeIntegrities,
-    compute_object_tree_integrities, compute_tree_metadata_integrity,
+    compute_object_tree_integrities, compute_object_tree_integrities_for_schema,
+    compute_tree_metadata_integrities, compute_tree_metadata_integrity,
 };
 use crate::extraction::{HashingReader, SizeLimitedReader, StreamingIntegrityReader};
 use crate::v2::graph_key::GraphKey;
@@ -1028,6 +1046,37 @@ impl Store {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn try_acquire_existing_build_entry_read_lock(
+        &self,
+        graph_key_digest: &str,
+    ) -> Result<(PathBuf, ExistingBuildEntryReadLock), LpmError> {
+        let locks_root = self.paths.build_entry_locks_root();
+        let lock_path = self.paths.build_entry_lock_path(graph_key_digest)?;
+        // Validate an existing lock tier without creating it (so restored
+        // read-only stores stay read-only while hostile symlinks/widened perms
+        // on an existing lock tier are still rejected/hardened). If chmod fails
+        // on a read-only filesystem (or owned chmod-denied directory) for an
+        // existing real directory, continue into the non-creating read-only
+        // shared lock instead of bypassing lock acquisition or failing reuse.
+        if let Err(error) = harden_store_tier_once(locks_root) {
+            let can_degrade_readonly = is_readonly_owned_real_dir(locks_root, &error);
+            if !can_degrade_readonly {
+                return Err(LpmError::Store(format!(
+                    "failed to validate virtual-store build-entry locks dir: {error}"
+                )));
+            }
+        }
+        let outcome = match lpm_common::try_acquire_existing_single_file_shared_lock(&lock_path) {
+            Ok(Some(handle)) => ExistingBuildEntryReadLock::Held(handle),
+            Ok(None) => ExistingBuildEntryReadLock::Absent,
+            Err(LpmError::Io(error)) if error.kind() == std::io::ErrorKind::ReadOnlyFilesystem => {
+                ExistingBuildEntryReadLock::ReadOnlyFilesystem
+            }
+            Err(error) => return Err(error),
+        };
+        Ok((lock_path, outcome))
     }
 
     /// Return the object directory when `sri` is already present and
@@ -2178,9 +2227,16 @@ impl Store {
             .transpose()?;
 
         if final_dir.exists() {
-            let _entry_read_lock = self.acquire_build_entry_read_lock(&graph_key.digest_hex())?;
+            let graph_key_digest = graph_key.digest_hex();
+            let (lock_path, existing_read_lock) =
+                self.try_acquire_existing_build_entry_read_lock(&graph_key_digest)?;
             let reuse_check_start = std::time::Instant::now();
-            if let Some(sidecar_mtime) = link_entry_is_reusable(
+            let lock_held = matches!(existing_read_lock, ExistingBuildEntryReadLock::Held(_));
+            let read_only_fs = matches!(
+                existing_read_lock,
+                ExistingBuildEntryReadLock::ReadOnlyFilesystem
+            );
+            let check_result = link_entry_is_reusable(
                 &final_dir,
                 &graph_key,
                 &object_dir,
@@ -2189,14 +2245,115 @@ impl Store {
                 verified_object_digest,
                 cas_tree_digest.as_deref(),
                 policy,
-            )? {
-                timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
-                return Ok(Self::reused_link_entry(
-                    final_dir,
-                    sidecar_mtime,
-                    total_start,
-                    timings,
-                ));
+                lock_held,
+            );
+            match check_result {
+                Ok(Some(hit))
+                    if lock_held
+                        || read_only_fs
+                        || (!lock_path.exists() && hit.deferred_heal.is_none()) =>
+                {
+                    timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
+                    return Ok(Self::reused_link_entry(
+                        final_dir,
+                        hit.sidecar_mtime,
+                        total_start,
+                        timings,
+                    ));
+                }
+                // If we checked unlocked and saw a concurrent writer creating
+                // the lock file or a verified hit that wants to heal its
+                // snapshot, synchronize on the shared lock before writing or
+                // deciding. Re-verify only the cheap metadata digest before
+                // persisting an already-computed snapshot so content hashing
+                // never runs twice. On read-only restored stores where lock
+                // creation is rejected, a verified hit without a lock file
+                // still succeeds.
+                Ok(Some(hit)) if !lock_held => {
+                    if let Ok(_entry_read_lock) =
+                        self.acquire_build_entry_read_lock(&graph_key_digest)
+                    {
+                        if let Some(heal) = hit.deferred_heal {
+                            let package_dir = link_entry_package_dir(&final_dir, &graph_key);
+                            if final_dir.exists()
+                                && package_dir.join("package.json").is_file()
+                                && let Some(verified_sidecar_mtime) =
+                                    apply_deferred_link_snapshot_heal(
+                                        &final_dir,
+                                        &package_dir,
+                                        &graph_key,
+                                        &source_sri,
+                                        &deps,
+                                        cas_tree_digest.as_deref(),
+                                        &heal,
+                                    )?
+                            {
+                                timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
+                                return Ok(Self::reused_link_entry(
+                                    final_dir,
+                                    verified_sidecar_mtime,
+                                    total_start,
+                                    timings,
+                                ));
+                            }
+                        }
+                        if final_dir.exists()
+                            && let Some(reverified) = link_entry_is_reusable(
+                                &final_dir,
+                                &graph_key,
+                                &object_dir,
+                                &source_sri,
+                                &deps,
+                                verified_object_digest,
+                                cas_tree_digest.as_deref(),
+                                policy,
+                                true,
+                            )?
+                        {
+                            timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
+                            return Ok(Self::reused_link_entry(
+                                final_dir,
+                                reverified.sidecar_mtime,
+                                total_start,
+                                timings,
+                            ));
+                        }
+                    } else if !lock_path.exists() {
+                        timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
+                        return Ok(Self::reused_link_entry(
+                            final_dir,
+                            hit.sidecar_mtime,
+                            total_start,
+                            timings,
+                        ));
+                    }
+                }
+                Err(_) if !lock_held && !read_only_fs => {
+                    let _entry_read_lock = self.acquire_build_entry_read_lock(&graph_key_digest)?;
+                    if final_dir.exists()
+                        && let Some(reverified) = link_entry_is_reusable(
+                            &final_dir,
+                            &graph_key,
+                            &object_dir,
+                            &source_sri,
+                            &deps,
+                            verified_object_digest,
+                            cas_tree_digest.as_deref(),
+                            policy,
+                            true,
+                        )?
+                    {
+                        timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
+                        return Ok(Self::reused_link_entry(
+                            final_dir,
+                            reverified.sidecar_mtime,
+                            total_start,
+                            timings,
+                        ));
+                    }
+                }
+                Ok(Some(_)) | Ok(None) => {}
+                Err(error) => return Err(error),
             }
             timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
         }
@@ -2211,7 +2368,7 @@ impl Store {
         // to hard-fail with ENOTEMPTY against a non-empty leftover.
         if final_dir.exists() {
             let reuse_check_start = std::time::Instant::now();
-            if let Some(sidecar_mtime) = link_entry_is_reusable(
+            if let Some(hit) = link_entry_is_reusable(
                 &final_dir,
                 &graph_key,
                 &object_dir,
@@ -2220,7 +2377,9 @@ impl Store {
                 verified_object_digest,
                 cas_tree_digest.as_deref(),
                 policy,
+                true,
             )? {
+                let sidecar_mtime = hit.sidecar_mtime;
                 timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
                 return Ok(Self::reused_link_entry(
                     final_dir,
@@ -2342,7 +2501,7 @@ impl Store {
             }),
             Err(e) => {
                 let recovery_start = std::time::Instant::now();
-                if let Some(sidecar_mtime) = link_entry_is_reusable(
+                if let Some(hit) = link_entry_is_reusable(
                     &final_dir,
                     &graph_key,
                     &object_dir,
@@ -2351,7 +2510,9 @@ impl Store {
                     verified_object_digest,
                     cas_tree_digest.as_deref(),
                     policy,
+                    true,
                 )? {
+                    let sidecar_mtime = hit.sidecar_mtime;
                     // Concurrent install beat us — discard our stage and
                     // refresh the existing sidecar's mtime when stale.
                     let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -2648,6 +2809,48 @@ impl Store {
         compute_tree_metadata_integrity(entry_dir)
     }
 
+    /// Compute both strict (`with_ctime`) and ctime-independent (`without_ctime`)
+    /// metadata digests for a compatibility-island entry in a single walk.
+    pub fn compat_island_entry_metadata_integrities(
+        &self,
+        entry_dir: &Path,
+    ) -> Result<(String, String), LpmError> {
+        let compat_root = self.paths.compat_root();
+        let relative = entry_dir.strip_prefix(compat_root).map_err(|_| {
+            LpmError::Store(format!(
+                "compatibility island entry is outside the store cache at {}",
+                entry_dir.display()
+            ))
+        })?;
+        if relative.as_os_str().is_empty()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::RootDir
+                )
+            })
+        {
+            return Err(LpmError::Store(format!(
+                "compatibility island entry is outside the store cache at {}",
+                entry_dir.display()
+            )));
+        }
+        let metadata = entry_dir.symlink_metadata().map_err(|error| {
+            LpmError::Store(format!(
+                "failed to inspect compatibility island entry at {}: {error}",
+                entry_dir.display()
+            ))
+        })?;
+        if !metadata.is_dir() || lpm_common::is_symlink_or_junction(&metadata) {
+            return Err(LpmError::Store(format!(
+                "refusing non-directory compatibility island entry at {}",
+                entry_dir.display()
+            )));
+        }
+        let digests = compute_tree_metadata_integrities(entry_dir)?;
+        Ok((digests.metadata, digests.metadata_no_ctime))
+    }
+
     fn link_entry_content_integrity_with_policy(
         &self,
         key: &GraphKey,
@@ -2668,12 +2871,13 @@ impl Store {
         let object_dir = self.paths.object_dir(&meta.source_sri)?;
         if source_policy_uses_source_integrity(&object_dir, policy) {
             let content = source_object_integrity(&meta.source_sri);
-            let metadata = compute_tree_metadata_integrity(&package_dir)?;
+            let metadata = compute_tree_metadata_integrities(&package_dir)?;
             write_tree_snapshot(
                 &link_dir,
                 &TreeIntegrities {
                     content: content.clone(),
-                    metadata,
+                    metadata: metadata.metadata,
+                    metadata_no_ctime: metadata.metadata_no_ctime,
                     stats: ObjectTreeStats::default(),
                     content_schema: TreeContentSchema::SequentialV1,
                 },
@@ -3492,16 +3696,17 @@ fn populate_into(
             &layout_integrities,
         )?;
     } else {
-        let package_metadata_integrity = match materialized_metadata_integrity {
+        let package_metadata = match materialized_metadata_integrity {
             Some(integrity) => integrity,
-            None => compute_tree_metadata_integrity(&pkg_dir)?,
+            None => compute_tree_metadata_integrities(&pkg_dir)?,
         };
         write_link_tree_snapshot_unpublished(
             tmp_dir,
             &pkg_dir,
             &TreeIntegrities {
                 content: object_integrity,
-                metadata: package_metadata_integrity,
+                metadata: package_metadata.metadata,
+                metadata_no_ctime: package_metadata.metadata_no_ctime,
                 stats: ObjectTreeStats::default(),
                 content_schema: TreeContentSchema::SequentialV1,
             },
@@ -3708,6 +3913,135 @@ fn should_touch_sidecar(mtime: Option<std::time::SystemTime>) -> bool {
     }
 }
 
+enum DeferredLinkSnapshotHeal {
+    ShallowGuard {
+        snapshot: Box<super::integrity::TreeSnapshot>,
+        expected_metadata: String,
+        expected_no_ctime: Option<String>,
+    },
+    FullSnapshot {
+        integrities: TreeIntegrities,
+    },
+    LayoutSnapshot {
+        content_integrity: String,
+        actual: TreeIntegrities,
+    },
+}
+
+fn is_readonly_owned_real_dir(path: &Path, error: &std::io::Error) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.is_dir() || lpm_common::is_symlink_or_junction(&meta) {
+        return false;
+    }
+    if error.kind() == std::io::ErrorKind::ReadOnlyFilesystem {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        // Refuse `EPERM` on a directory owned by another user while allowing
+        // chmod refusal on an owned directory (such as a read-only mount or
+        // immutable directory).
+        error.kind() == std::io::ErrorKind::PermissionDenied
+            && meta.uid() == lpm_common::current_uid()
+    }
+    #[cfg(not(unix))]
+    {
+        error.kind() == std::io::ErrorKind::PermissionDenied
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_deferred_link_snapshot_heal(
+    dir: &Path,
+    package_dir: &Path,
+    key: &GraphKey,
+    source_sri: &str,
+    deps: &[DepLink],
+    tree_digest: Option<&str>,
+    heal: &DeferredLinkSnapshotHeal,
+) -> Result<Option<Option<std::time::SystemTime>>, LpmError> {
+    let Some((sidecar, sidecar_mtime)) = LinkMeta::read_from_with_mtime_if_present(dir)? else {
+        return Ok(None);
+    };
+    if sidecar.graph_key_digest_hex != key.digest_hex()
+        || sidecar.source_sri != source_sri
+        || sidecar.tree_digest.as_deref() != tree_digest
+        || !dependency_links_match(dir, key, deps, &sidecar.deps)?
+    {
+        return Ok(None);
+    }
+    let expected_metadata = match heal {
+        DeferredLinkSnapshotHeal::ShallowGuard {
+            expected_metadata, ..
+        } => expected_metadata.as_str(),
+        DeferredLinkSnapshotHeal::FullSnapshot { integrities } => integrities.metadata.as_str(),
+        DeferredLinkSnapshotHeal::LayoutSnapshot { actual, .. } => actual.metadata.as_str(),
+    };
+    if compute_tree_metadata_integrity(package_dir)? != expected_metadata {
+        return Ok(None);
+    }
+    match heal {
+        DeferredLinkSnapshotHeal::ShallowGuard {
+            snapshot,
+            expected_metadata,
+            expected_no_ctime,
+        } => {
+            refresh_link_snapshot_shallow_guard_best_effort(
+                dir,
+                package_dir,
+                snapshot,
+                expected_metadata,
+                expected_no_ctime.as_deref(),
+            );
+        }
+        DeferredLinkSnapshotHeal::FullSnapshot { integrities } => {
+            write_link_tree_snapshot_best_effort(dir, package_dir, integrities);
+        }
+        DeferredLinkSnapshotHeal::LayoutSnapshot {
+            content_integrity,
+            actual,
+        } => {
+            if let Err(error) =
+                write_tree_snapshot_with_layout_content(dir, content_integrity, actual)
+            {
+                tracing::debug!(
+                    target = %dir.display(),
+                    "virtual store: failed to refresh link layout snapshot: {error}"
+                );
+            }
+        }
+    }
+    Ok(Some(sidecar_mtime))
+}
+
+struct LinkEntryReuseHit {
+    sidecar_mtime: Option<std::time::SystemTime>,
+    /// Verified snapshot/guard update deferred until the shared lock is held.
+    deferred_heal: Option<Box<DeferredLinkSnapshotHeal>>,
+}
+
+impl LinkEntryReuseHit {
+    fn clean(sidecar_mtime: Option<std::time::SystemTime>) -> Self {
+        Self {
+            sidecar_mtime,
+            deferred_heal: None,
+        }
+    }
+
+    fn with_deferred_heal(
+        sidecar_mtime: Option<std::time::SystemTime>,
+        deferred_heal: Option<DeferredLinkSnapshotHeal>,
+    ) -> Self {
+        Self {
+            sidecar_mtime,
+            deferred_heal: deferred_heal.map(Box::new),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn link_entry_is_reusable(
     dir: &Path,
@@ -3718,7 +4052,8 @@ fn link_entry_is_reusable(
     verified_object_digest: Option<&VerifiedObjectIntegrity>,
     tree_digest: Option<&str>,
     policy: ObjectIntegrityPolicy,
-) -> Result<Option<Option<std::time::SystemTime>>, LpmError> {
+    allow_snapshot_writes: bool,
+) -> Result<Option<LinkEntryReuseHit>, LpmError> {
     harden_tier_of(dir, "links")?;
     let Some((sidecar, sidecar_mtime)) = LinkMeta::read_from_with_mtime_if_present(dir)? else {
         return Ok(None);
@@ -3738,11 +4073,16 @@ fn link_entry_is_reusable(
         Some(digest) => Cow::Borrowed(digest.as_str()),
         None => Cow::Owned(object_integrity_for_link(object_dir, source_sri, policy)?),
     };
-    let source_shallow_eligible = source_policy_uses_source_integrity(object_dir, policy)
+    let source_policy = source_policy_uses_source_integrity(object_dir, policy);
+    let source_shallow_eligible = source_policy
         && package_dir
             .join(LINK_BUILD_MARKER)
             .symlink_metadata()
             .is_err();
+    // Local-source objects enforce Tree integrity even under default Source
+    // policy, so restored-store ctime relaxation only applies when this entry's
+    // effective policy is Source.
+    let trust_restored = source_policy && trust_restored_store_enabled(policy);
     let existing_snapshot = read_tree_snapshot(dir);
     if let Some(snapshot) = existing_snapshot.as_ref()
         && snapshot.content_integrity == expected.as_ref()
@@ -3753,49 +4093,253 @@ fn link_entry_is_reusable(
             && let Some(current_guard) = read_shallow_package_guard(&package_dir)
             && current_guard.matches_non_racy(&recorded_guard)
         {
-            return Ok(Some(sidecar_mtime));
+            return Ok(Some(LinkEntryReuseHit::clean(sidecar_mtime)));
         }
-        if compute_tree_metadata_integrity(&package_dir)? == snapshot.metadata_integrity {
-            if source_shallow_eligible && snapshot.layout_content_integrity.is_none() {
-                refresh_link_snapshot_shallow_guard_best_effort(dir, &package_dir, snapshot);
+        if !trust_restored {
+            let actual_metadata = compute_tree_metadata_integrity(&package_dir)?;
+            if actual_metadata == snapshot.metadata_integrity {
+                let wants_guard =
+                    source_shallow_eligible && snapshot.layout_content_integrity.is_none();
+                if allow_snapshot_writes && wants_guard {
+                    refresh_link_snapshot_shallow_guard_best_effort(
+                        dir,
+                        &package_dir,
+                        snapshot,
+                        &actual_metadata,
+                        snapshot.metadata_integrity_no_ctime.as_deref(),
+                    );
+                    return Ok(Some(LinkEntryReuseHit::clean(sidecar_mtime)));
+                }
+                let deferred = (wants_guard
+                    && !allow_snapshot_writes
+                    && read_shallow_package_guard(&package_dir)
+                        .is_some_and(|guard| guard.is_non_racy()))
+                .then(|| DeferredLinkSnapshotHeal::ShallowGuard {
+                    snapshot: Box::new(snapshot.clone()),
+                    expected_metadata: actual_metadata,
+                    expected_no_ctime: snapshot.metadata_integrity_no_ctime.clone(),
+                });
+                return Ok(Some(LinkEntryReuseHit::with_deferred_heal(
+                    sidecar_mtime,
+                    deferred,
+                )));
             }
-            return Ok(Some(sidecar_mtime));
+        } else {
+            let actual_metadata = compute_tree_metadata_integrities(&package_dir)?;
+            if actual_metadata.metadata == snapshot.metadata_integrity {
+                let wants_guard =
+                    source_shallow_eligible && snapshot.layout_content_integrity.is_none();
+                if allow_snapshot_writes && wants_guard {
+                    refresh_link_snapshot_shallow_guard_best_effort(
+                        dir,
+                        &package_dir,
+                        snapshot,
+                        &actual_metadata.metadata,
+                        Some(&actual_metadata.metadata_no_ctime),
+                    );
+                    return Ok(Some(LinkEntryReuseHit::clean(sidecar_mtime)));
+                }
+                let deferred = (wants_guard
+                    && !allow_snapshot_writes
+                    && read_shallow_package_guard(&package_dir)
+                        .is_some_and(|guard| guard.is_non_racy()))
+                .then(|| DeferredLinkSnapshotHeal::ShallowGuard {
+                    snapshot: Box::new(snapshot.clone()),
+                    expected_metadata: actual_metadata.metadata,
+                    expected_no_ctime: Some(actual_metadata.metadata_no_ctime),
+                });
+                return Ok(Some(LinkEntryReuseHit::with_deferred_heal(
+                    sidecar_mtime,
+                    deferred,
+                )));
+            }
+            if snapshot.metadata_integrity_no_ctime.as_deref()
+                == Some(actual_metadata.metadata_no_ctime.as_str())
+            {
+                // Never overwrite strict `metadata_integrity` or strict shallow
+                // guards from a ctime-free restored-store match so turning off
+                // `LPM_TRUST_RESTORED_STORE` enforces content verification once.
+                return Ok(Some(LinkEntryReuseHit::clean(sidecar_mtime)));
+            }
+            tracing::debug!(
+                target = %dir.display(),
+                "LPM_TRUST_RESTORED_STORE enabled but ctime-free link metadata digest missed; falling back to content verification"
+            );
         }
     }
-    let actual = compute_object_tree_integrities(&package_dir)?;
+
+    let object_snapshot = read_tree_snapshot(object_dir);
+    let has_layout_override = existing_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.layout_content_integrity.is_some());
+    let primary_schema = if source_policy && !has_layout_override {
+        object_snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.content_integrity != expected.as_ref())
+            .map_or(TreeContentSchema::SequentialV1, |snapshot| {
+                snapshot.content_schema()
+            })
+    } else {
+        existing_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.content_schema())
+            .or_else(|| {
+                object_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.content_schema())
+            })
+            .unwrap_or(TreeContentSchema::SequentialV1)
+    };
+    let actual = compute_object_tree_integrities_for_schema(&package_dir, primary_schema)?;
     if actual.content == expected.as_ref() {
-        write_link_tree_snapshot_best_effort(dir, &package_dir, &actual);
-        return Ok(Some(sidecar_mtime));
+        if allow_snapshot_writes {
+            write_link_tree_snapshot_best_effort(dir, &package_dir, &actual);
+            return Ok(Some(LinkEntryReuseHit::clean(sidecar_mtime)));
+        }
+        return Ok(Some(LinkEntryReuseHit::with_deferred_heal(
+            sidecar_mtime,
+            Some(DeferredLinkSnapshotHeal::FullSnapshot {
+                integrities: actual,
+            }),
+        )));
     }
     if existing_snapshot.as_ref().is_some_and(|snapshot| {
         snapshot.content_integrity == expected.as_ref()
             && snapshot.layout_content_integrity.as_deref() == Some(actual.content.as_str())
     }) {
-        if let Err(error) = write_tree_snapshot_with_layout_content(dir, expected.as_ref(), &actual)
-        {
-            tracing::debug!(
-                target = %dir.display(),
-                "virtual store: failed to refresh link layout snapshot: {error}"
-            );
+        if allow_snapshot_writes {
+            if let Err(error) =
+                write_tree_snapshot_with_layout_content(dir, expected.as_ref(), &actual)
+            {
+                tracing::debug!(
+                    target = %dir.display(),
+                    "virtual store: failed to refresh link layout snapshot: {error}"
+                );
+            }
+            return Ok(Some(LinkEntryReuseHit::clean(sidecar_mtime)));
         }
-        return Ok(Some(sidecar_mtime));
+        return Ok(Some(LinkEntryReuseHit::with_deferred_heal(
+            sidecar_mtime,
+            Some(DeferredLinkSnapshotHeal::LayoutSnapshot {
+                content_integrity: expected.into_owned(),
+                actual,
+            }),
+        )));
     }
-    if source_policy_uses_source_integrity(object_dir, policy)
-        && link_tree_matches_object_tree(&actual, object_dir)?
-    {
-        write_link_tree_snapshot_best_effort(
-            dir,
-            &package_dir,
-            &TreeIntegrities {
+    if source_policy {
+        if let Some(obj_snapshot) = object_snapshot.as_ref()
+            && obj_snapshot.content_integrity != expected.as_ref()
+            && object_snapshot_matches_live_object(object_dir, source_sri, obj_snapshot)?
+        {
+            if obj_snapshot.content_schema() == actual.content_schema
+                && actual.content == obj_snapshot.content_integrity
+            {
+                let integrities = TreeIntegrities {
+                    content: expected.as_ref().to_owned(),
+                    metadata: actual.metadata,
+                    metadata_no_ctime: actual.metadata_no_ctime,
+                    stats: actual.stats,
+                    content_schema: actual.content_schema,
+                };
+                if allow_snapshot_writes {
+                    write_link_tree_snapshot_best_effort(dir, &package_dir, &integrities);
+                    return Ok(Some(LinkEntryReuseHit::clean(sidecar_mtime)));
+                }
+                return Ok(Some(LinkEntryReuseHit::with_deferred_heal(
+                    sidecar_mtime,
+                    Some(DeferredLinkSnapshotHeal::FullSnapshot { integrities }),
+                )));
+            }
+            if obj_snapshot.content_schema() != actual.content_schema {
+                let alt = compute_object_tree_integrities_for_schema(
+                    &package_dir,
+                    obj_snapshot.content_schema(),
+                )?;
+                if alt.content == obj_snapshot.content_integrity {
+                    let integrities = TreeIntegrities {
+                        content: expected.as_ref().to_owned(),
+                        metadata: alt.metadata,
+                        metadata_no_ctime: alt.metadata_no_ctime,
+                        stats: alt.stats,
+                        content_schema: alt.content_schema,
+                    };
+                    if allow_snapshot_writes {
+                        write_link_tree_snapshot_best_effort(dir, &package_dir, &integrities);
+                        return Ok(Some(LinkEntryReuseHit::clean(sidecar_mtime)));
+                    }
+                    return Ok(Some(LinkEntryReuseHit::with_deferred_heal(
+                        sidecar_mtime,
+                        Some(DeferredLinkSnapshotHeal::FullSnapshot { integrities }),
+                    )));
+                }
+            }
+        }
+        if link_tree_matches_object_tree(&actual, object_dir)? {
+            let integrities = TreeIntegrities {
                 content: expected.as_ref().to_owned(),
                 metadata: actual.metadata,
+                metadata_no_ctime: actual.metadata_no_ctime,
                 stats: actual.stats,
                 content_schema: actual.content_schema,
-            },
-        );
-        return Ok(Some(sidecar_mtime));
+            };
+            if allow_snapshot_writes {
+                write_link_tree_snapshot_best_effort(dir, &package_dir, &integrities);
+                return Ok(Some(LinkEntryReuseHit::clean(sidecar_mtime)));
+            }
+            return Ok(Some(LinkEntryReuseHit::with_deferred_heal(
+                sidecar_mtime,
+                Some(DeferredLinkSnapshotHeal::FullSnapshot { integrities }),
+            )));
+        }
+    } else {
+        let known_same_schema = object_snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.content_schema() == primary_schema
+                && snapshot.content_integrity == expected.as_ref()
+        });
+        if !known_same_schema {
+            let alternate_schema = match primary_schema {
+                TreeContentSchema::SequentialV1 => TreeContentSchema::EntryDigestV2,
+                TreeContentSchema::EntryDigestV2 => TreeContentSchema::SequentialV1,
+            };
+            let alternate =
+                compute_object_tree_integrities_for_schema(&package_dir, alternate_schema)?;
+            if alternate.content == expected.as_ref() {
+                if allow_snapshot_writes {
+                    write_link_tree_snapshot_best_effort(dir, &package_dir, &alternate);
+                    return Ok(Some(LinkEntryReuseHit::clean(sidecar_mtime)));
+                }
+                return Ok(Some(LinkEntryReuseHit::with_deferred_heal(
+                    sidecar_mtime,
+                    Some(DeferredLinkSnapshotHeal::FullSnapshot {
+                        integrities: alternate,
+                    }),
+                )));
+            }
+        }
     }
     Ok(None)
+}
+
+/// Confirm that an object's recorded tree snapshot still strictly matches the
+/// live object directory and source sidecar before using its `content_integrity`
+/// as the single-hash source-policy baseline.
+fn object_snapshot_matches_live_object(
+    object_dir: &Path,
+    source_sri: &str,
+    object_snapshot: &super::integrity::TreeSnapshot,
+) -> Result<bool, LpmError> {
+    let recorded_sri = match lpm_common::read_text_file_capped_nofollow(
+        &object_dir.join(".integrity"),
+        INTEGRITY_MARKER_SIZE_CAP_BYTES,
+    ) {
+        Ok(content) => content,
+        Err(_) => return Ok(false),
+    };
+    if recorded_sri.trim() != source_sri {
+        return Ok(false);
+    }
+    let live_metadata = compute_tree_metadata_integrity(object_dir)?;
+    Ok(live_metadata == object_snapshot.metadata_integrity)
 }
 
 fn dependency_links_match(
@@ -3814,15 +4358,8 @@ fn dependency_links_match(
     if by_local.len() != deps.len() {
         return Ok(false);
     }
-    let node_modules = dir.join(LINK_NODE_MODULES);
-    let mut expected_slots = std::collections::HashSet::with_capacity(deps.len() + 1);
-    expected_slots.insert(key.name());
-    expected_slots.extend(deps.iter().map(|dep| dep.local.as_str()));
-    if !is_real_link_directory(dir)?
-        || !wrapper_slots_match(&node_modules, key.name(), &expected_slots)?
-    {
-        return Ok(false);
-    }
+    // Validate recorded metadata before touching the filesystem so mismatched
+    // link metadata fails without a `read_dir` scan.
     for dep in deps {
         let Some(recorded) = by_local.get(dep.local.as_str()) else {
             return Ok(false);
@@ -3833,6 +4370,17 @@ fn dependency_links_match(
         {
             return Ok(false);
         }
+    }
+    let node_modules = dir.join(LINK_NODE_MODULES);
+    let mut expected_slots = std::collections::HashSet::with_capacity(deps.len() + 1);
+    expected_slots.insert(key.name());
+    expected_slots.extend(deps.iter().map(|dep| dep.local.as_str()));
+    if !is_real_link_directory(dir)?
+        || !wrapper_slots_match(&node_modules, key.name(), &expected_slots)?
+    {
+        return Ok(false);
+    }
+    for dep in deps {
         let (link, expected) = sibling_link_paths(&node_modules, dep, key)?;
         if dep.local == key.name() {
             let mut nested = node_modules.join(key.name());
@@ -3847,30 +4395,46 @@ fn dependency_links_match(
                 }
             }
         }
-        match std::fs::symlink_metadata(&link) {
-            Ok(meta) if lpm_common::is_symlink_or_junction(&meta) => {}
-            Ok(_) => return Ok(false),
+        #[cfg(windows)]
+        {
+            match std::fs::symlink_metadata(&link) {
+                Ok(meta) if lpm_common::is_symlink_or_junction(&meta) => {}
+                Ok(_) => return Ok(false),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    return Ok(false);
+                }
+                Err(error) => {
+                    return Err(LpmError::Store(format!(
+                        "failed to inspect dependency link {}: {error}",
+                        link.display()
+                    )));
+                }
+            }
+        }
+        let actual = match std::fs::read_link(&link) {
+            Ok(target) => target,
             Err(error)
                 if matches!(
                     error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::NotADirectory
+                        | std::io::ErrorKind::InvalidInput
                 ) =>
             {
                 return Ok(false);
             }
             Err(error) => {
                 return Err(LpmError::Store(format!(
-                    "failed to inspect dependency link {}: {error}",
+                    "failed to read dependency link {}: {error}",
                     link.display()
                 )));
             }
-        }
-        let actual = std::fs::read_link(&link).map_err(|error| {
-            LpmError::Store(format!(
-                "failed to read dependency link {}: {error}",
-                link.display()
-            ))
-        })?;
+        };
         if actual != expected {
             #[cfg(windows)]
             if actual.is_absolute() {
@@ -3907,6 +4471,16 @@ fn is_real_link_directory(path: &Path) -> Result<bool, LpmError> {
     }
 }
 
+fn entry_is_real_link_directory(entry: &std::fs::DirEntry) -> Result<bool, LpmError> {
+    #[cfg(not(windows))]
+    {
+        if let Ok(file_type) = entry.file_type() {
+            return Ok(file_type.is_dir() && !file_type.is_symlink());
+        }
+    }
+    is_real_link_directory(&entry.path())
+}
+
 fn wrapper_slots_match(
     node_modules: &Path,
     own_name: &str,
@@ -3916,6 +4490,7 @@ fn wrapper_slots_match(
         return Ok(false);
     }
     let mut found = 0;
+    let mut scoped_local = String::new();
     for entry in std::fs::read_dir(node_modules)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -3923,7 +4498,7 @@ fn wrapper_slots_match(
             return Ok(false);
         };
         if name.starts_with('@') {
-            if !is_real_link_directory(&entry.path())? {
+            if !entry_is_real_link_directory(&entry)? {
                 return Ok(false);
             }
             let mut scoped_count = 0;
@@ -3933,9 +4508,13 @@ fn wrapper_slots_match(
                 let Some(child_name) = child_name.to_str() else {
                     return Ok(false);
                 };
-                let local = format!("{name}/{child_name}");
-                if !expected.contains(local.as_str())
-                    || (local == own_name && !is_real_link_directory(&child.path())?)
+                scoped_local.clear();
+                scoped_local.reserve(name.len() + 1 + child_name.len());
+                scoped_local.push_str(name);
+                scoped_local.push('/');
+                scoped_local.push_str(child_name);
+                if !expected.contains(scoped_local.as_str())
+                    || (scoped_local == own_name && !entry_is_real_link_directory(&child)?)
                 {
                     return Ok(false);
                 }
@@ -3947,7 +4526,7 @@ fn wrapper_slots_match(
             found += scoped_count;
         } else {
             if !expected.contains(name)
-                || (name == own_name && !is_real_link_directory(&entry.path())?)
+                || (name == own_name && !entry_is_real_link_directory(&entry)?)
             {
                 return Ok(false);
             }
@@ -3986,7 +4565,8 @@ fn link_tree_matches_object_tree(
     link_integrities: &TreeIntegrities,
     object_dir: &Path,
 ) -> Result<bool, LpmError> {
-    let object_integrities = compute_object_tree_integrities(object_dir)?;
+    let object_integrities =
+        compute_object_tree_integrities_for_schema(object_dir, link_integrities.content_schema)?;
     Ok(link_integrities.content == object_integrities.content)
 }
 

@@ -1122,8 +1122,207 @@ fn parse_policy_firewall(
     })
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnixPathAuthorityStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    dev: u64,
+    ino: u64,
+    ctime: i64,
+    ctime_nsec: i64,
+    mode: u32,
+    uid: u32,
+}
+
+#[cfg(unix)]
+impl UnixPathAuthorityStamp {
+    fn from_metadata(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+            ctime: meta.ctime(),
+            ctime_nsec: meta.ctime_nsec(),
+            mode: meta.mode(),
+            uid: meta.uid(),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedPolicyStamp {
+    file: UnixPathAuthorityStamp,
+    canonical_path: PathBuf,
+    /// Stamps for every lexical ancestor directory from the policy parent up to `/`.
+    lexical_ancestors: Vec<UnixPathAuthorityStamp>,
+    /// Stamps for every canonical ancestor directory validated by
+    /// `validate_managed_policy_authority` (for example `/private/etc` and
+    /// `/private` behind `/etc` on macOS).
+    canonical_ancestors: Vec<UnixPathAuthorityStamp>,
+}
+
+#[cfg(unix)]
+impl ManagedPolicyStamp {
+    fn capture(path: &Path) -> Result<Option<Self>, std::io::Error> {
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let file = UnixPathAuthorityStamp::from_metadata(&meta);
+        let mut lexical_ancestors = Vec::new();
+        let mut current = path.parent();
+        while let Some(dir) = current {
+            if dir.as_os_str().is_empty() {
+                break;
+            }
+            let dir_meta = std::fs::symlink_metadata(dir)?;
+            lexical_ancestors.push(UnixPathAuthorityStamp::from_metadata(&dir_meta));
+            current = dir.parent();
+        }
+        let canonical_path = std::fs::canonicalize(path)?;
+        let mut canonical_ancestors = Vec::new();
+        let mut canonical_current = canonical_path.parent();
+        while let Some(dir) = canonical_current {
+            if dir.as_os_str().is_empty() {
+                break;
+            }
+            let dir_meta = std::fs::symlink_metadata(dir)?;
+            canonical_ancestors.push(UnixPathAuthorityStamp::from_metadata(&dir_meta));
+            canonical_current = dir.parent();
+        }
+        Ok(Some(Self {
+            file,
+            canonical_path,
+            lexical_ancestors,
+            canonical_ancestors,
+        }))
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ManagedPolicyCache {
+    #[cfg(unix)]
+    entries:
+        std::sync::Mutex<std::collections::HashMap<PathBuf, (ManagedPolicyStamp, ManagedPolicy)>>,
+    #[cfg(unix)]
+    load_lock: std::sync::Mutex<()>,
+}
+
+tokio::task_local! {
+    static SCOPED_MANAGED_POLICY_CACHE: std::sync::Arc<ManagedPolicyCache>;
+}
+
+pub(crate) fn new_managed_policy_cache() -> std::sync::Arc<ManagedPolicyCache> {
+    std::sync::Arc::new(ManagedPolicyCache::default())
+}
+
+pub(crate) fn current_or_new_managed_policy_cache() -> std::sync::Arc<ManagedPolicyCache> {
+    SCOPED_MANAGED_POLICY_CACHE
+        .try_with(std::sync::Arc::clone)
+        .unwrap_or_else(|_| new_managed_policy_cache())
+}
+
+pub(crate) async fn scope_managed_policy_cache<F>(
+    cache: std::sync::Arc<ManagedPolicyCache>,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    SCOPED_MANAGED_POLICY_CACHE.scope(cache, future).await
+}
+
 pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
     let path = managed_policy_path();
+    #[cfg(not(unix))]
+    {
+        load_managed_policy_from_disk(path)
+    }
+    #[cfg(unix)]
+    {
+        let Ok(cache) = SCOPED_MANAGED_POLICY_CACHE.try_with(std::sync::Arc::clone) else {
+            return load_managed_policy_from_disk(path);
+        };
+
+        // Always inspect the policy file and every ancestor directory via
+        // `symlink_metadata` so newly-created, replaced, or chmod/chown'd
+        // policy files or parents are never shadowed by a stale cache entry.
+        let Some(current_stamp) = ManagedPolicyStamp::capture(&path)
+            .map_err(|error| privileged_policy_io_error(&path, "inspect", error))?
+        else {
+            cache
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&path);
+            return Ok(None);
+        };
+
+        if let Some((cached_stamp, cached_policy)) = cache
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&path)
+            && *cached_stamp == current_stamp
+        {
+            return Ok(Some(cached_policy.clone()));
+        }
+
+        // Serialize cache-miss disk reads so concurrent workers share a single
+        // parse and cannot publish an older policy generation over a newer one.
+        let _loading = cache
+            .load_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(pre_stamp) = ManagedPolicyStamp::capture(&path)
+            .map_err(|error| privileged_policy_io_error(&path, "inspect", error))?
+        else {
+            cache
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&path);
+            return Ok(None);
+        };
+        if let Some((cached_stamp, cached_policy)) = cache
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&path)
+            && *cached_stamp == pre_stamp
+        {
+            return Ok(Some(cached_policy.clone()));
+        }
+
+        let policy = load_managed_policy_from_disk(path.clone())?;
+        let post_stamp = ManagedPolicyStamp::capture(&path).ok().flatten();
+        match (policy.as_ref(), post_stamp) {
+            (Some(parsed), Some(stamp)) if stamp == pre_stamp => {
+                cache
+                    .entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(path, (stamp, parsed.clone()));
+            }
+            _ => {
+                cache
+                    .entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&path);
+            }
+        }
+        Ok(policy)
+    }
+}
+
+fn load_managed_policy_from_disk(path: PathBuf) -> Result<Option<ManagedPolicy>, LpmError> {
     match std::fs::symlink_metadata(&path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1721,5 +1920,100 @@ mod access_tests {
     fn policy_parent_child_deletion_is_a_modifying_permission() {
         assert!(super::windows_policy_access_can_modify(0x40));
         assert!(!super::windows_policy_access_can_modify(0x1));
+    }
+
+    #[tokio::test]
+    async fn scoped_managed_policy_cache_validates_file_stamp_and_does_not_cache_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_path = dir.path().join("security-policy.toml");
+        let _env = crate::test_env::ScopedEnv::update([(
+            super::SECURITY_POLICY_PATH_ENV,
+            Some(policy_path.as_os_str().to_os_string()),
+        )]);
+
+        let cache = super::new_managed_policy_cache();
+        super::scope_managed_policy_cache(cache.clone(), async {
+            assert!(
+                super::load_managed_policy().unwrap().is_none(),
+                "missing policy file must return None"
+            );
+
+            // Creating the policy file after an initial miss must be observed immediately.
+            std::fs::write(&policy_path, "minimum-release-age-secs = 86400\n").unwrap();
+            let created = super::load_managed_policy().unwrap();
+            assert_eq!(
+                created.as_ref().and_then(|p| p.minimum_release_age_secs),
+                Some(86400),
+                "absence must not be cached across subsequent creation"
+            );
+
+            // Nested scopes using current_or_new_managed_policy_cache reuse the outer cache.
+            let nested = super::current_or_new_managed_policy_cache();
+            assert!(
+                std::sync::Arc::ptr_eq(&cache, &nested),
+                "current_or_new_managed_policy_cache must reuse the active task-local cache"
+            );
+
+            // Atomic replacement with a new inode/length invalidates the cached stamp.
+            let replacement = dir.path().join("security-policy.toml.next");
+            std::fs::write(&replacement, "minimum-release-age-secs = 172800\n").unwrap();
+            std::fs::rename(&replacement, &policy_path).unwrap();
+            let replaced = super::load_managed_policy().unwrap();
+            assert_eq!(
+                replaced.as_ref().and_then(|p| p.minimum_release_age_secs),
+                Some(172800),
+                "atomic policy replacement must invalidate the cached entry"
+            );
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                let stamp_before = super::ManagedPolicyStamp::capture(&policy_path)
+                    .unwrap()
+                    .expect("policy stamp must exist");
+                std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                let stamp_after = super::ManagedPolicyStamp::capture(&policy_path)
+                    .unwrap()
+                    .expect("policy stamp must exist after parent chmod");
+                assert_ne!(
+                    stamp_before, stamp_after,
+                    "parent directory permission change must invalidate the managed policy stamp"
+                );
+
+                // Changing a canonical ancestor behind a symlinked ancestor must also
+                // invalidate the stamp (matching macOS `/etc` -> `/private/etc`).
+                let real_root = dir.path().join("real-root");
+                let real_sub = real_root.join("etc");
+                std::fs::create_dir_all(&real_sub).unwrap();
+                let real_policy = real_sub.join("security-policy.toml");
+                std::fs::write(&real_policy, "minimum-release-age-secs = 3600\n").unwrap();
+                let link_dir = dir.path().join("linked-etc");
+                std::os::unix::fs::symlink(&real_sub, &link_dir).unwrap();
+                let via_symlink = link_dir.join("security-policy.toml");
+
+                let sym_stamp_before = super::ManagedPolicyStamp::capture(&via_symlink)
+                    .unwrap()
+                    .expect("symlink-ancestor policy stamp must exist");
+                std::fs::set_permissions(&real_root, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                let sym_stamp_after = super::ManagedPolicyStamp::capture(&via_symlink)
+                    .unwrap()
+                    .expect("symlink-ancestor policy stamp must exist after canonical ancestor chmod");
+                assert_ne!(
+                    sym_stamp_before, sym_stamp_after,
+                    "canonical ancestor permission change behind a symlinked parent must invalidate the managed policy stamp"
+                );
+            }
+
+            // Deleting the policy file must immediately drop the cached entry.
+            std::fs::remove_file(&policy_path).unwrap();
+            assert!(
+                super::load_managed_policy().unwrap().is_none(),
+                "removing the policy file must clear the cached entry"
+            );
+        })
+        .await;
     }
 }

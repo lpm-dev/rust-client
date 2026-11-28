@@ -11,10 +11,112 @@ use super::integrity::{OBJECT_INTEGRITY_FILENAME, TREE_SNAPSHOT_FILENAME};
 
 mod metadata_walk;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TreeMetadataDigests {
+    pub(crate) metadata: String,
+    pub(crate) metadata_no_ctime: String,
+}
+
+pub(crate) struct TreeMetadataHasher {
+    with_ctime: Sha256,
+    without_ctime: Option<Sha256>,
+}
+
+impl TreeMetadataHasher {
+    pub(crate) fn new() -> Self {
+        Self {
+            with_ctime: Sha256::new(),
+            without_ctime: Some(Sha256::new()),
+        }
+    }
+
+    pub(crate) fn strict_only() -> Self {
+        Self {
+            with_ctime: Sha256::new(),
+            without_ctime: None,
+        }
+    }
+
+    fn update_record(
+        &mut self,
+        kind: &[u8],
+        relative: &[u8],
+        metadata: &ObjectTreeEntry,
+        payload: &[u8],
+    ) {
+        self.update_fields(
+            kind,
+            relative,
+            metadata.mode,
+            metadata.len,
+            metadata.modified_time_nanos,
+            metadata.change_time_nanos,
+            payload,
+        );
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn update_fields(
+        &mut self,
+        kind: &[u8],
+        relative: &[u8],
+        mode: u32,
+        len: u64,
+        modified_time_nanos: i128,
+        change_time_nanos: i128,
+        payload: &[u8],
+    ) {
+        hash_tree_metadata_fields(
+            &mut self.with_ctime,
+            kind,
+            relative,
+            mode,
+            len,
+            modified_time_nanos,
+            change_time_nanos,
+            payload,
+        );
+        if let Some(without_ctime) = self.without_ctime.as_mut() {
+            // Restored archives (GNU tar, zip CI caches) often truncate mtimes
+            // to whole seconds and produce different directory st_size across
+            // filesystems, so normalize both along with zeroing ctime.
+            let restored_len = if kind == b"dir" { 0 } else { len };
+            let restored_mtime_nanos = modified_time_nanos
+                .div_euclid(1_000_000_000)
+                .saturating_mul(1_000_000_000);
+            hash_tree_metadata_fields(
+                without_ctime,
+                kind,
+                relative,
+                mode,
+                restored_len,
+                restored_mtime_nanos,
+                0,
+                payload,
+            );
+        }
+    }
+
+    pub(crate) fn finish(self) -> TreeMetadataDigests {
+        let without_ctime = self
+            .without_ctime
+            .expect("TreeMetadataHasher::finish requires dual-digest mode");
+        TreeMetadataDigests {
+            metadata: format!("sha256-{}", hex::encode(self.with_ctime.finalize())),
+            metadata_no_ctime: format!("sha256-{}", hex::encode(without_ctime.finalize())),
+        }
+    }
+
+    pub(crate) fn finish_strict(self) -> String {
+        format!("sha256-{}", hex::encode(self.with_ctime.finalize()))
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct TreeIntegrities {
     pub(crate) content: String,
     pub(crate) metadata: String,
+    pub(crate) metadata_no_ctime: String,
     pub(crate) stats: ObjectTreeStats,
     pub(crate) content_schema: TreeContentSchema,
 }
@@ -157,11 +259,10 @@ impl TreeMetadataBuilder {
         Ok(())
     }
 
-    pub(crate) fn finish(self) -> String {
-        let mut hasher = Sha256::new();
+    pub(crate) fn finish(self) -> TreeMetadataDigests {
+        let mut hasher = TreeMetadataHasher::new();
         for record in self.records {
-            hash_tree_metadata_fields(
-                &mut hasher,
+            hasher.update_fields(
                 record.kind.tag(),
                 &record.relative,
                 record.mode,
@@ -171,7 +272,7 @@ impl TreeMetadataBuilder {
                 &record.payload,
             );
         }
-        format!("sha256-{}", hex::encode(hasher.finalize()))
+        hasher.finish()
     }
 }
 
@@ -241,7 +342,7 @@ fn compute_object_tree_integrities_with_hasher(
     content_hasher: &mut TreeContentHasher<'_>,
     content_schema: TreeContentSchema,
 ) -> Result<TreeIntegrities, LpmError> {
-    let mut metadata_hasher = Sha256::new();
+    let mut metadata_hasher = TreeMetadataHasher::new();
     let mut stats = ObjectTreeStats::default();
     hash_object_tree_dir(
         dir,
@@ -250,43 +351,62 @@ fn compute_object_tree_integrities_with_hasher(
         &mut metadata_hasher,
         Some(&mut stats),
     )?;
+    let metadata = metadata_hasher.finish();
     Ok(TreeIntegrities {
         content: content_hasher.finish()?,
-        metadata: format!("sha256-{}", hex::encode(metadata_hasher.finalize())),
+        metadata: metadata.metadata,
+        metadata_no_ctime: metadata.metadata_no_ctime,
         stats,
         content_schema,
     })
 }
 
-pub(crate) fn compute_tree_metadata_integrity(dir: &Path) -> Result<String, LpmError> {
+pub(crate) fn compute_tree_metadata_integrities(
+    dir: &Path,
+) -> Result<TreeMetadataDigests, LpmError> {
     #[cfg(target_os = "macos")]
-    match compute_tree_metadata_integrity_bulk(dir) {
-        Ok(integrity) => return Ok(integrity),
+    match compute_tree_metadata_integrities_bulk(dir) {
+        Ok(digests) => return Ok(digests),
         Err(error) => tracing::trace!(
             target = %dir.display(),
             "virtual store: bulk metadata walk unavailable, using portable walker: {error}"
         ),
     }
-    compute_tree_metadata_integrity_portable(dir)
+    compute_tree_metadata_integrities_portable(dir)
 }
 
-fn compute_tree_metadata_integrity_portable(dir: &Path) -> Result<String, LpmError> {
+pub(crate) fn compute_tree_metadata_integrity(dir: &Path) -> Result<String, LpmError> {
+    #[cfg(target_os = "macos")]
+    match compute_tree_metadata_integrity_bulk(dir) {
+        Ok(digest) => return Ok(digest),
+        Err(error) => tracing::trace!(
+            target = %dir.display(),
+            "virtual store: bulk metadata walk unavailable, using portable walker: {error}"
+        ),
+    }
     metadata_walk::tree_metadata_integrity(dir, metadata_walk::MetadataReader::Portable)
+}
+
+#[cfg(target_os = "macos")]
+fn compute_tree_metadata_integrity_bulk(dir: &Path) -> Result<String, LpmError> {
+    metadata_walk::tree_metadata_integrity(dir, metadata_walk::MetadataReader::Bulk)
+}
+
+fn compute_tree_metadata_integrities_portable(dir: &Path) -> Result<TreeMetadataDigests, LpmError> {
+    metadata_walk::tree_metadata_integrities(dir, metadata_walk::MetadataReader::Portable)
 }
 
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn metadata_hash_implementations_match_for_test(dir: &Path) -> Result<bool, LpmError> {
-    Ok(
-        compute_tree_metadata_integrity_bulk(dir)?
-            == compute_tree_metadata_integrity_portable(dir)?,
-    )
+    Ok(compute_tree_metadata_integrities_bulk(dir)?
+        == compute_tree_metadata_integrities_portable(dir)?)
 }
 
 fn hash_object_tree_dir(
     root: &Path,
     dir: &Path,
     content_hasher: Option<&mut TreeContentHasher<'_>>,
-    metadata_hasher: &mut Sha256,
+    metadata_hasher: &mut TreeMetadataHasher,
     stats: Option<&mut ObjectTreeStats>,
 ) -> Result<(), LpmError> {
     let mut relative = Vec::new();
@@ -398,7 +518,7 @@ fn hash_object_tree_dir_inner(
     dir: &Path,
     relative: &mut Vec<u8>,
     mut content_hasher: Option<&mut TreeContentHasher<'_>>,
-    metadata_hasher: &mut Sha256,
+    metadata_hasher: &mut TreeMetadataHasher,
     mut stats: Option<&mut ObjectTreeStats>,
     bulk_buffer: &mut Vec<u8>,
 ) -> Result<(), LpmError> {
@@ -431,13 +551,7 @@ fn hash_object_tree_dir_inner(
             if let Some(hasher) = content_hasher.as_deref_mut() {
                 hasher.hash_symlink(relative.as_slice(), metadata, &target_bytes);
             }
-            hash_tree_metadata_record(
-                metadata_hasher,
-                b"symlink",
-                relative.as_slice(),
-                metadata,
-                &target_bytes,
-            );
+            metadata_hasher.update_record(b"symlink", relative.as_slice(), metadata, &target_bytes);
             Ok(())
         } else if metadata.kind == ObjectTreeEntryKind::Directory {
             if let Some(stats) = stats.as_deref_mut() {
@@ -448,7 +562,7 @@ fn hash_object_tree_dir_inner(
             if let Some(hasher) = content_hasher.as_deref_mut() {
                 hasher.hash_directory(relative.as_slice(), metadata);
             }
-            hash_tree_metadata_record(metadata_hasher, b"dir", relative.as_slice(), metadata, &[]);
+            metadata_hasher.update_record(b"dir", relative.as_slice(), metadata, &[]);
             hash_object_tree_dir_inner(
                 root,
                 &path,
@@ -463,7 +577,7 @@ fn hash_object_tree_dir_inner(
                 stats.file_count = stats.file_count.saturating_add(1);
                 stats.unpacked_bytes = stats.unpacked_bytes.saturating_add(metadata.len);
             }
-            hash_tree_metadata_record(metadata_hasher, b"file", relative.as_slice(), metadata, &[]);
+            metadata_hasher.update_record(b"file", relative.as_slice(), metadata, &[]);
             if let Some(hasher) = content_hasher.as_deref_mut() {
                 path.push(entry_name);
                 path_pushed = true;
@@ -494,8 +608,8 @@ fn hash_object_tree_dir_inner(
 }
 
 #[cfg(target_os = "macos")]
-fn compute_tree_metadata_integrity_bulk(dir: &Path) -> Result<String, LpmError> {
-    metadata_walk::tree_metadata_integrity(dir, metadata_walk::MetadataReader::Bulk)
+fn compute_tree_metadata_integrities_bulk(dir: &Path) -> Result<TreeMetadataDigests, LpmError> {
+    metadata_walk::tree_metadata_integrities(dir, metadata_walk::MetadataReader::Bulk)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -913,25 +1027,6 @@ fn hash_entry_digest_record(
         None => leaf.update([0]),
     }
     root.update(leaf.finalize());
-}
-
-fn hash_tree_metadata_record(
-    hasher: &mut Sha256,
-    kind: &[u8],
-    relative: &[u8],
-    metadata: &ObjectTreeEntry,
-    payload: &[u8],
-) {
-    hash_tree_metadata_fields(
-        hasher,
-        kind,
-        relative,
-        metadata.mode,
-        metadata.len,
-        metadata.modified_time_nanos,
-        metadata.change_time_nanos,
-        payload,
-    );
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -1366,14 +1461,14 @@ mod tests {
                 .unwrap();
         let mut digests = StreamedTreeBuilder::from_extraction(files).file_digests;
         let mut content = TreeContentHasher::entry_digest_from_extraction(&mut digests);
-        let mut metadata = Sha256::new();
+        let mut metadata = TreeMetadataHasher::new();
         let mut stats = ObjectTreeStats::default();
         let mut bulk_buffer = vec![0; 64 * 1024];
         for entry in read_object_tree_entries(root, root).unwrap() {
             let path = root.join(&entry.name);
             let mut relative = relative_path_bytes(root, &path).unwrap();
             content.hash_directory(&relative, &entry);
-            hash_tree_metadata_record(&mut metadata, b"dir", &relative, &entry, &[]);
+            metadata.update_record(b"dir", &relative, &entry, &[]);
             stats.dir_count += 1;
             if entry.name == "b" {
                 bulk_buffer.truncate(1);
@@ -1404,9 +1499,11 @@ mod tests {
                 assert!(bulk_buffer.is_empty());
             }
         }
+        let metadata = metadata.finish();
         let actual = TreeIntegrities {
             content: content.finish().unwrap(),
-            metadata: format!("sha256-{}", hex::encode(metadata.finalize())),
+            metadata: metadata.metadata,
+            metadata_no_ctime: metadata.metadata_no_ctime,
             stats,
             content_schema: TreeContentSchema::EntryDigestV2,
         };
@@ -1429,7 +1526,7 @@ mod tests {
             };
             let mut digests = StreamedTreeBuilder::from_extraction(files).file_digests;
             let mut content = TreeContentHasher::entry_digest_from_extraction(&mut digests);
-            let mut metadata = Sha256::new();
+            let mut metadata = TreeMetadataHasher::new();
             let mut stats = ObjectTreeStats::default();
             let mut buffer = vec![0];
             let walked = hash_object_tree_dir_inner(

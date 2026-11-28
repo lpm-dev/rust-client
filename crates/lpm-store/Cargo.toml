@@ -37,6 +37,7 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+lpm-common = { workspace = true, features = ["test-support"] }
 tempfile = "3"
 flate2 = "1"
 tar = "0.4"

@@ -30,9 +30,21 @@ impl WorkspaceFreshnessSnapshot {
     }
 }
 
+type MemberCanonicalSetSlot = Arc<std::sync::OnceLock<Arc<std::collections::HashSet<PathBuf>>>>;
+
+#[derive(Default)]
+struct CanonicalPathState {
+    generation: u64,
+    entries: std::collections::HashMap<PathBuf, PathBuf>,
+    member_sets: Vec<(std::sync::Weak<Workspace>, MemberCanonicalSetSlot)>,
+}
+
 #[derive(Default)]
 pub(crate) struct WorkspaceFreshnessCache {
     snapshot: Mutex<Option<Arc<WorkspaceFreshnessSnapshot>>>,
+    canonical_paths: Mutex<CanonicalPathState>,
+    #[cfg(test)]
+    canonicalize_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl WorkspaceFreshnessCache {
@@ -41,6 +53,13 @@ impl WorkspaceFreshnessCache {
             .snapshot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let mut state = self
+            .canonical_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.generation = state.generation.wrapping_add(1);
+        state.entries.clear();
+        state.member_sets.clear();
     }
 
     fn get_or_init(
@@ -53,6 +72,80 @@ impl WorkspaceFreshnessCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Arc::clone(snapshot.get_or_insert_with(|| Arc::new(build())))
     }
+
+    fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+        let generation = {
+            let state = self
+                .canonical_paths
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = state.entries.get(path) {
+                return Ok(cached.clone());
+            }
+            state.generation
+        };
+        #[cfg(test)]
+        self.canonicalize_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let canonical = path.canonicalize()?;
+        let mut state = self
+            .canonical_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation == generation {
+            state.entries.insert(path.to_path_buf(), canonical.clone());
+        }
+        Ok(canonical)
+    }
+
+    fn canonical_member_paths(
+        &self,
+        workspace: &Arc<Workspace>,
+    ) -> Arc<std::collections::HashSet<PathBuf>> {
+        let slot = {
+            let mut state = self
+                .canonical_paths
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state
+                .member_sets
+                .retain(|(weak, _)| weak.strong_count() > 0);
+            if let Some((_, existing)) = state
+                .member_sets
+                .iter()
+                .find(|(weak, _)| weak.upgrade().is_some_and(|ws| Arc::ptr_eq(&ws, workspace)))
+            {
+                Arc::clone(existing)
+            } else {
+                let slot = Arc::new(std::sync::OnceLock::new());
+                state
+                    .member_sets
+                    .push((Arc::downgrade(workspace), Arc::clone(&slot)));
+                slot
+            }
+        };
+        Arc::clone(slot.get_or_init(|| {
+            let mut paths = std::collections::HashSet::with_capacity(workspace.members.len());
+            for member in &workspace.members {
+                paths.insert(
+                    self.canonicalize(&member.path)
+                        .unwrap_or_else(|_| member.path.clone()),
+                );
+            }
+            Arc::new(paths)
+        }))
+    }
+}
+
+pub(crate) fn canonicalize_cached(path: &Path) -> std::io::Result<PathBuf> {
+    match ACTIVE_WORKSPACE.try_with(|context| Arc::clone(&context.freshness_cache)) {
+        Ok(cache) => cache.canonicalize(path),
+        Err(_) => path.canonicalize(),
+    }
+}
+
+pub(crate) fn canonicalize_or_original(path: &Path) -> PathBuf {
+    canonicalize_cached(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 struct ActiveWorkspaceContext {
@@ -100,12 +193,13 @@ where
         || start_dir.to_path_buf(),
         |workspace| workspace.root.clone(),
     );
+    let freshness_cache = Arc::new(WorkspaceFreshnessCache::default());
     ACTIVE_WORKSPACE
         .scope(
             ActiveWorkspaceContext {
                 workspace,
                 scope_root,
-                freshness_cache: Arc::new(WorkspaceFreshnessCache::default()),
+                freshness_cache,
             },
             ACTIVE_ROOT_PROVIDER_FINGERPRINT.scope(None, future),
         )
@@ -147,6 +241,22 @@ pub(crate) fn active_workspace(start_dir: &Path) -> Option<Arc<Workspace>> {
                 .starts_with(&context.scope_root)
                 .then(|| context.workspace.clone())
                 .flatten()
+        })
+        .ok()
+        .flatten()
+}
+
+/// Return the active scoped workspace if `project_dir` is an exact declared
+/// member (O(1) lookup against the pre-canonicalized member set).
+pub(crate) fn active_workspace_for_declared_member(project_dir: &Path) -> Option<Arc<Workspace>> {
+    let canonical = canonicalize_or_original(project_dir);
+    ACTIVE_WORKSPACE
+        .try_with(|context| {
+            let workspace = context.workspace.as_ref()?;
+            let member_paths = context.freshness_cache.canonical_member_paths(workspace);
+            member_paths
+                .contains(&canonical)
+                .then(|| Arc::clone(workspace))
         })
         .ok()
         .flatten()
@@ -344,5 +454,97 @@ mod tests {
         .await;
 
         assert!(discover_workspace(directory.path()).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_path_cache_clears_on_invalidation_and_reflects_retargeted_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_a = dir.path().join("target-a");
+        let target_b = dir.path().join("target-b");
+        std::fs::create_dir_all(&target_a).unwrap();
+        std::fs::create_dir_all(&target_b).unwrap();
+        let link = dir.path().join("current");
+        std::os::unix::fs::symlink(&target_a, &link).unwrap();
+
+        let cache = WorkspaceFreshnessCache::default();
+        assert_eq!(
+            cache.canonicalize(&link).unwrap(),
+            target_a.canonicalize().unwrap()
+        );
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&target_b, &link).unwrap();
+        cache.invalidate();
+        assert_eq!(
+            cache.canonicalize(&link).unwrap(),
+            target_b.canonicalize().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_reuses_shared_canonical_member_index_in_linear_canonicalizations() {
+        let root = tempfile::tempdir().unwrap();
+        let mut members = Vec::new();
+        for idx in 0..8 {
+            let member_path = root.path().join(format!("packages/pkg-{idx}"));
+            std::fs::create_dir_all(&member_path).unwrap();
+            members.push(lpm_workspace::WorkspaceMember {
+                path: member_path,
+                package: lpm_workspace::PackageJson {
+                    name: Some(format!("pkg-{idx}")),
+                    version: Some("1.0.0".to_string()),
+                    ..lpm_workspace::PackageJson::default()
+                },
+            });
+        }
+        let workspace = Arc::new(Workspace {
+            root: root.path().to_path_buf(),
+            root_package: lpm_workspace::PackageJson::default(),
+            members,
+        });
+        let cache = Arc::new(WorkspaceFreshnessCache::default());
+
+        let first_set = scope(Arc::clone(&workspace), None, Arc::clone(&cache), async {
+            ACTIVE_WORKSPACE.with(|ctx| {
+                ctx.freshness_cache
+                    .canonical_member_paths(ctx.workspace.as_ref().unwrap())
+            })
+        })
+        .await;
+        for _ in 0..7 {
+            let next_set = scope(Arc::clone(&workspace), None, Arc::clone(&cache), async {
+                ACTIVE_WORKSPACE.with(|ctx| {
+                    ctx.freshness_cache
+                        .canonical_member_paths(ctx.workspace.as_ref().unwrap())
+                })
+            })
+            .await;
+            assert!(
+                Arc::ptr_eq(&first_set, &next_set),
+                "repeated scopes with the same workspace snapshot must share one canonical member set"
+            );
+        }
+        assert_eq!(
+            cache.canonicalize_calls.load(Ordering::Relaxed),
+            8,
+            "entering scope N times must canonicalize each member once (O(N), not O(N^2))"
+        );
+
+        // Invalidation must drop the cached member set so `active_workspace_for_declared_member`
+        // observes newly canonicalized paths instead of a stale scope-entry snapshot.
+        cache.invalidate();
+        let rebuilt = scope(Arc::clone(&workspace), None, Arc::clone(&cache), async {
+            assert!(active_workspace_for_declared_member(&workspace.members[0].path).is_some());
+            ACTIVE_WORKSPACE.with(|ctx| {
+                ctx.freshness_cache
+                    .canonical_member_paths(ctx.workspace.as_ref().unwrap())
+            })
+        })
+        .await;
+        assert!(
+            !Arc::ptr_eq(&first_set, &rebuilt),
+            "invalidate() must force rebuilding the canonical member set"
+        );
     }
 }

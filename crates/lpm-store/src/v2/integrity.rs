@@ -22,6 +22,98 @@ pub(crate) const OBJECT_INTEGRITY_FILENAME: &str = ".lpm-object-integrity";
 pub(crate) const TREE_SNAPSHOT_FILENAME: &str = ".lpm-tree-snapshot.json";
 const TREE_SNAPSHOT_MAX_BYTES: u64 = 4096;
 pub const ENV_V2_OBJECT_INTEGRITY: &str = "LPM_V2_OBJECT_INTEGRITY";
+/// Explicit opt-in for ephemeral CI runners restoring `~/.lpm/store` from an
+/// archive (which bumps file `ctime`, truncates `mtime` subseconds, and alters
+/// directory `st_size` while preserving regular-file size, mode, and whole-second
+/// `mtime`). Honored only under `ObjectIntegrityPolicy::Source` (never `Tree`)
+/// and never overwrites strict `metadata_integrity` or shallow guards.
+pub const ENV_TRUST_RESTORED_STORE: &str = "LPM_TRUST_RESTORED_STORE";
+
+static TRUST_RESTORED_STORE_CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static TRUST_RESTORED_STORE_WARNED: std::sync::Once = std::sync::Once::new();
+
+#[cfg(any(test, debug_assertions))]
+static TRUST_RESTORED_STORE_TEST_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(any(test, debug_assertions))]
+static TRUST_RESTORED_STORE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(any(test, debug_assertions))]
+pub struct TrustRestoredStoreOverrideGuard {
+    previous: u8,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(any(test, debug_assertions))]
+impl Drop for TrustRestoredStoreOverrideGuard {
+    fn drop(&mut self) {
+        TRUST_RESTORED_STORE_TEST_OVERRIDE
+            .store(self.previous, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+pub fn override_trust_restored_store_for_test(
+    value: Option<bool>,
+) -> TrustRestoredStoreOverrideGuard {
+    let lock = TRUST_RESTORED_STORE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let encoded = match value {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    let previous =
+        TRUST_RESTORED_STORE_TEST_OVERRIDE.swap(encoded, std::sync::atomic::Ordering::SeqCst);
+    TrustRestoredStoreOverrideGuard {
+        previous,
+        _lock: lock,
+    }
+}
+
+fn parse_trust_restored_store_env() -> bool {
+    std::env::var(ENV_TRUST_RESTORED_STORE)
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
+pub fn trust_restored_store_from_env() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        match TRUST_RESTORED_STORE_TEST_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    *TRUST_RESTORED_STORE_CACHED.get_or_init(parse_trust_restored_store_env)
+}
+
+/// Whether restored-store ctime/subsecond-mtime tolerance is active for `policy`.
+///
+/// Strict `ObjectIntegrityPolicy::Tree` never weakens tamper detection, even
+/// when `LPM_TRUST_RESTORED_STORE` is set in the environment.
+pub fn trust_restored_store_enabled(policy: ObjectIntegrityPolicy) -> bool {
+    if policy != ObjectIntegrityPolicy::Source {
+        return false;
+    }
+    let enabled = trust_restored_store_from_env();
+    if enabled {
+        TRUST_RESTORED_STORE_WARNED.call_once(|| {
+            tracing::warn!(
+                "{ENV_TRUST_RESTORED_STORE} is enabled: reusing restored source-policy store entries via ctime-free metadata digests without content rehashing"
+            );
+        });
+    }
+    enabled
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectIntegrityPolicy {
@@ -118,6 +210,8 @@ pub(crate) struct TreeSnapshot {
     pub(crate) layout_content_integrity: Option<String>,
     pub(crate) metadata_integrity: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) metadata_integrity_no_ctime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) package_dir_mtime_nanos: Option<i128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) package_dir_ctime_nanos: Option<i128>,
@@ -134,7 +228,7 @@ pub(crate) struct TreeSnapshot {
 }
 
 impl TreeSnapshot {
-    fn content_schema(&self) -> TreeContentSchema {
+    pub(crate) fn content_schema(&self) -> TreeContentSchema {
         TreeContentSchema::from_snapshot_schema(self.schema)
             .unwrap_or(TreeContentSchema::SequentialV1)
     }
@@ -1035,6 +1129,10 @@ pub(crate) fn read_tree_snapshot(dir: &Path) -> Option<TreeSnapshot> {
             .as_deref()
             .is_some_and(|integrity| !valid_sha256_integrity(integrity))
         || !valid_sha256_integrity(&snapshot.metadata_integrity)
+        || snapshot
+            .metadata_integrity_no_ctime
+            .as_deref()
+            .is_some_and(|integrity| !valid_sha256_integrity(integrity))
     {
         return None;
     }
@@ -1069,6 +1167,7 @@ pub(crate) fn write_link_tree_snapshot_best_effort(
         &integrities.content,
         None,
         &integrities.metadata,
+        Some(&integrities.metadata_no_ctime),
         shallow_guard,
         false,
     ) {
@@ -1083,14 +1182,15 @@ pub(crate) fn refresh_link_snapshot_shallow_guard_best_effort(
     dir: &Path,
     package_dir: &Path,
     snapshot: &TreeSnapshot,
+    actual_metadata_integrity: &str,
+    actual_metadata_no_ctime: Option<&str>,
 ) {
     let Some(shallow_guard) = read_shallow_package_guard(package_dir) else {
         return;
     };
-    // Avoid rewriting the snapshot while mtimes are still inside the
-    // racily-clean window: the stamped guard would still miss on the next
-    // check, causing a wasted atomic write+rename.
-    if !shallow_guard.is_non_racy() {
+    let needs_backfill =
+        snapshot.metadata_integrity_no_ctime.is_none() && actual_metadata_no_ctime.is_some();
+    if !shallow_guard.is_non_racy() && !needs_backfill {
         return;
     }
     if let Err(error) = write_tree_snapshot_fields(
@@ -1098,7 +1198,8 @@ pub(crate) fn refresh_link_snapshot_shallow_guard_best_effort(
         snapshot.content_schema(),
         &snapshot.content_integrity,
         snapshot.layout_content_integrity.as_deref(),
-        &snapshot.metadata_integrity,
+        actual_metadata_integrity,
+        actual_metadata_no_ctime.or(snapshot.metadata_integrity_no_ctime.as_deref()),
         Some(shallow_guard),
         false,
     ) {
@@ -1119,6 +1220,7 @@ pub(crate) fn write_tree_snapshot(
         &integrities.content,
         None,
         &integrities.metadata,
+        Some(&integrities.metadata_no_ctime),
         None,
         false,
     )
@@ -1134,6 +1236,7 @@ pub(crate) fn write_tree_snapshot_unpublished(
         &integrities.content,
         None,
         &integrities.metadata,
+        Some(&integrities.metadata_no_ctime),
         None,
         true,
     )
@@ -1150,6 +1253,7 @@ pub(crate) fn write_link_tree_snapshot_unpublished(
         &integrities.content,
         None,
         &integrities.metadata,
+        Some(&integrities.metadata_no_ctime),
         read_shallow_package_guard(package_dir),
         true,
     )
@@ -1166,6 +1270,7 @@ pub(crate) fn write_tree_snapshot_with_layout_content(
         source_content_integrity,
         Some(&layout_integrities.content),
         &layout_integrities.metadata,
+        Some(&layout_integrities.metadata_no_ctime),
         None,
         false,
     )
@@ -1182,17 +1287,20 @@ pub(crate) fn write_tree_snapshot_with_layout_content_unpublished(
         source_content_integrity,
         Some(&layout_integrities.content),
         &layout_integrities.metadata,
+        Some(&layout_integrities.metadata_no_ctime),
         None,
         true,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_tree_snapshot_fields(
     dir: &Path,
     content_schema: TreeContentSchema,
     content_integrity: &str,
     layout_content_integrity: Option<&str>,
     metadata_integrity: &str,
+    metadata_integrity_no_ctime: Option<&str>,
     shallow_guard: Option<ShallowPackageGuard>,
     unpublished: bool,
 ) -> Result<(), LpmError> {
@@ -1201,6 +1309,7 @@ fn write_tree_snapshot_fields(
         content_integrity: content_integrity.to_owned(),
         layout_content_integrity: layout_content_integrity.map(str::to_owned),
         metadata_integrity: metadata_integrity.to_owned(),
+        metadata_integrity_no_ctime: metadata_integrity_no_ctime.map(str::to_owned),
         package_dir_mtime_nanos: shallow_guard.map(|guard| guard.package_dir_mtime_nanos),
         package_dir_ctime_nanos: shallow_guard.and_then(|guard| guard.package_dir_ctime_nanos),
         package_json_size: shallow_guard.map(|guard| guard.package_json_size),
@@ -1338,6 +1447,7 @@ pub(crate) fn write_object_integrity_for_policy_with_tree_unpublished(
             Ok(TreeIntegrities {
                 content,
                 metadata: actual.metadata,
+                metadata_no_ctime: actual.metadata_no_ctime,
                 stats: actual.stats,
                 content_schema: actual.content_schema,
             })
@@ -1364,6 +1474,7 @@ pub(crate) fn write_source_object_integrity_with_tree(
     Ok(TreeIntegrities {
         content,
         metadata: actual.metadata.clone(),
+        metadata_no_ctime: actual.metadata_no_ctime.clone(),
         stats: actual.stats,
         content_schema: actual.content_schema,
     })

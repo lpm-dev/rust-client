@@ -126,6 +126,15 @@ struct TargetTaskResult {
     )>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct RecursiveSetupTiming {
+    total_ms: u64,
+    discovery_ms: u64,
+    validation_ms: u64,
+    lockfile_coordinator_ms: u64,
+    replay_check_ms: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_recursive_workspace_install(
     client: &RegistryClient,
@@ -137,6 +146,9 @@ pub(crate) async fn run_recursive_workspace_install(
     fail_if_no_match: bool,
     options: RecursiveInstallOptions,
 ) -> Result<(), LpmError> {
+    let command_started = Instant::now();
+    let shared_node_versions = Arc::new(crate::engine_check::path_node_versions());
+    let shared_managed_policy = crate::security_approval::new_managed_policy_cache();
     let workspace_root = find_recursive_workspace_root(cwd)?;
     let timing_detail_mode = TimingDetailMode::from_env();
     let _registry_timing_scope = if options.timing {
@@ -150,7 +162,14 @@ pub(crate) async fn run_recursive_workspace_install(
         None
     };
 
-    workspace_lockfile::with_project_install_lock(&workspace_root, async {
+    workspace_lockfile::with_project_install_lock(
+        &workspace_root,
+        crate::security_approval::scope_managed_policy_cache(
+            Arc::clone(&shared_managed_policy),
+            crate::engine_check::scope_shared_node_versions(
+                Arc::clone(&shared_node_versions),
+                async {
+        let discovery_started = Instant::now();
         let pre_discovery_root_stamp = capture_root_manifest_stamp(&workspace_root);
         let workspace = discover_recursive_workspace(cwd)?;
         let post_discovery_root_stamp = capture_root_manifest_stamp(&workspace.root);
@@ -173,6 +192,7 @@ pub(crate) async fn run_recursive_workspace_install(
             changed_files_ignore_pattern,
             test_pattern,
         )?;
+        let discovery_ms = duration_ms(discovery_started.elapsed());
         let legacy_importers = workspace
             .members
             .iter()
@@ -188,6 +208,11 @@ pub(crate) async fn run_recursive_workspace_install(
                 ));
             }
             if options.emit_summary {
+                let setup_timing = RecursiveSetupTiming {
+                    total_ms: duration_ms(command_started.elapsed()),
+                    discovery_ms,
+                    ..RecursiveSetupTiming::default()
+                };
                 emit_workspace_install_report(
                     &workspace.root,
                     &[],
@@ -195,12 +220,14 @@ pub(crate) async fn run_recursive_workspace_install(
                     options.json_output,
                     options.timing,
                     timing_detail_mode,
-                    0,
+                    setup_timing,
+                    duration_ms(command_started.elapsed()),
                 );
             }
             return Ok(());
         }
 
+        let validation_started = Instant::now();
         validation::validate_project_layout(&workspace.root)?;
         for target in &targets {
             crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(&target.path)?;
@@ -208,12 +235,53 @@ pub(crate) async fn run_recursive_workspace_install(
                 validation::validate_project_layout(&target.path)?;
             }
         }
+        let validation_ms = duration_ms(validation_started.elapsed());
 
+        let lockfile_coordinator_started = Instant::now();
         let workspace_lockfile_coordinator =
             Arc::new(workspace_lockfile::WorkspaceLockfileCoordinator::new(
                 &workspace.root,
                 &legacy_importers,
             )?);
+        let has_any_lockfile = workspace.root.join(lpm_lockfile::LOCKFILE_NAME).is_file()
+            || legacy_importers
+                .iter()
+                .any(|(_, path)| path.join(lpm_lockfile::LOCKFILE_NAME).is_file());
+        let workspace_frozen = options.frozen_lockfile == super::FrozenLockfileMode::Always
+            || (options.frozen_lockfile == super::FrozenLockfileMode::Auto
+                && super::install_running_in_ci()
+                && has_any_lockfile);
+        if workspace_frozen {
+            workspace_lockfile_coordinator.mark_frozen();
+            if targets.is_empty() {
+                if filters.is_empty() && filter_prod.is_empty() {
+                    workspace_lockfile_coordinator.validate_frozen_preflight()?;
+                }
+            } else {
+                let mut packages_by_path = HashMap::with_capacity(workspace.members.len() + 1);
+                packages_by_path.insert(workspace.root.as_path(), &workspace.root_package);
+                for member in &workspace.members {
+                    packages_by_path.insert(member.path.as_path(), &member.package);
+                }
+                let target_manifests: Vec<(&str, &lpm_workspace::PackageJson)> = targets
+                    .iter()
+                    .filter_map(|target| {
+                        packages_by_path
+                            .get(target.path.as_path())
+                            .copied()
+                            .map(|package| (target.importer.as_str(), package))
+                    })
+                    .collect();
+                let global_auto_install_peers = crate::commands::config::GlobalConfig::load_checked()
+                    .ok()
+                    .and_then(|config| config.get_bool("auto-install-peers"));
+                workspace_lockfile_coordinator.validate_frozen_preflight_for_targets(
+                    &workspace.root_package,
+                    &target_manifests,
+                    global_auto_install_peers,
+                )?;
+            }
+        }
         let workspace_project_state_coordinator =
             Arc::new(workspace_project_state::WorkspaceProjectStateCoordinator::new(targets.len()));
         let root_target_index = targets.iter().position(|target| target.kind == "root");
@@ -231,6 +299,9 @@ pub(crate) async fn run_recursive_workspace_install(
                     })
             })
             .map(Arc::<str>::from);
+        let lockfile_coordinator_ms = duration_ms(lockfile_coordinator_started.elapsed());
+
+        let replay_check_started = Instant::now();
         let targets_need_materialization = workspace_targets_need_materialization(&targets);
         let lockfile_replay_ready = workspace_targets_are_lockfile_replay_ready(
             client,
@@ -240,6 +311,7 @@ pub(crate) async fn run_recursive_workspace_install(
             &workspace_lockfile_coordinator,
             root_provider_fingerprint.as_deref(),
         );
+        let replay_check_ms = duration_ms(replay_check_started.elapsed());
         let unshared_local_source_roots = scripted_local_source_provider_roots(&targets);
         let explicit_concurrency =
             explicit_workspace_install_concurrency(options.workspace_concurrency).is_some();
@@ -407,7 +479,6 @@ pub(crate) async fn run_recursive_workspace_install(
             .then(|| client.clone_with_metadata_memory_cache());
         let client = workspace_client.as_ref().unwrap_or(client);
         let workspace_root = workspace.root.clone();
-        let started = Instant::now();
         let lpm_root = lpm_common::LpmRoot::from_env()?;
         // Read once, before any member's install can replace the lockfile.
         let locked_integrities = super::LockedIntegrities::detect(&workspace_root)?;
@@ -423,6 +494,13 @@ pub(crate) async fn run_recursive_workspace_install(
         let workspace_freshness_cache =
             Arc::new(crate::workspace_discovery_cache::WorkspaceFreshnessCache::default());
         let any_script_ran = Arc::new(AtomicBool::new(false));
+        let setup_timing = RecursiveSetupTiming {
+            total_ms: duration_ms(command_started.elapsed()),
+            discovery_ms,
+            validation_ms,
+            lockfile_coordinator_ms,
+            replay_check_ms,
+        };
         let scheduler = async {
             let mut active_workspace = Arc::new(workspace);
             let target_count = targets.len();
@@ -507,6 +585,8 @@ pub(crate) async fn run_recursive_workspace_install(
                             root_provider_fingerprint.as_ref().map(Arc::clone),
                             root_manifest_stamp,
                             Arc::clone(&any_script_ran),
+                            Arc::clone(&shared_node_versions),
+                            Arc::clone(&shared_managed_policy),
                             &mut outcomes,
                         );
                     }
@@ -551,20 +631,34 @@ pub(crate) async fn run_recursive_workspace_install(
                 }
             }
 
+            let mut frozen_commit_validated = false;
             if first_error.is_none()
                 && let Some((index, path, lifecycle)) = deferred_root_after_install
             {
-                let hook_start = Instant::now();
-                if let Err(error) =
-                    lifecycle.run_after_successful_install(&path, options.json_output)
+                let required_importers = outcomes
+                    .iter()
+                    .flatten()
+                    .map(|outcome| outcome.importer.clone())
+                    .collect::<Vec<_>>();
+                if workspace_frozen
+                    && let Err(error) =
+                        workspace_lockfile_coordinator.validate_frozen_commit(&required_importers)
                 {
                     first_error = Some(error);
                 } else {
-                    workspace_freshness_cache.invalidate();
-                    if let Some(outcome) = outcomes[index].as_mut() {
-                        outcome.duration_ms = outcome
-                            .duration_ms
-                            .saturating_add(duration_ms(hook_start.elapsed()));
+                    frozen_commit_validated = workspace_frozen;
+                    let hook_start = Instant::now();
+                    if let Err(error) =
+                        lifecycle.run_after_successful_install(&path, options.json_output)
+                    {
+                        first_error = Some(error);
+                    } else {
+                        workspace_freshness_cache.invalidate();
+                        if let Some(outcome) = outcomes[index].as_mut() {
+                            outcome.duration_ms = outcome
+                                .duration_ms
+                                .saturating_add(duration_ms(hook_start.elapsed()));
+                        }
                     }
                 }
             }
@@ -574,10 +668,11 @@ pub(crate) async fn run_recursive_workspace_install(
                 None => Ok((
                     active_workspace,
                     outcomes.into_iter().flatten().collect::<Vec<_>>(),
+                    frozen_commit_validated,
                 )),
             }
         };
-        let (active_workspace, outcomes) = match scheduler.await {
+        let (active_workspace, outcomes, frozen_commit_validated) = match scheduler.await {
             Ok(result) => result,
             Err(error) => {
                 return Err(rollback_workspace_project_state(
@@ -590,17 +685,21 @@ pub(crate) async fn run_recursive_workspace_install(
             .iter()
             .map(|outcome| outcome.importer.clone())
             .collect::<Vec<_>>();
-        let lockfile_committed = match workspace_lockfile_coordinator.commit(&required_importers) {
-            Ok(committed) => committed,
-            Err(error) => {
-                return Err(rollback_workspace_project_state(
-                    &workspace_project_state_coordinator,
-                    error,
-                ));
+        let lockfile_committed = if frozen_commit_validated {
+            false
+        } else {
+            match workspace_lockfile_coordinator.commit(&required_importers) {
+                Ok(committed) => committed,
+                Err(error) => {
+                    return Err(rollback_workspace_project_state(
+                        &workspace_project_state_coordinator,
+                        error,
+                    ));
+                }
             }
         };
         workspace_project_state_coordinator.commit();
-        if lockfile_committed {
+        if lockfile_committed && !workspace_frozen {
             workspace_lockfile::remove_member_lockfiles(&legacy_importers);
         }
 
@@ -651,7 +750,8 @@ pub(crate) async fn run_recursive_workspace_install(
                 options.json_output,
                 options.timing,
                 timing_detail_mode,
-                duration_ms(started.elapsed()),
+                setup_timing,
+                duration_ms(command_started.elapsed()),
             );
         } else if !options.json_output {
             crate::dependency_skills::print_report(&dependency_skills);
@@ -662,7 +762,10 @@ pub(crate) async fn run_recursive_workspace_install(
         )
         .await;
         Ok(())
-    })
+                },
+            ),
+        ),
+    )
     .await
 }
 
@@ -794,6 +897,8 @@ fn spawn_workspace_target_install(
     root_provider_fingerprint: Option<Arc<str>>,
     root_manifest_stamp: Option<RootManifestStamp>,
     any_script_ran: Arc<AtomicBool>,
+    shared_node_versions: Arc<lpm_runtime::effective::PathNodeVersionCache>,
+    shared_managed_policy: Arc<crate::security_approval::ManagedPolicyCache>,
     outcomes: &mut [Option<WorkspaceInstallOutcome>],
 ) {
     outcomes[index] = Some(WorkspaceInstallOutcome {
@@ -821,6 +926,10 @@ fn spawn_workspace_target_install(
             root_provider_fingerprint,
             root_manifest_stamp,
             any_script_ran,
+        );
+        let install = crate::engine_check::scope_shared_node_versions(
+            shared_node_versions,
+            crate::security_approval::scope_managed_policy_cache(shared_managed_policy, install),
         );
         let install = async {
             match root_provider_coordinator {
@@ -869,6 +978,9 @@ async fn run_workspace_target_install(
     any_script_ran: Arc<AtomicBool>,
 ) -> Result<TargetTaskResult, LpmError> {
     crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(&plan.path)?;
+    if plan.lifecycle.has_dev_preinstall() {
+        workspace_lockfile::validate_active_frozen_preflight()?;
+    }
     plan.lifecycle
         .run_dev_preinstall(&plan.path, options.json_output)?;
     if plan.lifecycle.has_dev_preinstall() {
@@ -982,6 +1094,9 @@ async fn run_workspace_target_install(
     let deferred_after_install = if defer_after_install {
         Some((plan.path, plan.lifecycle))
     } else {
+        if plan.lifecycle.has_scripts() {
+            workspace_lockfile::validate_active_frozen_preflight()?;
+        }
         plan.lifecycle
             .run_after_successful_install(&plan.path, options.json_output)?;
         if plan.lifecycle.has_scripts() {
@@ -1519,6 +1634,7 @@ const TARGET_REPORT_FIELDS: &[&str] = &[
     "audit_summary",
 ];
 
+#[allow(clippy::too_many_arguments)]
 fn emit_workspace_install_report(
     workspace_root: &Path,
     outcomes: &[WorkspaceInstallOutcome],
@@ -1526,6 +1642,7 @@ fn emit_workspace_install_report(
     json_output: bool,
     emit_timing: bool,
     timing_detail_mode: TimingDetailMode,
+    setup_timing: RecursiveSetupTiming,
     duration_ms: u64,
 ) {
     if json_output {
@@ -1572,7 +1689,13 @@ fn emit_workspace_install_report(
         if !dependency_skills.warnings.is_empty() {
             report["warnings"] = serde_json::json!(dependency_skills.warnings);
         }
-        attach_aggregate_telemetry(&mut report, duration_ms, emit_timing, timing_detail_mode);
+        attach_aggregate_telemetry(
+            &mut report,
+            duration_ms,
+            emit_timing,
+            timing_detail_mode,
+            setup_timing,
+        );
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
     } else {
         output::success(&format!(
@@ -1700,6 +1823,7 @@ fn attach_aggregate_telemetry(
     wall_ms: u64,
     emit_timing: bool,
     timing_detail_mode: TimingDetailMode,
+    setup_timing: RecursiveSetupTiming,
 ) {
     let Some(targets) = report.get("targets").and_then(serde_json::Value::as_array) else {
         return;
@@ -1884,6 +2008,13 @@ fn attach_aggregate_telemetry(
             "fetch_ms": fetch_ms,
             "link_ms": link_ms,
             "total_ms": wall_ms,
+            "setup": {
+                "total_ms": setup_timing.total_ms,
+                "discovery_ms": setup_timing.discovery_ms,
+                "validation_ms": setup_timing.validation_ms,
+                "lockfile_coordinator_ms": setup_timing.lockfile_coordinator_ms,
+                "replay_check_ms": setup_timing.replay_check_ms,
+            },
             "workspace_union": workspace_union_timing,
             "waterfall": {
                 "total_ms": wall_ms,
@@ -2672,5 +2803,24 @@ mod tests {
             stable_stamp,
             root
         ));
+    }
+
+    #[test]
+    fn recursive_timing_report_includes_pre_scheduler_setup_breakdown() {
+        let mut report = serde_json::json!({ "targets": [] });
+        let setup_timing = RecursiveSetupTiming {
+            total_ms: 145,
+            discovery_ms: 40,
+            validation_ms: 25,
+            lockfile_coordinator_ms: 50,
+            replay_check_ms: 30,
+        };
+        attach_aggregate_telemetry(&mut report, 210, true, TimingDetailMode::Off, setup_timing);
+        assert_eq!(report["timing"]["total_ms"], 210);
+        assert_eq!(report["timing"]["setup"]["total_ms"], 145);
+        assert_eq!(report["timing"]["setup"]["discovery_ms"], 40);
+        assert_eq!(report["timing"]["setup"]["validation_ms"], 25);
+        assert_eq!(report["timing"]["setup"]["lockfile_coordinator_ms"], 50);
+        assert_eq!(report["timing"]["setup"]["replay_check_ms"], 30);
     }
 }

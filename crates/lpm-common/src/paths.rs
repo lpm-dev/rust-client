@@ -774,21 +774,13 @@ pub struct SingleFileExclusiveLockHandle {
 }
 
 fn open_lock_file(lock_path: &Path) -> std::io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).read(true).write(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-
-        options.mode(0o600);
-    }
-    match options.open(lock_path) {
+    match open_lock_file_nofollow(lock_path) {
         Ok(file) => Ok(file),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if let Some(parent) = lock_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            options.open(lock_path)
+            open_lock_file_nofollow(lock_path)
         }
         Err(error) => Err(error),
     }
@@ -1428,6 +1420,233 @@ pub fn acquire_single_file_shared_lock(
 ) -> Result<SingleFileSharedLockHandle, LpmError> {
     let file = open_lock_file(lock_path.as_ref())?;
     acquire_single_file_shared_lock_from_file(file)
+}
+
+/// Acquire a shared single-file lock only when `lock_path` already exists.
+///
+/// Opens without creating the file so warm store reads avoid `O_CREAT` metadata
+/// churn (and avoid creating lock directories/files for restored read-only caches).
+/// Refuses symlinks, junctions, FIFOs, and non-regular files.
+/// Returns `Ok(None)` when `lock_path` does not exist.
+pub fn try_acquire_existing_single_file_shared_lock(
+    lock_path: impl AsRef<Path>,
+) -> Result<Option<SingleFileSharedLockHandle>, LpmError> {
+    let lock_path = lock_path.as_ref();
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = match options.open(lock_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(LpmError::Io(error)),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || crate::is_symlink_or_junction(&metadata) {
+        return Err(LpmError::Io(std::io::Error::other(format!(
+            "refusing lock path that is a link or not a regular file: {}",
+            lock_path.display()
+        ))));
+    }
+    acquire_single_file_shared_lock_from_file(file).map(Some)
+}
+
+/// Reason a no-follow descendant directory + regular file verification failed.
+#[derive(Debug)]
+pub enum DescendantVerifyError {
+    /// A component in the relative path was not a normal component or resolved
+    /// through a symlink or Windows junction/reparse point.
+    UnsafeOrLink(std::path::PathBuf),
+    /// A directory component existed on disk but was not a directory.
+    NotDirectory(std::path::PathBuf),
+    /// The expected regular file inside the verified directory was a symlink,
+    /// junction, directory, or other non-regular entry.
+    NotRegularFile(std::path::PathBuf),
+    /// An underlying I/O error (e.g. `NotFound`, `PermissionDenied`) while
+    /// opening a directory component or reading file metadata.
+    Io {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+}
+
+/// Pinned directory handle rooted at a verified real directory, allowing
+/// component-by-component no-follow traversal without re-walking or racing
+/// path prefixes.
+pub struct OpenRealDir {
+    dir: cap_std::fs::Dir,
+}
+
+impl OpenRealDir {
+    /// Open `path` as a pinned directory handle after confirming it is a real
+    /// directory (not a symlink or junction).
+    pub fn open_ambient(path: &Path) -> std::io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::ffi::CString;
+            use std::os::fd::FromRawFd as _;
+            use std::os::unix::ffi::OsStrExt as _;
+
+            let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("interior NUL in directory path {}", path.display()),
+                )
+            })?;
+            // `O_PATH` allows verifying known descendants beneath search-only (`0111`)
+            // directories while `O_DIRECTORY | O_NOFOLLOW` rejects symlinks and non-dirs.
+            // SAFETY: `c_path` is a valid NUL-terminated string for the duration of the call.
+            let fd = unsafe {
+                libc::open(
+                    c_path.as_ptr(),
+                    libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: `fd` is a newly opened owned descriptor returned by `libc::open`.
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            let dir = cap_std::fs::Dir::from_std_file(file);
+            Ok(Self { dir })
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)?;
+            let dir = cap_std::fs::Dir::from_std_file(file);
+            Ok(Self { dir })
+        }
+        #[cfg(not(unix))]
+        {
+            let metadata = std::fs::symlink_metadata(path)?;
+            if !metadata.is_dir() || crate::is_symlink_or_junction(&metadata) {
+                return Err(std::io::Error::other(format!(
+                    "refusing non-directory or symlink root at {}",
+                    path.display()
+                )));
+            }
+            let dir = cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())?;
+            let opened_meta = dir.dir_metadata()?;
+            if !opened_meta.is_dir() || capability_metadata_is_link_or_reparse(&opened_meta) {
+                return Err(std::io::Error::other(format!(
+                    "refusing non-directory or symlink root at {}",
+                    path.display()
+                )));
+            }
+            Ok(Self { dir })
+        }
+    }
+
+    /// Walk `relative_dir` component-by-component without following symlinks or
+    /// junctions and confirm that `file_name` inside the final pinned directory
+    /// is a regular non-symlink file.
+    pub fn verify_descendant_dir_and_regular_file(
+        &self,
+        display_root: &Path,
+        relative_dir: &Path,
+        file_name: &str,
+    ) -> Result<(), DescendantVerifyError> {
+        use cap_fs_ext::DirExt as _;
+
+        let mut cursor = display_root.to_path_buf();
+        let mut current: Option<cap_std::fs::Dir> = None;
+        for component in relative_dir.components() {
+            let std::path::Component::Normal(part) = component else {
+                return Err(DescendantVerifyError::UnsafeOrLink(cursor));
+            };
+            cursor.push(part);
+            let parent = current.as_ref().unwrap_or(&self.dir);
+            #[cfg(not(unix))]
+            {
+                let meta =
+                    parent
+                        .symlink_metadata(part)
+                        .map_err(|source| DescendantVerifyError::Io {
+                            path: cursor.clone(),
+                            source,
+                        })?;
+                if capability_metadata_is_link_or_reparse(&meta) {
+                    return Err(DescendantVerifyError::UnsafeOrLink(cursor));
+                }
+                if !meta.is_dir() {
+                    return Err(DescendantVerifyError::NotDirectory(cursor));
+                }
+            }
+            let next = parent.open_dir_nofollow(part).map_err(|source| {
+                #[cfg(unix)]
+                {
+                    if let Ok(meta) = parent.symlink_metadata(part) {
+                        if capability_metadata_is_link_or_reparse(&meta) {
+                            return DescendantVerifyError::UnsafeOrLink(cursor.clone());
+                        }
+                        if !meta.is_dir() {
+                            return DescendantVerifyError::NotDirectory(cursor.clone());
+                        }
+                    }
+                    if let Some(code) = source.raw_os_error() {
+                        if is_nofollow_link_error(&source, code) {
+                            return DescendantVerifyError::UnsafeOrLink(cursor.clone());
+                        }
+                        if code == libc::ENOTDIR {
+                            return DescendantVerifyError::NotDirectory(cursor.clone());
+                        }
+                    }
+                }
+                DescendantVerifyError::Io {
+                    path: cursor.clone(),
+                    source,
+                }
+            })?;
+            #[cfg(not(unix))]
+            {
+                let opened_meta =
+                    next.dir_metadata()
+                        .map_err(|source| DescendantVerifyError::Io {
+                            path: cursor.clone(),
+                            source,
+                        })?;
+                if !opened_meta.is_dir() || capability_metadata_is_link_or_reparse(&opened_meta) {
+                    return Err(DescendantVerifyError::UnsafeOrLink(cursor));
+                }
+            }
+            current = Some(next);
+        }
+
+        let target_dir = current.as_ref().unwrap_or(&self.dir);
+        let file_display = cursor.join(file_name);
+        let file_meta =
+            target_dir
+                .symlink_metadata(file_name)
+                .map_err(|source| DescendantVerifyError::Io {
+                    path: file_display.clone(),
+                    source,
+                })?;
+        if capability_metadata_is_link_or_reparse(&file_meta) || !file_meta.is_file() {
+            return Err(DescendantVerifyError::NotRegularFile(file_display));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn is_nofollow_link_error(_error: &std::io::Error, code: i32) -> bool {
+    code == libc::ELOOP || code == libc::EMLINK
 }
 
 pub fn acquire_single_file_shared_lock_from_file(
@@ -3215,6 +3434,108 @@ mod tests {
             3,
             "all queued readers must acquire after the writer chain drains",
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_acquire_existing_single_file_shared_lock_rejects_symlink_and_fifo() {
+        use std::ffi::CString;
+
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("real.lock");
+        std::fs::write(&target, b"").unwrap();
+        let symlink_lock = tmp.path().join("link.lock");
+        std::os::unix::fs::symlink(&target, &symlink_lock).unwrap();
+        assert!(
+            try_acquire_existing_single_file_shared_lock(&symlink_lock).is_err(),
+            "symlink lock path must be rejected"
+        );
+
+        let fifo_lock = tmp.path().join("fifo.lock");
+        let c_path = CString::new(fifo_lock.to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed");
+        assert!(
+            try_acquire_existing_single_file_shared_lock(&fifo_lock).is_err(),
+            "FIFO at lock path must fail immediately without blocking"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_real_dir_rejects_symlinked_descendant_and_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("package.json"), b"{}").unwrap();
+
+        let root = tmp.path().join("links");
+        let pkg = root.join("k1/node_modules/pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("package.json"), b"{}").unwrap();
+
+        let open_root = OpenRealDir::open_ambient(&root).unwrap();
+        assert!(
+            open_root
+                .verify_descendant_dir_and_regular_file(
+                    &root,
+                    Path::new("k1/node_modules/pkg"),
+                    "package.json"
+                )
+                .is_ok()
+        );
+
+        // Replace intermediate directory with symlink outside root.
+        let escaped_parent = root.join("k2/node_modules");
+        std::fs::create_dir_all(&escaped_parent).unwrap();
+        std::os::unix::fs::symlink(&outside, escaped_parent.join("pkg")).unwrap();
+        assert!(matches!(
+            open_root.verify_descendant_dir_and_regular_file(
+                &root,
+                Path::new("k2/node_modules/pkg"),
+                "package.json"
+            ),
+            Err(DescendantVerifyError::UnsafeOrLink(_))
+        ));
+
+        // Symlinked manifest inside a real directory is also rejected.
+        let sym_manifest_dir = root.join("k3/node_modules/pkg");
+        std::fs::create_dir_all(&sym_manifest_dir).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("package.json"),
+            sym_manifest_dir.join("package.json"),
+        )
+        .unwrap();
+        assert!(matches!(
+            open_root.verify_descendant_dir_and_regular_file(
+                &root,
+                Path::new("k3/node_modules/pkg"),
+                "package.json"
+            ),
+            Err(DescendantVerifyError::NotRegularFile(_))
+        ));
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let search_only = tmp.path().join("search-only");
+            let inner = search_only.join("sub");
+            std::fs::create_dir_all(&inner).unwrap();
+            std::fs::write(inner.join("package.json"), b"{}").unwrap();
+            std::fs::set_permissions(&search_only, std::fs::Permissions::from_mode(0o111)).unwrap();
+            let verified = OpenRealDir::open_ambient(&search_only).and_then(|dir| {
+                dir.verify_descendant_dir_and_regular_file(
+                    &search_only,
+                    Path::new("sub"),
+                    "package.json",
+                )
+                .map_err(|e| std::io::Error::other(format!("{e:?}")))
+            });
+            std::fs::set_permissions(&search_only, std::fs::Permissions::from_mode(0o755)).unwrap();
+            verified.expect(
+                "search-only 0111 real root must allow verifying known descendants on Linux",
+            );
+        }
     }
 }
 

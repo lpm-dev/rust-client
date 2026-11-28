@@ -452,7 +452,10 @@ fn build_task_context(
 
     let project_variables: Vec<(std::ffi::OsString, std::ffi::OsString)> = env_vars
         .iter()
-        .filter(|(name, _)| lpm_runtime::task_identity::is_version_manager_variable(name))
+        .filter(|(name, _)| {
+            lpm_runtime::task_identity::is_version_manager_variable(name)
+                || lpm_runtime::task_identity::is_dynamic_loader_override_variable(name)
+        })
         .map(|(name, value)| (name.into(), value.into()))
         .collect();
     let Some(runtime) = TaskRuntimeIdentity::capture(

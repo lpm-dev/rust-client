@@ -1085,7 +1085,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             };
 
             if packages.is_empty() {
-                let manifest_declares_workspaces = lpm_workspace::read_package_json(
+                let manifest_declares_workspaces = match lpm_workspace::read_package_json(
                     &cwd.join("package.json"),
                 )
                 .map_err(|error| {
@@ -1094,11 +1094,25 @@ async fn async_main(cli: Cli) -> Result<()> {
                     ))
                 })?
                 .workspaces
-                .is_some();
+                {
+                    Some(lpm_workspace::WorkspacesConfig::Globs(globs)) => !globs.is_empty(),
+                    Some(lpm_workspace::WorkspacesConfig::Object { packages }) => {
+                        !packages.is_empty()
+                    }
+                    None => false,
+                };
+                let pnpm_workspace_active = install_state::pnpm_workspace_declares_packages(&cwd)
+                    && match lpm_workspace::find_workspace_root(&cwd) {
+                        Ok(Some(root)) => {
+                            lpm_workspace::is_same_directory(&root, &cwd)
+                                || lpm_workspace::workspace_declares_member(&root, &cwd)
+                                    .unwrap_or(false)
+                        }
+                        Ok(None) => false,
+                        Err(_) => true,
+                    };
                 let recursive_install = recursive
-                    || (!no_recursive
-                        && (manifest_declares_workspaces
-                            || install_state::pnpm_workspace_declares_packages(&cwd)));
+                    || (!no_recursive && (manifest_declares_workspaces || pnpm_workspace_active));
 
                 if catalog.is_some() {
                     return Err(lpm_common::LpmError::Script(
@@ -3036,47 +3050,100 @@ async fn async_main(cli: Cli) -> Result<()> {
 
 
             let cli_linker = linker.map(LinkerCli::into_linker_mode);
-            let root_lifecycle = commands::root_lifecycle::RootProjectLifecycle::load(&cwd)?;
-            root_lifecycle.run_dev_preinstall(&cwd, cli.json)?;
+            let recursive_install = match lpm_workspace::find_workspace_root(&cwd) {
+                Ok(Some(root)) => lpm_workspace::is_same_directory(&root, &cwd),
+                Ok(None) => false,
+                Err(error) => {
+                    return Err(lpm_common::LpmError::Workspace(format!(
+                        "failed to inspect workspace layout before running `lpm ci`: {error}"
+                    )));
+                }
+            };
 
-            commands::install::with_deferred_report(async {
-                        commands::install::run_with_options(
-                &client,
-                &cwd,
-                cli.json,
-                offline,
-                commands::install::FrozenLockfileMode::Always,
-                false,
-                eff_allow_new,
-                strict_integrity,
-                no_engine_strict,
-                cli_strict_peer_dependencies,
-                cli_linker,
-                lpm_skills_preference,
-                eff_no_sec,
-                eff_auto_build,
-                None,
-                None,
-                None,
-                cli_script_policy_override,
-                advisor.clone(),
-                min_release_age_override,
-                &min_release_age_exclude,
-                drift_ignore_policy,
-                verify_policy,
-                omit_policy,
-                strict_sandbox || paranoid,
-                no_sandbox,
-                cli.verbose,
-                eff_audit_after_install,
-                false,
-                &[],
-            )
-            .await?;
+            if recursive_install {
+                commands::install::run_recursive_workspace_install(
+                    &client,
+                    &cwd,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    false,
+                    commands::install::RecursiveInstallOptions {
+                        json_output: cli.json,
+                        emit_summary: true,
+                        offline,
+                        frozen_lockfile: commands::install::FrozenLockfileMode::Always,
+                        force: false,
+                        allow_new: eff_allow_new,
+                        strict_integrity,
+                        no_engine_strict,
+                        strict_peer_dependencies_override: cli_strict_peer_dependencies,
+                        linker_override: cli_linker,
+                        lpm_skills_preference,
+                        no_security_summary: eff_no_sec,
+                        auto_build: eff_auto_build,
+                        script_policy_override: cli_script_policy_override,
+                        advisor_override: advisor.clone(),
+                        min_release_age_override,
+                        min_release_age_exclude,
+                        drift_ignore_policy,
+                        verify_policy,
+                        omit_policy,
+                        strict_sandbox: strict_sandbox || paranoid,
+                        no_sandbox,
+                        verbose: cli.verbose,
+                        audit_after_install: eff_audit_after_install,
+                        timing: false,
+                        workspace_concurrency: None,
+                        firewall_bypass_report: None,
+                    },
+                )
+                .await
+            } else {
+                let root_lifecycle = commands::root_lifecycle::RootProjectLifecycle::load(&cwd)?;
+                root_lifecycle.run_dev_preinstall(&cwd, cli.json)?;
 
-            commands::root_lifecycle::RootProjectLifecycle::load(&cwd)?
-                .run_after_successful_install(&cwd, cli.json)
-                        }).await
+                commands::install::with_deferred_report(async {
+                    commands::install::run_with_options(
+                        &client,
+                        &cwd,
+                        cli.json,
+                        offline,
+                        commands::install::FrozenLockfileMode::Always,
+                        false,
+                        eff_allow_new,
+                        strict_integrity,
+                        no_engine_strict,
+                        cli_strict_peer_dependencies,
+                        cli_linker,
+                        lpm_skills_preference,
+                        eff_no_sec,
+                        eff_auto_build,
+                        None,
+                        None,
+                        None,
+                        cli_script_policy_override,
+                        advisor.clone(),
+                        min_release_age_override,
+                        &min_release_age_exclude,
+                        drift_ignore_policy,
+                        verify_policy,
+                        omit_policy,
+                        strict_sandbox || paranoid,
+                        no_sandbox,
+                        cli.verbose,
+                        eff_audit_after_install,
+                        false,
+                        &[],
+                    )
+                    .await?;
+
+                    commands::root_lifecycle::RootProjectLifecycle::load(&cwd)?
+                        .run_after_successful_install(&cwd, cli.json)
+                })
+                .await
+            }
         }).await,
         Commands::Dev(args) => {
             let build_args::DevArgs {

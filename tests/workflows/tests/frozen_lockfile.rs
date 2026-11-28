@@ -26,12 +26,7 @@ async fn install_once(project: &TempProject, mock: &MockRegistry) {
 
 fn install_workspace_once(project: &TempProject) {
     let output = lpm(project)
-        .args([
-            "install",
-            "--no-recursive",
-            "--no-security-summary",
-            "--no-skills",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run initial workspace lpm install");
 
@@ -459,6 +454,11 @@ fn lpm_ci_accepts_workspace_member_trusted_dependencies_without_rewriting_lockfi
   }
 }"#,
     );
+    support::write_signed_unlock_for(
+        &project,
+        &project.path().join("packages/foo"),
+        &["trust-bulk-approve"],
+    );
 
     install_workspace_once(&project);
     let lock_before = project.read_file("lpm.lock");
@@ -564,5 +564,444 @@ fn lpm_ci_rejects_workspace_member_dependency_edge_absent_from_lockfile() {
         project.read_file("lpm.lock"),
         lock_before,
         "a mutable install must record the new workspace dependency edge"
+    );
+}
+
+#[test]
+fn ci_default_auto_frozen_workspace_install_preserves_lockfile_and_rejects_removed_importer() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-ci-auto-frozen-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{ "name": "foo", "version": "1.0.0" }"#,
+    );
+    project.write_file(
+        "packages/removed/package.json",
+        r#"{ "name": "removed", "version": "1.0.0" }"#,
+    );
+
+    install_workspace_once(&project);
+    let lock_before = project.read_file("lpm.lock");
+    std::fs::remove_dir_all(project.path().join("packages/removed"))
+        .expect("remove workspace member directory");
+
+    let output = lpm(&project)
+        .env("CI", "true")
+        .args(["install", "--no-skills", "--no-security-summary"])
+        .output()
+        .expect("failed to run CI-default lpm install");
+
+    assert!(
+        !output.status.success(),
+        "CI=true default install must refuse a workspace lockfile with a removed importer:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        project.read_file("lpm.lock"),
+        lock_before,
+        "CI=true auto-frozen install must preserve lpm.lock byte-for-byte"
+    );
+}
+
+#[test]
+fn filtered_frozen_workspace_install_rejects_removed_importer_before_running_member_hooks() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-filtered-frozen-preflight-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    let marker = project.path().join("hook-ran.marker");
+    project.write_file(
+        "packages/foo/package.json",
+        &serde_json::json!({
+            "name": "foo",
+            "version": "1.0.0",
+            "scripts": {
+                "postinstall": "node -e \"require('fs').writeFileSync('../../hook-ran.marker', 'ran')\""
+            }
+        })
+        .to_string(),
+    );
+    project.write_file(
+        "packages/removed/package.json",
+        r#"{ "name": "removed", "version": "1.0.0" }"#,
+    );
+
+    install_workspace_once(&project);
+    let _ = std::fs::remove_file(&marker);
+    let lock_before = project.read_file("lpm.lock");
+    std::fs::remove_dir_all(project.path().join("packages/removed"))
+        .expect("remove workspace member directory");
+
+    let output = lpm(&project)
+        .args([
+            "install",
+            "--frozen-lockfile",
+            "--filter",
+            "foo",
+            "--no-skills",
+            "--no-security-summary",
+        ])
+        .output()
+        .expect("failed to run filtered frozen workspace install");
+
+    assert!(
+        !output.status.success(),
+        "filtered frozen install must fail on a removed workspace importer:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "filtered frozen preflight must reject before running selected member lifecycle hooks"
+    );
+    assert_eq!(
+        project.read_file("lpm.lock"),
+        lock_before,
+        "rejected filtered frozen install must preserve lpm.lock byte-for-byte"
+    );
+}
+
+#[test]
+fn ci_default_install_succeeds_in_fresh_workspace_without_any_lockfile() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-ci-fresh-no-lock-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{ "name": "foo", "version": "1.0.0" }"#,
+    );
+
+    let output = lpm(&project)
+        .env("CI", "true")
+        .args(["install", "--no-skills", "--no-security-summary"])
+        .output()
+        .expect("failed to run CI-default lpm install on fresh workspace");
+
+    assert!(
+        output.status.success(),
+        "CI=true default install must succeed in a fresh workspace with no lockfile:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        project.path().join("lpm.lock").is_file(),
+        "fresh workspace install under CI=true should create lpm.lock"
+    );
+}
+
+#[test]
+fn ci_default_filtered_workspace_install_rejects_before_running_deferred_root_and_new_member_hooks()
+{
+    let project = TempProject::empty(
+        &serde_json::json!({
+            "name": "workspace-ci-filtered-hooks-root",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"],
+            "scripts": {
+                "postinstall": "node -e \"require('fs').writeFileSync('root-hook.marker', 'ran')\""
+            }
+        })
+        .to_string(),
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{ "name": "foo", "version": "1.0.0" }"#,
+    );
+    project.write_file(
+        "packages/removed/package.json",
+        r#"{ "name": "removed", "version": "1.0.0" }"#,
+    );
+
+    install_workspace_once(&project);
+    let root_marker = project.path().join("root-hook.marker");
+    let _ = std::fs::remove_file(&root_marker);
+
+    // Case 1: adding a brand-new unlocked member `newpkg` + unfiltered CI=true install
+    // must reject before running the deferred root postinstall hook.
+    let new_marker = project.path().join("new-hook.marker");
+    project.write_file(
+        "packages/newpkg/package.json",
+        &serde_json::json!({
+            "name": "newpkg",
+            "version": "1.0.0",
+            "scripts": {
+                "postinstall": "node -e \"require('fs').writeFileSync('../../new-hook.marker', 'ran')\""
+            }
+        })
+        .to_string(),
+    );
+    let root_output = lpm(&project)
+        .env("CI", "true")
+        .args(["install", "--no-skills", "--no-security-summary"])
+        .output()
+        .expect("failed to run CI-default workspace install with new member");
+    assert!(
+        !root_output.status.success(),
+        "CI=true install must fail on newly added unlocked importer:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&root_output.stdout),
+        String::from_utf8_lossy(&root_output.stderr)
+    );
+    assert!(
+        !root_marker.exists(),
+        "CI=true install must not run deferred root postinstall hook before frozen rejection"
+    );
+    assert!(
+        !new_marker.exists(),
+        "CI=true install must not run postinstall hook of a newly added unlocked member"
+    );
+
+    // Case 2: filtered CI=true --filter newpkg must also reject before running `newpkg`'s hook.
+    let new_output = lpm(&project)
+        .env("CI", "true")
+        .args([
+            "install",
+            "--filter",
+            "newpkg",
+            "--no-skills",
+            "--no-security-summary",
+        ])
+        .output()
+        .expect("failed to run CI-default filtered new-member install");
+    assert!(
+        !new_output.status.success(),
+        "CI=true filtered install must reject a new unlocked importer:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&new_output.stdout),
+        String::from_utf8_lossy(&new_output.stderr)
+    );
+    assert!(
+        !new_marker.exists(),
+        "CI=true filtered install must not run postinstall hook of a newly added unlocked member"
+    );
+}
+
+#[test]
+fn frozen_workspace_preflight_rejects_missing_importer_before_running_locked_sibling_hooks() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "workspace-frozen-sibling-preflight",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"]
+        }"#,
+    );
+    project.write_file(
+        "packages/aaa-locked/package.json",
+        &serde_json::json!({
+            "name": "aaa-locked",
+            "version": "1.0.0",
+            "scripts": {
+                "postinstall": "node -e \"require('fs').writeFileSync('../../locked-sibling.marker', 'ran')\""
+            }
+        })
+        .to_string(),
+    );
+
+    install_workspace_once(&project);
+    let sibling_marker = project.path().join("locked-sibling.marker");
+    let _ = std::fs::remove_file(&sibling_marker);
+    // Remove node_modules so `aaa-locked` is not skipped as already up-to-date.
+    let _ = std::fs::remove_dir_all(project.path().join("packages/aaa-locked/node_modules"));
+    let _ = std::fs::remove_dir_all(project.path().join("packages/aaa-locked/.lpm"));
+
+    // Add a second member scheduled after `aaa-locked` that is missing from `lpm.lock`.
+    project.write_file(
+        "packages/zzz-unlocked/package.json",
+        r#"{ "name": "zzz-unlocked", "version": "1.0.0" }"#,
+    );
+
+    let output = lpm(&project)
+        .args([
+            "install",
+            "--frozen-lockfile",
+            "--no-skills",
+            "--no-security-summary",
+        ])
+        .output()
+        .expect("failed to run frozen workspace install");
+
+    assert!(
+        !output.status.success(),
+        "frozen workspace install must fail when a selected member is missing from lpm.lock:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !sibling_marker.exists(),
+        "frozen preflight must reject before running hooks on an already-locked sibling member"
+    );
+}
+
+#[test]
+fn frozen_workspace_preflight_rejects_drifted_member_before_running_root_dev_preinstall() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "workspace-frozen-drift-preflight",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"],
+            "scripts": {
+                "pnpm:devPreinstall": "node -e \"require('fs').writeFileSync('root-dev-preinstall.marker', 'ran')\""
+            }
+        }"#,
+    );
+    project.write_file(
+        "packages/aaa-hooked/package.json",
+        &serde_json::json!({
+            "name": "aaa-hooked",
+            "version": "1.0.0",
+            "scripts": {
+                "pnpm:devPreinstall": "node -e \"require('fs').writeFileSync('../../sibling-dev-preinstall.marker', 'ran')\"",
+                "postinstall": "node -e \"require('fs').writeFileSync('../../sibling-postinstall.marker', 'ran')\""
+            }
+        })
+        .to_string(),
+    );
+    project.write_file(
+        "packages/zzz-drifted/package.json",
+        r#"{ "name": "zzz-drifted", "version": "1.0.0" }"#,
+    );
+
+    install_workspace_once(&project);
+    let root_marker = project.path().join("root-dev-preinstall.marker");
+    let sibling_pre_marker = project.path().join("sibling-dev-preinstall.marker");
+    let sibling_post_marker = project.path().join("sibling-postinstall.marker");
+    for marker in [&root_marker, &sibling_pre_marker, &sibling_post_marker] {
+        let _ = std::fs::remove_file(marker);
+    }
+    let _ = std::fs::remove_dir_all(project.path().join("packages/aaa-hooked/node_modules"));
+    let _ = std::fs::remove_dir_all(project.path().join("packages/aaa-hooked/.lpm"));
+
+    // Mutate zzz-drifted's declared dependency so its locked importer is stale.
+    project.write_file(
+        "packages/zzz-drifted/package.json",
+        r#"{ "name": "zzz-drifted", "version": "1.0.0", "dependencies": { "left-pad": "^1.3.0" } }"#,
+    );
+
+    let output = lpm(&project)
+        .args([
+            "install",
+            "--frozen-lockfile",
+            "--no-skills",
+            "--no-security-summary",
+        ])
+        .output()
+        .expect("failed to run frozen workspace install");
+
+    assert!(
+        !output.status.success(),
+        "frozen workspace install must fail when a member's declared dependencies drifted:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !root_marker.exists(),
+        "frozen preflight must reject manifest drift before running root pnpm:devPreinstall"
+    );
+    assert!(
+        !sibling_pre_marker.exists(),
+        "frozen preflight must reject manifest drift before running sibling pnpm:devPreinstall"
+    );
+    assert!(
+        !sibling_post_marker.exists(),
+        "frozen preflight must reject manifest drift before running sibling postinstall"
+    );
+}
+
+#[test]
+fn frozen_workspace_preflight_rejects_peer_rules_and_overrides_drift_before_hooks() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "workspace-frozen-policy-drift-preflight",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"],
+            "scripts": {
+                "pnpm:devPreinstall": "node -e \"require('fs').writeFileSync('root-dev-preinstall.marker', 'ran')\""
+            }
+        }"#,
+    );
+    project.write_file(
+        "packages/member-a/package.json",
+        &serde_json::json!({
+            "name": "member-a",
+            "version": "1.0.0",
+            "scripts": {
+                "pnpm:devPreinstall": "node -e \"require('fs').writeFileSync('../../member-dev-preinstall.marker', 'ran')\""
+            }
+        })
+        .to_string(),
+    );
+
+    install_workspace_once(&project);
+    let root_marker = project.path().join("root-dev-preinstall.marker");
+    let member_marker = project.path().join("member-dev-preinstall.marker");
+    assert!(
+        root_marker.exists() && member_marker.exists(),
+        "initial workspace install must run pnpm:devPreinstall hooks so marker assertions are non-vacuous"
+    );
+    let _ = std::fs::remove_file(&root_marker);
+    let _ = std::fs::remove_file(&member_marker);
+
+    // Change only `lpm.peerDependencyRules` (not the 4 dependency maps).
+    project.write_file(
+        "packages/member-a/package.json",
+        &serde_json::json!({
+            "name": "member-a",
+            "version": "1.0.0",
+            "lpm": {
+                "peerDependencyRules": {
+                    "ignoreMissing": ["react"]
+                }
+            },
+            "scripts": {
+                "pnpm:devPreinstall": "node -e \"require('fs').writeFileSync('../../member-dev-preinstall.marker', 'ran')\""
+            }
+        })
+        .to_string(),
+    );
+
+    let output = lpm(&project)
+        .args([
+            "install",
+            "--frozen-lockfile",
+            "--no-skills",
+            "--no-security-summary",
+        ])
+        .output()
+        .expect("failed to run frozen workspace install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "frozen workspace install must fail on peerDependencyRules drift:\nstdout: {}\nstderr: {stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        stderr.contains("peer dependency rules") || stderr.contains("Frozen lockfile mismatch"),
+        "expected frozen peer dependency rules mismatch error, got: {stderr}"
+    );
+    assert!(
+        !root_marker.exists(),
+        "frozen preflight must reject peerDependencyRules drift before running root pnpm:devPreinstall"
+    );
+    assert!(
+        !member_marker.exists(),
+        "frozen preflight must reject peerDependencyRules drift before running member pnpm:devPreinstall"
     );
 }

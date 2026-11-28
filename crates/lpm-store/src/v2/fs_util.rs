@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use lpm_common::{LpmError, is_symlink_or_junction};
 
 use super::integrity::has_local_source_sentinel;
-use super::tree_hash::{TreeMetadataBuilder, TreeMetadataKind, is_object_metadata_sidecar};
+use super::tree_hash::{
+    TreeMetadataBuilder, TreeMetadataDigests, TreeMetadataKind, is_object_metadata_sidecar,
+};
 
 pub(crate) fn tmp_sibling(dir: &Path) -> PathBuf {
     // Random 64-bit suffix replaces the pid+tid pair so a same-UID
@@ -320,7 +322,7 @@ pub(crate) fn materialize_into_with_integrity(
     dst: &Path,
     allow_source_symlinks: bool,
     warm_source: bool,
-) -> Result<Option<String>, LpmError> {
+) -> Result<Option<TreeMetadataDigests>, LpmError> {
     #[cfg(target_os = "macos")]
     {
         let _ = warm_source;
@@ -338,7 +340,7 @@ fn materialize_into_portable_with_integrity_inner(
     dst: &Path,
     allow_source_symlinks: bool,
     warm_source: bool,
-) -> Result<String, LpmError> {
+) -> Result<TreeMetadataDigests, LpmError> {
     let mut metadata = TreeMetadataBuilder::new();
     materialize_into_inner_impl(
         src,
@@ -359,6 +361,7 @@ pub(crate) fn materialize_into_portable_with_integrity(
     dst: &Path,
 ) -> Result<String, LpmError> {
     materialize_into_portable_with_integrity_inner(src, dst, has_local_source_sentinel(src), false)
+        .map(|digests| digests.metadata)
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -367,6 +370,7 @@ pub(crate) fn materialize_into_portable_with_integrity_warm(
     dst: &Path,
 ) -> Result<String, LpmError> {
     materialize_into_portable_with_integrity_inner(src, dst, has_local_source_sentinel(src), true)
+        .map(|digests| digests.metadata)
 }
 
 #[cfg(all(test, unix))]
@@ -376,6 +380,7 @@ pub(crate) fn materialize_into_portable_with_integrity_and_symlink_policy(
     allow_source_symlinks: bool,
 ) -> Result<String, LpmError> {
     materialize_into_portable_with_integrity_inner(src, dst, allow_source_symlinks, false)
+        .map(|digests| digests.metadata)
 }
 
 pub(crate) fn materialize_into_inner(

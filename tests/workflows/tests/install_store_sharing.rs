@@ -327,3 +327,28 @@ async fn a_package_declared_by_shasum_keeps_its_entry_through_a_build_and_the_ne
     std::fs::remove_dir_all(neighbours.dir("first").join("node_modules")).unwrap();
     assert_eq!(install_and_build(), entries);
 }
+
+#[tokio::test]
+async fn isolated_and_hoisted_installs_share_the_same_store_link_entry() {
+    let registry = MockRegistry::start().await;
+    registry
+        .with_package("shared-mod", "1.0.0", &owned_package("shared-mod", "both"))
+        .await;
+    let neighbours = Neighbours::new();
+    for project in ["isolated-proj", "hoisted-proj"] {
+        neighbours.write(
+            project,
+            "package.json",
+            r#"{"name":"consumer","version":"1.0.0","dependencies":{"shared-mod":"1.0.0"}}"#,
+        );
+    }
+
+    neighbours.install_with("isolated-proj", &registry, &["--linker=isolated"]);
+    neighbours.install_with("hoisted-proj", &registry, &["--linker=hoisted"]);
+
+    assert_eq!(
+        neighbours.store_entry("isolated-proj", "shared-mod"),
+        neighbours.store_entry("hoisted-proj", "shared-mod"),
+        "isolated and hoisted linkers should reuse the same v2 store link entry"
+    );
+}

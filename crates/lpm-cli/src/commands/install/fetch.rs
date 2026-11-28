@@ -994,12 +994,11 @@ pub(super) async fn run_online_fetch_phase(
     //
     // Mode independence: `link_v2_prepare` / `link_v2_one` /
     // `link_v2_finalize` are linker-mode-agnostic for per-package
-    // work. `linker_mode` feeds into `LinkerModeTag` which is folded
-    // into graph-key derivation (Isolated vs Hoisted both produce
-    // valid keys), and `link_v2_finalize` handles project-side
-    // wiring identically across modes. So the gate does NOT require
-    // Isolated — the post-Hoisted default is fully
-    // supported.
+    // work. Virtual-store link entries under `v2/links/<key>/` share one
+    // canonical key across Isolated and Hoisted modes, and
+    // `link_v2_finalize` handles project-side wiring identically across modes.
+    // So the gate does NOT require Isolated — the default Hoisted mode is
+    // fully supported.
     let v2_targets_pre: Vec<lpm_linker::v2::V2Target> = if v2_mode && !serial_link {
         let mut acc: Vec<lpm_linker::v2::V2Target> = Vec::with_capacity(link_targets.len());
         let mut all_have_sri = true;

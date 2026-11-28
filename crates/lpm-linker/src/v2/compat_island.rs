@@ -12,7 +12,7 @@ use super::V2Target;
 use super::keymap::KeyMap;
 use super::reconcile::{
     ensure_link_parent_dir, ensure_node_modules_dir, ensure_real_dir, is_direct,
-    reconcile_scoped_root_dir, remove_node_modules_entry, root_link_names, symlink_points_to,
+    reconcile_scoped_root_dir, remove_node_modules_entry, symlink_points_to,
 };
 use crate::materialize::copy_dir_recursive;
 use crate::validation::is_safe_node_modules_entry_name as is_safe_root_link_name;
@@ -230,7 +230,6 @@ pub(super) fn create_project_compatibility_links(
     {
         create_project_compatibility_links_store_cached(
             project_dir,
-            targets,
             store,
             key_map,
             &entries,
@@ -241,7 +240,6 @@ pub(super) fn create_project_compatibility_links(
     {
         create_project_compatibility_links_in_place(
             project_dir,
-            targets,
             store,
             key_map,
             &entries,
@@ -349,7 +347,6 @@ fn build_compat_island_at(
 #[cfg(not(target_os = "macos"))]
 fn create_project_compatibility_links_in_place(
     project_dir: &Path,
-    targets: &[Arc<V2Target>],
     store: &Store,
     key_map: &KeyMap,
     entries: &[CompatibilityEntry<'_>],
@@ -361,15 +358,13 @@ fn create_project_compatibility_links_in_place(
         .map(|entry| entry.key.dir_name().to_string())
         .collect();
     reconcile_compatibility_root(&compatibility_root, &desired)?;
-    let compatibility_links = build_compat_island_at(
+    build_compat_island_at(
         &compatibility_root,
         entries,
         store,
         key_map,
         refresh_package_copies,
-    )?;
-    rewire_project_roots_to_compat(project_dir, targets, key_map, &compatibility_links)?;
-    Ok(compatibility_links)
+    )
 }
 
 // Sentinel written last when building a store-cached island (a crash
@@ -380,7 +375,6 @@ fn create_project_compatibility_links_in_place(
 #[cfg(target_os = "macos")]
 fn create_project_compatibility_links_store_cached(
     project_dir: &Path,
-    targets: &[Arc<V2Target>],
     store: &Store,
     key_map: &KeyMap,
     entries: &[CompatibilityEntry<'_>],
@@ -406,7 +400,6 @@ fn create_project_compatibility_links_store_cached(
             compatibility_package_dir(&compatibility_root, &entry.key),
         );
     }
-    rewire_project_roots_to_compat(project_dir, targets, key_map, &compatibility_links)?;
     Ok(compatibility_links)
 }
 
@@ -445,7 +438,7 @@ fn ensure_store_compat_island(
     key_map: &KeyMap,
     force_refresh: bool,
 ) -> Result<(), LpmError> {
-    if store_compat_island_complete(store_island, entries, store, key_map) && !force_refresh {
+    if !force_refresh && store_compat_island_complete(store_island, entries, store, key_map) {
         // Reuse: refresh the sentinel's mtime so `lpm cache prune
         // --max-age` treats an actively-used island as live (the clone
         // that follows only reads the island, so without this an island
@@ -663,6 +656,9 @@ fn store_compat_island_complete(
     if recorded_entries.len() != entries.len() {
         return false;
     }
+    let recorded_entries_no_ctime = manifest
+        .get("entries_no_ctime")
+        .and_then(serde_json::Value::as_object);
     let recorded_guards = manifest
         .get("shallow_guards")
         .and_then(serde_json::Value::as_object);
@@ -670,58 +666,193 @@ fn store_compat_island_complete(
         .get("captured_at_nanos")
         .and_then(serde_json::Value::as_str)
         .and_then(|value| value.parse::<i128>().ok());
-    entries.iter().all(|entry| {
+    let trust_restored =
+        lpm_store::v2::trust_restored_store_enabled(store.object_integrity_policy());
+
+    let mut any_strict_guard_refresh_needed = false;
+    let mut any_restored_only = false;
+    let mut refreshed_entries_no_ctime: Option<serde_json::Map<String, serde_json::Value>> = None;
+    let mut any_no_ctime_backfilled = false;
+
+    for entry in entries {
         let entry_dir = compatibility_entry_dir(store_island, &entry.key);
-        let expected = recorded_entries
+        let Some(expected) = recorded_entries
             .get(entry.key.dir_name())
+            .and_then(serde_json::Value::as_str)
+        else {
+            return false;
+        };
+        if !compatibility_entry_reusable(&entry_dir, entry) {
+            return false;
+        }
+        let package_dir = compatibility_package_dir(store_island, &entry.key);
+        let entry_source_policy =
+            store.source_policy_allows_shallow_guard_for_sri(&entry.target.source_sri);
+        let entry_trust_restored = trust_restored && entry_source_policy;
+        let shallow_eligible =
+            entry_source_policy && package_dir.join(".lpm-built").symlink_metadata().is_err();
+        let mut hit_shallow = false;
+        if shallow_eligible
+            && let Some(captured_at) = captured_at_nanos
+            && let Some(guard_val) =
+                recorded_guards.and_then(|guards| guards.get(entry.key.dir_name()))
+            && let Some(current) = compat_package_shallow_guard(&package_dir)
+            && captured_at.saturating_sub(current.dir_mtime_nanos)
+                >= COMPAT_SHALLOW_GUARD_RACILY_CLEAN_WINDOW_NANOS
+            && captured_at.saturating_sub(current.pkg_json_mtime_nanos)
+                >= COMPAT_SHALLOW_GUARD_RACILY_CLEAN_WINDOW_NANOS
+            && guard_val
+                .get("dir_mtime_nanos")
+                .and_then(serde_json::Value::as_str)
+                == Some(current.dir_mtime_nanos.to_string().as_str())
+            && guard_val
+                .get("dir_ctime_nanos")
+                .and_then(serde_json::Value::as_str)
+                == Some(current.dir_ctime_nanos.to_string().as_str())
+            && guard_val
+                .get("pkg_json_size")
+                .and_then(serde_json::Value::as_u64)
+                == Some(current.pkg_json_size)
+            && guard_val
+                .get("pkg_json_mtime_nanos")
+                .and_then(serde_json::Value::as_str)
+                == Some(current.pkg_json_mtime_nanos.to_string().as_str())
+            && guard_val
+                .get("pkg_json_ctime_nanos")
+                .and_then(serde_json::Value::as_str)
+                == Some(current.pkg_json_ctime_nanos.to_string().as_str())
+            && compat_entry_sibling_links_match(store_island, entry, key_map)
+        {
+            hit_shallow = true;
+        }
+        if hit_shallow {
+            continue;
+        }
+        let expected_no_ctime = recorded_entries_no_ctime
+            .and_then(|map| map.get(entry.key.dir_name()))
             .and_then(serde_json::Value::as_str);
-        expected.is_some_and(|expected| {
-            if !compatibility_entry_reusable(&entry_dir, entry) {
+        if !entry_trust_restored && expected_no_ctime.is_some() {
+            let Ok(actual) = store.compat_island_entry_metadata_integrity(&entry_dir) else {
+                return false;
+            };
+            if actual != expected {
                 return false;
             }
-            if store.source_policy_allows_shallow_guard_for_sri(&entry.target.source_sri)
-                && let Some(captured_at) = captured_at_nanos
-                && let Some(guard_val) =
-                    recorded_guards.and_then(|guards| guards.get(entry.key.dir_name()))
-            {
-                let package_dir = compatibility_package_dir(store_island, &entry.key);
-                let has_build_marker = package_dir.join(".lpm-built").symlink_metadata().is_ok();
-                if !has_build_marker
-                    && let Some(current) = compat_package_shallow_guard(&package_dir)
-                    && captured_at.saturating_sub(current.dir_mtime_nanos)
-                        >= COMPAT_SHALLOW_GUARD_RACILY_CLEAN_WINDOW_NANOS
-                    && captured_at.saturating_sub(current.pkg_json_mtime_nanos)
-                        >= COMPAT_SHALLOW_GUARD_RACILY_CLEAN_WINDOW_NANOS
-                    && guard_val
-                        .get("dir_mtime_nanos")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(current.dir_mtime_nanos.to_string().as_str())
-                    && guard_val
-                        .get("dir_ctime_nanos")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(current.dir_ctime_nanos.to_string().as_str())
-                    && guard_val
-                        .get("pkg_json_size")
-                        .and_then(serde_json::Value::as_u64)
-                        == Some(current.pkg_json_size)
-                    && guard_val
-                        .get("pkg_json_mtime_nanos")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(current.pkg_json_mtime_nanos.to_string().as_str())
-                    && guard_val
-                        .get("pkg_json_ctime_nanos")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(current.pkg_json_ctime_nanos.to_string().as_str())
-                    && compat_entry_sibling_links_match(store_island, entry, key_map)
-                {
-                    return true;
-                }
+            if shallow_eligible {
+                any_strict_guard_refresh_needed = true;
             }
-            store
-                .compat_island_entry_metadata_integrity(&entry_dir)
-                .is_ok_and(|actual| actual == expected)
-        })
-    })
+            continue;
+        }
+        let Ok((actual, actual_no_ctime)) =
+            store.compat_island_entry_metadata_integrities(&entry_dir)
+        else {
+            return false;
+        };
+        let matched_strict = actual == expected;
+        let matched_restored = !matched_strict
+            && entry_trust_restored
+            && expected_no_ctime == Some(actual_no_ctime.as_str());
+        if !matched_strict && !matched_restored {
+            if entry_trust_restored {
+                tracing::debug!(
+                    entry = %entry.key.dir_name(),
+                    "LPM_TRUST_RESTORED_STORE enabled but compat island ctime-free digest missed"
+                );
+            }
+            return false;
+        }
+        if matched_restored {
+            // Never overwrite strict metadata digests or strict shallow guards
+            // from a trust-only match so disabling LPM_TRUST_RESTORED_STORE
+            // still enforces strict verification on the next run.
+            any_restored_only = true;
+            continue;
+        }
+        if shallow_eligible {
+            any_strict_guard_refresh_needed = true;
+        }
+        if expected_no_ctime != Some(actual_no_ctime.as_str()) {
+            any_no_ctime_backfilled = true;
+            let no_ctime_map = refreshed_entries_no_ctime
+                .get_or_insert_with(|| recorded_entries_no_ctime.cloned().unwrap_or_default());
+            no_ctime_map.insert(
+                entry.key.dir_name().to_string(),
+                serde_json::Value::String(actual_no_ctime),
+            );
+        }
+    }
+
+    if !any_restored_only && (any_strict_guard_refresh_needed || any_no_ctime_backfilled) {
+        refresh_store_compat_island_completion_best_effort(
+            store_island,
+            entries,
+            store,
+            recorded_entries.clone(),
+            refreshed_entries_no_ctime
+                .unwrap_or_else(|| recorded_entries_no_ctime.cloned().unwrap_or_default()),
+            any_no_ctime_backfilled,
+        );
+    }
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn refresh_store_compat_island_completion_best_effort(
+    store_island: &Path,
+    entries: &[CompatibilityEntry<'_>],
+    store: &Store,
+    recorded_entries: serde_json::Map<String, serde_json::Value>,
+    recorded_entries_no_ctime: serde_json::Map<String, serde_json::Value>,
+    force_write: bool,
+) {
+    let now_nanos = compat_system_time_nanos(std::time::SystemTime::now());
+    let mut shallow_guards = serde_json::Map::new();
+    let mut any_eligible = false;
+    let mut all_non_racy = true;
+    for entry in entries {
+        if !store.source_policy_allows_shallow_guard_for_sri(&entry.target.source_sri) {
+            continue;
+        }
+        any_eligible = true;
+        let package_dir = compatibility_package_dir(store_island, &entry.key);
+        let Some(guard) = compat_package_shallow_guard(&package_dir) else {
+            all_non_racy = false;
+            continue;
+        };
+        if now_nanos.saturating_sub(guard.dir_mtime_nanos)
+            < COMPAT_SHALLOW_GUARD_RACILY_CLEAN_WINDOW_NANOS
+            || now_nanos.saturating_sub(guard.pkg_json_mtime_nanos)
+                < COMPAT_SHALLOW_GUARD_RACILY_CLEAN_WINDOW_NANOS
+        {
+            all_non_racy = false;
+        }
+        shallow_guards.insert(
+            entry.key.dir_name().to_string(),
+            serde_json::json!({
+                "dir_mtime_nanos": guard.dir_mtime_nanos.to_string(),
+                "dir_ctime_nanos": guard.dir_ctime_nanos.to_string(),
+                "pkg_json_size": guard.pkg_json_size,
+                "pkg_json_mtime_nanos": guard.pkg_json_mtime_nanos.to_string(),
+                "pkg_json_ctime_nanos": guard.pkg_json_ctime_nanos.to_string(),
+            }),
+        );
+    }
+    if !force_write && (!any_eligible || !all_non_racy) {
+        return;
+    }
+    let manifest = serde_json::json!({
+        "schema": COMPAT_ISLAND_COMPLETE_SCHEMA,
+        "captured_at_nanos": now_nanos.to_string(),
+        "entries": recorded_entries,
+        "entries_no_ctime": recorded_entries_no_ctime,
+        "shallow_guards": shallow_guards,
+    });
+    if let Ok(content) = serde_json::to_vec(&manifest) {
+        let _ = lpm_common::write_file_atomic(
+            &store_island.join(COMPAT_ISLAND_COMPLETE_FILENAME),
+            content,
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -731,13 +862,19 @@ fn write_store_compat_island_completion(
     store: &Store,
 ) -> Result<(), LpmError> {
     let mut recorded_entries = serde_json::Map::new();
+    let mut recorded_entries_no_ctime = serde_json::Map::new();
     let mut shallow_guards = serde_json::Map::new();
     for entry in entries {
         let entry_dir = compatibility_entry_dir(store_island, &entry.key);
-        let integrity = store.compat_island_entry_metadata_integrity(&entry_dir)?;
+        let (integrity, integrity_no_ctime) =
+            store.compat_island_entry_metadata_integrities(&entry_dir)?;
         recorded_entries.insert(
             entry.key.dir_name().to_string(),
             serde_json::Value::String(integrity),
+        );
+        recorded_entries_no_ctime.insert(
+            entry.key.dir_name().to_string(),
+            serde_json::Value::String(integrity_no_ctime),
         );
         if store.source_policy_allows_shallow_guard_for_sri(&entry.target.source_sri) {
             let package_dir = compatibility_package_dir(store_island, &entry.key);
@@ -760,6 +897,7 @@ fn write_store_compat_island_completion(
         "schema": COMPAT_ISLAND_COMPLETE_SCHEMA,
         "captured_at_nanos": captured_at_nanos,
         "entries": recorded_entries,
+        "entries_no_ctime": recorded_entries_no_ctime,
         "shallow_guards": shallow_guards,
     });
     let content = serde_json::to_vec(&manifest).map_err(|error| {
@@ -1455,44 +1593,6 @@ fn compatibility_marker(entry: &CompatibilityEntry<'_>) -> String {
     )
 }
 
-fn rewire_project_roots_to_compat(
-    project_dir: &Path,
-    targets: &[Arc<V2Target>],
-    key_map: &KeyMap,
-    compatibility_links: &CompatibilityLinks,
-) -> Result<(), LpmError> {
-    let nm = ensure_node_modules_dir(project_dir)?;
-    for v2t in targets {
-        let Some(key) = key_map.get_for(v2t) else {
-            continue;
-        };
-        let Some(package_dir) = compatibility_links.package_dir_for_key(key) else {
-            continue;
-        };
-        for root_name in root_link_names(&v2t.target) {
-            if root_name != v2t.target.name {
-                continue;
-            }
-            let link_path = nm.join(&root_name);
-            ensure_link_parent_dir(&nm, &link_path, "compatibility root symlink")?;
-            if symlink_points_to(&link_path, package_dir) {
-                continue;
-            }
-            if link_path.symlink_metadata().is_ok() {
-                remove_node_modules_entry(&link_path, "store root symlink")?;
-            }
-            create_dir_symlink_or_junction(package_dir, &link_path).map_err(|e| {
-                LpmError::Store(format!(
-                    "virtual-store linker: failed to rewire project root {} -> {}: {e}",
-                    link_path.display(),
-                    package_dir.display()
-                ))
-            })?;
-        }
-    }
-    Ok(())
-}
-
 fn compatibility_entry_dir(compatibility_root: &Path, key: &GraphKey) -> PathBuf {
     compatibility_root.join(key.dir_name())
 }
@@ -1530,6 +1630,260 @@ mod tests {
         );
         std::fs::write(destination_file, b"modified").unwrap();
         assert_eq!(std::fs::read(source_file).unwrap(), b"original");
+    }
+
+    #[test]
+    fn store_compat_island_complete_refreshes_shallow_guard_timestamp_after_racily_clean_window() {
+        use super::super::V2Target;
+        use super::super::keymap::derive_graph_keys;
+        use super::{
+            CompatibilityEntry, compatibility_package_dir, ensure_store_compat_island,
+            store_compat_island_complete,
+        };
+        use crate::{LinkTarget, Materialization};
+        use lpm_store::v2::{COMPAT_ISLAND_COMPLETE_FILENAME, LinkerModeTag, PlatformTuple, Store};
+        use std::sync::Arc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::at(temp.path().join("store"));
+        let mut tar_builder = tar::Builder::new(Vec::new());
+        let pkg_json =
+            br#"{"name":"tool","version":"1.0.0","bin":{"tool":"cli.js"},"dependencies":{}}"#;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(pkg_json.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar_builder
+            .append_data(&mut header, "package/package.json", &pkg_json[..])
+            .unwrap();
+        let cli_js = b"#!/usr/bin/env node\nconsole.log('ok');\n";
+        let mut cli_header = tar::Header::new_gnu();
+        cli_header.set_size(cli_js.len() as u64);
+        cli_header.set_mode(0o755);
+        cli_header.set_cksum();
+        tar_builder
+            .append_data(&mut cli_header, "package/cli.js", &cli_js[..])
+            .unwrap();
+        let tar_bytes = tar_builder.into_inner().unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &tar_bytes).unwrap();
+        let tarball = encoder.finish().unwrap();
+
+        let (object_dir, sri, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
+        let platform = PlatformTuple::current();
+        let v2_target = Arc::new(V2Target {
+            instance_id: lpm_common::PackageInstanceId::derive(
+                "tool",
+                "1.0.0",
+                "registry+npm",
+                "tool",
+            ),
+            target: Arc::new(LinkTarget {
+                name: "tool".to_string(),
+                version: "1.0.0".to_string(),
+                store_path: object_dir.clone(),
+                dependencies: vec![],
+                aliases: std::collections::HashMap::new(),
+                is_direct: true,
+                root_link_names: None,
+                wrapper_id: None,
+                materialization: Materialization::CasBacked,
+                peers: vec![],
+                patch_fingerprint: None,
+            }),
+            dependency_targets: std::collections::HashMap::new(),
+            peer_targets: std::collections::HashMap::new(),
+            source_sri: sri.clone(),
+            verified_object_integrity: None,
+            fresh_object: None,
+        });
+        let key_map = derive_graph_keys(
+            std::slice::from_ref(&v2_target),
+            &platform,
+            LinkerModeTag::Isolated,
+            None,
+        )
+        .unwrap();
+        let derived_key = Arc::clone(key_map.get_for(&v2_target).unwrap());
+        store
+            .populate_link_entry(lpm_store::v2::LinkEntryRequest {
+                graph_key: Arc::clone(&derived_key),
+                source_sri: sri,
+                object_dir,
+                deps: vec![],
+                platform: Arc::new(lpm_store::v2::LinkMetaPlatform {
+                    os: platform.os,
+                    cpu: platform.cpu,
+                    libc: platform.libc,
+                }),
+            })
+            .unwrap();
+
+        let store_island = store.paths().compat_island_dir("test-island-refresh");
+        let entry = CompatibilityEntry {
+            target: &v2_target,
+            key: Arc::clone(&derived_key),
+        };
+        ensure_store_compat_island(
+            &store_island,
+            std::slice::from_ref(&entry),
+            &store,
+            &key_map,
+            false,
+        )
+        .unwrap();
+
+        // Age the island's files and set captured_at_nanos equal to those old mtimes
+        // (simulating the racy capture recorded at creation time).
+        let pkg_dir = compatibility_package_dir(&store_island, &derived_key);
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::set_times(
+            pkg_dir.join("package.json"),
+            std::fs::FileTimes::new().set_modified(old),
+        )
+        .unwrap();
+        std::fs::set_times(
+            pkg_dir.join("cli.js"),
+            std::fs::FileTimes::new().set_modified(old),
+        )
+        .unwrap();
+        std::fs::set_times(&pkg_dir, std::fs::FileTimes::new().set_modified(old)).unwrap();
+        // Rewrite completion manifest with the current aged metadata AND a racy captured_at_nanos.
+        super::write_store_compat_island_completion(
+            &store_island,
+            std::slice::from_ref(&entry),
+            &store,
+        )
+        .unwrap();
+        let sentinel_path = store_island.join(COMPAT_ISLAND_COMPLETE_FILENAME);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sentinel_path).unwrap()).unwrap();
+        let racy_captured = super::compat_system_time_nanos(old).to_string();
+        manifest["captured_at_nanos"] = serde_json::Value::String(racy_captured);
+        std::fs::write(&sentinel_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        assert!(store_compat_island_complete(
+            &store_island,
+            std::slice::from_ref(&entry),
+            &store,
+            &key_map,
+        ));
+        let refreshed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sentinel_path).unwrap()).unwrap();
+        let refreshed_captured = refreshed["captured_at_nanos"]
+            .as_str()
+            .unwrap()
+            .parse::<i128>()
+            .unwrap();
+        assert!(
+            refreshed_captured - super::compat_system_time_nanos(old)
+                >= super::COMPAT_SHALLOW_GUARD_RACILY_CLEAN_WINDOW_NANOS,
+            "store_compat_island_complete must advance captured_at_nanos once outside the 2s window"
+        );
+
+        // Simulate a CI cache restore where ctime shifted on disk (invalidating both
+        // the strict shallow guard ctime and the strict full metadata digest while
+        // preserving the ctime-free digest). A trust-restored match under Source
+        // policy must NOT overwrite strict digests or strict shallow guards.
+        let mut stale_strict = refreshed.clone();
+        stale_strict["entries"][derived_key.dir_name()] =
+            serde_json::Value::String("sha256-stale-strict-digest".to_string());
+        stale_strict["shallow_guards"][derived_key.dir_name()]["dir_ctime_nanos"] =
+            serde_json::Value::String("0".to_string());
+        std::fs::write(&sentinel_path, serde_json::to_vec(&stale_strict).unwrap()).unwrap();
+        assert!(
+            !store_compat_island_complete(
+                &store_island,
+                std::slice::from_ref(&entry),
+                &store,
+                &key_map,
+            ),
+            "without LPM_TRUST_RESTORED_STORE, stale strict digest must miss"
+        );
+        #[cfg(debug_assertions)]
+        {
+            let _trust = lpm_store::v2::override_trust_restored_store_for_test(Some(true));
+            assert!(
+                store_compat_island_complete(
+                    &store_island,
+                    std::slice::from_ref(&entry),
+                    &store,
+                    &key_map,
+                ),
+                "with LPM_TRUST_RESTORED_STORE under Source policy, matching ctime-free digest must hit"
+            );
+            let after_trust: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&sentinel_path).unwrap()).unwrap();
+            assert_eq!(
+                after_trust["entries"][derived_key.dir_name()].as_str(),
+                Some("sha256-stale-strict-digest"),
+                "trust-restored hit must never overwrite the recorded strict metadata digest"
+            );
+            assert_eq!(
+                after_trust["shallow_guards"][derived_key.dir_name()]["dir_ctime_nanos"].as_str(),
+                Some("0"),
+                "trust-restored hit must never overwrite the recorded strict shallow guard"
+            );
+
+            // Local-source objects enforce Tree integrity even under Source policy,
+            // so `LPM_TRUST_RESTORED_STORE` must NOT accept ctime drift for them.
+            let local_sentinel = store
+                .paths()
+                .objects_root()
+                .join(".lpm-object-meta")
+                .join(
+                    store
+                        .paths()
+                        .object_dir(&entry.target.source_sri)
+                        .unwrap()
+                        .file_name()
+                        .unwrap(),
+                )
+                .join("local-source");
+            std::fs::create_dir_all(local_sentinel.parent().unwrap()).unwrap();
+            std::fs::write(&local_sentinel, b"1").unwrap();
+            assert!(
+                !store_compat_island_complete(
+                    &store_island,
+                    std::slice::from_ref(&entry),
+                    &store,
+                    &key_map,
+                ),
+                "local-source entry using Tree integrity must ignore LPM_TRUST_RESTORED_STORE"
+            );
+            std::fs::remove_file(&local_sentinel).unwrap();
+        }
+        assert!(
+            !store_compat_island_complete(
+                &store_island,
+                std::slice::from_ref(&entry),
+                &store,
+                &key_map,
+            ),
+            "disabling LPM_TRUST_RESTORED_STORE must immediately re-enforce strict verification"
+        );
+
+        // Warm hit on a `.lpm-built` package (shallow-ineligible) must not rewrite `.complete.json`.
+        std::fs::write(&sentinel_path, serde_json::to_vec(&refreshed).unwrap()).unwrap();
+        std::fs::write(pkg_dir.join(".lpm-built"), b"1").unwrap();
+        super::write_store_compat_island_completion(
+            &store_island,
+            std::slice::from_ref(&entry),
+            &store,
+        )
+        .unwrap();
+        std::fs::set_times(&sentinel_path, std::fs::FileTimes::new().set_modified(old)).unwrap();
+        assert!(store_compat_island_complete(
+            &store_island,
+            std::slice::from_ref(&entry),
+            &store,
+            &key_map,
+        ));
+        assert_eq!(
+            sentinel_path.metadata().unwrap().modified().unwrap(),
+            old,
+            "warm hit for .lpm-built entry must not rewrite completion sentinel"
+        );
     }
 }
 

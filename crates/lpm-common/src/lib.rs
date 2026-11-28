@@ -112,18 +112,20 @@ pub use paths::absolute_extended_path;
 pub use paths::canonical_identity;
 pub use paths::credential_service;
 pub use paths::{
-    ExclusiveLockHandle, FsKind, GLOBAL_INSTALL_PATH_BUDGET, INSTALL_READY_MARKER, LpmRoot,
-    ProjectLockDirectory, ProjectLockKind, SharedLockHandle, SingleFileExclusiveLockHandle,
-    SingleFileSharedLockHandle, acquire_exclusive_lock, acquire_single_file_exclusive_lock,
+    DescendantVerifyError, ExclusiveLockHandle, FsKind, GLOBAL_INSTALL_PATH_BUDGET,
+    INSTALL_READY_MARKER, LpmRoot, OpenRealDir, ProjectLockDirectory, ProjectLockKind,
+    SharedLockHandle, SingleFileExclusiveLockHandle, SingleFileSharedLockHandle,
+    acquire_exclusive_lock, acquire_single_file_exclusive_lock,
     acquire_single_file_exclusive_lock_from_file,
     acquire_single_file_exclusive_lock_from_file_within, acquire_single_file_shared_lock,
     acquire_single_file_shared_lock_from_file, as_extended_path, check_install_path_budget,
     is_local_fs, open_lock_file_nofollow, parent_install_lock_environment, project_install_lock,
     project_publish_lock, try_acquire_capability_exclusive_lock, try_acquire_exclusive_lock,
-    try_acquire_single_file_exclusive_lock_from_file, try_with_exclusive_lock,
-    with_capability_exclusive_lock, with_exclusive_lock, with_exclusive_lock_async,
-    with_project_exclusive_lock, with_project_exclusive_lock_async, with_project_shared_lock,
-    with_project_shared_lock_async, with_shared_lock, with_shared_lock_async,
+    try_acquire_existing_single_file_shared_lock, try_acquire_single_file_exclusive_lock_from_file,
+    try_with_exclusive_lock, with_capability_exclusive_lock, with_exclusive_lock,
+    with_exclusive_lock_async, with_project_exclusive_lock, with_project_exclusive_lock_async,
+    with_project_shared_lock, with_project_shared_lock_async, with_shared_lock,
+    with_shared_lock_async,
 };
 pub use peer::PeerEdge;
 pub use project_glob::{rooted_project_glob, validate_project_glob};

@@ -248,7 +248,7 @@ fn hash_collected(
     id: usize,
     reader: MetadataReader,
     relative: &mut Vec<u8>,
-    hasher: &mut Sha256,
+    hasher: &mut TreeMetadataHasher,
 ) -> Result<(), LpmError> {
     let dir = dirs.get_mut(id).and_then(Option::take).ok_or_else(|| {
         LpmError::Store("virtual-store metadata walk lost a discovered directory".to_owned())
@@ -262,16 +262,15 @@ fn hash_collected(
         let entry = &collected.entry;
         let result = match collected.kind {
             CollectedKind::Directory(child) => {
-                hash_tree_metadata_record(hasher, b"dir", relative, entry, &[]);
+                hasher.update_record(b"dir", relative, entry, &[]);
                 hash_collected(dirs, child, reader, relative, hasher)
             }
             CollectedKind::File => {
-                hash_tree_metadata_record(hasher, b"file", relative, entry, &[]);
+                hasher.update_record(b"file", relative, entry, &[]);
                 Ok(())
             }
             CollectedKind::Symlink(target) => target.map(|target| {
-                hash_tree_metadata_fields(
-                    hasher,
+                hasher.update_fields(
                     b"symlink",
                     relative,
                     entry.mode,
@@ -292,11 +291,28 @@ fn hash_collected(
     Ok(())
 }
 
+pub(super) fn tree_metadata_integrities(
+    root: &Path,
+    reader: MetadataReader,
+) -> Result<TreeMetadataDigests, LpmError> {
+    tree_metadata_integrities_with_helpers(root, reader).map(|(digests, _)| digests)
+}
+
 pub(super) fn tree_metadata_integrity(
     root: &Path,
     reader: MetadataReader,
 ) -> Result<String, LpmError> {
-    tree_metadata_integrity_with_helpers(root, reader).map(|(integrity, _)| integrity)
+    tree_metadata_integrity_with_helpers(root, reader).map(|(digest, _)| digest)
+}
+
+fn tree_metadata_integrities_with_helpers(
+    root: &Path,
+    reader: MetadataReader,
+) -> Result<(TreeMetadataDigests, usize), LpmError> {
+    let Collected { mut dirs, helpers } = collect(root, reader);
+    let mut hasher = TreeMetadataHasher::new();
+    hash_collected(&mut dirs, 0, reader, &mut Vec::new(), &mut hasher)?;
+    Ok((hasher.finish(), helpers))
 }
 
 fn tree_metadata_integrity_with_helpers(
@@ -304,12 +320,9 @@ fn tree_metadata_integrity_with_helpers(
     reader: MetadataReader,
 ) -> Result<(String, usize), LpmError> {
     let Collected { mut dirs, helpers } = collect(root, reader);
-    let mut hasher = Sha256::new();
+    let mut hasher = TreeMetadataHasher::strict_only();
     hash_collected(&mut dirs, 0, reader, &mut Vec::new(), &mut hasher)?;
-    Ok((
-        format!("sha256-{}", hex::encode(hasher.finalize())),
-        helpers,
-    ))
+    Ok((hasher.finish_strict(), helpers))
 }
 
 #[cfg(test)]
@@ -317,9 +330,9 @@ mod tests {
     use super::*;
 
     fn sequential_portable(root: &Path) -> Result<String, LpmError> {
-        let mut hasher = Sha256::new();
+        let mut hasher = TreeMetadataHasher::new();
         hash_object_tree_dir(root, root, None, &mut hasher, None)?;
-        Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
+        Ok(hasher.finish().metadata)
     }
 
     /// NTFS updates the copy of a directory's timestamps in its parent's index

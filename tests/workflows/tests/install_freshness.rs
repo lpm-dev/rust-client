@@ -893,6 +893,9 @@ async fn strict_replay_rejects_substituted_local_peer_source() {
         peer.target_name = other.name.clone();
         peer.target_version = other.version.clone();
         peer.target_wrapper_id = Some(other.source_kind().unwrap().unwrap().source_id());
+        if workspace {
+            union.importers.remove("packages/host");
+        }
         union.replace_importer(importer, lockfile).unwrap();
         union
             .write_to_file(&project.path().join("lpm.lock"))
