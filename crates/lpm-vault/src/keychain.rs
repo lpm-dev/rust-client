@@ -2280,10 +2280,15 @@ fn read_project_metadata(
     Ok(Some(ProjectMetadataSnapshot { record }))
 }
 
-/// Whether the Keychain holds values for `vault_id`, found from the item's
-/// attributes without reading it, which could ask for the user's presence.
+/// Whether the Keychain holds values for `vault_id`, found without asking
+/// for the user's presence unless the Keychain answers nothing without it.
 pub(crate) fn holds_vault_values(vault_id: &str) -> Result<bool, String> {
-    Ok(crate::macos_keychain::claimed_access(&service(), vault_id)?.is_some())
+    let marker = crate::companion::account::marker_account(vault_id);
+    crate::macos_keychain::holds(
+        &service(),
+        vault_id,
+        &[PROJECT_INDEX_MARKER_ACCOUNT, marker.as_str()],
+    )
 }
 
 /// The name and folder the project index records for `vault_id`. The index

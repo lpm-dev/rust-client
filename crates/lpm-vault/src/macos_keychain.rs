@@ -189,6 +189,18 @@ fn approval_reason(account: &str) -> String {
     }
 }
 
+/// What the run's one approval says it's for when a listing of every item
+/// is the first call to need it: the project a link check noted the
+/// command reads for, else LPM's env values.
+fn listing_approval_reason() -> String {
+    REQUESTER
+        .with_borrow(|requester| requester.as_ref().map(|noted| noted.vault_id.clone()))
+        .map_or_else(
+            || AUTHENTICATION_REASON.to_owned(),
+            |vault_id| approval_reason(&vault_id),
+        )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CliAccess {
     Automatic,
@@ -214,6 +226,12 @@ thread_local! {
     > = const { std::cell::RefCell::new(None) };
     /// Whether the person approved the invocation's context.
     static RUN_APPROVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How each Keychain call through the run's approval ran.
+    static RAN_THROUGH_APPROVAL: std::cell::RefCell<Vec<Ui>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// What the invocation's one context gives as its reason when the Keychain
@@ -257,7 +275,7 @@ enum Ui {
 /// Until the run is approved, `call` runs without authentication UI, so an
 /// item that needs none never asks. The first one that does approves the
 /// run's context once, and `call` runs again with it, as every later call
-/// does: macOS asks for each call through a context nobody approved.
+/// does, so no later call asks.
 fn approving_once<T>(
     approved: bool,
     approve: impl FnOnce() -> Result<(), KeychainStorageError>,
@@ -275,20 +293,32 @@ fn approving_once<T>(
     }
 }
 
-/// [`approving_once`] for a Keychain call on `account`, given the context
-/// to pass.
+/// [`run_approving`] for a Keychain call on `account`, whose approval names
+/// what reading it is for.
 fn with_run_approval<T>(
     account: &str,
+    call: impl FnMut(CFType) -> Result<T, KeychainStorageError>,
+) -> Result<T, KeychainStorageError> {
+    run_approving(|| approval_reason(account), call)
+}
+
+/// [`approving_once`] for a Keychain call, given the context to pass.
+/// `reason` says what the run's approval is for, if the call is the first
+/// to need it.
+fn run_approving<T>(
+    reason: impl FnOnce() -> String,
     mut call: impl FnMut(CFType) -> Result<T, KeychainStorageError>,
 ) -> Result<T, KeychainStorageError> {
     approving_once(
         RUN_APPROVED.get(),
         || {
-            approve_run(&approval_reason(account))?;
+            approve_run(&reason())?;
             RUN_APPROVED.set(true);
             Ok(())
         },
         |ui| {
+            #[cfg(test)]
+            RAN_THROUGH_APPROVAL.with_borrow_mut(|ran| ran.push(ui));
             call(match ui {
                 Ui::Never => non_interactive_context(),
                 Ui::Approved => authentication_context(),
@@ -530,10 +560,37 @@ impl SecurityFrameworkBackend {
         ])
     }
 
-    /// The approval `account`'s attributes claim. Attributes need no
-    /// authentication, so like [`Self::claimed_access`] it passes no context.
+    /// The approval `account`'s attributes claim; an absent item claims
+    /// none.
     fn cli_access(service: &str, account: &str) -> Result<CliAccess, KeychainStorageError> {
+        Self::attributes(service, account)?.map_or(Ok(CliAccess::Automatic), |attributes| {
+            Self::classify(&attributes)
+        })
+    }
+
+    /// `account`'s attributes, or `None` when it's absent. macOS guards an
+    /// item's attributes as it guards its data: a query that passes no
+    /// context asks the person each time it meets an item that demands
+    /// approval, so this one goes through the run's approval.
+    fn attributes(
+        service: &str,
+        account: &str,
+    ) -> Result<Option<CFDictionary<CFString, CFType>>, KeychainStorageError> {
+        with_run_approval(account, |context| {
+            Self::attributes_through(service, account, context)
+        })
+    }
+
+    fn attributes_through(
+        service: &str,
+        account: &str,
+        context: CFType,
+    ) -> Result<Option<CFDictionary<CFString, CFType>>, KeychainStorageError> {
         let mut pairs = Self::identity_pairs(service, account);
+        pairs.push((
+            unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationContext) },
+            context,
+        ));
         pairs.push((
             unsafe { CFString::wrap_under_get_rule(kSecReturnAttributes) },
             CFBoolean::from(true).into_CFType(),
@@ -542,7 +599,7 @@ impl SecurityFrameworkBackend {
         let mut result: CFTypeRef = std::ptr::null();
         let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &mut result) };
         if status == ERR_SEC_ITEM_NOT_FOUND {
-            return Ok(CliAccess::Automatic);
+            return Ok(None);
         }
         if status != 0 {
             return Err(Self::map_status("read env access policy", status));
@@ -554,9 +611,9 @@ impl SecurityFrameworkBackend {
             .downcast_into::<CFDictionary>()
             .ok_or(KeychainStorageError::VerificationFailed)?;
         // SAFETY: The successful downcast established the dictionary's type; keys and values come from Security.framework.
-        let attributes: CFDictionary<CFString, CFType> =
-            unsafe { CFDictionary::wrap_under_get_rule(attributes.as_concrete_TypeRef()) };
-        Self::classify(&attributes)
+        Ok(Some(unsafe {
+            CFDictionary::wrap_under_get_rule(attributes.as_concrete_TypeRef())
+        }))
     }
 
     /// An item's CLI approval as its attributes claim it: the approval marker
@@ -677,43 +734,29 @@ impl SecurityFrameworkBackend {
         service: &str,
         account: &str,
     ) -> Result<Option<ClaimedAccess>, KeychainStorageError> {
-        // Attributes need no authentication, but a context that forbids
-        // interaction makes the Keychain refuse an item that demands user
-        // presence even for them, so attribute queries pass none.
-        let mut pairs = Self::identity_pairs(service, account);
-        pairs.push((
-            unsafe { CFString::wrap_under_get_rule(kSecReturnAttributes) },
-            CFBoolean::from(true).into_CFType(),
-        ));
-        let query = CFDictionary::from_CFType_pairs(&pairs);
-        let mut result: CFTypeRef = std::ptr::null();
-        let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &mut result) };
-        if status == ERR_SEC_ITEM_NOT_FOUND {
-            return Ok(None);
-        }
-        if status != 0 {
-            return Err(Self::map_status("read env access policy", status));
-        }
-        if result.is_null() {
-            return Err(KeychainStorageError::VerificationFailed);
-        }
-        let attributes = unsafe { CFType::wrap_under_create_rule(result) }
-            .downcast_into::<CFDictionary>()
-            .ok_or(KeychainStorageError::VerificationFailed)?;
-        // SAFETY: The successful downcast established the dictionary's type; keys and values come from Security.framework.
-        let attributes: CFDictionary<CFString, CFType> =
-            unsafe { CFDictionary::wrap_under_get_rule(attributes.as_concrete_TypeRef()) };
-        Ok(Some(Self::claim(&attributes)))
+        Ok(Self::attributes(service, account)?.map(|attributes| Self::claim(&attributes)))
     }
 
     /// The account name of every item in `service`, with the approval its
-    /// attributes claim, from attributes alone, which never ask for
-    /// authentication. Like [`Self::claimed_access`], it passes no
-    /// authentication context.
+    /// attributes claim, from attributes alone. Like [`Self::attributes`],
+    /// it goes through the run's approval.
     fn accounts(service: &str) -> Result<Vec<(String, ClaimedAccess)>, KeychainStorageError> {
+        run_approving(listing_approval_reason, |context| {
+            Self::accounts_through(service, context)
+        })
+    }
+
+    fn accounts_through(
+        service: &str,
+        context: CFType,
+    ) -> Result<Vec<(String, ClaimedAccess)>, KeychainStorageError> {
         let mut pairs = Self::identity_pairs(service, "");
         let account_key = unsafe { CFString::wrap_under_get_rule(kSecAttrAccount) };
         pairs.retain(|(key, _)| key != &account_key);
+        pairs.push((
+            unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationContext) },
+            context,
+        ));
         pairs.push((
             unsafe { CFString::wrap_under_get_rule(kSecReturnAttributes) },
             CFBoolean::from(true).into_CFType(),
@@ -966,6 +1009,48 @@ pub(crate) fn write_bytes(service: &str, account: &str, value: &[u8]) -> Result<
     SecurityFrameworkBackend::write(service, account, value)
         .and_then(|()| verify_stored(service, account, value))
         .map_err(|error| error.to_string())
+}
+
+/// Whether `service` holds `account`, from its attributes, without asking
+/// the person whenever the answer can be had without: an item that refuses
+/// a query without UI while one of `open_accounts`, items without approval
+/// in the same service, answers one is there and demands approval. A locked
+/// Keychain refuses both, so then the query goes through the run's
+/// approval, which says why it fails.
+pub(crate) fn holds(service: &str, account: &str, open_accounts: &[&str]) -> Result<bool, String> {
+    let context = non_interactive_context();
+    held(
+        SecurityFrameworkBackend::attributes_through(service, account, context.clone())
+            .map(|attributes| attributes.is_some()),
+        || {
+            open_accounts.iter().any(|open| {
+                matches!(
+                    SecurityFrameworkBackend::attributes_through(service, open, context.clone()),
+                    Ok(Some(_))
+                )
+            })
+        },
+        || {
+            SecurityFrameworkBackend::attributes(service, account)
+                .map(|attributes| attributes.is_some())
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Whether an item is there, given what a query without UI `found`, whether
+/// an open item in the same Keychain answers one, and the same query through
+/// the run's approval.
+fn held(
+    found: Result<bool, KeychainStorageError>,
+    an_open_item_answers: impl FnOnce() -> bool,
+    through_approval: impl FnOnce() -> Result<bool, KeychainStorageError>,
+) -> Result<bool, KeychainStorageError> {
+    match found {
+        Err(KeychainStorageError::InteractionNotAllowed) if an_open_item_answers() => Ok(true),
+        Err(KeychainStorageError::InteractionNotAllowed) => through_approval(),
+        found => found,
+    }
 }
 
 /// Every account in `service` with the approval its attributes claim, in
@@ -1283,9 +1368,9 @@ mod tests {
         assert!(shown.contains('…'), "{shown}");
     }
 
-    /// A Keychain as macOS behaves with the run's context: an item that
-    /// demands approval refuses a call without UI, and asks the person for
-    /// each call until the context itself is approved.
+    /// A Keychain as macOS behaves with the run's contexts: an item that
+    /// demands approval refuses a call without UI, and answers one through
+    /// the context the person approved.
     #[derive(Default)]
     struct FakeKeychain {
         protected: HashSet<&'static str>,
@@ -1294,7 +1379,6 @@ mod tests {
         closed: bool,
         context_approved: std::cell::Cell<bool>,
         approvals: std::cell::Cell<usize>,
-        prompts: std::cell::RefCell<Vec<&'static str>>,
         calls: std::cell::RefCell<Vec<(&'static str, Ui)>>,
     }
 
@@ -1331,10 +1415,6 @@ mod tests {
                         Ui::Approved if self.closed => {
                             Err(KeychainStorageError::InteractionNotAllowed)
                         }
-                        Ui::Approved if protected && !self.context_approved.get() => {
-                            self.prompts.borrow_mut().push(item);
-                            Ok(())
-                        }
                         _ => Ok(()),
                     }
                 },
@@ -1342,7 +1422,7 @@ mod tests {
         }
 
         fn asked(&self) -> usize {
-            self.approvals.get() + self.prompts.borrow().len()
+            self.approvals.get()
         }
     }
 
@@ -1356,12 +1436,7 @@ mod tests {
             keychain.run(item).expect("run");
         }
 
-        assert_eq!(
-            keychain.asked(),
-            1,
-            "prompts: {:?}",
-            keychain.prompts.borrow()
-        );
+        assert_eq!(keychain.asked(), 1, "calls: {:?}", keychain.calls.borrow());
     }
 
     #[test]
@@ -1432,6 +1507,118 @@ mod tests {
         assert_eq!(keychain.asked(), 1);
     }
 
+    /// How each Keychain call that `query` made through the run's approval
+    /// ran.
+    fn through_the_runs_approval(query: impl FnOnce()) -> Vec<Ui> {
+        RAN_THROUGH_APPROVAL.take();
+        query();
+        RAN_THROUGH_APPROVAL.take()
+    }
+
+    #[test]
+    fn attribute_queries_and_listings_go_through_the_runs_one_approval() {
+        // This unsigned test binary can't reach the shared access group, so
+        // each query fails before it reads anything; what it asked with is
+        // what counts.
+        let service = format!("dev.lpm.cli-approval.fixture.{}", rand::random::<u128>());
+        let queries = [
+            (
+                "the approval an item claims",
+                through_the_runs_approval(|| {
+                    let _ = claimed_access(&service, "values");
+                }),
+            ),
+            (
+                "the approval a write copies",
+                through_the_runs_approval(|| {
+                    let _ = SecurityFrameworkBackend::cli_access(&service, "values");
+                }),
+            ),
+            (
+                "a listing",
+                through_the_runs_approval(|| {
+                    let _ = accounts_with_access(&service);
+                }),
+            ),
+        ];
+
+        let skipping: Vec<&str> = queries
+            .iter()
+            .filter(|(_, ran)| ran.first() != Some(&Ui::Never))
+            .map(|(query, _)| *query)
+            .collect();
+        assert!(
+            skipping.is_empty(),
+            "these skip the run's approval, so macOS asks for each on its own: {skipping:?}"
+        );
+    }
+
+    #[test]
+    fn a_folder_check_finds_whether_values_are_there_without_the_runs_approval() {
+        let vault_id = format!("fixture-{}", rand::random::<u64>());
+
+        let ran = through_the_runs_approval(|| {
+            let _ = crate::keychain::holds_vault_values(&vault_id);
+        });
+
+        assert!(
+            ran.is_empty(),
+            "the check went through the run's approval, which asks the person: {ran:?}"
+        );
+    }
+
+    #[test]
+    fn an_item_that_refuses_a_query_without_ui_while_an_open_one_answers_is_there() {
+        let never = || -> Result<bool, KeychainStorageError> {
+            panic!("asked the person when the answer needed no approval")
+        };
+        assert!(matches!(
+            held(Ok(true), || panic!("probed"), never),
+            Ok(true)
+        ));
+        assert!(matches!(
+            held(Ok(false), || panic!("probed"), never),
+            Ok(false)
+        ));
+        assert!(matches!(
+            held(
+                Err(KeychainStorageError::InteractionNotAllowed),
+                || true,
+                never
+            ),
+            Ok(true)
+        ));
+        assert!(matches!(
+            held(
+                Err(KeychainStorageError::MissingEntitlement),
+                || panic!("probed"),
+                never
+            ),
+            Err(KeychainStorageError::MissingEntitlement)
+        ));
+    }
+
+    #[test]
+    fn an_item_that_refuses_a_query_while_the_keychain_answers_none_asks_through_the_run() {
+        let locked = held(
+            Err(KeychainStorageError::InteractionNotAllowed),
+            || false,
+            || Err(KeychainStorageError::InteractionNotAllowed),
+        );
+        assert!(
+            matches!(locked, Err(KeychainStorageError::InteractionNotAllowed)),
+            "a locked Keychain says it's locked, never that the item is absent"
+        );
+        assert!(matches!(
+            held(
+                Err(KeychainStorageError::InteractionNotAllowed),
+                || false,
+                || Ok(true)
+            ),
+            Ok(true)
+        ));
+    }
+
     #[test]
     fn local_authentication_errors_say_whether_the_person_cancelled_failed_or_had_no_ui() {
         use objc2_local_authentication::LAError;
@@ -1489,6 +1676,24 @@ mod tests {
         assert_eq!(
             operation_prompt(&record),
             "Allow LPM CLI in \"/srv/approval\" to access env project \"Project\"'s personal overrides"
+        );
+    }
+
+    #[test]
+    fn a_listing_s_approval_names_the_project_the_command_reads_for() {
+        assert_eq!(listing_approval_reason(), AUTHENTICATION_REASON);
+        note_requester(
+            "listing-reason-vault",
+            std::path::Path::new("/srv/listing"),
+            || Some("Project".to_owned()),
+        );
+        assert_eq!(
+            listing_approval_reason(),
+            "access env project \"Project\" in \"/srv/listing\""
+        );
+        assert_eq!(
+            prompting_for_local_history(listing_approval_reason),
+            "access env project \"Project\"'s local history in \"/srv/listing\""
         );
     }
 
@@ -1601,11 +1806,13 @@ mod tests {
     {
         assert_eq!(std::env::var("LPM_RUN_KEYCHAIN_TESTS").as_deref(), Ok("1"));
         const ITEMS: [&str; 3] = ["values", "stage", "record"];
+        const COPY: &str = "copy";
+        const OPEN: &str = "open";
         let service = format!("dev.lpm.cli-approval.fixture.{}", rand::random::<u128>());
         struct FixtureCleanup<'a>(&'a str);
         impl Drop for FixtureCleanup<'_> {
             fn drop(&mut self) {
-                for account in ITEMS {
+                for account in ITEMS.into_iter().chain([COPY, OPEN]) {
                     let _ = delete(self.0, account);
                 }
             }
@@ -1615,6 +1822,20 @@ mod tests {
         eprintln!(
             "\nmacOS asks to approve this run now. Approve every prompt and count them: one is expected.\n"
         );
+        write_bytes(&service, OPEN, b"synthetic-fixture").expect("write an open item");
+        SecurityFrameworkBackend::write_with_access(
+            &service,
+            "values",
+            b"synthetic-fixture",
+            CliAccess::RequireApproval,
+        )
+        .expect("add an item that needs approval");
+        assert_eq!(
+            holds(&service, "values", &[OPEN]),
+            Ok(true),
+            "an item that needs approval is found without asking"
+        );
+        assert_eq!(holds(&service, COPY, &[OPEN]), Ok(false));
         for account in ITEMS {
             write_bytes_with_access(
                 &service,
@@ -1629,7 +1850,28 @@ mod tests {
                 read_bytes(&service, account).expect("read it back"),
                 Some(b"synthetic-fixture".to_vec())
             );
+            assert_eq!(
+                claimed_access(&service, account),
+                Ok(Some(ClaimedAccess::RequireApproval))
+            );
         }
+        let mut listed = accounts_with_access(&service).expect("list the items");
+        listed.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            listed,
+            [
+                (OPEN.to_owned(), ClaimedAccess::Automatic),
+                ("record".to_owned(), ClaimedAccess::RequireApproval),
+                ("stage".to_owned(), ClaimedAccess::RequireApproval),
+                ("values".to_owned(), ClaimedAccess::RequireApproval),
+            ]
+        );
+        write_bytes_with_access_from(&service, COPY, b"synthetic-fixture", "values")
+            .expect("copy an item's approval to a new one");
+        assert_eq!(
+            claimed_access(&service, COPY),
+            Ok(Some(ClaimedAccess::RequireApproval))
+        );
         write_bytes(&service, "values", b"synthetic-change").expect("change an approved item");
         assert_eq!(
             delete(&service, "stage"),
@@ -1645,6 +1887,24 @@ mod tests {
                 Err(KeychainStorageError::InteractionNotAllowed)
             ),
             "the items still demand approval from a context nobody approved"
+        );
+        assert!(
+            matches!(
+                SecurityFrameworkBackend::attributes_through(
+                    &service,
+                    "record",
+                    non_interactive_context()
+                ),
+                Err(KeychainStorageError::InteractionNotAllowed)
+            ),
+            "an item's attributes demand approval as its data does"
+        );
+        assert!(
+            matches!(
+                SecurityFrameworkBackend::accounts_through(&service, non_interactive_context()),
+                Err(KeychainStorageError::InteractionNotAllowed)
+            ),
+            "a listing that meets an item demanding approval is refused, rather than leaving the item out"
         );
 
         eprint!("How many times did macOS ask? ");
