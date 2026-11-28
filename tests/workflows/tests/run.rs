@@ -7708,3 +7708,150 @@ fn direct_file_watch_recovers_when_an_external_symlink_target_directory_returns(
     );
     watcher.wait_until(|| value() == "third");
 }
+
+#[tokio::test]
+async fn run_env_enabled_remote_cache_uploads_before_process_exit() {
+    let server = MockServer::start().await;
+    let state = RemoteCacheState::default();
+    mount_stateful_remote_cache(&server, state.clone()).await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "env-only-remote-cache",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "node build.js"
+  }
+}"#,
+    );
+    // Deliberately omit `remoteCache` from `lpm.json` so only `LPM_REMOTE_CACHE=1` enables it.
+    project.write_file(
+        "lpm.json",
+        r#"{
+  "tasks": {
+    "build": {
+      "command": "node build.js",
+      "cache": true,
+      "inputs": ["src/**"],
+      "outputs": ["dist/**"]
+    }
+  }
+}"#,
+    );
+    project.write_file("src/input.txt", "hello");
+    project.write_file(
+        "build.js",
+        r#"
+const fs = require('node:fs');
+fs.mkdirSync('dist', { recursive: true });
+fs.writeFileSync('dist/value.txt', 'env-remote-hit');
+fs.writeFileSync('executed-marker', 'ran');
+console.log('env-remote-build-output');
+"#,
+    );
+
+    let first = lpm(&project)
+        .env("LPM_REMOTE_CACHE", "1")
+        .env("LPM_REMOTE_CACHE_URL", format!("{}/v8", server.uri()))
+        .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+        .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
+        .args(["run", "build"])
+        .output()
+        .expect("failed to run env-enabled remote cache build");
+    assert!(
+        first.status.success(),
+        "first run should succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
+    assert!(
+        state
+            .artifact
+            .lock()
+            .expect("remote cache artifact mutex poisoned")
+            .is_some(),
+        "env-enabled remote cache must upload the artifact before process exit",
+    );
+
+    remove_local_task_cache(&project);
+    remove_project_file(&project, "dist");
+    remove_project_file(&project, "executed-marker");
+
+    let second = lpm(&project)
+        .env("LPM_REMOTE_CACHE", "1")
+        .env("LPM_REMOTE_CACHE_URL", format!("{}/v8", server.uri()))
+        .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+        .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
+        .args(["run", "build"])
+        .output()
+        .expect("failed to run env-enabled remote cache restore");
+    assert!(
+        second.status.success(),
+        "second run should succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+    );
+    assert_eq!(project.read_file("dist/value.txt"), "env-remote-hit");
+    assert!(
+        !project.file_exists("executed-marker"),
+        "remote cache hit must restore outputs without re-running the script",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_unlinked_project_refuses_folder_before_probing_local_node_bin() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let linked = TempProject::empty(
+        r#"{"name":"linked-proj","version":"1.0.0","scripts":{"dev":"echo ok"}}"#,
+    );
+    lpm(&linked)
+        .args(["env", "set", "A_SECRET=MARKER_SECRET_VALUE"])
+        .assert()
+        .success();
+
+    let unlinked = linked.path().join("unlinked-copy");
+    std::fs::create_dir_all(unlinked.join("node_modules/.bin")).unwrap();
+    std::fs::write(
+        unlinked.join("package.json"),
+        r#"{"name":"unlinked-copy","version":"1.0.0","engines":{"node":">=20.0.0"},"scripts":{"dev":"echo ok"}}"#,
+    )
+    .unwrap();
+    std::fs::copy(linked.path().join("lpm.json"), unlinked.join("lpm.json")).unwrap();
+
+    let probe_marker = unlinked.join("node-bin-probed.txt");
+    let fake_node = unlinked.join("node_modules/.bin/node");
+    std::fs::write(
+        &fake_node,
+        format!(
+            "#!/bin/sh\necho probed > '{}'\necho v22.0.0\n",
+            probe_marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_node, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = lpm(&linked)
+        .current_dir(&unlinked)
+        .args(["run", "dev"])
+        .output()
+        .expect("failed to run lpm in unlinked copy");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "unlinked folder must be refused:\n{combined}"
+    );
+    assert!(
+        combined.contains("lpm env link"),
+        "unlinked folder refusal must instruct the user to run lpm env link:\n{combined}"
+    );
+    assert!(
+        !probe_marker.exists(),
+        "unlinked folder must fail folder authorization before executing local node_modules/.bin/node"
+    );
+}

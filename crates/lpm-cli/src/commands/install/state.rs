@@ -92,16 +92,57 @@ fn write_post_install_hash_with_context_and_proof(
     lock: &workspace_lockfile::ActiveLockfileSnapshot,
     proof_context: Option<PostInstallSyncNoopProofContext<'_>>,
 ) -> std::io::Result<()> {
-    let pkg = lpm_common::read_text_file_capped(
-        &project_dir.join("package.json"),
-        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    write_post_install_hash_with_context_and_proof_with_hook(
+        project_dir,
+        linker_mode,
+        object_integrity_policy,
+        security_analysis_policy,
+        dependency_engine_key,
+        node_runtime_fingerprint,
+        release_age_policy_key,
+        lock,
+        proof_context,
+        || {},
     )
-    .unwrap_or_default();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_post_install_hash_with_context_and_proof_with_hook(
+    project_dir: &Path,
+    linker_mode: lpm_linker::LinkerMode,
+    object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
+    security_analysis_policy: lpm_store::SecurityAnalysisPolicy,
+    dependency_engine_key: &str,
+    node_runtime_fingerprint: Option<&str>,
+    release_age_policy_key: Option<&str>,
+    lock: &workspace_lockfile::ActiveLockfileSnapshot,
+    proof_context: Option<PostInstallSyncNoopProofContext<'_>>,
+    after_snapshot_read: impl FnOnce(),
+) -> std::io::Result<()> {
+    let (pkg, pkg_stamp, pkg_read_ok) =
+        match crate::install_state::read_text_regular_file_capped_with_stamp(
+            &project_dir.join("package.json"),
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) {
+            Ok((pkg, stamp)) => (pkg, stamp, true),
+            Err(_) => (String::new(), None, false),
+        };
+    let lock_disk = crate::install_state::read_regular_file_capped_with_stamp(
+        &lock.path,
+        lpm_common::STATE_FILE_SIZE_CAP_BYTES.max(64 * 1024 * 1024),
+    );
+    let lock_matches_on_disk = match &lock_disk {
+        Ok((lock_raw, _)) => lock_raw.as_slice() == lock.content.as_bytes(),
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => lock.content.is_empty(),
+        Err(_) => false,
+    };
     // Compute the proof from the exact on-disk `package.json` and `lpm.lock`
     // bytes hashed into `.lpm/install-hash` so concurrent edits during install
     // cannot stamp a stale manifest verdict onto the new bytes.
     let sync_noop_proof = proof_context.and_then(|ctx| {
-        if crate::install_state::package_json_needs_slow_freshness(&pkg)
+        if !pkg_read_ok
+            || !lock_matches_on_disk
+            || crate::install_state::package_json_needs_slow_freshness(&pkg)
             || lock.path != project_dir.join(lpm_lockfile::LOCKFILE_NAME)
             || crate::install_state::has_pnpm_workspace_yaml(project_dir)
             || lpm_workspace::find_workspace_root(project_dir)
@@ -113,22 +154,17 @@ fn write_post_install_hash_with_context_and_proof(
         }
         let pkg_stripped = lpm_common::strip_utf8_bom_str(&pkg);
         let fresh_package: lpm_workspace::PackageJson = serde_json::from_str(pkg_stripped).ok()?;
-        let lock_raw = lpm_common::read_file_capped(
-            &lock.path,
-            lpm_common::STATE_FILE_SIZE_CAP_BYTES.max(64 * 1024 * 1024),
-        )
-        .ok()?;
+        let (lock_raw, lock_stamp) = lock_disk.as_ref().ok()?;
         let owned_lockfile;
         let current_stamp = std::fs::metadata(&lock.path)
             .ok()
             .and_then(|meta| Some((meta.len(), meta.modified().ok()?)));
         let fresh_lockfile = if let Some((parsed, committed_stamp)) = ctx.parsed_lockfile
             && current_stamp == Some(committed_stamp)
-            && lock_raw == lock.content.as_bytes()
         {
             parsed
         } else {
-            let lock_raw_str = std::str::from_utf8(&lock_raw).ok()?;
+            let lock_raw_str = std::str::from_utf8(lock_raw).ok()?;
             owned_lockfile = lpm_lockfile::Lockfile::from_toml(lock_raw_str).ok()?;
             &owned_lockfile
         };
@@ -138,9 +174,11 @@ fn write_post_install_hash_with_context_and_proof(
             &fresh_package,
             pkg_stripped,
             fresh_lockfile,
-            &lock_raw,
+            lock_raw,
             ctx.routes,
             ctx.auto_install_peers,
+            pkg_stamp,
+            *lock_stamp,
         ))
     });
     let file_link_bytes =
@@ -158,7 +196,28 @@ fn write_post_install_hash_with_context_and_proof(
             security_analysis_policy,
         },
     );
-    crate::install_state::write_install_hash_with_known_runtime_state(
+    let mtime_policy = if pkg_read_ok && lock_matches_on_disk {
+        let verified_lock_stamp = match &lock_disk {
+            Ok((_, Some(stamp))) => Some(Some(*stamp)),
+            Err(lpm_common::BoundedReadError::NotFound { .. }) if lock.content.is_empty() => {
+                Some(None)
+            }
+            _ => None,
+        };
+        match (pkg_stamp, verified_lock_stamp) {
+            (Some(pkg_stamp), Some(lock_stamp)) => {
+                crate::install_state::InstallHashMtimePolicy::Verified {
+                    pkg_stamp,
+                    lock_stamp,
+                }
+            }
+            _ => crate::install_state::InstallHashMtimePolicy::Disable,
+        }
+    } else {
+        crate::install_state::InstallHashMtimePolicy::Disable
+    };
+    after_snapshot_read();
+    crate::install_state::write_install_hash_with_known_runtime_state_and_mtime_policy(
         project_dir,
         &hash,
         linker_mode,
@@ -172,6 +231,7 @@ fn write_post_install_hash_with_context_and_proof(
             sync_noop_proof: sync_noop_proof.as_ref(),
             release_age_policy_key,
         },
+        mtime_policy,
     )
 }
 
@@ -1243,6 +1303,316 @@ mod workspace_freshness_tests {
         assert_eq!(
             lockfile_deps.as_ref(),
             &HashMap::from([("registry-package".to_string(), "^1.0.0".to_string())])
+        );
+    }
+
+    #[test]
+    fn post_install_hash_omits_sync_noop_proof_when_on_disk_lockfile_differs_from_installed_snapshot()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let pkg_json =
+            r#"{"name":"proof-race","version":"1.0.0","dependencies":{"react":"^1.0.0"}}"#;
+        std::fs::write(project.join("package.json"), pkg_json).unwrap();
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+
+        let make_lock = |version: &str| {
+            let mut lock = lpm_lockfile::Lockfile::new();
+            let instance_id = lpm_common::PackageInstanceId::derive("react", version, "npm", "");
+            lock.add_package(lpm_lockfile::LockedPackage {
+                instance_id: Some(instance_id),
+                name: "react".to_string(),
+                version: version.to_string(),
+                ..lpm_lockfile::LockedPackage::default()
+            });
+            lock.root_resolutions.insert(
+                "react".to_string(),
+                lpm_lockfile::LockedRootResolution {
+                    instance_id: Some(instance_id),
+                    package: "react".to_string(),
+                    version: version.to_string(),
+                    source: None,
+                },
+            );
+            lock.root_resolutions.insert(
+                "react".to_string(),
+                lpm_lockfile::LockedRootResolution {
+                    instance_id: Some(instance_id),
+                    package: "react".to_string(),
+                    version: version.to_string(),
+                    source: None,
+                },
+            );
+            lock
+        };
+        let installed_lock = make_lock("1.0.0");
+        let installed_content = installed_lock.to_toml().unwrap();
+
+        // Substitute a second valid lockfile on disk with a different resolved version
+        // while `lock.content` holds the originally installed lockfile snapshot.
+        let substituted_lock = make_lock("1.0.1");
+        let lock_path = project.join(lpm_lockfile::LOCKFILE_NAME);
+        substituted_lock.write_to_file(&lock_path).unwrap();
+
+        let routes = lpm_registry::RouteTable::from_env_and_filesystem(project).unwrap();
+        let lock_snapshot = super::workspace_lockfile::ActiveLockfileSnapshot {
+            path: lock_path,
+            content: Arc::from(installed_content),
+        };
+        write_post_install_hash_with_context_and_proof(
+            project,
+            lpm_linker::LinkerMode::Hoisted,
+            lpm_store::v2::ObjectIntegrityPolicy::Source,
+            lpm_store::SecurityAnalysisPolicy::Disabled,
+            "none",
+            None,
+            None,
+            &lock_snapshot,
+            Some(PostInstallSyncNoopProofContext {
+                routes: &routes,
+                auto_install_peers: true,
+                parsed_lockfile: None,
+            }),
+        )
+        .unwrap();
+
+        let state = std::fs::read_to_string(project.join(".lpm/install-hash")).unwrap();
+        assert!(
+            crate::install_state::SyncNoopLockfileProof::parse_from_state(&state).is_none(),
+            "post-install hash must not emit a sync-noop proof when on-disk lpm.lock differs from lock.content:\n{state}"
+        );
+        let freshness =
+            crate::install_state::check_install_state_with_linker_integrity_dependency_engine_and_security_analysis(
+                project,
+                pkg_json,
+                lpm_linker::LinkerMode::Hoisted,
+                lpm_store::v2::ObjectIntegrityPolicy::Source,
+                "none",
+                lpm_store::StoreVersion::V2,
+                lpm_store::SecurityAnalysisPolicy::Disabled,
+            );
+        assert!(
+            !freshness.up_to_date,
+            "post-install hash must not stamp substituted lockfile mtime as up-to-date:\n{state}"
+        );
+    }
+
+    #[test]
+    fn post_install_hash_records_verified_read_mtime_when_lockfile_is_replaced_mid_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let pkg_json = r#"{"name":"app","version":"1.0.0","dependencies":{"react":"^1.0.0"}}"#;
+        std::fs::write(project.join("package.json"), pkg_json).unwrap();
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+
+        let make_lock = |version: &str| {
+            let mut lock = lpm_lockfile::Lockfile::new();
+            let instance_id = lpm_common::PackageInstanceId::derive("react", version, "npm", "");
+            lock.add_package(lpm_lockfile::LockedPackage {
+                instance_id: Some(instance_id),
+                name: "react".to_string(),
+                version: version.to_string(),
+                ..lpm_lockfile::LockedPackage::default()
+            });
+            lock.root_resolutions.insert(
+                "react".to_string(),
+                lpm_lockfile::LockedRootResolution {
+                    instance_id: Some(instance_id),
+                    package: "react".to_string(),
+                    version: version.to_string(),
+                    source: None,
+                },
+            );
+            lock
+        };
+        let installed_lock = make_lock("1.0.0");
+        let installed_content = installed_lock.to_toml().unwrap();
+        let lock_path = project.join(lpm_lockfile::LOCKFILE_NAME);
+        installed_lock.write_to_file(&lock_path).unwrap();
+        let orig_mtime = std::fs::metadata(&lock_path).unwrap().modified().unwrap();
+        let replacement_mtime = orig_mtime + std::time::Duration::from_secs(5);
+        let replacement_lock = make_lock("2.0.0");
+        let replacement_path = lock_path.clone();
+
+        let lock_snapshot = super::workspace_lockfile::ActiveLockfileSnapshot {
+            path: lock_path,
+            content: Arc::from(installed_content),
+        };
+        write_post_install_hash_with_context_and_proof_with_hook(
+            project,
+            lpm_linker::LinkerMode::Hoisted,
+            lpm_store::v2::ObjectIntegrityPolicy::Source,
+            lpm_store::SecurityAnalysisPolicy::Disabled,
+            "none",
+            None,
+            None,
+            &lock_snapshot,
+            None,
+            move || {
+                replacement_lock.write_to_file(&replacement_path).unwrap();
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&replacement_path)
+                    .unwrap()
+                    .set_modified(replacement_mtime)
+                    .unwrap();
+            },
+        )
+        .unwrap();
+
+        let freshness =
+            crate::install_state::check_install_state_with_linker_integrity_dependency_engine_and_security_analysis(
+                project,
+                pkg_json,
+                lpm_linker::LinkerMode::Hoisted,
+                lpm_store::v2::ObjectIntegrityPolicy::Source,
+                "none",
+                lpm_store::StoreVersion::V2,
+                lpm_store::SecurityAnalysisPolicy::Disabled,
+            );
+        assert!(
+            !freshness.up_to_date,
+            "post-install hash must never stamp the replacement lockfile's mtime onto the old hash"
+        );
+    }
+
+    #[test]
+    fn post_install_hash_rejects_same_mtime_same_length_lockfile_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let pkg_json = r#"{"name":"app","version":"1.0.0","dependencies":{"react":"^1.0.0"}}"#;
+        std::fs::write(project.join("package.json"), pkg_json).unwrap();
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+
+        let make_lock = |version: &str| {
+            let mut lock = lpm_lockfile::Lockfile::new();
+            let instance_id = lpm_common::PackageInstanceId::derive("react", version, "npm", "");
+            lock.add_package(lpm_lockfile::LockedPackage {
+                instance_id: Some(instance_id),
+                name: "react".to_string(),
+                version: version.to_string(),
+                ..lpm_lockfile::LockedPackage::default()
+            });
+            lock.root_resolutions.insert(
+                "react".to_string(),
+                lpm_lockfile::LockedRootResolution {
+                    instance_id: Some(instance_id),
+                    package: "react".to_string(),
+                    version: version.to_string(),
+                    source: None,
+                },
+            );
+            lock
+        };
+        let installed_lock = make_lock("1.0.0");
+        let installed_content = installed_lock.to_toml().unwrap();
+        let replacement_lock = make_lock("2.0.0");
+        let replacement_content = replacement_lock.to_toml().unwrap();
+        assert_eq!(
+            installed_content.len(),
+            replacement_content.len(),
+            "test fixture requires equal-length lockfiles"
+        );
+        let lock_path = project.join(lpm_lockfile::LOCKFILE_NAME);
+        installed_lock.write_to_file(&lock_path).unwrap();
+        let orig_mtime = std::fs::metadata(&lock_path).unwrap().modified().unwrap();
+        let replacement_path = lock_path.clone();
+
+        let lock_snapshot = super::workspace_lockfile::ActiveLockfileSnapshot {
+            path: lock_path,
+            content: Arc::from(installed_content),
+        };
+        write_post_install_hash_with_context_and_proof_with_hook(
+            project,
+            lpm_linker::LinkerMode::Hoisted,
+            lpm_store::v2::ObjectIntegrityPolicy::Source,
+            lpm_store::SecurityAnalysisPolicy::Disabled,
+            "none",
+            None,
+            None,
+            &lock_snapshot,
+            None,
+            move || {
+                replacement_lock.write_to_file(&replacement_path).unwrap();
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&replacement_path)
+                    .unwrap()
+                    .set_modified(orig_mtime)
+                    .unwrap();
+            },
+        )
+        .unwrap();
+
+        let freshness =
+            crate::install_state::check_install_state_with_linker_integrity_dependency_engine_and_security_analysis(
+                project,
+                pkg_json,
+                lpm_linker::LinkerMode::Hoisted,
+                lpm_store::v2::ObjectIntegrityPolicy::Source,
+                "none",
+                lpm_store::StoreVersion::V2,
+                lpm_store::SecurityAnalysisPolicy::Disabled,
+            );
+        assert!(
+            !freshness.up_to_date,
+            "ordinary fast freshness check must reject a replacement lockfile even when its mtime and length match"
+        );
+    }
+
+    #[test]
+    fn post_install_hash_emits_verified_fast_path_stamps_for_unchanged_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let pkg_json = r#"{"name":"app","version":"1.0.0"}"#;
+        std::fs::write(project.join("package.json"), pkg_json).unwrap();
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+
+        let lock = lpm_lockfile::Lockfile::new();
+        let lock_content = lock.to_toml().unwrap();
+        let lock_path = project.join(lpm_lockfile::LOCKFILE_NAME);
+        lock.write_to_file(&lock_path).unwrap();
+
+        let lock_snapshot = super::workspace_lockfile::ActiveLockfileSnapshot {
+            path: lock_path,
+            content: Arc::from(lock_content),
+        };
+        write_post_install_hash_with_context_and_proof_with_hook(
+            project,
+            lpm_linker::LinkerMode::Hoisted,
+            lpm_store::v2::ObjectIntegrityPolicy::Source,
+            lpm_store::SecurityAnalysisPolicy::Disabled,
+            "none",
+            None,
+            None,
+            &lock_snapshot,
+            None,
+            || {},
+        )
+        .unwrap();
+
+        let state = std::fs::read_to_string(project.join(".lpm/install-hash")).unwrap();
+        assert!(
+            !state.contains("m:stale:stale"),
+            "unchanged regular manifests must record verified mtimes rather than disabling fast path:\n{state}"
+        );
+        assert!(
+            state.lines().any(|line| line.starts_with("t:")),
+            "unchanged regular manifests must persist verified file stamps:\n{state}"
+        );
+        let freshness =
+            crate::install_state::check_install_state_with_linker_integrity_dependency_engine_and_security_analysis(
+                project,
+                pkg_json,
+                lpm_linker::LinkerMode::Hoisted,
+                lpm_store::v2::ObjectIntegrityPolicy::Source,
+                "none",
+                lpm_store::StoreVersion::V2,
+                lpm_store::SecurityAnalysisPolicy::Disabled,
+            );
+        assert!(
+            freshness.up_to_date,
+            "unchanged regular manifests must hit the fast freshness path:\n{state}"
         );
     }
 }

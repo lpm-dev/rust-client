@@ -106,3 +106,57 @@ fn startup_env_validation_error_under_json_emits_single_envelope() {
         "JSON error should carry startup validation message: {envelope:#}"
     );
 }
+
+#[test]
+fn unusable_lpm_home_on_global_list_renders_slim_error_without_miette_debug_dump() {
+    let project = TempProject::empty(r#"{"name":"slim-error-home","version":"1.0.0"}"#);
+    let file_as_home = project.path().join("not-a-directory");
+    std::fs::write(&file_as_home, "blocker").unwrap();
+
+    let output = lpm(&project)
+        .env("LPM_HOME", &file_as_home)
+        .args(["--color=never", "global", "list"])
+        .output()
+        .expect("failed to run lpm global list with file LPM_HOME");
+
+    assert_failed(&output, "LPM_HOME=<file> lpm global list");
+    assert_no_miette_frame(&output, "LPM_HOME=<file> lpm global list");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("Diagnostic {"),
+        "stderr/stdout must not leak raw miette debug output:\n{combined}"
+    );
+    assert!(
+        combined.contains("✗ "),
+        "failure should render through the slim error presenter:\n{combined}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_binary_retains_local_authentication_framework_link() {
+    let binary = support::lpm_binary();
+    let output = match std::process::Command::new("otool")
+        .args(["-L"])
+        .arg(&binary)
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => panic!("failed to run otool -L on lpm-rs: {error}"),
+    };
+    assert!(
+        output.status.success(),
+        "otool -L failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let libraries = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        libraries.contains("LocalAuthentication.framework"),
+        "lpm-rs on macOS must link LocalAuthentication.framework for biometric unlock:\n{libraries}"
+    );
+}

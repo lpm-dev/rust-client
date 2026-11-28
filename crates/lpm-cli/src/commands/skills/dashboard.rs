@@ -22,10 +22,30 @@ use super::managed::{self, ManagedMutationPlan, ManagedUpdatePlan, Mutation};
 use super::{AgentTarget, DashboardArgs};
 
 const INDEX_HTML: &str = include_str!("dashboard/index.html");
-const DASHBOARD_CSS: &str = include_str!("dashboard/assets/dashboard.css");
-const DASHBOARD_JS: &str = include_str!("dashboard/assets/dashboard.js");
+const DASHBOARD_CSS_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dashboard.css.gz"));
+const DASHBOARD_JS_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dashboard.js.gz"));
 const PLAN_LIFETIME: Duration = Duration::from_secs(10 * 60);
 const MAX_CACHED_PLANS: usize = 4;
+
+fn decompress_embedded_utf8(bytes: &[u8]) -> String {
+    use std::io::Read as _;
+    let mut decoder = flate2::read::GzDecoder::new(bytes);
+    let mut out = String::new();
+    decoder
+        .read_to_string(&mut out)
+        .expect("embedded dashboard asset must decompress to valid UTF-8");
+    out
+}
+
+fn dashboard_css() -> &'static str {
+    static CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CSS.get_or_init(|| decompress_embedded_utf8(DASHBOARD_CSS_GZ))
+}
+
+fn dashboard_js() -> &'static str {
+    static JS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    JS.get_or_init(|| decompress_embedded_utf8(DASHBOARD_JS_GZ))
+}
 
 #[derive(Clone)]
 struct DashboardState {
@@ -267,14 +287,14 @@ async fn index() -> Html<&'static str> {
 async fn stylesheet() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        DASHBOARD_CSS,
+        dashboard_css(),
     )
 }
 
 async fn script() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        DASHBOARD_JS,
+        dashboard_js(),
     )
 }
 
@@ -648,8 +668,8 @@ mod tests {
         assert!(INDEX_HTML.contains("src=\"./assets/dashboard.js\""));
         assert!(INDEX_HTML.contains("href=\"./assets/dashboard.css\""));
         assert!(!INDEX_HTML.contains("<style"));
-        assert!(!DASHBOARD_CSS.is_empty());
-        assert!(!DASHBOARD_JS.is_empty());
+        assert!(!dashboard_css().is_empty());
+        assert!(!dashboard_js().is_empty());
     }
 
     #[tokio::test]

@@ -6958,12 +6958,20 @@ mod tests {
         let on_disk = fs::read_to_string(p.join(".lpm").join("install-hash"))
             .expect("install-hash must exist after auto_install_if_stale");
         let lines: Vec<&str> = on_disk.lines().collect();
+        let expected_lines = if cfg!(any(unix, windows)) { 12 } else { 11 };
         assert_eq!(
             lines.len(),
-            11,
-            "install-hash MUST contain 11 lines (hash + m: + l: + i: + p: + a: + e: + n: + s: + k: + r:), got:\n{on_disk}\n\
+            expected_lines,
+            "install-hash MUST contain {expected_lines} lines (hash + m: + l: + i: + p: + a: + e: + n: + s: + k: + r: + optional t:), got:\n{on_disk}\n\
              A bare-hash overwrite anywhere in the dev path would fail here."
         );
+        if cfg!(any(unix, windows)) {
+            assert!(
+                lines[11].starts_with("t:"),
+                "line 12 must record verified descriptor stamps, got {:?}",
+                lines[11]
+            );
+        }
         assert_eq!(lines[0].len(), 64, "line 1 must be a SHA-256 hex hash");
         assert!(
             lines[1].starts_with("m:"),

@@ -142,7 +142,7 @@ impl LinkerCli {
 // the CLI flag — the rest of the chain is handled inside install.
 
 #[derive(Subcommand)]
-#[command(allow_external_subcommands = true)]
+#[command(defer = true, allow_external_subcommands = true)]
 pub(crate) enum Commands {
     /// Show package information.
     Info(registry::InfoArgs),
@@ -198,14 +198,14 @@ pub(crate) enum Commands {
     /// flag refreshes lockfile/store state but does NOT rewrite the
     /// existing range — your "zod": "~4.3.6" stays put.
     #[command(visible_alias = "i", verbatim_doc_comment)]
-    Install(lifecycle::InstallArgs),
+    Install(Box<lifecycle::InstallArgs>),
 
     /// Remove packages from dependencies and node_modules.
     #[command(visible_aliases = ["un", "unlink"])]
-    Uninstall(lifecycle::UninstallArgs),
+    Uninstall(Box<lifecycle::UninstallArgs>),
 
     /// Add source files from a package into your project (shadcn-style).
-    Add(lifecycle::AddArgs),
+    Add(Box<lifecycle::AddArgs>),
 
     /// Publish a package to the LPM registry.
     #[command(visible_alias = "p")]
@@ -224,7 +224,7 @@ pub(crate) enum Commands {
     Version(registry::VersionArgs),
 
     /// Plan, apply, or publish a workspace release.
-    Release(release::ReleaseArgs),
+    Release(Box<release::ReleaseArgs>),
 
     /// Stage packages for npm publishing.
     Stage(registry::StageArgs),
@@ -407,7 +407,7 @@ pub(crate) enum Commands {
     Env(network::EnvArgs),
 
     /// Run script(s) from package.json.
-    Run(network::RunArgs),
+    Run(Box<network::RunArgs>),
 
     /// Run a project-local binary from node_modules/.bin.
     Exec(network::ExecArgs),
@@ -447,7 +447,7 @@ pub(crate) enum Commands {
     /// FROM node:20-alpine
     /// COPY --from=pruned /prod/api /app
     /// ```
-    Deploy(lifecycle::DeployArgs),
+    Deploy(Box<lifecycle::DeployArgs>),
 
     /// Review and approve packages whose lifecycle scripts were blocked by
     /// LPM's default-deny security posture.
@@ -518,19 +518,19 @@ pub(crate) enum Commands {
     Plugin(build::PluginArgs),
 
     /// Lint source files (powered by Oxlint, lazy-downloaded on first use).
-    Lint(build::LintArgs),
+    Lint(Box<build::LintArgs>),
 
     /// Format source files (powered by Biome, lazy-downloaded on first use).
-    Fmt(build::FmtArgs),
+    Fmt(Box<build::FmtArgs>),
 
     /// Type-check the project (runs tsc --noEmit by default).
-    Check(build::CheckArgs),
+    Check(Box<build::CheckArgs>),
 
     /// Bundle the project with Rolldown through an LPM-owned command surface.
-    Bundle(build::BundleArgs),
+    Bundle(Box<build::BundleArgs>),
 
     /// Build package-oriented library output through a stable LPM command surface.
-    Pack(build::PackArgs),
+    Pack(Box<build::PackArgs>),
 
     /// Run tests (auto-detects vitest/jest/mocha).
     ///
@@ -539,22 +539,22 @@ pub(crate) enum Commands {
     /// forwarded to the per-member runner. To pass `--all` / `--filter` etc.
     /// to the runner itself (e.g. bun's `--filter`), prefix with `--`:
     /// `lpm test -- --filter pattern`.
-    Test(build::TestArgs),
+    Test(Box<build::TestArgs>),
 
     /// Run benchmarks (auto-detects vitest bench).
     ///
     /// Workspace flags behave the same as `lpm test`. To forward `--all`
     /// / `--filter` etc. to the bench runner itself, prefix with `--`.
-    Bench(build::BenchArgs),
+    Bench(Box<build::BenchArgs>),
 
     /// Frozen install for CI.
-    Ci(build::CiArgs),
+    Ci(Box<build::CiArgs>),
 
     /// Start the dev server with optional HTTPS, tunnel, and network features.
     ///
     /// Auto-detects features from lpm.json: tunnel.domain enables --tunnel,
     /// services enables orchestrator. Dependencies auto-installed if stale.
-    Dev(build::DevArgs),
+    Dev(Box<build::DevArgs>),
 
     /// Manage local HTTPS certificates (status, trust, uninstall, generate, rotate, reconcile).
     Cert(security::CertArgs),
@@ -587,7 +587,7 @@ pub(crate) enum Commands {
     ///   lpm tunnel inspect                    — show captured webhooks
     ///   lpm tunnel replay 3                   — replay webhook #3
     ///   lpm tunnel log                        — browse webhook event log
-    Tunnel(network::TunnelArgs),
+    Tunnel(Box<network::TunnelArgs>),
 
     /// Migrate from npm/yarn/pnpm/bun to LPM.
     Migrate(lifecycle::MigrateArgs),

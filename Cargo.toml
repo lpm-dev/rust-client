@@ -100,7 +100,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io", "io-util"] }
 
 # HTTP
-reqwest = { version = "0.13", features = ["json", "query", "rustls", "stream", "blocking", "http2", "gzip", "brotli", "zstd"], default-features = false }
+reqwest = { version = "0.13", features = ["json", "query", "rustls", "stream", "http2", "gzip", "brotli", "zstd"], default-features = false }
 webpki-root-certs = "1.0.11"
 httpdate = "1"
 axum = { version = "0.8", features = ["json"] }
@@ -142,8 +142,8 @@ clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 cvss = "3"
 
-# Error display
-miette = { version = "7", features = ["fancy"] }
+# Error display (derive-only; CLI renders errors directly without miette's fancy handler)
+miette = { version = "7", default-features = false, features = ["derive"] }
 
 # Terminal
 owo-colors = "4"
@@ -231,11 +231,25 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+# Unwinding is kept intentionally: oxc_parser/lpm-security rely on resume_unwind
+# for stack-exhaustion containment, TUI/raw-mode Drop guards restore terminal
+# state on panic, lpm-env-ffi catches panics across its C ABI boundary, and
+# Tokio/rayon tasks remain isolated instead of aborting the whole process.
+panic = "unwind"
 
 [profile.release.package.axum]
 opt-level = "z"
 
+[profile.release.package.axum-core]
+opt-level = "z"
+
+[profile.release.package.clap_builder]
+opt-level = "z"
+
 [profile.release.package.clap_complete]
+opt-level = "z"
+
+[profile.release.package.clap_lex]
 opt-level = "z"
 
 [profile.release.package.cliclack]
@@ -244,7 +258,34 @@ opt-level = "z"
 [profile.release.package.jsonschema]
 opt-level = "z"
 
+[profile.release.package.jsonschema-regex]
+opt-level = "z"
+
+[profile.release.package.jsonschema-value]
+opt-level = "z"
+
+[profile.release.package.libsqlite3-sys]
+opt-level = "z"
+
+[profile.release.package.lpm-cert]
+opt-level = "z"
+
 [profile.release.package.lpm-dashboard]
+opt-level = "z"
+
+[profile.release.package.lpm-env-backup]
+opt-level = "z"
+
+[profile.release.package.lpm-env-codegen]
+opt-level = "z"
+
+[profile.release.package.lpm-env-companion]
+opt-level = "z"
+
+[profile.release.package.lpm-env-source]
+opt-level = "z"
+
+[profile.release.package.lpm-global]
 opt-level = "z"
 
 [profile.release.package.lpm-inspect]
@@ -253,13 +294,52 @@ opt-level = "z"
 [profile.release.package.lpm-migrate]
 opt-level = "z"
 
+[profile.release.package.lpm-network]
+opt-level = "z"
+
+[profile.release.package.lpm-plugin]
+opt-level = "z"
+
+[profile.release.package.lpm-proxy]
+opt-level = "z"
+
+[profile.release.package.lpm-skill]
+opt-level = "z"
+
+[profile.release.package.lpm-triage-advisor]
+opt-level = "z"
+
+[profile.release.package.lpm-tunnel]
+opt-level = "z"
+
+[profile.release.package.lpm-vault]
+opt-level = "z"
+
 [profile.release.package.miette]
 opt-level = "z"
 
 [profile.release.package.ratatui]
 opt-level = "z"
 
+[profile.release.package.ratatui-core]
+opt-level = "z"
+
+[profile.release.package.ratatui-crossterm]
+opt-level = "z"
+
+[profile.release.package.ratatui-termina]
+opt-level = "z"
+
+[profile.release.package.ratatui-termwiz]
+opt-level = "z"
+
+[profile.release.package.ratatui-widgets]
+opt-level = "z"
+
 [profile.release.package.rmcp]
+opt-level = "z"
+
+[profile.release.package.rusqlite]
 opt-level = "z"
 
 [profile.release.package.schemars]

@@ -47,6 +47,7 @@ mod url_gate;
 
 pub use self::auth::AuthPosture;
 pub use self::body::parse_capped_api_json;
+pub use self::cache::ensure_private_metadata_cache_dir;
 pub use self::firewall::{
     NpmFirewallAction, NpmFirewallBatchPackage, NpmFirewallBatchResponse,
     NpmFirewallCacheDirective, NpmFirewallClientTiming, NpmFirewallDecision,

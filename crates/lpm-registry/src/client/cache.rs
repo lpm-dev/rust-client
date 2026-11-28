@@ -64,7 +64,7 @@ impl MetadataCacheDirective {
     }
 }
 
-pub(super) fn ensure_private_metadata_cache_dir(path: &std::path::Path) -> std::io::Result<()> {
+pub fn ensure_private_metadata_cache_dir(path: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)?;
     #[cfg(unix)]
     {

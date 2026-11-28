@@ -72,6 +72,227 @@ fn env_error(error: LpmError) -> LpmError {
     }
 }
 
+/// Run purely local `lpm env` subcommands synchronously without constructing a
+/// Tokio runtime or registry client. Returns `None` when the action requires
+/// network / remote registry access.
+pub fn try_run_local_sync(
+    resolve_project_dir: impl FnOnce() -> Result<std::path::PathBuf, LpmError>,
+    extra: &[String],
+    json_output: bool,
+) -> Option<Result<(), LpmError>> {
+    let args: Vec<&str> = extra.iter().map(String::as_str).collect();
+    if args.is_empty() {
+        return Some(
+            resolve_project_dir()
+                .and_then(|project_dir| {
+                    links::ensure_folder_linked(&project_dir, json_output)
+                        .and_then(|()| local::env_list(None, false, &project_dir, json_output))
+                })
+                .map_err(env_error),
+        );
+    }
+    if !arguments::is_local_sync_subcommand(&args) {
+        return None;
+    }
+    if arguments::try_display_help(&args) {
+        return Some(Ok(()));
+    }
+    // Resolve the project root BEFORE `arguments::parse` prints any JSON/clap
+    // diagnostic so a disallowed directory (such as LPM_HOME) emits a single
+    // error envelope rather than both a clap error and a project-root error.
+    let project_dir = match resolve_project_dir() {
+        Ok(dir) => dir,
+        Err(error) => return Some(Err(env_error(error))),
+    };
+    let parsed = match arguments::parse(&args, json_output) {
+        Ok(Some(action)) => action,
+        Ok(None) => return None,
+        Err(error) => return Some(Err(env_error(error))),
+    };
+    Some(run_local_sync_action(parsed, &project_dir, json_output).map_err(env_error))
+}
+
+fn run_local_sync_action(
+    action: arguments::LocalAction,
+    project_dir: &std::path::Path,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    use arguments::LocalAction;
+    if action.uses_project_values() {
+        links::ensure_folder_linked(project_dir, json_output)?;
+    }
+    let result = match action {
+        LocalAction::Set {
+            environment,
+            assignments,
+        } => local::env_set(
+            environment.env.as_deref(),
+            &assignments,
+            project_dir,
+            json_output,
+        ),
+        LocalAction::Get {
+            environment,
+            key,
+            reveal,
+        } => local::env_get(
+            environment.env.as_deref(),
+            &key,
+            reveal,
+            project_dir,
+            json_output,
+        ),
+        LocalAction::List {
+            environment,
+            reveal,
+        } => local::env_list(environment.env.as_deref(), reveal, project_dir, json_output),
+        LocalAction::Delete { environment, keys } => {
+            local::env_delete(environment.env.as_deref(), &keys, project_dir, json_output)
+        }
+        LocalAction::Import {
+            environment,
+            file,
+            overwrite,
+        } => local::env_import(
+            environment.env.as_deref(),
+            &file,
+            overwrite,
+            project_dir,
+            json_output,
+        ),
+        LocalAction::Export {
+            environment,
+            file,
+            ci,
+        } => local::env_export(
+            environment.env.as_deref(),
+            &file,
+            ci,
+            project_dir,
+            json_output,
+        ),
+        LocalAction::Print {
+            environment,
+            scope,
+            format,
+            schema_only,
+            client_only,
+            ci,
+        } => schema::vars_print(
+            environment.env.as_deref(),
+            format,
+            schema_only,
+            client_only,
+            ci,
+            &scope,
+            project_dir,
+            json_output,
+        ),
+        LocalAction::Example { environment } => {
+            schema::vars_example(project_dir, environment.env.as_deref(), json_output)
+        }
+        LocalAction::Check { environment, scope } => {
+            schema::vars_check(project_dir, environment.env.as_deref(), &scope, json_output)
+        }
+        LocalAction::Validate { strict } => schema::vars_validate(project_dir, strict, json_output),
+        LocalAction::Schema => schema::schema_definition(project_dir, json_output),
+        LocalAction::Generate {
+            environment,
+            scope,
+            out_dir,
+            adapter,
+            check,
+        } => {
+            let out_dir = match out_dir {
+                Some(typed) => crate::project_fs::project_relative_path(
+                    &std::env::current_dir().map_err(LpmError::Io)?,
+                    project_dir,
+                    &typed,
+                ),
+                None => std::path::PathBuf::from(generate::DEFAULT_OUT_DIR),
+            };
+            generate::run(
+                project_dir,
+                environment.env.as_deref(),
+                &scope,
+                &out_dir,
+                adapter,
+                check,
+                json_output,
+            )
+        }
+        LocalAction::Init { force } => inventory::vars_init(project_dir, force, json_output),
+        LocalAction::Repair { yes } => repair::env_repair(project_dir, yes, json_output),
+        #[cfg(debug_assertions)]
+        LocalAction::DebugCompanion {
+            state,
+            environment,
+            set,
+            unset,
+        } => debug_companion::plant(
+            project_dir,
+            &state,
+            environment.env.as_deref(),
+            &set,
+            &unset,
+            json_output,
+        ),
+        LocalAction::History {
+            action,
+            key,
+            environment,
+            source,
+            limit,
+            reveal,
+        } => history::env_history(
+            action,
+            history::ListArgs {
+                key: key.as_deref(),
+                environment: environment.env.as_deref(),
+                source,
+                limit,
+                reveal,
+            },
+            project_dir,
+            json_output,
+        ),
+        LocalAction::Rollback {
+            to,
+            before,
+            undo,
+            environment,
+            keys,
+            yes,
+        } => history::env_rollback(
+            &history::RollbackArgs {
+                to: to.as_deref(),
+                before: before.as_deref(),
+                undo: undo.as_deref(),
+                environment: environment.env.as_deref(),
+                keys: &keys,
+                yes,
+            },
+            project_dir,
+            json_output,
+        ),
+        LocalAction::Ls => inventory::vars_ls(project_dir, json_output),
+        LocalAction::Link { yes } => links::env_link(project_dir, yes, json_output),
+        LocalAction::Unlink { folder } => {
+            links::env_unlink(project_dir, folder.as_deref(), json_output)
+        }
+        LocalAction::Links => links::env_links(project_dir, json_output),
+        LocalAction::Copy {
+            source,
+            target,
+            overwrite,
+        } => inventory::vars_copy(project_dir, &source, &target, overwrite, json_output),
+        LocalAction::Log | LocalAction::Unpair | LocalAction::Diff { .. } => {
+            unreachable!("remote actions are handled by run_action")
+        }
+    };
+    reported(result)
+}
+
 async fn run_action(
     client: &RegistryClient,
     project_dir: &std::path::Path,
@@ -85,184 +306,29 @@ async fn run_action(
     }
     if let Some(action) = arguments::parse(&args, json_output)? {
         use arguments::LocalAction;
-        if action.uses_project_values() {
-            links::ensure_folder_linked(project_dir, json_output)?;
-        }
-        let result = match action {
-            LocalAction::Set {
-                environment,
-                assignments,
-            } => local::env_set(
-                environment.env.as_deref(),
-                &assignments,
-                project_dir,
-                json_output,
-            ),
-            LocalAction::Get {
-                environment,
-                key,
-                reveal,
-            } => local::env_get(
-                environment.env.as_deref(),
-                &key,
-                reveal,
-                project_dir,
-                json_output,
-            ),
-            LocalAction::List {
-                environment,
-                reveal,
-            } => local::env_list(environment.env.as_deref(), reveal, project_dir, json_output),
-            LocalAction::Delete { environment, keys } => {
-                local::env_delete(environment.env.as_deref(), &keys, project_dir, json_output)
+        match action {
+            LocalAction::Log => {
+                if action.uses_project_values() {
+                    links::ensure_folder_linked(project_dir, json_output)?;
+                }
+                return reported(remote::env_log(client, project_dir, json_output).await);
             }
-            LocalAction::Import {
-                environment,
-                file,
-                overwrite,
-            } => local::env_import(
-                environment.env.as_deref(),
-                &file,
-                overwrite,
-                project_dir,
-                json_output,
-            ),
-            LocalAction::Export {
-                environment,
-                file,
-                ci,
-            } => local::env_export(
-                environment.env.as_deref(),
-                &file,
-                ci,
-                project_dir,
-                json_output,
-            ),
-            LocalAction::Print {
-                environment,
-                scope,
-                format,
-                schema_only,
-                client_only,
-                ci,
-            } => schema::vars_print(
-                environment.env.as_deref(),
-                format,
-                schema_only,
-                client_only,
-                ci,
-                &scope,
-                project_dir,
-                json_output,
-            ),
-            LocalAction::Example { environment } => {
-                schema::vars_example(project_dir, environment.env.as_deref(), json_output)
+            LocalAction::Unpair => {
+                return reported(pairing::env_unpair(client, json_output).await);
             }
-            LocalAction::Check { environment, scope } => {
-                schema::vars_check(project_dir, environment.env.as_deref(), &scope, json_output)
-            }
-            LocalAction::Validate { strict } => {
-                schema::vars_validate(project_dir, strict, json_output)
-            }
-            LocalAction::Schema => schema::schema_definition(project_dir, json_output),
-            LocalAction::Generate {
-                environment,
-                scope,
-                out_dir,
-                adapter,
-                check,
-            } => {
-                let out_dir = match out_dir {
-                    Some(typed) => crate::project_fs::project_relative_path(
-                        &std::env::current_dir().map_err(LpmError::Io)?,
-                        project_dir,
-                        &typed,
-                    ),
-                    None => std::path::PathBuf::from(generate::DEFAULT_OUT_DIR),
-                };
-                generate::run(
-                    project_dir,
-                    environment.env.as_deref(),
-                    &scope,
-                    &out_dir,
-                    adapter,
-                    check,
-                    json_output,
-                )
-            }
-            LocalAction::Init { force } => inventory::vars_init(project_dir, force, json_output),
-            LocalAction::Repair { yes } => repair::env_repair(project_dir, yes, json_output),
-            #[cfg(debug_assertions)]
-            LocalAction::DebugCompanion {
-                state,
-                environment,
-                set,
-                unset,
-            } => debug_companion::plant(
-                project_dir,
-                &state,
-                environment.env.as_deref(),
-                &set,
-                &unset,
-                json_output,
-            ),
-            LocalAction::History {
-                action,
-                key,
-                environment,
-                source,
-                limit,
-                reveal,
-            } => history::env_history(
-                action,
-                history::ListArgs {
-                    key: key.as_deref(),
-                    environment: environment.env.as_deref(),
-                    source,
-                    limit,
-                    reveal,
-                },
-                project_dir,
-                json_output,
-            ),
-            LocalAction::Rollback {
-                to,
-                before,
-                undo,
-                environment,
-                keys,
-                yes,
-            } => history::env_rollback(
-                &history::RollbackArgs {
-                    to: to.as_deref(),
-                    before: before.as_deref(),
-                    undo: undo.as_deref(),
-                    environment: environment.env.as_deref(),
-                    keys: &keys,
-                    yes,
-                },
-                project_dir,
-                json_output,
-            ),
-            LocalAction::Ls => inventory::vars_ls(project_dir, json_output),
-            LocalAction::Link { yes } => links::env_link(project_dir, yes, json_output),
-            LocalAction::Unlink { folder } => {
-                links::env_unlink(project_dir, folder.as_deref(), json_output)
-            }
-            LocalAction::Links => links::env_links(project_dir, json_output),
-            LocalAction::Log => remote::env_log(client, project_dir, json_output).await,
-            LocalAction::Unpair => pairing::env_unpair(client, json_output).await,
-            LocalAction::Diff { environments } => {
+            LocalAction::Diff { ref environments } => {
+                if action.uses_project_values() {
+                    links::ensure_folder_linked(project_dir, json_output)?;
+                }
                 let environments: Vec<&str> = environments.iter().map(String::as_str).collect();
-                remote::vars_diff(client, &environments, project_dir, json_output).await
+                return reported(
+                    remote::vars_diff(client, &environments, project_dir, json_output).await,
+                );
             }
-            LocalAction::Copy {
-                source,
-                target,
-                overwrite,
-            } => inventory::vars_copy(project_dir, &source, &target, overwrite, json_output),
-        };
-        return reported(result);
+            local_action => {
+                return run_local_sync_action(local_action, project_dir, json_output);
+            }
+        }
     }
 
     let result = match args[0] {
@@ -362,6 +428,24 @@ mod tests {
         assert_eq!(
             count, 0,
             "found {count} env control-plane call(s) that still accept non-session tokens"
+        );
+    }
+
+    #[test]
+    fn help_token_as_option_value_does_not_bypass_project_dir_validation() {
+        let args = vec![
+            "list".to_string(),
+            "--env".to_string(),
+            "--help".to_string(),
+        ];
+        let result = super::try_run_local_sync(
+            || Err(super::LpmError::Env("disallowed LPM_HOME".into())),
+            &args,
+            false,
+        );
+        assert!(
+            matches!(result, Some(Err(super::LpmError::Env(ref msg))) if msg == "disallowed LPM_HOME"),
+            "non-help invocation containing `--help` as an option value must not swallow action or bypass project-dir check: {result:?}"
         );
     }
 }

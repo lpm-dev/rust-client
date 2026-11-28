@@ -960,6 +960,29 @@ pub fn run_script_with_envs_and_config(
     bin_hint: &ManagedRuntimeHint,
     config: Option<&lpm_json::LpmJsonConfig>,
 ) -> Result<(), LpmError> {
+    run_script_with_envs_config_and_package(
+        project_dir,
+        script_name,
+        extra_args,
+        env_mode,
+        extra_envs,
+        bin_hint,
+        config,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_script_with_envs_config_and_package(
+    project_dir: &Path,
+    script_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    extra_envs: &[(String, String)],
+    bin_hint: &ManagedRuntimeHint,
+    config: Option<&lpm_json::LpmJsonConfig>,
+    package: Option<&lpm_workspace::PackageJson>,
+) -> Result<(), LpmError> {
     let validate_schema = !should_skip_env_validation();
     let validator = config
         .filter(|_| validate_schema)
@@ -969,10 +992,11 @@ pub fn run_script_with_envs_and_config(
         command: script_cmd,
         scripts,
         context,
-    } = resolve_script_command_with_config(
+    } = resolve_script_command_with_config_and_package(
         project_dir,
         script_name,
         config,
+        package,
         ScriptPreference::PackageScript,
     )?;
 
@@ -2602,21 +2626,43 @@ fn resolve_script_command_with_config(
     lpm_config: Option<&lpm_json::LpmJsonConfig>,
     preference: ScriptPreference,
 ) -> Result<ResolvedScript, LpmError> {
-    let pkg_json_path = project_dir.join("package.json");
+    resolve_script_command_with_config_and_package(
+        project_dir,
+        script_name,
+        lpm_config,
+        None,
+        preference,
+    )
+}
 
-    let package = match read_package_json(&pkg_json_path) {
-        Ok(package) => Some(package),
-        Err(lpm_workspace::WorkspaceError::NotFound(_)) => None,
-        Err(error) => {
-            return Err(LpmError::Script(format!(
-                "failed to read package.json: {error}"
-            )));
+fn resolve_script_command_with_config_and_package(
+    project_dir: &Path,
+    script_name: &str,
+    lpm_config: Option<&lpm_json::LpmJsonConfig>,
+    preloaded_package: Option<&lpm_workspace::PackageJson>,
+    preference: ScriptPreference,
+) -> Result<ResolvedScript, LpmError> {
+    let owned_package;
+    let package: Option<&lpm_workspace::PackageJson> = match preloaded_package {
+        Some(pkg) => Some(pkg),
+        None => {
+            let pkg_json_path = project_dir.join("package.json");
+            owned_package = match read_package_json(&pkg_json_path) {
+                Ok(package) => Some(package),
+                Err(lpm_workspace::WorkspaceError::NotFound(_)) => None,
+                Err(error) => {
+                    return Err(LpmError::Script(format!(
+                        "failed to read package.json: {error}"
+                    )));
+                }
+            };
+            owned_package.as_ref()
         }
     };
 
     let context = NpmScriptContext::new(
-        package.as_ref().and_then(|pkg| pkg.name.as_deref()),
-        package.as_ref().and_then(|pkg| pkg.version.as_deref()),
+        package.and_then(|pkg| pkg.name.as_deref()),
+        package.and_then(|pkg| pkg.version.as_deref()),
         project_dir,
         &std::env::current_dir()?,
     );
@@ -2626,7 +2672,7 @@ fn resolve_script_command_with_config(
         .and_then(|task| task.command.as_ref());
 
     if (preference == ScriptPreference::PackageScript || task_command.is_none())
-        && let Some(pkg) = &package
+        && let Some(pkg) = package
         && let Some(command) = pkg.scripts.get(script_name)
     {
         return Ok(ResolvedScript {
@@ -2751,6 +2797,28 @@ fn script_not_found_error(script_name: &str, scripts: &HashMap<String, String>) 
         "script '{script_name}' not found. Available: {}",
         available.join(", ")
     ))
+}
+
+/// Execute a package script using the configuration and manifest snapshot retained by the caller.
+pub fn run_script_with_config_and_package(
+    project_dir: &Path,
+    name: &str,
+    args: &[String],
+    mode: Option<&str>,
+    hint: &ManagedRuntimeHint,
+    config: Option<&lpm_json::LpmJsonConfig>,
+    package: Option<&lpm_workspace::PackageJson>,
+) -> Result<(), LpmError> {
+    run_script_with_envs_config_and_package(
+        project_dir,
+        name,
+        args,
+        mode,
+        &[],
+        hint,
+        config,
+        package,
+    )
 }
 
 /// Execute a package script using the configuration snapshot retained by the caller.

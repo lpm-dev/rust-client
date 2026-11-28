@@ -240,9 +240,13 @@ optional = true
 version = "0.12"
 optional = true
 
+[build-dependencies]
+flate2 = { workspace = true }
+
 [dev-dependencies]
 # Disk images the macOS deploy tests attach.
 lpm-common = { workspace = true, features = ["test-support"] }
+reqwest = { workspace = true, features = ["blocking"] }
 # Paused clocks for the publication wait's deadline tests.
 tokio = { workspace = true, features = ["test-util"] }
 wiremock = "0.6"

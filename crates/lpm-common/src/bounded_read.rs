@@ -294,6 +294,162 @@ pub fn current_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// A cross-platform persistent file identity (volume + 128-bit file number)
+/// that remains unique on Unix, NTFS, and ReFS volumes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct FileIdentity {
+    pub volume: u64,
+    pub file_id: u128,
+}
+
+impl FileIdentity {
+    /// Read the persistent file identity from an already-open file descriptor or handle.
+    pub fn from_open_file(file: &std::fs::File) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            let metadata = file.metadata()?;
+            Ok(Self::from_unix_metadata(&metadata))
+        }
+        #[cfg(windows)]
+        {
+            windows_file_identity_from_open_file(file)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = file;
+            Ok(Self {
+                volume: 0,
+                file_id: 0,
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    #[inline]
+    pub fn from_unix_metadata(metadata: &Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+
+        Self {
+            volume: metadata.dev(),
+            file_id: u128::from(metadata.ino()),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowsFileStamp {
+    pub len: u64,
+    pub mtime_ns: u64,
+    pub ctime_ns: u64,
+    pub identity: FileIdentity,
+}
+
+#[cfg(windows)]
+fn windows_file_identity_from_open_file(file: &std::fs::File) -> io::Result<FileIdentity> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: `file` holds a live handle and `info` is valid writable storage for `FILE_ID_INFO`.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            (&raw mut info).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if ok != 0 {
+        return Ok(FileIdentity {
+            volume: info.VolumeSerialNumber,
+            file_id: u128::from_le_bytes(info.FileId.Identifier),
+        });
+    }
+    let error = io::Error::last_os_error();
+    let code = error.raw_os_error().map(|raw| raw as u32);
+    if !matches!(
+        code,
+        Some(ERROR_INVALID_FUNCTION | ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED)
+    ) {
+        return Err(error);
+    }
+    let legacy = handle_information(file)?;
+    let index = (u64::from(legacy.nFileIndexHigh) << 32) | u64::from(legacy.nFileIndexLow);
+    Ok(FileIdentity {
+        volume: u64::from(legacy.dwVolumeSerialNumber),
+        file_id: u128::from(index),
+    })
+}
+
+#[cfg(windows)]
+fn windows_100ns_to_unix_ns(ticks_since_1601: i64) -> Option<u64> {
+    const WINDOWS_TO_UNIX_EPOCH_100NS: i64 = 116_444_736_000_000_000;
+    let unix_100ns = ticks_since_1601.checked_sub(WINDOWS_TO_UNIX_EPOCH_100NS)?;
+    u64::try_from(unix_100ns).ok()?.checked_mul(100)
+}
+
+#[cfg(windows)]
+pub fn windows_regular_file_stamp_from_open_file(file: &std::fs::File) -> Option<WindowsFileStamp> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO, FileBasicInfo,
+        GetFileInformationByHandleEx,
+    };
+
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let mut basic = FILE_BASIC_INFO::default();
+    // SAFETY: `file` holds a live handle and `basic` is valid writable storage for `FILE_BASIC_INFO`.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            (&raw mut basic).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        return None;
+    }
+    if basic.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return None;
+    }
+    let mtime_ns = windows_100ns_to_unix_ns(basic.LastWriteTime)?;
+    let ctime_ns = windows_100ns_to_unix_ns(basic.ChangeTime)?;
+    let identity = windows_file_identity_from_open_file(file).ok()?;
+    Some(WindowsFileStamp {
+        len: metadata.len(),
+        mtime_ns,
+        ctime_ns,
+        identity,
+    })
+}
+
+#[cfg(windows)]
+pub fn windows_regular_file_stamp_from_path(path: &Path) -> Option<WindowsFileStamp> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .ok()?;
+    windows_regular_file_stamp_from_open_file(&file)
+}
+
 /// How many names the open file has, as hard links, on Unix and on Windows,
 /// where the standard library doesn't say.
 pub fn link_count(file: &std::fs::File) -> io::Result<u64> {
@@ -459,7 +615,9 @@ pub fn permissions_are_owner_only(permissions: &std::fs::Permissions) -> bool {
     permissions.mode() & 0o077 == 0
 }
 
-fn read_opened_file_capped<R: Read>(
+/// Read at most `limit + 1` bytes from an already-open reader, returning
+/// [`BoundedReadError::TooLarge`] if the stream exceeds `limit`.
+pub fn read_opened_file_capped<R: Read>(
     reader: &mut R,
     path: &Path,
     limit: u64,

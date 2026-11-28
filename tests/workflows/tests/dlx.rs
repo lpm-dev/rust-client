@@ -1663,3 +1663,29 @@ async fn dlx_never_fetches_package_skills_for_its_throwaway_install() {
     assert_dlx_success(&output);
     assert!(!dlx_entry(&project).join(".lpm/skills").exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn lpx_symlink_prints_version_for_bare_version_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let lpx_path = dir.path().join("lpx");
+    std::os::unix::fs::symlink(support::lpm_binary(), &lpx_path).unwrap();
+
+    for flag in ["--version", "-V", "-v"] {
+        let output = std::process::Command::new(&lpx_path)
+            .arg(flag)
+            .output()
+            .expect("failed to execute lpx symlink");
+        assert!(
+            output.status.success(),
+            "lpx {flag} should succeed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.trim().starts_with("lpm "),
+            "lpx {flag} should print lpm version, got: {stdout:?}"
+        );
+    }
+}

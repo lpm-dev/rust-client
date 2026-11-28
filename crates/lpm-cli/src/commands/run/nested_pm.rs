@@ -159,17 +159,16 @@ fn ensure_shim_dir(lpm: &Path, managers: &[&str]) -> Result<PathBuf, LpmError> {
         .cache_root()
         .join("nested-pm")
         .join(key);
-    std::fs::create_dir_all(&dir)?;
     let marker = dir.join(SHIM_MARKER);
-    if !marker.is_file() {
-        lpm_common::write_file_atomic(&marker, b"LPM package-manager shims\n")?;
+    let marker_is_regular = std::fs::symlink_metadata(&marker).is_ok_and(|meta| meta.is_file());
+    if marker_is_regular && shim_dir_is_warm(&dir, lpm, managers) {
+        return Ok(dir);
     }
+    std::fs::create_dir_all(&dir)?;
     for manager in managers {
         let target = dir.join(shim_file_name(manager));
         let content = shim_script(lpm, manager);
-        if lpm_common::read_file_capped(&target, MAX_SHIM_BYTES)
-            .is_ok_and(|existing| existing == content)
-        {
+        if shim_file_is_valid(&target, &content) {
             continue;
         }
         lpm_common::write_file_atomic_with_options(
@@ -185,7 +184,55 @@ fn ensure_shim_dir(lpm: &Path, managers: &[&str]) -> Result<PathBuf, LpmError> {
             ensure_launcher(lpm, &dir.join(format!("{manager}.exe")))?;
         }
     }
+    if !marker_is_regular {
+        lpm_common::write_file_atomic(&marker, b"LPM package-manager shims\n")?;
+    }
     Ok(dir)
+}
+
+fn shim_file_is_valid(target: &Path, expected: &[u8]) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(target) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() != expected.len() as u64 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if meta.permissions().mode() & 0o100 == 0 {
+            return false;
+        }
+    }
+    lpm_common::read_file_capped(target, MAX_SHIM_BYTES).is_ok_and(|existing| existing == expected)
+}
+
+fn shim_dir_is_warm(dir: &Path, lpm: &Path, managers: &[&str]) -> bool {
+    for manager in managers {
+        let target = dir.join(shim_file_name(manager));
+        let expected = shim_script(lpm, manager);
+        if !shim_file_is_valid(&target, &expected) {
+            return false;
+        }
+    }
+    #[cfg(windows)]
+    {
+        let record = dir.join(LPM_BINARY_RECORD);
+        let expected_record = encode_path(lpm);
+        if !std::fs::symlink_metadata(&record)
+            .is_ok_and(|meta| meta.is_file() && meta.len() == expected_record.len() as u64)
+            || !lpm_common::read_file_capped(&record, MAX_SHIM_BYTES)
+                .is_ok_and(|existing| existing == expected_record)
+        {
+            return false;
+        }
+        for manager in managers {
+            if !launcher_in_place(&dir.join(format!("{manager}.exe"))).is_ok_and(|ok| ok) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 #[cfg(any(windows, test))]
@@ -317,7 +364,22 @@ pub(crate) fn launcher_manager(exe: &Path) -> Option<&'static str> {
 
 /// Run a shimmed command and exit with its status.
 pub(crate) fn exit_with_shim(manager: &str, args: Vec<OsString>) -> ! {
-    let code = match run_shim(manager, args) {
+    let result = match prepare_shim_command(manager, args) {
+        Ok(mut command) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt as _;
+                let error = command.exec();
+                Err(LpmError::Io(error))
+            }
+            #[cfg(not(unix))]
+            {
+                execute_shim_command(&mut command)
+            }
+        }
+        Err(error) => Err(error),
+    };
+    let code = match result {
         Ok(()) => 0,
         Err(LpmError::ExitCode(code)) => code,
         Err(error) => {
@@ -990,8 +1052,18 @@ fn append_log(path: &Path, entry: &LogEntry) {
     }
 }
 
-/// Entry point of the hidden `internal-nested-pm` command the shims call.
-pub(crate) fn run_shim(manager: &str, args: Vec<OsString>) -> Result<(), LpmError> {
+#[cfg(not(unix))]
+fn execute_shim_command(command: &mut Command) -> Result<(), LpmError> {
+    let signals = lpm_runner::execution::ExecutionSignals::new()?;
+    let status = signals.run(command)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(LpmError::ExitCode(lpm_runner::shell::exit_code(&status)))
+    }
+}
+
+fn prepare_shim_command(manager: &str, args: Vec<OsString>) -> Result<Command, LpmError> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let cwd = std::env::current_dir()?;
     let text_args: Option<Vec<String>> = args
@@ -1035,7 +1107,7 @@ pub(crate) fn run_shim(manager: &str, args: Vec<OsString>) -> Result<(), LpmErro
             },
         );
     }
-    let mut command = match plan {
+    let command = match plan {
         Plan::Lpm { args, dir } => {
             let mut command = Command::new(lpm_binary_for(std::env::current_exe()?)?);
             command
@@ -1057,13 +1129,7 @@ pub(crate) fn run_shim(manager: &str, args: Vec<OsString>) -> Result<(), LpmErro
             command
         }
     };
-    let signals = lpm_runner::execution::ExecutionSignals::new()?;
-    let status = signals.run(&mut command)?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(LpmError::ExitCode(lpm_runner::shell::exit_code(&status)))
-    }
+    Ok(command)
 }
 
 fn path_without_shims(path: &OsStr) -> Result<OsString, LpmError> {
@@ -2018,5 +2084,47 @@ mod tests {
                 truncated: false,
             }
         );
+    }
+
+    #[test]
+    fn ensure_shim_dir_restores_same_length_tampered_shim() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::ScopedEnv::set([
+            ("LPM_HOME", home.path().as_os_str().to_owned()),
+            ("HOME", home.path().as_os_str().to_owned()),
+        ]);
+        let fake_lpm = home.path().join("bin/lpm");
+        std::fs::create_dir_all(fake_lpm.parent().unwrap()).unwrap();
+        std::fs::write(&fake_lpm, b"lpm-stub").unwrap();
+
+        let dir = ensure_shim_dir(&fake_lpm, &["npm"]).unwrap();
+        let shim_path = dir.join(shim_file_name("npm"));
+        let expected = shim_script(&fake_lpm, "npm");
+        assert_eq!(std::fs::read(&shim_path).unwrap(), expected);
+
+        let mut tampered = expected.clone();
+        tampered[0] = if tampered[0] == b'#' { b'X' } else { b'#' };
+        assert_eq!(tampered.len(), expected.len());
+        std::fs::write(&shim_path, &tampered).unwrap();
+        assert!(!shim_dir_is_warm(&dir, &fake_lpm, &["npm"]));
+
+        ensure_shim_dir(&fake_lpm, &["npm"]).unwrap();
+        assert_eq!(std::fs::read(&shim_path).unwrap(), expected);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o641)).unwrap();
+            assert!(
+                !shim_dir_is_warm(&dir, &fake_lpm, &["npm"]),
+                "shim without owner execute bit (0641) must not be treated as warm"
+            );
+            ensure_shim_dir(&fake_lpm, &["npm"]).unwrap();
+            let mode = std::fs::symlink_metadata(&shim_path)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_ne!(mode & 0o100, 0);
+        }
     }
 }

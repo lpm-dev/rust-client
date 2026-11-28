@@ -71,14 +71,19 @@ pub use bounded_read::current_uid;
 #[cfg(unix)]
 pub use bounded_read::permissions_are_owner_only;
 pub use bounded_read::{
-    BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, NPMRC_FILE_SIZE_CAP_BYTES,
+    BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, FileIdentity, NPMRC_FILE_SIZE_CAP_BYTES,
     TLS_MATERIAL_AGGREGATE_CAP_BYTES, TLS_MATERIAL_FILE_SIZE_CAP_BYTES, link_count, open_nofollow,
     read_file_capped, read_file_capped_from_open_file, read_file_capped_unlinked, read_file_prefix,
-    read_regular_file_capped_with_metadata, read_stream_capped, read_stream_prefix,
-    read_text_file_capped, read_text_file_capped_from_open_file,
+    read_opened_file_capped, read_regular_file_capped_with_metadata, read_stream_capped,
+    read_stream_prefix, read_text_file_capped, read_text_file_capped_from_open_file,
     read_text_file_capped_from_open_file_with_known_size, read_text_file_capped_nofollow,
     read_text_file_capped_nofollow_with_metadata, read_text_file_capped_with_metadata,
     read_text_regular_file_capped_with_metadata,
+};
+#[cfg(windows)]
+pub use bounded_read::{
+    WindowsFileStamp, windows_regular_file_stamp_from_open_file,
+    windows_regular_file_stamp_from_path,
 };
 pub use command_name::{PortableCommandNameError, validate_portable_command_name};
 pub use error::{

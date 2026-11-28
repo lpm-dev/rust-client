@@ -1340,39 +1340,209 @@ fn is_valid_monitor_verdict_expiry(expires_at: u64, now_secs: u64) -> bool {
     expires_at > now_secs && expires_at <= max_expiry
 }
 
+struct OpenedMonitorVerdictDir {
+    dir: cap_std::fs::Dir,
+    was_previously_untrusted: bool,
+}
+
+#[cfg(unix)]
+fn is_trusted_verdict_file_unix(file_uid: u32, euid: u32, mode: u32) -> bool {
+    file_uid == euid && (mode & 0o077) == 0
+}
+
 fn open_monitor_verdict_cache_dir_nofollow(
     cache_root: &Path,
     create: bool,
-) -> Option<cap_std::fs::Dir> {
-    use cap_fs_ext::DirExt as _;
+) -> Option<OpenedMonitorVerdictDir> {
+    // Reject a symlinked or non-directory cache root before mutating permissions
+    // so pathname-based `chmod` can never follow a link to an unrelated target.
+    match std::fs::symlink_metadata(cache_root) {
+        Ok(root_meta) => {
+            if !root_meta.is_dir() || lpm_common::is_symlink_or_junction(&root_meta) {
+                return None;
+            }
+        }
+        Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                let mut builder = std::fs::DirBuilder::new();
+                builder.recursive(true).mode(0o700);
+                builder.create(cache_root).ok()?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::create_dir_all(cache_root).ok()?;
+            }
+        }
+        Err(_) => return None,
+    }
 
-    if create && !cache_root.exists() {
-        let _ = std::fs::create_dir_all(cache_root);
-    }
-    let root_meta = std::fs::symlink_metadata(cache_root).ok()?;
-    if !root_meta.is_dir() || lpm_common::is_symlink_or_junction(&root_meta) {
-        return None;
-    }
-    let root_dir =
-        cap_std::fs::Dir::open_ambient_dir(cache_root, cap_std::ambient_authority()).ok()?;
-    if create {
-        match root_dir.create_dir(MONITOR_VERDICT_SUBDIR) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(_) => return None,
+    #[cfg(unix)]
+    let (root_dir, root_was_writable) = {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+        let euid = unsafe { libc::geteuid() };
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(cache_root)
+            .ok()?;
+        let opened_meta = file.metadata().ok()?;
+        if !opened_meta.is_dir() || opened_meta.uid() != euid {
+            return None;
+        }
+        let mode = opened_meta.permissions().mode() & 0o777;
+        let was_writable = (mode & 0o022) != 0;
+        if create {
+            if mode != 0o700 {
+                // SAFETY: `file` is a valid open directory descriptor pinned without following symlinks.
+                if unsafe { libc::fchmod(file.as_raw_fd(), 0o700) } != 0 {
+                    return None;
+                }
+            }
+        } else if was_writable {
+            return None;
+        }
+        (cap_std::fs::Dir::from_std_file(file), was_writable)
+    };
+    #[cfg(not(unix))]
+    let (root_dir, root_was_writable) = {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+                FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                FILE_TRAVERSE,
+            };
+
+            let file = std::fs::OpenOptions::new()
+                .access_mode(FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(cache_root)
+                .ok()?;
+            let opened_meta = file.metadata().ok()?;
+            if !opened_meta.is_dir() || lpm_common::is_symlink_or_junction(&opened_meta) {
+                return None;
+            }
+            (cap_std::fs::Dir::from_std_file(file), false)
+        }
+        #[cfg(not(windows))]
+        {
+            let root_meta = std::fs::symlink_metadata(cache_root).ok()?;
+            if !root_meta.is_dir() || lpm_common::is_symlink_or_junction(&root_meta) {
+                return None;
+            }
+            (
+                cap_std::fs::Dir::open_ambient_dir(cache_root, cap_std::ambient_authority())
+                    .ok()?,
+                false,
+            )
+        }
+    };
+
+    #[cfg(unix)]
+    let (sub_dir, sub_was_writable) = {
+        use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _};
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let euid = unsafe { libc::geteuid() };
+        let root_fd = root_dir.as_fd().as_raw_fd();
+        let subdir_cstr = std::ffi::CString::new(MONITOR_VERDICT_SUBDIR).ok()?;
+        if create {
+            // SAFETY: `root_fd` is a valid open directory descriptor and `subdir_cstr` is NUL-terminated.
+            let rc = unsafe { libc::mkdirat(root_fd, subdir_cstr.as_ptr(), 0o700) };
+            if rc != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+                return None;
+            }
+        }
+        // Open with `O_RDONLY` rather than `cap_std`'s Linux `O_PATH` so `fchmod`
+        // succeeds on the pinned descriptor even when the process umask widens mode bits.
+        // SAFETY: `root_fd` is a valid open directory descriptor and `subdir_cstr` is NUL-terminated.
+        let sub_fd = unsafe {
+            libc::openat(
+                root_fd,
+                subdir_cstr.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if sub_fd < 0 {
+            return None;
+        }
+        // SAFETY: `sub_fd` was just returned by `openat` and is exclusively owned here.
+        let sub_file = unsafe { std::fs::File::from_raw_fd(sub_fd) };
+        let sub_meta = sub_file.metadata().ok()?;
+        if !sub_meta.is_dir() || sub_meta.uid() != euid {
+            return None;
+        }
+        let sub_mode = sub_meta.permissions().mode() & 0o777;
+        let was_writable = (sub_mode & 0o022) != 0;
+        let sub_dir = cap_std::fs::Dir::from_std_file(sub_file);
+        if create {
+            if root_was_writable || was_writable {
+                // Purge pre-existing files while the untrusted mode still causes
+                // concurrent readers to reject the directory, then seal to 0700
+                // and sweep once more to clear any entry planted before fchmod.
+                purge_monitor_verdict_dir_entries(&sub_dir);
+            }
+            if sub_mode != 0o700 {
+                // SAFETY: `sub_dir` wraps a real `O_RDONLY` directory descriptor opened with `O_NOFOLLOW`.
+                if unsafe { libc::fchmod(sub_dir.as_fd().as_raw_fd(), 0o700) } != 0 {
+                    return None;
+                }
+            }
+            if root_was_writable || was_writable {
+                purge_monitor_verdict_dir_entries(&sub_dir);
+            }
+        } else if was_writable {
+            return None;
+        }
+        (sub_dir, was_writable)
+    };
+    #[cfg(not(unix))]
+    let (sub_dir, sub_was_writable) = {
+        use cap_fs_ext::DirExt as _;
+
+        if create {
+            match root_dir.create_dir(MONITOR_VERDICT_SUBDIR) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return None,
+            }
+        }
+        let sub_dir = root_dir.open_dir_nofollow(MONITOR_VERDICT_SUBDIR).ok()?;
+        let sub_meta = sub_dir.dir_metadata().ok()?;
+        if !sub_meta.is_dir() {
+            return None;
+        }
+        (sub_dir, false)
+    };
+    Some(OpenedMonitorVerdictDir {
+        dir: sub_dir,
+        was_previously_untrusted: root_was_writable || sub_was_writable,
+    })
+}
+
+#[cfg(unix)]
+fn purge_monitor_verdict_dir_entries(dir: &cap_std::fs::Dir) {
+    let Ok(entries) = dir.entries() else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let is_dir = entry
+            .metadata()
+            .ok()
+            .is_some_and(|meta| meta.file_type().is_dir());
+        if is_dir {
+            let _ = dir.remove_dir_all(&name);
+        } else {
+            let _ = dir.remove_file(&name);
         }
     }
-    let sub_dir = root_dir.open_dir_nofollow(MONITOR_VERDICT_SUBDIR).ok()?;
-    let sub_meta = sub_dir.dir_metadata().ok()?;
-    if !sub_meta.is_dir() {
-        return None;
-    }
-    #[cfg(unix)]
-    if create {
-        use cap_std::fs::{Permissions, PermissionsExt as _};
-        let _ = root_dir.set_permissions(MONITOR_VERDICT_SUBDIR, Permissions::from_mode(0o700));
-    }
-    Some(sub_dir)
 }
 
 fn read_monitor_verdict_cache_from_dir(
@@ -1396,8 +1566,9 @@ fn read_monitor_verdict_cache_from_dir(
     }
     #[cfg(unix)]
     {
-        use cap_std::fs::PermissionsExt as _;
-        if metadata.permissions().mode() & 0o077 != 0 {
+        use cap_std::fs::{MetadataExt as _, PermissionsExt as _};
+        let euid = unsafe { libc::geteuid() };
+        if !is_trusted_verdict_file_unix(metadata.uid(), euid, metadata.permissions().mode()) {
             return HashMap::new();
         }
     }
@@ -1426,10 +1597,10 @@ fn read_monitor_verdict_cache(
     target: &MonitorVerdictCacheTarget,
     now_secs: u64,
 ) -> HashMap<String, MonitorVerdictCacheEntry> {
-    let Some(dir) = open_monitor_verdict_cache_dir_nofollow(&target.cache_root, false) else {
+    let Some(opened) = open_monitor_verdict_cache_dir_nofollow(&target.cache_root, false) else {
         return HashMap::new();
     };
-    read_monitor_verdict_cache_from_dir(&dir, &target.filename, now_secs)
+    read_monitor_verdict_cache_from_dir(&opened.dir, &target.filename, now_secs)
 }
 
 fn effective_monitor_verdict_ttl_secs(directive: NpmFirewallCacheDirective) -> Option<u64> {
@@ -1513,11 +1684,18 @@ fn update_monitor_verdict_cache(
         return;
     }
     let create = !additions.is_empty();
-    let Some(dir) = open_monitor_verdict_cache_dir_nofollow(&target.cache_root, create) else {
+    let Some(opened) = open_monitor_verdict_cache_dir_nofollow(&target.cache_root, create) else {
         return;
     };
-    let mut entries = read_monitor_verdict_cache_from_dir(&dir, &target.filename, now_secs);
-    let mut changed = false;
+    let dir = opened.dir;
+    // If the directory failed the trust check before being healed to 0700, discard
+    // any pre-existing file instead of laundering potentially planted entries.
+    let mut entries = if opened.was_previously_untrusted {
+        HashMap::new()
+    } else {
+        read_monitor_verdict_cache_from_dir(&dir, &target.filename, now_secs)
+    };
+    let mut changed = opened.was_previously_untrusted;
     for key in removals {
         if entries.remove(&key).is_some() {
             changed = true;
@@ -1530,6 +1708,10 @@ fn update_monitor_verdict_cache(
         }
     }
     if !changed {
+        return;
+    }
+    if entries.is_empty() && opened.was_previously_untrusted {
+        let _ = dir.remove_file(&target.filename);
         return;
     }
     let Some(bytes) = serialize_bounded_monitor_verdict_cache(entries, now_secs) else {
@@ -3019,6 +3201,215 @@ mod tests {
                 "summary": "Host and potentially sensitive root-readable file contents are sent to a hard-coded external host.",
                 "report_url": "https://firewall.lpm.dev/npm/n8n-nodes-pwn/v/1.0.1",
             })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_monitor_verdict_cache_dir_tightens_existing_cache_root_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let cache_root = root.path().join("metadata-cache");
+        std::fs::create_dir(&cache_root).unwrap();
+        std::fs::set_permissions(&cache_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dir = open_monitor_verdict_cache_dir_nofollow(&cache_root, true)
+            .expect("cache dir should open");
+        drop(dir);
+
+        let root_mode = std::fs::symlink_metadata(&cache_root)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            root_mode, 0o700,
+            "existing cache root must be tightened to owner-only 0o700"
+        );
+        let subdir_mode = std::fs::symlink_metadata(cache_root.join(MONITOR_VERDICT_SUBDIR))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            subdir_mode, 0o700,
+            "monitor verdict subdir must be owner-only 0o700"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_monitor_verdict_cache_dir_refuses_symlink_without_changing_target_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("real-target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let symlink_cache = root.path().join("linked-cache");
+        std::os::unix::fs::symlink(&target, &symlink_cache).unwrap();
+
+        assert!(
+            open_monitor_verdict_cache_dir_nofollow(&symlink_cache, true).is_none(),
+            "symlinked cache root must be refused"
+        );
+        let target_mode = std::fs::symlink_metadata(&target)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            target_mode, 0o755,
+            "refusing a symlinked cache root must not chmod its target directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_monitor_verdict_cache_dir_read_mode_rejects_group_or_world_writable_directories() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let cache_root = root.path().join("metadata-cache");
+        let subdir = cache_root.join(MONITOR_VERDICT_SUBDIR);
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::set_permissions(&cache_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&subdir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        assert!(
+            open_monitor_verdict_cache_dir_nofollow(&cache_root, false).is_none(),
+            "read-only verdict cache open must reject world-writable monitor-verdicts directory"
+        );
+
+        std::fs::set_permissions(&subdir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&cache_root, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(
+            open_monitor_verdict_cache_dir_nofollow(&cache_root, false).is_none(),
+            "read-only verdict cache open must reject group-writable cache root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_monitor_verdict_cache_discards_entries_from_previously_writable_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let cache_root = root.path().join("metadata-cache");
+        let subdir = cache_root.join(MONITOR_VERDICT_SUBDIR);
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::set_permissions(&cache_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&subdir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let target = MonitorVerdictCacheTarget {
+            cache_root,
+            filename: "verdicts.json".to_string(),
+        };
+        let now_secs = 1_700_000_000;
+        let planted_file = subdir.join(&target.filename);
+        let planted_payload = serde_json::json!({
+            "version": MONITOR_VERDICT_CACHE_VERSION,
+            "entries": {
+                "planted-pkg@1.0.0": {
+                    "expires_at": now_secs + 120
+                }
+            }
+        });
+        std::fs::write(&planted_file, planted_payload.to_string()).unwrap();
+        std::fs::set_permissions(&planted_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Read-only lookup rejects the world-writable directory.
+        assert!(read_monitor_verdict_cache(&target, now_secs).is_empty());
+
+        // Writing a fresh verdict heals permissions and must discard planted entries.
+        update_monitor_verdict_cache(
+            &target,
+            vec![(
+                "fresh-pkg@1.0.0".to_string(),
+                MonitorVerdictCacheEntry {
+                    expires_at: now_secs + 120,
+                    unknown: false,
+                    matched: false,
+                },
+            )],
+            Vec::new(),
+            now_secs,
+        );
+
+        let after = read_monitor_verdict_cache(&target, now_secs);
+        assert!(
+            !after.contains_key("planted-pkg@1.0.0"),
+            "healing a previously world-writable verdict cache directory must not launder planted entries"
+        );
+        assert!(
+            after.contains_key("fresh-pkg@1.0.0"),
+            "fresh addition written during heal must be persisted"
+        );
+        assert!(!is_trusted_verdict_file_unix(1001, 1000, 0o600));
+        assert!(!is_trusted_verdict_file_unix(1000, 1000, 0o640));
+        assert!(is_trusted_verdict_file_unix(1000, 1000, 0o600));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn healing_verdict_directory_purges_sibling_profile_files_before_reuse() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let cache_root = root.path().join("metadata-cache");
+        let subdir = cache_root.join(MONITOR_VERDICT_SUBDIR);
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::set_permissions(&cache_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&subdir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let target_a = MonitorVerdictCacheTarget {
+            cache_root: cache_root.clone(),
+            filename: "profile-a.json".to_string(),
+        };
+        let target_b = MonitorVerdictCacheTarget {
+            cache_root,
+            filename: "profile-b.json".to_string(),
+        };
+        let now_secs = 1_700_000_000;
+        let planted_payload = serde_json::json!({
+            "version": MONITOR_VERDICT_CACHE_VERSION,
+            "entries": {
+                "planted-sibling@1.0.0": {
+                    "expires_at": now_secs + 120
+                }
+            }
+        });
+        for name in [&target_a.filename, &target_b.filename] {
+            let file = subdir.join(name);
+            std::fs::write(&file, planted_payload.to_string()).unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        // Updating profile A heals the directory to 0o700; profile B's pre-heal file
+        // must also be purged so a later read for profile B cannot reuse it.
+        update_monitor_verdict_cache(
+            &target_a,
+            vec![(
+                "fresh-a@1.0.0".to_string(),
+                MonitorVerdictCacheEntry {
+                    expires_at: now_secs + 120,
+                    unknown: false,
+                    matched: false,
+                },
+            )],
+            Vec::new(),
+            now_secs,
+        );
+
+        let after_b = read_monitor_verdict_cache(&target_b, now_secs);
+        assert!(
+            after_b.is_empty(),
+            "healing verdict cache directory for profile A must purge sibling profile B's pre-heal entries"
+        );
+        assert!(
+            !subdir.join(&target_b.filename).exists(),
+            "sibling pre-heal verdict file must be removed on heal"
         );
     }
 }

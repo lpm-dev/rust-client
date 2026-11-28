@@ -31,6 +31,7 @@ pub(crate) fn is_up_to_date(
     let Ok(package) = serde_json::from_str::<lpm_workspace::PackageJson>(package_json) else {
         return Ok(false);
     };
+    let ancestors = scan_ancestors(project_dir)?;
     if crate::install_recovery::pending(project_dir)
         || project_dir.join("Package.swift").exists()
         || crate::commands::root_lifecycle::RootProjectLifecycle::from_package(
@@ -38,9 +39,7 @@ pub(crate) fn is_up_to_date(
             &package,
         )
         .has_scripts()
-        || lpm_workspace::find_workspace_root(project_dir)
-            .map_err(|error| LpmError::Workspace(error.to_string()))?
-            .is_some()
+        || ancestors.has_workspace_root
     {
         return Ok(false);
     }
@@ -82,6 +81,12 @@ pub(crate) fn is_up_to_date(
     let lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
     let parsed_proof = crate::install_state::SyncNoopLockfileProof::parse_from_state(&cached_state);
 
+    let mut upgrade_v2_proof_stamps: Option<(
+        crate::install_state::SyncNoopFileStamp,
+        crate::install_state::SyncNoopFileStamp,
+        bool,
+        Option<crate::install_state::SyncNoopFileStamp>,
+    )> = None;
     let fast_has_node_engines = if let Some(proof) = parsed_proof.as_ref()
         && proof.lockfile_eligible
         && (!frozen
@@ -92,8 +97,8 @@ pub(crate) fn is_up_to_date(
                 && proof.frozen_ok
                 && proof.auto_install_peers == auto_install_peers))
         && proof.routes_fingerprint == routes.routing_fingerprint()
-        && !has_ancestor_lockfile(project_dir)
-        && crate::install_state::check_cached_state_mtime_match(
+        && !ancestors.has_ancestor_lockfile
+        && let Some(mtime_match) = crate::install_state::check_cached_state_mtime_match(
             project_dir,
             &lock_path,
             package_json,
@@ -103,17 +108,81 @@ pub(crate) fn is_up_to_date(
             store_version,
             hash_context,
         )
-        .is_some_and(|m| m.lock_size > 0)
-        && let Ok(lock_raw) = lpm_common::read_file_capped(
-            &lock_path,
-            lpm_common::STATE_FILE_SIZE_CAP_BYTES.max(64 * 1024 * 1024),
-        )
-        && !raw_lockfile_mentions_lpm_scope(&lock_raw)
-        && crate::install_state::sync_noop_content_digest_hex(package_json.as_bytes())
-            == proof.pkg_digest
-        && crate::install_state::sync_noop_content_digest_hex(&lock_raw) == proof.lock_digest
+        && mtime_match.lock_size > 0
     {
-        Some(proof.has_node_engines)
+        // `package_json` is already in memory, so verifying its digest costs microseconds
+        // and catches same-size + restored-mtime edits even on platforms without ctime.
+        let pkg_digest_matches =
+            crate::install_state::sync_noop_content_digest_hex(package_json.as_bytes())
+                == proof.pkg_digest;
+        let lock_stamp_verified = cfg!(unix)
+            && pkg_digest_matches
+            && proof.pkg_stamp.is_some()
+            && proof.lock_stamp.is_some()
+            && proof.pkg_stamp == mtime_match.pkg_stamp
+            && proof.lock_stamp == mtime_match.lock_stamp
+            && mtime_match.hash_stamp.is_some_and(|hash_stamp| {
+                mtime_match
+                    .pkg_stamp
+                    .is_some_and(|pkg| pkg.is_strictly_older_than(hash_stamp))
+                    && mtime_match
+                        .lock_stamp
+                        .is_some_and(|lock| lock.is_strictly_older_than(hash_stamp))
+            });
+        if lock_stamp_verified {
+            // Regular-file stamps match and predate `.lpm/install-hash`: skip reading and
+            // hashing `lpm.lock` because proof-write already verified its digest and scope.
+            Some(proof.has_node_engines)
+        } else if pkg_digest_matches
+            && let Ok((lock_raw, lock_stamp)) =
+                crate::install_state::read_regular_file_capped_with_stamp(
+                    &lock_path,
+                    lpm_common::STATE_FILE_SIZE_CAP_BYTES.max(64 * 1024 * 1024),
+                )
+            && !raw_lockfile_mentions_lpm_scope(&lock_raw)
+            && crate::install_state::sync_noop_content_digest_hex(&lock_raw) == proof.lock_digest
+        {
+            // Upgrade v2 proofs, refresh stale stamps, or self-heal a same-tick
+            // timestamp collision on Unix once both files have verified
+            // descriptor-bound stamps matching the exact bytes we validated.
+            if cfg!(unix)
+                && let Some(lock_stamp) = lock_stamp
+                && let Ok((pkg_check, Some(pkg_stamp))) =
+                    crate::install_state::read_text_regular_file_capped_with_stamp(
+                        &project_dir.join("package.json"),
+                        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+                    )
+                && lpm_common::strip_utf8_bom_str(&pkg_check) == package_json
+            {
+                let stamps_changed =
+                    proof.pkg_stamp != Some(pkg_stamp) || proof.lock_stamp != Some(lock_stamp);
+                let now_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|dur| dur.as_nanos() as u64);
+                let can_self_heal_same_tick = now_ns.is_some_and(|now| {
+                    pkg_stamp.is_strictly_older_than_wall_clock(now)
+                        && lock_stamp.is_strictly_older_than_wall_clock(now)
+                });
+                let same_tick_collision = !stamps_changed
+                    && can_self_heal_same_tick
+                    && mtime_match.hash_stamp.is_some_and(|hash_stamp| {
+                        !pkg_stamp.is_strictly_older_than(hash_stamp)
+                            || !lock_stamp.is_strictly_older_than(hash_stamp)
+                    });
+                if stamps_changed || same_tick_collision {
+                    upgrade_v2_proof_stamps = Some((
+                        pkg_stamp,
+                        lock_stamp,
+                        same_tick_collision,
+                        mtime_match.hash_stamp,
+                    ));
+                }
+            }
+            Some(proof.has_node_engines)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -252,15 +321,21 @@ pub(crate) fn is_up_to_date(
     if current_engine_key != cached_engine.key {
         return Ok(false);
     }
+    let mut node_fp_refreshed = false;
     if cached_engine.key != "none" {
         let runtime_fingerprint = engine_policy.resolved_node_runtime_fingerprint();
-        if runtime_fingerprint != cached_engine.runtime_fingerprint {
+        if runtime_fingerprint != cached_engine.runtime_fingerprint
+            && let Ok(Some(_install_lock)) = lpm_common::try_acquire_exclusive_lock(
+                lpm_common::project_install_lock(project_dir),
+            )
+        {
             match crate::install_state::refresh_install_hash_node_runtime_fingerprint(
                 project_dir,
                 cached_engine.key,
                 runtime_fingerprint,
             ) {
                 Ok(true) => {
+                    node_fp_refreshed = true;
                     crate::cli::keep_state_ignored_at_exit_from(project_dir);
                     crate::cli::keep_state_ignored_at_exit();
                 }
@@ -273,15 +348,59 @@ pub(crate) fn is_up_to_date(
             }
         }
     }
-    if fast_has_node_engines.is_none()
+    let cached_header_lines = {
+        let mut lines = cached_state.lines();
+        lines
+            .next()
+            .and_then(|hash_line| Some((hash_line, lines.next()?)))
+    };
+    if let (Some(proof), Some((pkg_stamp, lock_stamp, force_refresh, hash_stamp))) =
+        (parsed_proof.as_ref(), upgrade_v2_proof_stamps)
+    {
+        let upgraded = crate::install_state::SyncNoopLockfileProofInput {
+            pkg_digest: proof.pkg_digest.clone(),
+            lock_digest: proof.lock_digest.clone(),
+            lockfile_eligible: proof.lockfile_eligible,
+            has_node_engines: proof.has_node_engines,
+            auto_install_peers: proof.auto_install_peers,
+            frozen_ok: proof.frozen_ok,
+            routes_fingerprint: proof.routes_fingerprint.clone(),
+            pkg_stamp: Some(pkg_stamp),
+            lock_stamp: Some(lock_stamp),
+        };
+        let expected_header = cached_header_lines.map(|(hash_line, mtime_line)| {
+            (
+                hash_line,
+                mtime_line,
+                if node_fp_refreshed { None } else { hash_stamp },
+            )
+        });
+        if let Ok(true) = crate::install_state::backfill_install_hash_sync_noop_proof_with_refresh(
+            project_dir,
+            &upgraded,
+            force_refresh,
+            expected_header,
+        ) {
+            crate::cli::keep_state_ignored_at_exit_from(project_dir);
+            crate::cli::keep_state_ignored_at_exit();
+        }
+    } else if fast_has_node_engines.is_none()
         && let Some(project_lockfile) = full_lockfile.as_ref()
         && project_lockfile.path == lock_path
-        && !has_ancestor_lockfile(project_dir)
+        && !ancestors.has_ancestor_lockfile
         && !crate::install_state::package_json_needs_slow_freshness(package_json)
-        && let Ok(lock_raw) = lpm_common::read_file_capped(
-            &lock_path,
-            lpm_common::STATE_FILE_SIZE_CAP_BYTES.max(64 * 1024 * 1024),
-        )
+        && let Ok((pkg_check, pkg_stamp)) =
+            crate::install_state::read_text_regular_file_capped_with_stamp(
+                &project_dir.join("package.json"),
+                lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+            )
+        && lpm_common::strip_utf8_bom_str(&pkg_check) == package_json
+        && let Ok((lock_raw, lock_stamp)) =
+            crate::install_state::read_regular_file_capped_with_stamp(
+                &lock_path,
+                lpm_common::STATE_FILE_SIZE_CAP_BYTES.max(64 * 1024 * 1024),
+            )
+        && lock_raw == project_lockfile.content.as_bytes()
     {
         let proof = compute_sync_noop_proof(
             project_dir,
@@ -292,10 +411,17 @@ pub(crate) fn is_up_to_date(
             &lock_raw,
             &routes,
             auto_install_peers,
+            pkg_stamp,
+            lock_stamp,
         );
-        if let Ok(true) =
-            crate::install_state::backfill_install_hash_sync_noop_proof(project_dir, &proof)
-        {
+        let expected_header =
+            cached_header_lines.map(|(hash_line, mtime_line)| (hash_line, mtime_line, None));
+        if let Ok(true) = crate::install_state::backfill_install_hash_sync_noop_proof_with_refresh(
+            project_dir,
+            &proof,
+            false,
+            expected_header,
+        ) {
             crate::cli::keep_state_ignored_at_exit_from(project_dir);
             crate::cli::keep_state_ignored_at_exit();
         }
@@ -304,15 +430,64 @@ pub(crate) fn is_up_to_date(
     Ok(true)
 }
 
-fn has_ancestor_lockfile(project_dir: &Path) -> bool {
+struct AncestorScan {
+    has_workspace_root: bool,
+    has_ancestor_lockfile: bool,
+}
+
+/// Single upward walk checking both ancestor `lpm.lock` files and ancestor
+/// workspace roots (`pnpm-workspace.yaml` or `package.json` with `workspaces`).
+fn scan_ancestors(project_dir: &Path) -> Result<AncestorScan, LpmError> {
+    let mut has_ancestor_lockfile = false;
+    let mut may_have_workspace_root = false;
     let mut parent = project_dir.parent();
     while let Some(dir) = parent {
-        if dir.join(lpm_lockfile::LOCKFILE_NAME).is_file() {
-            return true;
+        if !has_ancestor_lockfile && dir.join(lpm_lockfile::LOCKFILE_NAME).is_file() {
+            has_ancestor_lockfile = true;
+        }
+        if !may_have_workspace_root {
+            if dir.join("pnpm-workspace.yaml").symlink_metadata().is_ok() {
+                may_have_workspace_root = true;
+            } else {
+                let ancestor_pkg = dir.join("package.json");
+                match lpm_common::read_text_file_capped(
+                    &ancestor_pkg,
+                    lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+                ) {
+                    Ok(content) => {
+                        // Parse with `PackageJson` so type-invalid ancestor manifests
+                        // (e.g. `{"name": 7}`) delegate to `find_workspace_root` and
+                        // surface the exact same error as the full install path.
+                        let parsed = serde_json::from_str::<lpm_workspace::PackageJson>(
+                            lpm_common::strip_utf8_bom_str(&content),
+                        );
+                        if !matches!(parsed, Ok(pkg) if pkg.workspaces.is_none()) {
+                            may_have_workspace_root = true;
+                        }
+                    }
+                    Err(lpm_common::BoundedReadError::NotFound { .. }) => {}
+                    Err(_) => {
+                        may_have_workspace_root = true;
+                    }
+                }
+            }
+        }
+        if has_ancestor_lockfile && may_have_workspace_root {
+            break;
         }
         parent = dir.parent();
     }
-    false
+    let has_workspace_root = if may_have_workspace_root {
+        lpm_workspace::find_workspace_root(project_dir)
+            .map_err(|error| LpmError::Workspace(error.to_string()))?
+            .is_some()
+    } else {
+        false
+    };
+    Ok(AncestorScan {
+        has_workspace_root,
+        has_ancestor_lockfile,
+    })
 }
 
 fn raw_lockfile_mentions_lpm_scope(bytes: &[u8]) -> bool {
@@ -330,6 +505,8 @@ pub(super) fn compute_sync_noop_proof(
     lock_raw_bytes: &[u8],
     routes: &lpm_registry::RouteTable,
     auto_install_peers: bool,
+    pkg_stamp: Option<crate::install_state::SyncNoopFileStamp>,
+    lock_stamp: Option<crate::install_state::SyncNoopFileStamp>,
 ) -> crate::install_state::SyncNoopLockfileProofInput {
     let version_ok = lockfile.metadata.lockfile_version
         >= lpm_lockfile::LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES;
@@ -368,6 +545,8 @@ pub(super) fn compute_sync_noop_proof(
         auto_install_peers,
         frozen_ok,
         routes_fingerprint: routes.routing_fingerprint(),
+        pkg_stamp,
+        lock_stamp,
     }
 }
 
@@ -1308,8 +1487,12 @@ mod tests {
         let lock_content = std::str::from_utf8(&lock_raw).unwrap();
         let package: lpm_workspace::PackageJson = serde_json::from_str(pkg_json).unwrap();
         let routes = lpm_registry::RouteTable::from_env_and_filesystem(project).unwrap();
+        let pkg_stamp =
+            crate::install_state::SyncNoopFileStamp::from_path(&project.join("package.json"));
+        let lock_stamp = crate::install_state::SyncNoopFileStamp::from_path(&lock_path);
         let proof = super::compute_sync_noop_proof(
             project, &lock_path, &package, pkg_json, &lockfile, &lock_raw, &routes, true,
+            pkg_stamp, lock_stamp,
         );
         assert!(proof.lockfile_eligible);
         assert!(!proof.has_node_engines);
@@ -1405,6 +1588,8 @@ mod tests {
             &lock_raw,
             &routes,
             true,
+            pkg_stamp,
+            lock_stamp,
         );
         assert!(!patched_proof.frozen_ok);
 
@@ -1421,6 +1606,148 @@ mod tests {
         );
         modified_lockfile.write_to_file(&lock_path).unwrap();
         assert!(!super::is_up_to_date(project, pkg_json, &mode).unwrap());
+    }
+
+    #[test]
+    fn sync_noop_v3_stamp_short_circuits_older_lockfile_and_rejects_racily_clean_mutation() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::ScopedEnv::set([
+            ("LPM_HOME", home.path().as_os_str().to_owned()),
+            ("HOME", home.path().as_os_str().to_owned()),
+            (
+                "NPM_CONFIG_USERCONFIG",
+                home.path().join(".npmrc").into_os_string(),
+            ),
+            ("LPM_LINKER", std::ffi::OsString::from("hoisted")),
+            ("CI", std::ffi::OsString::from("")),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let pkg_json = r#"{"name":"app","version":"1.0.0","dependencies":{"react":"^1.0.0"}}"#;
+        let pkg_path = project.join("package.json");
+        std::fs::write(&pkg_path, pkg_json).unwrap();
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+
+        let mut lockfile = lockfile_with_packages(&["react"]);
+        lockfile.root_resolutions.insert(
+            "react".to_string(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: None,
+                package: "react".to_string(),
+                version: "1.0.0".to_string(),
+                source: None,
+            },
+        );
+        let lock_path = project.join(lpm_lockfile::LOCKFILE_NAME);
+        lockfile.write_to_file(&lock_path).unwrap();
+
+        // Backdate package.json and lpm.lock so both strictly predate `.lpm/install-hash`.
+        let older = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+        for file_path in [&pkg_path, &lock_path] {
+            std::fs::File::options()
+                .write(true)
+                .open(file_path)
+                .unwrap()
+                .set_modified(older)
+                .unwrap();
+        }
+
+        let lock_raw = std::fs::read(&lock_path).unwrap();
+        let lock_content = std::str::from_utf8(&lock_raw).unwrap();
+        let package: lpm_workspace::PackageJson = serde_json::from_str(pkg_json).unwrap();
+        let routes = lpm_registry::RouteTable::from_env_and_filesystem(project).unwrap();
+        let pkg_stamp =
+            crate::install_state::SyncNoopFileStamp::from_path(&project.join("package.json"));
+        let lock_stamp = crate::install_state::SyncNoopFileStamp::from_path(&lock_path);
+        let proof = super::compute_sync_noop_proof(
+            project, &lock_path, &package, pkg_json, &lockfile, &lock_raw, &routes, true,
+            pkg_stamp, lock_stamp,
+        );
+        #[cfg(any(unix, windows))]
+        {
+            assert!(proof.pkg_stamp.is_some());
+            assert!(proof.lock_stamp.is_some());
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            assert!(proof.pkg_stamp.is_none());
+            assert!(proof.lock_stamp.is_none());
+        }
+
+        let platform = lpm_store::v2::PlatformTuple::current();
+        let hash = crate::install_state::compute_install_hash_v10(
+            pkg_json,
+            lock_content,
+            &[],
+            lpm_linker::LinkerMode::Hoisted,
+            lpm_store::v2::ObjectIntegrityPolicy::Source,
+            &platform,
+            crate::install_state::InstallHashContext {
+                dependency_engine_key: "none",
+                security_analysis_policy: lpm_store::SecurityAnalysisPolicy::Disabled,
+            },
+        );
+        crate::install_state::write_install_hash_with_known_runtime_state(
+            project,
+            &hash,
+            lpm_linker::LinkerMode::Hoisted,
+            lpm_store::v2::ObjectIntegrityPolicy::Source,
+            &platform,
+            "none",
+            crate::install_state::KnownInstallHashRuntimeState {
+                lockfile_path: &lock_path,
+                node_runtime_fingerprint: None,
+                security_analysis_policy: lpm_store::SecurityAnalysisPolicy::Disabled,
+                sync_noop_proof: Some(&proof),
+                release_age_policy_key: None,
+            },
+        )
+        .unwrap();
+
+        let mode = crate::install_state::FastLaneMode {
+            json: true,
+            timing: false,
+            frozen_lockfile: crate::commands::install::FrozenLockfileMode::Never,
+            no_skills: true,
+            min_release_age: None,
+            min_release_age_exclude: Vec::new(),
+            linker: None,
+            no_engine_strict: false,
+        };
+        assert!(super::is_up_to_date(project, pkg_json, &mode).unwrap());
+
+        // A same-size lockfile edit with restored older mtime must still invalidate
+        // (via ctime change on Unix and content digest fallback).
+        let mut mutated = lock_raw.clone();
+        let idx = mutated
+            .windows(b"1.0.0".len())
+            .position(|window| window == b"1.0.0")
+            .expect("lockfile contains version");
+        mutated[idx..idx + 5].copy_from_slice(b"1.0.1");
+        assert_eq!(mutated.len(), lock_raw.len());
+        std::fs::write(&lock_path, &mutated).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_modified(older)
+            .unwrap();
+        assert!(!super::is_up_to_date(project, pkg_json, &mode).unwrap());
+
+        // Restoring original bytes at the hash file's mtime (racily-clean) falls back
+        // to full content verification and still succeeds.
+        let hash_mtime = std::fs::metadata(project.join(".lpm/install-hash"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::fs::write(&lock_path, &lock_raw).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_modified(hash_mtime)
+            .unwrap();
+        assert!(super::is_up_to_date(project, pkg_json, &mode).unwrap());
     }
 
     #[test]
@@ -1457,8 +1784,12 @@ mod tests {
         let lock_content = std::str::from_utf8(&lock_raw).unwrap();
         let package: lpm_workspace::PackageJson = serde_json::from_str(pkg_json).unwrap();
         let routes = lpm_registry::RouteTable::from_env_and_filesystem(project).unwrap();
+        let pkg_stamp =
+            crate::install_state::SyncNoopFileStamp::from_path(&project.join("package.json"));
+        let lock_stamp = crate::install_state::SyncNoopFileStamp::from_path(&lock_path);
         let proof = super::compute_sync_noop_proof(
             project, &lock_path, &package, pkg_json, &lockfile, &lock_raw, &routes, true,
+            pkg_stamp, lock_stamp,
         );
         let platform = lpm_store::v2::PlatformTuple::current();
         let hash = crate::install_state::compute_install_hash_v10(
@@ -1844,6 +2175,215 @@ mod tests {
             super::try_workspace_up_to_date(root, Some(dev_preinstall_pkg), &mode)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn scan_ancestors_detects_unicode_escaped_workspaces_and_malformed_ancestor_manifest() {
+        let escaped_root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            escaped_root.path().join("package.json"),
+            r#"{"name":"mono","\u0077orkspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        let member = escaped_root.path().join("packages/app");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(member.join("package.json"), r#"{"name":"app"}"#).unwrap();
+
+        let scan = super::scan_ancestors(&member).unwrap();
+        assert!(
+            scan.has_workspace_root,
+            "escaped workspaces key must be recognized as an ancestor workspace root"
+        );
+
+        let malformed_root = tempfile::tempdir().unwrap();
+        std::fs::write(malformed_root.path().join("package.json"), "{not-json").unwrap();
+        let child = malformed_root.path().join("nested/app");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("package.json"), r#"{"name":"app"}"#).unwrap();
+
+        assert!(
+            super::scan_ancestors(&child).is_err(),
+            "malformed ancestor package.json must surface the workspace discovery error"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_noop_upgrades_v2_proof_to_v3_and_read_with_stamp_captures_regular_file_stamp() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::ScopedEnv::set([
+            ("LPM_HOME", home.path().as_os_str().to_owned()),
+            ("HOME", home.path().as_os_str().to_owned()),
+            (
+                "NPM_CONFIG_USERCONFIG",
+                home.path().join(".npmrc").into_os_string(),
+            ),
+            ("LPM_LINKER", std::ffi::OsString::from("hoisted")),
+            ("CI", std::ffi::OsString::from("")),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let pkg_json = r#"{"name":"app","version":"1.0.0","dependencies":{"react":"^1.0.0"}}"#;
+        let pkg_path = project.join("package.json");
+        std::fs::write(&pkg_path, pkg_json).unwrap();
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+
+        let mut lockfile = lockfile_with_packages(&["react"]);
+        lockfile.root_resolutions.insert(
+            "react".to_string(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: None,
+                package: "react".to_string(),
+                version: "1.0.0".to_string(),
+                source: None,
+            },
+        );
+        let lock_path = project.join(lpm_lockfile::LOCKFILE_NAME);
+        lockfile.write_to_file(&lock_path).unwrap();
+
+        let older = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+        for file_path in [&pkg_path, &lock_path] {
+            std::fs::File::options()
+                .write(true)
+                .open(file_path)
+                .unwrap()
+                .set_modified(older)
+                .unwrap();
+        }
+
+        let (lock_raw, lock_stamp) = crate::install_state::read_regular_file_capped_with_stamp(
+            &lock_path,
+            lpm_common::STATE_FILE_SIZE_CAP_BYTES,
+        )
+        .unwrap();
+        assert!(lock_stamp.is_some());
+        let lock_content = std::str::from_utf8(&lock_raw).unwrap();
+        let package: lpm_workspace::PackageJson = serde_json::from_str(pkg_json).unwrap();
+        let routes = lpm_registry::RouteTable::from_env_and_filesystem(project).unwrap();
+        // Seed a v2 proof (no file stamps).
+        let v2_proof = super::compute_sync_noop_proof(
+            project, &lock_path, &package, pkg_json, &lockfile, &lock_raw, &routes, true, None,
+            None,
+        );
+        let platform = lpm_store::v2::PlatformTuple::current();
+        let hash = crate::install_state::compute_install_hash_v10(
+            pkg_json,
+            lock_content,
+            &[],
+            lpm_linker::LinkerMode::Hoisted,
+            lpm_store::v2::ObjectIntegrityPolicy::Source,
+            &platform,
+            crate::install_state::InstallHashContext {
+                dependency_engine_key: "none",
+                security_analysis_policy: lpm_store::SecurityAnalysisPolicy::Disabled,
+            },
+        );
+        crate::install_state::write_install_hash_with_known_runtime_state(
+            project,
+            &hash,
+            lpm_linker::LinkerMode::Hoisted,
+            lpm_store::v2::ObjectIntegrityPolicy::Source,
+            &platform,
+            "none",
+            crate::install_state::KnownInstallHashRuntimeState {
+                lockfile_path: &lock_path,
+                node_runtime_fingerprint: None,
+                security_analysis_policy: lpm_store::SecurityAnalysisPolicy::Disabled,
+                sync_noop_proof: Some(&v2_proof),
+                release_age_policy_key: None,
+            },
+        )
+        .unwrap();
+
+        let before = std::fs::read_to_string(project.join(".lpm/install-hash")).unwrap();
+        assert!(
+            before.lines().any(|line| line.starts_with("f:v2:")),
+            "seeded state should hold a v2 proof:\n{before}"
+        );
+
+        let mode = crate::install_state::FastLaneMode {
+            json: true,
+            timing: false,
+            frozen_lockfile: crate::commands::install::FrozenLockfileMode::Never,
+            no_skills: true,
+            min_release_age: None,
+            min_release_age_exclude: Vec::new(),
+            linker: None,
+            no_engine_strict: false,
+        };
+        assert!(super::is_up_to_date(project, pkg_json, &mode).unwrap());
+
+        let after = std::fs::read_to_string(project.join(".lpm/install-hash")).unwrap();
+        assert!(
+            after.lines().any(|line| line.starts_with("f:v3:")),
+            "verified v2 proof should upgrade in place to v3 stamps:\n{after}"
+        );
+        let upgraded = crate::install_state::SyncNoopLockfileProof::parse_from_state(&after)
+            .expect("upgraded v3 proof must parse");
+        assert!(upgraded.pkg_stamp.is_some());
+        assert_eq!(upgraded.lock_stamp, lock_stamp);
+
+        // Force a same-tick collision between `.lpm/install-hash` and `lpm.lock`
+        // (while keeping `node_modules` at or before `install-hash` so the mtime
+        // fast path enters and reaches the v3 stamp check): the verified digest
+        // fallback must rewrite `.lpm/install-hash` so the next call returns to
+        // the strict stamp-only path.
+        let hash_path = project.join(".lpm/install-hash");
+        std::fs::File::open(project.join("node_modules"))
+            .unwrap()
+            .set_modified(older)
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&hash_path)
+            .unwrap()
+            .set_modified(older)
+            .unwrap();
+        let colliding_hash_stamp =
+            crate::install_state::SyncNoopFileStamp::from_path(&hash_path).unwrap();
+        assert!(
+            !upgraded
+                .lock_stamp
+                .unwrap()
+                .is_strictly_older_than(colliding_hash_stamp),
+            "test fixture must put install-hash on or before lockfile mtime"
+        );
+        assert!(super::is_up_to_date(project, pkg_json, &mode).unwrap());
+        let healed_hash_stamp =
+            crate::install_state::SyncNoopFileStamp::from_path(&hash_path).unwrap();
+        assert!(
+            upgraded
+                .lock_stamp
+                .unwrap()
+                .is_strictly_older_than(healed_hash_stamp),
+            "same-tick collision must self-heal install-hash onto a strictly newer stamp"
+        );
+    }
+
+    #[test]
+    fn ill_typed_ancestor_manifest_errors_consistently_on_fast_sync_noop_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        let project = parent.join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        // Valid JSON without a `"workspaces"` key, yet ill-typed `lpm` field that
+        // `PackageJson` / `find_workspace_root` rejects.
+        std::fs::write(
+            parent.join("package.json"),
+            r#"{"name": "parent", "lpm": 7}"#,
+        )
+        .unwrap();
+        std::fs::write(project.join("package.json"), r#"{"name":"app"}"#).unwrap();
+
+        let err = super::scan_ancestors(&project).err().expect(
+            "ill-typed ancestor package.json must surface an error like find_workspace_root",
+        );
+        let full_err = lpm_workspace::find_workspace_root(&project)
+            .expect_err("full discovery must reject ill-typed ancestor package.json");
+        assert_eq!(
+            err.to_string(),
+            lpm_common::LpmError::Workspace(full_err.to_string()).to_string()
         );
     }
 }
