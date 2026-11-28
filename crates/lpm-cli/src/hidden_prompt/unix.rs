@@ -123,13 +123,7 @@ impl Terminal {
     /// awaited ends in the restart rather than as a cut paste. True when it
     /// did.
     fn take_restart(&mut self, each: &mut dyn FnMut(Event)) -> bool {
-        let restarts = RESTARTS.load(Ordering::SeqCst);
-        if restarts == self.restarts_seen {
-            return false;
-        }
-        self.restarts_seen = restarts;
-        start_over(&mut self.bytes, each);
-        true
+        take_restart(&mut self.bytes, &mut self.restarts_seen, each)
     }
 }
 
@@ -148,16 +142,19 @@ impl Keyboard for Terminal {
     fn read(&mut self, wait: Option<Duration>, each: &mut dyn FnMut(Event)) -> io::Result<bool> {
         let started = Instant::now();
         let deadline = wait.map(|wait| started + wait);
-        if deadline.is_some() && !input_by(deadline)? {
+        // Reading only once input is there, the read never waits, so a stop
+        // whose handler runs as it returns came after it took what it read.
+        if !input_by(deadline)? {
             return Ok(self.take_restart(each));
         }
         let mut buffer = Zeroizing::new([0_u8; 1024]);
-        let read = loop {
+        let (read, restarts_before) = loop {
+            let restarts_before = RESTARTS.load(Ordering::SeqCst);
             // SAFETY: `buffer` is valid for writes of its whole length.
             let read =
                 unsafe { libc::read(libc::STDIN_FILENO, buffer.as_mut_ptr().cast(), buffer.len()) };
             if let Ok(read) = usize::try_from(read) {
-                break read;
+                break (read, restarts_before);
             }
             let error = io::Error::last_os_error();
             match error.kind() {
@@ -177,14 +174,13 @@ impl Keyboard for Terminal {
                 "the terminal closed",
             ));
         }
-        // A stop gave the terminal back and showed the prompt again once it
-        // continued, so what's read now begins a value of its own.
-        self.take_restart(each);
-        self.bytes.next_read();
-        for &byte in &buffer[..read] {
-            self.bytes.feed(byte, each);
-        }
-        self.bytes.end_of_read(each);
+        take_read(
+            &mut self.bytes,
+            &mut self.restarts_seen,
+            &buffer[..read],
+            restarts_before,
+            each,
+        );
         // A terminal sends the rest of a sequence with the escape that
         // starts it, and a string's with its introducer; one nothing follows
         // soon was the Escape key, or a Meta chord.
@@ -206,6 +202,43 @@ impl Keyboard for Terminal {
     fn end_unfinished(&mut self, each: &mut dyn FnMut(Event)) {
         self.bytes.end_unfinished(each);
     }
+}
+
+/// Starts the value over from `bytes` when the prompt did since `seen`,
+/// which moves on to it. True when it did.
+fn take_restart(bytes: &mut Bytes, seen: &mut u32, each: &mut dyn FnMut(Event)) -> bool {
+    let restarts = RESTARTS.load(Ordering::SeqCst);
+    if restarts == *seen {
+        return false;
+    }
+    *seen = restarts;
+    start_over(bytes, each);
+    true
+}
+
+/// Takes `read`, what one read of standard input returned, with
+/// `restarts_before` the restarts counted just before it. A stop gave the
+/// terminal back and showed the prompt again once it continued, so what's
+/// read after it begins a value of its own. A stop that came as the read
+/// returned came after the read took its bytes: they were typed before it,
+/// so they're dropped, as the stop drops what's typed and not read yet.
+fn take_read(
+    bytes: &mut Bytes,
+    seen: &mut u32,
+    read: &[u8],
+    restarts_before: u32,
+    each: &mut dyn FnMut(Event),
+) {
+    let stopped_meanwhile = RESTARTS.load(Ordering::SeqCst) != restarts_before;
+    take_restart(bytes, seen, each);
+    if stopped_meanwhile {
+        return;
+    }
+    bytes.next_read();
+    for &byte in read {
+        bytes.feed(byte, each);
+    }
+    bytes.end_of_read(each);
 }
 
 /// Starts the value over from `bytes`' state: a paste, sequence or string
@@ -1162,6 +1195,63 @@ fn wait_while(flag: &AtomicBool, value: bool, steps: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_a_read_took_before_a_stop_that_came_as_it_returned_never_begins_the_new_value() {
+        let mut bytes = Bytes::default();
+        let restarts_before = RESTARTS.load(Ordering::SeqCst);
+        let mut seen = restarts_before;
+        // The stop's handler runs as the read returns: the process stops
+        // after the read took what was typed, continues, and starts over.
+        RESTARTS.fetch_add(1, Ordering::SeqCst);
+        let mut events = Vec::new();
+
+        take_read(
+            &mut bytes,
+            &mut seen,
+            b"fixture-a",
+            restarts_before,
+            &mut |event| events.push(event),
+        );
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| **event == Event::Restart)
+                .count(),
+            1,
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| event.is_text()),
+            "what was typed before the stop is part of the new value: {events:?}"
+        );
+    }
+
+    #[test]
+    fn what_a_read_took_after_a_stop_begins_the_new_value() {
+        let mut bytes = Bytes::default();
+        let mut seen = RESTARTS.load(Ordering::SeqCst);
+        // The stop came and went before this read began.
+        RESTARTS.fetch_add(1, Ordering::SeqCst);
+        let restarts_before = RESTARTS.load(Ordering::SeqCst);
+        let mut events = Vec::new();
+
+        take_read(
+            &mut bytes,
+            &mut seen,
+            b"fixture-b",
+            restarts_before,
+            &mut |event| events.push(event),
+        );
+
+        assert_eq!(events.first(), Some(&Event::Restart), "{events:?}");
+        assert_eq!(
+            events.iter().filter(|event| event.is_text()).count(),
+            b"fixture-b".len(),
+            "{events:?}"
+        );
+    }
 
     #[test]
     fn emacs_s_shell_buffer_shows_what_s_typed_and_its_terminals_hide_it() {
