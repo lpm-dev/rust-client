@@ -620,7 +620,7 @@ fn command_directory_in_with_hook(
         .inspect_err(|error| tracing::debug!("npm's node-gyp isn't offered: {error}"))
         .ok()?;
     after_write();
-    let file_stamps: Option<Vec<(&'static str, FileStamp)>> = npm
+    let file_stamps: Vec<(&'static str, FileStamp)> = npm
         .command_files()
         .into_iter()
         .map(|(name, expected)| {
@@ -629,20 +629,18 @@ fn command_directory_in_with_hook(
                 verified_written_shim_stamp(&directory.join(name), expected.as_bytes())?,
             ))
         })
-        .collect();
-    if let Some(file_stamps) = file_stamps {
-        if written.len() >= MAX_NODE_GYP_CACHE_ENTRIES && !written.contains_key(&key) {
-            written.clear();
-        }
-        written.insert(
-            key,
-            CachedWrittenCommands {
-                version: npm.version.clone(),
-                directory: directory.clone(),
-                file_stamps,
-            },
-        );
+        .collect::<Option<Vec<_>>>()?;
+    if written.len() >= MAX_NODE_GYP_CACHE_ENTRIES && !written.contains_key(&key) {
+        written.clear();
     }
+    written.insert(
+        key,
+        CachedWrittenCommands {
+            version: npm.version.clone(),
+            directory: directory.clone(),
+            file_stamps,
+        },
+    );
     Some(directory)
 }
 
@@ -656,6 +654,14 @@ fn verified_written_shim_stamp(path: &Path, expected: &[u8]) -> Option<FileStamp
     let pre_meta = file.metadata().ok()?;
     if !pre_meta.is_file() || pre_meta.len() != expected.len() as u64 {
         return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if pre_meta.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
     }
     let pre = FileStamp::from_metadata(&pre_meta);
     let mut bytes = Vec::with_capacity(expected.len());
@@ -1203,17 +1209,58 @@ pub(crate) mod tests {
                 other_process_npm
                     .write_commands(&commands_for_hook)
                     .expect("external writer");
-            })
-            .expect("writer A command dir");
+            });
+        assert!(
+            dir_a.is_none(),
+            "post-write verification failure on externally overwritten shim must fail closed"
+        );
 
-        // Next request for 11.0.0 must NOT treat the external 12.0.0 shim on disk as
-        // a valid cached 11.0.0 shim.
+        // Next request for 11.0.0 must rewrite and return the expected 11.0.0 shim.
         let dir_next = command_directory_in(&[bin], &commands).expect("second 11.0.0 lookup");
-        assert_eq!(dir_next, dir_a);
         let shim_text = std::fs::read_to_string(dir_next.join(shim_name)).unwrap();
         assert!(
             shim_text.contains("11.0.0") && !shim_text.contains("12.0.0-external"),
             "cached stamps must not accept an externally overwritten shim:\n{shim_text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_executable_written_shim_is_not_cached_or_returned() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let prefix = root.path().join("node-nonexec");
+        let commands = root.path().join("commands");
+        let bin = node_with_npm(&prefix, "11.0.0", "console.log('ok');");
+        let commands_for_hook = commands.clone();
+
+        let dir_first =
+            command_directory_in_with_hook(std::slice::from_ref(&bin), &commands, move || {
+                // Strip executable bits from the written shim without changing its bytes.
+                for entry in std::fs::read_dir(&commands_for_hook).unwrap().flatten() {
+                    let shim = entry.path().join("node-gyp");
+                    if shim.is_file() {
+                        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o644))
+                            .unwrap();
+                    }
+                }
+            });
+        assert!(
+            dir_first.is_none(),
+            "post-write verification failure (non-executable shim) must fail closed and withhold directory"
+        );
+
+        let dir_repaired =
+            command_directory_in(&[bin], &commands).expect("subsequent lookup must rewrite shim");
+        let mode = std::fs::symlink_metadata(dir_repaired.join("node-gyp"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(
+            mode & 0o111,
+            0,
+            "repaired node-gyp shim must be executable after prior verification failure"
         );
     }
 }

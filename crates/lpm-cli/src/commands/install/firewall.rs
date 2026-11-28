@@ -1480,17 +1480,27 @@ fn open_monitor_verdict_cache_dir_nofollow(
         }
         let sub_mode = sub_meta.permissions().mode() & 0o777;
         let was_writable = (sub_mode & 0o022) != 0;
+        let sub_dir = cap_std::fs::Dir::from_std_file(sub_file);
         if create {
+            if root_was_writable || was_writable {
+                // Purge pre-existing files while the untrusted mode still causes
+                // concurrent readers to reject the directory, then seal to 0700
+                // and sweep once more to clear any entry planted before fchmod.
+                purge_monitor_verdict_dir_entries(&sub_dir);
+            }
             if sub_mode != 0o700 {
-                // SAFETY: `sub_file` is a real `O_RDONLY` directory descriptor opened with `O_NOFOLLOW`.
-                if unsafe { libc::fchmod(sub_file.as_raw_fd(), 0o700) } != 0 {
+                // SAFETY: `sub_dir` wraps a real `O_RDONLY` directory descriptor opened with `O_NOFOLLOW`.
+                if unsafe { libc::fchmod(sub_dir.as_fd().as_raw_fd(), 0o700) } != 0 {
                     return None;
                 }
+            }
+            if root_was_writable || was_writable {
+                purge_monitor_verdict_dir_entries(&sub_dir);
             }
         } else if was_writable {
             return None;
         }
-        (cap_std::fs::Dir::from_std_file(sub_file), was_writable)
+        (sub_dir, was_writable)
     };
     #[cfg(not(unix))]
     let (sub_dir, sub_was_writable) = {
@@ -1514,6 +1524,25 @@ fn open_monitor_verdict_cache_dir_nofollow(
         dir: sub_dir,
         was_previously_untrusted: root_was_writable || sub_was_writable,
     })
+}
+
+#[cfg(unix)]
+fn purge_monitor_verdict_dir_entries(dir: &cap_std::fs::Dir) {
+    let Ok(entries) = dir.entries() else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let is_dir = entry
+            .metadata()
+            .ok()
+            .is_some_and(|meta| meta.file_type().is_dir());
+        if is_dir {
+            let _ = dir.remove_dir_all(&name);
+        } else {
+            let _ = dir.remove_file(&name);
+        }
+    }
 }
 
 fn read_monitor_verdict_cache_from_dir(
@@ -3320,5 +3349,67 @@ mod tests {
         assert!(!is_trusted_verdict_file_unix(1001, 1000, 0o600));
         assert!(!is_trusted_verdict_file_unix(1000, 1000, 0o640));
         assert!(is_trusted_verdict_file_unix(1000, 1000, 0o600));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn healing_verdict_directory_purges_sibling_profile_files_before_reuse() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let cache_root = root.path().join("metadata-cache");
+        let subdir = cache_root.join(MONITOR_VERDICT_SUBDIR);
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::set_permissions(&cache_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&subdir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let target_a = MonitorVerdictCacheTarget {
+            cache_root: cache_root.clone(),
+            filename: "profile-a.json".to_string(),
+        };
+        let target_b = MonitorVerdictCacheTarget {
+            cache_root,
+            filename: "profile-b.json".to_string(),
+        };
+        let now_secs = 1_700_000_000;
+        let planted_payload = serde_json::json!({
+            "version": MONITOR_VERDICT_CACHE_VERSION,
+            "entries": {
+                "planted-sibling@1.0.0": {
+                    "expires_at": now_secs + 120
+                }
+            }
+        });
+        for name in [&target_a.filename, &target_b.filename] {
+            let file = subdir.join(name);
+            std::fs::write(&file, planted_payload.to_string()).unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        // Updating profile A heals the directory to 0o700; profile B's pre-heal file
+        // must also be purged so a later read for profile B cannot reuse it.
+        update_monitor_verdict_cache(
+            &target_a,
+            vec![(
+                "fresh-a@1.0.0".to_string(),
+                MonitorVerdictCacheEntry {
+                    expires_at: now_secs + 120,
+                    unknown: false,
+                    matched: false,
+                },
+            )],
+            Vec::new(),
+            now_secs,
+        );
+
+        let after_b = read_monitor_verdict_cache(&target_b, now_secs);
+        assert!(
+            after_b.is_empty(),
+            "healing verdict cache directory for profile A must purge sibling profile B's pre-heal entries"
+        );
+        assert!(
+            !subdir.join(&target_b.filename).exists(),
+            "sibling pre-heal verdict file must be removed on heal"
+        );
     }
 }

@@ -2002,31 +2002,24 @@ fn try_mtime_fast_path_with_cached_content(
 
     let pkg_path = project_dir.join("package.json");
     let pkg_lmeta = std::fs::symlink_metadata(&pkg_path).ok()?;
-    let (pkg_ns, pkg_stamp) = if lpm_common::is_symlink_or_junction(&pkg_lmeta) {
-        (mtime_ns_and_len(&pkg_path)?.0, None)
+    let (pkg_ns, pkg_is_regular) = if lpm_common::is_symlink_or_junction(&pkg_lmeta) {
+        (mtime_ns_and_len(&pkg_path)?.0, false)
     } else if pkg_lmeta.is_file() {
-        #[cfg(windows)]
-        let stamp = SyncNoopFileStamp::from_path(&pkg_path);
-        #[cfg(not(windows))]
-        let stamp = SyncNoopFileStamp::from_symlink_metadata(&pkg_lmeta);
-        (mtime_ns_from_metadata(&pkg_lmeta)?, stamp)
+        (mtime_ns_from_metadata(&pkg_lmeta)?, true)
     } else {
         return None;
     };
     // lpm.lock may be absent on a never-installed fast-lane entry; 0
     // sentinel lines up with the writer's convention.
-    let (lock_ns, lock_size, lock_stamp) = match std::fs::symlink_metadata(lock_path) {
+    let (lock_ns, lock_size, lock_regular_meta) = match std::fs::symlink_metadata(lock_path) {
         Ok(meta) if lpm_common::is_symlink_or_junction(&meta) => {
             let (ns, len) = mtime_ns_and_len(lock_path).unwrap_or((0, 0));
             (ns, len, None)
         }
         Ok(meta) if meta.is_file() => {
             let ns = mtime_ns_from_metadata(&meta).unwrap_or(0);
-            #[cfg(windows)]
-            let stamp = SyncNoopFileStamp::from_path(lock_path);
-            #[cfg(not(windows))]
-            let stamp = SyncNoopFileStamp::from_symlink_metadata(&meta);
-            (ns, meta.len(), stamp)
+            let len = meta.len();
+            (ns, len, Some(meta))
         }
         _ => (0, 0, None),
     };
@@ -2035,13 +2028,44 @@ fn try_mtime_fast_path_with_cached_content(
         return None;
     }
 
-    if let Some((expected_pkg_stamp, expected_lock_stamp)) = parse_verified_file_stamps(content) {
-        if pkg_stamp != Some(expected_pkg_stamp) || lock_stamp != expected_lock_stamp {
-            return None;
+    let pkg_stamp = if pkg_is_regular {
+        #[cfg(windows)]
+        {
+            SyncNoopFileStamp::from_path(&pkg_path)
         }
-        if expected_lock_stamp.is_none() && lock_ns != 0 {
-            return None;
+        #[cfg(not(windows))]
+        {
+            SyncNoopFileStamp::from_symlink_metadata(&pkg_lmeta)
         }
+    } else {
+        None
+    };
+    let lock_stamp = match lock_regular_meta {
+        Some(meta) => {
+            #[cfg(windows)]
+            {
+                let _ = meta;
+                SyncNoopFileStamp::from_path(lock_path)
+            }
+            #[cfg(not(windows))]
+            {
+                SyncNoopFileStamp::from_symlink_metadata(&meta)
+            }
+        }
+        None => None,
+    };
+
+    match parse_verified_file_stamps(content) {
+        VerifiedFileStampsParse::Valid(expected_pkg_stamp, expected_lock_stamp) => {
+            if pkg_stamp != Some(expected_pkg_stamp) || lock_stamp != expected_lock_stamp {
+                return None;
+            }
+            if expected_lock_stamp.is_none() && lock_ns != 0 {
+                return None;
+            }
+        }
+        VerifiedFileStampsParse::Malformed => return None,
+        VerifiedFileStampsParse::Absent => {}
     }
 
     if obsolete_binary_lockfile_remains(lock_path) {
@@ -2053,20 +2077,28 @@ fn try_mtime_fast_path_with_cached_content(
     // cannot be trusted even with matching manifest mtimes.
     let nm_ns = mtime_ns(&nm)?;
     let hash_lmeta = std::fs::symlink_metadata(&hash_file).ok()?;
-    let (hash_ns, hash_stamp) = if lpm_common::is_symlink_or_junction(&hash_lmeta) {
-        (mtime_ns(&hash_file)?, None)
+    let (hash_ns, hash_is_regular) = if lpm_common::is_symlink_or_junction(&hash_lmeta) {
+        (mtime_ns(&hash_file)?, false)
     } else if hash_lmeta.is_file() {
-        #[cfg(windows)]
-        let stamp = SyncNoopFileStamp::from_path(&hash_file);
-        #[cfg(not(windows))]
-        let stamp = SyncNoopFileStamp::from_symlink_metadata(&hash_lmeta);
-        (mtime_ns_from_metadata(&hash_lmeta)?, stamp)
+        (mtime_ns_from_metadata(&hash_lmeta)?, true)
     } else {
         return None;
     };
     if nm_ns > hash_ns {
         return None;
     }
+    let hash_stamp = if hash_is_regular {
+        #[cfg(windows)]
+        {
+            SyncNoopFileStamp::from_path(&hash_file)
+        }
+        #[cfg(not(windows))]
+        {
+            SyncNoopFileStamp::from_symlink_metadata(&hash_lmeta)
+        }
+    } else {
+        None
+    };
 
     Some((
         InstallState {
@@ -2254,18 +2286,41 @@ pub(crate) fn write_install_hash_with_integrity_platform_and_dependency_engine(
     )
 }
 
-fn parse_verified_file_stamps(
-    content: &str,
-) -> Option<(SyncNoopFileStamp, Option<SyncNoopFileStamp>)> {
-    let rest = content.lines().find_map(|line| line.strip_prefix("t:"))?;
-    let (pkg_raw, lock_raw) = rest.split_once(':')?;
-    let pkg_stamp = SyncNoopFileStamp::parse_compact(pkg_raw)?;
+enum VerifiedFileStampsParse {
+    Absent,
+    Valid(SyncNoopFileStamp, Option<SyncNoopFileStamp>),
+    Malformed,
+}
+
+fn parse_verified_file_stamps(content: &str) -> VerifiedFileStampsParse {
+    let mut found = None;
+    for line in content.lines() {
+        let Some(rest) = line.strip_prefix("t:") else {
+            continue;
+        };
+        if found.is_some() {
+            return VerifiedFileStampsParse::Malformed;
+        }
+        found = Some(rest);
+    }
+    let Some(rest) = found else {
+        return VerifiedFileStampsParse::Absent;
+    };
+    let Some((pkg_raw, lock_raw)) = rest.split_once(':') else {
+        return VerifiedFileStampsParse::Malformed;
+    };
+    let Some(pkg_stamp) = SyncNoopFileStamp::parse_compact(pkg_raw) else {
+        return VerifiedFileStampsParse::Malformed;
+    };
     let lock_stamp = if lock_raw == "none" {
         None
     } else {
-        Some(SyncNoopFileStamp::parse_compact(lock_raw)?)
+        let Some(stamp) = SyncNoopFileStamp::parse_compact(lock_raw) else {
+            return VerifiedFileStampsParse::Malformed;
+        };
+        Some(stamp)
     };
-    Some((pkg_stamp, lock_stamp))
+    VerifiedFileStampsParse::Valid(pkg_stamp, lock_stamp)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5240,5 +5295,130 @@ mod tests {
             "proof backfill must skip when another install holds the project install lock"
         );
         assert_eq!(fs::read_to_string(&hash_path).unwrap(), original);
+    }
+
+    #[test]
+    fn malformed_verified_stamp_line_rejects_mtime_fast_path_while_absent_stays_compatible() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let pkg_path = root.join("package.json");
+        let lock_path = root.join("lpm.lock");
+        let pkg = r#"{"name":"stamp-parse","version":"1.0.0"}"#;
+        fs::write(&pkg_path, pkg).unwrap();
+        fs::write(&lock_path, "lockfile_version = 13\n").unwrap();
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+        fs::create_dir_all(root.join(".lpm")).unwrap();
+
+        let pkg_stamp = read_text_regular_file_capped_with_stamp(
+            &pkg_path,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        )
+        .unwrap()
+        .1
+        .expect("package.json stamp");
+        let lock_stamp = read_text_regular_file_capped_with_stamp(
+            &lock_path,
+            lpm_common::STATE_FILE_SIZE_CAP_BYTES,
+        )
+        .unwrap()
+        .1
+        .expect("lpm.lock stamp");
+        let hash_context = InstallHashContext {
+            security_analysis_policy: lpm_store::SecurityAnalysisPolicy::Disabled,
+            dependency_engine_key: "none",
+        };
+        let platform = PlatformTuple::current();
+        write_install_hash_with_known_runtime_state_and_mtime_policy(
+            root,
+            "fakehash",
+            lpm_linker::LinkerMode::Isolated,
+            ObjectIntegrityPolicy::Source,
+            &platform,
+            hash_context.dependency_engine_key,
+            KnownInstallHashRuntimeState {
+                lockfile_path: &lock_path,
+                node_runtime_fingerprint: None,
+                security_analysis_policy: hash_context.security_analysis_policy,
+                sync_noop_proof: None,
+                release_age_policy_key: None,
+            },
+            InstallHashMtimePolicy::Verified {
+                pkg_stamp,
+                lock_stamp: Some(lock_stamp),
+            },
+        )
+        .unwrap();
+
+        let hash_file = root.join(".lpm/install-hash");
+        let saved = fs::read_to_string(&hash_file).unwrap();
+        assert!(
+            saved.lines().any(|line| line.starts_with("t:")),
+            "verified save must write a t: stamp line"
+        );
+        // Valid t: line hits the fast path directly.
+        assert!(
+            try_mtime_fast_path_with_cached_content(
+                root,
+                &lock_path,
+                pkg,
+                Some(&saved),
+                lpm_linker::LinkerMode::Isolated,
+                ObjectIntegrityPolicy::Source,
+                &platform,
+                lpm_store::StoreVersion::V2,
+                hash_context,
+            )
+            .is_some(),
+            "unchanged files with valid t: stamp must hit mtime fast path"
+        );
+
+        // Legacy install-hash with NO t: line stays compatible.
+        let without_t: String = saved
+            .lines()
+            .filter(|line| !line.starts_with("t:"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert!(
+            try_mtime_fast_path_with_cached_content(
+                root,
+                &lock_path,
+                pkg,
+                Some(&without_t),
+                lpm_linker::LinkerMode::Isolated,
+                ObjectIntegrityPolicy::Source,
+                &platform,
+                lpm_store::StoreVersion::V2,
+                hash_context,
+            )
+            .is_some(),
+            "legacy install-hash without t: line must remain eligible for mtime fast path"
+        );
+
+        // A present-but-malformed t: line must force slow-path verification.
+        let malformed_t: String = saved
+            .lines()
+            .map(|line| {
+                if line.starts_with("t:") {
+                    "t:corrupted\n".to_string()
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect();
+        assert!(
+            try_mtime_fast_path_with_cached_content(
+                root,
+                &lock_path,
+                pkg,
+                Some(&malformed_t),
+                lpm_linker::LinkerMode::Isolated,
+                ObjectIntegrityPolicy::Source,
+                &platform,
+                lpm_store::StoreVersion::V2,
+                hash_context,
+            )
+            .is_none(),
+            "malformed t: line must not silently fall back to mtime-only freshness"
+        );
     }
 }
