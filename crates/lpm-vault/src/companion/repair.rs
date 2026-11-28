@@ -4,16 +4,18 @@
 //! repair runs only against the state the person reviewed.
 
 use super::account::CompanionAccount;
-use super::assessment::{Observed, Repair, assess};
+use super::assessment::{Observed, Repair, assess_gate, gate_of, reads_overrides_record};
 use super::lifecycle::{FoundMarker, execute, plan_discard};
 use super::marker::Marker;
 use super::overrides::OVERRIDES_KIND;
-use super::{Checked, CompanionBackend};
+use super::{Checked, CompanionBackend, Opened};
 
-/// What's damaged in a project's newer data, and how each problem is
-/// repaired, in the order the engine found them.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// What's damaged in one project's newer data, and how each problem is
+/// repaired, in the order the engine found them. A repair runs it only on
+/// the project it reviewed.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompanionReview {
+    vault_id: String,
     pub problems: Vec<CompanionProblem>,
     /// The repairs that set every problem right, as the engine decides them.
     repairs: Vec<CompanionRepair>,
@@ -67,8 +69,9 @@ impl From<Repair> for CompanionRepair {
 impl CompanionReview {
     /// A review of one problem that only discarding the newer data repairs,
     /// such as an interrupted change that can't be finished.
-    pub(crate) fn discard(description: String) -> Self {
+    pub(crate) fn discard(vault_id: &str, description: String) -> Self {
         Self {
+            vault_id: vault_id.to_owned(),
             problems: vec![CompanionProblem {
                 description,
                 repair: Some(CompanionRepair::DiscardProject),
@@ -81,6 +84,11 @@ impl CompanionReview {
     /// is needed, since it removes everything the others would.
     pub fn repairs(&self) -> &[CompanionRepair] {
         &self.repairs
+    }
+
+    /// The project this reviewed.
+    pub(crate) fn vault_id(&self) -> &str {
+        &self.vault_id
     }
 }
 
@@ -95,44 +103,86 @@ fn marker_account(vault_id: &str) -> CompanionAccount {
 
 /// Review `vault_id`'s companion data as the engine judges it, after its
 /// interrupted steps were finished. `access` is why the store found the
-/// project's access damaged, if it did, and `unfinished` why its interrupted
-/// step can never be finished, if it can't; its records aren't read then.
+/// project's access damaged, if it did, and `opened` what opening the
+/// project found in this lock scope: its gate, or why its interrupted step
+/// can never be finished. Records aren't read with damaged access or such a
+/// step, since the approval that protects them can't be told, or what they
+/// hold can't be trusted. Otherwise the overrides record is read only where
+/// the listing shows it and the engine judges what it holds, and only beside
+/// values.
 pub(crate) fn review(
     backend: &mut impl CompanionBackend,
     vault_id: &str,
     access: Option<&str>,
-    unfinished: Option<&str>,
+    opened: Opened,
 ) -> Result<CompanionReview, String> {
-    let marker = backend.read(&marker_account(vault_id))?;
-    let inventory = backend.inventory(vault_id)?;
-    let overrides = match unfinished {
-        Some(_) => None,
-        None => Some(backend.read(&CompanionAccount::Record {
-            kind: OVERRIDES_KIND.to_owned(),
-            vault_id: vault_id.to_owned(),
-            part: None,
-        })?),
+    let (gate, unfinished) = match opened {
+        Opened::Gate(gate) => (gate, None),
+        Opened::Unfinished(reason) => (
+            gate_of(
+                vault_id,
+                backend.read(&marker_account(vault_id))?.as_deref(),
+            ),
+            Some(reason),
+        ),
     };
-    let history = match (unfinished, marker.as_deref()) {
-        (None, Some(bytes)) => history_damage(backend, vault_id, bytes)?,
+    let unfinished = unfinished.as_deref();
+    let inventory = backend.inventory(vault_id)?;
+    let contents_are_judged =
+        reads_overrides_record(vault_id, &gate, Some(&inventory), access, unfinished);
+    let mut unreadable_overrides = None;
+    let overrides = if contents_are_judged {
+        backend
+            .read_overrides_beside_values(vault_id)?
+            .map(|checked| match checked {
+                Checked::Present(bytes) => Some(bytes),
+                Checked::Absent => None,
+                // Content that won't decrypt won't open as a record either, so
+                // the engine judges it as it judges any record it can't open.
+                Checked::Unreadable(reason) => {
+                    unreadable_overrides = Some(reason);
+                    Some(zeroize::Zeroizing::new(Vec::new()))
+                }
+            })
+    } else {
+        None
+    };
+    let history = match (unfinished, gate.marker()) {
+        (None, Some(parsed)) => history_damage(backend, vault_id, parsed)?,
         _ => Vec::new(),
     };
-    let assessment = assess(
+    let assessment = assess_gate(
         vault_id,
+        gate,
         Observed {
-            marker: marker.as_deref(),
+            marker: None,
             inventory: Some(&inventory),
-            overrides: overrides.as_ref().map(Option::as_deref),
+            overrides: overrides
+                .as_ref()
+                .map(|record| record.as_deref().map(Vec::as_slice)),
             access,
             unfinished,
             history: &history,
         },
     );
+    let described = |damage: &super::gate::Damage| match (damage, &unreadable_overrides) {
+        (super::gate::Damage::InvalidRecord { kind, .. }, Some(reason))
+            if kind == OVERRIDES_KIND =>
+        {
+            super::gate::Damage::InvalidRecord {
+                kind: kind.clone(),
+                reason: format!("it can't be read: {reason}"),
+            }
+            .to_string()
+        }
+        _ => damage.to_string(),
+    };
     Ok(CompanionReview {
+        vault_id: vault_id.to_owned(),
         problems: assessment
             .every_damage()
             .map(|damage| CompanionProblem {
-                description: damage.to_string(),
+                description: described(damage),
                 repair: assessment.repair(damage).map(CompanionRepair::from),
             })
             .collect(),
@@ -151,14 +201,11 @@ pub(crate) fn review(
 fn history_damage(
     backend: &mut impl CompanionBackend,
     vault_id: &str,
-    marker: &[u8],
+    marker: &Marker,
 ) -> Result<Vec<super::gate::Damage>, String> {
     use lpm_env_companion::history::switch::MarkerHistory;
     use lpm_env_companion::history::{head_account, key_account, part_account};
-    let Ok(marker) = Marker::parse(vault_id, marker) else {
-        return Ok(Vec::new());
-    };
-    if MarkerHistory::of(Some(&marker)) != MarkerHistory::On {
+    if MarkerHistory::of(Some(marker)) != MarkerHistory::On {
         return Ok(Vec::new());
     }
     let unreadable = |kind: &str, reason: String| super::gate::Damage::InvalidRecord {
@@ -207,18 +254,29 @@ fn history_damage(
 }
 
 /// Run every repair `reviewed` lists, after checking `vault_id` still shows
-/// exactly that damage. Returns the repairs it ran. A discard runs on the
-/// marker as it stands, so it never needs the interrupted step finished.
+/// exactly that damage. Returns the repairs it ran.
+#[cfg(target_os = "macos")]
 pub(crate) fn repair(
     backend: &mut impl CompanionBackend,
     vault_id: &str,
     access: Option<&str>,
-    unfinished: Option<&str>,
+    opened: Opened,
     reviewed: &CompanionReview,
 ) -> Result<Vec<CompanionRepair>, String> {
-    if review(backend, vault_id, access, unfinished)? != *reviewed {
+    if review(backend, vault_id, access, opened)? != *reviewed {
         return Err(CHANGED_SINCE_REVIEW.to_owned());
     }
+    run_repairs(backend, vault_id, reviewed)
+}
+
+/// Run every repair `reviewed` lists, for a caller that checked in this lock
+/// scope that `vault_id` still shows exactly that damage. A discard runs on
+/// the marker as it stands, so it never needs the interrupted step finished.
+pub(crate) fn run_repairs(
+    backend: &mut impl CompanionBackend,
+    vault_id: &str,
+    reviewed: &CompanionReview,
+) -> Result<Vec<CompanionRepair>, String> {
     let repairs = reviewed.repairs().to_vec();
     for repair in &repairs {
         let marker = backend

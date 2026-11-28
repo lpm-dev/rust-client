@@ -13,7 +13,7 @@ use crate::graph::{self, SHARED_KEY_KIND};
 
 pub const MARKER_SCHEMA_VERSION: u8 = 1;
 pub const MAX_RECORD_BYTES: usize = 100 * 1024;
-const MAX_FEATURES: usize = 16;
+pub const MAX_FEATURES: usize = 16;
 const MAX_KINDS_PER_FEATURE: usize = 8;
 
 /// What a client that doesn't support a feature's version may do, from most
@@ -456,7 +456,7 @@ mod tests {
     fn an_unsupported_version_of_a_known_feature_may_add_a_kind() {
         let marker = marker(&[(
             "overrides",
-            entry(2, Level::Ignore, &["overrides", "overrides-index"]),
+            entry(3, Level::Ignore, &["overrides", "overrides-index"]),
         )]);
         assert!(marker.validate().is_ok());
         assert_eq!(marker.level(), Level::Refuse);
@@ -535,7 +535,7 @@ mod tests {
                 Level::Ignore,
             ),
             (
-                vec![("overrides", entry(2, Level::Ignore, &["overrides"]))],
+                vec![("overrides", entry(3, Level::Ignore, &["overrides"]))],
                 Level::Refuse,
             ),
             (

@@ -35,6 +35,7 @@ pub mod lpm_json;
 pub mod node_gyp;
 pub mod npm_context;
 pub mod orchestrator;
+pub mod override_marker;
 pub mod ports;
 pub mod ready;
 pub mod script;

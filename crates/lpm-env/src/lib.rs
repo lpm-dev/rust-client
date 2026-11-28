@@ -26,6 +26,7 @@ mod example;
 mod inheritance;
 mod names;
 mod object;
+mod personal;
 mod print;
 pub mod resolver;
 mod schema;
@@ -42,6 +43,7 @@ pub use characters::{
 pub use example::generate as generate_env_example;
 pub use inheritance::{EnvDefinition, EnvironmentsConfig, list_environments, resolve_chain};
 pub use names::{CasingConflict, EnvName, align_declared_casing};
+pub use personal::{PersonalOverrideLayer, PersonalOverrideOrigins, apply_personal_overrides};
 pub use print::{PrintFormat, format_env, is_valid_env_var_name};
 pub use resolver::{EnvSource, ResolvedEnv, extract_mode_from_env_path};
 pub use schema::{
@@ -51,7 +53,8 @@ pub use schema::{
 pub use scopes::{EnvStage, EvalContext, ScopeSelector, ScopedDefault};
 pub use stored::{
     DEFAULT_ENVIRONMENT, INHERITED_RUNTIME_HOOKS, StoredValuesCheck, check_stored_values,
-    is_denied_env_var, is_never_passed, reads_default_environment,
+    check_stored_values_with_overrides, is_denied_env_var, is_never_passed,
+    reads_default_environment,
 };
 pub use unknown_fields::{
     UnknownField, first_unknown_definition_field, first_unknown_schema_field,

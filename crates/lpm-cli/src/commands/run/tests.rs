@@ -262,6 +262,50 @@ fn build_cache_context_returns_none_without_lpm_json() {
 }
 
 #[test]
+fn a_task_s_keyed_reads_name_the_project_its_parsed_config_names_without_reading_lpm_json_again() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"scripts":{"build":"echo hi"}}"#,
+    )
+    .unwrap();
+    let mut config = lpm_runner::lpm_json::LpmJsonConfig {
+        tasks: std::collections::HashMap::from([(
+            "build".into(),
+            lpm_runner::lpm_json::TaskConfig {
+                cache: true,
+                outputs: vec!["dist/**".into()],
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    write_lpm_json_config(dir.path(), &config);
+    config.vault = Some("named-in-the-parsed-config".into());
+
+    let ctx = build_cache_context(
+        dir.path(),
+        "build",
+        None,
+        &[],
+        &lpm_runner::bin_path::ManagedRuntimeHint::Absent,
+        Some(&config),
+    )
+    .unwrap()
+    .expect("a cached task");
+
+    assert_eq!(
+        ctx.keyed_entries,
+        lpm_vault::override_marker::Access::keyed(
+            "named-in-the-parsed-config",
+            "default",
+            None,
+            None
+        )
+    );
+}
+
+#[test]
 fn build_cache_context_returns_none_when_cache_false() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(

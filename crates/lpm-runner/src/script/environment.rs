@@ -45,7 +45,7 @@ pub(super) fn print_env_context(loaded: &LoadedEnv) {
             override_count,
             loaded.env_name.as_deref().unwrap_or("default"),
         );
-        dotenv::log_personal_override_names(loaded.layers.overrides());
+        dotenv::log_personal_override_names(|| loaded.layers.override_names());
     }
 
     // Build parts and join with " · "
@@ -79,6 +79,9 @@ pub(crate) struct LoadedEnv {
     /// The canonical environment name (e.g., "development", "production").
     /// `None` if no env was resolved (just .env + .env.local).
     pub(crate) env_name: Option<String>,
+    /// The environment the vault was read for, `None` for `default` without
+    /// a fallback.
+    vault_environment: Option<String>,
     /// The alias that resolved to this env (e.g., "dev" → "development").
     alias: Option<String>,
     /// How the env was determined.
@@ -194,23 +197,23 @@ pub(crate) fn resolve_and_load_env_with_schema_validation(
         let validator = config
             .and_then(|config| config.env_schema.as_ref())
             .map(lpm_env::EnvValidator::new);
-        let vault_count = layers.vault_count();
-        let mut child = layers.compose(None, None)?;
-        dotenv::validate_project_env_with_plan(
-            &mut child,
-            validator.as_ref(),
-            lpm_env::EvalContext {
-                environment: env_name.unwrap_or("default"),
-                stage: lpm_env::EnvStage::for_script(script_name),
-                service: None,
-            },
-        )?;
-        layers = dotenv::ProjectEnvLayers::already_composed(child, vault_count);
+        layers = layers.into_validated(|child| {
+            dotenv::validate_project_env_with_plan(
+                child,
+                validator.as_ref(),
+                lpm_env::EvalContext {
+                    environment: env_name.unwrap_or("default"),
+                    stage: lpm_env::EnvStage::for_script(script_name),
+                    service: None,
+                },
+            )
+        })?;
     }
 
     Ok(LoadedEnv {
         layers,
         env_name: env_name.map(str::to_string),
+        vault_environment: load_mode.map(str::to_owned),
         alias: resolved.and_then(|env| env.alias),
         source,
     })
@@ -245,6 +248,21 @@ pub fn load_script_env_with_config(
         .map(dotenv::ChildEnv::into_vars)
 }
 
+/// A script's validated final environment, and how many personal overrides
+/// changed it.
+pub struct ScriptChildEnv {
+    pub vars: HashMap<String, String>,
+    pub personal_overrides: usize,
+    /// See [`lpm_vault::RunEnvironment::overrides_identity`].
+    pub project_overrides: Option<lpm_vault::OverridesIdentity>,
+    /// The environment whose values the vault gave, `default` when none
+    /// was resolved.
+    pub vault_environment: String,
+    /// What identifies the values the vault gave, as an lpm the script
+    /// starts reads them; `None` when it gave none.
+    pub vault_values: Option<lpm_vault::ValuesIdentity>,
+}
+
 /// Load the validated final script environment for task-cache fingerprinting.
 /// A change to the effective environment, personal overrides included under
 /// [`dotenv::OverridePolicy::Apply`], changes the result.
@@ -258,7 +276,7 @@ pub fn load_script_child_env_with_config(
     command: &str,
     context: &NpmScriptContext,
     policy: dotenv::OverridePolicy,
-) -> Result<HashMap<String, String>, LpmError> {
+) -> Result<ScriptChildEnv, LpmError> {
     let mut loaded = resolve_and_load_env_with_schema_validation(
         project_dir,
         script_name,
@@ -267,7 +285,10 @@ pub fn load_script_child_env_with_config(
         false,
         policy,
     )?;
+    let vault_values = loaded.layers.vault_values_identity();
     let mut vars = loaded.take_child_env()?;
+    let personal_overrides = vars.override_count();
+    let project_overrides = vars.overrides_identity();
     mark_script_child_env(&mut vars);
     vars.apply_npm_context(context, script_name, command);
     let validate_schema = !should_skip_env_validation();
@@ -286,7 +307,16 @@ pub fn load_script_child_env_with_config(
         path,
         validate_schema,
     )?;
-    Ok(vars.into_vars())
+    Ok(ScriptChildEnv {
+        vars: vars.into_vars(),
+        personal_overrides,
+        project_overrides,
+        vault_environment: loaded
+            .vault_environment
+            .take()
+            .unwrap_or_else(|| lpm_env::DEFAULT_ENVIRONMENT.to_owned()),
+        vault_values,
+    })
 }
 
 #[cfg(test)]

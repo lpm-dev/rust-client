@@ -24,6 +24,7 @@ use crate::macos_keychain::{
 
 mod companion_gate;
 mod history;
+pub(crate) mod overrides;
 
 pub(crate) use history::history_store;
 
@@ -330,9 +331,10 @@ pub(crate) trait ProjectStorage {
 }
 
 /// A project storage that lists the service once, and learns each item's
-/// claimed approval once, keeping both current through the writes and
-/// deletions it makes, for the several transactions of one operation inside
-/// one lock. Nothing else writes the service while the lock is held.
+/// claimed approval and probed access once, keeping them current through the
+/// writes, deletions and approvals it makes, for the several transactions of
+/// one operation inside one lock. Nothing else writes the service while the
+/// lock is held.
 struct ListedStorage<'storage, S: ProjectStorage> {
     storage: &'storage mut S,
     /// Every account and its claim from one listing; `None` for an account
@@ -340,6 +342,8 @@ struct ListedStorage<'storage, S: ProjectStorage> {
     listing: Option<HashMap<String, Option<ClaimedAccess>>>,
     /// Claims learned without a listing; `None` for an absent item.
     claims: HashMap<String, Option<ClaimedAccess>>,
+    /// Probes that concluded; a probe of a locked Keychain is asked again.
+    probes: HashMap<String, ProbeOutcome>,
 }
 
 impl<'storage, S: ProjectStorage> ListedStorage<'storage, S> {
@@ -348,12 +352,19 @@ impl<'storage, S: ProjectStorage> ListedStorage<'storage, S> {
             storage,
             listing: None,
             claims: HashMap::new(),
+            probes: HashMap::new(),
         }
     }
 
-    fn wrote(&mut self, account: &str) {
+    /// Notes a write to `account` that ended with `written`: what it claims
+    /// and how it probes may have changed either way, and a write that failed
+    /// may or may not have left the item, so the listing is read again.
+    fn wrote(&mut self, account: &str, written: &Result<(), String>) {
         self.claims.remove(account);
-        if let Some(listing) = self.listing.as_mut() {
+        self.probes.remove(account);
+        if written.is_err() {
+            self.listing = None;
+        } else if let Some(listing) = self.listing.as_mut() {
             listing.insert(account.to_owned(), None);
         }
     }
@@ -379,12 +390,13 @@ impl<S: ProjectStorage> ProjectStorage for ListedStorage<'_, S> {
 
     fn write(&mut self, account: &str, value: &[u8]) -> Result<(), String> {
         let written = self.storage.write(account, value);
-        self.wrote(account);
+        self.wrote(account, &written);
         written
     }
 
     fn delete(&mut self, account: &str) -> Result<bool, String> {
         let deleted = self.storage.delete(account);
+        self.probes.remove(account);
         if deleted.is_ok() {
             self.claims.insert(account.to_owned(), None);
             if let Some(listing) = self.listing.as_mut() {
@@ -473,16 +485,25 @@ impl<S: ProjectStorage> ProjectStorage for ListedStorage<'_, S> {
     }
 
     fn probe(&mut self, account: &str, open_accounts: &[&str]) -> ProbeOutcome {
-        self.storage.probe(account, open_accounts)
+        if let Some(outcome) = self.probes.get(account) {
+            return *outcome;
+        }
+        let outcome = self.storage.probe(account, open_accounts);
+        if outcome != ProbeOutcome::Inconclusive {
+            self.probes.insert(account.to_owned(), outcome);
+        }
+        outcome
     }
 
     fn require_approval(&mut self, account: &str, open_accounts: &[&str]) -> Result<(), String> {
-        self.storage.require_approval(account, open_accounts)
+        let approved = self.storage.require_approval(account, open_accounts);
+        self.wrote(account, &approved);
+        approved
     }
 
     fn write_verified(&mut self, account: &str, value: &[u8]) -> Result<(), String> {
         let written = self.storage.write_verified(account, value);
-        self.wrote(account);
+        self.wrote(account, &written);
         written
     }
 
@@ -495,7 +516,7 @@ impl<S: ProjectStorage> ProjectStorage for ListedStorage<'_, S> {
         let written = self
             .storage
             .write_verified_with_access_from(account, value, source);
-        self.wrote(account);
+        self.wrote(account, &written);
         written
     }
 
@@ -508,7 +529,7 @@ impl<S: ProjectStorage> ProjectStorage for ListedStorage<'_, S> {
         let written = self
             .storage
             .write_verified_with_access(account, value, access);
-        self.wrote(account);
+        self.wrote(account, &written);
         written
     }
 }
@@ -747,10 +768,12 @@ fn follows_values(account: &CompanionAccount) -> bool {
     }
 }
 
-/// Write `target`'s stage. A values stage copies the values item's claimed
-/// approval, as it always has. A companion record that follows values takes
-/// the values item's approval as a probe verifies it, so a weak item
-/// claiming approval can't pass a weaker one on.
+/// Write `target`'s stage. A companion record that follows values takes the
+/// values item's approval as a probe verifies it, so a weak item claiming
+/// approval can't pass a weaker one on, and so does the values stage of a
+/// transaction that also changes companion records, whose probe that
+/// verification shares. A values stage alone copies the values item's
+/// claimed approval, as it always has.
 fn stage_write(
     storage: &mut impl ProjectStorage,
     stage: &str,
@@ -760,8 +783,18 @@ fn stage_write(
     values_access: &mut HashMap<String, CliAccess>,
 ) -> Result<(), String> {
     let companion = CompanionAccount::parse(target);
-    if let Some(companion) = companion.as_ref().filter(|parsed| follows_values(parsed)) {
-        let vault_id = companion.vault_id().to_owned();
+    let verified_for = match companion.as_ref() {
+        Some(parsed) if follows_values(parsed) => Some(parsed.vault_id().to_owned()),
+        None if validate_vault_id(target).is_ok()
+            && mutations
+                .iter()
+                .any(|mutation| CompanionAccount::parse(mutation.account()).is_some()) =>
+        {
+            Some(target.to_owned())
+        }
+        _ => None,
+    };
+    if let Some(vault_id) = verified_for {
         let access = match values_access.get(&vault_id) {
             Some(access) => *access,
             None => {
@@ -773,9 +806,13 @@ fn stage_write(
                 access
             }
         };
-        return storage.write_verified_with_access(stage, value, access);
+        return crate::macos_keychain::prompting_as(target, || {
+            storage.write_verified_with_access(stage, value, access)
+        });
     }
-    storage.write_verified_with_access_from(stage, value, target)
+    crate::macos_keychain::prompting_as(target, || {
+        storage.write_verified_with_access_from(stage, value, target)
+    })
 }
 
 /// The values item's CLI approval, verified by a probe rather than read
@@ -785,10 +822,8 @@ fn verified_values_access(
     vault_id: &str,
     written_in_transaction: bool,
 ) -> Result<CliAccess, String> {
-    probe_values_access(storage, vault_id, written_in_transaction)?.ok_or_else(|| {
-        "the macOS Keychain is unavailable, so env approval couldn't be confirmed; retry once the Mac is unlocked"
-            .to_owned()
-    })
+    probe_values_access(storage, vault_id, written_in_transaction)?
+        .ok_or_else(|| companion_gate::APPROVAL_UNCONFIRMED.to_owned())
 }
 
 /// [`verified_values_access`], with `None` when the Keychain is unavailable,
@@ -886,6 +921,21 @@ fn recover_project_transaction(
             Ok(TransactionRecovery::DiscardedPreparing)
         }
         TransactionState::Committed => {
+            let mut changed: Vec<String> = Vec::new();
+            for account in journal
+                .operations
+                .iter()
+                .filter_map(|operation| CompanionAccount::parse(&operation.target_account))
+                .filter(crate::companion::changes_overrides)
+            {
+                if !changed
+                    .iter()
+                    .any(|vault_id| vault_id == account.vault_id())
+                {
+                    crate::companion::report_replayed_change(account.vault_id())?;
+                    changed.push(account.vault_id().to_owned());
+                }
+            }
             roll_forward_persisted_project_transaction(storage, &journal)?;
             Ok(TransactionRecovery::RolledForwardCommitted)
         }
@@ -948,11 +998,7 @@ fn discard_preparing_project_transaction(
     storage: &mut impl ProjectStorage,
     journal: &TransactionJournal,
 ) -> Result<(), String> {
-    for operation in &journal.operations {
-        if let Some(stage) = &operation.staged_account {
-            delete_verified(storage, stage)?;
-        }
-    }
+    delete_stages(storage, journal)?;
     delete_verified(storage, TRANSACTION_MARKER_ACCOUNT)
 }
 
@@ -1040,7 +1086,10 @@ fn read_validated_stage(
     operation: &TransactionJournalOperation,
     stage: &str,
 ) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, String> {
-    let Some(value) = storage.read(stage)?.map(zeroize::Zeroizing::new) else {
+    let Some(value) =
+        crate::macos_keychain::prompting_as(&operation.target_account, || storage.read(stage))?
+            .map(zeroize::Zeroizing::new)
+    else {
         return Ok(None);
     };
     if value.len() > MAX_TRANSACTION_VALUE_BYTES
@@ -1132,12 +1181,24 @@ fn finish_project_transaction(
     storage: &mut impl ProjectStorage,
     journal: &TransactionJournal,
 ) -> Result<(), String> {
+    delete_stages(storage, journal)?;
+    delete_verified(storage, TRANSACTION_MARKER_ACCOUNT)
+}
+
+/// Delete `journal`'s stages, each read back, as it's checked gone, in the
+/// name of the item it stands for, which an approval prompt shows.
+fn delete_stages(
+    storage: &mut impl ProjectStorage,
+    journal: &TransactionJournal,
+) -> Result<(), String> {
     for operation in &journal.operations {
         if let Some(stage) = &operation.staged_account {
-            delete_verified(storage, stage)?;
+            crate::macos_keychain::prompting_as(&operation.target_account, || {
+                delete_verified(storage, stage)
+            })?;
         }
     }
-    delete_verified(storage, TRANSACTION_MARKER_ACCOUNT)
+    Ok(())
 }
 
 fn transaction_is_fully_applied(
@@ -1149,7 +1210,10 @@ fn transaction_is_fully_applied(
     }
     for operation in &journal.operations {
         if let Some(stage) = &operation.staged_account
-            && storage.read(stage)?.is_some()
+            && crate::macos_keychain::prompting_as(&operation.target_account, || {
+                storage.read(stage)
+            })?
+            .is_some()
         {
             return Ok(false);
         }
@@ -1637,7 +1701,73 @@ pub(crate) fn write_all_environments_unlocked(
         project_path,
         std::borrow::Cow::Borrowed(environments),
         recording,
+        Vec::new(),
     )
+}
+
+/// [`write_all_environments_unlocked`], carrying `edits`, the environments
+/// the write renames and removes, over to the project's personal overrides:
+/// planned before anything is written, so a refusal leaves both as they
+/// were, and committed in the values write's own journal transaction, so
+/// neither lands without the other. The plan and the write share one
+/// listing and one probe of the values.
+pub(crate) fn write_all_environments_following_unlocked(
+    vault_id: &str,
+    project_name: &str,
+    project_path: &str,
+    environments: &EnvironmentMap,
+    recording: &crate::history::scope::Recording,
+    edits: &[crate::companion::overrides::change::Edit],
+) -> Result<(), String> {
+    write_all_environments_following_with_storage(
+        &mut KeychainProjectStorage,
+        vault_id,
+        project_name,
+        project_path,
+        environments,
+        recording,
+        edits,
+    )
+}
+
+fn write_all_environments_following_with_storage(
+    storage: &mut impl ProjectStorage,
+    vault_id: &str,
+    project_name: &str,
+    project_path: &str,
+    environments: &EnvironmentMap,
+    recording: &crate::history::scope::Recording,
+    edits: &[crate::companion::overrides::change::Edit],
+) -> Result<(), String> {
+    validate_vault_id(vault_id)?;
+    let mut listed = ListedStorage::new(storage);
+    let mut following = overrides::plan_listed(
+        &mut listed,
+        vault_id,
+        edits,
+        crate::overrides::Expect::Nothing,
+    )?;
+    let mutations: Vec<ProjectStorageMutation> = std::mem::take(&mut following.mutations)
+        .into_iter()
+        .map(companion_gate::storage_mutation)
+        .collect();
+    let changes_overrides = !mutations.is_empty();
+    let written = write_all_environments_with_storage_after_recovery(
+        &mut listed,
+        vault_id,
+        project_name,
+        project_path,
+        std::borrow::Cow::Borrowed(environments),
+        recording,
+        mutations,
+    );
+    if changes_overrides {
+        match &written {
+            Ok(()) => crate::companion::remember(vault_id, &following.gate),
+            Err(_) => crate::companion::forget(vault_id),
+        }
+    }
+    written
 }
 
 pub(crate) fn mutate_vault_env<T>(
@@ -1661,6 +1791,7 @@ pub(crate) fn mutate_vault_env<T>(
             project_path,
             std::borrow::Cow::Owned(environments),
             &recording,
+            Vec::new(),
         )?;
         Ok(result)
     })
@@ -1692,6 +1823,7 @@ pub(crate) fn mutate_existing_vault_env<T>(
                 project_path,
                 std::borrow::Cow::Owned(environments),
                 &recording,
+                Vec::new(),
             )?;
         }
         Ok(Some(result))
@@ -1723,6 +1855,7 @@ fn write_all_environments_with_storage_after_recovery(
     project_path: &str,
     environments: std::borrow::Cow<'_, EnvironmentMap>,
     recording: &crate::history::scope::Recording,
+    following: Vec<ProjectStorageMutation>,
 ) -> Result<(), String> {
     let encoded = crate::selected_environment::serialize(&environments)?;
     warn_if_large(encoded.len());
@@ -1734,6 +1867,7 @@ fn write_all_environments_with_storage_after_recovery(
         project_name,
         project_path,
         payload,
+        following,
     )?;
     crate::history::scope::committed(recording, environments);
     Ok(())
@@ -1780,24 +1914,29 @@ fn save_vault_data_with_storage_after_recovery(
         project_name,
         project_path,
         payload,
+        Vec::new(),
     )
 }
 
+/// Write `payload`, and the project's records when it has none yet, with
+/// `following`, the companion changes that follow this write, in one journal
+/// transaction.
 fn save_validated_vault_data_with_storage_after_recovery(
     storage: &mut impl ProjectStorage,
     project_name: &str,
     project_path: &str,
     payload: ValidatedVaultPayload,
+    following: Vec<ProjectStorageMutation>,
 ) -> Result<(), String> {
     let vault_id = payload.vault_id().to_owned();
     companion_gate::authorize(storage, &vault_id, Operation::Write)?;
     let state = ensure_project_index_after_recovery(storage)?;
     if let Some(mut metadata) = read_project_metadata(storage, &vault_id, &state)? {
         if metadata.record.environment_summaries == payload.environment_summaries() {
-            return apply_project_transaction_after_recovery(
-                storage,
-                vec![ProjectStorageMutation::validated_vault_write(payload)],
-            );
+            let mut mutations = Vec::with_capacity(1 + following.len());
+            mutations.push(ProjectStorageMutation::validated_vault_write(payload));
+            mutations.extend(following);
+            return apply_project_transaction_after_recovery(storage, mutations);
         }
         storage
             .read(&vault_id)?
@@ -1806,15 +1945,23 @@ fn save_validated_vault_data_with_storage_after_recovery(
         let metadata_data = serde_json::to_string(&metadata.record)
             .map_err(|error| format!("failed to serialize vault project metadata: {error}"))?;
         let metadata_account = project_metadata_account(&state.marker.storage_id, &vault_id);
-        return apply_project_transaction_after_recovery(
-            storage,
-            vec![
-                ProjectStorageMutation::validated_vault_write(payload),
-                ProjectStorageMutation::write(metadata_account, metadata_data),
-            ],
-        );
+        let mut mutations = Vec::with_capacity(2 + following.len());
+        mutations.push(ProjectStorageMutation::validated_vault_write(payload));
+        mutations.push(ProjectStorageMutation::write(
+            metadata_account,
+            metadata_data,
+        ));
+        mutations.extend(following);
+        return apply_project_transaction_after_recovery(storage, mutations);
     }
-    create_project_records(storage, project_name, project_path, payload, state)
+    create_project_records(
+        storage,
+        project_name,
+        project_path,
+        payload,
+        state,
+        following,
+    )
 }
 
 /// What's damaged in `vault_id`'s newer data in the Keychain.
@@ -1838,22 +1985,30 @@ pub(crate) fn repair_companion_data(
 
 /// Finish `vault_id`'s interrupted step if it can be finished, then report
 /// why its access is damaged, if it is, and why the step can never be
-/// finished, if it can't.
+/// finished, if it can't. Access is damaged when the values' approval
+/// attributes contradict each other, or, beside values, the overrides
+/// record's do; a record left without values is never read, whatever it
+/// claims.
 fn open_for_repair(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
-) -> Result<(Option<&'static str>, Option<String>), String> {
+) -> Result<(Option<&'static str>, crate::companion::Opened), String> {
     validate_vault_id(vault_id)?;
-    let unfinished = match crate::companion::open_project_or_unfinished(
+    let opened = crate::companion::open_project_or_unfinished(
         &mut companion_gate::KeychainCompanion(&mut *storage),
         vault_id,
-    )? {
-        crate::companion::Opened::Unfinished(reason) => Some(reason),
-        crate::companion::Opened::Gate(_) => None,
+    )?;
+    let access = match storage.claimed_access(vault_id)? {
+        Some(ClaimedAccess::Contradictory) => Some(companion_gate::CONTRADICTORY_VALUES),
+        None => None,
+        Some(_) => (storage.claimed_access(&crate::companion::account::record_account(
+            crate::companion::overrides::OVERRIDES_KIND,
+            vault_id,
+            None,
+        ))? == Some(ClaimedAccess::Contradictory))
+        .then_some(companion_gate::CONTRADICTORY_RECORD),
     };
-    let access = (storage.claimed_access(vault_id)? == Some(ClaimedAccess::Contradictory))
-        .then_some(companion_gate::CONTRADICTORY_VALUES);
-    Ok((access, unfinished))
+    Ok((access, opened))
 }
 
 fn review_companion_data_with_storage(
@@ -1861,12 +2016,12 @@ fn review_companion_data_with_storage(
     vault_id: &str,
 ) -> Result<crate::companion::repair::CompanionReview, String> {
     let storage = &mut ListedStorage::new(storage);
-    let (access, unfinished) = open_for_repair(storage, vault_id)?;
+    let (access, opened) = open_for_repair(storage, vault_id)?;
     crate::companion::repair::review(
         &mut companion_gate::KeychainCompanion(storage),
         vault_id,
         access,
-        unfinished.as_deref(),
+        opened,
     )
 }
 
@@ -1876,12 +2031,12 @@ fn repair_companion_data_with_storage(
     reviewed: &crate::companion::repair::CompanionReview,
 ) -> Result<Vec<crate::companion::repair::CompanionRepair>, String> {
     let storage = &mut ListedStorage::new(storage);
-    let (access, unfinished) = open_for_repair(storage, vault_id)?;
+    let (access, opened) = open_for_repair(storage, vault_id)?;
     crate::companion::repair::repair(
         &mut companion_gate::KeychainCompanion(storage),
         vault_id,
         access,
-        unfinished.as_deref(),
+        opened,
         reviewed,
     )
 }
@@ -1938,6 +2093,19 @@ fn plant_debug_companion_state_with_storage<S: ProjectStorage>(
         && storage.claimed_access(vault_id)? != Some(ClaimedAccess::Automatic)
     {
         return Err("turn this project's CLI approval off first".to_owned());
+    }
+    if planting.approve_values {
+        if storage.claimed_access(vault_id)?.is_none() {
+            return Err(
+                "this project has no values on this computer to approve; store one with lpm env set first"
+                    .to_owned(),
+            );
+        }
+        if storage.probe(vault_id, &[PROJECT_INDEX_MARKER_ACCOUNT]) == ProbeOutcome::Protected {
+            return Ok("This project's values already need CLI approval.".to_owned());
+        }
+        storage.require_approval(vault_id, &[PROJECT_INDEX_MARKER_ACCOUNT])?;
+        return Ok(planting.description);
     }
     let apply = |storage: &mut S, owner: &str, mutations: Vec<Mutation>| -> Result<(), String> {
         for mutation in mutations {
@@ -2013,20 +2181,25 @@ pub(crate) fn read_for_run_unlocked(
     vault_id: &str,
     env: &str,
     default_fallback: bool,
-) -> Result<(Option<SecretMap>, crate::PersonalOverrides), String> {
-    let read = companion_gate::read_for_run(&mut KeychainProjectStorage, vault_id)?;
-    let overrides = crate::companion::overrides::evaluate(
-        &read.gate,
-        vault_id,
-        env,
-        read.overrides_record.as_deref(),
-    )
-    .map_err(crate::companion::damaged)?;
-    let Some(bytes) = read.values else {
-        return Ok((None, overrides));
+) -> Result<crate::StoredRunEnvironment, String> {
+    read_for_run_from(&mut KeychainProjectStorage, vault_id, env, default_fallback)
+}
+
+fn read_for_run_from(
+    storage: &mut impl ProjectStorage,
+    vault_id: &str,
+    env: &str,
+    default_fallback: bool,
+) -> Result<crate::StoredRunEnvironment, String> {
+    let read = companion_gate::read_for_run(storage, vault_id)?;
+    let overrides = read.overrides(vault_id, env)?;
+    let identity = read
+        .overrides_record
+        .as_deref()
+        .map(|record| crate::OverridesIdentity::of(record));
+    let Some(json) = read.into_values_text()? else {
+        return Ok((None, overrides, identity));
     };
-    let json = String::from_utf8(bytes)
-        .map_err(|_| "vault keychain data is not valid UTF-8".to_owned())?;
     let parsed = if default_fallback {
         crate::selected_environment::parse_with_default_fallback(&json, env)
     } else {
@@ -2035,37 +2208,35 @@ pub(crate) fn read_for_run_unlocked(
     let values = parsed
         .map(crate::selected_environment::SelectedVaultPayload::into_selected)
         .map_err(|error| format!("vault keychain data is not valid JSON: {error}"))?;
-    Ok((values, overrides))
+    Ok((values, overrides, identity))
 }
 
 /// Every environment's values and personal overrides, read together inside
 /// one lock on this thread.
 pub(crate) fn read_all_for_run_unlocked(
     vault_id: &str,
-) -> Result<
-    (
-        Option<EnvironmentMap>,
-        std::collections::BTreeMap<String, crate::PersonalOverrides>,
-    ),
-    String,
-> {
-    let read = companion_gate::read_for_run(&mut KeychainProjectStorage, vault_id)?;
-    let overrides = crate::companion::overrides::evaluate_all(
-        &read.gate,
-        vault_id,
-        read.overrides_record.as_deref(),
-    )
-    .map_err(crate::companion::damaged)?;
+) -> Result<crate::StoredRunEnvironments, String> {
+    read_all_for_run_from(&mut KeychainProjectStorage, vault_id)
+}
+
+fn read_all_for_run_from(
+    storage: &mut impl ProjectStorage,
+    vault_id: &str,
+) -> Result<crate::StoredRunEnvironments, String> {
+    let read = companion_gate::read_for_run(storage, vault_id)?;
+    let overrides = read.all_overrides(vault_id)?;
+    let identity = read
+        .overrides_record
+        .as_deref()
+        .map(|record| crate::OverridesIdentity::of(record));
     let values = read
-        .values
-        .map(|bytes| {
-            let json = String::from_utf8(bytes)
-                .map_err(|_| "vault keychain data is not valid UTF-8".to_owned())?;
+        .into_values_text()?
+        .map(|json| {
             crate::selected_environment::parse_all(&json)
                 .map_err(|error| format!("vault keychain data is not valid JSON: {error}"))
         })
         .transpose()?;
-    Ok((values, overrides))
+    Ok((values, overrides, identity))
 }
 
 /// Authorize `operation` on `vault_id` against its Keychain feature marker,
@@ -2340,6 +2511,7 @@ fn create_project_records(
     project_path: &str,
     payload: ValidatedVaultPayload,
     mut state: ProjectIndexState,
+    following: Vec<ProjectStorageMutation>,
 ) -> Result<(), String> {
     let vault_id = payload.vault_id();
     let metadata_account = project_metadata_account(&state.marker.storage_id, vault_id);
@@ -2404,6 +2576,7 @@ fn create_project_records(
             marker_data,
         ));
     }
+    mutations.extend(following);
     apply_project_transaction_after_recovery(storage, mutations)
 }
 
@@ -2709,6 +2882,7 @@ mod tests {
 
     mod companion;
     mod history;
+    mod overrides;
 
     #[test]
     fn large_env_data_is_warned_of_in_binary_units() {
@@ -2883,6 +3057,57 @@ mod tests {
         assert!(!found, "the payload read from the Keychain is wiped");
     }
 
+    #[test]
+    fn a_write_that_fails_leaves_no_account_in_the_listing_it_kept() {
+        let mut storage = MemoryProjectStorage::default();
+        storage.values.insert("kept", "value".to_owned());
+        storage.rejected_writes.insert("refused".to_owned());
+        let mut listed = ListedStorage::new(&mut storage);
+        assert_eq!(listed.account_names().expect("listed"), ["kept"]);
+
+        assert!(listed.write("refused", b"value").is_err());
+        listed.write("written", b"value").expect("written");
+
+        let mut names = listed.account_names().expect("listed");
+        names.sort();
+        assert_eq!(names, ["kept", "written"]);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn reading_the_keychain_s_values_for_a_run_leaves_no_copy_of_the_payload() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        let mut storage = MemoryProjectStorage::default();
+        // Escaped, as in a PEM private key, in the environment the run
+        // reads and in one it doesn't.
+        storage.values.insert(
+            "proj",
+            format!(
+                r#"{{"environments":{{"default":{{"TOKEN":"{MARKER}\n-----END-----"}},"live":{{"OTHER":"{MARKER}\n"}}}}}}"#
+            ),
+        );
+        let (read, found) = watch(|| {
+            let (values, _, _) =
+                read_for_run_from(&mut storage, "proj", "default", false).expect("read");
+            let mut values = values.expect("stored values");
+            let read = values["TOKEN"].starts_with(MARKER);
+            crate::history::wipe_environment(&mut values);
+            read
+        });
+        assert!(read);
+        assert!(!found, "a run's read of one environment is wiped");
+
+        let (read, found) = watch(|| {
+            let (values, _, _) = read_all_for_run_from(&mut storage, "proj").expect("read");
+            let mut values = values.expect("stored values");
+            let read = values["live"]["OTHER"].starts_with(MARKER);
+            crate::history::wipe_values(&mut values);
+            read
+        });
+        assert!(read);
+        assert!(!found, "a run's read of every environment is wiped");
+    }
+
     #[cfg(not(miri))]
     #[test]
     fn the_values_a_write_replaces_are_read_for_history_without_leaving_a_copy() {
@@ -2913,9 +3138,21 @@ mod tests {
         claims: HashMap<String, ClaimedAccess>,
         /// Items that really demand user presence, whatever they claim.
         protected: HashSet<String>,
+        /// The person cancels every approval, so a protected item's data
+        /// can't be read.
+        approval_cancelled: bool,
+        /// Items another process makes automatic just before their next read
+        /// with access.
+        weakened_before_read: HashSet<String>,
         keychain_unavailable: bool,
         probes: Vec<String>,
         approvals_required: Vec<String>,
+        /// What the approval prompt said each time reading a protected item,
+        /// or reading back one just written, would ask.
+        prompts: Vec<String>,
+        /// Whether a write is reading back what it wrote, which its own
+        /// prompt covers.
+        reading_back: bool,
         listings: usize,
         reads: HashMap<String, usize>,
         /// Attributes-only reads, by account.
@@ -2926,6 +3163,8 @@ mod tests {
         deletes: HashMap<String, usize>,
         rejected_writes: HashSet<String>,
         ignored_writes: HashSet<String>,
+        /// Accounts whose deletes report success but leave them.
+        ignored_deletes: HashSet<String>,
         mutation_attempts: usize,
         fail_once_at_mutation: Option<usize>,
         injected_failure: bool,
@@ -2948,6 +3187,10 @@ mod tests {
             if self.rejected_access_sources.contains(source) {
                 return Err("env access approval was cancelled".to_owned());
             }
+            if self.protected.contains(source) {
+                self.prompts
+                    .push(crate::macos_keychain::operation_prompt(account));
+            }
             self.access_sources
                 .push((account.to_owned(), source.to_owned()));
             if !self.values.contains_key(account) {
@@ -2967,6 +3210,10 @@ mod tests {
             value: &[u8],
             access: CliAccess,
         ) -> Result<(), String> {
+            if access == CliAccess::RequireApproval {
+                self.prompts
+                    .push(crate::macos_keychain::operation_prompt(account));
+            }
             if !self.values.contains_key(account) && access == CliAccess::RequireApproval {
                 self.claims
                     .insert(account.to_owned(), ClaimedAccess::RequireApproval);
@@ -2979,6 +3226,16 @@ mod tests {
             *self.reads.entry(account.to_owned()).or_default() += 1;
             if self.failing_reads.contains(account) {
                 return Err("the macOS Keychain is locked".to_owned());
+            }
+            if self.approval_cancelled && self.protected.contains(account) {
+                return Err("env access approval was cancelled".to_owned());
+            }
+            if !self.reading_back
+                && self.protected.contains(account)
+                && self.values.contains_key(account)
+            {
+                self.prompts
+                    .push(crate::macos_keychain::operation_prompt(account));
             }
             if account == TRANSACTION_MARKER_ACCOUNT
                 && self.fail_committed_marker_verification_once
@@ -3006,7 +3263,10 @@ mod tests {
             let verified = if self.verifies_writes_itself {
                 self.values.get_bytes(account) == Some(value)
             } else {
-                self.read(account)?.as_deref() == Some(value)
+                self.reading_back = true;
+                let read = self.read(account);
+                self.reading_back = false;
+                read?.as_deref() == Some(value)
             };
             if verified {
                 Ok(())
@@ -3038,6 +3298,9 @@ mod tests {
             if self.fail_once_at_mutation == Some(self.mutation_attempts) {
                 self.injected_failure = true;
                 return Err(format!("injected mutation failure for {account}"));
+            }
+            if self.ignored_deletes.contains(account) {
+                return Ok(true);
             }
             let marker_was_committed = account == TRANSACTION_MARKER_ACCOUNT
                 && self
@@ -3076,6 +3339,10 @@ mod tests {
             &mut self,
             account: &str,
         ) -> Result<Option<(Vec<u8>, ClaimedAccess)>, String> {
+            if self.weakened_before_read.remove(account) {
+                self.claims.remove(account);
+                self.protected.remove(account);
+            }
             let claim = self
                 .claims
                 .get(account)
@@ -3328,6 +3595,7 @@ mod tests {
                 "new-vault",
                 &crate::history::Source::new(crate::history::Action::Set),
             ),
+            Vec::new(),
         )
         .expect("locally generated project save should succeed");
 

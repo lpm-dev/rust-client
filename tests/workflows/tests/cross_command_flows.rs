@@ -1107,6 +1107,22 @@ async fn flow_env_push_pull_cross_machine_round_trip() {
         String::from_utf8_lossy(&out_set_a.stderr)
     );
 
+    let override_on_a = lpm(&machine_a)
+        .args([
+            "env",
+            "override",
+            "set",
+            "API_KEY=override-on-machine-a",
+            "ONLY_ON_MACHINE_A=personal",
+        ])
+        .output()
+        .expect("spawn env override set on machine A");
+    assert!(
+        override_on_a.status.success(),
+        "machine A env override set failed: {}",
+        String::from_utf8_lossy(&override_on_a.stderr)
+    );
+
     let out_push_a = lpm(&machine_a)
         .env("LPM_REGISTRY_URL", mock.url())
         .args(["--json", "env", "push", "--yes"])
@@ -1193,6 +1209,25 @@ async fn flow_env_push_pull_cross_machine_round_trip() {
          expected to find {SECRET_VALUE:?}; got:\n{revealed}\nstderr: {}",
         String::from_utf8_lossy(&out_get_b.stderr)
     );
+    assert!(
+        !revealed.contains("override-on-machine-a"),
+        "a personal override never leaves the machine that set it"
+    );
+    assert!(
+        !lpm(&machine_b)
+            .args(["env", "get", "ONLY_ON_MACHINE_A", "--reveal"])
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "a key only an override gives never reaches another machine"
+    );
+    let overrides_on_b = lpm(&machine_b)
+        .args(["--json", "env", "override", "list"])
+        .output()
+        .expect("spawn env override list on machine B");
+    let listed: serde_json::Value = serde_json::from_slice(&overrides_on_b.stdout).unwrap();
+    assert_eq!(listed["environments"], serde_json::json!([]));
 }
 
 // ─── Workspace filter isolation ─────────

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::*;
 use crate::fallback::tests::{force_file_vault, with_temp_vault_home};
@@ -926,4 +926,558 @@ fn companion_entry_from_a_released_client_still_opens() {
         open(&key, &account, sealed).unwrap(),
         br#"{"features":["companion"]}"#
     );
+}
+
+fn set_override(key: &str, value: &str) -> crate::companion::overrides::change::Edit {
+    crate::companion::overrides::change::Edit::Set {
+        environment: "default".to_owned(),
+        key: key.to_owned(),
+        value: zeroize::Zeroizing::new(value.to_owned()),
+    }
+}
+
+fn change_overrides(
+    edits: &[crate::companion::overrides::change::Edit],
+) -> Result<crate::companion::overrides::change::ChangePlan, String> {
+    with_vault_transaction(|directory| {
+        change_overrides_unlocked(directory, VAULT, edits, crate::overrides::Expect::Nothing)
+    })
+}
+
+fn read_overrides() -> Result<std::collections::BTreeMap<String, PersonalOverrides>, String> {
+    with_vault_transaction(|directory| read_all_overrides_unlocked(directory, VAULT))
+        .map(|(overrides, _)| overrides)
+}
+
+#[test]
+fn override_changes_commit_the_record_with_its_marker_and_the_last_removal_leaves_no_folder() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        let created = change_overrides(&[
+            set_override("API_URL", "mine"),
+            crate::companion::overrides::change::Edit::Unset {
+                environment: "default".to_owned(),
+                key: "TOKEN".to_owned(),
+            },
+        ])
+        .expect("set");
+        assert!(created.activated);
+        let read = read_overrides().expect("read");
+        assert_eq!(read["default"].set["API_URL"], "mine");
+        assert_eq!(read["default"].unset, ["TOKEN"]);
+        let run = crate::try_get_run_environment_for_vault_id(VAULT, None).expect("run read");
+        assert_eq!(run.overrides.set["API_URL"], "mine");
+        assert!(!journal_path(home, VAULT).exists());
+
+        change_overrides(&[crate::companion::overrides::change::Edit::ClearAll]).expect("clear");
+        assert!(read_overrides().expect("read").is_empty());
+        assert!(
+            !vaults_path(home)
+                .join(companion_folder_name(VAULT))
+                .exists(),
+            "a project without overrides is as it was before it had any"
+        );
+    });
+}
+
+#[test]
+fn overrides_need_values_beside_them_in_the_file_store() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        let error = change_overrides(&[set_override("API_URL", "mine")]).expect_err("no values");
+        assert!(error.contains("has no values on this computer"), "{error}");
+        assert!(
+            !vaults_path(home)
+                .join(companion_folder_name(VAULT))
+                .exists()
+        );
+    });
+}
+
+#[test]
+fn an_override_change_interrupted_at_any_step_is_finished_by_the_next_operation() {
+    // The first override writes the marker and the record: a crash can come
+    // after either once the journal is committed.
+    for applied in 1..=2 {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            seed_values();
+            CRASH_AFTER_CHANGES.with(|crash| crash.set(Some(applied)));
+
+            change_overrides(&[set_override("API_URL", "mine")]).expect_err("the simulated crash");
+
+            assert!(journal_path(home, VAULT).exists(), "{applied}");
+            let read = read_overrides().expect("the next operation recovers");
+            assert_eq!(read["default"].set["API_URL"], "mine", "{applied}");
+            assert!(!journal_path(home, VAULT).exists(), "{applied}");
+        });
+    }
+}
+
+#[test]
+fn a_committed_override_change_is_replayed_only_by_an_lpm_that_can_report_it() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        CRASH_AFTER_CHANGES.with(|crash| crash.set(Some(1)));
+        change_overrides(&[set_override("API_URL", "mine")]).expect_err("the simulated crash");
+        let not_a_marker = home.join("not-a-marker");
+        std::fs::write(&not_a_marker, "").expect("a file where a marker would be");
+
+        let refused = crate::override_marker::reporting_to(vec![not_a_marker], read_overrides)
+            .expect_err("the replay couldn't be reported");
+
+        assert!(crate::override_marker::describes(&refused), "{refused}");
+        assert!(
+            journal_path(home, VAULT).exists(),
+            "the journal waits for an lpm that can report it"
+        );
+        assert_eq!(
+            read_overrides().expect("the next operation recovers")["default"].set["API_URL"],
+            "mine"
+        );
+    });
+}
+
+#[test]
+fn a_committed_journal_of_values_alone_is_replayed_without_a_report() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        change_overrides(&[set_override("API_URL", "mine")]).expect("set");
+        // Every journal a write takes changes companion records too, so this
+        // one is committed by hand.
+        CRASH_AFTER_CHANGES.with(|crash| crash.set(Some(0)));
+        with_vault_transaction(|directory| {
+            let json = crate::selected_environment::serialize(&HashMap::from([(
+                "default".to_owned(),
+                HashMap::from([("TOKEN".to_owned(), "replayed".to_owned())]),
+            )]))?;
+            let encrypted = zeroize::Zeroizing::new(
+                crate::fallback::encrypt_with_store_unlocked(
+                    directory,
+                    VAULT,
+                    &json,
+                    &crate::fallback::KeyringNativeDataKeyStore,
+                )?
+                .into_bytes(),
+            );
+            FileCompanion::open(directory)?.commit_changes(
+                VAULT,
+                vec![FileChange::ReplaceValues(encrypted)],
+                true,
+            )
+        })
+        .expect_err("the simulated crash");
+        assert!(
+            journal_path(home, VAULT).exists(),
+            "the crash left it committed"
+        );
+        let not_a_marker = home.join("not-a-marker");
+        std::fs::write(&not_a_marker, "").expect("a file where a marker would be");
+
+        let values = crate::override_marker::reporting_to(vec![not_a_marker], || {
+            with_vault_transaction(|directory| {
+                crate::fallback::read_all_environments_unlocked(directory, VAULT)
+            })
+        })
+        .expect("a journal that changes values alone has nothing to report");
+
+        assert_eq!(values.expect("values")["default"]["TOKEN"], "replayed");
+        assert!(!journal_path(home, VAULT).exists());
+    });
+}
+
+#[test]
+fn a_journal_whose_folder_sync_failed_is_finished_before_the_next_read_in_the_same_lock() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        with_vault_transaction(|directory| {
+            assert!(read_all_overrides_unlocked(directory, VAULT)?.0.is_empty());
+            assert!(crate::companion::is_open(VAULT));
+            crate::storage_transaction::FAIL_DIRECTORY_SYNC_OF
+                .with(|failing| failing.set(Some("env file journal")));
+
+            change_overrides_unlocked(
+                directory,
+                VAULT,
+                &[set_override("API_URL", "mine")],
+                crate::overrides::Expect::Nothing,
+            )
+            .expect_err("the journal's folder didn't sync");
+
+            assert!(journal_path(home, VAULT).exists());
+            assert!(
+                !crate::companion::is_open(VAULT),
+                "a journal that may be in place leaves the project to open again"
+            );
+            let (read, _) = read_all_overrides_unlocked(directory, VAULT)?;
+            assert_eq!(read["default"].set["API_URL"], "mine");
+            Ok(())
+        })
+        .expect("in one lock");
+    });
+}
+
+#[test]
+fn the_last_removal_needs_no_other_projects_records_in_the_file_store() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        change_overrides(&[set_override("API_URL", "mine")]).expect("set");
+        // A sibling the service count can't read: a file where a folder goes.
+        std::fs::write(vaults_path(home).join("broken.companion"), b"").expect("seed");
+
+        change_overrides(&[crate::companion::overrides::change::Edit::ClearAll])
+            .expect("the last removal reads only this project's records");
+        assert!(read_overrides().expect("read").is_empty());
+    });
+}
+
+#[test]
+fn a_record_that_fails_to_decrypt_is_damage_with_the_way_to_repair_it() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        change_overrides(&[set_override("API_URL", "fixture-mine")]).expect("set");
+        let entry = vaults_path(home)
+            .join(companion_folder_name(VAULT))
+            .join(entry_name(&record("overrides", None)));
+        let mut sealed = std::fs::read(&entry).expect("the sealed record");
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0xff;
+        std::fs::write(&entry, sealed).expect("corrupt it");
+        crate::companion::forget(VAULT);
+
+        for error in [
+            read_overrides().expect_err("damage refuses a read"),
+            change_overrides(&[set_override("B", "2")]).expect_err("damage refuses a change"),
+        ] {
+            assert!(
+                error.starts_with("This env project's newer data is damaged"),
+                "{error}"
+            );
+        }
+    });
+}
+
+#[test]
+fn a_record_that_fails_to_decrypt_is_repaired_by_removing_its_feature_alone() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        change_overrides(&[set_override("API_URL", "fixture-mine")]).expect("set");
+        let entry = vaults_path(home)
+            .join(companion_folder_name(VAULT))
+            .join(entry_name(&record("overrides", None)));
+        let mut sealed = std::fs::read(&entry).expect("the sealed record");
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0xff;
+        std::fs::write(&entry, sealed).expect("corrupt it");
+        crate::companion::forget(VAULT);
+
+        let reviewed = review();
+
+        assert_eq!(
+            reviewed.repairs(),
+            [CompanionRepair::RemoveFeature("overrides".to_owned())]
+        );
+        assert!(
+            reviewed
+                .problems
+                .iter()
+                .any(|problem| problem.description.contains("it can't be read")),
+            "{reviewed:?}"
+        );
+        repair(&reviewed).expect("repaired");
+        assert!(read_overrides().expect("readable again").is_empty());
+        assert_eq!(
+            crate::try_get_run_environment_for_vault_id(VAULT, None)
+                .expect("the project runs")
+                .values["TOKEN"],
+            "team"
+        );
+    });
+}
+
+#[test]
+fn a_record_past_the_size_a_record_may_have_is_repaired_by_removing_its_feature() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        change_overrides(&[set_override("API_URL", "fixture-mine")]).expect("set");
+        let entry = vaults_path(home)
+            .join(companion_folder_name(VAULT))
+            .join(entry_name(&record("overrides", None)));
+        std::fs::write(&entry, vec![0_u8; MAX_SEALED_ENTRY_BYTES as usize + 1])
+            .expect("grow it past the cap");
+        crate::companion::forget(VAULT);
+
+        let reviewed = review();
+
+        assert_eq!(
+            reviewed.repairs(),
+            [CompanionRepair::RemoveFeature("overrides".to_owned())]
+        );
+        assert!(
+            reviewed
+                .problems
+                .iter()
+                .any(|problem| problem.description.contains("it can't be read")),
+            "{reviewed:?}"
+        );
+        repair(&reviewed).expect("repaired");
+        assert!(read_overrides().expect("readable again").is_empty());
+    });
+}
+
+#[test]
+fn a_marker_past_the_size_one_may_have_is_repaired_by_a_discard() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        change_overrides(&[set_override("API_URL", "fixture-mine")]).expect("set");
+        let entry = vaults_path(home)
+            .join(companion_folder_name(VAULT))
+            .join(entry_name(&marker_account()));
+        std::fs::write(&entry, vec![0_u8; MAX_SEALED_ENTRY_BYTES as usize + 1])
+            .expect("grow it past the cap");
+        crate::companion::forget(VAULT);
+
+        let reviewed = review();
+
+        assert_eq!(reviewed.repairs(), [CompanionRepair::DiscardProject]);
+        repair(&reviewed).expect("repaired");
+        assert_discarded_with_values_kept(home);
+    });
+}
+
+#[test]
+fn an_ordinary_operation_reports_a_marker_past_its_size_as_damage() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        change_overrides(&[set_override("API_URL", "fixture-mine")]).expect("set");
+        let entry = vaults_path(home)
+            .join(companion_folder_name(VAULT))
+            .join(entry_name(&marker_account()));
+        std::fs::write(&entry, vec![0_u8; MAX_SEALED_ENTRY_BYTES as usize + 1])
+            .expect("grow it past the cap");
+        crate::companion::forget(VAULT);
+
+        for failed in [
+            read_overrides().map(drop),
+            change_overrides(&[set_override("API_URL", "fixture-yours")]).map(drop),
+            crate::try_get_run_environment_for_vault_id(VAULT, None).map(drop),
+        ] {
+            let error = failed.expect_err("damaged");
+            assert!(
+                crate::companion::gate::GateError::describes(&error),
+                "the gate's damage, which names the repair: {error}"
+            );
+        }
+    });
+}
+
+#[test]
+fn a_record_left_without_values_is_never_applied_or_listed() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        change_overrides(&[set_override("API_URL", "fixture-mine")]).expect("set");
+        std::fs::remove_file(vaults_path(home).join(ValuesFile::Digest.name(VAULT)))
+            .expect("the values go");
+        crate::companion::forget(VAULT);
+
+        let run = crate::try_get_run_environment_for_vault_id(VAULT, None).expect("a run");
+        assert!(run.overrides.set.is_empty() && run.overrides.unset.is_empty());
+        let all = with_vault_transaction(|directory| {
+            crate::fallback::read_all_run_environments_unlocked(directory, VAULT)
+        })
+        .expect("every environment");
+        assert!(all.1.is_empty());
+        assert!(read_overrides().expect("listed").is_empty());
+    });
+}
+
+#[test]
+fn a_list_and_a_run_identify_a_record_without_environments_alike() {
+    with_temp_vault_home(|_| {
+        force_file_vault();
+        seed_values();
+        commit(vec![
+            write(marker_account(), marker_with_overrides()),
+            write(
+                record("overrides", None),
+                br#"{"schemaVersion":1,"vaultId":"proj","environments":{}}"#.to_vec(),
+            ),
+        ]);
+        crate::companion::forget(VAULT);
+
+        let run = crate::try_get_run_environment_for_vault_id(VAULT, None)
+            .expect("a run")
+            .overrides_identity;
+        let (listed, identity) =
+            with_vault_transaction(|directory| read_all_overrides_unlocked(directory, VAULT))
+                .expect("a list");
+
+        assert!(listed.is_empty());
+        assert!(run.is_some());
+        assert_eq!(
+            identity, run,
+            "an lpm that lists them reports what the key holds"
+        );
+    });
+}
+
+#[test]
+fn a_repair_review_never_reads_a_record_left_without_values() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        change_overrides(&[set_override("API_URL", "fixture-mine")]).expect("set");
+        let entry = vaults_path(home)
+            .join(companion_folder_name(VAULT))
+            .join(entry_name(&record("overrides", None)));
+        let mut sealed = std::fs::read(&entry).expect("the sealed record");
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0xff;
+        std::fs::write(&entry, sealed).expect("corrupt it");
+        std::fs::remove_file(vaults_path(home).join(ValuesFile::Digest.name(VAULT)))
+            .expect("the values go");
+        crate::companion::forget(VAULT);
+
+        let reviewed = review();
+
+        assert!(reviewed.problems.is_empty(), "{reviewed:?}");
+        assert!(reviewed.repairs().is_empty());
+    });
+}
+
+#[test]
+fn a_directory_or_link_where_the_values_go_never_counts_as_values() {
+    let replacements: &[fn(&std::path::Path)] = &[
+        |path| std::fs::create_dir(path).expect("a directory there"),
+        #[cfg(unix)]
+        |path| std::os::unix::fs::symlink("/dev/null", path).expect("a link there"),
+    ];
+    for replace in replacements {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            seed_values();
+            change_overrides(&[set_override("API_URL", "fixture-mine")]).expect("set");
+            let values = vaults_path(home).join(ValuesFile::Digest.name(VAULT));
+            std::fs::remove_file(&values).expect("the values go");
+            replace(&values);
+            crate::companion::forget(VAULT);
+
+            let listed = read_overrides();
+
+            assert!(
+                listed.as_ref().is_ok_and(BTreeMap::is_empty) || listed.is_err(),
+                "no values, no overrides: {listed:?}"
+            );
+        });
+    }
+}
+
+#[test]
+fn an_override_change_loads_the_data_key_once() {
+    with_temp_vault_home(|_| {
+        force_file_vault();
+        seed_values();
+        change_overrides(&[set_override("API_URL", "mine")]).expect("set");
+        crate::companion::forget(VAULT);
+        crate::fallback::DATA_KEY_LOADS.with(|loads| loads.set(0));
+
+        change_overrides(&[set_override("API_URL", "yours")]).expect("replace");
+
+        assert_eq!(
+            crate::fallback::DATA_KEY_LOADS.with(std::cell::Cell::get),
+            1
+        );
+    });
+}
+
+#[test]
+fn removing_overrides_without_values_in_the_file_store_changes_nothing_and_says_so() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        let plan = change_overrides(&[crate::companion::overrides::change::Edit::Remove {
+            environment: "default".to_owned(),
+            key: "API_URL".to_owned(),
+        }])
+        .expect("nothing to remove");
+        assert!(plan.mutations.is_empty());
+        assert!(matches!(
+            plan.effects[..],
+            [crate::companion::overrides::change::Effect::Key { changed: false, .. }]
+        ));
+        assert!(
+            !vaults_path(home)
+                .join(companion_folder_name(VAULT))
+                .exists()
+        );
+    });
+}
+
+#[test]
+fn the_last_removal_interrupted_at_any_step_is_finished_by_the_next_operation() {
+    // Deleting the record and the marker: a crash can come once the journal
+    // is committed, before either, between them or after both.
+    for applied in 0..=2 {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            seed_values();
+            change_overrides(&[set_override("API_URL", "mine")]).expect("set");
+            CRASH_AFTER_CHANGES.with(|crash| crash.set(Some(applied)));
+
+            change_overrides(&[crate::companion::overrides::change::Edit::ClearAll])
+                .expect_err("the simulated crash");
+
+            assert!(journal_path(home, VAULT).exists(), "{applied}");
+            assert!(
+                read_overrides()
+                    .expect("the next operation recovers")
+                    .is_empty(),
+                "{applied}"
+            );
+            assert!(!journal_path(home, VAULT).exists(), "{applied}");
+            assert!(
+                !vaults_path(home)
+                    .join(companion_folder_name(VAULT))
+                    .exists(),
+                "{applied}"
+            );
+        });
+    }
+}
+
+#[test]
+fn a_damaged_record_refuses_override_changes_in_the_file_store() {
+    with_temp_vault_home(|_| {
+        force_file_vault();
+        seed_values();
+        commit(vec![
+            write(marker_account(), marker_with_overrides()),
+            write(record("overrides", None), overrides(r#""A":"1""#)),
+        ]);
+        with_vault_transaction(|directory| {
+            commit_unchecked(
+                directory,
+                VAULT,
+                vec![write(record("overrides", None), b"{not json".to_vec())],
+            )
+        })
+        .expect("damage the record");
+        crate::companion::forget(VAULT);
+
+        let error = change_overrides(&[set_override("B", "2")]).expect_err("damage refuses");
+        assert!(
+            error.starts_with("This env project's newer data is damaged"),
+            "{error}"
+        );
+    });
 }

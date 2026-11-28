@@ -175,6 +175,8 @@ fn exit_with_clap_error(error: clap::Error, json_output: bool, help_hint: Option
 }
 
 pub(super) fn exit_with_lpm_error(error: &lpm_common::LpmError, json_output: bool) -> ! {
+    let classified = classified(error);
+    let error = classified.as_ref().unwrap_or(error);
     // The process exits without dropping an install still running in another
     // task, so what it let through is reported here, before the error.
     let firewall_bypassed =
@@ -242,6 +244,20 @@ pub(crate) fn print_json_clap_error(error: &clap::Error, help_hint: Option<&str>
         "{}",
         serde_json::to_string_pretty(&serde_json::Value::Object(object)).unwrap()
     );
+}
+
+/// The error an env error's message names, when it's an env project's
+/// refusal or an access that couldn't be reported: the vault reports both
+/// as text, and they keep their own code and headline whichever command
+/// passed one on.
+fn classified(error: &lpm_common::LpmError) -> Option<lpm_common::LpmError> {
+    let lpm_common::LpmError::Env(message) = error else {
+        return None;
+    };
+    Some(lpm_runner::dotenv::vault_error(lpm_common::LpmError::Env)(
+        message.clone(),
+    ))
+    .filter(|classified| !matches!(classified, lpm_common::LpmError::Env(_)))
 }
 
 fn print_json_error(
@@ -1097,6 +1113,11 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         lpm_common::LpmError::EnvProjectRefused(reason) => {
             diagnostic_lines("This env project needs attention", Some(reason), error)
         }
+        lpm_common::LpmError::PersonalOverridesUnreported(reason) => diagnostic_lines(
+            "Couldn't report to the lpm that started this one",
+            Some(reason),
+            error,
+        ),
         lpm_common::LpmError::EnvGeneration { reason, .. } => {
             diagnostic_lines("Environment generation failed", Some(reason), error)
         }
@@ -2063,6 +2084,35 @@ mod tests {
                 .all(|line| !line.contains("store clean") && !line.contains("cache prune")),
             "project layout output must not recommend global store repair: {plain:?}"
         );
+    }
+
+    #[test]
+    fn an_env_error_that_is_a_refusal_or_an_unreported_access_keeps_its_own_code() {
+        let unlinked = lpm_vault::UnlinkedFolder {
+            vault_id: "fixture-vault".to_owned(),
+            folder: std::path::PathBuf::from("/fixture/folder"),
+            project_name: None,
+            linked_folders: Vec::new(),
+        };
+        let refusal = classified(&lpm_common::LpmError::Env(unlinked.refusal()))
+            .expect("a refusal is classified");
+        assert_eq!(
+            json_error_value(&refusal)["error_code"],
+            "env_project_refused"
+        );
+
+        let unreported = classified(&lpm_common::LpmError::Env(
+            "LPM_PERSONAL_OVERRIDES_MARKER names /fixture/marker, where an entry can't be added"
+                .to_owned(),
+        ))
+        .expect("an unreported access is classified");
+        assert_eq!(
+            json_error_value(&unreported)["error_code"],
+            "personal_overrides_unreported"
+        );
+
+        assert!(classified(&lpm_common::LpmError::Env("disk full".to_owned())).is_none());
+        assert!(classified(&lpm_common::LpmError::EnvValidation(unlinked.refusal())).is_none());
     }
 
     #[test]

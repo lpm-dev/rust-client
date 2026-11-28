@@ -38,6 +38,23 @@ struct Requester {
 
 thread_local! {
     static REQUESTER: std::cell::RefCell<Option<Requester>> = const { std::cell::RefCell::new(None) };
+    /// The account a transaction's staged item stands for, which approval
+    /// prompts name while the staged item is written and read back.
+    static STAGED_FOR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `run` with approval prompts naming `target`, the account a staged
+/// item stands for, in place of the staging account they read.
+pub(crate) fn prompting_as<T>(target: &str, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            STAGED_FOR.with_borrow_mut(|staged| *staged = previous);
+        }
+    }
+    let _restore = Restore(STAGED_FOR.with_borrow_mut(|staged| staged.replace(target.to_owned())));
+    run()
 }
 
 /// Name `folder`, which may use the vault `vault_id`, in the approval
@@ -112,20 +129,31 @@ fn prompt_folder(folder: &std::path::Path) -> String {
 /// Run `run` with every approval prompt saying it's for the project's
 /// local history, as a history command's one prompt must.
 pub(crate) fn prompting_for_local_history<T>(run: impl FnOnce() -> T) -> T {
+    prompting_for("local history", run)
+}
+
+/// Run `run` with every approval prompt saying it's for the project's
+/// personal overrides, as an overrides command's one prompt must.
+pub(crate) fn prompting_for_personal_overrides<T>(run: impl FnOnce() -> T) -> T {
+    prompting_for("personal overrides", run)
+}
+
+fn prompting_for<T>(purpose: &'static str, run: impl FnOnce() -> T) -> T {
     struct Restore(Option<&'static str>);
     impl Drop for Restore {
         fn drop(&mut self) {
             PURPOSE.set(self.0);
         }
     }
-    let _restore = Restore(PURPOSE.replace(Some("local history")));
+    let _restore = Restore(PURPOSE.replace(Some(purpose)));
     run()
 }
 
-/// What an approval names for reading `account`: the project's recorded
-/// name and the folder asking when a link check noted them, else its vault
-/// ID; a companion record also by what it holds, and either by what the
-/// running command reads for when it says.
+/// What an approval names for reading `account`, or for the account a
+/// staged item stands for: the project's recorded name and the folder asking
+/// when a link check noted them, else its vault ID; a companion record also
+/// by what it holds, and either by what the running command reads for when
+/// it says.
 struct PromptSubject {
     project: String,
     holds: Option<&'static str>,
@@ -135,6 +163,8 @@ struct PromptSubject {
 impl PromptSubject {
     fn of(account: &str) -> Self {
         use crate::companion::account::CompanionAccount;
+        let staged_for = STAGED_FOR.with_borrow(Clone::clone);
+        let account = staged_for.as_deref().unwrap_or(account);
         let history = lpm_env_companion::append_log::HISTORY;
         let record = CompanionAccount::parse(account);
         let vault_id = record.as_ref().map_or(account, CompanionAccount::vault_id);
@@ -169,7 +199,7 @@ impl PromptSubject {
 
 /// The Keychain's own prompt for reading `account`, which macOS shows only
 /// if the run's approved context doesn't cover the item.
-fn operation_prompt(account: &str) -> String {
+pub(crate) fn operation_prompt(account: &str) -> String {
     let subject = PromptSubject::of(account);
     let requester = subject
         .folder
@@ -445,6 +475,30 @@ enum KeychainStorageError {
 }
 
 struct SecurityFrameworkBackend;
+
+/// What a read without authentication UI showed about an item's access,
+/// asking `keychain_is_available` only when the read wasn't allowed, to tell
+/// a protected item from a locked Keychain.
+fn probe_outcome(
+    read: Result<Option<Vec<u8>>, KeychainStorageError>,
+    keychain_is_available: impl FnOnce() -> bool,
+) -> ProbeOutcome {
+    match read {
+        Ok(Some(bytes)) => {
+            drop(zeroize::Zeroizing::new(bytes));
+            ProbeOutcome::Automatic
+        }
+        Ok(None) => ProbeOutcome::Absent,
+        Err(KeychainStorageError::InteractionNotAllowed) => {
+            if keychain_is_available() {
+                ProbeOutcome::Protected
+            } else {
+                ProbeOutcome::Inconclusive
+            }
+        }
+        Err(_) => ProbeOutcome::Inconclusive,
+    }
+}
 
 pub(crate) fn with_keychain_transaction<T>(
     operation: impl FnOnce() -> Result<T, String>,
@@ -796,24 +850,17 @@ impl SecurityFrameworkBackend {
 
     fn probe(service: &str, account: &str, open_accounts: &[&str]) -> ProbeOutcome {
         let context = non_interactive_context();
-        match Self::read_with_context(service, account, context.clone()) {
-            Ok(Some(_)) => ProbeOutcome::Automatic,
-            Ok(None) => ProbeOutcome::Absent,
-            Err(KeychainStorageError::InteractionNotAllowed) => {
-                let keychain_is_available = open_accounts.iter().any(|open| {
+        probe_outcome(
+            Self::read_with_context(service, account, context.clone()),
+            || {
+                open_accounts.iter().any(|open| {
                     matches!(
                         Self::read_with_context(service, open, context.clone()),
                         Ok(Some(_))
                     )
-                });
-                if keychain_is_available {
-                    ProbeOutcome::Protected
-                } else {
-                    ProbeOutcome::Inconclusive
-                }
-            }
-            Err(_) => ProbeOutcome::Inconclusive,
-        }
+                })
+            },
+        )
     }
 
     /// Give an existing item CLI approval, keeping its data.
@@ -1237,6 +1284,31 @@ mod tests {
             SecurityFrameworkBackend::map_status_in("read", -128, None),
             KeychainStorageError::ApprovalCancelled
         ));
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn a_probe_that_reads_an_item_wipes_what_it_read() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        let (outcome, found) = watch(|| {
+            probe_outcome(Ok(Some(MARKER.as_bytes().to_vec())), || {
+                unreachable!("an item that reads is automatic")
+            })
+        });
+        assert_eq!(outcome, ProbeOutcome::Automatic);
+        assert!(
+            !found,
+            "the probe's copy of the item, perhaps values, is wiped"
+        );
+        assert_eq!(
+            probe_outcome(Err(KeychainStorageError::InteractionNotAllowed), || true),
+            ProbeOutcome::Protected
+        );
+        assert_eq!(
+            probe_outcome(Err(KeychainStorageError::InteractionNotAllowed), || false),
+            ProbeOutcome::Inconclusive
+        );
+        assert_eq!(probe_outcome(Ok(None), || true), ProbeOutcome::Absent);
     }
 
     #[cfg(not(miri))]

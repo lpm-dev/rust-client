@@ -11,7 +11,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use lpm_common::stored_env::is_safe_vault_id;
 use lpm_env_companion::account::CompanionAccount;
-use lpm_env_companion::assessment::{Assessment, Observed, Repair, assess};
+use lpm_env_companion::assessment::{
+    Assessment, Observed, Repair, assess_gate, gate_of, reads_overrides_record,
+};
 use lpm_env_companion::gate::{Damage, Operation, ProjectGate};
 use lpm_env_companion::graph::{AccessClass, record_access_class};
 use lpm_env_companion::invariants::{Refusal, check_transaction};
@@ -304,6 +306,11 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
         access_damage: Option<String>,
         #[serde(default)]
         unfinished: Option<String>,
+        /// Whether the project's values item exists, which only the caller
+        /// can tell; a record left without values is never read. Callers
+        /// from before personal overrides don't say, which reads nothing.
+        #[serde(default)]
+        has_values: Option<bool>,
         /// The damage `lpm_env_history_check` found in history's records,
         /// passed on unchanged.
         #[serde(default)]
@@ -365,6 +372,7 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
         damage: Vec<DamageOutput<'assessment>>,
         repairs: Vec<RepairOutput>,
         allows: Allows,
+        reads_overrides: bool,
     }
     fn repair_output(repair: Repair) -> RepairOutput {
         match repair {
@@ -421,14 +429,26 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
                     reason: damage.reason.clone(),
                 })
                 .collect();
-            let assessment = assess(
+            let marker_bytes = request.marker.as_ref().map(|bytes| bytes.0.as_slice());
+            let gate = gate_of(&request.vault_id, marker_bytes);
+            let reads_overrides = request.has_values == Some(true)
+                && reads_overrides_record(
+                    &request.vault_id,
+                    &gate,
+                    inventory.as_deref(),
+                    request.access_damage.as_deref(),
+                    request.unfinished.as_deref(),
+                );
+            let assessment = assess_gate(
                 &request.vault_id,
+                gate,
                 Observed {
-                    marker: request.marker.as_ref().map(|bytes| bytes.0.as_slice()),
+                    marker: marker_bytes,
                     inventory: inventory.as_deref(),
                     overrides: request
                         .overrides
                         .as_ref()
+                        .filter(|_| reads_overrides)
                         .map(|read| read.bytes.as_ref().map(|bytes| bytes.0.as_slice())),
                     access: request.access_damage.as_deref(),
                     unfinished: request.unfinished.as_deref(),
@@ -474,6 +494,7 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
                     read_applying_overrides: allows(Operation::ReadApplyingOverrides),
                     write: allows(Operation::Write),
                 },
+                reads_overrides,
             })
         })
     }

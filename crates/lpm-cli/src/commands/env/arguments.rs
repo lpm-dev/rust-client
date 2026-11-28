@@ -56,13 +56,10 @@ pub(super) struct Values {
     pub from_files: Vec<String>,
 }
 
-const SET_AFTER_HELP: &str = "\
-Examples:
-  lpm env set API_KEY                          Ask for the value, hidden
-  op read op://dev/api/key | lpm env set API_KEY --stdin
-  lpm env set --from-file TLS_KEY=./tls.key
-  lpm env set --from-file A=<(op read op://dev/a) --from-file B=<(op read op://dev/b)
-  lpm env set PORT=3000                        A value that isn't secret
+/// The paragraphs both `set` commands end with.
+macro_rules! value_entry_help {
+    () => {
+        "
 
 A KEY=VALUE argument is saved in your shell history and is visible to other
 processes on this computer while lpm runs. Use it only for values that aren't
@@ -70,7 +67,110 @@ secret.
 
 From the prompt, standard input or a file, a value that is one line loses the
 line break at its end. A value of several lines, such as a PEM key, is kept
-exactly, except that each line break pasted into the prompt is a line feed.";
+exactly, except that each line break pasted into the prompt is a line feed."
+    };
+}
+
+const SET_AFTER_HELP: &str = concat!(
+    "\
+Examples:
+  lpm env set API_KEY                          Ask for the value, hidden
+  op read op://dev/api/key | lpm env set API_KEY --stdin
+  lpm env set --from-file TLS_KEY=./tls.key
+  lpm env set --from-file A=<(op read op://dev/a) --from-file B=<(op read op://dev/b)
+  lpm env set PORT=3000                        A value that isn't secret",
+    value_entry_help!()
+);
+
+/// Which releases can't use a project with personal overrides: LPM Vault's
+/// only on a Mac, which alone has it.
+#[cfg(target_os = "macos")]
+macro_rules! refusing_releases_help {
+    () => {
+        "LPM CLI 0.82.0 to 0.88.0 and LPM Vault 1.1.0 to 1.3.0
+can't use a project with overrides until they're updated, and an LPM CLI older
+than 0.82.0 runs it with team values."
+    };
+}
+#[cfg(not(target_os = "macos"))]
+macro_rules! refusing_releases_help {
+    () => {
+        "LPM CLI 0.82.0 to 0.88.0 can't use
+a project with overrides until it's updated, and an LPM CLI older than 0.82.0
+runs it with team values."
+    };
+}
+
+const OVERRIDE_SET_AFTER_HELP: &str = concat!(
+    "\
+Examples:
+  lpm env override set DATABASE_URL --env=development    Ask for the value, hidden
+  echo \"$LOCAL_URL\" | lpm env override set API_URL --stdin
+  lpm env override set --from-file TLS_KEY=./dev.key
+  lpm env override set LOG_LEVEL=debug                   A value that isn't secret
+
+A personal override is this computer's own value for a key. LPM applies it when
+it runs, prints or checks the project here. It never syncs, and LPM leaves it
+out when it pushes values or sends them to CI or a platform. Once the project
+has one, its tasks, and the tasks that depend on them, don't use the remote task
+cache on this computer. ",
+    refusing_releases_help!(),
+    value_entry_help!()
+);
+
+#[derive(Subcommand)]
+pub(super) enum OverrideAction {
+    /// Give keys this computer's own value, on top of the team's.
+    #[command(after_help = OVERRIDE_SET_AFTER_HELP)]
+    Set {
+        #[command(flatten)]
+        environment: Environment,
+        #[command(flatten)]
+        values: Values,
+    },
+    /// Leave out the project's value for keys when LPM runs the project on
+    /// this computer.
+    Unset {
+        #[command(flatten)]
+        environment: Environment,
+        /// The keys to leave out, such as `DEBUG`.
+        #[arg(required = true, num_args = 1.., value_name = "KEY")]
+        keys: Vec<String>,
+    },
+    /// Remove this computer's override of keys, so they get the project's
+    /// value, if it has one.
+    Remove {
+        #[command(flatten)]
+        environment: Environment,
+        /// The keys whose override to remove.
+        #[arg(required = true, num_args = 1.., value_name = "KEY")]
+        keys: Vec<String>,
+    },
+    /// List this computer's overrides: names only, values with --reveal.
+    List {
+        /// Only this environment, by name or by an alias lpm.json gives it;
+        /// every environment when left out.
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        env: Option<String>,
+        /// Show values.
+        #[arg(long)]
+        reveal: bool,
+    },
+    /// Remove every override of one environment, or of all of them.
+    #[command(group(clap::ArgGroup::new("scope").required(true).args(["env", "all"])))]
+    Clear {
+        /// The environment whose overrides to remove, by name or by an alias
+        /// lpm.json gives it.
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        env: Option<String>,
+        /// Every environment's overrides.
+        #[arg(long, conflicts_with = "env")]
+        all: bool,
+        /// Remove them without asking first, as a script or `--json` must.
+        #[arg(long)]
+        yes: bool,
+    },
+}
 
 #[derive(Subcommand)]
 pub(super) enum LocalAction {
@@ -173,6 +273,11 @@ pub(super) enum LocalAction {
         #[arg(long)]
         force: bool,
     },
+    /// This computer's own values for keys, on top of the team's.
+    Override {
+        #[command(subcommand)]
+        action: OverrideAction,
+    },
     /// Show what's damaged in this project's newer data, such as its personal
     /// overrides, and repair it.
     Repair {
@@ -185,16 +290,17 @@ pub(super) enum LocalAction {
     #[cfg(debug_assertions)]
     #[command(name = "debug-companion", hide = true)]
     DebugCompanion {
-        /// overrides, missing-record, invalid-marker, unlisted-records,
-        /// newer-version, read-only, interrupted-deletion, stuck-restore,
-        /// contradictory-record, weak-values, orphans or clear.
+        /// overrides, overrides-v1, missing-record, invalid-marker,
+        /// unlisted-records, newer-version, approved-values, read-only,
+        /// interrupted-deletion, stuck-restore, contradictory-record,
+        /// weak-values, orphans or clear.
         state: String,
         #[command(flatten)]
         environment: Environment,
-        /// A personal override to plant, for the overrides state.
+        /// A personal override to plant, for the overrides states.
         #[arg(long = "set", value_name = "NAME=VALUE")]
         set: Vec<String>,
-        /// A name the overrides state unsets.
+        /// A name the overrides states unset.
         #[arg(long = "unset", value_name = "NAME")]
         unset: Vec<String>,
     },
@@ -346,6 +452,7 @@ impl LocalAction {
             | Self::Check { .. }
             | Self::Validate { .. }
             | Self::Repair { .. }
+            | Self::Override { .. }
             | Self::History { .. }
             | Self::Rollback { .. }
             | Self::Copy { .. } => true,
@@ -374,8 +481,8 @@ fn source_group(value: &str) -> Result<lpm_vault::history::SourceGroup, String> 
 
 const LOCAL_SYNC_SUBCOMMANDS: &[&str] = &[
     "set", "get", "list", "delete", "import", "export", "print", "example", "check", "validate",
-    "schema", "generate", "init", "repair", "ls", "copy", "cp", "history", "rollback", "link",
-    "unlink", "links",
+    "schema", "generate", "init", "repair", "override", "ls", "copy", "cp", "history", "rollback",
+    "link", "unlink", "links",
 ];
 
 const LOCAL_ASYNC_SUBCOMMANDS: &[&str] = &["log", "unpair", "diff"];
@@ -443,10 +550,57 @@ fn print_format(value: &str) -> Result<lpm_env::PrintFormat, String> {
     })
 }
 
-#[cfg(all(test, debug_assertions))]
+#[cfg(test)]
 mod tests {
     use clap::CommandFactory;
 
+    #[test]
+    fn override_set_help_names_lpm_vault_on_a_mac_alone() {
+        assert_eq!(
+            super::OVERRIDE_SET_AFTER_HELP.contains("LPM Vault"),
+            cfg!(target_os = "macos")
+        );
+        assert!(super::OVERRIDE_SET_AFTER_HELP.contains("LPM CLI 0.82.0 to 0.88.0"));
+    }
+
+    /// The long help of the subcommand at `path`, its whitespace collapsed.
+    fn long_help(path: &[&str]) -> String {
+        let mut command = super::LocalCommand::command();
+        let mut subcommand = &mut command;
+        for name in path {
+            subcommand = subcommand
+                .find_subcommand_mut(name)
+                .expect("subcommand registered");
+        }
+        let mut buffer = Vec::new();
+        subcommand
+            .write_long_help(&mut buffer)
+            .expect("write the help");
+        String::from_utf8(buffer)
+            .expect("UTF-8 help")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn both_set_commands_say_what_happens_to_a_value_s_line_breaks() {
+        for path in [&["set"][..], &["override", "set"]] {
+            let help = long_help(path);
+            assert!(
+                help.contains(
+                    "From the prompt, standard input or a file, a value that is one line loses the line break at its end."
+                ),
+                "{path:?}: {help}"
+            );
+            assert!(
+                help.contains("A KEY=VALUE argument is saved in your shell history"),
+                "{path:?}: {help}"
+            );
+        }
+    }
+
+    #[cfg(debug_assertions)]
     #[test]
     fn debug_companion_help_names_every_state() {
         let command = super::LocalCommand::command();

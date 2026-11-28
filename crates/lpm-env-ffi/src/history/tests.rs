@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::*;
+use crate::frame::{FRAME_MAGIC, FRAME_VERSION, decode_frame};
 use crate::lpm_env_release;
 
 const VAULT: &str = "proj";
@@ -43,7 +44,7 @@ fn call(
             Vec::new(),
         );
     }
-    let decoded = decode_frame(&raw).expect("an output frame");
+    let decoded = decode_frame(&raw, usize::MAX).expect("an output frame");
     (
         status,
         serde_json::from_slice(decoded.request).expect("response json"),

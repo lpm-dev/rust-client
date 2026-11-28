@@ -67,8 +67,24 @@ pub enum ValidationErrorKind {
     },
 }
 
+impl ValidationError {
+    /// Keep none of the value judged, as a secret's error keeps none: for a
+    /// failure a personal override caused, whose value is this computer's
+    /// own, so neither its message nor its debug output shows it.
+    pub fn forget_value(&mut self) {
+        if let ValidationErrorKind::InvalidFormat { got, .. }
+        | ValidationErrorKind::PatternMismatch { got, .. }
+        | ValidationErrorKind::NotInEnum { got, .. } = &mut self.kind
+        {
+            zeroize::Zeroize::zeroize(got);
+            *got = REDACTED_VALUE.to_owned();
+        }
+    }
+}
+
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hide = self.is_secret;
         let key = TerminalSafe(&self.key);
         match &self.kind {
             ValidationErrorKind::InvalidEnvironmentName { canonical, alias } => write!(
@@ -130,7 +146,7 @@ impl std::fmt::Display for ValidationError {
                 }
             }
             ValidationErrorKind::InvalidFormat { expected, got } => {
-                let display_value = display_value(got, self.is_secret);
+                let display_value = display_value(got, hide);
                 write!(
                     f,
                     "{}: invalid format, expected {expected}, got \"{}\"",
@@ -139,7 +155,7 @@ impl std::fmt::Display for ValidationError {
                 )?;
             }
             ValidationErrorKind::PatternMismatch { pattern, got } => {
-                let display_value = display_value(got, self.is_secret);
+                let display_value = display_value(got, hide);
                 write!(
                     f,
                     "{}: must match pattern `{}`, got \"{}\"",
@@ -149,7 +165,7 @@ impl std::fmt::Display for ValidationError {
                 )?;
             }
             ValidationErrorKind::NotInEnum { allowed, got } => {
-                let display_value = display_value(got, self.is_secret);
+                let display_value = display_value(got, hide);
                 write!(f, "{}: must be one of [", key)?;
                 write_allowed_values(f, allowed, self.is_secret)?;
                 write!(f, "], got \"{}\"", TerminalSafe(display_value))?;
@@ -349,6 +365,31 @@ impl<'a> EnvValidator<'a> {
     /// The immutable schema used to compile this plan.
     pub fn schema(&self) -> &'a EnvSchema {
         self.schema
+    }
+
+    /// Whether `key`, holding `value` when validation begins, holds a
+    /// non-empty value once [`validate_with_default_policy`] has given a
+    /// missing value its default in `context`, as a group rule counts it.
+    /// The caller's default policy allows `key`.
+    ///
+    /// [`validate_with_default_policy`]: Self::validate_with_default_policy
+    pub fn has_value_after_defaults(
+        &self,
+        key: &str,
+        value: Option<&str>,
+        context: crate::EvalContext<'_>,
+    ) -> bool {
+        if value.is_some_and(|value| !value.is_empty()) {
+            return true;
+        }
+        if !self.definition_errors.is_empty() || !context.is_valid() {
+            return false;
+        }
+        self.schema.vars.get(key).is_some_and(|rule| {
+            (value.is_none() || rule.empty == EmptyPolicy::Missing)
+                && crate::scopes::default_for_context(rule, context)
+                    .is_some_and(|default| !default.is_empty())
+        })
     }
 
     /// Return declaration errors independently of supplied values.
@@ -1024,6 +1065,47 @@ fn matches_pattern(value: &str, pattern: &str) -> bool {
 mod tests {
     use super::*;
     use crate::schema::EnvSchema;
+
+    #[test]
+    fn an_error_that_forgets_its_value_names_the_key_and_rule_and_never_the_value() {
+        let value = "fixture-not-secret-value";
+        let error = |kind| ValidationError {
+            key: "API_URL".to_owned(),
+            kind,
+            description: None,
+            is_secret: false,
+        };
+        for kind in [
+            ValidationErrorKind::InvalidFormat {
+                expected: VarFormat::Url,
+                got: value.to_owned(),
+            },
+            ValidationErrorKind::PatternMismatch {
+                pattern: "^https://".to_owned(),
+                got: value.to_owned(),
+            },
+            ValidationErrorKind::NotInEnum {
+                allowed: vec!["a".to_owned(), "b".to_owned()],
+                got: value.to_owned(),
+            },
+        ] {
+            let mut error = error(kind);
+            assert!(error.to_string().contains(value), "{error}");
+            error.forget_value();
+            let shown = format!("{error} {error:?}");
+            assert!(!shown.contains(value), "{shown}");
+            assert!(shown.starts_with("API_URL: "), "{shown}");
+        }
+        let mut enumerated = error(ValidationErrorKind::NotInEnum {
+            allowed: vec!["a".to_owned(), "b".to_owned()],
+            got: value.to_owned(),
+        });
+        enumerated.forget_value();
+        assert!(
+            enumerated.to_string().contains("[a, b]"),
+            "the schema's own choices still show: {enumerated}"
+        );
+    }
 
     fn schema_from_json(json: &str) -> EnvSchema {
         serde_json::from_str(json).unwrap()

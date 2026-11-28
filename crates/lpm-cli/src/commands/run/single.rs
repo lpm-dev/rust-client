@@ -1,6 +1,7 @@
 use super::cache::{
     CacheStoreRequest, WorkspaceCacheContract, is_task_cached_with_config,
     prepare_package_script_cache_context, try_cache_hit_with_context, try_cache_store_with_context,
+    watch_task,
 };
 use super::format::{print_captured_stderr, print_captured_stdout};
 use super::runtime::prepare_runtime;
@@ -239,6 +240,7 @@ pub(super) fn run_with_loaded_context(
     let start = std::time::Instant::now();
 
     if caching_enabled || reserve_stdout {
+        let task_marker = caching_enabled.then(watch_task).transpose()?;
         // Run with tee capture (output streams to terminal + captured for cache)
         let output = lpm_runner::script::run_script_captured_with_config(
             project_dir,
@@ -250,9 +252,10 @@ pub(super) fn run_with_loaded_context(
             lpm_config,
         )?;
         let duration_ms = start.elapsed().as_millis() as u64;
-        if let Some(context) = cache_context.as_ref() {
-            let _ = try_cache_store_with_context(
+        if let (Some(context), Some(task)) = (cache_context.as_ref(), &task_marker) {
+            try_cache_store_with_context(
                 CacheStoreRequest {
+                    task,
                     project_dir,
                     workspace_contract: workspace_contract.as_ref(),
                     script_name,

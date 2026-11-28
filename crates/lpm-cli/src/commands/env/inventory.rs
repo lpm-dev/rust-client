@@ -110,7 +110,7 @@ fn perform_init_actions(
         snapshot,
         &lpm_vault::history::Source::new(lpm_vault::history::Action::InitFromFiles),
     )
-    .map_err(LpmError::Env)
+    .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))
     .map(|results| {
         results
             .into_iter()
@@ -409,12 +409,20 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
     let schema = config.as_ref().and_then(|c| c.env_schema.as_ref());
     // Status is what each environment would run with on this machine, so it
     // includes the personal overrides.
-    let (vault_envs, overrides_by_env) = match vault_id.as_deref() {
+    let lpm_vault::AllRunEnvironments {
+        values: vault_envs,
+        overrides: overrides_by_env,
+        ..
+    } = match vault_id.as_deref() {
         Some(vault_id) => lpm_vault::try_get_all_run_environments_for_vault_id(vault_id)
             .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?,
-        None => (HashMap::new(), HashMap::new()),
+        None => lpm_vault::AllRunEnvironments::default(),
     };
-    let all_envs = lpm_env::resolver::list_all(env_map, environments, &vault_envs);
+    let all_envs = lpm_env::resolver::list_all_from_vault_names(
+        env_map,
+        environments,
+        lpm_vault::run_environment_names(&vault_envs, &overrides_by_env),
+    );
 
     if all_envs.is_empty() {
         if json_output {
@@ -468,11 +476,24 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
                 lpm_runner::dotenv::merge_stored_project_env(&mut values, stored)?;
             }
             Ok(lpm_runner::dotenv::compose_with_overrides(
-                values, overrides,
+                values,
+                overrides,
+                lpm_runner::dotenv::OverridePolicy::Apply,
             ))
         })();
+        // Without the project's files, count what the overrides change in
+        // its stored values, as a run would count them over those alone.
         let override_count = composed.as_ref().map_or_else(
-            |_| overrides.map_or(0, lpm_vault::PersonalOverrides::len),
+            |_| {
+                overrides.map_or(0, |overrides| {
+                    lpm_runner::dotenv::OverrideOrigins::changing(
+                        effective_vars.unwrap_or(&HashMap::new()),
+                        overrides.layer(),
+                        cfg!(windows),
+                    )
+                    .len()
+                })
+            },
             lpm_runner::dotenv::ChildEnv::override_count,
         );
 
@@ -488,14 +509,14 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
                 let composed = composed
                     .as_mut()
                     .map_err(|error| LpmError::EnvValidation(error.to_string()))?;
-                let errors = composed.evaluate(
+                let verdict = composed.evaluate(
                     Some(validator),
                     lpm_env::EvalContext {
                         environment: &env.canonical,
                         ..Default::default()
                     },
                 )?;
-                Ok(super::schema::valid_variable_count(schema, &errors))
+                Ok(super::schema::valid_variable_count(schema, &verdict.errors))
             })();
             let valid = match evaluation {
                 Ok(valid) => valid,
@@ -680,7 +701,7 @@ pub(super) fn vars_copy(
         overwrite,
         &lpm_vault::history::Source::new(lpm_vault::history::Action::CopyEnvironment),
     )
-    .map_err(LpmError::Env)?;
+    .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
     let Some(copy) = copy else {
         return Err(LpmError::Env(format!(
             "no secrets in source environment \"{}\"",

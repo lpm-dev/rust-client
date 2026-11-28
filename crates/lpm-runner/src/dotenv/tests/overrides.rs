@@ -19,20 +19,17 @@ fn overrides(set: &[(&str, &str)], unset: &[&str]) -> PersonalOverrides {
 fn layers(vars: &[(&str, &str)], overrides: PersonalOverrides) -> ProjectEnvLayers {
     ProjectEnvLayers {
         vars: map(vars),
-        overrides,
+        overrides: std::sync::Arc::new(overrides),
+        overrides_identity: None,
         composed: None,
         vault_count: 0,
         vault_values: map(vars),
     }
 }
 
-fn error(key: &str, kind: lpm_env::ValidationErrorKind) -> lpm_env::ValidationError {
-    lpm_env::ValidationError {
-        key: key.to_owned(),
-        kind,
-        description: None,
-        is_secret: false,
-    }
+/// A project whose `envSchema` is `schema`.
+fn config(schema: &str) -> lpm_json::LpmJsonConfig {
+    lpm_json::parse_lpm_json(&format!(r#"{{"envSchema":{schema}}}"#)).expect("schema")
 }
 
 #[test]
@@ -74,35 +71,6 @@ fn unset_removes_the_project_value_and_an_empty_string_is_a_value() {
 
     assert!(!vars.contains_key("SENTRY_DSN"));
     assert_eq!(vars["FEATURE"], "");
-}
-
-#[test]
-fn overrides_match_names_without_case_where_the_host_ignores_case() {
-    let mut vars = map(&[
-        ("api_url", "team"),
-        ("Sentry_Dsn", "team"),
-        ("KEEP", "team"),
-    ]);
-    apply_overrides_with_case_policy(
-        &mut vars,
-        &overrides(&[("API_URL", "mine")], &["SENTRY_DSN"]),
-        true,
-    );
-
-    assert_eq!(vars, map(&[("API_URL", "mine"), ("KEEP", "team")]));
-
-    let mut exact = map(&[("api_url", "team")]);
-    apply_overrides_with_case_policy(&mut exact, &overrides(&[("API_URL", "mine")], &[]), false);
-    assert_eq!(exact, map(&[("api_url", "team"), ("API_URL", "mine")]));
-}
-
-#[test]
-fn non_ascii_names_use_the_hosts_own_comparison() {
-    let mut vars = map(&[("ÄPI", "team"), ("API", "team")]);
-    apply_overrides_with_case_policy(&mut vars, &overrides(&[("API", "mine")], &[]), true);
-
-    assert_eq!(vars["API"], "mine");
-    assert_eq!(vars["ÄPI"], "team");
 }
 
 #[test]
@@ -154,44 +122,86 @@ fn validation_failures_name_an_override_only_while_it_is_the_final_origin() {
     );
 }
 
-#[test]
-fn an_unset_is_blamed_only_for_the_value_it_left_missing() {
-    let origins =
-        OverrideOrigins::changing(&map(&[("PORT", "8080")]), &overrides(&[], &["PORT"]), false);
-    let empty = HashMap::new();
-    assert!(origins.caused(
-        &error("PORT", lpm_env::ValidationErrorKind::Missing),
-        &empty
-    ));
-    let invalid = error(
-        "PORT",
-        lpm_env::ValidationErrorKind::ConstraintViolation { constraint: "port" },
+/// The validation failure of `vars` under `overrides` against `schema`,
+/// with `inherited` in this process's environment while it's evaluated.
+fn failure(
+    schema: &str,
+    inherited: (&str, &str),
+    vars: &[(&str, &str)],
+    personal: PersonalOverrides,
+) -> String {
+    let config = config(schema);
+    let validator = config.env_schema.as_ref().map(lpm_env::EnvValidator::new);
+    let mut child = layers(vars, personal).compose(None, None).expect("compose");
+    // SAFETY: the name is this test's own, and nothing else reads or writes it.
+    unsafe { std::env::set_var(inherited.0, inherited.1) };
+    let result = validate_child_env(
+        &mut child,
+        validator.as_ref(),
+        lpm_env::EvalContext::default(),
+        "/usr/bin",
+        true,
     );
-    assert!(
-        !origins.caused(&invalid, &empty),
-        "an invalid value came from somewhere the unset didn't"
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(inherited.0) };
+    result.expect_err("the group fails").to_string()
+}
+
+#[test]
+fn a_group_an_override_broke_counts_the_member_the_shell_gives() {
+    const SHELL: &str = "LPM_RUNNER_TEST_ATTRIBUTION_UNSET_PAIR";
+    let message = failure(
+        &format!(
+            r#"{{"vars":{{"{SHELL}":{{}},"B":{{}}}},"groups":{{"pair":{{"mode":"allOrNone","vars":["{SHELL}","B"]}}}}}}"#
+        ),
+        (SHELL, "1"),
+        &[("B", "1")],
+        overrides(&[], &["B"]),
+    );
+    let attributed = format!("(from a personal override on {THIS_MACHINE})");
+    assert_eq!(
+        message.matches(&attributed).count(),
+        2,
+        "both were present before the unset, so it broke the group: {message}"
     );
 }
 
 #[test]
-fn an_override_is_found_under_the_declared_spelling_where_the_host_ignores_case() {
-    let origins = OverrideOrigins::changing(
-        &HashMap::new(),
-        &overrides(&[("api_url", "not a url")], &[]),
-        true,
+fn a_required_name_an_unset_leaves_to_an_empty_shell_value_is_blamed_on_it() {
+    const SHELL: &str = "LPM_RUNNER_TEST_ATTRIBUTION_UNSET_EMPTY";
+    for empty in ["missing", "allow", "reject"] {
+        let message = failure(
+            &format!(r#"{{"vars":{{"{SHELL}":{{"required":true,"empty":"{empty}"}}}}}}"#),
+            (SHELL, ""),
+            &[(SHELL, "team")],
+            overrides(&[], &[SHELL]),
+        );
+        assert!(
+            message.contains(&format!("(from a personal override on {THIS_MACHINE})")),
+            "with empty {empty}, the team's value passed before the unset: {message}"
+        );
+    }
+}
+
+#[test]
+fn an_override_of_a_name_the_shell_gives_leaves_its_group_as_it_was() {
+    const SHELL: &str = "LPM_RUNNER_TEST_ATTRIBUTION_SET_ONE";
+    let message = failure(
+        &format!(
+            r#"{{"vars":{{"{SHELL}":{{}},"B":{{}}}},"groups":{{"one":{{"mode":"exactlyOne","vars":["{SHELL}","B"]}}}}}}"#
+        ),
+        (SHELL, "1"),
+        &[("B", "1")],
+        overrides(&[(SHELL, "mine")], &[]),
     );
-    let invalid = error(
-        "API_URL",
-        lpm_env::ValidationErrorKind::ConstraintViolation { constraint: "url" },
+    assert_eq!(
+        message.matches("group one requires").count(),
+        2,
+        "{message}"
     );
-    assert!(origins.caused(&invalid, &map(&[("API_URL", "not a url")])));
     assert!(
-        !OverrideOrigins::changing(
-            &HashMap::new(),
-            &overrides(&[("api_url", "not a url")], &[]),
-            false
-        )
-        .caused(&invalid, &map(&[("API_URL", "not a url")]))
+        !message.contains("personal override"),
+        "the shell gave the name a value without the override, so the group failed before it: {message}"
     );
 }
 
@@ -217,21 +227,44 @@ fn the_count_includes_only_overrides_that_change_the_environment() {
     assert_eq!(child.override_count(), 2);
 }
 
+/// The verdict on `vars` under `personal` against an `envSchema`.
+fn verdict(schema: &str, vars: &[(&str, &str)], personal: PersonalOverrides) -> Verdict {
+    let config = config(schema);
+    let validator = config.env_schema.as_ref().map(lpm_env::EnvValidator::new);
+    layers(vars, personal)
+        .compose(None, None)
+        .expect("compose")
+        .evaluate(validator.as_ref(), lpm_env::EvalContext::default())
+        .expect("evaluate")
+}
+
 #[test]
 fn an_override_of_the_value_the_project_has_is_never_blamed() {
-    let layers = layers(
+    let verdict = verdict(
+        r#"{"vars":{"API_URL":{"format":"url"}}}"#,
         &[("API_URL", "not a url")],
         overrides(&[("API_URL", "not a url")], &[]),
     );
-    let child = layers.compose(None, None).expect("compose");
-    let invalid = error(
-        "API_URL",
-        lpm_env::ValidationErrorKind::ConstraintViolation { constraint: "url" },
-    );
-    assert!(
-        !child.caused_by_override(&invalid),
+    assert_eq!(verdict.errors.len(), 1);
+    assert_eq!(
+        verdict.from_overrides,
+        [false],
         "removing the override wouldn't change the value"
     );
+}
+
+#[test]
+fn an_error_an_override_caused_forgets_its_value() {
+    let verdict = verdict(
+        r#"{"vars":{"API_URL":{"format":"url"}}}"#,
+        &[("API_URL", "https://team.example")],
+        overrides(&[("API_URL", "fixture-not-a-url")], &[]),
+    );
+
+    assert_eq!(verdict.from_overrides, [true]);
+    let shown = format!("{} {:?}", verdict.errors[0], verdict);
+    assert!(!shown.contains("fixture-not-a-url"), "{shown}");
+    assert!(shown.contains("API_URL"), "{shown}");
 }
 
 #[test]
@@ -284,5 +317,40 @@ fn stored_value_characters_lists_vault_values_then_personal_overrides_by_key() {
             ("B_KEY", false, "ZERO WIDTH SPACE"),
             ("B_KEY", true, "NO-BREAK SPACE"),
         ]
+    );
+}
+
+#[test]
+fn debug_output_of_the_layers_and_the_composed_child_names_keys_and_never_values() {
+    let layers = layers(
+        &[("API_URL", "fixture-team")],
+        overrides(&[("API_URL", "fixture-mine")], &[]),
+    );
+    let printed = format!("{layers:?}");
+    assert!(!printed.contains("fixture-"), "{printed}");
+    assert!(printed.contains("API_URL"), "{printed}");
+    let child = layers.compose(None, None).expect("compose");
+    let printed = format!("{child:?}");
+    assert!(!printed.contains("fixture-"), "{printed}");
+    assert!(printed.contains("API_URL"), "{printed}");
+}
+
+#[test]
+fn the_vault_s_values_go_once_the_child_s_environment_is_taken() {
+    let values = map(&[("API_URL", "team")]);
+    let mut layers = ProjectEnvLayers {
+        vars: values.clone(),
+        vault_count: 1,
+        vault_values: values,
+        ..ProjectEnvLayers::default()
+    };
+    let identity = layers.vault_values_identity();
+
+    layers.take_child_env().expect("the child's environment");
+
+    assert!(identity.is_some());
+    assert!(
+        layers.vault_values.is_empty(),
+        "no copy of the values is held while the child runs"
     );
 }

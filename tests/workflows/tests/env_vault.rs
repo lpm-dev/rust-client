@@ -2676,6 +2676,73 @@ async fn env_pull_oidc_writes_env_file_with_sorted_and_quoted_values() {
 }
 
 #[tokio::test]
+async fn env_pull_oidc_writes_the_team_s_values_whatever_this_computer_overrides() {
+    let project = TempProject::empty(r#"{"name":"vault-oidc-overrides","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let output_file = project.path().join(".env.ci");
+    std::fs::write(
+        project.path().join("lpm.json"),
+        r#"{"vault":"vault-ci-overrides"}"#,
+    )
+    .expect("failed to write lpm.json");
+    for args in [
+        &["env", "set", "--env", "preview", "API_KEY=local-team"][..],
+        &[
+            "env",
+            "override",
+            "set",
+            "--env",
+            "preview",
+            "API_KEY=fixture-mine",
+            "ONLY_MINE=fixture-mine",
+        ],
+    ] {
+        lpm(&project).args(args).assert().success();
+    }
+    mock.with_oidc_exchange(
+        "ci-oidc-token",
+        "vault-ci-overrides",
+        Some("preview"),
+        "lpm-ci-token",
+    )
+    .await;
+    mock.with_ci_pull(
+        "vault-ci-overrides",
+        "lpm-ci-token",
+        Some("preview"),
+        serde_json::json!({"API_KEY": "registry-team"}),
+    )
+    .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .env("LPM_VAULT_ID", "vault-ci-overrides")
+        .env("LPM_OIDC_TOKEN", "ci-oidc-token")
+        .env("LPM_OIDC_POLICY_ID", TEST_OIDC_POLICY_ID)
+        .args([
+            "env",
+            "pull",
+            "--oidc",
+            "--env=preview",
+            &format!("--output={}", output_file.display()),
+        ])
+        .output()
+        .expect("failed to run lpm env pull --oidc");
+
+    assert!(
+        output.status.success(),
+        "oidc pull failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let written = std::fs::read_to_string(&output_file).expect("the pulled file");
+    let parsed = lpm_runner::dotenv::parse_env_str(&written);
+    assert_eq!(parsed["API_KEY"], "registry-team");
+    assert!(!written.contains("fixture-mine"), "{written}");
+    assert!(!parsed.contains_key("ONLY_MINE"));
+}
+
+#[tokio::test]
 async fn env_pull_oidc_uses_lpm_vault_id_without_local_vault() {
     let project =
         TempProject::empty(r#"{"name":"vault-oidc-env-bootstrap-test","version":"1.0.0"}"#);
@@ -7754,6 +7821,23 @@ async fn env_railway_platform_connect_and_status_use_direct_graphql_api() {
         String::from_utf8_lossy(&seeded.stdout),
         String::from_utf8_lossy(&seeded.stderr),
     );
+    let overridden = lpm(&project)
+        .args([
+            "env",
+            "override",
+            "set",
+            "--env",
+            "production",
+            "APPLICATION_SECRET=personal-override",
+            "ONLY_ON_THIS_COMPUTER=personal",
+        ])
+        .output()
+        .expect("failed to set personal overrides");
+    assert!(
+        overridden.status.success(),
+        "{}",
+        String::from_utf8_lossy(&overridden.stderr)
+    );
 
     mock.with_platform_connect_success(
         bearer_token,
@@ -7928,7 +8012,10 @@ async fn env_railway_platform_connect_and_status_use_direct_graphql_api() {
     let push_json = parse_clean_json_stdout(&push);
     assert_eq!(push_json["success"], true);
     assert_eq!(push_json["platform"], "railway");
-    assert_eq!(push_json["added"], 0);
+    assert_eq!(
+        push_json["added"], 0,
+        "a key only a personal override gives never reaches a platform"
+    );
     assert_eq!(push_json["updated"], 1);
     assert_eq!(push_json["removed"], 0);
     insta::assert_json_snapshot!("env_railway_push_json_envelope", push_json);

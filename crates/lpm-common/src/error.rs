@@ -850,6 +850,13 @@ pub enum LpmError {
     #[diagnostic(code(lpm::env_project_refused))]
     EnvProjectRefused(String),
 
+    /// An `lpm` above this one caches what it builds and couldn't be told
+    /// which env project this one uses. The message names the marker and
+    /// what to do.
+    #[error("{0}")]
+    #[diagnostic(code(lpm::personal_overrides_unreported))]
+    PersonalOverridesUnreported(String),
+
     /// Local history refused or couldn't do what was asked. `code` is the
     /// stable `history.*` code JSON output gives, and the message says why.
     #[error("{message}")]
@@ -1178,6 +1185,7 @@ impl LpmError {
             LpmError::EnvValidation(_) => "env_validation",
             LpmError::Env(_) => "env",
             LpmError::EnvProjectRefused(_) => "env_project_refused",
+            LpmError::PersonalOverridesUnreported(_) => "personal_overrides_unreported",
             LpmError::History { code, .. } => code,
             LpmError::EnvGeneration { .. } => "env_generation",
             LpmError::EngineMismatch(_) | LpmError::RunEngineMismatch(_) => "engine_mismatch",

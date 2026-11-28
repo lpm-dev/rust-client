@@ -31,6 +31,8 @@ mod fallback;
 mod freed_memory_probe;
 pub mod history;
 mod links;
+pub mod override_marker;
+pub mod overrides;
 mod selected_environment;
 pub mod signature;
 pub mod sync;
@@ -120,6 +122,34 @@ pub mod acceptance {
             crate::fallback::companion::commit_unchecked(directory, vault_id, mutations)
         })
     }
+
+    /// `vault_id`'s feature marker and personal overrides, as text, from the
+    /// file store of the LPM home at `lpm_home`.
+    pub fn file_companion_records(
+        lpm_home: &Path,
+        vault_id: &str,
+    ) -> Result<(Option<String>, Option<String>), String> {
+        crate::storage_transaction::with_vault_transaction_at(lpm_home, |directory| {
+            crate::fallback::use_file_data_key_in_scope(directory)?;
+            let text = |account: CompanionAccount| {
+                crate::fallback::companion::read_unchecked(directory, &account)?
+                    .map(|bytes| {
+                        String::from_utf8(bytes).map_err(|_| "a record isn't UTF-8".to_owned())
+                    })
+                    .transpose()
+            };
+            Ok((
+                text(CompanionAccount::Marker {
+                    vault_id: vault_id.to_owned(),
+                })?,
+                text(CompanionAccount::Record {
+                    kind: crate::companion::overrides::OVERRIDES_KIND.to_owned(),
+                    vault_id: vault_id.to_owned(),
+                    part: None,
+                })?,
+            ))
+        })
+    }
 }
 
 /// Whether `message` is an env project's refusal of an operation, by a
@@ -134,9 +164,14 @@ pub fn is_env_project_refusal(message: &str) -> bool {
 /// after any interrupted step was finished, or `None` when the directory has
 /// no env project.
 pub fn review_companion_data(project_dir: &Path) -> Result<Option<CompanionReview>, String> {
-    let Some(vault_id) = linked_vault_id(project_dir)? else {
+    let Some(vault_id) = checked_linked_vault_id(project_dir)? else {
         return Ok(None);
     };
+    // What a review says depends on the project's overrides, and the repair
+    // it leads to can remove them.
+    override_marker::report_access(override_marker::Access::Change {
+        vault_id: &vault_id,
+    })?;
     #[cfg(target_os = "macos")]
     if !force_file_vault_backend() {
         return keychain::review_companion_data(&vault_id).map(Some);
@@ -154,9 +189,16 @@ pub fn repair_companion_data(
     project_dir: &Path,
     reviewed: &CompanionReview,
 ) -> Result<Vec<CompanionRepair>, String> {
-    let Some(vault_id) = linked_vault_id(project_dir)? else {
+    let Some(vault_id) = checked_linked_vault_id(project_dir)? else {
         return Err("this directory has no env project".to_owned());
     };
+    if vault_id != reviewed.vault_id() {
+        return Err(companion::repair::CHANGED_SINCE_REVIEW.to_owned());
+    }
+    // A repair can remove the project's overrides.
+    override_marker::report_access(override_marker::Access::Change {
+        vault_id: &vault_id,
+    })?;
     #[cfg(target_os = "macos")]
     if !force_file_vault_backend() {
         return keychain::repair_companion_data(&vault_id, reviewed);
@@ -199,7 +241,75 @@ pub fn plant_debug_companion_state(
 pub struct RunEnvironment {
     pub values: HashMap<String, String>,
     pub overrides: PersonalOverrides,
+    /// The project's personal overrides in every environment, when it has
+    /// any: a command a run starts can read any of them.
+    pub overrides_identity: Option<OverridesIdentity>,
 }
+
+/// What a project's personal overrides on this computer are, in every
+/// environment: a digest of their record, which any change to them changes.
+/// It never leaves this computer.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OverridesIdentity([u8; 32]);
+
+impl OverridesIdentity {
+    pub fn of(record: &[u8]) -> Self {
+        use sha2::Digest as _;
+        Self(sha2::Sha256::digest(record).into())
+    }
+
+    pub fn to_hex(self) -> String {
+        hex::encode(self.0)
+    }
+}
+
+/// A digest of secrets: shown, it would let a guess of them be checked.
+impl std::fmt::Debug for OverridesIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OverridesIdentity(..)")
+    }
+}
+
+/// What an environment's values are as stored: a digest of every name and
+/// value, which any change to them changes. Like the values a run passes,
+/// it leaves this computer only inside a task's cache key.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ValuesIdentity([u8; 32]);
+
+impl ValuesIdentity {
+    pub fn of(values: &HashMap<String, String>) -> Self {
+        use sha2::Digest as _;
+        let mut entries: Vec<(&String, &String)> = values.iter().collect();
+        entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        let mut hasher = sha2::Sha256::new();
+        for (name, value) in entries {
+            for part in [name.as_bytes(), value.as_bytes()] {
+                hasher.update((part.len() as u64).to_le_bytes());
+                hasher.update(part);
+            }
+        }
+        Self(hasher.finalize().into())
+    }
+
+    pub fn to_hex(self) -> String {
+        hex::encode(self.0)
+    }
+}
+
+/// A digest of secrets: shown, it would let a guess of them be checked.
+impl std::fmt::Debug for ValuesIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ValuesIdentity(..)")
+    }
+}
+
+/// The selected environment's values, its personal overrides, and what
+/// identifies the project's overrides in every environment.
+pub(crate) type StoredRunEnvironment = (
+    Option<SecretMap>,
+    PersonalOverrides,
+    Option<OverridesIdentity>,
+);
 
 /// Authorize `operation` on `vault_id` against the feature marker of the
 /// store that holds its companion records, finishing any interrupted
@@ -264,8 +374,7 @@ impl CheckedValues {
 /// env project yet, which the write creates. [`set_checked`] writes to the
 /// project it checked.
 pub fn check_values_writable(project_dir: &Path) -> Result<CheckedValues, String> {
-    vault_id::check_vault_field(project_dir)?;
-    let vault_id = linked_vault_id(project_dir)?;
+    let vault_id = checked_linked_vault_id(project_dir)?;
     if let Some(vault_id) = &vault_id {
         with_project_vault_transaction(|directory| {
             authorize_companion(directory, vault_id, companion::gate::Operation::Write)
@@ -334,9 +443,22 @@ fn with_link_transaction<T>(
 /// The vault ID `project_dir`'s lpm.json names, when this machine lets the
 /// folder use that vault. See [`links`].
 fn linked_vault_id(project_dir: &Path) -> Result<Option<String>, String> {
-    let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
-        return Ok(None);
-    };
+    vault_id::read_vault_id(project_dir)
+        .map(|vault_id| link_checked(project_dir, vault_id))
+        .transpose()
+}
+
+/// [`linked_vault_id`], refusing a `vault` field no write could use (see
+/// [`vault_id::checked_vault_id`]), for a command that changes or lists what
+/// the project holds.
+pub(crate) fn checked_linked_vault_id(project_dir: &Path) -> Result<Option<String>, String> {
+    vault_id::checked_vault_id(project_dir)?
+        .map(|vault_id| link_checked(project_dir, vault_id))
+        .transpose()
+}
+
+/// `vault_id`, once this machine lets `project_dir` use it.
+fn link_checked(project_dir: &Path, vault_id: String) -> Result<String, String> {
     if !is_listed(&vault_id, &links::link_folder_path(project_dir)) {
         let listed =
             with_link_transaction(|directory| links::require(directory, project_dir, &vault_id))?;
@@ -344,7 +466,7 @@ fn linked_vault_id(project_dir: &Path) -> Result<Option<String>, String> {
             remember_listed(&vault_id, folder);
         }
     }
-    Ok(Some(vault_id))
+    Ok(vault_id)
 }
 
 /// The vault ID `project_dir` stores values under, created when lpm.json
@@ -644,14 +766,22 @@ pub fn try_get_run_environment_for_vault_id(
         Some(env) => (env, true),
         None => (lpm_env::DEFAULT_ENVIRONMENT, false),
     };
-    with_project_vault_transaction(|directory| {
-        let (values, overrides) =
+    let read = with_project_vault_transaction(|directory| {
+        let (values, overrides, overrides_identity) =
             read_run_environment_unlocked(directory, vault_id, environment, default_fallback)?;
         Ok(RunEnvironment {
             values: values.unwrap_or_default(),
             overrides,
+            overrides_identity,
         })
-    })
+    })?;
+    override_marker::report_access_with(|| override_marker::Access::Environment {
+        vault_id,
+        environment,
+        values: (!read.values.is_empty()).then(|| ValuesIdentity::of(&read.values)),
+        overrides: read.overrides_identity,
+    })?;
+    Ok(read)
 }
 
 /// Every environment's values and personal overrides from one read of the
@@ -660,6 +790,8 @@ pub fn try_get_run_environment_for_vault_id(
 pub struct AllRunEnvironments {
     pub values: EnvironmentMap,
     pub overrides: HashMap<String, PersonalOverrides>,
+    /// See [`RunEnvironment::overrides_identity`].
+    pub overrides_identity: Option<OverridesIdentity>,
 }
 
 impl AllRunEnvironments {
@@ -679,8 +811,31 @@ impl AllRunEnvironments {
         RunEnvironment {
             values: selected.cloned().unwrap_or_default(),
             overrides: self.overrides.get(name).cloned().unwrap_or_default(),
+            overrides_identity: self.overrides_identity,
         }
     }
+
+    /// See [`run_environment_names`].
+    pub fn environment_names(&self) -> Vec<&str> {
+        run_environment_names(&self.values, &self.overrides)
+    }
+}
+
+/// The environments that have values or personal overrides, each once, in
+/// order: one with overrides and no values is still one a run on this
+/// computer uses, with `default`'s values.
+pub fn run_environment_names<'a>(
+    values: &'a EnvironmentMap,
+    overrides: &'a HashMap<String, PersonalOverrides>,
+) -> Vec<&'a str> {
+    let mut names: Vec<&str> = values
+        .keys()
+        .chain(overrides.keys())
+        .map(String::as_str)
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 /// [`AllRunEnvironments`] for the project's vault; empty when it has none.
@@ -688,25 +843,33 @@ pub fn try_get_all_run_environments(project_dir: &Path) -> Result<AllRunEnvironm
     let Some(vault_id) = linked_vault_id(project_dir)? else {
         return Ok(AllRunEnvironments::default());
     };
-    let (values, overrides) = try_get_all_run_environments_for_vault_id(&vault_id)?;
-    Ok(AllRunEnvironments { values, overrides })
+    try_get_all_run_environments_for_vault_id(&vault_id)
 }
 
 /// Every environment's values and personal overrides, read together in one
 /// lock, for a view of what each environment would run with.
 pub fn try_get_all_run_environments_for_vault_id(
     vault_id: &str,
-) -> Result<(EnvironmentMap, HashMap<String, PersonalOverrides>), String> {
+) -> Result<AllRunEnvironments, String> {
     validate_explicit_vault_id(vault_id)?;
-    with_project_vault_transaction(|directory| {
-        let (values, overrides) = read_all_run_environments_unlocked(directory, vault_id)?;
-        Ok((values.unwrap_or_default(), overrides.into_iter().collect()))
+    let (values, overrides, overrides_identity) = with_project_vault_transaction(|directory| {
+        read_all_run_environments_unlocked(directory, vault_id)
+    })?;
+    override_marker::report_access(override_marker::Access::Environments {
+        vault_id,
+        overrides: overrides_identity.is_some(),
+    })?;
+    Ok(AllRunEnvironments {
+        values: values.unwrap_or_default(),
+        overrides: overrides.into_iter().collect(),
+        overrides_identity,
     })
 }
 
-type StoredRunEnvironments = (
+pub(crate) type StoredRunEnvironments = (
     Option<EnvironmentMap>,
     std::collections::BTreeMap<String, PersonalOverrides>,
+    Option<OverridesIdentity>,
 );
 
 fn read_all_run_environments_unlocked(
@@ -718,12 +881,12 @@ fn read_all_run_environments_unlocked(
     }
     #[cfg(target_os = "macos")]
     {
-        let (values, overrides) = keychain::read_all_for_run_unlocked(vault_id)?;
+        let (values, overrides, identity) = keychain::read_all_for_run_unlocked(vault_id)?;
         let values = match values {
             Some(values) => Some(values),
             None => fallback::read_all_environments_unlocked(directory, vault_id)?,
         };
-        Ok((values, overrides))
+        Ok((values, overrides, identity))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -736,7 +899,7 @@ fn read_run_environment_unlocked(
     vault_id: &str,
     environment: &str,
     default_fallback: bool,
-) -> Result<(Option<SecretMap>, PersonalOverrides), String> {
+) -> Result<StoredRunEnvironment, String> {
     if force_file_vault_backend() {
         return fallback::read_run_environment_unlocked(
             directory,
@@ -747,7 +910,7 @@ fn read_run_environment_unlocked(
     }
     #[cfg(target_os = "macos")]
     {
-        let (values, overrides) =
+        let (values, overrides, identity) =
             keychain::read_for_run_unlocked(vault_id, environment, default_fallback)?;
         let values = match values {
             Some(values) => Some(values),
@@ -758,7 +921,7 @@ fn read_run_environment_unlocked(
                 default_fallback,
             )?,
         };
-        Ok((values, overrides))
+        Ok((values, overrides, identity))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1678,6 +1841,71 @@ fn write_all_environments_unlocked(
     }
 }
 
+/// Write `environments`, carrying the environments the write renames,
+/// `(from, to)`, and removes, all at once as it makes them, over to the
+/// project's personal overrides: planned before anything is written, so a
+/// refusal leaves both as they were, and committed in the values write's own
+/// journal transaction in either store.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a values write's arguments and the environment changes it carries"
+)]
+fn write_all_environments_following_unlocked(
+    directory: &storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+    project_name: &str,
+    project_path: &str,
+    environments: &EnvironmentMap,
+    recording: &history::scope::Recording,
+    renamed: Vec<(String, String)>,
+    removed: Vec<String>,
+) -> Result<(), String> {
+    if renamed.is_empty() && removed.is_empty() {
+        return write_all_environments_unlocked(
+            directory,
+            vault_id,
+            project_name,
+            project_path,
+            environments,
+            recording,
+        );
+    }
+    // The overrides of an environment it renames or removes move or go.
+    override_marker::report_access(override_marker::Access::Change { vault_id })?;
+    let edits = [companion::overrides::change::Edit::EnvironmentsChanged { renamed, removed }];
+    if force_file_vault_backend() {
+        return fallback::companion::write_values_following_unlocked(
+            directory,
+            vault_id,
+            environments,
+            recording,
+            &edits,
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        keychain::write_all_environments_following_unlocked(
+            vault_id,
+            project_name,
+            project_path,
+            environments,
+            recording,
+            &edits,
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (project_name, project_path);
+        fallback::companion::write_values_following_unlocked(
+            directory,
+            vault_id,
+            environments,
+            recording,
+            &edits,
+        )
+    }
+}
+
 /// Delete one or more secrets from the vault.
 pub fn delete(
     project_dir: &Path,
@@ -2370,6 +2598,96 @@ mod tests {
         )
     }
 
+    /// Values for `vault_id` beside an overrides record no marker lists,
+    /// damage whose description names no project.
+    fn plant_unlisted_overrides(project_dir: &Path, vault_id: &str) {
+        std::fs::write(
+            project_dir.join("lpm.json"),
+            format!(r#"{{"vault":"{vault_id}"}}"#),
+        )
+        .unwrap();
+        set(project_dir, &[("TOKEN", "value")]).unwrap();
+        storage_transaction::with_vault_transaction(|directory| {
+            fallback::companion::commit_unchecked(
+                directory,
+                vault_id,
+                vec![companion::lifecycle::Mutation::Write {
+                    account: companion::account::CompanionAccount::Record {
+                        kind: companion::overrides::OVERRIDES_KIND.to_owned(),
+                        vault_id: vault_id.to_owned(),
+                        part: None,
+                    },
+                    value: br#"{"schemaVersion":1}"#.to_vec().into(),
+                }],
+            )
+        })
+        .unwrap();
+        companion::forget(vault_id);
+    }
+
+    #[test]
+    fn a_values_identity_changes_with_any_name_or_value_and_never_with_their_order() {
+        let of = |pairs: &[(&str, &str)]| {
+            ValuesIdentity::of(
+                &pairs
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+            )
+        };
+        let first = of(&[("API_URL", "one"), ("TOKEN", "two")]);
+
+        assert_eq!(first, of(&[("TOKEN", "two"), ("API_URL", "one")]));
+        for other in [
+            of(&[("API_URL", "one"), ("TOKEN", "three")]),
+            of(&[("API_URL", "one"), ("TOKENS", "two")]),
+            of(&[("API_URL", "one")]),
+            of(&[("API_URLo", "ne"), ("TOKEN", "two")]),
+        ] {
+            assert_ne!(first, other);
+        }
+        assert_eq!(format!("{first:?}"), "ValuesIdentity(..)");
+    }
+
+    #[test]
+    fn a_repair_never_runs_on_a_project_other_than_the_one_reviewed() {
+        crate::fallback::tests::with_temp_vault_home(|_| {
+            crate::fallback::tests::force_file_vault();
+            let reviewed_folder = tempfile::tempdir().unwrap();
+            let other_folder = tempfile::tempdir().unwrap();
+            plant_unlisted_overrides(reviewed_folder.path(), "reviewed-project");
+            plant_unlisted_overrides(other_folder.path(), "other-project");
+            let reviewed = review_companion_data(reviewed_folder.path())
+                .unwrap()
+                .expect("the folder has an env project");
+            let other = review_companion_data(other_folder.path())
+                .unwrap()
+                .expect("the folder has an env project");
+            assert_eq!(
+                (&other.problems, other.repairs()),
+                (&reviewed.problems, reviewed.repairs()),
+                "the same damage reads the same way for either project"
+            );
+            assert!(!reviewed.repairs().is_empty(), "{reviewed:?}");
+            std::fs::write(
+                reviewed_folder.path().join("lpm.json"),
+                r#"{"vault":"other-project"}"#,
+            )
+            .unwrap();
+            link_folder_to_vault_id(reviewed_folder.path(), "other-project").unwrap();
+
+            let refused = repair_companion_data(reviewed_folder.path(), &reviewed)
+                .expect_err("the review was of another project");
+
+            assert_eq!(refused, companion::repair::CHANGED_SINCE_REVIEW);
+            assert_eq!(
+                review_companion_data(other_folder.path()).unwrap(),
+                Some(other),
+                "the other project's damage is untouched"
+            );
+        });
+    }
+
     #[test]
     fn a_checked_first_write_links_the_folder_to_the_vault_its_lpm_json_names() {
         crate::fallback::tests::with_temp_vault_home(|_| {
@@ -2469,6 +2787,61 @@ mod tests {
             assert_eq!(
                 all.run_environment(Some("preview")).values["SHARED"],
                 "default"
+            );
+            cleanup_vault(project.path());
+        });
+    }
+
+    #[test]
+    fn every_reader_of_stored_values_alone_leaves_personal_overrides_out() {
+        crate::fallback::tests::with_temp_vault_home(|_| {
+            crate::fallback::tests::force_file_vault();
+            let project = tempfile::tempdir().unwrap();
+            set_env(project.path(), "default", &[("API_KEY", "team")]).unwrap();
+            set_env(project.path(), "staging", &[("API_KEY", "team")]).unwrap();
+            for environment in ["default", "staging"] {
+                overrides::change(
+                    project.path(),
+                    &[
+                        overrides::Edit::Set {
+                            environment: environment.to_owned(),
+                            key: "API_KEY".to_owned(),
+                            value: zeroize::Zeroizing::new("fixture-mine".to_owned()),
+                        },
+                        overrides::Edit::Set {
+                            environment: environment.to_owned(),
+                            key: "ONLY_MINE".to_owned(),
+                            value: zeroize::Zeroizing::new("fixture-mine".to_owned()),
+                        },
+                    ],
+                )
+                .unwrap();
+            }
+            let vault_id = vault_id::read_vault_id(project.path()).unwrap();
+            let team = HashMap::from([("API_KEY".to_owned(), "team".to_owned())]);
+
+            assert_eq!(
+                try_get(project.path(), "API_KEY").unwrap().as_deref(),
+                Some("team")
+            );
+            assert_eq!(
+                try_get_env(project.path(), "staging", "API_KEY")
+                    .unwrap()
+                    .as_deref(),
+                Some("team")
+            );
+            assert_eq!(try_get_all(project.path()).unwrap(), team);
+            assert_eq!(try_get_all_env(project.path(), "staging").unwrap(), team);
+            assert_eq!(
+                try_get_all_env_for_vault_id(&vault_id, "staging").unwrap(),
+                team
+            );
+            assert_eq!(
+                try_get_all_environments_for_vault_id(&vault_id).unwrap(),
+                HashMap::from([
+                    ("default".to_owned(), team.clone()),
+                    ("staging".to_owned(), team)
+                ])
             );
             cleanup_vault(project.path());
         });
@@ -2743,6 +3116,85 @@ KEY3=no-quotes"#;
             .expect("imported secret");
         assert_eq!(stored_key.as_ptr(), key_ptr);
         assert_eq!(stored_value.as_ptr(), value_ptr);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn reading_personal_overrides_leaves_no_copy_of_any_value() {
+        use crate::companion::overrides::{change, evaluate, evaluate_all};
+        use crate::freed_memory_probe::{MARKER, watch};
+        let marker = br#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{"overrides":{"version":1,"ifUnsupported":"refuse","kinds":["overrides"],"state":"active"}}}"#;
+        let gate = crate::companion::assessment::gate_of("proj", Some(marker));
+        // Escaped, as in a PEM private key, in the environment read and in
+        // one only checked.
+        let record = format!(
+            r#"{{"schemaVersion":1,"vaultId":"proj","environments":{{"default":{{"set":{{"TOKEN":"{MARKER}\n-----END-----"}},"unset":[]}},"live":{{"set":{{"OTHER":"{MARKER}\n","QUOTED":"say \"{MARKER}\""}},"unset":["GONE"]}}}}}}"#
+        );
+
+        let (read, found) = watch(|| {
+            let mut overrides =
+                evaluate(&gate, "proj", "default", Some(record.as_bytes())).expect("valid");
+            let read = overrides.set["TOKEN"].starts_with(MARKER);
+            history::wipe_environment(&mut overrides.set);
+            read
+        });
+        assert!(read);
+        assert!(!found, "one environment's overrides leave nothing behind");
+
+        let (read, found) = watch(|| {
+            let mut every = evaluate_all(&gate, "proj", Some(record.as_bytes())).expect("valid");
+            let read = every["live"].set["OTHER"].starts_with(MARKER);
+            for overrides in every.values_mut() {
+                history::wipe_environment(&mut overrides.set);
+            }
+            read
+        });
+        assert!(read);
+        assert!(!found, "every environment's overrides leave nothing behind");
+
+        let ((), found) = watch(|| {
+            let planned = change::plan_change(
+                "proj",
+                &gate,
+                Some(record.as_bytes()),
+                &[change::Edit::Remove {
+                    environment: "live".to_owned(),
+                    key: "GONE".to_owned(),
+                }],
+                None,
+            );
+            drop(planned);
+        });
+        assert!(!found, "a plan's read of the record leaves nothing behind");
+
+        let damaged = format!(
+            r#"{{"schemaVersion":1,"vaultId":"proj","environments":{{"default":{{"set":{{"TOKEN":"{MARKER}\n"}},"unset":[]}},"live":{{"set":{{"OTHER":1}},"unset":[]}}}}}}"#
+        );
+        let (refused, found) =
+            watch(|| evaluate_all(&gate, "proj", Some(damaged.as_bytes())).is_err());
+        assert!(refused);
+        assert!(!found, "a record that doesn't read leaves nothing behind");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn personal_overrides_are_wiped_when_dropped() {
+        use crate::companion::overrides::evaluate;
+        use crate::freed_memory_probe::{MARKER, watch};
+        let marker = br#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{"overrides":{"version":1,"ifUnsupported":"refuse","kinds":["overrides"],"state":"active"}}}"#;
+        let gate = crate::companion::assessment::gate_of("proj", Some(marker));
+        let record = format!(
+            r#"{{"schemaVersion":1,"vaultId":"proj","environments":{{"default":{{"set":{{"TOKEN":"{MARKER}"}},"unset":[]}}}}}}"#
+        );
+
+        let (read, found) = watch(|| {
+            let overrides =
+                evaluate(&gate, "proj", "default", Some(record.as_bytes())).expect("valid");
+            overrides.set["TOKEN"] == MARKER
+        });
+
+        assert!(read);
+        assert!(!found, "a reader that never shows the value leaves no copy");
     }
 
     #[cfg(not(miri))]

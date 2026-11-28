@@ -184,20 +184,52 @@ fn format_print_env(
     format: lpm_env::PrintFormat,
     scope: &super::arguments::Scope,
 ) -> Result<String, LpmError> {
-    // Use the unified loader (handles inheritance, vault, overrides, schema validation + defaults)
+    // GitHub Actions' format is for a workflow, which takes team values only,
+    // as `--ci` does.
+    let overrides = if format == lpm_env::PrintFormat::GithubActions {
+        lpm_runner::dotenv::OverridePolicy::Exclude
+    } else {
+        lpm_runner::dotenv::OverridePolicy::Apply
+    };
     let composed = lpm_runner::dotenv::load_project_env_with_config_and_context(
         project_dir,
         resolved_mode,
         config,
         scope.stage.unwrap_or_default(),
         scope.service.as_deref(),
-        lpm_runner::dotenv::OverridePolicy::Apply,
+        overrides,
     )?;
     // Every format is machine-readable, so overridden keys are reported on
-    // stderr, never marked in the output.
-    lpm_runner::dotenv::announce_personal_overrides(&composed, resolved_mode.unwrap_or("default"));
-    let mut env_vars = composed.into_vars();
+    // stderr, never marked in the output, under the environment's own name
+    // as runs report it.
+    let environment = resolved_mode.map_or_else(
+        || lpm_env::DEFAULT_ENVIRONMENT.to_owned(),
+        |mode| {
+            let no_aliases = std::collections::HashMap::new();
+            lpm_env::resolver::resolve(
+                mode,
+                config.map_or(&no_aliases, |config| &config.env),
+                config.and_then(|config| config.environments.as_ref()),
+            )
+            .canonical
+        },
+    );
     let schema = config.and_then(|c| c.env_schema.as_ref());
+    let filter = schema.filter(|_| schema_only || client_only);
+    let shown = |rule: &lpm_env::EnvVarRule| !client_only || rule.client;
+    match filter {
+        Some(schema) => lpm_runner::dotenv::announce_personal_overrides_of(
+            &composed,
+            &environment,
+            schema
+                .vars
+                .iter()
+                .filter(|(_, rule)| shown(rule))
+                .map(|(key, _)| key.as_str()),
+        ),
+        None => lpm_runner::dotenv::announce_personal_overrides(&composed, &environment),
+    }
+    let mut env_vars = composed.into_vars();
 
     // Collect secret keys for masking
     let secret_keys: std::collections::HashSet<String> = schema
@@ -210,16 +242,8 @@ fn format_print_env(
         })
         .unwrap_or_default();
 
-    // Filter to schema-only if requested
-    if (schema_only || client_only)
-        && let Some(schema) = schema
-    {
-        env_vars.retain(|key, _| {
-            schema
-                .vars
-                .get(key)
-                .is_some_and(|rule| !client_only || rule.client)
-        });
+    if let Some(schema) = filter {
+        env_vars.retain(|key, _| schema.vars.get(key).is_some_and(shown));
     }
 
     Ok(lpm_env::format_env(&env_vars, format, &secret_keys))
@@ -271,15 +295,19 @@ pub(super) fn vars_check(
     let _env_access_binding = env_access.bind();
     let all_envs = match env_input {
         Some(_) => check_environments(env_input, lpm_config.as_ref(), || Ok(HashMap::new()))?,
-        None => lpm_runner::dotenv::read_vault_environments_for_run(project_dir, |vault_envs| {
-            let empty_env_map = HashMap::new();
-            let config = lpm_config.as_ref();
-            lpm_env::resolver::list_all(
-                config.map_or(&empty_env_map, |c| &c.env),
-                config.and_then(|c| c.environments.as_ref()),
-                vault_envs,
-            )
-        })
+        None => lpm_runner::dotenv::read_vault_environments_for_run(
+            project_dir,
+            lpm_runner::dotenv::OverridePolicy::Apply,
+            |names| {
+                let empty_env_map = HashMap::new();
+                let config = lpm_config.as_ref();
+                lpm_env::resolver::list_all_from_vault_names(
+                    config.map_or(&empty_env_map, |c| &c.env),
+                    config.and_then(|c| c.environments.as_ref()),
+                    names.iter().copied(),
+                )
+            },
+        )
         .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?
         .unwrap_or_default(),
     };
@@ -287,7 +315,8 @@ pub(super) fn vars_check(
         name: String,
         total: usize,
         errors: Vec<lpm_env::ValidationError>,
-        from_overrides: std::collections::HashSet<String>,
+        /// For each error, whether a personal override caused it.
+        from_overrides: Vec<bool>,
         ignored: Vec<String>,
         characters: Vec<lpm_runner::dotenv::StoredValueCharacters>,
     }
@@ -309,7 +338,7 @@ pub(super) fn vars_check(
                     description: None,
                     is_secret: false,
                 }],
-                from_overrides: std::collections::HashSet::new(),
+                from_overrides: vec![false],
                 ignored: Vec::new(),
                 characters: Vec::new(),
             });
@@ -324,7 +353,7 @@ pub(super) fn vars_check(
             )?;
             let characters = layers.stored_value_characters();
             let mut composed = layers.compose(lpm_config.as_ref(), scope.service.as_deref())?;
-            let errors = composed.evaluate(
+            let verdict = composed.evaluate(
                 Some(&validator),
                 lpm_env::EvalContext {
                     environment: &environment.canonical,
@@ -332,12 +361,7 @@ pub(super) fn vars_check(
                     service: scope.service.as_deref(),
                 },
             )?;
-            let from_overrides = errors
-                .iter()
-                .filter(|error| composed.caused_by_override(error))
-                .map(|error| error.key.clone())
-                .collect();
-            Ok::<_, LpmError>((errors, from_overrides, characters))
+            Ok::<_, LpmError>((verdict.errors, verdict.from_overrides, characters))
         });
         let (errors, from_overrides, characters) = checked?;
         all_valid &= errors.is_empty();
@@ -369,13 +393,14 @@ pub(super) fn vars_check(
                     "valid": valid_variable_count(schema, errors),
                     "ignored": ignored,
                     "value_warnings": value_warnings,
-                    "errors": errors.iter().map(|e| {
-                        let mut diagnostic = serde_json::json!({"key": e.key, "error": e.to_string()});
+                    "errors": errors.iter().zip(from_overrides).map(|(e, caused)| {
+                        let message = e.to_string();
+                        let mut diagnostic = serde_json::json!({"key": e.key, "error": message});
                         if let lpm_env::ValidationErrorKind::GroupViolation { group, mode } = &e.kind {
                             diagnostic["group"] = serde_json::json!(group);
                             diagnostic["mode"] = serde_json::json!(mode);
                         }
-                        if from_overrides.contains(&e.key) {
+                        if *caused {
                             diagnostic["personalOverride"] = serde_json::json!(true);
                         }
                         diagnostic
@@ -430,8 +455,8 @@ pub(super) fn vars_check(
                     total,
                 )
             );
-            for error in errors {
-                if from_overrides.contains(&error.key) {
+            for (error, caused) in errors.iter().zip(from_overrides) {
+                if *caused {
                     println!(
                         "    {} {}",
                         install_ui::red(&error.to_string()),

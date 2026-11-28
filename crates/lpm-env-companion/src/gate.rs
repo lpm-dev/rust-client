@@ -290,13 +290,13 @@ mod tests {
 
     #[test]
     fn unsupported_overrides_refuse_whatever_the_marker_says() {
-        let gate = marked("overrides", 2, Level::Ignore, &["overrides"]);
+        let gate = marked("overrides", 3, Level::Ignore, &["overrides"]);
         let error = gate
             .authorize(Operation::ReadApplyingOverrides)
             .expect_err("unsupported overrides refuse");
         assert_eq!(
             error.to_string(),
-            "This env project uses personal overrides v2, which this LPM CLI doesn't support. Update the LPM CLI: lpm self-update"
+            "This env project uses personal overrides v3, which this LPM CLI doesn't support. Update the LPM CLI: lpm self-update"
         );
     }
 
@@ -322,7 +322,7 @@ mod tests {
         let refusals = [
             GateError::Unsupported {
                 feature: "overrides".to_owned(),
-                version: 2,
+                version: 3,
                 level: Level::Refuse,
             },
             GateError::Unsupported {

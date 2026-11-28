@@ -3330,7 +3330,8 @@ mod tests {
     ) -> lpm_task::cache::PublishedCacheEntry {
         match stored {
             lpm_task::cache::StoredCacheEntry::Published(published) => published,
-            lpm_task::cache::StoredCacheEntry::KeptExisting => {
+            lpm_task::cache::StoredCacheEntry::KeptExisting
+            | lpm_task::cache::StoredCacheEntry::Withdrawn => {
                 panic!("expected the store to publish the entry")
             }
         }

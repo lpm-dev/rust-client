@@ -12,7 +12,7 @@ mod environment;
 use environment::print_env_context;
 pub(crate) use environment::resolve_and_load_env_with_schema_validation;
 pub use environment::{
-    load_script_child_env_with_config, load_script_env, load_script_env_with_config,
+    ScriptChildEnv, load_script_child_env_with_config, load_script_env, load_script_env_with_config,
 };
 
 use crate::bin_path;

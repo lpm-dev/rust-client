@@ -10,14 +10,7 @@ fn run_read(storage: &mut MemoryProjectStorage) -> Result<companion_gate::RunRea
 }
 
 fn run_overrides(storage: &mut MemoryProjectStorage) -> Result<crate::PersonalOverrides, String> {
-    let read = run_read(storage)?;
-    crate::companion::overrides::evaluate(
-        &read.gate,
-        VAULT,
-        "default",
-        read.overrides_record.as_deref(),
-    )
-    .map_err(crate::companion::damaged)
+    run_read(storage)?.overrides(VAULT, "default")
 }
 
 const VAULT: &str = "proj";
@@ -43,7 +36,10 @@ fn storage_with_values() -> MemoryProjectStorage {
     storage
 }
 
-fn committed_journal(storage: &mut MemoryProjectStorage, operations: &[(&str, Option<&[u8]>)]) {
+pub(super) fn committed_journal(
+    storage: &mut MemoryProjectStorage,
+    operations: &[(&str, Option<&[u8]>)],
+) {
     let transaction_id = "00000000-0000-4000-8000-0000000000aa";
     let mut journal_operations = Vec::new();
     for (index, (target, value)) in operations.iter().enumerate() {
@@ -251,7 +247,7 @@ fn writes_are_refused_while_a_feature_needs_a_newer_client() {
     storage.values.insert(
         marker_account(VAULT),
         marker(
-            r#""overrides":{"version":2,"ifUnsupported":"ignore","kinds":["overrides"],"state":"active"}"#,
+            r#""overrides":{"version":3,"ifUnsupported":"ignore","kinds":["overrides"],"state":"active"}"#,
             "active",
         ),
     );
@@ -477,12 +473,15 @@ fn applying_overrides_returns_the_selected_environment_with_the_values() {
     let values = run_read(&mut storage).expect("apply read").values;
     let overrides = run_overrides(&mut storage).expect("apply read");
 
-    assert_eq!(values.as_deref(), Some(VALUES.as_bytes()));
+    assert_eq!(
+        values.as_deref().map(Vec::as_slice),
+        Some(VALUES.as_bytes())
+    );
     assert_eq!(overrides.set["TOKEN"], "mine");
 }
 
 #[test]
-fn weaker_overrides_under_approved_values_are_strengthened_before_use() {
+fn a_run_strengthens_weaker_overrides_under_approved_values_before_it_uses_them() {
     let mut storage = storage_with_values();
     let overrides = record_account("overrides", VAULT, None);
     storage
@@ -495,15 +494,22 @@ fn weaker_overrides_under_approved_values_are_strengthened_before_use() {
         .claims
         .insert(VAULT.to_owned(), ClaimedAccess::RequireApproval);
     storage.protected.insert(VAULT.to_owned());
+    storage.attribute_reads.clear();
 
-    run_overrides(&mut storage).expect("apply read");
+    let read = run_overrides(&mut storage).expect("apply read");
 
+    assert_eq!(read.set["TOKEN"], "mine");
     assert_eq!(storage.approvals_required, std::slice::from_ref(&overrides));
     assert!(storage.protected.contains(&overrides));
+    assert_eq!(
+        storage.attribute_reads.get(&overrides).copied(),
+        None,
+        "the record's attributes come with its data"
+    );
 }
 
 #[test]
-fn an_unavailable_keychain_returns_no_override_bytes_and_records_nothing() {
+fn a_run_whose_weaker_overrides_cant_be_strengthened_gets_none_of_their_bytes() {
     let mut storage = storage_with_values();
     storage
         .values
@@ -521,7 +527,60 @@ fn an_unavailable_keychain_returns_no_override_bytes_and_records_nothing() {
     let error = run_overrides(&mut storage).expect_err("an inconclusive probe fails");
 
     assert!(error.contains("retry once the Mac is unlocked"), "{error}");
+    assert!(!error.contains("mine"), "{error}");
+}
+
+#[test]
+fn a_run_never_applies_overrides_left_without_values() {
+    let mut storage = storage_with_values();
+    let overrides = record_account("overrides", VAULT, None);
+    storage
+        .values
+        .insert(marker_account(VAULT), marker(OVERRIDES_FEATURE, "active"));
+    storage
+        .values
+        .insert(overrides.clone(), overrides_record(r#""TOKEN":"mine""#));
+    storage.values.remove(VAULT);
+    storage.reads.clear();
+
+    let read = run_overrides(&mut storage).expect("a run without values");
+
+    assert!(read.set.is_empty() && read.unset.is_empty());
+    assert_eq!(storage.reads.get(&overrides).copied(), None);
+}
+
+#[test]
+fn an_unavailable_keychain_lists_no_weaker_override_bytes_and_records_nothing() {
+    let mut storage = storage_with_values();
+    storage
+        .values
+        .insert(marker_account(VAULT), marker(OVERRIDES_FEATURE, "active"));
+    storage.values.insert(
+        record_account("overrides", VAULT, None),
+        overrides_record(r#""TOKEN":"mine""#),
+    );
+    storage
+        .claims
+        .insert(VAULT.to_owned(), ClaimedAccess::RequireApproval);
+    storage.protected.insert(VAULT.to_owned());
+    storage.keychain_unavailable = true;
+    storage.reads.clear();
+
+    let error = {
+        let _scope = crate::companion::LockScope::enter();
+        crate::keychain::overrides::read_all_with_storage(&mut storage, VAULT)
+            .expect_err("an inconclusive probe fails")
+    };
+
+    assert!(error.contains("retry once the Mac is unlocked"), "{error}");
     assert!(storage.approvals_required.is_empty());
+    assert_eq!(
+        storage
+            .reads
+            .get(&record_account("overrides", VAULT, None))
+            .copied(),
+        None
+    );
 }
 
 #[test]
@@ -706,6 +765,40 @@ fn an_apply_read_without_overrides_still_reads_their_account_once() {
 }
 
 #[test]
+fn an_apply_read_of_approved_values_asks_nothing_more_about_its_overrides() {
+    for with_overrides in [true, false] {
+        let mut storage = storage_with_values();
+        let overrides = record_account("overrides", VAULT, None);
+        if with_overrides {
+            storage
+                .values
+                .insert(marker_account(VAULT), marker(OVERRIDES_FEATURE, "active"));
+            storage
+                .values
+                .insert(overrides.clone(), overrides_record(r#""A":"1""#));
+        }
+        for account in [VAULT.to_owned(), overrides.clone()] {
+            storage
+                .claims
+                .insert(account.clone(), ClaimedAccess::RequireApproval);
+            storage.protected.insert(account);
+        }
+        storage.reads.clear();
+        storage.attribute_reads.clear();
+
+        run_overrides(&mut storage).expect("apply read");
+
+        assert_eq!(
+            storage.attribute_reads.get(&overrides).copied(),
+            None,
+            "with overrides: {with_overrides}"
+        );
+        assert_eq!(storage.reads.get(&overrides).copied(), Some(1));
+        assert!(storage.probes.is_empty());
+    }
+}
+
+#[test]
 fn a_values_write_adds_one_marker_read_and_no_probe_or_listing() {
     let mut storage = storage_with_values();
     storage.reads.clear();
@@ -844,6 +937,24 @@ fn deleting_a_project_lists_the_service_once_however_many_transactions_it_takes(
             .any(|account| crate::companion::account::is_in_companion_namespace(account))
     );
     assert_eq!(storage.listings, 1);
+}
+
+#[test]
+fn a_repair_review_reads_the_marker_once() {
+    let mut storage = storage_with_values();
+    storage
+        .values
+        .insert(marker_account(VAULT), marker(OVERRIDES_FEATURE, "active"));
+    storage.values.insert(
+        record_account("overrides", VAULT, None),
+        overrides_record(r#""TOKEN":"mine""#),
+    );
+    storage.reads.clear();
+
+    let review = review_companion_data_with_storage(&mut storage, VAULT).expect("a review");
+
+    assert!(review.problems.is_empty(), "{:?}", review.problems);
+    assert_eq!(storage.reads.get(&marker_account(VAULT)).copied(), Some(1));
 }
 
 #[test]
@@ -1132,6 +1243,114 @@ fn a_planted_state_leaves_no_claim_of_the_state_before() {
         Some(&ClaimedAccess::RequireApproval),
         "clear keeps approval the Keychain enforces"
     );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn planting_approved_values_gives_the_values_enforced_approval_and_keeps_the_newer_data() {
+    use crate::companion::debug_states::{DebugCompanionState, PlantedClaim};
+    let mut storage = storage_with_values();
+    let no_claim = |_: &mut MemoryProjectStorage, account: &str, _: PlantedClaim| {
+        Err(format!("no claim is planted, yet one was on {account}"))
+    };
+    plant_debug_companion_state_with_storage(
+        &mut storage,
+        VAULT,
+        &DebugCompanionState::Overrides {
+            environment: "default".to_owned(),
+            set: vec![("API_URL".to_owned(), "fixture-mine".to_owned())],
+            unset: Vec::new(),
+        },
+        no_claim,
+    )
+    .expect("plant overrides");
+    let newer_data = |storage: &MemoryProjectStorage| {
+        let mut newer: Vec<(String, Vec<u8>)> = storage
+            .values
+            .keys()
+            .filter(|account| account.starts_with("__vault_"))
+            .map(|account| {
+                let value = storage.values.get_bytes(account).expect("a listed item");
+                (account.clone(), value.to_vec())
+            })
+            .collect();
+        newer.sort_unstable();
+        newer
+    };
+    let before = newer_data(&storage);
+
+    let planted = plant_debug_companion_state_with_storage(
+        &mut storage,
+        VAULT,
+        &DebugCompanionState::ApprovedValues,
+        no_claim,
+    )
+    .expect("plant approved values");
+    assert!(planted.contains("CLI approval"), "{planted}");
+    assert!(
+        storage.protected.contains(VAULT),
+        "the Keychain enforces it"
+    );
+    assert_eq!(
+        storage.claims.get(VAULT),
+        Some(&ClaimedAccess::RequireApproval)
+    );
+    assert_eq!(
+        newer_data(&storage),
+        before,
+        "the newer data stays as it was"
+    );
+
+    assert_eq!(
+        plant_debug_companion_state_with_storage(
+            &mut storage,
+            VAULT,
+            &DebugCompanionState::ApprovedValues,
+            no_claim,
+        )
+        .expect("plant again"),
+        "This project's values already need CLI approval."
+    );
+    assert_eq!(
+        storage.approvals_required,
+        [VAULT],
+        "approval is given once"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn planting_approved_values_protects_values_that_only_claim_approval_and_needs_values() {
+    use crate::companion::debug_states::{DebugCompanionState, PlantedClaim};
+    let no_claim = |_: &mut MemoryProjectStorage, account: &str, _: PlantedClaim| {
+        Err(format!("no claim is planted, yet one was on {account}"))
+    };
+    let mut storage = storage_with_values();
+    storage
+        .claims
+        .insert(VAULT.to_owned(), ClaimedAccess::RequireApproval);
+
+    plant_debug_companion_state_with_storage(
+        &mut storage,
+        VAULT,
+        &DebugCompanionState::ApprovedValues,
+        no_claim,
+    )
+    .expect("plant approved values");
+    assert!(
+        storage.protected.contains(VAULT),
+        "a claim the Keychain doesn't enforce gets the approval it claims"
+    );
+
+    let mut without_values = MemoryProjectStorage::default();
+    let refused = plant_debug_companion_state_with_storage(
+        &mut without_values,
+        VAULT,
+        &DebugCompanionState::ApprovedValues,
+        no_claim,
+    )
+    .expect_err("no values to approve");
+    assert!(refused.contains("lpm env set"), "{refused}");
 }
 
 #[test]

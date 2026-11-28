@@ -39,6 +39,11 @@ pub(crate) trait CompanionBackend: LifecycleStore {
             None => Checked::Absent,
         })
     }
+
+    /// `vault_id`'s personal overrides record, read as every reader of it
+    /// reads it, for a damage check; `None` when the project has no values:
+    /// a record left without them is one LPM Vault collects, never reads.
+    fn read_overrides_beside_values(&mut self, vault_id: &str) -> Result<Option<Checked>, String>;
 }
 
 /// A record as a damage check found it. A present record may be a key, so
@@ -176,11 +181,19 @@ pub(crate) fn open_project_or_unfinished(
     let marker_account = CompanionAccount::Marker {
         vault_id: vault_id.to_owned(),
     };
-    let gate = match backend.read(&marker_account)? {
-        None => ProjectGate::Plain,
-        Some(bytes) => match Marker::parse(vault_id, &bytes) {
+    // A marker the store holds but can't read, such as one past its size or
+    // one that won't decrypt, damages the project, which a repair discards.
+    let gate = match backend.read_checked(&marker_account)? {
+        Checked::Absent => ProjectGate::Plain,
+        Checked::Unreadable(reason) => ProjectGate::Damaged(Damage::InvalidMarker(reason)),
+        Checked::Present(bytes) => match Marker::parse(vault_id, &bytes) {
             Err(error) => ProjectGate::Damaged(error.into()),
             Ok(marker) if lifecycle::needs_resume(&marker) => {
+                // Finishing or undoing a step can change the project's
+                // overrides, so every lpm above this one is told first.
+                crate::override_marker::report_access(crate::override_marker::Access::Change {
+                    vault_id,
+                })?;
                 let notice = resume_notice(&marker);
                 let inventory = backend.inventory(vault_id)?;
                 let gate = match lifecycle::resume(backend, marker, inventory) {
@@ -229,6 +242,24 @@ fn resume_notice(marker: &Marker) -> Option<String> {
             )
         }
     })
+}
+
+/// Whether a change to `account` can change what its project's personal
+/// overrides are: the overrides record, or the feature marker that says
+/// whether they apply.
+pub(crate) fn changes_overrides(account: &CompanionAccount) -> bool {
+    match account {
+        CompanionAccount::Marker { .. } => true,
+        CompanionAccount::Record { kind, .. } => kind == overrides::OVERRIDES_KIND,
+        _ => false,
+    }
+}
+
+/// Tell every `lpm` above this one that a journal an earlier run committed
+/// changes `vault_id`'s overrides, before it's replayed: one that can't be
+/// told leaves the journal for one that can.
+pub(crate) fn report_replayed_change(vault_id: &str) -> Result<(), String> {
+    crate::override_marker::report_access(crate::override_marker::Access::Change { vault_id })
 }
 
 /// [`open_project`], then the operation matrix.

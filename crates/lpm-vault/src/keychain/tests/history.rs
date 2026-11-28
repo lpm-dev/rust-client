@@ -74,8 +74,8 @@ fn a_steady_append_reads_the_head_key_and_tail_once_and_writes_the_tail_once() {
     );
     assert_eq!(
         storage.probes.len(),
-        2,
-        "creation probes the values item to record the key's approval, and the journal again to stage"
+        1,
+        "creation probes the values item once, for the key's approval and the journal's staging"
     );
 
     storage.reads.clear();

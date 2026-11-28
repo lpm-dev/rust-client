@@ -67,7 +67,7 @@ impl FileCompanion<'_> {
         Ok(())
     }
 
-    fn record_count(&self) -> Result<usize, String> {
+    pub(super) fn record_count(&self) -> Result<usize, String> {
         let mut count = 0;
         for name in self.vaults.entry_names()? {
             if !name.ends_with(".companion") {

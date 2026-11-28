@@ -740,8 +740,13 @@ jobs:
       # history leaves, mid-crash ones included, must be a valid project they
       # write to, and every interrupted step one they finish: a step they
       # can't finish is repaired by a project-wide discard, which loses "off".
-      - name: Every history state through the v0.84.0 engine
+      - name: Every history state and override change through the v0.84.0 engine
         run: bash scripts/ci/check-engine-compatibility.sh v0.84.0
+
+      # CLI 0.82.0, the first release that applies personal overrides, must
+      # accept every override change this release plans, and read them.
+      - name: Every history state and override change through the v0.82.0 engine
+        run: bash scripts/ci/check-engine-compatibility.sh v0.82.0
 
   windows-platform-backends:
     if: ${{ !github.event.pull_request.draft }}

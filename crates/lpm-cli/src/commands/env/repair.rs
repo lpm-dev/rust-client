@@ -12,7 +12,7 @@ pub(super) fn env_repair(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let review = lpm_vault::review_companion_data(project_dir)
-        .map_err(LpmError::Env)?
+        .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?
         .ok_or_else(|| {
             LpmError::Env(
                 "this directory has no env project, so there's nothing to repair".to_owned(),
@@ -57,7 +57,8 @@ pub(super) fn env_repair(
             }
         }
     }
-    let repaired = lpm_vault::repair_companion_data(project_dir, &review).map_err(LpmError::Env)?;
+    let repaired = lpm_vault::repair_companion_data(project_dir, &review)
+        .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
     if json_output {
         print_json(&review, &repaired);
     } else {

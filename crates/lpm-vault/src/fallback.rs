@@ -653,26 +653,49 @@ pub(crate) fn read_vault_file_env_unlocked(
     let Some((name, content)) = read_vault_content(&vaults, vault_id)? else {
         return Ok(None);
     };
-    let encoded = std::str::from_utf8(&content).map_err(|_| {
+    let json = decrypt_vault_content(directory, vault_id, &vaults, &name, &content)?;
+    select_environment(&json, env, default_fallback)
+}
+
+/// A values file's payload, wiped when dropped.
+fn decrypt_vault_content(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+    vaults: &crate::storage_transaction::VaultStorageDirectory,
+    name: &str,
+    content: &[u8],
+) -> Result<zeroize::Zeroizing<String>, String> {
+    let encoded = std::str::from_utf8(content).map_err(|_| {
         format!(
             "encrypted vault {} is not valid UTF-8",
-            vaults.display_path(&name).display()
+            vaults.display_path(name).display()
         )
     })?;
-    let json = decrypt_with_store_unlocked(
+    decrypt_with_store_unlocked(
         directory,
         vault_id,
         encoded.trim(),
         &KeyringNativeDataKeyStore,
-    )?;
+    )
+}
 
+fn select_environment(
+    json: &str,
+    env: &str,
+    default_fallback: bool,
+) -> Result<Option<SecretMap>, String> {
     let parsed = if default_fallback {
-        crate::selected_environment::parse_with_default_fallback(&json, env)
+        crate::selected_environment::parse_with_default_fallback(json, env)
     } else {
-        crate::selected_environment::parse(&json, env)
+        crate::selected_environment::parse(json, env)
     };
     parsed
         .map(crate::selected_environment::SelectedVaultPayload::into_selected)
+        .map_err(|error| format!("vault payload is invalid: {error}"))
+}
+
+fn parse_environments(json: &str) -> Result<EnvironmentMap, String> {
+    crate::selected_environment::parse_all(json)
         .map_err(|error| format!("vault payload is invalid: {error}"))
 }
 
@@ -689,28 +712,39 @@ pub(crate) fn read_run_environment_unlocked(
     vault_id: &str,
     env: &str,
     default_fallback: bool,
-) -> Result<(Option<SecretMap>, crate::PersonalOverrides), String> {
-    let overrides = companion::read_overrides_unlocked(directory, vault_id, env)?;
-    let values = read_vault_file_env_unlocked(directory, vault_id, env, default_fallback)?;
-    Ok((values, overrides))
+) -> Result<crate::StoredRunEnvironment, String> {
+    let read = companion::read_for_run_unlocked(directory, vault_id)?;
+    let overrides = read.overrides(vault_id, env)?;
+    let identity = read.overrides_identity();
+    let Some((name, content)) = &read.values else {
+        return Ok((None, overrides, identity));
+    };
+    let json = decrypt_vault_content(directory, vault_id, &read.vaults, name, content)?;
+    Ok((
+        select_environment(&json, env, default_fallback)?,
+        overrides,
+        identity,
+    ))
 }
 
 /// Every environment's values and personal overrides, in the caller's lock.
 pub(crate) fn read_all_run_environments_unlocked(
     directory: &crate::storage_transaction::VaultStorageDirectory,
     vault_id: &str,
-) -> Result<
-    (
-        Option<EnvironmentMap>,
-        std::collections::BTreeMap<String, crate::PersonalOverrides>,
-    ),
-    String,
-> {
-    let (gate, record) = companion::read_overrides_record_unlocked(directory, vault_id)?;
-    let overrides = crate::companion::overrides::evaluate_all(&gate, vault_id, record.as_deref())
-        .map_err(crate::companion::damaged)?;
-    let values = read_all_environments_unlocked(directory, vault_id)?;
-    Ok((values, overrides))
+) -> Result<crate::StoredRunEnvironments, String> {
+    let read = companion::read_for_run_unlocked(directory, vault_id)?;
+    let overrides = read.all_overrides(vault_id)?;
+    let identity = read.overrides_identity();
+    let environments = read
+        .values
+        .as_ref()
+        .map(|(name, content)| {
+            let json = decrypt_vault_content(directory, vault_id, &read.vaults, name, content)?;
+            parse_environments(&json)
+        })
+        .transpose()?;
+    crate::history::scope::observe_read(vault_id, environments.as_ref());
+    Ok((environments, overrides, identity))
 }
 
 /// Read all environments from encrypted file.
@@ -751,22 +785,8 @@ fn read_environments_with_digest(
         return Ok((None, None));
     };
     let digest = sha2::Sha256::digest(&content).into();
-    let encoded = std::str::from_utf8(&content).map_err(|_| {
-        format!(
-            "encrypted vault {} is not valid UTF-8",
-            vaults.display_path(&name).display()
-        )
-    })?;
-    let json = decrypt_with_store_unlocked(
-        directory,
-        vault_id,
-        encoded.trim(),
-        &KeyringNativeDataKeyStore,
-    )?;
-
-    let environments = crate::selected_environment::parse_all(&json)
-        .map_err(|error| format!("vault payload is invalid: {error}"))?;
-    Ok((Some(environments), Some(digest)))
+    let json = decrypt_vault_content(directory, vault_id, &vaults, &name, &content)?;
+    Ok((Some(parse_environments(&json)?), Some(digest)))
 }
 
 pub(crate) fn vault_payload_digest_unlocked(
@@ -1365,6 +1385,43 @@ pub(crate) mod tests {
                 1,
                 "a legacy file is matched by its exact name"
             );
+        });
+    }
+
+    #[test]
+    fn a_run_read_of_a_legacy_vault_file_lists_the_directory_once() {
+        use crate::storage_transaction::ENTRY_LISTINGS;
+
+        with_temp_vault_home(|_| {
+            force_file_vault();
+            write_vault_file("legacy-run", &secrets("value")).expect("write");
+            let content = read_encrypted_vault("legacy-run");
+            with_storage_directory(|directory| {
+                let vaults = directory.open_or_create_directory("vaults")?;
+                vaults.write_owner_only_file("legacy-run.enc", &content, "encrypted vault")?;
+                vaults.remove_file(&vault_file_name("legacy-run"), "encrypted vault")?;
+                Ok(())
+            });
+
+            ENTRY_LISTINGS.with(|listings| listings.set(0));
+            let (values, overrides, identity) = with_storage_directory(|directory| {
+                read_run_environment_unlocked(directory, "legacy-run", "default", false)
+            });
+            assert_eq!(values, Some(secrets("value")));
+            assert!(overrides.is_empty());
+            assert!(identity.is_none());
+            assert_eq!(ENTRY_LISTINGS.with(std::cell::Cell::get), 1);
+
+            ENTRY_LISTINGS.with(|listings| listings.set(0));
+            let (environments, all_overrides, _) = with_storage_directory(|directory| {
+                read_all_run_environments_unlocked(directory, "legacy-run")
+            });
+            assert_eq!(
+                environments.and_then(|mut environments| environments.remove("default")),
+                Some(secrets("value"))
+            );
+            assert!(all_overrides.is_empty());
+            assert_eq!(ENTRY_LISTINGS.with(std::cell::Cell::get), 1);
         });
     }
 

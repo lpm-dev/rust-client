@@ -52,6 +52,13 @@ impl<S: ProjectStorage> CompanionBackend for KeychainHistory<'_, S> {
     fn inventory(&mut self, vault_id: &str) -> Result<Vec<CompanionAccount>, String> {
         KeychainCompanion(&mut self.storage).inventory(vault_id)
     }
+
+    fn read_overrides_beside_values(
+        &mut self,
+        vault_id: &str,
+    ) -> Result<Option<crate::companion::Checked>, String> {
+        KeychainCompanion(&mut self.storage).read_overrides_beside_values(vault_id)
+    }
 }
 
 impl<S: ProjectStorage> HistoryStore for KeychainHistory<'_, S> {

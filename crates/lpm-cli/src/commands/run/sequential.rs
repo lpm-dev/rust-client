@@ -2,6 +2,7 @@ use super::cache::{
     CacheStoreRequest, CompletedTaskCacheIdentity, WorkspaceCacheContract,
     WorkspaceDependencyIdentities, complete_task_cache_identity, prepare_cache_context_with_config,
     resolve_task_dependency_identities, try_cache_hit_with_context, try_cache_store_with_context,
+    watch_task,
 };
 use super::format::{
     TaskOutputPolicy, TaskResult, TaskRunReport, format_run_failure_detail, print_captured_stderr,
@@ -100,6 +101,9 @@ pub(super) fn run_tasks_sequential(
             continue;
         }
 
+        // The task's process runs with the values its cache key is computed
+        // from, whatever another task's cache publication rereads meanwhile.
+        let _pinned_vault_reads = lpm_runner::env_access::pin_vault_reads();
         let cache_context = match dependency_identities.as_deref() {
             Some(dependency_identities) => prepare_cache_context_with_config(
                 project_dir,
@@ -151,6 +155,7 @@ pub(super) fn run_tasks_sequential(
         ));
 
         let caching_enabled = cache_context.is_some();
+        let task_marker = caching_enabled.then(watch_task).transpose()?;
         let task_start = std::time::Instant::now();
 
         // Resolve command: lpm.json task command > package.json script
@@ -167,9 +172,10 @@ pub(super) fn run_tasks_sequential(
             ) {
                 Ok(captured) => {
                     let duration_ms = task_start.elapsed().as_millis() as u64;
-                    if let Some(context) = &cache_context
-                        && try_cache_store_with_context(
+                    if let (Some(context), Some(task)) = (&cache_context, &task_marker)
+                        && let Some(identity) = try_cache_store_with_context(
                             CacheStoreRequest {
+                                task,
                                 project_dir,
                                 workspace_contract,
                                 script_name: script,
@@ -182,8 +188,6 @@ pub(super) fn run_tasks_sequential(
                             },
                             context,
                         )
-                        && let Some(identity) =
-                            complete_task_cache_identity(project_dir, script, context)
                     {
                         cache_identities.insert(script.clone(), identity);
                     }

@@ -457,6 +457,302 @@ mod api {
     }
 
     #[test]
+    fn a_rollback_that_renames_an_environment_takes_its_personal_overrides_along() {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            let dir = home.join("project");
+            std::fs::create_dir_all(&dir).expect("project dir");
+            project_set(&dir, "A", "1");
+            let vault_id = crate::vault_id::read_vault_id(&dir).expect("vault id");
+            with_vault_transaction(|directory| {
+                let recording = crate::history::scope::begin(
+                    &vault_id,
+                    &Source::new(Action::RenameEnvironment),
+                );
+                crate::history::scope::renamed_environment(&recording, "default", "prod");
+                let renamed = std::collections::HashMap::from([(
+                    "prod".to_owned(),
+                    std::collections::HashMap::from([("A".to_owned(), "1".to_owned())]),
+                )]);
+                crate::write_all_environments_unlocked(
+                    directory, &vault_id, "project", "/project", &renamed, &recording,
+                )
+            })
+            .expect("renamed");
+            crate::overrides::change(
+                &dir,
+                &[crate::overrides::Edit::Set {
+                    environment: "prod".to_owned(),
+                    key: "A".to_owned(),
+                    value: zeroize::Zeroizing::new("mine".to_owned()),
+                }],
+            )
+            .expect("an override of prod");
+            take_outcomes();
+            let entries = ids(&dir);
+            let (_, plan) = crate::history::review_rollback(&dir, &hex::encode(entries[0]), |_| {
+                Ok(Target::Environment {
+                    environment: EnvironmentName::AtPoint("default".to_owned()),
+                    side: RelatedSide::After,
+                })
+            })
+            .expect("review");
+            crate::history::commit_rollback(&dir, &plan, &Choices::default()).expect("commit");
+
+            let overrides = crate::overrides::read_all(&dir).expect("overrides");
+            assert_eq!(overrides.keys().collect::<Vec<_>>(), ["default"]);
+            assert_eq!(overrides["default"].set["A"], "mine");
+        });
+    }
+
+    #[test]
+    fn a_rollback_that_can_t_report_its_override_change_changes_nothing() {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            let dir = home.join("project");
+            std::fs::create_dir_all(&dir).expect("project dir");
+            project_set(&dir, "A", "1");
+            let vault_id = crate::vault_id::read_vault_id(&dir).expect("vault id");
+            with_vault_transaction(|directory| {
+                let recording = crate::history::scope::begin(
+                    &vault_id,
+                    &Source::new(Action::RenameEnvironment),
+                );
+                crate::history::scope::renamed_environment(&recording, "default", "prod");
+                let renamed = std::collections::HashMap::from([(
+                    "prod".to_owned(),
+                    std::collections::HashMap::from([("A".to_owned(), "1".to_owned())]),
+                )]);
+                crate::write_all_environments_unlocked(
+                    directory, &vault_id, "project", "/project", &renamed, &recording,
+                )
+            })
+            .expect("renamed");
+            crate::overrides::change(
+                &dir,
+                &[crate::overrides::Edit::Set {
+                    environment: "prod".to_owned(),
+                    key: "A".to_owned(),
+                    value: zeroize::Zeroizing::new("mine".to_owned()),
+                }],
+            )
+            .expect("an override of prod");
+            take_outcomes();
+            let entries = ids(&dir);
+            let (_, plan) = crate::history::review_rollback(&dir, &hex::encode(entries[0]), |_| {
+                Ok(Target::Environment {
+                    environment: EnvironmentName::AtPoint("default".to_owned()),
+                    side: RelatedSide::After,
+                })
+            })
+            .expect("review");
+
+            let not_a_marker = home.join("not-a-marker");
+            std::fs::write(&not_a_marker, "").expect("a file where a marker would be");
+            let refused = crate::override_marker::reporting_to(vec![not_a_marker], || {
+                crate::history::commit_rollback(&dir, &plan, &Choices::default())
+            })
+            .expect_err("a change no lpm above can be told of");
+
+            assert!(
+                matches!(&refused, HistoryError::Storage(message)
+                    if crate::override_marker::describes(message)),
+                "{refused:?}"
+            );
+            let overrides = crate::overrides::read_all(&dir).expect("overrides");
+            assert_eq!(overrides.keys().collect::<Vec<_>>(), ["prod"]);
+            assert_eq!(
+                crate::try_get_all(&dir).map(|_| ()).ok(),
+                Some(()),
+                "the values are readable as they were"
+            );
+        });
+    }
+
+    #[test]
+    fn a_rollback_whose_overrides_cannot_follow_leaves_the_values_as_they_were() {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            let dir = home.join("project");
+            std::fs::create_dir_all(&dir).expect("project dir");
+            project_set(&dir, "A", "1");
+            let vault_id = crate::vault_id::read_vault_id(&dir).expect("vault id");
+            with_vault_transaction(|directory| {
+                let recording = crate::history::scope::begin(
+                    &vault_id,
+                    &Source::new(Action::RenameEnvironment),
+                );
+                crate::history::scope::renamed_environment(&recording, "default", "prod");
+                let renamed = std::collections::HashMap::from([(
+                    "prod".to_owned(),
+                    std::collections::HashMap::from([("A".to_owned(), "1".to_owned())]),
+                )]);
+                crate::write_all_environments_unlocked(
+                    directory, &vault_id, "project", "/project", &renamed, &recording,
+                )
+            })
+            .expect("renamed");
+            crate::overrides::change(
+                &dir,
+                &[crate::overrides::Edit::Set {
+                    environment: "prod".to_owned(),
+                    key: "A".to_owned(),
+                    value: zeroize::Zeroizing::new("mine".to_owned()),
+                }],
+            )
+            .expect("an override of prod");
+            take_outcomes();
+            let record = companion_folder(home).join("record.overrides");
+            let mut sealed = std::fs::read(&record).expect("the sealed record");
+            let last = sealed.len() - 1;
+            sealed[last] ^= 0xff;
+            std::fs::write(&record, sealed).expect("corrupt it");
+            crate::companion::forget(&vault_id);
+            let entries = ids(&dir);
+            let (_, plan) = crate::history::review_rollback(&dir, &hex::encode(entries[0]), |_| {
+                Ok(Target::Environment {
+                    environment: EnvironmentName::AtPoint("default".to_owned()),
+                    side: RelatedSide::After,
+                })
+            })
+            .expect("review");
+
+            let refused = crate::history::commit_rollback(&dir, &plan, &Choices::default())
+                .expect_err("overrides that can't follow refuse the rollback");
+
+            assert!(
+                matches!(&refused, HistoryError::Storage(message) if message.contains("damaged")),
+                "{refused:?}"
+            );
+            assert_eq!(stored(&dir, "A"), None, "the values weren't rolled back");
+            assert_eq!(ids(&dir).len(), entries.len(), "nothing was recorded");
+        });
+    }
+
+    // Measured at about 5.3 times the values on the file store: the values
+    // read, the target built from them, their JSON and ciphertext, and the
+    // journal that carries it.
+    #[cfg(not(miri))]
+    #[test]
+    fn a_rollback_that_moves_overrides_holds_at_most_six_times_the_values_at_once() {
+        with_temp_vault_home(|home| {
+            let (dir, _vault_id, plan) = renamed_with_an_override(home, true);
+            let values = 11 * 100 * 1024;
+
+            let (committed, most) = crate::freed_memory_probe::most_held(|| {
+                crate::history::commit_rollback(&dir, &plan, &Choices::default())
+            });
+
+            committed.expect("rolled back");
+            assert!(most < 6 * values, "{most} bytes at once");
+        });
+    }
+
+    /// A project whose `default` environment was renamed `prod` and given a
+    /// personal override, `large` enough to pass a file journal's payload
+    /// when asked, and the review of the rollback that renames it back.
+    fn renamed_with_an_override(
+        home: &std::path::Path,
+        large: bool,
+    ) -> (std::path::PathBuf, String, crate::history::RollbackPlan) {
+        force_file_vault();
+        let dir = home.join("project");
+        std::fs::create_dir_all(&dir).expect("project dir");
+        let filler = "x".repeat(100 * 1024);
+        let names: Vec<String> = (0..if large { 11 } else { 0 })
+            .map(|index| format!("FILLER_{index}"))
+            .collect();
+        let mut pairs = vec![("A", "1")];
+        pairs.extend(names.iter().map(|name| (name.as_str(), filler.as_str())));
+        crate::set(&dir, &pairs, &Source::new(Action::Set)).expect("the values");
+        take_outcomes();
+        let vault_id = crate::vault_id::read_vault_id(&dir).expect("vault id");
+        with_vault_transaction(|directory| {
+            let recording =
+                crate::history::scope::begin(&vault_id, &Source::new(Action::RenameEnvironment));
+            crate::history::scope::renamed_environment(&recording, "default", "prod");
+            let mut values =
+                crate::read_all_environments_unlocked(directory, &vault_id)?.expect("the values");
+            let default = values.remove("default").expect("the default environment");
+            let renamed = std::collections::HashMap::from([("prod".to_owned(), default)]);
+            crate::write_all_environments_unlocked(
+                directory, &vault_id, "project", "/project", &renamed, &recording,
+            )
+        })
+        .expect("renamed");
+        crate::overrides::change(
+            &dir,
+            &[crate::overrides::Edit::Set {
+                environment: "prod".to_owned(),
+                key: "A".to_owned(),
+                value: zeroize::Zeroizing::new("mine".to_owned()),
+            }],
+        )
+        .expect("an override of prod");
+        take_outcomes();
+        let entries = ids(&dir);
+        let (_, plan) = crate::history::review_rollback(&dir, &hex::encode(entries[0]), |_| {
+            Ok(Target::Environment {
+                environment: EnvironmentName::AtPoint("default".to_owned()),
+                side: RelatedSide::After,
+            })
+        })
+        .expect("review");
+        (dir, vault_id, plan)
+    }
+
+    #[test]
+    fn a_rollback_commits_its_values_and_overrides_in_one_file_journal() {
+        // Values past what a companion transaction may write travel in the
+        // journal too: their own cap bounds them, as it bounds every write.
+        for large in [false, true] {
+            with_temp_vault_home(|home| {
+                let (dir, vault_id, plan) = renamed_with_an_override(home, large);
+                let values_file = home
+                    .join(".lpm")
+                    .join("vaults")
+                    .join(crate::fallback::vault_file_name(&vault_id));
+                let before = std::fs::read(&values_file).expect("the values");
+                crate::fallback::companion::CRASH_AFTER_CHANGES.with(|crash| crash.set(Some(0)));
+
+                crate::history::commit_rollback(&dir, &plan, &Choices::default())
+                    .expect_err("the simulated crash after the journal");
+
+                assert!(
+                    std::fs::read(&values_file).expect("the values") == before,
+                    "nothing was changed before the journal's changes, large: {large}"
+                );
+                crate::companion::forget(&vault_id);
+                let overrides =
+                    crate::overrides::read_all(&dir).expect("the next operation recovers");
+                assert_eq!(overrides.keys().collect::<Vec<_>>(), ["default"], "{large}");
+                assert_eq!(stored(&dir, "A").as_deref(), Some("1"), "and finishes both");
+            });
+        }
+    }
+
+    #[test]
+    fn a_rollback_refused_by_what_lies_where_the_legacy_values_were_changes_nothing() {
+        with_temp_vault_home(|home| {
+            let (dir, vault_id, plan) = renamed_with_an_override(home, false);
+            std::fs::create_dir(
+                home.join(".lpm")
+                    .join("vaults")
+                    .join(format!("{vault_id}.enc")),
+            )
+            .expect("a directory in the legacy file's place");
+
+            crate::history::commit_rollback(&dir, &plan, &Choices::default())
+                .expect_err("the legacy file's place holds a directory");
+
+            assert_eq!(stored(&dir, "A"), None, "the values kept their environment");
+            let overrides = crate::overrides::read_all(&dir).expect("overrides");
+            assert_eq!(overrides.keys().collect::<Vec<_>>(), ["prod"]);
+            assert_eq!(overrides["prod"].set["A"], "mine");
+        });
+    }
+
+    #[test]
     fn a_rollback_that_renames_an_environment_back_records_a_rename() {
         with_temp_vault_home(|home| {
             force_file_vault();

@@ -146,3 +146,172 @@ fn every_overrides_fixture_validates_and_selects_as_recorded() {
         }
     }
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChangeCase {
+    name: String,
+    vault_id: String,
+    /// Whether the project's values item exists; it does unless a case says.
+    #[serde(default)]
+    has_values: Option<bool>,
+    marker: Option<String>,
+    record: Option<String>,
+    names: Option<Vec<String>>,
+    edits: Vec<serde_json::Value>,
+    expect: ChangeExpectation,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChangeExpectation {
+    result: String,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    writes: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    deletes: Vec<String>,
+    #[serde(default)]
+    marker_after: Option<String>,
+    #[serde(default)]
+    activated: Option<bool>,
+}
+
+fn fixture_edit(edit: &serde_json::Value) -> crate::overrides::change::Edit {
+    use crate::overrides::change::Edit;
+    let text = |field: &str| edit[field].as_str().expect(field).to_owned();
+    match edit["action"].as_str().expect("an action") {
+        "set" => Edit::Set {
+            environment: text("environment"),
+            key: text("key"),
+            value: zeroize::Zeroizing::new(text("value")),
+        },
+        "unset" => Edit::Unset {
+            environment: text("environment"),
+            key: text("key"),
+        },
+        "remove" => Edit::Remove {
+            environment: text("environment"),
+            key: text("key"),
+        },
+        "clearEnvironment" => Edit::ClearEnvironment {
+            environment: text("environment"),
+        },
+        "clearAll" => Edit::ClearAll,
+        "environmentRenamed" => Edit::EnvironmentRenamed {
+            from: text("from"),
+            to: text("to"),
+        },
+        "environmentRemoved" => Edit::EnvironmentRemoved {
+            environment: text("environment"),
+        },
+        "environmentDuplicated" => Edit::EnvironmentDuplicated {
+            from: text("from"),
+            to: text("to"),
+        },
+        "environmentCreated" => Edit::EnvironmentCreated {
+            environment: text("environment"),
+        },
+        "environmentsChanged" => Edit::EnvironmentsChanged {
+            renamed: edit["renamed"]
+                .as_array()
+                .expect("renamed")
+                .iter()
+                .map(|rename| {
+                    (
+                        rename["from"].as_str().expect("from").to_owned(),
+                        rename["to"].as_str().expect("to").to_owned(),
+                    )
+                })
+                .collect(),
+            removed: edit["removed"]
+                .as_array()
+                .expect("removed")
+                .iter()
+                .map(|environment| environment.as_str().expect("an environment").to_owned())
+                .collect(),
+        },
+        other => panic!("unknown action {other}"),
+    }
+}
+
+#[test]
+fn every_override_change_fixture_plans_the_transaction_it_records() {
+    use crate::gate::ProjectGate;
+    use crate::lifecycle::Mutation;
+    use crate::overrides::change::{Inventory, PlanError, plan_change, plan_without_values};
+
+    let fixture: Fixture<ChangeCase> =
+        serde_json::from_str(include_str!("../tests/fixtures/override-changes.json"))
+            .expect("override change fixtures decode");
+    assert_eq!(fixture.schema_version, 1);
+    assert!(!fixture.cases.is_empty());
+    for case in fixture.cases {
+        let gate = match &case.marker {
+            None => ProjectGate::Plain,
+            Some(json) => match Marker::parse(&case.vault_id, json.as_bytes()) {
+                Ok(marker) => ProjectGate::Marked(marker),
+                Err(error) => ProjectGate::Damaged(error.into()),
+            },
+        };
+        let inventory = case
+            .names
+            .as_ref()
+            .map(|names| Inventory::from_names(&case.vault_id, names.iter().map(String::as_str)));
+        let edits: Vec<_> = case.edits.iter().map(fixture_edit).collect();
+        let planned = if case.has_values == Some(false) {
+            plan_without_values(&gate, &edits)
+        } else {
+            plan_change(
+                &case.vault_id,
+                &gate,
+                case.record.as_deref().map(str::as_bytes),
+                &edits,
+                inventory.as_ref(),
+            )
+        };
+        let expect = &case.expect;
+        match (expect.result.as_str(), planned) {
+            ("needsNames", Err(PlanError::NeedsInventory { .. })) => {}
+            ("refused", Err(error)) => assert_eq!(
+                Some(format!("overrides.{}", error.code())),
+                expect.code,
+                "{}",
+                case.name
+            ),
+            ("unchanged", Ok(plan)) => assert!(plan.mutations.is_empty(), "{}", case.name),
+            ("planned", Ok(plan)) => {
+                let mut writes = std::collections::BTreeMap::new();
+                let mut deletes = Vec::new();
+                for mutation in &plan.mutations {
+                    match mutation {
+                        Mutation::Write { account, value } => {
+                            writes.insert(
+                                account.name(),
+                                String::from_utf8(value.to_vec()).expect("UTF-8"),
+                            );
+                        }
+                        Mutation::Delete { account } => deletes.push(account.name()),
+                    }
+                }
+                assert_eq!(writes, expect.writes, "{}", case.name);
+                assert_eq!(deletes, expect.deletes, "{}", case.name);
+                assert_eq!(
+                    Some(if plan.gate == ProjectGate::Plain {
+                        "absent"
+                    } else {
+                        "present"
+                    }),
+                    expect.marker_after.as_deref(),
+                    "{}",
+                    case.name
+                );
+                assert_eq!(Some(plan.activated), expect.activated, "{}", case.name);
+            }
+            (expected, planned) => {
+                panic!("{}: expected {expected}, planned {planned:?}", case.name)
+            }
+        }
+    }
+}

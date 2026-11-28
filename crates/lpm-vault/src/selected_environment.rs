@@ -1,8 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 
-use serde::de::{DeserializeSeed, Deserializer, Error as _, MapAccess, Visitor};
+use lpm_common::stored_env::json::{ReadError, Reader};
 use zeroize::Zeroizing;
 
 use crate::{EnvironmentMap, SecretMap};
@@ -10,273 +9,148 @@ pub(crate) use lpm_common::stored_env::is_valid_environment_name;
 use lpm_common::stored_env::is_valid_variable_name;
 use lpm_env::{DEFAULT_ENVIRONMENT, reads_default_environment};
 
-/// Why a stored payload didn't parse.
-#[derive(Debug)]
-pub(crate) struct PayloadError(String);
+/// Why a stored payload didn't parse. It names keys and environments,
+/// never a value.
+pub(crate) type PayloadError = ReadError;
 
-impl fmt::Display for PayloadError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
+#[cfg(test)]
+mod serde_oracle;
 
-/// Every environment of the stored payload `{"environments":{name:{KEY:
-/// VALUE}}}`, by the rules serde applies to it: one `environments` field,
-/// unique valid environment and variable names, and string values. A
-/// parser of its own, because serde_json decodes escaped strings through a
-/// scratch buffer it never wipes: here each string is decoded into a buffer
-/// sized to its encoded length, and a payload that doesn't parse wipes what
-/// it built.
+/// Every environment of the stored payload, as [`parse_payload`] reads it.
 pub(crate) fn parse_all(json: &str) -> Result<EnvironmentMap, PayloadError> {
-    let mut parser = PayloadParser { text: json, at: 0 };
     let mut environments = crate::history::ZeroizingValues::default();
-    let mut found = false;
-    parser.object(|parser, field| {
-        if field != "environments" {
-            return Err(parser.error(&format!("unknown field `{field}`, expected `environments`")));
-        }
-        if std::mem::replace(&mut found, true) {
-            return Err(parser.error("duplicate field `environments`"));
-        }
-        parser.object(|parser, environment| {
-            if !is_valid_environment_name(&environment) {
-                return Err(parser.error(&format!("environment name {environment:?} is invalid")));
-            }
-            if environments.contains_key(&environment) {
-                return Err(parser.error(&format!("duplicate environment name {environment:?}")));
-            }
-            let secrets = environments.entry(environment).or_default();
-            parser.object(|parser, variable| {
-                if !is_valid_variable_name(&variable) {
-                    return Err(parser.error(&format!("env variable name {variable:?} is invalid")));
-                }
-                let mut value = Zeroizing::new(parser.string()?);
-                if secrets.contains_key(&variable) {
-                    return Err(parser.error(&format!("duplicate env variable name {variable:?}")));
-                }
-                secrets.insert(variable, std::mem::take(&mut *value));
-                Ok(())
-            })
-        })
+    let any = parse_payload(json, |reader, environment| {
+        secrets(
+            reader,
+            Some(environments.entry(environment.into_owned()).or_default()),
+        )
     })?;
-    parser.skip_whitespace();
-    if parser.at != json.len() {
-        return Err(parser.error("trailing characters"));
-    }
-    if !found {
-        return Err(parser.error("missing field `environments`"));
-    }
-    if environments.is_empty() {
+    if !any {
         environments.insert(DEFAULT_ENVIRONMENT.to_owned(), HashMap::new());
     }
     Ok(std::mem::take(&mut *environments))
 }
 
-struct PayloadParser<'a> {
-    text: &'a str,
-    at: usize,
+pub(crate) fn parse(
+    json: &str,
+    selected_environment: &str,
+) -> Result<SelectedVaultPayload, PayloadError> {
+    select(json, selected_environment, false)
 }
 
-impl PayloadParser<'_> {
-    fn error(&self, message: &str) -> PayloadError {
-        PayloadError(format!("{message} at byte {}", self.at))
-    }
+pub(crate) fn parse_with_default_fallback(
+    json: &str,
+    selected_environment: &str,
+) -> Result<SelectedVaultPayload, PayloadError> {
+    select(json, selected_environment, true)
+}
 
-    fn skip_whitespace(&mut self) {
-        while matches!(
-            self.text.as_bytes().get(self.at),
-            Some(b' ' | b'\t' | b'\n' | b'\r')
-        ) {
-            self.at += 1;
-        }
-    }
-
-    fn next_is(&mut self, byte: u8) -> bool {
-        self.skip_whitespace();
-        if self.text.as_bytes().get(self.at) == Some(&byte) {
-            self.at += 1;
-            true
+/// `selected_environment`'s values from the stored payload or, with
+/// `default_fallback`, the default environment's where
+/// [`reads_default_environment`] says so. Every other environment is checked
+/// as [`parse_payload`] checks it, and none of its values is kept.
+fn select(
+    json: &str,
+    selected_environment: &str,
+    default_fallback: bool,
+) -> Result<SelectedVaultPayload, PayloadError> {
+    let mut selected = None::<crate::wiping::ParsedValues>;
+    let mut fallback = None::<crate::wiping::ParsedValues>;
+    let any = parse_payload(json, |reader, environment| {
+        let kept = if environment == selected_environment {
+            Some(&mut selected)
+        } else if default_fallback && environment == DEFAULT_ENVIRONMENT {
+            Some(&mut fallback)
         } else {
-            false
-        }
-    }
-
-    /// An object, calling `member` with each key once its colon is read.
-    fn object(
-        &mut self,
-        mut member: impl FnMut(&mut Self, String) -> Result<(), PayloadError>,
-    ) -> Result<(), PayloadError> {
-        if !self.next_is(b'{') {
-            return Err(self.error("expected an object"));
-        }
-        if self.next_is(b'}') {
-            return Ok(());
-        }
-        loop {
-            let key = self.string()?;
-            if !self.next_is(b':') {
-                return Err(self.error("expected `:`"));
-            }
-            member(self, key)?;
-            if self.next_is(b'}') {
-                return Ok(());
-            }
-            if !self.next_is(b',') {
-                return Err(self.error("expected `,` or `}`"));
-            }
-        }
-    }
-
-    /// A string, decoded into a buffer the size of its encoded form, which
-    /// a decoded string never exceeds, so it's never moved.
-    fn string(&mut self) -> Result<String, PayloadError> {
-        if !self.next_is(b'"') {
-            return Err(self.error("expected a string"));
-        }
-        let bytes = self.text.as_bytes();
-        let start = self.at;
-        let mut end = start;
-        loop {
-            match bytes.get(end) {
-                None => {
-                    self.at = end;
-                    return Err(self.error("unterminated string"));
-                }
-                Some(b'"') => break,
-                Some(b'\\') => end += 2,
-                Some(_) => end += 1,
-            }
-        }
-        let mut decoded = Zeroizing::new(String::with_capacity(end - start));
-        while self.at < end {
-            let run = bytes[self.at..end]
-                .iter()
-                .position(|byte| *byte == b'\\' || *byte < 0x20)
-                .map_or(end, |offset| self.at + offset);
-            decoded.push_str(&self.text[self.at..run]);
-            self.at = run;
-            if self.at == end {
-                break;
-            }
-            if bytes[self.at] < 0x20 {
-                return Err(self.error("control character in a string"));
-            }
-            self.at += 1;
-            let escaped = bytes.get(self.at).copied();
-            self.at += 1;
-            match escaped {
-                Some(b'"') => decoded.push('"'),
-                Some(b'\\') => decoded.push('\\'),
-                Some(b'/') => decoded.push('/'),
-                Some(b'b') => decoded.push('\u{8}'),
-                Some(b'f') => decoded.push('\u{c}'),
-                Some(b'n') => decoded.push('\n'),
-                Some(b'r') => decoded.push('\r'),
-                Some(b't') => decoded.push('\t'),
-                Some(b'u') => decoded.push(self.unicode_escape(end)?),
-                _ => return Err(self.error("invalid escape")),
-            }
-        }
-        self.at = end + 1;
-        Ok(std::mem::take(&mut *decoded))
-    }
-
-    /// The character a `\u` escape names, after its `\u`: a surrogate pair
-    /// takes two escapes, and a lone surrogate is refused.
-    fn unicode_escape(&mut self, end: usize) -> Result<char, PayloadError> {
-        let high = self.hex4(end)?;
-        let code = match high {
-            0xD800..=0xDBFF => {
-                if self.text.as_bytes().get(self.at..self.at + 2) != Some(b"\\u") {
-                    return Err(self.error("lone leading surrogate in a \\u escape"));
-                }
-                self.at += 2;
-                let low = self.hex4(end)?;
-                if !(0xDC00..=0xDFFF).contains(&low) {
-                    return Err(self.error("lone leading surrogate in a \\u escape"));
-                }
-                0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00)
-            }
-            0xDC00..=0xDFFF => return Err(self.error("lone trailing surrogate in a \\u escape")),
-            code => code,
+            None
         };
-        char::from_u32(code).ok_or_else(|| self.error("invalid \\u escape"))
-    }
-
-    fn hex4(&mut self, end: usize) -> Result<u32, PayloadError> {
-        let digits = self
-            .text
-            .get(self.at..self.at + 4)
-            .filter(|_| self.at + 4 <= end)
-            .filter(|digits| digits.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            .ok_or_else(|| self.error("invalid \\u escape"))?;
-        self.at += 4;
-        u32::from_str_radix(digits, 16).map_err(|_| self.error("invalid \\u escape"))
-    }
-}
-
-#[cfg(test)]
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CompleteVaultPayload {
-    #[serde(deserialize_with = "deserialize_environment_map")]
-    environments: EnvironmentMap,
-}
-
-/// `parse_all` as serde parses it: the oracle the hand-written parser is
-/// tested against.
-#[cfg(test)]
-fn parse_all_with_serde(json: &str) -> Result<EnvironmentMap, serde_json::Error> {
-    let payload = serde_json::from_str::<CompleteVaultPayload>(json)?;
-    let mut environments = payload.environments;
-    if environments.is_empty() {
-        environments.insert(DEFAULT_ENVIRONMENT.to_owned(), HashMap::new());
-    }
-    Ok(environments)
-}
-
-#[cfg(test)]
-fn deserialize_environment_map<'de, D>(deserializer: D) -> Result<EnvironmentMap, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserializer.deserialize_map(EnvironmentMapVisitor)
-}
-
-#[cfg(test)]
-struct EnvironmentMapVisitor;
-
-#[cfg(test)]
-impl<'de> Visitor<'de> for EnvironmentMapVisitor {
-    type Value = EnvironmentMap;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("an environment map with unique valid names")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
+        secrets(
+            reader,
+            kept.map(|slot| &mut **slot.insert(Default::default())),
+        )
+    })?;
+    let take = |mut values: crate::wiping::ParsedValues| std::mem::take(&mut *values);
+    let selected = if !any && selected_environment == DEFAULT_ENVIRONMENT {
+        Some(SecretMap::new())
+    } else if default_fallback
+        && reads_default_environment(
+            selected_environment,
+            selected.as_ref().is_some_and(|values| !values.is_empty()),
+        )
     {
-        let mut environments = HashMap::with_capacity(map.size_hint().unwrap_or_default());
-        while let Some(environment) = map.next_key::<Cow<'de, str>>()? {
-            if !is_valid_environment_name(&environment) {
-                return Err(A::Error::custom(format!(
-                    "environment name {environment:?} is invalid"
-                )));
+        fallback.map(take)
+    } else {
+        selected.map(take)
+    };
+    Ok(SelectedVaultPayload::Versioned(selected))
+}
+
+/// Reads the stored payload `{"environments":{name:{KEY: VALUE}}}` by the
+/// rules serde applies to it: one `environments` field, unique valid
+/// environment and variable names, and string values. `environment` reads
+/// each environment's variables, given its name once that's checked, and
+/// the result says whether there was any environment. It reads with
+/// [`Reader`], which leaves no copy of a value.
+fn parse_payload<'a>(
+    json: &'a str,
+    mut environment: impl FnMut(&mut Reader<'a>, Cow<'a, str>) -> Result<(), PayloadError>,
+) -> Result<bool, PayloadError> {
+    let mut reader = Reader::new(json);
+    let mut names = HashSet::new();
+    let mut found = false;
+    reader.object(|reader, field| {
+        if field != "environments" {
+            return Err(
+                reader.unexpected(&format!("unknown field `{field}`, expected `environments`"))
+            );
+        }
+        if std::mem::replace(&mut found, true) {
+            return Err(reader.unexpected("duplicate field `environments`"));
+        }
+        reader.object(|reader, name| {
+            if !is_valid_environment_name(&name) {
+                return Err(reader.unexpected(&format!("environment name {name:?} is invalid")));
             }
-            let secrets = map.next_value_seed(RetainedSecretMapSeed)?;
-            if environments
-                .insert(environment.clone().into_owned(), secrets)
-                .is_some()
-            {
-                return Err(A::Error::custom(format!(
-                    "duplicate environment name {environment:?}"
-                )));
+            if !names.insert(name.clone()) {
+                return Err(reader.unexpected(&format!("duplicate environment name {name:?}")));
+            }
+            environment(reader, name)
+        })
+    })?;
+    reader.end()?;
+    if !found {
+        return Err(reader.unexpected("missing field `environments`"));
+    }
+    Ok(!names.is_empty())
+}
+
+/// An environment's variables: valid, unique names with string values,
+/// decoded into `kept` or, without it, only checked.
+fn secrets(reader: &mut Reader<'_>, mut kept: Option<&mut SecretMap>) -> Result<(), PayloadError> {
+    let mut checked = HashSet::new();
+    reader.object(|reader, variable| {
+        if !is_valid_variable_name(&variable) {
+            return Err(reader.unexpected(&format!("env variable name {variable:?} is invalid")));
+        }
+        let seen = kept.as_deref().map_or_else(
+            || checked.contains(&variable),
+            |secrets| secrets.contains_key(&*variable),
+        );
+        if seen {
+            return Err(reader.unexpected(&format!("duplicate env variable name {variable:?}")));
+        }
+        match kept.as_deref_mut() {
+            Some(secrets) => {
+                let value = reader.string()?;
+                secrets.insert(variable.into_owned(), value);
+            }
+            None => {
+                reader.skip_string()?;
+                checked.insert(variable);
             }
         }
-        Ok(environments)
-    }
+        Ok(())
+    })
 }
 
 pub(crate) enum SelectedVaultPayload {
@@ -337,313 +211,40 @@ fn unescaped_len(environments: &EnvironmentMap) -> usize {
     })
 }
 
-pub(crate) fn parse(
-    json: &str,
-    selected_environment: &str,
-) -> Result<SelectedVaultPayload, serde_json::Error> {
-    parse_with_optional_fallback(json, selected_environment, false)
-}
-
-pub(crate) fn parse_with_default_fallback(
-    json: &str,
-    selected_environment: &str,
-) -> Result<SelectedVaultPayload, serde_json::Error> {
-    parse_with_optional_fallback(json, selected_environment, true)
-}
-
-fn parse_with_optional_fallback(
-    json: &str,
-    selected_environment: &str,
-    default_fallback: bool,
-) -> Result<SelectedVaultPayload, serde_json::Error> {
-    let mut deserializer = serde_json::Deserializer::from_str(json);
-    let payload = SelectedPayloadSeed {
-        selected_environment,
-        default_fallback,
-    }
-    .deserialize(&mut deserializer)?;
-    deserializer.end()?;
-    Ok(payload)
-}
-
-struct SelectedPayloadSeed<'selection> {
-    selected_environment: &'selection str,
-    default_fallback: bool,
-}
-
-impl<'de> DeserializeSeed<'de> for SelectedPayloadSeed<'_> {
-    type Value = SelectedVaultPayload;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_map(SelectedPayloadVisitor {
-            selected_environment: self.selected_environment,
-            default_fallback: self.default_fallback,
-        })
-    }
-}
-
-struct SelectedPayloadVisitor<'selection> {
-    selected_environment: &'selection str,
-    default_fallback: bool,
-}
-
-impl<'de> Visitor<'de> for SelectedPayloadVisitor<'_> {
-    type Value = SelectedVaultPayload;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("an object containing exactly one environments map")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut selected = None;
-        let mut saw_environments = false;
-
-        while let Some(key) = map.next_key::<Cow<'de, str>>()? {
-            if key != "environments" {
-                return Err(A::Error::unknown_field(&key, &["environments"]));
-            }
-            if saw_environments {
-                return Err(A::Error::duplicate_field("environments"));
-            }
-            saw_environments = true;
-            let parsed = map.next_value_seed(SelectedEnvironmentsSeed {
-                selected_environment: self.selected_environment,
-                default_fallback: self.default_fallback,
-            })?;
-            selected = if parsed.is_empty && self.selected_environment == DEFAULT_ENVIRONMENT {
-                Some(HashMap::new())
-            } else {
-                parsed.selected
-            };
-        }
-
-        if !saw_environments {
-            return Err(A::Error::missing_field("environments"));
-        }
-        Ok(SelectedVaultPayload::Versioned(selected))
-    }
-}
-
-struct SelectedEnvironments {
-    selected: Option<SecretMap>,
-    is_empty: bool,
-}
-
-struct SelectedEnvironmentsSeed<'selection> {
-    selected_environment: &'selection str,
-    default_fallback: bool,
-}
-
-impl<'de> DeserializeSeed<'de> for SelectedEnvironmentsSeed<'_> {
-    type Value = SelectedEnvironments;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_map(SelectedEnvironmentsVisitor {
-            selected_environment: self.selected_environment,
-            default_fallback: self.default_fallback,
-        })
-    }
-}
-
-struct SelectedEnvironmentsVisitor<'selection> {
-    selected_environment: &'selection str,
-    default_fallback: bool,
-}
-
-impl<'de> Visitor<'de> for SelectedEnvironmentsVisitor<'_> {
-    type Value = SelectedEnvironments;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("an environment map")
-    }
-
-    fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        visit_selected_environments_map(map, self.selected_environment, self.default_fallback)
-    }
-}
-
-fn visit_selected_environments_map<'de, A>(
-    mut map: A,
-    selected_environment: &str,
-    default_fallback: bool,
-) -> Result<SelectedEnvironments, A::Error>
-where
-    A: MapAccess<'de>,
-{
-    let mut selected = None;
-    let mut fallback = None;
-    let mut names = HashSet::with_capacity(map.size_hint().unwrap_or_default());
-    while let Some(environment) = map.next_key::<Cow<'de, str>>()? {
-        if !is_valid_environment_name(&environment) {
-            return Err(A::Error::custom(format!(
-                "environment name {environment:?} is invalid"
-            )));
-        }
-        if !names.insert(environment.clone().into_owned()) {
-            return Err(A::Error::custom(format!(
-                "duplicate environment name {environment:?}"
-            )));
-        }
-        if environment == selected_environment {
-            selected = Some(map.next_value_seed(RetainedSecretMapSeed)?);
-        } else if default_fallback && environment == DEFAULT_ENVIRONMENT {
-            fallback = Some(map.next_value_seed(RetainedSecretMapSeed)?);
-        } else {
-            map.next_value_seed(ValidateSecretMapSeed)?;
-        }
-    }
-    let selected = if default_fallback
-        && reads_default_environment(
-            selected_environment,
-            selected.as_ref().is_some_and(|values| !values.is_empty()),
-        ) {
-        fallback
-    } else {
-        selected
-    };
-    Ok(SelectedEnvironments {
-        selected,
-        is_empty: names.is_empty(),
-    })
-}
-
-struct RetainedSecretMapSeed;
-
-impl<'de> DeserializeSeed<'de> for RetainedSecretMapSeed {
-    type Value = SecretMap;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_map(RetainedSecretMapVisitor)
-    }
-}
-
-struct RetainedSecretMapVisitor;
-
-impl<'de> Visitor<'de> for RetainedSecretMapVisitor {
-    type Value = SecretMap;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a secret map containing unique valid variable names and string values")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut secrets = HashMap::with_capacity(map.size_hint().unwrap_or_default());
-        while let Some(variable) = map.next_key::<Cow<'de, str>>()? {
-            if !is_valid_variable_name(&variable) {
-                return Err(A::Error::custom(format!(
-                    "env variable name {variable:?} is invalid"
-                )));
-            }
-            let value = map.next_value::<Cow<'de, str>>()?.into_owned();
-            if secrets
-                .insert(variable.clone().into_owned(), value)
-                .is_some()
-            {
-                return Err(A::Error::custom(format!(
-                    "duplicate env variable name {variable:?}"
-                )));
-            }
-        }
-        Ok(secrets)
-    }
-}
-
-struct ValidateSecretMapSeed;
-
-impl<'de> DeserializeSeed<'de> for ValidateSecretMapSeed {
-    type Value = ();
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_map(ValidateSecretMapVisitor)
-    }
-}
-
-struct ValidateSecretMapVisitor;
-
-impl<'de> Visitor<'de> for ValidateSecretMapVisitor {
-    type Value = ();
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a secret map containing string values")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut names = HashSet::with_capacity(map.size_hint().unwrap_or_default());
-        while let Some(variable) = map.next_key::<Cow<'de, str>>()? {
-            if !is_valid_variable_name(&variable) {
-                return Err(A::Error::custom(format!(
-                    "env variable name {variable:?} is invalid"
-                )));
-            }
-            if !names.insert(variable.clone().into_owned()) {
-                return Err(A::Error::custom(format!(
-                    "duplicate env variable name {variable:?}"
-                )));
-            }
-            map.next_value_seed(ValidateStringSeed)?;
-        }
-        Ok(())
-    }
-}
-
-struct ValidateStringSeed;
-
-impl<'de> DeserializeSeed<'de> for ValidateStringSeed {
-    type Value = ();
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_string(ValidateStringVisitor)
-    }
-}
-
-struct ValidateStringVisitor;
-
-impl Visitor<'_> for ValidateStringVisitor {
-    type Value = ();
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a string secret value")
-    }
-
-    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
-        Ok(())
-    }
-
-    fn visit_string<E>(self, _: String) -> Result<Self::Value, E> {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::serde_oracle::{parse_all_with_serde, parse_with_serde};
     use super::*;
+
+    /// Payloads with an escape, or a byte a string can't hold, at every
+    /// offset of values long enough to cross the reader's 16- and 64-byte
+    /// steps twice, in `environment` and in another one.
+    fn special_bytes_at_every_offset(environment: &str) -> Vec<String> {
+        let mut payloads = Vec::new();
+        for special in [
+            "\\n",
+            "\\\"",
+            "\\\\",
+            "\\u00e9",
+            "\\ud83d\\ude00",
+            "\n",
+            "\u{1f}",
+            "\"",
+            "\\",
+        ] {
+            for offset in 0..140 {
+                let value = format!(
+                    "{}{special}{}",
+                    "x".repeat(offset),
+                    "y".repeat(140 - offset)
+                );
+                payloads.push(format!(
+                    r#"{{"environments":{{"{environment}":{{"A":"{value}"}},"other":{{"B":"{value}"}}}}}}"#
+                ));
+            }
+        }
+        payloads
+    }
 
     #[test]
     fn the_payload_parser_agrees_with_serde_on_every_payload() {
@@ -687,12 +288,80 @@ mod tests {
             r#"{"environments":{"default":{"A":"unterminated}}}"#,
             r#"{"environments":{"default":{"A":"ends in a backslash\"#,
             "\u{feff}{\"environments\":{}}",
+            r#"[{"default":{"A":"1"}}]"#,
+            r#"{"environments":[{"A":"1"}]}"#,
+            r#"{"environments":{"default":{"A":"1","\u0041":"2"}}}"#,
+            r#"{"environments":{"default":{"A":"1"},"\u0064efault":{}}}"#,
+            r#"{"\u0065nvironments":{"default":{"A":"1"}}}"#,
+            "{\"environments\":{\"default\":{\"A\u{1}\":\"1\"}}}",
+            r#"{"environments":{"default":{"A\u0001":"1"}}}"#,
         ];
-        for case in cases {
+        let long = special_bytes_at_every_offset("default");
+        for case in cases.into_iter().chain(long.iter().map(String::as_str)) {
             match (parse_all(case), parse_all_with_serde(case)) {
                 (Ok(ours), Ok(serde)) => assert_eq!(ours, serde, "{case:?}"),
                 (Err(_), Err(_)) => {}
                 (ours, serde) => panic!("{case:?}: ours {ours:?}, serde {serde:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn selecting_an_environment_agrees_with_serde_on_every_payload() {
+        let cases = [
+            r#"{"environments":{}}"#,
+            r#"{"environments":{"default":{"A":"1"}}}"#,
+            r#"{"environments":{"default":{"A":"1"},"live":{"B":"2"},"empty":{}}}"#,
+            r#"{"environments":{"live":{"B":"line\nbreak \"quoted\" \u00e9"},"other":{"C":"\ud83d\ude00"}}}"#,
+            r#"{"environments":{"default":{},"live":{}}}"#,
+            r#"{"environments":{"default":{"A":"1"},"live":{"B":2}}}"#,
+            r#"{"environments":{"default":{"A":"1"},"other":{"B":null}}}"#,
+            r#"{"environments":{"default":{"A":"1"},"other":{"B":"\x"}}}"#,
+            r#"{"environments":{"default":{"A":"1"},"other":{"B":"\ud83d"}}}"#,
+            r#"{"environments":{"default":{"A":"1"},"other":{"1BAD":"x"}}}"#,
+            r#"{"environments":{"default":{"A":"1"},"other":{"B":"x","B":"y"}}}"#,
+            r#"{"environments":{"live":{"B":"x","B":"y"}}}"#,
+            r#"{"environments":{"live":{},"live":{}}}"#,
+            r#"{"environments":{"other":{},"other":{}}}"#,
+            r#"{"environments":{"bad name":{}}}"#,
+            r#"{"environments":{},"environments":{}}"#,
+            r#"{"environments":{},"extra":true}"#,
+            r#"{"environments":{"live":{"B":"1"}}} x"#,
+            r#"{"environments":{"other":{"B":"unterminated}}}"#,
+            "{\"environments\":{\"other\":{\"B\":\"new\nline\"}}}",
+            r#"{"A":"one"}"#,
+            r#"{"environments":"legacy-value"}"#,
+            "",
+            "{}",
+            "\u{feff}{\"environments\":{}}",
+            r#"[{"live":{"B":"1"}}]"#,
+            r#"{"environments":{"live":[{"B":"1"}]}}"#,
+            r#"{"environments":{"other":{"B":"1","\u0042":"2"},"live":{"A":"1"}}}"#,
+            r#"{"environments":{"live":{"A":"1"},"\u006cive":{"A":"2"}}}"#,
+        ];
+        let long = special_bytes_at_every_offset("live");
+        for case in cases.into_iter().chain(long.iter().map(String::as_str)) {
+            for environment in ["default", "live", "empty", "missing"] {
+                for fallback in [false, true] {
+                    let ours = if fallback {
+                        parse_with_default_fallback(case, environment)
+                    } else {
+                        parse(case, environment)
+                    };
+                    match (ours, parse_with_serde(case, environment, fallback)) {
+                        (Ok(ours), Ok(serde)) => assert_eq!(
+                            ours.into_selected(),
+                            serde.into_selected(),
+                            "{case:?} {environment} {fallback}"
+                        ),
+                        (Err(_), Err(_)) => {}
+                        (ours, serde) => panic!(
+                            "{case:?} {environment} {fallback}: ours {:?}, serde {:?}",
+                            ours.map(SelectedVaultPayload::into_selected),
+                            serde.map(SelectedVaultPayload::into_selected)
+                        ),
+                    }
+                }
             }
         }
     }
@@ -746,6 +415,59 @@ mod tests {
             !found,
             "a payload that doesn't parse leaves nothing behind either"
         );
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn selecting_an_environment_leaves_no_copy_of_any_value_in_freed_memory() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        let payload = format!(
+            r#"{{"environments":{{"default":{{"KEY":"{MARKER}\n-----END-----"}},"empty":{{}},"live":{{"KEY":"{MARKER}\n","QUOTED":"say \"{MARKER}\""}}}}}}"#
+        );
+        for (environment, fallback) in [
+            ("live", false),
+            ("default", false),
+            ("missing", false),
+            ("live", true),
+            ("empty", true),
+        ] {
+            let (read, found) = watch(|| {
+                let selected = if fallback {
+                    parse_with_default_fallback(&payload, environment)
+                } else {
+                    parse(&payload, environment)
+                };
+                let mut selected = selected.expect("parses").into_selected();
+                let read = selected
+                    .as_ref()
+                    .map(|values| values["KEY"].starts_with(MARKER));
+                if let Some(values) = &mut selected {
+                    crate::history::wipe_environment(values);
+                }
+                read
+            });
+            assert_eq!(
+                read,
+                (environment != "missing").then_some(true),
+                "{environment}"
+            );
+            assert!(
+                !found,
+                "{environment}, fallback {fallback}: no value selected, passed over or validated is left behind"
+            );
+        }
+
+        let unfinished = format!(
+            r#"{{"environments":{{"default":{{"KEY":"{MARKER}\n"}},"live":{{"KEY":"{MARKER}\n","#
+        );
+        for environment in ["default", "live"] {
+            let (failed, found) = watch(|| parse(&unfinished, environment).is_err());
+            assert!(failed);
+            assert!(
+                !found,
+                "{environment}: a payload that doesn't parse leaves nothing behind"
+            );
+        }
     }
 
     #[test]
@@ -817,7 +539,7 @@ mod tests {
         .err()
         .expect("malformed unselected environment must be rejected");
 
-        assert!(error.to_string().contains("string secret value"), "{error}");
+        assert!(error.to_string().contains("expected a string"), "{error}");
     }
 
     #[test]

@@ -60,11 +60,14 @@ fn collect_environment(
         let requested = approved.iter().any(|key| key.eq_ignore_ascii_case(text));
         #[cfg(not(windows))]
         let requested = approved.contains(text);
-        if !crate::capability::reserved_env_name(text)
-            && (requested
-                || BASELINE_ENV
-                    .iter()
-                    .any(|baseline| OsStr::new(baseline).eq_ignore_ascii_case(&name)))
+        // LPM's own, which no package may ask for: an lpm a script starts
+        // reports what it uses through it to the tasks above it.
+        if lpm_vault::override_marker::names_the_marker(&name)
+            || (!crate::capability::reserved_env_name(text)
+                && (requested
+                    || BASELINE_ENV
+                        .iter()
+                        .any(|baseline| OsStr::new(baseline).eq_ignore_ascii_case(&name))))
         {
             env.insert(name, value);
         }
@@ -96,6 +99,7 @@ mod tests {
             "npm_config_ignore_scripts",
             "PNPM_CONFIG_IGNORE_SCRIPTS",
             "YARN_ENABLE_SCRIPTS",
+            "LPM_PERSONAL_OVERRIDES_MARKER",
         ] {
             let error =
                 build_env_with_approved_names(&BTreeSet::from([name.to_string()])).unwrap_err();
@@ -126,6 +130,26 @@ mod tests {
             Some(b"/home/\xff".as_slice())
         );
         assert!(env.keys().all(|name| name.to_str().is_some()));
+    }
+
+    #[test]
+    fn a_scrubbed_environment_keeps_where_an_lpm_a_script_starts_reports_what_it_uses() {
+        let env = collect_environment(
+            [
+                (
+                    "LPM_PERSONAL_OVERRIDES_MARKER".into(),
+                    "/tmp/lpm-personal-overrides-1".into(),
+                ),
+                ("APP_TOKEN".into(), "dummy".into()),
+            ],
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(
+            env.get(OsStr::new("LPM_PERSONAL_OVERRIDES_MARKER")),
+            Some(&OsString::from("/tmp/lpm-personal-overrides-1"))
+        );
+        assert!(!env.contains_key(OsStr::new("APP_TOKEN")));
     }
 
     #[test]

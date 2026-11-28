@@ -146,7 +146,7 @@ pub(super) fn store_cache_from_remote_artifact_with_root(
             return Ok(());
         }
         artifact.rewind()?;
-        publish_cache_entry(&cache, key, |staging| {
+        publish_cache_entry(&cache, key, &|| true, |staging| {
             write_local_entry_from_remote_artifact(staging, key, &mut artifact)
         })
         .map(drop)

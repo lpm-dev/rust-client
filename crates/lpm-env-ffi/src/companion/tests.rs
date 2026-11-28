@@ -220,15 +220,113 @@ fn every_marker_fixture_assesses_with_its_recorded_level() {
 }
 
 #[test]
+fn the_assessment_says_when_to_read_the_overrides_record() {
+    let newer = OVERRIDES_MARKER.replace(r#""version":1"#, r#""version":3"#);
+    let removing = OVERRIDES_MARKER.replace(r#""state":"active"}"#, r#""state":"removing"}"#);
+    let listed = json!([record_name("overrides", None)]);
+    let read = |marker: Option<&str>, extra: Value| {
+        let mut input = json!({
+            "vaultId": "proj",
+            "marker": marker.map(|marker| base64(marker.as_bytes())),
+            "inventory": listed,
+            "hasValues": true,
+        });
+        for (key, value) in extra.as_object().expect("an object") {
+            input[key] = value.clone();
+        }
+        let (status, output) = call(lpm_env_companion_assess, &input);
+        assert_eq!(status, 0);
+        output["readsOverrides"].clone()
+    };
+
+    assert_eq!(read(Some(OVERRIDES_MARKER), json!({})), true);
+    for (case, marker, extra) in [
+        ("no marker", None, json!({})),
+        ("an invalid marker", Some("not a marker"), json!({})),
+        ("a newer overrides feature", Some(newer.as_str()), json!({})),
+        (
+            "a feature being removed",
+            Some(removing.as_str()),
+            json!({}),
+        ),
+        (
+            "not listed",
+            Some(OVERRIDES_MARKER),
+            json!({"inventory": []}),
+        ),
+        (
+            "no listing",
+            Some(OVERRIDES_MARKER),
+            json!({"inventory": null}),
+        ),
+        (
+            "no values",
+            Some(OVERRIDES_MARKER),
+            json!({"hasValues": false}),
+        ),
+        (
+            "values not said",
+            Some(OVERRIDES_MARKER),
+            json!({"hasValues": null}),
+        ),
+        (
+            "damaged access",
+            Some(OVERRIDES_MARKER),
+            json!({"accessDamage": "contradictory"}),
+        ),
+        (
+            "a step that can't be finished",
+            Some(OVERRIDES_MARKER),
+            json!({"unfinished": "stuck"}),
+        ),
+    ] {
+        assert_eq!(read(marker, extra), false, "{case}");
+    }
+}
+
+#[test]
+fn a_record_handed_over_is_judged_only_where_the_assessment_says_to_read_it() {
+    let judged = |extra: Value| {
+        let mut input = json!({
+            "vaultId": "proj",
+            "marker": base64(OVERRIDES_MARKER.as_bytes()),
+            "inventory": [record_name("overrides", None)],
+            "overrides": {"bytes": base64(b"not a record")},
+            "hasValues": true,
+        });
+        for (key, value) in extra.as_object().expect("an object") {
+            input[key] = value.clone();
+        }
+        let (status, output) = call(lpm_env_companion_assess, &input);
+        assert_eq!(status, 0);
+        output["damage"]
+            .as_array()
+            .expect("damage")
+            .iter()
+            .any(|damage| damage["code"] == "invalidRecord")
+    };
+
+    assert!(judged(json!({})), "a record the assessment reads is judged");
+    for (case, extra) in [
+        ("no values", json!({"hasValues": false})),
+        ("values not said", json!({"hasValues": null})),
+        ("not listed", json!({"inventory": []})),
+        ("no listing", json!({"inventory": null})),
+    ] {
+        assert!(!judged(extra), "{case}");
+    }
+}
+
+#[test]
 fn an_unsupported_feature_names_itself_and_its_level() {
-    let newer = OVERRIDES_MARKER.replace(r#""version":1"#, r#""version":2"#);
+    let newer = OVERRIDES_MARKER.replace(r#""version":1"#, r#""version":3"#);
     let (_, output) = call(
         lpm_env_companion_assess,
         &json!({ "vaultId": "proj", "marker": base64(newer.as_bytes()) }),
     );
     assert_eq!(
         output["unsupported"],
-        json!({ "feature": "overrides", "version": 2, "level": "refuse" })
+        json!({ "feature": "overrides", "version": 3, "level": "refuse" })
     );
     assert_eq!(output["features"][0]["supported"], false);
     assert_eq!(
@@ -275,6 +373,8 @@ fn damage_carries_its_repair_and_only_damaged_overrides_still_allow_excluding_re
         &json!({
             "vaultId": "proj",
             "marker": base64(OVERRIDES_MARKER.as_bytes()),
+            "inventory": [record_name("overrides", None)],
+            "hasValues": true,
             "overrides": { "bytes": base64(b"[]") },
         }),
     );

@@ -10,6 +10,7 @@
 #define LPM_ENV_BACKUP_FILE_LIMIT (64 * 1024 * 1024)
 #define LPM_ENV_BACKUP_PASSPHRASE_LIMIT (4 * 1024)
 #define LPM_ENV_HISTORY_INPUT_LIMIT (4 * 1024 * 1024)
+#define LPM_ENV_OVERRIDES_INPUT_LIMIT (16 * 1024 * 1024)
 
 typedef struct LPMEnvSnapshot LPMEnvSnapshot;
 typedef struct {
@@ -39,12 +40,28 @@ uint32_t lpm_env_verify(const LPMEnvSnapshot *snapshot);
  * "default"'s values were checked), problems [{key, code, format?, constraint?,
  * group?, mode?}], defaults {KEY: schema default that fills it}, and ignored keys the
  * runner never passes to a process. Output never contains stored values.
+ * With overrides: {vaultId, marker?, record?, hasValues: bool}, an object whose
+ * optional fields are left out, never null (the marker and
+ * the personal overrides record as read in the same lock, standard base64: this
+ * function takes stored values as JSON, as it takes environments, and decodes
+ * the record once per call), each environment given is checked as a run on this
+ * computer gets it: its own overrides applied over the values it selects, even
+ * when it reads "default"'s. hasValues, which every check with overrides
+ * states, is false when the project's values item is absent: overrides live
+ * beside values, so after the marker's refusals none apply. A problem an
+ * override caused has personalOverride: true (the key is left out otherwise),
+ * and appliedOverrides lists the overrides that change the environment, the ones
+ * a run's notice counts; it's left out when none do. Neither shows a value. An
+ * environment that has overrides but no values must be given, empty, to be
+ * checked.
  * At most 256 environments and 262144 work units are checked. Each environment
  * costs one unit per declaration, enum member, enum UTF-8 byte, group, group member,
- * and selected stored value (including fallback values), plus one.
+ * selected stored value (including fallback values) and override, plus one.
  * Larger inputs fail before evaluation.
- * status: 0=checked, 1=invalid schema or names differing only in case where the host
- * ignores case, 2=invalid input, 3=panic, 4=work or output limit. */
+ * status: 0=checked, 1=invalid schema, names differing only in case where the host
+ * ignores case, or overrides that can't be applied (code overrides.damaged,
+ * overrides.unsupported or overrides.needs_resume), 2=invalid input (an invalid
+ * overrides vaultId included), 3=panic, 4=work or output limit. */
 LPMEnvResult lpm_env_check(const uint8_t *schema, size_t schema_length,
                          const uint8_t *input, size_t input_length);
 /* Characters in values that are hard to see or change how text reads, flagged
@@ -222,7 +239,9 @@ LPMEnvResult lpm_env_companion_account_names(const uint8_t *input, size_t input_
  * names-only listing in the same scope (other projects' names are ignored),
  * overrides?: {bytes: bytes | null} when the overrides record was read, found or
  * not, accessDamage?: why access was found damaged, unfinished?: why a resume
- * found the interrupted step can never be finished}. Output {marker: "absent" |
+ * found the interrupted step can never be finished, hasValues?: whether the
+ * values item exists, which a caller that doesn't read overrides may leave out,
+ * as unknown}. Output {marker: "absent" |
  * "invalid" | "valid", state, restorePhase, needsResume, level: "ignore" |
  * "readOnly" | "refuse" (null unless valid), unsupported: {feature, version,
  * level} | null, features: [{name, version, ifUnsupported, kinds, state,
@@ -231,9 +250,14 @@ LPMEnvResult lpm_env_companion_account_names(const uint8_t *input, size_t input_
  * reason?, repair:
  * {action: "discardProject" | "removeFeature" | "removeUnlisted", feature?} |
  * null}], repairs: [{action, feature?}], allows: {readExcludingOverrides,
- * readApplyingOverrides, write}}. repairs lists what sets every damage right,
- * each once in the order found: a discardProject alone when any damage needs
- * one, none for damaged access.
+ * readApplyingOverrides, write}, readsOverrides}. readsOverrides says whether
+ * the client reads the overrides record, with the values' approval, and
+ * assesses again with it: only when the record's contents decide part of the
+ * assessment, inventory shows the record, hasValues is true, and neither
+ * accessDamage nor unfinished is given. A record given otherwise is ignored,
+ * so its contents never count.
+ * repairs lists what sets every damage right, each once in the order found: a
+ * discardProject alone when any damage needs one, none for damaged access.
  * allows applies the operation matrix to the marker and to every damage listed,
  * so damage only a listing finds counts when inventory is given. Maintenance is
  * always allowed; with needsResume nothing else is until a resume plan has run.
@@ -291,7 +315,8 @@ LPMEnvResult lpm_env_companion_check_transaction(const uint8_t *input, size_t in
  *   "LPMF", version 1 (one byte), a big-endian uint32 field count, then each
  *   field as a big-endian uint32 length and its bytes.
  * Field 0 is UTF-8 JSON with everything that isn't secret; the other fields are
- * blobs that JSON names by index (the first blob is 1), at most 64 of them. Values, values payloads
+ * blobs that JSON names by index (the first blob is 1), at most 64 in an input;
+ * an output carries as many as it needs. Values, values payloads
  * and the key record only ever travel as blobs. A values payload is the stored
  * {"environments":{name:{KEY:VALUE}}}. Outputs list records to write as
  * writes: [{account, blob}]; with journal true they commit as one journal
@@ -404,6 +429,104 @@ LPMEnvResult lpm_env_history_admission(const uint8_t *input, size_t input_length
  * {needsTail: true}: read the key and the tail (part omitted when absent) and
  * call again. It trims nothing while the tail isn't the head's. */
 LPMEnvResult lpm_env_history_ring(const uint8_t *input, size_t input_length);
+/* Personal overrides: values one Mac sets or unsets on top of a project's team
+ * values, per environment, read and planned exactly as the CLI reads and plans
+ * them. Nothing here reads or writes a store. Each function takes one frame of at
+ * most LPM_ENV_OVERRIDES_INPUT_LIMIT bytes and returns one, as local history's
+ * do; values only ever travel as blobs. marker and record name the blobs of the
+ * project's feature marker and its overrides record
+ * (__vault_companion_v1__:overrides:<b64url(vault id)>), read in the caller's
+ * lock; leave each out when its account is absent. An optional field is left
+ * out, never null, and every shape is an object with named fields; any other
+ * input is invalid. An input carries at most
+ * 1026 blobs, the marker, the record and one value per edit; an output as many
+ * as it needs. Status 2 is {code: "overrides.invalid_input"}, 3 a panic, 5 a
+ * refusal {code: "overrides.<reason>", message, ...details}: details name what
+ * it's about, never a value. Every output is wiped when released.
+ *
+ * Every environment's overrides. Input {vaultId, marker?, record?, hasValues:
+ * bool, values?: bool}. Output {environments: [{environment, set: [{key,
+ * passed, value?: blob}], unset: [{key, passed}]}]}, environments and keys in
+ * order. hasValues, which every read states, is false when the project's
+ * values item is absent: overrides live beside values, so after the marker's
+ * refusals there are none to list. value is given only with values: true.
+ * passed is false for a name LPM never passes to a process, which only a
+ * record written before LPM denied it can hold.
+ * Refusals: overrides.damaged, overrides.unsupported, overrides.needs_resume
+ * (finish the interrupted step first, as lpm_env_companion_plan's resume does;
+ * its message says so). */
+LPMEnvResult lpm_env_overrides_read(const uint8_t *input, size_t input_length);
+/* Plan one batch of edits, all or none. Input {vaultId, marker?, record?,
+ * hasValues: bool, names?: [every account name in the service, from one
+ * names-only listing], edits: [{action: "set", environment, key, value: blob} |
+ * {action: "unset", environment, key} | {action: "remove", environment, key} |
+ * {action: "clearEnvironment", environment} | {action: "clearAll"} | {action:
+ * "environmentRenamed", from, to} | {action: "environmentRemoved", environment}
+ * | {action: "environmentDuplicated", from, to} | {action: "environmentCreated",
+ * environment} | {action: "environmentsChanged", renamed: [{from, to}],
+ * removed: [environment]}]}, at most 1024 edits, with at most 1024 renames and
+ * removals of environments changed together across them, and at most 131072
+ * names; past any of them is invalid input. hasValues, which every plan
+ * states, is false when the project's values item is absent: overrides live
+ * beside values, so after the marker's refusals a batch that gives no key an
+ * override removes nothing and is unchanged, and any other is refused with
+ * overrides.no_values. set gives
+ * the key this Mac's own value (an empty value is a value, at most 100 KiB; the
+ * values one batch sets total at most 4 MiB); unset removes the project's
+ * value; remove drops the key's override. Report every rename, removal,
+ * duplicate and creation of an environment. Overrides are this Mac's own, so
+ * only removing an environment removes its overrides; a rename merges them into
+ * the new name, each moved one replacing one of the same name there; a
+ * duplicate or a new environment changes none and says how many the name
+ * already has, for the app to tell the person. environmentsChanged reports the
+ * renames and removals one values change makes at once, as a rollback does:
+ * every renamed and removed environment's overrides are taken out first, then
+ * each renamed one's merge into its new name, so names that swap or chain keep
+ * their own; a name is the source of one rename or removal at most, and the
+ * target of one rename at most, and a removed name is no rename's target. Plan
+ * an edit that follows a values change before writing the values, so a refusal
+ * leaves both as they were, and commit its writes and deletes in the values
+ * write's own journal transaction. Output
+ * {result: "needsNames", needs: "project" | "projectAndService", effects} when
+ * the batch deletes the record (needs: "project", for the project's records)
+ * or creates it (needs: "projectAndService", for the service's count as well):
+ * list the service's names, pass them as names, and call again (effects are
+ * already what the batch does, for a confirmation first); {result:
+ * "unchanged", effects}; or {result: "planned", journal: true, writes:
+ * [{account, blob}], deletes: [account], markerAfter: "present" | "absent",
+ * activated (the project's first override), overAdmissionTarget, effects}.
+ * Commit writes and deletes as one journal transaction; the overrides record
+ * takes the values item's verified approval. effects, one per edit: {kind:
+ * "key", environment, key, previous: "none" | "set" | "unset", changed} |
+ * {kind: "cleared", environment (null for every environment), removed} |
+ * {kind: "environmentRemoved", environment, removed} | {kind: "moved", from,
+ * to, moved, replaced, kept} | {kind: "notCopied", from, to, count, existing} |
+ * {kind: "existing", environment, count} | {kind: "environmentsChanged",
+ * moved: [{from, to, moved, replaced, kept}], removed: [{environment,
+ * removed}]}. A set's value blob holds UTF-8 text: a value blob past the
+ * input's blobs, or one that isn't UTF-8, is invalid input, refused with the
+ * rest of the input's shape. Refusals then come in this order: the marker's
+ * (overrides.damaged, overrides.unsupported, overrides.needs_resume); each
+ * edit's, in edit order and every one of an edit's before the next edit's
+ * (its environment and name, then a NUL in a set's value, then, with values,
+ * the value's size and the batch's); overrides.no_values without values; and
+ * then, with values, the record's damage and size, the budget, admission and
+ * a removal that needs repair. Refusals, with edit (its index, from 0) for
+ * one edit's:
+ * overrides.invalid_environment {environment}, overrides.invalid_key (the name
+ * is never repeated: it may be a value; a set's name is checked before its
+ * value's size), overrides.denied_name {key} (a name LPM never passes to a
+ * process can't be set or unset, only removed), overrides.nul_value {key},
+ * overrides.same_environment {environment},
+ * overrides.environment_named_twice {environment}, overrides.too_large ({edit,
+ * key, limit: 102400} for one value, {edit, limit: 4194304} for the values a
+ * batch sets, {bytes, limit: 102400} for the record), overrides.no_values,
+ * overrides.damaged, overrides.unsupported, overrides.needs_resume,
+ * overrides.over_budget, overrides.admission_refused {records, limit},
+ * overrides.removal_needs_repair (repair the project, as lpm env repair does,
+ * then try again). An input holds a full service's names: the admission cap
+ * bounds its companion records at 4 MiB of names at the longest. */
+LPMEnvResult lpm_env_overrides_plan(const uint8_t *input, size_t input_length);
 /* Release only the output buffer after decoding; the snapshot stays live.
  * Exclusively borrow result. Clears data/length; repeated calls are harmless.
  * A matching lpm_env_release is still required for the result. */

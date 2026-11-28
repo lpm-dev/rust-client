@@ -7,18 +7,26 @@
 //! transaction check, which that release's recovery runs before it replays
 //! a journal.
 //!
+//! Given the personal override change fixtures too, every transaction a
+//! change plans must pass that check, and the project it leaves, or one a
+//! change leaves as it was, must never be damaged. While it has overrides of
+//! a version the older engine doesn't support, as this release writes them,
+//! the older engine must refuse its values, for any read or write, and still
+//! maintain it; with none, or with a version it supports, the older engine
+//! reads and writes it as before.
+//!
 //! The source uses only API the older engine has, so it builds against it.
 
 use std::collections::BTreeMap;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use lpm_env_companion::account::{CompanionAccount, marker_account};
+use lpm_env_companion::account::{CompanionAccount, marker_account, record_account};
 use lpm_env_companion::assessment::{Observed, assess};
-use lpm_env_companion::gate::Operation;
+use lpm_env_companion::gate::{GateError, Operation};
 use lpm_env_companion::invariants::check_transaction;
 use lpm_env_companion::lifecycle::{self, LifecycleStore, Mutation};
-use lpm_env_companion::marker::{Level, Marker};
+use lpm_env_companion::marker::{Level, Marker, is_supported};
 
 struct Store(BTreeMap<String, Vec<u8>>);
 
@@ -124,6 +132,117 @@ fn replay_check(transaction: &serde_json::Value) -> Result<(), String> {
     .map_err(|refusal| format!("{name}: recovery would refuse it: {refusal}"))
 }
 
+/// Plan by plan, the project a personal override change leaves, through
+/// the older engine: its transaction passes the check recovery runs, and the
+/// project is never damaged. One whose overrides the older engine doesn't
+/// support is refused for its values and maintained; any other reads and
+/// allows writes.
+fn override_change_check(case: &serde_json::Value) -> Result<(), String> {
+    let name = case["name"].as_str().expect("name");
+    let vault_id = case["vaultId"].as_str().expect("vaultId");
+    let marker_name = marker_account(vault_id);
+    let record_name = record_account("overrides", vault_id, None);
+    let mut before = BTreeMap::new();
+    for (account, field) in [(&marker_name, "marker"), (&record_name, "record")] {
+        if let Some(text) = case[field].as_str() {
+            before.insert(account.clone(), text.as_bytes().to_vec());
+        }
+    }
+    let expect = &case["expect"];
+    let none = serde_json::Map::new();
+    let writes = expect["writes"].as_object().unwrap_or(&none);
+    let deletes = expect["deletes"].as_array().map_or(&[][..], Vec::as_slice);
+    let mut changes: Vec<(String, Option<Vec<u8>>)> = writes
+        .iter()
+        .map(|(account, text)| {
+            (
+                account.clone(),
+                Some(text.as_str().expect("record").as_bytes().to_vec()),
+            )
+        })
+        .collect();
+    changes.extend(
+        deletes
+            .iter()
+            .map(|account| (account.as_str().expect("account").to_owned(), None)),
+    );
+    let borrowed: Vec<(&str, Option<&[u8]>)> = changes
+        .iter()
+        .map(|(account, value)| (account.as_str(), value.as_deref()))
+        .collect();
+    check_transaction(
+        &borrowed,
+        |vault_id| Ok(before.get(&marker_account(vault_id)).cloned()),
+        |_| Ok(inventory(&before)),
+    )
+    .map_err(|refusal| format!("{name}: recovery would refuse it: {refusal}"))?;
+    let mut after = before;
+    for (account, value) in changes {
+        match value {
+            Some(value) => {
+                after.insert(account, value);
+            }
+            None => {
+                after.remove(&account);
+            }
+        }
+    }
+    let accounts = inventory(&after);
+    let assessment = assess(
+        vault_id,
+        Observed {
+            marker: after.get(&marker_name).map(Vec::as_slice),
+            inventory: Some(&accounts),
+            overrides: Some(after.get(&record_name).map(Vec::as_slice)),
+            ..Observed::default()
+        },
+    );
+    if let Some(damage) = assessment.every_damage().next() {
+        return Err(format!("{name}: damaged: {damage}"));
+    }
+    let unsupported = match after.get(&marker_name) {
+        Some(bytes) => Marker::parse(vault_id, bytes)
+            .map_err(|error| format!("{name}: {error}"))?
+            .feature("overrides")
+            .is_some_and(|entry| !is_supported("overrides", entry.version)),
+        None => false,
+    };
+    if unsupported {
+        for operation in [
+            Operation::ReadExcludingOverrides,
+            Operation::ReadApplyingOverrides,
+            Operation::Write,
+        ] {
+            match assessment.authorize(operation) {
+                Err(GateError::Unsupported {
+                    level: Level::Refuse,
+                    ..
+                }) => {}
+                other => {
+                    return Err(format!(
+                        "{name}: {operation:?} wasn't refused as unsupported: {other:?}"
+                    ));
+                }
+            }
+        }
+        return assessment
+            .authorize(Operation::Maintenance)
+            .map_err(|error| format!("{name}: maintenance refused: {error}"));
+    }
+    for operation in [Operation::ReadApplyingOverrides, Operation::Write] {
+        assessment
+            .authorize(operation)
+            .map_err(|error| format!("{name}: {operation:?} refused: {error}"))?;
+    }
+    lpm_env_companion::overrides::evaluate_all(
+        &assessment.gate,
+        vault_id,
+        after.get(&record_name).map(Vec::as_slice),
+    )
+    .map(|_| ())
+    .map_err(|damage| format!("{name}: overrides unreadable: {damage}"))
+}
+
 fn main() {
     let path = std::env::args().nth(1).expect("the history fixtures' path");
     let fixture: serde_json::Value =
@@ -147,6 +266,22 @@ fn main() {
             Err(failure) => failures.push(failure),
         }
     }
+    let mut override_changes = 0;
+    if let Some(path) = std::env::args().nth(2) {
+        let fixture: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read fixtures"))
+                .expect("fixtures are JSON");
+        for case in fixture["cases"].as_array().expect("cases") {
+            if case["expect"]["result"] != "planned" && case["expect"]["result"] != "unchanged" {
+                continue;
+            }
+            override_changes += 1;
+            match override_change_check(case) {
+                Ok(()) => println!("ok: {}", case["name"].as_str().expect("name")),
+                Err(failure) => failures.push(failure),
+            }
+        }
+    }
     if !failures.is_empty() {
         for failure in &failures {
             eprintln!("FAIL {failure}");
@@ -154,7 +289,7 @@ fn main() {
         std::process::exit(1);
     }
     println!(
-        "{} states read and {} transactions accepted by the older engine",
+        "{} states read, {} transactions and {override_changes} personal override changes checked against the older engine",
         states.len(),
         transactions.len()
     );

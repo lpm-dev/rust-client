@@ -3728,6 +3728,7 @@ dependencies = [
  "tracing",
  "url",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -3772,6 +3773,7 @@ dependencies = [
  "hkdf 0.13.0",
  "hmac 0.13.0",
  "lpm-common",
+ "lpm-env",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -3786,6 +3788,7 @@ dependencies = [
  "cap-std",
  "crypto_box",
  "hex",
+ "libc",
  "lpm-common",
  "lpm-env",
  "lpm-env-backup",

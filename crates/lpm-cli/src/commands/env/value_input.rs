@@ -135,6 +135,19 @@ pub(super) struct Checked<'a> {
     pub(super) reads_input: bool,
 }
 
+impl<'a> Checked<'a> {
+    /// Every key the request names, in order.
+    pub(super) fn keys(&self) -> Vec<&'a str> {
+        self.entries
+            .iter()
+            .map(|entry| match entry {
+                Entry::Given(key, _) | Entry::Bare(key) => *key,
+            })
+            .chain(self.files.iter().map(|(key, _)| *key))
+            .collect()
+    }
+}
+
 /// Refuse what `request`'s arguments are refused for, before any value is
 /// read or asked for: a malformed key, a key named twice, or a value with
 /// nowhere to come from.
@@ -782,6 +795,37 @@ mod tests {
             "or /dev/null;"
         };
         assert!(message.contains(null), "{message}");
+    }
+
+    #[test]
+    fn a_request_reads_input_only_when_a_value_isnt_in_its_arguments() {
+        let fake = Fake {
+            terminal: true,
+            ..Fake::default()
+        };
+        let checked = |entries: &[&str], from_files: &[&str]| {
+            let entries = strings(entries);
+            let from_files = strings(from_files);
+            let request = Request {
+                entries: &entries,
+                stdin: false,
+                from_files: &from_files,
+                json_output: false,
+                command: "lpm env set",
+                asking: Asking {
+                    what: "Value",
+                    environment: "default",
+                },
+                total_limit: usize::MAX,
+            };
+            check(&request, &fake)
+                .map(|checked| (checked.keys().join(" "), checked.reads_input))
+                .map_err(|error| error.to_string())
+        };
+
+        assert_eq!(checked(&["A=1", "B="], &[]), Ok(("A B".to_owned(), false)));
+        assert_eq!(checked(&["A=1", "B"], &[]), Ok(("A B".to_owned(), true)));
+        assert_eq!(checked(&["A=1"], &["C=./c"]), Ok(("A C".to_owned(), true)));
     }
 
     #[test]

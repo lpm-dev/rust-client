@@ -37,6 +37,7 @@ use crate::companion::lifecycle::{
     Mutation, Plan,
 };
 use crate::companion::marker::MAX_RECORD_BYTES;
+use crate::companion::overrides::change::InventoryNeed;
 use crate::companion::overrides::{OVERRIDES_KIND, PersonalOverrides};
 use crate::companion::repair::{CompanionRepair, CompanionReview};
 use crate::companion::{Checked, CompanionBackend, damaged};
@@ -378,6 +379,9 @@ enum FileChange {
     /// Delete one of the project's values files, as a deletion's first
     /// transaction does with the shared key and the single records.
     DeleteValues(ValuesFile),
+    /// Replace the project's values file with these encrypted bytes, with
+    /// the records that follow a values write.
+    ReplaceValues(zeroize::Zeroizing<Vec<u8>>),
 }
 
 /// Why recovery couldn't finish a project's journal.
@@ -466,6 +470,15 @@ impl<'directory> FileCompanion<'directory> {
             .vaults
             .open_existing_directory(&stage_folder_name(vault_id))?;
         self.check_journal_invariants(vault_id, &journal, stage.as_ref())?;
+        if journal.operations.iter().any(|operation| {
+            matches!(
+                operation.physical(vault_id),
+                Ok(PhysicalTarget::Companion { account, .. })
+                    if crate::companion::changes_overrides(&account)
+            )
+        }) {
+            crate::companion::report_replayed_change(vault_id).map_err(RecoveryError::Failed)?;
+        }
         self.replay(vault_id, &journal, stage.as_ref(), Replay::Recovery)?;
         drop(stage);
         Ok(self.finish(vault_id)?)
@@ -576,7 +589,6 @@ impl<'directory> FileCompanion<'directory> {
         for (index, operation) in journal.operations.iter().enumerate() {
             #[cfg(test)]
             if replay == Replay::Commit
-                && index > 0
                 && CRASH_AFTER_CHANGES.with(|crash| crash.get()) == Some(index)
             {
                 CRASH_AFTER_CHANGES.with(|crash| crash.set(None));
@@ -695,11 +707,14 @@ impl<'directory> FileCompanion<'directory> {
                 .remove_file(&file.name(vault_id), "encrypted vault")?;
             return Ok(());
         }
+        // The budget is for the companion records a transaction writes;
+        // values a journal carries have their own cap, which every values
+        // write has and older recovery reads stages within.
         let payload: usize = changes
             .iter()
             .map(|change| match change {
                 FileChange::Companion(mutation) => mutation.payload_bytes(),
-                FileChange::DeleteValues(_) => 0,
+                FileChange::DeleteValues(_) | FileChange::ReplaceValues(_) => 0,
             })
             .sum();
         if payload > MAX_TRANSACTION_PAYLOAD_BYTES {
@@ -720,7 +735,7 @@ impl<'directory> FileCompanion<'directory> {
                     FileChange::Companion(Mutation::Delete { account }) => {
                         Some((account.name(), None))
                     }
-                    FileChange::DeleteValues(_) => None,
+                    FileChange::DeleteValues(_) | FileChange::ReplaceValues(_) => None,
                 })
                 .collect();
             self.check_changes(&companion, &key)
@@ -731,8 +746,38 @@ impl<'directory> FileCompanion<'directory> {
         let folder = self.folder(vault_id)?;
         let mut stage = None;
         let mut operations = Vec::with_capacity(changes.len());
+        let mut staged = |index: usize, bytes: &[u8]| -> Result<String, String> {
+            if stage.is_none() {
+                stage = Some(
+                    self.vaults
+                        .open_or_create_directory(&stage_folder_name(vault_id))?,
+                );
+            }
+            let Some(stage) = stage.as_ref() else {
+                unreachable!("the stage folder was just opened");
+            };
+            stage.write_owner_only_file_unsynced(
+                &stage_name(&transaction_id, index),
+                bytes,
+                "env file journal stage",
+            )?;
+            Ok(sha256_hex(bytes))
+        };
         for (index, change) in changes.iter().enumerate() {
             let operation = match change {
+                FileChange::ReplaceValues(bytes) => FileOperation {
+                    action: FileAction::Replace,
+                    target: vault_id.to_owned(),
+                    values_file: Some(ValuesFile::Digest),
+                    before: self
+                        .vaults
+                        .sha256_owner_only_file(
+                            &ValuesFile::Digest.name(vault_id),
+                            "encrypted vault",
+                        )?
+                        .map(hex::encode),
+                    after: Some(staged(index, bytes)?),
+                },
                 FileChange::DeleteValues(file) => FileOperation {
                     action: FileAction::Delete,
                     target: vault_id.to_owned(),
@@ -765,24 +810,7 @@ impl<'directory> FileCompanion<'directory> {
                         .flatten()
                         .map(hex::encode);
                     let after = match value {
-                        Some(value) => {
-                            let sealed = seal(&key, account, value)?;
-                            if stage.is_none() {
-                                stage = Some(
-                                    self.vaults
-                                        .open_or_create_directory(&stage_folder_name(vault_id))?,
-                                );
-                            }
-                            let Some(stage) = stage.as_ref() else {
-                                unreachable!("the stage folder was just opened");
-                            };
-                            stage.write_owner_only_file_unsynced(
-                                &stage_name(&transaction_id, index),
-                                &sealed,
-                                "env file journal stage",
-                            )?;
-                            Some(sha256_hex(&sealed))
-                        }
+                        Some(value) => Some(staged(index, &seal(&key, account, value)?)?),
                         None => None,
                     };
                     FileOperation {
@@ -815,8 +843,15 @@ impl<'directory> FileCompanion<'directory> {
         if encoded.len() > MAX_FILE_JOURNAL_BYTES {
             return Err("the env file journal is too large".to_owned());
         }
-        self.vaults
-            .write_owner_only_file(&journal_name(vault_id), &encoded, "env file journal")?;
+        if let Err(error) =
+            self.vaults
+                .write_owner_only_file(&journal_name(vault_id), &encoded, "env file journal")
+        {
+            // The journal's rename can land before its folder's sync fails,
+            // so the next operation opens the project and finishes it.
+            crate::companion::forget(vault_id);
+            return Err(error);
+        }
         let applied = (|| {
             #[cfg(test)]
             if CRASH_AFTER_CHANGES.with(|crash| crash.get()) == Some(0) {
@@ -856,6 +891,21 @@ impl<'directory> FileCompanion<'directory> {
         self.vaults
             .remove_empty_directory(&name, "env file journal stages")?;
         Ok(())
+    }
+
+    /// Whether `vault_id` has values, in either file name; anything but a
+    /// regular file there is refused, as the values' read refuses it.
+    fn has_values(&self, vault_id: &str) -> Result<bool, String> {
+        if self
+            .vaults
+            .regular_file_exists(&ValuesFile::Digest.name(vault_id), "encrypted vault")?
+        {
+            return Ok(true);
+        }
+        match super::existing_legacy_vault_file_name(&self.vaults, vault_id)? {
+            Some(legacy) => self.vaults.regular_file_exists(&legacy, "encrypted vault"),
+            None => Ok(false),
+        }
     }
 
     /// `vault_id`'s companion and staged records, failing on an entry whose
@@ -937,12 +987,32 @@ impl CompanionBackend for FileCompanion<'_> {
         self.inventory_of(vault_id)
     }
 
+    fn read_overrides_beside_values(&mut self, vault_id: &str) -> Result<Option<Checked>, String> {
+        if !self.has_values(vault_id)? {
+            return Ok(None);
+        }
+        self.read_checked(&CompanionAccount::Record {
+            kind: OVERRIDES_KIND.to_owned(),
+            vault_id: vault_id.to_owned(),
+            part: None,
+        })
+        .map(Some)
+    }
+
     fn read_checked(&mut self, account: &CompanionAccount) -> Result<Checked, String> {
         let Some(folder) = self.folder(account.vault_id())? else {
             return Ok(Checked::Absent);
         };
-        let Some(sealed) = self.read_sealed(&folder, &entry_name(account))? else {
-            return Ok(Checked::Absent);
+        let sealed = match folder.read_owner_only_file_within(
+            &entry_name(account),
+            "companion entry",
+            MAX_SEALED_ENTRY_BYTES,
+        )? {
+            None => return Ok(Checked::Absent),
+            Some(Err(over)) => {
+                return Ok(Checked::Unreadable(over.describe("companion entry")));
+            }
+            Some(Ok(sealed)) => sealed,
         };
         let key = self.data_key()?;
         Ok(match open(&key, account, sealed) {
@@ -959,40 +1029,300 @@ pub(crate) fn authorize_unlocked(
     vault_id: &str,
     operation: Operation,
 ) -> Result<ProjectGate, String> {
-    let mut companion = FileCompanion::open(directory)?;
+    authorize_with(&mut FileCompanion::open(directory)?, vault_id, operation)
+}
+
+fn authorize_with(
+    companion: &mut FileCompanion<'_>,
+    vault_id: &str,
+    operation: Operation,
+) -> Result<ProjectGate, String> {
     if !crate::companion::is_open(vault_id) {
         companion
             .recover(vault_id)
             .map_err(RecoveryError::into_message)?;
     }
-    crate::companion::authorize(&mut companion, vault_id, operation)
+    crate::companion::authorize(companion, vault_id, operation)
 }
 
-/// The personal overrides record, read in the caller's lock after the Apply
-/// gate, with the gate that decides what it means.
-pub(crate) fn read_overrides_record_unlocked(
-    directory: &VaultStorageDirectory,
+/// A record's bytes, wiped when dropped; `None` when it's absent.
+pub(crate) type RecordBytes = Option<zeroize::Zeroizing<Vec<u8>>>;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static OVERRIDES_RECORD_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The personal overrides record. One that fails to decrypt is damage,
+/// which says how to repair it.
+fn read_overrides_record(
+    companion: &mut FileCompanion<'_>,
     vault_id: &str,
-) -> Result<(ProjectGate, Option<Vec<u8>>), String> {
-    let gate = authorize_unlocked(directory, vault_id, Operation::ReadApplyingOverrides)?;
-    let mut companion = FileCompanion::open(directory)?;
-    let record = companion.read(&CompanionAccount::Record {
+) -> Result<RecordBytes, String> {
+    #[cfg(test)]
+    OVERRIDES_RECORD_READS.with(|reads| reads.set(reads.get() + 1));
+    let account = CompanionAccount::Record {
         kind: OVERRIDES_KIND.to_owned(),
         vault_id: vault_id.to_owned(),
         part: None,
-    })?;
-    Ok((gate, record))
+    };
+    match companion.read_checked(&account)? {
+        Checked::Present(bytes) => Ok(Some(bytes)),
+        Checked::Absent => Ok(None),
+        Checked::Unreadable(reason) => Err(damaged(Damage::InvalidRecord {
+            kind: OVERRIDES_KIND.to_owned(),
+            reason,
+        })),
+    }
 }
 
-/// The selected environment's personal overrides.
-pub(crate) fn read_overrides_unlocked(
+/// The personal overrides record, read in the caller's lock after the Apply
+/// gate, with the gate that decides what it means; `None` for a project
+/// without values, which has no overrides: they live beside values, and a
+/// record left without them is never applied.
+fn read_overrides_record_unlocked(
     directory: &VaultStorageDirectory,
     vault_id: &str,
-    environment: &str,
-) -> Result<PersonalOverrides, String> {
-    let (gate, record) = read_overrides_record_unlocked(directory, vault_id)?;
-    crate::companion::overrides::evaluate(&gate, vault_id, environment, record.as_deref())
+) -> Result<Option<(ProjectGate, RecordBytes)>, String> {
+    let mut companion = FileCompanion::open(directory)?;
+    let gate = authorize_with(&mut companion, vault_id, Operation::ReadApplyingOverrides)?;
+    if !companion.has_values(vault_id)? {
+        return Ok(None);
+    }
+    let record = read_overrides_record(&mut companion, vault_id)?;
+    Ok(Some((gate, record)))
+}
+
+/// What a run reads in the caller's lock, after the Apply gate: the values
+/// file's name and content, and the personal overrides record only when
+/// there are values, which overrides need.
+pub(crate) struct RunRead {
+    pub(crate) values: Option<(String, Vec<u8>)>,
+    /// The folder the values file is in, which names it in an error.
+    pub(crate) vaults: VaultStorageDirectory,
+    gate: ProjectGate,
+    record: RecordBytes,
+}
+
+pub(crate) fn read_for_run_unlocked(
+    directory: &VaultStorageDirectory,
+    vault_id: &str,
+) -> Result<RunRead, String> {
+    let mut companion = FileCompanion::open(directory)?;
+    let gate = authorize_with(&mut companion, vault_id, Operation::ReadApplyingOverrides)?;
+    let values = super::read_vault_content(&companion.vaults, vault_id)?;
+    let record = match values {
+        Some(_) => read_overrides_record(&mut companion, vault_id)?,
+        None => None,
+    };
+    Ok(RunRead {
+        values,
+        vaults: companion.vaults,
+        gate,
+        record,
+    })
+}
+
+impl RunRead {
+    /// What identifies the project's overrides in every environment, when
+    /// they apply: there are values, and a record beside them.
+    pub(crate) fn overrides_identity(&self) -> Option<crate::OverridesIdentity> {
+        self.values.as_ref()?;
+        self.record
+            .as_deref()
+            .map(|record| crate::OverridesIdentity::of(record))
+    }
+
+    /// `environment`'s personal overrides.
+    pub(crate) fn overrides(
+        &self,
+        vault_id: &str,
+        environment: &str,
+    ) -> Result<PersonalOverrides, String> {
+        if self.values.is_none() {
+            return Ok(PersonalOverrides::default());
+        }
+        crate::companion::overrides::evaluate(
+            &self.gate,
+            vault_id,
+            environment,
+            self.record.as_ref().map(|bytes| bytes.as_slice()),
+        )
         .map_err(damaged)
+    }
+
+    /// Every environment's personal overrides.
+    pub(crate) fn all_overrides(
+        &self,
+        vault_id: &str,
+    ) -> Result<std::collections::BTreeMap<String, PersonalOverrides>, String> {
+        if self.values.is_none() {
+            return Ok(std::collections::BTreeMap::new());
+        }
+        crate::companion::overrides::evaluate_all(
+            &self.gate,
+            vault_id,
+            self.record.as_ref().map(|bytes| bytes.as_slice()),
+        )
+        .map_err(damaged)
+    }
+}
+
+/// Every environment's personal overrides, read in the caller's lock after
+/// the Apply gate.
+pub(crate) fn read_all_overrides_unlocked(
+    directory: &VaultStorageDirectory,
+    vault_id: &str,
+) -> Result<crate::overrides::AllOverrides, String> {
+    let Some((gate, record)) = read_overrides_record_unlocked(directory, vault_id)? else {
+        return Ok((std::collections::BTreeMap::new(), None));
+    };
+    let overrides = crate::companion::overrides::evaluate_all(
+        &gate,
+        vault_id,
+        record.as_ref().map(|bytes| bytes.as_slice()),
+    )
+    .map_err(damaged)?;
+    Ok((
+        overrides,
+        record.map(|record| crate::OverridesIdentity::of(&record)),
+    ))
+}
+
+/// Refuse what `edits` to `vault_id`'s overrides are refused for whatever
+/// their values, in the caller's lock: an interrupted step that can't be
+/// finished, a gate that refuses writes, or no values, which overrides need.
+/// No value or record is decrypted.
+pub(crate) fn check_overrides_unlocked(
+    directory: &VaultStorageDirectory,
+    vault_id: &str,
+    edits: &[crate::companion::overrides::change::Edit],
+) -> Result<(), String> {
+    let mut companion = FileCompanion::open(directory)?;
+    let gate = authorize_with(&mut companion, vault_id, Operation::Write)?;
+    if companion.has_values(vault_id)? {
+        return Ok(());
+    }
+    crate::overrides::plan_without_values(&gate, edits, crate::overrides::Expect::Nothing).map(drop)
+}
+
+/// Plan `edits` against `vault_id`'s overrides, once they're as `expect`
+/// says, and commit them in one journaled transaction, in the caller's lock
+/// after the write gate.
+pub(crate) fn change_overrides_unlocked(
+    directory: &VaultStorageDirectory,
+    vault_id: &str,
+    edits: &[crate::companion::overrides::change::Edit],
+    expect: crate::overrides::Expect<'_>,
+) -> Result<crate::companion::overrides::change::ChangePlan, String> {
+    let mut companion = FileCompanion::open(directory)?;
+    let mut plan = plan_with(&mut companion, vault_id, edits, expect)?;
+    commit_plan(&mut companion, vault_id, &mut plan)?;
+    Ok(plan)
+}
+
+/// Write `environments` and carry `edits`, the environments the write
+/// renames and removes, over to `vault_id`'s personal overrides, in the
+/// caller's lock. The plan comes first, so a refusal leaves both as they
+/// were; then one journal transaction replaces the values file, removes a
+/// legacy one, and changes the records, as the journals of LPM CLI 0.82 and
+/// later replay.
+pub(crate) fn write_values_following_unlocked(
+    directory: &VaultStorageDirectory,
+    vault_id: &str,
+    environments: &crate::EnvironmentMap,
+    recording: &crate::history::scope::Recording,
+    edits: &[crate::companion::overrides::change::Edit],
+) -> Result<(), String> {
+    let mut companion = FileCompanion::open(directory)?;
+    let mut plan = plan_with(
+        &mut companion,
+        vault_id,
+        edits,
+        crate::overrides::Expect::Nothing,
+    )?;
+    if plan.mutations.is_empty() {
+        drop(companion);
+        return super::write_all_environments_unlocked(
+            directory,
+            vault_id,
+            environments,
+            recording,
+        );
+    }
+    // History gets the values as they were, when its caller hasn't read
+    // them, before the new ones are built; the plain text goes once it's
+    // encrypted.
+    crate::history::scope::observe_before(recording, || {
+        super::read_environments_with_digest(directory, vault_id).map(|(before, _)| before)
+    });
+    let encrypted = {
+        let json = crate::selected_environment::serialize(environments)?;
+        zeroize::Zeroizing::new(
+            super::encrypt_with_store_unlocked(
+                directory,
+                vault_id,
+                &json,
+                &super::KeyringNativeDataKeyStore,
+            )?
+            .into_bytes(),
+        )
+    };
+    let mutations = std::mem::take(&mut plan.mutations);
+    let mut changes = Vec::with_capacity(mutations.len() + 2);
+    changes.push(FileChange::ReplaceValues(encrypted));
+    if super::existing_legacy_vault_file_name(&companion.vaults, vault_id)?.is_some() {
+        changes.push(FileChange::DeleteValues(ValuesFile::Legacy));
+    }
+    changes.extend(mutations.into_iter().map(FileChange::Companion));
+    companion.commit_changes(vault_id, changes, true)?;
+    crate::history::scope::committed(recording, std::borrow::Cow::Borrowed(environments));
+    crate::companion::remember(vault_id, &plan.gate);
+    Ok(())
+}
+
+fn plan_with(
+    companion: &mut FileCompanion,
+    vault_id: &str,
+    edits: &[crate::companion::overrides::change::Edit],
+    expect: crate::overrides::Expect<'_>,
+) -> Result<crate::companion::overrides::change::ChangePlan, String> {
+    let gate = authorize_with(companion, vault_id, Operation::Write)?;
+    if !companion.has_values(vault_id)? {
+        return crate::overrides::plan_without_values(&gate, edits, expect);
+    }
+    let record = read_overrides_record(companion, vault_id)?;
+    crate::overrides::plan(
+        vault_id,
+        &gate,
+        record.as_ref().map(|bytes| bytes.as_slice()),
+        edits,
+        expect,
+        |need| {
+            // Only creating the record counts every project's records.
+            Ok(crate::companion::overrides::change::Inventory {
+                project: companion.inventory_of(vault_id)?,
+                service_records: match need {
+                    InventoryNeed::Project => None,
+                    InventoryNeed::ProjectAndService => Some(companion.record_count()?),
+                },
+            })
+        },
+    )
+}
+
+fn commit_plan(
+    companion: &mut FileCompanion,
+    vault_id: &str,
+    plan: &mut crate::companion::overrides::change::ChangePlan,
+) -> Result<(), String> {
+    let mutations = std::mem::take(&mut plan.mutations);
+    if !mutations.is_empty() {
+        companion.commit(mutations)?;
+        crate::companion::remember(vault_id, &plan.gate);
+    }
+    Ok(())
 }
 
 /// Delete `vault_id`'s values files and every companion record through the
@@ -1054,6 +1384,7 @@ pub(crate) fn review_companion_data_unlocked(
         Ok(()) => {}
         Err(RecoveryError::Stuck(reason)) => {
             return Ok(CompanionReview::discard(
+                vault_id,
                 Damage::Unfinished(reason).to_string(),
             ));
         }
@@ -1061,35 +1392,46 @@ pub(crate) fn review_companion_data_unlocked(
     }
     let strays = companion.stray_entries(vault_id)?;
     if !strays.is_empty() {
-        return Ok(CompanionReview::discard(format!(
-            "its folder holds files LPM doesn't write: {}",
-            strays
-                .iter()
-                .map(|name| format!("{name:?}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
+        return Ok(CompanionReview::discard(
+            vault_id,
+            format!(
+                "its folder holds files LPM doesn't write: {}",
+                strays
+                    .iter()
+                    .map(|name| format!("{name:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
     }
-    let key = companion.data_key()?;
-    for account in [
-        CompanionAccount::Marker {
-            vault_id: vault_id.to_owned(),
-        },
-        CompanionAccount::Record {
-            kind: OVERRIDES_KIND.to_owned(),
-            vault_id: vault_id.to_owned(),
-            part: None,
-        },
-    ] {
-        if let Some(folder) = companion.folder(vault_id)?
-            && let Some(sealed) = companion.read_sealed(&folder, &entry_name(&account))?
-            && let Err(error) = open(&key, &account, sealed)
-        {
-            return Ok(CompanionReview::discard(error));
+    // A marker that won't decrypt says nothing about what the project holds,
+    // so only discarding everything repairs it. A record that won't decrypt
+    // is judged by the review, which removes its feature alone.
+    let marker = CompanionAccount::Marker {
+        vault_id: vault_id.to_owned(),
+    };
+    if let Some(folder) = companion.folder(vault_id)? {
+        let sealed = folder.read_owner_only_file_within(
+            &entry_name(&marker),
+            "companion entry",
+            MAX_SEALED_ENTRY_BYTES,
+        )?;
+        let unreadable = match sealed {
+            None => None,
+            Some(Err(over)) => Some(over.describe("companion entry")),
+            Some(Ok(sealed)) => open(&companion.data_key()?, &marker, sealed).err(),
+        };
+        if let Some(error) = unreadable {
+            return Ok(CompanionReview::discard(vault_id, error));
         }
     }
-    crate::companion::authorize(&mut companion, vault_id, Operation::Maintenance)?;
-    crate::companion::repair::review(&mut companion, vault_id, None, None)
+    let gate = crate::companion::authorize(&mut companion, vault_id, Operation::Maintenance)?;
+    crate::companion::repair::review(
+        &mut companion,
+        vault_id,
+        None,
+        crate::companion::Opened::Gate(gate),
+    )
 }
 
 /// Run what `reviewed` lists on the file store, after checking `vault_id`
@@ -1107,7 +1449,7 @@ pub(crate) fn repair_companion_data_unlocked(
         companion.discard_project(vault_id)?;
         return Ok(vec![CompanionRepair::DiscardProject]);
     }
-    crate::companion::repair::repair(&mut companion, vault_id, None, None, reviewed)
+    crate::companion::repair::run_repairs(&mut companion, vault_id, reviewed)
 }
 
 /// The file store's records with commits that skip the invariant check, for
@@ -1191,6 +1533,15 @@ impl FileCompanion<'_> {
         crate::companion::forget(vault_id);
         Ok(())
     }
+}
+
+/// What the file store holds for `account`, as tests that seeded it read it.
+#[cfg(any(test, feature = "acceptance-test-hooks"))]
+pub(crate) fn read_unchecked(
+    directory: &VaultStorageDirectory,
+    account: &CompanionAccount,
+) -> Result<Option<Vec<u8>>, String> {
+    crate::companion::lifecycle::LifecycleStore::read(&mut FileCompanion::open(directory)?, account)
 }
 
 /// Write `mutations` without the invariant check, as only damaged data

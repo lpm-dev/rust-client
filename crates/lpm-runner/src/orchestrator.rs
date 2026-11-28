@@ -1531,7 +1531,7 @@ pub fn run_services_with_config(
         loaded.env_name.as_deref().unwrap_or("default"),
     ) {
         terminal_eprintln!("  {}", lpm_common::color::Painted::dimmed(&notice));
-        crate::dotenv::log_personal_override_names(loaded.layers.overrides());
+        crate::dotenv::log_personal_override_names(|| loaded.layers.override_names());
     }
     for name in &service_names {
         let config = &active_services[name];

@@ -27,6 +27,7 @@ const RUNTIME_ENV: &[&str] = &[
     "TMPDIR",
     "TMP",
     "TEMP",
+    "LPM_PERSONAL_OVERRIDES_MARKER",
 ];
 
 pub(crate) fn reserved_env_name(name: &str) -> bool {

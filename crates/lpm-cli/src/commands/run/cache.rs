@@ -2,6 +2,7 @@ use lpm_common::LpmError;
 use lpm_runtime::task_identity::{TaskRuntimeIdentity, TaskRuntimeScope, TaskRuntimeVersions};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 
 /// Runtime versions probed for task-cache keys, shared by every task of this
@@ -89,6 +90,10 @@ pub(super) struct CompletedTaskCacheIdentity {
     value: String,
     output_validation: Option<lpm_task::hasher::FilesystemValidation>,
     dependencies: Vec<Arc<Self>>,
+    /// The task's project has personal overrides on this computer, or a
+    /// task it depends on does, so nothing built from its outputs leaves
+    /// this computer.
+    local_only: bool,
 }
 
 impl CompletedTaskCacheIdentity {
@@ -100,6 +105,7 @@ impl CompletedTaskCacheIdentity {
                 &context.task_config.outputs,
             )?),
             dependencies: Vec::new(),
+            local_only: context.local_only,
         }))
     }
 
@@ -113,8 +119,15 @@ impl CompletedTaskCacheIdentity {
                 .iter()
                 .map(|dependency| Arc::clone(&dependency.node))
                 .collect(),
+            local_only: any_local_only(dependencies),
         })
     }
+}
+
+fn any_local_only(dependencies: &[TaskDependencyIdentity]) -> bool {
+    dependencies
+        .iter()
+        .any(|dependency| dependency.node.local_only)
 }
 
 #[derive(Clone)]
@@ -145,6 +158,10 @@ pub(super) fn is_task_cached_with_config(
 pub(super) struct CacheContext {
     pub(super) task_config: lpm_runner::lpm_json::TaskConfig,
     pub(super) cache_key: String,
+    /// The entries of the reads a nested lpm can make that the key holds:
+    /// its project's environment and its overrides (see
+    /// [`lpm_vault::override_marker::Access::keyed`]); none without a project.
+    pub(super) keyed_entries: Vec<String>,
     pub(super) command: String,
     pub(super) env_vars: HashMap<String, String>,
     pub(super) inherited_env: HashMap<std::ffi::OsString, std::ffi::OsString>,
@@ -155,9 +172,13 @@ pub(super) struct CacheContext {
     schema_snapshot: Option<Arc<lpm_env_source::SchemaSnapshot>>,
     dependencies: Vec<TaskDependencyIdentity>,
     command_preference: CommandPreference,
+    /// See [`CompletedTaskCacheIdentity::local_only`].
+    local_only: bool,
 }
 
 pub(super) struct CacheStoreRequest<'a> {
+    /// What the task's processes reported to while it ran.
+    pub(super) task: &'a lpm_runner::override_marker::TaskMarker,
     pub(super) project_dir: &'a Path,
     pub(super) workspace_contract: Option<&'a WorkspaceCacheContract>,
     pub(super) script_name: &'a str,
@@ -381,7 +402,13 @@ fn build_task_context(
         project_dir,
         &std::env::current_dir()?,
     );
-    let env_vars = lpm_runner::script::load_script_child_env_with_config(
+    let lpm_runner::script::ScriptChildEnv {
+        vars: env_vars,
+        personal_overrides,
+        project_overrides,
+        vault_environment,
+        vault_values,
+    } = lpm_runner::script::load_script_child_env_with_config(
         project_dir,
         script_name,
         env_mode,
@@ -391,6 +418,23 @@ fn build_task_context(
         &script_context,
         lpm_runner::dotenv::OverridePolicy::Apply,
     )?;
+    // The project a nested lpm reports reading is the one lpm.json names: a
+    // folder that may not use it failed the read above. A name read before
+    // lpm.json changed only keeps the task out; the store's rebuild compares
+    // these entries again.
+    let keyed_entries = config_ref
+        .and_then(|config| config.vault.as_deref())
+        .filter(|vault_id| lpm_vault::vault_id::is_safe_vault_id(vault_id))
+        .map(|vault_id| {
+            lpm_vault::override_marker::Access::keyed(
+                vault_id,
+                &vault_environment,
+                vault_values,
+                project_overrides,
+            )
+            .to_vec()
+        })
+        .unwrap_or_default();
 
     let inherited_env = lpm_runner::shell::inherited_child_env();
     let cache_env = task_config.cache_env.as_ref().map(|names| {
@@ -424,6 +468,9 @@ fn build_task_context(
             })
             .map(|(key, value)| (key.into(), value.into())),
     );
+    // Where a nested lpm reports what it uses differs every run and
+    // changes nothing a task builds.
+    child_env.retain(|key, _| !lpm_vault::override_marker::names_the_marker(key));
     let root = cache_key_root(project_dir, workspace_contract);
     if task_config.is_cache_portable() {
         match script_context.portable_manifest_path(&root) {
@@ -482,6 +529,16 @@ fn build_task_context(
             .map_err(|error| LpmError::EnvValidation(error.to_string()))?;
     }
     let mut dependency_pairs = dependency_identity_pairs(dependency_identities);
+    // A command the task starts can read any environment's overrides, so
+    // all of them key what it builds here.
+    if let Some(overrides) = project_overrides {
+        dependency_pairs.push(("lpm-personal-overrides:v1".into(), overrides.to_hex()));
+    }
+    // A command the task starts reads the environment's values as stored,
+    // including those the run replaced, which its own environment lacks.
+    if let Some(values) = vault_values {
+        dependency_pairs.push(("lpm-vault-values:v1".into(), values.to_hex()));
+    }
     if let Some(snapshot) = &schema_snapshot {
         dependency_pairs.push((
             "lpm-env-schema-closure:v1".into(),
@@ -505,7 +562,30 @@ fn build_task_context(
             .verify_dependencies()
             .map_err(|error| LpmError::EnvValidation(error.to_string()))?;
     }
+    // Outputs and logs a project's tasks build where it has personal
+    // overrides, which a command a task starts can read for any
+    // environment, or built from such a task's, stay on this computer:
+    // they're never shared, and the team's never stand in for them.
+    let local_only = personal_overrides > 0
+        || project_overrides.is_some()
+        || any_local_only(dependency_identities);
     let remote_cache = match remote_cache {
+        RemoteCacheResolution::Resolve(_) if local_only => {
+            if crate::commands::remote_cache::remote_cache_requested(config_ref) {
+                static SHOWN: AtomicBool = AtomicBool::new(false);
+                announce_once(&SHOWN, || {
+                    format!(
+                        "the remote cache is off for tasks of a project with personal overrides on {}, and for the tasks that depend on them",
+                        lpm_runner::dotenv::THIS_MACHINE
+                    )
+                });
+            }
+            tracing::debug!(
+                "task '{}' is in a project with personal overrides, or depends on a task that is; not using the remote cache for it",
+                lpm_common::sanitize_terminal_inline(script_name)
+            );
+            None
+        }
         RemoteCacheResolution::Resolve(session) => {
             crate::commands::remote_cache::client_from_config(config_ref, session)
         }
@@ -518,6 +598,7 @@ fn build_task_context(
         command_preference,
         task_config,
         cache_key: cache_snapshot.key,
+        keyed_entries,
         command,
         env_vars,
         inherited_env,
@@ -530,6 +611,7 @@ fn build_task_context(
         },
         schema_snapshot,
         dependencies: dependency_identities.to_vec(),
+        local_only,
     }))
 }
 
@@ -728,21 +810,84 @@ pub(super) fn complete_task_cache_identity(
     }
 }
 
+/// Store a successful task's outputs, unless an `lpm` it started read
+/// what its key doesn't hold: another env project, whose values and
+/// personal overrides can change without changing the key, or a change to
+/// overrides. Then neither cache keeps it. That `lpm` told every `lpm` above
+/// this one itself. Returns the outputs' identity for the tasks that depend
+/// on it, when they may use them under a key.
 pub(super) fn try_cache_store_with_context(
     request: CacheStoreRequest<'_>,
     expected: &CacheContext,
-) -> bool {
+) -> Option<Arc<CompletedTaskCacheIdentity>> {
     let script_name = request.script_name;
+    if let Some(unkeyed) = request.task.unkeyed(&expected.keyed_entries) {
+        say_not_cached(script_name, unkeyed, request.task.unwatched());
+        return None;
+    }
     match store_cache_with_context(request, expected) {
-        Ok(stored) => stored,
+        Ok(identity) => identity,
         Err(error) => {
             tracing::warn!(
                 "failed to publish cache for successful task '{}': {error}",
                 lpm_common::sanitize_terminal_inline(script_name)
             );
-            false
+            None
         }
     }
+}
+
+/// Say, once a command, that a task isn't cached because of what an lpm it
+/// started used, or because it had no marker of its own (`unwatched` says
+/// why), and for each task under `--verbose`.
+fn say_not_cached(
+    script_name: &str,
+    unkeyed: lpm_runner::override_marker::Unkeyed,
+    unwatched: Option<&str>,
+) {
+    use lpm_runner::override_marker::Unkeyed;
+    static SHOWN: AtomicBool = AtomicBool::new(false);
+    const NOT_CACHED_ALWAYS: &str = "if it always does, set `cache` to false for it in lpm.json";
+    let reason = match unkeyed {
+        Unkeyed::Changed => format!(
+            "an lpm it started changed, or may have changed, an env project's personal overrides or other newer data; {NOT_CACHED_ALWAYS}"
+        ),
+        Unkeyed::Used => format!(
+            "an lpm it started used another env project or environment, or values or personal overrides other than those its cache key holds; {NOT_CACHED_ALWAYS}"
+        ),
+        Unkeyed::EveryEnvironment => "an lpm it started read every environment of an env project, as `lpm env ls` and `lpm env check` without `--env` do, while its cache key holds one; `lpm env check --env` with the task's environment keeps it cached".to_owned(),
+        Unkeyed::Untold => "an lpm it started couldn't make the marker a task of its own reports to, so what that task used can't be told; check the temporary folder".to_owned(),
+        Unkeyed::Unlisted => "the marker that the lpm processes it started report to was gone or couldn't be read once it ended, as when a task empties the temporary folder".to_owned(),
+        Unkeyed::Foreign(file) => format!(
+            "the marker that the lpm processes it started report to holds a file no lpm adds, `{}`",
+            lpm_common::sanitize_terminal_inline(&file)
+        ),
+        Unkeyed::Unwatched => format!(
+            "lpm couldn't make the marker that the lpm processes it starts report to ({}); check the temporary folder",
+            lpm_common::sanitize_terminal_inline(unwatched.unwrap_or_default())
+        ),
+    };
+    let script_name = lpm_common::sanitize_terminal_inline(script_name);
+    announce_once(&SHOWN, || {
+        format!(
+            "task '{script_name}' isn't cached: {reason} (`lpm --verbose` names each task this keeps out of the cache)"
+        )
+    });
+    tracing::debug!("task '{script_name}' isn't cached: {reason}");
+}
+
+/// Print the notice `shown` stands for once a command, however many tasks
+/// it concerns.
+fn announce_once(shown: &AtomicBool, notice: impl FnOnce() -> String) {
+    if !shown.swap(true, Ordering::Relaxed) {
+        eprintln!("lpm: {}", notice());
+    }
+}
+
+/// A marker of its own for a cached task about to start.
+pub(super) fn watch_task() -> Result<lpm_runner::override_marker::TaskMarker, LpmError> {
+    lpm_runner::override_marker::TaskMarker::watch()
+        .map_err(lpm_runner::dotenv::vault_error(LpmError::Task))
 }
 
 fn warn_execution_context_changed(script_name: &str, expected: &CacheContext) {
@@ -773,7 +918,7 @@ fn pattern_spelling(path: &Path) -> String {
 fn store_cache_with_context(
     request: CacheStoreRequest<'_>,
     expected: &CacheContext,
-) -> Result<bool, LpmError> {
+) -> Result<Option<Arc<CompletedTaskCacheIdentity>>, LpmError> {
     // The rebuild rereads what the input snapshot doesn't cover, such as env
     // files and vault values, from disk and the vault rather than from the
     // run's earlier reads. The execution context is checked after it, so that
@@ -792,29 +937,46 @@ fn store_cache_with_context(
         expected.command_preference,
     )? {
         Some(current) => current,
-        None => return Ok(false),
+        None => return Ok(None),
     };
     drop(fresh_vault_reads);
+    if current.keyed_entries != expected.keyed_entries {
+        tracing::warn!(
+            "the env project, environment, stored values or personal overrides of task '{}' changed while it ran; skipping cache publication",
+            lpm_common::sanitize_terminal_inline(request.script_name)
+        );
+        return Ok(None);
+    }
     if !execution_context_is_unchanged(expected)? {
         warn_execution_context_changed(request.script_name, expected);
-        return Ok(false);
+        return Ok(None);
     }
     if current.cache_key != expected.cache_key {
         tracing::warn!(
             "task cache inputs changed while task '{}' ran; skipping cache publication",
             request.script_name
         );
-        return Ok(false);
+        return Ok(None);
     }
     if current.task_config != expected.task_config {
         tracing::warn!(
             "task output contract changed while task '{}' ran; skipping cache publication",
             request.script_name
         );
-        return Ok(false);
+        return Ok(None);
     }
 
-    let stored = lpm_task::cache::store_cache(
+    lpm_task::cache::hold_for_test("storing");
+    // An lpm the task left running can report a use until the outputs are
+    // taken, and it reports before it uses what it read, so a use reported
+    // after this check left nothing in them. What the dependents see of the
+    // outputs is taken before it too, rather than once they're stored.
+    let output_validation = lpm_task::hasher::capture_task_output_validation(
+        request.project_dir,
+        &expected.task_config.outputs,
+    )?;
+    let unkeyed = std::cell::Cell::new(None);
+    let stored = lpm_task::cache::store_cache_checked(
         &expected.cache_key,
         request.project_dir,
         &expected.command,
@@ -822,7 +984,23 @@ fn store_cache_with_context(
         request.stdout,
         request.stderr,
         request.duration_ms,
+        &|| {
+            let found = request.task.unkeyed(&expected.keyed_entries);
+            let publishable = found.is_none();
+            unkeyed.set(found);
+            publishable
+        },
     )?;
+    // A kept entry is another run's, so no check covered this run's
+    // outputs, which the dependents use: check them now.
+    if matches!(stored, lpm_task::cache::StoredCacheEntry::KeptExisting) {
+        unkeyed.set(request.task.unkeyed(&expected.keyed_entries));
+    }
+    if let Some(unkeyed) = unkeyed.take() {
+        say_not_cached(request.script_name, unkeyed, request.task.unwatched());
+        return Ok(None);
+    }
+    lpm_task::cache::hold_for_test("stored");
 
     // A kept entry is another run's result, which this run's upload checks
     // don't cover.
@@ -846,7 +1024,12 @@ fn store_cache_with_context(
         expected.cache_key,
         request.stdout.len()
     );
-    Ok(true)
+    Ok(Some(Arc::new(CompletedTaskCacheIdentity {
+        value: expected.cache_key.clone(),
+        output_validation: Some(output_validation),
+        dependencies: Vec::new(),
+        local_only: expected.local_only,
+    })))
 }
 
 #[cfg(test)]
@@ -866,7 +1049,29 @@ mod tests {
             value: value.into(),
             output_validation: None,
             dependencies: Vec::new(),
+            local_only: false,
         })
+    }
+
+    #[test]
+    fn a_meta_task_over_one_built_with_personal_overrides_stays_on_this_computer() {
+        let local = Arc::new(CompletedTaskCacheIdentity {
+            value: "local".into(),
+            output_validation: None,
+            dependencies: Vec::new(),
+            local_only: true,
+        });
+        let dependencies = |node| {
+            vec![TaskDependencyIdentity {
+                label: "local:generate".into(),
+                node,
+            }]
+        };
+        assert!(CompletedTaskCacheIdentity::meta(&dependencies(local)).local_only);
+        assert!(
+            !CompletedTaskCacheIdentity::meta(&dependencies(completed_identity("shared")))
+                .local_only
+        );
     }
 
     fn output_identity(
@@ -885,6 +1090,7 @@ mod tests {
                 .unwrap(),
             ),
             dependencies,
+            local_only: false,
         })
     }
 
@@ -968,6 +1174,7 @@ mod tests {
             value: "meta".into(),
             output_validation: None,
             dependencies: vec![generated],
+            local_only: false,
         });
         std::fs::write(project.path().join("generated.txt"), "after").unwrap();
 

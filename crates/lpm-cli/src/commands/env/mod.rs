@@ -14,6 +14,7 @@ pub(crate) mod links;
 mod local;
 mod oidc;
 mod pairing;
+mod personal_overrides;
 mod platform;
 mod pull;
 mod push;
@@ -119,8 +120,14 @@ fn run_local_sync_action(
     json_output: bool,
 ) -> Result<(), LpmError> {
     use arguments::LocalAction;
-    // set checks its arguments first, so a wrong one never asks to link.
-    if action.uses_project_values() && !matches!(action, LocalAction::Set { .. }) {
+    // set and override check their arguments first, so a wrong one
+    // never asks to link.
+    if action.uses_project_values()
+        && !matches!(
+            action,
+            LocalAction::Set { .. } | LocalAction::Override { .. }
+        )
+    {
         links::ensure_folder_linked(project_dir, json_output)?;
     }
     let result = match action {
@@ -225,6 +232,9 @@ fn run_local_sync_action(
         }
         LocalAction::Init { force } => inventory::vars_init(project_dir, force, json_output),
         LocalAction::Repair { yes } => repair::env_repair(project_dir, yes, json_output),
+        LocalAction::Override { action } => {
+            personal_overrides::run(action, project_dir, json_output)
+        }
         #[cfg(debug_assertions)]
         LocalAction::DebugCompanion {
             state,
@@ -352,7 +362,7 @@ async fn run_action(
         }
         "pair" => pairing::env_pair(client, &args[1..], json_output).await,
         unknown => Err(LpmError::Env(format!(
-            "unknown env action: '{unknown}'. Available: set, get, list, delete, import, export, push, pull, diff, validate, schema, generate, example, print, check, connect, status, log, history, rollback, share, rotate-key, rotate-sharing-key, pair, unpair, init, ls, list-remote, copy, oidc, repair, link, unlink, links"
+            "unknown env action: '{unknown}'. Available: set, get, list, delete, import, export, push, pull, diff, validate, schema, generate, example, print, check, connect, status, log, history, rollback, share, rotate-key, rotate-sharing-key, pair, unpair, init, ls, list-remote, copy, oidc, override, repair, link, unlink, links"
         ))),
     };
     reported(result)
@@ -377,6 +387,7 @@ mod tests {
         include_str!("local.rs"),
         include_str!("oidc.rs"),
         include_str!("pairing.rs"),
+        include_str!("personal_overrides.rs"),
         include_str!("platform/mod.rs"),
         include_str!("platform/coolify.rs"),
         include_str!("platform/fly.rs"),
@@ -409,6 +420,10 @@ mod tests {
         for (name, source) in [
             ("value_input.rs", include_str!("value_input.rs")),
             ("local.rs", include_str!("local.rs")),
+            (
+                "personal_overrides.rs",
+                include_str!("personal_overrides.rs"),
+            ),
             ("hidden_prompt.rs", include_str!("../../hidden_prompt.rs")),
             (
                 "hidden_prompt/unix.rs",
