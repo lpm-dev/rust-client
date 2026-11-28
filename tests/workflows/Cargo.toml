@@ -43,7 +43,7 @@ rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc
 # private CA that only `.npmrc` `cafile=` makes them trust.
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 tokio-rustls = "0.26"
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
 lpm-runtime = { path = "../../crates/lpm-runtime" }
 lpm-plugin = { path = "../../crates/lpm-plugin" }
 lpm-common = { path = "../../crates/lpm-common" }
