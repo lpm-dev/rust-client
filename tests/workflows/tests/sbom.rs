@@ -3,39 +3,27 @@
 mod sbom_contract;
 mod support;
 
+use support::request_gate::{RequestGate, run_while};
 use support::{
-    TempProject, installed_manifest_dependency_graph, lpm, workspace_projection_project,
+    TempProject, installed_manifest_dependency_graph, lpm, lpm_spawnable,
+    workspace_projection_project,
 };
 use wiremock::matchers::{method, path, path_regex};
-use wiremock::{Mock, Request, Respond, ResponseTemplate};
+use wiremock::{Mock, Request, ResponseTemplate};
 
-#[derive(Clone)]
-struct RecordDelayedSbomMetadataStart {
-    starts: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
-    delay: std::time::Duration,
-}
-
-impl Respond for RecordDelayedSbomMetadataStart {
-    fn respond(&self, request: &Request) -> ResponseTemplate {
-        self.starts
-            .lock()
-            .expect("record SBOM metadata request start")
-            .push(std::time::Instant::now());
-        let name = request
-            .url
-            .path()
-            .strip_prefix("/api/registry/")
-            .unwrap_or_default();
-        ResponseTemplate::new(200)
-            .set_delay(self.delay)
-            .set_body_json(serde_json::json!({
-                "name": name,
-                "dist-tags": { "latest": "1.0.0" },
-                "versions": {
-                    "1.0.0": { "name": name, "version": "1.0.0" }
-                }
-            }))
-    }
+fn sbom_metadata(request: &Request) -> ResponseTemplate {
+    let name = request
+        .url
+        .path()
+        .strip_prefix("/api/registry/")
+        .unwrap_or_default();
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "name": name,
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": { "name": name, "version": "1.0.0" }
+        }
+    }))
 }
 
 #[tokio::test]
@@ -621,45 +609,40 @@ async fn sbom_fetches_independent_registry_metadata_concurrently() {
         .expect("write concurrent SBOM lockfile");
 
     let registry = support::mock_registry::MockRegistry::start().await;
-    let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     Mock::given(method("GET"))
         .and(path_regex(
             r"^/api/registry/@lpm\.dev/sbom\.concurrent-[0-7]$",
         ))
-        .respond_with(RecordDelayedSbomMetadataStart {
-            starts: starts.clone(),
-            delay: std::time::Duration::from_millis(200),
-        })
+        .respond_with(sbom_metadata)
+        .expect(PACKAGE_COUNT as u64)
         .mount(registry.server())
         .await;
+    let mut gate = RequestGate::start(&registry.url(), |request| {
+        request
+            .uri
+            .path()
+            .starts_with("/api/registry/@lpm.dev/sbom.concurrent-")
+    });
 
-    let output = lpm(&project)
-        .args([
-            "--registry",
-            &registry.url(),
-            "--insecure",
-            "sbom",
-            "--registry-metadata",
-        ])
-        .output()
-        .expect("run registry-enriched SBOM");
+    let mut command = lpm_spawnable(&project);
+    command.args([
+        "--registry",
+        gate.url(),
+        "--insecure",
+        "sbom",
+        "--registry-metadata",
+    ]);
+    let output = run_while(
+        command,
+        gate.hold_a_bounded_pool(PACKAGE_COUNT, PACKAGE_COUNT),
+    )
+    .await;
     assert!(
         output.status.success(),
         "concurrent SBOM enrichment failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-
-    let starts = starts.lock().expect("read SBOM request starts");
-    assert_eq!(starts.len(), PACKAGE_COUNT);
-    let spread = starts
-        .iter()
-        .max()
-        .expect("latest request")
-        .duration_since(*starts.iter().min().expect("earliest request"));
-    assert!(
-        spread < std::time::Duration::from_millis(400),
-        "independent metadata requests started too far apart: {spread:?}"
-    );
+    gate.assert_held(PACKAGE_COUNT);
 }
 
 #[cfg(unix)]

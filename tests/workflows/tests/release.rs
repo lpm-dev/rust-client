@@ -5,9 +5,10 @@ use support::assertions::{assert_fault_injection_aborted, parse_json_output};
 use support::mock_registry::{
     MockRegistry, lpm_published_tarball, make_tarball, mount_tarball_uploads,
 };
+use support::request_gate::{HeldRequest, Picked, RequestGate, query_value, run_while};
 use support::{
-    LOCK_CONTENTION_MARKER_ENV, TempProject, lpm, lpm_spawnable, lpm_with_registry,
-    wait_for_lock_contention,
+    LOCK_CONTENTION_MARKER_ENV, TempProject, lpm, lpm_spawnable, lpm_spawnable_with_registry,
+    lpm_with_registry, wait_for_lock_contention,
 };
 use wiremock::matchers::{body_string_contains, header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -31,37 +32,6 @@ struct RewriteManifestAfterFirstPublish {
 
 #[derive(Clone, Copy)]
 struct AvailableLpmPublishPreflight;
-
-#[derive(Clone)]
-struct RecordDelayedPreflightStart {
-    starts: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
-    delay: std::time::Duration,
-}
-
-#[derive(Clone)]
-struct RecordGatedPreflightStart {
-    starts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    first_response_url: String,
-    refill_started: std::sync::mpsc::SyncSender<()>,
-}
-
-#[derive(Clone)]
-struct RecordDelayedNpmPackumentStart {
-    starts: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
-    delay: std::time::Duration,
-}
-
-#[derive(Clone)]
-struct FailFirstPreflightAndDelayOthers {
-    starts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    delay: std::time::Duration,
-}
-
-#[derive(Clone)]
-struct RecordDelayedLpmMetadataStart {
-    starts: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
-    delay: std::time::Duration,
-}
 
 #[derive(Clone, Default)]
 struct FailSecondPublish {
@@ -141,131 +111,49 @@ impl Respond for RewriteManifestAfterFirstPublish {
     }
 }
 
-impl Respond for RecordDelayedPreflightStart {
-    fn respond(&self, request: &Request) -> ResponseTemplate {
-        self.starts
-            .lock()
-            .expect("record metadata request start")
-            .push(std::time::Instant::now());
-        let query: std::collections::HashMap<_, _> =
-            request.url.query_pairs().into_owned().collect();
-        let name = query.get("name").cloned().unwrap_or_default();
-        let version = query.get("version").cloned().unwrap_or_default();
-        ResponseTemplate::new(200)
-            .set_delay(self.delay)
-            .set_body_json(serde_json::json!({
-                "success": true,
-                "name": name,
-                "version": version,
-                "packageExists": false,
-            }))
-    }
+const PUBLISH_PREFLIGHT_PATH: &str = "/api/registry/-/package/publish-preflight";
+
+fn preflight_for_a_new_version(request: &Request) -> ResponseTemplate {
+    let query: std::collections::HashMap<_, _> = request.url.query_pairs().into_owned().collect();
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "success": true,
+        "name": query.get("name").cloned().unwrap_or_default(),
+        "version": query.get("version").cloned().unwrap_or_default(),
+        "packageExists": false,
+    }))
 }
 
-impl Respond for RecordGatedPreflightStart {
-    fn respond(&self, request: &Request) -> ResponseTemplate {
-        let query: std::collections::HashMap<_, _> =
-            request.url.query_pairs().into_owned().collect();
-        let name = query.get("name").cloned().unwrap_or_default();
-        let version = query.get("version").cloned().unwrap_or_default();
-        self.starts
-            .lock()
-            .expect("record preflight start")
-            .push(name.clone());
-        if name.ends_with("package-0") {
-            return ResponseTemplate::new(307)
-                .insert_header("Location", self.first_response_url.as_str());
+fn npm_packument_without_versions(request: &Request) -> ResponseTemplate {
+    let name = request.url.path().trim_start_matches('/');
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "name": name,
+        "versions": {},
+    }))
+}
+
+fn existing_lpm_metadata(request: &Request) -> ResponseTemplate {
+    let name = request
+        .url
+        .path()
+        .strip_prefix("/api/registry/")
+        .unwrap_or_default();
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "name": name,
+        "description": "existing package",
+        "latestVersion": "0.9.0",
+        "dist-tags": {"latest": "0.9.0"},
+        "versions": {
+            "0.9.0": {
+                "name": name,
+                "version": "0.9.0",
+                "dist": {
+                    "tarball": "https://example.com/package-0.9.0.tgz",
+                    "integrity": "sha512-test"
+                },
+                "dependencies": {}
+            }
         }
-        if name
-            .rsplit('-')
-            .next()
-            .and_then(|index| index.parse::<usize>().ok())
-            .is_some_and(|index| index >= 4)
-        {
-            let _ = self.refill_started.try_send(());
-        }
-        ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "success": true,
-            "name": name,
-            "version": version,
-            "packageExists": false,
-        }))
-    }
-}
-
-impl Respond for RecordDelayedNpmPackumentStart {
-    fn respond(&self, request: &Request) -> ResponseTemplate {
-        self.starts
-            .lock()
-            .expect("record npm packument request start")
-            .push(std::time::Instant::now());
-        let name = request.url.path().trim_start_matches('/');
-        ResponseTemplate::new(200)
-            .set_delay(self.delay)
-            .set_body_json(serde_json::json!({
-                "name": name,
-                "versions": {},
-            }))
-    }
-}
-
-impl Respond for FailFirstPreflightAndDelayOthers {
-    fn respond(&self, request: &Request) -> ResponseTemplate {
-        self.starts
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let query: std::collections::HashMap<_, _> =
-            request.url.query_pairs().into_owned().collect();
-        let name = query.get("name").cloned().unwrap_or_default();
-        if name.ends_with("package-0") {
-            return ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "success": true,
-                "name": name,
-                "version": "1.0.0"
-            }));
-        }
-        let version = query.get("version").cloned().unwrap_or_default();
-        ResponseTemplate::new(200)
-            .set_delay(self.delay)
-            .set_body_json(serde_json::json!({
-                "success": true,
-                "name": name,
-                "version": version,
-                "packageExists": false,
-            }))
-    }
-}
-
-impl Respond for RecordDelayedLpmMetadataStart {
-    fn respond(&self, request: &Request) -> ResponseTemplate {
-        self.starts
-            .lock()
-            .expect("record LPM metadata request start")
-            .push(std::time::Instant::now());
-        let name = request
-            .url
-            .path()
-            .strip_prefix("/api/registry/")
-            .unwrap_or_default();
-        ResponseTemplate::new(200)
-            .set_delay(self.delay)
-            .set_body_json(serde_json::json!({
-                "name": name,
-                "description": "existing package",
-                "latestVersion": "0.9.0",
-                "dist-tags": {"latest": "0.9.0"},
-                "versions": {
-                    "0.9.0": {
-                        "name": name,
-                        "version": "0.9.0",
-                        "dist": {
-                            "tarball": "https://example.com/package-0.9.0.tgz",
-                            "integrity": "sha512-test"
-                        },
-                        "dependencies": {}
-                    }
-                }
-            }))
-    }
+    }))
 }
 
 fn workspace_project() -> TempProject {
@@ -1118,50 +1006,40 @@ async fn release_publish_preflights_independent_members_concurrently() {
         ("@lpm.dev/acme.beta", "packages/beta"),
         ("@lpm.dev/acme.gamma", "packages/gamma"),
     ];
-    let server = MockServer::start().await;
-    let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     for (name, path) in packages {
         project.write_file(
             &format!("{path}/package.json"),
             &format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
         );
     }
+    let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/api/registry/-/package/publish-preflight"))
-        .respond_with(RecordDelayedPreflightStart {
-            starts: std::sync::Arc::clone(&starts),
-            delay: std::time::Duration::from_millis(600),
-        })
+        .and(path(PUBLISH_PREFLIGHT_PATH))
+        .respond_with(preflight_for_a_new_version)
         .expect(3)
         .mount(&server)
         .await;
+    let mut gate = RequestGate::start(&server.uri(), |request| {
+        request.uri.path() == PUBLISH_PREFLIGHT_PATH
+    });
 
-    let output = lpm_with_registry(&project, &server.uri())
-        .args([
-            "release",
-            "publish",
-            "--all",
-            "--lpm",
-            "--dry-run",
-            "--json",
-        ])
-        .output()
-        .expect("run release publish with delayed preflights");
+    let mut command = lpm_spawnable_with_registry(&project, gate.url());
+    command.args([
+        "release",
+        "publish",
+        "--all",
+        "--lpm",
+        "--dry-run",
+        "--json",
+    ]);
+    let output = run_while(command, gate.hold_a_bounded_pool(3, 3)).await;
     assert!(
         output.status.success(),
         "release publish failed\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    let starts = starts.lock().expect("read metadata request starts");
-    assert_eq!(starts.len(), 3);
-    let first = starts.iter().min().expect("first preflight start");
-    let last = starts.iter().max().expect("last preflight start");
-    assert!(
-        last.duration_since(*first) < std::time::Duration::from_millis(300),
-        "delayed preflights started {:?} apart; they ran serially",
-        last.duration_since(*first),
-    );
+    gate.assert_held(3);
 }
 
 #[tokio::test]
@@ -1176,40 +1054,33 @@ async fn release_publish_preflight_starts_at_most_four_requests_before_one_compl
         );
     }
     let server = MockServer::start().await;
-    let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     Mock::given(method("GET"))
-        .and(path("/api/registry/-/package/publish-preflight"))
-        .respond_with(RecordDelayedPreflightStart {
-            starts: std::sync::Arc::clone(&starts),
-            delay: std::time::Duration::from_millis(500),
-        })
+        .and(path(PUBLISH_PREFLIGHT_PATH))
+        .respond_with(preflight_for_a_new_version)
         .expect(8)
         .mount(&server)
         .await;
+    let mut gate = RequestGate::start(&server.uri(), |request| {
+        request.uri.path() == PUBLISH_PREFLIGHT_PATH
+    });
 
-    let output = lpm_with_registry(&project, &server.uri())
-        .args([
-            "release",
-            "publish",
-            "--all",
-            "--lpm",
-            "--dry-run",
-            "--json",
-        ])
-        .output()
-        .expect("run bounded release preflight");
-    assert!(output.status.success());
-    let mut starts = starts.lock().expect("read preflight starts").clone();
-    starts.sort_unstable();
-    assert_eq!(starts.len(), 8);
+    let mut command = lpm_spawnable_with_registry(&project, gate.url());
+    command.args([
+        "release",
+        "publish",
+        "--all",
+        "--lpm",
+        "--dry-run",
+        "--json",
+    ]);
+    let output = run_while(command, gate.hold_a_bounded_pool(4, 8)).await;
     assert!(
-        starts[3].duration_since(starts[0]) < std::time::Duration::from_millis(250),
-        "the first four requests did not start concurrently"
+        output.status.success(),
+        "bounded release preflight failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
-    assert!(
-        starts[4].duration_since(starts[0]) >= std::time::Duration::from_millis(400),
-        "more than four preflight requests started before a slot completed"
-    );
+    gate.assert_held(8);
 }
 
 #[tokio::test]
@@ -1223,91 +1094,173 @@ async fn release_publish_preflight_refills_slots_behind_a_slow_first_request() {
             &format!(r#"{{"name":"@lpm.dev/acme.package-{index}","version":"1.0.0"}}"#),
         );
     }
-    use std::io::{BufRead, Write};
-    let first_response =
-        std::net::TcpListener::bind("127.0.0.1:0").expect("bind gated preflight response");
-    let first_response_url = format!("http://{}/", first_response.local_addr().unwrap());
-    first_response.set_nonblocking(true).unwrap();
-    let (refill_started, refill_received) = std::sync::mpsc::sync_channel(1);
-    let gated_response = std::thread::spawn(move || {
-        let timeout = std::time::Duration::from_secs(30);
-        let deadline = std::time::Instant::now() + timeout;
-        let mut stream = loop {
-            match first_response.accept() {
-                Ok((stream, _)) => break stream,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "first preflight never arrived"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(error) => panic!("accept gated preflight: {error}"),
-            }
-        };
-        stream
-            .set_nonblocking(false)
-            .expect("make gated preflight response blocking");
-        stream.set_read_timeout(Some(timeout)).unwrap();
-        stream.set_write_timeout(Some(timeout)).unwrap();
-        let mut request = std::io::BufReader::new(&mut stream);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            assert!(
-                request.read_line(&mut line).unwrap() > 0,
-                "incomplete preflight request"
-            );
-            if line == "\r\n" {
-                break;
-            }
-        }
-        let refilled_before_first_completed = refill_received.recv_timeout(timeout).is_ok();
-        let body = r#"{"success":true,"name":"@lpm.dev/acme.package-0","version":"1.0.0","packageExists":false}"#;
-        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
-            .expect("send gated first preflight response");
-        refilled_before_first_completed
-    });
     let server = MockServer::start().await;
-    let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     Mock::given(method("GET"))
-        .and(path("/api/registry/-/package/publish-preflight"))
-        .respond_with(RecordGatedPreflightStart {
-            starts: std::sync::Arc::clone(&starts),
-            first_response_url,
-            refill_started,
-        })
+        .and(path(PUBLISH_PREFLIGHT_PATH))
+        .respond_with(preflight_for_a_new_version)
         .expect(8)
         .mount(&server)
         .await;
+    let mut gate = RequestGate::start(&server.uri(), |request| {
+        request.uri.path() == PUBLISH_PREFLIGHT_PATH
+    });
 
-    let output = lpm_with_registry(&project, &server.uri())
-        .args([
-            "release",
-            "publish",
-            "--all",
-            "--lpm",
-            "--dry-run",
-            "--json",
-        ])
-        .output()
-        .expect("run gated release preflight");
-
-    let refilled_before_first_completed = gated_response.join().expect("join gated preflight");
+    let mut command = lpm_spawnable_with_registry(&project, gate.url());
+    command.args([
+        "release",
+        "publish",
+        "--all",
+        "--lpm",
+        "--dry-run",
+        "--json",
+    ]);
+    let output = run_while(command, async {
+        let mut held = std::collections::VecDeque::with_capacity(4);
+        for _ in 0..4 {
+            held.push_back(gate.next().await);
+        }
+        let first = held
+            .iter()
+            .position(|request| request.target().contains("package-0"))
+            .and_then(|first| held.remove(first))
+            .expect("the first package's preflight started with the first four");
+        for _ in 4..8 {
+            held.pop_front().expect("a held preflight").release();
+            held.push_back(gate.next().await);
+        }
+        first.release();
+        held.into_iter().for_each(HeldRequest::release);
+    })
+    .await;
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(starts.lock().expect("read preflight starts").len(), 8);
-    assert!(
-        refilled_before_first_completed,
-        "bounded preflight waited for the first request before refilling a completed slot"
-    );
+    gate.assert_held(8);
+    gate.assert_peak(4).await;
 }
 
 #[tokio::test]
 async fn release_publish_preflight_stops_the_delayed_tail_after_the_first_error() {
+    let project = release_of_twelve();
+    let server = MockServer::start().await;
+    // The first package's preflight answers without saying whether the
+    // version exists, which fails it.
+    Mock::given(method("GET"))
+        .and(path(PUBLISH_PREFLIGHT_PATH))
+        .and(query_param("name", "@lpm.dev/acme.package-0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "name": "@lpm.dev/acme.package-0",
+            "version": "1.0.0"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut gate = RequestGate::choosing(&server.uri(), |request| {
+        (request.uri.path() == PUBLISH_PREFLIGHT_PATH).then(|| {
+            if query_value(request, "name").as_deref() == Some("@lpm.dev/acme.package-0") {
+                Picked::Hold
+            } else {
+                Picked::Stall
+            }
+        })
+    });
+
+    let output = run_while(release_publish(&project, gate.url()), async {
+        let first = gate.next().await;
+        assert!(
+            first.target().contains("package-0"),
+            "the first package's preflight starts the first window: {}",
+            first.target()
+        );
+        gate.wait_until_held(4).await;
+        first.release();
+    })
+    .await;
+
+    assert!(
+        !output.status.success(),
+        "a failed first preflight must fail the release\nstdout: {}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    let envelope = parse_json_output(&output.stdout);
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("publish preflight response")
+                && error.contains("packageExists")),
+        "the release failed for the first package's answer: {envelope:#}"
+    );
+    assert_eq!(
+        gate.held(),
+        4,
+        "the three stalled preflights of the first window were stopped, and none after them started"
+    );
+}
+
+#[tokio::test]
+async fn release_publish_preflight_starts_none_after_a_failure_while_an_earlier_one_runs() {
+    let project = release_of_twelve();
+    let server = MockServer::start().await;
+    let (failed, mut failure_answered) = tokio::sync::mpsc::unbounded_channel();
+    Mock::given(method("GET"))
+        .and(path(PUBLISH_PREFLIGHT_PATH))
+        .and(query_param("name", "@lpm.dev/acme.package-1"))
+        .respond_with(move |_: &Request| {
+            let _ = failed.send(());
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "name": "@lpm.dev/acme.package-1",
+                "version": "1.0.0"
+            }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(PUBLISH_PREFLIGHT_PATH))
+        .respond_with(preflight_for_a_new_version)
+        .mount(&server)
+        .await;
+    let mut gate = RequestGate::start(&server.uri(), |request| {
+        request.uri.path() == PUBLISH_PREFLIGHT_PATH
+            && query_value(request, "name").as_deref() != Some("@lpm.dev/acme.package-1")
+    });
+
+    let output = run_while(release_publish(&project, gate.url()), async {
+        let held = [gate.next().await, gate.next().await, gate.next().await];
+        assert!(
+            held.iter()
+                .any(|request| request.target().contains("package-0")),
+            "the first package's preflight, before the failing one, still runs"
+        );
+        tokio::time::timeout(support::request_gate::WAIT_LIMIT, failure_answered.recv())
+            .await
+            .expect("the second package's preflight never started")
+            .expect("the mock answered");
+        gate.assert_quiet(
+            "a preflight started in the slot of one that failed, after an earlier one",
+        )
+        .await;
+        held.into_iter().for_each(HeldRequest::release);
+    })
+    .await;
+
+    assert!(!output.status.success());
+    let envelope = parse_json_output(&output.stdout);
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("packageExists")),
+        "the release failed for the second package's answer: {envelope:#}"
+    );
+    gate.assert_held(3);
+}
+
+/// A workspace of twelve packages to release.
+fn release_of_twelve() -> TempProject {
     let project = TempProject::empty(
         r#"{"name":"root","private":true,"version":"0.0.0","workspaces":["packages/*"]}"#,
     );
@@ -1317,39 +1270,22 @@ async fn release_publish_preflight_stops_the_delayed_tail_after_the_first_error(
             &format!(r#"{{"name":"@lpm.dev/acme.package-{index}","version":"1.0.0"}}"#),
         );
     }
-    let server = MockServer::start().await;
-    let starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    Mock::given(method("GET"))
-        .and(path("/api/registry/-/package/publish-preflight"))
-        .respond_with(FailFirstPreflightAndDelayOthers {
-            starts: std::sync::Arc::clone(&starts),
-            delay: std::time::Duration::from_millis(700),
-        })
-        .mount(&server)
-        .await;
+    project
+}
 
-    let started = std::time::Instant::now();
-    let output = lpm_with_registry(&project, &server.uri())
-        .args([
-            "release",
-            "publish",
-            "--all",
-            "--lpm",
-            "--dry-run",
-            "--json",
-        ])
-        .output()
-        .expect("run fail-fast release preflight");
-
-    assert!(!output.status.success());
-    assert!(
-        started.elapsed() < std::time::Duration::from_millis(650),
-        "release preflight waited for delayed work after the first error"
-    );
-    assert!(
-        starts.load(std::sync::atomic::Ordering::SeqCst) <= 4,
-        "release preflight started work beyond its initial bounded window"
-    );
+/// `lpm release publish` of every package to lpm.dev, a dry run, through
+/// `registry`.
+fn release_publish(project: &TempProject, registry: &str) -> std::process::Command {
+    let mut command = lpm_spawnable_with_registry(project, registry);
+    command.args([
+        "release",
+        "publish",
+        "--all",
+        "--lpm",
+        "--dry-run",
+        "--json",
+    ]);
+    command
 }
 
 #[tokio::test]
@@ -1358,6 +1294,9 @@ async fn release_publish_limits_full_npm_packument_preflights_to_one_in_flight()
         r#"{"name":"root","private":true,"version":"0.0.0","workspaces":["packages/*"]}"#,
     );
     let server = MockServer::start().await;
+    let mut gate = RequestGate::start(&server.uri(), |request| {
+        request.uri.path().starts_with("/package-")
+    });
     for index in 0..4 {
         project.write_file(
             &format!("packages/package-{index}/package.json"),
@@ -1365,10 +1304,7 @@ async fn release_publish_limits_full_npm_packument_preflights_to_one_in_flight()
         );
         project.write_file(
             &format!("packages/package-{index}/lpm.json"),
-            &format!(
-                r#"{{"publish":{{"npm":{{"registry":"{}"}}}}}}"#,
-                server.uri()
-            ),
+            &format!(r#"{{"publish":{{"npm":{{"registry":"{}"}}}}}}"#, gate.url()),
         );
     }
     let login = lpm(&project)
@@ -1376,35 +1312,30 @@ async fn release_publish_limits_full_npm_packument_preflights_to_one_in_flight()
             "--json",
             "login",
             "--login-registry",
-            &server.uri(),
+            gate.url(),
             "--token",
             "packument-memory-token",
         ])
         .output()
         .expect("store registry-scoped token");
     assert!(login.status.success());
-    let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     Mock::given(method("GET"))
         .and(path_regex("/package-[0-9]+"))
-        .respond_with(RecordDelayedNpmPackumentStart {
-            starts: std::sync::Arc::clone(&starts),
-            delay: std::time::Duration::from_millis(250),
-        })
+        .respond_with(npm_packument_without_versions)
         .expect(4)
         .mount(&server)
         .await;
 
-    let output = lpm_with_registry(&project, &server.uri())
-        .args([
-            "release",
-            "publish",
-            "--all",
-            "--npm",
-            "--dry-run",
-            "--json",
-        ])
-        .output()
-        .expect("run memory-bounded npm preflight");
+    let mut command = lpm_spawnable_with_registry(&project, gate.url());
+    command.args([
+        "release",
+        "publish",
+        "--all",
+        "--npm",
+        "--dry-run",
+        "--json",
+    ]);
+    let output = run_while(command, gate.hold_a_bounded_pool(1, 4)).await;
 
     assert!(
         output.status.success(),
@@ -1412,13 +1343,7 @@ async fn release_publish_limits_full_npm_packument_preflights_to_one_in_flight()
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    let starts = starts.lock().expect("read npm packument starts").clone();
-    assert_eq!(starts.len(), 4);
-    assert!(
-        starts.windows(2).all(|pair| {
-            pair[1].duration_since(pair[0]) >= std::time::Duration::from_millis(150)
-        })
-    );
+    gate.assert_held(4);
 }
 
 #[tokio::test]
@@ -1434,7 +1359,7 @@ async fn release_publish_limits_lpm_metadata_fallbacks_to_one_in_flight() {
     }
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/api/registry/-/package/publish-preflight"))
+        .and(path(PUBLISH_PREFLIGHT_PATH))
         .respond_with(|request: &Request| {
             let query: std::collections::HashMap<_, _> =
                 request.url.query_pairs().into_owned().collect();
@@ -1448,28 +1373,29 @@ async fn release_publish_limits_lpm_metadata_fallbacks_to_one_in_flight() {
         .expect(4)
         .mount(&server)
         .await;
-    let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     Mock::given(method("GET"))
         .and(path_regex("/api/registry/@lpm[.]dev/acme[.]package-[0-9]+"))
-        .respond_with(RecordDelayedLpmMetadataStart {
-            starts: std::sync::Arc::clone(&starts),
-            delay: std::time::Duration::from_millis(250),
-        })
+        .respond_with(existing_lpm_metadata)
         .expect(4)
         .mount(&server)
         .await;
+    let mut gate = RequestGate::start(&server.uri(), |request| {
+        request
+            .uri
+            .path()
+            .starts_with("/api/registry/@lpm.dev/acme.package-")
+    });
 
-    let output = lpm_with_registry(&project, &server.uri())
-        .args([
-            "release",
-            "publish",
-            "--all",
-            "--lpm",
-            "--dry-run",
-            "--json",
-        ])
-        .output()
-        .expect("run memory-bounded LPM metadata fallback");
+    let mut command = lpm_spawnable_with_registry(&project, gate.url());
+    command.args([
+        "release",
+        "publish",
+        "--all",
+        "--lpm",
+        "--dry-run",
+        "--json",
+    ]);
+    let output = run_while(command, gate.hold_a_bounded_pool(1, 4)).await;
 
     assert!(
         output.status.success(),
@@ -1477,13 +1403,7 @@ async fn release_publish_limits_lpm_metadata_fallbacks_to_one_in_flight() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    let starts = starts.lock().expect("read LPM metadata starts").clone();
-    assert_eq!(starts.len(), 4);
-    assert!(
-        starts.windows(2).all(|pair| {
-            pair[1].duration_since(pair[0]) >= std::time::Duration::from_millis(150)
-        })
-    );
+    gate.assert_held(4);
 }
 
 #[tokio::test]

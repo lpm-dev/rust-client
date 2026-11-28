@@ -8,71 +8,44 @@
 mod support;
 
 use support::mock_registry::{MockRegistry, make_tarball};
-use support::{TempProject, lpm, lpm_with_registry};
+use support::request_gate::{RequestGate, query_value, run_while};
+use support::{TempProject, lpm, lpm_spawnable_with_registry, lpm_with_registry};
 use wiremock::matchers::{method, path, path_regex, query_param};
-use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-#[derive(Clone)]
-struct RecordDelayedOutdatedMetadataStart {
-    starts: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
-    delay: std::time::Duration,
+fn outdated_metadata(request: &Request) -> ResponseTemplate {
+    let name = request
+        .url
+        .path()
+        .strip_prefix("/api/registry/")
+        .unwrap_or_default();
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "name": name,
+        "dist-tags": { "latest": "1.1.0" },
+        "versions": {
+            "1.0.0": { "name": name, "version": "1.0.0" },
+            "1.1.0": { "name": name, "version": "1.1.0" }
+        },
+        "time": {
+            "1.0.0": "2025-01-01T00:00:00.000Z",
+            "1.1.0": "2025-01-01T00:00:00.000Z"
+        }
+    }))
 }
 
-impl Respond for RecordDelayedOutdatedMetadataStart {
-    fn respond(&self, request: &Request) -> ResponseTemplate {
-        self.starts
-            .lock()
-            .expect("record outdated metadata request start")
-            .push(std::time::Instant::now());
-        let name = request
-            .url
-            .path()
-            .strip_prefix("/api/registry/")
-            .unwrap_or_default();
-        ResponseTemplate::new(200)
-            .set_delay(self.delay)
-            .set_body_json(serde_json::json!({
-                "name": name,
-                "dist-tags": { "latest": "1.1.0" },
-                "versions": {
-                    "1.0.0": { "name": name, "version": "1.0.0" },
-                    "1.1.0": { "name": name, "version": "1.1.0" }
-                },
-                "time": {
-                    "1.0.0": "2025-01-01T00:00:00.000Z",
-                    "1.1.0": "2025-01-01T00:00:00.000Z"
-                }
-            }))
-    }
-}
-
-#[derive(Clone)]
-struct RecordDelayedOutdatedReleaseTimesStart {
-    starts: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
-    delay: std::time::Duration,
-}
-
-impl Respond for RecordDelayedOutdatedReleaseTimesStart {
-    fn respond(&self, request: &Request) -> ResponseTemplate {
-        self.starts
-            .lock()
-            .expect("record outdated release-time request start")
-            .push(std::time::Instant::now());
-        let name = request
-            .url
-            .path()
-            .strip_prefix("/api/registry/")
-            .unwrap_or_default();
-        ResponseTemplate::new(200)
-            .set_delay(self.delay)
-            .set_body_json(serde_json::json!({
-                "name": name,
-                "time": {
-                    "1.0.0": "2025-01-01T00:00:00.000Z",
-                    "1.1.0": "2025-01-01T00:00:00.000Z"
-                }
-            }))
-    }
+fn outdated_release_times(request: &Request) -> ResponseTemplate {
+    let name = request
+        .url
+        .path()
+        .strip_prefix("/api/registry/")
+        .unwrap_or_default();
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "name": name,
+        "time": {
+            "1.0.0": "2025-01-01T00:00:00.000Z",
+            "1.1.0": "2025-01-01T00:00:00.000Z"
+        }
+    }))
 }
 
 fn iso8601_n_secs_ago(n_secs: i64) -> String {
@@ -1536,8 +1509,9 @@ async fn outdated_human_failure_does_not_claim_every_dependency_is_up_to_date() 
 }
 
 #[tokio::test]
-async fn outdated_hydrates_release_times_in_bounded_parallel_waves() {
+async fn outdated_hydrates_release_times_sixteen_at_a_time_and_refills_each_freed_slot() {
     const PACKAGE_COUNT: usize = 20;
+    const LOOKUP_LIMIT: usize = 16;
     let mut manifest_dependencies = serde_json::Map::with_capacity(PACKAGE_COUNT);
     let mut lockfile =
         String::from("[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n");
@@ -1579,51 +1553,34 @@ async fn outdated_hydrates_release_times_in_bounded_parallel_waves() {
             .mount(&server)
             .await;
     }
-    let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     Mock::given(method("GET"))
         .and(path_regex(
             r"^/api/registry/@lpm\.dev/owner\.hydration-wave-[0-9]+$",
         ))
         .and(query_param("release_times", "1"))
-        .respond_with(RecordDelayedOutdatedReleaseTimesStart {
-            starts: std::sync::Arc::clone(&starts),
-            delay: std::time::Duration::from_millis(250),
-        })
+        .respond_with(outdated_release_times)
         .with_priority(1)
         .expect(PACKAGE_COUNT as u64)
         .mount(&server)
         .await;
+    let mut gate = RequestGate::start(&server.uri(), |request| {
+        query_value(request, "release_times").as_deref() == Some("1")
+    });
 
-    let out = lpm_with_registry(&project, &server.uri())
-        .args(["outdated", "--json"])
-        .output()
-        .expect("spawn outdated hydration wave check");
+    let mut command = lpm_spawnable_with_registry(&project, gate.url());
+    command.args(["outdated", "--json"]);
+    let out = run_while(
+        command,
+        gate.hold_a_bounded_pool(LOOKUP_LIMIT, PACKAGE_COUNT),
+    )
+    .await;
     assert!(
         out.status.success(),
         "bounded hydration check should succeed\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
-    let starts = starts.lock().expect("read release-time request starts");
-    assert_eq!(starts.len(), PACKAGE_COUNT);
-    let first = *starts.iter().min().expect("at least one hydration start");
-    let mut offsets = starts
-        .iter()
-        .map(|start| start.duration_since(first))
-        .collect::<Vec<_>>();
-    offsets.sort();
-    assert!(
-        offsets[15] < std::time::Duration::from_millis(150),
-        "the first sixteen hydration slots did not start together: {offsets:?}",
-    );
-    assert!(
-        offsets[16] >= std::time::Duration::from_millis(200),
-        "more than sixteen hydration requests ran in the first wave: {offsets:?}",
-    );
-    assert!(
-        offsets[19] < std::time::Duration::from_millis(450),
-        "the hydration scheduler did not refill promptly: {offsets:?}",
-    );
+    gate.assert_held(PACKAGE_COUNT);
 }
 
 #[tokio::test]
@@ -1671,8 +1628,9 @@ async fn outdated_bounds_one_shared_metadata_failure_across_many_aliases() {
 }
 
 #[tokio::test]
-async fn outdated_runs_metadata_lookups_in_bounded_parallel_waves() {
+async fn outdated_looks_up_metadata_sixteen_at_a_time_and_refills_each_freed_slot() {
     const PACKAGE_COUNT: usize = 20;
+    const LOOKUP_LIMIT: usize = 16;
     let mut manifest_dependencies = serde_json::Map::with_capacity(PACKAGE_COUNT);
     let mut lockfile =
         String::from("[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n");
@@ -1694,48 +1652,35 @@ async fn outdated_runs_metadata_lookups_in_bounded_parallel_waves() {
     project.write_file("lpm.lock", &lockfile);
 
     let server = MockServer::start().await;
-    let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     Mock::given(method("GET"))
         .and(path_regex(
             r"^/api/registry/@lpm\.dev/owner\.bounded-[0-9]+$",
         ))
-        .respond_with(RecordDelayedOutdatedMetadataStart {
-            starts: std::sync::Arc::clone(&starts),
-            delay: std::time::Duration::from_millis(250),
-        })
+        .respond_with(outdated_metadata)
+        .expect(PACKAGE_COUNT as u64)
         .mount(&server)
         .await;
+    let mut gate = RequestGate::start(&server.uri(), |request| {
+        request
+            .uri
+            .path()
+            .starts_with("/api/registry/@lpm.dev/owner.bounded-")
+    });
 
-    let out = lpm_with_registry(&project, &server.uri())
-        .args(["outdated", "--json"])
-        .output()
-        .expect("spawn bounded outdated check");
+    let mut command = lpm_spawnable_with_registry(&project, gate.url());
+    command.args(["outdated", "--json"]);
+    let out = run_while(
+        command,
+        gate.hold_a_bounded_pool(LOOKUP_LIMIT, PACKAGE_COUNT),
+    )
+    .await;
     assert!(
         out.status.success(),
         "bounded outdated check should succeed\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
-    let starts = starts.lock().expect("read metadata request starts");
-    assert_eq!(starts.len(), PACKAGE_COUNT);
-    let first = *starts.iter().min().unwrap();
-    let mut offsets = starts
-        .iter()
-        .map(|start| start.duration_since(first))
-        .collect::<Vec<_>>();
-    offsets.sort();
-    assert!(
-        offsets[15] < std::time::Duration::from_millis(150),
-        "the first sixteen bounded slots did not start together: {offsets:?}"
-    );
-    assert!(
-        offsets[16] >= std::time::Duration::from_millis(200),
-        "more than sixteen metadata requests ran in the first wave: {offsets:?}"
-    );
-    assert!(
-        offsets[19] < std::time::Duration::from_millis(450),
-        "the bounded scheduler did not refill promptly for the second wave: {offsets:?}"
-    );
+    gate.assert_held(PACKAGE_COUNT);
 }
 
 // ─── JSON contract snapshot ─────────────────────────────────────────────
