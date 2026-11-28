@@ -1295,6 +1295,7 @@ impl SyncNoopFileStamp {
         }
     }
 
+    #[cfg(not(windows))]
     pub(crate) fn from_symlink_metadata(meta: &std::fs::Metadata) -> Option<Self> {
         if meta.file_type().is_symlink() {
             return None;
@@ -1302,6 +1303,7 @@ impl SyncNoopFileStamp {
         Self::from_regular_metadata(meta)
     }
 
+    #[cfg(not(windows))]
     fn from_regular_metadata(meta: &std::fs::Metadata) -> Option<Self> {
         #[cfg(not(unix))]
         {
